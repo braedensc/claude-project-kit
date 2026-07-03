@@ -75,9 +75,9 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    `.husky/pre-commit`, the hook's `git add` guard, AND CLAUDE.md Hard Rule 1
 >    (all three layers + the doc must agree). Delete the concept only if I said none.
 > 4. Activate workflows: `git rm .github/workflows/ci.yml && git mv
->    templates/workflows/ci.yml .github/workflows/ci.yml`, then add a hook-battery
->    step (`python3 .claude/hooks/test_hooks.py`) to its secrets-and-paths job so the
->    battery stays in CI. Move `deploy-on-green.yml`, `backup-cron.yml`,
+>    templates/workflows/ci.yml .github/workflows/ci.yml` — it ships with the
+>    hook-battery step built in (`python3 .claude/hooks/test_hooks.py`); the battery
+>    must stay in CI. Move `deploy-on-green.yml`, `backup-cron.yml`,
 >    `keepalive.yml` the same way; adapt their fenced stack sections; DELETE any that
 >    don't apply (no DB → no backup-cron; nothing pauses → no keepalive). Fill
 >    `{{EDGE_FUNCTION_NAMES}}`, `{{SMOKE_FUNCTION_NAME}}`, `{{KEEPALIVE_TABLE}}` or

@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Hook battery (48 block/allow cases)
+      - name: Hook battery (block/allow)
         run: python3 .claude/hooks/test_hooks.py
 
       - name: Validate all tracked JSON/YAML

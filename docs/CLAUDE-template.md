@@ -97,6 +97,13 @@ bullets for changes, one verification line. Everything deeper goes in a `<detail
 block, never the visible body. Target ≤ ~150 visible words. After committing on a
 feature branch, push and open the PR without asking.
 
+**Working agreements (every session):** explain any tool or service the owner may not
+know in a few plain sentences (what + why) before adopting it. Flag any security risk
+and any recurring cost BEFORE incurring it; default to free tiers. When a project
+surfaces a transferable lesson or security improvement, PR it back to the
+[claude-project-kit](https://github.com/braedensc/claude-project-kit) template — that
+repo is the living successor to per-machine bootstrap kits.
+
 **Docs lifecycle (docs-as-scaffolding, then right-sized):**
 - **Bootstrap phase:** heavy discipline on purpose — an ADR per significant PR,
   SETUP/SERVICES kept current, co-located READMEs. The docs let cold sessions (and

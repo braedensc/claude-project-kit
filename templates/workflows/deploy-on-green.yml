@@ -80,6 +80,7 @@ jobs:
   gate:
     name: Gate — CI passed on main
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # gate is one no-network step, but it holds the concurrency lock too
     # Proceed only when the triggering CI run SUCCEEDED, or for a manual
     # dispatch FROM MAIN. The `github.ref == main` guard closes the hole where
     # `gh workflow run deploy.yml --ref <any-branch>` could push an unreviewed,

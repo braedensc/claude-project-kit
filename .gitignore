@@ -8,6 +8,7 @@ planning/
 # Secrets — only .env.example (placeholder values) is ever committed
 .env
 .env.*
+.env*.local
 !.env.example
 *.pem
 *.key

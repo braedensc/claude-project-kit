@@ -63,6 +63,10 @@ Rules that fall out of this:
   dashboards)" — Claude cannot and should not do them; that boundary is the design.
 - **Secrets in workflows stay in `env:`** referenced as `"$VAR"` — never inline, never
   with `set -x`/`--debug`, or the value leaks into logs.
+- **MCP servers that carry tokens are user-scoped, never committed.** Register them
+  with `claude mcp add --scope user …` (lives in `~/.claude.json`, OAuth on first use)
+  so no token or server config lands in project files; collaborators run the same
+  command on their own machines (todoclaw's Sentry MCP pattern).
 
 ---
 
