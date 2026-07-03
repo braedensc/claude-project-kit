@@ -39,6 +39,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The hook battery ships as a permanent CI step (needs only python3 + git,
+      # both preinstalled) — every edit to .claude/hooks/pre-tool-use.py is
+      # regression-gated forever.
+      - name: Hook battery (block/allow)
+        run: python3 .claude/hooks/test_hooks.py
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -47,10 +53,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Block forbidden paths (planning/, real .env)
+      - name: Block forbidden paths (planning/, real .env, key material)
         run: |
           FORBIDDEN=$(git ls-files \
-            | grep -E '^planning/|(^|/)\.env' \
+            | grep -E '^planning/|(^|/)\.env|\.pem$|\.key$' \
             | grep -v -E '(^|/)\.env\.example$' \
             || true)
           if [ -n "$FORBIDDEN" ]; then

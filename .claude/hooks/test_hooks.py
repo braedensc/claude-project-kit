@@ -11,7 +11,7 @@ beyond python3 + git.
 Two execution modes per case:
   * path-independent guards run against THIS repo's hook directly;
   * branch-guard cases run against a copy of the hook inside a throwaway
-    git repo pinned to `main` or a feature branch, because the hook derives
+    git repo pinned to `main`/`master` or a feature branch, because the hook derives
     PROJECT_ROOT from its own file location — this keeps the battery
     deterministic in CI (where checkouts are detached-HEAD).
 
@@ -100,6 +100,7 @@ def main():
         return 1
 
     main_root, main_hook = make_sandbox("main")
+    master_root, master_hook = make_sandbox("master")
     feat_root, feat_hook = make_sandbox("feat/battery")
 
     # (name, payload, expect_block, hook_path)
@@ -135,6 +136,8 @@ def main():
         ("Read .env blocked", read("/x/.env"), BLOCK, HOOK),
         ("Read .env.production blocked", read("/x/.env.production"), BLOCK, HOOK),
         ("Read deploy.key blocked", read("deploy.key"), BLOCK, HOOK),
+        ("Read cert.pem blocked", read("/x/cert.pem"), BLOCK, HOOK),
+        ("tail .key via shell blocked", bash("tail -n2 keys/deploy.key"), BLOCK, HOOK),
         ("Read .env.example allowed", read("/x/.env.example"), ALLOW, HOOK),
 
         # ── universal: secret writes ─────────────────────────────────────────
@@ -162,6 +165,7 @@ def main():
         ("Edit in-project on main blocked",
          edit(os.path.join(main_root, "src/app.ts"), "x"), BLOCK, main_hook),
         ("git commit on main blocked", bash('git commit -F /tmp/msg.txt'), BLOCK, main_hook),
+        ("git commit on master blocked", bash('git commit -F /tmp/msg.txt'), BLOCK, master_hook),
         ("Edit in-project on feature branch allowed",
          edit(os.path.join(feat_root, "src/app.ts"), "x"), ALLOW, feat_hook),
         ("git commit on feature branch allowed", bash('git commit -F /tmp/msg.txt'), ALLOW, feat_hook),
@@ -200,6 +204,7 @@ def main():
         failures += 0 if ok else 1
 
     shutil.rmtree(main_root, ignore_errors=True)
+    shutil.rmtree(master_root, ignore_errors=True)
     shutil.rmtree(feat_root, ignore_errors=True)
 
     total = len(cases)

@@ -47,3 +47,8 @@ The kit is a **public GitHub template repo** that self-hosts its own protections
 - `is_template: true` confirmed via `gh api` (the "Use this template" button exists).
 - The missing-script deadlock during bootstrap (docs/LESSONS.md) empirically confirmed
   the fail-closed property.
+
+**Update (2026-07-03, completeness pass):** the battery grew to 51 cases
+(master-branch guard, Read `.pem`, shell-read `.key` alternatives) and the battery
+step now ships inside `templates/workflows/ci.yml` — its permanence in bootstrapped
+projects is structural, not instructional.

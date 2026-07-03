@@ -146,8 +146,8 @@ if tool == "Bash":
     # Block staging reference dirs or real .env files.
     # `planning/` is this kit's default name for a gitignored reference-material
     # dir (licensed specs, exports, scratch notes). If your project names it
-    # differently, update this pattern AND .gitignore AND .husky/pre-commit
-    # together — the three layers must agree.
+    # differently, update this pattern AND .gitignore AND .husky/pre-commit AND
+    # the app CI's forbidden-paths grep together — every layer must agree.
     if re.search(r"\bgit\s+add\b[^#\n;&|]*(planning/|\.env(?!\.example))", scan):
         block(
             "Staging planning/ or .env files is forbidden — "

@@ -1,3 +1,5 @@
+<!-- Distilled from todoclaw's PR convention (CLAUDE.md → Conventions → PRs),
+     the format of every PR in a full production build, 2026-06-23 → 2026-07-03. -->
 <!-- Concise PR format — the body must be scannable in under a minute.
      2–3 plain sentences: WHAT changed and WHY. Target ≤ ~150 visible words total.
      (Convention: docs/CLAUDE-template.md → Conventions → PRs.) -->

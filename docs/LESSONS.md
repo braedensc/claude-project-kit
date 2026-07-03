@@ -19,7 +19,9 @@ written before the hook script existed. Fixes: always
 `python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/…` (absolute, quoted; the var is set in the
 hook environment — verified — though not in the Bash tool env), and **create the
 scripts first, write settings.json last**. Recovery is human-only: create an exit-0
-stub at the expected path, or fix/remove settings.json. Do NOT "harden" with a
+stub at the expected path, fix/remove settings.json — or, for the relative-path
+variant only, restart the session (a fresh shell resets cwd to the project root). Do
+NOT "harden" with a
 `${CLAUDE_PROJECT_DIR:-.}` fallback (reintroduces the relative-path hole) — fail-closed
 is correct for a security hook.
 
@@ -81,6 +83,8 @@ literal `node_modules/.bin/...` path (that bug misreported as "found a potential
 secret" and pushed people toward `--no-verify`). If a worktree commit is blocked by
 hook tooling: run the exact scan manually with the main checkout's binary, confirm exit
 0, THEN `--no-verify` — perform the check, don't skip it; CI re-runs it regardless.
+To *test* a hook fix from a worktree before it merges, commit once with
+`git -c core.hooksPath=<dir> commit …` pointing `<dir>/pre-commit` at the fixed hook.
 
 **Husky resets `core.hooksPath` on every `npm install`** (the `prepare` script). Don't
 fight it or repoint it; make the hook itself robust.

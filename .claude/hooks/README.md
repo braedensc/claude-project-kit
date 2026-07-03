@@ -62,11 +62,16 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-~48 block/allow cases covering every guard above, including the v2 prose-stripping allows and sandboxed branch-guard cases (throwaway git repos pinned to `main` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD). Runs in CI on every PR. **If you edit the hook, add a case.**
+51 block/allow cases covering every guard above, including the v2 prose-stripping allows and sandboxed branch-guard cases (throwaway git repos pinned to `main` / `master` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD). Runs in CI on every PR; also available as `npm run test:hooks`
+(and the repo-wide secret scan as `npm run lint:secrets`). **If you edit the hook, add a case.**
 
 ---
 
 ## Defense in depth
+
+(`.secretlintrc.json` — layer 2's config — is copied byte-for-byte from todoclaw's, in
+production 2026-06-23 → 2026-07-03; strict JSON can't carry its own provenance header,
+so it lives here.)
 
 These hooks are **layer 1** of three (full model: `docs/SECURITY.md`):
 1. **Claude Code hooks** (this) — guard Claude's actions in real time; the model cannot bypass.

@@ -15,9 +15,11 @@ place in your new project.
 Activation (done by the bootstrap session, not by hand):
 
 ```bash
+git rm .github/workflows/ci.yml           # the kit's own CI yields to the app CI first
 git mv templates/workflows/*.yml .github/workflows/
-# then: fill the {{…}} tokens (see PLACEHOLDERS.md), adapt the fenced
-# STACK-SPECIFIC sections, and delete templates/ once empty.
+git rm -r templates/                      # one-way: this README goes too
+# then: fill the {{…}} tokens (see PLACEHOLDERS.md) and adapt the fenced
+# STACK-SPECIFIC sections.
 ```
 
 Every template carries a header comment stating its todoclaw provenance and

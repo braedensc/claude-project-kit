@@ -35,7 +35,8 @@ Phase 4 replaces them all, deletes this file, and re-runs the script with
 
 - `.env.example` — replace the example vars with your project's public-env contract.
 - `planning/` — the reference-dir name, if you chose a different one, must change in
-  `.gitignore` + `.husky/pre-commit` + the hook's `git add` guard + CLAUDE.md Rule 1.
+  `.gitignore` + `.husky/pre-commit` + the hook's `git add` guard + the app CI's
+  forbidden-paths grep + CLAUDE.md Rule 1 (every enforcement layer must agree).
 - The hook's fenced STACK-SPECIFIC section + matching battery cases in `test_hooks.py`.
 - npm script names in `templates/workflows/ci.yml` (`lint` / `format:check` /
   `typecheck` / `test` / `test:e2e`) if your toolchain differs.
