@@ -1,0 +1,110 @@
+#!/bin/sh
+# Pre-commit hook — layer 2 of 3 (bypassable via --no-verify; CI is the real gate).
+# Distilled from todoclaw's .husky/pre-commit — in production 2026-06-23 → 2026-07-03,
+# including the worktree-aware secretlint resolution (husky's core.hooksPath means
+# worktree commits run this file even before the worktree has node_modules —
+# see docs/LESSONS.md).
+#
+# NOTE: git runs this via husky's runner under `sh -e` (any unguarded non-zero
+# exit aborts the script), and it inherits the nvm *default* node — which may be
+# older than secretlint needs. Both facts are handled below.
+
+# ── Ensure a modern Node is on PATH (secretlint needs >= 20) ──────────────────
+if ! node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' 2>/dev/null; then
+  for major in 24 22 20; do
+    dir=$(ls -d "$HOME/.nvm/versions/node/v${major}".* 2>/dev/null | sort -V | tail -1)
+    if [ -n "$dir" ]; then
+      PATH="$dir/bin:$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
+
+# ── 0. Block direct commits to main/master ───────────────────────────────────
+# Layer 2 of the feature-branch workflow (see docs/COLLABORATION.md). Bypassable
+# with --no-verify, but CI + branch protection is the real gate. Keeps main clean
+# so collaborators never pull half-finished work.
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+  echo ""
+  echo "  BLOCKED: direct commit to '$BRANCH'."
+  echo "  Create a feature branch first:"
+  echo "    git checkout -b <type>/<short-kebab-desc>   (feat|fix|chore|refactor|docs)"
+  echo ""
+  exit 1
+fi
+
+# ── 1. Block planning/ and real .env files from being staged ─────────────────
+# Match planning/ or any path component starting with .env, then explicitly
+# allow .env.example. (|| true so a no-match grep doesn't abort under `sh -e`)
+FORBIDDEN=$(git diff --cached --name-only \
+  | grep -E '^planning/|(^|/)\.env' \
+  | grep -v -E '(^|/)\.env\.example$' \
+  || true)
+if [ -n "$FORBIDDEN" ]; then
+  echo ""
+  echo "  BLOCKED: Forbidden files in this commit:"
+  echo "$FORBIDDEN" | sed 's/^/    /'
+  echo ""
+  echo "  planning/ is gitignored reference material and must never be published."
+  echo "  .env files (other than .env.example) contain real secrets."
+  echo ""
+  exit 1
+fi
+
+# ── 2. Run secretlint on all staged files ────────────────────────────────────
+# A git worktree (e.g. .claude/worktrees/<name>/) usually has no node_modules of
+# its own, so the literal `node_modules/.bin/secretlint` path resolves only in a
+# checkout that ran `npm install`. Resolve the binary robustly: prefer a local
+# install, else fall back to the MAIN checkout's node_modules, located via the
+# shared git dir (`git rev-parse --git-common-dir`; its parent is the main
+# working tree). CWD stays the worktree, so the staged paths + .secretlintrc.json
+# resolve there while secretlint loads its rule preset from its own install.
+# If no binary is found we FAIL loudly — silently skipping would disable layer 2.
+STAGED=$(git diff --cached --name-only --diff-filter=ACM || true)
+if [ -n "$STAGED" ]; then
+  if [ -x node_modules/.bin/secretlint ]; then
+    SECRETLINT=node_modules/.bin/secretlint
+  else
+    COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null || echo "")
+    MAIN_ROOT=$(dirname -- "${COMMON_DIR:-.}")
+    if [ -x "$MAIN_ROOT/node_modules/.bin/secretlint" ]; then
+      SECRETLINT="$MAIN_ROOT/node_modules/.bin/secretlint"
+    else
+      SECRETLINT=""
+    fi
+  fi
+
+  if [ -z "$SECRETLINT" ]; then
+    echo ""
+    echo "  BLOCKED: could not find the secretlint binary — the secret scan did not run."
+    echo "  Run 'npm install' in the main checkout, then commit again."
+    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
+    echo ""
+    exit 1
+  fi
+
+  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json; then
+    echo ""
+    echo "  BLOCKED: secretlint found a potential secret in staged files."
+    echo "  Remove the secret value and reference it by env var name only."
+    echo ""
+    exit 1
+  fi
+fi
+
+# ── 3. Lint + format staged code (eslint --fix + prettier via lint-staged) ─────
+# Optional: runs only if the project installed lint-staged (app projects do;
+# the bare kit doesn't). lint-staged needs Node >= 20 — the PATH shim above
+# guarantees it.
+if [ -f node_modules/.bin/lint-staged ]; then
+  if ! node_modules/.bin/lint-staged; then
+    echo ""
+    echo "  BLOCKED: lint-staged failed — fix the eslint/prettier errors above."
+    echo ""
+    exit 1
+  fi
+fi
+
+exit 0

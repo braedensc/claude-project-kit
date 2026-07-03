@@ -1,0 +1,17 @@
+{
+  "name": "claude-project-kit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-stack project template: Claude Code hook suite, CI/CD patterns, 3-layer security model, process docs — distilled from a production build",
+  "type": "module",
+  "scripts": {
+    "test:hooks": "python3 .claude/hooks/test_hooks.py",
+    "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@secretlint/secretlint-rule-preset-recommend": "^13.0.2",
+    "husky": "^9.1.7",
+    "secretlint": "^13.0.2"
+  }
+}

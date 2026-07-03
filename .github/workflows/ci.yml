@@ -1,0 +1,74 @@
+name: CI
+
+# The kit's own CI — the kit lints itself. Layer 3 of the 3-layer security model
+# (docs/SECURITY.md). Distilled from todoclaw's ci.yml (live 2026-06-23 →
+# 2026-07-03); the app-project version with lint/typecheck/test/e2e jobs lives
+# at templates/workflows/ci.yml.
+#
+# The job `name:` IS the required-status-check context. Branch protection
+# requiring "Kit checks" is set only AFTER this workflow's first green run on
+# main — requiring a context before it has ever reported wedges every open PR
+# (merge-THEN-require; see docs/LESSONS.md).
+
+on:
+  push:
+    branches: [main]
+  # Run on every PR regardless of base branch — so stacked PRs (base != main)
+  # are gated too, not just PRs that target main directly.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  kit-checks:
+    name: Kit checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hook battery (48 block/allow cases)
+        run: python3 .claude/hooks/test_hooks.py
+
+      - name: Validate all tracked JSON/YAML
+        run: |
+          python3 -m pip install --quiet pyyaml
+          git ls-files '*.json' '*.yml' '*.yaml' | python3 -c '
+          import json, sys, yaml
+          bad = []
+          for f in sys.stdin.read().split():
+              try:
+                  with open(f) as fh:
+                      if f.endswith(".json"):
+                          json.load(fh)
+                      else:
+                          list(yaml.safe_load_all(fh))
+              except Exception as e:
+                  bad.append(f + ": " + str(e))
+          print("\n".join(bad) if bad else "all tracked JSON/YAML parse OK")
+          sys.exit(1 if bad else 0)
+          '
+
+      - name: Block forbidden paths (planning/, real .env, key material)
+        run: |
+          FORBIDDEN=$(git ls-files \
+            | grep -E '^planning/|(^|/)\.env|\.pem$|\.key$' \
+            | grep -v -E '(^|/)\.env\.example$' \
+            || true)
+          if [ -n "$FORBIDDEN" ]; then
+            echo "::error::Forbidden files are tracked in git:"
+            echo "$FORBIDDEN"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: secretlint (scan all tracked files)
+        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
