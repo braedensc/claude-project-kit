@@ -1,6 +1,6 @@
 <!-- ═══════════════════════════════════════════════════════════════════════════
      CLAUDE.md TEMPLATE — copy to the project root as CLAUDE.md at bootstrap,
-     fill every {{PLACEHOLDER}}, delete sections that don't apply, then DELETE
+     fill every {{…}} token, delete sections that don't apply, then DELETE
      THIS COMMENT BLOCK. Structure distilled from todoclaw's CLAUDE.md (the
      coordination document for every session of a full production build).
      The **Hard Rules** and **Branch Workflow** sections are verbatim policy —
