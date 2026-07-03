@@ -1,0 +1,113 @@
+name: DB Backup
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Daily ENCRYPTED pg_dump → GitHub Actions artifact — distilled from todoclaw's
+# backup.yml, verified working in production 2026-06-23 → 2026-07-03 (restore
+# round-trip proven before ship: seed → dump → encrypt → wipe → decrypt →
+# restore → rows + RLS recovered).
+#
+# UNIVERSAL PATTERN: cron + preflight-skip-green + dump → symmetric-encrypt →
+# artifact (90-day retention). STACK-SPECIFIC: the connection gotchas below are
+# Supabase/Postgres; every one cost a failed run — read before touching:
+#
+# ── Connection gotchas (Supabase + GitHub-hosted runners) ─────────────────────
+#   • The DIRECT host (db.<ref>.supabase.co:5432) is IPv6-only; GitHub runners
+#     are IPv4-only → `pg_dump: connection failed: Network unreachable`.
+#     Use the SESSION POOLER instead: aws-<N>-<region>.pooler.supabase.com:5432.
+#   • Session pooler (5432), NOT transaction pooler (6543) — transaction mode
+#     can't run pg_dump.
+#   • The free pooler only accepts the built-in `postgres` user. A custom
+#     least-privilege role (e.g. read-only backup_ro) fails with
+#     `FATAL (ENOTFOUND) tenant/user <role>.<ref> not found` even though the
+#     role exists — Supavisor doesn't route custom roles. True least-privilege
+#     backup needs the paid IPv4 add-on or a self-hosted runner (direct/IPv6);
+#     until then: dump as `postgres`, scoped --schema=public, and treat the
+#     secret as full-DB access.
+#   • The aws-<N>- prefix is PROJECT-SPECIFIC (aws-0 vs aws-1 …). Wrong instance
+#     → "tenant/user not found"; wrong host → "Name does not resolve". Copy the
+#     exact string from the dashboard's green Connect button → Session pooler.
+#     Narrowing without the dashboard: `dig +short aws-{0,1,2}-<region>.pooler.supabase.com`
+#     — only real instances resolve.
+#   • Append `?sslmode=require` (encrypts without needing the CA cert).
+#   • The DB password is shown ONCE at project creation and never retrievable —
+#     reset at Settings → Database if lost (safe: the app uses the anon key,
+#     not the DB password).
+#
+# Config (repo → Settings → Secrets and variables → Actions):
+#   Secret BACKUP_DATABASE_URL   = postgresql://postgres.<ref>@aws-<N>-<region>
+#                                  .pooler.supabase.com:5432/postgres?sslmode=require
+#                                  (password inserted after the colon — write
+#                                  docs with the user@host form, password
+#                                  omitted: secretlint trips on user:pass@host
+#                                  even with placeholder passwords.)
+#   Secret BACKUP_GPG_PASSPHRASE = strong passphrase; store in your password
+#                                  manager — WITHOUT IT BACKUPS CANNOT BE
+#                                  DECRYPTED.
+#
+# Until both secrets are set the job runs green but SKIPS. Trigger manually from
+# the Actions tab (workflow_dispatch) to test once configured.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # 09:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    name: Encrypted pg_dump → artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Preflight — are backup secrets configured?
+        id: pre
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+          BACKUP_GPG_PASSPHRASE: ${{ secrets.BACKUP_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$BACKUP_DATABASE_URL" ] || [ -z "$BACKUP_GPG_PASSPHRASE" ]; then
+            echo "::notice::Backup secrets not set — skipping. Configure BACKUP_DATABASE_URL + BACKUP_GPG_PASSPHRASE to enable."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # pg_dump must be >= the server's major version. Run it from a pinned
+      # Postgres image so the runner's client version can't break the dump.
+      - name: Dump public schema
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        run: |
+          docker run --rm -e PGCONN="$BACKUP_DATABASE_URL" postgres:17-alpine \
+            sh -c 'pg_dump "$PGCONN" --schema=public --no-owner --no-privileges' \
+            > backup.sql
+          echo "dump size: $(wc -c < backup.sql) bytes"
+          test -s backup.sql || { echo "::error::empty dump"; exit 1; }
+
+      - name: Encrypt (AES-256, symmetric)
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          BACKUP_GPG_PASSPHRASE: ${{ secrets.BACKUP_GPG_PASSPHRASE }}
+        run: |
+          gpg --batch --yes --passphrase "$BACKUP_GPG_PASSPHRASE" \
+            --cipher-algo AES256 --symmetric -o backup.sql.gpg backup.sql
+          rm -f backup.sql
+
+      - name: Upload encrypted artifact
+        if: steps.pre.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-${{ github.run_id }}
+          path: backup.sql.gpg
+          retention-days: 90
+          if-no-files-found: error
+
+# Restore runbook (from docs/SECURITY.md):
+#   1. download the db-backup-<run_id> artifact from the Actions run, then:
+#      gpg --batch --passphrase "$BACKUP_GPG_PASSPHRASE" -d backup.sql.gpg > backup.sql
+#   2. restore into a fresh/throwaway database:  psql "<target-db-url>" < backup.sql
+#   3. verify row counts match expectations.

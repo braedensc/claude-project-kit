@@ -1,0 +1,231 @@
+name: Deploy (prod)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The deploy-on-green pattern — distilled from todoclaw's deploy.yml (ADR-0022),
+# live in production since 2026-07-02: it ran the real cutover deploy (migrations
+# + Edge Functions) and every deploy after it.
+#
+# UNIVERSAL SKELETON (keep for any platform): workflow_run success gate,
+# dispatch-from-main guard, exact-SHA checkout, sequential migrate → deploy,
+# no-cancel concurrency, per-job timeouts, skip-green secret preflights.
+# STACK-SPECIFIC (fenced below): the Supabase step bodies — swap for your
+# platform, keep the skeleton.
+#
+# ── Careful gating (why a bad merge can't wedge prod) ─────────────────────────
+#   • Trigger is `workflow_run` on the CI workflow COMPLETING SUCCESSFULLY on
+#     `main` — not a raw `push`. Prod only ever changes AFTER the full CI gate
+#     went green on the exact merged commit. `branches: [main]` filters on the
+#     CI run's head_branch: a pull_request CI run's head_branch is the PR's
+#     SOURCE branch (e.g. `feat/x`), so PR-branch CI is excluded; only the
+#     push-to-main CI run (head_branch == main) matches. If main's CI goes red,
+#     deploy is skipped.
+#   • Jobs are SEQUENTIAL: migrate → deploy (`needs:`). If migrations error, the
+#     app deploy is skipped. Do NOT add `if: always()` / `continue-on-error`
+#     downstream — that re-enables deploys after a failed migration/CI.
+#   • Migration application must be idempotent (only applies what the remote
+#     hasn't seen); a `--dry-run` preview is logged first as an audit trail.
+#   • `concurrency` + per-job `timeout-minutes` mean a hung deploy can't hold
+#     the lock forever.
+#
+# ── The workflow_run trap that WILL get you once ──────────────────────────────
+#   workflow_run uses this file's version on the DEFAULT branch. Edits take
+#   effect only once merged to main; you cannot exercise the workflow_run path
+#   from a feature branch (docs/LESSONS.md). Use workflow_dispatch (main only)
+#   for the first seed deploy and manual re-deploys.
+#
+# ── Rollback (honest runbook — git revert does NOT undo applied DDL) ──────────
+#   Databases don't auto-run `down` migrations; reverting a migration file just
+#   stops it re-applying. Roll a schema change back by running its hand-written
+#   `-- down:` block against prod, then removing its row from the migrations
+#   ledger; for a data-lossy change, restore the encrypted backup (take an
+#   on-demand backup BEFORE a risky migration). Roll the frontend back with your
+#   host's tooling (e.g. `vercel rollback`) — it's independent.
+#
+# ── Config (repo → Settings → Secrets and variables → Actions) ────────────────
+#   Secret   BACKUP_DATABASE_URL   = prod DB connection string used for
+#            migrations. Todoclaw REUSED the backup job's secret (one secret,
+#            one source of truth — the free Supabase pooler forces the same
+#            `postgres` user for read and write anyway). See
+#            templates/workflows/backup-cron.yml for the IPv4/pooler gotchas.
+#   Secret   SUPABASE_ACCESS_TOKEN = platform deploy token (NOT a DB credential).
+#   Variable SUPABASE_PROJECT_REF  = the prod project identifier.
+#   PREREQUISITE for runtime config (set on the PLATFORM, not here): server-side
+#   secrets like your AI key and ALLOWED_ORIGIN must be set as function secrets
+#   (e.g. `supabase secrets set`), or deployed functions fail at runtime. The
+#   post-deploy smoke asserts reachability but cannot check those.
+#
+# Each job PREFLIGHTS its own config and SKIPS (green) when unset — the workflow
+# merges and stays green until the secrets are added (mirrors backup-cron.yml /
+# keepalive.yml).
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read # only actions/checkout needs it; deploy auth is via secrets, not GITHUB_TOKEN
+
+# One prod deploy at a time. cancel-in-progress: false — never interrupt an
+# in-flight migration mid-apply; queue instead. Per-job timeouts (below) stop a
+# hung run from holding this lock.
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate — CI passed on main
+    runs-on: ubuntu-latest
+    # Proceed only when the triggering CI run SUCCEEDED, or for a manual
+    # dispatch FROM MAIN. The `github.ref == main` guard closes the hole where
+    # `gh workflow run deploy.yml --ref <any-branch>` could push an unreviewed,
+    # CI-failing branch straight to prod. For extra safety, wire an
+    # `environment: production` with a required reviewer in repo settings.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Resolve the commit to deploy
+        id: resolve
+        run: |
+          # workflow_dispatch → the current main tip (which passed CI to merge);
+          # workflow_run → the EXACT commit CI validated (github.sha would be
+          # main's tip, not necessarily what CI ran on). Downstream jobs check
+          # this SHA out.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            sha="${{ github.sha }}"
+          else
+            sha="${{ github.event.workflow_run.head_sha }}"
+          fi
+          [ -n "$sha" ] || { echo "::error::could not resolve a commit SHA to deploy"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # STACK-SPECIFIC FROM HERE DOWN — Supabase (Postgres migrations + Deno Edge
+  # Functions). Swap the step bodies for your datastore/platform; keep the
+  # preflight-skip, exact-SHA checkout, `needs:` chain, and timeouts.
+  # ════════════════════════════════════════════════════════════════════════════
+  migrate:
+    name: Apply migrations to prod
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # a hung migration aborts (releasing any DB lock) instead of wedging deploys
+    steps:
+      - name: Preflight — is the DB URL configured?
+        id: pre
+        env:
+          SUPABASE_DB_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        run: |
+          if [ -z "$SUPABASE_DB_URL" ]; then
+            # ::warning:: (not ::notice::) so a green run is never mistaken for "migrations applied".
+            echo "::warning::BACKUP_DATABASE_URL not set — SKIPPING migrations."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.pre.outputs.configured == 'true'
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - uses: supabase/setup-cli@v2
+        if: steps.pre.outputs.configured == 'true'
+        with:
+          version: 2.107.0
+
+      # The DB URL holds the DB password — keep it in env and referenced as
+      # "$SUPABASE_DB_URL" (never inline, never with `set -x`/`--debug`, or the
+      # DSN leaks into logs).
+      - name: Preview pending migrations (dry-run, audit only)
+        if: steps.pre.outputs.configured == 'true'
+        continue-on-error: true # informational; never block the deploy on the preview
+        env:
+          SUPABASE_DB_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        run: supabase db push --db-url "$SUPABASE_DB_URL" --dry-run
+
+      - name: Apply migrations (db push)
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+        # `db push` has NO --yes flag and can hang on a "[Y/n]" prompt on some
+        # CI runners (supabase/cli#2238); pipe `yes` to force non-interactive.
+        # Pipeline exit status is db push's, so a failed migration still fails
+        # the step.
+        run: yes | supabase db push --db-url "$SUPABASE_DB_URL"
+
+  deploy-functions:
+    name: Deploy Edge Functions
+    # Runs after migrate so functions never ship against a failed/half-applied
+    # schema. If migrate SKIPS (unconfigured) it still "succeeds", so functions
+    # can deploy on their own.
+    needs: [gate, migrate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # bundling can take minutes; bound it so a hang can't hold the lock
+    steps:
+      - name: Preflight — is the access token configured?
+        id: pre
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ] || [ -z "$SUPABASE_PROJECT_REF" ]; then
+            echo "::warning::SUPABASE_ACCESS_TOKEN / SUPABASE_PROJECT_REF not set — SKIPPING function deploy."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.pre.outputs.configured == 'true'
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - uses: supabase/setup-cli@v2
+        if: steps.pre.outputs.configured == 'true'
+        with:
+          version: 2.107.0
+
+      - name: Deploy functions
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        run: |
+          # Deploy each function explicitly (skips `_shared` / config).
+          #   --use-api      : bundle server-side, no Docker (removes a whole CI failure class).
+          #   --no-verify-jwt: turn OFF the gateway JWT check so the CORS OPTIONS
+          #                    preflight reaches the function; each function
+          #                    verifies the JWT itself (_shared/auth.ts) and RLS
+          #                    isolates data. Mirrors `verify_jwt = false` in
+          #                    supabase/config.toml (belt-and-suspenders).
+          for fn in {{EDGE_FUNCTION_NAMES}}; do
+            echo "::group::deploy $fn"
+            supabase functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_REF" --use-api --no-verify-jwt
+            echo "::endgroup::"
+          done
+
+      # Cheap post-deploy smoke: prove the functions actually landed and are
+      # reachable. An unauthenticated POST must be rejected by the function's
+      # OWN auth (401); a 404/000/5xx means the deploy didn't take. Deeper
+      # CORS/ALLOWED_ORIGIN verification is a separate manual step (needs the
+      # prod origin) — see docs/SECURITY.md.
+      - name: Smoke — functions reachable
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        run: |
+          url="https://${SUPABASE_PROJECT_REF}.supabase.co/functions/v1/{{SMOKE_FUNCTION_NAME}}"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST --max-time 20 \
+            -H 'content-type: application/json' -d '{}' "$url")
+          echo "{{SMOKE_FUNCTION_NAME}} unauth POST: HTTP $code"
+          case "$code" in
+            401) echo "deployed + reachable + own-auth enforced (expected)" ;;
+            *) echo "::error::{{SMOKE_FUNCTION_NAME}} returned $code (expected 401) — deploy may not have taken"; exit 1 ;;
+          esac
