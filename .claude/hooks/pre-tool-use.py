@@ -220,6 +220,9 @@ if tool in ("Edit", "Write"):
         (r"(?:AKID|AKIA)[A-Z0-9]{16}", "AWS access key"),
         (r"gh[pousr]_[A-Za-z0-9_]{36,}", "GitHub personal access token"),
         (r"eyJ[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}\.[a-zA-Z0-9_-]{20,}", "JWT token value"),
+        # Extension point: add patterns for providers YOUR project uses, e.g.
+        # OpenAI-style keys: (r"sk-[a-zA-Z0-9]{32,}", "OpenAI-style API key").
+        # Add a battery case in test_hooks.py for every pattern you add.
     ]
     for pattern, label in SECRET_PATTERNS:
         if re.search(pattern, content):

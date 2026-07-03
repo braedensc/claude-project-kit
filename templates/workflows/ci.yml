@@ -1,0 +1,144 @@
+name: CI
+
+# ══════════════════════════════════════════════════════════════════════════════
+# App-project CI — distilled from todoclaw's ci.yml, the gate for every PR from
+# 2026-06-23 → 2026-07-03 (live production build). The kit repo's own smaller CI
+# is .github/workflows/ci.yml; THIS file is the one your app project activates
+# (see templates/README.md — `git mv` it to .github/workflows/ci.yml).
+#
+# Layer 3 of the security/quality model — the unbypassable gate (--no-verify
+# can't skip it). Five parallel jobs on every push to main and every PR:
+#   - "Secret scan + forbidden paths" — secretlint + planning//.env path gate
+#   - "Lint" / "Typecheck" / "Test"  — adapt the npm scripts to your toolchain
+#   - "E2E (smoke)"                  — non-required by design (see its comment)
+#
+# ── Two rules that bite if you skip them ──────────────────────────────────────
+# 1. Each job's `name:` IS the required-status-check context string.
+# 2. Merge THEN require: add contexts to branch protection only AFTER they have
+#    reported at least once on main — requiring a context that has never run
+#    wedges every open PR waiting on it (docs/LESSONS.md). Adding later without
+#    dropping existing ones:
+#      gh api -X POST repos/<owner>/<repo>/branches/main/protection/required_status_checks/contexts \
+#        -f 'contexts[]=Lint' -f 'contexts[]=Typecheck' -f 'contexts[]=Test'
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  push:
+    branches: [main]
+  # Run on every PR regardless of base branch — so stacked PRs (base != main)
+  # are gated too, not just PRs that target main directly.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets-and-paths:
+    name: Secret scan + forbidden paths
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Block forbidden paths (planning/, real .env)
+        run: |
+          FORBIDDEN=$(git ls-files \
+            | grep -E '^planning/|(^|/)\.env' \
+            | grep -v -E '(^|/)\.env\.example$' \
+            || true)
+          if [ -n "$FORBIDDEN" ]; then
+            echo "::error::Forbidden files are tracked in git:"
+            echo "$FORBIDDEN"
+            exit 1
+          fi
+
+      - name: secretlint (scan all tracked files)
+        run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
+
+  # ── Adapt the three jobs below to your toolchain (script names are the
+  #    contract: lint / format:check / typecheck / test). ─────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Prettier (check)
+        run: npm run format:check
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: tsc -b
+        run: npm run typecheck
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit + component tests
+        run: npm test
+
+  # E2E smoke. Deliberately NOT a required check (promote once it's proven
+  # stable) so a flaky browser run can't wedge main. The smoke config boots the
+  # app with DUMMY env (no database, no secrets) — see docs/TESTING.md for the
+  # smoke-in-CI vs DB-backed-golden-local-only split and why CI never points an
+  # E2E suite at a real database.
+  e2e:
+    name: E2E (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser (chromium)
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E smoke
+        run: npm run test:e2e
