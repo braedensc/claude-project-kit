@@ -50,6 +50,9 @@ jobs:
           sys.exit(1 if bad else 0)
           '
 
+      - name: Placeholder integrity (used == documented)
+        run: python3 scripts/check_placeholders.py
+
       - name: Block forbidden paths (planning/, real .env, key material)
         run: |
           FORBIDDEN=$(git ls-files \

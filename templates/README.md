@@ -16,7 +16,7 @@ Activation (done by the bootstrap session, not by hand):
 
 ```bash
 git mv templates/workflows/*.yml .github/workflows/
-# then: replace {{PLACEHOLDERS}} (see PLACEHOLDERS.md), adapt the fenced
+# then: fill the {{…}} tokens (see PLACEHOLDERS.md), adapt the fenced
 # STACK-SPECIFIC sections, and delete templates/ once empty.
 ```
 
