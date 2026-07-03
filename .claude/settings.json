@@ -1,0 +1,36 @@
+{
+  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too. Distilled from todoclaw .claude/settings.json, in production 2026-06-23 → 2026-07-03.",
+  "_path_note": "Replace {{NODE_BIN_PATH}} with your Node bin dir (e.g. $HOME/.nvm/versions/node/v22.23.0/bin) — version managers like nvm do not apply in non-interactive shells, so Claude Code needs the resolved path. Machine-specific values can instead live in .claude/settings.local.json (gitignored), whose env keys override this file. See PLACEHOLDERS.md.",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "env": {
+    "PATH": "{{NODE_BIN_PATH}}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/pre-tool-use.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/audit.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
