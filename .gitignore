@@ -1,0 +1,40 @@
+# Distilled from todoclaw's .gitignore (in production 2026-06-23 → 2026-07-03),
+# strengthened: .env.* is deny-all with an explicit .env.example allow.
+
+# Reference material — never published (licensed specs, exports, scratch planning).
+# The PreToolUse hook and the pre-commit hook both refuse to stage this path.
+planning/
+
+# Secrets — only .env.example (placeholder values) is ever committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Generated-file guard: running a tool from the repo root can spawn a bogus
+# root-level lockfile when the real one lives deeper (todoclaw: a stray
+# /deno.lock appeared beside supabase/functions/deno.lock). Guard such paths
+# explicitly rather than discovering them in a diff.
+/deno.lock
+
+# Test artifacts (Playwright pattern — harmless if you use another runner)
+test-results/
+playwright-report/
+playwright/.cache/
+e2e/.auth/
+
+# OS
+.DS_Store
+
+# Claude Code runtime (local-only, never project config)
+.claude/audit.log
+.claude/settings.local.json
+.claude/launch.json
+.claude/worktrees/
