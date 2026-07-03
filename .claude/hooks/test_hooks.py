@@ -11,7 +11,7 @@ beyond python3 + git.
 Two execution modes per case:
   * path-independent guards run against THIS repo's hook directly;
   * branch-guard cases run against a copy of the hook inside a throwaway
-    git repo pinned to `main` or a feature branch, because the hook derives
+    git repo pinned to `main`/`master` or a feature branch, because the hook derives
     PROJECT_ROOT from its own file location — this keeps the battery
     deterministic in CI (where checkouts are detached-HEAD).
 

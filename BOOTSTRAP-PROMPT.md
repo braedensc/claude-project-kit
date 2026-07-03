@@ -72,8 +72,9 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    hard-blocked). **Update `test_hooks.py` in the same commit** — add block/allow
 >    cases for every guard you change; the battery must pass and stay in CI.
 > 3. Rename the reference dir if I chose a different name — in `.gitignore`,
->    `.husky/pre-commit`, the hook's `git add` guard, AND CLAUDE.md Hard Rule 1
->    (all three layers + the doc must agree). Delete the concept only if I said none.
+>    `.husky/pre-commit`, the hook's `git add` guard, the app CI's forbidden-paths
+>    grep, AND CLAUDE.md Hard Rule 1 (every enforcement layer must agree). Delete
+>    the concept only if I said none.
 > 4. Activate workflows: `git rm .github/workflows/ci.yml && git mv
 >    templates/workflows/ci.yml .github/workflows/ci.yml` — it ships with the
 >    hook-battery step built in (`python3 .claude/hooks/test_hooks.py`); the battery
@@ -81,8 +82,8 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    `keepalive.yml` the same way; adapt their fenced stack sections; DELETE any that
 >    don't apply (no DB → no backup-cron; nothing pauses → no keepalive). Fill
 >    `{{EDGE_FUNCTION_NAMES}}`, `{{SMOKE_FUNCTION_NAME}}`, `{{KEEPALIVE_TABLE}}` or
->    remove with their files. Keep every provenance header. Delete `templates/` once
->    empty.
+>    remove with their files. Keep every provenance header. Finish with
+>    `git rm -r templates/` (its README goes too — activation is one-way).
 > 5. `.env.example`: replace the example vars with this project's real public-env
 >    contract (placeholder values only). I create `.env.local` myself — you cannot
 >    (the hook blocks it; that's the design).
@@ -102,6 +103,10 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    the three stores, exact dashboard click-paths labeled "(you, in dashboards)",
 >    date-stamped provisioning record, deferred-hardening list). Create
 >    `docs/ARCHITECTURE.md` as the ADR index (docs/adr/README.md has the convention).
+>    In `docs/adr/`: keep README.md but delete its kit-specific "Index" section
+>    (your index lives in docs/ARCHITECTURE.md) and delete the kit's seed ADR
+>    (`2026-07-03-kit-shape-and-conventions.md`) — it documents the kit, not your
+>    project.
 >    Keep docs/{SECURITY,COLLABORATION,TESTING,LESSONS,STACK-RATIONALE}.md — fix any
 >    line my stack choices made stale.
 > 9. Delete `BOOTSTRAP-PROMPT.md` and `PLACEHOLDERS.md`, then run

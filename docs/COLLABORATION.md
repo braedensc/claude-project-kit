@@ -189,8 +189,9 @@ branching. Branch name references the issue (`feat/142-grid-drag`). The loop bec
 Three layers, mirroring docs/SECURITY.md:
 
 1. **Claude Code PreToolUse hook** — blocks `Edit`/`Write`/`git commit` while on
-   `main`/`master`. The model **cannot** bypass this; CLAUDE.md also tells Claude to
-   branch *proactively* before ever hitting the block.
+   `main`/`master`. The model **cannot** bypass this; the project's CLAUDE.md
+   (created from docs/CLAUDE-template.md at bootstrap) also tells Claude to branch
+   *proactively* before ever hitting the block.
 2. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
 3. **CI + branch protection** — the unbypassable gate. All changes land via PR with
