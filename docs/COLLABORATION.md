@@ -201,7 +201,8 @@ branching. Branch name references the issue (`feat/142-grid-drag`). The loop bec
 
 ## What's automatic (enforcement)
 
-Four layers, mirroring docs/SECURITY.md:
+Four layers — the three *security* layers of docs/SECURITY.md, plus a workflow-nag
+Stop hook between them:
 
 1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
    bypass it:
