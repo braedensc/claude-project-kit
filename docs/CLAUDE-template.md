@@ -189,7 +189,8 @@ non-negotiable product invariant a numbered slot here. -->
 ## Security Model (three independent layers)
 
 1. **Claude Code hooks** (`PreToolUse`) — guard real-time tool calls; the model cannot
-   bypass these.
+   bypass these, and cannot edit them: the hook scripts + `settings.json` are
+   self-protected (human-only — changes come as a terminal command you run).
 2. **Git pre-commit hooks** (Husky + secretlint) — guard commit contents locally
    (bypassable with `--no-verify`, caught by CI).
 3. **CI + branch protection** — the unbypassable gate on every PR.

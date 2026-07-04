@@ -28,7 +28,7 @@ saying where it came from and what was verified in production.
   (cold sessions reconstruct the system from written context), dialed down explicitly
   at launch. Written context is how isolated agent sessions coordinate.
 - **Guards match operations, not prose.** Learned the hard way; encoded in the hook
-  and verified by a 75-case battery that runs in CI forever.
+  and verified by a 91-case battery that runs in CI forever.
 
 ## Quickstart
 
@@ -44,7 +44,7 @@ saying where it came from and what was verified in production.
 
 | Path | What it is |
 |---|---|
-| `.claude/` | Settings + the PreToolUse/PostToolUse/Stop hook suite + `test_hooks.py` (75-case block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
+| `.claude/` | Settings + the PreToolUse/PostToolUse/Stop hook suite + `test_hooks.py` (91-case block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
 | `.husky/` + `.secretlintrc.json` | Layer-2 pre-commit: branch block, forbidden paths, worktree-aware secretlint |
 | `.github/workflows/ci.yml` | The kit's own CI (battery, JSON/YAML validation, forbidden paths, secretlint, placeholder integrity) |
 | `.github/pull_request_template.md` | The concise-PR format (≤ ~150 visible words, depth in `<details>`) |
@@ -55,6 +55,7 @@ saying where it came from and what was verified in production.
 | `docs/STACK-RATIONALE.md` | Every stack choice, tagged TRANSFERABLE vs STACK-SPECIFIC |
 | `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
 | `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own seed ADR |
+| `CLAUDE.md` | The kit's own auto-loaded context (guardrails + conventions) — a worked example; bootstrap replaces it with your project's |
 | `docs/CLAUDE-template.md` | Fill-in `CLAUDE.md` for the new project (Hard Rules verbatim) |
 | `BOOTSTRAP-PROMPT.md` / `PLACEHOLDERS.md` | The adaptation UX + the complete `{{…}}` token inventory |
 | `scripts/check_placeholders.py` | CI-enforced: tokens used == tokens documented (`--bootstrapped`: zero remain) |

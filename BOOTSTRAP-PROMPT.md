@@ -64,9 +64,12 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > features; local-first, ship-last).
 >
 > **Phase 4 — execute (on a feature branch; the hooks will insist anyway):**
-> 1. `docs/CLAUDE-template.md` → `CLAUDE.md` (repo root): fill every `{{…}}` token,
->    keep the Hard Rules and Branch Workflow sections' strength, delete the template
->    comment block and `docs/CLAUDE-template.md` itself.
+> 1. `docs/CLAUDE-template.md` → `CLAUDE.md` (repo root), **overwriting the kit's own
+>    CLAUDE.md that ships here** (it describes maintaining the kit; yours describes my
+>    project). `CLAUDE.md` is the file Claude Code auto-loads every session, so this is
+>    how future sessions learn my project's rules + the live guardrails — fill every
+>    `{{…}}` token, keep the Hard Rules and Branch Workflow sections' strength, delete
+>    the template comment block and `docs/CLAUDE-template.md` itself.
 > 2. `.claude/hooks/pre-tool-use.py`: replace the fenced STACK-SPECIFIC section for my
 >    datastore (keep the shape: local/disposable frictionless, remote/irreplaceable
 >    hard-blocked). **Update `test_hooks.py` in the same commit** — add block/allow
@@ -89,10 +92,13 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > 5. `.env.example`: replace the example vars with this project's real public-env
 >    contract (placeholder values only). I create `.env.local` myself — you cannot
 >    (the hook blocks it; that's the design).
-> 6. `.claude/settings.json`: fill `{{NODE_BIN_PATH}}`; machine-specific overrides go
->    in `.claude/settings.local.json` (gitignored). Verify/update the shipped
+> 6. `.claude/settings.json`: fill `{{NODE_BIN_PATH}}`. **settings.json and the hook
+>    scripts are self-protected — you cannot edit them; hand me a terminal command to
+>    fill the placeholder** (e.g. `sed -i '' 's#{{NODE_BIN_PATH}}#<my node bin>#'
+>    .claude/settings.json`), or I set my machine PATH in `.claude/settings.local.json`
+>    (gitignored, not protected — you may write that). Verify/update the shipped
 >    `.nvmrc` for my Node choice. NEVER reorder the hooks-scripts-then-settings
->    relationship if you touch wiring (docs/LESSONS.md).
+>    relationship if wiring changes (docs/LESSONS.md).
 > 7. Scaffold the app toolchain if needed (Vite/Next/etc.) — **run generators in a
 >    temp dir and merge their output INTO the kit's files by hand; never let a
 >    generator overwrite package.json, .gitignore, .husky/, or .claude/**

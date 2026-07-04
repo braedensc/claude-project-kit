@@ -16,6 +16,7 @@ Runs before every tool call. Exit 2 = block with reason. Exit 0 = allow.
 
 | What it blocks | Tool | Why |
 |---|---|---|
+| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `.claude/settings.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline `-c`/`-e` interpreters) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings. These files are **human-only**: to change one, Claude prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed. A first line, not a sandbox — the real backstop is still git + review |
 | Edit/Write while on `main`/`master` | Edit/Write | Forces the feature-branch workflow automatically (`docs/COLLABORATION.md`) — keeps `main` clean for collaborators |
 | `git commit` while on `main`/`master` | Bash | Same — no direct commits to `main` |
 | Edit/Write/`git commit` on a branch not matching `<type>/<slug>` | Edit/Write, Bash | Forces a rename before work, so an auto-generated `claude/<codename>` worktree branch never lands unrenamed in a PR |
@@ -84,7 +85,7 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-75 block/allow cases covering every guard above — the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), a real sibling-worktree sandbox for the cross-worktree guard, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
+91 block/allow cases covering every guard above — the self-protection cases (edit/mutate a hook → block; read/py_compile/stage → allow, incl. that a redirect must *target* a protected path so `... hook 2>&1` isn't a false positive), the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), a real sibling-worktree sandbox for the cross-worktree guard, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
 (and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a
 case — and keep docs/COLLABORATION.md's "What's automatic (enforcement)" section in
 sync.**

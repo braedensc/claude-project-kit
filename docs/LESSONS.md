@@ -232,6 +232,21 @@ revert).
 
 ## Process
 
+**A guard the agent can edit is theater — the hooks must protect themselves.** A
+PreToolUse hook that blocks something is worthless if Claude can just Edit the hook to
+delete the block, or edit `settings.json` to unwire it — unwiring is the *easiest*
+bypass. So the hook scripts + `settings.json` are human-only: Edit/Write and Bash
+mutations (`>`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline `-c`/`-e`
+interpreters) targeting them are blocked; changing one means Claude prints a terminal
+command for the human to run. Caveats worth stating honestly: (1) a shell can't be
+perfectly fenced by regex, so this is a first line, not a sandbox — the real backstop
+is git + branch protection + CI (the committed hook is what runs after merge, and CI
+re-runs the battery against it); (2) it self-references (the running hook forbids
+editing itself), so **compose and validate the guard before the lock lands** — once the
+Edit/Write block is live, the hook is un-editable by the agent (and a syntax error would
+fail *closed* — every tool blocked), so build it in a candidate and test the Bash-regex
+half before adding the tool-level lock as the final edit.
+
 **Written workflow rules are not reliably followed — back them with hooks.** The
 todoclaw retro's core process lesson: CLAUDE.md said "open a PR when done," "watch CI
 to green," "don't push to merged branches" — and each was violated anyway across

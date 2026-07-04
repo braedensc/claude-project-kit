@@ -30,6 +30,16 @@ Two principles worth keeping verbatim:
 dangerous operations in every permission mode. Remove or weaken the hooks and you must
 remove the bypass too — they are one decision, not two.
 
+**The hooks protect themselves.** A guard the agent can edit is theater — Claude could
+delete the block or unwire it in `settings.json` the moment it hit one. So the hook
+scripts and `settings.json` are **human-only**: the PreToolUse guard blocks Edit/Write
+(and Bash mutations — `>`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline
+interpreters) targeting itself, `audit.py`, `stop-pr-check.py`, and `settings.json`.
+Changing one is a human step — Claude prints a terminal command for you to run. This is
+a first line, not a perfect sandbox (a shell can't be fully fenced by regex); the real
+guarantee stays git: any change must survive a reviewed PR + CI, which re-runs the
+battery against the committed hook. (Reads are always allowed.)
+
 **The system fails closed.** A missing/broken hook script blocks *every* tool call
 (python exits 2 = the block signal) rather than silently disabling protection. Correct
 for a security hook; operationally it means **create hook scripts before wiring

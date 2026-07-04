@@ -214,6 +214,9 @@ Stop hook between them:
 
 1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
    bypass it:
+   - **Protects itself**: blocks Edit/Write (and Bash mutations) of the hook scripts
+     and `settings.json`, so a guard can't be edited away or unwired — changing them is
+     a human-only terminal step. (Reads are fine.)
    - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
      forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
      also tells Claude to branch *proactively* before ever hitting the block.

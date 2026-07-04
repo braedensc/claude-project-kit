@@ -67,3 +67,15 @@ branch guard), a **branch-naming guard** (blocks work on a non-`<type>/<slug>` b
 so an auto-generated `claude/<codename>` never lands unrenamed), and a **DIRTY-PR
 guard** in the Stop hook (a conflicted PR skips required CI and can look green on side
 checks alone). Battery → 75 cases, now with a real sibling-worktree sandbox.
+
+**Update (2026-07-04, self-protection):** the hooks now protect *themselves* — the
+PreToolUse guard blocks Edit/Write and Bash mutations of the hook scripts +
+`settings.json`, so a block can't be edited away or unwired (the easiest bypass). This
+closes the model's biggest gap: previously any guard was defeatable by rewriting the
+hook. Changing a hook is now a human-only terminal step; the guard is validated by
+build-before-lock discipline (it self-references) and new battery cases (→ 91). A
+first-pass false positive (a benign `2>&1` near a hook path over-blocked) was fixed by
+making the mutation match *target* the protected path — and, fittingly, applied via the
+human-only terminal flow the guard itself mandates.
+Consequence: bootstrap's `{{NODE_BIN_PATH}}` fill in settings.json becomes a
+human terminal step (BOOTSTRAP-PROMPT Phase 4 step 6).

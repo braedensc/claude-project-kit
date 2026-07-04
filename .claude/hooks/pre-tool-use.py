@@ -225,6 +225,76 @@ def _merged_pr_info(branch: str):
         return None
 
 
+# ── Self-protection guard: Claude must never edit the hooks that guard it ───────
+# Every block above is trivially defeated if Claude can rewrite the hook to delete the
+# guard, or edit settings.json to unwire it. So these files are HUMAN-ONLY: the
+# Edit/Write tools are blocked outright, and Bash that would mutate them (redirect,
+# tee, sed -i, cp/mv/rm, git checkout/restore, an inline `-c`/`-e` interpreter, …) is
+# blocked too. To change one, Claude must hand the HUMAN a terminal command to run —
+# it cannot apply the change itself. The running hook protects itself (pre-tool-use.py
+# is in its own set). This is a first line, not a sandbox: a shell can't be perfectly
+# fenced by regex, so the real backstop stays git — any change must survive a reviewed
+# PR + CI, which re-runs the battery against the committed hook. (Reads are allowed:
+# Claude may `Read`/`cat` these files freely; only writes/mutations are blocked.)
+SELF_PROTECTED = {
+    os.path.join(PROJECT_ROOT, ".claude", "hooks", "pre-tool-use.py"),
+    os.path.join(PROJECT_ROOT, ".claude", "hooks", "audit.py"),
+    os.path.join(PROJECT_ROOT, ".claude", "hooks", "stop-pr-check.py"),
+    os.path.join(PROJECT_ROOT, ".claude", "settings.json"),
+}
+SELF_PROTECT_HELP = (
+    "🔒 `{path}` is a protected hook file — Claude may not edit it. Editing the "
+    "guardrails would let any block be removed, so these files are HUMAN-ONLY. Do not "
+    "reach for another tool or a shell workaround — instead, print a terminal command "
+    "for the human to run themselves, e.g.:\n"
+    "  cat > {path} <<'EOF'\n"
+    "  <full new file contents>\n"
+    "  EOF\n"
+    "and let them run it. (The change still lands via a reviewed PR — CI re-runs the "
+    "hook battery against it.)"
+)
+SELF_PROTECT_BASH_HELP = (
+    "🔒 That command would modify a protected hook file (one of: pre-tool-use.py, "
+    "audit.py, stop-pr-check.py, .claude/settings.json). These are HUMAN-ONLY — Claude "
+    "cannot edit or overwrite the guards that constrain it. Print the change as a "
+    "terminal command for the human to run themselves instead; it lands via a reviewed "
+    "PR. (Reading them — cat/less/grep — is fine.)"
+)
+
+
+def _is_self_protected(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.abspath(path) in {os.path.abspath(p) for p in SELF_PROTECTED}
+    except Exception:
+        return False
+
+
+# Bash detection: a write/mutation operator TARGETING a protected file — the path
+# must be the operator's target, so an unrelated `2>&1` / `> /dev/null` / `rm other`
+# in a command that merely mentions a hook path is NOT a false positive. Read-only
+# commands (cat/grep, `python3 <dir>/test_hooks.py`, `python3 -m py_compile <path>`,
+# `cat <hook> > /tmp/x`) do not match, so verifying the hooks stays frictionless.
+_SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|audit\.py|\.claude[/\\]settings\.json)"
+_SELF_MUTATE_RE = re.compile(
+    r">>?\s*['\"]?[^\s'\"|&;<>]*?" + _SELF_PROT +                     # redirect INTO a protected path
+    r"|\btee\b[^|;&]*?" + _SELF_PROT +                                # tee protected
+    r"|\b(?:sed|perl)\b[^|;&]*\s-[a-zA-Z]*i\b[^|;&]*?" + _SELF_PROT + # sed -i / perl -i protected
+    r"|\b(?:cp|mv|rm|ln|install|truncate|dd|shred|unlink)\b[^|;&]*?" + _SELF_PROT +  # cmd -> protected
+    r"|\bgit\b[^|;&]*\b(?:checkout|restore)\b[^|;&]*?" + _SELF_PROT + # git revert protected
+    r"|\b(?:python3?|node|deno|ruby)\b[^|;&]*\s-[a-zA-Z]*[ce]\b[^|;&]*?" + _SELF_PROT  # inline interpreter writing protected
+)
+
+
+# Self-protection FIRST — highest-priority block, so its message wins. Claude may not
+# edit the hook files or settings.json themselves; changing them is a human-only
+# terminal step (see SELF_PROTECTED). Covers NotebookEdit too, for completeness.
+if tool in ("Edit", "Write", "NotebookEdit"):
+    _spp = inp.get("file_path", "") or inp.get("notebook_path", "")
+    if _is_self_protected(_spp):
+        block(SELF_PROTECT_HELP.format(path=os.path.abspath(_spp)))
+
 # Cross-worktree guard runs for ALL Edit/Write (not just in-project), and BEFORE
 # the branch guard — a write into another checkout must be caught even though it is
 # outside PROJECT_ROOT.
@@ -280,6 +350,11 @@ def _strip_prose(c: str) -> str:
 if tool == "Bash":
     cmd = inp.get("command", "")
     scan = _strip_prose(cmd)
+
+    # Self-protection: block any shell mutation of a protected hook file. First guard
+    # in the Bash block so its message wins.
+    if _SELF_MUTATE_RE.search(scan):
+        block(SELF_PROTECT_BASH_HELP)
 
     # Block rm -rf / rm -fr / rm --recursive
     if re.search(r"\brm\b[^#\n;&|]*-[a-zA-Z]*r[a-zA-Z]*f", scan) or \

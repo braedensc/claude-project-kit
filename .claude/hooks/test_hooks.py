@@ -304,6 +304,41 @@ def main():
         ("Write OUTSIDE any worktree allowed (scratchpad/tmp)",
          write("/tmp/scratch/x.ts", "x"), ALLOW, wt_hook),
 
+        # ── self-protection: Claude can't edit the hooks that guard it ────────
+        ("Edit pre-tool-use.py blocked (self-protect)",
+         edit(os.path.join(feat_root, ".claude/hooks/pre-tool-use.py"), "x"), BLOCK, feat_hook),
+        ("Write stop-pr-check.py blocked (self-protect)",
+         write(os.path.join(feat_root, ".claude/hooks/stop-pr-check.py"), "x"), BLOCK, feat_hook),
+        ("Write settings.json blocked (self-protect)",
+         write(os.path.join(feat_root, ".claude/settings.json"), "{}"), BLOCK, feat_hook),
+        ("Edit test_hooks.py allowed (not a live guard)",
+         edit(os.path.join(feat_root, ".claude/hooks/test_hooks.py"), "x"), ALLOW, feat_hook),
+        ("sed -i on the hook blocked", bash(
+            f"sed -i 's/x/y/' {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), BLOCK, feat_hook),
+        ("redirect into settings.json blocked", bash(
+            f"echo x > {os.path.join(feat_root, '.claude/settings.json')}"), BLOCK, feat_hook),
+        ("cp over the stop hook blocked", bash(
+            f"cp evil.py {os.path.join(feat_root, '.claude/hooks/stop-pr-check.py')}"), BLOCK, feat_hook),
+        ("rm the audit hook blocked", bash(
+            f"rm {os.path.join(feat_root, '.claude/hooks/audit.py')}"), BLOCK, feat_hook),
+        ("git checkout -- hook (revert) blocked",
+         bash("git checkout main -- .claude/hooks/pre-tool-use.py"), BLOCK, feat_hook),
+        ("cat the hook allowed (read)", bash(
+            f"cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), ALLOW, feat_hook),
+        ("py_compile the hook allowed", bash(
+            f"python3 -m py_compile {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), ALLOW, feat_hook),
+        ("run the battery allowed", bash(
+            f"python3 {os.path.join(feat_root, '.claude/hooks/test_hooks.py')}"), ALLOW, feat_hook),
+        ("git add the hook allowed (staging, not mutating)", bash(
+            f"git add {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), ALLOW, feat_hook),
+        # targeting: a redirect/op must apply TO the protected path, not merely co-occur
+        ("py_compile hook + 2>&1 allowed (redirect not to a protected path)", bash(
+            f"python3 -m py_compile {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')} 2>&1"), ALLOW, feat_hook),
+        ("cat hook > /tmp/x allowed (read-out; redirect target isn't protected)", bash(
+            f"cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')} > /tmp/x"), ALLOW, feat_hook),
+        ("rm /tmp/junk beside a hook mention allowed (rm targets junk, not the hook)", bash(
+            f"rm /tmp/junk && cat {os.path.join(feat_root, '.claude/hooks/pre-tool-use.py')}"), ALLOW, feat_hook),
+
         # ── stack-specific: Supabase/Postgres (replace with your datastore) ──
         ("supabase db reset --linked blocked", bash("supabase db reset --linked"), BLOCK, HOOK),
         ("supabase db reset --db-url blocked",
