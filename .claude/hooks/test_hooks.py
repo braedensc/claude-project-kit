@@ -153,6 +153,20 @@ def make_pr_sandbox(gh_body):
     return root, hook_copy, env
 
 
+def make_worktree_sandbox():
+    """Main sandbox + a real sibling worktree, so the cross-worktree write guard's
+    `git worktree list` path is exercised deterministically. Returns
+    (main_root, hook_copy, sibling_root). Roots are realpath-canonicalized so they
+    match what `git worktree list` reports (macOS /var → /private/var symlinks would
+    otherwise defeat the commonpath check)."""
+    root, _ = make_sandbox("feat/battery")
+    root = os.path.realpath(root)
+    hook_copy = os.path.join(root, ".claude", "hooks", "pre-tool-use.py")
+    sibling = root + "-sibling"
+    _git(root, "worktree", "add", "-q", "-b", "feat/sibling", sibling)
+    return root, hook_copy, sibling
+
+
 def make_stop_sandbox(list_json, view_json):
     """Sandbox for the Stop hook: main + a pushed feature branch one commit AHEAD
     of main, with a mocked `gh` answering both `pr list` and `pr view`."""
@@ -180,6 +194,8 @@ def main():
     main_root, main_hook = make_sandbox("main")
     master_root, master_hook = make_sandbox("master")
     feat_root, feat_hook = make_sandbox("feat/battery")
+    codename_root, codename_hook = make_sandbox("claude/cool-jones-ab12cd")
+    wt_root, wt_hook, wt_sibling = make_worktree_sandbox()
     merged_root, merged_hook, merged_env = make_pr_sandbox(
         "echo '{\"state\":\"MERGED\",\"number\":7}'")
     open_root, open_hook, open_env = make_pr_sandbox(
@@ -193,6 +209,9 @@ def main():
     stop_green_root, stop_green, stop_green_env = make_stop_sandbox(
         '[{"number":7,"state":"OPEN"}]',
         '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    stop_dirty_root, stop_dirty, stop_dirty_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"mergeStateStatus":"DIRTY","statusCheckRollup":[{"name":"CodeQL","conclusion":"SUCCESS"}]}')
 
     # (name, payload, expect_block, hook_path)
     cases = [
@@ -269,6 +288,22 @@ def main():
         ("Edit OUTSIDE project while on main allowed",
          edit("/somewhere/else/x.ts", "x"), ALLOW, main_hook),
 
+        # ── branch-naming guard (auto-generated codename branches) ───────────
+        ("Edit on claude/<codename> branch blocked",
+         edit(os.path.join(codename_root, "src/app.ts"), "x"), BLOCK, codename_hook),
+        ("git commit on claude/<codename> branch blocked",
+         bash("git commit -F /tmp/msg.txt"), BLOCK, codename_hook),
+
+        # ── cross-worktree write guard (real sibling worktree; todoclaw PR #77) ─
+        ("Write into a SIBLING worktree blocked",
+         write(os.path.join(wt_sibling, "src/x.ts"), "x"), BLOCK, wt_hook),
+        ("Edit into a SIBLING worktree blocked",
+         edit(os.path.join(wt_sibling, "src/x.ts"), "x"), BLOCK, wt_hook),
+        ("Write into OWN worktree allowed (same-worktree)",
+         write(os.path.join(wt_root, "src/x.ts"), "x"), ALLOW, wt_hook),
+        ("Write OUTSIDE any worktree allowed (scratchpad/tmp)",
+         write("/tmp/scratch/x.ts", "x"), ALLOW, wt_hook),
+
         # ── stack-specific: Supabase/Postgres (replace with your datastore) ──
         ("supabase db reset --linked blocked", bash("supabase db reset --linked"), BLOCK, HOOK),
         ("supabase db reset --db-url blocked",
@@ -316,6 +351,8 @@ def main():
          {}, BLOCK, stop_red, stop_red_env),
         ("stop: open PR with green CI allowed",
          {}, ALLOW, stop_green, stop_green_env),
+        ("stop: DIRTY PR (merge conflicts) blocks despite green side checks",
+         {}, BLOCK, stop_dirty, stop_dirty_env),
     ]
 
     failures = 0
@@ -350,8 +387,9 @@ def main():
         print(f"[{verdict}] {name}  (want {want}, got {got})")
         failures += 0 if ok else 1
 
-    for r in (main_root, master_root, feat_root, merged_root, open_root, gherr_root,
-              stop_nopr_root, stop_red_root, stop_green_root):
+    for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
+              merged_root, open_root, gherr_root, stop_nopr_root, stop_red_root,
+              stop_green_root, stop_dirty_root):
         shutil.rmtree(r, ignore_errors=True)
 
     total = len(cases) + len(stop_cases)

@@ -128,10 +128,13 @@ git checkout -b <type>/<short-kebab-desc>
 ```
 
 - **Branch name:** `<type>/<short-kebab-desc>`, type ∈ `feat | fix | chore | refactor | docs`.
+  A hook *enforces* this — rename an auto-generated `claude/<codename>` worktree branch
+  before working (`git branch -m <type>/<desc>`).
 - **One task = one branch = one PR.** Small and short-lived.
-- **The hooks enforce this:** `Edit`/`Write`/`git commit` are *blocked* on `main`; so
-  are `git commit`/`git push` on a branch whose PR already **merged**, and
-  `gh pr merge` in any form. A block isn't a bug — branch fresh and retry; never work
+- **The hooks enforce this:** `Edit`/`Write`/`git commit` are *blocked* on `main` or a
+  mis-named branch; writes into a *different worktree* are blocked; so are
+  `git commit`/`git push` on a branch whose PR already **merged**, and `gh pr merge` in
+  any form. A block isn't a bug — branch fresh (or fix the path) and retry; never work
   around it.
 - **Ordered/generated files are serialized** (migrations etc.): pull latest main
   immediately before generating one; never two generating branches in parallel.
@@ -141,8 +144,9 @@ git checkout -b <type>/<short-kebab-desc>
 - **Watch CI to green before considering the task done:** `gh pr checks <n> --watch`.
   On a red check: read the failing job's log, fix, push, re-watch — never hand back a
   red PR. Local checks passing is necessary, not sufficient; the PR's CI status is
-  the source of truth. (A Stop hook also blocks ending a turn with no PR or a
-  failing check.)
+  the source of truth. **A `DIRTY` (conflicted) PR is not green** — GitHub skips the
+  required CI entirely, so only side checks report; rebase, resolve, force-push. (A
+  Stop hook also blocks ending a turn with no PR, a failing check, or a DIRTY PR.)
 - **Before a follow-up commit to an open PR, confirm it's still open**
   (`gh pr view <n> --json state`) — a commit pushed to a merged PR's branch is
   silently orphaned. If merged, branch fresh off updated `main`. (Also enforced by

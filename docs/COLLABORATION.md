@@ -138,9 +138,11 @@ worktrees for you — ask it to "work on X in a new worktree.")
   script); or prefer tooling that resolves env at runtime from the running stack.
 - Git hooks run from the MAIN checkout (`core.hooksPath` is absolute): a hook fix on a
   branch takes effect only after it merges AND the main checkout pulls it.
-- **Cross-worktree writes bypass the branch guard** (the hook only guards its own
-  checkout): before writing into any *other* worktree — especially the main
-  checkout — check that directory's branch: `git -C <dir> rev-parse --abbrev-ref HEAD`.
+- **Cross-worktree writes are hook-blocked**: a write whose path belongs to a
+  *different* worktree (especially the main checkout on `main`) would otherwise land
+  there silently — past the branch guard, with tests here still green. The PreToolUse
+  hook now blocks it and prints the corrected in-worktree path. Prefer absolute
+  worktree paths and `git -C <dir>` over a persisted `cd` into another checkout.
 
 ---
 
@@ -215,6 +217,14 @@ Stop hook between them:
    - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
      forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
      also tells Claude to branch *proactively* before ever hitting the block.
+   - Blocks the same on a branch **not matching** `<type>/<short-kebab-desc>`, so an
+     auto-generated `claude/<codename>` worktree branch is renamed before any work
+     (one landed unrenamed in a real PR).
+   - Blocks `Edit`/`Write` whose path is in a **different worktree** than this
+     session (resolved via `git worktree list`) — a write into another checkout
+     (classically the main checkout on `main`, reached via a stray `cd`) otherwise
+     lands there silently, past every branch guard. Fails open; same-worktree and
+     out-of-repo writes are untouched.
    - Blocks `git commit`/`git push` on a branch whose PR is already **merged** —
      pushes there are silently stranded (GitHub stops syncing the head and stops
      running CI). Fails open if `gh`/network is unavailable.
@@ -222,8 +232,10 @@ Stop hook between them:
      action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
      only *undoes* an auto-merge.)
 2. **Claude Code Stop hook** (`.claude/hooks/stop-pr-check.py`) — blocks ending a
-   turn when the branch has pushed commits ahead of `main` with **no PR**, or its
-   open PR has **failing CI**. Dedups per (branch, reason, commit) so it can't loop;
+   turn when the branch has pushed commits ahead of `main` with **no PR**, its open
+   PR has **failing CI**, or its open PR is **`DIRTY`** (merge conflicts — GitHub
+   then never runs the required CI, so side checks like CodeQL/Vercel can make a
+   conflicted PR look green). Dedups per (branch, reason, commit) so it can't loop;
    fails open like the PreToolUse guards.
 3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…

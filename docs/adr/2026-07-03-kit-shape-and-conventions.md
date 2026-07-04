@@ -59,3 +59,11 @@ never-merge `gh pr merge` block in the PreToolUse hook, plus a Stop hook
 (`stop-pr-check.py`) that blocks ending a turn with no PR or failing CI. The battery
 grew to 68 cases, now including mocked-`gh` sandboxes and the Stop hook's
 exit-0/JSON protocol.
+
+**Update (2026-07-04, hook-guardrails port):** three more deterministic guards from
+todoclaw PR #77 (+ its branch-naming guard): a **cross-worktree write guard** (blocks
+Edit/Write into a different checkout — the one way a session wrote to `main` past the
+branch guard), a **branch-naming guard** (blocks work on a non-`<type>/<slug>` branch
+so an auto-generated `claude/<codename>` never lands unrenamed), and a **DIRTY-PR
+guard** in the Stop hook (a conflicted PR skips required CI and can look green on side
+checks alone). Battery → 75 cases, now with a real sibling-worktree sandbox.
