@@ -82,20 +82,25 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    `keepalive.yml` the same way; adapt their fenced stack sections; DELETE any that
 >    don't apply (no DB → no backup-cron; nothing pauses → no keepalive). Fill
 >    `{{EDGE_FUNCTION_NAMES}}`, `{{SMOKE_FUNCTION_NAME}}`, `{{KEEPALIVE_TABLE}}` or
->    remove with their files. Keep every provenance header. Finish with
->    `git rm -r templates/` (its README goes too — activation is one-way).
+>    remove with their files. Also adapt `templates/scripts/dev-worktree-login.sh`
+>    to my backend and `git mv` it to `scripts/` (or delete it if no local
+>    backend). Keep every provenance header. Finish with `git rm -r templates/`
+>    (its README goes too — activation is one-way).
 > 5. `.env.example`: replace the example vars with this project's real public-env
 >    contract (placeholder values only). I create `.env.local` myself — you cannot
 >    (the hook blocks it; that's the design).
 > 6. `.claude/settings.json`: fill `{{NODE_BIN_PATH}}`; machine-specific overrides go
->    in `.claude/settings.local.json` (gitignored). Add `.nvmrc`. NEVER reorder the
->    hooks-scripts-then-settings relationship if you touch wiring (docs/LESSONS.md).
+>    in `.claude/settings.local.json` (gitignored). Verify/update the shipped
+>    `.nvmrc` for my Node choice. NEVER reorder the hooks-scripts-then-settings
+>    relationship if you touch wiring (docs/LESSONS.md).
 > 7. Scaffold the app toolchain if needed (Vite/Next/etc.) — **run generators in a
 >    temp dir and merge their output INTO the kit's files by hand; never let a
 >    generator overwrite package.json, .gitignore, .husky/, or .claude/**
 >    (docs/STACK-RATIONALE.md, "explicit over clever"). Merge kit package.json
 >    scripts/devDeps into the scaffold's result; add `lint-staged` if the stack wants
->    it (the pre-commit hook picks it up automatically).
+>    it (the pre-commit hook picks it up automatically) — todoclaw's proven config:
+>    `"lint-staged": {"*.{ts,tsx}": ["eslint --fix", "prettier --write"],
+>    "*.{css,html}": "prettier --write"}`.
 > 8. Create `docs/SETUP.md` (prerequisites table w/ version floors + the Node gotcha
 >    callout, first-time setup, env-var recipe, command table, testing tiers,
 >    local-services table, troubleshooting) and `docs/SERVICES.md` (per service:

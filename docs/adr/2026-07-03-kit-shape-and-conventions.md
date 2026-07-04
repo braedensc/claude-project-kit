@@ -52,3 +52,10 @@ The kit is a **public GitHub template repo** that self-hosts its own protections
 (master-branch guard, Read `.pem`, shell-read `.key` alternatives) and the battery
 step now ships inside `templates/workflows/ci.yml` — its permanence in bootstrapped
 projects is structural, not instructional.
+
+**Update (2026-07-03, workflow-guards port):** the enforcement surface gained a
+fourth layer from the todoclaw handoff (PRs #59/#61/#63): a merged-PR guard and a
+never-merge `gh pr merge` block in the PreToolUse hook, plus a Stop hook
+(`stop-pr-check.py`) that blocks ending a turn with no PR or failing CI. The battery
+grew to 68 cases, now including mocked-`gh` sandboxes and the Stop hook's
+exit-0/JSON protocol.

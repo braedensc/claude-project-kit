@@ -11,6 +11,7 @@ place in your new project.
 | `workflows/deploy-on-green.yml` | `.github/workflows/deploy-on-green.yml` | Deploy-on-green: `workflow_run` gate → migrate → deploy, with every production lesson inline |
 | `workflows/backup-cron.yml` | `.github/workflows/backup-cron.yml` | Daily encrypted `pg_dump` → artifact, with the IPv6/pooler/role gotchas inline |
 | `workflows/keepalive.yml` | `.github/workflows/keepalive.yml` | Free-tier anti-pause ping (401-is-healthy pattern) |
+| `scripts/dev-worktree-login.sh` | `scripts/dev-worktree-login.sh` | Per-worktree env regeneration + dedicated test login (Supabase-flavored — port the pattern; delete if no local backend) |
 
 Activation (done by the bootstrap session, not by hand):
 

@@ -129,11 +129,24 @@ git checkout -b <type>/<short-kebab-desc>
 
 - **Branch name:** `<type>/<short-kebab-desc>`, type ∈ `feat | fix | chore | refactor | docs`.
 - **One task = one branch = one PR.** Small and short-lived.
-- **The PreToolUse hook enforces this:** `Edit`/`Write`/`git commit` are *blocked* on
-  `main`. If you see that block, branch and retry — do not work around it.
+- **The hooks enforce this:** `Edit`/`Write`/`git commit` are *blocked* on `main`; so
+  are `git commit`/`git push` on a branch whose PR already **merged**, and
+  `gh pr merge` in any form. A block isn't a bug — branch fresh and retry; never work
+  around it.
 - **Ordered/generated files are serialized** (migrations etc.): pull latest main
   immediately before generating one; never two generating branches in parallel.
-- **Open a PR when the task is done**; never merge your own work directly to `main`.
+- **Open a PR when the task is done** (`gh pr create`) — and stop there. **Merging is
+  the human's action only: never run `gh pr merge` (including `--auto`), never enable
+  auto-merge.** Opening the PR is the end of Claude's involvement.
+- **Watch CI to green before considering the task done:** `gh pr checks <n> --watch`.
+  On a red check: read the failing job's log, fix, push, re-watch — never hand back a
+  red PR. Local checks passing is necessary, not sufficient; the PR's CI status is
+  the source of truth. (A Stop hook also blocks ending a turn with no PR or a
+  failing check.)
+- **Before a follow-up commit to an open PR, confirm it's still open**
+  (`gh pr view <n> --json state`) — a commit pushed to a merged PR's branch is
+  silently orphaned. If merged, branch fresh off updated `main`. (Also enforced by
+  the merged-PR hook guard.)
 
 ---
 
