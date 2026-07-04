@@ -89,6 +89,14 @@ To *test* a hook fix from a worktree before it merges, commit once with
 **Husky resets `core.hooksPath` on every `npm install`** (the `prepare` script). Don't
 fight it or repoint it; make the hook itself robust.
 
+**Cross-worktree writes bypass the branch guard.** The PreToolUse hook derives
+PROJECT_ROOT from its own file location, so an absolute `Write`/`Edit` path into a
+*different* worktree (e.g. the main checkout sitting on `main`) is out of scope and
+silently bypasses the guard — the one documented way a session writes to `main`
+despite the hook. Rule: before any write outside your session's worktree, check that
+directory's branch first — `git -C <dir> rev-parse --abbrev-ref HEAD` (todoclaw
+gotcha, 2026-07-03).
+
 **Verify a PR merged before any follow-up.** Fast-merging owners mean the branch you
 just pushed is probably already merged; a follow-up commit onto it is stranded —
 GitHub stops syncing a merged PR's head and stops running CI on pushes to it (this
@@ -146,6 +154,12 @@ no-match greps with `|| true`; capture tool exits with `if ! cmd; then`.
 copying it. Prefer tooling that resolves env **at runtime from the running stack**
 (todoclaw's golden suite shells out to `supabase status -o env` — zero env files
 needed); otherwise copying is a human step.
+
+**Never guess which backend a `.env.local` points at.** Verify with an unambiguous
+single-pattern grep per candidate host — e.g. `grep -oE 'supabase\.co' .env.local`
+then `grep -oE '127\.0\.0\.1' .env.local` — and never print the values (grep of a
+pattern is hook-compatible; `cat` is not). A combined-pattern grep produced a wrong
+prod-vs-local claim in todoclaw (2026-07-03).
 
 **macOS keychain re-prompts after `brew upgrade`.** Keychain ACLs are per binary
 signature; an upgraded CLI is a "new" binary and asks again. Expected — not an attack.

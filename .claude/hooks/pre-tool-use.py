@@ -84,6 +84,11 @@ def _current_branch() -> str:
 
 
 def _in_project(path: str) -> bool:
+    # KNOWN LIMIT: PROJECT_ROOT is THIS checkout. An absolute Write/Edit into a
+    # DIFFERENT worktree (e.g. the main checkout while it sits on `main`) is
+    # outside this root and bypasses the branch guard entirely. Before writing
+    # outside your own worktree, check ITS branch:
+    #   git -C <dir> rev-parse --abbrev-ref HEAD    (docs/LESSONS.md)
     if not path:
         return False
     try:

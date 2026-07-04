@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Per-worktree dev-environment provisioning — ported from todoclaw (2026-07-03).
+# Per-worktree dev-environment provisioning — ported from todoclaw (2026-07-03),
+# where it provisioned parallel worktree sessions against the shared local stack
+# (dedicated per-slug logins ended the shared-test-account collisions).
 #
 # THE PATTERN (portable to any backend): git worktrees don't share gitignored
 # files (.env.local), so every new worktree starts broken until someone
@@ -8,8 +10,11 @@
 # Claude — the PreToolUse hook blocks .env writes and key-shaped values):
 #   1. regenerates THIS worktree's .env.local from the running local backend
 #   2. provisions a dedicated <slug>@dev.local test login for this worktree
-# Gate on a backend config file's presence, fail loudly if the local stack
-# isn't running, and make user creation idempotent.
+# (Run by a human OR invoked by Claude; the values never enter the model's
+# context.) Gate on a backend config file's presence, fail loudly if the local stack
+# isn't running, and make user creation idempotent. Claude may INVOKE this
+# committed script — the hooks block constructing/reading env content, not
+# running a script that does.
 #
 # THE IMPLEMENTATION BELOW IS SUPABASE-SPECIFIC — swap the `supabase status` /
 # admin-API calls for your backend (Firebase emulator, local Postgres + custom

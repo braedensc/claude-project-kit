@@ -76,8 +76,10 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-65 block/allow cases covering every guard above — the v2 prose-stripping allows, sandboxed branch-guard cases (throwaway git repos pinned to `main` / `master` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases (its exit-0 + JSON-decision protocol, including the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
-(and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a case.**
+68 block/allow cases covering every guard above — the v2 prose-stripping allows, sandboxed branch-guard cases (throwaway git repos pinned to `main` / `master` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases (its exit-0 + JSON-decision protocol, including the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
+(and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a
+case — and keep docs/COLLABORATION.md's "What's automatic (enforcement)" section in
+sync.**
 
 ---
 

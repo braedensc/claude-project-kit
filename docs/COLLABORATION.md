@@ -59,7 +59,8 @@ still never push to `main` directly.
 **Opening the PR is where Claude's involvement ends. Merging is the human's action
 only — never `gh pr merge` in any form, including `--auto`; enabling auto-merge still
 means the agent caused the merge** (a real todoclaw near-miss, 2026-07-03 — now
-hook-blocked). **And watch CI to green before considering the task done:**
+hook-blocked). The repo-level `allow_auto_merge` *setting* may stay enabled for the
+human's own use — the boundary is the agent never invoking a merge, not the setting. **And watch CI to green before considering the task done:**
 `gh pr checks <n> --watch`; if a check fails, read the failing job's log, fix, push,
 re-watch. Local checks passing is necessary but not sufficient — the PR's actual CI
 status is the source of truth.
@@ -127,14 +128,19 @@ worktrees for you — ask it to "work on X in a new worktree.")
 - `node_modules/` and local service state are per-folder: run `npm install` in each
   worktree (the pre-commit secret scan self-heals via the shared git dir even before
   you do).
-- **`.env.local` does not follow you into a worktree** — and if parallel worktrees
-  share one local test account, they collide. Run the per-worktree provisioning
-  script once per new worktree (`scripts/dev-worktree-login.sh <slug>` — regenerates
-  `.env.local` from the running local stack + creates a dedicated `<slug>@dev.local`
-  login; a human step — hooks block Claude from `.env*`). Or prefer tooling that
-  resolves env at runtime from the running stack.
+- **`.env.local` does not follow you into a worktree** (symptom: a blank page, not an
+  error, in Vite-style apps) — and if parallel worktrees share one local test
+  account, they collide. Run the per-worktree provisioning script once per new
+  worktree: `scripts/dev-worktree-login.sh <slug>` (ships at `templates/scripts/`
+  until bootstrap activates it) — regenerates `.env.local` from the running local
+  stack + creates a dedicated `<slug>@dev.local` login. Claude may *invoke* the
+  script (hooks block constructing/reading env content, not running a committed
+  script); or prefer tooling that resolves env at runtime from the running stack.
 - Git hooks run from the MAIN checkout (`core.hooksPath` is absolute): a hook fix on a
   branch takes effect only after it merges AND the main checkout pulls it.
+- **Cross-worktree writes bypass the branch guard** (the hook only guards its own
+  checkout): before writing into any *other* worktree — especially the main
+  checkout — check that directory's branch: `git -C <dir> rev-parse --abbrev-ref HEAD`.
 
 ---
 

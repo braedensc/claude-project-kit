@@ -213,6 +213,7 @@ def main():
         # ── universal: push guards ───────────────────────────────────────────
         ("push main blocked", bash("git push origin main"), BLOCK, HOOK),
         ("push refspec HEAD:main blocked", bash("git push origin HEAD:main"), BLOCK, HOOK),
+        ("push naming master blocked", bash("git push origin master"), BLOCK, HOOK),
         ("bare --force blocked", bash("git push --force origin feat/x"), BLOCK, HOOK),
         ("bare -f blocked", bash("git push -f"), BLOCK, HOOK),
         # run against the no-upstream feat sandbox so results never depend on the
@@ -235,6 +236,7 @@ def main():
 
         # ── universal: secret writes ─────────────────────────────────────────
         ("Write .env blocked", write("/x/.env", "X=1"), BLOCK, HOOK),
+        ("Edit .env blocked", edit("/x/.env", "X=2"), BLOCK, HOOK),
         ("Write .env.example allowed",
          write("/x/.env.example", "ANTHROPIC_API_KEY=your-key-here"), ALLOW, HOOK),
         ("Anthropic key in content blocked", write("/x/note.md", f"key: {FAKE_ANTHROPIC}"), BLOCK, HOOK),
@@ -257,6 +259,8 @@ def main():
         # ── universal: branch guard (sandboxed repos) ────────────────────────
         ("Edit in-project on main blocked",
          edit(os.path.join(main_root, "src/app.ts"), "x"), BLOCK, main_hook),
+        ("Write in-project on main blocked",
+         write(os.path.join(main_root, "src/new.ts"), "x"), BLOCK, main_hook),
         ("git commit on main blocked", bash('git commit -F /tmp/msg.txt'), BLOCK, main_hook),
         ("git commit on master blocked", bash('git commit -F /tmp/msg.txt'), BLOCK, master_hook),
         ("Edit in-project on feature branch allowed",
