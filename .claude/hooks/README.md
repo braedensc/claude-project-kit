@@ -16,8 +16,11 @@ Runs before every tool call. Exit 2 = block with reason. Exit 0 = allow.
 
 | What it blocks | Tool | Why |
 |---|---|---|
+| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `.claude/settings.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline `-c`/`-e` interpreters) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings. These files are **human-only**: to change one, Claude prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed. A first line, not a sandbox — the real backstop is still git + review |
 | Edit/Write while on `main`/`master` | Edit/Write | Forces the feature-branch workflow automatically (`docs/COLLABORATION.md`) — keeps `main` clean for collaborators |
 | `git commit` while on `main`/`master` | Bash | Same — no direct commits to `main` |
+| Edit/Write/`git commit` on a branch not matching `<type>/<slug>` | Edit/Write, Bash | Forces a rename before work, so an auto-generated `claude/<codename>` worktree branch never lands unrenamed in a PR |
+| Edit/Write into a **different worktree** | Edit/Write | Target's owning worktree (via `git worktree list`) ≠ this session's. A write to another checkout (classically the main checkout, reached via a persisted `cd`) skips every branch guard and lands there **silently** — tests here still pass against the unmodified files. The block prints the corrected in-worktree path; fails open; same-worktree writes and paths outside the repo (scratchpad, `~/.claude`, `/tmp`) are unaffected |
 | `rm -rf` / `rm --recursive` | Bash | Accidental mass deletion |
 | `curl/wget \| sh` | Bash | Supply-chain attack vector |
 | `git add planning/` | Bash | `planning/` is gitignored reference material; staging it would publish it |
@@ -49,13 +52,19 @@ Keep the *shape* when you swap datastores: local/disposable stays frictionless, 
 
 ## Stop — `stop-pr-check.py`
 
-Runs when Claude tries to end a turn; blocks (once) with a reminder when the current
-branch has pushed commits ahead of `main` with **no PR**, or its open PR has
-**failing CI** (`statusCheckRollup`). Written rules ("open a PR when done," "watch CI
-to green") weren't reliably followed across parallel sessions — this makes them
-hard to miss. Dedups per (branch, reason, HEAD sha) in `.claude/.stop-pr-nag/`
-(gitignored) so it can never loop; fails open when `gh`/network is unavailable.
-Ported from todoclaw PR #59, in production since 2026-07-03.
+Runs when Claude tries to end a turn on a **pushed** branch ahead of `main`; blocks
+(once) with a reminder when any of these hold, so "open a PR and watch CI to green"
+isn't just a written rule that gets skipped across parallel sessions:
+
+| Blocks ending the turn when | Why |
+|---|---|
+| The branch has **no PR** yet | The workflow expects a PR once a task is done (`gh pr create`) |
+| The open PR has **failing CI** (`FAILURE`/`CANCELLED`/`TIMED_OUT`/…) | CI must be watched to green before a task is "done" |
+| The open PR is **`DIRTY`** (merge conflicts) | GitHub can't build the merge ref, so the required `pull_request` CI **never runs** — only side checks (CodeQL/Vercel) report and can look green. A conflicted PR must be rebased, not mistaken for passing (2026-07-03 near-miss). Fires only on explicit `DIRTY`, never the transient `UNKNOWN` right after a push |
+
+Dedups per (branch, reason, HEAD sha) in `.claude/.stop-pr-nag/` (gitignored) so
+explaining instead of acting can't trap the session in a loop; fails open when
+`git`/`gh`/network is unavailable. Ported from todoclaw PRs #59 + #77 (2026-07-03).
 
 ---
 
@@ -76,7 +85,7 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-68 block/allow cases covering every guard above — the v2 prose-stripping allows, sandboxed branch-guard cases (throwaway git repos pinned to `main` / `master` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases (its exit-0 + JSON-decision protocol, including the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
+91 block/allow cases covering every guard above — the self-protection cases (edit/mutate a hook → block; read/py_compile/stage → allow, incl. that a redirect must *target* a protected path so `... hook 2>&1` isn't a false positive), the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), a real sibling-worktree sandbox for the cross-worktree guard, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
 (and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a
 case — and keep docs/COLLABORATION.md's "What's automatic (enforcement)" section in
 sync.**

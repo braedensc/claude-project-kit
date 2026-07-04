@@ -89,13 +89,25 @@ To *test* a hook fix from a worktree before it merges, commit once with
 **Husky resets `core.hooksPath` on every `npm install`** (the `prepare` script). Don't
 fight it or repoint it; make the hook itself robust.
 
-**Cross-worktree writes bypass the branch guard.** The PreToolUse hook derives
-PROJECT_ROOT from its own file location, so an absolute `Write`/`Edit` path into a
-*different* worktree (e.g. the main checkout sitting on `main`) is out of scope and
-silently bypasses the guard — the one documented way a session writes to `main`
-despite the hook. Rule: before any write outside your session's worktree, check that
-directory's branch first — `git -C <dir> rev-parse --abbrev-ref HEAD` (todoclaw
-gotcha, 2026-07-03).
+**Cross-worktree writes bypass the branch guard — so a dedicated guard blocks them.**
+The branch guard only fires for paths inside the session's own checkout, so an
+absolute `Write`/`Edit` into a *different* worktree (classically the main checkout on
+`main`, reached via a stray `cd`) lands there silently — tests/typecheck here still
+pass against the unmodified files, so a whole session's edits can go to the wrong
+checkout unnoticed. The one way a session writes to `main` despite the hook. Fix
+(todoclaw PR #77): a cross-worktree guard resolves the target's owning worktree via
+`git worktree list` and blocks any write outside the session's own root, printing the
+corrected in-worktree path. Fails open; same-worktree and out-of-repo writes are
+untouched. Prefer `git -C <dir>` over a persisted `cd`.
+
+**A DIRTY (conflicted) PR looks green but never ran the real CI.** When a PR has merge
+conflicts with its base, GitHub can't build the merge ref, so the `pull_request`-
+triggered required checks (Lint/Typecheck/Test/E2E) **never run** — only side
+workflows (CodeQL, Vercel) report, and those can be SUCCESS. `gh pr checks` then shows
+passing while the gate never executed (a real 2026-07-03 near-miss). Never treat a
+DIRTY PR as done: rebase onto latest main, resolve, force-push, re-watch CI. The kit's
+Stop hook now blocks turn-end on `mergeStateStatus == DIRTY` (only explicit DIRTY, not
+the transient UNKNOWN right after a push).
 
 **Verify a PR merged before any follow-up.** Fast-merging owners mean the branch you
 just pushed is probably already merged; a follow-up commit onto it is stranded —
@@ -220,12 +232,30 @@ revert).
 
 ## Process
 
+**A guard the agent can edit is theater — the hooks must protect themselves.** A
+PreToolUse hook that blocks something is worthless if Claude can just Edit the hook to
+delete the block, or edit `settings.json` to unwire it — unwiring is the *easiest*
+bypass. So the hook scripts + `settings.json` are human-only: Edit/Write and Bash
+mutations (`>`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline `-c`/`-e`
+interpreters) targeting them are blocked; changing one means Claude prints a terminal
+command for the human to run. Caveats worth stating honestly: (1) a shell can't be
+perfectly fenced by regex, so this is a first line, not a sandbox — the real backstop
+is git + branch protection + CI (the committed hook is what runs after merge, and CI
+re-runs the battery against it); (2) it self-references (the running hook forbids
+editing itself), so **compose and validate the guard before the lock lands** — once the
+Edit/Write block is live, the hook is un-editable by the agent (and a syntax error would
+fail *closed* — every tool blocked), so build it in a candidate and test the Bash-regex
+half before adding the tool-level lock as the final edit.
+
 **Written workflow rules are not reliably followed — back them with hooks.** The
 todoclaw retro's core process lesson: CLAUDE.md said "open a PR when done," "watch CI
 to green," "don't push to merged branches" — and each was violated anyway across
-parallel sessions until made *structurally impossible* (branch guard, merged-PR
-guard, `gh pr merge` block, Stop-hook nag). When a written rule gets violated twice,
-stop rewording it and write a hook.
+parallel sessions until made *structurally impossible* (branch guard, branch-naming
+guard, cross-worktree guard, merged-PR guard, `gh pr merge` block, Stop-hook no-PR /
+failing-CI / DIRTY nags). When a written rule gets violated twice, stop rewording it
+and write a hook. (Even the branch *name* convention: a fresh worktree's auto-generated
+`claude/<codename>` branch landed unrenamed in a real PR, so the naming guard now
+blocks work until it's renamed.)
 
 **Docs are scaffolding first, then right-sized.** Heavy ADR/docs discipline exists to
 let cold sessions reconstruct a system under construction; once built and stable, new

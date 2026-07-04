@@ -133,15 +133,36 @@ if pr.get("state") != "OPEN":
     sys.exit(0)  # merged or closed — nothing further to watch
 
 code, out = _run(
-    ["gh", "pr", "view", str(pr["number"]), "--json", "statusCheckRollup"],
+    ["gh", "pr", "view", str(pr["number"]), "--json", "statusCheckRollup,mergeStateStatus"],
     timeout=10,
 )
 if code != 0:
     sys.exit(0)
 
 try:
-    checks = json.loads(out or "{}").get("statusCheckRollup", [])
+    info = json.loads(out or "{}")
 except Exception:
+    sys.exit(0)
+checks = info.get("statusCheckRollup", [])
+
+# DIRTY = merge conflicts with the base branch. GitHub can't build the merge ref, so the
+# PR's `pull_request` CI (Lint/Typecheck/Test/E2E) never runs — only side workflows like
+# CodeQL/Vercel report, which can be SUCCESS and make a conflicted PR look green (a real
+# near-miss, 2026-07-03: `gh pr checks` showed passing while the required CI hadn't run at
+# all). Block so the PR gets rebased instead of mistaken for done. Fires only on explicit
+# DIRTY — the transient UNKNOWN right after a push is ignored, so it can't false-block while
+# GitHub is still computing mergeability.
+if info.get("mergeStateStatus") == "DIRTY":
+    msg = (
+        f"PR #{pr['number']} for `{branch}` is DIRTY — it has merge conflicts with `main`, "
+        "so the required CI (Lint/Typecheck/Test/E2E) never ran; only side checks such as "
+        "CodeQL/Vercel reported, which can look green. Don't mistake that for a passing PR — "
+        "rebase onto latest main, resolve, force-push, then watch CI to green "
+        f"(`gh pr checks {pr['number']} --watch`):\n"
+        "  git fetch origin main && git rebase origin/main\n"
+        "  # resolve conflicts, then: git push --force-with-lease"
+    )
+    _block(branch, "pr-dirty", head_sha, msg)
     sys.exit(0)
 
 failing = [c for c in checks if c.get("conclusion") in FAILING_CONCLUSIONS]

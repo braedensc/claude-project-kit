@@ -70,6 +70,23 @@ BRANCH_HELP = (
 )
 
 
+# ── Branch-naming guard: work only happens on a properly-named branch ──────────
+# docs/COLLABORATION.md's convention: <type>/<short-kebab-desc>, type in
+# feat|fix|chore|refactor|docs. A fresh Claude Code worktree session defaults to
+# an auto-generated `claude/<random-codename>` branch (e.g. claude/cool-jones-ca5); in
+# todoclaw one landed UNRENAMED in a real PR. Blocking Edit/Write/commit the same
+# way the main/master guard does forces a rename before any work, not just a
+# reminder. (Fails open on an empty branch string, e.g. outside a repo.)
+BRANCH_NAME_RE = re.compile(r"^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*$")
+BRANCH_NAME_HELP = (
+    "Branch `{branch}` doesn't match this repo's naming convention "
+    "(`<type>/<short-kebab-desc>`, type = feat|fix|chore|refactor|docs — see "
+    "docs/COLLABORATION.md). Rename it before continuing, so an auto-generated "
+    "worktree codename never lands in a real PR:\n"
+    "  git branch -m <type>/<short-kebab-desc>"
+)
+
+
 def _current_branch() -> str:
     try:
         r = subprocess.run(
@@ -84,11 +101,6 @@ def _current_branch() -> str:
 
 
 def _in_project(path: str) -> bool:
-    # KNOWN LIMIT: PROJECT_ROOT is THIS checkout. An absolute Write/Edit into a
-    # DIFFERENT worktree (e.g. the main checkout while it sits on `main`) is
-    # outside this root and bypasses the branch guard entirely. Before writing
-    # outside your own worktree, check ITS branch:
-    #   git -C <dir> rev-parse --abbrev-ref HEAD    (docs/LESSONS.md)
     if not path:
         return False
     try:
@@ -97,6 +109,70 @@ def _in_project(path: str) -> bool:
         )
     except Exception:
         return False
+
+
+# ── Cross-worktree write guard: never write into a DIFFERENT checkout ───────────
+# The branch guards above only fire for paths INSIDE this worktree (_in_project).
+# A write whose path belongs to a SIBLING/PARENT worktree — classically the main
+# checkout (on `main`), reached via a persisted `cd` into it — skips every guard and
+# lands there SILENTLY: tests/typecheck here still pass against the unmodified files,
+# so a whole session's edits can go to the wrong checkout unnoticed (todoclaw PR #77,
+# 2026-07-03 retro). Resolve the target's OWNING worktree via `git worktree list` (the
+# most-specific/longest root that contains it); if that isn't THIS session's worktree,
+# block. Fails open (no git / not a worktree → owner None → allow), and same-worktree
+# writes are untouched (owner == PROJECT_ROOT), so paths outside the repo (scratchpad,
+# ~/.claude memory, /tmp) and normal edits are unaffected — the guard cannot lock the
+# session out of its own worktree.
+CROSS_WORKTREE_HELP = (
+    "Cross-worktree write blocked — this path is in a DIFFERENT checkout than your session:\n"
+    "  target worktree: {owner}\n"
+    "  your session:    {here}\n"
+    "Writing into another worktree (especially the MAIN checkout, usually on `main`) lands "
+    "there SILENTLY: the branch guard only protects your own worktree, and your tests/typecheck "
+    "would still pass against the unmodified files here. Use your OWN worktree's path instead:\n"
+    "  {suggested}\n"
+    "(Usual cause: a persisted `cd` into another checkout — prefer absolute worktree paths and "
+    "`git -C <dir>` over `cd`. If you genuinely must edit the other worktree, do it from a "
+    "session rooted there.)"
+)
+
+
+def _worktree_roots():
+    """Absolute roots of every git worktree for this repo, or [] on any failure."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", PROJECT_ROOT, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode != 0:
+            return []
+        return [
+            os.path.abspath(line[len("worktree ") :].strip())
+            for line in r.stdout.splitlines()
+            if line.startswith("worktree ")
+        ]
+    except Exception:
+        return []
+
+
+def _owning_worktree(path: str, roots):
+    """The most-specific (longest) worktree root that contains `path`, or None."""
+    try:
+        ap = os.path.abspath(path)
+    except Exception:
+        return None
+    best = None
+    for root in roots:
+        try:
+            if os.path.commonpath([ap, root]) == root and (
+                best is None or len(root) > len(best)
+            ):
+                best = root
+        except Exception:
+            continue
+    return best
 
 
 # ── Merged-PR guard: no commits/pushes on a branch whose PR already merged ──────
@@ -149,15 +225,104 @@ def _merged_pr_info(branch: str):
         return None
 
 
+# ── Self-protection guard: Claude must never edit the hooks that guard it ───────
+# Every block above is trivially defeated if Claude can rewrite the hook to delete the
+# guard, or edit settings.json to unwire it. So these files are HUMAN-ONLY: the
+# Edit/Write tools are blocked outright, and Bash that would mutate them (redirect,
+# tee, sed -i, cp/mv/rm, git checkout/restore, an inline `-c`/`-e` interpreter, …) is
+# blocked too. To change one, Claude must hand the HUMAN a terminal command to run —
+# it cannot apply the change itself. The running hook protects itself (pre-tool-use.py
+# is in its own set). This is a first line, not a sandbox: a shell can't be perfectly
+# fenced by regex, so the real backstop stays git — any change must survive a reviewed
+# PR + CI, which re-runs the battery against the committed hook. (Reads are allowed:
+# Claude may `Read`/`cat` these files freely; only writes/mutations are blocked.)
+SELF_PROTECTED = {
+    os.path.join(PROJECT_ROOT, ".claude", "hooks", "pre-tool-use.py"),
+    os.path.join(PROJECT_ROOT, ".claude", "hooks", "audit.py"),
+    os.path.join(PROJECT_ROOT, ".claude", "hooks", "stop-pr-check.py"),
+    os.path.join(PROJECT_ROOT, ".claude", "settings.json"),
+}
+SELF_PROTECT_HELP = (
+    "🔒 `{path}` is a protected hook file — Claude may not edit it. Editing the "
+    "guardrails would let any block be removed, so these files are HUMAN-ONLY. Do not "
+    "reach for another tool or a shell workaround — instead, print a terminal command "
+    "for the human to run themselves, e.g.:\n"
+    "  cat > {path} <<'EOF'\n"
+    "  <full new file contents>\n"
+    "  EOF\n"
+    "and let them run it. (The change still lands via a reviewed PR — CI re-runs the "
+    "hook battery against it.)"
+)
+SELF_PROTECT_BASH_HELP = (
+    "🔒 That command would modify a protected hook file (one of: pre-tool-use.py, "
+    "audit.py, stop-pr-check.py, .claude/settings.json). These are HUMAN-ONLY — Claude "
+    "cannot edit or overwrite the guards that constrain it. Print the change as a "
+    "terminal command for the human to run themselves instead; it lands via a reviewed "
+    "PR. (Reading them — cat/less/grep — is fine.)"
+)
+
+
+def _is_self_protected(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.abspath(path) in {os.path.abspath(p) for p in SELF_PROTECTED}
+    except Exception:
+        return False
+
+
+# Bash detection: a write/mutation operator TARGETING a protected file — the path
+# must be the operator's target, so an unrelated `2>&1` / `> /dev/null` / `rm other`
+# in a command that merely mentions a hook path is NOT a false positive. Read-only
+# commands (cat/grep, `python3 <dir>/test_hooks.py`, `python3 -m py_compile <path>`,
+# `cat <hook> > /tmp/x`) do not match, so verifying the hooks stays frictionless.
+_SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|audit\.py|\.claude[/\\]settings\.json)"
+_SELF_MUTATE_RE = re.compile(
+    r">>?\s*['\"]?[^\s'\"|&;<>]*?" + _SELF_PROT +                     # redirect INTO a protected path
+    r"|\btee\b[^|;&]*?" + _SELF_PROT +                                # tee protected
+    r"|\b(?:sed|perl)\b[^|;&]*\s-[a-zA-Z]*i\b[^|;&]*?" + _SELF_PROT + # sed -i / perl -i protected
+    r"|\b(?:cp|mv|rm|ln|install|truncate|dd|shred|unlink)\b[^|;&]*?" + _SELF_PROT +  # cmd -> protected
+    r"|\bgit\b[^|;&]*\b(?:checkout|restore)\b[^|;&]*?" + _SELF_PROT + # git revert protected
+    r"|\b(?:python3?|node|deno|ruby)\b[^|;&]*\s-[a-zA-Z]*[ce]\b[^|;&]*?" + _SELF_PROT  # inline interpreter writing protected
+)
+
+
+# Self-protection FIRST — highest-priority block, so its message wins. Claude may not
+# edit the hook files or settings.json themselves; changing them is a human-only
+# terminal step (see SELF_PROTECTED). Covers NotebookEdit too, for completeness.
+if tool in ("Edit", "Write", "NotebookEdit"):
+    _spp = inp.get("file_path", "") or inp.get("notebook_path", "")
+    if _is_self_protected(_spp):
+        block(SELF_PROTECT_HELP.format(path=os.path.abspath(_spp)))
+
+# Cross-worktree guard runs for ALL Edit/Write (not just in-project), and BEFORE
+# the branch guard — a write into another checkout must be caught even though it is
+# outside PROJECT_ROOT.
+if tool in ("Edit", "Write"):
+    _fp = inp.get("file_path", "")
+    _owner = _owning_worktree(_fp, _worktree_roots()) if _fp else None
+    if _owner and os.path.abspath(_owner) != os.path.abspath(PROJECT_ROOT):
+        try:
+            _suggested = os.path.join(
+                PROJECT_ROOT, os.path.relpath(os.path.abspath(_fp), _owner)
+            )
+        except Exception:
+            _suggested = os.path.join(PROJECT_ROOT, "<same-relative-path>")
+        block(CROSS_WORKTREE_HELP.format(owner=_owner, here=PROJECT_ROOT, suggested=_suggested))
+
 if tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")):
     branch = _current_branch()
     if branch in PROTECTED_BRANCHES:
         block(BRANCH_HELP.format(branch=branch))
+    elif branch and not BRANCH_NAME_RE.match(branch):
+        block(BRANCH_NAME_HELP.format(branch=branch))
 
 if tool == "Bash" and re.search(r"\bgit\s+commit\b", inp.get("command", "")):
     branch = _current_branch()
     if branch in PROTECTED_BRANCHES:
         block(BRANCH_HELP.format(branch=branch))
+    elif branch and not BRANCH_NAME_RE.match(branch):
+        block(BRANCH_NAME_HELP.format(branch=branch))
     elif _has_upstream():
         merged = _merged_pr_info(branch)
         if merged:
@@ -185,6 +350,11 @@ def _strip_prose(c: str) -> str:
 if tool == "Bash":
     cmd = inp.get("command", "")
     scan = _strip_prose(cmd)
+
+    # Self-protection: block any shell mutation of a protected hook file. First guard
+    # in the Bash block so its message wins.
+    if _SELF_MUTATE_RE.search(scan):
+        block(SELF_PROTECT_BASH_HELP)
 
     # Block rm -rf / rm -fr / rm --recursive
     if re.search(r"\brm\b[^#\n;&|]*-[a-zA-Z]*r[a-zA-Z]*f", scan) or \
