@@ -59,3 +59,12 @@ shipping (the syntax is newer than the model's cutoff in several cases):
   kit CI green on the PR.
 - The one self-protected change (settings.json: `permissions.deny` + SessionStart
   wiring) applied via the human-only terminal flow the kit mandates.
+
+**Update (2026-07-04): `/ship` is model-invocable, not user-only.** The initial
+decision locked `/ship` with `disable-model-invocation: true` (and so Claude couldn't
+even *see* it). That was over-cautious: `/ship` does nothing Claude can't already do —
+it commits, pushes, and opens a PR, which is the kit's documented default behavior, and
+merging (the only irreversible step) stays hook-blocked. Packaging the routine as a
+skill Claude can run makes shipping *more* reliable (it won't skip the watch-CI step).
+`disable-model-invocation` is now reserved for genuinely irreversible/expensive skills
+(a real deploy). `/new-adr` was already model-invocable.
