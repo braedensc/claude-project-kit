@@ -63,20 +63,38 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > stage plan (walking skeleton first: repo hygiene → thin end-to-end slice deployed →
 > features; local-first, ship-last).
 >
-> **Phase 4 — execute (on a feature branch; the hooks will insist anyway):**
+> **Phase 4 — execute (on a feature branch; the hooks will insist anyway). Two setup
+> facts change *how* you do a couple of these steps:**
+> - **`.claude/hooks/*.py` and `.claude/settings.json` are self-protected** — the live
+>   hook blocks you from editing them (Edit/Write and shell mutations alike). To change
+>   one: write the full new version to a scratch file, then hand ME a terminal command
+>   to apply it (e.g. `cp <scratch> .claude/hooks/pre-tool-use.py` — run in my terminal,
+>   no hook intercepts it), then verify and `git add`/commit it (staging them IS
+>   allowed). `.claude/settings.local.json` is NOT protected — write it directly.
+> - **Unbrick Node before any `npm`:** a fresh clone's `settings.json` PATH still holds
+>   the literal `{{NODE_BIN_PATH}}`, so `npm`/`node` may not resolve. Before installing
+>   or scaffolding, write `.claude/settings.local.json` with my real Node bin (ask me,
+>   or read `~/.nvm/versions/node/`) — its `env.PATH` overrides the placeholder and
+>   resolves the toolchain immediately. (Step 6 still fills the committed `settings.json`
+>   placeholder — via a terminal command — for the default + placeholder integrity.)
+>
 > 1. `docs/CLAUDE-template.md` → `CLAUDE.md` (repo root), **overwriting the kit's own
 >    CLAUDE.md that ships here** (it describes maintaining the kit; yours describes my
 >    project). `CLAUDE.md` is the file Claude Code auto-loads every session, so this is
 >    how future sessions learn my project's rules + the live guardrails — fill every
 >    `{{…}}` token, keep the Hard Rules and Branch Workflow sections' strength, delete
 >    the template comment block and `docs/CLAUDE-template.md` itself.
-> 2. `.claude/hooks/pre-tool-use.py`: replace the fenced STACK-SPECIFIC section for my
->    datastore (keep the shape: local/disposable frictionless, remote/irreplaceable
->    hard-blocked). **Update `test_hooks.py` in the same commit** — add block/allow
->    cases for every guard you change; the battery must pass and stay in CI.
+> 2. `.claude/hooks/pre-tool-use.py` (**self-protected — apply via a terminal command,
+>    per above**): replace the fenced STACK-SPECIFIC section for my datastore (keep the
+>    shape: local/disposable frictionless, remote/irreplaceable hard-blocked). Compose
+>    the full new hook, hand me the `cp` command, and once I've run it: **update
+>    `test_hooks.py`** (NOT protected — edit it directly) with block/allow cases for
+>    every guard you changed, run the battery green, and commit both together.
 > 3. Rename the reference dir if I chose a different name — in `.gitignore`,
 >    `.husky/pre-commit`, the hook's `git add` guard, the app CI's forbidden-paths
->    grep, AND CLAUDE.md Hard Rule 1 (every enforcement layer must agree). Delete
+>    grep, AND CLAUDE.md Hard Rule 1 (every enforcement layer must agree). The hook's
+>    guard is self-protected — fold that one edit into step 2's `cp` (one new hook
+>    version covers both changes) rather than a second terminal round-trip. Delete
 >    the concept only if I said none.
 > 4. Activate workflows: `git rm .github/workflows/ci.yml && git mv
 >    templates/workflows/ci.yml .github/workflows/ci.yml` — it ships with the
@@ -92,13 +110,13 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > 5. `.env.example`: replace the example vars with this project's real public-env
 >    contract (placeholder values only). I create `.env.local` myself — you cannot
 >    (the hook blocks it; that's the design).
-> 6. `.claude/settings.json`: fill `{{NODE_BIN_PATH}}`. **settings.json and the hook
->    scripts are self-protected — you cannot edit them; hand me a terminal command to
->    fill the placeholder** (e.g. `sed -i '' 's#{{NODE_BIN_PATH}}#<my node bin>#'
->    .claude/settings.json`), or I set my machine PATH in `.claude/settings.local.json`
->    (gitignored, not protected — you may write that). Verify/update the shipped
->    `.nvmrc` for my Node choice. NEVER reorder the hooks-scripts-then-settings
->    relationship if wiring changes (docs/LESSONS.md).
+> 6. `.claude/settings.json` (**self-protected — terminal command per above**): fill
+>    the committed `{{NODE_BIN_PATH}}` placeholder — hand me e.g.
+>    `sed -i '' 's#{{NODE_BIN_PATH}}#<my node bin>#' .claude/settings.json` (this is the
+>    committed default; the runtime PATH already came from `settings.local.json` in the
+>    Node-first step above). Verify/update the shipped `.nvmrc` for my Node choice.
+>    NEVER reorder the hooks-scripts-then-settings relationship if wiring changes
+>    (docs/LESSONS.md).
 > 7. Scaffold the app toolchain if needed (Vite/Next/etc.) — **run generators in a
 >    temp dir and merge their output INTO the kit's files by hand; never let a
 >    generator overwrite package.json, .gitignore, .husky/, or .claude/**
