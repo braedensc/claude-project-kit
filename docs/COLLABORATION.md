@@ -56,6 +56,14 @@ asked** (`git push -u origin <branch>` → `gh pr create --body-file …`). The 
 already routes everything through PRs, so opening one is the expected next step — but
 still never push to `main` directly.
 
+**Opening the PR is where Claude's involvement ends. Merging is the human's action
+only — never `gh pr merge` in any form, including `--auto`; enabling auto-merge still
+means the agent caused the merge** (a real todoclaw near-miss, 2026-07-03 — now
+hook-blocked). **And watch CI to green before considering the task done:**
+`gh pr checks <n> --watch`; if a check fails, read the failing job's log, fix, push,
+re-watch. Local checks passing is necessary but not sufficient — the PR's actual CI
+status is the source of truth.
+
 ### The fast-merger protocol (never strand a commit)
 
 If the repo owner merges PRs quickly, **never assume a prior PR is still open.** A
@@ -70,6 +78,10 @@ gh pr view <n> --json state    # or: gh pr list --state merged --limit 5
 If merged: `git checkout main && git pull --ff-only && git checkout -b <type>/<desc>`
 and open a NEW PR. Caveat: squash-merges collapse stacked changes into one commit — to
 confirm something landed, check the files in `origin/main`, not just the log.
+
+This protocol is now **deterministic, not just written**: the PreToolUse hook blocks
+`git commit`/`git push` outright on any branch whose PR is already MERGED (fails open
+if `gh`/network is unavailable — it never blocks on what it can't verify).
 
 ---
 
@@ -115,9 +127,12 @@ worktrees for you — ask it to "work on X in a new worktree.")
 - `node_modules/` and local service state are per-folder: run `npm install` in each
   worktree (the pre-commit secret scan self-heals via the shared git dir even before
   you do).
-- **`.env.local` does not follow you into a worktree** — copy it by hand (a human step;
-  hooks block Claude from `.env*`), or better, prefer tooling that resolves env at
-  runtime from the running stack.
+- **`.env.local` does not follow you into a worktree** — and if parallel worktrees
+  share one local test account, they collide. Run the per-worktree provisioning
+  script once per new worktree (`scripts/dev-worktree-login.sh <slug>` — regenerates
+  `.env.local` from the running local stack + creates a dedicated `<slug>@dev.local`
+  login; a human step — hooks block Claude from `.env*`). Or prefer tooling that
+  resolves env at runtime from the running stack.
 - Git hooks run from the MAIN checkout (`core.hooksPath` is absolute): a hook fix on a
   branch takes effect only after it merges AND the main checkout pulls it.
 
@@ -186,15 +201,26 @@ branching. Branch name references the issue (`feat/142-grid-drag`). The loop bec
 
 ## What's automatic (enforcement)
 
-Three layers, mirroring docs/SECURITY.md:
+Four layers, mirroring docs/SECURITY.md:
 
-1. **Claude Code PreToolUse hook** — blocks `Edit`/`Write`/`git commit` while on
-   `main`/`master`. The model **cannot** bypass this; the project's CLAUDE.md
-   (created from docs/CLAUDE-template.md at bootstrap) also tells Claude to branch
-   *proactively* before ever hitting the block.
-2. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
+1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
+   bypass it:
+   - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
+     forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
+     also tells Claude to branch *proactively* before ever hitting the block.
+   - Blocks `git commit`/`git push` on a branch whose PR is already **merged** —
+     pushes there are silently stranded (GitHub stops syncing the head and stops
+     running CI). Fails open if `gh`/network is unavailable.
+   - Blocks `gh pr merge` outright, including `--auto` — **merging is the human's
+     action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
+     only *undoes* an auto-merge.)
+2. **Claude Code Stop hook** (`.claude/hooks/stop-pr-check.py`) — blocks ending a
+   turn when the branch has pushed commits ahead of `main` with **no PR**, or its
+   open PR has **failing CI**. Dedups per (branch, reason, commit) so it can't loop;
+   fails open like the PreToolUse guards.
+3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
-3. **CI + branch protection** — the unbypassable gate. All changes land via PR with
+4. **CI + branch protection** — the unbypassable gate. All changes land via PR with
    passing checks; no direct or force-push to `main`.
 
 In practice: just start working. If you (or Claude) try to edit on `main`, you'll be
@@ -231,6 +257,7 @@ git worktree remove ../<repo>-<task>
 # Keep up to date / resolve drift
 git fetch origin && git rebase origin/main
 
-# Finish
+# Finish — open the PR, watch CI to green, then STOP (the human merges)
 gh pr create --body-file <file>   # concise body; push + PR without being asked
+gh pr checks <n> --watch          # red check? read the log, fix, push, re-watch
 ```

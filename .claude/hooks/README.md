@@ -24,6 +24,8 @@ Runs before every tool call. Exit 2 = block with reason. Exit 0 = allow.
 | `git add .env*` (non-example) | Bash | Secrets leak via git |
 | Any push naming `main`/`master` | Bash | Bypasses PR + CI gate |
 | Bare `--force`/`-f` push (any branch) | Bash | Can clobber unseen remote commits; `--force-with-lease` is allowed on feature branches |
+| `git commit`/`git push` on a branch whose PR is **MERGED** | Bash | Pushes there are silently stranded (GitHub stops syncing the head + running CI); fails open if `gh`/network can't verify |
+| `gh pr merge` in any form except `--disable-auto` | Bash | **Merging is the human's action only** — Claude opens PRs and stops; `--auto` still means the agent caused the merge |
 | Reading `.env*`, `*.pem`, `*.key` via shell | Bash | Secrets entering Claude's context |
 | Reading `.env*` (non-example), `*.pem`, `*.key` | Read | Same |
 | Writing to `.env*` (non-example) | Edit/Write | Only `.env.example` is committed |
@@ -45,6 +47,18 @@ Keep the *shape* when you swap datastores: local/disposable stays frictionless, 
 
 ---
 
+## Stop — `stop-pr-check.py`
+
+Runs when Claude tries to end a turn; blocks (once) with a reminder when the current
+branch has pushed commits ahead of `main` with **no PR**, or its open PR has
+**failing CI** (`statusCheckRollup`). Written rules ("open a PR when done," "watch CI
+to green") weren't reliably followed across parallel sessions — this makes them
+hard to miss. Dedups per (branch, reason, HEAD sha) in `.claude/.stop-pr-nag/`
+(gitignored) so it can never loop; fails open when `gh`/network is unavailable.
+Ported from todoclaw PR #59, in production since 2026-07-03.
+
+---
+
 ## PostToolUse — `audit.py`
 
 Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.claude/audit.log` (gitignored — local only). Review it to see what Claude did in a session, especially before a commit.
@@ -62,8 +76,8 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-51 block/allow cases covering every guard above, including the v2 prose-stripping allows and sandboxed branch-guard cases (throwaway git repos pinned to `main` / `master` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD). Runs in CI on every PR; also available as `npm run test:hooks`
-(and the repo-wide secret scan as `npm run lint:secrets`). **If you edit the hook, add a case.**
+65 block/allow cases covering every guard above — the v2 prose-stripping allows, sandboxed branch-guard cases (throwaway git repos pinned to `main` / `master` / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases (its exit-0 + JSON-decision protocol, including the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
+(and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a case.**
 
 ---
 

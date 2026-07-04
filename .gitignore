@@ -42,3 +42,5 @@ e2e/.auth/
 .claude/settings.local.json
 .claude/launch.json
 .claude/worktrees/
+.claude/.stop-pr-nag/
+.claude/hooks/__pycache__/

@@ -26,6 +26,7 @@ Layout:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -93,6 +94,56 @@ def _in_project(path: str) -> bool:
         return False
 
 
+# ── Merged-PR guard: no commits/pushes on a branch whose PR already merged ──────
+# A branch pushed with more work after its PR merges is silently stranded: GitHub
+# stops syncing that PR's head and stops running CI on further pushes to the
+# branch (burned real debugging time in todoclaw before "PR merged" was recognized
+# as the cause — ported from todoclaw PR #61, 2026-07-03). Only fires once the
+# branch has an upstream (skips fresh local-only branches, avoiding a network
+# call), and fails open on any gh/network error — never block on something this
+# can't verify.
+MERGED_PR_HELP = (
+    "`{branch}`'s PR (#{number}) is already MERGED. Commits/pushes here would be "
+    "silently stranded — GitHub stops syncing a merged PR's head and stops "
+    "running CI on further pushes to that branch. Branch fresh off updated main "
+    "instead:\n"
+    "  git checkout main && git pull --ff-only && git checkout -b <type>/<desc>"
+)
+
+
+def _has_upstream() -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _merged_pr_info(branch: str):
+    """Returns {"number": ...} if `branch` has a MERGED PR, else None. Fails open."""
+    if not shutil.which("gh"):
+        return None
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "state,number"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        info = json.loads(r.stdout)
+        return info if info.get("state") == "MERGED" else None
+    except Exception:
+        return None
+
+
 if tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")):
     branch = _current_branch()
     if branch in PROTECTED_BRANCHES:
@@ -102,6 +153,10 @@ if tool == "Bash" and re.search(r"\bgit\s+commit\b", inp.get("command", "")):
     branch = _current_branch()
     if branch in PROTECTED_BRANCHES:
         block(BRANCH_HELP.format(branch=branch))
+    elif _has_upstream():
+        merged = _merged_pr_info(branch)
+        if merged:
+            block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
 
 
 # ── Bash ──────────────────────────────────────────────────────────────────────
@@ -170,6 +225,25 @@ if tool == "Bash":
                 "Bare --force/-f push is blocked — use `git push --force-with-lease`, "
                 "which refuses to overwrite remote commits you haven't seen."
             )
+        branch = _current_branch()
+        if branch not in PROTECTED_BRANCHES and _has_upstream():
+            merged = _merged_pr_info(branch)
+            if merged:
+                block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
+
+    # Merging a PR (with or without --auto) is the HUMAN's action only — Claude
+    # opens PRs and stops there (todoclaw near-miss 2026-07-03: `gh pr merge
+    # --auto` was briefly used on Claude-opened PRs before being corrected;
+    # auto-merge still means the agent caused the merge). `--disable-auto` is
+    # exempted since it only *undoes* an auto-merge, never causes one.
+    _gh_merge = re.search(r"\bgh\s+pr\s+merge\b([^#\n;&|]*)", scan)
+    if _gh_merge and "--disable-auto" not in _gh_merge.group(1):
+        block(
+            "`gh pr merge` (including --auto) is not allowed — merging PRs is "
+            "the human's action only. Open the PR (`gh pr create`) and stop "
+            "there. (`gh pr merge --disable-auto` is still allowed, to undo an "
+            "auto-merge that shouldn't have been enabled.)"
+        )
 
     # Block shell-reading secret files (cat, less, head, etc.).
     # The [^#\n;&|]* gap is scoped per shell command, so a .env named in a

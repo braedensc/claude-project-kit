@@ -28,7 +28,7 @@ saying where it came from and what was verified in production.
   (cold sessions reconstruct the system from written context), dialed down explicitly
   at launch. Written context is how isolated agent sessions coordinate.
 - **Guards match operations, not prose.** Learned the hard way; encoded in the hook
-  and verified by a 51-case battery that runs in CI forever.
+  and verified by a 65-case battery that runs in CI forever.
 
 ## Quickstart
 
@@ -44,7 +44,7 @@ saying where it came from and what was verified in production.
 
 | Path | What it is |
 |---|---|
-| `.claude/` | Settings + the PreToolUse/PostToolUse hook suite + `test_hooks.py` (51-case block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
+| `.claude/` | Settings + the PreToolUse/PostToolUse/Stop hook suite + `test_hooks.py` (65-case block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
 | `.husky/` + `.secretlintrc.json` | Layer-2 pre-commit: branch block, forbidden paths, worktree-aware secretlint |
 | `.github/workflows/ci.yml` | The kit's own CI (battery, JSON/YAML validation, forbidden paths, secretlint, placeholder integrity) |
 | `.github/pull_request_template.md` | The concise-PR format (≤ ~150 visible words, depth in `<details>`) |

@@ -82,8 +82,10 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    `keepalive.yml` the same way; adapt their fenced stack sections; DELETE any that
 >    don't apply (no DB → no backup-cron; nothing pauses → no keepalive). Fill
 >    `{{EDGE_FUNCTION_NAMES}}`, `{{SMOKE_FUNCTION_NAME}}`, `{{KEEPALIVE_TABLE}}` or
->    remove with their files. Keep every provenance header. Finish with
->    `git rm -r templates/` (its README goes too — activation is one-way).
+>    remove with their files. Also adapt `templates/scripts/dev-worktree-login.sh`
+>    to my backend and `git mv` it to `scripts/` (or delete it if no local
+>    backend). Keep every provenance header. Finish with `git rm -r templates/`
+>    (its README goes too — activation is one-way).
 > 5. `.env.example`: replace the example vars with this project's real public-env
 >    contract (placeholder values only). I create `.env.local` myself — you cannot
 >    (the hook blocks it; that's the design).
