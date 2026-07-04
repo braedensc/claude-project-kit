@@ -42,6 +42,10 @@ commit it): {{REFERENCE_MATERIAL_LIST_OR_DELETE}}
 
 ## Commands
 
+<!-- Keep this section near the TOP — Anthropic calls exact build/test/lint/run
+     invocations "the highest-ROI section by a wide margin"; Claude gets them wrong
+     most often without them. Don't restate what a formatter enforces deterministically. -->
+
 > Keep this real: every command here must work today. Note the Node/toolchain gate
 > (e.g. "run `nvm use` first — this shell defaults to an older Node").
 
@@ -63,6 +67,16 @@ npm run test:e2e       # CI-safe smoke
 # DB (if applicable)
 {{MIGRATION_COMMANDS}}
 ```
+
+**Skills** (`.claude/skills/<name>/SKILL.md`, invoked `/name`): the kit ships `/ship`
+(commit → push → PR → watch CI → stop) and `/new-adr`. Add project-specific ones for
+repeatable rituals; mark side-effecting ones `disable-model-invocation: true` so Claude
+can't run them unprompted. Bundled skills already exist (`/code-review`,
+`/security-review`, `/debug`, `/run`, `/verify`) — don't reinvent them.
+
+**Cost & memory:** delegate search/read to `model: haiku` subagents; keep the main
+model for judgment. `CLAUDE.md` is *authored* rules (loaded every session); the
+machine-local `MEMORY.md` auto-memory is Claude-*discovered* learnings — don't conflate.
 
 ---
 

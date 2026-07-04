@@ -96,10 +96,18 @@ code, head_sha = _run(["git", "rev-parse", "HEAD"])
 if code != 0 or not head_sha:
     sys.exit(0)
 
-# Any commits on this branch not on main?
-code, _ = _run(["git", "merge-base", "--is-ancestor", "HEAD", "main"])
+# Any commits on this branch not on the mainline? Compare against the REMOTE base
+# (origin/main), not local `main` — in normal PR flow you branch off origin/main and
+# never update local main, so it's usually stale, and comparing against it makes a
+# fresh branch with zero commits look "ahead of main" and false-nags (2026-07-04 fix).
+base = "main"
+for _ref in ("origin/main", "origin/master", "main", "master"):
+    if _run(["git", "rev-parse", "--verify", "--quiet", _ref])[0] == 0:
+        base = _ref
+        break
+code, _ = _run(["git", "merge-base", "--is-ancestor", "HEAD", base])
 if code == 0:
-    sys.exit(0)  # HEAD is an ancestor of main — nothing new to ship
+    sys.exit(0)  # HEAD is an ancestor of the mainline — nothing new to ship
 
 if not shutil.which("gh"):
     sys.exit(0)

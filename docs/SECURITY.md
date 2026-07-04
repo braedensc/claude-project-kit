@@ -40,6 +40,16 @@ a first line, not a perfect sandbox (a shell can't be fully fenced by regex); th
 guarantee stays git: any change must survive a reviewed PR + CI, which re-runs the
 battery against the committed hook. (Reads are always allowed.)
 
+**Native `permissions.deny` — a layer independent of the Python hook.**
+`.claude/settings.json` also carries platform deny rules
+(`Read(.env)`, `Read(.env.*)`, `Read(secrets/**)`, …) that Claude Code enforces itself.
+This matters: per the docs, **deny wins even under `defaultMode: bypassPermissions`**,
+deny beats allow across every settings scope, and deny rules aren't gated by the
+workspace-trust dialog — so secret-file reads are blocked immediately, even if the
+PreToolUse hook were removed. It's belt-and-suspenders with the hook, not a replacement
+(deny covers built-in Read/Edit/Grep and recognized `cat`/`head` Bash reads, but not an
+arbitrary subprocess opening the file — which the hook and OS sandboxing cover).
+
 **The system fails closed.** A missing/broken hook script blocks *every* tool call
 (python exits 2 = the block signal) rather than silently disabling protection. Correct
 for a security hook; operationally it means **create hook scripts before wiring
@@ -77,6 +87,13 @@ Rules that fall out of this:
   with `claude mcp add --scope user …` (lives in `~/.claude.json`, OAuth on first use)
   so no token or server config lands in project files; collaborators run the same
   command on their own machines (todoclaw's Sentry MCP pattern).
+- **Project-scoped MCP (`.mcp.json`, committed) references secrets only via `${VAR}`** —
+  never hardcode a token in it (see `.mcp.json.example`). Env-var expansion (`${VAR}`,
+  `${VAR:-default}`) is the supported form; a project `.mcp.json` server is also
+  approval-gated on first use, so a committed config can't silently connect.
+- **Autonomous/unattended runs** (`--dangerously-skip-permissions`) belong in a
+  sandboxed devcontainer with an egress firewall — never on the host, never with
+  `~/.ssh` mounted (`.devcontainer/README.md`).
 
 ---
 

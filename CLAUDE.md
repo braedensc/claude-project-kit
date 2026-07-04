@@ -23,7 +23,8 @@ guardrails below are live in this repo and guarded your predecessors' work from 
 
 **Stack** (the kit is infrastructure, not an app): Python 3 hooks (`.claude/hooks/`),
 POSIX `sh` git hooks (`.husky/`), GitHub Actions (`.github/workflows/` + inert
-`templates/workflows/`), Markdown docs, and a tiny `package.json` (husky + secretlint).
+`templates/workflows/`), skills (`.claude/skills/`), a devcontainer, a project-MCP
+example (`.mcp.json.example`), Markdown docs, and a tiny `package.json`.
 
 ---
 
@@ -65,6 +66,13 @@ open the PR, then watch CI to green (`gh pr checks <n> --watch`) before calling 
 done. A DIRTY PR is *not* green — GitHub skips the required CI, so side checks alone can
 look passing; rebase, resolve, force-push.
 
+Two non-enforcing complements: `.claude/settings.json` also carries native
+`permissions.deny` rules that hard-block reads of secret files independently of the
+Python hook (deny wins even under `bypassPermissions`); and
+`.claude/hooks/session-start.py` is an *advisory* SessionStart hook that injects repo
+orientation at startup — deliberately **not** self-protected, since it informs rather
+than blocks.
+
 ---
 
 ## Conventions
@@ -98,6 +106,32 @@ npm install             # installs husky + secretlint, wires the pre-commit hook
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the forbidden-paths gate, placeholder integrity, and secretlint on every
 PR. `main` is protected (that context required, admins enforced).
+
+---
+
+## Skills
+
+Custom `/`-commands live in `.claude/skills/<name>/SKILL.md` (the current form —
+commands were folded into skills in 2026; `.claude/commands/*.md` still works as
+legacy).
+
+- **`/ship <summary>`** — the kit's ship ritual: commit (`-F`) → push → PR
+  (`--body-file`) → watch CI → **stop** (never merges). User-only
+  (`disable-model-invocation: true`).
+- **`/new-adr <slug>`** — scaffolds a dated ADR + index row.
+
+Before reinventing, note the bundled skills Claude Code already ships: `/code-review`,
+`/security-review`, `/debug`, `/run`, `/verify`, `/loop`.
+
+## Cost & memory
+
+- **Delegate cheaply:** fan search/read work to subagents with `model: haiku` (or set
+  `CLAUDE_CODE_SUBAGENT_MODEL`); reserve the main model for judgment. Verify model
+  IDs/pricing against live docs before asserting (they move faster than any cutoff).
+- **Two memory layers, don't conflate them:** `CLAUDE.md` (this file) is *authored*
+  rules loaded every session; `~/.claude/projects/<proj>/memory/MEMORY.md` is
+  Claude-*discovered* learnings, machine-local and gitignored. Write durable
+  conventions here; let auto-memory hold session-to-session findings.
 
 ---
 

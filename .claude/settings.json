@@ -1,13 +1,42 @@
 {
-  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too. Distilled from todoclaw .claude/settings.json, in production 2026-06-23 → 2026-07-03.",
+  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too. The permissions.deny rules are a SECOND, native layer: deny hard-blocks even under bypassPermissions and even if the hooks were removed (see docs/SECURITY.md). Distilled from todoclaw .claude/settings.json, in production 2026-06-23 → 2026-07-03.",
   "_path_note": "Replace {{NODE_BIN_PATH}} with your Node bin dir (e.g. $HOME/.nvm/versions/node/v22.23.0/bin) — version managers like nvm do not apply in non-interactive shells, so Claude Code needs the resolved path. Machine-specific values can instead live in .claude/settings.local.json (gitignored), whose env keys override this file. See PLACEHOLDERS.md.",
   "permissions": {
-    "defaultMode": "bypassPermissions"
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(secrets/**)",
+      "Read(*.pem)",
+      "Read(*.key)"
+    ]
   },
   "env": {
     "PATH": "{{NODE_BIN_PATH}}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": ".*",

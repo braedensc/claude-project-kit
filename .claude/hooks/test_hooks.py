@@ -186,6 +186,25 @@ def make_stop_sandbox(list_json, view_json):
     return root, stop_copy, env
 
 
+def make_stale_main_sandbox():
+    """Stop-hook sandbox where local `main` is STALE behind origin/main and the branch's
+    HEAD == origin/main with no commits of its own — the normal PR-flow state (you branch
+    off origin/main and never update local main). The hook must compare against
+    origin/main, not local main, or it false-nags. Fake gh returns no PR, so a wrong base
+    comparison would reach the no-PR block."""
+    root, _ = make_sandbox("main")                       # local main = seed (A)
+    _git(root, "checkout", "-q", "-b", "feat/battery")
+    _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "--allow-empty", "-q", "-m", "B")      # feat/battery = B
+    _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")  # origin/main = B
+    _git(root, "remote", "add", "origin", os.devnull)
+    _git(root, "config", "branch.feat/battery.remote", "origin")
+    _git(root, "config", "branch.feat/battery.merge", "refs/heads/main")  # @{u} = origin/main
+    env = _fake_gh(root, "echo '[]'")                     # no PR
+    stop_copy = os.path.join(root, ".claude", "hooks", "stop-pr-check.py")
+    return root, stop_copy, env
+
+
 def main():
     if not os.path.exists(HOOK):
         print(f"FATAL: hook not found at {HOOK}")
@@ -212,6 +231,7 @@ def main():
     stop_dirty_root, stop_dirty, stop_dirty_env = make_stop_sandbox(
         '[{"number":7,"state":"OPEN"}]',
         '{"mergeStateStatus":"DIRTY","statusCheckRollup":[{"name":"CodeQL","conclusion":"SUCCESS"}]}')
+    stale_root, stale_stop, stale_env = make_stale_main_sandbox()
 
     # (name, payload, expect_block, hook_path)
     cases = [
@@ -388,6 +408,8 @@ def main():
          {}, ALLOW, stop_green, stop_green_env),
         ("stop: DIRTY PR (merge conflicts) blocks despite green side checks",
          {}, BLOCK, stop_dirty, stop_dirty_env),
+        ("stop: stale local main + HEAD==origin/main does NOT nag (base-ref fix)",
+         {}, ALLOW, stale_stop, stale_env),
     ]
 
     failures = 0
@@ -424,7 +446,7 @@ def main():
 
     for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
               merged_root, open_root, gherr_root, stop_nopr_root, stop_red_root,
-              stop_green_root, stop_dirty_root):
+              stop_green_root, stop_dirty_root, stale_root):
         shutil.rmtree(r, ignore_errors=True)
 
     total = len(cases) + len(stop_cases)

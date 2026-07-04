@@ -1,0 +1,63 @@
+name: Claude
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The official @claude GitHub Action — INERT template (activated at bootstrap, like
+# the other templates/workflows/*.yml). Lets you @claude on an issue or PR comment and
+# have it implement/review in CI, decoupled from any laptop. Verified against
+# https://code.claude.com/docs/en/github-actions (v1 GA), 2026-07-04.
+#
+# ACTIVATE (bootstrap): `git mv templates/workflows/claude.yml .github/workflows/`,
+# then add the repo secret ANTHROPIC_API_KEY (Settings → Secrets and variables →
+# Actions). Easiest setup is `/install-github-app` inside a Claude Code session — it
+# installs the GitHub App and scaffolds this for you.
+#
+# ── Cost & safety (this one spends real money — flag it) ──────────────────────
+#   • Caps live in `claude_args` now (v1 folded the old top-level inputs in): keep
+#     `--max-turns` set, and bound the job with `timeout-minutes` + `concurrency`.
+#   • `ANTHROPIC_API_KEY` is a secret — never hardcode. Grant the workflow only the
+#     minimum permissions below.
+#   • v1 auto-detects interactive (@mention) vs automation (immediate prompt) mode;
+#     there is no `mode:` input anymore. Old beta inputs (`direct_prompt`, `mode`,
+#     `max_turns`, `allowed_tools`) were removed — use `prompt` + `claude_args`.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  claude:
+    # Only run when someone actually mentions @claude (skips unrelated comments).
+    if: >-
+      contains(github.event.comment.body, '@claude') ||
+      contains(github.event.issue.body, '@claude')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # hard wall-clock cap; a runaway job can't bill indefinitely
+    concurrency:
+      group: claude-${{ github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4 # needed so @claude can see repo skills/CLAUDE.md
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Bound cost: cap turns + pin a model. Add --allowedTools / --disallowedTools
+          # here if you want to restrict what @claude may do in CI.
+          claude_args: "--max-turns 15 --model claude-sonnet-5"
+
+# ── Optional: automated PR review using a repo/plugin skill (separate workflow) ──
+# Trigger on pull_request and pass a skill as the prompt, e.g.:
+#   on: { pull_request: { types: [opened, synchronize] } }
+#   with:
+#     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+#     prompt: "/code-review ${{ github.repository }}#${{ github.event.pull_request.number }}"
+#     claude_args: "--max-turns 10"
