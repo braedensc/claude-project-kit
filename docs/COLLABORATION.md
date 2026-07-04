@@ -245,6 +245,11 @@ Stop hook between them:
 4. **CI + branch protection** — the unbypassable gate. All changes land via PR with
    passing checks; no direct or force-push to `main`.
 
+Plus two non-enforcing complements: native `permissions.deny` rules in `settings.json`
+hard-block secret-file reads independently of the Python hook (docs/SECURITY.md), and
+an advisory `SessionStart` hook injects branch/PR/dirty-tree orientation so a fresh
+session opens already knowing where it is.
+
 In practice: just start working. If you (or Claude) try to edit on `main`, you'll be
 told to branch first — that's the system doing its job, not an error.
 

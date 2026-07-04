@@ -52,9 +52,9 @@ Keep the *shape* when you swap datastores: local/disposable stays frictionless, 
 
 ## Stop — `stop-pr-check.py`
 
-Runs when Claude tries to end a turn on a **pushed** branch ahead of `main`; blocks
-(once) with a reminder when any of these hold, so "open a PR and watch CI to green"
-isn't just a written rule that gets skipped across parallel sessions:
+Runs when Claude tries to end a turn on a **pushed** branch ahead of the mainline;
+blocks (once) with a reminder when any of these hold, so "open a PR and watch CI to
+green" isn't just a written rule that gets skipped across parallel sessions:
 
 | Blocks ending the turn when | Why |
 |---|---|
@@ -62,9 +62,24 @@ isn't just a written rule that gets skipped across parallel sessions:
 | The open PR has **failing CI** (`FAILURE`/`CANCELLED`/`TIMED_OUT`/…) | CI must be watched to green before a task is "done" |
 | The open PR is **`DIRTY`** (merge conflicts) | GitHub can't build the merge ref, so the required `pull_request` CI **never runs** — only side checks (CodeQL/Vercel) report and can look green. A conflicted PR must be rebased, not mistaken for passing (2026-07-03 near-miss). Fires only on explicit `DIRTY`, never the transient `UNKNOWN` right after a push |
 
-Dedups per (branch, reason, HEAD sha) in `.claude/.stop-pr-nag/` (gitignored) so
-explaining instead of acting can't trap the session in a loop; fails open when
-`git`/`gh`/network is unavailable. Ported from todoclaw PRs #59 + #77 (2026-07-03).
+"Ahead of the mainline" is measured against **`origin/main`** (the remote-tracking
+base), not local `main` — in PR flow you branch off `origin/main` and rarely update
+local `main`, so it lags; comparing against it would false-nag a zero-commit branch
+(2026-07-04 fix). Dedups per (branch, reason, HEAD sha) in `.claude/.stop-pr-nag/`
+(gitignored) so explaining instead of acting can't trap the session in a loop; fails
+open when `git`/`gh`/network is unavailable. Ported from todoclaw PRs #59 + #77
+(2026-07-03).
+
+---
+
+## SessionStart — `session-start.py`
+
+**Advisory, not a guard.** At session start it injects a short orientation string
+(current branch, dirty-tree status, this branch's open PR, and a one-line reminder of
+the workflow) via the `hookSpecificOutput.additionalContext` output contract — so a
+fresh session opens already knowing where it is. Always exits 0 (SessionStart has no
+block semantics) and fails open silently. **Deliberately NOT in the self-protected set**
+below: it informs rather than blocks, so there's no guard for the agent to edit away.
 
 ---
 
@@ -85,7 +100,7 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-91 block/allow cases covering every guard above — the self-protection cases (edit/mutate a hook → block; read/py_compile/stage → allow, incl. that a redirect must *target* a protected path so `... hook 2>&1` isn't a false positive), the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), a real sibling-worktree sandbox for the cross-worktree guard, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
+92 block/allow cases covering every guard above — the self-protection cases (edit/mutate a hook → block; read/py_compile/stage → allow, incl. that a redirect must *target* a protected path so `... hook 2>&1` isn't a false positive), the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, so results don't depend on this repo's current branch or CI's detached HEAD), a real sibling-worktree sandbox for the cross-worktree guard, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
 (and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a
 case — and keep docs/COLLABORATION.md's "What's automatic (enforcement)" section in
 sync.**

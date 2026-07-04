@@ -109,6 +109,14 @@ DIRTY PR as done: rebase onto latest main, resolve, force-push, re-watch CI. The
 Stop hook now blocks turn-end on `mergeStateStatus == DIRTY` (only explicit DIRTY, not
 the transient UNKNOWN right after a push).
 
+**A hook that compares to *local* `main` false-nags — use `origin/main`.** In PR flow
+you branch off `origin/main` and rarely update local `main`, so it lags (often several
+merged PRs behind). A check like `git merge-base --is-ancestor HEAD main` against
+*local* main then reads a zero-commit branch as "ahead of main" and nags for a PR that
+isn't needed — the kit's own Stop hook did exactly this (2026-07-04). Compare against
+the remote-tracking base (`origin/main`, no fetch needed); it's strictly fresher than
+local main. Battery-cased so it can't regress.
+
 **Verify a PR merged before any follow-up.** Fast-merging owners mean the branch you
 just pushed is probably already merged; a follow-up commit onto it is stranded —
 GitHub stops syncing a merged PR's head and stops running CI on pushes to it (this
