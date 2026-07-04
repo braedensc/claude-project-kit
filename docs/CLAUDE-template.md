@@ -70,9 +70,11 @@ npm run test:e2e       # CI-safe smoke
 
 **Skills** (`.claude/skills/<name>/SKILL.md`, invoked `/name`): the kit ships `/ship`
 (commit → push → PR → watch CI → stop) and `/new-adr`. Add project-specific ones for
-repeatable rituals; mark side-effecting ones `disable-model-invocation: true` so Claude
-can't run them unprompted. Bundled skills already exist (`/code-review`,
-`/security-review`, `/debug`, `/run`, `/verify`) — don't reinvent them.
+repeatable rituals. Reserve `disable-model-invocation: true` (user-only) for the
+genuinely *irreversible or expensive* — a real deploy, anything that spends money;
+routine git rituals like `/ship` are fine for Claude to run, since the hooks still
+bound them. Bundled skills already exist (`/code-review`, `/security-review`, `/debug`,
+`/run`, `/verify`) — don't reinvent them.
 
 **Cost & memory:** delegate search/read to `model: haiku` subagents; keep the main
 model for judgment. `CLAUDE.md` is *authored* rules (loaded every session); the

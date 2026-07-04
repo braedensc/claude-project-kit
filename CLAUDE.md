@@ -116,8 +116,9 @@ commands were folded into skills in 2026; `.claude/commands/*.md` still works as
 legacy).
 
 - **`/ship <summary>`** — the kit's ship ritual: commit (`-F`) → push → PR
-  (`--body-file`) → watch CI → **stop** (never merges). User-only
-  (`disable-model-invocation: true`).
+  (`--body-file`) → watch CI → **stop** (never merges). You can invoke it, and Claude
+  may run it when a task is done — it does nothing Claude can't already do (merging
+  stays blocked), so it just packages the routine reliably.
 - **`/new-adr <slug>`** — scaffolds a dated ADR + index row.
 
 Before reinventing, note the bundled skills Claude Code already ships: `/code-review`,

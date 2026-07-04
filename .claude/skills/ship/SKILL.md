@@ -1,7 +1,6 @@
 ---
 name: ship
-description: Commit staged work, push, open a PR with a concise body, and watch CI to green — the kit's ship ritual. User-invoked only; it never merges.
-disable-model-invocation: true
+description: Ship a finished task — commit → push → open a PR (concise body) → watch CI to green → stop. Never merges. Use this when work on a feature branch is done and ready for review, or invoke it manually as /ship.
 argument-hint: [optional one-line summary of the change]
 allowed-tools: Bash(git add *) Bash(git commit *) Bash(git status *) Bash(git branch *) Bash(git push *) Bash(git rev-parse *) Bash(gh pr create *) Bash(gh pr view *) Bash(gh pr checks *)
 ---
