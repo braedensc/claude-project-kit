@@ -1,18 +1,20 @@
 {
-  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too. The permissions.deny rules are a SECOND, native layer: deny hard-blocks even under bypassPermissions and even if the hooks were removed (see docs/SECURITY.md). Distilled from todoclaw .claude/settings.json, in production 2026-06-23 → 2026-07-03.",
-  "_path_note": "Replace {{NODE_BIN_PATH}} with your Node bin dir (e.g. $HOME/.nvm/versions/node/v22.23.0/bin) — version managers like nvm do not apply in non-interactive shells, so Claude Code needs the resolved path. Machine-specific values can instead live in .claude/settings.local.json (gitignored), whose env keys override this file. See PLACEHOLDERS.md.",
+  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too (or flip defaultMode to acceptEdits; every guard still enforces). The permissions.deny rules are a SECOND, native layer: deny hard-blocks even under bypassPermissions and even if the hooks were removed (docs/SECURITY.md). The deny list enumerates real env files instead of a .env.* wildcard so .env.example — the one env file MEANT to be read — stays readable; exotic variants are still caught by the hook. Distilled from todoclaw, in production 2026-06-23 → 2026-07-03.",
+  "_local_note": "No PATH override ships here — a machine-specific PATH in a template breaks other machines. If node/npm don't resolve in Claude's shell, put an env.PATH in .claude/settings.local.json (gitignored). The PreToolUse command wraps python3 in a command -v guard so a machine WITHOUT python3 fails CLOSED (blocks all tools) instead of silently running unguarded.",
   "permissions": {
     "defaultMode": "bypassPermissions",
     "deny": [
       "Read(.env)",
-      "Read(.env.*)",
+      "Read(.env.local)",
+      "Read(.env.development)",
+      "Read(.env.production)",
+      "Read(.env.staging)",
+      "Read(.env.test)",
+      "Read(.env.*.local)",
       "Read(secrets/**)",
       "Read(*.pem)",
       "Read(*.key)"
     ]
-  },
-  "env": {
-    "PATH": "{{NODE_BIN_PATH}}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   },
   "hooks": {
     "SessionStart": [
@@ -43,7 +45,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-tool-use.py",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-tool-use.py || exit 2",
             "timeout": 10
           }
         ]

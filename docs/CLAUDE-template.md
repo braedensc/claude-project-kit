@@ -44,7 +44,9 @@ commit it): {{REFERENCE_MATERIAL_LIST_OR_DELETE}}
 
 <!-- Keep this section near the TOP — Anthropic calls exact build/test/lint/run
      invocations "the highest-ROI section by a wide margin"; Claude gets them wrong
-     most often without them. Don't restate what a formatter enforces deterministically. -->
+     most often without them. Don't restate what a formatter enforces deterministically.
+     npm is the worked example — swap every invocation for your runner (pnpm, cargo,
+     uv, gradle, …). -->
 
 > Keep this real: every command here must work today. Note the Node/toolchain gate
 > (e.g. "run `nvm use` first — this shell defaults to an older Node").
@@ -116,9 +118,9 @@ feature branch, push and open the PR without asking.
 **Working agreements (every session):** explain any tool or service the owner may not
 know in a few plain sentences (what + why) before adopting it. Flag any security risk
 and any recurring cost BEFORE incurring it; default to free tiers. When a project
-surfaces a transferable lesson or security improvement, PR it back to the
-[claude-project-kit](https://github.com/braedensc/claude-project-kit) template — that
-repo is the living successor to per-machine bootstrap kits.
+surfaces a transferable lesson or security improvement, PR it back to the template
+repo this project was bootstrapped from (its URL + commit are recorded in the
+bootstrap PR).
 
 **Docs lifecycle (docs-as-scaffolding, then right-sized):**
 - **Bootstrap phase:** heavy discipline on purpose — an ADR per significant PR,

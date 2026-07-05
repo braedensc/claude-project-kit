@@ -1,16 +1,89 @@
 # claude-project-kit
 
-A GitHub **template repo** for starting full-stack projects with every system and
-lesson from a real production build already in place: a Claude Code security-hook
-suite (with its own test battery), git-level secret scanning, CI, deploy/backup/
-keepalive workflow templates, and the process docs that make multi-session agentic
-development safe.
+[![Kit checks](https://github.com/braedensc/claude-project-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/braedensc/claude-project-kit/actions/workflows/ci.yml)
+
+**Claude Code is at its best with permission prompts off — and that's dangerous.**
+This template makes it safe: a GitHub template repo that starts your project with a
+tested hook suite that hard-blocks the failure modes (secret reads, pushes to `main`,
+self-merged PRs, edits to the guards themselves), git-level secret scanning, CI gates,
+ready-to-adapt deploy/backup workflows, and the process docs that keep multi-session
+agentic development coherent.
 
 Everything here is **distilled, not invented** — generalized from
-[todoclaw](https://github.com/braedensc/todoclaw)'s build (2026-06-23 → 2026-07-03,
-Stages 0–6 + retro; live in production), the project's memory files, and the v1
-secure-bootstrap kit it supersedes. Every generalized file carries a provenance header
-saying where it came from and what was verified in production.
+[todoclaw](https://github.com/braedensc/todoclaw), a production app built with Claude
+Code in a 10-day staged build, plus its retrospective. Every generalized file carries
+a provenance header saying where it came from and what was verified in production.
+(Headers cite todoclaw-internal artifacts — `ADR-00xx`, PR numbers, `SERVICES.md` —
+as provenance breadcrumbs; they aren't links into *this* repo.) MIT licensed.
+
+## Prerequisites
+
+| Tool | Version | Why |
+|---|---|---|
+| macOS or Linux | POSIX shell | Hooks are `python3` + `sh`. **Windows: not supported natively — use WSL2** |
+| git + [GitHub CLI](https://cli.github.com) (`gh`), authenticated | recent | The workflow guards (merged-PR, Stop-hook PR checks) query GitHub via `gh` and fail open without it |
+| Python 3 | 3.9+ on `PATH` as `python3` | Every hook + the self-check scripts |
+| Node.js | ≥ 20 (see `.nvmrc`) + npm | husky + secretlint (layer 2), regardless of your app's stack |
+
+## Quickstart
+
+1. **Use this template** (button above) → create your repo → clone it.
+   (CLI: `gh repo create <name> --template braedensc/claude-project-kit --clone`)
+2. Open a fresh **Claude Code** session in the clone — the hooks are already active.
+3. Paste the prompt from **[BOOTSTRAP-PROMPT.md](BOOTSTRAP-PROMPT.md)**. It interviews
+   you for stack choices, adapts every stack-specific file, fills every placeholder
+   ([PLACEHOLDERS.md](PLACEHOLDERS.md)), deletes what doesn't apply, and runs the
+   kit's self-checks. You keep the human-only steps (secrets, dashboards, branch
+   protection).
+
+**What you'll see on first open** (all expected — none of it is broken):
+
+- A one-time **workspace trust** dialog, and a **Bypass Permissions warning** —
+  the kit ships `defaultMode: bypassPermissions` *because* the hooks hard-block the
+  dangerous operations in every mode. Uncomfortable anyway? Flip it to `acceptEdits`
+  in `.claude/settings.local.json` — every guard still enforces.
+- A short **orientation line** injected at session start (branch, PR, dirty tree) —
+  that's the SessionStart hook.
+- Occasional **hook blocks** (e.g. editing on `main`) — that's the system working;
+  branch and retry, exactly as the block message says.
+- A growing `.claude/audit.log` (gitignored) — the local record of every command.
+
+## What's inside
+
+| Path | What it is |
+|---|---|
+| `.claude/` | Settings (hooks wiring + native `permissions.deny`) + the PreToolUse/PostToolUse/Stop hook suite + advisory SessionStart hook + `test_hooks.py` (the block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
+| `.claude/skills/` | `/ship` (commit → push → PR → watch CI → stop) and `/new-adr` custom slash-commands |
+| `.husky/` + `.secretlintrc.json` | Layer-2 pre-commit: branch block, forbidden paths, worktree-aware secretlint |
+| `.github/workflows/ci.yml` | The kit's own CI (battery, JSON/YAML validation, forbidden paths, secretlint, placeholder integrity) |
+| `.github/pull_request_template.md` | The concise-PR format (≤ ~150 visible words, depth in `<details>`) |
+| `templates/workflows/` | **Inert** app-project workflows — CI, deploy-on-green, backup-cron, keepalive, `@claude` Action — activated by `git mv` at bootstrap ([templates/README.md](templates/README.md)) |
+| `.devcontainer/` | Minimal Claude-Code devcontainer + hardening/firewall notes for sandboxed autonomous runs |
+| `.mcp.json.example` | Project-scoped MCP config example (`${VAR}` secrets only) |
+| `docs/SECURITY.md` | The layered security model, secrets stores, runbooks |
+| `docs/TESTING.md` | The pyramid as built: smoke-in-CI vs DB-backed-golden-local-only + the harness blueprint |
+| `docs/COLLABORATION.md` | Branch workflow, worktrees, the parallel-session protocol |
+| `docs/STACK-RATIONALE.md` | Every stack choice, tagged TRANSFERABLE vs STACK-SPECIFIC |
+| `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
+| `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own ADRs |
+| `CLAUDE.md` | The kit's own auto-loaded context (guardrails + conventions) — a worked example; bootstrap replaces it with your project's |
+| `docs/CLAUDE-template.md` | Fill-in `CLAUDE.md` for the new project (Hard Rules verbatim) |
+| `BOOTSTRAP-PROMPT.md` / `PLACEHOLDERS.md` | The adaptation UX + the complete `{{…}}` token inventory |
+| `scripts/check_placeholders.py` | CI-enforced: tokens used == tokens documented (`--bootstrapped`: zero remain) |
+
+## How stack-specific is it?
+
+The worked example is a JS full-stack app, but the core is stack-agnostic — **one repo
+serves any workflow** (web, CLI, mobile, data); bootstrap adapts or deletes the
+coupled parts rather than you forking variants:
+
+| Layer | Coupling |
+|---|---|
+| `.claude/` hooks, skills, settings, battery | **Universal** (python3 + git + gh; the Supabase DB guards are a clearly-fenced example section) |
+| docs: COLLABORATION, LESSONS, SECURITY, adr convention | **Universal** |
+| `.husky/` + secretlint (+ `package.json`) | Node-based tooling — kept even in non-Node projects (it only guards commits), or swap to lefthook/pre-commit + gitleaks |
+| `templates/workflows/*` | Worked examples (npm / Supabase / Vercel) — **adapt or delete at bootstrap**; the gating skeletons transfer |
+| docs: TESTING, STACK-RATIONALE | Flavored examples of universal patterns — keep the shape, swap the tools |
 
 ## Philosophy
 
@@ -27,52 +100,19 @@ saying where it came from and what was verified in production.
 - **Docs as scaffolding, then right-sized.** Heavy ADR/docs discipline while building
   (cold sessions reconstruct the system from written context), dialed down explicitly
   at launch. Written context is how isolated agent sessions coordinate.
-- **Guards match operations, not prose.** Learned the hard way; encoded in the hook
-  and verified by a 92-case battery that runs in CI forever.
-
-## Quickstart
-
-1. **Use this template** (button above) → create your repo → clone it.
-2. Open a fresh **Claude Code** session in the clone — the hooks are already active.
-3. Paste the prompt from **[BOOTSTRAP-PROMPT.md](BOOTSTRAP-PROMPT.md)**. It interviews
-   you for stack choices, adapts every stack-specific file, fills every placeholder
-   ([PLACEHOLDERS.md](PLACEHOLDERS.md)), deletes what doesn't apply, and runs the
-   kit's self-checks. You keep the human-only steps (secrets, dashboards, branch
-   protection).
-
-## What's inside
-
-| Path | What it is |
-|---|---|
-| `.claude/` | Settings (hooks wiring + native `permissions.deny`) + the PreToolUse/PostToolUse/Stop hook suite + advisory SessionStart hook + `test_hooks.py` (92-case block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
-| `.claude/skills/` | `/ship` (commit → push → PR → watch CI → stop) and `/new-adr` custom slash-commands |
-| `.husky/` + `.secretlintrc.json` | Layer-2 pre-commit: branch block, forbidden paths, worktree-aware secretlint |
-| `.github/workflows/ci.yml` | The kit's own CI (battery, JSON/YAML validation, forbidden paths, secretlint, placeholder integrity) |
-| `.github/pull_request_template.md` | The concise-PR format (≤ ~150 visible words, depth in `<details>`) |
-| `templates/workflows/` | **Inert** app-project workflows — CI, deploy-on-green, backup-cron, keepalive, `@claude` Action — activated by `git mv` at bootstrap ([templates/README.md](templates/README.md)) |
-| `.devcontainer/` | Minimal Claude-Code devcontainer + hardening/firewall notes for sandboxed autonomous runs |
-| `.mcp.json.example` | Project-scoped MCP config example (`${VAR}` secrets only) |
-| `docs/SECURITY.md` | 3-layer model, three-isolated-secret-stores, DB posture, AI cost guardrails, runbooks, keychain norms |
-| `docs/TESTING.md` | The pyramid as built: smoke-in-CI vs DB-backed-golden-local-only + the harness blueprint |
-| `docs/COLLABORATION.md` | Branch workflow, worktrees, the parallel-session protocol, fast-merger protocol |
-| `docs/STACK-RATIONALE.md` | Every stack choice, tagged TRANSFERABLE vs STACK-SPECIFIC |
-| `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
-| `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own seed ADR |
-| `CLAUDE.md` | The kit's own auto-loaded context (guardrails + conventions) — a worked example; bootstrap replaces it with your project's |
-| `docs/CLAUDE-template.md` | Fill-in `CLAUDE.md` for the new project (Hard Rules verbatim) |
-| `BOOTSTRAP-PROMPT.md` / `PLACEHOLDERS.md` | The adaptation UX + the complete `{{…}}` token inventory |
-| `scripts/check_placeholders.py` | CI-enforced: tokens used == tokens documented (`--bootstrapped`: zero remain) |
+- **Guards match operations, not prose — and get tested.** Every guard is verified by
+  a 90+-case block/allow battery that runs in CI forever; edit a hook, add a case.
 
 ## Keep the kit living
 
-When any project bootstrapped from this template surfaces a transferable lesson, hook
-improvement, or workflow gotcha, **PR it back here** — this repo is the single living
-successor to the old per-machine `~/.claude/secure-bootstrap/` kit (and its iCloud
-copy), whose two-copy sync ritual is retired. One repo, PR-gated, battery-tested.
+Bootstrapped a project and learned something transferable — a guard, a gotcha, a
+better template? **PRs welcome** ([CONTRIBUTING.md](CONTRIBUTING.md)). `main` is the
+only supported version; bootstrap records the kit commit you started from.
 
 ## The kit protects itself
 
 This repo runs its own medicine: the hooks guarded the kit's construction from PR #1
 (the branch guard forced PR-flow from the first commit), the battery + secretlint run
-on every PR, and `main` is protected by the same merge-then-require sequence the docs
-teach. See [docs/adr/2026-07-03-kit-shape-and-conventions.md](docs/adr/2026-07-03-kit-shape-and-conventions.md).
+on every PR, `main` is protected by the same merge-then-require sequence the docs
+teach — and the hooks are self-protected, so not even the agent that built them can
+edit them. See [docs/adr/](docs/adr/).

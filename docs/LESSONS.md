@@ -2,8 +2,9 @@
 
 The gotcha catalog — every entry cost a failed run, a wedged PR, a deadlock, or a
 debugging session during the todoclaw build (2026-06-22 → 2026-07-03) or this kit's own
-construction. Format: what bites → the fix. Sources: todoclaw memory files, ADRs,
-SERVICES.md, the v1 secure-bootstrap gotcha log, and this repo's build.
+construction. Format: what bites → the fix. Sources: todoclaw's build records (ADRs,
+runbooks, session notes — cited as provenance, not links into this repo) and this
+repo's own build incidents.
 
 ---
 
@@ -20,7 +21,11 @@ written before the hook script existed. Fixes: always
 hook environment — verified — though not in the Bash tool env), and **create the
 scripts first, write settings.json last**. Recovery is human-only: create an exit-0
 stub at the expected path, fix/remove settings.json — or, for the relative-path
-variant only, restart the session (a fresh shell resets cwd to the project root). Do
+variant only, restart the session (a fresh shell resets cwd to the project root).
+Asymmetry worth knowing: a missing *interpreter* is the opposite failure — `python3`
+absent means shell exit 127, which the harness treats as non-blocking, i.e. **fail
+open**: every guard silently gone while bypassPermissions stays on. The kit's
+PreToolUse wiring closes this with `command -v python3 … || exit 2`. Do
 NOT "harden" with a
 `${CLAUDE_PROJECT_DIR:-.}` fallback (reintroduces the relative-path hole) — fail-closed
 is correct for a security hook.

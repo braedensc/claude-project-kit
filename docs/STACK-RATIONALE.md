@@ -36,7 +36,8 @@ project). Sources: CLAUDE.md stack table + ADR-0001/0002/0003/0008/0009/0011/001
 | Markdown in `.prettierignore` | Doc reflow is pure diff noise | Hand-formatted docs are exempt from the formatter | T |
 | Vitest + RTL, jsdom, `globals: false` | Explicit imports keep strict TS clean of ambient types | Test config should not leak ambient types into app code | T |
 | Playwright, two separate configs (smoke vs golden) | CI must be structurally unable to run the DB suite | Split E2E by dependency weight; enforce the split by config file, not convention (docs/TESTING.md) | T |
-| husky + secretlint + lint-staged | Layer 2 of 3; worktree-aware binary resolution | Local hooks mirror CI checks — fast feedback, same rules | T |
+| Local hooks mirror CI (layer 2 of 3) | Fast feedback, same rules as the unbypassable gate | Always have a bypassable local mirror of CI | T |
+| husky + secretlint + lint-staged as the tools | Node-native, worktree-aware binary resolution proven in production | The tools are swappable — lefthook or pre-commit for the manager, gitleaks for the scanner — keep the layer | S |
 | Sentry, DSN-gated init | No DSN ⇒ no-op: devs/CI/tests never send events; DSN is public, not a secret | Observability is opt-in by env presence; tag release SHA + true deploy environment | T |
 
 ## Process & tooling

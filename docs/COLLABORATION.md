@@ -2,8 +2,8 @@
 
 How multiple people — and multiple Claude Code sessions — work on the same repo at the
 same time without stepping on each other. Ported near-verbatim from todoclaw's
-COLLABORATION.md (proven across a parallel Stage 5 ∥ Stage 6 build, 2026-07-01 → 03)
-plus the retro's fast-merge protocol.
+COLLABORATION.md (proven by running two Claude sessions in parallel on one repo for
+the final build milestones, 2026-07-01 → 03) plus the retro's fast-merge protocol.
 
 **Key mental model:** Claude Code does **not** coordinate across machines. Each session
 is isolated and has no idea other humans or agents exist. Coordination is **git +
@@ -168,7 +168,7 @@ serialized resource. Two branches generating them in parallel collide on orderin
 2. Don't run two generating branches at once without coordinating.
 3. Merge such PRs quickly — don't let them sit.
 
-### Parallel-session protocol (learned the hard way, Stage 5 ∥ Stage 6)
+### Parallel-session protocol (learned the hard way, running two sessions at once)
 
 Running several Claude sessions at once works well **if** shared serialized resources
 are handled explicitly. The parallel build collided three times on ADR numbering and

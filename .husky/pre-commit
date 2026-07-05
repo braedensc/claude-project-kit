@@ -11,6 +11,8 @@
 
 # ── Ensure a modern Node is on PATH (secretlint needs >= 20) ──────────────────
 if ! node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' 2>/dev/null; then
+  # Auto-detects nvm layouts only; fnm/volta/asdf users: ensure `node` >=20 is on the
+  # PATH git hooks inherit (or adapt this glob to your manager's install dir).
   for major in 24 22 20; do
     dir=$(ls -d "$HOME/.nvm/versions/node/v${major}".* 2>/dev/null | sort -V | tail -1)
     if [ -n "$dir" ]; then

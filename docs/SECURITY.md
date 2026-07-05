@@ -1,9 +1,13 @@
 # Security Model
 
+> **Found a vulnerability in the kit itself** (a hook bypass, a guard gap)? Please
+> open a [private security advisory](https://github.com/braedensc/claude-project-kit/security/advisories/new)
+> rather than a public issue.
+
 Distilled from todoclaw's production security posture (built 2026-06-23 → 2026-07-03,
-live app + real API spend, zero leaks). Everything here was enforced, not aspirational —
-sources: the hook suite, SERVICES.md runbooks, ADR-0003/0005/0015/0017, and the v1
-secure-bootstrap kit's gotcha log.
+live app + real API spend, zero leaks). Everything here was enforced, not aspirational.
+(Citations like `ADR-00xx` / `SERVICES.md` / PR numbers refer to todoclaw-internal
+artifacts — provenance breadcrumbs, not files in this repo.)
 
 ---
 
@@ -42,18 +46,26 @@ battery against the committed hook. (Reads are always allowed.)
 
 **Native `permissions.deny` — a layer independent of the Python hook.**
 `.claude/settings.json` also carries platform deny rules
-(`Read(.env)`, `Read(.env.*)`, `Read(secrets/**)`, …) that Claude Code enforces itself.
-This matters: per the docs, **deny wins even under `defaultMode: bypassPermissions`**,
-deny beats allow across every settings scope, and deny rules aren't gated by the
-workspace-trust dialog — so secret-file reads are blocked immediately, even if the
-PreToolUse hook were removed. It's belt-and-suspenders with the hook, not a replacement
-(deny covers built-in Read/Edit/Grep and recognized `cat`/`head` Bash reads, but not an
-arbitrary subprocess opening the file — which the hook and OS sandboxing cover).
+(`Read(.env)`, `Read(.env.local)`, `Read(.env.production)`, `Read(secrets/**)`,
+`Read(*.pem)`, `Read(*.key)`, …) that Claude Code enforces itself. This matters: per
+the docs, **deny wins even under `defaultMode: bypassPermissions`**, deny beats allow
+across every settings scope, and deny rules aren't gated by the workspace-trust
+dialog — so secret-file reads are blocked immediately, even if the PreToolUse hook
+were removed. It's belt-and-suspenders with the hook, not a replacement (deny covers
+built-in Read/Edit/Grep and recognized `cat`/`head` Bash reads, but not an arbitrary
+subprocess opening the file — which the hook and OS sandboxing cover). The list
+deliberately **enumerates** real env-file names rather than using a `Read(.env.*)`
+wildcard: the wildcard would also catch `.env.example` — the one env file that's
+*meant* to be read and edited — and deny rules can't express exceptions; exotic
+`.env.foo` variants are still caught by the hook layer.
 
-**The system fails closed.** A missing/broken hook script blocks *every* tool call
-(python exits 2 = the block signal) rather than silently disabling protection. Correct
-for a security hook; operationally it means **create hook scripts before wiring
-`settings.json`** (see docs/LESSONS.md — this kit hit both variants of that deadlock).
+**The system fails closed — including when python3 itself is missing.** A
+missing/broken hook *script* blocks every tool call (python exits 2 = the block
+signal). A missing *interpreter* would have failed open (shell exit 127 is treated as
+a non-blocking error), so the PreToolUse wiring guards it explicitly:
+`command -v python3 … || exit 2` — no python3, no tools, rather than no guards.
+Operationally: **create hook scripts before wiring `settings.json`** (see
+docs/LESSONS.md — this kit hit both variants of that deadlock).
 
 Server-side extras (free, one-time toggles in GitHub → Settings → Security): secret
 scanning, **push protection**, Dependabot security updates. They backstop layer 3.
