@@ -77,5 +77,6 @@ build-before-lock discipline (it self-references) and new battery cases (→ 91)
 first-pass false positive (a benign `2>&1` near a hook path over-blocked) was fixed by
 making the mutation match *target* the protected path — and, fittingly, applied via the
 human-only terminal flow the guard itself mandates.
-Consequence: bootstrap's `{{NODE_BIN_PATH}}` fill in settings.json becomes a
+Consequence: bootstrap's NODE_BIN_PATH-placeholder fill in settings.json (the
+placeholder was later retired — see 2026-07-04-publish-readiness) becomes a
 human terminal step (BOOTSTRAP-PROMPT Phase 4 step 6).

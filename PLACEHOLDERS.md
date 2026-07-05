@@ -7,7 +7,6 @@ Phase 4 replaces them all, deletes this file, and re-runs the script with
 
 | Token | File | Fill with |
 |---|---|---|
-| `{{NODE_BIN_PATH}}` | `.claude/settings.json` | Your Node bin dir (e.g. `$HOME/.nvm/versions/node/v22.23.0/bin`) — nvm doesn't apply in non-interactive shells |
 | `{{EDGE_FUNCTION_NAMES}}` | `templates/workflows/deploy-on-green.yml` | Space-separated function names to deploy (e.g. `api-status send-report`) |
 | `{{SMOKE_FUNCTION_NAME}}` | `templates/workflows/deploy-on-green.yml` | One deployed function for the post-deploy 401 smoke (an auth-required, no-key endpoint) |
 | `{{KEEPALIVE_TABLE}}` | `templates/workflows/keepalive.yml` | Any real table name — a denied anon read still resets the pause timer |

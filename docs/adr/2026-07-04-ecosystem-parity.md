@@ -54,7 +54,8 @@ shipping (the syntax is newer than the model's cutoff in several cases):
   (deny-under-bypass, `disable-model-invocation`, `!`-shell injection,
   `hookSpecificOutput.additionalContext`, the `@claude` v1 `claude_args` migration,
   `.mcp.json` `${VAR}` expansion) — quotes in the PR.
-- Hook battery stays green (no guard changed); all tracked JSON/YAML parse
+- Hook battery green at 92 (the PR also fixed the Stop hook's stale-local-main
+  comparison — see the commit — with a regression case); all tracked JSON/YAML parse
   (devcontainer.json kept strict-JSON so CI validates it); placeholder integrity clean;
   kit CI green on the PR.
 - The one self-protected change (settings.json: `permissions.deny` + SessionStart

@@ -11,9 +11,6 @@ template — scripts and settings together, so the missing-script deadlock in
 docs/LESSONS.md can't happen here). Claude adapts the kit to your stack; you keep the
 human-only steps at the end.
 
-Supersedes the v1 `~/.claude/secure-bootstrap/` kit — this template carries everything
-it had, plus the CI/deploy/testing/process layers it lacked.
-
 ---
 
 ## The prompt (copy from here)
@@ -45,6 +42,8 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > **Phase 2 — interview me.** Batch your questions; recommend defaults from
 > docs/STACK-RATIONALE.md (the TRANSFERABLE rows are kit policy; the STACK-SPECIFIC
 > rows are my choices). Cover at least:
+> 0. Project type: web app / CLI / mobile / library / data pipeline — then skip any
+>    stack question below that doesn't apply (a CLI has no frontend or hosting).
 > 1. Project name + one-paragraph description + the one product invariant that must
 >    always hold.
 > 2. Frontend stack (framework, styling, state) — pin exact majors.
@@ -53,8 +52,9 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >    monthly budget cap) from docs/SECURITY.md → "AI cost guardrails".
 > 5. Reference-material dir: is there licensed/private reference content? What's its
 >    name? (Kit default: `planning/` — gitignored, never published, hook-guarded.)
-> 6. My machine paths: Node bin dir for `{{NODE_BIN_PATH}}` (e.g.
->    `~/.nvm/versions/node/v22.x.x/bin`), plus anything for `.claude/settings.local.json`.
+> 6. My machine specifics for `.claude/settings.local.json` (gitignored): e.g. my Node
+>    bin dir if `node` doesn't resolve in your shell — I can get it by running
+>    `dirname "$(which node)"` in my own terminal.
 > 7. Testing depth: unit + CI smoke are kit policy; confirm whether a DB-backed golden
 >    suite applies (it does for any app with a real datastore).
 >
@@ -71,12 +71,12 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 >   to apply it (e.g. `cp <scratch> .claude/hooks/pre-tool-use.py` — run in my terminal,
 >   no hook intercepts it), then verify and `git add`/commit it (staging them IS
 >   allowed). `.claude/settings.local.json` is NOT protected — write it directly.
-> - **Unbrick Node before any `npm`:** a fresh clone's `settings.json` PATH still holds
->   the literal `{{NODE_BIN_PATH}}`, so `npm`/`node` may not resolve. Before installing
->   or scaffolding, write `.claude/settings.local.json` with my real Node bin (ask me,
->   or read `~/.nvm/versions/node/`) — its `env.PATH` overrides the placeholder and
->   resolves the toolchain immediately. (Step 6 still fills the committed `settings.json`
->   placeholder — via a terminal command — for the default + placeholder integrity.)
+> - **Check Node resolves before any `npm`:** the committed settings ship NO `PATH`
+>   override (a machine-specific PATH in a template breaks other machines). If
+>   `node`/`npm` don't resolve in your shell (version managers like nvm don't apply
+>   non-interactively), write `.claude/settings.local.json` (gitignored, NOT protected)
+>   with an `env.PATH` that prepends my Node bin — ask me for
+>   `dirname "$(which node)"` from my terminal.
 >
 > 1. `docs/CLAUDE-template.md` → `CLAUDE.md` (repo root), **overwriting the kit's own
 >    CLAUDE.md that ships here** (it describes maintaining the kit; yours describes my
@@ -110,13 +110,19 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > 5. `.env.example`: replace the example vars with this project's real public-env
 >    contract (placeholder values only). I create `.env.local` myself — you cannot
 >    (the hook blocks it; that's the design).
-> 6. `.claude/settings.json` (**self-protected — terminal command per above**): fill
->    the committed `{{NODE_BIN_PATH}}` placeholder — hand me e.g.
->    `sed -i '' 's#{{NODE_BIN_PATH}}#<my node bin>#' .claude/settings.json` (this is the
->    committed default; the runtime PATH already came from `settings.local.json` in the
->    Node-first step above). Verify/update the shipped `.nvmrc` for my Node choice.
->    NEVER reorder the hooks-scripts-then-settings relationship if wiring changes
+> 6. Runtime pinning: verify/update the shipped `.nvmrc` and `package.json` `engines`
+>    for my Node choice. `.claude/settings.json` normally needs NO edit at bootstrap
+>    (machine PATH lives in `settings.local.json`, per the Node note above); if my
+>    stack DOES need a settings change, it's self-protected — terminal command per
+>    above, and NEVER reorder the hooks-scripts-then-settings relationship
 >    (docs/LESSONS.md).
+> 6b. The Claude-layer extras — decide each with me: keep `.claude/skills/` (`/ship`,
+>    `/new-adr` — adapt `/ship`'s allowed-tools if my remote isn't GitHub);
+>    `.mcp.json.example` → rename to `.mcp.json` and fill (env-var secrets only) or
+>    delete; `.devcontainer/` → keep (swap the base image for my stack) or delete;
+>    `templates/workflows/claude.yml` moves with the other workflow templates in step
+>    4 — activate only if I want @claude-on-GitHub and will add the
+>    `ANTHROPIC_API_KEY` secret (it spends real money), else delete.
 > 7. Scaffold the app toolchain if needed (Vite/Next/etc.) — **run generators in a
 >    temp dir and merge their output INTO the kit's files by hand; never let a
 >    generator overwrite package.json, .gitignore, .husky/, or .claude/**
@@ -147,9 +153,13 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 > - `npm install` → husky live; then prove layer 2 the way git invokes it: stage a
 >   fake `ghp_` + 36-char token in a scratch file → commit must BLOCK; commit
 >   `.env.example` → must pass; confirm `.claude/audit.log` grew this session.
+>   (Non-Node project? Node ≥20 stays a prerequisite just for this commit-guard
+>   layer — or swap it: lefthook/pre-commit + gitleaks, and adapt the CI secretlint
+>   step to match. The Claude-hook layer needs no Node either way.)
 > - `python3 scripts/check_placeholders.py --bootstrapped` → clean.
 > - Every JSON/YAML in the repo parses.
-> - Open the bootstrap PR (concise body), and show me: the stack table as configured,
+> - Open the bootstrap PR (concise body; include the template repo URL + the kit
+>   commit SHA this project started from), and show me: the stack table as configured,
 >   files deleted, checks output, and the human-only list from Phase 6.
 >
 > **Phase 6 — hand me the human-only list** (you cannot do these; give exact
@@ -165,11 +175,13 @@ it had, plus the CI/deploy/testing/process layers it lacked.
 
 ## After Claude finishes (you, in dashboards)
 
-1. **Branch protection** — after the new CI has reported on `main`:
+1. **Branch protection** — after the new CI has reported on `main`
+   (a working example ships at `docs/examples/protection.json`):
    ```bash
-   gh api -X PUT repos/<you>/<repo>/branches/main/protection --input protection.json
-   # contexts: the app CI's job names (e.g. "Lint","Typecheck","Test",
-   # "Secret scan + forbidden paths") — NOT the kit's old "Kit checks".
+   gh api -X PUT repos/<you>/<repo>/branches/main/protection \
+     --input docs/examples/protection.json
+   # Edit its "contexts" first if your CI job names differ — they must match your
+   # app CI's job names, NOT the kit's old "Kit checks".
    ```
 2. **GitHub security toggles**: secret scanning, push protection, Dependabot.
 3. **Service dashboards**: create projects, set secrets (`supabase secrets set …`,

@@ -2,9 +2,9 @@
 
 Project-scoped hooks configured in `.claude/settings.json`. They guard Claude's real-time tool calls before execution — unlike git pre-commit hooks, **the model cannot bypass them** (no `--no-verify` equivalent). This is why `settings.json` can ship `permissions.defaultMode: bypassPermissions`: the bypass is *earned* by these hard blocks running in every mode.
 
-Distilled from todoclaw's hook suite — in production 2026-06-23 → 2026-07-03; v2 hardening (prose-stripping, branch-scoped push guard) verified by an 18-case battery in the retro PR, expanded here into the permanent `test_hooks.py`.
+Distilled from todoclaw's hook suite — in production 2026-06-23 → 2026-07-03; v2 hardening (prose-stripping, branch-scoped push guard) verified by an 18-case battery in todoclaw's post-launch retrospective PR, expanded here into the permanent `test_hooks.py`.
 
-> **Bootstrap order warning:** hook wiring hot-loads the instant `settings.json` is written, and a missing hook script **blocks every tool call** (fail-closed). Create the scripts in `.claude/hooks/` *first*, write `settings.json` *last*.
+> **Bootstrap order warning:** hook wiring hot-loads the instant `settings.json` is written, and a missing hook script **blocks every tool call** (fail-closed). Create the scripts in `.claude/hooks/` *first*, write `settings.json` *last*. A missing python3 *interpreter* is also fail-closed — the PreToolUse wiring wraps the command in `command -v python3 … || exit 2`, so a machine without python3 blocks everything instead of silently running unguarded.
 
 ---
 

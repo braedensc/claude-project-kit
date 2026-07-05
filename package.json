@@ -2,6 +2,10 @@
   "name": "claude-project-kit",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "description": "Full-stack project template: Claude Code hook suite, CI/CD patterns, 3-layer security model, process docs — distilled from a production build",
   "type": "module",
   "scripts": {
