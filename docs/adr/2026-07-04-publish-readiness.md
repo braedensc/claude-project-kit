@@ -10,7 +10,7 @@ Prepare the kit for public promotion:
 1. **MIT LICENSE** (+ `license`/`engines` in package.json). A template's whole point is
    copying files into other projects; unlicensed = all-rights-reserved = unusable.
 2. **Stop shipping a `PATH` override in `settings.json`** — the committed
-   `env.PATH` (macOS-Homebrew-flavored, `{{NODE_BIN_PATH}}` placeholder) *replaced* the
+   `env.PATH` (macOS-Homebrew-flavored, NODE_BIN_PATH placeholder) *replaced* the
    user's PATH, hiding `gh`/`node` on non-Mac layouts and silently failing guards open.
    Machine PATH now lives only in gitignored `settings.local.json`; the placeholder is
    retired (22 tokens remain).
