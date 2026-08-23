@@ -129,8 +129,10 @@ Before reinventing, note the bundled skills Claude Code already ships: `/code-re
 - **Delegate cheaply:** fan search/read work to subagents with `model: haiku` (or set
   `CLAUDE_CODE_SUBAGENT_MODEL`); reserve the main model for judgment. Verify model
   IDs/pricing against live docs before asserting (they move faster than any cutoff).
-- **Two memory layers, don't conflate them:** `CLAUDE.md` (this file) is *authored*
-  rules loaded every session; `~/.claude/projects/<proj>/memory/MEMORY.md` is
+- **Three memory layers, don't conflate them:** `CLAUDE.md` (this file) is *authored*
+  rules loaded every session — committed, so it must stand alone in a fresh clone;
+  gitignored `CLAUDE.local.md` is machine-local instructions (private paths, personal
+  runners), auto-loaded by Claude Code; `~/.claude/projects/<proj>/memory/MEMORY.md` is
   Claude-*discovered* learnings, machine-local and gitignored. Write durable
   conventions here; let auto-memory hold session-to-session findings.
 

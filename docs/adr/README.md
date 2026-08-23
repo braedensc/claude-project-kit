@@ -21,7 +21,7 @@ renumbered twice, 0019 → 0020 → landing as 0022). The structural fix (todocl
 ```markdown
 # <Title>
 
-**Date:** YYYY-MM-DD · **Context:** <stage / PR #>
+**Date:** YYYY-MM-DD · **Status:** Accepted · **Context:** <stage / PR #>
 
 ## Decision
 <what, in 2–4 sentences>
@@ -37,6 +37,9 @@ run-twice idempotency. An ADR without evidence is an opinion.>
 Conventions that proved their worth:
 - **Amend in place** with dated `**Update (…)**` blocks rather than superseding files —
   cross-references stay stable.
+- **Status stays truthful:** when a decision *is* replaced, the PR that supersedes an
+  ADR flips the old one's `**Status:**` to `Superseded by <file>` *and* its index row,
+  in the same change.
 - **Deferrals get ADRs too**, with a named revisit trigger — and a dated re-decision
   ADR when the trigger fires. The log records what was *not* done and when.
 - **Deviations from plan** are recorded with owner sign-off + date + the re-entry path.
