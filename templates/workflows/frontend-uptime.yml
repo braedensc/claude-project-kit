@@ -1,0 +1,129 @@
+name: Frontend uptime check
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Synthetic frontend uptime check — INERT template (activate at bootstrap:
+# `git mv templates/workflows/frontend-uptime.yml .github/workflows/`).
+# Ported near-verbatim from todoclaw's frontend-uptime.yml (PR #242); fully
+# stack-neutral — the check body is plain curl + grep.
+#
+# The hole this closes (todoclaw's 2026-07-13 incident): the frontend often
+# deploys via its own host (Vercel/Netlify/Pages) entirely OUTSIDE the deploy
+# pipeline, so a green backend deploy says NOTHING about the app users see. This
+# curls the prod site every ~15 min and, if it is unreachable or not serving the
+# app shell, opens/updates a GitHub issue (assigning + @mentioning the owner,
+# same chassis as the other monitors). Catches: hard-down, provider error page,
+# DNS/domain break, deleted project, host outage.
+#
+# What it does NOT catch: a STALE-but-serving build (a failed frontend BUILD
+# keeps the last good deploy live, still HTTP 200). For that, enable your host's
+# own deploy-failure notifications (e.g. Vercel → Project → Settings →
+# Notifications). Schema skew (frontend ahead of a failed migration) belongs to
+# the deploy pipeline's own alerting (deploy-failure-alert.yml).
+#
+# Config (repo → Settings → Secrets and variables → Actions → Variables — both
+# are public values, so they are repo VARIABLES, not secrets):
+#   gh variable set FRONTEND_URL --body "https://your-app.example.com"
+#   gh variable set APP_SHELL_MARKER --body "<title>YourApp</title>"
+# APP_SHELL_MARKER is a string only the REAL app shell serves (its <title> is
+# the classic choice) — it catches provider error/placeholder pages that still
+# return HTTP 200. Until FRONTEND_URL is set the job runs green but SKIPS, so an
+# unconfigured fork is never red (mirrors backup-cron.yml / keepalive.yml).
+#
+# NOTE: scheduled workflows only run from the DEFAULT branch (main). Trigger
+# manually (workflow_dispatch) to test.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *' # ~every 15 min, off the top of the hour to dodge Actions load
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  uptime:
+    name: Prod frontend reachable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Preflight — is the check configured?
+        id: pre
+        env:
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+        run: |
+          if [ -z "$FRONTEND_URL" ]; then
+            echo "::notice::Uptime check not configured — set the FRONTEND_URL repo variable to enable. Skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Curl the prod site
+        id: check
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+          APP_SHELL_MARKER: ${{ vars.APP_SHELL_MARKER }}
+        run: |
+          # Two failure classes: transport (non-200 / no response) and content (200 but
+          # not the app shell — a provider error/placeholder page). Retry a few times so
+          # a single blip doesn't page; only a SUSTAINED failure opens an issue.
+          # If APP_SHELL_MARKER is unset, only the transport check runs (set it — error
+          # pages that still 200 are the sneakier failure).
+          code=""
+          ok=false
+          for attempt in 1 2 3; do
+            resp=$(curl -sS --max-time 20 -w '\n%{http_code}' "$FRONTEND_URL" || true)
+            code=$(printf '%s' "$resp" | tail -n1)
+            html=$(printf '%s' "$resp" | sed '$d')
+            if [ "$code" = "200" ]; then
+              if [ -z "$APP_SHELL_MARKER" ] || printf '%s' "$html" | grep -qF -- "$APP_SHELL_MARKER"; then
+                ok=true
+                break
+              fi
+            fi
+            echo "attempt $attempt: HTTP ${code:-none}, app-shell marker missing"
+            sleep 10
+          done
+          if [ "$ok" = true ]; then
+            echo "prod frontend OK (HTTP 200 + app shell)"
+            echo "down=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::prod frontend check failed (last HTTP ${code:-none})"
+            echo "down=true" >> "$GITHUB_OUTPUT"
+            echo "last_code=${code:-none}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open/update an outage issue
+        if: steps.pre.outputs.configured == 'true' && steps.check.outputs.down == 'true'
+        uses: actions/github-script@v7
+        env:
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+          LAST_CODE: ${{ steps.check.outputs.last_code }}
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            // The stable title IS the dedupe key — change it and you fork the issue.
+            const title = '🚨 Production frontend is unreachable'
+            const body = [
+              `The synthetic uptime check could not load ${process.env.FRONTEND_URL} (last HTTP \`${process.env.LAST_CODE || 'no response'}\`; app-shell marker missing).`,
+              '',
+              'The frontend is served by its own host, OUTSIDE the deploy pipeline, so this is likely the only automated detector for it. Check the host dashboard (latest deployment + build logs) and load the site directly.',
+              '',
+              // @mention + assign so this reaches the owner even under a "Participating
+              // and @mentions" watch (see deploy-failure-alert.yml). Repeated on every
+              // comment so a sustained outage keeps nudging.
+              `cc @${owner} — the app is down for users.`,
+            ].join('\n')
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
+            const existing = open.data.find((i) => i.title === title && !i.pull_request)
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
+              core.info(`Updated #${existing.number}`)
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title, body, assignees: [owner] })
+              core.info(`Opened #${created.data.number}`)
+            }
