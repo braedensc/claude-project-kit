@@ -44,6 +44,17 @@ a first line, not a perfect sandbox (a shell can't be fully fenced by regex); th
 guarantee stays git: any change must survive a reviewed PR + CI, which re-runs the
 battery against the committed hook. (Reads are always allowed.)
 
+**The server-side backstop: the "Hooks change guard" CI job.** Local
+self-protection constrains only sessions that run the hook — a PR authored
+anywhere else (another clone, the GitHub web UI, an `@claude` workflow) never
+meets it. So CI carries the merge-time layer: any PR whose diff touches
+`.claude/hooks/**` or `.claude/settings*.json` fails unless it carries the
+`hooks-change` label — an explicit, human-visible acknowledgment instead of a
+silent merge (adding/removing the label re-runs the check via the
+`labeled`/`unlabeled` PR trigger types). One dependency to know: the label only
+becomes a real *gate* once branch protection also requires at least one
+approving review — otherwise the PR author can self-label and merge unseen.
+
 **Native `permissions.deny` — a layer independent of the Python hook.**
 `.claude/settings.json` also carries platform deny rules
 (`Read(.env)`, `Read(.env.local)`, `Read(.env.production)`, `Read(secrets/**)`,
@@ -69,6 +80,21 @@ docs/LESSONS.md — this kit hit both variants of that deadlock).
 
 Server-side extras (free, one-time toggles in GitHub → Settings → Security): secret
 scanning, **push protection**, Dependabot security updates. They backstop layer 3.
+
+### Security invariants as CI
+
+A security rule that lives only in CLAUDE.md is advisory — the model can drift
+from it and nobody is told. The pattern that held in production: **every written
+security rule gets a deterministic, dependency-free CI scanner that fails when a
+new surface appears without a reviewed allowlist entry.** todoclaw's five
+scanner jobs are the worked example — static RLS coverage, live-DB RLS proof, a
+write-capability audit, a `SECURITY DEFINER` grant audit, and an edge-function
+outbound-fetch allowlist — each a small script with its own tests, each job
+comment citing the numbered rule it enforces. Those scripts are stack-specific
+and don't ship here; the pattern does. The kit already self-hosts it (hook
+battery, forbidden-paths gate, placeholder integrity, the hooks-change guard);
+when you write a new security rule for your project, write the scanner that
+detects its violation in the same PR.
 
 ---
 

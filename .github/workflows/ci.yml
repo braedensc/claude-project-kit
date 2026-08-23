@@ -14,8 +14,12 @@ on:
   push:
     branches: [main]
   # Run on every PR regardless of base branch — so stacked PRs (base != main)
-  # are gated too, not just PRs that target main directly.
+  # are gated too, not just PRs that target main directly. `labeled`/`unlabeled`
+  # are included so "Hooks change guard" re-evaluates the moment a
+  # `hooks-change` label is added or removed (the default PR activity types —
+  # opened/synchronize/reopened — don't cover labels).
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -75,3 +79,52 @@ jobs:
 
       - name: secretlint (scan all tracked files)
         run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
+
+  # Server-side backstop for hook self-protection (docs/SECURITY.md; ported from
+  # todoclaw's GAP-1 audit job, PR #117). Local self-protection constrains only
+  # sessions that run the hook — a PR authored anywhere else (another clone, the
+  # GitHub web UI, an @claude workflow) never meets it. So a PR that changes the
+  # guard machinery (.claude/hooks/** or .claude/settings*.json) must not land
+  # unnoticed: it has to carry an explicit `hooks-change` label.
+  # Operational notes (learned in todoclaw):
+  #   - the `hooks-change` label must EXIST in the repo before this job's first
+  #     run can pass on a guarded PR (gh label create hooks-change …);
+  #   - adding/removing the label re-runs the check via the labeled/unlabeled
+  #     trigger types above; if a run ever wedges, an empty commit gives a
+  #     clean re-run;
+  #   - this flag only becomes a real gate once branch protection requires a
+  #     review (required_approving_review_count >= 1, owner-set in the GitHub
+  #     UI) so a human actually sees it. PR-only — a push to main has no label
+  #     context.
+  hooks-change-guard:
+    name: Hooks change guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require the 'hooks-change' label to edit hook/settings files
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
+          SENSITIVE=$(printf '%s\n' "$CHANGED" | grep -E '^\.claude/(hooks/|settings[^/]*\.json$)' || true)
+          if [ -z "$SENSITIVE" ]; then
+            echo "No security-hook files changed — nothing to gate."
+            exit 0
+          fi
+          echo "This PR modifies security-critical hook/settings files:"
+          printf '  %s\n' $SENSITIVE
+          for label in $LABELS; do
+            if [ "$label" = "hooks-change" ]; then
+              echo "OK: 'hooks-change' label present — change acknowledged."
+              exit 0
+            fi
+          done
+          echo "::error::This PR changes .claude/hooks/** or .claude/settings*.json — the guard machinery that self-protection makes human-only locally. Edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
+          exit 1
