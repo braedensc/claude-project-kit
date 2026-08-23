@@ -7,7 +7,11 @@ name: Deploy (prod)
 #
 # UNIVERSAL SKELETON (keep for any platform): workflow_run success gate,
 # dispatch-from-main guard, exact-SHA checkout, sequential migrate → deploy,
-# no-cancel concurrency, per-job timeouts, skip-green secret preflights.
+# no-cancel concurrency, per-job timeouts, preflights with a LIFECYCLE
+# (skip-green before first seed, fail-loud after — fenced blocks in each
+# preflight below), deploy targets DERIVED FROM THE TREE, and a smoke that
+# probes every target for ABSENCE signals (retrying cold starts) instead of
+# asserting one expected code.
 # STACK-SPECIFIC (fenced below): the Supabase step bodies — swap for your
 # platform, keep the skeleton.
 #
@@ -54,9 +58,16 @@ name: Deploy (prod)
 #   (e.g. `supabase secrets set`), or deployed functions fail at runtime. The
 #   post-deploy smoke asserts reachability but cannot check those.
 #
-# Each job PREFLIGHTS its own config and SKIPS (green) when unset — the workflow
-# merges and stays green until the secrets are added (mirrors backup-cron.yml /
-# keepalive.yml).
+# ── Preflight lifecycle (skip-green is a PHASE, not a policy) ─────────────────
+#   As shipped, each job PREFLIGHTS its own config and SKIPS (green) when unset —
+#   the workflow merges and stays green until the secrets are added (mirrors
+#   backup-cron.yml / keepalive.yml: a fork is never red out of the box).
+#   AFTER YOUR FIRST SUCCESSFUL DEPLOY, flip both preflights to the fail-loud
+#   variants commented inline below. Post-seed, a missing/rotated secret must
+#   FAIL the run: a silent skip once shipped functions against an un-migrated
+#   schema with the run still green (todoclaw PR #242, the 2026-07-13 incident) —
+#   and a green run is invisible to pipeline-failure-alert.yml, which only fires
+#   on a FAILED conclusion.
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -110,7 +121,8 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # STACK-SPECIFIC FROM HERE DOWN — Supabase (Postgres migrations + Deno Edge
   # Functions). Swap the step bodies for your datastore/platform; keep the
-  # preflight-skip, exact-SHA checkout, `needs:` chain, and timeouts.
+  # preflight lifecycle, exact-SHA checkout, `needs:` chain, timeouts,
+  # tree-derived target discovery, and the absence-signal smoke.
   # ════════════════════════════════════════════════════════════════════════════
   migrate:
     name: Apply migrations to prod
@@ -127,6 +139,15 @@ jobs:
             # ::warning:: (not ::notice::) so a green run is never mistaken for "migrations applied".
             echo "::warning::BACKUP_DATABASE_URL not set — SKIPPING migrations."
             echo "configured=false" >> "$GITHUB_OUTPUT"
+            # ── AFTER YOUR FIRST SUCCESSFUL DEPLOY flip these — a skipped deploy is ──────
+            # invisible to pipeline-failure-alert. Replace the two lines above with:
+            #   echo "::error::BACKUP_DATABASE_URL not set — cannot apply migrations. Set it (Settings → Secrets → Actions) and re-run Deploy (prod)."
+            #   exit 1
+            # Post-seed, skip-green means a rotated/vanished secret ships a silent
+            # half-deploy forever: todoclaw 2026-07-13 shipped functions against an
+            # un-migrated schema on a GREEN run, and the alert workflow (which only
+            # fires on a `failure` conclusion) never saw it.
+            # ─────────────────────────────────────────────────────────────────────────────
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
@@ -144,12 +165,24 @@ jobs:
       # The DB URL holds the DB password — keep it in env and referenced as
       # "$SUPABASE_DB_URL" (never inline, never with `set -x`/`--debug`, or the
       # DSN leaks into logs).
+      #
+      # --include-all: apply migrations whose version sorts BEFORE the last one
+      # already on remote. Parallel feature branches routinely merge migrations
+      # out of timestamp order (a branch cut before another's migration lands
+      # ends up "in the past"); without this flag, db push hard-stops on the
+      # first such file and NO further migration or function deploy reaches
+      # prod — todoclaw PR #198: prod silently fell 5 migrations behind for
+      # hours. Versions stay unique, so ordering within a push is deterministic;
+      # --include-all only relaxes the "must be newer than remote's latest"
+      # guard. Ordering is enforced at PR time instead — see
+      # templates/scripts/check-migrations.mjs (tolerate out-of-order at deploy
+      # time, enforce ordering at PR time).
       - name: Preview pending migrations (dry-run, audit only)
         if: steps.pre.outputs.configured == 'true'
         continue-on-error: true # informational; never block the deploy on the preview
         env:
           SUPABASE_DB_URL: ${{ secrets.BACKUP_DATABASE_URL }}
-        run: supabase db push --db-url "$SUPABASE_DB_URL" --dry-run
+        run: supabase db push --db-url "$SUPABASE_DB_URL" --include-all --dry-run
 
       - name: Apply migrations (db push)
         if: steps.pre.outputs.configured == 'true'
@@ -159,13 +192,15 @@ jobs:
         # CI runners (supabase/cli#2238); pipe `yes` to force non-interactive.
         # Pipeline exit status is db push's, so a failed migration still fails
         # the step.
-        run: yes | supabase db push --db-url "$SUPABASE_DB_URL"
+        run: yes | supabase db push --db-url "$SUPABASE_DB_URL" --include-all
 
   deploy-functions:
     name: Deploy Edge Functions
     # Runs after migrate so functions never ship against a failed/half-applied
     # schema. If migrate SKIPS (unconfigured) it still "succeeds", so functions
-    # can deploy on their own.
+    # can deploy on their own — one more reason to flip the preflights to
+    # fail-loud post-seed: a hard-failing migrate makes this `needs:` chain
+    # actually block the function deploy.
     needs: [gate, migrate]
     runs-on: ubuntu-latest
     timeout-minutes: 15 # bundling can take minutes; bound it so a hang can't hold the lock
@@ -179,6 +214,14 @@ jobs:
           if [ -z "$SUPABASE_ACCESS_TOKEN" ] || [ -z "$SUPABASE_PROJECT_REF" ]; then
             echo "::warning::SUPABASE_ACCESS_TOKEN / SUPABASE_PROJECT_REF not set — SKIPPING function deploy."
             echo "configured=false" >> "$GITHUB_OUTPUT"
+            # ── AFTER YOUR FIRST SUCCESSFUL DEPLOY flip these — a skipped deploy is ──────
+            # invisible to pipeline-failure-alert. Replace the two lines above with:
+            #   echo "::error::SUPABASE_ACCESS_TOKEN / SUPABASE_PROJECT_REF not set — cannot deploy functions. Set them (Settings → Secrets/Variables → Actions) and re-run Deploy (prod)."
+            #   exit 1
+            # Post-seed, skip-green means a rotated credential leaves prod silently
+            # running the stale function bundle on a green run — no failure event,
+            # no alert (todoclaw PR #242).
+            # ─────────────────────────────────────────────────────────────────────────────
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
@@ -193,40 +236,116 @@ jobs:
         with:
           version: 2.107.0
 
+      - name: Discover deployable functions
+        id: discover
+        if: steps.pre.outputs.configured == 'true'
+        run: |
+          # Derive the deploy list from the TREE instead of hardcoding it — the
+          # glob is the stack-specific bit to adapt; the pattern (deploy targets
+          # come from the repo, never a hand-maintained list) is universal.
+          # Every Edge Function is a directory under supabase/functions/ with an
+          # index.ts; globbing */index.ts naturally excludes _shared (a helper
+          # dir, no index.ts) and any non-function file. A newly added function
+          # is now deployed AND smoke-tested automatically — a hardcoded
+          # omission once left todoclaw's dispatch-reminders undeployed while
+          # its cron POST 404'd every minute, silently green (PRs #203/#244).
+          fns=""
+          for idx in supabase/functions/*/index.ts; do
+            [ -f "$idx" ] || continue # zero matches → literal glob; skip it
+            name=$(basename "$(dirname "$idx")")
+            [ "$name" = "_shared" ] && continue # defensive: _shared has no index.ts today
+            fns="${fns:+$fns }$name"
+          done
+          if [ -z "$fns" ]; then
+            echo "::error::no deployable functions found under supabase/functions/*/index.ts — refusing to deploy nothing"
+            exit 1
+          fi
+          echo "Deployable functions: $fns"
+          echo "fns=$fns" >> "$GITHUB_OUTPUT"
+
       - name: Deploy functions
         if: steps.pre.outputs.configured == 'true'
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+          FNS: ${{ steps.discover.outputs.fns }}
         run: |
-          # Deploy each function explicitly (skips `_shared` / config).
+          # Deploy every function the discover step found (list derived from the
+          # tree, not hardcoded — a function can no longer be silently omitted).
           #   --use-api      : bundle server-side, no Docker (removes a whole CI failure class).
           #   --no-verify-jwt: turn OFF the gateway JWT check so the CORS OPTIONS
           #                    preflight reaches the function; each function
           #                    verifies the JWT itself (_shared/auth.ts) and RLS
           #                    isolates data. Mirrors `verify_jwt = false` in
           #                    supabase/config.toml (belt-and-suspenders).
-          for fn in {{EDGE_FUNCTION_NAMES}}; do
+          for fn in $FNS; do
             echo "::group::deploy $fn"
             supabase functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_REF" --use-api --no-verify-jwt
             echo "::endgroup::"
           done
 
-      # Cheap post-deploy smoke: prove the functions actually landed and are
-      # reachable. An unauthenticated POST must be rejected by the function's
-      # OWN auth (401); a 404/000/5xx means the deploy didn't take. Deeper
+      # Cheap post-deploy smoke: prove EVERY discovered function actually landed
+      # and is reachable. Auth differs per function (own-JWT functions answer
+      # 401, shared-secret ones 403, a body-validating public one 400), so we
+      # can't assert one expected code for all: the smoke asserts the response
+      # is NOT a not-deployed signal instead — FAIL on 404 (function absent),
+      # 000 (no response/timeout), or 5xx (deployed but crashing); PASS on
+      # anything it actually answered with (401/403/400/2xx). Deeper
       # CORS/ALLOWED_ORIGIN verification is a separate manual step (needs the
       # prod origin) — see docs/SECURITY.md.
+      #
+      # Retry with backoff (todoclaw #327): a function's FIRST hit after deploy
+      # is a COLD isolate boot, so a single probe can exceed --max-time and 000
+      # an otherwise-healthy deploy (a docs-only deploy once failed on exactly
+      # that). Probe each function up to $TRIES times with linear backoff — the
+      # first attempt doubles as a warmup, and only a function STILL failing on
+      # its LAST attempt fails the step. Retry absorbs cold-start jitter, it
+      # does not paper over a real outage: a persistently absent (404) or
+      # crashing (5xx) function still fails. Worst case (a total outage — every
+      # fn, every attempt) stays within this job's timeout-minutes.
       - name: Smoke — functions reachable
         if: steps.pre.outputs.configured == 'true'
         env:
           SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+          FNS: ${{ steps.discover.outputs.fns }}
         run: |
-          url="https://${SUPABASE_PROJECT_REF}.supabase.co/functions/v1/{{SMOKE_FUNCTION_NAME}}"
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST --max-time 20 \
-            -H 'content-type: application/json' -d '{}' "$url")
-          echo "{{SMOKE_FUNCTION_NAME}} unauth POST: HTTP $code"
-          case "$code" in
-            401) echo "deployed + reachable + own-auth enforced (expected)" ;;
-            *) echo "::error::{{SMOKE_FUNCTION_NAME}} returned $code (expected 401) — deploy may not have taken"; exit 1 ;;
-          esac
+          base="https://${SUPABASE_PROJECT_REF}.supabase.co/functions/v1"
+          TRIES=3
+          failed=""
+          for fn in $FNS; do
+            code=000
+            attempt=1
+            while [ "$attempt" -le "$TRIES" ]; do
+              # `|| true` + default keeps a curl timeout/connection error
+              # (non-zero exit, code 000) from aborting the loop under `set -e`,
+              # so every function is probed and reported.
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST --max-time 20 \
+                -H 'content-type: application/json' -d '{}' "$base/$fn" || true)
+              code=${code:-000}
+              case "$code" in
+                # Not-deployed / no-response / crash — treat as a cold-boot
+                # transient: back off and retry, unless this was the last
+                # attempt (then it falls through to fail below).
+                404|000|5??)
+                  if [ "$attempt" -lt "$TRIES" ]; then
+                    echo "retry: $fn → HTTP $code (attempt $attempt/$TRIES)"
+                    sleep $((attempt * 2))
+                  fi
+                  ;;
+                # Any real answer (401/403/400/2xx) → reachable; stop retrying.
+                *) break ;;
+              esac
+              attempt=$((attempt + 1))
+            done
+            case "$code" in
+              404) echo "::error::$fn → HTTP 404 (function not deployed)"; failed="$failed $fn" ;;
+              000) echo "::error::$fn → no response / unreachable (curl 000)"; failed="$failed $fn" ;;
+              5??) echo "::error::$fn → HTTP $code (deployed but erroring)"; failed="$failed $fn" ;;
+              *) echo "✓ $fn → HTTP $code (deployed + reachable)" ;;
+            esac
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::post-deploy smoke failed for:$failed"
+            exit 1
+          fi
+          echo "All functions reachable."

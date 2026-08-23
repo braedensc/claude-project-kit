@@ -163,6 +163,56 @@ append-only log with a shared counter or common tail.
 guard) must be tested in a sandbox repo pinned to a named branch — the kit's battery
 does exactly this.
 
+## Deploys, alerting & scheduled jobs (todoclaw, 2026-07-09 → 2026-07-22)
+
+**Post-merge failures are silent by default — PR-green is SEPARATE from deployed.**
+Todoclaw's prod deploy failed in the Actions tab for hours with nothing surfacing it
+(2026-07-09): every PR check was green, the `workflow_run` deploy after merge was not.
+Fix: a `workflow_run`-triggered alert that opens/comments ONE deduped, stable-titled
+issue when a watched workflow fails on main (`templates/workflows/pipeline-failure-alert.yml`;
+the stable title IS the dedupe key). And **detection without delivery is still silence**
+(PR #242): an auto-opened issue a solo owner doesn't watch is a dead-end — @mention +
+assign the owner on create AND on every comment, so the notification reason becomes
+mention/assign = email + GitHub Mobile phone push, zero new secrets. One manual step:
+install GitHub Mobile and enable push.
+
+**Skip-green preflights become a silent half-deploy hole once secrets exist — and they
+blind the alerting layer.** Skip-green (a fork is never red) is right pre-configuration,
+and stays right for low-stakes crons (backup/keepalive). For the deploy it is
+lifecycle-bound: after the first successful deploy, flip preflights to fail-loud
+(variants commented inline in deploy-on-green.yml). A rotated secret once shipped
+functions against an un-migrated schema on a GREEN run (todoclaw 2026-07-13) — and a
+skipped deploy produces no `failure` event, so pipeline-failure-alert can never fire.
+
+**Hardcoded deploy lists rot — derive targets from the tree, smoke everything with an
+absence classifier.** A hardcoded function list silently omitted a newly added function;
+its cron POST 404'd every minute while every run stayed green (todoclaw #203/#244).
+Glob the deploy list from the repo, REFUSE to deploy an empty list, and probe EVERY
+target. Don't assert one expected status (auth differs per target): classify only
+absence signals as failure (404/000/5xx) and pass anything actually answered
+(401/403/400/2xx). Retry with linear backoff for cold starts (#327) — retry absorbs
+cold-start jitter, it does not paper over a real outage.
+
+**Actions cron silently drops ticks, and schedulers self-report success.** GitHub
+Actions `schedule` is best-effort — ticks at busy times (:00 especially) simply vanish
+(todoclaw #197 lost the user-facing morning push two days running). For time-critical
+work: the platform's own scheduler is primary, an idempotent Actions cron is the
+redundant backup, and every cron runs off the top of the hour. Separately, a scheduler
+saying "succeeded" only covers the trigger: pg_cron reported success all day while the
+HTTP call its SQL made 403'd/404'd (#203). Monitor the downstream EFFECT with a blip
+threshold (e.g. ≥3 failures in 30 min) so a transient never pages but a broken cron
+always does.
+
+**Ordered-file collisions from parallel branches need a PR-time guard plus deploy-time
+tolerance.** Two branches took the same migration timestamp and another sorted before
+remote's latest — `db push` hard-stops on it, and prod fell 5 migrations behind for
+hours (todoclaw 2026-07-09; the written serialization rule existed and was violated
+anyway — see "write a hook" below). Deterministic PR-time check of only the files the
+branch ADDS (`templates/scripts/check-migrations.mjs`: duplicate key, or not sorting
+after base's latest), paired with `--include-all` on deploy-time `db push` so
+legitimately out-of-order merges still apply. Tolerate out-of-order at deploy time,
+enforce ordering at PR time.
+
 ## Environment & tooling
 
 **nvm doesn't apply in non-interactive shells.** Claude Code's shell (and git hooks)

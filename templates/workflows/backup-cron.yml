@@ -50,7 +50,12 @@ name: DB Backup
 
 on:
   schedule:
-    - cron: '0 9 * * *' # 09:00 UTC daily
+    # 09:23 UTC daily — deliberately OFF the top of the hour. Actions cron is
+    # best-effort and sheds load at popular times (:00 especially), silently
+    # dropping ticks (todoclaw PR #197 lost a whole morning's scheduled runs,
+    # two days running). A daily idempotent backup tolerates a dropped tick;
+    # scheduling off :00 just makes drops rarer. See docs/LESSONS.md.
+    - cron: '23 9 * * *'
   workflow_dispatch:
 
 permissions:
@@ -77,6 +82,12 @@ jobs:
 
       # pg_dump must be >= the server's major version. Run it from a pinned
       # Postgres image so the runner's client version can't break the dump.
+      #
+      # Delete-means-delete: if the app promises HARD deletion of anything
+      # (chats, memories, PII), exclude those tables — or every deletion
+      # silently survives in rotated dumps for the 90-day artifact retention
+      # (todoclaw PR #260). Append to the pg_dump line, e.g.:
+      #   --exclude-table=public.chat_messages --exclude-table=public.assistant_memories
       - name: Dump public schema
         if: steps.pre.outputs.configured == 'true'
         env:
