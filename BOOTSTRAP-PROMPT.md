@@ -52,7 +52,8 @@ human-only steps at the end.
 >    monthly budget cap) from docs/SECURITY.md → "AI cost guardrails".
 > 5. Reference-material dir: is there licensed/private reference content? What's its
 >    name? (Kit default: `planning/` — gitignored, never published, hook-guarded.)
-> 6. My machine specifics for `.claude/settings.local.json` (gitignored): e.g. my Node
+> 6. My machine specifics for `.claude/settings.local.json` (gitignored,
+>    self-protected — you'll hand me a terminal command to write it): e.g. my Node
 >    bin dir if `node` doesn't resolve in your shell — I can get it by running
 >    `dirname "$(which node)"` in my own terminal.
 > 7. Testing depth: unit + CI smoke are kit policy; confirm whether a DB-backed golden
@@ -65,18 +66,21 @@ human-only steps at the end.
 >
 > **Phase 4 — execute (on a feature branch; the hooks will insist anyway). Two setup
 > facts change *how* you do a couple of these steps:**
-> - **`.claude/hooks/*.py` and `.claude/settings.json` are self-protected** — the live
->   hook blocks you from editing them (Edit/Write and shell mutations alike). To change
->   one: write the full new version to a scratch file, then hand ME a terminal command
->   to apply it (e.g. `cp <scratch> .claude/hooks/pre-tool-use.py` — run in my terminal,
->   no hook intercepts it), then verify and `git add`/commit it (staging them IS
->   allowed). `.claude/settings.local.json` is NOT protected — write it directly.
+> - **`.claude/hooks/*.py`, `.claude/settings.json`, AND `.claude/settings.local.json`
+>   are self-protected** — the live hook blocks you from editing them (Edit/Write and
+>   shell mutations alike; local settings override project scalars, so they get the
+>   same protection). To change one: write the full new version to a scratch file
+>   (under a *different basename* — interpreter commands naming a protected basename
+>   are blocked too), validate it there, then hand ME a terminal command to apply it
+>   (e.g. `cp <scratch> .claude/hooks/pre-tool-use.py` — run in my terminal, no hook
+>   intercepts it), then verify and `git add`/commit it (staging them IS allowed).
 > - **Check Node resolves before any `npm`:** the committed settings ship NO `PATH`
 >   override (a machine-specific PATH in a template breaks other machines). If
 >   `node`/`npm` don't resolve in your shell (version managers like nvm don't apply
->   non-interactively), write `.claude/settings.local.json` (gitignored, NOT protected)
+>   non-interactively), compose the `.claude/settings.local.json` JSON (gitignored)
 >   with an `env.PATH` that prepends my Node bin — ask me for
->   `dirname "$(which node)"` from my terminal.
+>   `dirname "$(which node)"` from my terminal, then hand me the terminal command to
+>   write the file (it's self-protected, per above).
 >
 > 1. `docs/CLAUDE-template.md` → `CLAUDE.md` (repo root), **overwriting the kit's own
 >    CLAUDE.md that ships here** (it describes maintaining the kit; yours describes my

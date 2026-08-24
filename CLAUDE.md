@@ -49,16 +49,26 @@ never work around it.** Full reference: `.claude/hooks/README.md`.
   auto-merge. (Even *mentioning* `gh pr merge` in a shell command — e.g. a grep
   pattern — trips it; that's expected.)
 - **Self-protection** — **you cannot edit the hook scripts (`pre-tool-use.py`,
-  `audit.py`, `stop-pr-check.py`) or `.claude/settings.json`.** Edit/Write and Bash
-  mutations (`>`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline `-c`/`-e`)
-  of them are blocked; reads are fine. **To change one: write the new version to a
-  scratch file, validate it, then hand the human a terminal command to apply it**
-  (e.g. a small `--write` patch script). This is by design — a guard you can edit is
-  theater. Compose + validate *before* the change lands, since the running hook
-  forbids editing itself and a syntax error fails closed. (docs/LESSONS.md.)
-- **Secrets / destructive ops** — no reading/writing `.env*`/`*.pem`/`*.key`, no
-  embedding secret values, no `rm -rf`, no `curl|sh`, no push to `main`, no bare
+  `audit.py`, `stop-pr-check.py`), `.claude/settings.json`, or
+  `.claude/settings.local.json`.** Edit/Write and Bash mutations (`>`, `sed -i`,
+  `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
+  apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) of
+  them are blocked; reads are fine. **To change one: write the new version to a
+  scratch file (use a different basename — interpreter commands naming a protected
+  basename are blocked), validate it, then hand the human a terminal command to
+  apply it.** This is by design — a guard you can edit is theater. Compose +
+  validate *before* the change lands, since the running hook forbids editing itself
+  and a syntax error fails closed. (docs/LESSONS.md.)
+- **Secrets / destructive ops** — no Bash command *naming* `.env*` (non-example)/
+  `*.pem`/`*.key`/`id_rsa`/`credentials` (path-target match, any leading command),
+  no embedding secret values, no `rm -rf`, no `curl|sh`, no push to `main`, no bare
   `--force`. Stack-specific remote-DB guards are fenced in the hook.
+- **Egress guard** — a network tool (`curl`/`wget`/`scp`/`sftp`/`nc`) aimed at a
+  **non-allowlisted host** with an exfil shape (upload/data flags, `@file` payload,
+  `$VAR` spliced in the URL, or any `scp`/`nc` push) is blocked; plain GETs are
+  fine. Allowlist = localhost, `github.com`, `githubusercontent.com`,
+  `anthropic.com`, `npmjs.org` (+ a fenced stack-specific slot in the hook),
+  matched on domain boundaries — lookalikes like `evil-github.com` don't pass.
 
 **Stop hook** (`.claude/hooks/stop-pr-check.py`) blocks *ending a turn* on a pushed
 branch that has **no PR**, a PR with **failing CI**, or a **DIRTY** (conflict) PR. So:
