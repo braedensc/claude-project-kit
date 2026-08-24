@@ -3,10 +3,10 @@ name: Frontend uptime check
 # ══════════════════════════════════════════════════════════════════════════════
 # Synthetic frontend uptime check — INERT template (activate at bootstrap:
 # `git mv templates/workflows/frontend-uptime.yml .github/workflows/`).
-# Ported near-verbatim from todoclaw's frontend-uptime.yml (PR #242); fully
+# Ported near-verbatim from a production frontend-uptime.yml; fully
 # stack-neutral — the check body is plain curl + grep.
 #
-# The hole this closes (todoclaw's 2026-07-13 incident): the frontend often
+# The hole this closes (a real 2026-07-13 incident): the frontend often
 # deploys via its own host (Vercel/Netlify/Pages) entirely OUTSIDE the deploy
 # pipeline, so a green backend deploy says NOTHING about the app users see. This
 # curls the prod site every ~15 min and, if it is unreachable or not serving the

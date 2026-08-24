@@ -1,7 +1,7 @@
 name: Keep-Alive
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Free-tier anti-pause ping — distilled from todoclaw's keepalive.yml, live in
+# Free-tier anti-pause ping — distilled from a production keepalive.yml, live in
 # production since 2026-07-02. Free-tier Supabase projects are PAUSED after ~7
 # days with no activity; a paused project stops serving the API — an outage.
 # One tiny read-only REST request on a schedule resets the inactivity timer.

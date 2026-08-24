@@ -8,7 +8,7 @@ name: Cron health check
 # the query, keep the chassis. THE GENERAL LAW: a scheduler's success signal
 # does not cover the work it triggers. pg_cron reports a run "succeeded" as long
 # as the SQL ran — but the HTTP call that SQL makes can still fail, and that
-# failure is otherwise SILENT. That's exactly how todoclaw's 2026-07-09 morning
+# failure is otherwise SILENT. That's exactly how a real 2026-07-09 morning
 # push stayed broken all day: the job ran every minute but the function returned
 # 403 (wrong shared secret) / 404 (function never deployed) and nobody knew.
 # Monitor the downstream EFFECT of a scheduled job, with a blip threshold and a

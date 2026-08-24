@@ -1,9 +1,9 @@
 name: CI
 
 # The kit's own CI — the kit lints itself. Layer 3 of the 3-layer security model
-# (docs/SECURITY.md). Distilled from todoclaw's ci.yml (live 2026-06-23 →
-# 2026-07-03); the app-project version with lint/typecheck/test/e2e jobs lives
-# at templates/workflows/ci.yml.
+# (docs/SECURITY.md). Distilled from a production build's ci.yml (live
+# 2026-06-23 → 2026-07-03); the app-project version with lint/typecheck/test/e2e
+# jobs lives at templates/workflows/ci.yml.
 #
 # The job `name:` IS the required-status-check context. Branch protection
 # requiring "Kit checks" is set only AFTER this workflow's first green run on
@@ -81,12 +81,12 @@ jobs:
         run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
 
   # Server-side backstop for hook self-protection (docs/SECURITY.md; ported from
-  # todoclaw's GAP-1 audit job, PR #117). Local self-protection constrains only
+  # a production build's audit job). Local self-protection constrains only
   # sessions that run the hook — a PR authored anywhere else (another clone, the
   # GitHub web UI, an @claude workflow) never meets it. So a PR that changes the
   # guard machinery (.claude/hooks/** or .claude/settings*.json) must not land
   # unnoticed: it has to carry an explicit `hooks-change` label.
-  # Operational notes (learned in todoclaw):
+  # Operational notes (learned in production):
   #   - the `hooks-change` label must EXIST in the repo before this job's first
   #     run can pass on a guarded PR (gh label create hooks-change …);
   #   - adding/removing the label re-runs the check via the labeled/unlabeled

@@ -9,12 +9,12 @@ self-merged PRs, edits to the guards themselves), git-level secret scanning, CI 
 ready-to-adapt deploy/backup workflows, and the process docs that keep multi-session
 agentic development coherent.
 
-Everything here is **distilled, not invented** — generalized from
-[todoclaw](https://github.com/braedensc/todoclaw), a production app built with Claude
-Code in a 10-day staged build, plus its retrospective. Every generalized file carries
-a provenance header saying where it came from and what was verified in production.
-(Headers cite todoclaw-internal artifacts — `ADR-00xx`, PR numbers, `SERVICES.md` —
-as provenance breadcrumbs; they aren't links into *this* repo.) MIT licensed.
+Everything here is **distilled, not invented** — generalized from a production app
+built with Claude Code in a 10-day staged build, plus its retrospective. Every
+generalized file carries a provenance header saying where it came from and what was
+verified in production. (Some headers cite artifacts from that build — `ADR-00xx`,
+PR numbers — as provenance breadcrumbs; they aren't links into *this* repo.)
+MIT licensed.
 
 ## Prerequisites
 

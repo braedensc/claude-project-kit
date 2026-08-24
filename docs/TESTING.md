@@ -1,8 +1,8 @@
 # Testing Model
 
-The pyramid as actually built and run in todoclaw (2026-06-23 → 2026-07-03; 135+ unit
-tests, 11-spec golden E2E suite, smoke in CI on every PR). Sources: ADR-0008/0011/0018/
-0020, both Playwright configs, and the e2e harness.
+The pyramid as actually built and run in a production build (2026-06-23 → 2026-07-03;
+135+ unit tests, 11-spec golden E2E suite, smoke in CI on every PR). Sources: that
+build's testing ADRs, both Playwright configs, and the e2e harness.
 
 ---
 
@@ -84,7 +84,7 @@ desktop and mobile. Coordinates, when unavoidable, are viewport-independent frac
 AI endpoints are route-mocked per spec with canned JSON and a canned **SSE stream**
 (same wire format the server emits: `data: {json}\n\n`). Three details that bit:
 - Answer OPTIONS preflights in mocks, and include every header the client actually
-  sends (todoclaw: `x-client-info`) or the preflight rejects before the POST fires.
+  sends (e.g. `x-client-info`) or the preflight rejects before the POST fires.
 - Register a **catch-all escape detector first** (later-registered routes win), abort +
   record anything unmocked, and end specs with `expect(escapes()).toEqual([])` — the
   zero-real-spend proof.
@@ -115,7 +115,7 @@ uses the shared helpers.
 ## Evaluating AI/prompt surfaces
 
 If the app has prompts, they're code — test them like code. Process rules distilled
-from todoclaw's eval harness and its de-rot arc (PRs #323–#378):
+from a production eval harness and its de-rot arc:
 
 - **Prompt changes get measured, not eyeballed:** run the eval suite against a
   git-native baseline and compare — "the output looks better" is not a review.

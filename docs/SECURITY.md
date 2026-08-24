@@ -86,7 +86,7 @@ scanning, **push protection**, Dependabot security updates. They backstop layer 
 A security rule that lives only in CLAUDE.md is advisory — the model can drift
 from it and nobody is told. The pattern that held in production: **every written
 security rule gets a deterministic, dependency-free CI scanner that fails when a
-new surface appears without a reviewed allowlist entry.** todoclaw's five
+new surface appears without a reviewed allowlist entry.** The origin build's five
 scanner jobs are the worked example — static RLS coverage, live-DB RLS proof, a
 write-capability audit, a `SECURITY DEFINER` grant audit, and an edge-function
 outbound-fetch allowlist — each a small script with its own tests, each job

@@ -1,9 +1,9 @@
 #!/bin/sh
 # Pre-commit hook — layer 2 of 3 (bypassable via --no-verify; CI is the real gate).
-# Distilled from todoclaw's .husky/pre-commit — in production 2026-06-23 → 2026-07-03,
-# including the worktree-aware secretlint resolution (husky's core.hooksPath means
-# worktree commits run this file even before the worktree has node_modules —
-# see docs/LESSONS.md).
+# Distilled from a production build's .husky/pre-commit — in production
+# 2026-06-23 → 2026-07-03, including the worktree-aware secretlint resolution
+# (husky's core.hooksPath means worktree commits run this file even before the
+# worktree has node_modules — see docs/LESSONS.md).
 #
 # NOTE: git runs this via husky's runner under `sh -e` (any unguarded non-zero
 # exit aborts the script), and it inherits the nvm *default* node — which may be
