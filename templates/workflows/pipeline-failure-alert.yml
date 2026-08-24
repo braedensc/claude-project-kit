@@ -1,13 +1,13 @@
 name: Pipeline failure alert
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Post-merge failures must be loud — ported near-verbatim from todoclaw's
-# deploy-failure-alert.yml (PR #199, delivery hardened in #242), born from the
-# 2026-07-09 incident: a PR's CI going green is SEPARATE from the post-merge
-# prod deploy, and the deploy failed in the Actions tab for hours with nothing
-# surfacing it. This reacts to a watched workflow finishing with `failure` on
-# main and opens (or comments on) ONE deduplicated GitHub issue, @mentioning and
-# assigning the repo owner so the alert actually reaches a human.
+# Post-merge failures must be loud — ported near-verbatim from a production
+# deploy-failure-alert.yml, born from the 2026-07-09 incident: a PR's CI going
+# green is SEPARATE from the post-merge prod deploy, and the deploy failed in
+# the Actions tab for hours with nothing surfacing it. This reacts to a watched
+# workflow finishing with `failure` on main and opens (or comments on) ONE
+# deduplicated GitHub issue, @mentioning and assigning the repo owner so the
+# alert actually reaches a human.
 #
 # STACK-NEUTRAL: pure actions/github-script + context.repo.owner — zero new
 # secrets, zero placeholders, and decoupled via workflow_run (no edits to the

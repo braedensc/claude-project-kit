@@ -36,7 +36,7 @@ git rm -r templates/                      # one-way: this README goes too
 # STACK-SPECIFIC sections.
 ```
 
-Every template carries a header comment stating its todoclaw provenance and
+Every template carries a header comment stating its provenance and
 what was verified in production. Scheduled + secret-dependent jobs follow the
 **preflight-skip-green** pattern: they merge before any secret exists and run
 green-but-skipped until configured — a fork is never red out of the box. For

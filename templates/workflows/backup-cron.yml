@@ -1,7 +1,7 @@
 name: DB Backup
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Daily ENCRYPTED pg_dump → GitHub Actions artifact — distilled from todoclaw's
+# Daily ENCRYPTED pg_dump → GitHub Actions artifact — distilled from a production
 # backup.yml, verified working in production 2026-06-23 → 2026-07-03 (restore
 # round-trip proven before ship: seed → dump → encrypt → wipe → decrypt →
 # restore → rows + RLS recovered).
@@ -52,7 +52,7 @@ on:
   schedule:
     # 09:23 UTC daily — deliberately OFF the top of the hour. Actions cron is
     # best-effort and sheds load at popular times (:00 especially), silently
-    # dropping ticks (todoclaw PR #197 lost a whole morning's scheduled runs,
+    # dropping ticks (in production this lost a whole morning's scheduled runs,
     # two days running). A daily idempotent backup tolerates a dropped tick;
     # scheduling off :00 just makes drops rarer. See docs/LESSONS.md.
     - cron: '23 9 * * *'
@@ -84,10 +84,10 @@ jobs:
       # Postgres image so the runner's client version can't break the dump.
       #
       # Delete-means-delete: if the app promises HARD deletion of anything
-      # (chats, memories, PII), exclude those tables — or every deletion
+      # (messages, embeddings, PII), exclude those tables — or every deletion
       # silently survives in rotated dumps for the 90-day artifact retention
-      # (todoclaw PR #260). Append to the pg_dump line, e.g.:
-      #   --exclude-table=public.chat_messages --exclude-table=public.assistant_memories
+      # (learned in production). Append to the pg_dump line, e.g.:
+      #   --exclude-table=public.messages --exclude-table=public.embeddings
       - name: Dump public schema
         if: steps.pre.outputs.configured == 'true'
         env:

@@ -1,13 +1,13 @@
-// check-migrations.mjs — PR-time guard for ORDERED FILE FAMILIES, ported from todoclaw
-// (PRs #198/#199). It catches, deterministically and before merge, the two collision modes
-// parallel branches produce in any directory of version-ordered files:
+// check-migrations.mjs — PR-time guard for ORDERED FILE FAMILIES, ported from a
+// production build. It catches, deterministically and before merge, the two collision
+// modes parallel branches produce in any directory of version-ordered files:
 //   1. DUPLICATE version — two files sharing the same ordering key. Supabase keys migrations
 //      by the 14-digit timestamp (schema_migrations primary key), so the second collides and
 //      errors db push/reset.
 //   2. OUT-OF-ORDER version — a new file that sorts BEFORE one already on the base branch.
 //      `supabase db push` hard-stops on it ("…inserted before the last migration on remote…")
 //      and applies NOTHING further — every later migration AND the function deploy silently
-//      stall. On 2026-07-09 exactly this wedged todoclaw's prod deploys for hours.
+//      stall. On 2026-07-09 exactly this wedged prod deploys for hours.
 //
 // Both are checked against the base branch (default origin/main), judging ONLY the files this
 // branch ADDS — pre-existing history is left alone — so the author gets an instant, hard

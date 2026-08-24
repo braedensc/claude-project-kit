@@ -1,7 +1,7 @@
 name: Deploy (prod)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# The deploy-on-green pattern — distilled from todoclaw's deploy.yml (ADR-0022),
+# The deploy-on-green pattern — distilled from a shipped deploy.yml,
 # live in production since 2026-07-02: it ran the real cutover deploy (migrations
 # + Edge Functions) and every deploy after it.
 #
@@ -47,7 +47,7 @@ name: Deploy (prod)
 #
 # ── Config (repo → Settings → Secrets and variables → Actions) ────────────────
 #   Secret   BACKUP_DATABASE_URL   = prod DB connection string used for
-#            migrations. Todoclaw REUSED the backup job's secret (one secret,
+#            migrations. This pattern REUSES the backup job's secret (one secret,
 #            one source of truth — the free Supabase pooler forces the same
 #            `postgres` user for read and write anyway). See
 #            templates/workflows/backup-cron.yml for the IPv4/pooler gotchas.
@@ -65,9 +65,9 @@ name: Deploy (prod)
 #   AFTER YOUR FIRST SUCCESSFUL DEPLOY, flip both preflights to the fail-loud
 #   variants commented inline below. Post-seed, a missing/rotated secret must
 #   FAIL the run: a silent skip once shipped functions against an un-migrated
-#   schema with the run still green (todoclaw PR #242, the 2026-07-13 incident) —
-#   and a green run is invisible to pipeline-failure-alert.yml, which only fires
-#   on a FAILED conclusion.
+#   schema with the run still green (the 2026-07-13 incident) — and a green run
+#   is invisible to pipeline-failure-alert.yml, which only fires on a FAILED
+#   conclusion.
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -144,7 +144,7 @@ jobs:
             #   echo "::error::BACKUP_DATABASE_URL not set — cannot apply migrations. Set it (Settings → Secrets → Actions) and re-run Deploy (prod)."
             #   exit 1
             # Post-seed, skip-green means a rotated/vanished secret ships a silent
-            # half-deploy forever: todoclaw 2026-07-13 shipped functions against an
+            # half-deploy forever: 2026-07-13 saw functions shipped against an
             # un-migrated schema on a GREEN run, and the alert workflow (which only
             # fires on a `failure` conclusion) never saw it.
             # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +171,7 @@ jobs:
       # out of timestamp order (a branch cut before another's migration lands
       # ends up "in the past"); without this flag, db push hard-stops on the
       # first such file and NO further migration or function deploy reaches
-      # prod — todoclaw PR #198: prod silently fell 5 migrations behind for
+      # prod — in one incident prod silently fell 5 migrations behind for
       # hours. Versions stay unique, so ordering within a push is deterministic;
       # --include-all only relaxes the "must be newer than remote's latest"
       # guard. Ordering is enforced at PR time instead — see
@@ -220,7 +220,7 @@ jobs:
             #   exit 1
             # Post-seed, skip-green means a rotated credential leaves prod silently
             # running the stale function bundle on a green run — no failure event,
-            # no alert (todoclaw PR #242).
+            # no alert.
             # ─────────────────────────────────────────────────────────────────────────────
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -247,8 +247,8 @@ jobs:
           # index.ts; globbing */index.ts naturally excludes _shared (a helper
           # dir, no index.ts) and any non-function file. A newly added function
           # is now deployed AND smoke-tested automatically — a hardcoded
-          # omission once left todoclaw's dispatch-reminders undeployed while
-          # its cron POST 404'd every minute, silently green (PRs #203/#244).
+          # omission once left a scheduled function undeployed while its cron
+          # POST 404'd every minute, silently green.
           fns=""
           for idx in supabase/functions/*/index.ts; do
             [ -f "$idx" ] || continue # zero matches → literal glob; skip it
@@ -294,9 +294,9 @@ jobs:
       # CORS/ALLOWED_ORIGIN verification is a separate manual step (needs the
       # prod origin) — see docs/SECURITY.md.
       #
-      # Retry with backoff (todoclaw #327): a function's FIRST hit after deploy
-      # is a COLD isolate boot, so a single probe can exceed --max-time and 000
-      # an otherwise-healthy deploy (a docs-only deploy once failed on exactly
+      # Retry with backoff: a function's FIRST hit after deploy is a COLD
+      # isolate boot, so a single probe can exceed --max-time and 000 an
+      # otherwise-healthy deploy (a docs-only deploy once failed on exactly
       # that). Probe each function up to $TRIES times with linear backoff — the
       # first attempt doubles as a warmup, and only a function STILL failing on
       # its LAST attempt fails the step. Retry absorbs cold-start jitter, it
