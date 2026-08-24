@@ -132,7 +132,7 @@ human-only steps at the end.
 >    generator overwrite package.json, .gitignore, .husky/, or .claude/**
 >    (docs/STACK-RATIONALE.md, "explicit over clever"). Merge kit package.json
 >    scripts/devDeps into the scaffold's result; add `lint-staged` if the stack wants
->    it (the pre-commit hook picks it up automatically) — todoclaw's proven config:
+>    it (the pre-commit hook picks it up automatically) — a proven production config:
 >    `"lint-staged": {"*.{ts,tsx}": ["eslint --fix", "prettier --write"],
 >    "*.{css,html}": "prettier --write"}`.
 > 8. Create `docs/SETUP.md` (prerequisites table w/ version floors + the Node gotcha

@@ -1,15 +1,14 @@
-# Todoclaw-parity hook hardening + subagent session-root fix
+# Hook hardening + subagent session-root fix
 
 **Status:** Accepted
 
-**Date:** 2026-08-23 · **Context:** todoclaw-parity audit (post-fork lessons from
-todoclaw's continued production use, esp. its PR #309 and GAP 2/3/4 audit) + a
-cross-worktree-guard bug confirmed by three independent subagent sessions during
-this initiative
+**Date:** 2026-08-23 · **Context:** an audit of lessons from continued production
+use of the build this kit was distilled from, plus a cross-worktree-guard bug
+confirmed by three independent subagent sessions during this initiative
 
 ## Decision
 
-Port todoclaw's post-fork hook hardening into `pre-tool-use.py` and `settings.json`
+Port that production hook hardening into `pre-tool-use.py` and `settings.json`
 (both self-protected, so they land via the human-terminal apply flow), and fix how
 the hook resolves the acting session's root:
 
@@ -27,8 +26,7 @@ the hook resolves the acting session's root:
    `scp`/`nc` push) blocks; plain GETs stay allowed. The allowlist is a
    domain-boundary suffix match (universal core: localhost, `github.com`,
    `githubusercontent.com`, `anthropic.com`, `npmjs.org`) plus a fenced
-   stack-specific slot (todoclaw's `supabase.co`/`supabase.com` as the worked
-   example).
+   stack-specific slot (a managed-backend host pair as the worked example).
 4. **`rm` short-flag runs are anchored** to the start of an argument token, so
    interior dashes in filenames (`rm build-for-prod.txt`) no longer false-block.
 5. **Self-protection widened** — `settings.local.json` joins the protected set
@@ -47,8 +45,8 @@ the hook resolves the acting session's root:
 
 ## Why
 
-Items 1–6 are straight parity: todoclaw hit each failure in production after the
-kit forked, and every one is portable (no stack coupling). The kit keeps its own
+Items 1–6 are straight parity: each failure was hit in production after the kit
+forked, and every one is portable (no stack coupling). The kit keeps its own
 guards intact — this is additive hardening, not a rewrite.
 
 Item 7 fixes a real bug with a real hole. Hooks are invoked as

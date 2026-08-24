@@ -1,9 +1,10 @@
 # Collaboration & Multi-Agent Workflow
 
 How multiple people — and multiple Claude Code sessions — work on the same repo at the
-same time without stepping on each other. Ported near-verbatim from todoclaw's
-COLLABORATION.md (proven by running two Claude sessions in parallel on one repo for
-the final build milestones, 2026-07-01 → 03) plus the retro's fast-merge protocol.
+same time without stepping on each other. Ported near-verbatim from a production
+build's COLLABORATION.md (proven by running two Claude sessions in parallel on one
+repo for the final build milestones, 2026-07-01 → 03) plus that retro's fast-merge
+protocol.
 
 **Key mental model:** Claude Code does **not** coordinate across machines. Each session
 is isolated and has no idea other humans or agents exist. Coordination is **git +
@@ -58,7 +59,7 @@ still never push to `main` directly.
 
 **Opening the PR is where Claude's involvement ends. Merging is the human's action
 only — never `gh pr merge` in any form, including `--auto`; enabling auto-merge still
-means the agent caused the merge** (a real todoclaw near-miss, 2026-07-03 — now
+means the agent caused the merge** (a real near-miss in production, 2026-07-03 — now
 hook-blocked). The repo-level `allow_auto_merge` *setting* may stay enabled for the
 human's own use — the boundary is the agent never invoking a merge, not the setting. **And watch CI to green before considering the task done:**
 `gh pr checks <n> --watch`; if a check fails, read the failing job's log, fix, push,
