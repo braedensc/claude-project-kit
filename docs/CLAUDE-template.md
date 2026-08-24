@@ -79,8 +79,12 @@ bound them. Bundled skills already exist (`/code-review`, `/security-review`, `/
 `/run`, `/verify`) — don't reinvent them.
 
 **Cost & memory:** delegate search/read to `model: haiku` subagents; keep the main
-model for judgment. `CLAUDE.md` is *authored* rules (loaded every session); the
-machine-local `MEMORY.md` auto-memory is Claude-*discovered* learnings — don't conflate.
+model for judgment. Three memory layers, don't conflate them: `CLAUDE.md` is
+*authored* rules (committed — its primary reader is the agent in ANY clone, so it
+must stand alone in a fresh clone); machine-local instructions (private paths,
+personal runners, reference material only you have) go in gitignored
+`CLAUDE.local.md`, which Claude Code auto-loads alongside it; the machine-local
+`MEMORY.md` auto-memory is Claude-*discovered* learnings.
 
 ---
 

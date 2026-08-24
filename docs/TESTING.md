@@ -109,3 +109,22 @@ uses the shared helpers.
 - Never receives real keys for tests — dummy env only.
 - Never points any test at production. Prod verification is a **deliberate, scripted
   smoke after deploy** (reachability + auth + CORS), not a test suite.
+
+---
+
+## Evaluating AI/prompt surfaces
+
+If the app has prompts, they're code — test them like code. Process rules distilled
+from todoclaw's eval harness and its de-rot arc (PRs #323–#378):
+
+- **Prompt changes get measured, not eyeballed:** run the eval suite against a
+  git-native baseline and compare — "the output looks better" is not a review.
+- **Judge rubrics enumerate FAIL conditions only, with a default-pass judge.**
+  Rubrics that grade quality (score warmth, count flourishes) are flaky; rubrics
+  that name concrete failure conditions are stable.
+- **Pin fixture clocks.** Date-relative fixtures rot silently as real time passes.
+- **Dedicated non-prod eval API key** (e.g. `EVAL_ANTHROPIC_API_KEY`), and the
+  harness hard-refuses any non-local backend — an eval run must never touch prod
+  data or spend against the prod key.
+- **Evals rot alongside the prompts they pin:** when prompts churn, schedule a
+  de-rot pass over the suite in the same arc, not "someday".

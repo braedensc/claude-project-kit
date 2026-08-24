@@ -19,7 +19,7 @@ the kebab-case slug; the rest of `$ARGUMENTS` is an optional one-line summary.
    ```markdown
    # <Title>
 
-   **Date:** <today> · **Context:** <branch / PR #>
+   **Date:** <today> · **Status:** Accepted · **Context:** <branch / PR #>
 
    ## Decision
    <what, in 2–4 sentences>

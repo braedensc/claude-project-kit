@@ -38,6 +38,7 @@ e2e/.auth/
 .DS_Store
 
 # Claude Code runtime (local-only, never project config)
+CLAUDE.local.md
 .claude/audit.log
 .claude/settings.local.json
 .claude/launch.json
