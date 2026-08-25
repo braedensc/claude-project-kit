@@ -1,0 +1,177 @@
+name: PR conflict monitor
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The kit's OWN conflict monitor — the ACTIVE twin of the inert app-project
+# template at templates/workflows/pr-conflict-monitor.yml. The template stays
+# inert (app projects activate it with `git mv` at bootstrap); this copy is
+# adapted for this repo and runs here.
+#
+# The hole it closes: the Stop hook's DIRTY gate (.claude/hooks/stop-pr-check.py)
+# reads a PR's merge state only at TURN-END, only in the session that owns the
+# branch. The kit's normal mode is several parallel PRs off one main, so the
+# common case is a PR that is clean when its session ends and goes CONFLICTING
+# LATER, when a sibling merges. Nothing was watching for that — PR #27 sat DIRTY
+# unnoticed while its required CI silently never ran (2026-08-24).
+#
+# Adaptations vs. the template (each is deliberate — see docs/LESSONS.md):
+#   • Triggers on PUSH TO MAIN, not just a schedule. A sibling merging IS the
+#     event that makes the others conflict, so the alert should not wait for the
+#     next tick. The hourly schedule stays as the backstop for the other causes
+#     (a PR force-pushed onto a stale base, a moved stacked base).
+#   • Bounded re-query for UNKNOWN. GitHub computes `mergeable` LAZILY — asking
+#     starts the computation — so right after a push to main every PR reads
+#     UNKNOWN. The template can shrug that off ("skip this tick"; the next run is
+#     30 min away). An event-driven run cannot: skipping the tick would skip the
+#     whole point. So this copy re-queries a FIXED number of times and then
+#     gives up. Bounded, never a retry loop.
+#   • No `@claude` handoff line. The template's Tier 1 comment offers one, and
+#     its Tier 2 posts it — both need claude.yml, which this repo does not run.
+#     Suggesting a reply that would do nothing here is worse than no suggestion.
+#
+# Unchanged from the template — the parts that are the design:
+#   • The LABEL is the dedupe key. CONFLICTING + unlabeled → label + exactly ONE
+#     comment. CONFLICTING + already labeled → say nothing (no nag loop).
+#     MERGEABLE + labeled → remove the label, so the NEXT conflict re-alerts.
+#   • Drafts are skipped, and THIS WORKFLOW NEVER MERGES, rebases, or pushes. It
+#     reports; a human fixes. (The local never-merge hooks cannot reach a GitHub
+#     Actions runner, so that rule has to hold by construction here.)
+#
+# Zero new secrets. Scheduled runs only ever fire from the default branch, so the
+# schedule goes live when this lands on main; use workflow_dispatch to test.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '27 * * * *' # hourly backstop, off the top of the hour to dodge Actions load
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # labels + comments on a PR go through the issues API
+  pull-requests: write
+
+# Three triggers can collide (a merge to main during a scheduled tick). Serialize
+# rather than cancel: a cancelled run could die between "add label" and "post
+# comment", leaving the dedupe key set with nothing explaining it.
+concurrency:
+  group: pr-conflict-monitor
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan open PRs for conflicts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Label + comment on conflicted PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const LABEL = 'conflict'
+            const MAX_ATTEMPTS = 5      // ≈ 60s worst case, well inside timeout-minutes
+            const RETRY_DELAY_MS = 15000
+
+            // Ensure the label exists (idempotent) — auto-managed, nobody should have
+            // to pre-create it for the first run to work.
+            try {
+              await github.rest.issues.createLabel({
+                owner, repo, name: LABEL, color: 'd93f0b',
+                description: 'Merge conflicts with main (auto-managed by pr-conflict-monitor)',
+              })
+            } catch (e) {
+              if (e.status !== 422) throw e // 422 = already exists; anything else is real
+            }
+
+            // One GraphQL call gets every open PR with its computed merge state.
+            // first: 100 is plenty for this repo; add pagination if that ever changes.
+            const fetchPRs = async () => {
+              const result = await github.graphql(`
+                query($owner: String!, $repo: String!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequests(states: OPEN, first: 100) {
+                      nodes {
+                        number
+                        isDraft
+                        mergeable
+                        headRefName
+                        labels(first: 100) { nodes { name } }
+                      }
+                    }
+                  }
+                }`, { owner, repo })
+              return result.repository.pullRequests.nodes.filter((pr) => !pr.isDraft)
+            }
+
+            // Bounded wait for mergeability to settle. The FIRST call is what asks
+            // GitHub to compute it; later calls read the answer. Give up after
+            // MAX_ATTEMPTS and treat whatever is still UNKNOWN as "not conflicting" —
+            // the next run re-checks it. Never loop until it settles.
+            let prs = await fetchPRs()
+            for (let attempt = 2; attempt <= MAX_ATTEMPTS; attempt++) {
+              const pending = prs.filter((pr) => pr.mergeable === 'UNKNOWN')
+              if (pending.length === 0) break
+              core.info(
+                `mergeability still computing for ${pending.map((p) => '#' + p.number).join(', ')}` +
+                ` — re-querying (attempt ${attempt}/${MAX_ATTEMPTS})`
+              )
+              await new Promise((r) => setTimeout(r, RETRY_DELAY_MS))
+              prs = await fetchPRs()
+            }
+
+            let conflicted = 0
+            for (const pr of prs) {
+              const hasLabel = pr.labels.nodes.some((l) => l.name === LABEL)
+
+              if (pr.mergeable === 'CONFLICTING' && !hasLabel) {
+                // New conflict episode: set the dedupe key FIRST, then comment once.
+                // (Label-then-comment means a mid-step failure re-alerts on the next
+                // run at worst; comment-then-label could double-comment.)
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: pr.number, labels: [LABEL],
+                })
+                const body = [
+                  `\`${pr.headRefName}\` has **merge conflicts** with \`main\` (mergeable = CONFLICTING).`,
+                  '',
+                  'While conflicted, GitHub cannot build the merge ref, so the **required "Kit checks" run never happens** — any side check can still report green. Do not read that as a passing PR.',
+                  '',
+                  'Fix (the canonical recipe):',
+                  '',
+                  '```',
+                  'git fetch origin main && git rebase origin/main',
+                  '# resolve conflicts, then:',
+                  'git push --force-with-lease',
+                  `gh pr checks ${pr.number} --watch`,
+                  '```',
+                  '',
+                  'This label clears itself once the PR is mergeable again, so a later conflict re-alerts.',
+                  '',
+                  // @mention + assign so this lands even under a
+                  // "Participating and @mentions" watch setting.
+                  `cc @${owner} — this PR cannot merge and its required CI is not running.`,
+                ].join('\n')
+                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body })
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number: pr.number, assignees: [owner] })
+                } catch (e) {
+                  core.info(`could not assign @${owner} on #${pr.number}: ${e.message}`)
+                }
+                conflicted++
+                core.info(`#${pr.number}: CONFLICTING — labeled + commented`)
+              } else if (pr.mergeable === 'CONFLICTING') {
+                conflicted++
+                core.info(`#${pr.number}: still CONFLICTING — already flagged, staying quiet`)
+              } else if (pr.mergeable === 'MERGEABLE' && hasLabel) {
+                // Resolved: drop the dedupe key so a FUTURE conflict alerts again.
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: pr.number, name: LABEL,
+                })
+                core.info(`#${pr.number}: mergeable again — label removed`)
+              } else if (pr.mergeable === 'UNKNOWN') {
+                core.info(`#${pr.number}: mergeability never settled — leaving for the next run`)
+              }
+            }
+            core.info(`scanned ${prs.length} open non-draft PR(s); ${conflicted} conflicted`)

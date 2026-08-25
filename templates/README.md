@@ -5,6 +5,11 @@ workflows would fail (or worse, run) against the bare kit, and the kit's own CI
 must stay green. They become real when BOOTSTRAP-PROMPT.md moves them into
 place in your new project.
 
+**One exception:** the kit runs its own adapted, *active* copy of
+`pr-conflict-monitor.yml` at `.github/workflows/` — parallel PRs off one `main`
+make the conflict hazard real in this repo too. The template below stays inert
+and unchanged; app projects still activate it the normal way.
+
 | Template | Activates to | What it is |
 |---|---|---|
 | `workflows/ci.yml` | `.github/workflows/ci.yml` (replacing the kit's own) | App CI: secret-scan + forbidden paths, lint, typecheck, test, non-required e2e smoke |
