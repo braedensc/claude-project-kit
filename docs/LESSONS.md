@@ -150,6 +150,21 @@ DIRTY PR as done: rebase onto latest main, resolve, force-push, re-watch CI. The
 Stop hook now blocks turn-end on `mergeStateStatus == DIRTY` (only explicit DIRTY, not
 the transient UNKNOWN right after a push).
 
+**A turn-end gate can't see a PR that goes DIRTY *after* the turn.** The Stop hook
+above reads merge state at turn-end, in the session that owns the branch — so the PR
+that was clean when its session ended and conflicted later, when a *sibling* merged,
+is exactly the one it misses. With several parallel PRs off one `main` that is the
+common case, not the edge: PR #27 opened clean and was conflicted a minute later,
+when a sibling touching the same two files merged, and nothing flagged it
+(2026-08-24). A gate inside the session cannot cover a state change outside it — that
+needs a standing watcher, so the kit now runs
+`.github/workflows/pr-conflict-monitor.yml` on every push to `main` (the merge IS the
+event that conflicts the siblings) plus an hourly backstop. The `conflict` label is
+the dedupe key: one comment per episode, cleared when the PR is mergeable again so a
+later conflict re-alerts. Event-driven costs one wrinkle — GitHub computes
+`mergeable` lazily, so a run right after a push reads `UNKNOWN` and must re-query a
+*bounded* number of times before giving up.
+
 **A hook that compares to *local* `main` false-nags — use `origin/main`.** In PR flow
 you branch off `origin/main` and rarely update local `main`, so it lags (often several
 merged PRs behind). A check like `git merge-base --is-ancestor HEAD main` against
