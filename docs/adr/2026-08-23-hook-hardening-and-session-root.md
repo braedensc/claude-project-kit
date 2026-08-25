@@ -84,6 +84,14 @@ Accepted tradeoffs:
   purpose: the `--git-common-dir` check keeps widening inside one repo, and every
   other guard (self-protection, `rm -rf`, secrets, egress, push-to-main,
   `gh pr merge`) is root-independent and still fires.
+- **A main session can no longer edit another worktree, even deliberately.**
+  `EnterWorktree` switches the session's cwd but not `CLAUDE_PROJECT_DIR`, and the
+  anchor ignores cwd for a main session — so the cross-worktree guard still judges
+  writes against the original checkout and blocks them. This is the cost of the
+  anchor being immovable: the hook cannot tell a deliberate switch from a stray
+  `cd`, which is exactly the ambiguity that made the cwd-derived draft unsafe. The
+  supported route into another worktree is a subagent rooted there (its payload
+  carries `agent_id`, so the widening applies) — or a session started in it.
 - Interpreter invocations *naming* a protected basename are blocked even against
   scratch copies (e.g. `python3 -m py_compile <scratch>/pre-tool-use.py`) —
   accepted; validate drafts under a different basename, or let the battery (which

@@ -295,6 +295,18 @@ def main():
     stop_green_root, stop_green, stop_green_env = make_stop_sandbox(
         '[{"number":7,"state":"OPEN"}]',
         '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    # Red ONLY on a human-pending check: no code change clears it, so nagging
+    # Claude to "fix it and push" would deadlock the turn against the very
+    # acknowledgment the guard exists to demand from a person.
+    stop_pending_root, stop_pending, stop_pending_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"},'
+        '{"name":"Hooks change guard","conclusion":"FAILURE"}]}')
+    # ...but a human-pending check must never MASK a real failure alongside it.
+    stop_mixed_root, stop_mixed, stop_mixed_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"},'
+        '{"name":"Hooks change guard","conclusion":"FAILURE"}]}')
     stop_dirty_root, stop_dirty, stop_dirty_env = make_stop_sandbox(
         '[{"number":7,"state":"OPEN"}]',
         '{"mergeStateStatus":"DIRTY","statusCheckRollup":[{"name":"CodeQL","conclusion":"SUCCESS"}]}')
@@ -597,6 +609,10 @@ def main():
          {}, BLOCK, stop_dirty, stop_dirty_env),
         ("stop: stale local main + HEAD==origin/main does NOT nag (base-ref fix)",
          {}, ALLOW, stale_stop, stale_env),
+        ("stop: red ONLY on a human-pending check does NOT nag (label, not a defect)",
+         {}, ALLOW, stop_pending, stop_pending_env),
+        ("stop: a human-pending check does not mask a real failure beside it",
+         {}, BLOCK, stop_mixed, stop_mixed_env),
     ]
 
     failures = 0
@@ -660,7 +676,7 @@ def main():
     for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
               wt_codename, nongit_dir, unrelated_root, merged_root, open_root,
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,
-              stop_dirty_root, stale_root):
+              stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root):
         shutil.rmtree(r, ignore_errors=True)
 
     # Counts EVERY assertion, reason_cases included — an under-reported total once
