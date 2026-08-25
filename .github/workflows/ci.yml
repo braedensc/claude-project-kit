@@ -108,6 +108,12 @@ jobs:
       - name: Auto-merge tier selftest (contract §11)
         run: python3 scripts/check_auto_merge.py --selftest
 
+      # The gate below ("Hooks change guard") runs the BASE copy of this script,
+      # so its own logic is verified here on the head — gated set and, above all,
+      # who is allowed to supply the acknowledging label.
+      - name: Grader-path gate selftest (floor + label identity)
+        run: python3 scripts/check_grader_paths.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
@@ -185,6 +191,12 @@ jobs:
     name: Hooks change guard
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    # `issues: read` is what lets the job ask WHO applied the label (the PR
+    # events API). Without it the applier is unknowable and the gate fails closed.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -195,4 +207,19 @@ jobs:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/check_grader_paths.py
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Run the BASE revision of the gate, never the PR's own copy. A head
+          # that can rewrite FLOOR — or delete the identity check below it — is
+          # grading its own homework; this is the same rule the script already
+          # applies to delivery.json, extended to the script itself. The fallback
+          # covers only the commit that first introduces the file.
+          gate="$RUNNER_TEMP/check_grader_paths.py"
+          if ! git show "$BASE_SHA:scripts/check_grader_paths.py" > "$gate" 2>/dev/null; then
+            echo "::notice::base has no grader script yet — using the head copy"
+            cp scripts/check_grader_paths.py "$gate"
+          fi
+          python3 "$gate"

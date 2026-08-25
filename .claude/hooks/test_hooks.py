@@ -57,6 +57,15 @@ FAKE_GH_TOKEN = "ghp" + "_" + "A" * 40
 FAKE_AWS_KEY = "AKIA" + "0" * 16
 FAKE_KEY_BLOCK = "-----BEGIN " + "PRIVATE KEY-----"
 
+# ── protected labels, assembled for the SAME reason the secrets above are ───
+# A literal label-application string in this file would trip the very guard these
+# cases assert, blocking edits to — and greps of — this file. Same doctrine, new
+# guard. (Keep in step with PROTECTED_LABEL_* in the hook and §6 of the contract.)
+LBL_HOOKS = "hooks" + "-change"
+LBL_NEEDS_HUMAN = "agent" + ":needs-human"
+LBL_BLOCKED = "agent" + ":blocked"
+LBL_PROV = "provenance" + ":epic"
+
 
 def bash(c):
     return {"tool_name": "Bash", "tool_input": {"command": c}}
@@ -814,6 +823,46 @@ def main():
         ("gh pr merge --auto blocked", bash("gh pr merge --auto --squash"), BLOCK, HOOK),
         ("gh pr merge --disable-auto allowed", bash("gh pr merge 7 --disable-auto"), ALLOW, HOOK),
 
+        # ── protected-label guard: an acknowledgement is the human's to give ──
+        # `hooks-change` is what turns the "Hooks change guard" job green, so a
+        # session that can apply it can acknowledge its own guard-machinery change
+        # (the reachable target being test_hooks.py — THIS file — which is
+        # deliberately not self-protected). Blocked in every `gh` spelling that
+        # APPLIES or REMOVES one; reads and unrelated labels stay free.
+        ("gh pr edit --add-label <protected> blocked",
+         bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"), BLOCK, HOOK),
+        ("gh pr edit --add-label=<protected> blocked",
+         bash(f"gh pr edit 7 --add-label={LBL_HOOKS}"), BLOCK, HOOK),
+        ("gh pr edit --add-label with <protected> in a comma list blocked",
+         bash(f'gh pr edit 7 --add-label "bug,{LBL_HOOKS}"'), BLOCK, HOOK),
+        ("gh issue edit --add-label <dispatcher-owned> blocked",
+         bash(f"gh issue edit 4 --add-label {LBL_NEEDS_HUMAN}"), BLOCK, HOOK),
+        ("gh issue edit --remove-label <dispatcher-owned> blocked",
+         bash(f"gh issue edit 4 --remove-label {LBL_BLOCKED}"), BLOCK, HOOK),
+        ("gh pr create --label <protected> blocked (pre-applied at creation)",
+         bash(f"gh pr create --title x --body y --label {LBL_HOOKS}"), BLOCK, HOOK),
+        ("gh api POST to /issues/N/labels with <protected> blocked",
+         bash(f"gh api repos/o/r/issues/39/labels -f labels[]={LBL_PROV}"), BLOCK, HOOK),
+        ("gh api /issues/N/labels with an OPAQUE --input body blocked",
+         bash("gh api -X POST repos/o/r/issues/39/labels --input body.json"), BLOCK, HOOK),
+        ("<protected> label in a CHAINED command still blocked",
+         bash(f"git push && gh pr edit 7 --add-label {LBL_HOOKS}"), BLOCK, HOOK),
+        # allow: the guard is about the gating SET, not about labelling at all.
+        ("gh pr edit --add-label with an unrelated label allowed",
+         bash("gh pr edit 7 --add-label bug"), ALLOW, HOOK),
+        ("gh pr edit --add-label with unrelated comma list allowed",
+         bash('gh pr edit 7 --add-label "bug,enhancement"'), ALLOW, HOOK),
+        ("reading labels allowed (gh pr view --json labels)",
+         bash("gh pr view 7 --json labels"), ALLOW, HOOK),
+        ("listing labels allowed (gh label list)",
+         bash("gh label list"), ALLOW, HOOK),
+        ("gh label create <protected> allowed — DEFINING a label is setup",
+         bash(f"gh label create {LBL_HOOKS} --color B60205"), ALLOW, HOOK),
+        ("repo-level label CRUD allowed (not issue application)",
+         bash(f"gh api repos/o/r/labels -f name={LBL_HOOKS}"), ALLOW, HOOK),
+        ("plain GET of an issue's labels allowed",
+         bash("gh api repos/o/r/issues/39/labels"), ALLOW, HOOK),
+
         # ── fail-open on malformed harness input (by design) ─────────────────
         ("garbage stdin allowed (fail-open)", None, ALLOW, HOOK),
 
@@ -1213,6 +1262,11 @@ def main():
         ("stderr reason: pinsRoot block names the resolved path",
          edit(os.path.join(pl_pinsin_root, "src/app.ts"), "x"),
          ".pipeline/pins", pl_pinsin),
+        ("stderr reason: protected-label block names the label it refused",
+         bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"), LBL_HOOKS, HOOK),
+        ("stderr reason: protected-label block routes to the human, like a hook edit",
+         bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"),
+         "print the command for the human", HOOK),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]

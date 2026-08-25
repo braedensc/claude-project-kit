@@ -17,6 +17,7 @@
     "test:local-dispatch": "python3 scripts/pipeline_dispatch_local.py --selftest",
     "test:approve": "python3 scripts/check_auto_approve.py --selftest",
     "test:merge": "python3 scripts/check_auto_merge.py --selftest",
+    "test:graders": "python3 scripts/check_grader_paths.py --selftest",
     "test:telemetry": "python3 scripts/telemetry_scrape.py --selftest",
     "test:dashboard": "python3 scripts/telemetry_dashboard.py --selftest",
     "test:review": "python3 scripts/check_weekly_review.py --selftest",
