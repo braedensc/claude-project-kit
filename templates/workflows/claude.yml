@@ -4,7 +4,9 @@ name: Claude
 # The official @claude GitHub Action — INERT template (activated at bootstrap, like
 # the other templates/workflows/*.yml). Lets you @claude on an issue or PR comment and
 # have it implement/review in CI, decoupled from any laptop. Verified against
-# https://code.claude.com/docs/en/github-actions (v1 GA), 2026-07-04.
+# https://code.claude.com/docs/en/github-actions (v1 GA), 2026-07-04; cost caps
+# re-verified against that page + https://code.claude.com/docs/en/cli-reference and
+# the action's own `claude_args` parser, 2026-08-24.
 #
 # ACTIVATE (bootstrap): `git mv templates/workflows/claude.yml .github/workflows/`,
 # then add the repo secret ANTHROPIC_API_KEY (Settings → Secrets and variables →
@@ -12,8 +14,21 @@ name: Claude
 # installs the GitHub App and scaffolds this for you.
 #
 # ── Cost & safety (this one spends real money — flag it) ──────────────────────
-#   • Caps live in `claude_args` now (v1 folded the old top-level inputs in): keep
-#     `--max-turns` set, and bound the job with `timeout-minutes` + `concurrency`.
+#   • Caps live in `claude_args` now (v1 folded the old top-level inputs in; the
+#     action has no `max_turns` input). Set BOTH caps — they bound different
+#     runaway shapes. `--max-turns` bounds how many times the loop may go round;
+#     `--max-budget-usd` bounds what those turns may cost. A turn cap is not a
+#     spend cap: one turn can burn a full context window, and subagent spend —
+#     which counts against the dollar cap — is not counted in turns at all.
+#     Then bound wall-clock separately with `timeout-minutes` + `concurrency`.
+#   • `--max-budget-usd` fine print, so nobody treats it as a hard invoice cap:
+#     it is print-mode-only (satisfied here — v1 runs headless via the Agent SDK,
+#     it no longer shells out to an interactive CLI); it rides the `claude_args`
+#     pass-through rather than a first-class input, so it reaches the CLI as an
+#     unrecognized-but-forwarded flag; full enforcement (subagent spend counted,
+#     running subagents stopped) needs Claude Code ≥ 2.1.217; and on a
+#     `claude_code_oauth_token` the dollars are notional — usage bills against
+#     the subscription, so `--max-turns` is the cap that actually bites there.
 #   • `ANTHROPIC_API_KEY` is a secret — never hardcode. Grant the workflow only the
 #     minimum permissions below.
 #   • v1 auto-detects interactive (@mention) vs automation (immediate prompt) mode;
@@ -50,9 +65,9 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Bound cost: cap turns + pin a model. Add --allowedTools / --disallowedTools
-          # here if you want to restrict what @claude may do in CI.
-          claude_args: "--max-turns 15 --model claude-sonnet-5"
+          # Bound cost: cap turns AND dollars, then pin a model. Add --allowedTools /
+          # --disallowedTools here if you want to restrict what @claude may do in CI.
+          claude_args: "--max-turns 15 --max-budget-usd 5 --model claude-sonnet-5"
 
 # ── Optional: automated PR review using a repo/plugin skill (separate workflow) ──
 # Trigger on pull_request and pass a skill as the prompt, e.g.:
@@ -60,4 +75,4 @@ jobs:
 #   with:
 #     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 #     prompt: "/code-review ${{ github.repository }}#${{ github.event.pull_request.number }}"
-#     claude_args: "--max-turns 10"
+#     claude_args: "--max-turns 10 --max-budget-usd 3"
