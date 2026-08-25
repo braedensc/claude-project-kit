@@ -160,6 +160,10 @@ legacy).
   quarantined feature proposals. Reads the **structured summary**, never the rendered
   dashboard. Proposes; never raises its own budgets, never rewrites its own graders,
   never merges. Inert unless `delivery.json` exists.
+- **`/sync-kit [kit path] [--apply]`** — ports kit improvements into a project
+  instantiated from it, sorting every difference into upstream-newer /
+  project-specific / genuinely-drifted and proposing a PR for the first bucket only.
+  Dry run by default; hook changes are always report-only.
 - **`/new-adr <slug>`** — scaffolds a dated ADR + index row.
 
 Before reinventing, note the bundled skills Claude Code already ships: `/code-review`,
