@@ -1,0 +1,363 @@
+name: Pipeline safe outputs
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INERT template (activated at bootstrap by `git mv`, like every
+# templates/workflows/*.yml). Part of the optional agentic delivery pipeline —
+# see docs/PIPELINE-CONTRACT.md. If your project has no `delivery.json`, the
+# pipeline is OFF and every job here exits 0 doing nothing (contract §2).
+#
+# ── What this is ──────────────────────────────────────────────────────────────
+# A REUSABLE workflow (`workflow_call`) that holds the Linear credential so the
+# AGENT JOB NEVER DOES. The session agent cannot write to the tracker at all; it
+# emits structured *write-requests* to a file, and this job validates them
+# against the DISPATCHER-PINNED ticket ID and the allowed state transitions,
+# then executes the survivors.
+#
+# Without this split, "the agent must not move its own ticket" is a prompt
+# instruction — and an agent with the API key in its environment can just curl
+# the GraphQL endpoint. With it, the constraint is structural: no key in the
+# job, no write path. (Pattern borrowed from github/gh-aw's safe-outputs.)
+#
+# ── The trust chain, stated plainly ───────────────────────────────────────────
+#   AUTHORITY (agent cannot write): delivery.json on the default branch, the pin
+#                                   file, `pinned_ticket_id` below — it comes
+#                                   from the dispatcher's own Linear read,
+#                                   passed as a workflow_call input the agent
+#                                   has no way to influence.
+#   REPORTING (agent authors):      the requests file. Every field in it is a
+#                                   REQUEST, never a fact. Nothing here trusts
+#                                   `request.ticket_id` — it is compared, not used.
+#
+# ── Fail-closed, all-or-nothing ───────────────────────────────────────────────
+# Every request is validated BEFORE any is executed. One invalid request rejects
+# the whole batch: an escape attempt must not earn partial credit, and a
+# half-applied batch leaves the tracker in a state nobody designed.
+#
+# ── Caller contract ───────────────────────────────────────────────────────────
+#   jobs:
+#     validate:
+#       needs: [claim, session]
+#       if: always() && needs.claim.result == 'success'
+#       uses: ./.github/workflows/pipeline-safe-outputs.yml
+#       with:
+#         artifact_name:    pipeline-safe-outputs-ENG-123
+#         pinned_ticket_id: ENG-123          # from the DISPATCHER, never the agent
+#         pinned_dispatch_id: d_01J…
+#         stage: dev
+#       secrets:
+#         linear_api_key: ${{ secrets.LINEAR_API_KEY }}
+#
+# NOTE: a reusable workflow is referenced by PATH, so this file must sit at
+# .github/workflows/pipeline-safe-outputs.yml after bootstrap. If you rename it,
+# update the `uses:` lines in pipeline-dispatch.yml and pipeline-bounce.yml.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: 'Artifact holding the agent-authored requests file'
+        required: true
+        type: string
+      pinned_ticket_id:
+        description: 'Ticket ID from the DISPATCHER (e.g. ENG-123). Never agent-supplied.'
+        required: true
+        type: string
+      pinned_dispatch_id:
+        description: 'Dispatch ID from the pin — joins these writes to one dispatch'
+        required: true
+        type: string
+      stage:
+        description: 'dev | bounce | review — selects the allowed transitions'
+        required: true
+        type: string
+      allowed_to_states:
+        description: 'Comma-separated canonical state keys the agent may move the ticket TO'
+        required: false
+        type: string
+        default: 'review'
+      require_telemetry:
+        description: 'Require exactly one valid telemetry block (contract §4)'
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Validate and report, but execute nothing'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      linear_api_key:
+        required: true
+    outputs:
+      verdict:
+        description: 'ok | rejected | skipped'
+        value: ${{ jobs.validate.outputs.verdict }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate:
+    name: Validate + execute safe outputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      verdict: ${{ steps.run.outputs.verdict }}
+    steps:
+      # Check out the DEFAULT BRANCH, never the PR head. Contract §1: values that
+      # gate behavior are read from the committed copy on the default branch —
+      # the head branch is inside the agent's worktree, so reading delivery.json
+      # from there would let a session widen its own allowed transitions.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          persist-credentials: false
+
+      # Contract §2: the ONE discriminator. Absent delivery.json means the
+      # pipeline is OFF, not broken — exit 0 before anything that can fail.
+      - name: Is the pipeline configured?
+        id: pre
+        run: |
+          if [ ! -f delivery.json ]; then
+            echo "::notice::No delivery.json — agentic pipeline not configured. Nothing to validate."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # continue-on-error: a missing artifact is normal (the session died before
+      # writing one). The validator below turns that into a verdict, not a crash.
+      - name: Download the agent's write-requests
+        id: dl
+        if: steps.pre.outputs.configured == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ runner.temp }}/safe-outputs
+
+      - name: Validate against the pin, then execute
+        id: run
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          # Every value crosses into the script as an ENV VAR, never as a
+          # ${{ }} interpolation inside the shell body — interpolating an
+          # attacker-influenced string directly into `run:` is script injection.
+          LINEAR_API_KEY: ${{ secrets.linear_api_key }}
+          PINNED_TICKET_ID: ${{ inputs.pinned_ticket_id }}
+          PINNED_DISPATCH_ID: ${{ inputs.pinned_dispatch_id }}
+          STAGE: ${{ inputs.stage }}
+          ALLOWED_TO_STATES: ${{ inputs.allowed_to_states }}
+          REQUIRE_TELEMETRY: ${{ inputs.require_telemetry }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REQUESTS_DIR: ${{ runner.temp }}/safe-outputs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request, urllib.error
+
+          API = "https://api.linear.app/graphql"
+          # Hard caps. A runaway or hostile session must not be able to spray the
+          # tracker: bounded count, bounded size, at most one state move per run.
+          MAX_REQUESTS, MAX_BODY, MAX_LABEL_OPS = 20, 16000, 10
+
+          cfg = json.load(open("delivery.json"))
+          if cfg.get("version") != 1:
+              sys.exit("::error::delivery.json version %r unrecognized — refusing to guess." % cfg.get("version"))
+
+          state_ids = cfg["linear"]["stateIds"]
+          label_ids = cfg["linear"]["labels"]["ids"]
+          pinned = os.environ["PINNED_TICKET_ID"]
+          team_key = cfg["linear"]["teamKey"]
+
+          def out(k, v):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("%s=%s\n" % (k, v))
+
+          def die(msg):
+              print("::error::%s" % msg)
+              out("verdict", "rejected")
+              sys.exit(1)
+
+          # ── Load the agent-authored requests ────────────────────────────────
+          path = os.path.join(os.environ["REQUESTS_DIR"], "requests.json")
+          if not os.path.exists(path):
+              # No file at all. If telemetry was required this is a
+              # `telemetry-required` violation (contract §2) and must be loud —
+              # a session that reports nothing is indistinguishable from one
+              # that silently failed.
+              if os.environ.get("REQUIRE_TELEMETRY") == "true":
+                  die("No safe-outputs file from the session (%s). Contract §4 requires "
+                      "exactly one telemetry block per terminal run." % os.environ["REQUESTS_DIR"])
+              print("::notice::No safe-outputs file — nothing to apply.")
+              out("verdict", "skipped")
+              sys.exit(0)
+
+          try:
+              doc = json.load(open(path))
+          except Exception as e:
+              die("safe-outputs file is not valid JSON: %s" % e)
+
+          if doc.get("schema") != "pipeline-safe-outputs/1":
+              die("safe-outputs schema %r unrecognized (want pipeline-safe-outputs/1)." % doc.get("schema"))
+
+          reqs = doc.get("requests")
+          if not isinstance(reqs, list):
+              die("safe-outputs `requests` must be a list.")
+          if len(reqs) > MAX_REQUESTS:
+              die("%d requests exceeds the cap of %d." % (len(reqs), MAX_REQUESTS))
+
+          # ── Which labels may the agent touch? ───────────────────────────────
+          # Contract §6: `agent:*` and `blocked:capacity` are DISPATCHER-owned —
+          # a session setting its own lifecycle labels is a session editing its
+          # own supervision. `provenance:*` is set at intake (§5) and `hooks-change`
+          # is human-set. Everything else in labels.ids is fair game to propose.
+          def dispatcher_owned(key):
+              return (key.startswith("agent:") or key == "blocked:capacity"
+                      or key.startswith("provenance:") or key == "hooks-change")
+
+          allowed_labels = {k for k in label_ids if not dispatcher_owned(k)}
+          allowed_states = {s.strip() for s in os.environ["ALLOWED_TO_STATES"].split(",") if s.strip()}
+          # Belt: `ready` would be self-approval (§5), `done` would be claiming a
+          # merge (§5/§6) — refuse them even if a caller passes them in.
+          allowed_states -= {"raw", "ready", "done"}
+
+          errors, plan, telemetry_blocks = [], [], 0
+          seen_state_move = False
+
+          for i, r in enumerate(reqs):
+              tag = "requests[%d]" % i
+              if not isinstance(r, dict):
+                  errors.append("%s is not an object" % tag); continue
+              rtype = r.get("type")
+
+              # THE central check: the agent names a ticket; we compare it to the
+              # pin and never use it. A mismatch is an attempted retarget.
+              tid = r.get("ticket_id")
+              if tid != pinned:
+                  errors.append("%s targets ticket %r but this session is pinned to %r"
+                                % (tag, tid, pinned))
+                  continue
+
+              if rtype == "ticket-comment":
+                  body = r.get("body")
+                  if not isinstance(body, str) or not body.strip():
+                      errors.append("%s: comment body must be a non-empty string" % tag); continue
+                  if len(body) > MAX_BODY:
+                      errors.append("%s: comment body %d chars exceeds %d" % (tag, len(body), MAX_BODY)); continue
+                  # Count telemetry blocks (§4): a ```json fence carrying the
+                  # schema marker. One per comment, and exactly one per run. The
+                  # marker is matched with whitespace tolerance — JSON writers
+                  # differ on spacing around the colon and nothing should hinge
+                  # on which one the session happened to use.
+                  marks = len(re.findall(r'"schema"\s*:\s*"pipeline-telemetry/1"', body))
+                  if marks > 1:
+                      errors.append("%s: %d telemetry blocks in one comment — §4 allows one" % (tag, marks)); continue
+                  telemetry_blocks += marks
+                  plan.append(("comment", body))
+
+              elif rtype == "ticket-state":
+                  if seen_state_move:
+                      errors.append("%s: more than one state transition in a single run" % tag); continue
+                  to = r.get("to")
+                  if to not in allowed_states:
+                      errors.append("%s: transition to %r not allowed for stage %r (allowed: %s)"
+                                    % (tag, to, os.environ["STAGE"], sorted(allowed_states) or "none")); continue
+                  target = state_ids.get(to)
+                  if not target:
+                      errors.append("%s: delivery.json has no stateIds.%s" % (tag, to)); continue
+                  seen_state_move = True
+                  plan.append(("state", target))
+
+              elif rtype == "ticket-label":
+                  add = r.get("add") or []
+                  rm = r.get("remove") or []
+                  if not isinstance(add, list) or not isinstance(rm, list):
+                      errors.append("%s: add/remove must be lists" % tag); continue
+                  if len(add) + len(rm) > MAX_LABEL_OPS:
+                      errors.append("%s: too many label ops" % tag); continue
+                  bad = [k for k in list(add) + list(rm) if k not in allowed_labels]
+                  if bad:
+                      errors.append("%s: labels %s are dispatcher/human-owned or unknown "
+                                    "(contract §6)" % (tag, bad)); continue
+                  for k in add:
+                      plan.append(("label-add", label_ids[k]))
+                  for k in rm:
+                      plan.append(("label-remove", label_ids[k]))
+
+              else:
+                  errors.append("%s: unknown request type %r" % (tag, rtype))
+
+          if os.environ.get("REQUIRE_TELEMETRY") == "true" and telemetry_blocks != 1:
+              errors.append("expected exactly one telemetry block across all comments, found %d "
+                            "(contract §4)" % telemetry_blocks)
+
+          if errors:
+              for e in errors:
+                  print("::error::safe-outputs rejected: %s" % e)
+              print("::error::Batch rejected — %d problem(s). NOTHING was applied "
+                    "(all-or-nothing by design)." % len(errors))
+              out("verdict", "rejected")
+              sys.exit(1)
+
+          print("::notice::%d request(s) validated against pin %s (dispatch %s)."
+                % (len(plan), pinned, os.environ["PINNED_DISPATCH_ID"]))
+
+          if os.environ.get("DRY_RUN") == "true":
+              for kind, _ in plan:
+                  print("  would apply: %s" % kind)
+              out("verdict", "ok")
+              sys.exit(0)
+
+          # ── Execute ─────────────────────────────────────────────────────────
+          def gql(query, variables):
+              body = json.dumps({"query": query, "variables": variables}).encode()
+              req = urllib.request.Request(API, data=body, headers={
+                  "Content-Type": "application/json",
+                  # Linear personal API keys go in Authorization RAW (no
+                  # "Bearer "). An OAuth access token DOES need the Bearer
+                  # prefix — add it here if you switch to OAuth.
+                  "Authorization": os.environ["LINEAR_API_KEY"],
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      payload = json.load(r)
+              except urllib.error.HTTPError as e:
+                  sys.exit("::error::Linear API HTTP %s: %s" % (e.code, e.read()[:500]))
+              if payload.get("errors"):
+                  sys.exit("::error::Linear API error: %s" % json.dumps(payload["errors"])[:500])
+              return payload["data"]
+
+          # Resolve the pinned identifier to Linear's UUID. Filtered by team key
+          # + number so it is unambiguous, and it re-proves the ticket exists.
+          num = int(pinned.rsplit("-", 1)[1])
+          found = gql("""
+            query($teamKey: String!, $number: Float!) {
+              issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $number } }, first: 1) {
+                nodes { id identifier }
+              }
+            }""", {"teamKey": team_key, "number": num})["issues"]["nodes"]
+          if not found:
+              die("pinned ticket %s not found in team %s" % (pinned, team_key))
+          issue_uuid = found[0]["id"]
+
+          M_COMMENT = "mutation($issueId: String!, $body: String!) { commentCreate(input: {issueId: $issueId, body: $body}) { success } }"
+          M_STATE = "mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, input: {stateId: $stateId}) { success } }"
+          M_ADD = "mutation($id: String!, $labelId: String!) { issueAddLabel(id: $id, labelId: $labelId) { success } }"
+          M_RM = "mutation($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }"
+
+          for kind, value in plan:
+              if kind == "comment":
+                  gql(M_COMMENT, {"issueId": issue_uuid, "body": value})
+              elif kind == "state":
+                  gql(M_STATE, {"id": issue_uuid, "stateId": value})
+              elif kind == "label-add":
+                  gql(M_ADD, {"id": issue_uuid, "labelId": value})
+              elif kind == "label-remove":
+                  gql(M_RM, {"id": issue_uuid, "labelId": value})
+              print("  applied: %s" % kind)
+
+          out("verdict", "ok")
+          PY

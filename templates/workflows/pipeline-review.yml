@@ -1,0 +1,433 @@
+name: Pipeline review
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INERT template (activated at bootstrap by `git mv`). Automated review pass of
+# the optional agentic delivery pipeline — see docs/PIPELINE-CONTRACT.md.
+# No delivery.json ⇒ the pipeline is OFF and this exits 0 doing nothing (§2).
+#
+# ── THREE RULES, and each one is load-bearing ────────────────────────────────
+#
+# 1. `opened` ONLY — never `synchronize`.
+#    A bounce pushes commits. On `synchronize` every bounce would re-trigger a
+#    full review, so review spend multiplies with the number of fix pushes —
+#    exactly the loop the bounce budget exists to bound. Re-review after a fix
+#    is the BOUNCE workflow's job, once, deliberately. Need a fresh read on a
+#    PR that has moved? Use the workflow_dispatch input below.
+#
+# 2. COMMENT-ONLY — it must never approve, and must NEVER be a required check.
+#    Approval is prevented structurally, not by asking nicely:
+#      • the reviewing job's token has `pull-requests: read`, not write;
+#      • the model runs under a CLOSED `--allowedTools` allowlist with no Bash
+#        and no GitHub MCP tools, so no approval path exists inside the session;
+#      • the comment is posted by a SEPARATE deterministic job that runs
+#        github-script, not a model.
+#    And it exits 0 whatever it finds — a review that can block the merge queue
+#    is a review that will be disabled the first busy week.
+#
+# 3. Compared against the DISPATCH-TIME SNAPSHOT, not the live ticket.
+#    Scope is judged against `pin.ticket` as it was when the session started.
+#    Reading the live ticket instead would let scope drift after the fact —
+#    someone edits the ticket, and a change that was out of scope becomes in
+#    scope retroactively. The pin is written by the dispatcher, outside the
+#    agent's worktree, before the session runs (contract §3).
+#
+# ── Setup ─────────────────────────────────────────────────────────────────────
+#   Secret ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) per delivery.json
+#   auth.review. Until it exists this runs green and skips.
+#   Fork PRs get no secrets, so they skip too — by design.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  # `opened` only. See rule 1 — adding `synchronize` here multiplies review cost
+  # by the number of bounce pushes.
+  pull_request:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Re-review this PR number (manual, deliberate, costs a review).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One review per PR. A re-review requested while one is running supersedes it —
+  # nothing has been published yet, so cancelling is free.
+  group: pipeline-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # 1. SNAPSHOT — resolve the dispatch-time pin, or decline to review.
+  # ════════════════════════════════════════════════════════════════════════════
+  snapshot:
+    name: Resolve the dispatch-time snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      go: ${{ steps.pin.outputs.go }}
+      ticket_id: ${{ steps.pin.outputs.ticket_id }}
+      dispatch_id: ${{ steps.pin.outputs.dispatch_id }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      auth_mode: ${{ steps.pin.outputs.auth_mode }}
+      threshold: ${{ steps.pin.outputs.threshold }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Is the pipeline configured?
+        id: pre
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ ! -f delivery.json ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "${KEY:-}" ] && [ -z "${OAUTH:-}" ]; then
+            echo "::notice::No Claude credential configured — pipeline review skipped."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the PR
+        id: pr
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR" > "$RUNNER_TEMP/pr.json"
+          {
+            echo "number=$PR"
+            echo "head_ref=$(jq -r .head.ref  "$RUNNER_TEMP/pr.json")"
+            echo "head_sha=$(jq -r .head.sha  "$RUNNER_TEMP/pr.json")"
+            echo "base_ref=$(jq -r .base.ref  "$RUNNER_TEMP/pr.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      # The resolution chain, and why each link holds:
+      #   branch name  → candidate ticket id   (agent-choosable — a HINT only)
+      #   ticket id    → dispatcher-written pin artifact
+      #   pin.branch   → must equal the PR head ref
+      # The last step is what makes the hint safe: a session that renamed its
+      # branch to claim another ticket's pin fails the equality check. No pin, or
+      # a mismatched one, means we decline to review rather than review against
+      # a snapshot we cannot trust.
+      - name: Find the dispatcher's pin for this branch
+        id: pin
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          team=$(jq -r '.linear.teamKey' delivery.json)
+          threshold=$(jq -r '.budgets.reviewSeverityThreshold' delivery.json)
+          auth=$(jq -r '.auth.review' delivery.json)
+          echo "threshold=$threshold" >> "$GITHUB_OUTPUT"
+          echo "auth_mode=$auth"      >> "$GITHUB_OUTPUT"
+
+          # feat/eng-123-slug -> ENG-123 (contract §branch lowercases the id).
+          num=$(printf '%s' "$HEAD_REF" | sed -nE "s#^[a-z]+/$(printf '%s' "$team" | tr 'A-Z' 'a-z')-([0-9]+)-.*#\1#p")
+          if [ -z "$num" ]; then
+            echo "::notice::Branch '$HEAD_REF' is not a pipeline ticket branch — this PR was not dispatched. Leaving it to human review."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ticket="$team-$num"
+
+          id=$(gh api "repos/$REPO/actions/artifacts?name=pipeline-pin-$ticket&per_page=20" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::warning::No dispatch snapshot found for $ticket. Declining to review: without the pin there is no scope fence to compare against."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/pin.zip"
+          unzip -o -q "$RUNNER_TEMP/pin.zip" -d "$RUNNER_TEMP/pin"
+
+          pin="$RUNNER_TEMP/pin/pin-$ticket.json"
+          test -f "$pin" || { echo "::warning::Pin artifact for $ticket did not contain pin-$ticket.json. Declining."; echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          pin_branch=$(jq -r '.branch' "$pin")
+          if [ "$pin_branch" != "$HEAD_REF" ]; then
+            echo "::error::Pin/branch mismatch: the dispatcher pinned $ticket to '$pin_branch' but this PR is on '$HEAD_REF'. Declining to review — a snapshot that does not match the branch is not a snapshot of this work."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          echo "ticket_id=$ticket" >> "$GITHUB_OUTPUT"
+          echo "dispatch_id=$(jq -r '.dispatch_id' "$pin")" >> "$GITHUB_OUTPUT"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+          echo "Reviewing $ticket against the snapshot taken at $(jq -r '.ticket.snapshot_at' "$pin")."
+
+      - name: Stage the review context
+        if: steps.pin.outputs.go == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-review-context-${{ github.run_id }}
+          path: ${{ runner.temp }}/pin
+          retention-days: 7
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 2. REVIEW — fresh context, closed toolset, no write permission anywhere.
+  # ════════════════════════════════════════════════════════════════════════════
+  review:
+    name: Review the diff against the snapshot
+    needs: snapshot
+    if: needs.snapshot.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # READ ONLY. This is the structural half of "never approves" — the token in
+    # this job cannot submit a review even if something asked it to.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # The BRANCH, not the head SHA. A SHA checkout leaves a detached HEAD, and
+      # the kit's branch-naming guard blocks every Edit/Write when the branch
+      # name is not `<type>/<slug>` — "HEAD" is not — so the reviewer could not
+      # write its own findings file. The branch is `feat/<team>-<n>-…`, which
+      # the guard accepts.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.snapshot.outputs.head_ref }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pipeline-review-context-${{ github.run_id }}
+          path: ${{ runner.temp }}/pin
+
+      # Everything the reviewer needs is prepared as FILES up front, so the
+      # session needs no Bash and no network: the diff, the snapshot, the rubric
+      # inputs. A reviewer that cannot run commands cannot approve, push, or
+      # reach the tracker — the allowlist below is then a closed set, not a
+      # denylist with holes.
+      - name: Prepare the review inputs
+        id: prep
+        env:
+          TICKET: ${{ needs.snapshot.outputs.ticket_id }}
+          PR: ${{ needs.snapshot.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/review"
+          base=$(jq -r '.base_branch' "$RUNNER_TEMP/pin/pin-$TICKET.json")
+          git fetch --quiet origin "$base"
+          git diff "origin/$base...HEAD" > REVIEW-DIFF.patch
+          git diff --stat "origin/$base...HEAD" > REVIEW-STAT.txt
+          cp "$RUNNER_TEMP/pin/pin-$TICKET.json" REVIEW-SNAPSHOT.json
+
+          # Delivery config the rubric needs, extracted so the reviewer reads one
+          # small file instead of the whole config.
+          jq '{securityNotes: .stack.securityNotes, graderPaths: .stack.graderPaths,
+               riskPaths: .autonomy.riskPaths, threshold: .budgets.reviewSeverityThreshold}' \
+            <(git show "origin/$base:delivery.json") > REVIEW-RUBRIC.json
+
+          for f in REVIEW-DIFF.patch REVIEW-STAT.txt REVIEW-SNAPSHOT.json REVIEW-RUBRIC.json REVIEW-FINDINGS.json; do
+            grep -qxF "$f" .git/info/exclude 2>/dev/null || echo "$f" >> .git/info/exclude
+          done
+          echo "Diff is $(wc -l < REVIEW-DIFF.patch) lines."
+
+      - name: Review
+        id: agent
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ needs.snapshot.outputs.auth_mode == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          claude_code_oauth_token: ${{ needs.snapshot.outputs.auth_mode == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Run `/code-review` over this pull request.
+
+            You are a reviewer with FRESH CONTEXT — you did not write this change and
+            you have no memory of the session that did. Judge only what is in front of
+            you. Read these four files first:
+
+              REVIEW-DIFF.patch     the complete change (base...head)
+              REVIEW-STAT.txt       the shape of it
+              REVIEW-SNAPSHOT.json  the ticket AS IT WAS AT DISPATCH — the pin. Its
+                                    `ticket.acceptance_criteria` is the definition of
+                                    done and `ticket.out_of_scope` is the scope fence.
+                                    Use THIS, never a live ticket: the snapshot is
+                                    what the author was actually asked to do.
+              REVIEW-RUBRIC.json    securityNotes, graderPaths, riskPaths, threshold
+
+            Cover exactly four dimensions and nothing else:
+
+              correctness  Does it do what the acceptance criteria say? Logic errors,
+                           unhandled edge cases, error paths that swallow failures,
+                           races, off-by-ones. Prefer a concrete failing input over a
+                           general worry.
+              security     Judge against every note in `securityNotes`. Always inspect
+                           any file matching `graderPaths`. A change touching
+                           `riskPaths` is `high` at minimum — those paths are the
+                           supervision machinery, and weakening supervision is not a
+                           routine edit.
+              tests        WEAKENED OR DELETED ASSERTIONS ARE THE HEADLINE FINDING.
+                           Scan the diff for removed `expect`/`assert` lines, tests
+                           renamed to skip/xfail/todo, matchers loosened (exact value
+                           to "truthy", specific error to any error), timeouts raised
+                           to hide a flake, snapshots re-recorded rather than
+                           explained. A change that makes a failing test pass by
+                           editing the test is `critical` unless the diff explains why
+                           the old assertion was wrong. New code with no new test is
+                           at most `medium`; a deleted assertion is not.
+              scope        Compare against `out_of_scope` and the acceptance criteria.
+                           Anything the ticket did not ask for — a drive-by refactor, a
+                           dependency bump, a reformat — is a `scope` finding even when
+                           the code is good. Scope drift is how a small ticket becomes
+                           an unreviewable diff.
+
+            Severity is one of: low, medium, high, critical. Be honest and be sparing:
+            a review that flags everything gets ignored, and everything at or above the
+            rubric's `threshold` starts a paid fix session. If the change is clean, say
+            so with an empty findings list.
+
+            WRITE YOUR RESULT to REVIEW-FINDINGS.json in the repository root, and write
+            nothing else anywhere:
+
+            {"schema":"pipeline-review/1",
+             "summary":"two or three sentences a human can read in ten seconds",
+             "findings":[
+               {"severity":"high","category":"security","file":"src/x.ts","line":42,
+                "summary":"one line","detail":"why it is wrong and what would fix it"}
+             ]}
+
+            `category` is one of correctness, security, tests, scope. Omit `line` if it
+            does not apply. Do not post a comment, do not approve, do not push, do not
+            modify any source file — you have no tools to do any of it, and the file
+            above is the entire deliverable.
+
+            One quirk of running inside this repo: the project's Stop hook may nag you
+            once about failing CI on this branch. You are a reviewer — you cannot and
+            must not fix CI here. Note it in your summary if it is relevant and finish.
+          claude_args: >-
+            --setting-sources user,project
+            --max-turns 30
+            --model ${{ vars.PIPELINE_REVIEW_MODEL || 'claude-sonnet-5' }}
+            --allowedTools Read,Grep,Glob,Write
+
+      # Fail-closed on shape, fail-open on outcome: a reviewer that produced
+      # nothing usable must not silently read as "no findings" — but it also must
+      # not wedge the PR, so the publish job says so in plain words instead.
+      - name: Normalize the findings
+        if: always()
+        env:
+          TICKET: ${{ needs.snapshot.outputs.ticket_id }}
+          DISPATCH_ID: ${{ needs.snapshot.outputs.dispatch_id }}
+          PR: ${{ needs.snapshot.outputs.pr_number }}
+          THRESHOLD: ${{ needs.snapshot.outputs.threshold }}
+          AGENT_RESULT: ${{ steps.agent.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/findings"
+          python3 - <<'PY'
+          import json, os
+          RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+          out = {"schema": "pipeline-review/1",
+                 "ticket_id": os.environ["TICKET"],
+                 "dispatch_id": os.environ["DISPATCH_ID"],
+                 "pr": int(os.environ["PR"]),
+                 "threshold": os.environ["THRESHOLD"],
+                 "reviewer_outcome": os.environ["AGENT_RESULT"],
+                 "summary": "", "findings": [], "max_severity": None,
+                 "meets_threshold": False, "usable": False}
+          try:
+              doc = json.load(open("REVIEW-FINDINGS.json"))
+              if doc.get("schema") != "pipeline-review/1":
+                  raise ValueError("schema %r unrecognized" % doc.get("schema"))
+              findings = [f for f in doc.get("findings", [])
+                          if isinstance(f, dict) and f.get("severity") in RANK]
+              out["summary"] = str(doc.get("summary", ""))[:2000]
+              out["findings"] = findings[:50]
+              out["usable"] = True
+              if findings:
+                  top = max(findings, key=lambda f: RANK[f["severity"]])
+                  out["max_severity"] = top["severity"]
+                  out["meets_threshold"] = RANK[top["severity"]] >= RANK[os.environ["THRESHOLD"]]
+          except Exception as e:
+              out["summary"] = ("The reviewer did not produce a usable REVIEW-FINDINGS.json (%s). "
+                                "Treat this PR as UNREVIEWED — not as clean." % e)
+          json.dump(out, open(os.path.join(os.environ["RUNNER_TEMP"], "findings", "findings.json"), "w"), indent=2)
+          print(json.dumps({k: v for k, v in out.items() if k != "findings"}, indent=2))
+          PY
+
+      # The bounce workflow reads this artifact to decide whether to spend a fix
+      # session. It is written by this job, not by the model: the model's only
+      # output was a file, and everything gating money is computed from it here.
+      - name: Publish the findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-review-findings-${{ needs.snapshot.outputs.pr_number }}
+          path: ${{ runner.temp }}/findings
+          retention-days: 30
+          if-no-files-found: error
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 3. PUBLISH — the only job that can write, and it runs no model.
+  # ════════════════════════════════════════════════════════════════════════════
+  publish:
+    name: Post the review comment
+    needs: [snapshot, review]
+    if: always() && needs.snapshot.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pipeline-review-findings-${{ needs.snapshot.outputs.pr_number }}
+          path: ${{ runner.temp }}/findings
+
+      - uses: actions/github-script@v7
+        env:
+          FINDINGS: ${{ runner.temp }}/findings/findings.json
+          PR: ${{ needs.snapshot.outputs.pr_number }}
+        with:
+          script: |
+            const fs = require('fs')
+            const d = JSON.parse(fs.readFileSync(process.env.FINDINGS, 'utf8'))
+            const icon = { low: '🔵', medium: '🟡', high: '🟠', critical: '🔴' }
+            const lines = [
+              `## 🤖 Pipeline review — ${d.ticket_id}`,
+              '',
+              d.summary || '_No summary._',
+              '',
+            ]
+            if (!d.usable) {
+              lines.push('> **This PR was not successfully reviewed.** Read it as unreviewed, not as clean.')
+            } else if (d.findings.length === 0) {
+              lines.push('No findings against correctness, security, test assertions, or scope.')
+            } else {
+              lines.push(`**${d.findings.length} finding(s)** · highest \`${d.max_severity}\` · threshold \`${d.threshold}\`` +
+                         (d.meets_threshold ? ' → **a fix pass will be started.**' : ' → below threshold, comments only.'))
+              lines.push('')
+              for (const f of d.findings) {
+                const where = f.file ? ` \`${f.file}${f.line ? ':' + f.line : ''}\`` : ''
+                lines.push(`- ${icon[f.severity] || '•'} **${f.severity}** · _${f.category || 'general'}_${where} — ${f.summary}`)
+                if (f.detail) lines.push(`  <details><summary>why</summary>\n\n  ${String(f.detail).replace(/\n/g, '\n  ')}\n\n  </details>`)
+              }
+            }
+            lines.push('', '---',
+              '_Comment-only, and deliberately not a required check. Reviewed against the ticket ' +
+              'as it was at dispatch, not as it reads now._')
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: Number(process.env.PR), body: lines.join('\n'),
+            })
+            // Exit 0 whatever was found. Findings start a bounce; they never
+            // gate the merge from here.
+            core.info(`Posted ${d.findings.length} finding(s) to #${process.env.PR}`)
