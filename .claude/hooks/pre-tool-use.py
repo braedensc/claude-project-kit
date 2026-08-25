@@ -433,6 +433,102 @@ def _mutate_re(path_re: str):
 _SELF_MUTATE_RE = _mutate_re(_SELF_PROT)
 
 
+# ── Protected-label guard: an acknowledgement is the HUMAN's to give ────────────
+# Added 2026-08-25. The CI job "Hooks change guard" (scripts/check_grader_paths.py)
+# holds a PR that touches grader paths RED until someone applies the `hooks-change`
+# label. That mechanism is worth exactly as much as the label is hard for a session
+# to apply — and the `--add-label` spelling was never blocked, so a session could
+# supply its OWN acknowledgement, turn its PR green, and delete the one signal that
+# tells a reviewer to read the diff closely.
+#
+# The realistic exploit is not editing a guard: self-protection already blocks that.
+# It is that `test_hooks.py` is deliberately NOT self-protected. A session can weaken
+# a battery case — the test that PROVES a guard works — self-acknowledge it, and land
+# a green PR that looks like every other one in the queue. Same for the hooks README
+# and, outside ticket mode, parts of the grader-path set.
+#
+# Same reasoning as the never-merge guard: an action that GRANTS PERMISSION belongs to
+# the human, never to the session asking for it. So the `gh` spellings that apply or
+# remove a protected label are blocked, and the agent is told to print the command for
+# the human — exactly the flow self-protection already uses for a hook edit.
+#
+# The set is docs/PIPELINE-CONTRACT.md §6 verbatim (and the safe-outputs schema's
+# refusal pattern), so the tracker path and this GitHub path refuse the SAME labels.
+# A future gating label is added to the contract table and to these tuples — it does
+# not need a new guard.
+#
+# Scope, stated plainly: this is a first line over command SHAPES, and an exhaustive
+# denylist of shell spellings is not achievable. The durable half is server-side —
+# check_grader_paths.py checks WHO applied the label — and that is what covers the
+# spellings this regex will never see.
+PROTECTED_LABEL_PREFIXES = ("agent:", "blocked:", "provenance:")
+PROTECTED_LABEL_EXACT = ("hooks-change",)
+PROTECTED_LABEL_HELP = (
+    "🔒 `{label}` is a protected label — Claude may not apply or remove it. These "
+    "labels are acknowledgement and supervision, not status: `hooks-change` is how a "
+    "HUMAN signs off that guard machinery changed, and `agent:*` / `blocked:*` / "
+    "`provenance:*` are dispatcher-owned. A session that labels its own PR is "
+    "acknowledging its own change — the one thing that gate exists to prevent. Do not "
+    "reach for another tool or a shell workaround — instead, print the command for the "
+    "human to run themselves, e.g.:\n"
+    "  gh pr edit <number> --add-label <the-label>\n"
+    "and let them run it. (Reading or listing labels is fine, and so is labelling with "
+    "an unrelated label such as `bug` — only the protected set is refused.)"
+)
+
+# Label-bearing `gh` subcommands, sliced to the next shell separator so a protected
+# label in a LATER chained command is still seen.
+_GH_LABEL_CMD_RE = re.compile(r"\bgh\s+(?:pr|issue)\s+(?:edit|create|new)\b([^#\n;&|]*)")
+# --add-label / --remove-label / --label / -l, in `--flag=v` and `--flag v` form.
+# gh accepts a comma-separated list in one flag, so the value is split on commas.
+_LABEL_FLAG_RE = re.compile(
+    r"(?<![\w-])(?:--(?:add-|remove-)?labels?|-l)(?:=|\s+)([\"'][^\"']*[\"']|[^\s;&|#]+)"
+)
+# The REST path that APPLIES labels to one issue/PR. `[^/\s'\"]+` so a shell variable
+# (…/issues/$N/labels) matches too. Repo-level label CRUD (`repos/o/r/labels`, which is
+# what `gh label create` calls) deliberately does NOT match: defining a label is setup,
+# not acknowledgement — docs/AUTONOMY.md tells the human to run it.
+_GH_API_RE = re.compile(r"\bgh\s+api\b([^#\n;&|]*)")
+_API_ISSUE_LABELS_RE = re.compile(r"/issues/[^/\s'\"]+/labels\b")
+_API_WRITE_RE = re.compile(
+    r"(?<![\w-])-X\s*['\"]?(?:POST|PATCH|PUT|DELETE)"
+    r"|(?<![\w-])(?:-f|-F|--field|--raw-field|--input)(?![\w-])",
+    re.IGNORECASE,
+)
+
+
+def _is_protected_label(name: str) -> bool:
+    n = (name or "").strip().strip("\"'").strip().lower()
+    return bool(n) and (n in PROTECTED_LABEL_EXACT or n.startswith(PROTECTED_LABEL_PREFIXES))
+
+
+def _protected_label_in(cmd: str):
+    """The first protected label this command would APPLY or REMOVE via `gh`, else None.
+
+    Read paths never match: only the mutating label FLAGS and the issue-labels API
+    endpoint are inspected, so `gh pr view`, `gh label list` and `gh issue view --json
+    labels` stay frictionless. Labelling with an unrelated label is untouched — the
+    value itself has to be in the protected set."""
+    for m in _GH_LABEL_CMD_RE.finditer(cmd):
+        for f in _LABEL_FLAG_RE.finditer(m.group(1)):
+            for part in f.group(1).strip("\"'").split(","):
+                if _is_protected_label(part):
+                    return part.strip().strip("\"'")
+    for m in _GH_API_RE.finditer(cmd):
+        seg = m.group(1)
+        if not (_API_ISSUE_LABELS_RE.search(seg) and _API_WRITE_RE.search(seg)):
+            continue
+        for tok in re.findall(r"[\w:.-]+", seg):
+            if _is_protected_label(tok):
+                return tok
+        # A body this hook cannot read (`--input file`, piped stdin). The ENDPOINT is
+        # already label application, so fail CLOSED rather than wave an opaque payload
+        # through — hiding the label in a file is the obvious next spelling.
+        if re.search(r"(?<![\w-])--input(?![\w-])", seg):
+            return "<opaque --input payload>"
+    return None
+
+
 # ── Config-anchor guard: the git ref store is a trust anchor, not scratch space ──
 # Added 2026-08-24 (docs/adr/2026-08-24-config-anchor-and-pin-expiry.md).
 # Several guards deliberately read a value from the DEFAULT BRANCH rather than from
@@ -1522,6 +1618,13 @@ def _dispatch(data) -> None:
                 "there. (`gh pr merge --disable-auto` is still allowed, to undo an "
                 "auto-merge that shouldn't have been enabled.)"
             )
+
+        # Applying (or removing) a protected label is an ACKNOWLEDGEMENT, and an
+        # acknowledgement is the human's action for the same reason a merge is:
+        # it grants permission to the very change the session is proposing.
+        _bad_label = _protected_label_in(scan)
+        if _bad_label:
+            block(PROTECTED_LABEL_HELP.format(label=_bad_label))
 
         # ── Secret-file read/source guard — path target, not reader verbs ──────
         # (see SENSITIVE_PATH_RE above; deliberately whole-command, so a secret

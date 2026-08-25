@@ -48,6 +48,16 @@ never work around it.** Full reference: `.claude/hooks/README.md`.
   the human's action only.** Open the PR (`gh pr create`) and stop. Never enable
   auto-merge. (Even *mentioning* `gh pr merge` in a shell command — e.g. a grep
   pattern — trips it; that's expected.)
+- **Protected-label guard** — **you cannot apply or remove `hooks-change`, `agent:*`,
+  `blocked:*` or `provenance:*`** (contract §6). Blocked in every `gh` spelling that
+  writes them: `pr`/`issue edit --add-label`/`--remove-label`, `pr`/`issue create
+  --label`/`-l`, and `gh api` writes to `/issues/<n>/labels`. **Print the command for
+  the human to run instead** — same flow as a self-protected file. `hooks-change` is
+  what turns the *Hooks change guard* CI job green, so labelling your own PR is
+  acknowledging your own change; that acknowledgement is the human's to give, for the
+  same reason a merge is. Reading/listing labels is fine, as is any unrelated label
+  (`bug`) and `gh label create` (defining a label is setup). CI checks **who** applied
+  it, so borrowing another spelling does not help.
 - **Self-protection** — **you cannot edit the hook scripts (`pre-tool-use.py`,
   `audit.py`, `stop-pr-check.py`), `.claude/settings.json`, or
   `.claude/settings.local.json`.** Edit/Write and Bash mutations (`>`, `sed -i`,
@@ -117,6 +127,7 @@ npm run test:dor        # Definition-of-Ready gate selftest
 npm run test:delivery   # delivery.json validator selftest (PIPELINE-CONTRACT §7)
 npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
+npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
 npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
@@ -136,8 +147,8 @@ and each asserts its contract rows against synthetic fixtures.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the forbidden-paths gate, placeholder integrity, the DoR, delivery-config,
-auto-approve, auto-merge, telemetry, dashboard and weekly-review selftests, and
-secretlint on every PR. `main` is protected (that context required, admins enforced).
+auto-approve, auto-merge, grader-path, telemetry, dashboard and weekly-review
+selftests, and secretlint on every PR. `main` is protected (that context required, admins enforced).
 
 ---
 

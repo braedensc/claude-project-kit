@@ -312,8 +312,12 @@ Stop hook between them:
    touches a grader path — `.claude/hooks/**`, `.claude/settings*.json`,
    `.github/workflows/**`, and (when configured) `delivery.json` plus its
    `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
-   `hooks-change` label. Local hooks only constrain sessions that run them; a PR
-   authored in another clone or the web UI never meets one.
+   `hooks-change` label — and, since that label is the *acknowledgement*, the job
+   also checks **who applied it**: a machine identity can never supply it, and a
+   bot-authored PR cannot label itself. Local hooks only constrain sessions that run
+   them; a PR authored in another clone or the web UI never meets one. The job runs
+   the gate script from the PR's **base** sha for the same reason it reads config
+   from base — a head that can rewrite the gate grades its own homework.
 
 Plus two non-enforcing complements: native `permissions.deny` rules in `settings.json`
 hard-block secret-file reads independently of the Python hook (docs/SECURITY.md), and
