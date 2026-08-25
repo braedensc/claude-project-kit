@@ -93,18 +93,23 @@ are all agent-mutable, so:
   `~/.claude/pipeline/pins`);
 - config **values** are read from the committed copy on the default branch
   (`git show origin/main:delivery.json`), never from the working-tree copy — a battery
-  case pins that a fully disarmed working-tree `delivery.json` moves nothing;
+  case pins that a fully disarmed working-tree `delivery.json` moves nothing. That only
+  holds while the **ref** is not model-movable either, which is what the universal
+  config-anchor guard below is for;
 - states and labels are compared **by ID**, never by display name, so a rename in the
   tracker UI cannot silently desync a guard.
 
 | Guard | Active when | What it blocks |
 |---|---|---|
-| **State transition / self-approval** | configured | Any tracker write setting a ticket to the configured `ready` state — **an approval is a human's action**. The one narrow exception is the pinned ticket itself when *all* of: `"epic"` ∈ `autonomy.autoApproveProvenance`, provenance is `epic/<ID>`, the definition of ready is complete (acceptance criteria, `effort:S\|M\|L`, `track:*`, title), and the session changes **no** risk-listed path. Monitor-, review- and retro-filed tickets can never auto-approve — that is exactly the path an attacker-influenced payload would take to mint itself a mandate. A project closes the exception entirely by emptying `autoApproveProvenance` |
+| **State transition / self-approval** | configured | Any tracker write setting a ticket to the configured `ready` state — **an approval is a human's action, and there is no in-session exception.** Only `epic/*` provenance ever auto-approves, and only *out of session* (contract §2, §5); the gate is `scripts/check_auto_approve.py`, which can read the epic and re-derive every condition from sources a session cannot write. `autonomy.autoApproveProvenance` configures **that** tier (§11) — this hook does not read it, and two paired battery cases (one config listing `epic`, one empty, same payload, same block) pin that it reads it in neither direction |
+| **Lifecycle-label** | configured + pinned | Any tracker write **naming** an `agent:*` or `blocked:*` label — matched by canonical key *and* by configured ID, in `add` and `remove` alike. Those are dispatcher-owned (§6): a session that can apply `agent:needs-human`, clear `agent:blocked`, or set `agent:queued` is editing its own supervision — the last one queues its own next dispatch. Whole-field-value matching, so *asking* for a label in a comment is untouched. Key matching is what keeps it failing closed when `linear.labels.ids` resolves nothing |
 | **Own-ticket-only writes** | configured + pinned | Tracker mutations outside the session's own ticket (decision table below) |
 | **AC integrity** | configured + pinned ticket | Editing the session's **own in-progress** ticket's description / acceptance criteria / title. Review compares the PR against the snapshot taken at dispatch, so a session that can rewrite its own ACs can make scope creep look compliant — the ticket-layer twin of weakening a test assertion. Comments and status changes stay allowed |
 | **Grader-path protection** | configured + pinned | Edit/Write **and** Bash mutations of `.github/workflows/**`, `delivery.json`, and every glob in `autonomy.riskPaths` — the machinery that decides whether the work is acceptable. Uses the *same* operator scaffold as self-protection (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/…`, any interpreter naming the path); reads and `git add` stay allowed. **Hook scripts and `settings*.json` remain blocked unconditionally, pipeline or not** — nothing here made that mode-conditional |
 | **Ticket-branch** | configured + `branch.requireTicketId` | Edit/Write/`git commit` on a branch whose ticket segment isn't the pinned ID. The branch regex is lower-case only, so tracker IDs **must** be lower-cased (`feat/eng-123-token-refresh`) and the comparison is case-**in**sensitive |
-| **Pin binding** | configured | A malformed pin, an unrecognized `pin_version`, or a pin written for a **different worktree** — a hard stop, not a warning |
+| **Pin binding** | configured | A malformed pin, an unrecognized `pin_version`, a pin written for a **different worktree**, or — on a `ticket`-mode session — an **expired** one. A hard stop, not a warning. **An expiry is not an absence:** an absence means nothing ever bound this session (a human's ad-hoc session, which must not be bricked), while a lapse means a binding *was* issued for this worktree and its ticket, scope and branch can no longer be verified — §2 calls that broken. Reading a lapse as "unpinned" would switch five of six pipeline guards off and make **waiting** an escape. §2 scopes broken to `ticket` mode, so a lapsed `planning` pin keeps working — but the pin object is still read, so every constraint it carried stays on |
+| **Config anchor** | **always** (universal) | Writing a protected git ref — `git update-ref`, `branch -f/-D/-M main`, a fetch/pull **refspec** targeting `main`/`master`, `symbolic-ref`, `replace`, history rewriters — plus repointing `origin` (`remote set-url/remove/rename`, `git config remote.origin.url`) and any mutation of `.git/**` in Bash or Edit/Write. Guards deliberately read values from the default branch *because* the worktree is model-writable; that only holds while the ref is not, and one `git update-ref` would otherwise pick the `delivery.json` those guards then read — `dispatch.pinsRoot` included, which is a forged pin. Reads and a plain `git fetch` (the one honest writer of `origin/main`) stay allowed, as does `git remote add origin`, which cannot repoint a remote that already exists. Tamper-**evident**, not tamper-proof — same posture §3 states for the pin |
+| **Pins-root containment** | configured | A `dispatch.pinsRoot` that resolves inside the repo or any worktree, or isn't a string — **broken config**, not a silent default. §7 makes it a validator hard-fail; the hook re-checks because it must not assume the validator ran, and because this is what a poisoned config would target first: a pins directory the session can write is a pin the session can forge |
 
 **Own-ticket-only writes — the decision table** (the approval guard above applies on top
 of every row):
@@ -120,12 +125,24 @@ of every row):
 **Fail direction is tested, not just asserted.** Write-blocking guards, state
 transitions and pin checks fail **closed**; checks that merely *withhold* autonomy from
 an unpinned session fail **open**, so a human's ad-hoc session in a configured repo is
-never bricked. An adversary must not be able to flip a guard open by inducing an error,
-so the battery covers the error paths too: a broken `delivery.json`, an unrecognized
-version, a malformed pin, an expired pin, a foreign-worktree pin, and a changed-file set
-that cannot be computed. One deliberate carve-out: when the config is broken, editing
-`delivery.json` itself stays allowed, so the repo is never held hostage by its own
-config.
+never bricked. An adversary must not be able to flip a guard open by inducing an error —
+and "inducing an error" includes simply **waiting**, which is why an expired pin is
+broken rather than absent. The battery covers the error paths too: a broken
+`delivery.json`, an unrecognized version, a malformed pin, an expired pin (ticket *and*
+non-ticket mode), a foreign-worktree pin, a `pinsRoot` of the wrong type, and label IDs
+that resolve to nothing. One deliberate carve-out: when the config is broken — parse
+failure or an out-of-bounds `pinsRoot` alike — editing `delivery.json` itself stays
+allowed, so the repo is never held hostage by its own config.
+
+**Changing a guard: compose, prove, then hand it over.** `pre-tool-use.py` is
+self-protected, so a new version is written to a scratch file *outside* the repo under a
+different basename, and proven there before a human applies it — a syntax error in a
+self-protected hook fails closed and needs terminal recovery (`docs/LESSONS.md`). Point
+the battery at the candidate with `HOOK_UNDER_TEST=/abs/path/<root>/.claude/hooks/<name>.py
+npm run test:hooks`; the candidate must sit in a `<root>/.claude/hooks/` layout inside a
+git repo on a feature branch, because the battery derives each run's session root from
+the hook's own location exactly as production does. Unset in CI, so it can never change
+what CI verifies.
 
 **Known limits** (documented rather than implied): the pin is *tamper-evident, not
 tamper-proof* — the session's shell runs as the same user, so `0444` and a path outside

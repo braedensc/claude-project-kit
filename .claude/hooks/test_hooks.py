@@ -34,7 +34,16 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
-HOOK = os.path.join(HOOKS_DIR, "pre-tool-use.py")
+# VALIDATING A HOOK CHANGE BEFORE IT LANDS. `pre-tool-use.py` is self-protected, so a
+# new version is composed in a scratch file and must be proven green THERE — a syntax
+# error in a self-protected hook fails closed and needs human-only terminal recovery
+# (docs/LESSONS.md). Point the battery at the candidate:
+#   HOOK_UNDER_TEST=/abs/path/<candroot>/.claude/hooks/<name>.py npm run test:hooks
+# The candidate must sit in a `<root>/.claude/hooks/` layout inside a git repo on a
+# feature branch: the battery derives each run's session root from the hook's own
+# location, exactly as production does. Unset (CI, every normal run) → the committed
+# hook, so this can never change what CI actually verifies.
+HOOK = os.environ.get("HOOK_UNDER_TEST") or os.path.join(HOOKS_DIR, "pre-tool-use.py")
 STOP_HOOK = os.path.join(HOOKS_DIR, "stop-pr-check.py")
 
 BLOCK, ALLOW = True, False
@@ -274,6 +283,10 @@ def make_stale_main_sandbox():
 PL_READY = "11111111-1111-4111-8111-111111111111"
 PL_RAW = "22222222-2222-4222-8222-222222222222"
 PL_LABEL = "33333333-3333-4333-8333-333333333333"
+# Dispatcher-owned lifecycle labels (§6) — the guard matches these by ID as well as
+# by canonical key, so the battery needs both halves resolved.
+PL_QUEUED = "44444444-4444-4444-8444-444444444444"
+PL_NEEDS_HUMAN = "55555555-5555-4555-8555-555555555555"
 PL_BRANCH = "feat/eng-123-token-refresh"
 
 
@@ -306,7 +319,9 @@ def _pl_cfg(pins_dir, **over):
             "teamKey": "ENG", "workspace": "battery",
             "stateIds": {"raw": PL_RAW, "ready": PL_READY, "working": "w-id",
                          "review": "v-id", "done": "d-id"},
-            "labels": {"ids": {"track:platform": PL_LABEL, "effort:M": "e-id"},
+            "labels": {"ids": {"track:platform": PL_LABEL, "effort:M": "e-id",
+                               "agent:queued": PL_QUEUED,
+                               "agent:needs-human": PL_NEEDS_HUMAN},
                        "required": []},
         },
         "github": {"owner": "acme", "repo": "app", "defaultBranch": "main"},
@@ -349,16 +364,19 @@ def _pl_pin(root, **over):
 
 def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
                           cfg_raw=None, pin_raw=None, worktree_cfg_raw=None,
-                          dirty=None):
+                          dirty=None, pins_in_repo=None):
     """Throwaway repo with the pipeline CONFIGURED. Returns (root, hook_copy, pins).
 
     `cfg_raw`/`pin_raw` write the file verbatim (the malformed-config and
     malformed-pin cases). `worktree_cfg_raw` overwrites the WORKING-TREE copy after
     branching — the adversarial case: an agent editing `delivery.json` inside its
     own worktree must not be able to move a guard, because values come from the
-    committed copy on the default branch. `dirty` writes uncommitted files, used to
-    put a risk-listed path into the session's changed-file set. `pin=None` means no
-    pin at all (a human's ad-hoc session in a configured repo)."""
+    committed copy on the default branch. `dirty` writes uncommitted files.
+    `pins_in_repo` is a repo-relative path that becomes `dispatch.pinsRoot`, so the
+    config points the pin INSIDE the worktree — the §7 hard-fail, and the payload a
+    poisoned config would want most: a pins directory the session can write is a
+    pin the session can forge. `pin=None` means no pin at all (a human's ad-hoc
+    session in a configured repo)."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pl-"))
     pins = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pins-"))
     hooks = os.path.join(root, ".claude", "hooks")
@@ -367,8 +385,9 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
     shutil.copy(HOOK, hook_copy)
     shutil.copy(STOP_HOOK, os.path.join(hooks, os.path.basename(STOP_HOOK)))
     _git(root, "init", "-q", "-b", "main")
+    cfg_pins = pins if pins_in_repo is None else os.path.join(root, pins_in_repo)
     _pl_write(root, "delivery.json", cfg_raw if cfg_raw is not None
-              else json.dumps(_pl_cfg(pins, **(cfg_over or {})), indent=2))
+              else json.dumps(_pl_cfg(cfg_pins, **(cfg_over or {})), indent=2))
     _pl_write(root, "src/app.ts", "export const x = 1\n")
     _pl_write(root, ".github/workflows/ci.yml", "name: CI\n")
     _git(root, "add", "-A")
@@ -452,6 +471,23 @@ def main():
         pin={"worktree": "/nonexistent/other-worktree"})
     pl_exp_root, pl_exp, pl_exp_pins = make_pipeline_sandbox(
         pin={"expires_at": "2020-01-01T00:00:00Z"})
+    # An expired pin on a NON-ticket session: §2 scopes BROKEN to `ticket` mode, so
+    # ordinary work keeps running — but the constraints the lapsed pin carried stay
+    # on, because an expiry must never hand back what the pin was withholding.
+    pl_expplan_root, pl_expplan, pl_expplan_pins = make_pipeline_sandbox(
+        branch="feat/decompose-the-epic",
+        pin={"session_mode": "planning", "ticket": None,
+             "expires_at": "2020-01-01T00:00:00Z"})
+    # `dispatch.pinsRoot` pointing inside the worktree — a pin the session can write
+    # is not a pin (§3), and §7 makes it a hard config failure.
+    pl_pinsin_root, pl_pinsin, pl_pinsin_pins = make_pipeline_sandbox(
+        pins_in_repo=".pipeline/pins")
+    pl_pinsbad_root, pl_pinsbad, pl_pinsbad_pins = make_pipeline_sandbox(
+        cfg_over={"dispatch": {"pinsRoot": 17}})
+    # Unresolvable label IDs — the lifecycle-label guard's error path: canonical-key
+    # matching must survive a config that resolves no label ID at all.
+    pl_nolbl_root, pl_nolbl, pl_nolbl_pins = make_pipeline_sandbox(
+        cfg_over={"linear": {"labels": {"ids": {}, "required": []}}})
     pl_noid_root, pl_noid, pl_noid_pins = make_pipeline_sandbox(pin={"ticket": None})
     pl_plan_root, pl_plan, pl_plan_pins = make_pipeline_sandbox(
         branch="feat/decompose-the-epic", pin={"session_mode": "planning", "ticket": None})
@@ -503,7 +539,9 @@ def main():
         pl_mon_root, pl_mon_pins, pl_rev_root, pl_rev_pins,
         pl_retro_root, pl_retro_pins, pl_noac_root, pl_noac_pins,
         pl_noeff_root, pl_noeff_pins, pl_noauto_root, pl_noauto_pins,
-        pl_disarm_root, pl_disarm_pins,
+        pl_disarm_root, pl_disarm_pins, pl_expplan_root, pl_expplan_pins,
+        pl_pinsin_root, pl_pinsin_pins, pl_pinsbad_root, pl_pinsbad_pins,
+        pl_nolbl_root, pl_nolbl_pins,
     ]
 
     # (name, payload, expect_block, hook_path)
@@ -849,8 +887,15 @@ def main():
          edit(os.path.join(pl_noreq_root, "src/app.ts"), "x"), ALLOW, pl_noreq),
 
         # ── state transition into `ready` IS an approval (matched by state ID) ─
-        ("ready: epic provenance + complete DoR + clean risk paths allowed",
-         mcp("save_issue", id="ENG-123", stateId=PL_READY), ALLOW, pl_hook),
+        # There is NO in-session allow-path and no config value that opens one:
+        # contract §2's `self-approval` row, §5 ("only out of session") and §8
+        # ("`ready` ... refused even when a caller passes them in
+        # `allowed_to_states`") all say the same thing. The first case is the
+        # regression gate — the best-case session (pinned, epic provenance, complete
+        # definition of ready, no risk-path change, targeting its OWN ticket) is
+        # still refused, so the allow-path cannot come back unnoticed.
+        ("ready: the BEST-case session is still blocked (no in-session approval exists)",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_hook),
         ("ready: monitor-filed ticket blocked",
          mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_mon),
         ("ready: review-filed ticket blocked",
@@ -867,7 +912,12 @@ def main():
          mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_nopin),
         ("ready: EXPIRED pin blocks — a GRANTING check fails CLOSED",
          mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_exp),
-        ("ready: autoApproveProvenance empty closes the path entirely",
+        # Paired with the `pl_hook` case above (same payload, same expectation, and
+        # that config lists "epic"): together they prove the hook no longer reads
+        # `autonomy.autoApproveProvenance` in EITHER direction. That field configures
+        # the out-of-session approve tier (§11, scripts/check_auto_approve.py), and a
+        # session must not be able to read a permission out of it.
+        ("ready: autoApproveProvenance is not an in-session permission (empty)",
          mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_noauto),
         ("ready: targeting a ticket other than the pinned one blocked",
          mcp("save_issue", id="ENG-777", stateId=PL_READY), BLOCK, pl_hook),
@@ -878,6 +928,14 @@ def main():
          mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_disarm),
         ("raw state change allowed — only `ready` is an approval",
          mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_hook),
+        # A tracker MCP takes plural fields as LISTS, and a scalar inside a list used
+        # to reach no value-matching guard at all (see _walk_items). Both halves of
+        # that gap are pinned here: a state ID and a foreign ticket ID, each nested.
+        ("ready: a `ready` state ID nested in a LIST is still an approval",
+         mcp("save_issue", id="ENG-123", stateIds=[PL_READY]), BLOCK, pl_hook),
+        ("own-ticket: a foreign ticket ID nested in a LIST is still a foreign target",
+         mcp("save_comment", issueId="ENG-123", mentionedIssues=["ENG-456"],
+             body="see also"), BLOCK, pl_hook),
 
         # ── own-ticket-only writes (the decision table) ───────────────────────
         ("own-ticket: issue write on the pinned ticket allowed",
@@ -941,8 +999,116 @@ def main():
          edit(os.path.join(pl_oldpin_root, "src/app.ts"), "x"), BLOCK, pl_oldpin),
         ("pin written for a DIFFERENT worktree blocked (hard stop)",
          edit(os.path.join(pl_mism_root, "src/app.ts"), "x"), BLOCK, pl_mism),
-        ("expired pin: treated as absent, so a WITHHOLDING check fails open",
-         edit(os.path.join(pl_exp_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_exp),
+
+        # ── an EXPIRED pin is BROKEN, not absent (§2) ─────────────────────────
+        # An absence means nothing ever bound this session; an expiry means a
+        # binding WAS issued for this worktree and lapsed, so the ticket, scope and
+        # branch it bound can no longer be verified. Reading that as "unpinned"
+        # would switch five of six pipeline guards off — and would make WAITING an
+        # escape, which is the fail-direction doctrine exactly inverted.
+        ("expired pin in ticket mode: ordinary source edit BLOCKED (fails closed)",
+         edit(os.path.join(pl_exp_root, "src/app.ts"), "x"), BLOCK, pl_exp),
+        ("expired pin in ticket mode: risk-path edit BLOCKED",
+         edit(os.path.join(pl_exp_root, ".github/workflows/ci.yml"), "x"), BLOCK, pl_exp),
+        ("expired pin in ticket mode: a Bash mutation is BLOCKED",
+         bash("npm test"), BLOCK, pl_exp),
+        ("expired pin in ticket mode: a tracker write is BLOCKED",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), BLOCK, pl_exp),
+        ("expired pin: Read stays allowed (diagnosis, as with a broken config)",
+         read(os.path.join(pl_exp_root, "delivery.json")), ALLOW, pl_exp),
+        # §2 scopes BROKEN to `ticket` mode. A lapsed planning pin does not brick the
+        # session — but it does not hand back what it was withholding either.
+        ("expired pin, planning mode: ordinary source edit allowed (§2 scopes BROKEN to ticket mode)",
+         edit(os.path.join(pl_expplan_root, "src/app.ts"), "x"), ALLOW, pl_expplan),
+        ("expired pin, planning mode: risk-path edit STILL blocked (a lapse grants nothing)",
+         edit(os.path.join(pl_expplan_root, ".github/workflows/ci.yml"), "x"),
+         BLOCK, pl_expplan),
+
+        # ── the pin must live where the session cannot reach it (§3, §7) ──────
+        ("pinsRoot inside the worktree is BROKEN config (a forgeable pin is not a pin)",
+         edit(os.path.join(pl_pinsin_root, "src/app.ts"), "x"), BLOCK, pl_pinsin),
+        ("pinsRoot inside the worktree: editing delivery.json stays allowed (no hostage)",
+         write(os.path.join(pl_pinsin_root, "delivery.json"), "{}"), ALLOW, pl_pinsin),
+        ("pinsRoot of the wrong TYPE is BROKEN, not silently defaulted",
+         edit(os.path.join(pl_pinsbad_root, "src/app.ts"), "x"), BLOCK, pl_pinsbad),
+
+        # ── lifecycle-label: supervision belongs to the dispatcher (§6, §8) ────
+        # A session that can set `agent:needs-human` — or clear `agent:blocked`, or
+        # apply `agent:queued` and so queue its own next dispatch — is editing the
+        # record of whether it is allowed to run.
+        ("lifecycle-label: setting agent:needs-human by canonical key blocked",
+         mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]), BLOCK, pl_hook),
+        ("lifecycle-label: setting it by configured label ID blocked",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_NEEDS_HUMAN]), BLOCK, pl_hook),
+        ("lifecycle-label: REMOVING a lifecycle label blocked too (§8: add and remove alike)",
+         mcp("save_issue", id="ENG-123", removeLabels=["agent:blocked"]), BLOCK, pl_hook),
+        ("lifecycle-label: a planning session may not queue its own next dispatch",
+         mcp("create_issue", teamId="ENG", labels=["agent:queued"]), BLOCK, pl_plan),
+        ("lifecycle-label: an ordinary label on the pinned ticket allowed",
+         mcp("save_issue", id="ENG-123", labels=["needs-design"]), ALLOW, pl_hook),
+        ("lifecycle-label: a non-lifecycle configured ID (track:*) allowed",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_LABEL]), ALLOW, pl_hook),
+        ("lifecycle-label: ASKING for one in a comment allowed (prose, not a whole value)",
+         mcp("save_comment", issueId="ENG-123",
+             body="blocked on an API key — please apply agent:blocked"), ALLOW, pl_hook),
+        ("lifecycle-label: UNPINNED session unaffected (a WITHHOLDING check fails open)",
+         mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]), ALLOW, pl_nopin),
+        # Error path: the ID map resolves nothing, so ID matching cannot fire. Key
+        # matching must still block — a guard whose config went blank fails CLOSED.
+        ("lifecycle-label: unresolvable label IDs still block by canonical key",
+         mcp("save_issue", id="ENG-123", labels=["agent:blocked"]), BLOCK, pl_nolbl),
+        ("lifecycle-label: an EXPIRED planning pin still blocks (a lapse grants nothing)",
+         mcp("save_issue", id="ENG-777", labels=["agent:queued"]), BLOCK, pl_expplan),
+
+        # ══ CONFIG ANCHOR: the git ref store is human-only ════════════════════
+        # Guards read `delivery.json`, the merged-PR base and the changed-file set
+        # from the DEFAULT BRANCH precisely because the worktree is model-writable —
+        # which only holds while the ref is not. Universal: these fire with or
+        # without a pipeline, because the anchor is shared.
+        ("config-anchor: git update-ref on origin/main blocked",
+         bash("git update-ref refs/remotes/origin/main abc1234"), BLOCK, feat_hook),
+        ("config-anchor: git update-ref -d blocked",
+         bash("git update-ref -d refs/heads/main"), BLOCK, feat_hook),
+        ("config-anchor: git branch -f main blocked",
+         bash("git branch -f main abc1234"), BLOCK, feat_hook),
+        ("config-anchor: git branch -D master blocked",
+         bash("git branch -D master"), BLOCK, feat_hook),
+        ("config-anchor: a fetch REFSPEC targeting origin/main blocked",
+         bash("git fetch https://example.invalid/r +HEAD:refs/remotes/origin/main"),
+         BLOCK, feat_hook),
+        ("config-anchor: repointing origin blocked",
+         bash("git remote set-url origin https://example.invalid/r"), BLOCK, feat_hook),
+        ("config-anchor: writing remote.origin.url via git config blocked",
+         bash("git config remote.origin.url https://example.invalid/r"), BLOCK, feat_hook),
+        ("config-anchor: git replace blocked (it rewrites what a ref resolves to)",
+         bash("git replace abc1234 def5678"), BLOCK, feat_hook),
+        ("config-anchor: redirect into .git/refs blocked",
+         bash("echo abc1234 > .git/refs/remotes/origin/main"), BLOCK, feat_hook),
+        ("config-anchor: sed -i on .git/config blocked",
+         bash("sed -i 's/a/b/' .git/config"), BLOCK, feat_hook),
+        ("config-anchor: Write into .git/ blocked (the Edit/Write twin)",
+         write(os.path.join(feat_root, ".git/config"), "x"), BLOCK, feat_hook),
+        # …and the reads and honest writers it must NOT touch. `git fetch` is the one
+        # legitimate writer of origin/main: a guard that stopped it would stop the
+        # repo from learning the truth.
+        ("config-anchor: plain git fetch allowed",
+         bash("git fetch origin main"), ALLOW, feat_hook),
+        ("config-anchor: reading through the ref allowed",
+         bash("git diff origin/main...HEAD --name-only"), ALLOW, feat_hook),
+        ("config-anchor: git branch --merged main allowed (a read that names the ref)",
+         bash("git branch --merged main"), ALLOW, feat_hook),
+        ("config-anchor: git config --get remote.origin.url allowed",
+         bash("git config --get remote.origin.url"), ALLOW, feat_hook),
+        ("config-anchor: cat .git/config allowed (reads are untouched)",
+         bash("cat .git/config"), ALLOW, feat_hook),
+        ("config-anchor: the documented branch rename allowed",
+         bash("git branch -m fix/some-real-work"), ALLOW, feat_hook),
+        ("config-anchor: an SSH URL containing ':main/' is not a refspec",
+         bash("git fetch git@github.com:main/repo.git"), ALLOW, feat_hook),
+        ("config-anchor: a path named replace.ts is not the `git replace` verb",
+         bash("git show HEAD:src/replace.ts"), ALLOW, feat_hook),
+        ("config-anchor: git remote add origin allowed (cannot repoint an existing one)",
+         bash("git remote add origin https://example.invalid/r"), ALLOW, feat_hook),
     ]
 
     # Stop hook: different protocol (exit 0 + JSON decision on stdout).
@@ -1035,6 +1201,18 @@ def main():
         ("stderr reason: ticket-branch block prints the rename command",
          edit(os.path.join(pl_wrongbr_root, "src/app.ts"), "x"),
          "git branch -m", pl_wrongbr),
+        ("stderr reason: an expired pin is named as a lapse, not an absence",
+         edit(os.path.join(pl_exp_root, "src/app.ts"), "x"),
+         "An expiry is not an absence", pl_exp),
+        ("stderr reason: lifecycle-label block names the label it refused",
+         mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]),
+         "agent:needs-human", pl_hook),
+        ("stderr reason: config-anchor block says the ref store is human-only",
+         bash("git update-ref refs/remotes/origin/main abc1234"),
+         "rewrite a git ref", feat_hook),
+        ("stderr reason: pinsRoot block names the resolved path",
+         edit(os.path.join(pl_pinsin_root, "src/app.ts"), "x"),
+         ".pipeline/pins", pl_pinsin),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]

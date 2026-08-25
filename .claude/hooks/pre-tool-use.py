@@ -433,6 +433,94 @@ def _mutate_re(path_re: str):
 _SELF_MUTATE_RE = _mutate_re(_SELF_PROT)
 
 
+# ── Config-anchor guard: the git ref store is a trust anchor, not scratch space ──
+# Added 2026-08-24 (docs/adr/2026-08-24-config-anchor-and-pin-expiry.md).
+# Several guards deliberately read a value from the DEFAULT BRANCH rather than from
+# the agent's worktree: the pipeline's `delivery.json` (see _read_delivery_config),
+# the merged-PR guard's base ref, the changed-file set a review is judged against.
+# The whole point of reading `origin/main` instead of the working tree is that the
+# working tree is model-writable — which only holds while the REF is not. A plain
+# local ref is rewritable by one `git update-ref`, so a session that can move
+# `main`/`origin/main` to a commit of its own making CHOOSES the config every one
+# of those guards then reads, `dispatch.pinsRoot` included — and that is where the
+# pin lives. Anchor poisoning is the entire escalation in one command, which is
+# exactly the failure docs/adr/ names: a guard's anchor must not be something the
+# model can move.
+#
+# So the ref store is human-only, the same way the hook files are. What is blocked
+# is WRITING a protected ref, or repointing the remote a protected ref comes from.
+# Every read (`git log origin/main`, `git diff origin/main...HEAD`) and the one
+# honest writer (`git fetch`, which copies the ref from the real remote) stay
+# allowed — a guard that stopped `git fetch` would stop the repo from learning the
+# truth.
+#
+# TAMPER-EVIDENT, NOT TAMPER-PROOF — the same posture contract §3 states for the
+# pin itself. A shell cannot be perfectly fenced by regex; what this buys is that
+# the cheap, silent, single-command version of the attack is gone, and the backstop
+# stays what it always was: nothing lands without a reviewed PR + CI.
+_PROTECTED_REF = r"(?:refs/(?:heads|remotes/[^\s'\"/]+)/)?(?:main|master)(?![\w./-])"
+# The `.git/**` metadata that DECIDES what a ref resolves to. Reads are untouched;
+# the operator scaffold is the same one self-protection uses.
+_GIT_STORE = (r"\.git[/\\](?:refs[/\\][^\s'\"|&;<>]*|packed-refs|config|HEAD"
+              r"|logs[/\\][^\s'\"|&;<>]*|worktrees[/\\][^\s'\"|&;<>]*)")
+_GIT_STORE_MUTATE_RE = _mutate_re(_GIT_STORE)
+_REF_WRITE_RES = (
+    # These verbs exist to change what a name resolves to. None of them appears in
+    # this repo's workflow, so they are blocked outright rather than by target. The
+    # lookarounds keep the verb from matching inside a PATH or a flag value
+    # (`git show HEAD:src/replace.ts`, `git log --grep=replace`, `git checkout
+    # replace-me`) — the same targeting discipline the guards above use.
+    re.compile(r"\bgit\b[^|;&]*?(?<![\w./=-])"
+               r"(?:update-ref|replace|fast-import|filter-branch)(?![\w./-])"),
+    re.compile(r"\bgit\b[^|;&]*\bsymbolic-ref\b[^|;&]*" + _PROTECTED_REF),
+    # `git branch -f/-M/-D/-d/-m main` — force-move or delete a protected branch.
+    # The flag must be its OWN token, so the read-only spellings that merely mention
+    # the branch (`git branch --merged main`, `--contains main`) do not match.
+    re.compile(r"\bgit\b[^|;&]*\bbranch\b[^|;&]*"
+               r"(?:(?<=\s)-[a-zA-Z]*[fMDdm](?=[\s'\"]|$)|--force\b|--delete\b|--move\b)"
+               r"[^|;&]*(?<![\w./-])" + _PROTECTED_REF),
+    # A fetch/pull REFSPEC (`<src>:<dst>`) whose destination is a protected ref —
+    # how a hostile remote gets copied over origin/main. A plain `git fetch origin
+    # main` carries no colon and stays allowed, and an SSH URL
+    # (`git@host:main/repo.git`) cannot match: the ref lookahead excludes `/`.
+    re.compile(r"\bgit\b[^|;&]*\b(?:fetch|pull)\b[^|;&]*:" + _PROTECTED_REF),
+    # Repointing `origin` itself and then fetching reaches the same place. `add` is
+    # deliberately NOT here: git refuses to add a remote that already exists, so it
+    # cannot repoint an anchor — repointing needs `remove` or `set-url` first, and
+    # both are blocked. That keeps first-push bootstrap (`git remote add origin …`)
+    # working, which is the one time a human legitimately types this.
+    re.compile(r"\bgit\b[^|;&]*\bremote\b[^|;&]*"
+               r"\b(?:set-url|set-head|rename|remove|rm)\b"
+               r"[^|;&]*(?<![\w.-])origin(?![\w.-])"),
+)
+_GIT_CONFIG_REMOTE_RE = re.compile(
+    r"\bgit\b[^|;&]*\bconfig\b[^|;&]*(?<![\w.-])remote\.origin\.url(?![\w.-])")
+_GIT_CONFIG_READ_RE = re.compile(r"(?:^|\s)--(?:get|get-all|get-regexp|list)\b")
+CONFIG_ANCHOR_HELP = (
+    "🔒 That command would rewrite a git ref — or the remote a ref comes from — "
+    "that this hook suite TRUSTS. Guards deliberately read values from the default "
+    "branch instead of your worktree (`delivery.json`, the merged-PR base, the "
+    "changed-file set a review is judged against), so a session that can move "
+    "`main`/`origin/main` picks the values that judge it. Moving a protected ref, "
+    "repointing `origin`, or writing into `.git/` is a human's action at a "
+    "terminal. Reads (`git log`, `git diff origin/main...HEAD`) and a plain "
+    "`git fetch` are untouched."
+)
+
+
+def _in_git_store(path: str) -> bool:
+    """True when `path` lands inside ANY `.git` directory — the Edit/Write twin of
+    _GIT_STORE_MUTATE_RE. Component-wise, so `.gitignore` and `.github/` (which
+    only *start* with `.git`) are never caught."""
+    if not path:
+        return False
+    try:
+        parts = os.path.abspath(path).replace(os.sep, "/").split("/")
+    except Exception:
+        return True  # unresolvable path → fail CLOSED
+    return ".git" in parts
+
+
 # ── Secret-file target match (Bash) ─────────────────────────────────────────────
 # Hardened 2026-08-23. The old guard was a verb denylist (cat/less/
 # head/tail/bat/open/more) so `xxd`, `od`, `strings`, `grep`, `base64`,
@@ -558,7 +646,9 @@ def _egress_hosts(cmd: str):
 #
 # FAIL DIRECTION: write-blocking and state-transition guards fail CLOSED; checks
 # that merely WITHHOLD autonomy from an unpinned (human, ad-hoc) session fail
-# OPEN. An adversary must not be able to flip a guard open by inducing an error.
+# OPEN. An adversary must not be able to flip a guard open by inducing an error —
+# and "inducing an error" includes simply WAITING, which is why an expired pin is
+# BROKEN rather than absent (see _read_pin).
 DELIVERY_FILE = "delivery.json"
 DELIVERY_VERSION = 1
 PIN_VERSION = 1
@@ -567,6 +657,12 @@ PIN_VERSION = 1
 # reading `github.defaultBranch` out of the working tree: the working-tree copy
 # is inside the agent's worktree, so trusting it to pick the ref we then read the
 # trusted values from would be circular.
+#
+# These refs are the config's TRUST ANCHOR, and a plain git ref is movable — see
+# the config-anchor guard above, which is what makes reading them worth more than
+# reading the working tree. Remote-tracking refs come first because their only
+# honest writer is `git fetch`; the local branches are the fallback for a repo with
+# no remote, where the alternative would be the fully model-writable working tree.
 _CONFIG_REFS = ("origin/main", "origin/master", "main", "master")
 
 PIPELINE_BROKEN_HELP = (
@@ -581,9 +677,20 @@ PIN_BROKEN_HELP = (
     "  pin file:     {path}\n"
     "  session root: {root}\n"
     "A pin binds one session to one ticket, and a reader must verify it "
-    "(docs/PIPELINE-CONTRACT.md §3). A malformed pin, or one written for a "
-    "different worktree, is a hard stop — not a warning. Ask the dispatcher to "
-    "re-dispatch, or delete the stale pin file."
+    "(docs/PIPELINE-CONTRACT.md §3). A malformed pin, one written for a different "
+    "worktree, or an EXPIRED one on a `ticket`-mode session is a hard stop — not a "
+    "warning. An expiry is not an absence: this session WAS dispatched with a "
+    "binding and that binding has lapsed, so the ticket, scope and branch it "
+    "bound can no longer be verified (§2 calls that BROKEN, and broken fails "
+    "closed). Ask the dispatcher to re-dispatch, or delete the stale pin file."
+)
+PINS_ROOT_HELP = (
+    "🔒 `delivery.json` is BROKEN: `dispatch.pinsRoot` resolves to `{path}`, which "
+    "is inside this repo or one of its worktrees. The pin is the one binding a "
+    "session cannot write, and a pins directory the session can reach is not that "
+    "(docs/PIPELINE-CONTRACT.md §3; §7 makes it a validator hard-fail). Fails "
+    "closed — edits to `delivery.json` itself stay allowed so the config can be "
+    "repaired from here."
 )
 GRADER_PATH_HELP = (
     "🔒 `{path}` is a risk-listed (grader) path and this is a PINNED agent "
@@ -610,12 +717,27 @@ TICKET_BRANCH_HELP = (
 )
 READY_HELP = (
     "🔒 Moving a ticket into the pipeline's `ready` state is an APPROVAL, and "
-    "approving work is a human's action. Blocked because {why}\n"
+    "approving work is a human's action. There is no in-session path to it and no "
+    "config value that opens one.\n"
     "Only `epic/<ID>` provenance — work decomposed from an epic a person already "
-    "approved — can ever auto-approve; monitor-, review- and retro-filed tickets "
-    "always wait in `raw` for a person, because that is precisely the path an "
-    "attacker-influenced payload would take to mint itself a mandate. Post a "
-    "comment asking for approval instead."
+    "approved — can ever auto-approve, and only OUT OF SESSION "
+    "(docs/PIPELINE-CONTRACT.md §2, §5; the gate is scripts/check_auto_approve.py, "
+    "which can read the epic and re-derive every condition from sources a session "
+    "cannot write). `autonomy.autoApproveProvenance` configures that out-of-session "
+    "approve tier (§11) — it is not a permission this session holds. §8's "
+    "safe-outputs validator refuses `ready` as a transition target however the "
+    "caller is configured; this guard is the same belt. Post a comment asking for "
+    "approval instead."
+)
+LIFECYCLE_LABEL_HELP = (
+    "🔒 This write sets or clears {labels} — a dispatcher-owned lifecycle label. "
+    "`agent:*` and `blocked:*` are the pipeline's supervision OF this session "
+    "(docs/PIPELINE-CONTRACT.md §6): a session that can apply `agent:needs-human`, "
+    "or clear `agent:blocked`, is editing the record of whether it is allowed to "
+    "run — and one that can apply `agent:queued` is queueing its own next dispatch. "
+    "A session ASKS for a lifecycle label in a comment; it never applies one. "
+    "Adding and removing count the same, exactly as §8's safe-outputs validator "
+    "treats them."
 )
 OWN_TICKET_HELP = (
     "🔒 This session is pinned to {ticket} and may not write to {targets}. "
@@ -739,12 +861,24 @@ def _pin_path(cfg) -> str:
 
 
 def _read_pin(cfg):
-    """(pin, status, path). status ∈ ok | absent | malformed | mismatch.
+    """(pin, status, path). status ∈ ok | absent | expired | malformed | mismatch.
 
-    `absent` covers a genuinely missing pin AND an expired one — contract §3:
-    "past it, the pin is stale; readers treat it as absent". Absence never GRANTS
-    autonomy (the approval guard still fails closed), but it must not brick a
-    human's ad-hoc session in a configured repo either."""
+    **`expired` is not `absent`, and the difference is the whole point.** An absent
+    pin means no dispatcher ever bound this session — a human's ad-hoc session in a
+    configured repo, which must not be bricked. An EXPIRED pin means a binding was
+    issued for this very worktree and has lapsed, so every guard that binding
+    carried is now unverifiable. Contract §2 lists "`session_mode: ticket` with a
+    missing, expired, or mismatched pin" as BROKEN, and per the fail-direction
+    doctrine a write-blocking guard whose anchor is unusable fails CLOSED. (§3's
+    "readers treat it as absent" is about the pin no longer being *authority* — and
+    in `ticket` mode absence is itself broken, so the two agree.)
+
+    The parsed pin IS returned for `expired`, because the caller must read the
+    `session_mode` the session was dispatched with to know that. That is sound only
+    because the worktree check runs FIRST: a lapsed pin we return is provably this
+    session's own. A lapsed pin may never GRANT anything, but it must not silently
+    WITHDRAW the constraints it was carrying either — an expiry that switched
+    guards off would make waiting an escape."""
     path = _pin_path(cfg)
     try:
         if not os.path.isfile(path):
@@ -755,24 +889,67 @@ def _read_pin(cfg):
         return None, "malformed", path
     if not isinstance(pin, dict) or pin.get("pin_version") != PIN_VERSION:
         return None, "malformed", path
-    exp = _parse_iso_utc(pin.get("expires_at"))
-    if exp is None:
-        return None, "malformed", path
-    if exp <= datetime.now(timezone.utc):
-        return None, "absent (expired)", path
     wt = pin.get("worktree")
     try:
         if not isinstance(wt, str) or os.path.realpath(wt) != PROJECT_ROOT:
             return None, "mismatch", path
     except Exception:
         return None, "mismatch", path
+    exp = _parse_iso_utc(pin.get("expires_at"))
+    if exp is None:
+        return None, "malformed", path
+    if exp <= datetime.now(timezone.utc):
+        return pin, "expired", path
     return pin, "ok", path
+
+
+def _pins_root_inside_repo(cfg):
+    """The resolved `dispatch.pinsRoot` when it lands inside this repo or any of its
+    worktrees, else None.
+
+    §3's entire argument is that the pin lives somewhere the session cannot write;
+    §7 therefore makes a `pinsRoot` inside the repo a validator hard-fail. The hook
+    re-checks it because a hook must not assume the validator ran — and because
+    this is the highest-value payload of a poisoned config: redirect `pinsRoot`
+    into the worktree and a session writes its own pin. Unresolvable → treated as
+    inside, i.e. fail CLOSED."""
+    raw = (cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"
+    if not isinstance(raw, str) or not raw.strip():
+        return "<unset>"
+    try:
+        root = os.path.realpath(os.path.expanduser(raw.strip()))
+    except Exception:
+        return str(raw)
+    for other in [PROJECT_ROOT] + list(_worktree_roots()):
+        try:
+            other = os.path.realpath(other)
+            if os.path.commonpath([root, other]) == other:
+                return root
+        except Exception:
+            continue
+    return None
+
+
+def _is_delivery_edit(tool, inp) -> bool:
+    """An Edit/Write aimed at `delivery.json` ITSELF. Always allowed through a
+    BROKEN-config block, so a repo is never taken hostage by its own config (the
+    bootstrap-order lesson, docs/LESSONS.md)."""
+    return tool in ("Edit", "Write", "NotebookEdit") and _repo_rel(
+        inp.get("file_path", "") or inp.get("notebook_path", "")) == DELIVERY_FILE
 
 
 # ── payload walking (MCP tool_input is arbitrary JSON) ─────────────────────────
 def _walk_items(obj, depth=0):
     """(key_or_None, value) for every node, so a guard can match on a FIELD NAME
-    (acceptance criteria) or on a VALUE (a state UUID) wherever it is nested."""
+    (acceptance criteria) or on a VALUE (a state UUID) wherever it is nested.
+
+    List ELEMENTS are yielded, not merely recursed into. They used not to be, and a
+    scalar inside a list reached no value-matching guard at all: `{"labels":
+    ["agent:queued"]}` and `{"issueIds": ["ENG-456"]}` were invisible to
+    _payload_strings, so the lifecycle-label, own-ticket and `ready`-state matches
+    all missed the plural form of the very fields a tracker MCP takes as lists.
+    Elements are yielded with key None, so the key-based checks (_ac_fields_present)
+    are unaffected — a nested dict is still attributed to its own field names."""
     if depth > 12:
         return
     if isinstance(obj, dict):
@@ -782,6 +959,7 @@ def _walk_items(obj, depth=0):
                 yield pair
     elif isinstance(obj, (list, tuple)):
         for v in obj:
+            yield None, v
             for pair in _walk_items(v, depth + 1):
                 yield pair
 
@@ -889,20 +1067,39 @@ def _ac_fields_present(inp):
     return sorted(set(hit))
 
 
-def _dor_gaps(ticket):
-    """What the ticket snapshot is missing to be Ready. Derived entirely from the
-    dispatcher-written pin — never from anything the session can edit."""
-    gaps = []
-    acs = ticket.get("acceptance_criteria")
-    if not (isinstance(acs, list) and any(isinstance(a, str) and a.strip() for a in acs)):
-        gaps.append("no acceptance_criteria")
-    if str(ticket.get("effort") or "").strip().upper() not in ("S", "M", "L"):
-        gaps.append("no effort:S|M|L")
-    if not str(ticket.get("track") or "").strip():
-        gaps.append("no track:*")
-    if not str(ticket.get("title") or "").strip():
-        gaps.append("no title")
-    return gaps
+# ── lifecycle labels (contract §6) ────────────────────────────────────────────
+# `agent:*` and `blocked:*` are DISPATCHER-owned: they record whether this session
+# is allowed to run. Matched on the canonical KEY as well as on the configured ID,
+# because a tracker MCP may take either — and because key matching still works when
+# `linear.labels.ids` is blank or unresolved, which is the error path this guard
+# has to fail CLOSED on. §6 names `blocked:capacity`; the class is matched whole, so
+# a later `blocked:*` label is dispatcher-owned by construction rather than by
+# someone remembering to add it here.
+_OWNED_LABEL_RE = re.compile(r"^(?:agent|blocked):[\w][\w.-]*$", re.IGNORECASE)
+
+
+def _owned_label_hits(inp, cfg):
+    """Dispatcher-owned lifecycle labels this payload NAMES, as canonical keys.
+
+    Whole-field-value matching (via _payload_strings), so prose mentioning
+    `agent:blocked` inside a comment body is reporting and does not match — the
+    same rule _payload_ticket_ids uses. Add and remove both land here: the guard
+    matches the label being named at all, not the direction."""
+    ids = ((cfg.get("linear") or {}).get("labels") or {}).get("ids") or {}
+    by_id = {}
+    if isinstance(ids, dict):
+        for key, val in ids.items():
+            if isinstance(key, str) and _OWNED_LABEL_RE.match(key.strip()):
+                cid = _clean_id(val)
+                if cid:
+                    by_id[cid] = key.strip()
+    hits = set()
+    for s in _payload_strings(inp):
+        if _OWNED_LABEL_RE.match(s):
+            hits.add(s.lower())
+        elif s in by_id:
+            hits.add(by_id[s].lower())
+    return sorted(hits)
 
 
 # ── risk / grader paths ───────────────────────────────────────────────────────
@@ -991,42 +1188,6 @@ def _grader_mutate_re(globs):
     return _mutate_re("(?:" + "|".join(_glob_to_bash_re(g) for g in globs) + ")")
 
 
-def _session_changed_paths(pin, cfg):
-    """Repo-relative paths this session changes vs its base — committed AND
-    working-tree. Raises on any failure; the caller treats that as "a risk-path
-    change cannot be ruled out" and blocks."""
-    base = (pin or {}).get("base_branch") or (cfg.get("github") or {}).get("defaultBranch") or "main"
-    ref = None
-    for cand in (f"origin/{base}", base):
-        r = subprocess.run(
-            ["git", "-C", PROJECT_ROOT, "rev-parse", "--verify", "--quiet", cand + "^{commit}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0:
-            ref = cand
-            break
-    if ref is None:
-        raise RuntimeError("base ref not found")
-    paths = set()
-    r = subprocess.run(
-        ["git", "-C", PROJECT_ROOT, "diff", "--name-only", f"{ref}...HEAD"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if r.returncode != 0:
-        raise RuntimeError("git diff failed")
-    paths.update(p.strip() for p in r.stdout.splitlines() if p.strip())
-    r = subprocess.run(
-        ["git", "-C", PROJECT_ROOT, "status", "--porcelain"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if r.returncode != 0:
-        raise RuntimeError("git status failed")
-    for line in r.stdout.splitlines():
-        if len(line) > 3:
-            paths.add(line[3:].split(" -> ")[-1].strip().strip('"'))
-    return {p for p in paths if p}
-
-
 def _branch_ticket(branch: str):
     """The ticket segment of a branch name, or None. Lower-case by construction —
     BRANCH_NAME_RE is `[a-z0-9-]` only, so tracker IDs MUST be lower-cased in a
@@ -1036,48 +1197,36 @@ def _branch_ticket(branch: str):
 
 
 # ── the guards themselves ─────────────────────────────────────────────────────
-def _approval_guard(cfg, pin, ticket, pinned_id, targets):
-    """State-transition / self-approval. A GRANTING check: every rung fails
-    CLOSED, including the ones that fail because something could not be verified.
-    A project closes the narrow allow-path entirely by dropping "epic" from
-    `autonomy.autoApproveProvenance` — which is the posture
-    docs/PIPELINE-CONTRACT.md §5 describes ("only out of session")."""
-    auto = (cfg.get("autonomy") or {}).get("autoApproveProvenance") or []
-    if "epic" not in auto:
-        block(READY_HELP.format(
-            why="`autonomy.autoApproveProvenance` does not list \"epic\", so no "
-                "in-session approval is possible in this project."))
-    if not pin or not pinned_id or not ticket:
-        block(READY_HELP.format(
-            why="this session has no dispatcher pin, so the ticket's provenance and "
-                "definition of ready cannot be verified from anything the session "
-                "did not write itself."))
-    if targets != {pinned_id}:
-        named = ", ".join(sorted(targets)) or "no resolvable ticket"
-        block(READY_HELP.format(
-            why=f"the write targets {named}, not this session's pinned ticket "
-                f"{pinned_id}."))
-    prov = str(ticket.get("provenance") or "").strip()
-    if not re.match(r"^epic/\S+$", prov):
-        block(READY_HELP.format(
-            why=f"the pinned ticket's provenance is {prov or 'unset'!r}, not "
-                "`epic/<ID>`."))
-    gaps = _dor_gaps(ticket)
-    if gaps:
-        block(READY_HELP.format(
-            why="the pinned ticket does not meet the definition of ready (" +
-                "; ".join(gaps) + ")."))
-    try:
-        changed = _session_changed_paths(pin, cfg)
-    except Exception as exc:
-        block(READY_HELP.format(
-            why=f"this session's changed-file set could not be computed "
-                f"({type(exc).__name__}), so a risk-path change cannot be ruled out."))
-    risky = sorted(p for p in changed if _matches_any_glob(p, _grader_globs(cfg)))
-    if risky:
-        block(READY_HELP.format(
-            why="this session changes risk-listed paths (" + ", ".join(risky[:5]) +
-                "), which always need a human."))
+def _approval_guard():
+    r"""State-transition / self-approval — an UNCONDITIONAL block.
+
+    This guard used to carry a narrow in-session allow-path (epic provenance +
+    complete definition of ready + no risk-path change). It is gone, and the
+    reasoning is worth keeping so nobody re-derives it from §5's table:
+
+    * **Three contract sections say it must not exist.** §2's `self-approval` row
+      ("the session does not move a ticket `raw` → `ready`; only `epic/*`
+      provenance auto-approves, and only *out of session*"), §5, and §8 ("`raw`,
+      `ready` and `done` are never valid targets ... refused even when a caller
+      passes them in `allowed_to_states` — a belt the caller cannot unbuckle"). A
+      hook that permits what the validator beside it refuses is not defense in
+      depth, it is a disagreement, and the permissive half is the one that decides.
+    * **It could not check the rule it implemented.** §5 rule 2 requires the
+      referenced epic to exist and itself be in a human-approved state. A PreToolUse
+      hook holds no tracker credential and cannot read the epic, so the allow-path
+      matched `^epic/\S+$` against a string and called that verification.
+    * **It was only ever reachable where the architecture had already failed.**
+      Under §8 a session holds no tracker credential at all — transitions travel as
+      write-requests a separate job executes. So the allow-path could only fire for
+      a session holding a *direct* tracker credential: precisely the deployment
+      where a guard should be at its most conservative, not its most permissive.
+
+    The approve tier still exists. It runs out of session in
+    scripts/check_auto_approve.py, which can read the epic and re-derive every gate
+    from sources the session cannot write (§11) — which is why
+    `autonomy.autoApproveProvenance` stays `["epic"]` by default and why this hook
+    no longer reads that field at all."""
+    block(READY_HELP)
 
 
 def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id):
@@ -1086,9 +1235,19 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id):
     targets = _payload_ticket_ids(inp)
     foreign = {t for t in targets if team and not t.startswith(team + "-")}
 
+    # ── 0. lifecycle-label: supervision labels belong to the dispatcher (§6) ───
+    # A WITHHOLDING check, so it is scoped to PINNED sessions: a human's ad-hoc
+    # session in a configured repo is not the thing being supervised. An EXPIRED
+    # pin is still a pin here — a lapsed binding must not hand back the labels.
+    if pin:
+        owned = _owned_label_hits(inp, cfg)
+        if owned:
+            block(LIFECYCLE_LABEL_HELP.format(
+                labels=", ".join("`" + o + "`" for o in owned)))
+
     # ── 1. state transition into `ready` — matched by state ID, never by name ──
     if ready and _payload_has_value(inp, ready):
-        _approval_guard(cfg, pin, ticket, pinned_id, targets)
+        _approval_guard()
 
     # ── 2. own-ticket-only writes ─────────────────────────────────────────────
     if mode == "ticket":
@@ -1137,20 +1296,32 @@ def _pipeline_guards(tool, inp) -> None:
         # `delivery.json` itself stays open so the config can be repaired
         # in-session (the bootstrap-order lesson, docs/LESSONS.md), and reads are
         # untouched so it can be diagnosed.
-        if not mutating:
-            return
-        if tool in ("Edit", "Write", "NotebookEdit") and _repo_rel(
-                inp.get("file_path", "") or inp.get("notebook_path", "")) == DELIVERY_FILE:
+        if not mutating or _is_delivery_edit(tool, inp):
             return
         block(PIPELINE_BROKEN_HELP.format(source=source or DELIVERY_FILE))
 
-    pin, pin_status, pin_file = _read_pin(cfg)
-    if pin_status in ("malformed", "mismatch") and mutating:
-        block(PIN_BROKEN_HELP.format(status=pin_status, path=pin_file, root=PROJECT_ROOT))
+    # A `pinsRoot` inside the repo is a §7 hard-fail, and the one config value whose
+    # corruption would let a session write its own pin. Same hostage carve-out.
+    bad_pins = _pins_root_inside_repo(cfg)
+    if bad_pins:
+        if not mutating or _is_delivery_edit(tool, inp):
+            return
+        block(PINS_ROOT_HELP.format(path=bad_pins))
 
+    pin, pin_status, pin_file = _read_pin(cfg)
     ticket = pin.get("ticket") if (pin and isinstance(pin.get("ticket"), dict)) else None
     mode = str((pin or {}).get("session_mode") or "").strip().lower()
     pinned_id = str((ticket or {}).get("id") or "").strip().upper()
+
+    # An EXPIRED pin is not an absent one (see _read_pin): the session was dispatched
+    # with a binding that has lapsed, so in `ticket` mode §2 calls it BROKEN and
+    # broken fails closed. The mode is read off the lapsed pin, which is sound
+    # because _read_pin verified the worktree before it considered expiry. In the
+    # other modes the lapse withholds nothing that was granted: the pin object is
+    # still returned, so every constraint it carried below stays on.
+    if mutating and (pin_status in ("malformed", "mismatch")
+                     or (pin_status == "expired" and mode == "ticket")):
+        block(PIN_BROKEN_HELP.format(status=pin_status, path=pin_file, root=PROJECT_ROOT))
 
     # ── grader-path protection (scoped to PINNED agent sessions) ──────────────
     if pin:
@@ -1222,6 +1393,10 @@ def _dispatch(data) -> None:
         _spp = inp.get("file_path", "") or inp.get("notebook_path", "")
         if _is_self_protected(_spp):
             block(SELF_PROTECT_HELP.format(path=os.path.abspath(_spp)))
+        # The git metadata store is part of the config anchor: a ref file rewritten
+        # with Edit/Write moves it exactly as `git update-ref` would.
+        if _in_git_store(_spp):
+            block(CONFIG_ANCHOR_HELP)
 
     # Cross-worktree guard runs for ALL Edit/Write (not just in-project), and BEFORE
     # the branch guard — a write into another checkout must be caught even though it
@@ -1265,6 +1440,15 @@ def _dispatch(data) -> None:
         # guard in the Bash block so its message wins.
         if _SELF_MUTATE_RE.search(scan):
             block(SELF_PROTECT_BASH_HELP)
+
+        # Config anchor: writing a protected ref, repointing `origin`, or mutating
+        # `.git/**` is human-only (see CONFIG_ANCHOR_HELP). `git config --get
+        # remote.origin.url` is a read and stays allowed.
+        if (_GIT_STORE_MUTATE_RE.search(scan)
+                or any(_r.search(scan) for _r in _REF_WRITE_RES)
+                or (_GIT_CONFIG_REMOTE_RE.search(scan)
+                    and not _GIT_CONFIG_READ_RE.search(scan))):
+            block(CONFIG_ANCHOR_HELP)
 
         # Block rm -rf / rm -fr / rm --recursive.
         # The short-flag run must START an argument token — (?:^|[\s'"]) before the
