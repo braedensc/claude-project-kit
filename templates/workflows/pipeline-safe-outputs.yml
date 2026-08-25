@@ -91,7 +91,14 @@ on:
         required: true
     outputs:
       verdict:
-        description: 'ok | rejected | skipped'
+        description: |
+          ok | rejected | skipped.
+
+          CALLER BEWARE: a reusable workflow called from a MATRIX has one set of
+          outputs shared by every leg, last writer wins — so this is only safe to
+          read when the caller invokes it once. A matrix caller must read the
+          per-call `<artifact_name>-verdict` ARTIFACT this workflow publishes
+          instead; pipeline-dispatch.yml's lifecycle job does exactly that.
         value: ${{ jobs.validate.outputs.verdict }}
 
 permissions:
@@ -361,3 +368,31 @@ jobs:
 
           out("verdict", "ok")
           PY
+
+      # The per-call verdict, as an artifact rather than a job output — the only
+      # form a MATRIX caller can read without picking up another leg's result
+      # (see the `verdict` output's own description). `always()` so a rejected or
+      # crashed validation still publishes a verdict: to the caller, "no verdict"
+      # and "rejected" must not look alike.
+      - name: Publish the per-call verdict
+        if: always() && steps.pre.outputs.configured == 'true'
+        env:
+          VERDICT: ${{ steps.run.outputs.verdict }}
+          TICKET: ${{ inputs.pinned_ticket_id }}
+          DISPATCH: ${{ inputs.pinned_dispatch_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/verdict"
+          printf '{"ticket":"%s","dispatch_id":"%s","verdict":"%s"}\n' \
+            "$TICKET" "$DISPATCH" "${VERDICT:-rejected}" \
+            > "$RUNNER_TEMP/verdict/verdict.json"
+          cat "$RUNNER_TEMP/verdict/verdict.json"
+
+      - name: Upload the per-call verdict
+        if: always() && steps.pre.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}-verdict
+          path: ${{ runner.temp }}/verdict
+          retention-days: 14
+          if-no-files-found: warn

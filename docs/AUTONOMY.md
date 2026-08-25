@@ -16,6 +16,9 @@ Nothing here is required. A project that never enables the second and third tier
 gets the whole pipeline — it just has a human at two points in it, which for most teams
 is the right answer for a long time.
 
+One thing *is* required before any of it works: **[the push credential](#the-push-credential--required-before-any-tier-does-anything)**.
+Without it the dispatcher and the bounce workflow skip, on purpose.
+
 ---
 
 ## The rule that outranks everything below
@@ -31,6 +34,104 @@ session. The capability is never held and then restrained. It is never held.
 
 That distinction is the entire security argument, and it collapses if the branch has no
 protection. **Set up the ruleset first.**
+
+---
+
+## The push credential — required before *any* tier does anything
+
+**This is not optional and it is not a tier.** Set it up before you turn on tier 1,
+because without it the pipeline runs sessions that produce PRs nothing ever looks at.
+
+GitHub deliberately **does not create workflow runs from events triggered by
+`GITHUB_TOKEN`**. A session that pushes its branch and opens its PR with the default
+token therefore fires no `pull_request` event and no `push` event — so
+`pipeline-review.yml` never runs, CI never runs, and since `pipeline-bounce.yml` and
+`pipeline-auto-merge.yml` trigger on `workflow_run`, they never fire either. The whole
+review → bounce → merge half of the pipeline is silently dead, and the only symptom is
+that PRs appear and nothing ever happens to them. Fix sessions fail the same way from
+the other end: `/fix-ci` pushes and then watches a CI run that never starts.
+
+So the dispatcher and the bounce workflow push under a **different identity**, and both
+refuse to start (green, with a warning) until one is configured.
+
+### Option A — a GitHub App (preferred)
+
+1. Settings → Developer settings → GitHub Apps → **New GitHub App**. Name it something
+   like `<project>-pipeline`. Uncheck *Webhook → Active*.
+2. Repository permissions — grant exactly these two, and nothing else:
+   - **Contents: Read and write** (push the ticket branch)
+   - **Pull requests: Read and write** (open the PR)
+3. **Install** it on this repository only.
+4. Generate a private key; it downloads as a `.pem`.
+5. Repo → Settings → Secrets and variables → Actions:
+   - Variable `PIPELINE_APP_ID` = the App's ID
+   - Secret `PIPELINE_APP_KEY` = the entire contents of the `.pem`, newlines included
+
+The App is its own identity: its events trigger workflows, it can be uninstalled in one
+click, and its blast radius is two permissions on one repository.
+
+### Option B — a fine-grained PAT (fallback)
+
+If you cannot install an App, create a **fine-grained** personal access token scoped to
+**this repository only**, with *Contents: Read and write* and *Pull requests: Read and
+write*, and store it as the secret `PIPELINE_PAT`. The dispatcher logs a warning when it
+uses this path, and the reason is worth repeating: a PAT carries **your** identity, so
+every pipeline commit is attributed to you and the token is only as narrow as you made
+it. A classic (non-fine-grained) PAT with `repo` scope grants write access to every
+repository you can reach — do not use one here.
+
+### What it does *not* buy the agent
+
+Nothing about this credential lets a session merge. `gh pr merge` is hook-blocked in
+every form, and the platform-side gate is branch protection, which lives in repository
+settings. Grant the App or PAT no permission beyond the two above — in particular not
+*Administration* or *Workflows* — and the ruleset in tier 3 stays outside its reach.
+
+---
+
+## Tier 1 — dispatch, and how a ticket actually enters the queue
+
+Tier 1 is on by default, and the thing to know about it is **who applies
+`agent:queued`**: the dispatcher, and only the dispatcher.
+
+Contract §6 makes every `agent:*` label dispatcher-owned — a session that sets its own
+lifecycle labels is a session editing its own supervision, and the safe-outputs validator
+rejects any batch that tries. So the human-facing action is simply **move the ticket to
+`ready`** (by hand, or via tier 2). On its next poll the dispatcher's `claim` job walks
+`ready`, applies `agent:queued` to everything eligible, and then selects from that. The
+label is internal bookkeeping; the state is the trigger.
+
+The `claim` job declines to queue a ready ticket in exactly three cases, all of them a
+dispatcher-owned hold:
+
+| Label on the ticket | What un-holds it |
+|---|---|
+| `agent:needs-human` | a person removes it — that is the whole point of the label |
+| `agent:blocked` | a person answers the escalation and removes it |
+| `agent:working` | the session finishes; the lifecycle job hands the ticket back |
+
+`blocked:capacity` is the exception, because it is the one hold the dispatcher owns on
+both ends: it is cleared automatically, along with its `agent:blocked`, on the first poll
+after the provider pause lifts.
+
+### The other half: tickets come back
+
+A session that does not finish perfectly used to hold its `working` slot forever, which
+after `wipLimit` such tickets killed the queue outright. The `lifecycle` job now
+guarantees the reverse invariant — **it never leaves a ticket in `working`**:
+
+| Outcome | What happens to the ticket |
+|---|---|
+| completed | it is already in `review`; `agent:working` comes off |
+| retryable failure, attempts left | back to `ready` **with `agent:queued`** — the next poll re-dispatches it |
+| session escalated (`outcome: blocked`, or `/work`'s escalation marker) | back to `ready` with `agent:blocked` and **without** the trigger; a person answers, removes the label, and the next poll picks it up |
+| escalated a `riskPaths` change | `agent:needs-human`, terminal |
+| `totalAttempts` exhausted | `agent:needs-human`, terminal |
+| provider capacity | `agent:blocked` + `blocked:capacity`, attempt refunded, cleared automatically |
+
+A re-queue adds nothing to the attempt counter — `claim` increments it at dispatch,
+because §9 requires the count to be known *before* a session starts. `totalAttempts` is
+what makes the loop a bounded retry rather than a loop.
 
 ---
 

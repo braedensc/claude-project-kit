@@ -155,7 +155,7 @@ jobs:
 
           # ── The PR itself: base/head shas, branch, merge state, check runs ──
           gh pr view "$PR" --repo "$REPO" \
-            --json number,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,statusCheckRollup,isDraft \
+            --json number,createdAt,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,statusCheckRollup,isDraft \
             > "$E/pr.json"
           jq -r '.statusCheckRollup // []' "$E/pr.json" > "$E/checks.json"
           echo "branch=$(jq -r .headRefName "$E/pr.json")" >> "$GITHUB_OUTPUT"
@@ -178,24 +178,36 @@ jobs:
             || cp delivery.json "$E/delivery.base.json"
 
           # ── Bounce count, from Actions run history ──────────────────────────
-          # Same method as pipeline-bounce.yml: one bounce = one run of that
-          # workflow on this branch that actually reached its `fix` job. Run
-          # history is not writable by the sessions being counted; the
-          # `pipeline:bounce-N` PR labels ARE (the fix session's token can edit
-          # PR labels), which is why they are not consulted here.
-          BR=$(jq -r .headRefName "$E/pr.json")
+          # Same method AND the same key as pipeline-bounce.yml's own counter:
+          # one bounce = one run of that workflow that reached a `fix` job FOR
+          # THIS PR. Run history is not writable by the sessions being counted;
+          # the `pipeline:bounce-N` PR labels ARE (the fix session's token can
+          # edit PR labels), which is why they are not consulted here.
+          #
+          # NOT `?branch=`: a bounce run's `head_branch` is the default branch
+          # (workflow_run) or the dispatch ref (workflow_dispatch), never the PR
+          # head. Filtering on it matched nothing, so this returned 0 for every
+          # PR — and 0 is the value that PASSES the zero-bounces condition. A
+          # bounced PR would have auto-merged on a count that could not fail.
+          # The PR number is in the `fix` job's NAME; keep this prefix in step
+          # with `jobs.fix.name` in pipeline-bounce.yml.
+          PRNUM=$(jq -r .number "$E/pr.json")
+          PR_CREATED=$(jq -r .createdAt "$E/pr.json")
           n=0
-          runs=$(gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?branch=$BR&per_page=30" \
-                   --jq '.workflow_runs[].id' 2>/dev/null || true)
+          gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?per_page=100" \
+            > "$E/bounce-runs.json" 2>/dev/null || echo '{"workflow_runs":[]}' > "$E/bounce-runs.json"
+          runs=$(jq -r --arg since "$PR_CREATED" \
+                   '.workflow_runs[] | select($since == "" or .created_at >= $since) | .id' \
+                   "$E/bounce-runs.json")
           for id in $runs; do
-            if gh api "repos/$REPO/actions/runs/$id/jobs" \
-                 --jq '.jobs[] | select(.name | startswith("Fix (bounce")) | .conclusion' \
-                 2>/dev/null | grep -q .; then
+            if gh api "repos/$REPO/actions/runs/$id/jobs?per_page=50" \
+                 --jq ".jobs[] | select(.name | startswith(\"Fix PR #$PRNUM (\")) | .conclusion" \
+                 2>/dev/null | grep -qvE '^(skipped)?$'; then
               n=$((n + 1))
             fi
           done
           echo "bounces=$n" >> "$GITHUB_OUTPUT"
-          echo "Found $n prior bounce run(s) on $BR."
+          echo "Found $n prior bounce run(s) for PR #$PRNUM."
 
       - name: Fetch the review findings artifact
         id: findings
