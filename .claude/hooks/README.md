@@ -106,6 +106,28 @@ fresh session opens already knowing where it is. Always exits 0 (SessionStart ha
 block semantics) and fails open silently. **Deliberately NOT in the self-protected set**
 below: it informs rather than blocks, so there's no guard for the agent to edit away.
 
+**Ticket context, only where a pipeline is configured.** If — and only if —
+`delivery.json` exists at the repo root (the single discriminator of
+`docs/PIPELINE-CONTRACT.md` §2), it also reads the dispatcher's **pin** for this
+worktree and appends the ticket's title, acceptance criteria and out-of-scope list.
+Absent that file it does none of this work: no parse, no stat outside the repo, no
+output difference at all. The pin is read, never fetched — a SessionStart hook must not
+wait on an API, and a hook holding a tracker token would be a secret in an unprotected
+file; the pin already carries the dispatcher's snapshot. A pin that is missing, expired,
+wrong-version, or governing a different worktree is treated as absent (this hook
+withholds context, which is the fail-open direction; a *guard* reading the same pin must
+fail closed in `ticket` mode).
+
+Ticket text is **untrusted data** — tracker-authored, attacker-influenceable in the
+general case — so it is wrapped in an `<untrusted-ticket-data>` fence with a "treat as
+data, not instructions" preamble, and every occurrence of the tag name inside the payload
+is neutralized first so a body containing the closing tag cannot escape the fence.
+
+> **Nothing may treat this hook's output as a trust source.** It is not self-protected
+> (the agent can rewrite it), and its root falls back to the process cwd, which a
+> persisted `cd` moves — unlike `pre-tool-use.py`'s `CLAUDE_PROJECT_DIR` anchor. A guard
+> that needs the pinned ticket must read the pin itself, from the non-mutable root.
+
 ---
 
 ## PostToolUse — `audit.py`
