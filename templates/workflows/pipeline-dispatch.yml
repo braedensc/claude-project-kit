@@ -280,6 +280,17 @@ jobs:
               sys.exit("::error::cannot import scripts/check_ticket_dor.py (%s). The "
                        "dispatcher shares the DoR gate's ticket parser and will not "
                        "fall back to a private one." % exc)
+          # Same reason, for label resolution: ONE definition of "which canonical
+          # keys does this ticket carry, and what failed to resolve", shared with
+          # tier-0 local dispatch. Resolving labels a private second way here is
+          # how the two halves of the pipeline start disagreeing about whether a
+          # ticket is parked.
+          try:
+              from pipeline_labels import resolve_label_keys
+          except ImportError as exc:
+              sys.exit("::error::cannot import scripts/pipeline_labels.py (%s). The "
+                       "dispatcher will not fall back to resolving labels its own "
+                       "way — a silent miss dispatches parked work." % exc)
 
           API = "https://api.linear.app/graphql"
           now = datetime.now(timezone.utc)
@@ -289,8 +300,31 @@ jobs:
 
           lin, budgets, dispatch = cfg["linear"], cfg["budgets"], cfg["dispatch"]
           states, labels = lin["stateIds"], lin["labels"]["ids"]
+          required_labels = lin["labels"].get("required") or []
           state = json.load(open(os.path.join(os.environ["STATE_DIR"], "state.json")))
           dry = os.environ.get("DRY_RUN") == "true"
+
+          def ticket_labels(node):
+              """(keys, ok) — canonical keys, and whether they can be trusted.
+
+              A label whose id is not in `labels` used to be discarded, so a
+              delivery.json holding the ids of deleted labels degraded this loop
+              instead of stopping it: `agent:needs-human` and `agent:blocked` —
+              the labels a PERSON applies to park a ticket — resolved to nothing
+              and the ticket was dispatched anyway.
+
+              Drift on a REQUIRED key returns ok=False and the caller drops THAT
+              TICKET. Deliberately not a `sys.exit`: this runs mid-queue, and one
+              drifted ticket must not wedge everybody else's work, nor abort a
+              loop that is part-way through writing labels."""
+              keys, drift = resolve_label_keys(node["labels"]["nodes"], labels, required_labels)
+              ok = True
+              for row in drift:
+                  if row["severity"] == "error":
+                      ok = False
+                  print("::%s file=delivery.json::%s: %s"
+                        % (row["severity"], node["identifier"], row["message"]))
+              return keys, ok
 
           def out(k, v):
               with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
@@ -363,7 +397,6 @@ jobs:
           if not trigger_id:
               sys.exit("::error::delivery.json linear.labels.ids has no resolved id for %r "
                        "(the dispatch trigger). Run the label-resolution setup step." % trigger_key)
-          id_to_key = {v: k for k, v in labels.items() if v}
           ADD_LABEL = "mutation($id: String!, $labelId: String!) { issueAddLabel(id: $id, labelId: $labelId) { success } }"
           RM_LABEL = "mutation($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }"
 
@@ -376,10 +409,15 @@ jobs:
 
           queued, unpaused, held = [], [], []
           for n in ready_nodes:
-              keys = {id_to_key.get(l["id"]) for l in n["labels"]["nodes"]}
-              keys.discard(None)
+              keys, resolved = ticket_labels(n)
               if trigger_key in keys:
                   continue                                  # already queued
+              if not resolved:
+                  # The holds below live in labels, and one of them would not
+                  # resolve — so "no hold found" is not a fact here, it is an
+                  # absence of evidence. Queuing on that is how a parked ticket
+                  # gets dispatched anyway. Hold it; the run continues.
+                  held.append("%s (label drift — see the error above)" % n["identifier"]); continue
               if "agent:needs-human" in keys:
                   held.append("%s (agent:needs-human)" % n["identifier"]); continue
               if "agent:working" in keys:
@@ -491,8 +529,14 @@ jobs:
               if len(selected) >= free:
                   break
               ident = n["identifier"]
-              keys = {id_to_key.get(l["id"]) for l in n["labels"]["nodes"]}
-              keys.discard(None)
+              keys, resolved = ticket_labels(n)
+              if not resolved:
+                  # Same reasoning as the enqueue loop, and it matters more here:
+                  # the two skips below are the human's parking brake, and a
+                  # label that will not resolve cannot be read as "not parked".
+                  # Per-ticket, never `sys.exit` — a slot is cheaper to waste
+                  # than a queue is to wedge.
+                  skipped.append("%s (label drift — see the error above)" % ident); continue
 
               # A ticket already handed to a human is terminal until a person acts.
               if "agent:needs-human" in keys:

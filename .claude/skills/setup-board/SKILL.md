@@ -91,8 +91,12 @@ query BoardState {
 Notes that save a round trip:
 
 - A label whose `team` is `null` is a **workspace** label; a label with a `team` is
-  scoped to it. The contract decides which the taxonomy wants — they are not
-  interchangeable, and you cannot convert one into the other.
+  scoped to it. **The contract wants every label in its taxonomy workspace-scoped**
+  (§6) — the machinery (`agent:*`, `provenance:*`, `blocked:capacity`, `hooks-change`)
+  *and* `track:*` / `effort:*`. They are not interchangeable and you cannot convert one
+  into the other: the only fix is delete and recreate, which mints new IDs and strands
+  every one already recorded in `delivery.json`. So `team: <anything>` on a taxonomy
+  label is drift, not a near-match.
 - `isGroup` / `parent` are label **groups** (mutually-exclusive sets). A taxonomy with
   `type/feat`-style names is usually a group plus children, not flat labels.
 - `state.type` is one of `triage`, `backlog`, `unstarted`, `started`, `completed`,
@@ -120,6 +124,7 @@ Team                 ENG "Engineering"         ENG                     ok
 Status: In Review    — (no state of type       "In Review" (started)   CREATE
                        `started` named that)
 Label: agent:queued  agent:queued (workspace)  workspace               ok
+Label: effort:M      effort:M (team ENG)       workspace               ASK — rescope?
 Label: risk/high     risk-high (team ENG)      workspace group `risk`  ASK — rename?
 gitBranchFormat      (null → Linear default)   feat/{issueIdentifier}… CONFIRM (org-wide)
 Webhook              — none                    <contract URL>          NEEDS SECRET
@@ -132,6 +137,9 @@ Rules for the plan:
   made. A near-match (`risk-high` vs `risk/high`) is an **ASK** row, never a silent
   create — creating the second one leaves the board with both, which is worse than the
   drift you started with.
+- **Matching is name AND scope.** A taxonomy label that exists on the wrong scope is not
+  `ok`; it is drift with no in-place fix (§6 — scope cannot be converted). Same for a
+  state matched on `name` when its `type` is wrong.
 - **Never fold the plan into the action.** Print, wait, then apply. `--check` stops here.
 - Say what is already correct, not only what is missing — that is what makes a re-run
   read as a drift report instead of a wall of noise.
@@ -213,11 +221,23 @@ mutation AddWebhook($teamId: String!, $url: String!, $types: [String!]!) {
 - `GitAutomationStates` events are `draft`, `start`, `review`, `mergeable`, `merge`.
   Scope one to a branch with `gitAutomationTargetBranchCreate` (`branchPattern`,
   `isRegex`) and pass the resulting `targetBranchId`.
-- Labels go through the MCP `create_issue_label`. Omit the team to make a **workspace**
-  label; groups are a parent with `isGroup: true` plus children carrying `parentId`.
+- Labels go through the MCP `create_issue_label`. **Do not pass a team — every taxonomy
+  label is workspace-scoped (§6), and omitting the team is what makes it one.** You are
+  holding a `teamId` from step 1, and every neighbouring mutation on this page takes
+  one; passing it here is the single easiest mistake in this skill, it succeeds
+  silently, and it is unfixable in place (delete + recreate, new IDs, `delivery.json`
+  stale). Groups are a parent with `isGroup: true` plus children carrying `parentId`.
 - **Idempotency is on you** — these mutations are not upserts. Re-check the step-1 read
   immediately before each create and skip anything already present. A second run must
   produce zero writes; if it does not, the diff in step 2 was wrong.
+- **"Already present" means present AND correctly scoped.** A taxonomy label carrying a
+  `team` is drift, not a skip — treating it as one is what lets a whole board sit
+  wrong-scoped while every re-run cheerfully reports `ok`, which is precisely the drift
+  check failing at the job it was added for. Raise it as the `ASK — rescope?` row from
+  step 2 and **wait**: remediation is deleting a label that is already on real tickets,
+  so it is never an auto-apply (step 5's boundary). Say plainly what it costs — the
+  label's issue associations, and a new ID, so `delivery.json` must be re-resolved
+  afterwards (step 6) or every read path will start reporting stale IDs.
 - On any error, stop and report the raw GraphQL `errors[]`. Do not retry a mutation that
   failed for an unknown reason — a partial board is easier to fix than a doubled one.
 
@@ -235,7 +255,7 @@ skip them quietly, and never mark them "done" from a guess. Print the exact step
 | Creating the **Ideas project** | It is a product decision about where work is triaged, not a config value. |
 | Issuing the **API key** or a **webhook secret** | Credentials. You never handle these. |
 | Changing **`gitBranchFormat`** | Step 3 — workspace-wide. |
-| Anything the plan marked **ASK** | A near-match is drift with a human cause. |
+| Anything the plan marked **ASK** | Drift with a human cause (a near-match), or a fix that has to delete something first (a rescope). |
 
 Format the handover so it can be pasted, not interpreted:
 

@@ -100,6 +100,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jsonschema_mini as jsm  # noqa: E402
+from pipeline_labels import resolve_label_keys  # noqa: E402
 
 DELIVERY_FILE = "delivery.json"
 DELIVERY_VERSION = 1
@@ -335,10 +336,30 @@ def fetch_ticket(ticket_id, team_key, number, args):
 
 def build_pin(cfg, node, ticket_id, args, session_root, now):
     lin, budgets = cfg["linear"], cfg["budgets"]
-    labels = (lin.get("labels") or {}).get("ids") or {}
-    id_to_key = {v: k for k, v in labels.items() if v}
-    keys = {id_to_key.get(l.get("id")) for l in ((node.get("labels") or {}).get("nodes") or [])}
-    keys.discard(None)
+    label_cfg = lin.get("labels") or {}
+    keys, drift = resolve_label_keys(
+        (node.get("labels") or {}).get("nodes") or [],
+        label_cfg.get("ids") or {},
+        label_cfg.get("required") or [])
+    # A label that named a canonical key but did not resolve to one used to be
+    # discarded, so a `delivery.json` holding the ids of deleted labels degraded
+    # this pin instead of stopping it — effort to `M`, provenance to `human`.
+    # Tier 0 binds ONE ticket for ONE human, so a required key that will not
+    # resolve is a refusal: there is no queue here to contain the damage to.
+    for row in drift:
+        if row["severity"] != "error":
+            print("warning: %s: %s" % (ticket_id, row["message"]), file=sys.stderr)
+    fatal = [row["message"] for row in drift if row["severity"] == "error"]
+    if fatal:
+        die("REFUSED: %s carries a label this delivery.json cannot resolve.\n\n%s\n\n"
+            "Each of those keys is in linear.labels.required — §7 says the "
+            "pipeline may not dispatch until they resolve. Pinning anyway would "
+            "silently default whatever the label carried, which is the failure "
+            "this check exists to catch, not report.\n\n"
+            "  python3 scripts/check_delivery_config.py    # what else is stale\n"
+            "\n"
+            "No pin was written."
+            % (ticket_id, "\n".join("  - " + m for m in fatal)), 1)
 
     effort = args.effort or next(
         (k.split(":", 1)[1] for k in keys if k.startswith("effort:")), "M")
@@ -799,6 +820,82 @@ def _st_repo(tmp, cfg=None, worktree_cfg=None, ticket=None):
     return root, pins, tf
 
 
+def _wf_python_blocks(wf_src):
+    """Every `python3 - <<'PY' … PY` heredoc in a workflow, dedented.
+
+    The workflow's embedded Python is real Python; parsing it is how this
+    selftest reasons about the dispatcher's behaviour without a GitHub runner.
+    """
+    import textwrap
+    return [textwrap.dedent(body) for _, body in
+            re.findall(r"\n( *)python3 - <<'PY'\n(.*?)\n\1PY\n", wf_src, re.S)]
+
+
+def _wf_label_checks(wf_src):
+    """[(ok, message)] — the dispatcher's two label READ sites, structurally.
+
+    Four properties, each one a way the fix could rot:
+
+      1. the step imports `resolve_label_keys` rather than resolving labels its
+         own way (a private copy is how the two halves of the pipeline start
+         disagreeing about whether a ticket is parked);
+      2. and actually calls it — an unused import resolves nothing;
+      3. both loops go through it — the `if not resolved:` guard appears twice,
+         once per site;
+      4. neither guard exits. Containment is the whole point: this runs
+         mid-queue and part-way through writing labels, so one drifted ticket
+         must cost one slot, not the run.
+
+    A missing or unparseable step is itself a finding — these checks would
+    otherwise silently assert nothing.
+
+    `ast`, not grep, so a comment mentioning any of it cannot make this pass.
+    """
+    import ast
+    step = next((b for b in _wf_python_blocks(wf_src) if "ready_nodes" in b), None)
+    if step is None:
+        return [(False, f"{WORKFLOW_FILE}: no embedded Python step builds "
+                        f"`ready_nodes` — the enqueue/selection step moved or "
+                        f"was renamed, and these checks now assert nothing.")]
+    try:
+        tree = ast.parse(step)
+    except SyntaxError as exc:
+        return [(False, f"{WORKFLOW_FILE}: the select-and-claim step is not "
+                        f"valid Python ({exc}).")]
+
+    imported = any(
+        isinstance(n, ast.ImportFrom) and n.module == "pipeline_labels"
+        and any(a.name == "resolve_label_keys" for a in n.names)
+        for n in ast.walk(tree))
+    called = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "resolve_label_keys" for n in ast.walk(tree))
+    guards = [n for n in ast.walk(tree)
+              if isinstance(n, ast.If) and isinstance(n.test, ast.UnaryOp)
+              and isinstance(n.test.op, ast.Not)
+              and isinstance(n.test.operand, ast.Name)
+              and n.test.operand.id == "resolved"]
+    contained = all(
+        guard.body and isinstance(guard.body[-1], ast.Continue)
+        and not any(isinstance(c, ast.Call) and ast.unparse(c.func).endswith("exit")
+                    for c in ast.walk(guard))
+        for guard in guards)
+
+    return [
+        (called, f"{WORKFLOW_FILE} imports `resolve_label_keys` but never calls "
+                 f"it — an unused import resolves nothing."),
+        (imported, f"{WORKFLOW_FILE} no longer imports `resolve_label_keys` "
+                   f"from scripts/pipeline_labels.py — an unresolvable label id "
+                   f"is silently discarded again, and a parked ticket dispatches."),
+        (len(guards) == 2, f"{WORKFLOW_FILE} has {len(guards)} `if not resolved:` "
+                           f"guard(s), expected 2 — the enqueue loop and the "
+                           f"selection loop each need one."),
+        (contained, f"{WORKFLOW_FILE} handles label drift by exiting, or without "
+                    f"a `continue`. It must contain the failure to the ONE "
+                    f"ticket: this runs mid-queue and part-way through writing "
+                    f"labels."),
+    ]
+
+
 def _st_run(argv, agent_env=False):
     """Run this script as a subprocess. The default env is scrubbed of the agent
     markers, because the selftest simulates the HUMAN terminal this tool is for
@@ -860,6 +957,15 @@ def selftest():
     expect(re.search(r'_CONFIG_REFS = \("origin/main", "origin/master", '
                      r'"main", "master"\)', hook_src) is not None,
            f"{HOOK_FILE}'s _CONFIG_REFS changed — CONFIG_REFS here must match")
+
+    # 0b. The dispatch workflow's two label READ sites. The behaviour itself is
+    #     covered by section 10 below, against the SAME `resolve_label_keys`
+    #     the workflow imports — so what is left to pin is that the workflow
+    #     still imports it (rather than growing a private copy that drifts) and
+    #     that it CONTAINS a drifted ticket instead of exiting mid-queue.
+    #     Structural, via ast — a text grep would pass on a comment.
+    for ok, msg in _wf_label_checks(wf_src):
+        expect(ok, msg)
 
     with tempfile.TemporaryDirectory() as tmp:
         # 1. Round trip: dispatch → a schema-valid pin at the derived key → release.
@@ -1071,6 +1177,136 @@ def selftest():
                f"--effort S should select perEffort.S: {shown.get('budget')}")
         expect(shown.get("ticket", {}).get("effort") == "S",
                "--effort must be recorded on the pin")
+
+        # 10. Label DRIFT on the read path. A label id that no longer resolves
+        #     used to be discarded, so a delivery.json holding the ids of
+        #     deleted labels degraded the pin instead of stopping it: effort
+        #     silently back to `M`, provenance to `human`. Resolution is still
+        #     by id (§1); the NAME is only the diagnostic that says which key
+        #     the config has wrong.
+        def _labelled(*nodes):
+            return dict(SELFTEST_TICKET, labels={"nodes": list(nodes)})
+
+        LIVE_M = {"id": "e-M-recreated", "name": "effort:M"}
+
+        # 10a. Stale id for a REQUIRED key → refuse loudly, write nothing.
+        req_cfg = _st_cfg(os.path.realpath(tempfile.mkdtemp(prefix="ld-drift-", dir=tmp)))
+        req_cfg["linear"]["labels"]["required"] = ["effort:M"]
+        root9, pins9, tf9 = _st_repo(
+            tmp, cfg=req_cfg,
+            ticket=_labelled(LIVE_M, {"id": "p-epic", "name": "provenance:epic"}))
+        r = _st_run(["ENG-123", "--session-root", root9, "--ticket-file", tf9])
+        expect(r.returncode == 1 and "STALE" in r.stderr and "effort:M" in r.stderr,
+               f"a stale REQUIRED label id must refuse by name: "
+               f"{r.returncode} {r.stderr[-400:]}")
+        expect("e-M-recreated" in r.stderr and "'e-M'" in r.stderr,
+               f"the refusal must show BOTH ids — live and recorded: {r.stderr[-400:]}")
+        expect(not os.path.exists(os.path.join(pins9, pin_key(root9) + ".json")),
+               "a stale required label must leave no pin behind")
+
+        # 10b. Same drift on a NON-required key → warn, and dispatch proceeds.
+        #      `track:*` is open-ended and project-named, so it can never be in
+        #      `required`; fatal here would wedge the queue over something the
+        #      DoR gate already rejects at intake.
+        root10, _, tf10 = _st_repo(
+            tmp, ticket=_labelled(
+                {"id": "e-M", "name": "effort:M"},
+                {"id": "t-plat-recreated", "name": "track:platform"},
+                {"id": "p-epic", "name": "provenance:epic"}))
+        r = _st_run(["ENG-123", "--session-root", root10, "--ticket-file", tf10,
+                     "--dry-run"])
+        expect(r.returncode == 0 and "STALE" in r.stderr and "track:platform" in r.stderr,
+               f"a stale NON-required label must warn and proceed: "
+               f"{r.returncode} {r.stderr[-400:]}")
+        shown = json.loads(r.stdout) if r.returncode == 0 else {}
+        expect(shown.get("ticket", {}).get("track") is None,
+               "the degraded value is still pinned as null — now with a warning "
+               "beside it, which is the whole difference")
+
+        # 10c. A label that is none of ours stays none of our business — no
+        #      warning, no refusal. This is the case the fail-open was FOR.
+        root11, _, tf11 = _st_repo(
+            tmp, ticket=_labelled(
+                {"id": "e-M", "name": "effort:M"},
+                {"id": "t-plat", "name": "track:platform"},
+                {"id": "p-epic", "name": "provenance:epic"},
+                {"id": "zz-design", "name": "needs-design"}))
+        r = _st_run(["ENG-123", "--session-root", root11, "--ticket-file", tf11,
+                     "--dry-run"])
+        expect(r.returncode == 0 and "needs-design" not in r.stderr,
+               f"a non-canonical label must be ignored in silence: {r.stderr[-300:]}")
+        shown = json.loads(r.stdout) if r.returncode == 0 else {}
+        expect(shown.get("ticket", {}).get("track") == "track:platform",
+               "the canonical labels around it must still resolve normally")
+
+        # 10d. A hand-written --ticket-file that omits `labels.nodes[].id`.
+        #      Distinct diagnostic: the payload is at fault, not the config.
+        nid_cfg = _st_cfg(os.path.realpath(tempfile.mkdtemp(prefix="ld-noid-", dir=tmp)))
+        nid_cfg["linear"]["labels"]["required"] = ["effort:M"]
+        root12, _, tf12 = _st_repo(
+            tmp, cfg=nid_cfg,
+            ticket=_labelled({"name": "effort:M"},
+                             {"id": "p-epic", "name": "provenance:epic"}))
+        r = _st_run(["ENG-123", "--session-root", root12, "--ticket-file", tf12])
+        expect(r.returncode == 1 and "NO LABEL ID" in r.stderr
+               and "--ticket-file" in r.stderr,
+               f"a label with no id must blame the ticket file, not the config: "
+               f"{r.returncode} {r.stderr[-400:]}")
+        expect("STALE" not in r.stderr,
+               "the no-id diagnostic must not masquerade as config drift")
+
+        # 10e. The third kind: recorded as "" with a live label of that name.
+        #      The config validator already hard-fails this for a required key,
+        #      so reaching the dispatcher means it was bypassed — same ladder,
+        #      its own message.
+        blank_cfg = _st_cfg(os.path.realpath(tempfile.mkdtemp(prefix="ld-blank-", dir=tmp)))
+        blank_cfg["linear"]["labels"]["ids"]["meta"] = ""
+        root13, _, tf13 = _st_repo(
+            tmp, cfg=blank_cfg,
+            ticket=_labelled({"id": "e-M", "name": "effort:M"},
+                             {"id": "p-epic", "name": "provenance:epic"},
+                             {"id": "m-live", "name": "meta"}))
+        r = _st_run(["ENG-123", "--session-root", root13, "--ticket-file", tf13,
+                     "--dry-run"])
+        expect(r.returncode == 0 and "NEVER RESOLVED" in r.stderr and "meta" in r.stderr,
+               f"an unresolved-but-live label must say setup is unfinished: "
+               f"{r.returncode} {r.stderr[-400:]}")
+
+        # 10f. The resolver itself, at the seam the workflow shares. Same
+        #      function, so these pin the two workflow sites' behaviour too.
+        ids = {"effort:M": "e-M", "agent:blocked": "a-blocked", "meta": ""}
+        keys, drift = resolve_label_keys(
+            [{"id": "e-M", "name": "renamed in the ui"}], ids, ["effort:M"])
+        expect(keys == {"effort:M"} and not drift,
+               f"a RENAMED label must still resolve by id — that is why §1 "
+               f"mandates ids: {keys} {drift}")
+        keys, drift = resolve_label_keys(
+            [{"id": "a-dead", "name": "agent:blocked"}], ids, ["agent:blocked"])
+        expect(keys == set() and [d["kind"] for d in drift] == ["stale"]
+               and drift[0]["severity"] == "error",
+               f"a stale dispatcher-owned hold must be an ERROR, not a discard: "
+               f"{keys} {drift}")
+        keys, drift = resolve_label_keys(
+            [{"id": "a-dead", "name": "agent:blocked"}], ids, [])
+        expect(drift and drift[0]["severity"] == "warning",
+               f"severity follows labels.required and nothing else: {drift}")
+        keys, drift = resolve_label_keys([{"id": "x", "name": "flaky"}], ids, [])
+        expect(keys == set() and not drift,
+               f"an unknown label is the project's own business: {drift}")
+        keys, drift = resolve_label_keys(
+            [{"id": "m-live", "name": "meta"}], ids, [])
+        expect([d["kind"] for d in drift] == ["unresolved"],
+               f'a live label recorded as "" is `unresolved`, not `stale`: {drift}')
+        keys, drift = resolve_label_keys([{"name": "effort:M"}], ids, [])
+        expect([d["kind"] for d in drift] == ["no-id"],
+               f"a label with no id is `no-id`, its own diagnostic: {drift}")
+        # A label RENAMED and then recreated resolves by neither id nor name.
+        # Documented blind spot, asserted so nobody assumes otherwise.
+        keys, drift = resolve_label_keys(
+            [{"id": "e-new", "name": "Effort — Medium"}], ids, ["effort:M"])
+        expect(keys == set() and not drift,
+               f"rename-plus-recreate is INVISIBLE to the name heuristic — "
+               f"closing it needs an api liveness check in /setup-board: {drift}")
 
     if failures:
         print("FAIL: pipeline_dispatch_local selftest")
