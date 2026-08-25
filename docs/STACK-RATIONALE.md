@@ -1,13 +1,14 @@
 # Stack Rationale
 
-Every significant todoclaw stack choice, why it was made, and — the part that matters
-for reuse — the principle that travels even when the tool doesn't. Tags: **T** =
-transferable (adopt the principle anywhere), **S** = stack-specific (re-decide per
-project). Sources: CLAUDE.md stack table + ADR-0001/0002/0003/0008/0009/0011/0015/0018.
+Every significant stack choice in the build this kit was distilled from, why it was
+made, and — the part that matters for reuse — the principle that travels even when
+the tool doesn't. Tags: **T** = transferable (adopt the principle anywhere), **S** =
+stack-specific (re-decide per project). Sources: that build's CLAUDE.md stack table
+and its ADRs.
 
 ## Frontend
 
-| Choice | Why todoclaw chose it | Transferable principle | Tag |
+| Choice | Why it was chosen | Transferable principle | Tag |
 |---|---|---|---|
 | Vite + React 18 + TS strict | Pure SPA (no SSR need → Next.js rejected); CRA unmaintained | Pick the simplest tool that serves the actual rendering model | S |
 | Pin majors; React 18 not 19, Tailwind 3 not 4 | Both next-majors were churn at build time | **Pin majors deliberately; upgrades are a scheduled task, not an accident of `npm install`** | T |

@@ -1,7 +1,7 @@
 # Kit shape & conventions
 
 **Date:** 2026-07-03 · **Context:** initial build of claude-project-kit (distilled from
-todoclaw, Stages 0–6 + retro)
+a production build, Stages 0–6 + retro)
 
 ## Decision
 
@@ -30,10 +30,10 @@ The kit is a **public GitHub template repo** that self-hosts its own protections
   workflows," but live copies would run (and fail) against the bare kit. An `if:`-guard
   per job was rejected (repo-name coupling, noise in every template); a separate dir
   with a one-command activation step is self-documenting.
-- *Battery as permanent test*: todoclaw's v2 hook was verified by an 18-case battery
-  that lived only in a PR description. Rebuilt here as a committed test (expanded to 48
-  cases incl. sandboxed branch-guard cases that survive CI's detached HEAD), so every
-  future hook edit is regression-gated.
+- *Battery as permanent test*: the origin build's v2 hook was verified by an 18-case
+  battery that lived only in a PR description. Rebuilt here as a committed test
+  (expanded to 48 cases incl. sandboxed branch-guard cases that survive CI's detached
+  HEAD), so every future hook edit is regression-gated.
 - *Public repo*: unlimited Actions minutes and branch protection on the free tier
   (private free repos get neither); the kit is placeholders-only by design and its own
   layers enforce that.
@@ -54,14 +54,14 @@ step now ships inside `templates/workflows/ci.yml` — its permanence in bootstr
 projects is structural, not instructional.
 
 **Update (2026-07-03, workflow-guards port):** the enforcement surface gained a
-fourth layer from the todoclaw handoff (PRs #59/#61/#63): a merged-PR guard and a
+fourth layer from the origin build's handoff: a merged-PR guard and a
 never-merge `gh pr merge` block in the PreToolUse hook, plus a Stop hook
 (`stop-pr-check.py`) that blocks ending a turn with no PR or failing CI. The battery
 grew to 68 cases, now including mocked-`gh` sandboxes and the Stop hook's
 exit-0/JSON protocol.
 
 **Update (2026-07-04, hook-guardrails port):** three more deterministic guards from
-todoclaw PR #77 (+ its branch-naming guard): a **cross-worktree write guard** (blocks
+the origin build (+ its branch-naming guard): a **cross-worktree write guard** (blocks
 Edit/Write into a different checkout — the one way a session wrote to `main` past the
 branch guard), a **branch-naming guard** (blocks work on a non-`<type>/<slug>` branch
 so an auto-generated `claude/<codename>` never lands unrenamed), and a **DIRTY-PR

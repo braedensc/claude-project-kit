@@ -1,8 +1,8 @@
 <!-- ═══════════════════════════════════════════════════════════════════════════
      CLAUDE.md TEMPLATE — copy to the project root as CLAUDE.md at bootstrap,
      fill every {{…}} token, delete sections that don't apply, then DELETE
-     THIS COMMENT BLOCK. Structure distilled from todoclaw's CLAUDE.md (the
-     coordination document for every session of a full production build).
+     THIS COMMENT BLOCK. Structure distilled from the CLAUDE.md that was the
+     coordination document for every session of a full production build.
      The **Hard Rules** and **Branch Workflow** sections are verbatim policy —
      adapt names, don't weaken them.
      ═══════════════════════════════════════════════════════════════════════════ -->
@@ -16,7 +16,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## What This Is
 
 {{PROJECT_ONE_PARAGRAPH}} <!-- what the app is, who it's for, the one-line invariant
-that must always hold (todoclaw's was "fully usable without AI") -->
+that must always hold (one real example: "fully usable without AI") -->
 
 **Reference material** (under `planning/`, gitignored — read it to port logic, never
 commit it): {{REFERENCE_MATERIAL_LIST_OR_DELETE}}
@@ -107,7 +107,7 @@ type IS the type — one source of truth.
 **Files:** small and focused. Logic lives in pure lib modules; components stay
 presentational. Three similar files beat a premature abstraction.
 
-**Naming:** {{NAMING_CONVENTIONS}} <!-- todoclaw: kebab-case filenames, PascalCase
+**Naming:** {{NAMING_CONVENTIONS}} <!-- e.g. kebab-case filenames, PascalCase
 components, camelCase everything else -->
 
 **Commits:** conventional commits — `feat:`, `fix:`, `chore:`, `refactor:`, `docs:`.
@@ -202,7 +202,7 @@ These apply every session without exception:
    command and wait — no sandbox-disabling, shim files, symlink hacks, or other clever
    workarounds. A deadlock is a signal, not a challenge.
 
-{{PROJECT_INVARIANT_RULE_OR_DELETE}} <!-- e.g. todoclaw rule 6: "the entire planner
+{{PROJECT_INVARIANT_RULE_OR_DELETE}} <!-- e.g. a real rule 6: "the entire planner
 works without AI — AI is additive, never required." Give your project's one
 non-negotiable product invariant a numbered slot here. -->
 

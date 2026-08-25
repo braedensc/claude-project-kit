@@ -91,6 +91,13 @@ a non-blocking error), so the PreToolUse wiring guards it explicitly:
 Operationally: **create hook scripts before wiring `settings.json`** (see
 docs/LESSONS.md — this kit hit both variants of that deadlock).
 
+**The provenance guard: the "Provenance scan" CI job.** A public repo leaks personal
+detail through ordinary text, not just secrets: `scripts/check_provenance.py` fails the
+PR on any tracked file carrying an **absolute home path** that names a real account or a
+**real-looking email**. An optional term list (`$PROVENANCE_DENYLIST`, or a git-ignored
+`.provenance-denylist`) additionally forbids specific names — matched in the path as well
+as the contents, and printed masked (`<term #1>`); unset, that rule silently no-ops.
+
 Server-side extras (free, one-time toggles in GitHub → Settings → Security): secret
 scanning, **push protection**, Dependabot security updates. They backstop layer 3.
 
@@ -99,7 +106,7 @@ scanning, **push protection**, Dependabot security updates. They backstop layer 
 A security rule that lives only in CLAUDE.md is advisory — the model can drift
 from it and nobody is told. The pattern that held in production: **every written
 security rule gets a deterministic, dependency-free CI scanner that fails when a
-new surface appears without a reviewed allowlist entry.** todoclaw's five
+new surface appears without a reviewed allowlist entry.** The origin build's five
 scanner jobs are the worked example — static RLS coverage, live-DB RLS proof, a
 write-capability audit, a `SECURITY DEFINER` grant audit, and an edge-function
 outbound-fetch allowlist — each a small script with its own tests, each job

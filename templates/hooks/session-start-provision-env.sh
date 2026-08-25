@@ -4,8 +4,8 @@
 # committed provisioning script (the kit ships it as
 # templates/scripts/dev-worktree-login.sh -> scripts/dev-worktree-login.sh at
 # bootstrap). Removes the need for a human to run that script manually every
-# time a new worktree spins up (todoclaw, 2026-07-04 — a fresh worktree hit the
-# "no .env.local yet" dialog and had to be unblocked by hand).
+# time a new worktree spins up (learned in production, 2026-07-04 — a fresh
+# worktree hit the "no .env.local yet" dialog and had to be unblocked by hand).
 #
 # INERT IN THE KIT — activate at bootstrap by copying to
 # .claude/hooks/session-start-provision-env.sh (keep it executable) and wiring
@@ -24,7 +24,7 @@
 #   - the local backend stack isn't running yet — legitimate; don't block
 #     session startup on it, and don't nag every session until it is.
 #
-# SECURITY RATIONALE (preserved from todoclaw's original): this is a plain,
+# SECURITY RATIONALE (preserved from the original production script): this is a plain,
 # reviewed shell script the harness runs on a lifecycle event — not a Claude
 # tool call — so it isn't subject to the separate PreToolUse guard that blocks
 # Claude from writing .env files or key-shaped values (that guard exists to

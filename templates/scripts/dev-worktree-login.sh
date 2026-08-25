@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Per-worktree dev-environment provisioning — ported from todoclaw (2026-07-03),
-# where it provisioned parallel worktree sessions against the shared local stack
-# (dedicated per-slug logins ended the shared-test-account collisions).
+# Per-worktree dev-environment provisioning — ported from a production build
+# (2026-07-03), where it provisioned parallel worktree sessions against the shared
+# local stack (dedicated per-slug logins ended the shared-test-account collisions).
 #
 # THE PATTERN (portable to any backend): git worktrees don't share gitignored
 # files (.env.local), so every new worktree starts broken until someone

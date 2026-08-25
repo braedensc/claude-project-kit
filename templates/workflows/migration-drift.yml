@@ -12,7 +12,7 @@ name: Migration drift check
 # step — substitute your platform's read-only desired-vs-actual diff
 # (`terraform plan`, `prisma migrate status`, `flyway info`, …).
 #
-# Why it exists (todoclaw PR #199): a deploy failed AFTER merge (PR CI was
+# Why it exists (learned in production): a deploy failed AFTER merge (PR CI was
 # green — the post-merge deploy is a separate workflow) and prod silently fell
 # 5 migrations behind. This is the standing monitor: it opens/updates a GitHub
 # issue the moment prod is behind. Complements deploy-failure-alert.yml — that

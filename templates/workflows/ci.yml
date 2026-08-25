@@ -1,15 +1,16 @@
 name: CI
 
 # ══════════════════════════════════════════════════════════════════════════════
-# App-project CI — distilled from todoclaw's ci.yml, the gate for every PR from
-# 2026-06-23 → 2026-07-03 (live production build). The kit repo's own smaller CI
+# App-project CI — distilled from a production build's ci.yml, the gate for
+# every PR from 2026-06-23 → 2026-07-03. The kit repo's own smaller CI
 # is .github/workflows/ci.yml; THIS file is the one your app project activates
 # (see templates/README.md — `git mv` it to .github/workflows/ci.yml).
 #
 # Layer 3 of the security/quality model — the unbypassable gate (--no-verify
-# can't skip it). Six parallel jobs on every push to main and every PR (the
+# can't skip it). Seven parallel jobs on every push to main and every PR (the
 # hooks guard is PR-only):
 #   - "Secret scan + forbidden paths" — secretlint + planning//.env path gate
+#   - "Provenance scan"               — no absolute home paths / real emails
 #   - "Lint" / "Typecheck" / "Test"  — adapt the npm scripts to your toolchain
 #   - "E2E (smoke)"                  — non-required by design (see its comment)
 #   - "Hooks change guard"           — PR-only label gate on guard-machinery edits
@@ -75,6 +76,19 @@ jobs:
 
       - name: secretlint (scan all tracked files)
         run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
+
+  # Provenance guard (runs the kit's scripts/check_provenance.py): fails on
+  # absolute home paths and real email addresses in tracked files. Optionally,
+  # a local .provenance-denylist can also forbid specific names.
+  provenance-scan:
+    name: Provenance scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No home paths or real emails in tracked files
+        run: python3 scripts/check_provenance.py
 
   # ── Adapt the three jobs below to your toolchain (script names are the
   #    contract: lint / format:check / typecheck / test). ─────────────────────
@@ -157,13 +171,13 @@ jobs:
       - name: Run E2E smoke
         run: npm run test:e2e
 
-  # Server-side backstop for hook self-protection (docs/SECURITY.md; from
-  # todoclaw's GAP-1 audit job, PR #117). The local PreToolUse guard constrains
+  # Server-side backstop for hook self-protection (docs/SECURITY.md; from a
+  # production build's audit job). The local PreToolUse guard constrains
   # only sessions that run the hook — a PR authored anywhere else (another
   # clone, the GitHub web UI, an @claude workflow) never meets it. So a PR that
   # changes the guard machinery (.claude/hooks/** or .claude/settings*.json)
   # must not land unnoticed: it has to carry an explicit `hooks-change` label.
-  # Operational notes (learned in todoclaw):
+  # Operational notes (learned in production):
   #   - the `hooks-change` label must EXIST in your repo before this job's
   #     first run can pass on a guarded PR — one-time setup:
   #       gh label create hooks-change --color D93F0B \
@@ -211,7 +225,7 @@ jobs:
   # ── Second-runtime gate (COMMENTED STUB — adapt if any subtree runs a
   #    runtime your main toolchain doesn't) ───────────────────────────────────
   # The lesson, in one line: no tree your primary toolchain skips goes ungated.
-  # In todoclaw (the skipped-Deno-tree incident, PR #254) the Deno edge-function
+  # In one real build (the skipped-Deno-tree incident) the Deno edge-function
   # tree sat invisible to tsc -b and ESLint — nothing in CI type-checked or
   # tested the server-side capability/guardrail/prompt logic, the exact gap
   # behind the "three-readers" class of bugs — and the first gate added
@@ -221,7 +235,7 @@ jobs:
   # `name:` becomes its required-check context.
   #
   # second-runtime:
-  #   name: Second runtime            # todoclaw's was "Deno"
+  #   name: Second runtime            # e.g. "Deno"
   #   runs-on: ubuntu-latest
   #   steps:
   #     - uses: actions/checkout@v4
@@ -244,7 +258,7 @@ jobs:
   # PR-only ordered-file collision check: fails on a DUPLICATE migration
   # version (migrations-ledger PK collision) or an OUT-OF-ORDER one (sorts
   # before main's latest, so the deploy tool hard-stops and applies nothing
-  # further — the two mistakes that wedged todoclaw's prod deploy on
+  # further — the two mistakes that wedged a real prod deploy on
   # 2026-07-09). Compares against the freshly-fetched main tip, so a parallel
   # branch that grabbed the same or an earlier timestamp fails HERE instead of
   # silently after merge.

@@ -1,4 +1,4 @@
-# Distilled from todoclaw's .gitignore (in production 2026-06-23 → 2026-07-03),
+# Distilled from a production build's .gitignore (live 2026-06-23 → 2026-07-03),
 # strengthened: .env.* is deny-all with an explicit .env.example allow.
 
 # Reference material — never published (licensed specs, exports, scratch planning).
@@ -12,6 +12,7 @@ planning/
 !.env.example
 *.pem
 *.key
+.provenance-denylist
 
 # Dependencies
 node_modules/
@@ -20,7 +21,7 @@ node_modules/
 dist/
 
 # Generated-file guard: running a tool from the repo root can spawn a bogus
-# root-level lockfile when the real one lives deeper (todoclaw: a stray
+# root-level lockfile when the real one lives deeper (in production: a stray
 # /deno.lock appeared beside supabase/functions/deno.lock). Guard such paths
 # explicitly rather than discovering them in a diff.
 /deno.lock

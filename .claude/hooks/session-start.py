@@ -16,7 +16,7 @@ NOTE: unlike pre-tool-use.py / stop-pr-check.py, this hook is DELIBERATELY NOT i
 self-protected set. Those enforce blocks the agent might want gone; this only informs,
 so there's nothing to "edit away." Keep it read-only and side-effect-free.
 
-Distilled from the todoclaw session-start pattern; generalized for the kit 2026-07-04.
+Distilled from a production session-start pattern; generalized for the kit 2026-07-04.
 """
 import json
 import os
