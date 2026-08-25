@@ -19,9 +19,22 @@ name: Pipeline bounce
 # round, leaving a half-fixed PR and a ticket marked needs-human for no reason.
 #
 # So: ONE BOUNCE = ONE RUN OF THIS WORKFLOW, counted by asking the Actions API
-# how many prior runs of this workflow on this branch actually reached the `fix`
-# job. Run history is not writable by the session — the fix job's token has no
+# how many prior runs of this workflow actually reached the `fix` job FOR THIS
+# PR. Run history is not writable by the session — the fix job's token has no
 # `actions: write` — so the count cannot be edited by the thing being counted.
+#
+# ── …AND KEYED ON THE PR NUMBER, NOT THE BRANCH ──────────────────────────────
+# The counter used to filter run history with `?branch=<PR head branch>`, which
+# matched nothing and made every count 0, so `maxBounces` was unreachable and the
+# hand-off to a human never fired. A run's `head_branch` is the ref the RUN was
+# created on: a `workflow_run` run is always created on the DEFAULT branch, and a
+# `workflow_dispatch` run on whatever ref it was dispatched from. Neither is ever
+# the PR's head branch.
+#
+# The PR number lives in the `fix` job's NAME instead — `Fix PR #<n> (bounce N)`.
+# Job names come from this file on the default branch, so the counted thing still
+# cannot write the count. Change that name and you must change the counter's
+# prefix match with it; they are one mechanism in two places.
 #
 # PR labels (`pipeline:bounce-N`) are applied for humans and are DISPLAY ONLY.
 # The fix session's token can edit PR labels, so a label can never hold a number
@@ -29,6 +42,12 @@ name: Pipeline bounce
 #
 # ── Setup ─────────────────────────────────────────────────────────────────────
 #   Secrets: LINEAR_API_KEY, and ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN.
+#   Plus the pipeline PUSH credential — PIPELINE_APP_ID (var) +
+#   PIPELINE_APP_KEY (secret), or PIPELINE_PAT (secret). A fix session's push
+#   must re-trigger CI, and GitHub does not create workflow runs from events
+#   triggered by GITHUB_TOKEN: push with the default token and `/fix-ci` sits
+#   watching a CI run that will never start. Same reason as
+#   pipeline-dispatch.yml; see docs/AUTONOMY.md, "The push credential".
 #   Until they exist this runs green and skips.
 #
 # NOTE: `workflow_run` reads THIS FILE from the DEFAULT branch — it only fires
@@ -87,6 +106,7 @@ jobs:
       auth_mode: ${{ steps.cfg.outputs.auth_mode }}
       default_branch: ${{ steps.cfg.outputs.default_branch }}
       fix_iterations: ${{ steps.cfg.outputs.fix_iterations }}
+      pins_root: ${{ steps.cfg.outputs.pins_root }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,6 +119,8 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          APP_ID: ${{ vars.PIPELINE_APP_ID }}
+          PAT: ${{ secrets.PIPELINE_PAT }}
         run: |
           set -euo pipefail
           if [ ! -f delivery.json ]; then
@@ -106,6 +128,14 @@ jobs:
           fi
           if [ -z "${LINEAR_API_KEY:-}" ] || { [ -z "${KEY:-}" ] && [ -z "${OAUTH:-}" ]; }; then
             echo "::notice::Pipeline credentials not configured — bounce skipped."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A fix session's whole method is "push, then watch CI". With the
+          # default GITHUB_TOKEN that push triggers no workflow run at all, so
+          # the session watches a CI run that never starts and burns its budget
+          # doing it. Refuse rather than pay for that.
+          if [ -z "${APP_ID:-}" ] && [ -z "${PAT:-}" ]; then
+            echo "::warning::No pipeline push credential configured (PIPELINE_APP_ID + PIPELINE_APP_KEY, or PIPELINE_PAT). A fix session's pushes would trigger no CI run to watch. Bounce skipped — see docs/AUTONOMY.md, 'The push credential'."
             echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           # Contract §1 budgets: two numbers at two levels. `maxBounces` bounds
@@ -130,6 +160,7 @@ jobs:
             echo "default_branch=$(jq -r '.github.defaultBranch' delivery.json)"
             echo "team=$(jq -r '.linear.teamKey' delivery.json)"
             echo "fix_iterations=$fix_iterations"
+            echo "pins_root=$(jq -r '.dispatch.pinsRoot // "~/.claude/pipeline/pins"' delivery.json)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Resolve the PR
@@ -204,35 +235,51 @@ jobs:
             echo "max_minutes=$(jq -r '.budget.maxMinutes' "$pin")"
           } >> "$GITHUB_OUTPUT"
 
-      # THE COUNTER. Prior runs of THIS workflow, on THIS branch, that actually
-      # reached the `fix` job — read from run history, which the fix session has
-      # no permission to alter. Not commits, not labels, not a PR body.
+      # THE COUNTER. Prior runs of THIS workflow that actually reached the `fix`
+      # job FOR THIS PR — read from run history, which the fix session has no
+      # permission to alter. Not commits, not labels, not a PR body.
+      #
+      # NOT `?branch=`: see the header. A bounce run's own `head_branch` is the
+      # default branch (workflow_run) or the dispatch ref (workflow_dispatch),
+      # never the PR's head branch, so that filter matched zero runs and `prior`
+      # was always 0 — `maxBounces` unreachable, the `exhausted` hand-off dead.
+      # The PR number is carried in the `fix` job's NAME, which this file sets on
+      # the default branch. Keep the prefix below in step with `jobs.fix.name`.
+      #
+      # Bounded two ways: runs older than the PR cannot be bounces of it, and the
+      # listing is one page. A PR needing more than a page of bounce runs has
+      # problems `maxBounces` was never going to solve.
       - name: Count prior bounces by Actions run id
         id: count
         if: steps.pin.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          BRANCH: ${{ steps.pr.outputs.head_ref }}
+          PR: ${{ steps.pr.outputs.number }}
           THIS_RUN: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          runs=$(gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?branch=$BRANCH&per_page=30" \
-                   --jq '.workflow_runs[].id' 2>/dev/null || true)
+          pr_created=$(jq -r '.created_at' "$RUNNER_TEMP/pr.json")
+          gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?per_page=100" \
+            > "$RUNNER_TEMP/bounce-runs.json" 2>/dev/null || echo '{"workflow_runs":[]}' > "$RUNNER_TEMP/bounce-runs.json"
+          runs=$(jq -r --arg since "$pr_created" \
+                   '.workflow_runs[] | select(.created_at >= $since) | .id' \
+                   "$RUNNER_TEMP/bounce-runs.json")
           n=0
           for r in $runs; do
             [ "$r" = "$THIS_RUN" ] && continue
             # A run that skipped `fix` (below threshold, no PR, cap already hit)
-            # cost nothing and is not a bounce.
+            # cost nothing and is not a bounce. The trailing " (" pins the match
+            # to this exact PR — without it "Fix PR #1" also matches "Fix PR #12".
             if gh api "repos/$REPO/actions/runs/$r/jobs?per_page=50" \
-                 --jq '.jobs[] | select(.name | startswith("Fix")) | .conclusion' 2>/dev/null \
+                 --jq ".jobs[] | select(.name | startswith(\"Fix PR #$PR (\")) | .conclusion" 2>/dev/null \
                  | grep -qvE '^(skipped)?$'; then
               n=$((n + 1))
             fi
           done
           echo "prior=$n" >> "$GITHUB_OUTPUT"
           echo "bounce_no=$((n + 1))" >> "$GITHUB_OUTPUT"
-          echo "This would be bounce #$((n + 1)) (found $n prior fix run(s) on $BRANCH)."
+          echo "This would be bounce #$((n + 1)) (found $n prior fix run(s) for PR #$PR)."
 
       - name: Gate on the trigger and the bounce budget
         id: gate
@@ -292,7 +339,9 @@ jobs:
   # 2. FIX — one bounce. The job name is what the counter looks for.
   # ════════════════════════════════════════════════════════════════════════════
   fix:
-    name: Fix (bounce ${{ needs.decide.outputs.bounce_no }})
+    # THE COUNTER READS THIS NAME. `Fix PR #<n> (` is the prefix the `count` step
+    # matches on; renaming this job silently zeroes every future bounce count.
+    name: Fix PR #${{ needs.decide.outputs.pr_number }} (bounce ${{ needs.decide.outputs.bounce_no }})
     needs: decide
     if: needs.decide.outputs.go == 'true'
     runs-on: ubuntu-latest
@@ -309,12 +358,41 @@ jobs:
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       SAFE_OUT: ${{ runner.temp }}/safe-outputs
     steps:
+      # ── The push credential. Deliberately NOT ${{ github.token }}. ──────────
+      # A fix session pushes and then WATCHES CI. GitHub creates no workflow run
+      # from an event triggered by GITHUB_TOKEN, so with the default token the
+      # push produces no CI run at all and `/fix-ci` watches nothing until it
+      # times out. `decide`'s config step already refused to bounce without one
+      # of these two, so exactly one resolves here.
+      - name: Mint the pipeline push token (GitHub App)
+        id: app_token
+        if: ${{ vars.PIPELINE_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_KEY }}
+
+      - name: Select the push token
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          PAT: ${{ secrets.PIPELINE_PAT }}
+        run: |
+          set -euo pipefail
+          token="${APP_TOKEN:-${PAT:-}}"
+          if [ -z "$token" ]; then
+            echo "::error::No pipeline push credential resolved. Set PIPELINE_APP_ID + PIPELINE_APP_KEY (preferred) or PIPELINE_PAT — see docs/AUTONOMY.md, 'The push credential'."
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "PIPELINE_PUSH_TOKEN=$token" >> "$GITHUB_ENV"
+
       # Start on the DEFAULT branch so the canary has something to be blocked by,
       # then move to the PR branch for the actual work.
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.decide.outputs.default_branch }}
           fetch-depth: 0
+          token: ${{ env.PIPELINE_PUSH_TOKEN }}
 
       - name: Write the dispatcher-owned settings file
         env:
@@ -409,6 +487,68 @@ jobs:
           fi
           grep -qxF 'BOUNCE-FINDINGS.json' .git/info/exclude 2>/dev/null || echo 'BOUNCE-FINDINGS.json' >> .git/info/exclude
 
+      # ── Place the pin (contract §3), exactly as pipeline-dispatch.yml does ──
+      # A fix session is the ONE session type that pushes to an already-open PR,
+      # which makes it the one where an unscoped agent does the most damage — and
+      # it was the only one running without a pin, so every pin-reading guard
+      # silently no-op'd on it. The pin is the dispatch-time snapshot published
+      # by the run that created this branch: dispatcher-written, outside the
+      # worktree, and re-fetched here rather than carried through anything the
+      # session could have touched.
+      #
+      # §4's mode→stage table allows `session_mode: ticket` to report stage
+      # `bounce`, so the dispatch pin is used verbatim — inventing a second pin
+      # shape for the fix session is exactly the divergence §3 exists to prevent.
+      - name: Place the dispatch-time pin for the fix session
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TICKET: ${{ needs.decide.outputs.ticket_id }}
+          BRANCH: ${{ needs.decide.outputs.branch }}
+          PINS_ROOT: ${{ needs.decide.outputs.pins_root }}
+        run: |
+          set -euo pipefail
+          id=$(gh api "repos/$REPO/actions/artifacts?name=pipeline-pin-$TICKET&per_page=20" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::error::No dispatch snapshot for $TICKET. The decide job found one moments ago, so it has expired or been deleted since — refusing to run an unpinned session against an open PR."
+            exit 1
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/pin.zip"
+          unzip -o -q "$RUNNER_TEMP/pin.zip" -d "$RUNNER_TEMP/pin"
+
+          # Same derivation as pipeline-dispatch.yml and as the PreToolUse hook:
+          # pin_key = sha256(realpath(session root))[:16], with `~` in pinsRoot
+          # expanded to $HOME. A reader finds its pin with no handshake.
+          pins_dir=$(printf '%s' "$PINS_ROOT" | sed "s|^~|$HOME|")
+          mkdir -p "$pins_dir"
+          root=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$GITHUB_WORKSPACE")
+          key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
+          python3 - "$RUNNER_TEMP/pin/pin-$TICKET.json" "$root" "$pins_dir/$key.json" "$BRANCH" <<'PY'
+          import json, os, sys
+          src, root, dest, branch = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          pin = json.load(open(src))
+          if pin.get("branch") != branch:
+              sys.exit("::error::pin branch %r != PR head %r — refusing to pin this session."
+                       % (pin.get("branch"), branch))
+          pin["worktree"] = root          # readers MUST compare this to their own derived root
+          tmp = dest + ".tmp"
+          with open(tmp, "w") as fh:
+              json.dump(pin, fh, indent=2)
+              fh.flush()
+              os.fsync(fh.fileno())
+          os.chmod(tmp, 0o444)
+          os.rename(tmp, dest)            # atomic — a reader never sees a half-written pin
+          with open(os.path.join(os.path.dirname(dest), "ledger.jsonl"), "a") as fh:
+              fh.write(json.dumps({"dispatch_id": pin["dispatch_id"],
+                                   "ticket": pin["ticket"]["id"],
+                                   "worktree": root,
+                                   "pinned_at": pin["pinned_at"],
+                                   "stage": "bounce"}) + "\n")
+          print("pin written:", dest)
+          PY
+          echo "PIN_FILE=$pins_dir/$key.json" >> "$GITHUB_ENV"
+
       - name: Run the fix session
         id: agent
         continue-on-error: true
@@ -421,7 +561,7 @@ jobs:
         with:
           anthropic_api_key: ${{ needs.decide.outputs.auth_mode == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
           claude_code_oauth_token: ${{ needs.decide.outputs.auth_mode == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
-          github_token: ${{ github.token }}
+          github_token: ${{ env.PIPELINE_PUSH_TOKEN }}
           prompt: |
             Run `/fix-ci ${{ needs.decide.outputs.pr_number }}` on this branch.
 
@@ -470,9 +610,13 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+      # Contract §3 write protocol, step 5: the DISPATCHER drops the pin, never
+      # the agent. The runner here is ephemeral, but teardown is explicit anyway —
+      # these are the same steps a local-daemon backend needs, and "the runner
+      # will clean up" is how a self-hosted runner leaks a pin into the next job.
       - name: Teardown
         if: always()
-        run: rm -f BOUNCE-FINDINGS.json RAILS-CANARY.txt || true
+        run: rm -f "${PIN_FILE:-/nonexistent}" BOUNCE-FINDINGS.json RAILS-CANARY.txt || true
 
   # ════════════════════════════════════════════════════════════════════════════
   # 3. VALIDATE — the fix session's tracker writes, checked against the pin.

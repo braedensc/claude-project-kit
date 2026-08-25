@@ -14,9 +14,9 @@ name: Pipeline dispatch
 #
 # ── The five jobs, and why they are separate ─────────────────────────────────
 #   claim         holds LINEAR_API_KEY. Serialized. Reads config from the
-#                 DEFAULT BRANCH, gates on capacity/budget/WIP, atomically
-#                 claims tickets, writes the pins. The only place a dispatch
-#                 decision is made.
+#                 DEFAULT BRANCH, gates on capacity/budget/WIP, ENQUEUES ready
+#                 tickets, atomically claims them, writes the pins. The only
+#                 place a dispatch decision is made.
 #   session       holds NO tracker credential. Loads the rails, PROVES they
 #                 loaded with a canary, then runs the agent. If the agent could
 #                 read LINEAR_API_KEY out of its environment it could curl the
@@ -25,18 +25,56 @@ name: Pipeline dispatch
 #   validate      pipeline-safe-outputs.yml. Holds the credential the session
 #                 does not, and executes only requests matching the pin.
 #   lifecycle     holds LINEAR_API_KEY. Turns the session's outcome into ticket
-#                 state: needs-human + attempt counter, or blocked:capacity.
+#                 state: re-queue, blocked, needs-human, or blocked:capacity.
+#                 IT NEVER LEAVES A TICKET IN `working` — see the job comment.
 #   carry-forward folds this run's flags into the state the next run reads.
+#
+# ── THE QUEUE IS A ROUND TRIP, NOT A ONE-WAY DOOR ────────────────────────────
+# Two halves that only work as a pair, both owned by the dispatcher because
+# contract §6 makes every `agent:*` label dispatcher-owned:
+#
+#   ENQUEUE  (claim)      a ticket a human — or the approve tier — moved into
+#                         `ready` gets `agent:queued` applied HERE. Nothing else
+#                         in the system may apply it: a session labelling itself
+#                         is a session editing its own supervision. So the
+#                         human-facing trigger is "move it to ready", and the
+#                         label is the dispatcher's internal bookkeeping.
+#   RETURN   (lifecycle)  a ticket whose session did not finish goes BACK to
+#                         `ready` — re-queued with the trigger re-applied when
+#                         attempts remain, parked with `agent:blocked` or
+#                         `agent:needs-human` when they do not. Either way it
+#                         leaves `working`, so it stops holding a `wipLimit`
+#                         slot. Without this half the queue dies after
+#                         `wipLimit` imperfect sessions.
 #
 # ── Setup (repo → Settings → Secrets and variables → Actions) ─────────────────
 #   Secret  LINEAR_API_KEY              Linear personal API key (dispatcher only)
 #   Secret  ANTHROPIC_API_KEY           when delivery.json auth.scheduled = api-key
 #   Secret  CLAUDE_CODE_OAUTH_TOKEN     when auth.scheduled = subscription
 #                                       (generate with `claude setup-token`)
+#   Var     PIPELINE_APP_ID    ┐ a GitHub App installed on this repo with
+#   Secret  PIPELINE_APP_KEY   ┘ Contents: write + Pull requests: write.
+#                                REQUIRED (or PIPELINE_PAT below) — see the next
+#                                block. Without one of them this workflow skips.
+#   Secret  PIPELINE_PAT                fallback if you cannot install an App: a
+#                                       FINE-GRAINED PAT scoped to this ONE repo
+#                                       with the same two permissions.
 #   Var     PIPELINE_MODEL              optional; default claude-sonnet-5
 #   Var     PIPELINE_DISPATCH_ENABLED   optional kill switch; set to "false" to
 #                                       stop dispatching without editing config
 # Until the secrets exist the workflow runs green and skips.
+#
+# ── WHY THE DEFAULT `GITHUB_TOKEN` CANNOT PUSH HERE ──────────────────────────
+# GitHub deliberately does not create workflow runs from events triggered by
+# `GITHUB_TOKEN`. Push a branch and open a PR with it and NOTHING downstream
+# fires: no `pull_request` event, so pipeline-review.yml never runs; no `push` /
+# `pull_request` event, so CI never runs; and because pipeline-bounce.yml and
+# pipeline-auto-merge.yml trigger on `workflow_run`, they never fire either.
+# The whole review → bounce → merge half of the pipeline is silently dead, and
+# the symptom is "sessions run, PRs appear, nothing ever happens to them".
+# An App installation token or a PAT is a different identity, and its events do
+# trigger workflows. This is the reason the extra setup step exists — do not
+# "simplify" it back to ${{ github.token }}.
 #
 # NOTE: scheduled workflows only run from the DEFAULT branch — this takes effect
 # once merged. Use workflow_dispatch to exercise it from the Actions tab.
@@ -114,6 +152,8 @@ jobs:
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           KILL_SWITCH: ${{ vars.PIPELINE_DISPATCH_ENABLED }}
+          APP_ID: ${{ vars.PIPELINE_APP_ID }}
+          PAT: ${{ secrets.PIPELINE_PAT }}
           EVENT: ${{ github.event_name }}
           SENT_AT: ${{ github.event.client_payload.sent_at }}
         run: |
@@ -129,6 +169,15 @@ jobs:
           fi
           if [ -z "${LINEAR_API_KEY:-}" ]; then
             echo "::notice::LINEAR_API_KEY not set — dispatcher not configured yet. Skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The push credential is a PRECONDITION, not a nicety. With only
+          # ${{ github.token }} the session's PR triggers no `pull_request` and
+          # no `workflow_run`, so review, CI and bounce never fire and every
+          # dispatched session is money spent into a dead end. Refusing to
+          # dispatch is the cheap failure; dispatching is the expensive one.
+          if [ -z "${APP_ID:-}" ] && [ -z "${PAT:-}" ]; then
+            echo "::warning::No pipeline push credential configured (PIPELINE_APP_ID + PIPELINE_APP_KEY, or PIPELINE_PAT). GitHub does not trigger workflows from events made with the default GITHUB_TOKEN, so review/CI/bounce would never run on the session's PR. Skipping — see docs/AUTONOMY.md, 'The push credential'."
             echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           # Webhook freshness. A repository_dispatch can be replayed; a stale one
@@ -292,6 +341,82 @@ jobs:
               print("::notice::Capacity pause expired at %s — resuming." % paused_until)
               state["capacity"] = {}
 
+          # ── ENQUEUE: the dispatcher is what applies the trigger label ───────
+          # Contract §6 attributes `agent:queued` to the DISPATCHER, and nothing
+          # else in the system may apply it: the safe-outputs validator refuses
+          # `agent:*` writes from a session, `/plan-epic` may not touch the ready
+          # state, and a session labelling itself is a session editing its own
+          # supervision. So this loop is where a ticket actually enters the queue.
+          #
+          # The human-facing trigger is therefore "the ticket is in `ready`" —
+          # put there by a person, or by the approve tier (§11), both of which
+          # have already decided this work may start. This step does not
+          # re-adjudicate that decision. It only declines to queue tickets the
+          # DISPATCHER itself has taken out of circulation, and clears the one
+          # hold that is dispatcher-owned rather than human-owned.
+          #
+          # Placed after the capacity gate and before the budget and WIP gates on
+          # purpose: a full queue or a spent daily budget is a reason not to
+          # START work, never a reason to let the board lie about what is waiting.
+          trigger_key = dispatch.get("labelTrigger", "agent:queued")
+          trigger_id = labels.get(trigger_key)
+          if not trigger_id:
+              sys.exit("::error::delivery.json linear.labels.ids has no resolved id for %r "
+                       "(the dispatch trigger). Run the label-resolution setup step." % trigger_key)
+          id_to_key = {v: k for k, v in labels.items() if v}
+          ADD_LABEL = "mutation($id: String!, $labelId: String!) { issueAddLabel(id: $id, labelId: $labelId) { success } }"
+          RM_LABEL = "mutation($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }"
+
+          ready_nodes = gql("""
+            query($stateId: ID!) {
+              issues(filter: { state: { id: { eq: $stateId } } }, first: 100) {
+                nodes { id identifier labels { nodes { id name } } }
+              }
+            }""", {"stateId": states["ready"]})["issues"]["nodes"]
+
+          queued, unpaused, held = [], [], []
+          for n in ready_nodes:
+              keys = {id_to_key.get(l["id"]) for l in n["labels"]["nodes"]}
+              keys.discard(None)
+              if trigger_key in keys:
+                  continue                                  # already queued
+              if "agent:needs-human" in keys:
+                  held.append("%s (agent:needs-human)" % n["identifier"]); continue
+              if "agent:working" in keys:
+                  held.append("%s (agent:working)" % n["identifier"]); continue
+              if "agent:blocked" in keys and "blocked:capacity" not in keys:
+                  # A person has to answer the escalation first. REMOVING
+                  # `agent:blocked` is the reset, and it is the only action this
+                  # step waits on — see the lifecycle job, which parks escalated
+                  # tickets here rather than leaving them in `working`.
+                  held.append("%s (agent:blocked)" % n["identifier"]); continue
+              if not any(k.startswith("provenance:") for k in keys):
+                  # §5 requires exactly one. Warn rather than refuse: selection
+                  # below already defaults a missing value to `human`, and being
+                  # stricter here than there would wedge the queue for a reason
+                  # visible only in a log nobody is reading.
+                  print("::warning::%s is in `ready` with no provenance label — contract §5 "
+                        "requires exactly one. Queuing it as `human`." % n["identifier"])
+              if not dry and "blocked:capacity" in keys:
+                  # Dispatcher-owned AND dispatcher-cleared (§6: "Cleared on
+                  # retry; does not consume an attempt"). Reaching this line means
+                  # gate 1 let the run through, so the provider pause is over.
+                  for k in ("blocked:capacity", "agent:blocked"):
+                      if labels.get(k):
+                          gql(RM_LABEL, {"id": n["id"], "labelId": labels[k]})
+                  unpaused.append(n["identifier"])
+              if not dry:
+                  gql(ADD_LABEL, {"id": n["id"], "labelId": trigger_id})
+              queued.append(n["identifier"])
+
+          if unpaused:
+              print("::notice::Capacity hold cleared on: %s" % ", ".join(unpaused))
+          if queued:
+              print("::notice::%s %s: %s" % ("Would enqueue" if dry else "Enqueued",
+                                             trigger_key, ", ".join(queued)))
+          if held:
+              print("::notice::In `ready` but deliberately not queued: %s" % "; ".join(held))
+
           # ── Gate 2: daily aggregate budget ──────────────────────────────────
           # The dispatcher RESERVES the ticket's maxUsd at dispatch time rather
           # than reconciling a self-reported number afterwards. Over-counting is
@@ -317,12 +442,7 @@ jobs:
                    % (wip, budgets["wipLimit"], ", ".join(n["identifier"] for n in wip_nodes)))
 
           # ── Select ──────────────────────────────────────────────────────────
-          trigger_key = dispatch.get("labelTrigger", "agent:queued")
-          trigger_id = labels.get(trigger_key)
-          if not trigger_id:
-              sys.exit("::error::delivery.json linear.labels.ids has no resolved id for %r "
-                       "(the dispatch trigger). Run the label-resolution setup step." % trigger_key)
-
+          # `trigger_key` / `trigger_id` were resolved by the enqueue block above.
           nodes = gql("""
             query($stateId: ID!, $labelId: ID!) {
               issues(filter: { state: { id: { eq: $stateId } },
@@ -344,7 +464,6 @@ jobs:
           if not nodes:
               stop("Queue empty: no tickets in `ready` carrying %s." % trigger_key)
 
-          id_to_key = {v: k for k, v in labels.items() if v}
           needs_human_id = labels.get("agent:needs-human")
           working_id = labels.get("agent:working")
           per_effort = budgets["perEffort"]
@@ -378,6 +497,13 @@ jobs:
               # A ticket already handed to a human is terminal until a person acts.
               if "agent:needs-human" in keys:
                   skipped.append("%s (agent:needs-human)" % ident); continue
+              # Belt and braces with the enqueue block: an escalated ticket is
+              # parked in `ready` WITHOUT the trigger, so it should not appear in
+              # this query at all. If it does — a stray hand-applied label, a
+              # half-finished manual edit — "remove `agent:blocked`" stays the one
+              # unambiguous human reset rather than becoming a race.
+              if "agent:blocked" in keys:
+                  skipped.append("%s (agent:blocked)" % ident); continue
 
               attempts = int(state.get("attempts", {}).get(ident, 0))
               if attempts >= total_attempts:
@@ -567,11 +693,15 @@ jobs:
     concurrency:
       group: pipeline-ticket-${{ matrix.ticket.id }}
       cancel-in-progress: false
-    # Narrower than the workflow default, on purpose. The agent gets exactly what
-    # it needs to push a branch and open a PR — and notably NOT `actions: read`,
-    # which would let it enumerate and download this repo's artifacts, including
-    # the pins of tickets it was never given. Same-run artifact steps in this job
-    # use the runner's own token and are unaffected.
+    # Narrower than the workflow default, on purpose. Notably NOT `actions: read`,
+    # which would let the agent enumerate and download this repo's artifacts,
+    # including the pins of tickets it was never given. Same-run artifact steps in
+    # this job use the runner's own token and are unaffected.
+    #
+    # These scope `github.token`. The branch push and `gh pr create` run under the
+    # separate PUSH credential minted below — grant that App or PAT exactly
+    # Contents: write and Pull requests: write and nothing more, because this
+    # block does not constrain it.
     permissions:
       contents: write
       pull-requests: write
@@ -585,13 +715,53 @@ jobs:
       # fails closed — every tool call blocked, for the wrong reason.
       CLAUDE_PROJECT_DIR: ${{ github.workspace }}
       SAFE_OUT: ${{ runner.temp }}/safe-outputs
-    outputs:
-      outcome: ${{ steps.agent.outcome }}
+    # NO job outputs. A matrix job has ONE set of outputs shared by every leg,
+    # last writer wins — so `outputs.outcome` would report some other ticket's
+    # session to the lifecycle leg reading it. This job's per-ticket findings
+    # travel as per-ticket ARTIFACTS instead (`pipeline-session-outcome-<id>`).
     steps:
+      # ── The push credential. Deliberately NOT ${{ github.token }}. ──────────
+      # GitHub does not create workflow runs from events triggered by
+      # GITHUB_TOKEN, so a branch pushed and a PR opened with it fire no
+      # `pull_request`, no `push` and therefore no `workflow_run` — review, CI
+      # and bounce would all stay silent and every session would be spent into a
+      # dead end. An App installation token is a different identity and its
+      # events do trigger workflows. `claim`'s preflight already refused to
+      # dispatch without one of these two, so exactly one of them resolves here.
+      - name: Mint the pipeline push token (GitHub App)
+        id: app_token
+        if: ${{ vars.PIPELINE_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_KEY }}
+
+      - name: Select the push token
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          PAT: ${{ secrets.PIPELINE_PAT }}
+        run: |
+          set -euo pipefail
+          token="${APP_TOKEN:-${PAT:-}}"
+          if [ -z "$token" ]; then
+            echo "::error::No pipeline push credential resolved. Set PIPELINE_APP_ID + PIPELINE_APP_KEY (preferred) or PIPELINE_PAT — see docs/AUTONOMY.md, 'The push credential'."
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "PIPELINE_PUSH_TOKEN=$token" >> "$GITHUB_ENV"
+          if [ -n "${APP_TOKEN:-}" ]; then
+            echo "Pushing as the GitHub App installation."
+          else
+            echo "::warning::Pushing with PIPELINE_PAT. A PAT carries its owner's identity — use a FINE-GRAINED token scoped to this repository only, with Contents: write and Pull requests: write and nothing else. A GitHub App is the better answer."
+          fi
+
+      # `token:` is what actions/checkout persists into .git/config, so it is
+      # what `git push` uses inside the session.
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.claim.outputs.default_branch }}
           fetch-depth: 0
+          token: ${{ env.PIPELINE_PUSH_TOKEN }}
 
       - name: Fetch this ticket's pin
         uses: actions/download-artifact@v4
@@ -771,6 +941,11 @@ jobs:
           grep -qxF 'PIPELINE-BRIEF.md' .git/info/exclude 2>/dev/null \
             || echo 'PIPELINE-BRIEF.md' >> .git/info/exclude
 
+      # `continue-on-error` here keeps the matrix leg alive so teardown runs and
+      # the write-requests are still collected — it does NOT swallow the result.
+      # `steps.agent.outcome` is evaluated BEFORE continue-on-error is applied,
+      # and the next step records it per ticket for the lifecycle job. A hard
+      # agent failure reaches the ticket.
       - name: Run the session
         id: agent
         continue-on-error: true
@@ -783,7 +958,7 @@ jobs:
         with:
           anthropic_api_key: ${{ needs.claim.outputs.auth_mode == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
           claude_code_oauth_token: ${{ needs.claim.outputs.auth_mode == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
-          github_token: ${{ github.token }}
+          github_token: ${{ env.PIPELINE_PUSH_TOKEN }}
           prompt: |
             You are running as an unattended pipeline session on branch `${{ matrix.ticket.branch }}`.
 
@@ -827,6 +1002,76 @@ jobs:
           path: ${{ runner.temp }}/safe-outputs
           retention-days: 14
           if-no-files-found: ignore
+
+      # ── The session's outcome, made legible to the lifecycle job ────────────
+      # Two values with two very different standings, kept apart on purpose:
+      #
+      #   step_outcome   DISPATCHER-OBSERVED. Did the agent step itself succeed?
+      #                  Read from `steps.agent.outcome`, which is the result
+      #                  BEFORE continue-on-error is applied.
+      #   agent_outcome  AGENT-REPORTED. The §4 telemetry `outcome`, plus /work's
+      #                  escalation marker, read out of the file the agent wrote.
+      #                  Reporting, never authority (§4) — and note the only
+      #                  thing lifecycle does with it is take the ticket OUT of
+      #                  the queue. It can buy a session no budget, no approval
+      #                  and no merge; a session can use it to stop itself and
+      #                  for nothing else. That asymmetry is why it is safe to
+      #                  read an agent-authored value here at all.
+      - name: Record the session outcome for the lifecycle job
+        if: always()
+        env:
+          TICKET: ${{ matrix.ticket.id }}
+          STEP_OUTCOME: ${{ steps.agent.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/session-outcome"
+          python3 - <<'PY'
+          import json, os, re, glob
+          out = {"ticket": os.environ["TICKET"],
+                 "step_outcome": os.environ.get("STEP_OUTCOME") or "unknown",
+                 "agent_outcome": None, "escalation": None, "error_class": None}
+          bodies = []
+          for path in glob.glob(os.path.join(os.environ["SAFE_OUT"], "*.json")):
+              try:
+                  doc = json.load(open(path))
+              except Exception:
+                  continue
+              for req in (doc.get("requests") or []):
+                  if isinstance(req, dict) and req.get("type") == "ticket-comment":
+                      bodies.append(str(req.get("body") or ""))
+          blob = "\n".join(bodies)
+          # /work's escalation markers (its step 4). §6 routes the two to
+          # different labels, so they are distinguished rather than merged.
+          if re.search(r"AGENT ESCALATION.*needs-human", blob):
+              out["escalation"] = "agent:needs-human"
+          elif re.search(r"AGENT ESCALATION.*blocked", blob):
+              out["escalation"] = "agent:blocked"
+          # The §4 telemetry block: a ```json fence carrying the schema marker.
+          for fence in re.findall(r"```json\s*(\{.*?\})\s*```", blob, re.S):
+              try:
+                  doc = json.loads(fence)
+              except Exception:
+                  continue
+              if doc.get("schema") != "pipeline-telemetry/1":
+                  continue
+              for row in (doc.get("runs") or []):
+                  if isinstance(row, dict) and row.get("outcome"):
+                      out["agent_outcome"] = row["outcome"]
+                      out["error_class"] = row.get("error_class")
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "session-outcome",
+                              "%s.json" % os.environ["TICKET"])
+          json.dump(out, open(dest, "w"), indent=2)
+          print(json.dumps(out))
+          PY
+
+      - name: Upload the session outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-session-outcome-${{ matrix.ticket.id }}
+          path: ${{ runner.temp }}/session-outcome
+          retention-days: 14
+          if-no-files-found: warn
 
       # Contract §3 write protocol, step 5: the DISPATCHER deletes the pin, never
       # the agent. On this backend the runner is ephemeral, but teardown is
@@ -872,7 +1117,38 @@ jobs:
       linear_api_key: ${{ secrets.LINEAR_API_KEY }}
 
   # ════════════════════════════════════════════════════════════════════════════
-  # 4. LIFECYCLE — outcome → ticket state. Never silently re-queues.
+  # 4. LIFECYCLE — outcome → ticket state.
+  #
+  # THE INVARIANT: this job never leaves a ticket in `working`. A ticket that
+  # keeps a `working` slot after its session has ended is a slot `wipLimit`
+  # never gets back, and after `wipLimit` such tickets the queue is permanently
+  # dead with the dispatcher cheerfully reporting "WIP limit reached".
+  #
+  # So every terminal path below moves the ticket out of `working`, and the only
+  # question is which one:
+  #
+  #   completed   the session moved it to `review` itself — nothing to do but
+  #               drop `agent:working`.
+  #   re-queued   a retryable failure with attempts left. Back to `ready`, the
+  #               trigger label re-applied, and the attempt already counted by
+  #               `claim` (the counter increments at dispatch, not here — §9
+  #               requires it to be known BEFORE dispatch). Bounded by
+  #               `totalAttempts`, which is what makes this not a loop.
+  #   blocked     the session escalated (§4 outcome `blocked`, or /work's
+  #               escalation marker). Parked in `ready` WITHOUT the trigger and
+  #               labelled `agent:blocked`; removing that label is the human's
+  #               reset. It is not re-queued, because a session that asked a
+  #               question will ask it again and burn another attempt doing it.
+  #   needs-human attempts exhausted, or the session escalated a `riskPaths`
+  #               change. Terminal until a person acts.
+  #   capacity    provider capacity: `blocked:capacity`, attempt refunded by
+  #               carry-forward, cleared by `claim`'s enqueue block when the
+  #               pause lifts. Not the ticket's fault.
+  #
+  # Per-ticket inputs come from per-ticket ARTIFACTS, never from `needs.*.result`
+  # or `needs.*.outputs`: a matrix job reports ONE aggregate result and ONE set
+  # of outputs for all its legs, so with `wipLimit > 1` a single failed session
+  # would re-queue and label every ticket in the run.
   # ════════════════════════════════════════════════════════════════════════════
   lifecycle:
     name: Lifecycle ${{ matrix.ticket.id }}
@@ -894,6 +1170,24 @@ jobs:
           ref: ${{ needs.claim.outputs.default_branch }}
           persist-credentials: false
 
+      # The two per-ticket artifacts this job classifies from. `continue-on-error`
+      # on both: a session cancelled before its recording step publishes neither,
+      # and "missing" must classify as a failure rather than crash the job that
+      # is supposed to hand the ticket back.
+      - name: Fetch this ticket's session outcome
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pipeline-session-outcome-${{ matrix.ticket.id }}
+          path: ${{ runner.temp }}/session-outcome
+
+      - name: Fetch this ticket's safe-outputs verdict
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pipeline-safe-outputs-${{ matrix.ticket.id }}-verdict
+          path: ${{ runner.temp }}/validate-verdict
+
       # Capacity is diagnosed from the session job's OWN LOG, read back through
       # the Actions API now that the job has finished. Consumer plans expose no
       # usage API, so the failure message is the only place the reset time
@@ -907,14 +1201,76 @@ jobs:
           TICKET: ${{ matrix.ticket.id }}
           SESSION_RESULT: ${{ needs.session.result }}
           VALIDATE_RESULT: ${{ needs.validate.result }}
+          OUTCOME_DIR: ${{ runner.temp }}/session-outcome
+          VERDICT_DIR: ${{ runner.temp }}/validate-verdict
         run: |
           set -euo pipefail
-          verdict="ok"
-          [ "$SESSION_RESULT" = "success" ] || verdict="failed"
-          case "$VALIDATE_RESULT" in success|skipped) ;; *) verdict="failed" ;; esac
+
+          # ── Authority: what the DISPATCHER observed ─────────────────────────
+          # `step_outcome` is `steps.agent.outcome` from the session job, which
+          # is evaluated BEFORE that step's continue-on-error — so a hard agent
+          # failure is visible here and is not masked. A missing file means the
+          # leg died before it could report, which is itself a failure.
+          of="$OUTCOME_DIR/$TICKET.json"
+          if [ -f "$of" ]; then
+            step_outcome=$(jq -r '.step_outcome // "unknown"' "$of")
+            # AGENT-AUTHORED strings, and they end up in $GITHUB_OUTPUT. A
+            # newline in one of them would let a session append its own key —
+            # `verdict=ok` after ours, last write wins — and talk its way out of
+            # its own classification. Strip line breaks and cap the length; the
+            # three are matched against fixed vocabularies anyway, so nothing
+            # legitimate is lost.
+            agent_outcome=$(jq -r '.agent_outcome // ""' "$of" | tr -d '\r\n' | cut -c1-32)
+            escalation=$(jq -r '.escalation // ""' "$of" | tr -d '\r\n' | cut -c1-32)
+            error_class=$(jq -r '.error_class // ""' "$of" | tr -d '\r\n' | cut -c1-64)
+          else
+            step_outcome="unknown"; agent_outcome=""; escalation=""; error_class=""
+            echo "::warning::No session-outcome artifact for $TICKET — treating the session as failed."
+          fi
+          vf="$VERDICT_DIR/verdict.json"
+          if [ -f "$vf" ]; then
+            safe_verdict=$(jq -r '.verdict // "rejected"' "$vf")
+          else
+            # Fall back to the coarse aggregate only when the per-ticket verdict
+            # is missing. It over-reports failures under a wide matrix; that is
+            # the safe direction, since a failure hands the ticket back.
+            case "$VALIDATE_RESULT" in success|skipped) safe_verdict="ok" ;; *) safe_verdict="rejected" ;; esac
+          fi
+
+          verdict="ok"; reason=""
+          if [ "$step_outcome" != "success" ]; then
+            verdict="failed"; reason="the agent step did not succeed ($step_outcome)"
+          elif [ "$safe_verdict" = "rejected" ]; then
+            verdict="failed"; reason="the safe-outputs batch was rejected — nothing the session asked for was applied"
+          fi
+
+          # ── Reporting: what the SESSION said about itself ───────────────────
+          # Contract §4: agent-authored, so never authority. It is read here for
+          # one direction only — it can take the ticket OUT of the queue and can
+          # never put it back in, buy budget, or grant an approval. A session can
+          # use it to stop itself and for nothing else.
+          # `if`, not `[ … ] && { … }`: under `set -e` a failing test as the last
+          # command of a case branch takes the whole step down with it.
+          if [ "$escalation" = "agent:needs-human" ]; then
+            verdict="needs-human"; reason="the session escalated a riskPaths change"
+          elif [ "$escalation" = "agent:blocked" ] && [ "$verdict" = "ok" ]; then
+            verdict="blocked"; reason="the session escalated and asked a question"
+          fi
+          if [ "$verdict" = "ok" ]; then
+            case "$agent_outcome" in
+              blocked)              verdict="blocked"; reason="the session reported outcome 'blocked'${error_class:+ ($error_class)}" ;;
+              timeout|budget|error) verdict="failed";  reason="the session reported outcome '$agent_outcome'${error_class:+ ($error_class)}" ;;
+            esac
+          fi
 
           capacity="false"; resets_at=""
-          if [ "$verdict" = "failed" ]; then
+          if [ "$agent_outcome" = "capacity" ]; then
+            capacity="true"; verdict="failed"; reason="the session reported provider capacity"
+          fi
+          # Scan the log whenever something went wrong — including when the
+          # session already told us it was capacity, because the reset TIME only
+          # ever appears in the provider's failure message.
+          if [ "$verdict" != "ok" ]; then
             job_id=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
                       --jq ".jobs[] | select(.name == \"Session $TICKET\") | .id" 2>/dev/null | head -1 || true)
             if [ -n "$job_id" ]; then
@@ -935,14 +1291,23 @@ jobs:
           echo "verdict=$verdict"     >> "$GITHUB_OUTPUT"
           echo "capacity=$capacity"   >> "$GITHUB_OUTPUT"
           echo "resets_at=$resets_at" >> "$GITHUB_OUTPUT"
-          echo "session=$SESSION_RESULT validate=$VALIDATE_RESULT -> $verdict (capacity=$capacity)"
+          echo "reason=$reason"       >> "$GITHUB_OUTPUT"
+          echo "step=$step_outcome safe_outputs=$safe_verdict agent=${agent_outcome:-none} escalation=${escalation:-none} -> $verdict (capacity=$capacity)"
 
-      - name: Apply the lifecycle labels
-        if: steps.classify.outputs.verdict == 'failed'
+      # Runs on EVERY verdict, `ok` included — because `ok` still has work to do:
+      # drop `agent:working`, and catch the session that "succeeded" without ever
+      # moving its ticket out of `working` (a PR that never opened, a state
+      # request the validator never saw). That case used to be the silent WIP
+      # leak; here it falls through to the same re-queue path as any other
+      # incomplete attempt.
+      - name: Apply the lifecycle transition
+        id: transition
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           TICKET: ${{ matrix.ticket.id }}
           ATTEMPT: ${{ matrix.ticket.attempt }}
+          VERDICT: ${{ steps.classify.outputs.verdict }}
+          REASON: ${{ steps.classify.outputs.reason }}
           IS_CAPACITY: ${{ steps.classify.outputs.capacity }}
           RESETS_AT: ${{ steps.classify.outputs.resets_at }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -954,8 +1319,14 @@ jobs:
           cfg = json.load(open("delivery.json"))
           lin = cfg["linear"]
           labels = lin["labels"]["ids"]
+          states = lin["stateIds"]
+          trigger_key = cfg["dispatch"].get("labelTrigger", "agent:queued")
           ticket, attempt = os.environ["TICKET"], int(os.environ["ATTEMPT"])
+          total = int(cfg["budgets"]["totalAttempts"])
+          verdict = os.environ["VERDICT"]
+          reason = os.environ.get("REASON") or "the session did not complete"
           capacity = os.environ["IS_CAPACITY"] == "true"
+          run_url = os.environ["RUN_URL"]
 
           def gql(q, v):
               req = urllib.request.Request(API, data=json.dumps({"query": q, "variables": v}).encode(),
@@ -967,16 +1338,22 @@ jobs:
                   sys.exit("::error::Linear API error: %s" % json.dumps(p["errors"])[:400])
               return p["data"]
 
+          def out(k, v):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("%s=%s\n" % (k, v))
+
           num = int(ticket.rsplit("-", 1)[1])
           nodes = gql("query($k:String!,$n:Float!){issues(filter:{team:{key:{eq:$k}},"
-                      "number:{eq:$n}},first:1){nodes{id}}}",
+                      "number:{eq:$n}},first:1){nodes{id state{id name}}}}",
                       {"k": lin["teamKey"], "n": num})["issues"]["nodes"]
           if not nodes:
               sys.exit("::error::ticket %s not found" % ticket)
           uid = nodes[0]["id"]
+          live_state, live_name = nodes[0]["state"]["id"], nodes[0]["state"]["name"]
           ADD = "mutation($id:String!,$labelId:String!){issueAddLabel(id:$id,labelId:$labelId){success}}"
           RM = "mutation($id:String!,$labelId:String!){issueRemoveLabel(id:$id,labelId:$labelId){success}}"
           CM = "mutation($issueId:String!,$body:String!){commentCreate(input:{issueId:$issueId,body:$body}){success}}"
+          MV = "mutation($id:String!,$stateId:String!){issueUpdate(id:$id,input:{stateId:$stateId}){success}}"
 
           def add(key):
               if labels.get(key):
@@ -986,34 +1363,105 @@ jobs:
               if labels.get(key):
                   gql(RM, {"id": uid, "labelId": labels[key]})
 
+          def to_ready():
+              gql(MV, {"id": uid, "stateId": states["ready"]})
+
+          # Is the ticket still parked on a WIP slot? Everything below turns on
+          # this: a ticket the session already moved to `review` has a PR and
+          # belongs to the review/bounce path, and re-queueing it would start a
+          # second session against an open PR.
+          still_working = live_state == states["working"]
+
+          # The session claimed success but never left `working`. Whatever it
+          # thinks it did, the ticket is not delivered — treat it as a failed
+          # attempt so it gets re-queued rather than stranded.
+          if verdict == "ok" and still_working:
+              verdict = "failed"
+              reason = ("the session ended without moving the ticket out of `working` — "
+                        "no accepted `ticket-state` request reached the validator")
+
           rm("agent:working")
+
+          if verdict == "ok":
+              print("::notice::%s completed; ticket is in `%s`." % (ticket, live_name))
+              out("final", "completed")
+              sys.exit(0)
+
           if capacity:
               # Capacity is NOT the ticket's fault (contract dispatch.pauseOnCapacity).
-              # It gets blocked:capacity — never agent:needs-human — and the
-              # attempt is refunded so a provider outage cannot burn a ticket's
-              # budget. Nothing about the ticket needs a human.
-              add("agent:blocked")
-              add("blocked:capacity")
+              # blocked:capacity — never agent:needs-human — and the attempt is
+              # refunded by carry-forward so a provider outage cannot burn a
+              # ticket's budget. `claim`'s enqueue block clears both labels and
+              # re-applies the trigger once the pause lifts.
+              add("agent:blocked"); add("blocked:capacity")
+              if still_working:
+                  to_ready()
               body = ("⏸️ Paused for provider capacity until `%s`. Nothing is wrong with this "
-                      "ticket — the queue resumes on its own and this attempt was not "
-                      "consumed.\n\n[Run](%s)"
-                      % (os.environ.get("RESETS_AT") or "the next reset", os.environ["RUN_URL"]))
-          else:
-              total = int(cfg["budgets"]["totalAttempts"])
-              if attempt >= total:
-                  # Terminal. Machinery NEVER returns the ticket to the
-                  # dispatchable state — a person does. Silent re-queueing is how
-                  # a broken ticket burns a budget in a loop.
-                  add("agent:needs-human")
-                  body = ("🛑 Attempt %d of %d failed — handing to a human. The ticket stays out "
-                          "of the queue until someone removes `agent:needs-human`.\n\n[Run](%s)"
-                          % (attempt, total, os.environ["RUN_URL"]))
+                      "ticket — it is back in `ready`, this attempt was not consumed, and the "
+                      "queue resumes on its own at the reset.\n\n[Run](%s)"
+                      % (os.environ.get("RESETS_AT") or "the next reset", run_url))
+              final = "capacity"
+
+          elif verdict == "needs-human" or attempt >= total:
+              # Terminal. The dispatcher never clears `agent:needs-human` — that
+              # label is the durable stop (§9), and removing it is the human's act.
+              add("agent:needs-human")
+              if still_working:
+                  to_ready()
+              if verdict == "needs-human":
+                  body = ("🛑 The session escalated for a human decision: %s.\n\nThe ticket is back "
+                          "in `ready` and out of the queue until someone removes "
+                          "`agent:needs-human`.\n\n[Run](%s)" % (reason, run_url))
               else:
-                  add("agent:blocked")
-                  body = ("⚠️ Attempt %d of %d failed. It will be retried on a later "
-                          "poll.\n\n[Run](%s)" % (attempt, total, os.environ["RUN_URL"]))
+                  body = ("🛑 Attempt %d of %d failed (%s) — that was the last attempt, so this is "
+                          "now a human's. The ticket is back in `ready` and stays out of the queue "
+                          "until someone removes `agent:needs-human`.\n\n[Run](%s)"
+                          % (attempt, total, reason, run_url))
+              final = "needs-human"
+
+          elif verdict == "blocked":
+              # An escalation is a question, not a transient failure. Re-queueing
+              # it would spend another attempt asking the same question, so the
+              # ticket waits in `ready` WITHOUT the trigger label until a person
+              # answers and removes `agent:blocked`.
+              add("agent:blocked")
+              if still_working:
+                  to_ready()
+              body = ("⛔ Blocked — %s.\n\nAttempt %d of %d is spent. The ticket is back in `ready` "
+                      "but is **not** queued: answer the question on this ticket and remove "
+                      "`agent:blocked`, and the next poll picks it up.\n\n[Run](%s)"
+                      % (reason, attempt, total, run_url))
+              final = "blocked"
+
+          elif still_working:
+              # RE-QUEUE. The attempt was already counted by `claim` at dispatch
+              # time (§9 requires the count to be known BEFORE dispatch), so this
+              # path adds nothing to the counter — it just makes the ticket
+              # visible to the next poll again. `totalAttempts` is what bounds it.
+              rm("agent:blocked"); rm("blocked:capacity")
+              to_ready()
+              if labels.get(trigger_key):
+                  gql(ADD, {"id": uid, "labelId": labels[trigger_key]})
+              body = ("⚠️ Attempt %d of %d failed (%s). Re-queued: the ticket is back in `ready` "
+                      "with `%s`, so the next dispatcher poll will pick it up. After attempt %d it "
+                      "goes to `agent:needs-human` instead.\n\n[Run](%s)"
+                      % (attempt, total, reason, trigger_key, total, run_url))
+              final = "requeued"
+
+          else:
+              # Failed, attempts remain — but the ticket has already moved on to
+              # `review`, so a PR exists. Re-queueing would race a second session
+              # against it; flag it for a human instead.
+              add("agent:blocked")
+              body = ("⚠️ Attempt %d of %d failed (%s) after the ticket had already moved to `%s`. "
+                      "Not re-queued — a PR is open and a second session would race it. Marked "
+                      "`agent:blocked` for a human read.\n\n[Run](%s)"
+                      % (attempt, total, reason, live_name, run_url))
+              final = "blocked"
+
           gql(CM, {"issueId": uid, "body": body})
-          print("::notice::%s: %s" % (ticket, body.splitlines()[0]))
+          out("final", final)
+          print("::notice::%s -> %s: %s" % (ticket, final, body.splitlines()[0]))
           PY
 
       # Notify ONCE per capacity window, not once per failed ticket — a paused
@@ -1052,12 +1500,12 @@ jobs:
           TICKET: ${{ matrix.ticket.id }}
           CAPACITY: ${{ steps.classify.outputs.capacity }}
           RESETS_AT: ${{ steps.classify.outputs.resets_at }}
-          VERDICT: ${{ steps.classify.outputs.verdict }}
+          VERDICT: ${{ steps.transition.outputs.final || steps.classify.outputs.verdict }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/flags"
           printf '{"ticket":"%s","capacity":%s,"resets_at":"%s","verdict":"%s"}\n' \
-            "$TICKET" "${CAPACITY:-false}" "$RESETS_AT" "$VERDICT" \
+            "$TICKET" "${CAPACITY:-false}" "$RESETS_AT" "${VERDICT:-unknown}" \
             > "$RUNNER_TEMP/flags/$TICKET.json"
 
       - name: Upload the lifecycle flag
