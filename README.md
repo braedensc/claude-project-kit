@@ -67,6 +67,7 @@ other specific project by name. MIT licensed.
 | `docs/STACK-RATIONALE.md` | Every stack choice, tagged TRANSFERABLE vs STACK-SPECIFIC |
 | `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
 | `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own ADRs |
+| `docs/PIPELINE-CONTRACT.md` + `delivery.example.json` | **Optional** agentic delivery pipeline (tickets → sessions → PRs): the frozen `delivery.json` / pin-file / telemetry formats. Inert unless a project creates `delivery.json` |
 | `CLAUDE.md` | The kit's own auto-loaded context (guardrails + conventions) — a worked example; bootstrap replaces it with your project's |
 | `docs/CLAUDE-template.md` | Fill-in `CLAUDE.md` for the new project (Hard Rules verbatim) |
 | `BOOTSTRAP-PROMPT.md` / `PLACEHOLDERS.md` | The adaptation UX + the complete `{{…}}` token inventory |

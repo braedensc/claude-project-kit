@@ -1,0 +1,113 @@
+{
+  "version": 1,
+
+  "linear": {
+    "teamKey": "{{LINEAR_TEAM_KEY}}",
+    "workspace": "{{LINEAR_WORKSPACE}}",
+    "stateIds": {
+      "raw": "{{LINEAR_STATE_ID_RAW}}",
+      "ready": "{{LINEAR_STATE_ID_READY}}",
+      "working": "{{LINEAR_STATE_ID_WORKING}}",
+      "review": "{{LINEAR_STATE_ID_REVIEW}}",
+      "done": "{{LINEAR_STATE_ID_DONE}}"
+    },
+    "labels": {
+      "ids": {
+        "track:{{DEFAULT_TRACK}}": "",
+        "effort:S": "",
+        "effort:M": "",
+        "effort:L": "",
+        "agent:queued": "",
+        "agent:working": "",
+        "agent:blocked": "",
+        "agent:needs-human": "",
+        "blocked:capacity": "",
+        "provenance:epic": "",
+        "provenance:monitor": "",
+        "provenance:review": "",
+        "provenance:retro-proposal": "",
+        "provenance:human": "",
+        "hooks-change": "",
+        "meta": ""
+      },
+      "required": [
+        "effort:S", "effort:M", "effort:L",
+        "agent:queued", "agent:working", "agent:blocked", "agent:needs-human",
+        "blocked:capacity",
+        "provenance:epic", "provenance:human",
+        "hooks-change"
+      ]
+    }
+  },
+
+  "github": {
+    "owner": "{{GITHUB_OWNER}}",
+    "repo": "{{GITHUB_REPO}}",
+    "defaultBranch": "main"
+  },
+
+  "branch": {
+    "types": ["feat", "fix", "chore", "refactor", "docs"],
+    "requireTicketId": true
+  },
+
+  "stack": {
+    "kind": "{{STACK_KIND}}",
+    "securityNotes": ["{{STACK_SECURITY_NOTE}}"],
+    "graderPaths": ["{{GRADER_PATH_GLOB}}"]
+  },
+
+  "commands": {
+    "lint": "{{CMD_LINT}}",
+    "typecheck": "{{CMD_TYPECHECK}}",
+    "test": "{{CMD_TEST}}",
+    "e2e": "{{CMD_E2E}}",
+    "preview": "{{CMD_PREVIEW}}"
+  },
+
+  "budgets": {
+    "perEffort": {
+      "S": { "maxTurns": 25,  "maxUsd": 2.0,  "maxMinutes": 20 },
+      "M": { "maxTurns": 60,  "maxUsd": 6.0,  "maxMinutes": 45 },
+      "L": { "maxTurns": 120, "maxUsd": 15.0, "maxMinutes": 90 }
+    },
+    "maxTurns": 150,
+    "wipLimit": 3,
+    "maxBounces": 2,
+    "totalAttempts": 3,
+    "dailyUsd": 50.0,
+    "reviewSeverityThreshold": "medium"
+  },
+
+  "auth": {
+    "devSessions": "subscription",
+    "scheduled": "api-key",
+    "review": "api-key"
+  },
+
+  "autonomy": {
+    "autoApproveProvenance": ["epic"],
+    "autoMergeMaxLines": 0,
+    "riskPaths": [
+      ".claude/hooks/**",
+      ".claude/settings*.json",
+      ".github/workflows/**",
+      ".husky/**",
+      "delivery.json",
+      "**/*.pem",
+      "**/*.key"
+    ]
+  },
+
+  "dispatch": {
+    "backend": "github-actions",
+    "labelTrigger": "agent:queued",
+    "pauseOnCapacity": true,
+    "pinsRoot": "~/.claude/pipeline/pins"
+  },
+
+  "monitoring": {
+    "provider": "github-actions",
+    "stormPerHour": 6
+  }
+}
