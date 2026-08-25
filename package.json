@@ -10,6 +10,7 @@
   "type": "module",
   "scripts": {
     "test:hooks": "python3 .claude/hooks/test_hooks.py",
+    "test:dor": "python3 scripts/check_ticket_dor.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },
