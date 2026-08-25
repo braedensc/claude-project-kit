@@ -497,15 +497,40 @@ jobs:
       # session could have touched.
       #
       # §4's mode→stage table allows `session_mode: ticket` to report stage
-      # `bounce`, so the dispatch pin is used verbatim — inventing a second pin
-      # shape for the fix session is exactly the divergence §3 exists to prevent.
-      - name: Place the dispatch-time pin for the fix session
+      # `bounce`, so the dispatch pin's SHAPE is used verbatim — inventing a
+      # second pin shape for the fix session is exactly the divergence §3 exists
+      # to prevent.
+      #
+      # ── BUT THE PIN'S CLOCK IS RE-STAMPED, AND IT HAS TO BE ────────────────
+      # `expires_at` was computed at CLAIM time as `now + maxMinutes + 30`. By
+      # the time a bounce starts, that budget has already been spent once: the
+      # dev session ran (up to `maxMinutes`), then the PR opened, then CI ran,
+      # then review ran, then `decide` ran. The dispatch-time `expires_at` is
+      # therefore lapsed essentially always — and §3 says a reader treats a
+      # lapsed pin as stale, which the PreToolUse pipeline guard turns into
+      # "BROKEN, fail closed" for `session_mode: ticket`. Copying it forward
+      # unchanged does not leave the fix session unpinned; it hands it a pin
+      # that is DEAD ON ARRIVAL and blocks every Edit, Write and Bash it makes.
+      #
+      # So the three provenance-of-the-pin fields are re-stamped for THIS
+      # placement, exactly as `worktree` already is, using the same formula
+      # pipeline-dispatch.yml uses. Everything that binds the session to its
+      # work — `dispatch_id`, `session_mode`, `ticket` (id, scope fence,
+      # acceptance criteria, snapshot_at) — is carried through UNTOUCHED: the
+      # dispatch_id is the join key the safe-outputs validator and the telemetry
+      # rows key on, and the ticket block is the scope fence. Re-stamping the
+      # clock extends how long the pin is honoured; it widens nothing.
+      # The ledger row's `stage` field is what distinguishes this placement from
+      # the dispatch-time one.
+      - name: Place the pin for the fix session
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TICKET: ${{ needs.decide.outputs.ticket_id }}
           BRANCH: ${{ needs.decide.outputs.branch }}
           PINS_ROOT: ${{ needs.decide.outputs.pins_root }}
+          RUN_ID: ${{ github.run_id }}
+          BOUNCE_NO: ${{ needs.decide.outputs.bounce_no }}
         run: |
           set -euo pipefail
           id=$(gh api "repos/$REPO/actions/artifacts?name=pipeline-pin-$TICKET&per_page=20" \
@@ -526,12 +551,33 @@ jobs:
           key=$(printf '%s' "$root" | sha256sum | cut -c1-16)
           python3 - "$RUNNER_TEMP/pin/pin-$TICKET.json" "$root" "$pins_dir/$key.json" "$BRANCH" <<'PY'
           import json, os, sys
+          from datetime import datetime, timedelta, timezone
           src, root, dest, branch = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
           pin = json.load(open(src))
           if pin.get("branch") != branch:
               sys.exit("::error::pin branch %r != PR head %r — refusing to pin this session."
                        % (pin.get("branch"), branch))
           pin["worktree"] = root          # readers MUST compare this to their own derived root
+
+          # The clock, re-stamped for THIS placement. `dispatch_id`,
+          # `session_mode` and `ticket` are deliberately NOT touched — see the
+          # step comment. Same formula and same ISO-8601-UTC-with-a-literal-Z
+          # format as pipeline-dispatch.yml; §3 allows exactly one timezone.
+          now = datetime.now(timezone.utc)
+          stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+          # This bounce's own wall clock. `budget.maxMinutes` is what bounds the
+          # fix session's agent step (`timeout-minutes`), so the pin outlives the
+          # session it governs by the same 30-minute margin a dispatch pin has.
+          minutes = float(((pin.get("budget") or {}).get("maxMinutes")) or 0)
+          if minutes <= 0:
+              sys.exit("::error::pin budget.maxMinutes is missing or not positive "
+                       "(%r) — refusing to stamp an expiry off a value that would "
+                       "expire the pin immediately." % ((pin.get("budget") or {}).get("maxMinutes"),))
+          pin["pinned_at"] = stamp
+          pin["pinned_by"] = "dispatcher:gha-bounce-%s-run-%s" % (
+              os.environ.get("BOUNCE_NO") or "?", os.environ.get("RUN_ID") or "?")
+          pin["expires_at"] = (now + timedelta(minutes=minutes + 30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
           tmp = dest + ".tmp"
           with open(tmp, "w") as fh:
               json.dump(pin, fh, indent=2)
@@ -545,7 +591,10 @@ jobs:
                                    "worktree": root,
                                    "pinned_at": pin["pinned_at"],
                                    "stage": "bounce"}) + "\n")
-          print("pin written:", dest)
+          # Printed so a human reading the run log can check the pin outlives the
+          # session without going near the runner's filesystem.
+          print("pin written: %s (pinned_at %s, expires_at %s, +%g min of session "
+                "budget + 30)" % (dest, pin["pinned_at"], pin["expires_at"], minutes))
           PY
           echo "PIN_FILE=$pins_dir/$key.json" >> "$GITHUB_ENV"
 
