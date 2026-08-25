@@ -19,6 +19,12 @@ is the right answer for a long time. **Tier 0 is not really an autonomy tier at 
 it answers no question without a person — but it belongs in the same table because it is
 the rung the other three are built on, and the one to start from.
 
+**One ordering matters before any of this.** `delivery.json`'s existence is the entire
+discriminator (§2), which makes it a one-way switch: the commit that adds it turns every
+pipeline guard live at once, including guards for machinery the project has not ported
+yet. Port or build the pieces first and commit the config last — configured early, a
+project reads as enforcing while nothing enforces ([`LESSONS.md`](LESSONS.md)).
+
 One thing *is* required before any of it works: **[the push credential](#the-push-credential--required-before-any-tier-does-anything)**.
 Without it the dispatcher and the bounce workflow skip, on purpose.
 
@@ -123,6 +129,9 @@ the cost and makes a bypass visible; it is not a boundary.
 ### Using it
 
 ```bash
+# 0. BE in the worktree you will work in — the pin binds this path, not the ticket
+cd /path/to/the/worktree
+
 # 1. bind this worktree to one ticket (reads the COMMITTED delivery.json)
 python3 scripts/pipeline_dispatch_local.py ENG-123
 
@@ -133,6 +142,12 @@ git checkout -b feat/eng-123-token-refresh
 # 3. you are the dispatcher, so you do §3 step 5 as well
 python3 scripts/pipeline_dispatch_local.py --release
 ```
+
+Step 0 is the one that gets skipped, and skipping it is silent: dispatch from the main
+checkout, start the session in a fresh worktree — which is exactly what a task chip or
+`claude --worktree` gives you — and the pin sits under a key the session never computes,
+so `/work` fails closed as though nothing had been dispatched
+([`LESSONS.md`](LESSONS.md)).
 
 `--show` reports what is bound to this worktree using the hook's own vocabulary
 (`ok` / `absent` / `expired` / `mismatch` / `malformed`), which is the fastest way to
@@ -145,7 +160,8 @@ Reading a ticket over MCP needs the project's Linear server to be keyed **`linea
 `.mcp.json`: MCP tool names are `mcp__<server-key>__<tool>`, and `/work`, `/ship` and
 `/weekly-review` grant `mcp__linear__*` by that literal name. A server under any other key
 (a connector's opaque UUID, say) leaves the grant matching nothing. `--ticket-file` needs
-no MCP server at all.
+no MCP server at all. ([`LESSONS.md`](LESSONS.md) records how that naming assumption bit
+a real project, and the open question about how it should be fixed.)
 
 ### What it deliberately does not do
 

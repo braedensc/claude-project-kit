@@ -139,6 +139,10 @@ worktrees for you — ask it to "work on X in a new worktree.")
   script); or prefer tooling that resolves env at runtime from the running stack.
 - Git hooks run from the MAIN checkout (`core.hooksPath` is absolute): a hook fix on a
   branch takes effect only after it merges AND the main checkout pulls it.
+- **Worktrees sited *inside* the repo** (Claude Code's default, `.claude/worktrees/`)
+  break every tool that walks the tree — including the lint gate a pipeline session has
+  to get green before it can ship. Exclude the worktree root in every glob-based tool,
+  or keep worktrees outside the repo (docs/LESSONS.md).
 - **Cross-worktree writes are hook-blocked**: a write whose path belongs to a
   *different* worktree (especially the main checkout on `main`) would otherwise land
   there silently — past the branch guard, with tests here still green. The PreToolUse
@@ -189,6 +193,26 @@ twice on doc-tail merges before these rules existed:
    diff** (`gh pr diff <n>`) — parallel sessions claim resources before they merge.
 5. **The later-opened PR rebases.** Merge small and fast; the collision window is
    exactly the open-PR window.
+6. **Seam-check after every parallel wave.** Two changes that are each correct can
+   combine into something worse than the bug either one fixed. Real case (2026-08-25):
+   one stream made the bounce workflow write a pin — right; another made an expired pin
+   fail closed — right. Together, the bounce copied its pin verbatim from dispatch time,
+   so it was *always already expired*, and the fix session it briefed was blocked from
+   every tool call — strictly worse than the original bug of running unpinned. No
+   single-stream review catches this, because neither diff is wrong on its own and CI
+   tests each PR against `main`, never against its siblings (the semantic-conflict entry
+   in docs/LESSONS.md is the same shape one layer down). The practice that does catch
+   it: after each wave, list the handoffs the wave touched, and for each one **quote the
+   exact string from both sides** and confirm they match.
+7. **A brief is not authority — a correct refusal is the system working.** Across this
+   build, sessions refused their instructions four times, each with reasoning and a
+   citation: a rule a later contract had superseded; a premise about hardcoded text that
+   was simply false; an API read that would have 403'd on every run because the token
+   lacks the scope; and emptying a config default that had a second, legitimate consumer.
+   Treat those as expected behaviour, not insubordination — a brief is written before the
+   code is read, and the session is the one reading the code. Running many sessions at
+   once, the failure mode to fear is the opposite: every one of them dutifully
+   implementing a stale brief, in parallel, at speed.
 
 ---
 
