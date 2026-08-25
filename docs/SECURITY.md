@@ -4,10 +4,8 @@
 > open a [private security advisory](https://github.com/braedensc/claude-project-kit/security/advisories/new)
 > rather than a public issue.
 
-Distilled from todoclaw's production security posture (built 2026-06-23 → 2026-07-03,
-live app + real API spend, zero leaks). Everything here was enforced, not aspirational.
-(Citations like `ADR-00xx` / `SERVICES.md` / PR numbers refer to todoclaw-internal
-artifacts — provenance breadcrumbs, not files in this repo.)
+Distilled from a production security posture (built 2026-06-23 → 2026-07-03, live
+app + real API spend, zero leaks). Everything here was enforced, not aspirational.
 
 ---
 
@@ -18,7 +16,7 @@ be bypassed:
 
 | Layer | Fires when | Bypassable? | Guards against |
 |---|---|---|---|
-| 1. Claude Code hooks (`.claude/hooks/`) | Claude attempts a tool call | **No** — enforced by the harness, not the model | Claude reading a secret, `rm -rf`, staging `.env`, embedding a key, editing on `main` |
+| 1. Claude Code hooks (`.claude/hooks/`) | Claude attempts a tool call | **No** — enforced by the harness, not the model | Claude reading a secret, `rm -rf`, staging `.env`, embedding a key, editing on `main`, **exfiltrating data to a non-allowlisted host** |
 | 2. Git pre-commit (`.husky/` + secretlint) | `git commit` | Yes (`--no-verify`) | A secret value reaching a commit; forbidden paths staged; commits on `main` |
 | 3. CI + branch protection | PR targets `main` | **No** — server-side on GitHub | Everything above, re-checked; the real gate |
 
@@ -36,13 +34,17 @@ remove the bypass too — they are one decision, not two.
 
 **The hooks protect themselves.** A guard the agent can edit is theater — Claude could
 delete the block or unwire it in `settings.json` the moment it hit one. So the hook
-scripts and `settings.json` are **human-only**: the PreToolUse guard blocks Edit/Write
-(and Bash mutations — `>`, `sed -i`, `cp`/`mv`/`rm`, `git checkout/restore`, inline
-interpreters) targeting itself, `audit.py`, `stop-pr-check.py`, and `settings.json`.
-Changing one is a human step — Claude prints a terminal command for you to run. This is
-a first line, not a perfect sandbox (a shell can't be fully fenced by regex); the real
-guarantee stays git: any change must survive a reviewed PR + CI, which re-runs the
-battery against the committed hook. (Reads are always allowed.)
+scripts and settings are **human-only**: the PreToolUse guard blocks Edit/Write
+(and Bash mutations — `>`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`,
+`git checkout/restore/reset/clean/stash/apply/rm/mv`, and any `python`/`node`/`ruby`
+invocation naming a protected path) targeting itself, `audit.py`, `stop-pr-check.py`,
+`settings.json`, and `settings.local.json` (local settings override project scalars, so
+writing them could neutralize every guard for future sessions). Changing one is a human
+step — Claude composes + validates a scratch copy and prints a terminal command for you
+to run. This is a first line, not a perfect sandbox (a shell can't be fully fenced by
+regex); the real guarantee stays git: any change must survive a reviewed PR + CI, which
+re-runs the battery against the committed hook. (Reads are always allowed; an
+unresolvable target path fails closed.)
 
 **The server-side backstop: the "Hooks change guard" CI job.** Local
 self-protection constrains only sessions that run the hook — a PR authored
@@ -58,7 +60,8 @@ approving review — otherwise the PR author can self-label and merge unseen.
 **Native `permissions.deny` — a layer independent of the Python hook.**
 `.claude/settings.json` also carries platform deny rules
 (`Read(.env)`, `Read(.env.local)`, `Read(.env.production)`, `Read(secrets/**)`,
-`Read(*.pem)`, `Read(*.key)`, …) that Claude Code enforces itself. This matters: per
+`Read(*.pem)`, `Read(*.key)`, `Read(**/id_rsa)`, `Read(**/credentials)`, …) that
+Claude Code enforces itself. This matters: per
 the docs, **deny wins even under `defaultMode: bypassPermissions`**, deny beats allow
 across every settings scope, and deny rules aren't gated by the workspace-trust
 dialog — so secret-file reads are blocked immediately, even if the PreToolUse hook
@@ -69,6 +72,16 @@ deliberately **enumerates** real env-file names rather than using a `Read(.env.*
 wildcard: the wildcard would also catch `.env.example` — the one env file that's
 *meant* to be read and edited — and deny rules can't express exceptions; exotic
 `.env.foo` variants are still caught by the hook layer.
+
+**Egress: secrets can leave without ever being *read*.** The guards above stop Claude
+opening a secret file; the egress guard covers the other direction — a network tool
+(`curl`/`wget`/`scp`/`sftp`/`nc`) aimed at a **non-allowlisted host** *combined with* an
+exfil shape (upload/data flags, `-X POST|PUT|PATCH`, an `@file` payload, a `$VAR` in the
+URL's query/fragment, or any `scp`/`nc` transfer) is blocked, while plain inbound
+downloads stay allowed. The allowlist matches on domain boundaries, so `evil-github.com`
+does not pass as `github.com`. It is a denylist of obvious shapes, not an egress
+firewall — the devcontainer/OS sandbox remains the real fence; this is the cheap layer
+that catches the careless case.
 
 **The system fails closed — including when python3 itself is missing.** A
 missing/broken hook *script* blocks every tool call (python exits 2 = the block
@@ -101,7 +114,7 @@ detects its violation in the same PR.
 ## The secrets model — three ISOLATED stores
 
 A value must be set separately in every store that needs it. **Setting one does nothing
-for the others** — todoclaw's deploys proved this repeatedly:
+for the others** — production deploys proved this repeatedly:
 
 | Store | Examples | Set by | Feeds |
 |---|---|---|---|
@@ -113,9 +126,9 @@ Rules that fall out of this:
 
 - **Placeholders only in code.** `.env.example` (placeholder values) is the only env
   file ever committed; all three enforcement layers verify that.
-- **Classify every var at birth** (ADR-0003): *public-by-design client value* (e.g. a
-  Supabase anon key — shipped in the bundle, gated by RLS) vs *server secret* (service
-  role, API keys — never in any frontend file or `VITE_*`-style var). Public values may
+- **Classify every var at birth**: *public-by-design client value* (e.g. a Supabase
+  anon key — shipped in the bundle, gated by RLS) vs *server secret* (service role,
+  API keys — never in any frontend file or `VITE_*`-style var). Public values may
   still live in CI Secrets purely for log-masking hygiene.
 - **Human-only steps are labeled.** Docs mark dashboard/CLI secret steps "(you, in
   dashboards)" — Claude cannot and should not do them; that boundary is the design.
@@ -124,7 +137,7 @@ Rules that fall out of this:
 - **MCP servers that carry tokens are user-scoped, never committed.** Register them
   with `claude mcp add --scope user …` (lives in `~/.claude.json`, OAuth on first use)
   so no token or server config lands in project files; collaborators run the same
-  command on their own machines (todoclaw's Sentry MCP pattern).
+  command on their own machines (the Sentry MCP pattern).
 - **Project-scoped MCP (`.mcp.json`, committed) references secrets only via `${VAR}`** —
   never hardcode a token in it (see `.mcp.json.example`). Env-var expansion (`${VAR}`,
   `${VAR:-default}`) is the supported form; a project `.mcp.json` server is also
@@ -163,8 +176,8 @@ disposable, production is irreplaceable.
 
 ## AI cost guardrails (the owner-key pattern)
 
-For any app calling a paid AI API on the owner's key (from todoclaw ADR-0015/0017,
-live with real spend):
+For any app calling a paid AI API on the owner's key (proven in production with real
+spend):
 
 1. **Server-side-only keys.** The API key is a platform function secret, read from
    server env. Never in the bundle, never in a client-visible var, never logged. The
@@ -176,7 +189,7 @@ live with real spend):
 3. **Per-user rate limits** as append-only event rows counted over trailing windows
    (e.g. chat 30/hr, 100/day) — no mutable counter to race, no cron to reset.
 4. **Global monthly budget kill-switch**: a ledger (one row per month, micro-dollar
-   integers) capped at a constant (todoclaw: $20/month). When tripped, every AI endpoint
+   integers) capped at a constant (e.g. $20/month). When tripped, every AI endpoint
    refuses until the next month. Check order: **budget first** (cheap, no write — don't
    charge a rate-limit unit against a paused month), then rate limit (which records).
 5. **Per-call output cap** (`max_tokens` small) bounds a single call; the kill-switch

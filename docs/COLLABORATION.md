@@ -1,9 +1,10 @@
 # Collaboration & Multi-Agent Workflow
 
 How multiple people — and multiple Claude Code sessions — work on the same repo at the
-same time without stepping on each other. Ported near-verbatim from todoclaw's
-COLLABORATION.md (proven by running two Claude sessions in parallel on one repo for
-the final build milestones, 2026-07-01 → 03) plus the retro's fast-merge protocol.
+same time without stepping on each other. Ported near-verbatim from a production
+build's COLLABORATION.md (proven by running two Claude sessions in parallel on one
+repo for the final build milestones, 2026-07-01 → 03) plus that retro's fast-merge
+protocol.
 
 **Key mental model:** Claude Code does **not** coordinate across machines. Each session
 is isolated and has no idea other humans or agents exist. Coordination is **git +
@@ -58,7 +59,7 @@ still never push to `main` directly.
 
 **Opening the PR is where Claude's involvement ends. Merging is the human's action
 only — never `gh pr merge` in any form, including `--auto`; enabling auto-merge still
-means the agent caused the merge** (a real todoclaw near-miss, 2026-07-03 — now
+means the agent caused the merge** (a real near-miss in production, 2026-07-03 — now
 hook-blocked). The repo-level `allow_auto_merge` *setting* may stay enabled for the
 human's own use — the boundary is the agent never invoking a merge, not the setting. **And watch CI to green before considering the task done:**
 `gh pr checks <n> --watch`; if a check fails, read the failing job's log, fix, push,
@@ -213,21 +214,38 @@ Four layers — the three *security* layers of docs/SECURITY.md, plus a workflow
 Stop hook between them:
 
 1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
-   bypass it:
-   - **Protects itself**: blocks Edit/Write (and Bash mutations) of the hook scripts
-     and `settings.json`, so a guard can't be edited away or unwired — changing them is
-     a human-only terminal step. (Reads are fine.)
+   bypass it. Block reasons print to **stderr** (the only stream Claude Code relays
+   for a blocking exit 2), and an internal hook error **fails closed** (blocks)
+   instead of crashing to a non-blocking exit:
+   - **Protects itself**: blocks Edit/Write (and Bash mutations — redirects, `sed -i`,
+     `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
+     apply/rm/mv`, any interpreter invocation naming a protected path) of the hook
+     scripts, `settings.json`, **and `settings.local.json`** (local settings override
+     project scalars, so writing it could neutralize every guard), so a guard can't be
+     edited away or unwired — changing them is a human-only terminal step. (Reads are
+     fine.)
    - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
      forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
      also tells Claude to branch *proactively* before ever hitting the block.
    - Blocks the same on a branch **not matching** `<type>/<short-kebab-desc>`, so an
      auto-generated `claude/<codename>` worktree branch is renamed before any work
      (one landed unrenamed in a real PR).
-   - Blocks `Edit`/`Write` whose path is in a **different worktree** than this
-     session (resolved via `git worktree list`) — a write into another checkout
+   - Blocks `Edit`/`Write` whose path is in a **different worktree** than the acting
+     session's (resolved via `git worktree list`) — a write into another checkout
      (classically the main checkout on `main`, reached via a stray `cd`) otherwise
-     lands there silently, past every branch guard. Fails open; same-worktree and
-     out-of-repo writes are untouched.
+     lands there silently, past every branch guard. The session's own worktree is
+     `CLAUDE_PROJECT_DIR`, **widened to the hook process's cwd only for a genuine
+     subagent** (payload has `agent_id`) whose cwd is a worktree of the *same* repo
+     (shared `--git-common-dir`) — subagents inherit that env var from their *parent*,
+     which used to false-block them inside their own SDK-created worktrees and let
+     writes into the parent's checkout through. The cwd is never trusted on its own:
+     a persisted `cd` moves it, which would otherwise disarm this very guard. Fails
+     open; same-worktree and out-of-repo writes are untouched.
+   - Blocks Bash commands **naming secret files** (`.env*` non-example, `*.pem`,
+     `*.key`, `id_rsa`, `credentials`) whatever the leading command — a path-target
+     match, not a reader-verb list — and **egress/exfiltration shapes** (upload
+     flags, `@file` payloads, `$VAR`-in-URL, `scp`/`nc` pushes) aimed at hosts
+     outside a domain-boundary allowlist; plain GETs stay allowed.
    - Blocks `git commit`/`git push` on a branch whose PR is already **merged** —
      pushes there are silently stranded (GitHub stops syncing the head and stops
      running CI). Fails open if `gh`/network is unavailable.

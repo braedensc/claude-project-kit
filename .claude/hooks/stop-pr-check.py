@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Stop hook: nudges Claude before ending a turn on a pushed branch that either
-(a) has no PR yet, or (b) has an open PR with failing CI. CLAUDE.md may say
+(a) has no PR yet, or (b) has an open PR with failing CI that Claude could
+actually fix. CLAUDE.md may say
 "open a PR when the task is done" and "watch CI to green," but written rules
 aren't reliably followed across parallel worktree sessions — this makes both
 a hard-to-miss reminder instead.
 
-Ported from todoclaw's stop-pr-check.py (PR #59, in production 2026-07-03) —
+Ported from a production build's stop-pr-check.py (in production 2026-07-03) —
 built after a PR's failing Prettier check went unnoticed until the owner
 pointed it out.
 
@@ -32,6 +33,17 @@ STATE_DIR = os.path.join(PROJECT_ROOT, ".claude", ".stop-pr-nag")
 # GitHub check conclusions that mean "this needs attention," excluding SUCCESS,
 # NEUTRAL, SKIPPED, and null/pending (still running — not something to nag about).
 FAILING_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+
+# Checks that are red PENDING A HUMAN, not pending a fix. Nagging Claude to
+# "read the log, fix it, push" is wrong for these: no code change clears them,
+# so the nag and the guard deadlock each other — Claude cannot finish the turn,
+# and the only way it *could* self-clear is by performing the very human
+# acknowledgment the guard exists to demand. Matched on check NAME.
+#   "Hooks change guard" — ci.yml fails it until a human adds the
+#   `hooks-change` label to a PR touching .claude/hooks/** or settings*.json.
+# Keep this set TINY and only for checks whose sole failure mode is an absent
+# human action; anything that can fail for a second reason belongs above.
+HUMAN_PENDING_CHECKS = {"Hooks change guard"}
 
 
 def _run(args, timeout=5):
@@ -177,12 +189,23 @@ failing = [c for c in checks if c.get("conclusion") in FAILING_CONCLUSIONS]
 if not failing:
     sys.exit(0)  # clean, or still running — nothing to nag about yet
 
-names = ", ".join(c.get("name", "?") for c in failing[:5])
+# Red-pending-a-human is not a defect: let the turn end so Claude can hand the
+# action over, rather than trapping it in a loop it must not self-clear.
+fixable = [c for c in failing if c.get("name") not in HUMAN_PENDING_CHECKS]
+if not fixable:
+    sys.exit(0)
+
+names = ", ".join(c.get("name", "?") for c in fixable[:5])
+pending = [c.get("name", "?") for c in failing if c.get("name") in HUMAN_PENDING_CHECKS]
+also = (
+    f" (Also red, but waiting on you, not on a fix: {', '.join(pending)}.)"
+    if pending else ""
+)
 msg = (
     f"PR #{pr['number']} for `{branch}` has failing CI ({names}). CLAUDE.md's "
     "branch workflow expects CI watched to green (`gh pr checks "
     f"{pr['number']} --watch`) before considering a task done — read the "
-    "failing job's log, fix it, push, and re-watch."
+    f"failing job's log, fix it, push, and re-watch.{also}"
 )
 _block(branch, "ci-failing", head_sha, msg)
 sys.exit(0)

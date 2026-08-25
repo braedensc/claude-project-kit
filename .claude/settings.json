@@ -1,6 +1,6 @@
 {
-  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too (or flip defaultMode to acceptEdits; every guard still enforces). The permissions.deny rules are a SECOND, native layer: deny hard-blocks even under bypassPermissions and even if the hooks were removed (docs/SECURITY.md). The deny list enumerates real env files instead of a .env.* wildcard so .env.example — the one env file MEANT to be read — stays readable; exotic variants are still caught by the hook. Distilled from todoclaw, in production 2026-06-23 → 2026-07-03.",
-  "_local_note": "No PATH override ships here — a machine-specific PATH in a template breaks other machines. If node/npm don't resolve in Claude's shell, put an env.PATH in .claude/settings.local.json (gitignored). The PreToolUse command wraps python3 in a command -v guard so a machine WITHOUT python3 fails CLOSED (blocks all tools) instead of silently running unguarded.",
+  "_comment": "bypassPermissions ONLY ships because the PreToolUse hook suite below enforces hard blocks in EVERY permission mode — the bypass is earned by the hooks. If you remove or weaken the hooks, remove bypassPermissions too (or flip defaultMode to acceptEdits; every guard still enforces). The permissions.deny rules are a SECOND, native layer: deny hard-blocks even under bypassPermissions and even if the hooks were removed (docs/SECURITY.md). The deny list enumerates real env files instead of a .env.* wildcard so .env.example — the one env file MEANT to be read — stays readable; exotic variants are still caught by the hook. Distilled from a Claude Code build that ran in production 2026-06-23 → 2026-07-03.",
+  "_local_note": "No PATH override ships here — a machine-specific PATH in a template breaks other machines. If node/npm don't resolve in Claude's shell, put an env.PATH in .claude/settings.local.json (gitignored) — it is self-protected like this file, so Claude composes the JSON and hands you a terminal command to write it. The PreToolUse command wraps python3 in a command -v guard so a machine WITHOUT python3 fails CLOSED (blocks all tools) instead of silently running unguarded.",
   "permissions": {
     "defaultMode": "bypassPermissions",
     "deny": [
@@ -13,7 +13,9 @@
       "Read(.env.*.local)",
       "Read(secrets/**)",
       "Read(*.pem)",
-      "Read(*.key)"
+      "Read(*.key)",
+      "Read(**/id_rsa)",
+      "Read(**/credentials)"
     ]
   },
   "hooks": {
