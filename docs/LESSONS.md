@@ -69,6 +69,30 @@ at which point **every open PR wedges** ("Expected — waiting for status"). Add
 in one step; flip them to required only after they've reported on main. Adding without
 dropping existing: `gh api -X POST …/protection/required_status_checks/contexts -f 'contexts[]=Lint'`.
 
+**Two green PRs can still make `main` red (semantic conflicts).** GitHub tests each
+PR as *main + that PR* — never *main + the other open PRs*. So a break that only exists
+in the **combination** is invisible to every PR's CI. Real case: one PR added a check
+that rejects absolute home paths; a sibling PR added a test fixture containing one.
+Each was green alone (the check without the fixture; the fixture without the check),
+and `main` went red the moment the second merged — with no PR to blame, because git
+reports no conflict: they touched different files. It is a *semantic* conflict, not a
+textual one, so `git merge` will never warn you.
+
+Cheap check before merging a batch — merge them together somewhere disposable and run
+CI's checks against *that* tree:
+```bash
+git worktree add -f --detach /tmp/union origin/main
+git -C /tmp/union merge --no-edit branch-a branch-b branch-c
+cd /tmp/union && <your CI checks>        # then: git worktree remove --force /tmp/union
+```
+The built-in prevention is branch protection's **"require branches to be up to date"**
+(`"strict": true`), but it forces every open PR to re-sync and re-run CI after each
+merge — real friction at any volume, and often removed for that reason. GitHub's
+**merge queue** buys the same guarantee without the churn (it tests the batch as one
+tree) at the cost of a `merge_group` trigger in CI. Otherwise: keep CI's `push: [main]`
+run — it turns this from silent to *loud within a minute* — and reach for the union
+check when landing several PRs at once.
+
 **`workflow_run` uses the workflow file on the DEFAULT branch.** Edits to a
 `workflow_run`-triggered workflow take effect only after merging to main; you cannot
 exercise that path from a feature branch. Test via `workflow_dispatch` (gated to main).
