@@ -65,8 +65,9 @@ Alternatives rejected:
 
 ## Verified
 
-A 68-case adversarial battery (run against the hook as a subprocess, sandboxed temp
-repos) pins the behavior. The cases that matter:
+A 76-case adversarial battery (run against the hook as a subprocess, sandboxed temp
+repos) pins the behavior, and a 47-agent adversarial review pass filed 41 findings of
+which 9 survived refutation and were fixed. The cases that matter:
 
 - **Fence escapes fail.** `</untrusted-ticket-data>`, `< /untrusted-ticket-data>`,
   `</ untrusted-ticket-data>`, `<  /  untrusted-ticket-data  >`,
@@ -79,6 +80,14 @@ repos) pins the behavior. The cases that matter:
 - **A pin without `ticket.id` is never described as pinned.** An earlier revision fell
   back to the branch-derived ID and still printed "this session is pinned to `ENG-123`",
   manufacturing exactly the authority the pin exists to provide.
+- **Branch IDs are only inferred when the prefix is the configured `linear.teamKey`.**
+  Otherwise `feat/grid-2-drag` reads as ticket "GRID-2" — an invented ticket. No team
+  key configured means no inference at all.
+- **A valid pin in `planning`/`diagnosis`/`maintenance` mode reports its mode**, rather
+  than being misreported as a missing pin.
+- **`pinsRoot` is resolved from the committed `delivery.json`, not the working tree**,
+  in `/work` as well as the hook — a config the session can rewrite would be a pin the
+  session can plant.
 - **Off is not broken.** With no `delivery.json` the hook does no pipeline work at all —
   a planted pin file is not even read, and the output is byte-identical to before.
 - **Fails open, always.** Malformed `delivery.json`, corrupt pin, unrecognized

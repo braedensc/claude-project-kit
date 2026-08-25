@@ -64,8 +64,11 @@ diff if empty.
 
 7. **Watch CI to green:** `gh pr checks <n> --watch`. If a check fails, read the log,
    fix, push, re-watch. A `DIRTY` PR is not green — rebase and force-push.
-   A PR touching `.claude/hooks/**` or `.claude/settings*.json` also needs the
-   `hooks-change` label before the *Hooks change guard* job can pass:
-   `gh pr edit <n> --add-label hooks-change`.
+   **`Hooks change guard` red is a stop-and-report, not a task.** A PR touching
+   `.claude/hooks/**` or `.claude/settings*.json` stays red until the `hooks-change`
+   label is added, and that label is **set by a human** (`docs/PIPELINE-CONTRACT.md`
+   §6) — it is the acknowledgement that guard machinery changed. A session that labels
+   its own PR is acknowledging its own change, which is the one thing the gate exists
+   to prevent. Report that the PR needs the label and stop; do not add it.
 8. **STOP.** Do not merge. Merging is the human's action only (`gh pr merge` is
    hook-blocked). Report the PR URL and that it's ready for their review.

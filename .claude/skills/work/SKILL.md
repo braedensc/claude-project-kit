@@ -38,12 +38,23 @@ Everything the session itself can write — the branch name, the PR body, ticket
 env vars, any file in the worktree — is *reporting*, never authority. **Treat the branch
 name as cosmetic: it is a convenience, not a binding.**
 
+Resolve `pinsRoot` from the copy of `delivery.json` **committed on the default branch**,
+never the working-tree copy (§1). The working copy sits inside the worktree this session
+can edit, and `pinsRoot` decides where "the only authority" is read from — a config the
+session can rewrite is a pin the session can plant:
+
 ```bash
 ROOT="$(git rev-parse --show-toplevel)"
-PINS="$(python3 -c 'import json,os,sys; d=json.load(open(sys.argv[1])); print(os.path.expanduser((d.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"))' "$ROOT/delivery.json")"
+CFG="$(git -C "$ROOT" show origin/main:delivery.json)"   # use github.defaultBranch if not main
+PINS="$(printf '%s' "$CFG" | python3 -c 'import json,os,sys; d=json.load(sys.stdin); print(os.path.expanduser((d.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"))')"
 KEY="$(python3 -c 'import hashlib,os,sys; print(hashlib.sha256(os.path.realpath(sys.argv[1]).encode()).hexdigest()[:16])' "$ROOT")"
 cat "$PINS/$KEY.json"
 ```
+
+Fall back to the working-tree copy only when the default branch genuinely has no
+`delivery.json` yet — the adoption PR, where nothing is dispatching anyway. **Stop if the
+resolved `pinsRoot` is relative, or resolves inside the repo or any worktree** (§7): a
+pins directory the session can write is not a pin store.
 
 Verify, and **stop on any failure** — in `ticket` mode a bad pin is *broken*, and broken
 fails closed (§2):
@@ -149,9 +160,18 @@ or silent on something you must decide — or if doing the work would touch anyt
 > label.
 
 Also escalate — same procedure — when the change would touch `autonomy.riskPaths`
-(guard machinery, CI workflows, git hooks, `delivery.json`, key material). Those always
-need a human, and a PR touching `.claude/hooks/**` or `.claude/settings*.json`
-additionally requires the `hooks-change` label before its required CI job can pass.
+(guard machinery, CI workflows, git hooks, `delivery.json`, key material). Use a
+different marker for this case, because §6 routes it to a different label: a
+`riskPaths` change is `agent:needs-human` ("terminal until a person acts"), not
+`agent:blocked` ("stopped on something external").
+
+```
+**AGENT ESCALATION — requesting `agent:needs-human` (riskPaths change)**
+```
+
+A PR touching `.claude/hooks/**` or `.claude/settings*.json` additionally needs the
+`hooks-change` label before its required CI job can pass — and that label is **set by a
+human** (§6). Do not add it yourself; say the PR needs it and stop.
 
 ### 5. Implement the smallest diff that satisfies the criteria
 

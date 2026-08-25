@@ -100,15 +100,23 @@ _BRANCH_TICKET_RE = re.compile(
 )
 
 
-def _ticket_id_from_branch(branch: str):
+def _ticket_id_from_branch(branch: str, team_key: str):
     """`feat/eng-123-token-refresh` -> `ENG-123`. Cosmetic only — the pin is authority.
 
     The branch name is agent-chosen (PIPELINE-CONTRACT §3, "Not valid pin transports"),
-    so this is a display convenience and a lookup hint, never a binding. The regex is
-    strict, so the only thing it can ever yield is `<ALNUM>-<digits>`.
+    so this is a display convenience and a lookup hint, never a binding.
+
+    The prefix must equal the configured `linear.teamKey`, or ordinary branch names get
+    read as tickets: `feat/grid-2-drag` would otherwise yield "GRID-2", inventing a
+    ticket that does not exist. No configured team key means no inference at all —
+    withholding the guess is the fail-safe direction here.
     """
+    if not team_key:
+        return None
     m = _BRANCH_TICKET_RE.match(branch or "")
-    return f"{m.group(1).upper()}-{m.group(2)}" if m else None
+    if not m or m.group(1) != team_key.lower():
+        return None
+    return f"{m.group(1).upper()}-{m.group(2)}"
 
 
 def _delivery_config(root: str):
@@ -125,6 +133,10 @@ def _delivery_config(root: str):
             local = json.load(fh)
     except Exception:
         local = {}
+    # A JSON file may legally hold a list or a string; `.get` on one raises. Coerce, so
+    # a malformed config degrades to "no values" instead of throwing past this function.
+    if not isinstance(local, dict):
+        local = {}
     default_branch = (local.get("github") or {}).get("defaultBranch") or "main"
     # Explicit short timeout: this runs inside a SessionStart hook whose harness budget
     # is 10s and which has already spent up to 14s worst-case on git/gh above. `git show`
@@ -134,7 +146,9 @@ def _delivery_config(root: str):
     )
     if committed:
         try:
-            return json.loads(committed)
+            parsed = json.loads(committed)
+            if isinstance(parsed, dict):
+                return parsed
         except Exception:
             pass
     return local
@@ -159,6 +173,8 @@ def _read_pin(root: str, cfg: dict):
             pin = json.load(fh)
     except Exception:
         return None
+    if not isinstance(pin, dict):
+        return None  # a pin that isn't an object is not a pin
     if pin.get("pin_version") != 1:
         return None  # unrecognized version -> refuse, never guess (§3)
     try:
@@ -185,19 +201,15 @@ def _ticket_context(root: str, branch: str):
     if not os.path.exists(os.path.join(root, "delivery.json")):
         return None
 
-    branch_id = _ticket_id_from_branch(branch)
-    pin = _read_pin(root, _delivery_config(root))
-    ticket = (pin or {}).get("ticket") or {}
+    cfg = _delivery_config(root)
+    branch_id = _ticket_id_from_branch(
+        branch, ((cfg.get("linear") or {}).get("teamKey") or "").strip()
+    )
+    pin = _read_pin(root, cfg)
 
-    # ONLY a pinned id may be described as pinned. Falling back to the branch-derived id
-    # here would print "this session is pinned to X" about a value that came from an
-    # agent-writable branch name — manufacturing exactly the authority the pin exists to
-    # provide, and contradicting this file's own docstring.
-    pinned_id = ticket.get("id")
-    if not pinned_id:
-        # No usable pin binding. Say only what the branch regex could produce — an ID —
-        # and be explicit that the snapshot is missing, so nobody reads silence as
-        # "no ticket".
+    def _no_pin():
+        # Say only what the branch regex could produce — an ID — and be explicit that
+        # the snapshot is missing, so nobody reads silence as "no ticket".
         if not branch_id:
             return None
         return (
@@ -205,7 +217,26 @@ def _ticket_context(root: str, branch: str):
             "found for this worktree, so no ticket snapshot is available. Read the "
             "ticket yourself before implementing; never infer scope from a branch name."
         )
-    ticket_id = pinned_id
+
+    if pin is None:
+        return _no_pin()
+
+    # A valid pin in a non-ticket mode is not a missing pin — reporting it as one would
+    # send a planning/diagnosis session hunting for a binding it was never given.
+    mode = pin.get("session_mode") or "ticket"
+    if mode != "ticket":
+        note = f"Pipeline: this session is pinned in `{mode}` mode, not to a ticket."
+        subject = pin.get("subject")
+        return note + ("\n" + _fenced(f"subject: {subject}") if subject else "")
+
+    # ONLY a pinned id may be described as pinned. Falling back to the branch-derived id
+    # here would print "this session is pinned to X" about a value that came from an
+    # agent-writable branch name — manufacturing exactly the authority the pin exists to
+    # provide, and contradicting this file's own docstring.
+    ticket = pin.get("ticket") or {}
+    ticket_id = ticket.get("id")
+    if not ticket_id:
+        return _no_pin()
 
     # Deliberately NO network fetch: SessionStart must not wait on an API, and a hook
     # holding a tracker token would be a secret living in an unprotected file. The pin
@@ -219,13 +250,14 @@ def _ticket_context(root: str, branch: str):
         ("out_of_scope", "out of scope"),
     ):
         values = ticket.get(key) or []
+        if isinstance(values, (str, bytes)):
+            values = [values]  # a scalar where the contract says string[] — still show it
         if values:
             lines.append(f"{label}:")
             lines.extend(f"  - {v}" for v in values)
     if ticket.get("snapshot_at"):
         lines.append(f"snapshotted at: {ticket['snapshot_at']}")
 
-    mode = (pin or {}).get("session_mode") or "ticket"
     return (
         f"Pipeline: this session is pinned to `{ticket_id}` (session_mode `{mode}`). "
         "The snapshot below is what the dispatcher pinned — it, not the branch name, "
