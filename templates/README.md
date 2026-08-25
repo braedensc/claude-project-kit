@@ -17,9 +17,20 @@ place in your new project.
 | `workflows/migration-drift.yml` | `.github/workflows/migration-drift.yml` | Daily read-only declared-vs-applied compare against prod → issue; catches drift however it arises |
 | `workflows/cron-health.yml` | `.github/workflows/cron-health.yml` | Monitors the downstream EFFECT of in-platform scheduled jobs — schedulers self-report success even when the work fails |
 | `workflows/claude.yml` | `.github/workflows/claude.yml` | Official `@claude` GitHub Action (v1) — mention `@claude` on an issue/PR; cost-capped (`--max-turns`, timeout). Needs the `ANTHROPIC_API_KEY` secret |
+| `workflows/pipeline-dispatch.yml` | `.github/workflows/pipeline-dispatch.yml` | **Pipeline**: polls the queue → claims a ticket atomically → pins it outside the worktree → proves the rails loaded with a canary → runs the session. Capacity/budget/WIP/attempt caps |
+| `workflows/pipeline-safe-outputs.yml` | `.github/workflows/pipeline-safe-outputs.yml` | **Pipeline**: reusable validator that holds the tracker credential *so the agent job never does*; checks the session's write-requests against the pin, all-or-nothing |
+| `workflows/pipeline-review.yml` | `.github/workflows/pipeline-review.yml` | **Pipeline**: `opened`-only AI review against the dispatch-time snapshot. Comment-only, structurally unable to approve, never a required check |
+| `workflows/pipeline-bounce.yml` | `.github/workflows/pipeline-bounce.yml` | **Pipeline**: wraps `/fix-ci` when findings meet the severity threshold. One bounce = one workflow run, counted by Actions run id, capped by `budgets.maxBounces` |
 | `scripts/check-migrations.mjs` | `scripts/check-migrations.mjs` | PR-time ordered-file guard: duplicate / out-of-order versions vs the base tip (pairs with the deploy's `--include-all`) |
 | `scripts/dev-worktree-login.sh` | `scripts/dev-worktree-login.sh` | Per-worktree env regeneration + dedicated test login (Supabase-flavored — port the pattern; delete if no local backend) |
 | `hooks/session-start-provision-env.sh` | `.claude/hooks/session-start-provision-env.sh` | SessionStart auto-provisioning of a fresh worktree's env (idempotent; secret stdout discarded, never enters model context) |
+
+The four `pipeline-*.yml` templates are the **optional agentic delivery
+pipeline** and are inert twice over: they no-op entirely unless a project has a
+`delivery.json` at its root (`docs/PIPELINE-CONTRACT.md` §2). Move them only if
+you are adopting that pipeline; a project without one should delete them along
+with `delivery.example.json`. `pipeline-safe-outputs.yml` is referenced by path
+from the other two, so it must keep its filename after activation.
 
 Rows for files a sibling PR of the 2026-08 parity-port initiative adds
 (`pr-conflict-monitor`, `frontend-uptime`, `migration-drift`, `cron-health`,

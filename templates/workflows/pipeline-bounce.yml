@@ -1,0 +1,589 @@
+name: Pipeline bounce
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INERT template (activated at bootstrap by `git mv`). The fix loop of the
+# optional agentic delivery pipeline — see docs/PIPELINE-CONTRACT.md.
+# No delivery.json ⇒ the pipeline is OFF and this exits 0 doing nothing (§2).
+#
+# A "bounce" is one round trip: review (or CI) found something at or above
+# `budgets.reviewSeverityThreshold`, so a fresh session runs the kit's existing
+# **`/fix-ci`** skill against the PR. After `budgets.maxBounces` rounds the
+# ticket goes to `agent:needs-human` and the machinery stops.
+#
+# ── THE COUNTER KEYS ON ACTIONS RUN IDs. This is the whole design. ───────────
+# The obvious counter — "how many bot commits are on this branch?" — is wrong,
+# and wrong in the direction that silently breaks the loop. `/fix-ci` iterates
+# INTERNALLY: read the failing log, apply the smallest fix, push, re-watch, up
+# to its own bound. Every one of those pushes is an ordinary bot commit. Count
+# commits and a single bounce trips a cap of 2 partway through its own first
+# round, leaving a half-fixed PR and a ticket marked needs-human for no reason.
+#
+# So: ONE BOUNCE = ONE RUN OF THIS WORKFLOW, counted by asking the Actions API
+# how many prior runs of this workflow on this branch actually reached the `fix`
+# job. Run history is not writable by the session — the fix job's token has no
+# `actions: write` — so the count cannot be edited by the thing being counted.
+#
+# PR labels (`pipeline:bounce-N`) are applied for humans and are DISPLAY ONLY.
+# The fix session's token can edit PR labels, so a label can never hold a number
+# that decides whether to spend more money.
+#
+# ── Setup ─────────────────────────────────────────────────────────────────────
+#   Secrets: LINEAR_API_KEY, and ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN.
+#   Until they exist this runs green and skips.
+#
+# NOTE: `workflow_run` reads THIS FILE from the DEFAULT branch — it only fires
+# once merged to main, and cannot be exercised from a feature branch
+# (docs/LESSONS.md). Fork PRs are skipped: the token cannot push to a fork.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_run:
+    # Watch list — EDIT ME. Each entry must match a watched workflow's top-level
+    # `name:` exactly.
+    #   'Pipeline review' → bounce when findings meet the severity threshold
+    #   'CI'              → bounce when a pipeline PR's CI goes red (this is
+    #                       literally what /fix-ci is for). Drop this entry if
+    #                       you would rather fix red CI by hand.
+    workflows: ['Pipeline review', 'CI']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Bounce this PR manually (still counted against maxBounces).'
+        required: true
+        type: string
+
+permissions:
+  contents: write        # the fix session pushes to the PR branch
+  pull-requests: write   # display-only bounce label + the explanatory comment
+  actions: read          # the run-ID bounce counter and the findings artifact
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # 1. DECIDE — is a bounce warranted, and is there budget left for one?
+  # ════════════════════════════════════════════════════════════════════════════
+  decide:
+    name: Should this PR bounce?
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Keyed on the branch: a review finishing and CI finishing at nearly the same
+    # moment must not start two fix sessions on one PR. cancel-in-progress:false
+    # so a bounce already fixing things is never killed mid-push.
+    concurrency:
+      group: pipeline-bounce-${{ github.event.workflow_run.head_branch || inputs.pr_number }}
+      cancel-in-progress: false
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+      reason: ${{ steps.gate.outputs.reason }}
+      exhausted: ${{ steps.gate.outputs.exhausted }}
+      bounce_no: ${{ steps.count.outputs.bounce_no }}
+      max_bounces: ${{ steps.cfg.outputs.max_bounces }}
+      ticket_id: ${{ steps.pin.outputs.ticket_id }}
+      dispatch_id: ${{ steps.pin.outputs.dispatch_id }}
+      branch: ${{ steps.pr.outputs.head_ref }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      max_turns: ${{ steps.pin.outputs.max_turns }}
+      max_minutes: ${{ steps.pin.outputs.max_minutes }}
+      auth_mode: ${{ steps.cfg.outputs.auth_mode }}
+      default_branch: ${{ steps.cfg.outputs.default_branch }}
+      fix_iterations: ${{ steps.cfg.outputs.fix_iterations }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Read the config
+        id: cfg
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ ! -f delivery.json ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "${LINEAR_API_KEY:-}" ] || { [ -z "${KEY:-}" ] && [ -z "${OAUTH:-}" ]; }; then
+            echo "::notice::Pipeline credentials not configured — bounce skipped."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "configured=true"
+            echo "max_bounces=$(jq -r '.budgets.maxBounces' delivery.json)"
+            echo "threshold=$(jq -r '.budgets.reviewSeverityThreshold' delivery.json)"
+            echo "auth_mode=$(jq -r '.auth.scheduled' delivery.json)"
+            echo "default_branch=$(jq -r '.github.defaultBranch' delivery.json)"
+            echo "team=$(jq -r '.linear.teamKey' delivery.json)"
+            # CONTRACT GAP: `budgets` has no field for /fix-ci's INNER iteration
+            # bound (its own read→fix→push→watch cycles), only the outer bounce
+            # count. We reuse maxBounces for both — same question, asked at two
+            # levels — and the outer one stays authoritative because it is the
+            # one keyed on run IDs. If the contract later grows a dedicated
+            # field, source it here instead.
+            echo "fix_iterations=$(jq -r '.budgets.maxBounces' delivery.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the PR
+        id: pr
+        if: steps.cfg.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          MANUAL_PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MANUAL_PR:-}" ]; then
+            pr="$MANUAL_PR"
+          else
+            pr=$(gh api "repos/$REPO/pulls?state=open&head=${REPO%%/*}:$BRANCH&per_page=1" --jq '.[0].number' 2>/dev/null || echo "")
+          fi
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "::notice::No open PR for '$BRANCH' — nothing to bounce."
+            echo "found=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          gh api "repos/$REPO/pulls/$pr" > "$RUNNER_TEMP/pr.json"
+          # A fork PR cannot be pushed to with this token, so a fix session would
+          # do the work and then fail at the push. Skip loudly instead.
+          if [ "$(jq -r '.head.repo.full_name' "$RUNNER_TEMP/pr.json")" != "$REPO" ]; then
+            echo "::notice::PR #$pr is from a fork — bounce skipped (the token cannot push to it)."
+            echo "found=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "found=true"
+            echo "number=$pr"
+            echo "head_ref=$(jq -r .head.ref "$RUNNER_TEMP/pr.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      # Same resolution chain as pipeline-review.yml: branch name is a HINT, the
+      # dispatcher's pin is the authority, and pin.branch == head ref is what
+      # makes the hint safe to use.
+      - name: Resolve the dispatch-time pin
+        id: pin
+        if: steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          TEAM: ${{ steps.cfg.outputs.team }}
+        run: |
+          set -euo pipefail
+          num=$(printf '%s' "$HEAD_REF" | sed -nE "s#^[a-z]+/$(printf '%s' "$TEAM" | tr 'A-Z' 'a-z')-([0-9]+)-.*#\1#p")
+          if [ -z "$num" ]; then
+            echo "::notice::'$HEAD_REF' is not a pipeline ticket branch — not ours to fix."
+            echo "found=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ticket="$TEAM-$num"
+          id=$(gh api "repos/$REPO/actions/artifacts?name=pipeline-pin-$ticket&per_page=20" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::warning::No dispatch snapshot for $ticket — declining to spend a fix session on a PR we cannot scope."
+            echo "found=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/pin.zip"
+          unzip -o -q "$RUNNER_TEMP/pin.zip" -d "$RUNNER_TEMP/pin"
+          pin="$RUNNER_TEMP/pin/pin-$ticket.json"
+          if [ "$(jq -r '.branch' "$pin")" != "$HEAD_REF" ]; then
+            echo "::error::Pin/branch mismatch for $ticket — declining."
+            echo "found=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          {
+            echo "found=true"
+            echo "ticket_id=$ticket"
+            echo "dispatch_id=$(jq -r '.dispatch_id' "$pin")"
+            echo "max_turns=$(jq -r '.budget.maxTurns' "$pin")"
+            echo "max_minutes=$(jq -r '.budget.maxMinutes' "$pin")"
+          } >> "$GITHUB_OUTPUT"
+
+      # THE COUNTER. Prior runs of THIS workflow, on THIS branch, that actually
+      # reached the `fix` job — read from run history, which the fix session has
+      # no permission to alter. Not commits, not labels, not a PR body.
+      - name: Count prior bounces by Actions run id
+        id: count
+        if: steps.pin.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.pr.outputs.head_ref }}
+          THIS_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?branch=$BRANCH&per_page=30" \
+                   --jq '.workflow_runs[].id' 2>/dev/null || true)
+          n=0
+          for r in $runs; do
+            [ "$r" = "$THIS_RUN" ] && continue
+            # A run that skipped `fix` (below threshold, no PR, cap already hit)
+            # cost nothing and is not a bounce.
+            if gh api "repos/$REPO/actions/runs/$r/jobs?per_page=50" \
+                 --jq '.jobs[] | select(.name | startswith("Fix")) | .conclusion' 2>/dev/null \
+                 | grep -qvE '^(skipped)?$'; then
+              n=$((n + 1))
+            fi
+          done
+          echo "prior=$n" >> "$GITHUB_OUTPUT"
+          echo "bounce_no=$((n + 1))" >> "$GITHUB_OUTPUT"
+          echo "This would be bounce #$((n + 1)) (found $n prior fix run(s) on $BRANCH)."
+
+      - name: Gate on the trigger and the bounce budget
+        id: gate
+        if: steps.pin.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          SRC_NAME: ${{ github.event.workflow_run.name }}
+          SRC_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SRC_RUN_ID: ${{ github.event.workflow_run.id }}
+          PR: ${{ steps.pr.outputs.number }}
+          PRIOR: ${{ steps.count.outputs.prior }}
+          MAX_BOUNCES: ${{ steps.cfg.outputs.max_bounces }}
+        run: |
+          set -euo pipefail
+          reason=""; go="false"
+          case "$EVENT" in
+            workflow_dispatch)
+              reason="manual bounce requested"; go="true" ;;
+            workflow_run)
+              if [ "$SRC_NAME" = "Pipeline review" ] && [ "$SRC_CONCLUSION" = "success" ]; then
+                # meets_threshold is computed by the review workflow's own
+                # deterministic step, never by the reviewing model.
+                if gh api "repos/$REPO/actions/runs/$SRC_RUN_ID/artifacts" \
+                     --jq '.artifacts[] | select(.name == "pipeline-review-findings-'"$PR"'") | .id' \
+                     > "$RUNNER_TEMP/aid" 2>/dev/null && [ -s "$RUNNER_TEMP/aid" ]; then
+                  gh api "repos/$REPO/actions/artifacts/$(head -1 "$RUNNER_TEMP/aid")/zip" > "$RUNNER_TEMP/f.zip"
+                  unzip -o -q "$RUNNER_TEMP/f.zip" -d "$RUNNER_TEMP/f"
+                  if [ "$(jq -r '.meets_threshold' "$RUNNER_TEMP/f/findings.json")" = "true" ]; then
+                    reason="review findings at or above the severity threshold (highest: $(jq -r '.max_severity' "$RUNNER_TEMP/f/findings.json"))"
+                    go="true"
+                  else
+                    reason="review findings below the severity threshold"
+                  fi
+                else
+                  reason="no findings artifact from the review run"
+                fi
+              elif [ "$SRC_CONCLUSION" = "failure" ]; then
+                reason="$SRC_NAME failed on this branch"; go="true"
+              else
+                reason="$SRC_NAME concluded '$SRC_CONCLUSION' — nothing to fix"
+              fi ;;
+          esac
+
+          exhausted="false"
+          if [ "$go" = "true" ] && [ "$PRIOR" -ge "$MAX_BOUNCES" ]; then
+            go="false"; exhausted="true"
+            reason="bounce budget exhausted ($PRIOR of $MAX_BOUNCES used) — $reason"
+          fi
+          echo "go=$go"               >> "$GITHUB_OUTPUT"
+          echo "exhausted=$exhausted" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason"       >> "$GITHUB_OUTPUT"
+          echo "::notice::go=$go exhausted=$exhausted — $reason"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 2. FIX — one bounce. The job name is what the counter looks for.
+  # ════════════════════════════════════════════════════════════════════════════
+  fix:
+    name: Fix (bounce ${{ needs.decide.outputs.bounce_no }})
+    needs: decide
+    if: needs.decide.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # `actions: read` is genuinely needed here — /fix-ci's whole method is
+    # `gh run view <id> --log-failed`. Read is enough: the bounce counter lives
+    # in run history, and without `actions: write` the session cannot delete or
+    # rewrite the runs that count it.
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    env:
+      CLAUDE_PROJECT_DIR: ${{ github.workspace }}
+      SAFE_OUT: ${{ runner.temp }}/safe-outputs
+    steps:
+      # Start on the DEFAULT branch so the canary has something to be blocked by,
+      # then move to the PR branch for the actual work.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.decide.outputs.default_branch }}
+          fetch-depth: 0
+
+      - name: Write the dispatcher-owned settings file
+        env:
+          PIPELINE_SETTINGS: ${{ runner.temp }}/pipeline/agent-settings.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pipeline" "$SAFE_OUT"
+          cat > "$PIPELINE_SETTINGS" <<'JSON'
+          {
+            "_comment": "Dispatcher-owned. Loaded via --settings on top of user+project sources. Defines NO hooks key on purpose: --settings wins on the keys it defines, so declaring hooks here would REPLACE the project's PreToolUse rails instead of adding to them.",
+            "permissions": {
+              "deny": [
+                "Read(.env)", "Read(.env.local)", "Read(.env.production)",
+                "Read(secrets/**)", "Read(*.pem)", "Read(*.key)",
+                "Read(**/id_rsa)", "Read(**/credentials)"
+              ]
+            }
+          }
+          JSON
+          chmod 0444 "$PIPELINE_SETTINGS"
+          echo "PIPELINE_SETTINGS=$PIPELINE_SETTINGS" >> "$GITHUB_ENV"
+
+      # A fix session pushes commits to an open PR — exactly as consequential as
+      # a dev session, so it gets exactly the same proof that the rails loaded.
+      - name: Rails self-check (offline)
+        env:
+          HOOK: .claude/hooks/pre-tool-use.py
+        run: |
+          set -euo pipefail
+          python3 --version
+          test -f "$HOOK" || { echo "::error::$HOOK missing — this project has no rails to load."; exit 1; }
+          set +e
+          printf '%s' "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$GITHUB_WORKSPACE/RAILS-CANARY.txt\",\"content\":\"x\"}}" \
+            | CLAUDE_PROJECT_DIR="$GITHUB_WORKSPACE" python3 "$HOOK" 2>/dev/null
+          rc=$?
+          set -e
+          [ "$rc" -eq 2 ] || { echo "::error::The guard did not block a Write on the default branch (exit $rc, want 2). Aborting before any session runs."; exit 1; }
+          b=$(git rev-parse --abbrev-ref HEAD)
+          [ "$b" = "${{ needs.decide.outputs.default_branch }}" ] || { echo "::error::Not on the default branch ('$b') — the canary would be meaningless."; exit 1; }
+          rm -f RAILS-CANARY.txt
+
+      - name: Rails canary (this session MUST be blocked)
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ needs.decide.outputs.auth_mode == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          claude_code_oauth_token: ${{ needs.decide.outputs.auth_mode == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          prompt: 'Create a file named RAILS-CANARY.txt in the repository root containing the single word: canary. Then stop.'
+          claude_args: >-
+            --setting-sources user,project
+            --settings ${{ env.PIPELINE_SETTINGS }}
+            --max-turns 3
+            --model ${{ vars.PIPELINE_MODEL || 'claude-sonnet-5' }}
+
+      - name: Verify the canary was blocked — abort if it was not
+        run: |
+          set -euo pipefail
+          if [ -e RAILS-CANARY.txt ]; then
+            rm -f RAILS-CANARY.txt
+            echo "::error::RAILS CANARY WROTE ITS FILE. The guards did not load into the session — aborting rather than pushing to a PR unguarded."
+            exit 1
+          fi
+          [ -z "$(git status --porcelain)" ] || { git status --porcelain; echo "::error::Canary left the tree dirty. Aborting."; exit 1; }
+          echo "Rails canary blocked as required."
+
+      - name: Switch to the PR branch and stage the findings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ needs.decide.outputs.branch }}
+          PR: ${{ needs.decide.outputs.pr_number }}
+          SRC_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          git config user.name  "claude[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --quiet origin "$BRANCH"
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+
+          # Hand the fix session the review's findings as a file, if there are
+          # any. Best-effort: a CI-triggered bounce has none, and /fix-ci reads
+          # the CI logs itself.
+          echo '{"findings":[],"note":"no review findings for this bounce"}' > BOUNCE-FINDINGS.json
+          if [ -n "${SRC_RUN_ID:-}" ]; then
+            aid=$(gh api "repos/$REPO/actions/runs/$SRC_RUN_ID/artifacts" \
+                    --jq '.artifacts[] | select(.name == "pipeline-review-findings-'"$PR"'") | .id' 2>/dev/null | head -1 || true)
+            if [ -n "$aid" ]; then
+              gh api "repos/$REPO/actions/artifacts/$aid/zip" > "$RUNNER_TEMP/f.zip" \
+                && unzip -o -q "$RUNNER_TEMP/f.zip" -d "$RUNNER_TEMP/f" \
+                && cp "$RUNNER_TEMP/f/findings.json" BOUNCE-FINDINGS.json
+            fi
+          fi
+          grep -qxF 'BOUNCE-FINDINGS.json' .git/info/exclude 2>/dev/null || echo 'BOUNCE-FINDINGS.json' >> .git/info/exclude
+
+      - name: Run the fix session
+        id: agent
+        continue-on-error: true
+        timeout-minutes: ${{ needs.decide.outputs.max_minutes }}
+        uses: anthropics/claude-code-action@v1
+        env:
+          PIPELINE_SAFE_OUTPUTS: ${{ runner.temp }}/safe-outputs/requests.json
+          PIPELINE_TICKET_ID: ${{ needs.decide.outputs.ticket_id }}
+          PIPELINE_DISPATCH_ID: ${{ needs.decide.outputs.dispatch_id }}
+        with:
+          anthropic_api_key: ${{ needs.decide.outputs.auth_mode == 'api-key' && secrets.ANTHROPIC_API_KEY || '' }}
+          claude_code_oauth_token: ${{ needs.decide.outputs.auth_mode == 'subscription' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Run `/fix-ci ${{ needs.decide.outputs.pr_number }}` on this branch.
+
+            This is bounce ${{ needs.decide.outputs.bounce_no }} of
+            ${{ needs.decide.outputs.max_bounces }} for ticket
+            ${{ needs.decide.outputs.ticket_id }}. It was started because:
+            ${{ needs.decide.outputs.reason }}.
+
+            Two adjustments to the skill's defaults, both from `delivery.json`:
+
+              • Bound yourself to ${{ needs.decide.outputs.fix_iterations }} internal
+                fix → push → watch iterations, not the skill's default. Still red
+                after that? STOP and report — a human decision beats another guess,
+                and this is the last bounce you get if the count is exhausted.
+              • `BOUNCE-FINDINGS.json` in the repository root holds the review
+                findings that triggered this bounce, if any. Address every one at or
+                above the `threshold` field, smallest change that actually fixes it.
+                Findings below the threshold are comments; do not widen the diff for
+                them.
+
+            Rules that do not bend:
+              • Fix the cause the log or the finding names. Do NOT weaken, skip or
+                delete a test assertion to make something pass — that is the single
+                thing the reviewer flags as critical, and doing it here guarantees
+                another bounce you cannot afford.
+              • Stay inside the ticket's scope. A bounce is not a chance to refactor.
+              • NEVER merge. `gh pr merge` is hook-blocked in every form, `--auto`
+                included.
+              • Write your tracker write-requests to the file named by
+                $PIPELINE_SAFE_OUTPUTS (JSON, schema `pipeline-safe-outputs/1`). You
+                have no tracker credential; a separate job validates that file
+                against the ticket you are pinned to. Include exactly one telemetry
+                block with `"stage": "bounce"`.
+          claude_args: >-
+            --setting-sources user,project
+            --settings ${{ env.PIPELINE_SETTINGS }}
+            --max-turns ${{ needs.decide.outputs.max_turns }}
+            --model ${{ vars.PIPELINE_MODEL || 'claude-sonnet-5' }}
+
+      - name: Collect the session's write-requests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-safe-outputs-${{ needs.decide.outputs.ticket_id }}-bounce-${{ needs.decide.outputs.bounce_no }}
+          path: ${{ runner.temp }}/safe-outputs
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: rm -f BOUNCE-FINDINGS.json RAILS-CANARY.txt || true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 3. VALIDATE — the fix session's tracker writes, checked against the pin.
+  # ════════════════════════════════════════════════════════════════════════════
+  validate:
+    name: Safe outputs (bounce ${{ needs.decide.outputs.bounce_no }})
+    needs: [decide, fix]
+    if: always() && needs.decide.outputs.go == 'true'
+    uses: ./.github/workflows/pipeline-safe-outputs.yml
+    with:
+      artifact_name: pipeline-safe-outputs-${{ needs.decide.outputs.ticket_id }}-bounce-${{ needs.decide.outputs.bounce_no }}
+      pinned_ticket_id: ${{ needs.decide.outputs.ticket_id }}
+      pinned_dispatch_id: ${{ needs.decide.outputs.dispatch_id }}
+      stage: bounce
+      allowed_to_states: review
+      require_telemetry: true
+    secrets:
+      linear_api_key: ${{ secrets.LINEAR_API_KEY }}
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 4. ANNOUNCE — the display-only label, and the hand-off when budget runs out.
+  # ════════════════════════════════════════════════════════════════════════════
+  announce:
+    name: Announce the bounce state
+    needs: [decide, fix]
+    if: always() && (needs.decide.outputs.go == 'true' || needs.decide.outputs.exhausted == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # DISPLAY ONLY. Stated in the label's own comment because the temptation to
+      # read it back later is real: the fix session's token can edit PR labels, so
+      # a number stored here is a number the counted thing can rewrite. The
+      # authority is the run-ID count in the `decide` job.
+      - name: Label the PR with the bounce number (for humans)
+        if: needs.decide.outputs.go == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ needs.decide.outputs.pr_number }}
+          N: ${{ needs.decide.outputs.bounce_no }}
+          MAXB: ${{ needs.decide.outputs.max_bounces }}
+        with:
+          script: |
+            const label = `pipeline:bounce-${process.env.N}/${process.env.MAXB}`
+            try {
+              await github.rest.issues.addLabels({
+                ...context.repo, issue_number: Number(process.env.PR), labels: [label],
+              })
+              core.info(`Labelled #${process.env.PR} ${label} (display only)`)
+            } catch (e) {
+              core.info(`Could not add the display label: ${e.message}`)
+            }
+
+      - name: Hand the ticket to a human when the bounce budget is spent
+        if: needs.decide.outputs.exhausted == 'true'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          TICKET: ${{ needs.decide.outputs.ticket_id }}
+          MAXB: ${{ needs.decide.outputs.max_bounces }}
+          PR: ${{ needs.decide.outputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          API = "https://api.linear.app/graphql"
+          cfg = json.load(open("delivery.json"))
+          lin = cfg["linear"]
+          labels = lin["labels"]["ids"]
+          ticket = os.environ["TICKET"]
+
+          def gql(q, v):
+              req = urllib.request.Request(API, data=json.dumps({"query": q, "variables": v}).encode(),
+                  headers={"Content-Type": "application/json",
+                           "Authorization": os.environ["LINEAR_API_KEY"]})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  p = json.load(r)
+              if p.get("errors"):
+                  sys.exit("::error::Linear API error: %s" % json.dumps(p["errors"])[:400])
+              return p["data"]
+
+          num = int(ticket.rsplit("-", 1)[1])
+          nodes = gql("query($k:String!,$n:Float!){issues(filter:{team:{key:{eq:$k}},"
+                      "number:{eq:$n}},first:1){nodes{id}}}",
+                      {"k": lin["teamKey"], "n": num})["issues"]["nodes"]
+          if not nodes:
+              sys.exit("::error::ticket %s not found" % ticket)
+          uid = nodes[0]["id"]
+          if labels.get("agent:needs-human"):
+              gql("mutation($id:String!,$labelId:String!){issueAddLabel(id:$id,labelId:$labelId){success}}",
+                  {"id": uid, "labelId": labels["agent:needs-human"]})
+          gql("mutation($issueId:String!,$body:String!){commentCreate(input:{issueId:$issueId,body:$body}){success}}",
+              {"issueId": uid,
+               "body": "🛑 Bounce budget spent — %s round trip(s) on PR #%s did not clear review or CI. "
+                       "Marked `agent:needs-human`; no further fix sessions will start until a person "
+                       "removes it.\n\n[Run](%s)" % (os.environ["MAXB"], os.environ["PR"], os.environ["RUN_URL"])})
+          print("::notice::%s handed to a human after %s bounces." % (ticket, os.environ["MAXB"]))
+          PY
+
+      - name: Explain the hand-off on the PR
+        if: needs.decide.outputs.exhausted == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ needs.decide.outputs.pr_number }}
+          MAXB: ${{ needs.decide.outputs.max_bounces }}
+          TICKET: ${{ needs.decide.outputs.ticket_id }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: Number(process.env.PR),
+              body: [
+                `## 🛑 Bounce budget spent — ${process.env.TICKET}`,
+                '',
+                `This PR has used all ${process.env.MAXB} automated fix round trip(s). No further fix sessions will start.`,
+                '',
+                `\`${process.env.TICKET}\` is marked \`agent:needs-human\`. Removing that label is the reset — until then the pipeline leaves this alone.`,
+              ].join('\n'),
+            })
