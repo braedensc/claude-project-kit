@@ -78,6 +78,18 @@ a non-blocking error), so the PreToolUse wiring guards it explicitly:
 Operationally: **create hook scripts before wiring `settings.json`** (see
 docs/LESSONS.md — this kit hit both variants of that deadlock).
 
+**The provenance guard: the "Provenance scan" CI job.** A public template distilled
+from a private build leaks its origin through words, not just secrets.
+`scripts/check_provenance.py` fails the PR on any tracked file that contains a
+denylisted name — **in its path as well as its contents**, since a filename or an ADR
+slug leaks just as loudly — or an absolute home path naming a real account, or a
+real-looking email. The denylist itself lives in a repo **variable**
+(`PROVENANCE_DENYLIST`), never in the tree: committing the words you are suppressing
+would *be* the leak, so hits print masked (`<term #1>`) and a public CI log never
+republishes them. An unset variable renders empty and silently no-ops the term rule —
+set `PROVENANCE_REQUIRE_DENYLIST=1` (as this repo's CI does) to turn that no-op into a
+failure; the path and email rules need no config and always run.
+
 Server-side extras (free, one-time toggles in GitHub → Settings → Security): secret
 scanning, **push protection**, Dependabot security updates. They backstop layer 3.
 

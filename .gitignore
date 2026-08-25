@@ -12,6 +12,7 @@ planning/
 !.env.example
 *.pem
 *.key
+.provenance-denylist
 
 # Dependencies
 node_modules/
