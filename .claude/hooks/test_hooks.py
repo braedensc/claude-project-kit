@@ -1104,7 +1104,7 @@ def main():
         ("config-anchor: the documented branch rename allowed",
          bash("git branch -m fix/some-real-work"), ALLOW, feat_hook),
         ("config-anchor: an SSH URL containing ':main/' is not a refspec",
-         bash("git fetch git@github.com:main/repo.git"), ALLOW, feat_hook),
+         bash("git fetch git@code.example.invalid:main/repo.git"), ALLOW, feat_hook),
         ("config-anchor: a path named replace.ts is not the `git replace` verb",
          bash("git show HEAD:src/replace.ts"), ALLOW, feat_hook),
         ("config-anchor: git remote add origin allowed (cannot repoint an existing one)",

@@ -182,8 +182,8 @@ where it is (the safe-outputs validator) until a pin field exists to carry it.
   refspec, origin repointing, `.git/**` via redirect, `sed -i` and the Edit/Write twin)
   against 9 allow cases chosen as the plausible false positives: `git fetch origin main`,
   `git diff origin/main...HEAD`, `git branch --merged main`, `git config --get
-  remote.origin.url`, `cat .git/config`, the documented `git branch -m` rename, the SSH
-  URL `git@github.com:main/repo.git` (a colon that is not a refspec), `git show
+  remote.origin.url`, `cat .git/config`, the documented `git branch -m` rename, an SSH
+  clone URL (`…:main/repo.git` — a colon that is not a refspec), `git show
   HEAD:src/replace.ts` (a path that is not the `replace` verb), and `git remote add
   origin`.
 - **Error paths are covered per the fail-direction doctrine**: a `pinsRoot` of the wrong
