@@ -108,14 +108,33 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 > **States and labels are referenced by ID, never by display name.** A rename in the
 > Linear UI must not silently desync a guard — with names, a renamed "Ready" state stops
 > matching and the queue quietly stops dispatching (or worse, a guard fails open). IDs
-> survive renames; a *deleted* ID fails loudly at the API call, which is the behavior we
-> want. Anywhere in the pipeline that compares a state or label, it compares IDs.
+> survive renames. Anywhere in the pipeline that compares a state or label, it compares
+> IDs.
+>
+> **A deleted ID fails loudly on a WRITE, and silently on a READ.** Linear rejects
+> `issueAddLabel` with a dead label ID, so every key → ID → mutation path is
+> self-checking. A read is a local dict lookup against `labels.ids`, and a miss is just
+> a miss: the label vanishes from the ticket's key set, `effort:*` falls back to `M`,
+> `provenance:*` to `human`, and an `agent:needs-human` hold a person applied to park
+> the ticket evaporates. **So every read path must detect staleness explicitly.**
+> Resolution stays by ID; the display name the queries already return is the
+> *diagnostic* — an unmapped label whose name matches a canonical key means the recorded
+> ID is wrong, not that the label is somebody else's. Severity follows `labels.required`
+> (§7's dial): fatal for a required key, a warning otherwise, because `track:*` is
+> open-ended and project-named so it can never be in `required`. One implementation —
+> `scripts/pipeline_labels.py` — imported by every read path, never re-derived.
+>
+> Residual gap, named so nobody assumes otherwise: a label **renamed and then
+> recreated** matches by neither ID nor name, so it reads as a label the project added
+> for its own reasons. Closing it needs a liveness check against the API, which belongs
+> in `/setup-board`.
 >
 > Corollary: `labels.ids` values are **resolved**, not authored. They ship as `""`
 > (unresolved) and a setup step fills them by looking each display name up once. The
 > five `stateIds` are placeholder tokens instead — a closed, mandatory set of exactly
 > five, where a missing value stalls the whole queue; labels are an open set
-> (`track:*` grows per project) that no fixed token list can cover.
+> (`track:*` grows per project) that no fixed token list can cover. §6 fixes the scope
+> those labels are created at.
 
 ### `github`
 
@@ -649,6 +668,18 @@ compare IDs; nothing compares display text.
 | `provenance:epic` \| `provenance:monitor` \| `provenance:review` \| `provenance:retro-proposal` \| `provenance:human` | dispatcher / human | Origin class (§5). Exactly one per ticket. |
 | `hooks-change` | human | The change touches guard machinery. |
 | `meta` | human | The pipeline working on itself. Excluded from throughput metrics so pipeline overhead never reads as delivery. |
+
+**Every label in that table is WORKSPACE-scoped — created with `teamId` omitted.** Not
+just the machinery (`agent:*`, `provenance:*`, `blocked:capacity`, `hooks-change`): the
+project taxonomy (`track:*`, `effort:*`) too. One workspace serves many teams sharing
+one taxonomy, and a team-scoped label cannot be applied to another team's tickets, so
+the second team onboarded is where the wrong choice surfaces.
+
+**Scope cannot be converted after creation.** There is no rescope; the fix is delete and
+recreate, which mints new IDs and strands every one `delivery.json` had recorded — the
+labels look fine on the board while the config points at nothing. That is a read-path
+failure §1 now requires each read to detect, not a reason to relax it. Re-run the
+resolution step (`/setup-board`) after any delete-and-recreate.
 
 **`agent:*` and `blocked:capacity` are dispatcher-owned.** A session must not set its own
 lifecycle labels — self-labelling `agent:needs-human` or clearing `agent:blocked` is a
