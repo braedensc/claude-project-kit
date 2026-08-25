@@ -24,12 +24,14 @@ The assembled values must never appear literally in this file — the hook
 itself (and secretlint) scan file contents, and a literal would block edits
 to this very file.
 """
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(HOOKS_DIR, "pre-tool-use.py")
@@ -262,6 +264,131 @@ def make_stale_main_sandbox():
     return root, stop_copy, env
 
 
+# ── pipeline sandboxes (docs/PIPELINE-CONTRACT.md) ───────────────────────────
+# The pipeline guards are INERT unless `delivery.json` exists at the repo root, so
+# every case below needs a sandbox that has one — committed on `main`, because the
+# hook reads config VALUES from the default branch, never from the working-tree
+# copy the session can edit. The dispatcher PIN is written OUTSIDE the worktree at
+# <pinsRoot>/<sha256(realpath(root))[:16]>.json, exactly where the hook looks: a
+# binding the session could rewrite is not a binding.
+PL_READY = "11111111-1111-4111-8111-111111111111"
+PL_RAW = "22222222-2222-4222-8222-222222222222"
+PL_LABEL = "33333333-3333-4333-8333-333333333333"
+PL_BRANCH = "feat/eng-123-token-refresh"
+
+
+def mcp(tool, server="linear", **payload):
+    """An MCP tool call. The hook is deliberately SERVER-NAME AGNOSTIC (Claude Code
+    names MCP servers however the user wired them — often an opaque id), so cases
+    exercise both a readable server name and an opaque one."""
+    return {"tool_name": f"mcp__{server}__{tool}", "tool_input": payload}
+
+
+def _pl_write(root, rel, content):
+    p = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as f:
+        f.write(content)
+
+
+def _pl_merge(base, over):
+    for k, v in (over or {}).items():
+        base[k] = {**base[k], **v} if isinstance(v, dict) and isinstance(base.get(k), dict) else v
+    return base
+
+
+def _pl_cfg(pins_dir, **over):
+    """A contract-shaped delivery.json with RESOLVED ids — guards compare IDs, never
+    display names, and an unresolved bootstrap placeholder must never match."""
+    return _pl_merge({
+        "version": 1,
+        "linear": {
+            "teamKey": "ENG", "workspace": "battery",
+            "stateIds": {"raw": PL_RAW, "ready": PL_READY, "working": "w-id",
+                         "review": "v-id", "done": "d-id"},
+            "labels": {"ids": {"track:platform": PL_LABEL, "effort:M": "e-id"},
+                       "required": []},
+        },
+        "github": {"owner": "acme", "repo": "app", "defaultBranch": "main"},
+        "branch": {"types": ["feat", "fix", "chore", "refactor", "docs"],
+                   "requireTicketId": True},
+        "stack": {"kind": "node-ts", "securityNotes": [], "graderPaths": []},
+        "commands": {"lint": None, "typecheck": None, "test": None,
+                     "e2e": None, "preview": None},
+        "budgets": {"perEffort": {"M": {"maxTurns": 60, "maxUsd": 6.0, "maxMinutes": 45}},
+                    "maxTurns": 150, "wipLimit": 3, "maxBounces": 2, "totalAttempts": 3,
+                    "dailyUsd": 50.0, "reviewSeverityThreshold": "medium"},
+        "auth": {"devSessions": "subscription", "scheduled": "api-key", "review": "api-key"},
+        "autonomy": {"autoApproveProvenance": ["epic"], "autoMergeMaxLines": 0,
+                     "riskPaths": [".claude/hooks/**", ".claude/settings*.json",
+                                   ".github/workflows/**", ".husky/**", "delivery.json"]},
+        "dispatch": {"backend": "local-daemon", "labelTrigger": "agent:queued",
+                     "pauseOnCapacity": True, "pinsRoot": pins_dir},
+        "monitoring": {"provider": "none", "stormPerHour": 6},
+    }, over)
+
+
+def _pl_pin(root, **over):
+    exp = datetime.now(timezone.utc) + timedelta(hours=2)
+    return _pl_merge({
+        "pin_version": 1, "dispatch_id": "d_battery", "session_mode": "ticket",
+        "worktree": root, "branch": PL_BRANCH, "base_branch": "main",
+        "auth_mode": "api-key",
+        "budget": {"maxTurns": 60, "maxUsd": 6.0, "maxMinutes": 45, "attempt": 1, "of": 3},
+        "ticket": {"id": "ENG-123", "team_key": "ENG",
+                   "url": "https://example.invalid/ENG-123", "state_id": PL_RAW,
+                   "effort": "M", "track": "track:platform",
+                   "provenance": "epic/ENG-100", "title": "Refresh tokens before expiry",
+                   "acceptance_criteria": ["tokens refresh before expiry"],
+                   "out_of_scope": [], "snapshot_at": "2026-08-24T15:04:05Z"},
+        "subject": None, "pinned_at": "2026-08-24T15:04:05Z",
+        "pinned_by": "dispatcher:battery",
+        "expires_at": exp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, over)
+
+
+def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
+                          cfg_raw=None, pin_raw=None, worktree_cfg_raw=None,
+                          dirty=None):
+    """Throwaway repo with the pipeline CONFIGURED. Returns (root, hook_copy, pins).
+
+    `cfg_raw`/`pin_raw` write the file verbatim (the malformed-config and
+    malformed-pin cases). `worktree_cfg_raw` overwrites the WORKING-TREE copy after
+    branching — the adversarial case: an agent editing `delivery.json` inside its
+    own worktree must not be able to move a guard, because values come from the
+    committed copy on the default branch. `dirty` writes uncommitted files, used to
+    put a risk-listed path into the session's changed-file set. `pin=None` means no
+    pin at all (a human's ad-hoc session in a configured repo)."""
+    root = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pl-"))
+    pins = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pins-"))
+    hooks = os.path.join(root, ".claude", "hooks")
+    os.makedirs(hooks)
+    hook_copy = os.path.join(hooks, os.path.basename(HOOK))
+    shutil.copy(HOOK, hook_copy)
+    shutil.copy(STOP_HOOK, os.path.join(hooks, os.path.basename(STOP_HOOK)))
+    _git(root, "init", "-q", "-b", "main")
+    _pl_write(root, "delivery.json", cfg_raw if cfg_raw is not None
+              else json.dumps(_pl_cfg(pins, **(cfg_over or {})), indent=2))
+    _pl_write(root, "src/app.ts", "export const x = 1\n")
+    _pl_write(root, ".github/workflows/ci.yml", "name: CI\n")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "-q", "-m", "seed")
+    _git(root, "checkout", "-q", "-b", branch)
+    if worktree_cfg_raw is not None:
+        _pl_write(root, "delivery.json", worktree_cfg_raw)
+    for rel, content in (dirty or {}).items():
+        _pl_write(root, rel, content)
+    if pin is not None:
+        key = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
+        body = pin_raw if pin_raw is not None else json.dumps(
+            _pl_pin(root, **(pin if isinstance(pin, dict) else {})), indent=2)
+        with open(os.path.join(pins, key + ".json"), "w") as f:
+            f.write(body)
+    return root, hook_copy, pins
+
+
+
 def main():
     if not os.path.exists(HOOK):
         print(f"FATAL: hook not found at {HOOK}")
@@ -311,6 +438,73 @@ def main():
         '[{"number":7,"state":"OPEN"}]',
         '{"mergeStateStatus":"DIRTY","statusCheckRollup":[{"name":"CodeQL","conclusion":"SUCCESS"}]}')
     stale_root, stale_stop, stale_env = make_stale_main_sandbox()
+
+    # ── pipeline sandboxes (see make_pipeline_sandbox) ───────────────────────
+    pl_root, pl_hook, pl_pins = make_pipeline_sandbox()
+    pl_nopin_root, pl_nopin, pl_nopin_pins = make_pipeline_sandbox(pin=None)
+    pl_broken_root, pl_broken, pl_broken_pins = make_pipeline_sandbox(cfg_raw="{ not json")
+    pl_badver_root, pl_badver, pl_badver_pins = make_pipeline_sandbox(
+        cfg_raw=json.dumps({"version": 99}))
+    pl_badpin_root, pl_badpin, pl_badpin_pins = make_pipeline_sandbox(pin_raw="not json")
+    pl_oldpin_root, pl_oldpin, pl_oldpin_pins = make_pipeline_sandbox(
+        pin_raw=json.dumps({"pin_version": 99}))
+    pl_mism_root, pl_mism, pl_mism_pins = make_pipeline_sandbox(
+        pin={"worktree": "/nonexistent/other-worktree"})
+    pl_exp_root, pl_exp, pl_exp_pins = make_pipeline_sandbox(
+        pin={"expires_at": "2020-01-01T00:00:00Z"})
+    pl_noid_root, pl_noid, pl_noid_pins = make_pipeline_sandbox(pin={"ticket": None})
+    pl_plan_root, pl_plan, pl_plan_pins = make_pipeline_sandbox(
+        branch="feat/decompose-the-epic", pin={"session_mode": "planning", "ticket": None})
+    pl_maint_root, pl_maint, pl_maint_pins = make_pipeline_sandbox(
+        branch="chore/weekly-retro", pin={"session_mode": "maintenance", "ticket": None})
+    pl_wrongbr_root, pl_wrongbr, pl_wrongbr_pins = make_pipeline_sandbox(
+        branch="feat/eng-999-other-work")
+    pl_nobr_root, pl_nobr, pl_nobr_pins = make_pipeline_sandbox(branch="feat/token-refresh")
+    pl_upbr_root, pl_upbr, pl_upbr_pins = make_pipeline_sandbox(
+        branch="feat/ENG-123-token-refresh")
+    pl_lowpin_root, pl_lowpin, pl_lowpin_pins = make_pipeline_sandbox(
+        pin={"ticket": {"id": "eng-123"}})
+    pl_noreq_root, pl_noreq, pl_noreq_pins = make_pipeline_sandbox(
+        branch="feat/token-refresh", cfg_over={"branch": {"requireTicketId": False}})
+    pl_risky_root, pl_risky, pl_risky_pins = make_pipeline_sandbox(
+        dirty={".github/workflows/deploy.yml": "name: deploy\n"})
+    pl_mon_root, pl_mon, pl_mon_pins = make_pipeline_sandbox(
+        pin={"ticket": {"provenance": "monitor"}})
+    pl_rev_root, pl_rev, pl_rev_pins = make_pipeline_sandbox(
+        pin={"ticket": {"provenance": "review"}})
+    pl_retro_root, pl_retro, pl_retro_pins = make_pipeline_sandbox(
+        pin={"ticket": {"provenance": "retro-proposal"}})
+    pl_noac_root, pl_noac, pl_noac_pins = make_pipeline_sandbox(
+        pin={"ticket": {"acceptance_criteria": []}})
+    pl_noeff_root, pl_noeff, pl_noeff_pins = make_pipeline_sandbox(
+        pin={"ticket": {"effort": ""}})
+    pl_noauto_root, pl_noauto, pl_noauto_pins = make_pipeline_sandbox(
+        cfg_over={"autonomy": {"autoApproveProvenance": []}})
+    # The adversarial one: the committed config is intact, the WORKING-TREE copy is
+    # disarmed (blank `ready` id, empty riskPaths, pinsRoot redirected). Every guard
+    # must still fire, because none of them read the copy the agent can write.
+    pl_disarm_root, pl_disarm, pl_disarm_pins = make_pipeline_sandbox(
+        pin={"ticket": {"provenance": "monitor"}},
+        worktree_cfg_raw=json.dumps({
+            "version": 1,
+            "linear": {"teamKey": "ENG", "stateIds": {"ready": ""}, "labels": {"ids": {}}},
+            "branch": {"requireTicketId": False},
+            "autonomy": {"autoApproveProvenance": ["epic"], "riskPaths": []},
+            "dispatch": {"pinsRoot": "/nonexistent/pins"}}))
+    pl_cleanup = [
+        pl_root, pl_pins, pl_nopin_root, pl_nopin_pins, pl_broken_root, pl_broken_pins,
+        pl_badver_root, pl_badver_pins, pl_badpin_root, pl_badpin_pins,
+        pl_oldpin_root, pl_oldpin_pins, pl_mism_root, pl_mism_pins,
+        pl_exp_root, pl_exp_pins, pl_noid_root, pl_noid_pins,
+        pl_plan_root, pl_plan_pins, pl_maint_root, pl_maint_pins,
+        pl_wrongbr_root, pl_wrongbr_pins, pl_nobr_root, pl_nobr_pins,
+        pl_upbr_root, pl_upbr_pins, pl_lowpin_root, pl_lowpin_pins,
+        pl_noreq_root, pl_noreq_pins, pl_risky_root, pl_risky_pins,
+        pl_mon_root, pl_mon_pins, pl_rev_root, pl_rev_pins,
+        pl_retro_root, pl_retro_pins, pl_noac_root, pl_noac_pins,
+        pl_noeff_root, pl_noeff_pins, pl_noauto_root, pl_noauto_pins,
+        pl_disarm_root, pl_disarm_pins,
+    ]
 
     # (name, payload, expect_block, hook_path)
     cases = [
@@ -590,6 +784,165 @@ def main():
         # error must convert to exit 2. Valid JSON, wrong shape.)
         ("crafted tool_input (list) fails closed",
          {"tool_name": "Bash", "tool_input": ["ls"]}, BLOCK, HOOK),
+
+        # ══ PIPELINE GUARDS (docs/PIPELINE-CONTRACT.md) ══════════════════════
+        # ── *Off* is not *broken*: a project without delivery.json sees NO change.
+        #    These four are the regression gate for every project that adopts the
+        #    kit and never runs a pipeline — the failure that would brick them.
+        ("pipeline off: tracker issue write allowed (no delivery.json)",
+         mcp("save_issue", id="ENG-123"), ALLOW, feat_hook),
+        ("pipeline off: a `ready`-state payload is inert",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), ALLOW, feat_hook),
+        ("pipeline off: editing a CI workflow allowed",
+         edit(os.path.join(feat_root, ".github/workflows/ci.yml"), "x"), ALLOW, feat_hook),
+        ("pipeline off: sed -i on a CI workflow allowed",
+         bash(f"sed -i 's/a/b/' {os.path.join(feat_root, '.github/workflows/ci.yml')}"),
+         ALLOW, feat_hook),
+
+        # ── grader-path protection, place 1 of 2: the Edit/Write glob set ─────
+        ("grader: Edit a CI workflow blocked in a pinned session",
+         edit(os.path.join(pl_root, ".github/workflows/ci.yml"), "x"), BLOCK, pl_hook),
+        ("grader: Write delivery.json blocked in a pinned session",
+         write(os.path.join(pl_root, "delivery.json"), "{}"), BLOCK, pl_hook),
+        ("grader: Edit test_hooks.py blocked (.claude/hooks/** risk glob)",
+         edit(os.path.join(pl_root, ".claude/hooks/test_hooks.py"), "x"), BLOCK, pl_hook),
+        ("grader: Edit ordinary source allowed",
+         edit(os.path.join(pl_root, "src/app.ts"), "x"), ALLOW, pl_hook),
+        ("grader: UNPINNED session may edit a workflow (withholding check fails open)",
+         edit(os.path.join(pl_nopin_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_nopin),
+
+        # ── grader-path protection, place 2 of 2: the Bash mutation regex ─────
+        ("grader Bash: redirect into a workflow blocked",
+         bash(f"echo x > {os.path.join(pl_root, '.github/workflows/ci.yml')}"), BLOCK, pl_hook),
+        ("grader Bash: sed -i delivery.json blocked",
+         bash("sed -i 's/a/b/' delivery.json"), BLOCK, pl_hook),
+        ("grader Bash: cp over a workflow blocked",
+         bash(f"cp evil.yml {os.path.join(pl_root, '.github/workflows/deploy.yml')}"),
+         BLOCK, pl_hook),
+        ("grader Bash: interpreter naming delivery.json blocked",
+         bash("python3 tamper.py delivery.json"), BLOCK, pl_hook),
+        ("grader Bash: cat a workflow allowed (read)",
+         bash(f"cat {os.path.join(pl_root, '.github/workflows/ci.yml')}"), ALLOW, pl_hook),
+        ("grader Bash: git add a workflow allowed (staging, not mutating)",
+         bash(f"git add {os.path.join(pl_root, '.github/workflows/ci.yml')}"), ALLOW, pl_hook),
+        ("grader Bash: rm /tmp/junk beside a workflow mention allowed (targeting)",
+         bash(f"rm /tmp/junk && cat {os.path.join(pl_root, '.github/workflows/ci.yml')}"),
+         ALLOW, pl_hook),
+        ("grader Bash: UNPINNED session may sed -i a workflow",
+         bash(f"sed -i 's/a/b/' {os.path.join(pl_nopin_root, '.github/workflows/ci.yml')}"),
+         ALLOW, pl_nopin),
+
+        # ── ticket-branch: the branch must carry the PINNED id, case-insensitively
+        ("ticket-branch: matching lower-cased branch allowed",
+         edit(os.path.join(pl_root, "src/app.ts"), "x"), ALLOW, pl_hook),
+        ("ticket-branch: a DIFFERENT ticket in the branch blocked",
+         edit(os.path.join(pl_wrongbr_root, "src/app.ts"), "x"), BLOCK, pl_wrongbr),
+        ("ticket-branch: no ticket segment blocked when requireTicketId is on",
+         edit(os.path.join(pl_nobr_root, "src/app.ts"), "x"), BLOCK, pl_nobr),
+        ("ticket-branch: UPPER-CASE id in the branch blocked (naming guard is lower-case only)",
+         edit(os.path.join(pl_upbr_root, "src/app.ts"), "x"), BLOCK, pl_upbr),
+        ("ticket-branch: lower-cased PIN id still matches the branch (case-insensitive)",
+         edit(os.path.join(pl_lowpin_root, "src/app.ts"), "x"), ALLOW, pl_lowpin),
+        ("ticket-branch: git commit on a mismatched branch blocked",
+         bash("git commit -F /tmp/msg.txt"), BLOCK, pl_wrongbr),
+        ("ticket-branch: requireTicketId off → a plain slug is fine",
+         edit(os.path.join(pl_noreq_root, "src/app.ts"), "x"), ALLOW, pl_noreq),
+
+        # ── state transition into `ready` IS an approval (matched by state ID) ─
+        ("ready: epic provenance + complete DoR + clean risk paths allowed",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), ALLOW, pl_hook),
+        ("ready: monitor-filed ticket blocked",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_mon),
+        ("ready: review-filed ticket blocked",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_rev),
+        ("ready: retro-proposal ticket blocked",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_retro),
+        ("ready: empty acceptance_criteria blocked (definition of ready)",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_noac),
+        ("ready: missing effort blocked (definition of ready)",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_noeff),
+        ("ready: a risk-path change in this session blocks approval",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_risky),
+        ("ready: no pin blocks — a GRANTING check fails CLOSED",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_nopin),
+        ("ready: EXPIRED pin blocks — a GRANTING check fails CLOSED",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_exp),
+        ("ready: autoApproveProvenance empty closes the path entirely",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_noauto),
+        ("ready: targeting a ticket other than the pinned one blocked",
+         mcp("save_issue", id="ENG-777", stateId=PL_READY), BLOCK, pl_hook),
+        ("ready: matched by state ID from an OPAQUE MCP server name too",
+         mcp("save_issue", server="ee511e16-940a-42fe-8cbd-7397bd7a5f79",
+             id="ENG-123", stateId=PL_READY), BLOCK, pl_mon),
+        ("ready: a disarmed WORKING-TREE delivery.json cannot move the guard",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_disarm),
+        ("raw state change allowed — only `ready` is an approval",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_hook),
+
+        # ── own-ticket-only writes (the decision table) ───────────────────────
+        ("own-ticket: issue write on the pinned ticket allowed",
+         mcp("update_issue_status", id="ENG-123", stateId=PL_RAW), ALLOW, pl_hook),
+        ("own-ticket: issue write on ANOTHER ticket blocked",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_hook),
+        ("own-ticket: create_issue blocked in ticket mode (file via safe-outputs)",
+         mcp("create_issue", title="unrelated bug", teamId="ENG"), BLOCK, pl_hook),
+        ("own-ticket: an upsert with no target is a CREATE — blocked",
+         mcp("save_issue", title="unrelated bug"), BLOCK, pl_hook),
+        ("own-ticket: issue write with an UNRESOLVABLE target blocked (fails closed)",
+         mcp("update_issue", id="9c1e-opaque-uuid", stateId=PL_RAW), BLOCK, pl_hook),
+        ("own-ticket: comment on the pinned ticket allowed",
+         mcp("save_comment", issueId="ENG-123", body="telemetry"), ALLOW, pl_hook),
+        ("own-ticket: comment on ANOTHER ticket blocked",
+         mcp("save_comment", issueId="ENG-456", body="hi"), BLOCK, pl_hook),
+        ("own-ticket: comment with an unresolvable target allowed (telemetry channel)",
+         mcp("save_comment", issueId="9c1e-opaque-uuid", body="telemetry"), ALLOW, pl_hook),
+        ("own-ticket: ticket mode with NO pinned id blocks EVERY tracker write",
+         mcp("save_comment", issueId="ENG-123", body="hi"), BLOCK, pl_noid),
+        ("own-ticket: a tracker READ is never blocked",
+         mcp("list_issues", teamId="ENG"), ALLOW, pl_hook),
+        ("own-ticket: a non-tracker MCP tool is untouched (prose ticket mention)",
+         mcp("create_pull_request", server="github", title="fixes ENG-777 leak"),
+         ALLOW, pl_hook),
+        ("own-ticket: an UNKNOWN MCP verb carrying a configured label ID is a write",
+         mcp("mutate_thing", labelId=PL_LABEL, issueId="ENG-456"), BLOCK, pl_hook),
+        ("planning mode: create_issue allowed (team-scoped)",
+         mcp("create_issue", title="child of the epic", teamId="ENG"), ALLOW, pl_plan),
+        ("planning mode: writing a FOREIGN team's ticket blocked",
+         mcp("save_issue", id="OTH-9", stateId=PL_RAW), BLOCK, pl_plan),
+        ("maintenance mode: writing another in-team ticket allowed (team-scoped)",
+         mcp("save_issue", id="ENG-777", stateId=PL_RAW), ALLOW, pl_maint),
+        ("no pin: tracker write allowed — a WITHHOLDING check fails OPEN",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_nopin),
+
+        # ── AC integrity: no rewriting your own definition of done ────────────
+        ("AC: editing the pinned ticket's description blocked",
+         mcp("save_issue", id="ENG-123", description="new scope"), BLOCK, pl_hook),
+        ("AC: editing the pinned ticket's title blocked",
+         mcp("update_issue", id="ENG-123", title="different work"), BLOCK, pl_hook),
+        ("AC: a status-only change on the pinned ticket allowed",
+         mcp("update_issue_status", id="ENG-123", stateId=PL_RAW), ALLOW, pl_hook),
+        ("AC: commenting on the pinned ticket allowed (a comment has a body, not ACs)",
+         mcp("save_comment", issueId="ENG-123", body="progress"), ALLOW, pl_hook),
+
+        # ── fail DIRECTION: broken config / broken pin fail CLOSED ────────────
+        ("broken config: a mutating Bash call is blocked",
+         bash("npm test"), BLOCK, pl_broken),
+        ("broken config: editing ordinary source is blocked",
+         edit(os.path.join(pl_broken_root, "src/app.ts"), "x"), BLOCK, pl_broken),
+        ("broken config: editing delivery.json stays ALLOWED (never take the repo hostage)",
+         write(os.path.join(pl_broken_root, "delivery.json"), "{}"), ALLOW, pl_broken),
+        ("broken config: Read stays allowed (diagnosis)",
+         read(os.path.join(pl_broken_root, "delivery.json")), ALLOW, pl_broken),
+        ("unrecognized delivery.json version blocked (a reader refuses, never guesses)",
+         edit(os.path.join(pl_badver_root, "src/app.ts"), "x"), BLOCK, pl_badver),
+        ("malformed pin blocked (hard stop, not a warning)",
+         edit(os.path.join(pl_badpin_root, "src/app.ts"), "x"), BLOCK, pl_badpin),
+        ("unknown pin_version blocked (a reader refuses, never guesses)",
+         edit(os.path.join(pl_oldpin_root, "src/app.ts"), "x"), BLOCK, pl_oldpin),
+        ("pin written for a DIFFERENT worktree blocked (hard stop)",
+         edit(os.path.join(pl_mism_root, "src/app.ts"), "x"), BLOCK, pl_mism),
+        ("expired pin: treated as absent, so a WITHHOLDING check fails open",
+         edit(os.path.join(pl_exp_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_exp),
     ]
 
     # Stop hook: different protocol (exit 0 + JSON decision on stdout).
@@ -669,6 +1022,19 @@ def main():
         ("stderr reason: branch-naming guard fires in the acting worktree",
          sub(edit(os.path.join(wt_codename, "src/x.ts"), "x")), "naming convention",
          wt_hook, subagent_env, wt_codename),
+        # pipeline guards: the reason is the product — each names the fix
+        ("stderr reason: grader-path block names the path",
+         edit(os.path.join(pl_root, ".github/workflows/ci.yml"), "x"),
+         "risk-listed (grader) path", pl_hook),
+        ("stderr reason: approval block says whose action approving is",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY),
+         "approving work is a human's action", pl_mon),
+        ("stderr reason: AC-integrity block names the field it refused",
+         mcp("save_issue", id="ENG-123", description="new scope"),
+         "description", pl_hook),
+        ("stderr reason: ticket-branch block prints the rename command",
+         edit(os.path.join(pl_wrongbr_root, "src/app.ts"), "x"),
+         "git branch -m", pl_wrongbr),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -680,7 +1046,8 @@ def main():
     for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
               wt_codename, nongit_dir, unrelated_root, merged_root, open_root,
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,
-              stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root):
+              stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
+              *pl_cleanup):
         shutil.rmtree(r, ignore_errors=True)
 
     # Counts EVERY assertion, reason_cases included — an under-reported total once

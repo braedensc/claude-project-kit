@@ -258,6 +258,28 @@ Stop hook between them:
    - Blocks `gh pr merge` outright, including `--auto` — **merging is the human's
      action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
      only *undoes* an auto-merge.)
+   - **Pipeline guards** (`docs/PIPELINE-CONTRACT.md`) — six more blocks that exist
+     **only** when a project opted into the agentic delivery pipeline. The single
+     discriminator is whether `delivery.json` exists at the repo root, and the
+     existence test runs before anything that can fail: absent → exit 0, no output,
+     no git, no network, so a project that never adopted the pipeline behaves exactly
+     as it always did. Everything they trust comes from the **dispatcher**, never the
+     session — the pinned ticket and session mode from a pin file *outside* the
+     worktree, config values from the committed copy on the default branch, states
+     and labels compared by **ID** rather than display name. They block: moving a
+     ticket into the `ready` state (**approving work is a human's action**; only an
+     `epic/*`-provenance ticket that meets the definition of ready and touches no
+     risk path can ever auto-approve, and emptying `autonomy.autoApproveProvenance`
+     closes even that); tracker writes outside the session's own ticket, including
+     creating tickets in `ticket` mode; editing the session's own in-progress
+     acceptance criteria; Edit/Write/Bash mutations of grader paths
+     (`.github/workflows/**`, `delivery.json`, `autonomy.riskPaths`); work on a branch
+     that doesn't carry the pinned ticket ID when `branch.requireTicketId` is on; and
+     a malformed, unrecognized or foreign-worktree pin. Write-blocking and approval
+     checks fail **closed**; checks that merely withhold autonomy from an *unpinned*
+     session fail **open**, so a human's ad-hoc session in a configured repo is never
+     bricked — and a broken `delivery.json` still leaves `delivery.json` itself
+     editable, so the repo can never be held hostage by its own config.
 2. **Claude Code Stop hook** (`.claude/hooks/stop-pr-check.py`) — blocks ending a
    turn when the branch has pushed commits ahead of `main` with **no PR**, its open
    PR has **failing CI**, or its open PR is **`DIRTY`** (merge conflicts — GitHub
@@ -267,7 +289,13 @@ Stop hook between them:
 3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
 4. **CI + branch protection** — the unbypassable gate. All changes land via PR with
-   passing checks; no direct or force-push to `main`.
+   passing checks; no direct or force-push to `main`. The **Hooks change guard** job
+   is the server-side twin of self-protection and grader-path protection: a PR that
+   touches a grader path — `.claude/hooks/**`, `.claude/settings*.json`,
+   `.github/workflows/**`, and (when configured) `delivery.json` plus its
+   `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
+   `hooks-change` label. Local hooks only constrain sessions that run them; a PR
+   authored in another clone or the web UI never meets one.
 
 Plus two non-enforcing complements: native `permissions.deny` rules in `settings.json`
 hard-block secret-file reads independently of the Python hook (docs/SECURITY.md), and

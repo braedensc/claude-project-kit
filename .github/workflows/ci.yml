@@ -96,9 +96,15 @@ jobs:
   # Server-side backstop for hook self-protection (docs/SECURITY.md; ported from
   # a production build's audit job). Local self-protection constrains only
   # sessions that run the hook — a PR authored anywhere else (another clone, the
-  # GitHub web UI, an @claude workflow) never meets it. So a PR that changes the
-  # guard machinery (.claude/hooks/** or .claude/settings*.json) must not land
-  # unnoticed: it has to carry an explicit `hooks-change` label.
+  # GitHub web UI, an @claude workflow) never meets it. So a PR that changes a
+  # GRADER path must not land unnoticed: it has to carry an explicit
+  # `hooks-change` label. The gated set is the guard machinery
+  # (.claude/hooks/**, .claude/settings*.json), the CI workflows that gate the PR
+  # itself (.github/workflows/**), and — when a project has opted into the
+  # agentic delivery pipeline — `delivery.json` plus everything in its
+  # `autonomy.riskPaths`, read from the PR's BASE sha (a head that could shorten
+  # its own riskPaths would be grading its own homework). Same job, same label as
+  # before: one flag, not a second taxonomy to keep in sync.
   # Operational notes (learned in production):
   #   - the `hooks-change` label must EXIST in the repo before this job's first
   #     run can pass on a guarded PR (gh label create hooks-change …);
@@ -108,7 +114,13 @@ jobs:
   #   - this flag only becomes a real gate once branch protection requires a
   #     review (required_approving_review_count >= 1, owner-set in the GitHub
   #     UI) so a human actually sees it. PR-only — a push to main has no label
-  #     context.
+  #     context;
+  #   - HEAD CONTEXT: this job runs from the PR's own checkout, so a PR can edit
+  #     the workflow and the script that gate it. The base-sha reads above close
+  #     the config half of that hole, not the code half. The property "a green
+  #     check can never be produced by the code under review" needs
+  #     `pull_request_target` (base-ref workflow) PLUS a required review —
+  #     owner-set, and deliberately not claimed until both are in place.
   hooks-change-guard:
     name: Hooks change guard
     runs-on: ubuntu-latest
@@ -118,26 +130,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require the 'hooks-change' label to edit hook/settings files
+      - name: Require the 'hooks-change' label to edit grader paths
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
-          SENSITIVE=$(printf '%s\n' "$CHANGED" | grep -E '^\.claude/(hooks/|settings[^/]*\.json$)' || true)
-          if [ -z "$SENSITIVE" ]; then
-            echo "No security-hook files changed — nothing to gate."
-            exit 0
-          fi
-          echo "This PR modifies security-critical hook/settings files:"
-          printf '  %s\n' $SENSITIVE
-          for label in $LABELS; do
-            if [ "$label" = "hooks-change" ]; then
-              echo "OK: 'hooks-change' label present — change acknowledged."
-              exit 0
-            fi
-          done
-          echo "::error::This PR changes .claude/hooks/** or .claude/settings*.json — the guard machinery that self-protection makes human-only locally. Edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
-          exit 1
+        run: python3 scripts/check_grader_paths.py
