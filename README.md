@@ -54,7 +54,7 @@ other specific project by name. MIT licensed.
 | Path | What it is |
 |---|---|
 | `.claude/` | Settings (hooks wiring + native `permissions.deny`) + the PreToolUse/PostToolUse/Stop hook suite + advisory SessionStart hook + `test_hooks.py` (the block/allow battery, runs in CI) — [hooks/README.md](.claude/hooks/README.md) |
-| `.claude/skills/` | `/ship` (commit → push → PR → watch CI → stop) and `/new-adr` custom slash-commands |
+| `.claude/skills/` | `/ship` (commit → push → PR → watch CI → stop), `/fix-ci`, `/work` (ticket → PR, pipeline projects only) and `/new-adr` custom slash-commands |
 | `.husky/` + `.secretlintrc.json` | Layer-2 pre-commit: branch block, forbidden paths, worktree-aware secretlint |
 | `.github/workflows/ci.yml` | The kit's own CI (battery, JSON/YAML validation, forbidden paths, secretlint, placeholder integrity) |
 | `.github/pull_request_template.md` | The concise-PR format (≤ ~150 visible words, depth in `<details>`) |

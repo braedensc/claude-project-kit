@@ -199,12 +199,18 @@ Claude doesn't need a tracker; **humans do**, to claim a unit of work. Scale the
 | Scale | Tool |
 |---|---|
 | 2–3 people | **GitHub Issues + a Project board.** Free, next to the code; Claude reads/closes issues via `gh`. Start here. |
-| Small team wanting polish | **Linear** (MCP server — Claude reads a ticket, implements, updates status). |
+| Small team wanting polish | **Linear** (MCP server — Claude reads a ticket, implements, updates status). Optionally the full agentic pipeline: `docs/PIPELINE-CONTRACT.md` + `/work`. |
 | Enterprise | **Jira / Azure DevOps**, usually via MCP. |
 
 Claiming convention: assign the issue to yourself and move it to *In Progress* **before**
 branching. Branch name references the issue (`feat/142-grid-drag`). The loop becomes:
 "Claude, implement #142" → it reads the issue, branches, builds, opens the PR.
+
+**Projects running the delivery pipeline** (those with a `delivery.json`) use the
+stricter form `<type>/<ticket-id-lowercased>-<slug>` — `feat/eng-123-token-refresh` —
+because a guard parses the ticket ID back out of it. Lower-case the team key: the
+branch-naming guard accepts `[a-z0-9-]` only. Everyone else keeps the simpler shape
+above; both satisfy `<type>/<short-kebab-desc>`.
 
 ---
 

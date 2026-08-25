@@ -52,6 +52,10 @@ diff if empty.
    - **Post a summary comment** — `mcp__linear__save_comment` with `issueId` and a short
      `body`: what changed, how it was verified, the PR URL.
 
+   `mcp__linear__*` assumes the server is keyed `linear` in the project's `.mcp.json`; a
+   different key means different tool names here and in `allowed-tools` (an allow rule
+   must name the server literally — a `mcp__*` wildcard is skipped).
+
    > **Never pass `labels` to `save_issue` here.** It **replaces the entire label set**, so
    > writing one label silently drops the rest — and `agent:*` labels are dispatcher-owned
    > anyway (§6): a session must not edit its own supervision. Read `delivery.json` values
