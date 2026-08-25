@@ -334,8 +334,10 @@ Stop hook between them:
    passing checks; no direct or force-push to `main`. The **Hooks change guard** job
    is the server-side twin of self-protection and grader-path protection: a PR that
    touches a grader path — `.claude/hooks/**`, `.claude/settings*.json`,
-   `.github/workflows/**`, and (when configured) `delivery.json` plus its
-   `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
+   `.github/workflows/**`, `scripts/check_*.py`, the dispatch path those graders
+   import (`scripts/pipeline_*.py`, `scripts/jsonschema_mini.py`),
+   `templates/workflows/pipeline-*.yml`, and (when configured) `delivery.json`
+   plus its `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
    `hooks-change` label — and, since that label is the *acknowledgement*, the job
    also checks **who applied it**: a machine identity can never supply it, and a
    bot-authored PR cannot label itself. Local hooks only constrain sessions that run
