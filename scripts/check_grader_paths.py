@@ -5,8 +5,14 @@ label must have been applied by SOMEONE OTHER THAN THE AGENT.
 Grader paths are the machinery that decides whether a change is acceptable —
 the hook scripts and settings files (human-only locally, via hook
 self-protection), the CI workflows that gate the PR, the `scripts/check_*.py`
-graders those workflows run, and, when a project has opted into the agentic
-delivery pipeline, `delivery.json` plus everything in its `autonomy.riskPaths`.
+graders those workflows run, the dispatch path those graders import
+(`scripts/pipeline_*.py`, `scripts/jsonschema_mini.py`), the
+`templates/workflows/pipeline-*.yml` sources the gated workflows are synced
+from, and, when a project has opted into the agentic delivery pipeline,
+`delivery.json` plus everything in its `autonomy.riskPaths`. The test is what a
+change can DO, not what the file is called: see FLOOR below, and the
+exhaustiveness assertion in the selftest that stops a new file escaping the set
+by being named something the globs miss.
 Local self-protection constrains only sessions that RUN the hook; a PR authored
 anywhere else (another clone, the GitHub web UI, an Action) never meets it. This
 job is the layer that does.
@@ -55,19 +61,75 @@ import sys
 import urllib.error
 import urllib.request
 
-# Always gated, in every project, pipeline or not. Kept in step with the
-# PreToolUse hook's self-protected set and its GRADER_PATH_FLOOR.
-# `scripts/check_*.py` is here because those graders ARE the acceptance
-# machinery: the workflows that gate a PR are only as trustworthy as the
-# checkers they shell out to, and gating the workflow while leaving the checker
-# open just moves the soft spot one file over.
+# Always gated, in every project, pipeline or not.
+#
+# THE TEST IS WHAT A CHANGE CAN DO, NOT WHAT THE FILE IS CALLED. A path belongs
+# here when editing it can alter what the pipeline is permitted to do without a
+# person seeing it. Three families qualify, and the rationale is the same one
+# each time — gating a thing while leaving what it *imports* open just moves the
+# soft spot one file over:
+#
+#   1. The guard machinery and the workflows that run it — `.claude/hooks/**`,
+#      `.claude/settings*.json`, `.github/workflows/**`.
+#   2. The graders those workflows shell out to (`scripts/check_*.py`) AND the
+#      dispatch path they import: `scripts/pipeline_*.py` decides whether a
+#      parked ticket dispatches at all (`pipeline_labels.py` resolves the
+#      `agent:needs-human` hold; `pipeline_dispatch_local.py` writes the pin,
+#      which §1 makes the only authority), and `scripts/jsonschema_mini.py` is
+#      the shape layer two gated graders validate through — neuter its
+#      `validate()` and `check_delivery_config.py`'s entire schema half goes
+#      dark with every gate still green.
+#   3. `templates/workflows/pipeline-*.yml`, the shipped source of those
+#      workflows. `.github/workflows/**` is already gated; these files become
+#      exactly that on the next sync, and one of them — pipeline-safe-outputs —
+#      carries inline the rule that stops a session labelling itself
+#      `agent:needs-human`. Their escaping the gate was an accident of the kit
+#      keeping workflows in two directories, not a decision.
+#
+# Deliberately NOT here: the telemetry scripts. Contract §4 makes every value
+# that flows through them reporting only — none may gate a budget, an approval
+# or a merge — so a bad edit costs dashboards, not supervision. UNGATED below
+# records that, and the selftest holds the two sets to covering both directories
+# exhaustively, so a NEW file cannot slip through by being named something the
+# globs miss. That exhaustiveness check, not the naming convention, is what
+# keeps this list honest.
+#
+# NOTE: the PreToolUse hook has its own, narrower GRADER_PATH_FLOOR. The two are
+# deliberately not identical — the hook blocks a pinned session's local edits,
+# this gates any PR from any author — so they are related, not mirrored.
 FLOOR = (
     ".claude/hooks/**",
     ".claude/settings*.json",
     ".github/workflows/**",
     "scripts/check_*.py",
+    "scripts/pipeline_*.py",
+    "scripts/jsonschema_mini.py",
+    "templates/workflows/pipeline-*.yml",
     "delivery.json",
 )
+
+# Every file in the two directories FLOOR reaches into must be either gated or
+# listed here WITH A REASON. The selftest checks both directions, so neither a
+# new ungated file nor a stale entry can sit here quietly.
+UNGATED = {
+    "scripts/telemetry_block.py":
+        "§4: reporting only — its own docstring disclaims authority; no value "
+        "through it may gate a budget, approval or merge",
+    "scripts/telemetry_lifecycle.py": "§4 reporting: emits ticket lifecycle rows",
+    "scripts/telemetry_scrape.py": "§4 reporting: collects blocks into the store",
+    "scripts/telemetry_dashboard.py": "§4 reporting: renders the store",
+    "templates/workflows/backup-cron.yml": "stack template; no supervision role",
+    "templates/workflows/ci.yml": "stack template a project adapts; its own CI gates it there",
+    "templates/workflows/claude.yml": "stack template; the runner, not the rules",
+    "templates/workflows/cron-health.yml": "stack template; no supervision role",
+    "templates/workflows/deploy-on-green.yml": "stack template; no supervision role",
+    "templates/workflows/frontend-uptime.yml": "stack template; no supervision role",
+    "templates/workflows/keepalive.yml": "stack template; no supervision role",
+    "templates/workflows/migration-drift.yml": "stack template; no supervision role",
+    "templates/workflows/pr-conflict-monitor.yml": "stack template; no supervision role",
+}
+# The directories UNGATED must account for, exhaustively.
+COVERED_DIRS = (("scripts", ".py"), ("templates/workflows", ".yml"))
 DELIVERY_FILE = "delivery.json"
 API = "https://api.github.com"
 
@@ -307,9 +369,55 @@ def _selftest():
     expect("floor gates workflows", gated(".github/workflows/ci.yml"), True)
     expect("floor gates THIS grader", gated("scripts/check_grader_paths.py"), True)
     expect("floor gates sibling graders", gated("scripts/check_auto_merge.py"), True)
-    expect("floor leaves ordinary scripts alone", gated("scripts/telemetry_scrape.py"), False)
+    # The dispatch path the graders and workflows import. Named `pipeline_*`,
+    # not `check_*`, and gating supervision the whole time.
+    expect("floor gates the label resolver", gated("scripts/pipeline_labels.py"), True)
+    expect("floor gates the local dispatcher", gated("scripts/pipeline_dispatch_local.py"), True)
+    expect("floor gates the shared schema engine", gated("scripts/jsonschema_mini.py"), True)
+    expect("floor gates the safe-outputs template",
+           gated("templates/workflows/pipeline-safe-outputs.yml"), True)
+    expect("floor gates the dispatch template",
+           gated("templates/workflows/pipeline-dispatch.yml"), True)
+    # …and still leaves alone what carries no supervision authority (§4).
+    expect("floor leaves telemetry alone", gated("scripts/telemetry_scrape.py"), False)
+    expect("floor leaves stack templates alone",
+           gated("templates/workflows/deploy-on-green.yml"), False)
     expect("floor leaves docs alone", gated("docs/SECURITY.md"), False)
     expect("floor leaves src alone", gated("src/app.ts"), False)
+
+    # EXHAUSTIVENESS. The point of the whole exercise: a file that gates
+    # supervision must not escape simply by being named something the globs do
+    # not match. Every file in the covered directories is either gated or
+    # explicitly excused in UNGATED, checked BOTH ways so the ledger cannot rot.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    seen = set()
+    unaccounted = []
+    walked = []
+    for rel_dir, ext in COVERED_DIRS:
+        abs_dir = os.path.join(repo, rel_dir)
+        if not os.path.isdir(abs_dir):
+            # A project that vendored the scripts without the kit's templates dir
+            # is fine; a MISSING scripts/ means this check walked nothing and
+            # would otherwise pass vacuously, so it is asserted below.
+            continue
+        walked.append(rel_dir)
+        for entry in sorted(os.listdir(abs_dir)):
+            if not entry.endswith(ext):
+                continue
+            rel = f"{rel_dir}/{entry}"
+            seen.add(rel)
+            if not gated(rel) and rel not in UNGATED:
+                unaccounted.append(rel)
+    # …and the walk must actually have happened: an empty `unaccounted` proves
+    # nothing if the loop never opened a directory.
+    expect("exhaustiveness walked scripts/", "scripts" in walked, True)
+    expect("every covered file is gated or excused with a reason", unaccounted, [])
+    expect("no UNGATED entry names a file that is gated",
+           sorted(k for k in UNGATED if gated(k)), [])
+    expect("no UNGATED entry names a file that is gone",
+           sorted(k for k in UNGATED if k not in seen), [])
+    expect("every UNGATED entry carries a reason",
+           sorted(k for k, v in UNGATED.items() if not (v or "").strip()), [])
 
     # identity: a machine may never supply the acknowledgement
     expect("bot applier rejected (by type)",

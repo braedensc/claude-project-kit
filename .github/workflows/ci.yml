@@ -174,11 +174,16 @@ jobs:
   # GRADER path must not land unnoticed: it has to carry an explicit
   # `hooks-change` label. The gated set is the guard machinery
   # (.claude/hooks/**, .claude/settings*.json), the CI workflows that gate the PR
-  # itself (.github/workflows/**), and — when a project has opted into the
-  # agentic delivery pipeline — `delivery.json` plus everything in its
-  # `autonomy.riskPaths`, read from the PR's BASE sha (a head that could shorten
-  # its own riskPaths would be grading its own homework). Same job, same label as
-  # before: one flag, not a second taxonomy to keep in sync.
+  # itself (.github/workflows/**), the graders those workflows run
+  # (scripts/check_*.py) together with the dispatch path they import
+  # (scripts/pipeline_*.py, scripts/jsonschema_mini.py) and the
+  # templates/workflows/pipeline-*.yml sources they are synced from, and — when a
+  # project has opted into the agentic delivery pipeline — `delivery.json` plus
+  # everything in its `autonomy.riskPaths`, read from the PR's BASE sha (a head
+  # that could shorten its own riskPaths would be grading its own homework). The
+  # authoritative list is FLOOR in scripts/check_grader_paths.py, whose selftest
+  # asserts every file in the covered directories is gated or explicitly excused.
+  # Same job, same label as before: one flag, not a second taxonomy to keep in sync.
   # Operational notes (learned in production):
   #   - the `hooks-change` label must EXIST in the repo before this job's first
   #     run can pass on a guarded PR (gh label create hooks-change …);
