@@ -630,6 +630,12 @@ Runs only when the pipeline is configured (§2). A `delivery.json` validator MUS
 A validator MUST NOT fail — or emit anything at all — when `delivery.json` is absent.
 That is *off*, not *broken*.
 
+**Implemented by `scripts/check_delivery_config.py`** (`npm run test:delivery` for its
+selftest; both run in CI's *Kit checks*). Every row above is a case in that selftest,
+checked against synthetic configs — the kit ships no live `delivery.json`, so the
+validator is inert here and the selftest is what has teeth. Amending a row means adding
+the case in the same PR.
+
 ---
 
 ## 8. Safe-outputs request file

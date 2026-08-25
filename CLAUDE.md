@@ -113,14 +113,22 @@ than blocks.
 
 ```bash
 npm run test:hooks      # the block/allow battery (must stay green; also runs in CI)
+npm run test:dor        # Definition-of-Ready gate selftest
+npm run test:delivery   # delivery.json validator selftest (PIPELINE-CONTRACT §7)
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
 ```
 
+`scripts/check_delivery_config.py` also runs bare (no `--selftest`) to validate a real
+`delivery.json`. **In this repo that is a silent no-op** — the kit ships only
+`delivery.example.json`, and contract §2 makes an absent `delivery.json` *off*, not
+broken: the validator exits 0 emitting nothing at all.
+
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
-validation, the forbidden-paths gate, placeholder integrity, and secretlint on every
-PR. `main` is protected (that context required, admins enforced).
+validation, the forbidden-paths gate, placeholder integrity, the DoR and delivery-config
+selftests, and secretlint on every PR. `main` is protected (that context required,
+admins enforced).
 
 ---
 

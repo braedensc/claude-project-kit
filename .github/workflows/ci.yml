@@ -57,6 +57,20 @@ jobs:
       - name: Placeholder integrity (used == documented)
         run: python3 scripts/check_placeholders.py
 
+      - name: Definition-of-Ready gate selftest
+        run: python3 scripts/check_ticket_dor.py --selftest
+
+      # The kit ships no live delivery.json, so the validator is inert here by
+      # design (contract §2: absent is OFF). --selftest is what has teeth in CI.
+      - name: delivery.json validator selftest (contract §7)
+        run: python3 scripts/check_delivery_config.py --selftest
+
+      # Belt-and-braces: if a delivery.json ever appears in this repo it is a
+      # mistake (§1 — the kit ships delivery.example.json only), and this run
+      # would catch it as a validation failure rather than shipping it silently.
+      - name: delivery.json validity (no-op unless one exists)
+        run: python3 scripts/check_delivery_config.py
+
       - name: Block forbidden paths (planning/, real .env, key material)
         run: |
           FORBIDDEN=$(git ls-files \
