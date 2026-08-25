@@ -20,7 +20,12 @@ TWO LAYERS, ONE DEFINITION OF SHAPE
     an ID that is RESOLVED rather than merely a string, a path that lands
     outside every worktree ON THIS DISK, `perEffort[e].maxTurns` compared
     against `budgets.maxTurns`, `statePath` against `backend`, the exact
-    `riskPaths` floor, and `branch.types` against the LIVE guard's own regex.
+    `riskPaths` and `labels.required` floors, and `branch.types` against the
+    LIVE guard's own regex.
+
+    A floor is the class a schema is furthest from expressing: the schema says
+    `labels.required` is an array of strings and would accept `[]`, but the
+    empty list is precisely the config that turns the parking brake off.
 
     This is defense in depth, not a handoff. A schema-valid config can still
     carry a UUID that resolves to nothing.
@@ -117,6 +122,19 @@ AUTH_CONTEXTS = ("devSessions", "scheduled", "review")
 # §9: the only backend with a durable store of its own (the `pipeline-state`
 # Actions artifact), hence the only one whose `statePath` may be null.
 SELF_STORING_BACKENDS = ("github-actions",)
+# §6's dispatcher-owned label set, verbatim: the labels a session may never
+# write and the dispatcher reads to decide whether a ticket moves. A project may
+# require MORE keys; it may not require fewer. Validating only the keys a project
+# happens to list makes the parking brake opt-in — empty the list and
+# `agent:needs-human`, the label a person applies to STOP a ticket, degrades from
+# "dispatch refuses" to a stderr warning nobody reads.
+REQUIRED_LABEL_KEYS = (
+    "agent:queued",
+    "agent:working",
+    "agent:blocked",
+    "agent:needs-human",
+    "blocked:capacity",
+)
 REQUIRED_RISK_PATHS = (
     ".claude/hooks/**",
     ".claude/settings*.json",
@@ -494,12 +512,30 @@ def check_state_ids(config, r):
 
 
 def check_labels(config, r):
-    """§7: required keys missing from `ids` or resolving to ""; no `track:*` key."""
+    """§7: the `labels.required` floor; required keys missing from `ids` or
+    resolving to ""; no `track:*` key."""
     labels = dig(config, "linear", "labels")
     if not isinstance(labels, dict):
         return
     ids = labels.get("ids", MISSING)
     required = labels.get("required", MISSING)
+
+    # The floor comes FIRST, and depends only on `required`: the rules below ask
+    # whether each listed key resolves, which says nothing about what must be
+    # listed. Same shape as the `autonomy.riskPaths` floor in check_autonomy.
+    if isinstance(required, list):
+        for needed in REQUIRED_LABEL_KEYS:
+            if needed not in required:
+                r.err(
+                    "linear.labels.required",
+                    f"linear.labels.required is missing '{needed}' (exact "
+                    f"canonical key). §6: the dispatcher-owned lifecycle labels "
+                    f"are the parking brake — a person applies "
+                    f"`agent:needs-human` to stop a ticket, and only membership "
+                    f"here makes a stale ID for it FAIL a read instead of "
+                    f"warning. Dropping one silently re-arms dispatch on tickets "
+                    f"somebody parked. Extend this list, never shorten it.",
+                )
 
     if isinstance(ids, dict) and isinstance(required, list):
         for key in required:
@@ -833,13 +869,22 @@ def good_config():
                     "effort:M": "lbl-m",
                     "effort:L": "lbl-l",
                     "agent:queued": "lbl-queued",
+                    "agent:working": "lbl-working",
+                    "agent:blocked": "lbl-blocked",
+                    "agent:needs-human": "lbl-needs-human",
+                    "blocked:capacity": "lbl-capacity",
                     "provenance:epic": "lbl-prov-epic",
                     "provenance:human": "lbl-prov-human",
                     "hooks-change": "lbl-hooks",
                 },
+                # Built FROM the floor, so a widened floor cannot leave the
+                # fixture quietly invalid. The floor's own contents are pinned
+                # separately in selftest(), because a fixture derived from a
+                # constant cannot notice that constant being emptied.
                 "required": [
                     "effort:S", "effort:M", "effort:L",
-                    "agent:queued", "provenance:epic", "provenance:human",
+                    *REQUIRED_LABEL_KEYS,
+                    "provenance:epic", "provenance:human",
                     "hooks-change",
                 ],
             },
@@ -941,7 +986,38 @@ CASES = [
         ["linear.stateIds"],
     ),
 
-    # §7 — linear.labels
+    # §7 — linear.labels: the floor. `required` is what makes a stale ID fatal
+    # rather than advisory, so shortening it is a supervision change.
+    (
+        "labels-required-drops-a-hold",
+        lambda c: c["linear"]["labels"]["required"].remove("agent:needs-human"),
+        ["linear.labels.required"],
+    ),
+    (
+        "labels-required-drops-capacity",
+        lambda c: c["linear"]["labels"]["required"].remove("blocked:capacity"),
+        ["linear.labels.required"],
+    ),
+    # The whole point of the floor: an EMPTY list resolves every key it lists
+    # (vacuously) and used to pass clean.
+    (
+        "labels-required-empty",
+        lambda c: _set(c, "linear.labels.required", []),
+        ["linear.labels.required"],
+    ),
+    # A project may require MORE than the floor — extending is not an error, and
+    # must stay silent so the floor adds no noise to a config that already meets it.
+    (
+        "labels-required-superset-is-fine",
+        lambda c: (
+            _set(c, "linear.labels.ids.provenance:monitor", "lbl-prov-monitor"),
+            c["linear"]["labels"]["required"].append("provenance:monitor"),
+        ),
+        [],
+    ),
+
+    # §7 — linear.labels: resolution. Does each key the project DID list point
+    # at a real ID?
     (
         "required-not-in-ids",
         lambda c: c["linear"]["labels"]["required"].append("effort:XL"),
@@ -1150,6 +1226,32 @@ def selftest():
     if schema is None:
         print("FAIL: check_delivery_config selftest")
         print(f"  - cannot read {SCHEMA_FILE}; the §1 schema is the shape layer")
+        return 1
+
+    # PRECONDITION: the label floor, pinned to literals and spelled out by hand
+    # on purpose — it must not be derivable from the thing it checks. Every case
+    # below reaches the floor THROUGH the constant (good_config() builds
+    # `required` from it), so an emptied REQUIRED_LABEL_KEYS would otherwise let
+    # the whole battery pass while the guarantee quietly vanished. Checked here,
+    # ahead of the fixtures, and fatal on its own: once the constant has drifted
+    # nothing downstream is measuring what it claims to.
+    floor = {
+        "agent:queued",
+        "agent:working",
+        "agent:blocked",
+        "agent:needs-human",
+        "blocked:capacity",
+    }
+    if set(REQUIRED_LABEL_KEYS) != floor:
+        print("FAIL: check_delivery_config selftest")
+        print(
+            f"  - REQUIRED_LABEL_KEYS drifted from §6's dispatcher-owned label "
+            f"set: missing {sorted(floor - set(REQUIRED_LABEL_KEYS))}, "
+            f"unexpected {sorted(set(REQUIRED_LABEL_KEYS) - floor)}. Shortening "
+            f"this floor downgrades the parking brake from 'dispatch refuses' to "
+            f"a warning; widening it is a §6/§7 contract amendment and must be "
+            f"made in the contract too."
+        )
         return 1
 
     # 0. The guard parser survives reformatting. Both of these have shipped in
@@ -1372,6 +1474,27 @@ def selftest():
     except (OSError, ValueError) as e:
         failures.append(f"cannot read delivery.example.json: {e}")
     else:
+        # The example must SATISFY the floor, not merely be judged by it. The
+        # rule-set assertion below cannot see this: a floor violation reports
+        # under `linear.labels.required`, which the example already expects for
+        # its unfilled placeholders, so a dropped floor key would hide in plain
+        # sight. The example seeds every project's config, so it is asked
+        # directly.
+        note()
+        example_required = dig(example_config, "linear", "labels", "required")
+        if not isinstance(example_required, list):
+            failures.append(
+                "delivery.example.json has no linear.labels.required list"
+            )
+        else:
+            missing = [k for k in REQUIRED_LABEL_KEYS if k not in example_required]
+            if missing:
+                failures.append(
+                    f"delivery.example.json's linear.labels.required omits "
+                    f"{missing} — the example seeds every project's config and "
+                    f"must meet the floor it will be validated against."
+                )
+
         result = run(
             example_config, example, root, worktree_roots(root)[0], schema,
             live_types=live_types, live_source=HOOK_FILE,

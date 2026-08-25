@@ -82,7 +82,7 @@
               "items": {"type": "string"},
               "x-rule": "linear.labels.required",
               "description": "Subset of labels.ids keys that must resolve before the pipeline may dispatch.",
-              "x-fix": "An array of canonical label keys from §6. Every entry must have an entry in labels.ids that resolves to a real ID — guards compare IDs, never display names (§1, §6)."
+              "x-fix": "An array of canonical label keys from §6. Every entry must have an entry in labels.ids that resolves to a real ID — guards compare IDs, never display names (§1, §6). Must include §6's dispatcher-owned set (agent:queued, agent:working, agent:blocked, agent:needs-human, blocked:capacity) — a project may require more, never fewer (§7)."
             }
           }
         }
