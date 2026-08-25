@@ -28,6 +28,11 @@ project reads as enforcing while nothing enforces ([`LESSONS.md`](LESSONS.md)).
 One thing *is* required before any of it works: **[the push credential](#the-push-credential--required-before-any-tier-does-anything)**.
 Without it the dispatcher and the bounce workflow skip, on purpose.
 
+And one thing is easy to misread: the table above is about who **decides**, not who
+**enforces**. Those are different pieces of machinery, and
+[which limits hold under which dispatcher](#which-limits-hold-under-which-dispatcher)
+is the part that catches people out.
+
 ---
 
 ## The rule that outranks everything below
@@ -43,6 +48,119 @@ session. The capability is never held and then restrained. It is never held.
 
 That distinction is the entire security argument, and it collapses if the branch has no
 protection. **Set up the ruleset first.**
+
+---
+
+## Which limits hold under which dispatcher
+
+**Every number in `budgets` is enforced by whatever writes the pin.** Nothing inside a
+session enforces any of them. Contract §1 meters spend against the dispatcher's own
+accounting, and the pin carries only the *resolved* caps — a snapshot the session is told
+about, not a mechanism that stops it. A session that blows through its pinned `maxTurns`
+is not halted by the pin; it is halted by the runner flag the dispatcher passed alongside
+it.
+
+So the question a project actually has to answer is not *"what does `delivery.json`
+say"*. It is **"what started this session, and does that thing read `delivery.json` at
+all?"**
+
+| Limit | Tier 0 — local (`pipeline_dispatch_local.py`) | Tier 1 — CI dispatch (`pipeline-dispatch.yml`) | An external agent daemon |
+|---|---|---|---|
+| `perEffort[e].maxTurns` (clamped by `maxTurns`) | pinned, **advisory** | **enforced** — `--max-turns` on the agent step | not pinned, **not enforced** |
+| `perEffort[e].maxMinutes` | pinned, **advisory** | **enforced** — `timeout-minutes` on the agent step, inside a 120-minute job wall | **none** |
+| `perEffort[e].maxUsd` | pinned, **advisory** | **enforced on the api-key lane** (`--max-budget-usd`); on the subscription lane it is a *reservation* against `dailyUsd`, not a cap on the run | **none** |
+| `wipLimit` | **none** — tier 0 keeps no state record | enforced twice: `max-parallel` within a run, the `working` count across runs | **none** |
+| `totalAttempts` | **none** — a local dispatch consumes no slot | enforced; `claim` increments *before* the session starts | **none** |
+| `dailyUsd` | **none** — reserves nothing | enforced; each ticket's `maxUsd` reserved at dispatch over a rolling 24h | **none** |
+| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | n/a |
+| `fixIterations` | prompt material only | prompt material only | prompt material only |
+
+Tier 0's column is deliberate, and [spelled out below](#tier-0--local-and-why-it-exists) —
+nothing meters a human's own session, which is why `--attempt N` exists so a re-run can
+say which attempt it is honestly. It is the last column that surprises people.
+
+### The last column: a daemon that starts sessions from tracker events
+
+A daemon that watches the tracker, creates a worktree on assignment and starts a session
+in it is **a dispatcher too** — just not one this kit ships, and not one that has agreed
+to any of the above. The class was verified against
+[Cyrus](https://github.com/cyrusagents/cyrus) at `85aeaaa`, read from source on a machine
+where it is not installed. It reads no `delivery.json`, writes no pin, and has no bound of
+its own to substitute: no turn cap on tracker-issue sessions, no wall clock, no spend
+threshold, no concurrency control, no retry ceiling. Its pre-session hook **cannot refuse
+to start a session** — a non-zero exit is caught and logged and the session starts anyway
+— and its teardown hook is handed the issue identifier and nothing else, so it cannot even
+report what a run spent. The evidence is in
+[the ADR](adr/2026-08-25-external-daemon-budget-enforcement.md).
+
+Two consequences, and the second is the one to plan around.
+
+**1. No budget applies.** Not the turn cap, not the wall clock, not the spend cap, not
+WIP, not the attempt counter.
+
+**2. The pin-dependent guards stand down too.** Contract §3 makes an *absent* pin
+deliberately **not** a block — a human's ad-hoc session in a configured repo must never be
+bricked — so an unpinned session is treated as exactly that. In
+`.claude/hooks/pre-tool-use.py` the grader-path half of `scope-fence` is scoped to pinned
+sessions (`:1423`), `ticket-branch` needs a pinned ID (`:1433`), and `pin-binding` blocks
+only on a *malformed, mismatched or expired* pin, never a missing one (`:981`). A session
+this daemon starts therefore gets **fewer** guards than a dispatched one, not more.
+
+What still holds, under every dispatcher, because §2 makes it universal and it lives in
+the hook rather than in the pin: the branch and branch-naming guards, never-merge, the
+secrets and destructive-op guards, cross-worktree, self-protection, and egress.
+
+> **Do not put an enforcement script in such a daemon's pre-session hook.** It has no veto
+> to offer, it is a file *inside the worktree* — the class §3 lists by name as an invalid
+> transport, because the agent's Edit/Write and shell reach all of it — and it executes
+> with the daemon's privileges, outside every agent guard. Zero enforcement value, real
+> escalation value. If you want budgets on this lane, dispatch the ticket with a
+> dispatcher that writes a pin.
+
+### What actually bounds a session nothing is metering
+
+Two operational facts, in the order they matter.
+
+**The credential decides whether a runaway costs money or costs a window.** Under a
+subscription credential (`CLAUDE_CODE_OAUTH_TOKEN`), Claude Code draws on the plan's
+shared usage limits rather than per-token billing, so a runaway consumes a rate-limit
+window and stops — it does not bill. That is the whole point of the `auth` block, and the
+reason `auth.scheduled` and `auth.review` are worth keeping honest.
+
+**A worktree `.env` silently converts that lane into metered spend.** The daemon builds
+each session's environment as *its own env* → *the parsed contents of `<worktree>/.env`* →
+*the runner's own additions*, in that order, re-read on every session
+(`ClaudeRunner.ts:673-680`). The first of those forwards the daemon's
+`CLAUDE_CODE_OAUTH_TOKEN`; an `ANTHROPIC_API_KEY` in the second wins. Claude Code's
+documented behaviour closes the loop: when `ANTHROPIC_API_KEY` is set it "is used instead
+of your Claude Pro, Max, Team, or Enterprise subscription even if you are logged in", and
+"in non-interactive mode (`-p`), the key is always used when present" — which is what an
+unattended session is. **One file, no prompt, and the ceiling changes from a usage window
+to your card.**
+
+The kit's own guards already stop a *session* from creating that file — writing or editing
+a dotenv path is blocked, any Bash command naming one is blocked, and an `sk-ant-…` value
+in file content is blocked separately — each covered in the battery. The realistic path is an
+operator's: a real dotenv file sitting in the persistent checkout and listed in the
+daemon's `.worktreeinclude`, copied into every worktree it creates. **Check that list.**
+
+### The backstop, which works by not being part of this system
+
+Neither fact above is a spend cap, and the kit cannot give you one: every mechanism it has
+lives inside the repo the runaway session is editing. Put the ceiling somewhere this
+system cannot reach.
+
+The Anthropic Console supports a **monthly spend limit per workspace**, API keys are "tied
+to the Workspace they're created in and cannot be moved between Workspaces", and a
+workspace limit may only be set *lower* than the organization's. So: make a workspace for
+pipeline work, mint the key there, and set its limit to what a bad week is allowed to
+cost. That number holds whatever `delivery.json` says, whatever the dispatcher does, and
+whatever a bug in either of them does — which is the only property a backstop needs.
+
+> One claim this section deliberately does **not** make: `CLAUDE_CODE_RETRY_WATCHDOG` is
+> sometimes cited as making a rate-limited session wait rather than die. It is not among
+> Claude Code's documented environment variables and could not be confirmed. Do not build
+> a plan on it.
 
 ---
 
