@@ -1,6 +1,6 @@
 ---
 name: setup-board
-description: Provision and record a project's Linear conventions — read the workspace, diff it against the delivery contract, print the plan, apply only what's missing, then emit delivery.json with real Linear IDs. Idempotent, so re-running doubles as a drift check. Use at bootstrap, or whenever the board and delivery.json may have drifted apart.
+description: Provision and record a project's Linear conventions — read the workspace, diff it against the delivery contract, print the plan, apply only what's missing, then fill delivery.json's Linear IDs and validate it against the contract. Idempotent, so re-running doubles as a drift check. Use at bootstrap, or whenever the board and delivery.json may have drifted apart.
 argument-hint: <team key or name> [--check]
 ---
 
@@ -119,7 +119,7 @@ Concern              Exists                    Contract wants          Action
 Team                 ENG "Engineering"         ENG                     ok
 Status: In Review    — (no state of type       "In Review" (started)   CREATE
                        `started` named that)
-Label: agent:claude  agent:claude (workspace)  workspace               ok
+Label: agent:queued  agent:queued (workspace)  workspace               ok
 Label: risk/high     risk-high (team ENG)      workspace group `risk`  ASK — rename?
 gitBranchFormat      (null → Linear default)   feat/{issueIdentifier}… CONFIRM (org-wide)
 Webhook              — none                    <contract URL>          NEEDS SECRET
@@ -255,40 +255,120 @@ Tell me when both exist and I'll re-read the workspace and continue.
 
 ---
 
-## Step 6 — Emit `delivery.json` (the point of the whole exercise)
+## Step 6 — Fill in `delivery.json` (the point of the whole exercise)
 
-Write **real IDs**, never display names. `docs/PIPELINE-CONTRACT.md` owns the schema —
-follow it exactly where it speaks. The shape below is the minimum this skill guarantees:
+**You do not design this file.** `docs/PIPELINE-CONTRACT.md` §1 owns the schema and
+`delivery.example.json` is the canonical shape — open both. Your job is to replace
+tokens inside the `linear` block with the real IDs you read in step 1:
+
+| You fill | With |
+|---|---|
+| `linear.teamKey` / `linear.workspace` | the team key (uppercase) and the org `urlKey` |
+| `linear.stateIds.{raw,ready,working,review,done}` | the five workflow-state **UUIDs** |
+| `linear.labels.ids.<canonical key>` | each label's Linear **UUID**, as a bare string |
+
+**Every other section — `version`, `github`, `branch`, `stack`, `commands`, `budgets`,
+`auth`, `autonomy`, `dispatch`, `monitoring` — carries through untouched** from
+`delivery.example.json` on a fresh project, or from the existing `delivery.json` on a
+re-run. Those are human-authored policy, not board readings; a re-run that rewrote them
+would silently reset someone's budgets.
+
+So the file you hand over is the example, with the `linear` block resolved:
 
 ```json
 {
+  "version": 1,
   "linear": {
-    "organizationId": "…uuid…",
-    "gitBranchFormat": "feat/{issueIdentifier}-{issueTitle}",
-    "team": { "id": "…uuid…", "key": "ENG", "name": "Engineering" },
-    "states": { "In Review": { "id": "…uuid…", "type": "started" } },
-    "labels": { "agent:claude": { "id": "…uuid…", "scope": "workspace" } },
-    "projects": { "Ideas": { "id": "…uuid…" } }
+    "teamKey": "ENG",
+    "workspace": "acme",
+    "stateIds": {
+      "raw":     "8f1c…",
+      "ready":   "2b40…",
+      "working": "c7d9…",
+      "review":  "51ae…",
+      "done":    "e034…"
+    },
+    "labels": {
+      "ids": {
+        "track:platform": "9a11…",
+        "effort:S": "4c62…",
+        "agent:queued": "7de5…",
+        "…": "… one row per canonical key in §6 …"
+      },
+      "required": ["… unchanged from delivery.example.json …"]
+    }
   },
-  "generatedBy": "setup-board",
-  "generatedAt": "…ISO-8601…"
+  "…": "… every other section exactly as delivery.example.json has it …"
 }
 ```
 
-- Keep the human-readable name **beside** the ID, never instead of it — the name makes
-  the file reviewable, the ID makes it correct.
-- Record what is actually true, including refusals. If the human declined the branch
-  format, write the value the workspace really has.
-- Re-emit the whole file each run; it is derived state, so a rewrite is the update.
-  Show the diff before writing, and if nothing changed, say so — that is the drift
-  check passing.
-- The per-delivery ticket pin (the field the "Ticket link" CI job reads) is written by
-  the *session doing the work*, not by this skill. Leave it untouched when re-emitting.
+Rules that are not negotiable, because guards depend on them:
+
+- **`version` must be present and must be `1`.** The PreToolUse hook treats a config
+  whose `version` it does not recognize as **BROKEN** and fails closed — blocking every
+  `Edit`, `Write` and `Bash` in the repo until a human repairs the file by hand. Handing
+  over a `delivery.json` without `version` bricks the project you were setting up.
+- **Keys are canonical, values are ID strings.** `stateIds` is the closed five-key map
+  `raw/ready/working/review/done` — never keyed by the display name a state happens to
+  have in the UI. If the `review` state is called "In Review", that name belongs in the
+  step-8 report, not in the file. Labels the same: `"agent:queued": "<uuid>"`, never
+  `"agent:queued": {"id": …}` — every consumer indexes `labels.ids[key]` and expects a
+  string. This is §1's corollary: states and labels are referenced by ID, never by
+  display name, so a rename in the UI cannot silently desync a guard.
+- **Do not invent fields.** `organizationId`, `gitBranchFormat`, project IDs, team
+  display names, `generatedBy`/`generatedAt` — none of them exist in §1. A second shape
+  for the same structure is precisely what the contract exists to prevent. Everything
+  you learned that has no schema slot goes in the report.
+- **Merge, do not re-emit.** Read the current `delivery.json` if there is one, replace
+  only the fields in the table above, and leave the rest byte-for-byte. Show the diff
+  before writing; an empty diff is the drift check passing, so say so.
+- **Record what is actually true, including refusals.** If the human declined the branch
+  format in step 3, report the value the workspace really has — do not compensate by
+  editing `branch`.
+- **The pin is not yours.** The dispatcher writes the per-session ticket binding at
+  `<dispatch.pinsRoot>/<sha256(realpath(session root))[:16]>.json`, **outside every
+  worktree and uncommitted**, before the session starts, and deletes it at session end
+  (§3). This skill neither reads nor writes it, and **no ticket ID ever goes in
+  `delivery.json`** — that file is committed per-project config, not per-run state.
 
 ---
 
-## Step 7 — Report
+## Step 7 — Validate before you hand it over
 
-Close with: what already existed, what you created, what the human still owes you, and
-whether `delivery.json` changed. If it changed on a run you expected to be a no-op, that
-is the finding — the board drifted. Say so plainly rather than burying it in the diff.
+Contract §7's checklist is mechanized, and all fifteen rules already run in one command.
+A config that fails it is **broken**, not merely imperfect — §2 says a present-but-invalid
+`delivery.json` fails closed:
+
+```bash
+python3 scripts/check_delivery_config.py
+```
+
+- **Exit 0 is the only acceptable outcome.** If it exits non-zero, fix what it names and
+  run it again. Never report the file as done, and never tell the human it is ready,
+  while the validator is red — you would be handing them a repo that blocks its own next
+  session.
+- Warnings do not fail the run, but read them out loud: an unresolved non-required label
+  ID means a guard reaching for that label gets nothing.
+- If it exits 0 and prints nothing at all, there is no `delivery.json` in the working
+  tree — that is §2's *off*, and it means step 6 did not actually write the file.
+
+---
+
+## Step 8 — Report
+
+Close with: what already existed, what you created, what the human still owes you,
+whether `delivery.json` changed, and the validator's verdict. If the file changed on a
+run you expected to be a no-op, that is the finding — the board drifted. Say so plainly
+rather than burying it in the diff.
+
+This is also where everything with no slot in the §1 schema lives, because it is
+genuinely useful and genuinely not config — write it out as prose, mapped to the
+canonical key it corresponds to:
+
+```
+Workspace   acme (org 8f1c…), gitBranchFormat feat/{issueIdentifier}-{issueTitle}
+Team        ENG "Engineering" (2b40…)
+States      raw "Ideas" · ready "Ready" · working "In Progress" · review "In Review" · done "Done"
+Projects    Ideas (c7d9…)  — triage target, created this run
+Validator   python3 scripts/check_delivery_config.py → OK, 0 errors, 0 warnings
+```

@@ -233,20 +233,36 @@ jobs:
   # `ENG-42`, the branch names they generate are slugged to `eng-42`, and the
   # kit's branch-naming guard accepts lower case only — so a case-SENSITIVE
   # compare would fail every correctly-named branch.
-  #   1. the branch        — `<type>/<ticket>-<slug>`, which is both the only
-  #                          shape the kit's branch guard accepts and what a
-  #                          branch format of `feat/{issueIdentifier}-{issueTitle}`
-  #                          produces. `/setup-board` sets that format.
-  #   2. the PR            — title OR body ("Closes ENG-42"); either satisfies it.
-  #   3. the pinned ticket — `delivery.json`, the session's own record of what it
-  #                          was told to work on. The anchor whenever present.
+  #   1. the branch  — `<type>/<ticket>-<slug>`, which is both the only shape the
+  #                    kit's branch guard accepts and what a branch format of
+  #                    `feat/{issueIdentifier}-{issueTitle}` produces;
+  #                    `/setup-board` sets that format. The agent picks its own
+  #                    branch name, so this is the CANDIDATE, never the authority.
+  #   2. the PR      — title OR body ("Closes ENG-42"); either satisfies it.
+  #   3. the pin     — the dispatcher's snapshot (contract §3), the one source no
+  #                    session can write: it is created outside every worktree
+  #                    before the session starts. CI reaches it through the
+  #                    `pipeline-pin-<TICKET>` artifact, the same resolution
+  #                    templates/workflows/pipeline-review.yml performs. When a
+  #                    pin exists, `pin.branch` must equal this PR's head ref —
+  #                    that equality is what makes source 1 safe to trust.
+  #
+  # `delivery.json` is NOT a pin. Contract §1 makes it committed, human-authored,
+  # per-project config carrying `linear.teamKey` — it holds no ticket ID at all,
+  # and §3 lists "any file inside the worktree" as an invalid pin transport
+  # precisely because the session can edit it. Reading a ticket out of it would
+  # both miss (the key does not exist, so the check silently never fires) and
+  # invert the trust model. It is read here for exactly one thing: the team key.
   #
   # Enablement is by SIGNAL, never by a placeholder token — the job stays silent
   # until the project actually has one:
-  #   - `delivery.json` pins a ticket → strict three-way check;
-  #   - else `vars.TICKET_PREFIXES`   → a repo/org variable (e.g. "ENG,OPS")
+  #   - `delivery.json` present → the pipeline is configured (§2), so every PR
+  #     must come from a `<type>/<teamkey>-<n>-<slug>` branch and the job FAILS
+  #     when it cannot establish an anchor. Presence is a promise; a configured
+  #     repo that skips this check quietly has no check at all.
+  #   - else `vars.TICKET_PREFIXES` → a repo/org variable (e.g. "ENG,OPS")
   #     requiring every PR to come from a ticket branch of a known team;
-  #   - else                          → green with a notice. A project that does
+  #   - else                        → green with a notice. A project that does
   #     not do ticket-linked delivery never sees this job fail.
   #
   # Escape hatches, both deliberate and visible (the same shape as the label gate
@@ -255,10 +271,7 @@ jobs:
   #   gh label create no-ticket --color BFD4F2 \
   #     --description 'PR intentionally not linked to a ticket'
   #
-  # Two things to adapt:
-  #   - PINNED_PATHS — the delivery.json key that holds the ticket. The first
-  #     path that resolves to a ticket-shaped string wins; trim the list to the
-  #     one canonical key once your delivery contract fixes the schema.
+  # One thing to adapt:
   #   - TICKET — the identifier regex, if your tracker is not `TEAM-123` shaped.
   #
   # Untrusted input: on a fork PR the branch name, title and body are all
@@ -270,10 +283,14 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read          # read the dispatcher's pin artifact (contract §3)
     steps:
       - uses: actions/checkout@v4
 
-      - name: Branch, PR and the pinned ticket must name the same issue
+      - name: Branch and PR must name the same ticket
+        id: link
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -288,7 +305,7 @@ jobs:
 
           BRANCH_TYPES = "feat|fix|chore|refactor|docs"
           TICKET = r"[A-Za-z][A-Za-z0-9]{1,5}-[0-9]+"
-          PINNED_PATHS = ("ticket.id", "ticket.identifier", "ticket", "ticketId", "issue.identifier")
+          TEAM_KEY = r"[A-Za-z][A-Za-z0-9]{1,5}"
           SKIP_LABEL = "no-ticket"
 
           head_ref = os.environ.get("HEAD_REF", "")
@@ -299,8 +316,14 @@ jobs:
           prefixes = [p.upper() for p in re.split(r"[,\s]+", os.environ.get("TICKET_PREFIXES", "")) if p]
 
           def notice(msg): print("::notice::Ticket link: " + msg)
+          def emit(**kw):
+              path = os.environ.get("GITHUB_OUTPUT")
+              if not path: return
+              with open(path, "a", encoding="utf-8") as fh:
+                  for k, v in kw.items(): fh.write("%s=%s\n" % (k, v))
           def skip(msg):
               notice(msg + " — nothing to check.")
+              emit(anchor="", configured="false")
               sys.exit(0)
           def token(text, tid):
               return re.search(r"(?<![A-Za-z0-9])" + re.escape(tid) + r"(?![A-Za-z0-9])", text or "", re.I)
@@ -310,27 +333,37 @@ jobs:
           if author_type == "Bot": skip("PR opened by a bot")
           if SKIP_LABEL in labels: skip("PR carries the '%s' label" % SKIP_LABEL)
 
-          pinned, pin_src = None, None
+          # §2: the pipeline is configured iff delivery.json exists. Present but
+          # unreadable is BROKEN — an error, never a silent skip.
           dj = Path("delivery.json")
-          if dj.is_file():
+          configured, team_key = dj.is_file(), None
+          if configured:
               try: data = json.loads(dj.read_text(encoding="utf-8"))
               except (ValueError, OSError) as e:
                   print("::error::Ticket link: delivery.json is present but unreadable (%s)." % e); sys.exit(1)
-              for path in PINNED_PATHS:
-                  cur = data
-                  for part in path.split("."):
-                      cur = cur.get(part) if isinstance(cur, dict) else None
-                  if isinstance(cur, str) and re.fullmatch(TICKET, cur.strip()):
-                      pinned, pin_src = cur.strip().upper(), "delivery.json:" + path
-                      break
+              linear = (data.get("linear") if isinstance(data, dict) else None) or {}
+              key = linear.get("teamKey") if isinstance(linear, dict) else None
+              if not (isinstance(key, str) and re.fullmatch(TEAM_KEY, key.strip())):
+                  print("::error::Ticket link: delivery.json has no usable linear.teamKey (%r). Contract §1 "
+                        "requires it — it is what ties a branch to this project's tracker. Run /setup-board."
+                        % (key,)); sys.exit(1)
+              team_key = key.strip().upper()
 
           lead = re.match(r"^(?:" + BRANCH_TYPES + r")/(" + TICKET + r")(?:-|$)", head_ref, re.I)
           branch_lead = lead.group(1).upper() if lead else None
+          lead_key = branch_lead.split("-")[0] if branch_lead else None
 
-          anchor, anchor_src = None, None
-          if pinned:
-              anchor, anchor_src = pinned, pin_src
-          elif branch_lead and branch_lead.split("-")[0] in prefixes:
+          if configured:
+              if lead_key != team_key:
+                  why = ("leads with %s, whose team key is not %s" % (branch_lead, team_key) if branch_lead
+                         else "has no leading <type>/%s-<n>- segment" % team_key.lower())
+                  print("::error::Ticket link: delivery.json is present, so this repo runs ticket-linked "
+                        "delivery (contract §2) and every PR must come from a %s ticket branch — but '%s' %s."
+                        % (team_key, head_ref, why))
+                  print("Rename the branch to <type>/%s-<n>-<slug>, or add the '%s' label to opt this PR out."
+                        % (team_key.lower(), SKIP_LABEL)); sys.exit(1)
+              anchor, anchor_src = branch_lead, "branch name, team key %s from delivery.json" % team_key
+          elif branch_lead and lead_key in prefixes:
               anchor, anchor_src = branch_lead, "branch name (prefix allow-listed by vars.TICKET_PREFIXES)"
           elif prefixes:
               known = ",".join(prefixes)
@@ -340,31 +373,53 @@ jobs:
                     "ticket branch, but '%s' %s." % (known, head_ref, why))
               print("Rename the branch, or add the '%s' label to opt this PR out." % SKIP_LABEL); sys.exit(1)
           else:
-              skip("no pinned ticket in delivery.json and vars.TICKET_PREFIXES is unset")
+              skip("no delivery.json and vars.TICKET_PREFIXES is unset")
 
           print("Anchor ticket: %s  (from %s)" % (anchor, anchor_src))
-          errors = []
-          if not token(head_ref, anchor):
-              errors.append("branch '%s' does not name %s" % (head_ref, anchor))
-          elif branch_lead and branch_lead != anchor:
-              errors.append("branch '%s' leads with %s but the anchor is %s" % (head_ref, branch_lead, anchor))
-          elif not branch_lead:
-              notice("%s appears in the branch but not as the leading <type>/%s-… segment." % (anchor, anchor.lower()))
-
           if not (token(title, anchor) or token(body, anchor)):
-              errors.append("neither the PR title nor the body mentions %s" % anchor)
+              print("::error::Ticket link: branch and PR disagree — branch '%s' names %s, but neither the "
+                    "PR title nor the body mentions it." % (head_ref, anchor))
+              print("Both must name %s. Fix the mismatch, or add the '%s' label to opt out."
+                    % (anchor, SKIP_LABEL)); sys.exit(1)
 
           extra = [i for i in ids(title) + ids(body) if i != anchor]
           if extra: notice("other ticket IDs mentioned (not checked): %s" % ", ".join(sorted(set(extra))))
-          if pinned and prefixes and pinned.split("-")[0] not in prefixes:
-              notice("pinned %s is outside vars.TICKET_PREFIXES (%s)." % (pinned, ",".join(prefixes)))
-
-          if errors:
-              print("::error::Ticket link: branch, PR, and the pinned ticket disagree — " + "; ".join(errors) + ".")
-              print("All three must name %s. Fix the mismatch, or add the '%s' label to opt out." % (anchor, SKIP_LABEL))
-              sys.exit(1)
-          print("OK: branch, PR title/body, and the pinned ticket all name %s." % anchor)
+          emit(anchor=anchor, configured="true" if configured else "false")
+          print("OK: branch and PR title/body both name %s." % anchor)
           TICKET_CHECK
+
+      # The third source, and the only one no session can write. Best-effort by
+      # design: a PR nobody dispatched has no pin, and that is a notice. A pin
+      # that EXISTS and names a different branch is a hard failure — that is a
+      # session claiming a dispatch it was not given.
+      - name: The dispatcher's pin must name this branch (contract §3)
+        if: steps.link.outputs.configured == 'true' && steps.link.outputs.anchor != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ANCHOR: ${{ steps.link.outputs.anchor }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          id=$(gh api "repos/$REPO/actions/artifacts?name=pipeline-pin-$ANCHOR&per_page=20" \
+                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "::notice::Ticket link: no dispatch pin for $ANCHOR — this PR was not dispatched by the pipeline, so branch and PR agreeing is the whole check."
+            exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/pin.zip"
+          unzip -o -q "$RUNNER_TEMP/pin.zip" -d "$RUNNER_TEMP/pin"
+          pin="$RUNNER_TEMP/pin/pin-$ANCHOR.json"
+          if [ ! -f "$pin" ]; then
+            echo "::error::Ticket link: artifact pipeline-pin-$ANCHOR does not contain pin-$ANCHOR.json. The dispatcher's snapshot is unreadable, so this branch's claim to $ANCHOR cannot be verified."
+            exit 1
+          fi
+          pin_branch=$(jq -r '.branch // empty' "$pin")
+          if [ "$pin_branch" != "$HEAD_REF" ]; then
+            echo "::error::Ticket link: the dispatcher pinned $ANCHOR to branch '$pin_branch', but this PR is on '$HEAD_REF'. A branch naming a ticket it was not dispatched for files the work under the wrong issue."
+            exit 1
+          fi
+          echo "OK: the dispatcher's pin for $ANCHOR names this branch ($HEAD_REF)."
 
   # ── Second-runtime gate (COMMENTED STUB — adapt if any subtree runs a
   #    runtime your main toolchain doesn't) ───────────────────────────────────
