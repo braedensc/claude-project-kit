@@ -8,13 +8,16 @@ enable them.
 
 | Tier | Question | Gate | Ships as |
 |---|---|---|---|
+| **0 — local** | *(nothing runs without a human — a person binds each session by hand)* | `scripts/pipeline_dispatch_local.py` | on, needs no credential |
 | **Dispatch** | may this *approved* ticket start a session? | dispatcher WIP / budget / attempt gates (§9) | on |
 | **Approve** | may this ticket move `raw` → `ready` without a person? | `scripts/check_auto_approve.py` | on for `epic/*` only |
 | **Merge** | may this PR merge without a person? | `scripts/check_auto_merge.py` + the platform ruleset | **off** |
 
 Nothing here is required. A project that never enables the second and third tier still
 gets the whole pipeline — it just has a human at two points in it, which for most teams
-is the right answer for a long time.
+is the right answer for a long time. **Tier 0 is not really an autonomy tier at all** —
+it answers no question without a person — but it belongs in the same table because it is
+the rung the other three are built on, and the one to start from.
 
 One thing *is* required before any of it works: **[the push credential](#the-push-credential--required-before-any-tier-does-anything)**.
 Without it the dispatcher and the bounce workflow skip, on purpose.
@@ -86,6 +89,90 @@ Nothing about this credential lets a session merge. `gh pr merge` is hook-blocke
 every form, and the platform-side gate is branch protection, which lives in repository
 settings. Grant the App or PAT no permission beyond the two above — in particular not
 *Administration* or *Workflows* — and the ruleset in tier 3 stays outside its reach.
+
+---
+
+## Tier 0 — local, and why it exists
+
+**The point of tier 0 is to prove the loop before you build the machine.** A ticket
+becomes a briefed session, becomes the smallest diff, becomes a PR that goes green — all
+of it on one workstation, with no push credential, no Actions secrets, no webhook and no
+queue. What you learn is whether *your tickets* are good enough to work from, which is
+the thing that actually decides whether the higher tiers are worth standing up.
+
+Without it there is no local loop at all. Every guard that binds a session reads a **pin**
+(contract §3), and until this script existed the only thing that wrote one was the GitHub
+Actions dispatcher. So a project that had just gained a `delivery.json` could not run
+`/work`: it resolved `pinsRoot`, computed the pin key, found nothing, and failed closed —
+correctly, because §2 makes *configured + `session_mode: ticket` + missing pin* **broken**,
+not off. The guard was right; the missing half was a human way to write the binding.
+
+### It is a human tool. An agent must never run it.
+
+The pin is the one piece of authority a session cannot write, and that is the whole
+security argument of §3 — everything else the session touches (branch name, PR body,
+ticket comments, env vars, every file in the worktree) is reporting. A session that could
+place its own pin could retarget itself at another ticket, widen its own scope fence, or
+hand itself a budget nobody approved.
+
+So the script refuses to run when it sees a Claude Code / agent environment, and has no
+override flag. That refusal is **tamper-evident, not tamper-proof** — the same posture §3
+takes about `chmod 0444` — because the session's shell runs as the same user. It raises
+the cost and makes a bypass visible; it is not a boundary.
+
+### Using it
+
+```bash
+# 1. bind this worktree to one ticket (reads the COMMITTED delivery.json)
+python3 scripts/pipeline_dispatch_local.py ENG-123
+
+# 2. it prints the branch to create, then work the ticket in a session rooted here
+git checkout -b feat/eng-123-token-refresh
+#   /work ENG-123     ... then /ship
+
+# 3. you are the dispatcher, so you do §3 step 5 as well
+python3 scripts/pipeline_dispatch_local.py --release
+```
+
+`--show` reports what is bound to this worktree using the hook's own vocabulary
+(`ok` / `absent` / `expired` / `mismatch` / `malformed`), which is the fastest way to
+tell a stale pin from an unbound session. `--dry-run` prints the pin without writing it.
+`--ticket-file <json>` dispatches offline from a saved issue object instead of calling
+Linear; otherwise the key is read from `$LINEAR_API_KEY` (the **name** of the variable is
+what `--api-key-env` takes — never the key itself).
+
+Reading a ticket over MCP needs the project's Linear server to be keyed **`linear`** in
+`.mcp.json`: MCP tool names are `mcp__<server-key>__<tool>`, and `/work`, `/ship` and
+`/weekly-review` grant `mcp__linear__*` by that literal name. A server under any other key
+(a connector's opaque UUID, say) leaves the grant matching nothing. `--ticket-file` needs
+no MCP server at all.
+
+### What it deliberately does not do
+
+| | |
+|---|---|
+| Start a session | you do, in your own terminal |
+| Create the branch | it prints the command; the pin records the expected name |
+| Touch ticket state or `agent:*` labels | those stay dispatcher- and human-owned (§6) |
+| Keep a dispatcher state record (§9) | there is none, so a local dispatch consumes no `totalAttempts` slot and reserves no `dailyUsd`. The `budget` block it pins is advisory — nothing meters a human's own session. `--attempt N` exists so a re-run can say which attempt it is honestly. |
+| Invent acceptance criteria | **never.** An empty `## Acceptance criteria` section is a Definition-of-Ready failure (§7), so the script prints the reason and exits non-zero rather than writing a pin with a grader it made up. Criteria written by the thing being graded are not a definition of done. |
+| Merge | nothing in this kit merges. |
+
+Everything else is identical to the CI dispatcher, on purpose: the same pin key
+(`sha256(realpath(session root))[:16]`), the same store, the same write protocol (temp
+file → `fsync` → `0444` → atomic `rename`), the same `ledger.jsonl` row — with
+`"stage": "local-dispatch"` so a hand dispatch is never mistaken for the queue's — and
+the same ticket parser, imported from `scripts/check_ticket_dor.py`. `npm run test:local-dispatch`
+asserts that agreement, including that the hook and the dispatch workflow still derive the
+key the same way.
+
+### Moving on to tier 1
+
+Tier 0 and tier 1 write the same pin into the same place, so they are not compatible in
+the same worktree at the same time: the dispatcher checks out a fresh workspace and pins
+that, and the script refuses to overwrite an existing pin without `--force`. Once the
+queue is running, use tier 0 for the checkouts a person drives by hand and let the
+dispatcher own the ones it creates.
 
 ---
 
@@ -307,6 +394,7 @@ not have a budget.
 Every gate is a plain script. None needs a credential, a network, or a running pipeline:
 
 ```bash
+npm run test:local-dispatch  # the tier-0 dispatcher's battery (incl. key-derivation drift)
 npm run test:approve     # the auto-approval gate's own battery
 npm run test:merge       # the auto-merge tier's battery
 npm run test:telemetry   # the collector's battery

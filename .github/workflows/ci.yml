@@ -90,6 +90,14 @@ jobs:
       - name: delivery.json validity (no-op unless one exists)
         run: python3 scripts/check_delivery_config.py
 
+      # Tier 0, the human-run local dispatcher. Also the drift check on the ONE
+      # pin-key derivation: this script, the PreToolUse hook and
+      # templates/workflows/pipeline-dispatch.yml must agree on
+      # sha256(realpath(session root))[:16], or every pin silently reads as
+      # absent and `/work` fails closed for a reason nobody can see.
+      - name: Local dispatcher selftest (contract §2, §3)
+        run: python3 scripts/pipeline_dispatch_local.py --selftest
+
       # The autonomy gates and the telemetry pipeline. Same posture as the two
       # above: inert in this repo (no delivery.json, no store), so the selftests
       # are what has teeth. Each asserts its own contract rows against synthetic
