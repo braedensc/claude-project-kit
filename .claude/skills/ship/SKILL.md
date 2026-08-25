@@ -1,8 +1,8 @@
 ---
 name: ship
-description: Ship a finished task — commit → push → open a PR (concise body) → move the ticket to review when a pipeline is configured → watch CI to green → stop. Never merges. Use this when work on a feature branch is done and ready for review, or invoke it manually as /ship.
+description: Ship a finished task — commit → push → open a PR (concise body) → queue the ticket's move to review when a pipeline is configured → watch CI to green → stop. Writes to the tracker only through safe-outputs requests. Never merges. Use this when work on a feature branch is done and ready for review, or invoke it manually as /ship.
 argument-hint: [optional one-line summary of the change]
-allowed-tools: Bash(git add *) Bash(git commit *) Bash(git status *) Bash(git branch *) Bash(git push *) Bash(git rev-parse *) Bash(git show *) Bash(gh pr create *) Bash(gh pr view *) Bash(gh pr checks *) Bash(test *) Bash(cat *) Bash(python3 *) mcp__linear__get_issue mcp__linear__save_issue mcp__linear__save_comment
+allowed-tools: Bash(git add *) Bash(git commit *) Bash(git status *) Bash(git branch *) Bash(git push *) Bash(git rev-parse *) Bash(git show *) Bash(gh pr create *) Bash(gh pr view *) Bash(gh pr checks *) Bash(test *) Bash(cat *) Bash(python3 *) mcp__linear__get_issue
 ---
 
 ## Repo state (injected before you start)
@@ -11,6 +11,7 @@ allowed-tools: Bash(git add *) Bash(git commit *) Bash(git status *) Bash(git br
 - Status: !`git status --short`
 - Commits ahead of main: !`git log --oneline origin/main..HEAD 2>/dev/null | wc -l | tr -d ' '`
 - Pipeline configured: !`test -f "$(git rev-parse --show-toplevel 2>/dev/null)/delivery.json" && echo "yes — do step 6" || echo "no — SKIP step 6 entirely"`
+- Safe-outputs channel: !`test -n "$PIPELINE_SAFE_OUTPUTS" && echo "$PIPELINE_SAFE_OUTPUTS" || echo "NONE — \$PIPELINE_SAFE_OUTPUTS unset"`
 
 ## Instructions
 
@@ -42,25 +43,65 @@ diff if empty.
    the branch implies and the values a human would need, and carry on to step 7 —
    attaching a PR to the wrong ticket is worse than attaching it to none.
 
-   With a pinned ticket, make exactly these three updates:
-   - **Move it to the review state** — `mcp__linear__save_issue` with `id` and `state` set
-     to `linear.stateIds.review` from `delivery.json`. Compare and pass **state IDs, never
-     display names**: a rename in the tracker UI must not silently desync the pipeline.
-   - **Attach the PR URL** — the same `save_issue` call, `links: [{ "url": "<PR URL>",
-     "title": "PR #<n>: <title>" }]`. `links` is append-only, so it never disturbs
-     existing attachments.
-   - **Post a summary comment** — `mcp__linear__save_comment` with `issueId` and a short
-     `body`: what changed, how it was verified, the PR URL.
+   **You do not write to the tracker.** You append **write-requests** to the safe-outputs
+   file (§8); a separate job that holds the tracker credential validates the batch against
+   the **dispatcher-supplied** pinned ticket ID and executes only the survivors. On the
+   shipped GitHub Actions backend the session job carries no `LINEAR_API_KEY` at all, so
+   there is no write path to take even if one were wanted. Reads (`mcp__linear__get_issue`)
+   are unaffected and stay direct.
 
-   `mcp__linear__*` assumes the server is keyed `linear` in the project's `.mcp.json`; a
-   different key means different tool names here and in `allowed-tools` (an allow rule
-   must name the server literally — a `mcp__*` wildcard is skipped).
+   The file is the path named by `$PIPELINE_SAFE_OUTPUTS` (basename `requests.json`).
+   **Unset → no validator is collecting:** do not invent a path and never write it inside
+   the worktree; print the requests you would have emitted, say plainly they were not
+   delivered, and carry on to step 7.
 
-   > **Never pass `labels` to `save_issue` here.** It **replaces the entire label set**, so
-   > writing one label silently drops the rest — and `agent:*` labels are dispatcher-owned
-   > anyway (§6): a session must not edit its own supervision. Read `delivery.json` values
-   > from the copy committed on the default branch (`git show origin/<defaultBranch>:delivery.json`),
-   > not the working tree — the working copy sits inside a worktree the session can edit.
+   With a pinned ticket, append exactly these two requests — **append, never overwrite**,
+   since `/work` writes to the same file, and the validator executes requests in array
+   order:
+
+   ```json
+   { "type": "ticket-comment", "ticket_id": "ENG-123", "body": "…what changed, how it was verified, the PR URL…" }
+   ```
+   ```json
+   { "type": "ticket-state", "ticket_id": "ENG-123", "to": "review" }
+   ```
+
+   ```bash
+   # $REQ = a scratch file holding ONE request object as JSON
+   python3 - "$PIPELINE_SAFE_OUTPUTS" "$REQ" <<'PY'
+   import json, os, sys
+   path, req = sys.argv[1], json.load(open(sys.argv[2]))
+   doc = json.load(open(path)) if os.path.exists(path) else {"schema": "pipeline-safe-outputs/1", "requests": []}
+   if doc.get("schema") != "pipeline-safe-outputs/1":
+       sys.exit("refusing to append to an unrecognized schema: %r" % doc.get("schema"))
+   doc["requests"].append(req)
+   os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+   with open(path, "w") as fh:
+       json.dump(doc, fh, indent=2)
+   print("queued %s (%d request(s) pending)" % (req.get("type"), len(doc["requests"])))
+   PY
+   ```
+
+   Four things decide whether the batch survives:
+   - **`to` is the canonical state key `review`** — from `linear.stateIds`, never a UUID
+     and never a display name. The validator resolves the key to an ID itself, reading
+     `delivery.json` from the default branch. `raw`, `ready` and `done` are refused
+     however the caller is configured: `ready` would be self-approval, `done` a session
+     claiming its own merge (§5).
+   - **At most one `ticket-state` in the whole batch.** `/work` never emits one, so this
+     is yours — but a second one anywhere rejects everything.
+   - **The PR URL goes in the comment body.** §8 defines no link-attachment request type,
+     so the summary comment carries the URL; the branch is `<type>/<ticket-id>-<slug>`, so
+     a tracker's own GitHub integration attaches the PR on its own.
+   - **Never queue a `ticket-label` request here.** `agent:*`, `blocked:capacity`,
+     `provenance:*` and `hooks-change` are dispatcher- and human-owned (§6) and are refused
+     in `add` **and** `remove` — a session must not edit its own supervision.
+
+   **One invalid request rejects the entire batch and nothing is applied** (§8). Caps: 20
+   requests, 16 000-char comment bodies. And the batch needs **exactly one** telemetry
+   block (§4) across all its comments — `/work` step 8 queues it. If this session ran
+   without `/work`, queue the block in its own comment, not in the summary above: zero
+   blocks rejects the batch as a `telemetry-required` violation, two as a double-count.
 
 7. **Watch CI to green:** `gh pr checks <n> --watch`. If a check fails, read the log,
    fix, push, re-watch. A `DIRTY` PR is not green — rebase and force-push.
