@@ -5,7 +5,7 @@ Appends a one-line record of every Bash/Edit/Write call to .claude/audit.log.
 The log is gitignored — local only. Review it to see what Claude did in a
 session, especially before a commit.
 
-Distilled from todoclaw's .claude/hooks/audit.py — in production
+Distilled from a production build's .claude/hooks/audit.py — in production
 2026-06-23 → 2026-07-03, unchanged since day one.
 """
 import json
