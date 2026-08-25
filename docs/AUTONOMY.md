@@ -117,6 +117,61 @@ secrets and destructive-op guards, cross-worktree, self-protection, and egress.
 > escalation value. If you want budgets on this lane, dispatch the ticket with a
 > dispatcher that writes a pin.
 
+### The same lane's other half: the tracker credential
+
+A daemon that starts sessions from tracker events has to give them a tracker credential,
+and the one verified here gives them **its own, at full write scope**. The token is
+injected into the session's MCP server set unconditionally
+(`McpConfigService.ts:107-113`), and the default tool list grants the bare *server*
+prefix `mcp__linear` (`allowed-tools-defaults.ts:88`) — which is every tool on that
+server. Removing the prefix from `allowedTools` stops the agent *calling* it; the
+injection happens either way. The `"readOnly"` preset is not an escape: it resolves to
+the Slack default set, which also carries the prefix (`ToolPermissionResolver.ts:60`,
+`allowed-tools-defaults.ts:133`). It is read-only with respect to the *filesystem*, not
+the tracker.
+
+That is weaker than §8's safe-outputs design intends — the whole point there is that a
+session never holds a tracker credential — so the kit's own guard has to carry it. **The
+guard that covers this is `_tracker_write_kind` / `_tracker_write_guards` in
+`.claude/hooks/pre-tool-use.py` (`:1122`, `:1328`).** It is deliberately
+**server-agnostic**: it matches any `mcp__<server>__<tool>` and classifies on the tool
+verb plus self-identifying payload IDs, so it does not care what the tracker server is
+keyed as, or which daemon injected it.
+
+**It does not all survive an unpinned session, and that is the part to plan around:**
+
+| Guard | Under a daemon-started (unpinned) session |
+|---|---|
+| `self-approval` — nothing may move a ticket into `ready` | **holds** — ungated on purpose; a check that would *grant* autonomy fails closed |
+| `lifecycle-label` — no self-applied `agent:*` / `blocked:*` | **stands down** (`:1338`, `if pin:`) |
+| own-ticket-only writes | **stands down** — scoped to `mode == "ticket"`, and the mode comes from the pin |
+| acceptance-criteria integrity | **stands down** — needs a pinned ticket ID to compare against |
+
+So on this lane a session holds a workspace-wide write token and only the approval guard
+stands between it and the board. It cannot approve a ticket. It **can** label one, write
+to a ticket that is not its own, and edit an acceptance criterion.
+
+> **Accepted, in writing.** For any ticket worked by a dispatcher that writes no pin, this
+> kit accepts two gaps rather than papering over them:
+>
+> 1. **No concurrency bound.** `budgets.wipLimit` is not enforced, and there is nothing in
+>    such a daemon to enforce it *with* — it has no limiter of any kind, global or
+>    per-repo. The only control is not queueing more than `wipLimit` tickets at a time,
+>    by hand.
+> 2. **A workspace-scoped tracker write token inside the session**, covered by the
+>    approval guard alone, per the table above.
+>
+> Both are consequences of *choosing that dispatcher*, not defects in the kit, and both
+> disappear the moment the ticket goes through tier 0 or tier 1 instead. Which is the
+> recommendation: **let such a daemon handle ad-hoc assignment, and dispatch pipeline
+> tickets with something that writes a pin.**
+
+One more thing that lane does unconditionally, worth knowing because it is the one piece
+of ticket state it takes over: on session start it moves the issue into the lowest-ordered
+`started` state, with no flag to disable it and failures swallowed
+(`EdgeWorker.ts:4164` → `:5577`). It writes nothing on finish — no move to review, no
+move to done — so the safe-outputs validator is **not** made redundant by it.
+
 ### What actually bounds a session nothing is metering
 
 Two operational facts, in the order they matter.

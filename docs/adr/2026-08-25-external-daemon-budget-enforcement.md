@@ -14,6 +14,12 @@ The rule this generalizes: **`delivery.json`'s `budgets` are enforced by whateve
 writes the pin.** A dispatcher that does not read the config enforces nothing in
 it, and no amount of documentation inside the repo changes that.
 
+Two gaps on that lane are **accepted in writing** rather than papered over: no
+`wipLimit` (nothing in such a daemon can enforce one), and a workspace-scoped
+tracker write token inside the session, covered by the `self-approval` guard
+alone. Both vanish the moment the ticket is dispatched by something that writes a
+pin, which is the standing recommendation.
+
 ## Why
 
 The specific surface offered was `cyrus-setup.sh`: a per-repo hook that an
@@ -43,7 +49,33 @@ executing outside every agent guard. Zero enforcement value, real escalation
 value. Step 2's constraint — *must not be writable by a session, must not read
 anything a session can author* — is not merely unmet; it is inverted.
 
-### The three alternatives, and why each loses
+### A wrapper, the other half of the same option
+
+The option paired "a wrapper" with the setup hook, and the two are not the same surface.
+The runner does expose the seams a wrapper would need — `pathToClaudeCodeExecutable`,
+`extraArgs`, `spawnClaudeCodeProcess` (`packages/claude-runner/src/types.ts:76-84`,
+threaded through at `ClaudeRunner.ts:739-742`) — and injecting `--max-turns` /
+`--max-budget-usd` through any of them would be a **real ceiling**, applied outside the
+session by something the session does not run.
+
+It is rejected on availability, not on principle: **nothing in the daemon ever sets
+them.** They are unset SDK-passthrough fields with no operator-facing config key — the
+edge-worker never writes any of the three, and neither `RepositoryConfigSchema` nor
+`EdgeConfigSchema` has a field that would. Reaching them means editing the daemon, which
+is option 4 with extra steps.
+
+That leaves the one wrapper that needs no cooperation: a `claude` shim earlier on the
+**daemon's** `PATH`, appending the flags before exec'ing the real binary. It is the
+strongest idea in the option set and it is deliberately not built here, for three
+reasons. It intercepts *every* `claude` invocation on the machine, including the
+operator's own interactive sessions, so its blast radius is far wider than the lane it
+polices. It must resolve which repo it is dispatching for — and its cwd is the worktree,
+which is agent-writable, so a naive implementation reads its limits from the thing being
+limited. And none of it can be tested here: the daemon is not installed, and shipping an
+untested privileged shim into a user's `PATH` is precisely the trade Step 2 says to
+refuse. It is written up as the viable-but-unbuilt option rather than shipped blind.
+
+### The remaining alternatives, and why each loses
 
 **Teardown as an observer.** `cyrus-teardown.sh` is handed only
 `LINEAR_ISSUE_IDENTIFIER` (`GitService.ts:1248-1256`) — no cost, no turn count —
@@ -59,6 +91,18 @@ possible. Acting on the count is not — there is no veto to attach it to. This
 would also have needed `dispatch.statePath`, which the contract reserves for
 exactly this and which is currently `null`; the point is moot, and the field stays
 unclaimed.
+
+**Enforcing inside the session**, via a mid-run checkpoint the agent consults. Rejected
+for the reason the option itself gives: the thing being limited is doing the limiting.
+The contract already settles this class — `fixIterations` is prompt material precisely
+because a self-applied number is a thrift knob, not a safety one, and §4 makes a
+session's own telemetry reporting that can never buy it more budget. A checkpoint is
+useful for making a session *stop tidily*; it is not a ceiling.
+
+**Contributing limits upstream.** The right long-term answer and no help now: bus factor
+1, unpredictable timeline, and nothing to run in the meantime. It is also not mutually
+exclusive with anything here — the decision below stands whether or not the daemon later
+grows its own caps, because the rule it encodes is about pins, not about one tool.
 
 **Bounding it from inside the session.** The kit's own guard machinery is the one
 thing here that *is* self-protected and does have a veto. It cannot help: it has
@@ -118,6 +162,40 @@ organization's. A key minted in a capped workspace holds its cap whatever
   operator's own file copied in via the daemon's `.worktreeinclude`
   (`WorktreeIncludeService.ts:35-47`), which is why `AUTONOMY.md` tells operators
   to check that list rather than telling agents anything.
+
+- **The tracker token is injected unconditionally, and the bare server prefix is
+  granted.** `McpConfigService.ts:107-113` writes `Authorization: Bearer
+  ${linearToken}` into the session's MCP server set; `mcp__linear` — the *server*
+  prefix, i.e. every tool on it — is in `LINEAR_DEFAULT_ALLOWED_TOOLS`
+  (`allowed-tools-defaults.ts:88`) and in `SLACK_DEFAULT_ALLOWED_TOOLS` (`:133`),
+  which is what the `"readOnly"` preset resolves to
+  (`ToolPermissionResolver.ts:60`). The token reaches the SDK as an in-memory
+  `mcpServers` object (`ClaudeRunner.ts:625`, `:717`), **not** as a file the
+  daemon writes into the worktree — so "the token sits in a file the session can
+  read" is not established from this source; whether the SDK materializes it is
+  an SDK question this checkout cannot answer.
+- **The guard covering it survives an unpinned session only in part** — and this
+  corrects the assumption that `agent:*` ownership still applies. In
+  `.claude/hooks/pre-tool-use.py:1328`, only the approval guard is ungated;
+  `lifecycle-label` is behind `if pin:` (`:1338`), and own-ticket scoping and
+  acceptance-criteria integrity both key off a pinned ticket ID. A daemon-started
+  session therefore *can* set `agent:*` labels, write to a ticket that is not its
+  own, and edit an acceptance criterion. That fail-open direction is §3's
+  deliberate choice — an ad-hoc human session must not be bricked — so the fix is
+  not to flip it wholesale. Making `lifecycle-label` unconditional is separable
+  and worth its own ticket: §6 makes `agent:*` dispatcher-owned for *every*
+  writer, and a human's ad-hoc session has no more business setting
+  `agent:working` than an agent's does.
+- **One unconditional ticket write.** `EdgeWorker.ts:4164` → `:5577` moves the
+  issue to the lowest-ordered `started` state on session start, with no disabling
+  flag and failures swallowed. Nothing is written on finish, so the safe-outputs
+  validator is not made redundant. `NoopActivitySink` exists and is exported
+  (`sinks/NoopActivitySink.ts:12`, `sinks/index.ts:14`) but is instantiated
+  nowhere, tests included — it is not an off switch.
+- **Per-PR serialization is real but irrelevant here.** `EdgeWorker.ts:235-237`
+  keeps one in-flight session per GitHub PR with an unbounded FIFO behind it,
+  because those sessions share a worktree. It is not a global limiter and does
+  not touch the tracker-issue path.
 
 **Not verified, and stated as such.** The daemon is not installed here, so nothing
 above was observed on a running system — in particular whether the kit's own
