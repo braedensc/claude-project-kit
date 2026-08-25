@@ -73,6 +73,72 @@ Keep the *shape* when you swap datastores: local/disposable stays frictionless, 
 
 > Bash *operator* guards (redirects, `rm`, mutation verbs) are scoped per shell command: the pattern gap excludes `;`, `&`, `|`, so an unrelated later command on the same line isn't a false positive. The **secret-path guard is deliberately whole-command** — `wc x; grep KEY .env` is still a secret read, wherever the path sits.
 
+### Pipeline guards — inert unless `delivery.json` exists
+
+Six guards for the optional **agentic delivery pipeline** (`docs/PIPELINE-CONTRACT.md`:
+tickets → Claude Code sessions → PRs). They are **off for every project that never
+adopted the pipeline**, and off is not broken: the *only* discriminator is whether
+`delivery.json` exists at the repo root, the existence test runs **before anything that
+can fail**, and absence exits 0 with no output, no git and no network. A fail-closed
+guard whose *precondition* is missing would take every manual project hostage — and
+since the guard machinery is self-protected, the agent could not repair it (the
+bootstrap-order lesson, `docs/LESSONS.md`).
+
+**Everything these guards trust comes from the dispatcher, never from the session.** A
+branch name, a PR body, a ticket comment, an env var and every file inside the worktree
+are all agent-mutable, so:
+
+- the pinned ticket, session mode and ticket snapshot are read from a **pin file outside
+  the worktree** (`<pinsRoot>/<sha256(session root)[:16]>.json`, `pinsRoot` defaulting to
+  `~/.claude/pipeline/pins`);
+- config **values** are read from the committed copy on the default branch
+  (`git show origin/main:delivery.json`), never from the working-tree copy — a battery
+  case pins that a fully disarmed working-tree `delivery.json` moves nothing;
+- states and labels are compared **by ID**, never by display name, so a rename in the
+  tracker UI cannot silently desync a guard.
+
+| Guard | Active when | What it blocks |
+|---|---|---|
+| **State transition / self-approval** | configured | Any tracker write setting a ticket to the configured `ready` state — **an approval is a human's action**. The one narrow exception is the pinned ticket itself when *all* of: `"epic"` ∈ `autonomy.autoApproveProvenance`, provenance is `epic/<ID>`, the definition of ready is complete (acceptance criteria, `effort:S\|M\|L`, `track:*`, title), and the session changes **no** risk-listed path. Monitor-, review- and retro-filed tickets can never auto-approve — that is exactly the path an attacker-influenced payload would take to mint itself a mandate. A project closes the exception entirely by emptying `autoApproveProvenance` |
+| **Own-ticket-only writes** | configured + pinned | Tracker mutations outside the session's own ticket (decision table below) |
+| **AC integrity** | configured + pinned ticket | Editing the session's **own in-progress** ticket's description / acceptance criteria / title. Review compares the PR against the snapshot taken at dispatch, so a session that can rewrite its own ACs can make scope creep look compliant — the ticket-layer twin of weakening a test assertion. Comments and status changes stay allowed |
+| **Grader-path protection** | configured + pinned | Edit/Write **and** Bash mutations of `.github/workflows/**`, `delivery.json`, and every glob in `autonomy.riskPaths` — the machinery that decides whether the work is acceptable. Uses the *same* operator scaffold as self-protection (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/…`, any interpreter naming the path); reads and `git add` stay allowed. **Hook scripts and `settings*.json` remain blocked unconditionally, pipeline or not** — nothing here made that mode-conditional |
+| **Ticket-branch** | configured + `branch.requireTicketId` | Edit/Write/`git commit` on a branch whose ticket segment isn't the pinned ID. The branch regex is lower-case only, so tracker IDs **must** be lower-cased (`feat/eng-123-token-refresh`) and the comparison is case-**in**sensitive |
+| **Pin binding** | configured | A malformed pin, an unrecognized `pin_version`, or a pin written for a **different worktree** — a hard stop, not a warning |
+
+**Own-ticket-only writes — the decision table** (the approval guard above applies on top
+of every row):
+
+| Session state | Own ticket | Another ticket | No resolvable target |
+|---|---|---|---|
+| pipeline off, or no pin (a human's ad-hoc session) | allow | allow | allow |
+| `ticket` mode | allow | **deny** | **deny** for issue writes (fail closed); allow for comments |
+| `ticket` mode, **create**-type call (no target) | — | — | **deny** — file out-of-scope bugs through a safe-outputs request instead |
+| `ticket` mode, pin carries **no ticket ID** | **deny every tracker write** | **deny** | **deny** |
+| `planning` / `diagnosis` / `maintenance` | allow | allow **in-team**; deny another team's key | allow |
+
+**Fail direction is tested, not just asserted.** Write-blocking guards, state
+transitions and pin checks fail **closed**; checks that merely *withhold* autonomy from
+an unpinned session fail **open**, so a human's ad-hoc session in a configured repo is
+never bricked. An adversary must not be able to flip a guard open by inducing an error,
+so the battery covers the error paths too: a broken `delivery.json`, an unrecognized
+version, a malformed pin, an expired pin, a foreign-worktree pin, and a changed-file set
+that cannot be computed. One deliberate carve-out: when the config is broken, editing
+`delivery.json` itself stays allowed, so the repo is never held hostage by its own
+config.
+
+**Known limits** (documented rather than implied): the pin is *tamper-evident, not
+tamper-proof* — the session's shell runs as the same user, so `0444` and a path outside
+the repo raise the cost of deleting or rewriting a pin without making it impossible; a
+deleted pin degrades to the unpinned (fail-open-for-withholding) path, and the ledger is
+what makes that divergence visible. Tracker mutations are recognized by tool **verb**
+plus self-identifying payload values (a configured state/label ID, or a
+`<teamKey>-<n>` identifier as a whole field value), deliberately *not* by MCP server
+name — Claude Code names servers however the user wired them. An unknown verb carrying a
+configured ID is treated as a write; an unknown verb with no such fingerprint is not
+seen. The real backstop stays what it always was: nothing lands without a reviewed PR
+and CI.
+
 ---
 
 ## Stop — `stop-pr-check.py`
@@ -147,7 +213,7 @@ Appends a one-line timestamped record of every `Bash`/`Edit`/`Write` call to `.c
 python3 .claude/hooks/test_hooks.py
 ```
 
-142 block/allow cases covering every guard above, plus 5 assertions that block reasons arrive **on stderr** (the stream exit 2 relays) — the self-protection cases (edit/mutate a hook → block, incl. the widened git/chmod/awk/interpreter net and `settings.local.json`; read/stage → allow, incl. that a redirect must *target* a protected path), the path-target secret-read cases (`xxd`/`od`/`strings`/`grep`/`base64`/`source`/`node -e` on `.env.local` block; `process.env`, `obj.key`, `.env.example` allow), the egress-guard cases (exfil shapes to unknown hosts block, as do the `evil-github.com` and `linear.app.evil.tld` lookalikes — one per allowlist tier, so the domain-boundary match is regression-gated for stack-specific entries too; the same shapes to allowlisted hosts and plain GETs allow), the anchored-`rm` false-positive filenames, the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, run with cwd at the sandbox root so results don't depend on this repo's current branch or CI's detached HEAD), real-worktree sandboxes for the cross-worktree guard **including the item-7 subagent cases** (controlled cwd + `CLAUDE_PROJECT_DIR`: a genuine subagent's own-worktree writes allow, parent-checkout writes block, branch checks follow the acting session) **and the cwd-attack cases** (a main session that cd'd, or a cwd inside an unrelated repo, can never widen the root — each of these fails against a cwd-derived-root implementation), the fail-closed crafted-`tool_input` case, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
+209 block/allow cases covering every guard above, plus 9 assertions that block reasons arrive **on stderr** (the stream exit 2 relays) — the self-protection cases (edit/mutate a hook → block, incl. the widened git/chmod/awk/interpreter net and `settings.local.json`; read/stage → allow, incl. that a redirect must *target* a protected path), the path-target secret-read cases (`xxd`/`od`/`strings`/`grep`/`base64`/`source`/`node -e` on `.env.local` block; `process.env`, `obj.key`, `.env.example` allow), the egress-guard cases (exfil shapes to unknown hosts block, as do the `evil-github.com` and `linear.app.evil.tld` lookalikes — one per allowlist tier, so the domain-boundary match is regression-gated for stack-specific entries too; the same shapes to allowlisted hosts and plain GETs allow), the anchored-`rm` false-positive filenames, the v2 prose-stripping allows, sandboxed branch-guard/branch-naming cases (throwaway git repos pinned to `main` / `master` / a codename / a feature branch, run with cwd at the sandbox root so results don't depend on this repo's current branch or CI's detached HEAD), real-worktree sandboxes for the cross-worktree guard **including the item-7 subagent cases** (controlled cwd + `CLAUDE_PROJECT_DIR`: a genuine subagent's own-worktree writes allow, parent-checkout writes block, branch checks follow the acting session) **and the cwd-attack cases** (a main session that cd'd, or a cwd inside an unrelated repo, can never widen the root — each of these fails against a cwd-derived-root implementation), the fail-closed crafted-`tool_input` case, merged-PR and never-merge guard cases against a **mocked `gh`** (no network), the **pipeline-guard cases** (throwaway repos with a committed `delivery.json` and a real dispatcher pin written outside the worktree — including four that pin *off is not broken* for projects without the pipeline, the adversarial disarmed-working-tree-config case, both casings of the ticket-branch comparison, a case for each of the two places a grader path is declared, and the fail-direction cases for broken config / malformed / expired / foreign-worktree pins), and Stop-hook cases including the DIRTY-PR block (its exit-0 + JSON-decision protocol, plus the dedup that prevents nag loops). Runs in CI on every PR; also available as `npm run test:hooks`
 (and the repo-wide secret scan as `npm run lint:secrets`). **If you edit a hook, add a
 case — and keep docs/COLLABORATION.md's "What's automatic (enforcement)" section in
 sync.**

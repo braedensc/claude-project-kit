@@ -32,16 +32,23 @@ building this kit — see docs/LESSONS.md.)
 
 Layout:
   1. UNIVERSAL GUARDS — keep these in every project.
+  1b. PIPELINE GUARDS — inert unless the project opted into the agentic
+     delivery pipeline (docs/PIPELINE-CONTRACT.md); the discriminator is the
+     existence of `delivery.json` at the repo root, and everything they trust
+     comes from the DISPATCHER (a pin file outside the worktree, config read
+     from the default branch), never from the session.
   2. STACK-SPECIFIC GUARDS — Supabase/Postgres examples at the bottom;
      replace them for your datastore, keep the *shape* (protect remote,
      allow local).
 """
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 
 def block(reason: str) -> None:
@@ -167,7 +174,17 @@ BRANCH_HELP = (
 # one such branch once landed UNRENAMED in a real PR. Blocking Edit/Write/commit the same
 # way the main/master guard does forces a rename before any work, not just a
 # reminder. (Fails open on an empty branch string, e.g. outside a repo.)
-BRANCH_NAME_RE = re.compile(r"^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*$")
+# The `ticket` group is OPTIONAL, so the language this accepts is unchanged for
+# every project: `feat/grid-drag` matches exactly as before. It exists so the
+# pipeline's `ticket-branch` guard can REQUIRE it when `branch.requireTicketId`
+# is on (docs/PIPELINE-CONTRACT.md §1). The class is lower-case only, so tracker
+# IDs must be lower-cased in a branch name (`feat/eng-123-token-refresh`) and the
+# branch-vs-pinned-ID comparison is case-INsensitive.
+BRANCH_NAME_RE = re.compile(
+    r"^(?:feat|fix|chore|refactor|docs)/"
+    r"(?:(?P<ticket>[a-z0-9]+-\d+)-)?"
+    r"[a-z0-9][a-z0-9-]*$"
+)
 BRANCH_NAME_HELP = (
     "Branch `{branch}` doesn't match this repo's naming convention "
     "(`<type>/<short-kebab-desc>`, type = feat|fix|chore|refactor|docs — see "
@@ -398,14 +415,22 @@ def _is_self_protected(path: str) -> bool:
 # rewrite the file no matter which flags it was launched with) — so validate hook
 # DRAFTS in a scratch dir under a different filename, not against the live path.
 _SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|audit\.py|\.claude[/\\]settings(?:\.local)?\.json)"
-_SELF_MUTATE_RE = re.compile(
-    r">>?\s*['\"]?[^\s'\"|&;<>]*?" + _SELF_PROT +                     # redirect INTO a protected path
-    r"|\btee\b[^|;&]*?" + _SELF_PROT +                                # tee protected
-    r"|\b(?:sed|perl)\b[^|;&]*\s-[a-zA-Z]*i\b[^|;&]*?" + _SELF_PROT + # sed -i / perl -i protected
-    r"|\b(?:cp|mv|rm|ln|install|truncate|dd|shred|unlink|chmod|chown|awk)\b[^|;&]*?" + _SELF_PROT +  # cmd -> protected
-    r"|\bgit\b[^|;&]*\b(?:checkout|restore|reset|clean|stash|apply|rm|mv)\b[^|;&]*?" + _SELF_PROT +  # git working-tree rewrite of protected
-    r"|\b(?:python3?|node|deno|ruby)\b[^|;&]*?" + _SELF_PROT          # interpreter invocation naming protected
-)
+def _mutate_re(path_re: str):
+    """The write/mutation operator scaffold, aimed at whatever path shape is
+    passed in. Factored out (behavior-identical for self-protection) so the
+    pipeline's grader-path guard applies the SAME operator net to the risk-listed
+    paths instead of growing a second, drifting copy."""
+    return re.compile(
+        r">>?\s*['\"]?[^\s'\"|&;<>]*?" + path_re +                     # redirect INTO the path
+        r"|\btee\b[^|;&]*?" + path_re +                                # tee it
+        r"|\b(?:sed|perl)\b[^|;&]*\s-[a-zA-Z]*i\b[^|;&]*?" + path_re + # sed -i / perl -i
+        r"|\b(?:cp|mv|rm|ln|install|truncate|dd|shred|unlink|chmod|chown|awk)\b[^|;&]*?" + path_re +
+        r"|\bgit\b[^|;&]*\b(?:checkout|restore|reset|clean|stash|apply|rm|mv)\b[^|;&]*?" + path_re +
+        r"|\b(?:python3?|node|deno|ruby)\b[^|;&]*?" + path_re          # interpreter naming it
+    )
+
+
+_SELF_MUTATE_RE = _mutate_re(_SELF_PROT)
 
 
 # ── Secret-file target match (Bash) ─────────────────────────────────────────────
@@ -507,6 +532,655 @@ def _egress_hosts(cmd: str):
         ):
             hosts.append(m.group(1))
     return hosts
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1b. PIPELINE GUARDS — inert unless the project opted into the agentic
+#     delivery pipeline (docs/PIPELINE-CONTRACT.md). Added 2026-08-24.
+# ════════════════════════════════════════════════════════════════════════════
+# THE GOVERNING PRINCIPLE: everything a guard trusts comes from the DISPATCHER,
+# never from the session. A branch name, a PR body, a ticket comment, an env
+# var and every file inside the worktree are all agent-mutable — the kit already
+# learned once that a guard's anchor must not be something the model can move
+# (docs/adr/2026-08-23-hook-hardening-and-session-root.md). So the pinned ticket,
+# the session mode and the ticket snapshot are read from a PIN FILE OUTSIDE the
+# worktree, and the pipeline's own config values are read from the COMMITTED copy
+# on the default branch (`git show origin/main:delivery.json`), never from the
+# working-tree copy the session can edit.
+#
+# ONE DISCRIMINATOR (contract §2): the pipeline is configured for a project IFF
+# `delivery.json` exists at the repo root. Absent → every guard below exits
+# immediately, before parsing anything, before touching git or the network. Most
+# projects that adopt this kit will never run a pipeline and must see no change
+# at all; conflating *off* with *broken* would brick every manual project, and
+# because the guard machinery is self-protected the agent could not repair it
+# (the hook-bootstrap-order lesson, docs/LESSONS.md).
+#
+# FAIL DIRECTION: write-blocking and state-transition guards fail CLOSED; checks
+# that merely WITHHOLD autonomy from an unpinned (human, ad-hoc) session fail
+# OPEN. An adversary must not be able to flip a guard open by inducing an error.
+DELIVERY_FILE = "delivery.json"
+DELIVERY_VERSION = 1
+PIN_VERSION = 1
+
+# The default branch is resolved by trying these refs in order rather than by
+# reading `github.defaultBranch` out of the working tree: the working-tree copy
+# is inside the agent's worktree, so trusting it to pick the ref we then read the
+# trusted values from would be circular.
+_CONFIG_REFS = ("origin/main", "origin/master", "main", "master")
+
+PIPELINE_BROKEN_HELP = (
+    "🔒 `delivery.json` is present but BROKEN ({source}) — the agentic delivery "
+    "pipeline fails closed on a misconfiguration (docs/PIPELINE-CONTRACT.md §2). "
+    "Absence of the file is *off* and harmless; presence is a promise. Fix or "
+    "remove the file — edits to `delivery.json` itself stay allowed so the repo "
+    "is never taken hostage by its own config."
+)
+PIN_BROKEN_HELP = (
+    "🔒 Dispatcher pin {status} for this session root.\n"
+    "  pin file:     {path}\n"
+    "  session root: {root}\n"
+    "A pin binds one session to one ticket, and a reader must verify it "
+    "(docs/PIPELINE-CONTRACT.md §3). A malformed pin, or one written for a "
+    "different worktree, is a hard stop — not a warning. Ask the dispatcher to "
+    "re-dispatch, or delete the stale pin file."
+)
+GRADER_PATH_HELP = (
+    "🔒 `{path}` is a risk-listed (grader) path and this is a PINNED agent "
+    "session (mode: {mode}). Guard machinery, CI workflows and the pipeline's own "
+    "config are the things that decide whether your work is acceptable — a "
+    "session that can edit them can grade its own homework. Changes here need a "
+    "human: describe the change in the PR body or file a follow-up ticket "
+    "instead. (Configured via `autonomy.riskPaths` in delivery.json; hook "
+    "scripts and settings files are blocked unconditionally, pipeline or not.)"
+)
+GRADER_PATH_BASH_HELP = (
+    "🔒 That command would modify a risk-listed (grader) path — CI workflows, "
+    "`delivery.json`, or another glob in `autonomy.riskPaths`. In a pinned agent "
+    "session those are human-only, for the same reason the hook scripts are: a "
+    "session must not be able to edit the machinery that judges it. Reading them "
+    "(cat/grep) is fine."
+)
+TICKET_BRANCH_HELP = (
+    "🔒 Branch `{branch}` does not carry this session's pinned ticket ID. "
+    "`branch.requireTicketId` is on, so the branch must be "
+    "`<type>/{ticket}-<short-kebab-desc>` (the ID lower-cased — the branch-naming "
+    "guard rejects upper-case). Rename before continuing:\n"
+    "  git branch -m {suggested}"
+)
+READY_HELP = (
+    "🔒 Moving a ticket into the pipeline's `ready` state is an APPROVAL, and "
+    "approving work is a human's action. Blocked because {why}\n"
+    "Only `epic/<ID>` provenance — work decomposed from an epic a person already "
+    "approved — can ever auto-approve; monitor-, review- and retro-filed tickets "
+    "always wait in `raw` for a person, because that is precisely the path an "
+    "attacker-influenced payload would take to mint itself a mandate. Post a "
+    "comment asking for approval instead."
+)
+OWN_TICKET_HELP = (
+    "🔒 This session is pinned to {ticket} and may not write to {targets}. "
+    "A `ticket`-mode session writes to its OWN ticket only "
+    "(docs/PIPELINE-CONTRACT.md §3) — otherwise one dispatch can reach across the "
+    "whole board. Report anything you found out of scope in your PR body, or file "
+    "it through a safe-outputs request the dispatcher can act on."
+)
+OWN_TICKET_UNRESOLVED_HELP = (
+    "🔒 This session is pinned to {ticket}, and this issue write names no ticket "
+    "the guard can resolve to it. Issue mutations fail CLOSED: pass the human "
+    "identifier ({ticket}) rather than an internal UUID so the binding is "
+    "checkable. (Comments — the reporting channel — are not affected.)"
+)
+NO_PINNED_TICKET_HELP = (
+    "🔒 This session's pin says `session_mode: ticket` but carries no ticket ID, "
+    "so no tracker write can be checked against it. Fails closed: all tracker "
+    "writes are blocked until the dispatcher writes a valid pin "
+    "(docs/PIPELINE-CONTRACT.md §3)."
+)
+CREATE_TICKET_HELP = (
+    "🔒 A `ticket`-mode session may not create tickets. An agent that can file "
+    "its own work items can widen its own mandate one ticket at a time. Put the "
+    "out-of-scope bug in your PR body or emit a safe-outputs request; a human (or "
+    "the dispatcher, out of session) files it."
+)
+TEAM_SCOPE_HELP = (
+    "🔒 This session's team is `{team}`; the write targets {targets}. "
+    "`{mode}`-mode sessions get team-scoped writes, not workspace-wide ones."
+)
+AC_INTEGRITY_HELP = (
+    "🔒 Editing {fields} on {ticket} — this session's OWN in-progress ticket — is "
+    "blocked. Review compares the PR against the acceptance criteria snapshotted "
+    "at dispatch, so a session that can rewrite its own ACs can make scope creep "
+    "look compliant. It is the ticket-layer twin of weakening a test assertion. "
+    "Comments and status changes stay allowed: say what changed, and let a human "
+    "amend the ticket."
+)
+
+
+def _pipeline_configured() -> bool:
+    """Contract §2's ONE discriminator, and nothing that can fail may run ahead of
+    it. A working-tree stat: cheap, offline-safe, and loud to defeat (deleting a
+    tracked file lands in the diff, and `delivery.json` is itself risk-listed)."""
+    try:
+        return os.path.isfile(os.path.join(PROJECT_ROOT, DELIVERY_FILE))
+    except Exception:
+        return False
+
+
+_CONFIG_CACHE = None
+
+
+def _read_delivery_config():
+    """(config, source) — config values from the COMMITTED copy on the default
+    branch, NOT from the working tree. The working-tree copy sits inside the
+    agent's worktree; reading it would let a session raise its own budgets or
+    blank the state ID this hook matches on. Falls back to the working tree only
+    when no candidate ref carries the file at all — the adoption PR, where
+    nothing is dispatching anyway. `(None, source)` means BROKEN."""
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
+    raw, source = None, None
+    for ref in _CONFIG_REFS:
+        try:
+            r = subprocess.run(
+                ["git", "-C", PROJECT_ROOT, "show", f"{ref}:{DELIVERY_FILE}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                raw, source = r.stdout, f"{ref}:{DELIVERY_FILE}"
+                break
+        except Exception:
+            continue
+    if raw is None:
+        try:
+            with open(os.path.join(PROJECT_ROOT, DELIVERY_FILE)) as fh:
+                raw, source = fh.read(), f"{DELIVERY_FILE} (working tree — adoption)"
+        except Exception:
+            _CONFIG_CACHE = (None, DELIVERY_FILE)
+            return _CONFIG_CACHE
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        _CONFIG_CACHE = (None, source)
+        return _CONFIG_CACHE
+    # "A reader that does not recognize the value must refuse to run, not guess."
+    if not isinstance(cfg, dict) or cfg.get("version") != DELIVERY_VERSION:
+        _CONFIG_CACHE = (None, source)
+        return _CONFIG_CACHE
+    _CONFIG_CACHE = (cfg, source)
+    return _CONFIG_CACHE
+
+
+def _clean_id(v) -> str:
+    """A resolved config ID, or "" for a blank or an unresolved bootstrap
+    placeholder token. Guards compare state and label IDs, never display names —
+    a rename in the tracker UI must not silently desync a guard (contract §1)."""
+    if not isinstance(v, str):
+        return ""
+    v = v.strip()
+    return "" if (not v or "{{" in v) else v
+
+
+def _parse_iso_utc(s):
+    if not isinstance(s, str) or not s.strip():
+        return None
+    try:
+        d = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _pin_path(cfg) -> str:
+    root = ((cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins")
+    root = os.path.expanduser(root if isinstance(root, str) else "")
+    key = hashlib.sha256(PROJECT_ROOT.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(root, key + ".json")
+
+
+def _read_pin(cfg):
+    """(pin, status, path). status ∈ ok | absent | malformed | mismatch.
+
+    `absent` covers a genuinely missing pin AND an expired one — contract §3:
+    "past it, the pin is stale; readers treat it as absent". Absence never GRANTS
+    autonomy (the approval guard still fails closed), but it must not brick a
+    human's ad-hoc session in a configured repo either."""
+    path = _pin_path(cfg)
+    try:
+        if not os.path.isfile(path):
+            return None, "absent", path
+        with open(path) as fh:
+            pin = json.load(fh)
+    except Exception:
+        return None, "malformed", path
+    if not isinstance(pin, dict) or pin.get("pin_version") != PIN_VERSION:
+        return None, "malformed", path
+    exp = _parse_iso_utc(pin.get("expires_at"))
+    if exp is None:
+        return None, "malformed", path
+    if exp <= datetime.now(timezone.utc):
+        return None, "absent (expired)", path
+    wt = pin.get("worktree")
+    try:
+        if not isinstance(wt, str) or os.path.realpath(wt) != PROJECT_ROOT:
+            return None, "mismatch", path
+    except Exception:
+        return None, "mismatch", path
+    return pin, "ok", path
+
+
+# ── payload walking (MCP tool_input is arbitrary JSON) ─────────────────────────
+def _walk_items(obj, depth=0):
+    """(key_or_None, value) for every node, so a guard can match on a FIELD NAME
+    (acceptance criteria) or on a VALUE (a state UUID) wherever it is nested."""
+    if depth > 12:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield (k if isinstance(k, str) else None), v
+            for pair in _walk_items(v, depth + 1):
+                yield pair
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            for pair in _walk_items(v, depth + 1):
+                yield pair
+
+
+def _payload_strings(inp):
+    return [v.strip() for _k, v in _walk_items(inp) if isinstance(v, str) and v.strip()]
+
+
+_ANY_TICKET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,9}-\d+$")
+
+
+def _payload_ticket_ids(inp):
+    """Ticket identifiers that are a WHOLE field value — `{"id": "ENG-123"}`, not
+    "fixes ENG-123" inside a PR title. Prose mentions are reporting, not targets."""
+    return {s.upper() for s in _payload_strings(inp) if _ANY_TICKET_RE.match(s)}
+
+
+def _payload_has_value(inp, needle: str) -> bool:
+    return bool(needle) and any(s == needle for s in _payload_strings(inp))
+
+
+# ── tracker (MCP) write classification ────────────────────────────────────────
+# Server-name agnostic on purpose: Claude Code names MCP servers however the user
+# wired them (often an opaque id), so keying on "is this the Linear server" would
+# be the weakest link. We key on the TOOL VERB plus self-identifying payload
+# values (a configured state/label ID, or a `<teamKey>-<n>` identifier).
+_MCP_NAME_RE = re.compile(r"^mcp__(?P<server>.+?)__(?P<tool>.+)$")
+_TRACKER_READ_PREFIXES = ("get_", "list_", "search_", "read_", "fetch_", "describe_",
+                          "extract_", "resolve_")
+# Mutation vocabulary. EXTENSION POINT: add YOUR tracker MCP's mutation tools.
+# Add a battery case in test_hooks.py for every entry you add.
+_TRACKER_ISSUE_CREATE_TOOLS = frozenset({"create_issue", "issue_create", "add_issue"})
+_TRACKER_ISSUE_WRITE_TOOLS = frozenset({
+    "save_issue", "update_issue", "issue_update", "update_issue_status",
+    "archive_issue", "unarchive_issue", "delete_issue",
+})
+# Upserts: the SAME verb creates when no target is given and updates when one is.
+_TRACKER_UPSERT_TOOLS = frozenset({"save_issue"})
+_TARGET_KEYS = ("id", "issueid", "issue_id", "identifier", "ticketid", "ticket_id")
+_TRACKER_OTHER_WRITE_TOOLS = frozenset({
+    "save_comment", "create_comment", "update_comment", "delete_comment",
+    "save_document", "save_project", "save_milestone", "save_release",
+    "save_release_note", "save_status_update", "delete_status_update",
+    "create_issue_label", "save_diff_comment", "delete_diff_comment",
+    "submit_diff_review", "resolve_diff_thread", "merge_diff",
+    "create_attachment", "create_attachment_from_upload",
+    "prepare_attachment_upload", "delete_attachment",
+})
+
+
+def _has_target_key(inp) -> bool:
+    """Does the payload name an EXISTING issue at all? Deliberately independent of
+    whether the value is a resolvable `<teamKey>-<n>` identifier: an opaque UUID is
+    still a target, and an issue write whose target cannot be resolved to the pin
+    must fail CLOSED as an update, not be waved through as a create."""
+    for k, v in _walk_items(inp):
+        if k and k.lower().replace("-", "_").replace("_", "") in (
+                t.replace("_", "") for t in _TARGET_KEYS):
+            if isinstance(v, str) and v.strip():
+                return True
+    return False
+
+
+def _tracker_write_kind(tool, inp, cfg):
+    """None | issue-create | issue-write | write — what kind of tracker mutation
+    this tool call is, or None if it isn't one.
+
+    An MCP tool whose verb we don't recognize is treated as a write when its
+    payload carries a configured state/label ID or a `<teamKey>-<n>` identifier:
+    an unknown verb must not be a free pass, and a payload naming the pipeline's
+    own IDs is self-identifying."""
+    m = _MCP_NAME_RE.match(tool or "")
+    if not m:
+        return None
+    base = m.group("tool").lower()
+    if base.startswith(_TRACKER_READ_PREFIXES):
+        return None
+    if base in _TRACKER_ISSUE_CREATE_TOOLS:
+        return "issue-create"
+    if base in _TRACKER_ISSUE_WRITE_TOOLS:
+        if base in _TRACKER_UPSERT_TOOLS and not _has_target_key(inp):
+            return "issue-create"        # upsert with no target = a create
+        return "issue-write"
+    if base in _TRACKER_OTHER_WRITE_TOOLS:
+        return "write"
+    lin = cfg.get("linear") or {}
+    known = {_clean_id(v) for v in (lin.get("stateIds") or {}).values()}
+    known |= {_clean_id(v) for v in ((lin.get("labels") or {}).get("ids") or {}).values()}
+    known.discard("")
+    if any(_payload_has_value(inp, k) for k in known) or _payload_ticket_ids(inp):
+        return "write"
+    return None
+
+
+_AC_FIELDS = {"description", "descriptiondata", "acceptancecriteria", "body", "title"}
+
+
+def _ac_fields_present(inp):
+    hit = []
+    for k, v in _walk_items(inp):
+        if not k or k.lower().replace("_", "").replace("-", "") not in _AC_FIELDS:
+            continue
+        if (isinstance(v, str) and v.strip()) or isinstance(v, (list, dict)) and v:
+            hit.append(k)
+    return sorted(set(hit))
+
+
+def _dor_gaps(ticket):
+    """What the ticket snapshot is missing to be Ready. Derived entirely from the
+    dispatcher-written pin — never from anything the session can edit."""
+    gaps = []
+    acs = ticket.get("acceptance_criteria")
+    if not (isinstance(acs, list) and any(isinstance(a, str) and a.strip() for a in acs)):
+        gaps.append("no acceptance_criteria")
+    if str(ticket.get("effort") or "").strip().upper() not in ("S", "M", "L"):
+        gaps.append("no effort:S|M|L")
+    if not str(ticket.get("track") or "").strip():
+        gaps.append("no track:*")
+    if not str(ticket.get("title") or "").strip():
+        gaps.append("no title")
+    return gaps
+
+
+# ── risk / grader paths ───────────────────────────────────────────────────────
+# `.claude/hooks/**` and `.claude/settings*.json` are blocked UNCONDITIONALLY by
+# self-protection above, pipeline or not — nothing here makes that mode-scoped.
+# These are the ADDITIONAL paths a PINNED agent session may not touch.
+GRADER_PATH_FLOOR = (".github/workflows/**", DELIVERY_FILE)
+
+
+def _grader_globs(cfg):
+    globs = list(GRADER_PATH_FLOOR)
+    for g in ((cfg.get("autonomy") or {}).get("riskPaths") or []):
+        if isinstance(g, str) and g.strip() and g.strip() not in globs:
+            globs.append(g.strip())
+    return globs
+
+
+def _glob_to_re(pat: str) -> str:
+    """git-style glob → regex over a '/'-separated repo-relative path."""
+    out, i = [], 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append(r"(?:[^/]+/)*"); i += 3
+        elif pat.startswith("**", i):
+            out.append(r".*"); i += 2
+        elif pat[i] == "*":
+            out.append(r"[^/]*"); i += 1
+        elif pat[i] == "?":
+            out.append(r"[^/]"); i += 1
+        else:
+            out.append(re.escape(pat[i])); i += 1
+    return "".join(out)
+
+
+def _matches_any_glob(rel: str, globs) -> bool:
+    return any(re.match("^" + _glob_to_re(g) + "$", rel) for g in globs)
+
+
+def _repo_rel(path: str):
+    """Repo-relative POSIX path, or None when the target is outside this worktree
+    (the cross-worktree guard above owns that case)."""
+    if not path:
+        return None
+    try:
+        ap = os.path.realpath(path)
+        if os.path.commonpath([ap, PROJECT_ROOT]) != PROJECT_ROOT:
+            return None
+        return os.path.relpath(ap, PROJECT_ROOT).replace(os.sep, "/")
+    except Exception:
+        return None
+
+
+_BASH_SEG = r"[^\s'\"|&;<>/\\]*"
+
+
+def _glob_to_bash_re(pat: str) -> str:
+    """The Bash-scanning twin of _glob_to_re: matches the same path shape as a
+    shell TOKEN (either separator, arbitrary directory prefix). A leading `**/`
+    becomes one-or-more segments, so an extension-only glob like `**/*.key`
+    cannot match a bare `'.key'` in a jq filter — bare secret files are already
+    covered unconditionally by the secret-path guard above. The trailing lookahead
+    is the complement of the token class, so a match must END a shell token:
+    without it, an extension glob matched INSIDE a longer name (`src/api.keys`)."""
+    out, i = [], 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append(r"(?:" + _BASH_SEG + r"[/\\])+"); i += 3
+        elif pat.startswith("**", i):
+            out.append(r"[^\s'\"|&;<>]*"); i += 2
+        elif pat[i] == "*":
+            out.append(_BASH_SEG); i += 1
+        elif pat[i] == "?":
+            out.append(r"[^\s'\"|&;<>/\\]"); i += 1
+        elif pat[i] == "/":
+            out.append(r"[/\\]"); i += 1
+        else:
+            out.append(re.escape(pat[i])); i += 1
+    return (r"(?<![\w.$~/\\-])(?:[^\s'\"|&;<>]*[/\\])?" + "".join(out)
+            + r"(?=[\s'\"|&;<>]|$)")
+
+
+def _grader_mutate_re(globs):
+    """The SAME operator scaffold self-protection uses, aimed at the grader set —
+    adding a path means adding it in two places (this Bash regex and the
+    Edit/Write glob set), which is why the battery carries a case for each."""
+    return _mutate_re("(?:" + "|".join(_glob_to_bash_re(g) for g in globs) + ")")
+
+
+def _session_changed_paths(pin, cfg):
+    """Repo-relative paths this session changes vs its base — committed AND
+    working-tree. Raises on any failure; the caller treats that as "a risk-path
+    change cannot be ruled out" and blocks."""
+    base = (pin or {}).get("base_branch") or (cfg.get("github") or {}).get("defaultBranch") or "main"
+    ref = None
+    for cand in (f"origin/{base}", base):
+        r = subprocess.run(
+            ["git", "-C", PROJECT_ROOT, "rev-parse", "--verify", "--quiet", cand + "^{commit}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            ref = cand
+            break
+    if ref is None:
+        raise RuntimeError("base ref not found")
+    paths = set()
+    r = subprocess.run(
+        ["git", "-C", PROJECT_ROOT, "diff", "--name-only", f"{ref}...HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0:
+        raise RuntimeError("git diff failed")
+    paths.update(p.strip() for p in r.stdout.splitlines() if p.strip())
+    r = subprocess.run(
+        ["git", "-C", PROJECT_ROOT, "status", "--porcelain"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0:
+        raise RuntimeError("git status failed")
+    for line in r.stdout.splitlines():
+        if len(line) > 3:
+            paths.add(line[3:].split(" -> ")[-1].strip().strip('"'))
+    return {p for p in paths if p}
+
+
+def _branch_ticket(branch: str):
+    """The ticket segment of a branch name, or None. Lower-case by construction —
+    BRANCH_NAME_RE is `[a-z0-9-]` only, so tracker IDs MUST be lower-cased in a
+    branch and every comparison against a pinned ID is case-INsensitive."""
+    m = BRANCH_NAME_RE.match(branch or "")
+    return m.group("ticket") if m else None
+
+
+# ── the guards themselves ─────────────────────────────────────────────────────
+def _approval_guard(cfg, pin, ticket, pinned_id, targets):
+    """State-transition / self-approval. A GRANTING check: every rung fails
+    CLOSED, including the ones that fail because something could not be verified.
+    A project closes the narrow allow-path entirely by dropping "epic" from
+    `autonomy.autoApproveProvenance` — which is the posture
+    docs/PIPELINE-CONTRACT.md §5 describes ("only out of session")."""
+    auto = (cfg.get("autonomy") or {}).get("autoApproveProvenance") or []
+    if "epic" not in auto:
+        block(READY_HELP.format(
+            why="`autonomy.autoApproveProvenance` does not list \"epic\", so no "
+                "in-session approval is possible in this project."))
+    if not pin or not pinned_id or not ticket:
+        block(READY_HELP.format(
+            why="this session has no dispatcher pin, so the ticket's provenance and "
+                "definition of ready cannot be verified from anything the session "
+                "did not write itself."))
+    if targets != {pinned_id}:
+        named = ", ".join(sorted(targets)) or "no resolvable ticket"
+        block(READY_HELP.format(
+            why=f"the write targets {named}, not this session's pinned ticket "
+                f"{pinned_id}."))
+    prov = str(ticket.get("provenance") or "").strip()
+    if not re.match(r"^epic/\S+$", prov):
+        block(READY_HELP.format(
+            why=f"the pinned ticket's provenance is {prov or 'unset'!r}, not "
+                "`epic/<ID>`."))
+    gaps = _dor_gaps(ticket)
+    if gaps:
+        block(READY_HELP.format(
+            why="the pinned ticket does not meet the definition of ready (" +
+                "; ".join(gaps) + ")."))
+    try:
+        changed = _session_changed_paths(pin, cfg)
+    except Exception as exc:
+        block(READY_HELP.format(
+            why=f"this session's changed-file set could not be computed "
+                f"({type(exc).__name__}), so a risk-path change cannot be ruled out."))
+    risky = sorted(p for p in changed if _matches_any_glob(p, _grader_globs(cfg)))
+    if risky:
+        block(READY_HELP.format(
+            why="this session changes risk-listed paths (" + ", ".join(risky[:5]) +
+                "), which always need a human."))
+
+
+def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id):
+    team = str((cfg.get("linear") or {}).get("teamKey") or "").strip().upper()
+    ready = _clean_id(((cfg.get("linear") or {}).get("stateIds") or {}).get("ready"))
+    targets = _payload_ticket_ids(inp)
+    foreign = {t for t in targets if team and not t.startswith(team + "-")}
+
+    # ── 1. state transition into `ready` — matched by state ID, never by name ──
+    if ready and _payload_has_value(inp, ready):
+        _approval_guard(cfg, pin, ticket, pinned_id, targets)
+
+    # ── 2. own-ticket-only writes ─────────────────────────────────────────────
+    if mode == "ticket":
+        if not pinned_id:
+            block(NO_PINNED_TICKET_HELP)          # broken pin → deny every write
+        if kind == "issue-create":
+            block(CREATE_TICKET_HELP)
+        if kind == "issue-write":
+            if targets != {pinned_id}:
+                if targets:
+                    block(OWN_TICKET_HELP.format(
+                        ticket=pinned_id, targets=", ".join(sorted(targets))))
+                block(OWN_TICKET_UNRESOLVED_HELP.format(ticket=pinned_id))
+        elif targets and targets != {pinned_id}:
+            # Non-issue writes (comments, attachments) with an UNRESOLVABLE target
+            # are deliberately allowed: comments are the contract's required
+            # reporting channel (§4) and blocking them would brick every terminal
+            # run. Naming someone else's ticket outright is still a block.
+            block(OWN_TICKET_HELP.format(
+                ticket=pinned_id, targets=", ".join(sorted(targets - {pinned_id}))))
+    elif mode in ("planning", "diagnosis", "maintenance"):
+        # Team-scoped, not workspace-wide — and the approval guard above still
+        # applies to every one of these writes.
+        if foreign:
+            block(TEAM_SCOPE_HELP.format(
+                team=team, mode=mode, targets=", ".join(sorted(foreign))))
+    # No pin (a human's ad-hoc session in a configured repo) → this WITHHOLDING
+    # check fails OPEN by design; the approval guard above already failed closed.
+
+    # ── 3. AC integrity — no rewriting your own definition of done ────────────
+    if kind == "issue-write" and pinned_id and pinned_id in targets:
+        fields = _ac_fields_present(inp)
+        if fields:
+            block(AC_INTEGRITY_HELP.format(fields=", ".join(fields), ticket=pinned_id))
+
+
+def _pipeline_guards(tool, inp) -> None:
+    """Contract §2's fixed check order: existence → parse/validate → mode."""
+    if not _pipeline_configured():
+        return                       # OFF. Nothing that can fail runs before this.
+    tool = tool or ""
+    mutating = tool in ("Edit", "Write", "NotebookEdit", "Bash") or tool.startswith("mcp__")
+    cfg, source = _read_delivery_config()
+    if cfg is None:
+        # BROKEN → fail closed, but never take the repo hostage: editing
+        # `delivery.json` itself stays open so the config can be repaired
+        # in-session (the bootstrap-order lesson, docs/LESSONS.md), and reads are
+        # untouched so it can be diagnosed.
+        if not mutating:
+            return
+        if tool in ("Edit", "Write", "NotebookEdit") and _repo_rel(
+                inp.get("file_path", "") or inp.get("notebook_path", "")) == DELIVERY_FILE:
+            return
+        block(PIPELINE_BROKEN_HELP.format(source=source or DELIVERY_FILE))
+
+    pin, pin_status, pin_file = _read_pin(cfg)
+    if pin_status in ("malformed", "mismatch") and mutating:
+        block(PIN_BROKEN_HELP.format(status=pin_status, path=pin_file, root=PROJECT_ROOT))
+
+    ticket = pin.get("ticket") if (pin and isinstance(pin.get("ticket"), dict)) else None
+    mode = str((pin or {}).get("session_mode") or "").strip().lower()
+    pinned_id = str((ticket or {}).get("id") or "").strip().upper()
+
+    # ── grader-path protection (scoped to PINNED agent sessions) ──────────────
+    if pin:
+        globs = _grader_globs(cfg)
+        if tool in ("Edit", "Write", "NotebookEdit"):
+            rel = _repo_rel(inp.get("file_path", "") or inp.get("notebook_path", ""))
+            if rel and _matches_any_glob(rel, globs):
+                block(GRADER_PATH_HELP.format(path=rel, mode=mode or "pinned"))
+        if tool == "Bash" and _grader_mutate_re(globs).search(
+                _strip_prose(inp.get("command", ""))):
+            block(GRADER_PATH_BASH_HELP)
+
+    # ── ticket-branch: the branch must carry the PINNED id, case-insensitively ─
+    if (cfg.get("branch") or {}).get("requireTicketId") and pinned_id:
+        touches_branch = (
+            (tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")))
+            or (tool == "Bash" and re.search(
+                r"\bgit\s+commit\b", _strip_prose(inp.get("command", ""))))
+        )
+        if touches_branch:
+            branch = _current_branch()
+            bt = _branch_ticket(branch)
+            if branch and (not bt or bt.upper() != pinned_id):
+                block(TICKET_BRANCH_HELP.format(
+                    branch=branch, ticket=pinned_id.lower(),
+                    suggested=f"feat/{pinned_id.lower()}-<short-kebab-desc>"))
+
+    kind = _tracker_write_kind(tool, inp, cfg)
+    if kind:
+        _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id)
 
 
 # ── Bash prose-stripping ──────────────────────────────────────────────────────
@@ -795,6 +1469,13 @@ def _dispatch(data) -> None:
                 "Destructive SQL (DROP/TRUNCATE/DELETE) against a remote database is "
                 "blocked. Run destructive changes only on the local DB, via migrations."
             )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # 1b. PIPELINE GUARDS — LAST, so every universal guard's message wins over
+    #     a pipeline one, and so the whole section is a single no-op `stat` for
+    #     the projects (most of them) that never adopted the pipeline.
+    # ═════════════════════════════════════════════════════════════════════════
+    _pipeline_guards(tool, inp)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
