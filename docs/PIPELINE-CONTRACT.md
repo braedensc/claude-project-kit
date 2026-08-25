@@ -103,7 +103,7 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 | `stateIds.review` | string (UUID) | dispatcher, reviewer | PR open, awaiting review/CI. |
 | `stateIds.done` | string (UUID) | dispatcher | Merged/closed. |
 | `labels.ids` | object → string (UUID) | dispatcher, guards | Map of **canonical key → Linear label ID**. The key is the stable name used in code; the Linear display name may drift from it. |
-| `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. |
+| `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. **Floored at §6's dispatcher-owned set** (`agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity`) — a project may require more, never fewer. |
 
 > **States and labels are referenced by ID, never by display name.** A rename in the
 > Linear UI must not silently desync a guard — with names, a renamed "Ready" state stops
@@ -121,7 +121,12 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 > *diagnostic* — an unmapped label whose name matches a canonical key means the recorded
 > ID is wrong, not that the label is somebody else's. Severity follows `labels.required`
 > (§7's dial): fatal for a required key, a warning otherwise, because `track:*` is
-> open-ended and project-named so it can never be in `required`. One implementation —
+> open-ended and project-named so it can never be in `required`. **That dial has a
+> floor** — membership in `labels.required` is what buys a key the fatal tier, so an
+> empty list would demote every hold to a warning and re-arm dispatch on parked
+> tickets. §7 therefore requires the dispatcher-owned set to be in it.
+>
+> One implementation —
 > `scripts/pipeline_labels.py` — imported by every read path, never re-derived.
 >
 > Residual gap, named so nobody assumes otherwise: a label **renamed and then
@@ -700,6 +705,7 @@ Runs only when the pipeline is configured (§2). A `delivery.json` validator MUS
 
 - [ ] `version` unrecognized
 - [ ] Any `linear.stateIds.*` empty or still a `{{…}}` token
+- [ ] `linear.labels.required` missing any of `agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity` — the §6 dispatcher-owned floor; membership is what makes a stale ID for a hold **fail** a read rather than warn
 - [ ] Any key in `linear.labels.required` missing from `linear.labels.ids`, or resolving to `""`
 - [ ] No `track:*` key present in `linear.labels.ids`
 - [ ] `branch.types` containing a type the live branch guard rejects
