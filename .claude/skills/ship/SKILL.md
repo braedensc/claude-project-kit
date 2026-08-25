@@ -99,9 +99,29 @@ diff if empty.
 
    **One invalid request rejects the entire batch and nothing is applied** (§8). Caps: 20
    requests, 16 000-char comment bodies. And the batch needs **exactly one** telemetry
-   block (§4) across all its comments — `/work` step 8 queues it. If this session ran
-   without `/work`, queue the block in its own comment, not in the summary above: zero
-   blocks rejects the batch as a `telemetry-required` violation, two as a double-count.
+   block (§4) across all its comments, **valid** against
+   `schemas/telemetry-block.schema.json` and not merely carrying the marker — the
+   validator checks the shape now, so a malformed block fails here instead of being
+   dropped without a word by the collector.
+
+   `/work` queues that block in its step 9, *after* this skill returns, so it can report
+   the PR number and the two lifecycle rows that only exist once you have run:
+   `first_commit` and `pr_opened`, both `actor: "agent"`. Leave them the values to do it
+   with — the numbers below are the ones §4 wants:
+
+   ```bash
+   gh pr view --json number,createdAt
+   ```
+
+   ```bash
+   TZ=UTC git log --reverse --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd origin/main..HEAD | head -1
+   ```
+
+   If this session ran **without** `/work`, queue the block yourself, in its own comment
+   rather than in the summary above, and carry those two rows: zero blocks rejects the
+   batch as a `telemetry-required` violation, two as a double-count. Never report
+   `ci_green`, `merged` or `deployed` — those are observed after you stop, by CI or by
+   the platform, and §4 forbids an agent-claimed merge outright.
 
 7. **Watch CI to green:** `gh pr checks <n> --watch`. If a check fails, read the log,
    fix, push, re-watch. A `DIRTY` PR is not green — rebase and force-push.

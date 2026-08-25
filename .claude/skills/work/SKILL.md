@@ -220,8 +220,9 @@ address anything — it compares it to the pin and rejects the batch on a mismat
 
 **Append; never overwrite.** `/work` and `/ship` both write to this one file, and the
 validator executes requests in array order — so append in the order you want them to read
-on the ticket (plan → summary → telemetry → state). Write the request object to a scratch
-file, then:
+on the ticket (plan → summary → state → telemetry). The telemetry block is queued
+**last** because it reports facts — the PR number, the first commit — that do not exist
+until `/ship` has run (step 9). Write the request object to a scratch file, then:
 
 ```bash
 # $REQ = a scratch file holding ONE request object as JSON
@@ -250,8 +251,11 @@ bodies, 10 label ops) and inside these refusals, all of which are enforced, not 
   `agent:blocked` is a session editing its own supervision.
 - `raw`, `ready` and `done` are never valid `ticket-state` targets — `ready` would be
   self-approval and `done` a session claiming its own merge (§5).
-- Exactly **one** telemetry block across all comments (step 8). Zero is a
-  `telemetry-required` violation; two is a double-count.
+- Exactly **one** telemetry block across all comments (step 9), and it must be **valid**,
+  not merely present: the validator checks it against
+  `schemas/telemetry-block.schema.json`, so a missing field, a negative counter or a
+  timestamp without its `Z` rejects the batch. Zero blocks is a `telemetry-required`
+  violation; two is a double-count.
 
 ### 5. Queue the plan — then honour the escalation valve
 
@@ -283,8 +287,9 @@ touch anything in `pin.ticket.out_of_scope` or otherwise drift outside the ticke
    **What unblocks me:** one line here choosing one.
    ```
 
-2. Emit the telemetry block (step 8) with `outcome: "blocked"` and the `error_class` its
-   marker pairs with, per the table below.
+2. Emit the telemetry block (step 9) with `outcome: "blocked"` and the `error_class` its
+   marker pairs with, per the table below. There is no `/ship` on this path, so
+   `ticket_events` is empty and `pr_number` is genuinely `null`.
 3. **END THE SESSION.** Do not implement a guess, do not implement "the obvious half", do
    not open a PR. A wrong guess costs more to unpick than a question costs to answer.
 
@@ -341,11 +346,36 @@ Local green is **necessary, not sufficient** — CI is the real gate. And never 
 `commands` to make the gate pass: `delivery.json` is in `riskPaths`, so that change needs
 a human and will be seen.
 
-### 8. Queue the telemetry block
+### 8. Hand off to `/ship` — never merge
+
+Run `/ship` to commit, push, open the PR, queue the review-state request and the summary
+comment, and watch CI to green. Then **stop**. Merging is the human's action only;
+`gh pr merge` is hook-blocked in every form, including `--auto`.
+
+On an escalating path you do **not** reach `/ship`: there is no PR, no state move, and the
+batch is the escalation comment plus the telemetry block.
+
+### 9. Queue the telemetry block — last
 
 Queue **one** `ticket-comment` request whose body carries a single fenced JSON block (§4).
 It travels as a request like everything else — the session does not post it. Rows are
 idempotent on `run_id`, so re-posting the same block must not double-count.
+
+**Compose it after `/ship`**, not before. `pr_number`, `pr_opened` and `first_commit` do
+not exist until the commit is made and the PR is open, and a block queued earlier can
+only report them as nothing at all — which is how a dashboard ends up structurally empty
+while every job in the pipeline stays green.
+
+Read the two timestamps out of the tools that hold them, never out of memory. Both must
+be ISO-8601 UTC with a literal `Z`, which is the only form §4 accepts:
+
+```bash
+TZ=UTC git log --reverse --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd origin/main..HEAD | head -1
+```
+
+```bash
+gh pr view --json number,createdAt
+```
 
 ````markdown
 ```json
@@ -369,32 +399,39 @@ idempotent on `run_id`, so re-posting the same block must not double-count.
     "outcome": "completed",
     "error_class": null,
     "files_changed": 0, "lines_added": 0, "lines_removed": 0,
-    "pr_number": null
+    "pr_number": 41
   }],
-  "ticket_events": []
+  "ticket_events": [
+    {"ticket_id": "ENG-123", "event": "first_commit", "at": "2026-08-24T15:22:10Z", "actor": "agent"},
+    {"ticket_id": "ENG-123", "event": "pr_opened",    "at": "2026-08-24T15:40:00Z", "actor": "agent"}
+  ]
 }
 ```
 ````
+
+**Two lifecycle events are yours, and only two.** The rest belong to whichever side owns
+that part of the loop — the same division that makes `agent:*` labels dispatcher-owned:
+
+| Event | Yours? | Why |
+|---|---|---|
+| `first_commit`, `pr_opened` | **Yes**, `actor: "agent"` | You performed them, and both timestamps are readable facts rather than recollections. |
+| `created`, `approved`, `dispatched`, `bounce_started` | No | Dispatcher-owned. A session reporting its own dispatch is reporting on its own supervision. |
+| `ci_green`, `merged`, `deployed`, `reverted` | No | They happen after you end, and the platform is the only honest witness. §4: **`merged` is never `agent`** — the collector refuses that row outright, because believing it would corrupt every autonomy metric computed downstream. |
+| `review_posted` | No | The review workflow reports it, as `system`. |
 
 - `stage` must be legal for the pinned `session_mode` — in `ticket` mode that is `dev` or
   `bounce`, nothing else.
 - `outcome` ∈ `completed|blocked|timeout|capacity|error|budget`; `error_class` is null
   unless the outcome is one of `blocked|error|timeout|capacity|budget`.
-- Timestamps are ISO-8601 UTC with `Z`; counters are non-negative integers.
-- **Exactly one block per batch, in exactly one comment.** The validator counts the
-  `"schema": "pipeline-telemetry/1"` marker across every queued comment; zero rejects the
-  batch as a `telemetry-required` violation and two rejects it as a double-count. If
-  `/ship` already queued a summary comment, keep the block out of it.
+- Timestamps are ISO-8601 UTC with `Z`; counters are non-negative integers, never null.
+- **The block is validated, not merely counted.** The safe-outputs validator checks it
+  against `schemas/telemetry-block.schema.json` — §4's machine rendering — so an unknown
+  key, a missing field or a malformed timestamp rejects the whole batch. Emit the fields
+  above and no others; do not invent one.
+- **Exactly one block per batch, in exactly one comment.** Zero rejects the batch as a
+  `telemetry-required` violation and two rejects it as a double-count. If `/ship` already
+  queued a summary comment, keep the block out of it.
 - Queue it on **every** terminal path, including escalation and failure. A run that ends
   silently is a run nobody can account for.
 - This block is **reporting, not authority** — it can never buy the session more budget,
   an approval, or a merge. Report honestly; under-reporting buys you nothing.
-
-### 9. Hand off — never merge
-
-Run `/ship` to commit, push, open the PR, queue the review-state request and the summary
-comment, and watch CI to green. Then **stop**. Merging is the human's action only;
-`gh pr merge` is hook-blocked in every form, including `--auto`.
-
-On an escalating path you do **not** reach `/ship`: there is no PR, no state move, and the
-batch is the escalation comment plus the telemetry block.
