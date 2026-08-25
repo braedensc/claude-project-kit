@@ -466,6 +466,7 @@ EGRESS_ALLOW_SUFFIXES = (
     # (worked example — a managed Postgres backend would add:)
     #   "supabase.co",
     #   "supabase.com",
+    "linear.app",          # api.linear.app
     # Add a battery case in test_hooks.py for every suffix you add.
 )
 NET_TOOL_RE = re.compile(r"(?<![\w./-])(?:curl|wget|scp|sftp|ncat|netcat|nc)(?![\w-])")
