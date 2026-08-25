@@ -14,7 +14,8 @@ built with Claude Code in a 10-day staged build, plus its retrospective. Every
 generalized file carries a provenance header saying where it came from and what was
 verified in production. (Some headers cite artifacts from that build — `ADR-00xx`,
 PR numbers — as provenance breadcrumbs; they aren't links into *this* repo.)
-MIT licensed.
+The template is deliberately project-neutral, so contributions shouldn't reference any
+other specific project by name. MIT licensed.
 
 ## Prerequisites
 

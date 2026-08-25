@@ -89,6 +89,11 @@ than blocks.
 - **Every hook/workflow edit updates the battery + docs in lockstep:** add a
   `test_hooks.py` case for any guard you change, and keep
   `docs/COLLABORATION.md`'s enforcement section + `.claude/hooks/README.md` in sync.
+- **Keep the kit source-agnostic:** this is a public reference template — never name a
+  specific other project, repo, company, or private artifact in it. Keep provenance
+  credible with dates, counts, and "in production" instead of names; the owner's own
+  repo URLs and the LICENSE are fine. The **Provenance scan** CI job only enforces the
+  mechanical part (absolute home paths, real emails) — the naming rule is a convention.
 - **On a hard environment block, explain the fix and HALT** — no sandbox-disabling,
   shims, or symlink hacks.
 

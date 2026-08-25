@@ -10,7 +10,7 @@ name: CI
 # can't skip it). Seven parallel jobs on every push to main and every PR (the
 # hooks guard is PR-only):
 #   - "Secret scan + forbidden paths" — secretlint + planning//.env path gate
-#   - "Provenance scan"               — no private names / home paths / real emails
+#   - "Provenance scan"               — no absolute home paths / real emails
 #   - "Lint" / "Typecheck" / "Test"  — adapt the npm scripts to your toolchain
 #   - "E2E (smoke)"                  — non-required by design (see its comment)
 #   - "Hooks change guard"           — PR-only label gate on guard-machinery edits
@@ -77,20 +77,9 @@ jobs:
       - name: secretlint (scan all tracked files)
         run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
 
-  # Provenance guard (runs the kit's scripts/check_provenance.py). Names that
-  # must never appear in this repo — a client, an internal codename, the private
-  # project a public repo was distilled from — live in a repo VARIABLE (Settings
-  # → Secrets and variables → Actions → Variables → PROVENANCE_DENYLIST), never
-  # in the tree: committing a file of the words you are suppressing would BE the
-  # leak. An unset variable makes the term check a no-op; the absolute-home-path
-  # and email rules need no config and run either way, so a teammate's
-  # "/Users/<them>/…" path or a real address can't creep in regardless.
-  #
-  # Once you HAVE set the variable, add `PROVENANCE_REQUIRE_DENYLIST: "1"` to the
-  # env below: an undefined variable renders empty, and without that flag the
-  # term rule would silently no-op green forever — looking exactly like a clean
-  # scan. It's left off here on purpose so a fresh project isn't broken out of
-  # the box before anyone has named a word to forbid.
+  # Provenance guard (runs the kit's scripts/check_provenance.py): fails on
+  # absolute home paths and real email addresses in tracked files. Optionally,
+  # a local .provenance-denylist can also forbid specific names.
   provenance-scan:
     name: Provenance scan
     runs-on: ubuntu-latest
@@ -98,9 +87,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: No private names, home paths, or real emails in tracked files
-        env:
-          PROVENANCE_DENYLIST: ${{ vars.PROVENANCE_DENYLIST }}
+      - name: No home paths or real emails in tracked files
         run: python3 scripts/check_provenance.py
 
   # ── Adapt the three jobs below to your toolchain (script names are the

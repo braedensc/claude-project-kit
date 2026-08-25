@@ -1,42 +1,30 @@
 #!/usr/bin/env python3
 """Provenance leak check.
 
-Scans TRACKED files (git ls-files) for three kinds of leak and exits non-zero
-with a file:line list of every hit. Public template, private history: what this
-kit was distilled from must not be inferable from what it ships.
+Scans TRACKED files (git ls-files) and exits non-zero with a file:line list of
+every hit. Two rules always run, need no configuration, and are the ones that
+catch accidental personal-data leaks in a public repo:
 
-(a) DENYLIST TERMS — case-insensitive substring match on names that must never
-    appear (the private project a template was distilled from, an internal
-    codename, a client). Both file CONTENTS and the file PATH itself are
-    checked: a repo can leak a name purely through a filename or a directory,
-    and this one did (an ADR whose slug carried the source app's name). The
-    terms are NEVER stored in the repo: writing them into a checked-in denylist
-    would BE the leak this rule prevents. They are read from OUTSIDE the tree,
-    in precedence order:
-      1. $PROVENANCE_DENYLIST — comma- and/or newline-separated (in CI: a repo
-         variable, `vars.PROVENANCE_DENYLIST`);
-      2. .provenance-denylist — a git-ignored file in the repo root, one term
-         per line, `#` comments allowed.
-    With neither present the rule is a NO-OP and says so: the shipped template
-    forbids no words by default — every adopter names their own. Because an
-    UNDEFINED repo variable renders as the empty string, that no-op is
-    indistinguishable in a CI log from "configured and clean"; a repo that has
-    set the variable should also set $PROVENANCE_REQUIRE_DENYLIST=1, which
-    turns the no-op into a hard failure. Hits print the position with the term
-    MASKED — in the path as well as the label, since the path is exactly where
-    a leaked name likes to hide — so a public CI log never republishes the very
-    words being suppressed (PROVENANCE_SHOW_TERMS=1 unmasks them locally).
+(a) ABSOLUTE HOME PATHS — an absolute macOS/Linux home path pins a real account
+    name to a public repo. Anonymized and placeholder account segments pass —
+    e.g. "/Users/<you>/repo" or the elided "/Users/.../repo" form
+    .claude/hooks/README.md uses — as do the shell forms that name no account
+    (${HOME}, ~) and the service accounts in GENERIC_ACCOUNTS (root, vscode,
+    runner, …).
 
-(b) ABSOLUTE HOME PATHS — needs no config: an absolute macOS/Linux home path
-    pins a real account name to a public repo. Anonymized and placeholder
-    account segments pass — e.g. "/Users/<you>/repo" or the elided
-    "/Users/.../repo" form .claude/hooks/README.md uses — as do the shell forms
-    that name no account (${HOME}, ~) and the service accounts in
-    GENERIC_ACCOUNTS (root, vscode, runner, …).
-
-(c) EMAIL ADDRESSES — reserved-TLD and documentation addresses pass (e.g.
+(b) EMAIL ADDRESSES — reserved-TLD and documentation addresses pass (e.g.
     dev@example.com, a fixture's user@host.invalid), as does the one real
     address this kit documents, the Co-Authored-By commit trailer.
+
+Optionally — and off by default — a list of forbidden TERMS (a client, an
+internal codename) can be supplied in $PROVENANCE_DENYLIST (comma- and/or
+newline-separated) or in .provenance-denylist (a git-ignored file in the repo
+root, one term per line, `#` comments allowed); with neither present the rule
+silently no-ops. Terms are matched case-insensitively against file CONTENTS and
+the file PATH itself (a filename or an ADR slug leaks a name just as loudly),
+and hits print MASKED as `<term #N>` — in the path as well as the label — so a
+public log never republishes the very words being suppressed
+(PROVENANCE_SHOW_TERMS=1 unmasks them locally).
 
 Runs from anywhere: main() chdirs to the repo root first, so a subdirectory
 invocation can't quietly scan a subtree (and miss a root denylist) while still
@@ -47,7 +35,7 @@ spells out the shapes it hunts for, so each literal above is written in a form
 its own allowlists clear — the examples in this docstring and in the constants
 below double as the check's regression test.
 
-Exit 0 = clean, 1 = leaks found (or an unreadable/required-but-missing denylist).
+Exit 0 = clean, 1 = leaks found (or an unreadable denylist file).
 """
 import os
 import re
@@ -56,7 +44,6 @@ import sys
 
 DENYLIST_ENV = "PROVENANCE_DENYLIST"
 DENYLIST_FILE = ".provenance-denylist"
-REQUIRE_ENV = "PROVENANCE_REQUIRE_DENYLIST"
 SHOW_ENV = "PROVENANCE_SHOW_TERMS"
 
 # Absolute home paths. Case-sensitive on purpose: the macOS/Linux spelling is
@@ -224,29 +211,6 @@ def main():
     for f in files:
         scan(f, terms, hits, redact)
 
-    # An undefined GitHub repo variable renders EMPTY, so an unconfigured term
-    # rule is green and silent — forever, and indistinguishable from a clean
-    # scan. A repo that has configured one opts into this strict mode so the
-    # difference is loud.
-    misconfigured = source is None and os.environ.get(REQUIRE_ENV) == "1"
-    if source is None:
-        if misconfigured:
-            report(
-                f"no denylist terms configured, but {REQUIRE_ENV}=1 requires them",
-                [f"${DENYLIST_ENV} is empty or unset and {DENYLIST_FILE} is absent — "
-                 "rule (a) would be a silent NO-OP"],
-                f"set the repo variable {DENYLIST_ENV} (GitHub → Settings → Secrets and "
-                f"variables → Actions → Variables) or create {DENYLIST_FILE} locally; "
-                f"unset {REQUIRE_ENV} only if this repo truly forbids no names.",
-            )
-        else:
-            print(
-                f"note: no denylist terms configured — rule (a) is a NO-OP. Set ${DENYLIST_ENV} "
-                f"(in CI: a repo variable) or create {DENYLIST_FILE} (git-ignored) to name the "
-                f"words this repo must never contain, and set {REQUIRE_ENV}=1 so an empty list "
-                "fails loudly instead of passing silently. The path and email rules always run."
-            )
-
     if hits["terms"]:
         report(
             f"denylisted names in tracked files ({len(terms)} term(s) from {source})",
@@ -266,11 +230,12 @@ def main():
             hits["emails"],
             "use an @example.com or .invalid address (or allowlist a deliberate one in ALLOWED_ADDRESSES).",
         )
-    if any(hits.values()) or misconfigured:
+    if any(hits.values()):
         return 1
 
     if source is None:
-        print(f"OK: no provenance leaks in {len(files)} tracked files (denylist empty)")
+        print(f"OK: no provenance leaks in {len(files)} tracked files")
+        print(f"     (optional: set ${DENYLIST_ENV} or {DENYLIST_FILE} to also forbid specific names)")
     else:
         print(f"OK: no provenance leaks in {len(files)} tracked files "
               f"({len(terms)} denylist term(s) from {source})")

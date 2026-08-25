@@ -80,21 +80,9 @@ jobs:
       - name: secretlint (scan all tracked files)
         run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
 
-  # Provenance guard: this template is public, the project it was distilled from
-  # is not. The forbidden names live in a repo VARIABLE (Settings → Secrets and
-  # variables → Actions → Variables → PROVENANCE_DENYLIST), never in the tree —
-  # committing a file of the words you are suppressing would BE the leak. An
-  # unset variable makes the term check a no-op; the absolute-home-path and
-  # email rules need no config and run either way, so a machine path or a real
-  # address can't creep in even before anyone sets the variable.
-  #
-  # `vars.PROVENANCE_DENYLIST` renders EMPTY when the variable is undefined, so
-  # the term rule would go quiet and this job would stay green — indistinguish-
-  # able from "configured and clean". So this repo sets
-  # PROVENANCE_REQUIRE_DENYLIST=1: an empty list becomes a hard failure naming
-  # the variable, not a silent pass. Prerequisite: the variable must actually be
-  # set on this repo, or this job fails by design. (templates/workflows/ci.yml
-  # deliberately does NOT set it — a downstream project starts with no denylist.)
+  # This template is public and must stay project-neutral. This job fails on
+  # absolute home paths and real email addresses in tracked files; the "don't
+  # name another project" rule is a convention in CLAUDE.md, not enforced here.
   provenance-scan:
     name: Provenance scan
     runs-on: ubuntu-latest
@@ -102,10 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: No private names, home paths, or real emails in tracked files
-        env:
-          PROVENANCE_DENYLIST: ${{ vars.PROVENANCE_DENYLIST }}
-          PROVENANCE_REQUIRE_DENYLIST: "1"
+      - name: No home paths or real emails in tracked files
         run: python3 scripts/check_provenance.py
 
   # Server-side backstop for hook self-protection (docs/SECURITY.md; ported from
