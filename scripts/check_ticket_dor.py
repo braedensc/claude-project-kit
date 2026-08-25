@@ -105,6 +105,28 @@ def template_sections(repo_root):
     return names or None
 
 
+def filled_example(repo_root):
+    """The worked ticket under `## A filled example`, or None if absent.
+
+    Selftest fixture: it is the shape a real ticket has, kept in the doc so the
+    example a human copies and the text the parsers are tested on cannot drift.
+    """
+    path = os.path.join(repo_root, TEMPLATE_DOC)
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return None
+    head = text.find("## A filled example")
+    if head < 0:
+        return None
+    start = text.find("```markdown", head)
+    if start < 0:
+        return None
+    start = text.index("\n", start) + 1
+    end = text.find("\n```", start)
+    return text[start:end] if end > start else None
+
+
 def load_config(explicit, repo_root):
     """Return (config|None, source|None). Exits 2 on an unreadable/invalid file."""
     path = explicit or os.path.join(repo_root, "delivery.json")
@@ -172,6 +194,24 @@ def checklist_items(lines):
 
 def bullets(lines):
     return [m.group(1).strip() for m in map(BULLET_RE.match, lines or []) if m]
+
+
+def pin_fields(description):
+    """Contract §3 "Ticket → pin field mapping": the two lists a pin snapshots.
+
+    The dispatcher imports THIS rather than reading the description its own
+    way. The gate is what certifies a ticket parses at all, so a dispatcher
+    that read the text differently could pin a criteria list no human ever
+    reviewed — the "second shape for the same structure" failure the contract
+    exists to prevent.
+
+    A missing or empty section yields an empty list, never an inferred one.
+    """
+    sections = split_sections(description)
+    return {
+        "acceptance_criteria": checklist_items(body_of(sections, "Acceptance criteria")),
+        "out_of_scope": bullets(body_of(sections, "Out of scope")),
+    }
 
 
 def prose_only(text):
@@ -890,6 +930,54 @@ def selftest():
                 failures.append(
                     f"delivery.json version={version!r}: expected exit={should_exit}, got exit={exited}"
                 )
+
+    # 11. Ticket → pin mapping (contract §3). `pin_fields` is what the
+    #     dispatcher imports, so these assert the DISPATCHER's view of a ticket,
+    #     not just the gate's. Each case is a divergence a hand-rolled second
+    #     parser has actually shipped with.
+    filled = filled_example(root)
+    note()
+    if filled is None:
+        failures.append(f"cannot parse the filled example out of {TEMPLATE_DOC}")
+    else:
+        got = pin_fields(filled)
+        note()
+        # The `[ ]` / `[x]` marker is list syntax, not part of the criterion. A
+        # parser that only strips `-*+ ` leaks it into the pin, and the brief
+        # then renders `- [ ] [ ] …`.
+        leaked = [c for c in got["acceptance_criteria"] if c.startswith(("[ ]", "[x]", "[X]"))]
+        if leaked:
+            failures.append(f"task-list marker not stripped from pin criteria: {leaked}")
+        note()
+        if len(got["acceptance_criteria"]) != 3 or len(got["out_of_scope"]) != 2:
+            failures.append(
+                "filled example should map to 3 criteria / 2 out-of-scope items, got "
+                f"{len(got['acceptance_criteria'])}/{len(got['out_of_scope'])}"
+            )
+        note()
+        if not got["acceptance_criteria"][0].startswith("A token within 5 minutes"):
+            failures.append(f"unexpected first criterion: {got['acceptance_criteria'][0]!r}")
+
+    # A `## ` inside a fence is sample text. `docs/TICKET-TEMPLATE.md` itself
+    # fences a full template, so a fence-blind reader parses the DOC as a ticket.
+    note()
+    fenced = "## Acceptance criteria\n\n- [ ] real one\n\n## Pointers\n\n```markdown\n## Out of scope\n- fenced sample\n```\n"
+    if pin_fields(fenced)["out_of_scope"]:
+        failures.append("a `## ` heading inside a code fence opened a section")
+
+    # Heading level is exactly `## `, and the name matches in full, not as a
+    # substring — `## Out of scope (draft)` is a different section.
+    note()
+    if pin_fields("### Out of scope\n- wrong level\n")["out_of_scope"]:
+        failures.append("`### ` opened a section; only `## ` may")
+    note()
+    if pin_fields("## Out of scope (draft)\n- draft only\n")["out_of_scope"]:
+        failures.append("heading matched as a substring; it must match in full")
+
+    # A missing section is an empty list, never an inferred one.
+    note()
+    if pin_fields("## Context\n\nNo criteria here.\n") != {"acceptance_criteria": [], "out_of_scope": []}:
+        failures.append("a description with neither section did not yield two empty lists")
 
     if failures:
         print("FAIL: check_ticket_dor selftest")

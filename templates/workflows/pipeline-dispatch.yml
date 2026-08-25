@@ -162,6 +162,24 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Contract §9 binds the state record to a concrete store PER BACKEND,
+          # declared by `dispatch.statePath`. This workflow IS the
+          # `github-actions` backend, whose store the contract fixes to the
+          # `pipeline-state` artifact read below — so statePath must be null.
+          # Read the field and assert it rather than ignoring it: a path
+          # configured here names a store this workflow will never write, and
+          # staying silent would leave the operator believing state lives there.
+          backend=$(jq -r '.dispatch.backend // "null"' delivery.json)
+          state_path=$(jq -r '.dispatch.statePath // "null"' delivery.json)
+          if [ "$backend" != "github-actions" ]; then
+            echo "::error::delivery.json dispatch.backend is \"$backend\", but this is the github-actions dispatcher. Contract §9 binds each backend to its own store — run the dispatcher that matches the backend."
+            exit 1
+          fi
+          if [ "$state_path" != "null" ]; then
+            echo "::error::delivery.json dispatch.statePath is \"$state_path\", but dispatch.backend is github-actions. Contract §9 fixes that store to the pipeline-state artifact and requires statePath to be null; refusing to run against a configured store this workflow would silently ignore."
+            exit 1
+          fi
+
           mkdir -p "$RUNNER_TEMP/state"
           echo '{"schema":"pipeline-dispatcher-state/1","capacity":{},"spend":[],"attempts":{}}' \
             > "$RUNNER_TEMP/state/state.json"
@@ -198,6 +216,21 @@ jobs:
           python3 - <<'PY'
           import json, os, sys, hashlib, urllib.request, urllib.error
           from datetime import datetime, timedelta, timezone
+
+          # Contract §3: ONE description, ONE parser. The dispatcher does not
+          # read a ticket its own way — it imports the Definition-of-Ready
+          # gate's reader, because the gate is what certified the ticket parses
+          # at all. A private second parser here could pin a criteria list no
+          # human ever reviewed, which is the exact failure §3 names. Like
+          # delivery.json below, this is the DEFAULT-BRANCH copy checked out
+          # above, not a worktree an agent can edit.
+          sys.path.insert(0, os.path.join(os.getcwd(), "scripts"))
+          try:
+              from check_ticket_dor import pin_fields
+          except ImportError as exc:
+              sys.exit("::error::cannot import scripts/check_ticket_dor.py (%s). The "
+                       "dispatcher shares the DoR gate's ticket parser and will not "
+                       "fall back to a private one." % exc)
 
           API = "https://api.linear.app/graphql"
           now = datetime.now(timezone.utc)
@@ -320,25 +353,6 @@ jobs:
           team_lc = lin["teamKey"].lower()
           repo_url = "%s/%s" % (os.environ["SERVER_URL"], os.environ["REPO"])
 
-          def section(desc, heading):
-              """Bullets under a `## <heading>` section of the ticket body.
-
-              The contract pins acceptance_criteria / out_of_scope but does not
-              say how a TICKET expresses them; this is the convention the
-              dispatcher assumes. A missing section yields an empty list, never
-              an invented one."""
-              if not desc:
-                  return []
-              items, capture = [], False
-              for line in desc.splitlines():
-                  s = line.strip()
-                  if s.startswith("#"):
-                      capture = heading.lower() in s.lower().lstrip("# ")
-                      continue
-                  if capture and s.startswith(("-", "*", "+")):
-                      items.append(s.lstrip("-*+ ").strip())
-              return [i for i in items if i]
-
           def slug(text):
               keep = "".join(c.lower() if c.isalnum() else "-" for c in text)
               while "--" in keep:
@@ -397,13 +411,17 @@ jobs:
               dispatch_id = "d_" + hashlib.sha256(
                   ("%s|%s|%s" % (ident, os.environ["RUN_ID"], attempts + 1)).encode()).hexdigest()[:24]
               stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+              # Contract §3 ticket → pin mapping. An absent or empty section is
+              # an empty list here, never a definition of done invented from
+              # the prose; the session is told plainly that the list was empty.
+              fields = pin_fields(n.get("description"))
 
               ticket = {
                   "id": ident, "team_key": lin["teamKey"], "url": n["url"],
                   "state_id": states["working"], "effort": effort, "track": track,
                   "provenance": provenance, "title": n["title"],
-                  "acceptance_criteria": section(n.get("description"), "acceptance criteria"),
-                  "out_of_scope": section(n.get("description"), "out of scope"),
+                  "acceptance_criteria": fields["acceptance_criteria"],
+                  "out_of_scope": fields["out_of_scope"],
                   "snapshot_at": stamp,
               }
               pin = {

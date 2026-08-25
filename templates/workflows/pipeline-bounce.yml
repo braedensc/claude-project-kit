@@ -108,6 +108,20 @@ jobs:
             echo "::notice::Pipeline credentials not configured — bounce skipped."
             echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          # Contract §1 budgets: two numbers at two levels. `maxBounces` bounds
+          # the OUTER review→fix round trips and stays authoritative — it is
+          # counted out of session, keyed on CI run IDs the session cannot write
+          # (§9). `fixIterations` bounds the INNER read→fix→push→re-watch cycles
+          # within ONE fix session; it is prompt material, injected below.
+          # §7 makes a missing or <1 value a validator failure, so it is asserted
+          # rather than defaulted — a null would land verbatim in the prompt.
+          fix_iterations=$(jq -r '
+            if (.budgets.fixIterations | type) == "number" and .budgets.fixIterations >= 1
+            then .budgets.fixIterations else "" end' delivery.json)
+          if [ -z "$fix_iterations" ]; then
+            echo "::error::delivery.json budgets.fixIterations is missing or less than 1. Contract §1 requires an integer ≥ 1 (default 3) and §7 makes it a validator failure; it is injected into the fix session's instructions, so there is nothing sensible to substitute."
+            exit 1
+          fi
           {
             echo "configured=true"
             echo "max_bounces=$(jq -r '.budgets.maxBounces' delivery.json)"
@@ -115,13 +129,7 @@ jobs:
             echo "auth_mode=$(jq -r '.auth.scheduled' delivery.json)"
             echo "default_branch=$(jq -r '.github.defaultBranch' delivery.json)"
             echo "team=$(jq -r '.linear.teamKey' delivery.json)"
-            # CONTRACT GAP: `budgets` has no field for /fix-ci's INNER iteration
-            # bound (its own read→fix→push→watch cycles), only the outer bounce
-            # count. We reuse maxBounces for both — same question, asked at two
-            # levels — and the outer one stays authoritative because it is the
-            # one keyed on run IDs. If the contract later grows a dedicated
-            # field, source it here instead.
-            echo "fix_iterations=$(jq -r '.budgets.maxBounces' delivery.json)"
+            echo "fix_iterations=$fix_iterations"
           } >> "$GITHUB_OUTPUT"
 
       - name: Resolve the PR
