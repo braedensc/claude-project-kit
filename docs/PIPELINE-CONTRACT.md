@@ -16,6 +16,7 @@ exists to prevent.
 | [Dispatcher state](#9-dispatcher-state-record) | outside every worktree, backend-durable | dispatcher | dispatcher |
 | [Telemetry store](#10-telemetry-store) | a Postgres schema, outside the repo | the collector | dashboards, the weekly review |
 | [Autonomy tiers](#11-autonomy-tiers) | — | — | the approve and merge gates |
+| [Machine-readable schemas](#12-machine-readable-schemas) | `schemas/`, committed | this document (amend both together) | producers, validators, CI |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -36,6 +37,11 @@ Two rules shape all of it:
 ---
 
 ## 1. `delivery.json`
+
+> **The machine-readable form of this section is
+> [`schemas/delivery.schema.json`](../schemas/delivery.schema.json)** (§12). The tables
+> below and that file are one definition in two renderings; CI fails if a field appears
+> in one and not the other. Amend both in the same PR.
 
 **Location: repo root.** Not `.claude/` — that directory is Claude-Code harness wiring
 (settings, hooks, skills), part of which is hook-self-protected. `delivery.json` is
@@ -686,6 +692,16 @@ checked against synthetic configs — the kit ships no live `delivery.json`, so 
 validator is inert here and the selftest is what has teeth. Amending a row means adding
 the case in the same PR.
 
+**It runs in two layers, and the split is the point (§12).** SHAPE comes from
+`schemas/delivery.schema.json` — the validator no longer re-implements "`stateIds` is an
+object with exactly five string values" in Python, and the schema's own `x-rule` /
+`x-tier` / `x-fix` annotations carry each violation's rule name, tier and remediation
+prose. SEMANTICS stay in the script, because no schema keyword reaches them: whether an
+ID is *resolved* rather than merely a string, whether a path lands outside every worktree
+**on this disk**, `perEffort[e].maxTurns` against `budgets.maxTurns`, `statePath` against
+`backend`, the exact `riskPaths` floor, and `branch.types` against the **live** guard's
+own regex. A schema-valid config can still be wrong, so neither layer replaces the other.
+
 ---
 
 ## 8. Safe-outputs request file
@@ -1030,3 +1046,70 @@ invented work carries `retro-proposal` provenance (which §5 bars from auto-appr
 and a proposed loosening of any cap is rejected mechanically by
 `scripts/check_weekly_review.py` (`npm run test:review`). A system that concludes it
 should be allowed to spend more, and then allows itself, does not have a budget.
+
+---
+
+## 12. Machine-readable schemas
+
+Every structure above is prose, and prose is what agents *read and try to follow*. Four
+of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
+are not a second source of truth — they are this document in a form a machine can
+enforce. `scripts/check_schemas.py` fails CI if the two disagree about which fields
+exist.
+
+| Section | Schema | Parity check |
+|---|---|---|
+| §1 `delivery.json` | `schemas/delivery.schema.json` | **exact, bidirectional, by path** — every field in a §1 table must be a schema property and vice versa |
+| §3 pin file | `schemas/pin.schema.json` | bidirectional by field name |
+| §4 telemetry block | `schemas/telemetry-block.schema.json` | bidirectional by field name |
+| §8 safe-outputs request file | `schemas/safe-outputs.schema.json` | bidirectional by field name |
+
+**Amending one of those sections means amending its schema in the same PR.** That is not
+a convention here — CI names the missing half.
+
+### Why this exists
+
+`/setup-board` once emitted a `delivery.json` sharing **zero field names** with §1. That
+config would have bricked the project it was setting up: a version-less config is
+*broken*, not *off* (§2), and a fail-closed guard blocks every tool call until a human
+repairs the file by hand. Fixing the emitter fixed one instance. Two independent
+implementations of one truth — the prose here and the rules each consumer hand-rolled —
+were free to drift, and that is the class.
+
+### Shape is not semantics, and the semantic layer does not move
+
+**A schema constrains shape. It says nothing about meaning.** A schema-valid config can
+still carry a UUID that resolves to nothing, a `pinsRoot` inside a worktree, or a
+`perEffort` band above the global cap; a schema-valid safe-outputs file can still name a
+ticket the session was never pinned to. So every consumer-side rule in this document
+stays exactly where it is — the hook's BROKEN classification (§2), the §7 validator's
+semantic rules, and §8's validation rules, which are the ones that matter and which run
+against the **dispatcher-supplied** pinned values.
+
+Conforming to a schema earns a document nothing. This is defense in depth, and the
+doctrine at the top of this file is unchanged: **anything the session agent can write is
+reporting, never authority** — including a document that validates.
+
+### Generating, rather than requesting, the right shape
+
+Where a **model** produces one of these documents, the schema is passed at generation:
+Claude Code headless takes `--json-schema <file>`, and the Agent SDK takes
+`outputFormat: { type: 'json_schema', schema }`. Where a **shell step or workflow**
+produces one, its output is validated before anything consumes it:
+
+```bash
+python3 scripts/check_schemas.py --instance "$FILE" --schema safe-outputs || exit 1
+```
+
+Asking for a shape in a prompt is a request. Constraining it at generation, or refusing
+it at the boundary, is a guarantee — of shape only, which is the whole point of the
+paragraph above.
+
+### The validator is vendored on purpose
+
+`scripts/jsonschema_mini.py` implements the draft 2020-12 subset these schemas use, in
+stdlib only. The kit installs no Python packages for its guards, and the validator that
+decides whether the pipeline may run is the last place to add a dependency. Its
+guarantee: **an unrecognized keyword is an error, never a silent no-op** — a schema
+keyword that nothing enforces reads as protection while giving none, so `check_schema()`
+rejects any keyword the validator cannot enforce, over every shipped schema, in CI.

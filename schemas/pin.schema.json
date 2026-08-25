@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pin.schema.json",
+  "title": "Pin file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §3 — the dispatcher-written binding of one session to one ticket, at <dispatch.pinsRoot>/<sha256(realpath(session root))[:16]>.json. Written OUTSIDE every worktree, before the session starts, by the dispatcher only; deleted by the dispatcher at session end. Nothing a session can write may ever be substituted for it.",
+  "$comment": "SHAPE ONLY. A schema cannot tell that `worktree` is the session root the reader derived, that `expires_at` is still in the future, or that `ticket` is present because `session_mode` is `ticket` — all three are semantic and all three are MUSTs in §3's read protocol. Conformance here is the floor, not the check.",
+
+  "type": "object",
+  "required": [
+    "pin_version", "dispatch_id", "session_mode", "worktree", "branch",
+    "base_branch", "auth_mode", "budget", "ticket", "subject",
+    "pinned_at", "pinned_by", "expires_at"
+  ],
+  "additionalProperties": false,
+
+  "properties": {
+    "pin_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "1. An unrecognized value means the reader refuses; it does not guess."
+    },
+    "dispatch_id": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "Opaque, unique per dispatch. Joins the pin to runs.run_id (§4) and to ledger.jsonl."
+    },
+    "session_mode": {
+      "enum": ["ticket", "planning", "diagnosis", "maintenance"],
+      "description": "What this session is allowed to be. Fixes which `stage` values its telemetry may report (§4)."
+    },
+    "worktree": {
+      "type": "string",
+      "pattern": "^/",
+      "description": "Absolute path to the worktree this pin governs. A reader MUST verify it matches the session root it derived; a mismatch is a hard stop, not a warning (§3)."
+    },
+    "branch": {
+      "$ref": "#/$defs/branchName",
+      "description": "Expected branch. Lowercased throughout — the live guard is [a-z0-9-] only, so feat/ENG-123-… is blocked before the first edit (§1)."
+    },
+    "base_branch": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "Expected PR base."
+    },
+    "auth_mode": {
+      "enum": ["subscription", "api-key"],
+      "description": "Copied from delivery.json → auth for the lane that dispatched."
+    },
+    "budget": {
+      "type": "object",
+      "required": ["maxTurns", "maxUsd", "maxMinutes", "attempt", "of"],
+      "additionalProperties": false,
+      "description": "The resolved caps for this run — ALREADY clamped against budgets.maxTurns. attempt/of carry the totalAttempts position from the dispatcher state record (§9).",
+      "properties": {
+        "maxTurns": {"type": "integer", "minimum": 1},
+        "maxUsd": {"type": "number", "exclusiveMinimum": 0},
+        "maxMinutes": {"type": "number", "exclusiveMinimum": 0},
+        "attempt": {"type": "integer", "minimum": 1},
+        "of": {"type": "integer", "minimum": 1}
+      }
+    },
+    "ticket": {
+      "type": ["object", "null"],
+      "required": [
+        "id", "team_key", "url", "state_id", "effort", "track",
+        "provenance", "title", "acceptance_criteria", "out_of_scope", "snapshot_at"
+      ],
+      "additionalProperties": false,
+      "description": "Required when session_mode is `ticket`; may be null otherwise. That conditional is semantic — a reader checks it, this schema cannot.",
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$", "description": "e.g. ENG-123. Uppercase team key; the BRANCH lowercases it."},
+        "team_key": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*$"},
+        "url": {"type": "string", "pattern": "^https?://"},
+        "state_id": {"type": "string", "pattern": "\\S", "description": "The Linear workflow-state ID, never the display name (§1)."},
+        "effort": {"enum": ["S", "M", "L"], "description": "From the effort:* label; selects budgets.perEffort."},
+        "track": {"type": "string", "pattern": "^track:", "description": "From the track:* label (§6)."},
+        "provenance": {
+          "type": "string",
+          "pattern": "^(epic/[A-Za-z0-9._-]+|monitor|review|retro-proposal|human)$",
+          "description": "The FULL value including the epic ID (§5 rule 4) — the label carries only the class. Guards match this, not the label."
+        },
+        "title": {"type": "string", "pattern": "\\S"},
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "The definition of done, snapshotted at dispatch. Parsed from the ticket's `## Acceptance criteria` section with the task-list marker stripped. A missing or empty section yields an EMPTY list — never an inferred one (§3)."
+        },
+        "out_of_scope": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Explicit non-goals — the scope fence. Parsed from `## Out of scope`. Empty means the ticket shipped without one (§3)."
+        },
+        "snapshot_at": {"$ref": "#/$defs/timestamp", "description": "When the ticket was read. The pin is a snapshot: later edits do not reach a running session."}
+      }
+    },
+    "subject": {
+      "type": ["string", "null"],
+      "description": "Free-text subject for non-ticket modes. Null for `ticket` mode."
+    },
+    "pinned_at": {"$ref": "#/$defs/timestamp"},
+    "pinned_by": {"type": "string", "pattern": "\\S", "description": "Provenance of the pin itself, e.g. dispatcher:runner-01."},
+    "expires_at": {
+      "$ref": "#/$defs/timestamp",
+      "description": "Past it the pin is stale; readers treat it as ABSENT and a sweeper deletes it. Absence never grants autonomy (§3)."
+    }
+  },
+
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "ISO-8601 UTC with a literal Z. Not a local offset — one timezone across the whole pipeline."
+    },
+    "branchName": {
+      "type": "string",
+      "pattern": "^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*$",
+      "description": "The live PreToolUse branch-naming guard's own pattern."
+    }
+  }
+}

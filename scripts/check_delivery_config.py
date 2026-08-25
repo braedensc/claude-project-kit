@@ -5,6 +5,26 @@ Deterministic, model-free, stdlib only. Without this, a project can adopt the
 pipeline with a malformed config and only find out at dispatch time, when the
 failure is expensive and remote.
 
+TWO LAYERS, ONE DEFINITION OF SHAPE
+
+    SHAPE comes from `schemas/delivery.schema.json` — a real JSON Schema, and
+    the single machine-readable rendering of contract §1. This file no longer
+    re-implements "stateIds is an object with exactly five string values" in
+    Python; it validates against the schema and translates each violation into
+    the rule vocabulary and tier §7 uses (via the schema's own `x-rule`,
+    `x-tier` and `x-fix` annotations). `scripts/check_schemas.py` fails CI if
+    §1 and the schema disagree about which fields exist, so the two cannot
+    drift the way the contract and this validator once could.
+
+    SEMANTICS stay here, because a schema structurally cannot express them:
+    an ID that is RESOLVED rather than merely a string, a path that lands
+    outside every worktree ON THIS DISK, `perEffort[e].maxTurns` compared
+    against `budgets.maxTurns`, `statePath` against `backend`, the exact
+    `riskPaths` floor, and `branch.types` against the LIVE guard's own regex.
+
+    This is defense in depth, not a handoff. A schema-valid config can still
+    carry a UUID that resolves to nothing.
+
 THE ONE RULE THAT OUTRANKS EVERY OTHER RULE HERE (contract §2):
 
     delivery.json ABSENT is OFF, not broken. This validator exits 0 and emits
@@ -30,7 +50,13 @@ Two tiers:
   WARNINGS — everything the contract specifies but does not make a MUST-fail:
              unresolved non-required label IDs, an unknown `dispatch.backend`,
              a non-zero `autonomy.autoMergeMaxLines`, and similar. `--strict`
-             promotes them.
+             promotes them. Which tier a schema violation lands in is declared
+             in the schema, as `x-tier` / `x-tier-<keyword>`.
+
+`telemetry` is defined in the schema (it is part of §1) but DELIBERATELY not
+judged here. Every §7 row gates autonomy; telemetry gates nothing, and a
+project with a misconfigured sink loses dashboards, not supervision. Its own
+consumer validates it at the point of use.
 
 Every message cites the contract section it comes from, because the fix almost
 always lives in the prose, not in the field name.
@@ -48,7 +74,8 @@ Usage:
 
 Exit: 0 = off, or valid (warnings alone do not fail)
       1 = broken (unparseable, or a rule failed)
-      2 = usage/IO error (an explicit --config that does not exist)
+      2 = usage/IO error (an explicit --config that does not exist, or a kit
+          checkout whose delivery schema is missing or unreadable)
 """
 import argparse
 import contextlib
@@ -60,11 +87,17 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jsonschema_mini as jsm  # noqa: E402
+
 SUPPORTED_VERSION = 1  # §1: an unrecognized version refuses to run, it does not guess
 
+SCHEMA_FILE = os.path.join("schemas", "delivery.schema.json")
+
 # Fallback only. The live list is parsed out of the PreToolUse branch-naming
-# guard; --selftest fails if this and that guard disagree, so `branch.types`
-# can never drift into accepting a type the guard blocks before the first edit.
+# guard; --selftest fails if this, that guard, and the schema's own enum ever
+# disagree, so `branch.types` can never drift into accepting a type the guard
+# blocks before the first edit.
 FALLBACK_BRANCH_TYPES = ["feat", "fix", "chore", "refactor", "docs"]
 HOOK_FILE = os.path.join(".claude", "hooks", "pre-tool-use.py")
 HOOK_ASSIGN_RE = re.compile(r"BRANCH_NAME_RE\s*=\s*re\.compile\(")
@@ -80,20 +113,19 @@ HOOK_TYPES_RE = re.compile(r"\((?:\?:)?([a-z]+(?:\|[a-z]+)+)\)")
 
 STATE_KEYS = ("raw", "ready", "working", "review", "done")  # §1: closed, mandatory set
 COMMAND_KEYS = ("lint", "typecheck", "test", "e2e", "preview")
-SEVERITIES = ("low", "medium", "high", "critical")
 AUTH_CONTEXTS = ("devSessions", "scheduled", "review")
-AUTH_VALUES = ("subscription", "api-key")
-BACKENDS = ("github-actions", "local-daemon", "cloud")
 # §9: the only backend with a durable store of its own (the `pipeline-state`
 # Actions artifact), hence the only one whose `statePath` may be null.
 SELF_STORING_BACKENDS = ("github-actions",)
-AUTO_APPROVE_ALLOWED = ("epic",)  # §5 rule 3 — `epic/*` is the only self-approving class
 REQUIRED_RISK_PATHS = (
     ".claude/hooks/**",
     ".claude/settings*.json",
     "delivery.json",
 )
-MONITORING_PROVIDERS = ("github-actions", "external", "none")
+
+# §1 defines `telemetry`, and the schema therefore does too — but it is not a
+# §7 row and this validator says nothing about it. See the module docstring.
+UNJUDGED_SUBTREES = ("telemetry",)
 
 # An unfilled template token. Written with escapes so this file never itself
 # contains a placeholder token and stays invisible to check_placeholders.py.
@@ -113,7 +145,12 @@ def dig(config, *keys):
 
 
 def is_int(value):
-    """True for a real integer. `bool` is an `int` in Python and is not one here."""
+    """True for a real integer. `bool` is an `int` in Python and is not one here.
+
+    Stricter than the schema's `type: integer`, which follows the spec and
+    accepts `150.0`. A cap written as a float is almost certainly a typo, and
+    the cross-field comparison below wants a literal.
+    """
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -285,6 +322,20 @@ def hook_branch_types(repo_root):
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
+def load_schema(kit_root):
+    """The §1 schema, or None when it cannot be read.
+
+    A missing schema is a broken KIT, never a broken project — the caller exits
+    2 rather than reporting a project's config as invalid on the strength of a
+    file the project does not own.
+    """
+    try:
+        with open(os.path.join(kit_root, SCHEMA_FILE), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
 def load_config(explicit, repo_root):
     """Return (config, path) or (None, None) when the pipeline is OFF.
 
@@ -338,6 +389,7 @@ class Report:
         self.errors = []
         self.warnings = []
         self.notes = []
+        self.flagged = set()  # instance paths the schema pass already complained about
 
     def err(self, rule, message):
         self.errors.append({"rule": rule, "message": message})
@@ -350,22 +402,27 @@ class Report:
 
 
 # --------------------------------------------------------------------------- #
-# Rules — §7 rows are errors; the rest is the warning tier
+# Layer 1 — shape, from schemas/delivery.schema.json
 # --------------------------------------------------------------------------- #
 def check_version(config, r):
     """§7: `version` unrecognized. Returns False to stop the run.
 
-    Stopping is the point. §1 says a reader that does not recognize the value
-    must refuse to run, not guess — and guessing here is fail-OPEN: a v2 that
-    relocates `linear.labels.ids` or `budgets` would leave those rules quietly
-    inapplicable and the config would validate clean on rules it never ran.
+    Runs AHEAD of the schema pass, and stopping is the point. §1 says a reader
+    that does not recognize the value must refuse to run, not guess — and
+    guessing here is fail-OPEN: a v2 that relocates `linear.labels.ids` or
+    `budgets` would leave those rules quietly inapplicable and the config would
+    validate clean on rules it never ran. The schema pins `version` too; this
+    check exists so the OTHER rules never run against a layout they do not
+    describe.
     """
     version = config.get("version", MISSING)
     if version is MISSING:
         r.err(
             "version",
             "version is missing. Contract §1 requires an explicit integer "
-            "(1 today); add \"version\": 1.",
+            "(1 today); add \"version\": 1. The PreToolUse hook classifies a "
+            "version-less config as BROKEN and fails closed, blocking every "
+            "tool call until a human repairs the file by hand.",
         )
         return False
     if version != SUPPORTED_VERSION:
@@ -380,36 +437,52 @@ def check_version(config, r):
     return True
 
 
+def check_shape(config, schema, r):
+    """Validate against §1's schema, translated into §7's rule vocabulary.
+
+    The schema carries the vocabulary itself, so adding a field to §1 and the
+    schema adds its rule name, its tier and its remediation prose in one place
+    rather than three.
+    """
+    for error in jsm.validate(config, schema):
+        path = error["path"]
+        if path.split(".", 1)[0] in UNJUDGED_SUBTREES:
+            continue
+        rule = jsm.annotation(error, "x-rule") or path or "delivery.json"
+        tier = (
+            jsm.annotation(error, "x-tier-" + error["keyword"])
+            or jsm.annotation(error, "x-tier")
+            or "error"
+        )
+        fix = jsm.annotation(error, "x-fix")
+        message = f"{path or 'delivery.json'} {error['message']}."
+        if fix:
+            message += f" {fix}"
+        r.flagged.add(path)
+        (r.warn if tier == "warning" else r.err)(rule, message)
+
+
+# --------------------------------------------------------------------------- #
+# Layer 2 — semantics a schema structurally cannot express
+# --------------------------------------------------------------------------- #
 def check_state_ids(config, r):
-    """§7: any `linear.stateIds.*` empty or still a token."""
+    """§7: any `linear.stateIds.*` empty or still a token.
+
+    The schema already said "five keys, string values". Whether a string is a
+    RESOLVED Linear ID is the part it cannot see.
+    """
     state_ids = dig(config, "linear", "stateIds")
     if not isinstance(state_ids, dict):
-        r.err(
-            "linear.stateIds",
-            f"linear.stateIds is {shape(state_ids)} — §1 requires an object with "
-            f"exactly the five workflow-state IDs "
-            f"({', '.join(STATE_KEYS)}). A missing value stalls the whole queue.",
-        )
         return
     for key in STATE_KEYS:
         value = state_ids.get(key, MISSING)
-        if value is MISSING:
-            r.err(
-                "linear.stateIds",
-                f"linear.stateIds.{key} is missing — the five states are a "
-                f"closed, mandatory set (§1).",
-            )
-        elif not isinstance(value, str):
-            r.err(
-                "linear.stateIds",
-                f"linear.stateIds.{key} is {shape(value)}; §1 requires the "
-                f"Linear workflow-state ID as a string (never the display name).",
-            )
-        elif not value.strip():
+        if value is MISSING or not isinstance(value, str):
+            continue  # shape; the schema reported it
+        if not value.strip():
             r.err(
                 "linear.stateIds",
                 f"linear.stateIds.{key} is empty — resolve the real Linear "
-                f"workflow-state ID (§1).",
+                f"workflow-state ID (§1). Run /setup-board.",
             )
         elif TOKEN_RE.search(value):
             r.err(
@@ -418,51 +491,21 @@ def check_state_ids(config, r):
                 f"({value}) — this config was copied from delivery.example.json "
                 f"and never filled in (§1).",
             )
-    extra = sorted(set(state_ids) - set(STATE_KEYS))
-    if extra:
-        r.warn(
-            "linear.stateIds",
-            f"linear.stateIds has unknown key(s) {extra}; §1 defines exactly "
-            f"{list(STATE_KEYS)} and nothing reads the rest.",
-        )
 
 
 def check_labels(config, r):
     """§7: required keys missing from `ids` or resolving to ""; no `track:*` key."""
     labels = dig(config, "linear", "labels")
     if not isinstance(labels, dict):
-        r.err(
-            "linear.labels",
-            f"linear.labels is {shape(labels)} — §1 requires an object with "
-            f"`ids` (canonical key → Linear label ID) and `required`.",
-        )
         return
     ids = labels.get("ids", MISSING)
-    if not isinstance(ids, dict):
-        r.err(
-            "linear.labels.ids",
-            f"linear.labels.ids is {shape(ids)} — §1 requires an object mapping "
-            f"each canonical label key to its Linear label ID.",
-        )
-        ids = {}
-
     required = labels.get("required", MISSING)
-    if not isinstance(required, list):
-        r.err(
-            "linear.labels.required",
-            f"linear.labels.required is {shape(required)} — §1 requires an array "
-            f"of the label keys that must resolve before the pipeline may "
-            f"dispatch.",
-        )
-    else:
+
+    if isinstance(ids, dict) and isinstance(required, list):
         for key in required:
             if not isinstance(key, str):
-                r.err(
-                    "linear.labels.required",
-                    f"linear.labels.required contains a non-string entry "
-                    f"({key!r}); entries are canonical label keys (§6).",
-                )
-            elif key not in ids:
+                continue  # shape; the schema reported it
+            if key not in ids:
                 r.err(
                     "linear.labels.required",
                     f"required label '{key}' has no entry in linear.labels.ids — "
@@ -477,6 +520,8 @@ def check_labels(config, r):
                     f"display name up once (§1 corollary). Run /setup-board.",
                 )
 
+    if not isinstance(ids, dict):
+        return
     if not any(isinstance(k, str) and k.startswith("track:") for k in ids):
         r.err(
             "linear.labels.track",
@@ -501,275 +546,93 @@ def check_labels(config, r):
 
 
 def check_branch(config, r, live_types, live_source):
-    """§7: `branch.types` containing a type the live branch guard rejects."""
-    branch = config.get("branch", MISSING)
-    if not isinstance(branch, dict):
-        r.err(
-            "branch.types",
-            f"branch is {shape(branch)} — §1 requires an object with `types` and "
-            f"`requireTicketId`.",
-        )
+    """§7: `branch.types` containing a type the LIVE branch guard rejects.
+
+    The schema pins the DOCUMENTED five. This catches the other direction — a
+    guard that has been narrowed below what §1 lists, which the schema alone
+    would happily accept.
+    """
+    types = dig(config, "branch", "types")
+    if not isinstance(types, list):
         return
-    types = branch.get("types", MISSING)
-    if not isinstance(types, list) or not types:
+    bad = [t for t in types
+           if isinstance(t, str) and t in FALLBACK_BRANCH_TYPES and t not in live_types]
+    if bad:
         r.err(
             "branch.types",
-            f"branch.types is {shape(types)} — §1 requires a non-empty array of "
-            f"branch type prefixes, a subset of {live_types}.",
-        )
-    else:
-        bad = [t for t in types if t not in live_types]
-        if bad:
-            r.err(
-                "branch.types",
-                f"branch.types contains {bad}, which the live branch-naming "
-                f"guard rejects ({live_source} accepts only {live_types}). A "
-                f"session on such a branch is blocked before its first edit "
-                f"(§1, §7).",
-            )
-    require_ticket = branch.get("requireTicketId", MISSING)
-    if not isinstance(require_ticket, bool):
-        r.warn(
-            "branch.requireTicketId",
-            f"branch.requireTicketId is {shape(require_ticket)}; §1 defines a "
-            f"boolean. The `ticket-branch` guard is scoped to it being true (§2).",
+            f"branch.types contains {bad}, which the live branch-naming "
+            f"guard rejects ({live_source} accepts only {live_types}). A "
+            f"session on such a branch is blocked before its first edit "
+            f"(§1, §7).",
         )
 
 
 def check_commands(config, r):
-    """§7: any `commands.*` set to "" — `null` is how a project says "no step"."""
+    """The advisory half of §1's commands rules — an all-null local gate."""
     commands = config.get("commands", MISSING)
     if not isinstance(commands, dict):
-        r.err(
-            "commands",
-            f"commands is {shape(commands)} — §1 requires an object; each of "
-            f"{list(COMMAND_KEYS)} is a command string or null.",
-        )
         return
-    for key in COMMAND_KEYS:
-        value = commands.get(key, MISSING)
-        if value is MISSING or value is None:
-            continue  # null / absent: the project has no such step, a runner skips it
-        if not isinstance(value, str):
-            r.err(
-                "commands",
-                f"commands.{key} is {shape(value)} — §1 allows a command string "
-                f"or null.",
-            )
-        elif not value.strip():
-            r.err(
-                "commands",
-                f"commands.{key} is an empty string. §1: use null. An empty "
-                f"string hides a misconfiguration behind a no-op — the runner "
-                f"reports a step it never ran.",
-            )
     if all(commands.get(k, MISSING) in (MISSING, None) for k in COMMAND_KEYS):
         r.warn(
             "commands",
             "every commands.* is null — the local gate before /ship runs nothing, "
             "so CI is the first thing that ever checks a session's work (§1).",
         )
-    extra = sorted(set(commands) - set(COMMAND_KEYS))
-    if extra:
-        r.warn(
-            "commands",
-            f"commands has unknown key(s) {extra}; §1 defines exactly "
-            f"{list(COMMAND_KEYS)} and a runner ignores the rest.",
-        )
 
 
 def check_budgets(config, r):
-    """§7: perEffort maxTurns above the cap, reviewSeverityThreshold, fixIterations."""
+    """§7: `perEffort[e].maxTurns > budgets.maxTurns` — a cross-field rule.
+
+    "Effective turns = min(perEffort[e].maxTurns, maxTurns)" compares two
+    fields, which no JSON Schema keyword reaches.
+    """
     budgets = config.get("budgets", MISSING)
     if not isinstance(budgets, dict):
-        r.err(
-            "budgets",
-            f"budgets is {shape(budgets)} — §1 requires an object (perEffort, "
-            f"maxTurns, wipLimit, maxBounces, fixIterations, totalAttempts, "
-            f"dailyUsd, reviewSeverityThreshold).",
-        )
         return
 
-    # Precondition for the perEffort rule: without a real cap, "may only lower
-    # the cap" has nothing to compare against, so this is an error, not a warning.
     max_turns = budgets.get("maxTurns", MISSING)
-    if not is_int(max_turns) or max_turns < 1:
+    if is_int(max_turns) and max_turns >= 1:
+        pass
+    elif "budgets.maxTurns" in r.flagged:
+        max_turns = None  # the schema already named it; do not say it twice
+    else:
+        # Reachable only for a value the schema accepts and this does not —
+        # `150.0`, a number with no fractional part. §1 means a literal.
         r.err(
             "budgets.maxTurns",
-            f"budgets.maxTurns is {shape(max_turns)}"
-            + (f" ({max_turns})" if is_int(max_turns) else "")
-            + " — §1 requires the hard turn ceiling as an integer ≥ 1. The §7 "
-            "per-effort rule cannot be evaluated without it.",
+            f"budgets.maxTurns is {max_turns!r} — §1 requires the hard turn "
+            f"ceiling as a JSON integer literal ≥ 1, not a float. The §7 "
+            f"per-effort rule cannot be evaluated without it.",
         )
         max_turns = None
 
     per_effort = budgets.get("perEffort", MISSING)
-    if not isinstance(per_effort, dict):
-        r.err(
-            "budgets.perEffort",
-            f"budgets.perEffort is {shape(per_effort)} — §1 requires an object "
-            f"keyed S/M/L, each {{maxTurns, maxUsd, maxMinutes}}, selected by the "
-            f"ticket's effort:* label.",
-        )
-    else:
-        for effort in ("S", "M", "L"):
-            band = per_effort.get(effort, MISSING)
-            if band is MISSING:
-                r.warn(
-                    "budgets.perEffort",
-                    f"budgets.perEffort has no '{effort}' band; a ticket labelled "
-                    f"effort:{effort} has no budget to select (§1, §6).",
-                )
-                continue
-            if not isinstance(band, dict):
-                r.err(
-                    "budgets.perEffort",
-                    f"budgets.perEffort.{effort} is {shape(band)} — §1 requires "
-                    f"{{maxTurns, maxUsd, maxMinutes}}.",
-                )
-                continue
-            turns = band.get("maxTurns", MISSING)
-            if not is_int(turns) or turns < 1:
-                r.err(
-                    "budgets.perEffort",
-                    f"budgets.perEffort.{effort}.maxTurns is {shape(turns)}"
-                    + (f" ({turns})" if is_int(turns) else "")
-                    + " — §1 requires an integer ≥ 1.",
-                )
-            elif max_turns is not None and turns > max_turns:
-                r.err(
-                    "budgets.perEffort",
-                    f"budgets.perEffort.{effort}.maxTurns ({turns}) exceeds "
-                    f"budgets.maxTurns ({max_turns}). Effective turns = "
-                    f"min(perEffort[e].maxTurns, maxTurns) — a per-effort value "
-                    f"may only LOWER the cap, never raise it (§1, §7). Lower it "
-                    f"to ≤ {max_turns}, or raise budgets.maxTurns deliberately.",
-                )
-            for money_key in ("maxUsd", "maxMinutes"):
-                money = band.get(money_key, MISSING)
-                if not isinstance(money, (int, float)) or isinstance(money, bool) or money <= 0:
-                    r.warn(
-                        "budgets.perEffort",
-                        f"budgets.perEffort.{effort}.{money_key} is "
-                        f"{shape(money)} — §1 defines a positive number; the "
-                        f"dispatcher meters spend and wall-clock against it.",
-                    )
-
-    threshold = budgets.get("reviewSeverityThreshold", MISSING)
-    if threshold not in SEVERITIES:
-        r.err(
-            "budgets.reviewSeverityThreshold",
-            f"budgets.reviewSeverityThreshold is {threshold!r}; §1 defines "
-            f"{list(SEVERITIES)} — the lowest severity that blocks progress and "
-            f"starts a bounce.",
-        )
-
-    fix_iterations = budgets.get("fixIterations", MISSING)
-    if not is_int(fix_iterations) or fix_iterations < 1:
-        r.err(
-            "budgets.fixIterations",
-            f"budgets.fixIterations is {shape(fix_iterations)}"
-            + (f" ({fix_iterations})" if is_int(fix_iterations) else "")
-            + " — §1 requires an integer ≥ 1 (default 3, matching /fix-ci's own "
-            "bound). It bounds read→fix→push→re-watch cycles INSIDE one fix "
-            "session, and is a different number from budgets.maxBounces, which "
-            "bounds how many fix sessions the pipeline pays for.",
-        )
-
-    for key, floor in (("wipLimit", 1), ("maxBounces", 0), ("totalAttempts", 1)):
-        value = budgets.get(key, MISSING)
-        if not is_int(value) or value < floor:
-            r.warn(
-                "budgets",
-                f"budgets.{key} is {shape(value)}"
-                + (f" ({value})" if is_int(value) else "")
-                + f" — §1 defines an integer ≥ {floor}.",
-            )
-    daily = budgets.get("dailyUsd", MISSING)
-    if not isinstance(daily, (int, float)) or isinstance(daily, bool) or daily <= 0:
-        r.warn(
-            "budgets",
-            f"budgets.dailyUsd is {shape(daily)} — §1 defines a positive rolling "
-            f"24h spend cap for the whole pipeline.",
-        )
-
-
-def check_auth(config, r):
-    """§7: any `auth.*` outside `subscription|api-key`."""
-    auth = config.get("auth", MISSING)
-    if not isinstance(auth, dict):
-        r.err(
-            "auth",
-            f"auth is {shape(auth)} — §1 requires an object declaring the "
-            f"credential for each of {list(AUTH_CONTEXTS)}, so cost attribution "
-            f"and rate-limit blast radius are predictable.",
-        )
+    if max_turns is None or not isinstance(per_effort, dict):
         return
-    for context in AUTH_CONTEXTS:
-        value = auth.get(context, MISSING)
-        if value is MISSING:
+    for effort in ("S", "M", "L"):
+        band = per_effort.get(effort, MISSING)
+        if not isinstance(band, dict):
+            continue
+        turns = band.get("maxTurns", MISSING)
+        if is_int(turns) and turns > max_turns:
             r.err(
-                "auth",
-                f"auth.{context} is missing — §1 requires every context to "
-                f"declare its credential ({'|'.join(AUTH_VALUES)}). Unattended "
-                f"lanes are normally kept off the interactive credential so a "
-                f"runaway queue cannot exhaust a human's session capacity.",
+                "budgets.perEffort",
+                f"budgets.perEffort.{effort}.maxTurns ({turns}) exceeds "
+                f"budgets.maxTurns ({max_turns}). Effective turns = "
+                f"min(perEffort[e].maxTurns, maxTurns) — a per-effort value "
+                f"may only LOWER the cap, never raise it (§1, §7). Lower it "
+                f"to ≤ {max_turns}, or raise budgets.maxTurns deliberately.",
             )
-        elif value not in AUTH_VALUES:
-            r.err(
-                "auth",
-                f"auth.{context} is {value!r}; §1 defines "
-                f"{list(AUTH_VALUES)} and §7 fails anything else.",
-            )
-    extra = sorted(set(auth) - set(AUTH_CONTEXTS))
-    if extra:
-        r.warn(
-            "auth",
-            f"auth has unknown key(s) {extra}; §1 defines exactly "
-            f"{list(AUTH_CONTEXTS)}.",
-        )
 
 
 def check_autonomy(config, r):
-    """§7: `autoApproveProvenance` not a subset of ["epic"]; `riskPaths` gaps."""
+    """§7: the `autonomy.riskPaths` floor, and the auto-merge advisory."""
     autonomy = config.get("autonomy", MISSING)
     if not isinstance(autonomy, dict):
-        r.err(
-            "autonomy",
-            f"autonomy is {shape(autonomy)} — §1 requires an object "
-            f"(autoApproveProvenance, autoMergeMaxLines, riskPaths).",
-        )
         return
 
-    auto_approve = autonomy.get("autoApproveProvenance", MISSING)
-    if not isinstance(auto_approve, list):
-        r.err(
-            "autonomy.autoApproveProvenance",
-            f"autonomy.autoApproveProvenance is {shape(auto_approve)} — §1 "
-            f"requires an array, and §5/§7 require it to be a subset of "
-            f"{list(AUTO_APPROVE_ALLOWED)}.",
-        )
-    else:
-        bad = [v for v in auto_approve if v not in AUTO_APPROVE_ALLOWED]
-        if bad:
-            r.err(
-                "autonomy.autoApproveProvenance",
-                f"autonomy.autoApproveProvenance contains {bad} — it must be a "
-                f"subset of {list(AUTO_APPROVE_ALLOWED)} (§5 rule 3, §7). Only "
-                f"`epic/*` may auto-approve raw → ready, because nothing an "
-                f"agent files carries epic provenance; widening this lets an "
-                f"agent widen its own mandate by filing tickets for itself.",
-            )
-
     risk_paths = autonomy.get("riskPaths", MISSING)
-    if not isinstance(risk_paths, list):
-        r.err(
-            "autonomy.riskPaths",
-            f"autonomy.riskPaths is {shape(risk_paths)} — §1 requires an array of "
-            f"globs that force human review, and it must include "
-            f"{list(REQUIRED_RISK_PATHS)}.",
-        )
-    else:
+    if isinstance(risk_paths, list):
         for needed in REQUIRED_RISK_PATHS:
             if needed not in risk_paths:
                 r.err(
@@ -781,13 +644,7 @@ def check_autonomy(config, r):
                 )
 
     auto_merge = autonomy.get("autoMergeMaxLines", MISSING)
-    if not is_int(auto_merge) or auto_merge < 0:
-        r.warn(
-            "autonomy.autoMergeMaxLines",
-            f"autonomy.autoMergeMaxLines is {shape(auto_merge)} — §1 defines an "
-            f"integer ≥ 0 (0 disables).",
-        )
-    elif auto_merge > 0:
+    if is_int(auto_merge) and auto_merge > 0:
         r.warn(
             "autonomy.autoMergeMaxLines",
             f"autonomy.autoMergeMaxLines is {auto_merge} (auto-merge enabled "
@@ -798,34 +655,19 @@ def check_autonomy(config, r):
 
 
 def check_dispatch(config, r, repo_root, roots):
-    """§7: pinsRoot/statePath inside the repo or a worktree; statePath vs backend."""
+    """§7: pinsRoot/statePath inside the repo or a worktree; statePath vs backend.
+
+    Both are questions about THIS DISK and about another field's value, which is
+    exactly the class a schema cannot answer.
+    """
     dispatch = config.get("dispatch", MISSING)
     if not isinstance(dispatch, dict):
-        r.err(
-            "dispatch",
-            f"dispatch is {shape(dispatch)} — §1 requires an object (backend, "
-            f"labelTrigger, pauseOnCapacity, pinsRoot, statePath).",
-        )
         return
 
     backend = dispatch.get("backend", MISSING)
-    if backend not in BACKENDS:
-        r.warn(
-            "dispatch.backend",
-            f"dispatch.backend is {backend!r}; §1 defines {list(BACKENDS)}. An "
-            f"unknown backend has no declared durable store, so statePath is "
-            f"treated as required below (§9).",
-        )
 
     pins_root = dispatch.get("pinsRoot", MISSING)
-    if not isinstance(pins_root, str) or not pins_root.strip():
-        r.err(
-            "dispatch.pinsRoot",
-            f"dispatch.pinsRoot is {shape(pins_root)} — §1 requires a directory "
-            f"path (default ~/.claude/pipeline/pins) that resolves OUTSIDE the "
-            f"repo and every worktree.",
-        )
-    else:
+    if isinstance(pins_root, str) and pins_root.strip():
         owner = containing_root(expand_path(pins_root, repo_root), roots)
         if owner:
             r.err(
@@ -838,14 +680,7 @@ def check_dispatch(config, r, repo_root, roots):
             )
 
     state_path = dispatch.get("statePath", MISSING)
-    if state_path is MISSING:
-        r.err(
-            "dispatch.statePath",
-            f"dispatch.statePath is missing — §1 requires the key, null for a "
-            f"backend with its own durable store "
-            f"({', '.join(SELF_STORING_BACKENDS)}) and a path otherwise (§9).",
-        )
-    elif state_path is None:
+    if state_path is None:
         if backend not in SELF_STORING_BACKENDS:
             r.err(
                 "dispatch.statePath",
@@ -857,13 +692,7 @@ def check_dispatch(config, r, repo_root, roots):
                 f"`pipeline-state` artifact); every other backend must name a "
                 f"path outside the repo and every worktree.",
             )
-    elif not isinstance(state_path, str) or not state_path.strip():
-        r.err(
-            "dispatch.statePath",
-            f"dispatch.statePath is {shape(state_path)} — §1 allows a path "
-            f"string or null.",
-        )
-    else:
+    elif isinstance(state_path, str) and state_path.strip():
         owner = containing_root(expand_path(state_path, repo_root), roots)
         if owner:
             r.err(
@@ -883,101 +712,74 @@ def check_dispatch(config, r, repo_root, roots):
 
     label_trigger = dispatch.get("labelTrigger", MISSING)
     ids = dig(config, "linear", "labels", "ids")
-    if not isinstance(label_trigger, str) or not label_trigger.strip():
-        r.warn(
-            "dispatch.labelTrigger",
-            f"dispatch.labelTrigger is {shape(label_trigger)} — §1 defines the "
-            f"canonical label key that queues a ticket (default agent:queued).",
-        )
-    elif isinstance(ids, dict) and label_trigger not in ids:
-        r.warn(
-            "dispatch.labelTrigger",
-            f"dispatch.labelTrigger '{label_trigger}' has no entry in "
-            f"linear.labels.ids, so it cannot be resolved to an ID and nothing "
-            f"will ever queue (§1, §6).",
-        )
-    if not isinstance(dispatch.get("pauseOnCapacity", MISSING), bool):
-        r.warn(
-            "dispatch.pauseOnCapacity",
-            "dispatch.pauseOnCapacity is not a boolean — §1 defines it as the "
-            "switch that pauses the queue on a provider capacity error instead "
-            "of consuming a totalAttempts slot.",
-        )
+    if isinstance(label_trigger, str) and label_trigger.strip():
+        if isinstance(ids, dict) and label_trigger not in ids:
+            r.warn(
+                "dispatch.labelTrigger",
+                f"dispatch.labelTrigger '{label_trigger}' has no entry in "
+                f"linear.labels.ids, so it cannot be resolved to an ID and nothing "
+                f"will ever queue (§1, §6).",
+            )
 
 
 def check_minor(config, r):
-    """Fields the contract specifies that no §7 row makes a MUST-fail."""
+    """Unfilled template tokens, and the one casing rule §1 states in prose."""
     team_key = dig(config, "linear", "teamKey")
-    if not isinstance(team_key, str) or not team_key.strip() or TOKEN_RE.search(team_key):
-        r.warn(
-            "linear.teamKey",
-            f"linear.teamKey is {shape(team_key)} — §1 requires the uppercase "
-            f"ticket prefix (e.g. ENG in ENG-123).",
-        )
-    elif team_key != team_key.upper():
-        r.warn(
-            "linear.teamKey",
-            f"linear.teamKey '{team_key}' is not uppercase; §1 requires "
-            f"uppercase. It is lowercased for the branch name — the branch guard "
-            f"is [a-z0-9-] only — but the config carries the canonical form.",
-        )
+    if isinstance(team_key, str) and team_key.strip():
+        if TOKEN_RE.search(team_key):
+            r.warn(
+                "linear.teamKey",
+                f"linear.teamKey is still an unfilled template token "
+                f"({team_key}) — §1 requires the uppercase ticket prefix "
+                f"(e.g. ENG in ENG-123).",
+            )
+        elif team_key != team_key.upper():
+            r.warn(
+                "linear.teamKey",
+                f"linear.teamKey '{team_key}' is not uppercase; §1 requires "
+                f"uppercase. It is lowercased for the branch name — the branch "
+                f"guard is [a-z0-9-] only — but the config carries the canonical "
+                f"form.",
+            )
 
     github = config.get("github", MISSING)
-    if not isinstance(github, dict):
-        r.warn(
-            "github",
-            f"github is {shape(github)} — §1 requires owner, repo and "
-            f"defaultBranch (the ref guards read config values from).",
-        )
-    else:
+    if isinstance(github, dict):
         for key in ("owner", "repo", "defaultBranch"):
             value = github.get(key, MISSING)
-            if not isinstance(value, str) or not value.strip() or TOKEN_RE.search(value):
-                r.warn("github", f"github.{key} is {shape(value)} or unfilled (§1).")
+            if isinstance(value, str) and TOKEN_RE.search(value):
+                r.warn("github", f"github.{key} is still an unfilled token ({value}) (§1).")
 
-    monitoring = config.get("monitoring", MISSING)
-    if not isinstance(monitoring, dict):
-        r.warn("monitoring", f"monitoring is {shape(monitoring)} — §1 requires an object.")
-    else:
-        provider = monitoring.get("provider", MISSING)
-        if provider not in MONITORING_PROVIDERS:
-            r.warn(
-                "monitoring",
-                f"monitoring.provider is {provider!r}; §1 defines "
-                f"{list(MONITORING_PROVIDERS)}.",
-            )
-        storm = monitoring.get("stormPerHour", MISSING)
-        if not is_int(storm) or storm < 1:
-            r.warn(
-                "monitoring",
-                f"monitoring.stormPerHour is {shape(storm)} — §1 defines an "
-                f"integer ≥ 1; it stops one broken cron filing a hundred tickets.",
-            )
+    kind = dig(config, "stack", "kind")
+    if isinstance(kind, str) and TOKEN_RE.search(kind):
+        r.warn("stack", f"stack.kind is still an unfilled token ({kind}) (§1).")
 
-    stack = config.get("stack", MISSING)
-    if not isinstance(stack, dict):
-        r.warn("stack", f"stack is {shape(stack)} — §1 requires an object.")
-    else:
-        kind = stack.get("kind", MISSING)
-        if not isinstance(kind, str) or not kind.strip() or TOKEN_RE.search(kind):
-            r.warn("stack", f"stack.kind is {shape(kind)} or unfilled (§1).")
+    dsn_env = dig(config, "telemetry", "dsnEnv")
+    if isinstance(dsn_env, str) and "://" in dsn_env:
+        r.warn(
+            "telemetry",
+            "telemetry.dsnEnv looks like a connection string, not the NAME of "
+            "an environment variable holding one. §1: a DSN carries a password "
+            "and delivery.json is a tracked file. (Telemetry is otherwise not "
+            "judged here — it gates nothing.)",
+        )
 
 
 # --------------------------------------------------------------------------- #
 # Run
 # --------------------------------------------------------------------------- #
-def run(config, source, repo_root, roots, strict=False, live_types=None, live_source=None):
+def run(config, source, repo_root, roots, schema, strict=False,
+        live_types=None, live_source=None):
     r = Report(source)
     if live_types is None:
         live_types, live_source = FALLBACK_BRANCH_TYPES, "the documented branch guard"
 
     if check_version(config, r):
+        check_shape(config, schema, r)
         check_state_ids(config, r)
         check_labels(config, r)
         check_branch(config, r, live_types, live_source)
         check_commands(config, r)
         check_budgets(config, r)
-        check_auth(config, r)
         check_autonomy(config, r)
         check_dispatch(config, r, repo_root, roots)
         check_minor(config, r)
@@ -987,6 +789,7 @@ def run(config, source, repo_root, roots, strict=False, live_types=None, live_so
         "ok": ok,
         "config": source,
         "strict": strict,
+        "schema": SCHEMA_FILE,
         "branch_types": live_types,
         "worktree_roots": roots,
         "errors": r.errors,
@@ -1128,6 +931,15 @@ CASES = [
     ("stateid-missing", lambda c: _drop(c, "linear.stateIds.working"), ["linear.stateIds"]),
     ("stateid-null", lambda c: _set(c, "linear.stateIds.review", None), ["linear.stateIds"]),
     ("stateids-absent", lambda c: _drop(c, "linear.stateIds"), ["linear.stateIds"]),
+    # The /setup-board regression, at field granularity: a state map keyed by
+    # the DISPLAY NAME rather than the canonical key.
+    (
+        "stateids-keyed-by-display-name",
+        lambda c: _set(c, "linear.stateIds",
+                       {"Ideas": "a", "Ready": "b", "In Progress": "c",
+                        "In Review": "d", "Done": "e"}),
+        ["linear.stateIds"],
+    ),
 
     # §7 — linear.labels
     (
@@ -1151,6 +963,12 @@ CASES = [
         ["linear.labels.track"],
     ),
     ("labels-absent", lambda c: _drop(c, "linear.labels"), ["linear.labels"]),
+    # The other half of the /setup-board regression: label values as objects.
+    (
+        "label-id-is-an-object",
+        lambda c: _set(c, "linear.labels.ids.agent:queued", {"id": "x", "name": "Queued"}),
+        ["linear.labels.ids", "linear.labels.required"],
+    ),
 
     # §7 — branch.types
     (
@@ -1186,6 +1004,9 @@ CASES = [
         ["budgets.perEffort"],
     ),
     ("maxturns-missing", lambda c: _drop(c, "budgets.maxTurns"), ["budgets.maxTurns"]),
+    # The schema calls 150.0 an integer (it is, per JSON Schema). §1 means a
+    # literal, so the semantic layer still catches it — and says so exactly once.
+    ("maxturns-float", lambda c: _set(c, "budgets.maxTurns", 150.0), ["budgets.maxTurns"]),
     (
         "severity-unknown",
         lambda c: _set(c, "budgets.reviewSeverityThreshold", "blocker"),
@@ -1242,6 +1063,11 @@ CASES = [
         ["autonomy.riskPaths"],
     ),
     ("riskpaths-absent", lambda c: _drop(c, "autonomy.riskPaths"), ["autonomy.riskPaths"]),
+    (
+        "automergemethod-unknown",
+        lambda c: _set(c, "autonomy.autoMergeMethod", "fast-forward"),
+        [],  # advisory: §1 calls it cosmetic
+    ),
 
     # §7 — dispatch.pinsRoot
     ("pinsroot-missing", lambda c: _drop(c, "dispatch.pinsRoot"), ["dispatch.pinsRoot"]),
@@ -1297,6 +1123,18 @@ CASES = [
     ),
     ("statepath-missing-key", lambda c: _drop(c, "dispatch.statePath"), ["dispatch.statePath"]),
     ("dispatch-absent", lambda c: _drop(c, "dispatch"), ["dispatch"]),
+
+    # Invented top-level fields — the shape `/setup-board` used to emit. Not a
+    # §7 MUST-fail, but never silent: §1 defines the sections exactly.
+    ("invented-top-level-field", lambda c: _set(c, "organizationId", "0000"), []),
+
+    # §1's optional section, present and malformed. Telemetry gates nothing, so
+    # the validator says nothing — its own consumer judges it at point of use.
+    (
+        "telemetry-malformed-is-not-this-validator's-business",
+        lambda c: _set(c, "telemetry", {"store": "mysql", "lookbackDays": 0}),
+        [],
+    ),
 ]
 
 
@@ -1307,6 +1145,12 @@ def selftest():
 
     def note():
         counted[0] += 1
+
+    schema = load_schema(root)
+    if schema is None:
+        print("FAIL: check_delivery_config selftest")
+        print(f"  - cannot read {SCHEMA_FILE}; the §1 schema is the shape layer")
+        return 1
 
     # 0. The guard parser survives reformatting. Both of these have shipped in
     #    this repo — the second landed while this validator was being written and
@@ -1344,8 +1188,10 @@ def selftest():
         if hook_branch_types(tmp0) is not None:
             failures.append("guard parser: an unreadable form must return None")
 
-    # 1. Drift: the live PreToolUse guard's branch types ARE the fallback list.
-    #    If someone widens the guard, branch.types validation must widen with it.
+    # 1. Drift, THREE ways. The live PreToolUse guard's branch types, the
+    #    fallback list here, and the schema's own enum must all agree — widen
+    #    one and this names the other two, so `branch.types` can never validate
+    #    against a list nothing else believes in.
     note()
     live = hook_branch_types(root)
     if live is None:
@@ -1355,7 +1201,23 @@ def selftest():
             f"branch-type drift: {HOOK_FILE} accepts {live}, fallback says "
             f"{FALLBACK_BRANCH_TYPES}"
         )
+    note()
+    schema_types = (
+        schema["properties"]["branch"]["properties"]["types"]["items"].get("enum")
+    )
+    if schema_types != FALLBACK_BRANCH_TYPES:
+        failures.append(
+            f"branch-type drift: {SCHEMA_FILE} enumerates {schema_types}, "
+            f"fallback says {FALLBACK_BRANCH_TYPES}"
+        )
     live_types = live or FALLBACK_BRANCH_TYPES
+
+    # 2. The schema is expressible by the vendored validator — no keyword that
+    #    silently does nothing. (check_schemas.py asserts this for every schema;
+    #    repeated here so this file's own dependency is checked where it is used.)
+    note()
+    for problem in jsm.check_schema(schema):
+        failures.append(f"{SCHEMA_FILE}: {problem}")
 
     with tempfile.TemporaryDirectory() as tmp:
         repo = os.path.join(tmp, "repo")
@@ -1382,24 +1244,45 @@ def selftest():
                 value = config.get("dispatch", {}).get(key) if isinstance(config.get("dispatch"), dict) else None
                 if isinstance(value, str):
                     config["dispatch"][key] = resolve(value)
-            result = run(config, "delivery.json", repo, roots, live_types=live_types,
-                         live_source=HOOK_FILE)
+            result = run(config, "delivery.json", repo, roots, schema,
+                         live_types=live_types, live_source=HOOK_FILE)
             got = sorted({f["rule"] for f in result["errors"]})
             if got != sorted(want):
                 failures.append(f"{name}: expected errors {sorted(want)}, got {got}")
             if not want and result["warnings"]:
+                # A few cases are warning-tier ON PURPOSE; they say so by name.
+                advisory = {
+                    "automergemethod-unknown", "invented-top-level-field",
+                }
+                if name not in advisory:
+                    failures.append(
+                        f"{name}: expected a clean config, got warnings "
+                        f"{sorted({f['rule'] for f in result['warnings']})}"
+                    )
+
+        # 2b. The advisory cases must actually WARN — a tier is only meaningful
+        #     if the finding is still made.
+        for name, rule in (("automergemethod-unknown", "autonomy.autoMergeMethod"),
+                           ("invented-top-level-field", "organizationId")):
+            note()
+            config = good_config()
+            dict(CASES_BY_NAME)[name](config)
+            result = run(config, "delivery.json", repo, roots, schema,
+                         live_types=live_types, live_source=HOOK_FILE)
+            if rule not in {f["rule"] for f in result["warnings"]}:
                 failures.append(
-                    f"{name}: expected a clean config, got warnings "
+                    f"{name}: expected a warning on [{rule}], got "
                     f"{sorted({f['rule'] for f in result['warnings']})}"
                 )
 
-        # 2. Warnings alone do not fail; --strict promotes them.
+        # 3. Warnings alone do not fail; --strict promotes them.
         note()
         config = good_config()
         config["dispatch"]["pinsRoot"] = resolve("OUTSIDE/pins")
         config["autonomy"]["autoMergeMaxLines"] = 500
-        loose = run(config, "delivery.json", repo, roots, live_types=live_types)
-        strict = run(config, "delivery.json", repo, roots, strict=True, live_types=live_types)
+        loose = run(config, "delivery.json", repo, roots, schema, live_types=live_types)
+        strict = run(config, "delivery.json", repo, roots, schema, strict=True,
+                     live_types=live_types)
         if not loose["ok"] or loose["summary"]["warnings"] != 1:
             failures.append(
                 f"warning tier: expected ok with 1 warning, got ok={loose['ok']} "
@@ -1408,7 +1291,7 @@ def selftest():
         if strict["ok"]:
             failures.append("--strict did not promote a warning to a failure")
 
-    # 3. OFF is silent. The headline §2 semantic: no delivery.json → exit 0 and
+    # 4. OFF is silent. The headline §2 semantic: no delivery.json → exit 0 and
     #    NOT ONE BYTE of output on either stream.
     with tempfile.TemporaryDirectory() as tmp:
         note()
@@ -1423,7 +1306,7 @@ def selftest():
                 f"stdout={out.getvalue()!r} stderr={err.getvalue()!r}"
             )
 
-        # 4. Present-but-broken fails, and the reason names the file.
+        # 5. Present-but-broken fails, and the reason names the file.
         for label, body in (
             ("unparseable", "{not json"),
             ("array", "[]"),
@@ -1447,7 +1330,7 @@ def selftest():
                 failures.append(f"broken/{label}: failure message does not name the file")
         os.remove(os.path.join(tmp, "delivery.json"))
 
-        # 5. Repo-root discovery works from a subdirectory, so running the check
+        # 6. Repo-root discovery works from a subdirectory, so running the check
         #    from anywhere in the tree cannot report a configured project as OFF.
         note()
         nested = os.path.join(tmp, "a", "b", "c")
@@ -1459,7 +1342,7 @@ def selftest():
         if find_repo_root(os.path.join(tmp, "a")) != os.path.abspath(tmp):
             failures.append("find_repo_root did not stop at the .git marker")
 
-    # 6. worktree_roots() answers with the real repo, and always includes it.
+    # 7. worktree_roots() answers with the real repo, and always includes it.
     note()
     real_roots, answered = worktree_roots(root)
     if os.path.abspath(root) not in real_roots:
@@ -1476,7 +1359,7 @@ def selftest():
             f"got {absent_roots} answered={absent_answered}"
         )
 
-    # 7. The shipped example is the shape this validator expects. Its ONLY
+    # 8. The shipped example is the shape this validator expects. Its ONLY
     #    failures may be the two unresolved-placeholder rules — the example is a
     #    template, not a valid config, and CI must keep it that way (§1: the kit
     #    ships delivery.example.json and never a live delivery.json). Any other
@@ -1490,7 +1373,7 @@ def selftest():
         failures.append(f"cannot read delivery.example.json: {e}")
     else:
         result = run(
-            example_config, example, root, worktree_roots(root)[0],
+            example_config, example, root, worktree_roots(root)[0], schema,
             live_types=live_types, live_source=HOOK_FILE,
         )
         got = sorted({f["rule"] for f in result["errors"]})
@@ -1500,6 +1383,15 @@ def selftest():
                 f"delivery.example.json drift: expected exactly {want} "
                 f"(unfilled placeholders), got {got}"
             )
+        # And it must conform to the SCHEMA outright: every remaining complaint
+        # is semantic. A shape failure here would mean the example drifted from
+        # §1 itself, which is the class of bug this schema exists to close.
+        note()
+        for error in jsm.validate(example_config, schema):
+            failures.append(
+                f"delivery.example.json violates {SCHEMA_FILE}: "
+                f"{error['path']} {error['message']}"
+            )
 
     if failures:
         print("FAIL: check_delivery_config selftest")
@@ -1508,6 +1400,9 @@ def selftest():
         return 1
     print(f"OK: check_delivery_config selftest ({counted[0]} cases)")
     return 0
+
+
+CASES_BY_NAME = [(name, mutate) for name, mutate, _ in CASES]
 
 
 # --------------------------------------------------------------------------- #
@@ -1526,16 +1421,33 @@ def main():
     repo_root = os.path.abspath(args.repo_root) if args.repo_root else find_repo_root(os.getcwd())
 
     # STEP 1 of the §2 order, and nothing that can fail runs ahead of it: git,
-    # the hook parse and every rule below all sit AFTER this returns.
+    # the schema read, the hook parse and every rule below all sit AFTER this
+    # returns. Reading the schema first would put an I/O failure in front of the
+    # existence test, which is the hostage failure §2 exists to prevent.
     config, source = load_config(args.config, repo_root)
     if config is None:
         return 0  # OFF — not configured, not broken. Silence is the contract.
+
+    # The schema ships with the KIT, not with the project, so it is looked up
+    # beside this script rather than under the project's repo root — a project
+    # that vendored the scripts without the schemas gets a usage error, not a
+    # verdict on its config.
+    kit_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    schema = load_schema(kit_root)
+    if schema is None:
+        print(
+            f"FAIL: cannot read {os.path.join(kit_root, SCHEMA_FILE)} — it is the "
+            f"machine-readable form of contract §1 and this validator's shape "
+            f"layer. Restore it from the kit; do not judge a config without it.",
+            file=sys.stderr,
+        )
+        return 2
 
     roots, git_answered = worktree_roots(repo_root)
     live_types = hook_branch_types(repo_root)
     live_source = HOOK_FILE if live_types else "the documented branch guard"
     result = run(
-        config, source, repo_root, roots,
+        config, source, repo_root, roots, schema,
         strict=args.strict, live_types=live_types or FALLBACK_BRANCH_TYPES,
         live_source=live_source,
     )

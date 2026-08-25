@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/delivery.schema.json",
+  "title": "delivery.json",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §1 — the agentic delivery pipeline's per-project config. This file and §1 are ONE definition in two renderings: scripts/check_schemas.py fails CI if a field exists in one and not the other. Shape lives here; semantics that a schema structurally cannot express (a UUID that actually resolves, a path that exists outside every worktree, perEffort vs the global cap) live in scripts/check_delivery_config.py. Neither replaces the other.",
+  "$comment": "x-rule / x-tier / x-tier-<keyword> / x-fix are annotations read by scripts/check_delivery_config.py. x-tier says whether a violation is a §7 MUST-fail (error) or the advisory tier (warning); x-fix is the remediation prose a reader needs, which almost always lives in the contract's paragraphs rather than in the field name.",
+
+  "type": "object",
+  "required": [
+    "version", "linear", "github", "branch", "stack", "commands",
+    "budgets", "auth", "autonomy", "dispatch", "monitoring"
+  ],
+  "additionalProperties": false,
+  "x-tier-additionalProperties": "warning",
+  "x-fix": "Contract §1 defines the top-level sections exactly. Do not invent fields — a second shape for the same structure is what the contract exists to prevent; anything you learned that has no slot belongs in a report, not in this file.",
+
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "x-rule": "version",
+      "description": "Contract version. 1 today.",
+      "x-fix": "Set \"version\": 1. A reader that does not recognize the value must refuse to run rather than guess (§1) — and the PreToolUse hook classifies a version-less config as BROKEN and fails closed, blocking every tool call until a human repairs the file by hand."
+    },
+
+    "linear": {
+      "type": "object",
+      "required": ["teamKey", "workspace", "stateIds", "labels"],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "linear",
+      "properties": {
+        "teamKey": {
+          "type": "string",
+          "pattern": "\\S",
+          "x-rule": "linear.teamKey",
+          "x-tier": "warning",
+          "description": "Ticket prefix, e.g. ENG in ENG-123. Uppercase.",
+          "x-fix": "Use the uppercase team key. It is lowercased for the branch name — the branch guard is [a-z0-9-] only — but the config carries the canonical form (§1)."
+        },
+        "workspace": {
+          "type": "string",
+          "pattern": "\\S",
+          "x-rule": "linear.workspace",
+          "x-tier": "warning",
+          "description": "Workspace slug; builds ticket URLs.",
+          "x-fix": "Set the workspace urlKey. Without it the dispatcher and comment poster cannot build a ticket URL (§1)."
+        },
+        "stateIds": {
+          "type": "object",
+          "required": ["raw", "ready", "working", "review", "done"],
+          "additionalProperties": false,
+          "x-tier-additionalProperties": "warning",
+          "x-rule": "linear.stateIds",
+          "description": "The five workflow-state IDs. A closed, mandatory set.",
+          "x-fix": "States are referenced by ID, never by display name (§1) — a rename in the UI must not silently desync a guard. Run /setup-board to resolve the five UUIDs; a missing value stalls the whole queue.",
+          "properties": {
+            "raw": {"type": "string", "description": "Intake: proposals land here, human-gated."},
+            "ready": {"type": "string", "description": "Approved and dispatchable."},
+            "working": {"type": "string", "description": "A session holds it. Counts against budgets.wipLimit."},
+            "review": {"type": "string", "description": "PR open, awaiting review/CI."},
+            "done": {"type": "string", "description": "Merged/closed."}
+          }
+        },
+        "labels": {
+          "type": "object",
+          "required": ["ids", "required"],
+          "additionalProperties": false,
+          "x-tier-additionalProperties": "warning",
+          "x-rule": "linear.labels",
+          "x-fix": "§1 requires an object with `ids` (canonical key → Linear label ID) and `required` (the subset that must resolve before the pipeline may dispatch).",
+          "properties": {
+            "ids": {
+              "type": "object",
+              "additionalProperties": {"type": "string"},
+              "x-rule": "linear.labels.ids",
+              "description": "Canonical label key → Linear label ID. Values are BARE ID STRINGS, and ship as \"\" until a setup step resolves them.",
+              "x-fix": "Every value is a bare ID string — never an object, never a display name (§1 corollary, §6). Keys are the canonical names used in code; the Linear display name may drift from them. Run /setup-board to fill the IDs."
+            },
+            "required": {
+              "type": "array",
+              "items": {"type": "string"},
+              "x-rule": "linear.labels.required",
+              "description": "Subset of labels.ids keys that must resolve before the pipeline may dispatch.",
+              "x-fix": "An array of canonical label keys from §6. Every entry must have an entry in labels.ids that resolves to a real ID — guards compare IDs, never display names (§1, §6)."
+            }
+          }
+        }
+      }
+    },
+
+    "github": {
+      "type": "object",
+      "required": ["owner", "repo", "defaultBranch"],
+      "additionalProperties": false,
+      "x-rule": "github",
+      "x-tier": "warning",
+      "x-fix": "§1 requires owner, repo and defaultBranch — the last is the base for PRs and the ref guards read config values from.",
+      "properties": {
+        "owner": {"type": "string", "pattern": "\\S", "description": "Org or user."},
+        "repo": {"type": "string", "pattern": "\\S", "description": "Repo name."},
+        "defaultBranch": {"type": "string", "pattern": "\\S", "description": "Base for PRs and the ref guards read config values from. Default main."}
+      }
+    },
+
+    "branch": {
+      "type": "object",
+      "required": ["types", "requireTicketId"],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "branch.types",
+      "properties": {
+        "types": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"enum": ["feat", "fix", "chore", "refactor", "docs"]},
+          "uniqueItems": true,
+          "x-rule": "branch.types",
+          "description": "Allowed branch type prefixes. Must stay a subset of what the live PreToolUse branch-naming guard accepts.",
+          "x-fix": "A session on a branch the live guard rejects is blocked before its first edit (§1, §7). The enum here, the fallback list in scripts/check_delivery_config.py and the live guard's own regex are asserted equal by that script's selftest — widen one and CI names the other two."
+        },
+        "requireTicketId": {
+          "type": "boolean",
+          "x-rule": "branch.requireTicketId",
+          "x-tier": "warning",
+          "description": "When true, the slug must begin with the ticket ID, lowercased.",
+          "x-fix": "§1 defines a boolean. The `ticket-branch` guard is scoped to it being true (§2)."
+        }
+      }
+    },
+
+    "stack": {
+      "type": "object",
+      "required": ["kind", "securityNotes", "graderPaths"],
+      "additionalProperties": false,
+      "x-rule": "stack",
+      "x-tier": "warning",
+      "x-fix": "§1 requires kind, securityNotes and graderPaths.",
+      "properties": {
+        "kind": {"type": "string", "pattern": "\\S", "description": "Stack identifier used to pick command defaults and prompt fragments, e.g. node-ts, python, go, mixed."},
+        "securityNotes": {"type": "array", "items": {"type": "string"}, "description": "Stack-specific cautions injected into session and review prompts. Prompt material, never a guard."},
+        "graderPaths": {"type": "array", "items": {"type": "string"}, "description": "Globs a reviewer must always inspect. Advisory; distinct from autonomy.riskPaths, which is enforced."}
+      }
+    },
+
+    "commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "commands",
+      "description": "The local gate. An absent key and null both mean 'no such step' and a runner skips it.",
+      "x-fix": "§1: null is how a project says it has no such step. An empty string is invalid — it hides a misconfiguration behind a no-op, and the runner reports a step it never ran.",
+      "properties": {
+        "lint": {"type": ["string", "null"], "pattern": "\\S"},
+        "typecheck": {"type": ["string", "null"], "pattern": "\\S"},
+        "test": {"type": ["string", "null"], "pattern": "\\S"},
+        "e2e": {"type": ["string", "null"], "pattern": "\\S"},
+        "preview": {"type": ["string", "null"], "pattern": "\\S", "description": "Starts the app for a human/visual check."}
+      }
+    },
+
+    "budgets": {
+      "type": "object",
+      "required": [
+        "perEffort", "maxTurns", "wipLimit", "maxBounces",
+        "fixIterations", "totalAttempts", "dailyUsd", "reviewSeverityThreshold"
+      ],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "budgets",
+      "properties": {
+        "perEffort": {
+          "type": "object",
+          "required": ["S", "M", "L"],
+          "additionalProperties": false,
+          "x-tier-additionalProperties": "warning",
+          "x-rule": "budgets.perEffort",
+          "description": "Selected by the ticket's effort:* label.",
+          "properties": {
+            "S": {"$ref": "#/$defs/budgetBand", "x-tier-required": "warning"},
+            "M": {"$ref": "#/$defs/budgetBand", "x-tier-required": "warning"},
+            "L": {"$ref": "#/$defs/budgetBand", "x-tier-required": "warning"}
+          }
+        },
+        "maxTurns": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rule": "budgets.maxTurns",
+          "description": "Hard ceiling. Effective turns = min(perEffort[e].maxTurns, maxTurns).",
+          "x-fix": "§1 requires the hard turn ceiling as an integer ≥ 1. The §7 per-effort rule cannot be evaluated without it."
+        },
+        "wipLimit": {
+          "type": "integer", "minimum": 1,
+          "x-rule": "budgets", "x-tier": "warning",
+          "description": "Max tickets in `working` at once, across the whole team."
+        },
+        "maxBounces": {
+          "type": "integer", "minimum": 0,
+          "x-rule": "budgets", "x-tier": "warning",
+          "description": "Max review→fix round trips on one ticket before agent:needs-human. One bounce = one fix session, counted out of session (§9). The enforced one."
+        },
+        "fixIterations": {
+          "type": "integer",
+          "minimum": 1,
+          "x-rule": "budgets.fixIterations",
+          "description": "Max read→fix→push→re-watch cycles INSIDE one fix session. Prompt material, not a guard.",
+          "x-fix": "§1 requires an integer ≥ 1 (default 3, matching /fix-ci's own bound). It is a different number from budgets.maxBounces, which bounds how many fix sessions the pipeline pays for — reusing one value for both couples them at exactly the wrong place."
+        },
+        "totalAttempts": {
+          "type": "integer", "minimum": 1,
+          "x-rule": "budgets", "x-tier": "warning",
+          "description": "Max dispatches of one ticket across all stages and bounces. The count lives in the dispatcher state record (§9)."
+        },
+        "dailyUsd": {
+          "type": "number", "exclusiveMinimum": 0,
+          "x-rule": "budgets", "x-tier": "warning",
+          "description": "Rolling 24h spend cap for the whole pipeline, metered by the dispatcher — never by a session's self-reported cost."
+        },
+        "reviewSeverityThreshold": {
+          "enum": ["low", "medium", "high", "critical"],
+          "x-rule": "budgets.reviewSeverityThreshold",
+          "description": "Lowest review severity that blocks progress and starts a bounce. Findings below it are posted as comments only.",
+          "x-fix": "§1 defines low|medium|high|critical."
+        }
+      }
+    },
+
+    "auth": {
+      "type": "object",
+      "required": ["devSessions", "scheduled", "review"],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "auth",
+      "description": "Which credential each context uses, so cost attribution and rate-limit blast radius are predictable.",
+      "x-fix": "§1 defines subscription|api-key for every context, and §7 fails anything else. Unattended lanes are normally kept off the interactive credential so a runaway queue cannot exhaust a human's session capacity.",
+      "properties": {
+        "devSessions": {"$ref": "#/$defs/authMode", "description": "Interactive, human-present sessions."},
+        "scheduled": {"$ref": "#/$defs/authMode", "description": "Unattended/cron dispatches."},
+        "review": {"$ref": "#/$defs/authMode", "description": "Automated review passes."}
+      }
+    },
+
+    "autonomy": {
+      "type": "object",
+      "required": ["autoApproveProvenance", "autoMergeMaxLines", "riskPaths"],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "autonomy",
+      "properties": {
+        "autoApproveProvenance": {
+          "type": "array",
+          "items": {"enum": ["epic"]},
+          "uniqueItems": true,
+          "x-rule": "autonomy.autoApproveProvenance",
+          "description": "Provenance classes allowed to move raw → ready without a human. Must be a subset of [\"epic\"].",
+          "x-fix": "§5 rule 3, §7: only epic/* may auto-approve, because nothing an agent files carries epic provenance. Widening this lets an agent widen its own mandate by filing tickets for itself. An empty array is a valid subset — it means nothing auto-approves."
+        },
+        "autoMergeMaxLines": {
+          "type": "integer", "minimum": 0,
+          "x-rule": "autonomy.autoMergeMaxLines", "x-tier": "warning",
+          "description": "Diff-size ceiling under which an OUT-OF-SESSION automation may merge. 0 disables. No Claude Code session may ever act on this — the merge command is hook-blocked in every form, including --auto."
+        },
+        "autoMergeMethod": {
+          "enum": ["squash", "merge", "rebase"],
+          "x-rule": "autonomy.autoMergeMethod", "x-tier": "warning",
+          "description": "Optional. How the platform merges a qualifying PR. Default squash. Cosmetic — it decides nothing about WHETHER a PR merges."
+        },
+        "riskPaths": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-rule": "autonomy.riskPaths",
+          "description": "Globs that force human review regardless of diff size or provenance. Enforced, unlike stack.graderPaths.",
+          "x-fix": "§1/§7: the guard machinery and delivery.json always need a human — a PR that edits supervision is not a routine edit. The required floor is checked as an exact glob string by scripts/check_delivery_config.py."
+        }
+      }
+    },
+
+    "dispatch": {
+      "type": "object",
+      "required": ["backend", "labelTrigger", "pauseOnCapacity", "pinsRoot", "statePath"],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "x-rule": "dispatch",
+      "properties": {
+        "backend": {
+          "enum": ["github-actions", "local-daemon", "cloud"],
+          "x-rule": "dispatch.backend", "x-tier": "warning",
+          "description": "Where sessions run. An unknown backend has no declared durable store, so statePath is treated as required (§9)."
+        },
+        "labelTrigger": {
+          "type": "string", "pattern": "\\S",
+          "x-rule": "dispatch.labelTrigger", "x-tier": "warning",
+          "description": "Canonical label key (resolved through linear.labels.ids) whose presence queues a ticket. Default agent:queued."
+        },
+        "pauseOnCapacity": {
+          "type": "boolean",
+          "x-rule": "dispatch.pauseOnCapacity", "x-tier": "warning",
+          "description": "On a provider capacity error, pause the queue and apply blocked:capacity instead of consuming a totalAttempts slot."
+        },
+        "pinsRoot": {
+          "type": "string",
+          "pattern": "\\S",
+          "x-rule": "dispatch.pinsRoot",
+          "description": "Directory for pin files. Default ~/.claude/pipeline/pins. Must resolve OUTSIDE the repo and every worktree.",
+          "x-fix": "§1, §3: the pin is the only authority binding a session to its ticket, and a pin the session can write is not a pin. Use ~/.claude/pipeline/pins. Pins are short-lived — nothing durable may be stored there (§9)."
+        },
+        "statePath": {
+          "type": ["string", "null"],
+          "pattern": "\\S",
+          "x-rule": "dispatch.statePath",
+          "description": "Where the dispatcher state record (§9) is kept. null when the backend supplies its own durable store — github-actions, where the store is the pipeline-state artifact.",
+          "x-fix": "§1 requires the key: a path outside the repo and every worktree, or null for a backend with its own durable store. §9: a counter the agent can edit is not a counter."
+        }
+      }
+    },
+
+    "monitoring": {
+      "type": "object",
+      "required": ["provider", "stormPerHour"],
+      "additionalProperties": false,
+      "x-rule": "monitoring",
+      "x-tier": "warning",
+      "x-fix": "§1 requires provider and stormPerHour.",
+      "properties": {
+        "provider": {"enum": ["github-actions", "external", "none"]},
+        "stormPerHour": {"type": "integer", "minimum": 1, "description": "Max alerts emitted per hour; beyond it, alerts are coalesced. Stops one broken cron filing a hundred tickets."}
+      }
+    },
+
+    "telemetry": {
+      "type": "object",
+      "required": ["store", "dsnEnv", "schema", "lookbackDays"],
+      "additionalProperties": false,
+      "x-rule": "telemetry",
+      "description": "OPTIONAL. Absent ⇒ collection is off: the collector exits 0 and emits nothing. Deliberately NOT judged by the §7 validator — every §7 row gates autonomy, and telemetry gates nothing. Its consumer, scripts/telemetry_scrape.py, validates it at the point of use.",
+      "properties": {
+        "store": {"enum": ["postgres"], "description": "A collector that does not recognize the value refuses to run rather than guessing at a dialect."},
+        "dsnEnv": {"type": "string", "pattern": "\\S", "description": "The NAME of an environment variable holding the connection string — never the connection string. A DSN carries a password and delivery.json is a tracked file."},
+        "schema": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "SQL schema the tables live in. Default pipeline. Must be a plain identifier — it is interpolated into SQL, so a placeholder token is not acceptable here even in the shipped example."},
+        "lookbackDays": {"type": "integer", "minimum": 1, "description": "How far back a sweep reads. Default 30; the sweep is idempotent (§10), so overlap is free and a gap is not."}
+      }
+    }
+  },
+
+  "$defs": {
+    "authMode": {
+      "enum": ["subscription", "api-key"]
+    },
+    "budgetBand": {
+      "type": "object",
+      "required": ["maxTurns", "maxUsd", "maxMinutes"],
+      "additionalProperties": false,
+      "x-tier-additionalProperties": "warning",
+      "description": "One effort band's resolved caps.",
+      "properties": {
+        "maxTurns": {
+          "type": "integer",
+          "minimum": 1,
+          "x-fix": "§1, §7: effective turns = min(perEffort[e].maxTurns, budgets.maxTurns) — a per-effort value may only LOWER the cap, never raise it."
+        },
+        "maxUsd": {"type": "number", "exclusiveMinimum": 0, "x-tier": "warning"},
+        "maxMinutes": {"type": "number", "exclusiveMinimum": 0, "x-tier": "warning"}
+      }
+    }
+  }
+}
