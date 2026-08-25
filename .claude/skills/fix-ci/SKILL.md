@@ -1,6 +1,6 @@
 ---
 name: fix-ci
-description: Drive a red PR back to green — find the current branch's PR, read each failing check's log, apply the smallest fix, push, re-watch. Bounded to ~3 iterations, then reports. Never merges. Use this when a PR's CI is failing (e.g. after /ship step 6 or a Stop-hook ci-failing nag), or invoke it manually as /fix-ci.
+description: Drive a red PR back to green — find the current branch's PR, read each failing check's log, apply the smallest fix, push, re-watch. Bounded to ~3 iterations, then reports. Never merges. Use this when a PR's CI is failing (e.g. after /ship's CI watch or a Stop-hook ci-failing nag), or invoke it manually as /fix-ci.
 argument-hint: [optional PR number, if not the current branch's PR]
 allowed-tools: Bash(gh pr view *) Bash(gh pr checks *) Bash(gh run view *) Bash(gh run rerun *) Bash(git add *) Bash(git commit *) Bash(git push *) Bash(git fetch *) Bash(git rebase *) Bash(git status *) Bash(git branch *) Bash(git rev-parse *) Bash(git log *) Bash(git diff *)
 ---

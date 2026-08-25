@@ -10,6 +10,18 @@ into this repo) and this repo's own build incidents.
 
 ## Claude Code & hooks
 
+**A delimiter fence only works if the payload can't close it.** The SessionStart hook
+injects a ticket's title and acceptance criteria wrapped in `<untrusted-ticket-data>`,
+because tracker text is third-party content and anyone who can file a ticket can write
+it. The first pattern that neutralized the tag inside the payload anchored the optional
+slash directly after `<`, so `</untrusted-ticket-data>` was caught but
+`< /untrusted-ticket-data>` sailed through — one space, and everything after it is
+promoted back to instruction level. Tolerate whitespace on **both** sides of the slash,
+swallow attributes and the trailing `>`, and keep a case per escape shape. Corollary:
+because that hook is deliberately *not* self-protected and its root falls back to the
+model-mutable cwd, its `additionalContext` is context, never authority — a guard that
+needs the pinned ticket reads the pin itself (docs/adr/2026-08-24-untrusted-ticket-data-fence.md).
+
 **Hook scripts BEFORE settings wiring — the missing-script deadlock (two variants).**
 `settings.json` hook config hot-loads the instant the file is written, and Claude Code
 reads python's exit 2 as "block" — which is exactly what python exits when the script
