@@ -34,6 +34,8 @@ name: Pipeline review
 # ── Setup ─────────────────────────────────────────────────────────────────────
 #   Secret ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) per delivery.json
 #   auth.review. Until it exists this runs green and skips.
+#   Secret LINEAR_API_KEY, optional — without it the review still comments on the
+#   PR, it just cannot report its §4 telemetry to the ticket.
 #   Fork PRs get no secrets, so they skip too — by design.
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -79,6 +81,7 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       auth_mode: ${{ steps.pin.outputs.auth_mode }}
       threshold: ${{ steps.pin.outputs.threshold }}
+      post_telemetry: ${{ steps.tele.outputs.post }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,6 +103,23 @@ jobs:
             echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      # A review that cannot reach the ticket still runs and still comments on
+      # the PR — it just has nowhere to put its §4 block. Said out loud here
+      # rather than discovered as a red job three jobs later.
+      - name: Does this review have a channel to the ticket?
+        id: tele
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          LINEAR: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LINEAR:-}" ]; then
+            echo "::notice::No LINEAR_API_KEY — the review will comment on the PR, but its telemetry has no route to the ticket (contract §4)."
+            echo "post=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "post=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Resolve the PR
         id: pr
@@ -189,6 +209,12 @@ jobs:
     if: needs.snapshot.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # The §4 runs row wants the wall-clock span of the run itself, so both ends
+    # are stamped by the job rather than by the model — a reviewer reporting its
+    # own duration is one more agent-authored number for no gain.
+    outputs:
+      started_at: ${{ steps.prep.outputs.started_at }}
+      ended_at: ${{ steps.norm.outputs.ended_at }}
     # READ ONLY. This is the structural half of "never approves" — the token in
     # this job cannot submit a review even if something asked it to.
     permissions:
@@ -239,6 +265,7 @@ jobs:
             grep -qxF "$f" .git/info/exclude 2>/dev/null || echo "$f" >> .git/info/exclude
           done
           echo "Diff is $(wc -l < REVIEW-DIFF.patch) lines."
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Review
         id: agent
@@ -306,8 +333,11 @@ jobs:
              ]}
 
             `category` is one of correctness, security, tests, scope. Omit `line` if it
-            does not apply. Do not post a comment, do not approve, do not push, do not
-            modify any source file — you have no tools to do any of it, and the file
+            does not apply. `detail` is read by the humans on this PR and by the fix
+            session that may follow; the six other fields are the ones contract §4
+            stores as a `review_findings` row, so put the claim in `summary` and the
+            reasoning in `detail`. Do not post a comment, do not approve, do not push,
+            do not modify any source file — you have no tools to do any of it, and the file
             above is the entire deliverable.
 
             One quirk of running inside this repo: the project's Stop hook may nag you
@@ -323,8 +353,10 @@ jobs:
       # nothing usable must not silently read as "no findings" — but it also must
       # not wedge the PR, so the publish job says so in plain words instead.
       - name: Normalize the findings
+        id: norm
         if: always()
         env:
+          EXEC_FILE: ${{ steps.agent.outputs.execution_file }}
           TICKET: ${{ needs.snapshot.outputs.ticket_id }}
           DISPATCH_ID: ${{ needs.snapshot.outputs.dispatch_id }}
           PR: ${{ needs.snapshot.outputs.pr_number }}
@@ -363,6 +395,14 @@ jobs:
           json.dump(out, open(os.path.join(os.environ["RUNNER_TEMP"], "findings", "findings.json"), "w"), indent=2)
           print(json.dumps({k: v for k, v in out.items() if k != "findings"}, indent=2))
           PY
+          echo "ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # What the run actually cost, from the action's own execution log, so
+          # the §4 runs row carries a real number instead of a self-report or a
+          # zero. Absent or unreadable is fine — the emitter reports zeros and
+          # says so; a review that cannot price itself must not fail the job.
+          if [ -n "${EXEC_FILE:-}" ] && [ -f "$EXEC_FILE" ]; then
+            cp "$EXEC_FILE" "$RUNNER_TEMP/findings/execution.json"
+          fi
 
       # The bounce workflow reads this artifact to decide whether to spend a fix
       # session. It is written by this job, not by the model: the model's only
@@ -431,3 +471,111 @@ jobs:
             // Exit 0 whatever was found. Findings start a bounce; they never
             // gate the merge from here.
             core.info(`Posted ${d.findings.length} finding(s) to #${process.env.PR}`)
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 4. TELEMETRY — what the review cost, that it ran, and what it found (§4).
+  #
+  # The PR comment is for the human reading THIS pull request. This job is for
+  # the question no artifact can answer: which category of finding keeps coming
+  # back, over months. The findings artifact expires with the Actions retention
+  # window; "we keep shipping the same class of bug" is a question about many
+  # runs over a quarter, so the rows have to outlive the run that produced them
+  # (§4's own rationale for putting findings in telemetry at all).
+  #
+  # The batch is authored HERE, by CI, out of a file the model wrote — and it
+  # still goes through the same validator a session's batch does. A narrower
+  # channel that skips the check is a channel nobody re-checks.
+  # ════════════════════════════════════════════════════════════════════════════
+  telemetry:
+    name: Build the review's telemetry block
+    needs: [snapshot, review]
+    if: always() && needs.snapshot.outputs.go == 'true' && needs.snapshot.outputs.post_telemetry == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.build.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # continue-on-error: a review job that died before publishing leaves no
+      # artifact. That is a warning, not a failed pipeline — the PR comment job
+      # already says the PR is unreviewed.
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pipeline-review-findings-${{ needs.snapshot.outputs.pr_number }}
+          path: ${{ runner.temp }}/findings
+
+      - name: Build the batch
+        id: build
+        env:
+          MODEL: ${{ vars.PIPELINE_REVIEW_MODEL || 'claude-sonnet-5' }}
+          AUTH_MODE: ${{ needs.snapshot.outputs.auth_mode }}
+          DISPATCH_ID: ${{ needs.snapshot.outputs.dispatch_id }}
+          STARTED_AT: ${{ needs.review.outputs.started_at }}
+          ENDED_AT: ${{ needs.review.outputs.ended_at }}
+          REVIEWER_RESULT: ${{ needs.review.result }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/safe-outputs"
+          if [ ! -f "$RUNNER_TEMP/findings/findings.json" ]; then
+            echo "::warning::No findings artifact — this review has nothing to report to the ticket."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A review job that died mid-step leaves an empty stamp behind. Now is
+          # still a truthful upper bound for when it ended, and §4 needs a real
+          # ISO-8601 timestamp far more than it needs a precise one.
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          usage=""
+          if [ -f "$RUNNER_TEMP/findings/execution.json" ]; then
+            usage="--usage $RUNNER_TEMP/findings/execution.json"
+          fi
+          # shellcheck disable=SC2086
+          python3 scripts/telemetry_block.py \
+            --from-review "$RUNNER_TEMP/findings/findings.json" \
+            --out "$RUNNER_TEMP/safe-outputs/requests.json" \
+            --team-key "$(jq -r '.linear.teamKey' delivery.json)" \
+            --model "$MODEL" \
+            --auth-mode "${AUTH_MODE:-api-key}" \
+            --run-id "r_review_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" \
+            --dispatch-id "$DISPATCH_ID" \
+            --started-at "${STARTED_AT:-$now}" \
+            --ended-at "${ENDED_AT:-$now}" \
+            --reviewer-outcome "$REVIEWER_RESULT" $usage
+          # Hold this batch to the gate a session's batch is held to. It was
+          # authored by CI, so a block that fails here is a bug in this repo —
+          # and finding it now beats a `rejected` verdict in the next job.
+          python3 scripts/telemetry_block.py --gate "$RUNNER_TEMP/safe-outputs/requests.json"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.build.outputs.ready == 'true'
+        with:
+          name: pipeline-review-telemetry-${{ needs.snapshot.outputs.pr_number }}
+          path: ${{ runner.temp }}/safe-outputs
+          retention-days: 14
+          if-no-files-found: error
+
+  # The credential lives in exactly one job in this repo, and this is how every
+  # other workflow reaches it. `allowed_to_states: ''` is deliberate: a review
+  # pass reports, and may not move the ticket it is reviewing.
+  report:
+    name: Post the review's telemetry to the ticket
+    needs: [snapshot, telemetry]
+    if: always() && needs.telemetry.outputs.ready == 'true'
+    uses: ./.github/workflows/pipeline-safe-outputs.yml
+    with:
+      artifact_name: pipeline-review-telemetry-${{ needs.snapshot.outputs.pr_number }}
+      pinned_ticket_id: ${{ needs.snapshot.outputs.ticket_id }}
+      pinned_dispatch_id: ${{ needs.snapshot.outputs.dispatch_id }}
+      stage: review
+      allowed_to_states: ''
+      require_telemetry: true
+    secrets:
+      linear_api_key: ${{ secrets.LINEAR_API_KEY }}

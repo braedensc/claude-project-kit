@@ -103,6 +103,14 @@ jobs:
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
+      # The producer side of §4: the block builder, and the `telemetry-required`
+      # gate that now validates shape instead of string-matching a marker.
+      - name: Telemetry block selftest (contract §4, §8)
+        run: python3 scripts/telemetry_block.py --selftest
+
+      - name: Lifecycle observer selftest (contract §4, §10)
+        run: python3 scripts/telemetry_lifecycle.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 

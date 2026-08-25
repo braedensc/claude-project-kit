@@ -163,7 +163,18 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, re, sys, urllib.request, urllib.error
+          import json, os, sys, urllib.request, urllib.error
+
+          # The telemetry block's shape lives in ONE place (contract §12), and
+          # this job validates against it rather than re-implementing it. Failing
+          # to load it is fail-CLOSED on purpose: a validator that cannot check a
+          # block must not certify one, or the silent hole this replaced reopens.
+          sys.path.insert(0, "scripts")
+          try:
+              import telemetry_block as tb
+          except Exception as exc:
+              sys.exit("::error::cannot load scripts/telemetry_block.py (%s) \u2014 refusing to "
+                       "wave through a telemetry block this job is unable to validate." % exc)
 
           API = "https://api.linear.app/graphql"
           # Hard caps. A runaway or hostile session must not be able to spray the
@@ -254,15 +265,20 @@ jobs:
                       errors.append("%s: comment body must be a non-empty string" % tag); continue
                   if len(body) > MAX_BODY:
                       errors.append("%s: comment body %d chars exceeds %d" % (tag, len(body), MAX_BODY)); continue
-                  # Count telemetry blocks (§4): a ```json fence carrying the
-                  # schema marker. One per comment, and exactly one per run. The
-                  # marker is matched with whitespace tolerance — JSON writers
-                  # differ on spacing around the colon and nothing should hinge
-                  # on which one the session happened to use.
-                  marks = len(re.findall(r'"schema"\s*:\s*"pipeline-telemetry/1"', body))
-                  if marks > 1:
-                      errors.append("%s: %d telemetry blocks in one comment — §4 allows one" % (tag, marks)); continue
-                  telemetry_blocks += marks
+                  # Telemetry blocks (§4), SCANNED THE WAY THE COLLECTOR SCANS
+                  # and VALIDATED against schemas/telemetry-block.schema.json.
+                  # Counting a marker was never enough: a block malformed in any
+                  # way a string match cannot see used to pass here and then get
+                  # dropped, one row at a time and without an error anywhere, by
+                  # the collector. The producing session is still alive at this
+                  # point and the dashboard reader is not, so this is where a bad
+                  # block has to be loud.
+                  probe = tb.scan(body)
+                  if probe["errors"]:
+                      for problem in probe["errors"]:
+                          errors.append("%s: %s" % (tag, problem))
+                      continue
+                  telemetry_blocks += probe["count"]
                   plan.append(("comment", body))
 
               elif rtype == "ticket-state":

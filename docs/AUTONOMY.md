@@ -282,6 +282,41 @@ The sweep is idempotent on natural keys (`run_id`; `(ticket_id, event, at)`; a c
 digest for findings), so it keeps no cursor and re-running over an overlapping window is
 free. Malformed blocks are counted and skipped; only an unreachable store is an error.
 
+### Who emits which lifecycle event
+
+`ticket_events` is the table the dashboard's headline metrics are computed from — tickets
+merged, cost per merged PR, cycle time — so **every one of §4's eleven events needs a
+named producer**, and which side produces it is a supervision question, not a plumbing
+one. The rule is the one that already governs `agent:*` labels: *anything the pipeline
+acts on comes from the side that owns the loop.*
+
+| Event | Actor | Emitted by | Why that side |
+|---|---|---|---|
+| `created` | `agent` / `human` | `/plan-epic`, at the end of its run | The tickets did not exist until it filed them. |
+| `approved` | `system` / `human` | the approve gate (`check_auto_approve.py`'s caller) | Approval is the gate's decision; a session must never record its own. |
+| `dispatched` | `system` | the dispatcher | It owns the queue, the WIP count and the attempt ledger (§9). |
+| `first_commit` | `agent` | the session, in its own §4 block | It made the commit; the timestamp is `git log`, not recollection. |
+| `pr_opened` | `agent` | the session — **and** the platform observer | Reported twice on purpose: the observer covers a run that died before it could report. Same natural key, so the store keeps one row. |
+| `ci_green` | `system` | the platform observer | Every check run on the head commit finished, none badly. Observed, never claimed. |
+| `review_posted` | `system` | `pipeline-review.yml`, beside the findings | The bounce *acts* on those findings, so the row comes from CI, not from the model that wrote the prose. |
+| `bounce_started` | `system` | the bounce workflow | It owns `budgets.maxBounces` and the counter behind it. |
+| `merged` | `human` / `system` | the platform observer | §4 states it outright: **`merged` is never `agent`.** The collector refuses that row rather than skipping it, because believing it would corrupt every autonomy metric downstream. |
+| `deployed` | `system` | the deploy workflow | A deploy is a fact about an environment, not about a session. |
+| `reverted` | `human` | a person, out of band | Nothing automated should be able to record that it un-shipped itself. |
+
+Two producers, split along exactly that line:
+
+- **`scripts/telemetry_block.py`** builds and validates the block — and is what the
+  safe-outputs validator now uses to check a session's block against
+  `schemas/telemetry-block.schema.json` instead of string-matching the marker. A block
+  malformed in any way a marker match cannot see used to pass the gate and then be
+  dropped, silently, by the collector; it now fails at the session that wrote it.
+- **`scripts/telemetry_lifecycle.py`** reads `pr_opened`, `ci_green` and `merged` back out
+  of GitHub in the same job as the sweep. Its PR→ticket mapping comes from the branch
+  name, which a session can write — acceptable *only* because these rows are reporting
+  and gate nothing (§10); a binding strong enough to gate on would have to come from the
+  dispatcher's own record.
+
 `/weekly-review` then reads the **structured summary**
 (`telemetry_dashboard.py --json`), never the rendered page — one `summarize()` call
 feeds both, so the human and the model cannot end up reasoning about different numbers.
@@ -310,6 +345,8 @@ Every gate is a plain script. None needs a credential, a network, or a running p
 npm run test:approve     # the auto-approval gate's own battery
 npm run test:merge       # the auto-merge tier's battery
 npm run test:telemetry   # the collector's battery
+npm run test:block       # the block builder + the telemetry-required gate
+npm run test:lifecycle   # the platform observer
 npm run test:dashboard   # the dashboard's battery
 npm run test:review      # the weekly-review limits
 ```

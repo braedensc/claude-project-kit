@@ -7,8 +7,17 @@ name: Pipeline telemetry
 # no `telemetry` block in delivery.json ⇒ collection is off in the same way.
 #
 # Sweeps the `pipeline-telemetry/1` blocks that sessions post as ticket comments
-# into the `runs`, `ticket_events` and `review_findings` tables, then regenerates
-# the dashboard from them.
+# into the `runs`, `ticket_events` and `review_findings` tables, then observes
+# from GitHub the lifecycle milestones no session may claim, then regenerates the
+# dashboard from all of it.
+#
+# ── TWO PRODUCERS, BECAUSE ONE OF THEM MUST NOT BE THE AGENT ─────────────────
+# A session reports what it did — its first commit, the PR it opened — inside
+# its own §4 block. It cannot report that its PR went green or got merged: those
+# happen after it ends, and §4 says outright that `merged` is never `agent`. So
+# `telemetry_lifecycle.py` reads them back out of the platform, in this same
+# job, into the same table under the same natural key. Both halves are
+# idempotent, so their overlap is free and their order does not matter.
 #
 # ── IDEMPOTENT, SO THE SCHEDULE CAN BE DUMB ──────────────────────────────────
 # Every row has a natural key the contract already froze (`run_id`;
@@ -65,6 +74,10 @@ on:
 
 permissions:
   contents: read
+  # The platform observer reads pull requests and the check runs on their head
+  # commits. Read-only, on the default branch, from a scheduled job.
+  pull-requests: read
+  checks: read
 
 concurrency:
   # One writer at a time. The upserts are safe to interleave, but two concurrent
@@ -138,6 +151,33 @@ jobs:
             echo ''
             echo '```'
             cat "$RUNNER_TEMP/sweep.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # AFTER the sweep, so `--init` has already created the tables, and because
+      # the two producers write disjoint rows anyway: the sweep can only report
+      # what a session claimed, and this can only report what GitHub recorded.
+      - name: Observe the lifecycle milestones no session may claim
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          # GitHub for the PR facts, the tracker for the two state transitions
+          # (`approved`, `dispatched`). Both read-only; neither is a channel
+          # this step could write anything back through.
+          GITHUB_TOKEN: ${{ github.token }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PIPELINE_TELEMETRY_DSN: ${{ secrets.PIPELINE_TELEMETRY_DSN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          extra=""
+          if [ "${DRY_RUN:-false}" = "true" ]; then extra="--dry-run"; fi
+          python3 scripts/telemetry_lifecycle.py \
+            --config delivery.json $extra | tee "$RUNNER_TEMP/lifecycle.txt"
+          {
+            echo "### Lifecycle observation"
+            echo ''
+            echo '```'
+            cat "$RUNNER_TEMP/lifecycle.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

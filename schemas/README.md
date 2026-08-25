@@ -9,8 +9,13 @@ second *rendering* of the one that already existed.
 |---|---|---|---|
 | [`delivery.schema.json`](delivery.schema.json) | §1 `delivery.json` | human (bootstrap), `/setup-board` | dispatcher, hooks, skills, CI, collectors |
 | [`pin.schema.json`](pin.schema.json) | §3 pin file | the dispatcher | hooks, validators |
-| [`telemetry-block.schema.json`](telemetry-block.schema.json) | §4 telemetry block | the session agent | the collector, dashboards |
+| [`telemetry-block.schema.json`](telemetry-block.schema.json) | §4 telemetry block | the session agent, the review workflow | **the safe-outputs validator**, the collector, dashboards |
 | [`safe-outputs.schema.json`](safe-outputs.schema.json) | §8 safe-outputs request file | the session agent | the safe-outputs validator |
+
+`telemetry-block.schema.json` is the one that is enforced *at write time* as well as in
+CI: `scripts/telemetry_block.py` validates a block against it inside the safe-outputs
+validator, so a session's malformed telemetry is rejected while the session that wrote it
+is still there to fix it, rather than being dropped a row at a time by the collector.
 
 ## Why they exist
 
