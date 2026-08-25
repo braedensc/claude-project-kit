@@ -12,6 +12,15 @@ exists to prevent.
 | [Pin file](#3-pin-file) | outside every worktree, uncommitted | dispatcher | hooks, validators |
 | [Telemetry block](#4-telemetry-block) | ticket comment | the session agent | collector / dashboards |
 | [Provenance + labels](#5-provenance-values) | ticket fields | dispatcher, human | approval gate, dispatcher |
+| [Safe-outputs request file](#8-safe-outputs-request-file) | run-scoped artifact, uncommitted | the session agent | the safe-outputs validator |
+| [Dispatcher state](#9-dispatcher-state-record) | outside every worktree, backend-durable | dispatcher | dispatcher |
+
+> **§8 and §9 are appended rather than slotted in beside their topical neighbours.**
+> These section numbers are cited by name from `.claude/hooks/session-start.py`, the
+> `templates/workflows/pipeline-*.yml` files, the skills and `scripts/check_ticket_dor.py`.
+> Renumbering §5–§7 to make room would silently repoint every one of those citations,
+> which is the same class of desync this document exists to prevent. Numbers are
+> append-only; the cross-links below carry the topical ordering instead.
 
 Two rules shape all of it:
 
@@ -155,8 +164,9 @@ empty string is invalid — it hides a misconfiguration behind a no-op.
 | `perEffort` | object keyed `S`/`M`/`L` | Each value: `{ maxTurns, maxUsd, maxMinutes }`. Selected by the ticket's `effort:*` label. |
 | `maxTurns` | integer | Hard ceiling. **Effective turns = `min(perEffort[e].maxTurns, maxTurns)`** — a per-effort value can lower the cap, never raise it. |
 | `wipLimit` | integer | Max tickets in `working` at once, across the whole team. |
-| `maxBounces` | integer | Max review→fix round trips on one ticket before `agent:needs-human`. |
-| `totalAttempts` | integer | Max dispatches of one ticket, counting all stages and bounces. Exhausted → `agent:needs-human`. |
+| `maxBounces` | integer | Max review→fix round trips on one ticket before `agent:needs-human`. **One bounce = one fix session**, counted out of session (§9). |
+| `fixIterations` | integer | Max read→fix→push→re-watch cycles **inside** one fix session. Default `3`, matching `/fix-ci`'s own bound. Must be ≥ 1. |
+| `totalAttempts` | integer | Max dispatches of one ticket, counting all stages and bounces. Exhausted → `agent:needs-human`. The count lives in the dispatcher state record (§9). |
 | `dailyUsd` | number | Rolling 24h spend cap for the whole pipeline. |
 | `reviewSeverityThreshold` | enum `low\|medium\|high\|critical` | Lowest review severity that blocks progress and starts a bounce. Findings below it are posted as comments only. |
 
@@ -164,6 +174,23 @@ empty string is invalid — it hides a misconfiguration behind a no-op.
 > `maxUsd` are enforced against the dispatcher's own accounting of the runs it started.
 > The `cost_usd` a session self-reports is for dashboards; a session that under-reports
 > must not be able to buy itself more budget.
+
+> **`maxBounces` and `fixIterations` are two different numbers at two different
+> levels, and one field cannot serve both.** `maxBounces` bounds how many times the
+> pipeline is willing to pay for a *fresh fix session*; `fixIterations` bounds how many
+> push-and-re-watch cycles *one such session* makes before it gives up and reports.
+> Reusing one value for both couples them at exactly the wrong place: `maxBounces: 1`
+> is a reasonable one-shot policy, and under the reuse it also tells the fix session to
+> make a single push — usually not enough to clear a red build, so the one bounce burns
+> for nothing.
+>
+> **Only `maxBounces` is enforced.** It is counted out of session, keyed on CI run IDs
+> the session cannot write (§9). `fixIterations` is **prompt material**: it is injected
+> into the fix session's instructions and the session could exceed it. That is
+> tolerable because it is a *thrift* knob, not a safety one — the caps that actually
+> stop a runaway session are `budget.maxTurns`, `maxUsd` and `maxMinutes` from the pin,
+> and every push still lands on a branch that no agent may merge. Do not build a guard
+> on `fixIterations`; it is reporting-grade, per the doctrine at the top of this file.
 
 ### `auth`
 
@@ -192,7 +219,8 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | `backend` | string | Where sessions run: `github-actions`, `local-daemon`, `cloud`. |
 | `labelTrigger` | string | Canonical label key (resolved through `linear.labels.ids`) whose presence queues a ticket. Default `agent:queued`. |
 | `pauseOnCapacity` | boolean | On a provider capacity error, pause the queue and apply `blocked:capacity` instead of consuming a `totalAttempts` slot. Capacity is not the ticket's fault. |
-| `pinsRoot` | string | Directory for pin files. Default `~/.claude/pipeline/pins`. Must resolve outside every worktree and outside the repo. |
+| `pinsRoot` | string | Directory for pin files. Default `~/.claude/pipeline/pins`. Must resolve outside every worktree and outside the repo. Pins are **short-lived** — written per dispatch, deleted at session end, expiring in hours — so nothing durable may be stored here (§9). |
+| `statePath` | string \| null | Where the dispatcher state record (§9) is kept, for backends that need a location named. `null` when the backend supplies its own durable store — which is the case for `github-actions`, where the store is the `pipeline-state` artifact. Must resolve outside every worktree and outside the repo. |
 
 ### `monitoring`
 
@@ -270,9 +298,9 @@ mechanics belong to the stream that implements each guard.
 | `pin-binding` | configured **and** `session_mode: ticket` | A valid, unexpired pin exists and its `worktree` matches the derived session root (§3) |
 | `ticket-branch` | configured **and** `branch.requireTicketId` | The branch embeds the pinned ticket ID, lowercased (§1) |
 | `scope-fence` | configured | Writes stay inside the pinned ticket's scope; a change touching `autonomy.riskPaths` forces human review |
-| `lifecycle-label` | configured | The session does not set its own `agent:*` or `blocked:capacity` labels (§6) |
-| `self-approval` | configured | The session does not move a ticket `raw` → `ready`; only `epic/*` provenance auto-approves, and only out of session (§5) |
-| `telemetry-required` | configured | A terminal run posts exactly one valid telemetry block before the turn ends (§4) |
+| `lifecycle-label` | configured | The session does not set its own `agent:*` or `blocked:capacity` labels (§6). Mechanically enforced by the safe-outputs validator, which refuses dispatcher- and human-owned label keys (§8) |
+| `self-approval` | configured | The session does not move a ticket `raw` → `ready`; only `epic/*` provenance auto-approves, and only out of session (§5). Mechanically enforced by the safe-outputs validator, which refuses `raw`, `ready` and `done` as transition targets however the caller is configured (§8) |
+| `telemetry-required` | configured | A terminal run posts exactly one valid telemetry block before the turn ends (§4), carried as a `ticket-comment` request and counted by the safe-outputs validator (§8) |
 
 ---
 
@@ -364,6 +392,60 @@ already establishes as not model-mutable.
 | `pinned_at`, `pinned_by` | ISO-8601 UTC, string | Provenance of the pin itself. |
 | `expires_at` | ISO-8601 UTC | Past it, the pin is stale; readers treat it as absent and a sweeper deletes it. |
 
+### Ticket → pin field mapping
+
+The shape above pins `ticket.acceptance_criteria` and `ticket.out_of_scope` as string
+arrays but says nothing about how a *ticket* expresses them. It is one convention, and
+this is it.
+
+**Everything else comes from Linear's structured fields, not from prose.** `id`,
+`team_key`, `url`, `state_id` and `title` are read from the issue; `effort` and `track`
+from labels; `provenance` from the `provenance:*` label class plus the parent link
+(§5 rule 4). Only these two lists are parsed out of the description, because Linear has
+nowhere else to put them.
+
+**Both are read from level-2 markdown headings in the issue description:**
+
+```markdown
+## Acceptance criteria
+
+- [ ] A token within 5 minutes of expiry is refreshed before the request is sent
+- [ ] `npm test` covers the near-expiry path and passes
+
+## Out of scope
+
+- Refresh-token rotation and reuse detection (separate ticket)
+```
+
+The parsing rule, which every reader of a ticket description MUST share:
+
+| Rule | Behavior |
+|---|---|
+| Heading level | Exactly `## `. A `#` or `###` line does not open a section. |
+| Heading match | The heading text equals `Acceptance criteria` / `Out of scope`, compared case-insensitively after trimming. Not a substring test — `## Acceptance criteria (draft)` is a different section and is ignored. |
+| Fenced blocks | A ```` ``` ```` or `~~~` fence suspends heading detection. A `## Acceptance criteria` line *inside* a code fence is sample text, not a section. |
+| Section end | The next `## ` heading outside a fence. |
+| Items | Lines matching `- ` or `* ` at the start (after optional indent). Acceptance criteria are task-list items (`- [ ] …` / `- [x] …`) and **the `[ ]` / `[x]` marker is stripped** — it is list syntax, not part of the criterion. Out-of-scope items are plain bullets. |
+| Continuation lines | Not joined. A wrapped item keeps only its first line, so **each item must fit on one line.** |
+| Repeated sections | Each section appears exactly once. A second occurrence is a malformed ticket, not more items. |
+| Every other `## ` section | **Ignored entirely.** `Context`, `Test plan` and `Pointers` are for the human reading the ticket and for the brief's verbatim description block; nothing in them reaches a pin field. |
+
+**A missing or empty section yields an empty list — never an inferred one.** The
+dispatcher does not guess a definition of done from the description prose, and it does
+not silently substitute one. An empty `out_of_scope` means the ticket shipped without a
+scope fence; an empty `acceptance_criteria` means it shipped without a definition of
+done. Both are Definition-of-Ready failures that `scripts/check_ticket_dor.py` is
+supposed to have caught at approval, and the session is told plainly that the list was
+empty rather than handed something invented.
+
+> **One description, one parser.** `scripts/check_ticket_dor.py` (the gate that admits
+> a ticket) and the dispatcher (which snapshots it into a pin) read the same five
+> sections of the same text. The table above is the DoR gate's rule, and it is
+> canonical **because the gate is what certifies the ticket parses at all** — a
+> dispatcher that reads the text differently from the gate that approved it can pin a
+> criteria list no human ever reviewed. Any second reader that diverges is the
+> "second shape for the same structure" failure, not a local convenience.
+
 ### Write protocol (dispatcher)
 
 1. Create the worktree and branch.
@@ -394,6 +476,10 @@ already establishes as not model-mutable.
 ## 4. Telemetry block
 
 A session reports itself by posting **one fenced JSON block** as a ticket comment.
+
+> **The session does not post it directly.** It has no tracker credential; the comment
+> is *requested* as a `ticket-comment` in the safe-outputs file (§8) and posted by the
+> validator job. §4 is the block's shape; §8 is how it travels.
 
 ````markdown
 ```json
@@ -533,6 +619,9 @@ Runs only when the pipeline is configured (§2). A `delivery.json` validator MUS
 - [ ] Any `commands.*` set to `""` (use `null`)
 - [ ] `perEffort[e].maxTurns > budgets.maxTurns` for any `e` (a per-effort value may only lower the cap)
 - [ ] `budgets.reviewSeverityThreshold` outside `low|medium|high|critical`
+- [ ] `budgets.fixIterations` missing, or less than `1`
+- [ ] `dispatch.statePath` non-null and resolving inside the repo or inside any worktree
+- [ ] `dispatch.statePath` null for a `dispatch.backend` that has no durable store of its own (anything other than `github-actions`) — the attempt counter would have nowhere to live (§9)
 - [ ] Any `auth.*` outside `subscription|api-key`
 - [ ] `autonomy.autoApproveProvenance` not a subset of `["epic"]`
 - [ ] `autonomy.riskPaths` missing `.claude/hooks/**`, `.claude/settings*.json`, or `delivery.json`
@@ -540,3 +629,206 @@ Runs only when the pipeline is configured (§2). A `delivery.json` validator MUS
 
 A validator MUST NOT fail — or emit anything at all — when `delivery.json` is absent.
 That is *off*, not *broken*.
+
+---
+
+## 8. Safe-outputs request file
+
+**The problem:** a session must be able to comment on its ticket and move it to review.
+Hand it a tracker credential and every "the agent must not …" rule in this document
+degrades to a prompt instruction — an agent holding the API key can call the GraphQL
+endpoint directly and no wording prevents it.
+
+**The rule:** the session holds **no tracker credential at all.** It writes structured
+*write-requests* to a file; a separate job that does hold the credential validates them
+against the **dispatcher-supplied** pinned ticket ID and executes only the survivors.
+The constraint stops being a request and becomes structural: no key in the job, no
+write path.
+
+### Shape
+
+```json
+{
+  "schema": "pipeline-safe-outputs/1",
+  "requests": [
+    { "type": "ticket-comment", "ticket_id": "ENG-123", "body": "…markdown…" },
+    { "type": "ticket-state",   "ticket_id": "ENG-123", "to": "review" },
+    { "type": "ticket-label",   "ticket_id": "ENG-123", "add": ["needs-design"], "remove": [] }
+  ]
+}
+```
+
+| Type | Fields | Notes |
+|---|---|---|
+| `ticket-comment` | `ticket_id`, `body` | `body` is non-empty markdown. The telemetry block (§4) travels as one of these. |
+| `ticket-state` | `ticket_id`, `to` | `to` is a **canonical state key** from `linear.stateIds` (`working`, `review`, …), never a UUID and never a display name. |
+| `ticket-label` | `ticket_id`, `add[]`, `remove[]` | Canonical label keys from `linear.labels.ids` (§6). Either list may be empty. |
+
+An unrecognized `schema`, an unrecognized `type`, or `requests` that is not a list
+rejects the batch. A reader that does not recognize the schema refuses; it does not
+guess.
+
+### Validation rules
+
+Every rule is a MUST, and all of them run **before any request executes**.
+
+| Rule | Rationale |
+|---|---|
+| Every `ticket_id` equals the **dispatcher-supplied** pinned ID | The central check. The agent *names* a ticket and the validator *compares* it — the value is never used to address anything. A mismatch is an attempted retarget, not a typo. |
+| At most **one** `ticket-state` per run | A run advances the ticket once. Several transitions in one batch is either confusion or an attempt to land somewhere by way of somewhere else. |
+| `raw`, `ready` and `done` are **never** valid targets | `ready` would be self-approval (§5); `done` would be a session claiming its own merge (§5, §6). Refused **even when a caller passes them in `allowed_to_states`** — a belt the caller cannot unbuckle. |
+| Targets are otherwise limited to the caller's `allowed_to_states` | Default `review`. The stage decides what a session may do, not the session. |
+| `agent:*`, `blocked:capacity`, `provenance:*` and `hooks-change` labels are refused, in `add` **and** `remove` | Dispatcher- and human-owned (§5, §6). A session setting `agent:needs-human` — or clearing `agent:blocked` — is a session editing its own supervision. `remove` matters as much as `add`. |
+| Unknown label keys are refused | Only keys present in `linear.labels.ids` resolve to an ID. |
+| Exactly **one** telemetry block across all comments, when the caller requires it | §4. Counted by the `"schema": "pipeline-telemetry/1"` marker, matched with whitespace tolerance so nothing hinges on a JSON writer's spacing. Zero blocks is a `telemetry-required` violation (§2); two is a double-count. |
+| A missing requests file with telemetry required is a **rejection**, not a skip | A session that reports nothing is indistinguishable from one that silently failed, and silence must not be the quiet path. |
+
+### Caps
+
+| Cap | Value | Why |
+|---|---|---|
+| Requests per batch | 20 | A runaway or hostile session must not spray the tracker. |
+| Comment body | 16 000 chars | Bounded cost, bounded blast radius. |
+| Label ops per request | 10 | `add` + `remove` combined. |
+
+### All-or-nothing
+
+**One invalid request rejects the entire batch and nothing is applied.** Two reasons,
+and both matter:
+
+1. **An escape attempt earns no partial credit.** If nineteen valid requests applied
+   and only the twentieth were dropped, probing for the edge of the validator would be
+   free — a session could smuggle its legitimate work through while testing what else
+   gets past.
+2. **A half-applied batch leaves the tracker in a state nobody designed** — a state
+   moved but the explaining comment missing, or labels changed with no telemetry to say
+   why.
+
+The job reports a single verdict: `ok` (validated, executed), `rejected` (batch
+refused, nothing applied), or `skipped` (nothing to apply and none required).
+
+### What is authority here, and what is not
+
+| | |
+|---|---|
+| **Authority** | `delivery.json` on the default branch; the pin; the pinned ticket ID and dispatch ID passed in by the dispatcher. The validator checks out the **default branch**, never the PR head — reading `delivery.json` from the head would let a session widen its own allowed transitions in the same PR it is asking to be approved. |
+| **Reporting** | Every field of the requests file. Each one is a *request*, never a fact. |
+
+> **The file path may be named by an environment variable, and that is not a §3
+> violation.** §3 rules env vars out as *pin* transports because a pin is authority. The
+> path here points at agent-authored output: repointing it only costs the session its
+> own reporting channel. What the agent cannot influence is the artifact name the
+> dispatcher collects and the pinned ID the validator compares against.
+
+---
+
+## 9. Dispatcher state record
+
+`budgets.totalAttempts` bounds how many times one ticket may be dispatched, and
+`budget.attempt` / `budget.of` are pinned into every pin (§3). Both require the count to
+be known **before** dispatch — which makes it authority, not reporting, and gives it
+nowhere to live in any structure written during a session.
+
+**The count lives in a dispatcher-owned state record**, written outside every worktree,
+by the dispatcher only.
+
+### Shape
+
+```json
+{
+  "schema": "pipeline-dispatcher-state/1",
+  "attempts": { "ENG-123": 2 },
+  "capacity": {
+    "paused_until": "2026-08-24T18:00:00Z",
+    "resets_at": "2026-08-24T18:00:00Z",
+    "used_percentage": null,
+    "noted_at": "2026-08-24T15:04:05Z"
+  },
+  "spend": [
+    { "at": "2026-08-24T15:04:05Z", "usd": 6.0, "ticket": "ENG-123", "dispatch_id": "d_01JAV8…" }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `attempts` | object → integer | Ticket identifier → dispatches so far. `attempts[t] >= totalAttempts` ⇒ the ticket is skipped and `agent:needs-human` is applied. |
+| `capacity` | object | Queue pause after a provider capacity error (`dispatch.pauseOnCapacity`). Time-bounded: a pause in the past is simply over. |
+| `spend` | array | The dispatcher's own accounting behind `budgets.dailyUsd` — the ledger referenced by "spend is metered by the dispatcher" in §1. |
+
+### Rules
+
+1. **Exactly one writer per run.** The record is written once, at the end of a dispatch
+   run, by one job. Concurrent writers would lose updates on the one number that decides
+   whether more money gets spent.
+2. **Never read from inside a worktree, never written by a session.** Same reason the
+   pin is not: a counter the agent can edit is not a counter.
+3. **A capacity failure refunds the attempt and the reserved spend.** Provider capacity
+   is not the ticket's fault (§1 `dispatch.pauseOnCapacity`).
+4. **A missing or unreadable record starts from zero. It never blocks dispatch.** Fail-
+   closed on a missing *precondition* is the hostage failure §2 exists to prevent.
+5. **The store's retention must exceed the longest a ticket can stay in flight.** On
+   `github-actions` that is the artifact's retention window; on a filesystem store it is
+   whatever prunes the directory.
+
+### Where it lives, per backend
+
+The contract owns the **record and its invariants**; each `dispatch.backend` binds them
+to a concrete durable store, declared by `dispatch.statePath` (§1):
+
+| `dispatch.backend` | Store | `statePath` |
+|---|---|---|
+| `github-actions` | The `pipeline-state` Actions artifact, read newest-first at the start of a run and republished at the end | `null` — the artifact name is fixed by this contract, so there is nothing to configure |
+| `local-daemon` | A file at the configured path | Required |
+| `cloud` | A file or object at the configured path in the service's own durable storage | Required |
+
+Naming the artifact *here* is the point: a well-known name written into the contract is
+one shape, whereas the same name chosen inside one workflow is a local convention the
+next backend cannot see.
+
+### The trade-off, stated plainly
+
+**The counter is bounded, not exact.** If the store is lost or expires, every in-flight
+ticket gets its attempts back and may be dispatched up to `totalAttempts` more times.
+That is accepted, because the **durable terminal signal is not the counter** — it is the
+`agent:needs-human` label, which lives on the ticket, is dispatcher-owned, and is never
+cleared by the dispatcher. A ticket carrying it is skipped before the count is even
+consulted. So losing the state costs **at most one extra attempt per ticket**, not an
+unbounded loop.
+
+The property that actually holds is: *a ticket never dispatches while carrying
+`agent:needs-human`*, and the attempt count is the mechanism that **applies** that
+label. A project that needs exact attempt accounting must supply a store that does not
+expire; the contract does not require a database to run a queue.
+
+### Rejected: a dispatcher-authored ticket comment
+
+A marker comment on the ticket itself is tempting — it is durable, backend-independent,
+and needs no new storage. It is **rejected**, and the reasoning is recorded here because
+it will be proposed again.
+
+§3 already lists ticket comments as **not a valid pin transport** — "the agent posts
+them." The tempting rescue is that in this architecture the agent has *no tracker
+credential at all* (§8), so it cannot post one. That rescue does not hold:
+
+1. **It is a property of one backend's implementation, not of the contract.** The
+   credential split is a `github-actions` workflow design. `dispatch.backend` also
+   admits `local-daemon` and `cloud`, and a session there may well run with a tracker
+   MCP server attached. A trust boundary that holds only until someone configures a
+   different backend is not a trust boundary.
+2. **Even with no credential, the agent has a validated write channel into ticket
+   comments.** §8 executes `ticket-comment` requests using the *dispatcher's* credential.
+   The validator bounds their count and size and refuses dispatcher-owned labels and
+   states — it does not inspect comment *bodies* for a state marker. A session could
+   request a comment containing a forged marker, and it would be posted under the
+   dispatcher's own identity, indistinguishable from the real thing. Defending that
+   needs a further validator rule whose whole security rests on a marker string staying
+   obscure.
+3. **It would make a frozen rule conditional.** Amending §3 to "ticket comments are
+   fine when the backend happens to withhold a credential" is exactly the second shape
+   for the same structure this document exists to prevent.
+
+Also rejected: **storing the counter in `pinsRoot`.** It reuses a directory that already
+exists, but it conflates two lifetimes — pins are per-dispatch scratch with a sweeper
+deleting stale ones, while the counter must outlive every session on the ticket. Long-
+lived authority does not belong in a directory something is designed to prune.
