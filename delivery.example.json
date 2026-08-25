@@ -74,6 +74,7 @@
     "maxTurns": 150,
     "wipLimit": 3,
     "maxBounces": 2,
+    "fixIterations": 3,
     "totalAttempts": 3,
     "dailyUsd": 50.0,
     "reviewSeverityThreshold": "medium"
@@ -103,7 +104,8 @@
     "backend": "github-actions",
     "labelTrigger": "agent:queued",
     "pauseOnCapacity": true,
-    "pinsRoot": "~/.claude/pipeline/pins"
+    "pinsRoot": "~/.claude/pipeline/pins",
+    "statePath": null
   },
 
   "monitoring": {
