@@ -12,6 +12,11 @@
     "test:hooks": "python3 .claude/hooks/test_hooks.py",
     "test:dor": "python3 scripts/check_ticket_dor.py --selftest",
     "test:delivery": "python3 scripts/check_delivery_config.py --selftest",
+    "test:approve": "python3 scripts/check_auto_approve.py --selftest",
+    "test:merge": "python3 scripts/check_auto_merge.py --selftest",
+    "test:telemetry": "python3 scripts/telemetry_scrape.py --selftest",
+    "test:dashboard": "python3 scripts/telemetry_dashboard.py --selftest",
+    "test:review": "python3 scripts/check_weekly_review.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },

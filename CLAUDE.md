@@ -115,6 +115,11 @@ than blocks.
 npm run test:hooks      # the block/allow battery (must stay green; also runs in CI)
 npm run test:dor        # Definition-of-Ready gate selftest
 npm run test:delivery   # delivery.json validator selftest (PIPELINE-CONTRACT §7)
+npm run test:approve    # auto-approval gate selftest (§5, §11)
+npm run test:merge      # auto-merge tier selftest (§11)
+npm run test:telemetry  # telemetry collector selftest (§4, §10)
+npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
+npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -125,10 +130,14 @@ npm install             # installs husky + secretlint, wires the pre-commit hook
 `delivery.example.json`, and contract §2 makes an absent `delivery.json` *off*, not
 broken: the validator exits 0 emitting nothing at all.
 
+**The autonomy and telemetry scripts are inert here for the same reason** — no
+`delivery.json`, no telemetry store. Their `--selftest` batteries are what has teeth,
+and each asserts its contract rows against synthetic fixtures.
+
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
-validation, the forbidden-paths gate, placeholder integrity, the DoR and delivery-config
-selftests, and secretlint on every PR. `main` is protected (that context required,
-admins enforced).
+validation, the forbidden-paths gate, placeholder integrity, the DoR, delivery-config,
+auto-approve, auto-merge, telemetry, dashboard and weekly-review selftests, and
+secretlint on every PR. `main` is protected (that context required, admins enforced).
 
 ---
 
@@ -145,6 +154,12 @@ legacy).
   routine reliably.
 - **`/work <TICKET-ID>`** — the dev loop below, start to finish. Inert unless
   `delivery.json` exists.
+- **`/weekly-review [days]`** — one document per period: what shipped (written for a
+  person, from the tickets' acceptance criteria), pipeline health from telemetry, review
+  findings turned into a proposed rubric change, backlog state, next period's plan, and
+  quarantined feature proposals. Reads the **structured summary**, never the rendered
+  dashboard. Proposes; never raises its own budgets, never rewrites its own graders,
+  never merges. Inert unless `delivery.json` exists.
 - **`/new-adr <slug>`** — scaffolds a dated ADR + index row.
 
 Before reinventing, note the bundled skills Claude Code already ships: `/code-review`,
@@ -195,6 +210,14 @@ criteria behind the same fence — **advisory only**. That hook is deliberately 
 self-protected *and* its root falls back to the model-mutable cwd, so nothing may ever
 treat its output as a trust source; a guard that needs the pin reads the pin itself.
 
+**Around that loop sit three autonomy tiers** (§11, `docs/AUTONOMY.md`), each narrower
+than the last and each off by default above the first: *dispatch* (may an approved
+ticket start a session), *approve* (`raw` → `ready` without a person — `epic/*`
+provenance only, with the epic itself verified out of intake), and *merge*. The merge
+tier does **not** merge: it asks GitHub to enable its own auto-merge, so the platform
+merges under branch-protection rules that live in repository settings, outside the repo
+tree and unreachable from a session. `gh pr merge` stays hook-blocked in every form.
+
 ---
 
 ## Cost & memory
@@ -213,7 +236,9 @@ treat its output as a trust source; a guard that needs the pin reads the pin its
 
 ## Where the depth lives
 
-`docs/SECURITY.md` (3-layer model, secrets stores, self-protection, runbooks) ·
+`docs/AUTONOMY.md` (the three autonomy tiers, the branch ruleset auto-merge depends on,
+and how to turn each rung on) · `docs/SECURITY.md` (3-layer model, secrets stores,
+self-protection, runbooks) ·
 `docs/COLLABORATION.md` (branch/worktree/parallel-session protocol + the enforcement
 list) · `docs/TESTING.md` · `docs/LESSONS.md` (every gotcha, incl. the self-protection
 build-before-lock lesson) · `docs/STACK-RATIONALE.md` · `.claude/hooks/README.md` ·

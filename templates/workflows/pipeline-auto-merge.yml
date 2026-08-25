@@ -1,0 +1,465 @@
+name: Pipeline auto-merge
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INERT template (activated at bootstrap by `git mv`). The narrowest tier of the
+# optional agentic delivery pipeline — see docs/AUTONOMY.md and
+# docs/PIPELINE-CONTRACT.md §11. No delivery.json ⇒ the pipeline is OFF and this
+# exits 0 doing nothing (§2).
+#
+# ── NOTHING HERE MERGES. THAT IS NOT A TECHNICALITY. ─────────────────────────
+# Claude never merges: the kit's PreToolUse hook blocks the CLI merge command in
+# every form, including `--auto`, and this template does not change that by one
+# character. What this workflow does is call GitHub's `enablePullRequestAutoMerge`
+# mutation, which asks the PLATFORM to merge the PR *if and when* branch
+# protection is satisfied. The merge is performed by GitHub, under rules that
+# live in repository settings — outside the repo tree, outside any diff, and
+# beyond the reach of anything running in a session.
+#
+# So the capability is never held and then restrained. It is never held. A PR
+# that this workflow enables auto-merge on still cannot merge while a required
+# check is red, and revoking that is a settings change a human makes, not a code
+# change a PR can carry.
+#
+# ── THE REQUIRED RULESET (docs/AUTONOMY.md has the copy-paste version) ───────
+# Enabling auto-merge is pointless — and unsafe — without protection on the
+# default branch. Before switching this on:
+#   • Settings → General → "Allow auto-merge" checked
+#   • A ruleset on the default branch requiring: the CI status check(s) by
+#     context name, at least one approving review, and a linear history
+#   • `gh label create hooks-change` (the grader-path job needs the label to exist)
+# Without the required checks, auto-merge merges as soon as it is enabled, and
+# every gate below becomes the ONLY gate. They are meant to be the second line.
+#
+# ── EIGHT CONDITIONS, ALL REQUIRED, ALL RECOMPUTED ───────────────────────────
+# `scripts/check_auto_merge.py` is the decision, and every input it reads is
+# something a session cannot write: config from the PR's BASE sha, the review
+# findings artifact, `git diff base...head`, the Actions run history for the
+# bounce count, the check-run API, and a RE-RUN of the auto-approval gate. PR
+# labels and PR body text are deliberately not consulted — the session's own
+# token can edit both.
+#
+# ZERO BOUNCES is the condition people will want to relax first. Don't: a bounce
+# means the first attempt was wrong in a way review or CI caught, and mixed
+# evidence is exactly the case worth a human's thirty seconds.
+#
+# ── Setup ────────────────────────────────────────────────────────────────────
+#   Secret  LINEAR_API_KEY                Linear personal API key
+#   Var     PIPELINE_AUTO_MERGE_ENABLED   must be exactly "true"
+#   delivery.json → autonomy.autoMergeMaxLines must be > 0 (ships as 0 = off)
+# Three switches with three owners: a repo variable (human, GitHub UI), a config
+# value (reviewable in a PR), and the branch ruleset (human, GitHub UI).
+#
+# NOTE: `workflow_run` reads THIS FILE from the DEFAULT branch — it only fires
+# once merged to main and cannot be exercised from a feature branch
+# (docs/LESSONS.md).
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_run:
+    # Runs after the review has published its findings. Each entry must match a
+    # watched workflow's top-level `name:` exactly.
+    workflows: ['Pipeline review']
+    types: [completed]
+  # A push to an open PR revokes any auto-merge request on it (see `invalidate`).
+  pull_request:
+    types: [synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Evaluate this PR number (report-only unless the switches are on).'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-auto-merge-${{ github.event.workflow_run.head_branch || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    name: Does this PR qualify?
+    # `pull_request` reaches the revoke job only — a push is never an occasion to
+    # grant auto-merge, only to take it away.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read          # bounce counter + the review findings artifact
+      pull-requests: write   # the auto-merge mutation, and the explaining comment
+    steps:
+      # The DEFAULT branch, for the same reason every other gate does it: a head
+      # checkout would let the PR under evaluation supply its own gate.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Preflight — configured, enabled, and is there a PR?
+        id: pre
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          ENABLED: ${{ vars.PIPELINE_AUTO_MERGE_ENABLED }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+          # §2 step 1: existence first, before anything that can fail.
+          if [ ! -f delivery.json ]; then
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # A non-integer cap is unreadable, and an unreadable cap is not an
+          # enabled one — fall through to "off" rather than letting `[ -le ]`
+          # abort the step on a config typo.
+          cap=$(jq -r '.autonomy.autoMergeMaxLines // 0' delivery.json)
+          case "$cap" in
+            ''|*[!0-9]*) cap=0 ;;
+          esac
+          if [ "$cap" -le 0 ]; then
+            echo "::notice::autonomy.autoMergeMaxLines is not a positive integer — auto-merge is off for this project."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -n "${CONCLUSION:-}" ] && [ "$CONCLUSION" != "success" ]; then
+            echo "::notice::The review run concluded '$CONCLUSION' — not evaluating."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          pr="${INPUT_PR:-}"
+          if [ -z "$pr" ] && [ -n "${BRANCH:-}" ]; then
+            pr=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+                   --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+          if [ -z "$pr" ]; then
+            echo "::notice::No open PR to evaluate."
+            echo "go=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "enabled=${ENABLED:-}" >> "$GITHUB_OUTPUT"
+          echo "go=true" >> "$GITHUB_OUTPUT"
+
+      - name: Gather the evidence (nothing here is agent-writable)
+        id: evidence
+        if: steps.pre.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pre.outputs.pr }}
+        run: |
+          set -euo pipefail
+          E="$RUNNER_TEMP/evidence"; mkdir -p "$E"
+
+          # ── The PR itself: base/head shas, branch, merge state, check runs ──
+          gh pr view "$PR" --repo "$REPO" \
+            --json number,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,statusCheckRollup,isDraft \
+            > "$E/pr.json"
+          jq -r '.statusCheckRollup // []' "$E/pr.json" > "$E/checks.json"
+          echo "branch=$(jq -r .headRefName "$E/pr.json")" >> "$GITHUB_OUTPUT"
+          echo "merge_state=$(jq -r '.mergeStateStatus // ""' "$E/pr.json")" >> "$GITHUB_OUTPUT"
+          echo "draft=$(jq -r '.isDraft' "$E/pr.json")" >> "$GITHUB_OUTPUT"
+
+          BASE=$(jq -r .baseRefOid "$E/pr.json")
+          HEAD=$(jq -r .headRefOid "$E/pr.json")
+          git fetch --no-tags origin "$BASE" "$HEAD" 2>/dev/null || true
+
+          # ── The diff, from git, not from the PR's own description of itself ──
+          git diff --name-only "$BASE...$HEAD" > "$E/changed.txt" || true
+          add=$(git diff --numstat "$BASE...$HEAD" | awk '{a+=$1} END {print a+0}')
+          del=$(git diff --numstat "$BASE...$HEAD" | awk '{d+=$2} END {print d+0}')
+          echo "added=$add" >> "$GITHUB_OUTPUT"
+          echo "removed=$del" >> "$GITHUB_OUTPUT"
+
+          # ── delivery.json from the BASE sha (§1) ────────────────────────────
+          git show "$BASE:delivery.json" > "$E/delivery.base.json" 2>/dev/null \
+            || cp delivery.json "$E/delivery.base.json"
+
+          # ── Bounce count, from Actions run history ──────────────────────────
+          # Same method as pipeline-bounce.yml: one bounce = one run of that
+          # workflow on this branch that actually reached its `fix` job. Run
+          # history is not writable by the sessions being counted; the
+          # `pipeline:bounce-N` PR labels ARE (the fix session's token can edit
+          # PR labels), which is why they are not consulted here.
+          BR=$(jq -r .headRefName "$E/pr.json")
+          n=0
+          runs=$(gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?branch=$BR&per_page=30" \
+                   --jq '.workflow_runs[].id' 2>/dev/null || true)
+          for id in $runs; do
+            if gh api "repos/$REPO/actions/runs/$id/jobs" \
+                 --jq '.jobs[] | select(.name | startswith("Fix (bounce")) | .conclusion' \
+                 2>/dev/null | grep -q .; then
+              n=$((n + 1))
+            fi
+          done
+          echo "bounces=$n" >> "$GITHUB_OUTPUT"
+          echo "Found $n prior bounce run(s) on $BR."
+
+      - name: Fetch the review findings artifact
+        id: findings
+        if: steps.pre.outputs.go == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pipeline-review-findings-${{ steps.pre.outputs.pr }}
+          path: ${{ runner.temp }}/evidence/findings
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # Recompute the approval tier rather than trusting a stored bit. A ticket
+      # relabelled, reparented or blocked since approval stops qualifying here,
+      # which a flag written at approval time could never notice.
+      - name: Recompute the auto-approval verdict for this PR's ticket
+        id: tier
+        if: steps.pre.outputs.go == 'true'
+        continue-on-error: true
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          BRANCH: ${{ steps.evidence.outputs.branch }}
+        run: |
+          set -euo pipefail
+          E="$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, urllib.request, urllib.error
+
+          E = os.path.join(os.environ["RUNNER_TEMP"], "evidence")
+          cfg = json.load(open(os.path.join(E, "delivery.base.json")))
+          team = ((cfg.get("linear") or {}).get("teamKey") or "").strip()
+          branch = os.environ.get("BRANCH", "")
+
+          # The branch name is COSMETIC (§3) — it is used only to find which
+          # ticket to go and ask about. Every fact that decides anything is then
+          # read from the tracker, and the approval gate re-derives provenance
+          # from labels and the parent link, not from the branch.
+          m = re.match(r"^(?:feat|fix|chore|refactor|docs)/([a-z][a-z0-9]*-\d+)-", branch)
+          if not m or not team:
+              sys.exit("::error::cannot derive a ticket ID from branch %r" % branch)
+          ticket = m.group(1).upper()
+          if not ticket.startswith(team.upper() + "-"):
+              sys.exit("::error::branch names ticket %s, outside team %s" % (ticket, team))
+
+          key = os.environ.get("LINEAR_API_KEY")
+          if not key:
+              sys.exit("::error::LINEAR_API_KEY not set — cannot verify the approval tier")
+
+          def gql(q, v):
+              req = urllib.request.Request(
+                  "https://api.linear.app/graphql",
+                  data=json.dumps({"query": q, "variables": v}).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": key})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      payload = json.load(r)
+              except urllib.error.HTTPError as e:
+                  sys.exit("::error::Linear API HTTP %s: %s" % (e.code, e.read()[:400]))
+              if payload.get("errors"):
+                  sys.exit("::error::Linear API error: %s" % json.dumps(payload["errors"])[:400])
+              return payload["data"]
+
+          FIELDS = """
+            id identifier title description
+            state { id }
+            parent { identifier }
+            project { id }
+            labels(first: 50) { nodes { id name } }
+          """
+
+          def shape(n):
+              return {
+                  "id": n["identifier"], "title": n.get("title") or "",
+                  "description": n.get("description") or "",
+                  "labels": [l["name"] for l in (n.get("labels") or {}).get("nodes", [])],
+                  "projectId": (n.get("project") or {}).get("id"),
+                  "parentId": (n.get("parent") or {}).get("identifier") or "",
+                  "stateId": (n.get("state") or {}).get("id"),
+              }
+
+          node = gql("query($id: String!) { issue(id: $id) { %s } }" % FIELDS,
+                     {"id": ticket}).get("issue")
+          if not node:
+              sys.exit("::error::ticket %s not found" % ticket)
+          t = shape(node)
+
+          # The ticket has of course left `raw` by now — it is in review. The
+          # approval gate's `state` check is about intake, so it is re-run
+          # against the state the ticket WAS approved out of; every other gate
+          # (provenance, epic, DoR, riskPaths, supervision) is evaluated live.
+          t["stateId"] = ((cfg.get("linear") or {}).get("stateIds") or {}).get("raw")
+
+          epics = {}
+          if t["parentId"]:
+              enode = gql("query($id: String!) { issue(id: $id) { %s } }" % FIELDS,
+                          {"id": t["parentId"]}).get("issue")
+              if enode:
+                  epics[enode["identifier"]] = shape(enode)
+
+          json.dump({"tickets": [t]}, open(os.path.join(E, "ticket.json"), "w"))
+          json.dump({"epics": epics}, open(os.path.join(E, "epics.json"), "w"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("ticket=%s\n" % ticket)
+          PY
+
+          python3 scripts/check_auto_approve.py \
+            --config "$E/delivery.base.json" \
+            --repo-root . \
+            --epic "$E/epics.json" \
+            --json "$E/ticket.json" > "$E/approval.json" || true
+          echo "Recomputed approval tier: $(jq -r '.ok' "$E/approval.json")"
+
+      - name: Decide (deterministic — no model runs here)
+        id: decide
+        if: steps.pre.outputs.go == 'true'
+        continue-on-error: true
+        env:
+          ENABLED: ${{ steps.pre.outputs.enabled }}
+          MERGE_STATE: ${{ steps.evidence.outputs.merge_state }}
+          ADDED: ${{ steps.evidence.outputs.added }}
+          REMOVED: ${{ steps.evidence.outputs.removed }}
+          BOUNCES: ${{ steps.evidence.outputs.bounces }}
+          DRAFT: ${{ steps.evidence.outputs.draft }}
+        run: |
+          set -uo pipefail
+          E="$RUNNER_TEMP/evidence"
+          if [ "$DRAFT" = "true" ]; then
+            echo "::notice::PR is a draft — not evaluating."
+            echo "qualifies=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          python3 scripts/check_auto_merge.py \
+            --config "$E/delivery.base.json" \
+            --findings "$E/findings/findings.json" \
+            --checks "$E/checks.json" \
+            --approval "$E/approval.json" \
+            --changed "$E/changed.txt" \
+            --lines-added "$ADDED" \
+            --lines-removed "$REMOVED" \
+            --bounces "$BOUNCES" \
+            --merge-state "$MERGE_STATE" \
+            --kill-switch "$ENABLED" \
+            --json > "$E/verdict.json"
+          echo "qualifies=$(jq -r '.qualifies' "$E/verdict.json")" >> "$GITHUB_OUTPUT"
+          python3 -c '
+          import json, os
+          v = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "evidence", "verdict.json")))
+          for c in v["checks"]:
+              print("  %s  %-12s %s" % ("PASS" if c["ok"] else "HOLD", c["gate"], c["detail"]))
+          print("QUALIFIES" if v["qualifies"] else "HELD (%d gate(s))" % len(v["held"]))
+          '
+
+      # THE MUTATION. Not a merge — a request that GitHub merge this PR if and
+      # when its own required checks are satisfied. If they never are, it never
+      # merges, and no retry here changes that.
+      - name: Ask GitHub to enable auto-merge
+        if: steps.pre.outputs.go == 'true' && steps.decide.outputs.qualifies == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pre.outputs.pr }}
+        run: |
+          set -euo pipefail
+          method=$(jq -r '.autonomy.autoMergeMethod // "SQUASH"' "$RUNNER_TEMP/evidence/delivery.base.json" | tr '[:lower:]' '[:upper:]')
+          case "$method" in SQUASH|MERGE|REBASE) ;; *) method=SQUASH ;; esac
+          node_id=$(gh api "repos/$REPO/pulls/$PR" --jq .node_id)
+          if gh api graphql -f query='
+                mutation($pr: ID!, $method: PullRequestMergeMethod!) {
+                  enablePullRequestAutoMerge(input: {pullRequestId: $pr, mergeMethod: $method}) {
+                    pullRequest { number autoMergeRequest { enabledAt mergeMethod } }
+                  }
+                }' -f pr="$node_id" -f method="$method"; then
+            echo "::notice::Auto-merge ($method) enabled on #$PR. GitHub will merge it if and when branch protection is satisfied."
+          else
+            # The common failure is "Pull request is in clean status" — the repo
+            # has no required checks, so there is nothing for auto-merge to wait
+            # on. That is a RULESET problem, and enabling nothing is the correct
+            # outcome: without required checks this workflow would be the only
+            # gate, which docs/AUTONOMY.md explicitly refuses to be.
+            echo "::warning::Could not enable auto-merge on #$PR. The usual cause is no required status checks on the default branch — see docs/AUTONOMY.md. Leaving the PR for a human."
+          fi
+
+      - name: Explain the verdict on the PR
+        if: steps.pre.outputs.go == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          PR: ${{ steps.pre.outputs.pr }}
+          VERDICT: ${{ runner.temp }}/evidence/verdict.json
+        with:
+          script: |
+            const fs = require('fs')
+            let d
+            try { d = JSON.parse(fs.readFileSync(process.env.VERDICT, 'utf8')) }
+            catch (e) { core.info('No verdict to report: ' + e.message); return }
+            const lines = ['### Auto-merge tier', '']
+            if (d.qualifies) {
+              lines.push('**Qualifies.** GitHub auto-merge has been requested — the platform')
+              lines.push('merges this PR if and when branch protection is satisfied. Nothing in')
+              lines.push('this pipeline can merge it directly.')
+            } else {
+              lines.push(`**Held** on ${d.held.length} gate(s) — this PR merges when a human merges it.`)
+            }
+            lines.push('')
+            for (const c of d.checks) {
+              lines.push(`- ${c.ok ? '✅' : '⏸'} \`${c.gate}\` — ${c.detail}`)
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: Number(process.env.PR), body: lines.join('\n'),
+            })
+            await core.summary.addRaw(lines.join('\n')).write()
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # A NEW PUSH INVALIDATES THE VERDICT — and GitHub does not know that.
+  #
+  # Auto-merge, once enabled, SURVIVES subsequent pushes: GitHub re-runs the
+  # required checks and merges when they pass. But every gate above described a
+  # specific head sha — that diff, those findings, that bounce count. A PR that
+  # qualified at 40 changed lines and was then amended to 400, or amended to
+  # touch a riskPath, would still merge on the strength of a verdict about
+  # different code.
+  #
+  # So a push revokes the request unconditionally, and the PR must qualify again
+  # from scratch. Revoking is cheap and re-earning is automatic; the reverse
+  # mistake is not recoverable.
+  # ════════════════════════════════════════════════════════════════════════════
+  invalidate:
+    name: Revoke auto-merge on a new push
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Disable auto-merge if it is enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # §2: off is off. Nothing to revoke in a project that never enabled it.
+          [ -f delivery.json ] || exit 0
+          node_id=$(gh api "repos/$REPO/pulls/$PR" --jq .node_id)
+          enabled=$(gh api graphql -f query='
+                query($id: ID!) {
+                  node(id: $id) { ... on PullRequest { autoMergeRequest { enabledAt } } }
+                }' -f id="$node_id" --jq '.data.node.autoMergeRequest.enabledAt // empty' 2>/dev/null || true)
+          if [ -z "$enabled" ]; then
+            echo "Auto-merge is not enabled on #$PR — nothing to revoke."
+            exit 0
+          fi
+          gh api graphql -f query='
+            mutation($pr: ID!) {
+              disablePullRequestAutoMerge(input: {pullRequestId: $pr}) {
+                pullRequest { number }
+              }
+            }' -f pr="$node_id"
+          echo "::notice::Revoked auto-merge on #$PR — the new head has not been evaluated. It must qualify again."

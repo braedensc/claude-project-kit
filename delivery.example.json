@@ -89,9 +89,11 @@
   "autonomy": {
     "autoApproveProvenance": ["epic"],
     "autoMergeMaxLines": 0,
+    "autoMergeMethod": "squash",
     "riskPaths": [
       ".claude/hooks/**",
       ".claude/settings*.json",
+      ".claude/skills/**",
       ".github/workflows/**",
       ".husky/**",
       "delivery.json",
@@ -111,5 +113,12 @@
   "monitoring": {
     "provider": "github-actions",
     "stormPerHour": 6
+  },
+
+  "telemetry": {
+    "store": "postgres",
+    "dsnEnv": "{{TELEMETRY_DSN_ENV}}",
+    "schema": "pipeline",
+    "lookbackDays": 30
   }
 }

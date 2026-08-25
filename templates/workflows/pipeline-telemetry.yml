@@ -1,0 +1,176 @@
+name: Pipeline telemetry
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INERT template (activated at bootstrap by `git mv`). The collector of the
+# optional agentic delivery pipeline — see docs/PIPELINE-CONTRACT.md §4 and §10.
+# No delivery.json ⇒ the pipeline is OFF and this exits 0 doing nothing (§2), and
+# no `telemetry` block in delivery.json ⇒ collection is off in the same way.
+#
+# Sweeps the `pipeline-telemetry/1` blocks that sessions post as ticket comments
+# into the `runs`, `ticket_events` and `review_findings` tables, then regenerates
+# the dashboard from them.
+#
+# ── IDEMPOTENT, SO THE SCHEDULE CAN BE DUMB ──────────────────────────────────
+# Every row has a natural key the contract already froze (`run_id`;
+# `(ticket_id, event, at)`; a content digest for findings), so re-sweeping an
+# overlapping window is a no-op. That is why this runs on a plain cron with a
+# generous lookback and keeps no "last scraped" cursor: a cursor is state that
+# can be lost, skipped past or rewound, and losing it would either double-count
+# or leave a silent hole. Overlap is free; a gap is not.
+#
+# ── AND WHY IT NEVER FAILS THE RUN ON BAD DATA ───────────────────────────────
+# The blocks most worth collecting come from runs that ended badly, which are
+# also the blocks most likely to be malformed. A collector that exits non-zero on
+# the first bad row stops collecting everything behind it. So the scrape counts
+# and names what it skipped, and only a store it could not reach is an error.
+#
+# ── REPORTING, NOT AUTHORITY (§4) ────────────────────────────────────────────
+# Everything in these tables was written by a session. Nothing read out of them
+# may gate a budget, an approval or a merge — `budgets.dailyUsd` is metered
+# against the dispatcher's own ledger (§9). This data exists to decide what to
+# change, not to decide what is allowed.
+#
+# ── Setup ────────────────────────────────────────────────────────────────────
+#   Secret  LINEAR_API_KEY          reads ticket comments
+#   Secret  <telemetry.dsnEnv>      the Postgres DSN, under the name delivery.json
+#                                   declares in `telemetry.dsnEnv`. The config
+#                                   holds the NAME; the value lives only here.
+#   delivery.json → telemetry { store, dsnEnv, schema, lookbackDays }
+# Until both secrets exist this runs green and skips.
+#
+# The dashboard is published as a build artifact rather than committed: it is a
+# derived file that changes on every run, and committing it would put a machine-
+# authored churn stream on the default branch. Point Pages at it, or download it
+# from the run — `docs/AUTONOMY.md` covers both.
+#
+# NOTE: scheduled workflows only run from the DEFAULT branch — this takes effect
+# once merged.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    - cron: '40 */6 * * *' # four times a day; the sweep is idempotent, so this is safe
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Dashboard period in days (default 7).'
+        required: false
+        default: '7'
+        type: string
+      dry_run:
+        description: 'Parse the comments and print the SQL, but write nothing.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # One writer at a time. The upserts are safe to interleave, but two concurrent
+  # sweeps of the same window is pure waste.
+  group: pipeline-telemetry
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: Sweep telemetry and rebuild the dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          persist-credentials: false
+
+      - name: Preflight — is collection configured?
+        id: pre
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          set -euo pipefail
+          # §2 step 1: existence first.
+          if [ ! -f delivery.json ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! jq -e '.telemetry.dsnEnv' delivery.json >/dev/null 2>&1; then
+            echo "::notice::delivery.json has no telemetry.dsnEnv — collection is off (§10)."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "${LINEAR_API_KEY:-}" ]; then
+            echo "::notice::LINEAR_API_KEY not set — nothing to read comments with. Skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          dsn_env=$(jq -r '.telemetry.dsnEnv' delivery.json)
+          echo "dsn_env=$dsn_env" >> "$GITHUB_OUTPUT"
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.pre.outputs.configured == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Install the Postgres driver
+        if: steps.pre.outputs.configured == 'true'
+        run: python3 -m pip install --quiet "psycopg[binary]"
+
+      # `--init` is idempotent (CREATE TABLE IF NOT EXISTS), so it runs every
+      # time rather than being a one-off bootstrap step somebody has to remember.
+      # A schema that creates itself cannot drift from the code that writes it.
+      - name: Sweep ticket comments into the store
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          PIPELINE_TELEMETRY_DSN: ${{ secrets.PIPELINE_TELEMETRY_DSN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # The DSN secret is exposed under the name delivery.json declares. If a
+          # project renamed it, add the matching `env:` line above — the config
+          # names the variable, the workflow supplies it, and the value itself is
+          # never in the tree.
+          extra=""
+          if [ "${DRY_RUN:-false}" = "true" ]; then extra="--dry-run"; fi
+          python3 scripts/telemetry_scrape.py \
+            --config delivery.json --init $extra | tee "$RUNNER_TEMP/sweep.txt"
+          {
+            echo "### Telemetry sweep"
+            echo ''
+            echo '```'
+            cat "$RUNNER_TEMP/sweep.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rebuild the dashboard
+        if: steps.pre.outputs.configured == 'true' && inputs.dry_run != true
+        env:
+          PIPELINE_TELEMETRY_DSN: ${{ secrets.PIPELINE_TELEMETRY_DSN }}
+          DAYS: ${{ inputs.days || '7' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dashboard"
+          # Both artefacts come from ONE summarize() call per invocation, and the
+          # JSON is the same object the HTML was rendered from. /weekly-review
+          # reads the JSON; a human reads the page; neither can drift from the
+          # other because neither recomputes anything.
+          python3 scripts/telemetry_dashboard.py \
+            --config delivery.json --days "$DAYS" \
+            --out "$RUNNER_TEMP/dashboard/index.html" \
+            --json > "$RUNNER_TEMP/dashboard/summary.json"
+          python3 -c '
+          import json, os
+          s = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "dashboard", "summary.json")))
+          m = s["metrics"]
+          rows = ["### Dashboard", "", "| Metric | Value | |", "|---|---|---|"]
+          for key, cell in m.items():
+              rows.append("| %s | **%s** | %s |" % (cell["label"], cell["display"], cell["note"]))
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write("\n".join(rows) + "\n")
+          '
+
+      - name: Publish the dashboard
+        if: steps.pre.outputs.configured == 'true' && inputs.dry_run != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-dashboard
+          path: ${{ runner.temp }}/dashboard
+          retention-days: 90

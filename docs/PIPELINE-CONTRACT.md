@@ -14,8 +14,10 @@ exists to prevent.
 | [Provenance + labels](#5-provenance-values) | ticket fields | dispatcher, human | approval gate, dispatcher |
 | [Safe-outputs request file](#8-safe-outputs-request-file) | run-scoped artifact, uncommitted | the session agent | the safe-outputs validator |
 | [Dispatcher state](#9-dispatcher-state-record) | outside every worktree, backend-durable | dispatcher | dispatcher |
+| [Telemetry store](#10-telemetry-store) | a Postgres schema, outside the repo | the collector | dashboards, the weekly review |
+| [Autonomy tiers](#11-autonomy-tiers) | — | — | the approve and merge gates |
 
-> **§8 and §9 are appended rather than slotted in beside their topical neighbours.**
+> **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
 > `templates/workflows/pipeline-*.yml` files, the skills and `scripts/check_ticket_dor.py`.
 > Renumbering §5–§7 to make room would silently repoint every one of those citations,
@@ -209,8 +211,9 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | Field | Type | Notes |
 |---|---|---|
 | `autoApproveProvenance` | string[] | Provenance **classes** allowed to move `raw` → `ready` without a human. Must be a subset of `["epic"]`; a validator hard-fails any other value. See §5. |
-| `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. |
-| `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, `delivery.json`, and key material. |
+| `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. The full tier is §11. |
+| `autoMergeMethod` | string (optional) | `squash` \| `merge` \| `rebase`. How the platform merges a qualifying PR. Default `squash`. Cosmetic — it decides nothing about *whether* a PR merges. |
+| `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. |
 
 ### `dispatch`
 
@@ -228,6 +231,25 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 |---|---|---|
 | `provider` | string | `github-actions`, `external`, or `none`. |
 | `stormPerHour` | integer | Max alerts emitted per hour; beyond it, alerts are coalesced. Prevents one broken cron from filing a hundred tickets. |
+
+### `telemetry` (optional)
+
+Absent ⇒ **collection is off**, in exactly the sense §2 gives the word: the collector
+exits 0 and emits nothing. A project can run the whole pipeline and never persist a row.
+
+| Field | Type | Notes |
+|---|---|---|
+| `store` | string | `postgres` today. A collector that does not recognize the value refuses to run rather than guessing at a dialect. |
+| `dsnEnv` | string | **The NAME of an environment variable holding the connection string — never the connection string.** A DSN carries a password, and `delivery.json` is a tracked file. |
+| `schema` | string | SQL schema the tables live in. Default `pipeline`. Must be a plain identifier. |
+| `lookbackDays` | integer | How far back a sweep reads. Default `30`. Generous on purpose: the sweep is idempotent (§10), so overlap is free and a gap is not. |
+
+> **Not in the §7 validator, and deliberately so.** Every §7 row gates *autonomy* —
+> what may dispatch, approve, or merge. Telemetry gates nothing: it is a sink for
+> reporting (§4), and a project with a misconfigured sink loses dashboards, not
+> supervision. It is validated by its own consumer, `scripts/telemetry_scrape.py`,
+> at the point of use. Adding it to the guard validator would imply the guards
+> depend on it, which is the opposite of true.
 
 ---
 
@@ -506,6 +528,8 @@ A session reports itself by posting **one fenced JSON block** as a ticket commen
 | Field | Type | Notes |
 |---|---|---|
 | `run_id` | string | Globally unique, opaque; recommended `r_` + ULID. Stable across re-posts — it is the idempotency key. |
+| `dispatch_id` | string \| null (optional) | The pin's `dispatch_id` (§3). §3 says this value "joins the pin to `runs.run_id`", and until it was carried here the join had no second side. Null for a run with no pin (a manual `/work`). |
+| `session_mode` | enum (optional) | The pinned mode this run believes it was dispatched under. Present ⇒ a collector can perform the mode/stage cross-check below; absent ⇒ it simply does not. It is a **self-report of a pinned value**, so it flags contract conformance and never grants anything. |
 | `ticket_id` | string \| null | e.g. `ENG-123`. Null for runs with no ticket. |
 | `team_key` | string | e.g. `ENG`. |
 | `stage` | enum `epic\|dev\|review\|bounce\|triage\|diagnosis\|retro` | What kind of work this run did. |
@@ -543,6 +567,32 @@ A stage outside its pinned mode is a contract violation the collector flags.
 
 Events are append-only facts. The same `(ticket_id, event, at)` posted twice is one
 event; a genuinely repeated event (a second `bounce_started`) carries a distinct `at`.
+
+### `review_findings` row (optional array)
+
+A `review`-stage run may carry a third array, so what the reviewer found is queryable
+alongside what the run cost. Every field mirrors the `pipeline-review/1` finding shape
+the review workflow already publishes, so there is one finding shape in the system and
+not two.
+
+| Field | Type | Notes |
+|---|---|---|
+| `severity` | enum `low\|medium\|high\|critical` | Required. |
+| `category` | string | `correctness`, `security`, `tests`, `scope`. Free-form beyond those, and grouped as-is by dashboards. |
+| `file` / `line` | string \| null, integer \| null | Where, when the reviewer could say. |
+| `summary` | string | One sentence. |
+| `pr_number` | integer \| null | Defaults to the PR named by the block's `runs` row. |
+| `at` | ISO-8601 UTC \| null | Defaults to the comment's own timestamp. |
+
+**Findings carry no ID.** A collector keys them on a digest of their own content
+(§10), so a re-posted block collapses onto one row while two genuinely different
+findings on the same line stay two.
+
+> **Why this lives in telemetry rather than only in the review artifact.** The
+> artifact is per-run and expires with the Actions retention window; "which category
+> of finding keeps recurring" is a question about *many* runs over *months*, and it is
+> the question that turns review output into a rubric change. An answer that expires
+> in 90 days cannot be the input to a quarterly habit.
 
 ---
 
@@ -838,3 +888,145 @@ Also rejected: **storing the counter in `pinsRoot`.** It reuses a directory that
 exists, but it conflates two lifetimes — pins are per-dispatch scratch with a sweeper
 deleting stale ones, while the counter must outlive every session on the ticket. Long-
 lived authority does not belong in a directory something is designed to prune.
+
+---
+
+## 10. Telemetry store
+
+§4 defines the **block a session posts**. This section defines **where those rows come
+to rest**, so that a dashboard, a retrospective and an ad-hoc query are all reading the
+same three tables rather than three private re-derivations of the same comments.
+
+Configured by `delivery.json` → `telemetry` (§1). Absent ⇒ collection is off: the
+collector exits 0 and emits nothing, the same way every other pipeline-scoped tool
+treats an absent discriminator (§2).
+
+### The three tables
+
+| Table | One row per | Fed by |
+|---|---|---|
+| `runs` | agent invocation | §4 `runs` |
+| `ticket_events` | lifecycle milestone | §4 `ticket_events` |
+| `review_findings` | finding from a review pass | §4 `review_findings` (optional) |
+
+Columns mirror the §4 row fields one-for-one, plus two the collector adds:
+`source_comment_id` (which comment a row came from — the audit trail back to the
+original text) and `ingested_at`.
+
+### Idempotency is by natural key, never by a cursor
+
+Each table has a key the contract already froze, and re-inserting the same row is
+defined to be a no-op:
+
+| Table | Key | On conflict |
+|---|---|---|
+| `runs` | `run_id` | **Update.** §4 makes `run_id` stable across re-posts, and a re-post may carry a corrected `ended_at` or a PR number the first post did not have yet. |
+| `ticket_events` | `(ticket_id, event, at)` | **Nothing.** §4: "the same `(ticket_id, event, at)` posted twice is one event." An event is a fact, not a record that gets amended. |
+| `review_findings` | `sha256` digest of `(ticket_id, pr_number, severity, category, file, line, summary)`, truncated | **Nothing.** Findings have no ID in §4, so identity is content. |
+
+**No "last scraped" cursor, by design.** A cursor is state that can be lost, skipped
+past, or rewound, and every one of those failures is silent: lose it and you either
+double-count or leave a hole nobody notices. Natural keys make an overlapping sweep
+free, so the collector reads a generous window every time and lets the store deduplicate.
+The trade is a little wasted read for the removal of an entire class of silent
+corruption.
+
+### A malformed row is skipped, never fatal
+
+The blocks most worth collecting come from runs that ended badly, which are also the
+blocks most likely to be malformed. So a collector MUST fault-isolate at every level —
+a comment that is not JSON, a fence that is not telemetry, a row missing a required
+field — count and name what it stepped over, and exit non-zero **only** when the store
+itself was unreachable. A sweep that dies on the first bad row stops collecting
+everything behind it.
+
+One row is refused outright rather than skipped-and-counted: a `merged` event with
+`actor: agent`. §4 forbids it, and recording it anyway would corrupt every autonomy
+metric computed downstream.
+
+### Still reporting, not authority
+
+Nothing read out of these tables may gate a budget, an approval, or a merge. `dailyUsd`
+is metered against the dispatcher's own ledger (§9); `runs.cost_usd` is a self-report
+that exists so humans can see the shape of spend. **Implemented by
+`scripts/telemetry_scrape.py`** (`npm run test:telemetry`), which owns the DDL.
+
+---
+
+## 11. Autonomy tiers
+
+Three questions the pipeline answers without a human, each narrower than the last, each
+with its own gate. The ladder is the point: a project adopts one rung at a time, and
+every rung above the first is off by default.
+
+| Tier | Question | Gate | Default |
+|---|---|---|---|
+| **Dispatch** | may this *approved* ticket start a session? | the dispatcher's WIP, budget and attempt gates (§9) | on |
+| **Approve** | may this ticket move `raw` → `ready` without a person? | `scripts/check_auto_approve.py` | on, but `epic/*` only (§5) |
+| **Merge** | may this PR merge without a person? | `scripts/check_auto_merge.py` + the platform's ruleset | **off** (`autoMergeMaxLines: 0`) |
+
+### The approve tier
+
+Every gate must pass, and each is recomputed from a source the session cannot write:
+provenance resolves to `epic/<ID>` (§5 rule 4); that epic exists and is itself out of
+intake (§5 rule 2); the ticket is in `raw`; it carries no dispatcher-owned `agent:*` /
+`blocked:*` label and no human-applied `hooks-change`; the Definition-of-Ready gate
+passes in `--strict`; and nothing the ticket names matches `autonomy.riskPaths`.
+
+**`monitor`, `review`, `retro-proposal` and `human` never auto-approve**, and the reason
+is adversarial rather than stylistic. Those four are the classes an agent — or anything
+that can trip a probe or influence a diff — can cause to be filed. If any of them could
+approve itself, the pipeline could widen its own mandate by writing a ticket, and
+"write a ticket asking for X" is a capability every one of those paths has. `epic/*` is
+the only class whose approval traces back to something a person did.
+
+### The merge tier — the platform merges, never the agent
+
+**Nothing in the kit merges.** The never-merge guard blocks the CLI merge command in
+every form including `--auto`, and that is unconditional. The merge tier works by asking
+**GitHub** to enable its own auto-merge, so the platform performs the merge under branch
+protection rules that live in repository settings — outside the repo tree, outside any
+diff, unreachable from a session. The capability is not held and then restrained; it is
+never held.
+
+That makes the required ruleset part of the tier, not an operational footnote: required
+status checks on the default branch, at least one approving review, and "Allow
+auto-merge" enabled. **Without required checks, auto-merge merges the instant it is
+enabled** and the gates below become the only gates, which is exactly what they are not
+designed to be. `docs/AUTONOMY.md` carries the copy-paste setup.
+
+Eight conditions, all required:
+
+| Condition | Read from (never from) |
+|---|---|
+| Auto-merge enabled: `autoMergeMaxLines > 0` **and** the `PIPELINE_AUTO_MERGE_ENABLED` repo variable is `true` | a repo variable (a config value alone — a PR can propose one) |
+| The ticket still passes the approve tier, **recomputed** | a live re-run (a stored "was approved" flag) |
+| **Zero bounces** | Actions run history (`pipeline:bounce-N` PR labels — the fix session's token can edit PR labels) |
+| Review findings usable, none at or above `reviewSeverityThreshold` | the review artifact (a PR comment — the author can edit it) |
+| Every check run terminal and green | the check-runs API ("CI passed" asserted in a commit message) |
+| `mergeStateStatus` is not `DIRTY` / `UNSTABLE` / `UNKNOWN` | the PR API |
+| The diff touches no `riskPaths` | `git diff base...head` (the PR body's description of its own size) |
+| Changed lines ≤ `autoMergeMaxLines` | `git diff --numstat` |
+
+**Zero bounces is the condition to leave alone.** A bounce means the first attempt was
+wrong in a way review or CI caught; the fix may well be right, but the evidence that the
+pipeline understood the ticket is now mixed — and mixed evidence is precisely the case
+worth a human's thirty seconds. It is also the state carrying the most machine-authored
+churn, so it is where a human read is worth the most. This does not conflict with
+`maxBounces > 0`: bounces exist to get a PR ready **for a person**, not ready to merge
+itself.
+
+**A push revokes the request.** Every gate above described one head sha. GitHub keeps
+auto-merge enabled across subsequent pushes, so a PR that qualified at 40 lines could be
+amended to 400 and still merge on the strength of a stale verdict. A new push therefore
+disables auto-merge unconditionally and the PR must qualify again. Revoking is cheap;
+the reverse mistake is not recoverable.
+
+### What no tier ever grants
+
+No tier lets anything raise its own limits. A retrospective may *propose* a budget,
+rubric or cap change and may never apply one: proposals ship as ordinary reviewed PRs,
+invented work carries `retro-proposal` provenance (which §5 bars from auto-approval),
+and a proposed loosening of any cap is rejected mechanically by
+`scripts/check_weekly_review.py` (`npm run test:review`). A system that concludes it
+should be allowed to spend more, and then allows itself, does not have a budget.

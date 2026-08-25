@@ -71,6 +71,25 @@ jobs:
       - name: delivery.json validity (no-op unless one exists)
         run: python3 scripts/check_delivery_config.py
 
+      # The autonomy gates and the telemetry pipeline. Same posture as the two
+      # above: inert in this repo (no delivery.json, no store), so the selftests
+      # are what has teeth. Each asserts its own contract rows against synthetic
+      # fixtures — §5/§11 for the two gates, §4/§10 for the collector.
+      - name: Auto-approval gate selftest (contract §5, §11)
+        run: python3 scripts/check_auto_approve.py --selftest
+
+      - name: Auto-merge tier selftest (contract §11)
+        run: python3 scripts/check_auto_merge.py --selftest
+
+      - name: Telemetry scrape selftest (contract §4, §10)
+        run: python3 scripts/telemetry_scrape.py --selftest
+
+      - name: Dashboard selftest (self-contained page, one summary object)
+        run: python3 scripts/telemetry_dashboard.py --selftest
+
+      - name: Weekly-review limits selftest (no self-raised budgets or graders)
+        run: python3 scripts/check_weekly_review.py --selftest
+
       - name: Block forbidden paths (planning/, real .env, key material)
         run: |
           FORBIDDEN=$(git ls-files \

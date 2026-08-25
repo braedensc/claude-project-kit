@@ -1,0 +1,322 @@
+name: Pipeline auto-approve
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INERT template (activated at bootstrap by `git mv`). The approval gate of the
+# optional agentic delivery pipeline — see docs/PIPELINE-CONTRACT.md §5 and
+# docs/AUTONOMY.md. No delivery.json ⇒ the pipeline is OFF and this exits 0
+# doing nothing (§2).
+#
+# WHAT IT DOES: moves tickets from `raw` to `ready` when — and only when — a
+# deterministic script says every gate passes. It is the narrow, legitimate path
+# through the boundary that `.claude/hooks/pre-tool-use.py`'s `self-approval`
+# guard closes for every session, everywhere, always.
+#
+# ── THE DECISION IS A SCRIPT, NOT A MODEL. ───────────────────────────────────
+# No Claude session runs in this workflow. `scripts/check_auto_approve.py` is
+# stdlib Python with no network access and no credential; this workflow's only
+# jobs are to fetch the tickets, hand them over, and execute the verdict. That
+# split is deliberate: an approval decided by a model is an approval that can be
+# argued into, and ticket text is attacker-influenceable by construction (§3).
+# Here the ticket text is *data the script parses*, never a prompt.
+#
+# ── ONLY `epic/<ID>` PROVENANCE EVER PASSES (§5). ────────────────────────────
+# `monitor`, `review`, `retro-proposal` and `human` never auto-approve. Those
+# are the classes an agent (or anything that can trip a probe, or edit a diff)
+# can cause to be filed — so if any of them could approve itself, the pipeline
+# could widen its own mandate by writing a ticket. And an `epic/<ID>` reference
+# is not taken on faith: the epic is fetched and must itself be out of intake,
+# or `epic/<anything>` would be a self-serve approval.
+#
+# ── Setup (repo → Settings → Secrets and variables → Actions) ────────────────
+#   Secret  LINEAR_API_KEY                 Linear personal API key
+#   Var     PIPELINE_AUTO_APPROVE_ENABLED  must be exactly "true" to approve
+#                                          anything; anything else = report-only
+# Until the secret exists this runs green and skips. The variable is a SECOND
+# switch with a different owner: `autonomy.autoApproveProvenance` lives in the
+# repo tree and can be changed in a PR, while a repository variable can only be
+# changed by a human in the GitHub UI. Two switches, two owners, and auto-
+# approval needs both.
+#
+# NOTE: scheduled workflows only run from the DEFAULT branch — this takes effect
+# once merged. Use workflow_dispatch to exercise it from the Actions tab.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    - cron: '17 * * * *' # hourly, off the hour so it never collides with dispatch
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Evaluate and report, but move nothing.'
+        required: false
+        default: true
+        type: boolean
+      ticket_id:
+        description: 'Evaluate exactly this ticket (e.g. ENG-123). Blank = every raw ticket.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialized against itself. Two runs evaluating the same backlog would both
+  # decide to approve, and the second transition would be a no-op at best.
+  group: pipeline-auto-approve
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    name: Evaluate the backlog
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Contract §1: anything that gates behavior is read from the committed copy
+      # on the default branch, never from a worktree an agent can edit. That
+      # applies to the SCRIPT as much as to the config — a head-branch checkout
+      # would let a PR grade its own approval.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          persist-credentials: false
+
+      - name: Preflight — is the pipeline configured and approval enabled?
+        id: pre
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          ENABLED: ${{ vars.PIPELINE_AUTO_APPROVE_ENABLED }}
+        run: |
+          set -euo pipefail
+          # §2 step 1: the existence test comes FIRST. Nothing that can fail may
+          # run ahead of it.
+          if [ ! -f delivery.json ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "${LINEAR_API_KEY:-}" ]; then
+            echo "::notice::LINEAR_API_KEY not set — auto-approval not configured yet. Skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+          # Report-only is the default posture, not an error state. A team that
+          # wants to watch the gate's verdicts for a few weeks before trusting it
+          # simply leaves the variable unset.
+          if [ "${ENABLED:-}" = "true" ]; then
+            echo "apply=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::PIPELINE_AUTO_APPROVE_ENABLED is not \"true\" — evaluating and reporting only."
+            echo "apply=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch the raw backlog and the epics it references
+        id: fetch
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          ONLY_TICKET: ${{ inputs.ticket_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/approve"
+          python3 - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+
+          API = "https://api.linear.app/graphql"
+          cfg = json.load(open("delivery.json"))
+          if cfg.get("version") != 1:
+              sys.exit("::error::delivery.json version %r unrecognized — refusing to guess."
+                       % cfg.get("version"))
+          lin = cfg["linear"]
+          raw_state = lin["stateIds"]["raw"]
+          only = (os.environ.get("ONLY_TICKET") or "").strip()
+
+          def gql(query, variables):
+              req = urllib.request.Request(
+                  API, data=json.dumps({"query": query, "variables": variables}).encode(),
+                  headers={"Content-Type": "application/json",
+                           # Linear personal API keys go in Authorization RAW.
+                           "Authorization": os.environ["LINEAR_API_KEY"]})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      payload = json.load(r)
+              except urllib.error.HTTPError as e:
+                  sys.exit("::error::Linear API HTTP %s: %s" % (e.code, e.read()[:400]))
+              if payload.get("errors"):
+                  sys.exit("::error::Linear API error: %s" % json.dumps(payload["errors"])[:400])
+              return payload["data"]
+
+          ISSUE_FIELDS = """
+            id identifier title description
+            state { id }
+            parent { identifier }
+            project { id }
+            labels(first: 50) { nodes { id name } }
+          """
+
+          # The backlog: everything sitting in `raw`. Filtering server-side on the
+          # state ID (not a display name) is the §1 rule — a renamed column in the
+          # Linear UI must never silently empty this query.
+          if only:
+              data = gql("query($id: String!) { issue(id: $id) { %s } }" % ISSUE_FIELDS,
+                         {"id": only})
+              nodes = [data["issue"]] if data.get("issue") else []
+          else:
+              data = gql(
+                  "query($f: IssueFilter) { issues(filter: $f, first: 100) { nodes { %s } } }"
+                  % ISSUE_FIELDS,
+                  {"f": {"state": {"id": {"eq": raw_state}}}})
+              nodes = data["issues"]["nodes"]
+
+          def shape(n):
+              return {
+                  "id": n["identifier"],
+                  "linearId": n["id"],
+                  "title": n.get("title") or "",
+                  "description": n.get("description") or "",
+                  "labels": [l["name"] for l in (n.get("labels") or {}).get("nodes", [])],
+                  "labelIds": [l["id"] for l in (n.get("labels") or {}).get("nodes", [])],
+                  "projectId": (n.get("project") or {}).get("id"),
+                  "parentId": (n.get("parent") or {}).get("identifier") or "",
+                  "stateId": (n.get("state") or {}).get("id"),
+              }
+
+          tickets = [shape(n) for n in nodes if n]
+          # Only the ones actually in `raw` — the --ticket_id path can name a
+          # ticket that has already moved, and the gate would hold it anyway, but
+          # fetching its epic for nothing is wasted API budget.
+          tickets = [t for t in tickets if t["stateId"] == raw_state]
+
+          # §5 rule 2: the referenced epic must exist and be out of intake. Fetch
+          # every distinct parent named by the backlog — the gate treats an epic
+          # it was not shown as a fabricated one.
+          epic_ids = sorted({t["parentId"] for t in tickets if t["parentId"]})
+          epics = {}
+          for eid in epic_ids:
+              got = gql("query($id: String!) { issue(id: $id) { %s } }" % ISSUE_FIELDS,
+                        {"id": eid})
+              node = got.get("issue")
+              if node:
+                  epics[node["identifier"]] = shape(node)
+
+          out = os.path.join(os.environ["RUNNER_TEMP"], "approve")
+          json.dump({"tickets": tickets}, open(os.path.join(out, "tickets.json"), "w"), indent=2)
+          json.dump({"epics": epics}, open(os.path.join(out, "epics.json"), "w"), indent=2)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("count=%d\n" % len(tickets))
+          print("Fetched %d raw ticket(s) and %d epic(s)." % (len(tickets), len(epics)))
+          PY
+
+      # The decision. Exit 1 simply means "nothing qualified", which is the
+      # ordinary outcome — `continue-on-error` keeps that from reading as a
+      # broken workflow.
+      - name: Decide (deterministic — no model runs here)
+        id: decide
+        if: steps.pre.outputs.configured == 'true' && steps.fetch.outputs.count != '0'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # One invocation, JSON only. The human-readable rendering is derived
+          # from that same file below, so the log and the applied decision can
+          # never be two different evaluations of the same backlog.
+          python3 scripts/check_auto_approve.py \
+            --config delivery.json \
+            --repo-root . \
+            --epic "$RUNNER_TEMP/approve/epics.json" \
+            --json \
+            "$RUNNER_TEMP/approve/tickets.json" > "$RUNNER_TEMP/approve/verdict.json"
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          python3 -c '
+          import json, os, sys
+          v = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "approve", "verdict.json")))
+          for t in v["tickets"]:
+              print("%s  %s  %s" % ("APPROVE" if t["approved"] else "HOLD   ", t["ref"], t["title"]))
+              for h in t["held"]:
+                  print("           hold [%s] %s" % (h["gate"], h["reason"]))
+          s = v["summary"]
+          print("%d ticket(s): %d approved, %d held" % (s["tickets"], s["approved"], s["held"]))
+          '
+
+      - name: Apply the approved transitions
+        if: steps.pre.outputs.configured == 'true' && steps.fetch.outputs.count != '0'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          APPLY: ${{ steps.pre.outputs.apply }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+
+          API = "https://api.linear.app/graphql"
+          tmp = os.path.join(os.environ["RUNNER_TEMP"], "approve")
+          # The decide step is continue-on-error, so a hard failure there leaves
+          # no verdict. No verdict is not an approval: say so and stop.
+          try:
+              verdict = json.load(open(os.path.join(tmp, "verdict.json")))
+          except (OSError, ValueError) as exc:
+              print("::warning::no usable verdict from the approval gate (%s) — "
+                    "nothing approved." % exc)
+              sys.exit(0)
+          tickets = {t["id"]: t for t in json.load(open(os.path.join(tmp, "tickets.json")))["tickets"]}
+          cfg = json.load(open("delivery.json"))
+          lin = cfg["linear"]
+          ready = lin["stateIds"]["ready"]
+          trigger = (cfg.get("dispatch") or {}).get("labelTrigger", "agent:queued")
+          trigger_id = (lin.get("labels") or {}).get("ids", {}).get(trigger) or ""
+
+          approve = verdict.get("approve") or []
+          hold = verdict.get("hold") or []
+          summary = ["### Auto-approval", "",
+                     "%d evaluated · **%d approved** · %d held"
+                     % (verdict["summary"]["tickets"], len(approve), len(hold)), ""]
+          for t in verdict["tickets"]:
+              if t["approved"]:
+                  summary.append("- ✅ `%s` %s" % (t["ref"], t["title"]))
+              else:
+                  summary.append("- ⏸ `%s` %s" % (t["ref"], t["title"]))
+                  for h in t["held"]:
+                      summary.append("  - _%s_ — %s" % (h["gate"], h["reason"]))
+          apply = os.environ.get("APPLY") == "true" and os.environ.get("DRY_RUN") != "true"
+          if not apply:
+              summary += ["", "_Report only — nothing was moved._"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(summary) + "\n")
+
+          if not apply or not approve:
+              print("Nothing applied (%d approved, apply=%s)." % (len(approve), apply))
+              sys.exit(0)
+
+          def gql(query, variables):
+              req = urllib.request.Request(
+                  API, data=json.dumps({"query": query, "variables": variables}).encode(),
+                  headers={"Content-Type": "application/json",
+                           "Authorization": os.environ["LINEAR_API_KEY"]})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      payload = json.load(r)
+              except urllib.error.HTTPError as e:
+                  sys.exit("::error::Linear API HTTP %s: %s" % (e.code, e.read()[:400]))
+              if payload.get("errors"):
+                  sys.exit("::error::Linear API error: %s" % json.dumps(payload["errors"])[:400])
+              return payload["data"]
+
+          MUTATION = """
+          mutation($id: String!, $input: IssueUpdateInput!) {
+            issueUpdate(id: $id, input: $input) { success }
+          }"""
+
+          for ref in approve:
+              t = tickets.get(ref)
+              if not t:
+                  continue
+              # `labelIds` REPLACES the whole set (the trap §5/§6 call out), so the
+              # existing IDs are read back and the trigger appended — never sent
+              # alone, or every other label on the ticket is silently dropped.
+              label_ids = list(t.get("labelIds") or [])
+              if trigger_id and trigger_id not in label_ids:
+                  label_ids.append(trigger_id)
+              payload = {"stateId": ready}
+              if trigger_id:
+                  payload["labelIds"] = label_ids
+              gql(MUTATION, {"id": t["linearId"], "input": payload})
+              print("Approved %s → ready%s" % (ref, " + %s" % trigger if trigger_id else ""))
+          print("Applied %d approval(s)." % len(approve))
+          PY
