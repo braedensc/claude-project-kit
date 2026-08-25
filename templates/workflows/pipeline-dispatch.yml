@@ -529,6 +529,12 @@ jobs:
                   for k in keys:
                       if k.startswith("provenance:"):
                           provenance = k.split(":", 1)[1]
+              # `None` when the ticket carries no `track:*` label — which the DoR
+              # gate rejects (§7), so it should be unreachable for anything that
+              # entered `ready` through approval. It is written through as null
+              # rather than defaulted to some invented track: the pin is a
+              # snapshot, and schemas/pin.schema.json types the field
+              # `["string", "null"]` for exactly this case.
               track = next((k for k in keys if k.startswith("track:")), None)
 
               # Branch name per contract §branch — TICKET ID LOWERCASED, because
@@ -569,6 +575,37 @@ jobs:
               # workflow, so it must never read to the agent as instructions.
               acceptance = "\n".join("- [ ] %s" % a for a in ticket["acceptance_criteria"])
               out_of_scope = "\n".join("- %s" % a for a in ticket["out_of_scope"])
+              # An EMPTY criteria list is a Definition-of-Ready failure, and §3 is
+              # explicit that the empty list is never quietly replaced by an
+              # inferred one. This text is what the session reads INSTEAD of a
+              # definition of done, and the dispatch prompt points it at the brief
+              # without invoking /work — so the brief has to carry the rule itself
+              # rather than assume the skill's override is in context. Telling the
+              # agent to "infer from the description" here told it to write its own
+              # definition of done and then grade itself against it, which is the
+              # ticket-layer version of weakening a test until it passes.
+              no_acceptance = "\n".join([
+                  "**None — and that is a Definition-of-Ready failure, not an "
+                  "invitation to invent some.**",
+                  "",
+                  "This ticket's `## Acceptance criteria` section was missing or empty. "
+                  "Contract §3: *a missing or empty section yields an empty list — never "
+                  "an inferred one.* Criteria you write for yourself are criteria you "
+                  "then grade yourself against, so do not write them.",
+                  "",
+                  "**Escalate and stop.** Queue exactly one `ticket-comment` write-request "
+                  "whose body begins, verbatim, on its own first line with:",
+                  "",
+                  "```",
+                  "<!-- pipeline-escalation: agent:blocked -->",
+                  "```",
+                  "",
+                  "followed by one specific answerable question asking for the definition "
+                  "of done. Emit the telemetry block with `\"outcome\": \"blocked\"` and "
+                  "`\"error_class\": \"needs_clarification\"`. Do not implement anything, "
+                  "do not open a PR, and do not apply any `agent:*` label yourself — "
+                  "those are the dispatcher's. Then end the session.",
+              ])
               notes = "\n".join("- %s" % s for s in (cfg["stack"].get("securityNotes") or []))
               verify = "\n".join("- `%s`" % v for v in
                                  [cfg["commands"].get(k) for k in ("lint", "typecheck", "test")] if v)
@@ -583,7 +620,7 @@ jobs:
                   "| Base | `%s` |" % cfg["github"]["defaultBranch"],
                   "", "## Title", "", n["title"], "",
                   "## Acceptance criteria (the definition of done)", "",
-                  acceptance or "_None listed — infer from the description, and say so in your PR._",
+                  acceptance or no_acceptance,
                   "", "## Out of scope (the scope fence — do not touch)", "",
                   out_of_scope or "_None listed._",
                   "", "## Stack security notes", "",
@@ -987,6 +1024,15 @@ jobs:
             If a guard blocks you, that is the system working: branch or fix and retry,
             never work around it. If you cannot finish, say so plainly in the telemetry
             block with outcome `blocked`, and stop.
+
+            When you stop because you need a person — an ambiguous or empty definition
+            of done, work that would leave the scope fence, a change to guard machinery
+            — begin that `ticket-comment` body, verbatim, on its own first line with
+            `<!-- pipeline-escalation: agent:blocked -->` (or `agent:needs-human` for a
+            guard-machinery change). That HTML comment is the machine-readable escalation
+            marker this dispatcher greps for to route the ticket; the prose under it is
+            for the human. Ask ONE specific answerable question, and do not label the
+            ticket yourself.
           claude_args: >-
             --setting-sources user,project
             --settings ${{ env.PIPELINE_SETTINGS }}
@@ -1040,9 +1086,31 @@ jobs:
                   if isinstance(req, dict) and req.get("type") == "ticket-comment":
                       bodies.append(str(req.get("body") or ""))
           blob = "\n".join(bodies)
-          # /work's escalation markers (its step 4). §6 routes the two to
-          # different labels, so they are distinguished rather than merged.
-          if re.search(r"AGENT ESCALATION.*needs-human", blob):
+          # /work's escalation marker (its step 4), matched on the STRING THE
+          # SKILL FREEZES. The skill emits an HTML comment on the comment body's
+          # first line and publishes this exact regex for it; the bold prose line
+          # beneath it is for the human reading the ticket. Grepping the prose
+          # instead worked only by coincidence — the human-facing sentence happens
+          # to contain "AGENT ESCALATION" and the label name — and it silently
+          # depended on both tokens landing on one physical line. Match the
+          # marker: it is the interface, it is invisible in rendered markdown, and
+          # it cannot be reworded by a session paraphrasing its own explanation.
+          #
+          # §6 routes the two labels differently, so they are distinguished rather
+          # than merged, and `agent:needs-human` — terminal until a person acts —
+          # WINS whenever both appear, wherever each one sits in the blob.
+          markers = re.findall(
+              r"<!--\s*pipeline-escalation:\s*(agent:needs-human|agent:blocked)\s*-->", blob)
+          if markers:
+              out["escalation"] = ("agent:needs-human" if "agent:needs-human" in markers
+                                   else markers[0])
+          # FALLBACK, deliberately second and deliberately loose: the prose line.
+          # It exists only for a session that escalated without running /work —
+          # the dispatch prompt points at the brief rather than invoking the skill,
+          # so the marker is not guaranteed to be in context. It is a safety net
+          # for a human-legible escalation, NOT the seam. If you find yourself
+          # editing it, the marker above is what you actually want to change.
+          elif re.search(r"AGENT ESCALATION.*needs-human", blob):
               out["escalation"] = "agent:needs-human"
           elif re.search(r"AGENT ESCALATION.*blocked", blob):
               out["escalation"] = "agent:blocked"

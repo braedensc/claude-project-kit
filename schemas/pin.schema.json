@@ -73,7 +73,7 @@
         "url": {"type": "string", "pattern": "^https?://"},
         "state_id": {"type": "string", "pattern": "\\S", "description": "The Linear workflow-state ID, never the display name (§1)."},
         "effort": {"enum": ["S", "M", "L"], "description": "From the effort:* label; selects budgets.perEffort."},
-        "track": {"type": "string", "pattern": "^track:", "description": "From the track:* label (§6)."},
+        "track": {"type": ["string", "null"], "pattern": "^track:", "description": "From the track:* label (§6). NULL when the ticket carried none — the same 'there is no value here' idiom this schema already uses for subject and ticket, and a faithful snapshot beats an invented default. A ticket without a track:* label is a Definition-of-Ready failure the gate is supposed to have caught (§7); the pin records that it happened rather than papering over it."},
         "provenance": {
           "type": "string",
           "pattern": "^(epic/[A-Za-z0-9._-]+|monitor|review|retro-proposal|human)$",
