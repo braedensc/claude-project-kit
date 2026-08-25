@@ -12,6 +12,8 @@
     "test:hooks": "python3 .claude/hooks/test_hooks.py",
     "test:dor": "python3 scripts/check_ticket_dor.py --selftest",
     "test:delivery": "python3 scripts/check_delivery_config.py --selftest",
+    "test:jsonschema": "python3 scripts/jsonschema_mini.py --selftest",
+    "test:schemas": "python3 scripts/check_schemas.py --selftest",
     "test:approve": "python3 scripts/check_auto_approve.py --selftest",
     "test:merge": "python3 scripts/check_auto_merge.py --selftest",
     "test:telemetry": "python3 scripts/telemetry_scrape.py --selftest",

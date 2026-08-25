@@ -257,8 +257,9 @@ Tell me when both exist and I'll re-read the workspace and continue.
 
 ## Step 6 — Fill in `delivery.json` (the point of the whole exercise)
 
-**You do not design this file.** `docs/PIPELINE-CONTRACT.md` §1 owns the schema and
-`delivery.example.json` is the canonical shape — open both. Your job is to replace
+**You do not design this file.** `docs/PIPELINE-CONTRACT.md` §1 owns the schema,
+`schemas/delivery.schema.json` is that schema in machine-readable form, and
+`delivery.example.json` is the canonical shape — open all three. Your job is to replace
 tokens inside the `linear` block with the real IDs you read in step 1:
 
 | You fill | With |
@@ -319,6 +320,10 @@ Rules that are not negotiable, because guards depend on them:
   display names, `generatedBy`/`generatedAt` — none of them exist in §1. A second shape
   for the same structure is precisely what the contract exists to prevent. Everything
   you learned that has no schema slot goes in the report.
+- **The schema is the arbiter, not your memory of this page.** Every rule above is
+  mechanized in `schemas/delivery.schema.json`; step 7 runs it. If you are unsure whether
+  a field exists, read the schema rather than guessing — and if a field you want is not
+  in it, that is the answer.
 - **Merge, do not re-emit.** Read the current `delivery.json` if there is one, replace
   only the fields in the table above, and leave the rest byte-for-byte. Show the diff
   before writing; an empty diff is the drift check passing, so say so.
@@ -337,14 +342,24 @@ Rules that are not negotiable, because guards depend on them:
 
 Contract §7's checklist is mechanized, and all fifteen rules already run in one command.
 A config that fails it is **broken**, not merely imperfect — §2 says a present-but-invalid
-`delivery.json` fails closed:
+`delivery.json` fails closed.
+
+**Run the shape check first.** It answers one question — is this the shape §1 defines? —
+against the schema itself, so a wrong-shaped file is caught before anything interprets
+its contents:
+
+```bash
+python3 scripts/check_schemas.py --instance delivery.json --schema delivery
+```
+
+Then the full validator, shape plus semantics:
 
 ```bash
 python3 scripts/check_delivery_config.py
 ```
 
-- **Exit 0 is the only acceptable outcome.** If it exits non-zero, fix what it names and
-  run it again. Never report the file as done, and never tell the human it is ready,
+- **Exit 0 from both is the only acceptable outcome.** If either exits non-zero, fix what
+  it names and run it again. Never report the file as done, and never tell the human it is ready,
   while the validator is red — you would be handing them a repo that blocks its own next
   session.
 - Warnings do not fail the run, but read them out loud: an unresolved non-required label
@@ -370,5 +385,6 @@ Workspace   acme (org 8f1c…), gitBranchFormat feat/{issueIdentifier}-{issueTit
 Team        ENG "Engineering" (2b40…)
 States      raw "Ideas" · ready "Ready" · working "In Progress" · review "In Review" · done "Done"
 Projects    Ideas (c7d9…)  — triage target, created this run
+Schema      python3 scripts/check_schemas.py --instance delivery.json --schema delivery → OK
 Validator   python3 scripts/check_delivery_config.py → OK, 0 errors, 0 warnings
 ```

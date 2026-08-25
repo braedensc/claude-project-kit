@@ -60,6 +60,25 @@ jobs:
       - name: Definition-of-Ready gate selftest
         run: python3 scripts/check_ticket_dor.py --selftest
 
+      # The vendored draft 2020-12 subset the schemas are held to. Its guarantee
+      # — an unrecognized keyword is an error, never a silent no-op — is what
+      # makes "the schema enforces this" a true statement.
+      - name: Vendored JSON Schema validator selftest
+        run: python3 scripts/jsonschema_mini.py --selftest
+
+      # schemas/ ⇄ docs/PIPELINE-CONTRACT.md. Fails if §1 grows a field the
+      # schema does not define (or vice versa), if delivery.example.json drifts
+      # from the spec, or if the malformed shape /setup-board once emitted stops
+      # being rejected. One definition, two renderings.
+      - name: Schema ⇄ contract parity selftest
+        run: python3 scripts/check_schemas.py --selftest
+
+      # Belt to that braces: validates this repo's own instances outside the
+      # selftest's fixtures, so a bad delivery.example.json fails even if the
+      # selftest were somehow skipped.
+      - name: Validate this repo's JSON documents against schemas/
+        run: python3 scripts/check_schemas.py
+
       # The kit ships no live delivery.json, so the validator is inert here by
       # design (contract §2: absent is OFF). --selftest is what has teeth in CI.
       - name: delivery.json validator selftest (contract §7)

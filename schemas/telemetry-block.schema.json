@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/telemetry-block.schema.json",
+  "title": "Telemetry block",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §4 — the single fenced JSON object a session posts as a ticket comment to report itself. The `schema` key is the marker a collector scans for; the fence info string is plain `json` so it renders everywhere.",
+  "$comment": "AGENT-AUTHORED ⇒ REPORTING ONLY. Conformance to this schema says the block is well formed. It says nothing about whether the numbers are true, and NOTHING here may ever gate a budget, an approval or a merge. The session_mode → stage table in §4 is a cross-field consistency check the collector performs; a schema cannot express it.",
+
+  "type": "object",
+  "required": ["schema", "runs"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": {
+      "const": "pipeline-telemetry/1",
+      "description": "The marker. A collector keeps the objects carrying exactly this value and ignores every other json fence in the comment."
+    },
+    "runs": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/run"},
+      "minItems": 1,
+      "description": "One row per run. Rows are idempotent on run_id — re-posting the same block must not double-count. One telemetry block per comment (§4, §8)."
+    },
+    "ticket_events": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/ticketEvent"},
+      "description": "Zero or more append-only facts. The same (ticket_id, event, at) posted twice is one event."
+    },
+    "review_findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/reviewFinding"},
+      "description": "Optional; a review-stage run may carry what it found alongside what it cost. Mirrors the pipeline-review/1 finding shape so there is one finding shape in the system, not two."
+    }
+  },
+
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "ISO-8601 UTC with a literal Z."
+    },
+    "counter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "A non-negative integer. Never null — 0 is how 'not used' is reported."
+    },
+
+    "run": {
+      "type": "object",
+      "required": [
+        "run_id", "ticket_id", "team_key", "stage", "model", "auth_mode",
+        "started_at", "ended_at", "tokens_in", "tokens_out",
+        "tokens_cache_read", "tokens_cache_write", "cost_usd", "turns",
+        "outcome", "error_class", "files_changed", "lines_added",
+        "lines_removed", "pr_number"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "Globally unique, opaque; recommended r_ + ULID. Stable across re-posts — it is the idempotency key."
+        },
+        "dispatch_id": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL. The pin's dispatch_id (§3), which is the second side of that join. Null for a run with no pin (a manual /work)."
+        },
+        "session_mode": {
+          "enum": ["ticket", "planning", "diagnosis", "maintenance"],
+          "description": "OPTIONAL. The pinned mode this run believes it was dispatched under — a SELF-REPORT of a pinned value, so it flags contract conformance and grants nothing. Present ⇒ the collector can run the §4 mode/stage cross-check."
+        },
+        "ticket_id": {"type": ["string", "null"], "description": "e.g. ENG-123. Null for runs with no ticket."},
+        "team_key": {"type": "string", "pattern": "\\S"},
+        "stage": {
+          "enum": ["epic", "dev", "review", "bounce", "triage", "diagnosis", "retro"],
+          "description": "What kind of work this run did. Must sit inside the pinned session_mode's allowed set (§4) — checked by the collector, not here."
+        },
+        "model": {"type": "string", "pattern": "\\S", "description": "Exact model ID as used."},
+        "auth_mode": {"enum": ["subscription", "api-key"]},
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "ended_at": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "description": "Null only for an in-flight row; a POSTED block should be terminal."
+        },
+        "tokens_in": {"$ref": "#/$defs/counter"},
+        "tokens_out": {"$ref": "#/$defs/counter"},
+        "tokens_cache_read": {"$ref": "#/$defs/counter", "description": "0 when caching was not used — never null."},
+        "tokens_cache_write": {"$ref": "#/$defs/counter", "description": "0 when caching was not used — never null."},
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0,
+          "multipleOf": 0.0001,
+          "description": "Best-effort self-report, up to 4 decimal places. Dashboards only — spend is metered by the dispatcher, and a session that under-reports must not be able to buy itself more budget (§1)."
+        },
+        "turns": {"$ref": "#/$defs/counter"},
+        "outcome": {
+          "enum": ["completed", "blocked", "timeout", "capacity", "error", "budget"],
+          "description": "capacity = provider capacity; budget = a cap in budgets stopped it; blocked = needs a human decision."
+        },
+        "error_class": {
+          "type": ["string", "null"],
+          "description": "Short stable slug, e.g. rate_limit, hook_block, ci_red. Null unless outcome is one of blocked/error/timeout/capacity/budget — a cross-field rule the collector checks."
+        },
+        "files_changed": {"$ref": "#/$defs/counter"},
+        "lines_added": {"$ref": "#/$defs/counter"},
+        "lines_removed": {"$ref": "#/$defs/counter"},
+        "pr_number": {"type": ["integer", "null"], "minimum": 1, "description": "Null until a PR exists."}
+      }
+    },
+
+    "ticketEvent": {
+      "type": "object",
+      "required": ["ticket_id", "event", "at", "actor"],
+      "additionalProperties": false,
+      "properties": {
+        "ticket_id": {"type": "string", "pattern": "\\S"},
+        "event": {
+          "enum": ["created", "approved", "dispatched", "first_commit", "pr_opened",
+                   "ci_green", "review_posted", "bounce_started", "merged", "deployed", "reverted"]
+        },
+        "at": {"$ref": "#/$defs/timestamp"},
+        "actor": {
+          "enum": ["human", "agent", "system"],
+          "description": "system = CI, a webhook, a cron. `merged` is always human or system — never agent."
+        }
+      }
+    },
+
+    "reviewFinding": {
+      "type": "object",
+      "required": ["severity", "category", "summary"],
+      "additionalProperties": false,
+      "description": "Findings carry no ID: a collector keys them on a digest of their own content (§10), so a re-posted block collapses onto one row while two genuinely different findings on the same line stay two.",
+      "properties": {
+        "severity": {"enum": ["low", "medium", "high", "critical"]},
+        "category": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "correctness, security, tests, scope. Free-form beyond those, and grouped as-is by dashboards."
+        },
+        "file": {"type": ["string", "null"]},
+        "line": {"type": ["integer", "null"], "minimum": 1},
+        "summary": {"type": "string", "pattern": "\\S", "description": "One sentence."},
+        "pr_number": {"type": ["integer", "null"], "minimum": 1, "description": "Defaults to the PR named by the block's runs row."},
+        "at": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "description": "Defaults to the comment's own timestamp."
+        }
+      }
+    }
+  }
+}

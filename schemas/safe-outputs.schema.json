@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/safe-outputs.schema.json",
+  "title": "Safe-outputs request file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §8 — the write-REQUESTS a session emits in place of holding a tracker credential. A separate job that does hold the credential validates them against the dispatcher-supplied pinned ticket ID and executes only the survivors.",
+  "$comment": "EVERY FIELD HERE IS REPORTING, NEVER A FACT. Conforming to this schema earns a batch nothing: §8's validation rules run before any request executes, and they are the part that matters — every ticket_id must equal the DISPATCHER-SUPPLIED pinned ID; at most one ticket-state per run; raw/ready/done are never valid targets even when a caller passes them in allowed_to_states; agent:*, blocked:capacity, provenance:* and hooks-change are refused in add AND remove; add+remove ≤ 10 per request; exactly one telemetry block across all comments when required. None of those is expressible in a schema, and one invalid request rejects the ENTIRE batch.",
+
+  "type": "object",
+  "required": ["schema", "requests"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": {
+      "const": "pipeline-safe-outputs/1",
+      "description": "An unrecognized schema rejects the batch. A reader that does not recognize it refuses; it does not guess."
+    },
+    "requests": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "At most 20 per batch — a runaway or hostile session must not spray the tracker (§8 caps).",
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/ticketComment"},
+          {"$ref": "#/$defs/ticketState"},
+          {"$ref": "#/$defs/ticketLabel"}
+        ]
+      }
+    }
+  },
+
+  "$defs": {
+    "ticketId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$",
+      "description": "The agent NAMES a ticket and the validator COMPARES it against the pinned ID; the value is never used to address anything. A mismatch is an attempted retarget, not a typo."
+    },
+
+    "ticketComment": {
+      "type": "object",
+      "required": ["type", "ticket_id", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "ticket-comment"},
+        "ticket_id": {"$ref": "#/$defs/ticketId"},
+        "body": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 16000,
+          "description": "Non-empty markdown, ≤ 16 000 chars. The telemetry block (§4) travels as one of these."
+        }
+      }
+    },
+
+    "ticketState": {
+      "type": "object",
+      "required": ["type", "ticket_id", "to"],
+      "additionalProperties": false,
+      "description": "At most one of these per run — a run advances the ticket once. Several transitions in one batch is either confusion or an attempt to land somewhere by way of somewhere else.",
+      "properties": {
+        "type": {"const": "ticket-state"},
+        "ticket_id": {"$ref": "#/$defs/ticketId"},
+        "to": {
+          "enum": ["working", "review"],
+          "description": "A canonical state key from linear.stateIds — never a UUID, never a display name. `raw`, `ready` and `done` are excluded here AND refused by the validator however the caller is configured: ready would be self-approval (§5), done would be a session claiming its own merge (§5, §6). The enum is the belt; the validator's refusal is the braces the caller cannot unbuckle."
+        }
+      }
+    },
+
+    "ticketLabel": {
+      "type": "object",
+      "required": ["type", "ticket_id", "add", "remove"],
+      "additionalProperties": false,
+      "description": "add + remove combined are capped at 10 by the validator (§8 caps) — a cross-list total a schema cannot express.",
+      "properties": {
+        "type": {"const": "ticket-label"},
+        "ticket_id": {"$ref": "#/$defs/ticketId"},
+        "add": {"$ref": "#/$defs/labelList"},
+        "remove": {"$ref": "#/$defs/labelList"}
+      }
+    },
+
+    "labelList": {
+      "type": "array",
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(?!agent:|blocked:|provenance:|hooks-change$)\\S+$",
+        "description": "Canonical label keys from linear.labels.ids (§6). Dispatcher- and human-owned classes are excluded here and refused by the validator in BOTH lists: a session setting agent:needs-human — or clearing agent:blocked — is a session editing its own supervision."
+      },
+      "description": "May be empty. Unknown keys are refused by the validator; only keys present in linear.labels.ids resolve to an ID."
+    }
+  }
+}
