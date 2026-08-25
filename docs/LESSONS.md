@@ -1,10 +1,10 @@
 # Lessons
 
 The gotcha catalog — every entry cost a failed run, a wedged PR, a deadlock, or a
-debugging session during the todoclaw build (2026-06-22 → 2026-07-03) or this kit's own
-construction. Format: what bites → the fix. Sources: todoclaw's build records (ADRs,
-runbooks, session notes — cited as provenance, not links into this repo) and this
-repo's own build incidents.
+debugging session during the production build this kit came from (2026-06-22 →
+2026-07-03) or this kit's own construction. Format: what bites → the fix. Sources:
+that build's records (ADRs, runbooks, session notes — cited as provenance, not links
+into this repo) and this repo's own build incidents.
 
 ---
 
@@ -14,7 +14,7 @@ repo's own build incidents.
 `settings.json` hook config hot-loads the instant the file is written, and Claude Code
 reads python's exit 2 as "block" — which is exactly what python exits when the script
 file can't be opened. Result: **every tool call blocks, including the ones that would
-fix it.** Variant 1 (todoclaw, 2026-06-23): relative hook path broke once the shell
+fix it.** Variant 1 (production, 2026-06-23): relative hook path broke once the shell
 `cd`'d out of the project root. Variant 2 (this kit, 2026-07-03): `settings.json`
 written before the hook script existed. Fixes: always
 `python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/…` (absolute, quoted; the var is set in the
@@ -56,10 +56,10 @@ re-verified in **all three layers** whenever a pattern changes.
 **Per-command regex scoping.** A Bash-guard gap of `[^#\n]*` spans `;`/`&`/`|`, so
 `cat foo; grep x .env` wrongly blocks. Use `[^#\n;&|]*` — real reads still block.
 
-**Test the hook the way the harness invokes it.** todoclaw's first pre-commit "looked
-fine" and was silently broken. Hence the permanent battery (`test_hooks.py`, in CI) and
-the ritual: stage a fake `ghp_…` token (must block), commit `.env.example` (must pass),
-confirm the audit log grew.
+**Test the hook the way the harness invokes it.** The first pre-commit hook of the
+production build "looked fine" and was silently broken. Hence the permanent battery
+(`test_hooks.py`, in CI) and the ritual: stage a fake `ghp_…` token (must block),
+commit `.env.example` (must pass), confirm the audit log grew.
 
 ## Git, GitHub & CI
 
@@ -99,11 +99,11 @@ The branch guard only fires for paths inside the session's own checkout, so an
 absolute `Write`/`Edit` into a *different* worktree (classically the main checkout on
 `main`, reached via a stray `cd`) lands there silently — tests/typecheck here still
 pass against the unmodified files, so a whole session's edits can go to the wrong
-checkout unnoticed. The one way a session writes to `main` despite the hook. Fix
-(todoclaw PR #77): a cross-worktree guard resolves the target's owning worktree via
-`git worktree list` and blocks any write outside the session's own root, printing the
-corrected in-worktree path. Fails open; same-worktree and out-of-repo writes are
-untouched. Prefer `git -C <dir>` over a persisted `cd`.
+checkout unnoticed. The one way a session writes to `main` despite the hook. Fix: a
+cross-worktree guard resolves the target's owning worktree via `git worktree list` and
+blocks any write outside the session's own root, printing the corrected in-worktree
+path. Fails open; same-worktree and out-of-repo writes are untouched. Prefer
+`git -C <dir>` over a persisted `cd`.
 
 **A DIRTY (conflicted) PR looks green but never ran the real CI.** When a PR has merge
 conflicts with its base, GitHub can't build the merge ref, so the `pull_request`-
@@ -125,15 +125,15 @@ local main. Battery-cased so it can't regress.
 **Verify a PR merged before any follow-up.** Fast-merging owners mean the branch you
 just pushed is probably already merged; a follow-up commit onto it is stranded —
 GitHub stops syncing a merged PR's head and stops running CI on pushes to it (this
-burned real todoclaw debugging time being misread as "CI is broken"). Check
+burned real debugging time being misread as "CI is broken"). Check
 `gh pr view <n> --json state` / `git fetch --prune` first; branch fresh from main.
 Squash-merge caveat: stacked changes collapse into one commit — verify by checking
-files in `origin/main`, not the log. Now **hook-enforced** (todoclaw PR #61): the
-PreToolUse guard blocks commit/push on a MERGED-PR branch outright, failing open when
-`gh`/network can't verify.
+files in `origin/main`, not the log. Now **hook-enforced**: the PreToolUse guard
+blocks commit/push on a MERGED-PR branch outright, failing open when `gh`/network
+can't verify.
 
 **Claude never merges — opening the PR is the end of its involvement.** A real
-near-miss (todoclaw, 2026-07-03): `gh pr merge --auto` was used on agent-opened PRs —
+near-miss (2026-07-03): `gh pr merge --auto` was used on agent-opened PRs —
 auto-merge still means the agent caused the merge, and the owner corrected it
 immediately. Hook-enforced now: `gh pr merge` blocks in every form except
 `--disable-auto` (which only *undoes* an auto-merge).
@@ -150,8 +150,8 @@ merge can land without CI having run on the literal post-merge state (the safety
 Merge Queue would have added). Real conflicts still block regardless.
 
 **Stage files explicitly — never `git add -A` / `git add .`.** Generated files appear
-where you don't expect (todoclaw: a bogus root `/deno.lock` from running `deno` at the
-repo root). Guard known generated paths in `.gitignore` AND stage by explicit path.
+where you don't expect (in one build, a bogus root `/deno.lock` from running `deno` at
+the repo root). Guard known generated paths in `.gitignore` AND stage by explicit path.
 
 **ADR numbering collides under parallel sessions.** Numbers are claimed at
 merge-to-main; two parallel branches drafted 0019/0020/0022/0023 collisions three times
@@ -163,10 +163,60 @@ append-only log with a shared counter or common tail.
 guard) must be tested in a sandbox repo pinned to a named branch — the kit's battery
 does exactly this.
 
+## Deploys, alerting & scheduled jobs (production, 2026-07-09 → 2026-07-22)
+
+**Post-merge failures are silent by default — PR-green is SEPARATE from deployed.**
+A prod deploy failed in the Actions tab for hours with nothing surfacing it
+(2026-07-09): every PR check was green, the `workflow_run` deploy after merge was not.
+Fix: a `workflow_run`-triggered alert that opens/comments ONE deduped, stable-titled
+issue when a watched workflow fails on main (`templates/workflows/pipeline-failure-alert.yml`;
+the stable title IS the dedupe key). And **detection without delivery is still
+silence**: an auto-opened issue a solo owner doesn't watch is a dead-end — @mention +
+assign the owner on create AND on every comment, so the notification reason becomes
+mention/assign = email + GitHub Mobile phone push, zero new secrets. One manual step:
+install GitHub Mobile and enable push.
+
+**Skip-green preflights become a silent half-deploy hole once secrets exist — and they
+blind the alerting layer.** Skip-green (a fork is never red) is right pre-configuration,
+and stays right for low-stakes crons (backup/keepalive). For the deploy it is
+lifecycle-bound: after the first successful deploy, flip preflights to fail-loud
+(variants commented inline in deploy-on-green.yml). A rotated secret once shipped
+functions against an un-migrated schema on a GREEN run (2026-07-13) — and a
+skipped deploy produces no `failure` event, so pipeline-failure-alert can never fire.
+
+**Hardcoded deploy lists rot — derive targets from the tree, smoke everything with an
+absence classifier.** A hardcoded function list silently omitted a newly added function;
+its cron POST 404'd every minute while every run stayed green.
+Glob the deploy list from the repo, REFUSE to deploy an empty list, and probe EVERY
+target. Don't assert one expected status (auth differs per target): classify only
+absence signals as failure (404/000/5xx) and pass anything actually answered
+(401/403/400/2xx). Retry with linear backoff for cold starts — retry absorbs
+cold-start jitter, it does not paper over a real outage.
+
+**Actions cron silently drops ticks, and schedulers self-report success.** GitHub
+Actions `schedule` is best-effort — ticks at busy times (:00 especially) simply vanish
+(one build lost the user-facing morning push two days running). For time-critical
+work: the platform's own scheduler is primary, an idempotent Actions cron is the
+redundant backup, and every cron runs off the top of the hour. Separately, a scheduler
+saying "succeeded" only covers the trigger: pg_cron reported success all day while the
+HTTP call its SQL made 403'd/404'd. Monitor the downstream EFFECT with a blip
+threshold (e.g. ≥3 failures in 30 min) so a transient never pages but a broken cron
+always does.
+
+**Ordered-file collisions from parallel branches need a PR-time guard plus deploy-time
+tolerance.** Two branches took the same migration timestamp and another sorted before
+remote's latest — `db push` hard-stops on it, and prod fell 5 migrations behind for
+hours (2026-07-09; the written serialization rule existed and was violated
+anyway — see "write a hook" below). Deterministic PR-time check of only the files the
+branch ADDS (`templates/scripts/check-migrations.mjs`: duplicate key, or not sorting
+after base's latest), paired with `--include-all` on deploy-time `db push` so
+legitimately out-of-order merges still apply. Tolerate out-of-order at deploy time,
+enforce ordering at PR time.
+
 ## Environment & tooling
 
 **nvm doesn't apply in non-interactive shells.** Claude Code's shell (and git hooks)
-get the nvm *default* Node — todoclaw's default was v16; Vite 8 and secretlint need
+get the nvm *default* Node — one build's default was v16; Vite 8 and secretlint need
 ≥20. Fixes, layered: `.nvmrc` in-repo; export the absolute path when scripting
 (`export PATH="$HOME/.nvm/versions/node/v22.23.0/bin:$PATH"`); settings.json `env.PATH`
 with the resolved bin dir; the pre-commit hook self-heals by globbing
@@ -177,14 +227,14 @@ no-match greps with `|| true`; capture tool exits with `if ! cmd; then`.
 
 **`.env.local` does not enter worktrees** — and hooks (correctly) block Claude from
 copying it. Prefer tooling that resolves env **at runtime from the running stack**
-(todoclaw's golden suite shells out to `supabase status -o env` — zero env files
+(one build's golden suite shells out to `supabase status -o env` — zero env files
 needed); otherwise copying is a human step.
 
 **Never guess which backend a `.env.local` points at.** Verify with an unambiguous
 single-pattern grep per candidate host — e.g. `grep -oE 'supabase\.co' .env.local`
 then `grep -oE '127\.0\.0\.1' .env.local` — and never print the values (grep of a
 pattern is hook-compatible; `cat` is not). A combined-pattern grep produced a wrong
-prod-vs-local claim in todoclaw (2026-07-03).
+prod-vs-local claim in a real session (2026-07-03).
 
 **macOS keychain re-prompts after `brew upgrade`.** Keychain ACLs are per binary
 signature; an upgraded CLI is a "new" binary and asks again. Expected — not an attack.
@@ -226,7 +276,7 @@ rows via app-side upsert instead.
 
 ## Cost & billing
 
-**Map billing by failure mode, not vibes.** Todoclaw's 3-provider sweep: **Supabase
+**Map billing by failure mode, not vibes.** A production 3-provider sweep: **Supabase
 Free and Vercel Hobby cannot charge you** — they pause/read-only the resource at a
 limit, never invoice. Only Anthropic bills per use — so external alerting targets only
 the provider that can actually invoice, and the in-app budget kill-switch is the
@@ -239,7 +289,7 @@ insurance, not load-bearing.
 
 **Model IDs and pricing move faster than knowledge cutoffs.** Verify both against live
 provider docs before hard-coding cost math; bias arithmetic in the conservative
-direction (over-count spend so a kill-switch trips early, never late — todoclaw's
+direction (over-count spend so a kill-switch trips early, never late — one build's
 formula deliberately over-counted during an intro-pricing window, no dated code to
 revert).
 
@@ -260,9 +310,9 @@ Edit/Write block is live, the hook is un-editable by the agent (and a syntax err
 fail *closed* — every tool blocked), so build it in a candidate and test the Bash-regex
 half before adding the tool-level lock as the final edit.
 
-**Written workflow rules are not reliably followed — back them with hooks.** The
-todoclaw retro's core process lesson: CLAUDE.md said "open a PR when done," "watch CI
-to green," "don't push to merged branches" — and each was violated anyway across
+**Written workflow rules are not reliably followed — back them with hooks.** The core
+process lesson from the production retro: CLAUDE.md said "open a PR when done," "watch
+CI to green," "don't push to merged branches" — and each was violated anyway across
 parallel sessions until made *structurally impossible* (branch guard, branch-naming
 guard, cross-worktree guard, merged-PR guard, `gh pr merge` block, Stop-hook no-PR /
 failing-CI / DIRTY nags). When a written rule gets violated twice, stop rewording it
@@ -280,5 +330,5 @@ drift.
 nothing for the others; walk the list on every rotation. Full model: docs/SECURITY.md.
 
 **Deferrals are managed loops, not shrugs.** Record a revisit trigger with every
-deferral and write the dated re-decision when it fires (todoclaw deferred Realtime
-twice, on schedule, with reasons).
+deferral and write the dated re-decision when it fires (the production build deferred
+Realtime twice, on schedule, with reasons).

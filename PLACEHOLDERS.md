@@ -7,8 +7,6 @@ Phase 4 replaces them all, deletes this file, and re-runs the script with
 
 | Token | File | Fill with |
 |---|---|---|
-| `{{EDGE_FUNCTION_NAMES}}` | `templates/workflows/deploy-on-green.yml` | Space-separated function names to deploy (e.g. `api-status send-report`) |
-| `{{SMOKE_FUNCTION_NAME}}` | `templates/workflows/deploy-on-green.yml` | One deployed function for the post-deploy 401 smoke (an auth-required, no-key endpoint) |
 | `{{KEEPALIVE_TABLE}}` | `templates/workflows/keepalive.yml` | Any real table name — a denied anon read still resets the pause timer |
 | `{{PROJECT_ONE_PARAGRAPH}}` | `docs/CLAUDE-template.md` | What the app is + the invariant that must always hold |
 | `{{REFERENCE_MATERIAL_LIST_OR_DELETE}}` | `docs/CLAUDE-template.md` | Per-file list of gitignored reference material, or delete the block |
@@ -29,6 +27,10 @@ Phase 4 replaces them all, deletes this file, and re-runs the script with
 | `{{ADMIN_KEY_NAME}}` | `docs/CLAUDE-template.md` | The server-only admin credential's name (e.g. service-role key) |
 | `{{PROJECT_INVARIANT_RULE_OR_DELETE}}` | `docs/CLAUDE-template.md` | A numbered Hard Rule for the product invariant, or delete |
 | `{{DATA_LAYER_LINE}}` | `docs/CLAUDE-template.md` | One line on the data-access guard (e.g. RLS on every table), or delete |
+
+(The deploy template no longer takes tokens: its function list is derived from the
+tree at run time and every discovered function is smoke-tested — the former
+`EDGE_FUNCTION_NAMES` / `SMOKE_FUNCTION_NAME` rows are gone with them.)
 
 ## Beyond `{{…}}` tokens (also filled at bootstrap)
 

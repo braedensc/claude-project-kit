@@ -99,11 +99,12 @@ human-only steps at the end.
 > 4. Activate workflows: `git rm .github/workflows/ci.yml && git mv
 >    templates/workflows/ci.yml .github/workflows/ci.yml` — it ships with the
 >    hook-battery step built in (`python3 .claude/hooks/test_hooks.py`); the battery
->    must stay in CI. Move `deploy-on-green.yml`, `backup-cron.yml`,
->    `keepalive.yml` the same way; adapt their fenced stack sections; DELETE any that
->    don't apply (no DB → no backup-cron; nothing pauses → no keepalive). Fill
->    `{{EDGE_FUNCTION_NAMES}}`, `{{SMOKE_FUNCTION_NAME}}`, `{{KEEPALIVE_TABLE}}` or
->    remove with their files. Also adapt `templates/scripts/dev-worktree-login.sh`
+>    must stay in CI. Move the other `templates/workflows/*.yml` (deploy-on-green,
+>    pipeline-failure-alert, backup-cron, keepalive, …) the same way; adapt their
+>    fenced stack sections; DELETE any that don't apply (no DB → no backup-cron;
+>    nothing pauses → no keepalive). Fill `{{KEEPALIVE_TABLE}}` or remove it with
+>    its file; `templates/scripts/check-migrations.mjs` moves to `scripts/` if you
+>    have an ordered-migrations dir (adjust its fenced knobs), else delete it. Also adapt `templates/scripts/dev-worktree-login.sh`
 >    to my backend and `git mv` it to `scripts/` (or delete it if no local
 >    backend). Keep every provenance header. Finish with `git rm -r templates/`
 >    (its README goes too — activation is one-way).
@@ -128,7 +129,7 @@ human-only steps at the end.
 >    generator overwrite package.json, .gitignore, .husky/, or .claude/**
 >    (docs/STACK-RATIONALE.md, "explicit over clever"). Merge kit package.json
 >    scripts/devDeps into the scaffold's result; add `lint-staged` if the stack wants
->    it (the pre-commit hook picks it up automatically) — todoclaw's proven config:
+>    it (the pre-commit hook picks it up automatically) — a proven production config:
 >    `"lint-staged": {"*.{ts,tsx}": ["eslint --fix", "prettier --write"],
 >    "*.{css,html}": "prettier --write"}`.
 > 8. Create `docs/SETUP.md` (prerequisites table w/ version floors + the Node gotcha
