@@ -2,9 +2,11 @@
 
 The gotcha catalog — every entry cost a failed run, a wedged PR, a deadlock, or a
 debugging session during the production build this kit came from (2026-06-22 →
-2026-07-03) or this kit's own construction. Format: what bites → the fix. Sources:
-that build's records (ADRs, runbooks, session notes — cited as provenance, not links
-into this repo) and this repo's own build incidents.
+2026-07-03), this kit's own construction, or the first ticket a kit-derived project
+ran end to end through the delivery pipeline (2026-08-25). Format: what bites → the
+fix. Sources: that build's records (ADRs, runbooks, session notes — cited as
+provenance, not links into this repo), this repo's own build incidents, and that first
+pipeline run.
 
 ---
 
@@ -263,6 +265,70 @@ branch ADDS (`templates/scripts/check-migrations.mjs`: duplicate key, or not sor
 after base's latest), paired with `--include-all` on deploy-time `db push` so
 legitimately out-of-order merges still apply. Tolerate out-of-order at deploy time,
 enforce ordering at PR time.
+
+## The delivery pipeline's first real run (2026-08-25)
+
+The four entries below came out of the first ticket a template-derived project took end
+to end — `/work` → the smallest diff → `/ship` → a PR. **Four rounds of static review
+over the same pipeline had found none of them.** Every one is environmental: it lives in
+the shape of the checkout, the order the config was committed, or the name a connector
+happened to be given — none of it visible in a diff, and none of it reachable by reading
+harder. One ticket through the loop buys what another review round cannot. The guards
+themselves came out well: where they refused they were right, including the refusal in
+the first entry that looked like a bug and was not.
+
+**The pin binds a *path*, so dispatch from the worktree you will actually work in.** The
+pin key is `sha256(realpath(session root))[:16]` (PIPELINE-CONTRACT §3) — the binding is
+to a directory, not to a ticket and not to a branch. Task chips and `claude --worktree`
+create a *fresh* worktree, so the sequence that feels natural — dispatch from the main
+checkout, then start the session — writes the pin under the main checkout's key and
+leaves nothing at the key the session computes. `/work` then fails closed, correctly, and
+the message reads as though the dispatcher never ran. The rule is one line: **`cd` into
+the worktree before dispatching**, so the dispatcher's default `--session-root` resolves
+to the same path the session will run from; `--show` from inside the worktree is the
+fastest confirmation. Two message fixes are worth making in any project that hits this —
+the dispatcher should print the pinned path prominently (*"start your session here"*),
+and `/work`'s failure should say *"a pin exists for `<other path>` — you are probably in
+the wrong directory"* rather than merely reporting absence. It had that information and
+buried it in prose, and wrong-directory beats never-dispatched by a wide margin as a
+first guess.
+
+**`delivery.json` is a one-way switch — build the machinery first, flip it last.** §2
+makes the file's existence the single discriminator, so the instant it lands the project
+is *configured*: every pipeline guard goes live, `/work` stops being inert, and a missing
+pin becomes broken rather than off. Committing it early — while the scripts, workflows
+and board conventions it presupposes are still being ported — produces the worst of the
+three states, a project whose config claims enforcement while nothing enforces, because
+it reads as on. Port or build the pieces first and add `delivery.json` as the last
+commit of the bootstrap. Ordering is the whole fix; there is no partial-configuration
+mode to reach for, on purpose.
+
+**Nested worktrees destroy every tool that walks the tree — and a gate that can never be
+green is not a gate.** Claude Code sites worktrees inside the repo by default
+(`.claude/worktrees/`), so each sibling's full checkout sits under the repo root and
+every glob picks it up. In the run above, `npm run lint` returned **4117 errors, 3794 of
+them from sibling worktrees** — not one of them real. Noise is the small half of the
+problem. That lint command is the local gate a pipeline session runs before it ships
+(`delivery.json` → `commands`), and an unattended session has nobody to do the forensics
+a human did here: it sees red, and its honest options are to bounce or to escalate, both
+of which burn an attempt on nothing. Every tool that globs the tree needs the exclusion —
+ESLint, `tsconfig`, Prettier, vitest, secretlint — or the worktrees belong outside the
+repo entirely. Fixing one tool only relocates the problem; the next glob finds it again.
+
+**MCP server names are per-installation, so granting a tool by name is not portable.**
+MCP tool names are `mcp__<server-key>__<tool>`, and the key comes from whatever wrote the
+server's config — so `/work`, `/ship` and `/weekly-review` granting `mcp__linear__*`
+matches only where the server is literally keyed `linear`. A project with no `.mcp.json`,
+reaching Linear through a connector configured elsewhere, gets an opaque UUID key and the
+grant matches nothing. The failure is silent: nothing reports "this grant matched no
+tool" — the session simply does not have the tool and routes around it. Two sessions hit
+it independently and each improvised its own workaround, which is exactly the divergence
+that costs a debugging session later. **The fix is genuinely open as of 2026-08-25:**
+either the project ships a project-scoped `.mcp.json` naming the server `linear` (which
+depends on existing connector auth carrying over — under investigation), or the skills
+resolve the server by capability instead of by literal name. docs/AUTONOMY.md states the
+requirement as it stands today; treat that as the current constraint, not the decided
+answer.
 
 ## Environment & tooling
 
