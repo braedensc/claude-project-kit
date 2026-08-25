@@ -258,6 +258,17 @@ Stop hook between them:
    - Blocks `gh pr merge` outright, including `--auto` — **merging is the human's
      action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
      only *undoes* an auto-merge.)
+   - **Config anchor** — blocks writing a protected git ref (`git update-ref`,
+     `branch -f/-D main`, a fetch/pull **refspec** targeting `main`/`master`,
+     `symbolic-ref`, `replace`, history rewriters), repointing `origin`
+     (`remote set-url/remove/rename`, `git config remote.origin.url`), and any
+     mutation of `.git/**` in Bash or Edit/Write. Several guards deliberately read
+     from the **default branch** rather than the worktree — `delivery.json`, the
+     merged-PR base, the changed-file set a review is judged against — and that is
+     only worth more than reading the worktree while the ref itself is not
+     model-movable. Reads and a plain `git fetch` (the one honest writer of
+     `origin/main`) are untouched, as is `git remote add origin`. Tamper-**evident**,
+     not tamper-proof: the backstop stays the reviewed PR + CI.
    - **Pipeline guards** (`docs/PIPELINE-CONTRACT.md`) — six more blocks that exist
      **only** when a project opted into the agentic delivery pipeline. The single
      discriminator is whether `delivery.json` exists at the repo root, and the
@@ -267,19 +278,26 @@ Stop hook between them:
      session — the pinned ticket and session mode from a pin file *outside* the
      worktree, config values from the committed copy on the default branch, states
      and labels compared by **ID** rather than display name. They block: moving a
-     ticket into the `ready` state (**approving work is a human's action**; only an
-     `epic/*`-provenance ticket that meets the definition of ready and touches no
-     risk path can ever auto-approve, and emptying `autonomy.autoApproveProvenance`
-     closes even that); tracker writes outside the session's own ticket, including
-     creating tickets in `ticket` mode; editing the session's own in-progress
-     acceptance criteria; Edit/Write/Bash mutations of grader paths
+     ticket into the `ready` state (**approving work is a human's action, with no
+     in-session exception** — only `epic/*` provenance auto-approves and only *out of
+     session*, through `scripts/check_auto_approve.py`, which can read the epic;
+     `autonomy.autoApproveProvenance` configures that out-of-session tier and is not
+     a permission a session holds); any tracker write **naming** an `agent:*` or
+     `blocked:*` label, which is the dispatcher's supervision of the session and not
+     the session's to edit; tracker writes outside the session's own ticket,
+     including creating tickets in `ticket` mode; editing the session's own
+     in-progress acceptance criteria; Edit/Write/Bash mutations of grader paths
      (`.github/workflows/**`, `delivery.json`, `autonomy.riskPaths`); work on a branch
-     that doesn't carry the pinned ticket ID when `branch.requireTicketId` is on; and
-     a malformed, unrecognized or foreign-worktree pin. Write-blocking and approval
-     checks fail **closed**; checks that merely withhold autonomy from an *unpinned*
-     session fail **open**, so a human's ad-hoc session in a configured repo is never
-     bricked — and a broken `delivery.json` still leaves `delivery.json` itself
-     editable, so the repo can never be held hostage by its own config.
+     that doesn't carry the pinned ticket ID when `branch.requireTicketId` is on; a
+     `dispatch.pinsRoot` resolving inside the repo (a pins directory the session can
+     write is a pin it can forge); and a malformed, unrecognized, foreign-worktree or
+     — in `ticket` mode — **expired** pin. Write-blocking and approval checks fail
+     **closed**; checks that merely withhold autonomy from an *unpinned* session fail
+     **open**, so a human's ad-hoc session in a configured repo is never bricked. An
+     **expiry is not an absence**, though: a lapsed pin means a binding was issued
+     and can no longer be verified, so reading it as "unpinned" would make waiting an
+     escape. A broken `delivery.json` still leaves `delivery.json` itself editable, so
+     the repo can never be held hostage by its own config.
 2. **Claude Code Stop hook** (`.claude/hooks/stop-pr-check.py`) — blocks ending a
    turn when the branch has pushed commits ahead of `main` with **no PR**, its open
    PR has **failing CI**, or its open PR is **`DIRTY`** (merge conflicts — GitHub
