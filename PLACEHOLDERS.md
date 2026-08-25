@@ -50,6 +50,7 @@ Phase 4 replaces them all, deletes this file, and re-runs the script with
 | `{{CMD_TEST}}` | `delivery.example.json` | Unit/integration test command, or `null` |
 | `{{CMD_E2E}}` | `delivery.example.json` | E2E command, or `null` |
 | `{{CMD_PREVIEW}}` | `delivery.example.json` | Command that starts the app for a human/visual check, or `null` |
+| `{{TELEMETRY_DSN_ENV}}` | `delivery.example.json` | The **name** of the env var holding the Postgres DSN (e.g. `PIPELINE_TELEMETRY_DSN`) — never the DSN itself. Delete the whole `telemetry` block to skip collection |
 
 **The `delivery.example.json` rows are opt-in.** The agentic delivery pipeline is
 optional: a project has it only if a real `delivery.json` exists
