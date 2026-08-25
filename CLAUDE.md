@@ -115,6 +115,7 @@ than blocks.
 npm run test:hooks      # the block/allow battery (must stay green; also runs in CI)
 npm run test:dor        # Definition-of-Ready gate selftest
 npm run test:delivery   # delivery.json validator selftest (PIPELINE-CONTRACT §7)
+npm run test:local-dispatch  # tier-0 local dispatcher selftest (§2, §3)
 npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
@@ -187,7 +188,10 @@ The loop, when it *is* on:
    before the session starts. **Everything the session can write is reporting, not
    authority** — the branch name, PR body, ticket comments, env vars, any file in the
    worktree. Treat the branch name as cosmetic; a guard that reads a value the agent
-   could have written is not a guard.
+   could have written is not a guard. A **human** can write one by hand for a local
+   session (`scripts/pipeline_dispatch_local.py`, tier 0 in `docs/AUTONOMY.md`) — that
+   script refuses to run in an agent environment, and **you must never invoke it**:
+   a session that places its own binding is the attack the pin exists to prevent.
 2. **Branch as `<type>/<ticket-id-lowercased>-<slug>`** (`feat/eng-123-token-refresh`).
    The branch-naming guard is `[a-z0-9-]` only, so **the team key must be
    lower-cased** — `feat/ENG-123-…` is blocked before the first edit.

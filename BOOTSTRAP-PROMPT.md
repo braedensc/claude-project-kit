@@ -124,7 +124,12 @@ human-only steps at the end.
 > 6b. The Claude-layer extras — decide each with me: keep `.claude/skills/` (`/ship`,
 >    `/new-adr` — adapt `/ship`'s allowed-tools if my remote isn't GitHub);
 >    `.mcp.json.example` → rename to `.mcp.json` and fill (env-var secrets only) or
->    delete; `.devcontainer/` → keep (swap the base image for my stack) or delete;
+>    delete — **if I'll run the delivery pipeline, the Linear server MUST keep the
+>    key `linear`**: MCP tool names are `mcp__<server-key>__<tool>`, and `/work`,
+>    `/ship` and `/weekly-review` grant `mcp__linear__*` by that literal name, so a
+>    server keyed anything else (a claude.ai connector's opaque UUID, say) leaves
+>    the grant matching nothing; `.devcontainer/` → keep (swap the base image for my
+>    stack) or delete;
 >    `templates/workflows/claude.yml` moves with the other workflow templates in step
 >    4 — activate only if I want @claude-on-GitHub and will add the
 >    `ANTHROPIC_API_KEY` secret (it spends real money), else delete.
