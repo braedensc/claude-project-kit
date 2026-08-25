@@ -7,13 +7,14 @@ name: CI
 # (see templates/README.md — `git mv` it to .github/workflows/ci.yml).
 #
 # Layer 3 of the security/quality model — the unbypassable gate (--no-verify
-# can't skip it). Seven parallel jobs on every push to main and every PR (the
-# hooks guard is PR-only):
+# can't skip it). Eight parallel jobs on every push to main and every PR (the
+# hooks and ticket guards are PR-only):
 #   - "Secret scan + forbidden paths" — secretlint + planning//.env path gate
 #   - "Provenance scan"               — no absolute home paths / real emails
 #   - "Lint" / "Typecheck" / "Test"  — adapt the npm scripts to your toolchain
 #   - "E2E (smoke)"                  — non-required by design (see its comment)
 #   - "Hooks change guard"           — PR-only label gate on guard-machinery edits
+#   - "Ticket link"                  — PR-only: branch / PR / pinned ticket agree
 # Plus two commented STUBS to adapt at the bottom: a second-runtime gate and a
 # migration guard.
 #
@@ -32,9 +33,10 @@ on:
     branches: [main]
   # Run on every PR regardless of base branch — so stacked PRs (base != main)
   # are gated too, not just PRs that target main directly. `labeled`/`unlabeled`
-  # are included so "Hooks change guard" re-evaluates the moment a
-  # `hooks-change` label is added or removed (the default PR activity types —
-  # opened/synchronize/reopened — don't cover labels).
+  # are included so the label-driven gates re-evaluate the moment their label is
+  # added or removed — `hooks-change` for "Hooks change guard", `no-ticket` for
+  # "Ticket link" (the default PR activity types — opened/synchronize/reopened —
+  # don't cover labels).
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
@@ -221,6 +223,148 @@ jobs:
           done
           echo "::error::This PR changes .claude/hooks/** or .claude/settings*.json — the guard machinery that self-protection makes human-only locally. Edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
           exit 1
+
+  # Ticket link (PR-only). In an agent-driven pipeline the ticket ID is the only
+  # thread tying a tracker issue → a branch → a PR → a merge commit. When those
+  # disagree the pipeline still *works* — it just files the work under the wrong
+  # issue, silently and permanently. This job makes that disagreement loud.
+  #
+  # Three sources, one ID, compared case-INSENSITIVELY: trackers display
+  # `ENG-42`, the branch names they generate are slugged to `eng-42`, and the
+  # kit's branch-naming guard accepts lower case only — so a case-SENSITIVE
+  # compare would fail every correctly-named branch.
+  #   1. the branch        — `<type>/<ticket>-<slug>`, which is both the only
+  #                          shape the kit's branch guard accepts and what a
+  #                          branch format of `feat/{issueIdentifier}-{issueTitle}`
+  #                          produces. `/setup-board` sets that format.
+  #   2. the PR            — title OR body ("Closes ENG-42"); either satisfies it.
+  #   3. the pinned ticket — `delivery.json`, the session's own record of what it
+  #                          was told to work on. The anchor whenever present.
+  #
+  # Enablement is by SIGNAL, never by a placeholder token — the job stays silent
+  # until the project actually has one:
+  #   - `delivery.json` pins a ticket → strict three-way check;
+  #   - else `vars.TICKET_PREFIXES`   → a repo/org variable (e.g. "ENG,OPS")
+  #     requiring every PR to come from a ticket branch of a known team;
+  #   - else                          → green with a notice. A project that does
+  #     not do ticket-linked delivery never sees this job fail.
+  #
+  # Escape hatches, both deliberate and visible (the same shape as the label gate
+  # above — a skip you can see beats a check you deleted): PRs opened by a bot
+  # (Dependabot et al.) and PRs carrying the `no-ticket` label. One-time setup:
+  #   gh label create no-ticket --color BFD4F2 \
+  #     --description 'PR intentionally not linked to a ticket'
+  #
+  # Two things to adapt:
+  #   - PINNED_PATHS — the delivery.json key that holds the ticket. The first
+  #     path that resolves to a ticket-shaped string wins; trim the list to the
+  #     one canonical key once your delivery contract fixes the schema.
+  #   - TICKET — the identifier regex, if your tracker is not `TEAM-123` shaped.
+  #
+  # Untrusted input: on a fork PR the branch name, title and body are all
+  # author-controlled, so they reach the script through `env:` and are never
+  # spliced into the shell — script injection via a PR title is a real,
+  # exploited GitHub Actions bug class, not a hypothetical one.
+  ticket-link:
+    name: Ticket link
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Branch, PR and the pinned ticket must name the same issue
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          TICKET_PREFIXES: ${{ vars.TICKET_PREFIXES }}
+        run: |
+          python3 - <<'TICKET_CHECK'
+          import json, os, re, sys
+          from pathlib import Path
+
+          BRANCH_TYPES = "feat|fix|chore|refactor|docs"
+          TICKET = r"[A-Za-z][A-Za-z0-9]{1,5}-[0-9]+"
+          PINNED_PATHS = ("ticket.id", "ticket.identifier", "ticket", "ticketId", "issue.identifier")
+          SKIP_LABEL = "no-ticket"
+
+          head_ref = os.environ.get("HEAD_REF", "")
+          title = os.environ.get("PR_TITLE", "")
+          body = os.environ.get("PR_BODY", "")
+          labels = os.environ.get("PR_LABELS", "").split()
+          author_type = os.environ.get("PR_AUTHOR_TYPE", "")
+          prefixes = [p.upper() for p in re.split(r"[,\s]+", os.environ.get("TICKET_PREFIXES", "")) if p]
+
+          def notice(msg): print("::notice::Ticket link: " + msg)
+          def skip(msg):
+              notice(msg + " — nothing to check.")
+              sys.exit(0)
+          def token(text, tid):
+              return re.search(r"(?<![A-Za-z0-9])" + re.escape(tid) + r"(?![A-Za-z0-9])", text or "", re.I)
+          def ids(text):
+              return sorted({m.group(0).upper() for m in re.finditer(TICKET, text or "")})
+
+          if author_type == "Bot": skip("PR opened by a bot")
+          if SKIP_LABEL in labels: skip("PR carries the '%s' label" % SKIP_LABEL)
+
+          pinned, pin_src = None, None
+          dj = Path("delivery.json")
+          if dj.is_file():
+              try: data = json.loads(dj.read_text(encoding="utf-8"))
+              except (ValueError, OSError) as e:
+                  print("::error::Ticket link: delivery.json is present but unreadable (%s)." % e); sys.exit(1)
+              for path in PINNED_PATHS:
+                  cur = data
+                  for part in path.split("."):
+                      cur = cur.get(part) if isinstance(cur, dict) else None
+                  if isinstance(cur, str) and re.fullmatch(TICKET, cur.strip()):
+                      pinned, pin_src = cur.strip().upper(), "delivery.json:" + path
+                      break
+
+          lead = re.match(r"^(?:" + BRANCH_TYPES + r")/(" + TICKET + r")(?:-|$)", head_ref, re.I)
+          branch_lead = lead.group(1).upper() if lead else None
+
+          anchor, anchor_src = None, None
+          if pinned:
+              anchor, anchor_src = pinned, pin_src
+          elif branch_lead and branch_lead.split("-")[0] in prefixes:
+              anchor, anchor_src = branch_lead, "branch name (prefix allow-listed by vars.TICKET_PREFIXES)"
+          elif prefixes:
+              known = ",".join(prefixes)
+              why = ("leads with %s, whose team prefix is not one of %s" % (branch_lead, known) if branch_lead
+                     else "has no leading <type>/<ticket-123>- segment")
+              print("::error::Ticket link: vars.TICKET_PREFIXES is set (%s), so every PR must come from a "
+                    "ticket branch, but '%s' %s." % (known, head_ref, why))
+              print("Rename the branch, or add the '%s' label to opt this PR out." % SKIP_LABEL); sys.exit(1)
+          else:
+              skip("no pinned ticket in delivery.json and vars.TICKET_PREFIXES is unset")
+
+          print("Anchor ticket: %s  (from %s)" % (anchor, anchor_src))
+          errors = []
+          if not token(head_ref, anchor):
+              errors.append("branch '%s' does not name %s" % (head_ref, anchor))
+          elif branch_lead and branch_lead != anchor:
+              errors.append("branch '%s' leads with %s but the anchor is %s" % (head_ref, branch_lead, anchor))
+          elif not branch_lead:
+              notice("%s appears in the branch but not as the leading <type>/%s-… segment." % (anchor, anchor.lower()))
+
+          if not (token(title, anchor) or token(body, anchor)):
+              errors.append("neither the PR title nor the body mentions %s" % anchor)
+
+          extra = [i for i in ids(title) + ids(body) if i != anchor]
+          if extra: notice("other ticket IDs mentioned (not checked): %s" % ", ".join(sorted(set(extra))))
+          if pinned and prefixes and pinned.split("-")[0] not in prefixes:
+              notice("pinned %s is outside vars.TICKET_PREFIXES (%s)." % (pinned, ",".join(prefixes)))
+
+          if errors:
+              print("::error::Ticket link: branch, PR, and the pinned ticket disagree — " + "; ".join(errors) + ".")
+              print("All three must name %s. Fix the mismatch, or add the '%s' label to opt out." % (anchor, SKIP_LABEL))
+              sys.exit(1)
+          print("OK: branch, PR title/body, and the pinned ticket all name %s." % anchor)
+          TICKET_CHECK
 
   # ── Second-runtime gate (COMMENTED STUB — adapt if any subtree runs a
   #    runtime your main toolchain doesn't) ───────────────────────────────────
