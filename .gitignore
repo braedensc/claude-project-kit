@@ -45,4 +45,11 @@ CLAUDE.local.md
 .claude/launch.json
 .claude/worktrees/
 .claude/.stop-pr-nag/
-.claude/hooks/__pycache__/
+
+# Compiled Python (hooks + scripts). Generic on purpose: a path-scoped
+# entry left scripts/__pycache__/ untracked-but-stageable, and no gate
+# objects to a .pyc — the CI forbidden-paths regex, the pre-commit gate,
+# secretlint and the provenance scan all pass it, so a `git add -A` would
+# publish build artifacts (and the absolute build path baked into them).
+__pycache__/
+*.pyc
