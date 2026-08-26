@@ -17,6 +17,7 @@ exists to prevent.
 | [Telemetry store](#10-telemetry-store) | a Postgres schema, outside the repo | the collector | dashboards, the weekly review |
 | [Autonomy tiers](#11-autonomy-tiers) | — | — | the approve and merge gates |
 | [Machine-readable schemas](#12-machine-readable-schemas) | `schemas/`, committed | this document (amend both together) | producers, validators, CI |
+| [Absence is not failure](#13-absence-is-not-failure) | — | — | every pipeline job that can legitimately do nothing |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -33,6 +34,9 @@ Two rules shape all of it:
 - **Anything the session agent can write is *reporting*, never *authority*.** Config and
   pins are authority; telemetry, PR bodies and commit messages are reporting. A guard
   that reads a value the agent could have written is not a guard.
+- **Absence is not failure.** A component that can legitimately do nothing must be able
+  to tell *nothing to do* from *could not do it*, and must say which. Otherwise the
+  pipeline's most common green outcome is also its best hiding place (§13).
 
 ---
 
@@ -790,7 +794,8 @@ Every rule is a MUST, and all of them run **before any request executes**.
 | `agent:*`, `blocked:capacity`, `provenance:*` and `hooks-change` labels are refused, in `add` **and** `remove` | Dispatcher- and human-owned (§5, §6). A session setting `agent:needs-human` — or clearing `agent:blocked` — is a session editing its own supervision. `remove` matters as much as `add`. |
 | Unknown label keys are refused | Only keys present in `linear.labels.ids` resolve to an ID. |
 | Exactly **one** telemetry block across all comments, when the caller requires it | §4. Counted by the `"schema": "pipeline-telemetry/1"` marker, matched with whitespace tolerance so nothing hinges on a JSON writer's spacing. Zero blocks is a `telemetry-required` violation (§2); two is a double-count. |
-| A missing requests file with telemetry required is a **rejection**, not a skip | A session that reports nothing is indistinguishable from one that silently failed, and silence must not be the quiet path. |
+| A missing requests file with telemetry required is a **rejection**, not a skip | A session that reports nothing is indistinguishable from one that silently failed, and silence must not be the quiet path (§13). |
+| An artifact that downloads but holds no `requests.json` is a **rejection**, not a skip | The artifact *was* read, so this is a malformed batch rather than an absent one — a different fact about a different party, and it must not report as the session having written nothing. |
 
 ### Caps
 
@@ -813,8 +818,27 @@ and both matter:
    moved but the explaining comment missing, or labels changed with no telemetry to say
    why.
 
-The job reports a single verdict: `ok` (validated, executed), `rejected` (batch
-refused, nothing applied), or `skipped` (nothing to apply and none required).
+The job reports a single verdict: `ok` (validated, executed), `rejected` (batch read and
+refused, nothing applied), `skipped` (nothing to apply and none required), or `errored`
+(**this job** failed — it could not read the requests, or could not reach the tracker to
+apply them).
+
+**`skipped` is the only clean way to have applied nothing, and it is only reachable by
+asking.** The validator queries the artifacts API for the collected artifact name
+*before* downloading it, because `download-artifact` fails on absence as well as on
+failure and so its own outcome can never tell the two apart. No artifact ⇒ `skipped`.
+An artifact that exists ⇒ the download must succeed, and anything else is `errored`.
+
+**`errored` is deliberately wider than "could not read".** A missing credential and a
+tracker that stops answering halfway through a plan are the same fact to a caller: the
+requests may exist and have gone unapplied, or been applied only in part, and none of
+that is a statement about what the session wrote. One token that covers the class is
+what stops a fifth being invented for the next cause. A caller MUST treat `errored` as a
+failure, never as an empty batch, and never as a verdict on the batch's contents (§13).
+
+**All-or-nothing covers validation, not the network.** Nothing executes until every
+request has passed, so a *rejected* batch applies nothing. An `errored` batch may be
+partly applied, and the job says how far it got rather than implying it got nowhere.
 
 ### What is authority here, and what is not
 
@@ -1150,3 +1174,89 @@ decides whether the pipeline may run is the last place to add a dependency. Its
 guarantee: **an unrecognized keyword is an error, never a silent no-op** — a schema
 keyword that nothing enforces reads as protection while giving none, so `check_schema()`
 rejects any keyword the validator cannot enforce, over every shipped schema, in CI.
+
+---
+
+## 13. Absence is not failure
+
+**A component that can legitimately do nothing MUST be able to distinguish "nothing to
+do" from "could not do it" — and MUST say which.**
+
+Most of this pipeline is built out of jobs whose ordinary answer is *nothing happened*.
+A session dies before writing its requests. A review finds no findings. A poll finds an
+empty queue. Every one of those is a correct, quiet, green outcome — and every one of
+them is one bad day away from being indistinguishable from a denied API call, an expired
+artifact, or a script that crashed before it reached its first line of work.
+
+The two states have opposite meanings and identical symptoms, which is why they get
+conflated: **no output, no error, no red check.** And the conflation is self-concealing.
+A component that reports "nothing to do" when it actually failed removes the only signal
+that would have brought anyone to look at it.
+
+### The three states, and what each owes the reader
+
+| State | What happened | How it must report |
+|---|---|---|
+| **Did the work** | The component ran and acted | Its normal success output |
+| **Nothing to do** | The component ran, *asked*, and the answer was genuinely nothing | Green — and it **says what it asked and what the answer was**. A silent green is not this state, it is an unlabelled one |
+| **Could not do it** | The component could not establish the answer, or could not act on it | **Loud.** Non-zero, or a distinct verdict a caller must treat as failure. Never the same token as *nothing to do* |
+
+### The test to apply
+
+> **If this component failed completely right now, would anything anywhere go red?**
+
+If the answer is no, the component is not reporting — it is being trusted. Ask the
+follow-up: *what tells absence from failure here, and could the agent or the failure
+itself have written that thing?* An inference drawn from the failure ("the download
+failed, so there must be no artifact") is not an answer, because the failure is exactly
+what makes it unreliable. Ask something that can answer independently.
+
+### Where this shows up in a workflow
+
+Three mechanical shapes, all fine in the right place and all worth a second look:
+
+- `continue-on-error: true` — asks the reader to believe every way this step can fail is
+  benign. Legitimate when a **later step evaluates the outcome** (`steps.<id>.outcome` is
+  computed *before* `continue-on-error` is applied) and fails on it. A defect when nothing
+  downstream reads it.
+- `|| true` — collapses "the command said no" into "the command could not run". Fine for
+  `grep` (exit 1 *is* the answer) and for cleanup. A defect when the empty result then
+  flows into a gate, where empty reads as *permitted*.
+- an early `exit 0` — correct for §2's *off* discriminator, which is a real answer to a
+  real question. A defect when it is reachable by something **going wrong** rather than by
+  something being **absent**.
+
+**A deliberate no-op that announces itself is not a defect.** The rule is not "never do
+nothing quietly"; it is "never let *doing nothing* and *failing* look the same".
+
+### Instances of this rule elsewhere in this document
+
+It is not a new idea here — it is the general form of rules this contract already states
+one case at a time, which is precisely why it earns a section of its own:
+
+- §2 — `delivery.json` absent is **off**; present-but-unreadable is **broken**. One
+  discriminator, three states, and *off* is never allowed to mean *broken*.
+- §8 — a missing requests file with telemetry required is a **rejection, not a skip**,
+  because "a session that reports nothing is indistinguishable from one that silently
+  failed".
+- §8 — the safe-outputs verdicts are `ok`, `skipped`, `rejected` and **`errored`**. The
+  fourth exists because collapsing it into `skipped` reads as a clean run, and collapsing
+  it into `rejected` asserts two things that are false: that the batch was refused, and
+  that nothing was applied.
+- §12 — an unrecognized schema keyword is **an error, never a silent no-op**.
+
+### What enforces it
+
+Partly a check, mostly a convention — stated rather than implied.
+
+`scripts/pipeline_safe_outputs_probe.py --selftest` (`npm run test:safe-outputs`, in CI's *Kit
+checks*) pins the §8 instance: the classification rows, the exit codes, and the step
+graph that carries them — that the probe runs **before** the download, that the download
+no longer wears `continue-on-error`, and that the verdict is computed from both outcomes.
+A perfect classifier wired behind `continue-on-error` would still report success for a
+failure, so the wiring is asserted, not assumed.
+
+The general rule is a **convention**, in the same sense as the source-agnostic rule in
+`CLAUDE.md`: no check can tell a benign `|| true` from a load-bearing one. What is
+mechanical is the reviewer's question, and it is short enough to actually get asked —
+*if this failed, what would go red?*

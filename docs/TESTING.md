@@ -105,6 +105,11 @@ uses the shared helpers.
 
 ## Workflows are code, and one of their failures is silent
 
+> The design rule this section is one instance of lives in
+> `docs/PIPELINE-CONTRACT.md` §13: *absence is not failure*. This section is about a
+> failure GitHub reports silently; §13 is about the components that report silently on
+> their own. Same symptom — a green run that did nothing — from opposite directions.
+
 Every other failure in this document is loud: a red job, a failing assertion, an
 annotation on the diff. **`startup_failure` is not.** When GitHub cannot build a run's
 job graph, the run produces *no jobs, no API annotations and no check run*. The message
@@ -157,6 +162,17 @@ not a format.
 **Known limit, stated rather than implied.** The check verifies each hop independently;
 a chain A → B → C is not verified transitively, because B's cap is A's grant and no
 single hop declares that. The kit has no such chain today.
+
+**Asked again, and the answer held.** A later sweep found four more components reporting
+success while doing nothing, and re-opened the question: would an activation smoke test
+have caught the `startup_failure`? It would — and it still is not worth requiring, for
+the four reasons above, none of which the new evidence touched. Worse, a smoke test is
+itself a component that can pass by doing nothing: a dispatch that never fires, a
+credential that never resolves, an assertion that never runs all report green. Buying
+one silent failure with another is not a trade. The general rule those five instances
+share — *a component that can legitimately do nothing must distinguish "nothing to do"
+from "could not do it", and must say which* — is `docs/PIPELINE-CONTRACT.md` §13, and it
+constrains the next workflow at the point it is written rather than after it ships.
 
 ---
 

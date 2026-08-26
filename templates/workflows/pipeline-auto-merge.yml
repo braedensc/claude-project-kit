@@ -167,7 +167,13 @@ jobs:
           git fetch --no-tags origin "$BASE" "$HEAD" 2>/dev/null || true
 
           # ── The diff, from git, not from the PR's own description of itself ──
-          git diff --name-only "$BASE...$HEAD" > "$E/changed.txt" || true
+          # No `|| true` (contract §13). An empty changed.txt is what a failed
+          # `git diff` leaves behind, and check_auto_merge.py's risk-paths gate
+          # reads an empty list as "0 changed file(s), none risk-allowlisted" —
+          # i.e. the gate that keeps auto-merge away from `.claude/hooks/**`
+          # would PASS on a diff nobody managed to compute. `set -e` makes that
+          # a failed job instead, which is what the next two lines already do.
+          git diff --name-only "$BASE...$HEAD" > "$E/changed.txt"
           add=$(git diff --numstat "$BASE...$HEAD" | awk '{a+=$1} END {print a+0}')
           del=$(git diff --numstat "$BASE...$HEAD" | awk '{d+=$2} END {print d+0}')
           echo "added=$add" >> "$GITHUB_OUTPUT"
