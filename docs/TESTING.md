@@ -103,6 +103,63 @@ uses the shared helpers.
 
 ---
 
+## Workflows are code, and one of their failures is silent
+
+Every other failure in this document is loud: a red job, a failing assertion, an
+annotation on the diff. **`startup_failure` is not.** When GitHub cannot build a run's
+job graph, the run produces *no jobs, no API annotations and no check run*. The message
+exists only on the run's HTML page. A PR's checks list shows nothing wrong — the
+workflow simply appears not to have run, which is indistinguishable from a workflow
+whose trigger didn't match. Nobody goes looking for a check that was never supposed to
+be there.
+
+The commonest cause in this kit's shape is the caller ⇄ callee permission cap. GitHub's
+rule is that *"the `GITHUB_TOKEN` permissions passed from the caller workflow can be
+only downgraded (not elevated) by the called workflow"* — so a job doing
+`uses: ./.github/workflows/x.yml` while holding less than `x.yml` declares does not get
+a quietly-narrowed token. The run refuses to start. That is exactly how
+`pipeline-review.yml` shipped: a workflow-level `contents: read` meant `actions: none`,
+the callee declared `actions: read`, and every review run died before its first job.
+
+**The rule: the caller/callee contract is checked statically, on every PR.**
+`scripts/check_workflow_calls.py` reads both files and verifies the permission cap, the
+required inputs, the input types and the required secrets, for every local `uses: ./…`
+in `.github/workflows/` and `templates/workflows/`. It runs in the kit's **Kit checks**
+job and in the app template's **Provenance scan** job, needs no credentials, and works
+in a repo where the pipeline is inert. Add a call site, and the check covers it the same
+day.
+
+### Why *not* a required activation smoke test
+
+The obvious alternative — "after bootstrap, dispatch each workflow once and assert the
+run reached its first job" — was considered and **deliberately not made a requirement**:
+
+- **It is one-shot, and the defect is not.** It proves a workflow started on the day
+  someone ran it. The next permissions edit reintroduces the bug, in silence, and no
+  ritual fires. The static check runs on the PR that would cause it.
+- **It detects after shipping; the gate detects at review.** A smoke test's earliest
+  possible signal is on a live repo with credentials, i.e. after the change has landed
+  somewhere. Everything it would catch here is decidable from two YAML files.
+- **A manual step that only a human on a live repo can perform will decay** — and this
+  defect is itself the proof that undetected things decay. Adding a ritual whose lapse
+  is as invisible as the bug is not a control.
+- **It is also not free**: dispatching pipeline workflows costs real sessions and real
+  tracker writes.
+
+What *is* worth keeping is the one-time **activation check** in the bootstrap runbook —
+after `git mv`-ing the workflow templates into `.github/workflows/`, open the Actions
+tab once and confirm each activated workflow has a run that produced jobs. It costs a
+minute, catches the residue the static check cannot see (a trigger that never matches, a
+missing secret at the org level), and it is a runbook line, not a gate. **No contract
+amendment**: `docs/PIPELINE-CONTRACT.md` freezes shared *formats*, and this is a check,
+not a format.
+
+**Known limit, stated rather than implied.** The check verifies each hop independently;
+a chain A → B → C is not verified transitively, because B's cap is A's grant and no
+single hop declares that. The kit has no such chain today.
+
+---
+
 ## What CI never does
 
 - Never runs the DB-backed suite.

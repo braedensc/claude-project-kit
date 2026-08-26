@@ -52,6 +52,15 @@ git rm -r templates/                      # one-way: this README goes too
 # STACK-SPECIFIC sections.
 ```
 
+**Activation check — one minute, once.** After the first PR that exercises them, open
+the Actions tab and confirm each activated workflow has a run **that produced jobs**. A
+run can end as `startup_failure` before its first job — no jobs, no annotations, no
+check run — and a PR's checks list then looks exactly like a workflow that simply wasn't
+triggered. `npm run lint:workflow-calls` catches the caller/callee half of that class on
+every PR; this eyeball catches the rest (a trigger that never matches, an org-level
+secret that isn't there). See `docs/TESTING.md` §
+*Workflows are code, and one of their failures is silent*.
+
 Every template carries a header comment stating its provenance and
 what was verified in production. Scheduled + secret-dependent jobs follow the
 **preflight-skip-green** pattern: they merge before any secret exists and run
