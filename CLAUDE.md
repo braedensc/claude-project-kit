@@ -135,6 +135,7 @@ npm run test:local-dispatch  # tier-0 local dispatcher selftest (§2, §3)
 npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
+npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
 npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
@@ -157,8 +158,15 @@ and each asserts its contract rows against synthetic fixtures.
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, auto-approve, auto-merge, grader-path,
-telemetry, dashboard and weekly-review selftests, and secretlint on every PR. `main` is
-protected (that context required, admins enforced).
+safe-outputs, telemetry, dashboard and weekly-review selftests, and secretlint on every
+PR. `main` is protected (that context required, admins enforced).
+
+**A component that can do nothing must say which nothing it did.** *Nothing to do* and
+*could not do it* have opposite meanings and identical symptoms — no output, no error,
+no red check — so a job that conflates them removes the only signal that would bring
+anyone to look. Before writing a `continue-on-error`, a `|| true`, or an early `exit 0`,
+ask: **if this failed completely right now, would anything go red?** The rule, its three
+states and the shapes it hides behind are contract §13.
 
 **A workflow that parses can still fail to start.** A job doing `uses: ./…` whose
 permissions are narrower than the called workflow declares ends the *whole run* as

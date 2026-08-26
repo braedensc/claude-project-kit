@@ -1352,8 +1352,25 @@ jobs:
           verdict="ok"; reason=""
           if [ "$step_outcome" != "success" ]; then
             verdict="failed"; reason="the agent step did not succeed ($step_outcome)"
-          elif [ "$safe_verdict" = "rejected" ]; then
-            verdict="failed"; reason="the safe-outputs batch was rejected — nothing the session asked for was applied"
+          else
+            # DEFAULT-DENY on the safe-outputs verdict, rather than enumerating
+            # the bad ones. Listing `rejected` alone meant every other token —
+            # `unreadable`, a typo, a value a later version of that workflow
+            # emits — read as success here, which is the same silent conflation
+            # one layer up (contract §13). Only the two tokens that genuinely
+            # mean "the tracker is in the state we asked for" pass.
+            case "$safe_verdict" in
+              ok|skipped) : ;;
+              rejected)
+                verdict="failed"
+                reason="the safe-outputs batch was rejected — nothing the session asked for was applied" ;;
+              unreadable)
+                verdict="failed"
+                reason="the safe-outputs job could not READ this session's write-requests — they may exist and have gone unapplied" ;;
+              *)
+                verdict="failed"
+                reason="unrecognized safe-outputs verdict '$safe_verdict' — refusing to read an unknown answer as success" ;;
+            esac
           fi
 
           # ── Reporting: what the SESSION said about itself ───────────────────
@@ -1640,8 +1657,24 @@ jobs:
     permissions:
       actions: read
     steps:
+      # No `continue-on-error`, and gated on `claim` instead (contract §13).
+      # `claim` writes a default state.json before it reads anything, so when
+      # claim SUCCEEDED the artifact exists: a failed download here is a failure
+      # to read it, not an absence. Swallowing that published no canonical
+      # `pipeline-state` at all — this run's attempt counts, spend rows and any
+      # capacity pause all silently dropped, with every check green.
+      #
+      # Contract §9 rule 4 deliberately fails OPEN when the record cannot be READ
+      # ("a missing or unreadable record starts from zero; it never blocks
+      # dispatch"), and that is exactly why the WRITE has to be loud. A forgiving
+      # reader is only safe while writes are known to have happened; a silent
+      # writer turns the one into unbounded drift.
+      #
+      # When claim did NOT succeed there is genuinely nothing to carry, and the
+      # run is already red from claim itself. A skipped step is not a failed one,
+      # so the fold below still runs and reports the empty case.
       - name: Fetch this run's draft state
-        continue-on-error: true
+        if: needs.claim.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: pipeline-state-draft-${{ github.run_id }}
@@ -1664,7 +1697,12 @@ jobs:
           d = os.path.join(os.environ["RUNNER_TEMP"], "merge")
           sp = os.path.join(d, "state.json")
           if not os.path.exists(sp):
-              print("::warning::No draft state.json to fold — nothing to carry forward.")
+              # Reachable only when `claim` did not succeed — the download above
+              # is gated on it and no longer swallows its own failures. So this
+              # is the honest empty case, and the run is already red elsewhere.
+              print("::warning::No draft state.json to fold — the claim job did not "
+                    "publish one, so there is nothing to carry forward. The canonical "
+                    "pipeline-state is unchanged from the previous run.")
               raise SystemExit(0)
           state = json.load(open(sp))
           paused, resets = False, None

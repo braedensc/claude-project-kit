@@ -138,6 +138,14 @@ jobs:
       - name: Lifecycle observer selftest (contract §4, §10)
         run: python3 scripts/telemetry_lifecycle.py --selftest
 
+      # Contract §13: the safe-outputs job can legitimately apply nothing, so it
+      # has to tell "the session wrote no requests" from "the requests could not
+      # be read" — and say which. The classification rows AND the step graph that
+      # carries them, because a correct classifier behind `continue-on-error`
+      # still reports success for a failure.
+      - name: Safe-outputs absence-vs-failure selftest (contract §13, §8)
+        run: python3 scripts/pipeline_safe_outputs_probe.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 

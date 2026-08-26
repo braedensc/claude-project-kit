@@ -33,6 +33,17 @@ name: Pipeline safe outputs
 # the whole batch: an escape attempt must not earn partial credit, and a
 # half-applied batch leaves the tracker in a state nobody designed.
 #
+# ── Absence is not failure (contract §13) ─────────────────────────────────────
+# This job can legitimately do nothing: a session may die before writing any
+# requests. So it must be able to tell that apart from being UNABLE to read the
+# requests, and it must say which — otherwise a denied API call, a network fault
+# or an expired artifact reports the same clean `skipped` as an honest no-op, and
+# the one component whose job is being the trustworthy executor stops executing
+# in silence. The artifacts API is asked BEFORE the download for exactly that
+# reason: `download-artifact` fails on absence too, so its own outcome can never
+# distinguish the two. Verdicts: `skipped` (asked, nothing there) vs
+# `unreadable` (could not find out, or could not read what is there).
+#
 # ── Caller contract ───────────────────────────────────────────────────────────
 #   jobs:
 #     validate:
@@ -92,7 +103,13 @@ on:
     outputs:
       verdict:
         description: |
-          ok | rejected | skipped.
+          ok | skipped | rejected | unreadable.
+
+          `skipped` is the ONLY clean way to have applied nothing: it means the
+          artifacts API was asked and said the session published no requests.
+          `unreadable` means this job could not read what the session wrote —
+          expired artifact, denied API call, failed download — and a caller must
+          treat it as a failure, never as an empty batch (contract §13).
 
           CALLER BEWARE: a reusable workflow called from a MATRIX has one set of
           outputs shared by every leg, last writer wins — so this is only safe to
@@ -111,7 +128,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      verdict: ${{ steps.run.outputs.verdict }}
+      # From the PUBLISH step, not the validator: the validator does not run at
+      # all on the `unreadable` path, and a job output left empty there would be
+      # a fourth state this workflow promises to name and then does not. One
+      # value, computed once, in both the output and the verdict artifact.
+      verdict: ${{ steps.verdict.outputs.verdict }}
     steps:
       # Check out the DEFAULT BRANCH, never the PR head. Contract §1: values that
       # gate behavior are read from the committed copy on the default branch —
@@ -134,12 +155,37 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # continue-on-error: a missing artifact is normal (the session died before
-      # writing one). The validator below turns that into a verdict, not a crash.
+      # ── Absence is not failure, and this job must say which it had ──────────
+      # Contract §13. A missing artifact really is normal — a session can die
+      # before writing one — and the download used to carry `continue-on-error`
+      # with exactly that comment. What it could NOT do was tell that apart from
+      # a failure to read: a permissions problem, a network problem or an
+      # expired artifact all produced the same downstream state (no file, a
+      # clean `skipped` verdict, every check green). Inside the one component
+      # whose whole job is being the trustworthy executor, that means tickets
+      # silently stop moving and nothing anywhere goes red.
+      #
+      # `steps.dl.outcome` cannot separate them either — download-artifact fails
+      # on absence too, so `failure` would mean both. So the question is asked
+      # FIRST, of something that can actually answer it: the artifacts API. The
+      # answer is a fact, not an inference from a failed download.
+      - name: Does the session's requests artifact exist?
+        id: probe
+        if: steps.pre.outputs.configured == 'true'
+        env:
+          # `actions: read` — declared at the top of this file, which is why
+          # every caller job must grant at least that much (a shortfall kills
+          # the whole run as `startup_failure`; scripts/check_workflow_calls.py).
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: python3 scripts/pipeline_safe_outputs_probe.py --name "$ARTIFACT_NAME"
+
+      # No `continue-on-error`, deliberately. The probe has already established
+      # that the artifact is there, so a failure at THIS point is a failure to
+      # read requests that exist — never an absence of requests.
       - name: Download the agent's write-requests
         id: dl
-        if: steps.pre.outputs.configured == 'true'
-        continue-on-error: true
+        if: steps.probe.outputs.present == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
@@ -160,6 +206,9 @@ jobs:
           REQUIRE_TELEMETRY: ${{ inputs.require_telemetry }}
           DRY_RUN: ${{ inputs.dry_run }}
           REQUESTS_DIR: ${{ runner.temp }}/safe-outputs
+          # The probe's answer, so that "there is no file" can be read two
+          # different ways below — because it means two different things.
+          ARTIFACT_PRESENT: ${{ steps.probe.outputs.present }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -202,14 +251,28 @@ jobs:
           # ── Load the agent-authored requests ────────────────────────────────
           path = os.path.join(os.environ["REQUESTS_DIR"], "requests.json")
           if not os.path.exists(path):
-              # No file at all. If telemetry was required this is a
-              # `telemetry-required` violation (contract §2) and must be loud —
-              # a session that reports nothing is indistinguishable from one
-              # that silently failed.
+              # "There is no file" means two different things, and the probe is
+              # what tells them apart (contract §13).
+              if os.environ.get("ARTIFACT_PRESENT") == "true":
+                  # The artifact existed and downloaded cleanly, so this file WAS
+                  # read — and requests.json is not in it. Something published an
+                  # artifact under the collected name that is not the document
+                  # this job collects. That is a producer error and a loud one;
+                  # it is emphatically not "the session wrote nothing".
+                  die("the safe-outputs artifact downloaded but contains no requests.json. "
+                      "An artifact exists under the name this job collects and it is not a "
+                      "pipeline-safe-outputs/1 document — this is a malformed batch, not an "
+                      "absent one.")
+              # Genuinely nothing was published. If telemetry was required this
+              # is a `telemetry-required` violation (contract §2) and must be
+              # loud — a session that reports nothing is indistinguishable from
+              # one that silently failed.
               if os.environ.get("REQUIRE_TELEMETRY") == "true":
                   die("No safe-outputs file from the session (%s). Contract §4 requires "
                       "exactly one telemetry block per terminal run." % os.environ["REQUESTS_DIR"])
-              print("::notice::No safe-outputs file — nothing to apply.")
+              print("::notice::The session published no safe-outputs artifact — nothing to "
+                    "apply, and none was required. This is an ANSWER, not a read failure: "
+                    "the artifacts API was asked and said the artifact does not exist.")
               out("verdict", "skipped")
               sys.exit(0)
 
@@ -389,20 +452,64 @@ jobs:
       # form a MATRIX caller can read without picking up another leg's result
       # (see the `verdict` output's own description). `always()` so a rejected or
       # crashed validation still publishes a verdict: to the caller, "no verdict"
-      # and "rejected" must not look alike.
+      # and an actual verdict must not look alike. This step is also where the
+      # verdict is DECIDED, because the paths that produce `unreadable` are
+      # exactly the ones on which the validator never runs.
       - name: Publish the per-call verdict
+        id: verdict
         if: always() && steps.pre.outputs.configured == 'true'
         env:
           VERDICT: ${{ steps.run.outputs.verdict }}
+          PROBE_OUTCOME: ${{ steps.probe.outcome }}
+          PROBE_STATE: ${{ steps.probe.outputs.state }}
+          DL_OUTCOME: ${{ steps.dl.outcome }}
           TICKET: ${{ inputs.pinned_ticket_id }}
           DISPATCH: ${{ inputs.pinned_dispatch_id }}
         run: |
           set -euo pipefail
+          # FOUR verdicts, and the fourth one is the point (contract §13):
+          #
+          #   ok          the batch was read, validated and executed
+          #   skipped     there was nothing to apply and none was required —
+          #               an ANSWER, arrived at by asking the artifacts API
+          #   rejected    the batch was read and REFUSED. Nothing was applied,
+          #               and the reason is the session's own output
+          #   unreadable  we could not read what the session wrote. Not clean,
+          #               and not a statement about the batch's contents at all
+          #
+          # Collapsing `unreadable` into either neighbour is the whole defect:
+          # into `skipped` it reads as a clean run, and into `rejected` it says
+          # something false about a batch nobody managed to look at.
+          verdict="${VERDICT:-}"
+          if [ -z "$verdict" ]; then
+            if [ "${PROBE_OUTCOME:-}" = "failure" ] || [ "${DL_OUTCOME:-}" = "failure" ]; then
+              verdict="unreadable"
+            else
+              verdict="rejected"
+            fi
+          fi
+
+          case "$verdict" in
+            ok)         detail="requests validated against the pin and applied." ;;
+            skipped)    detail="the session published no write-requests, and none were required. Nothing to apply." ;;
+            rejected)   detail="the batch was read and refused — nothing was applied. See the errors above." ;;
+            unreadable) detail="the session's write-requests could NOT BE READ (probe: ${PROBE_STATE:-unknown}, download: ${DL_OUTCOME:-none}). This is a failure of this job, not of the session — the requests may exist and have gone unapplied." ;;
+            *)          detail="unrecognized verdict." ;;
+          esac
+
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/verdict"
           printf '{"ticket":"%s","dispatch_id":"%s","verdict":"%s"}\n' \
-            "$TICKET" "$DISPATCH" "${VERDICT:-rejected}" \
+            "$TICKET" "$DISPATCH" "$verdict" \
             > "$RUNNER_TEMP/verdict/verdict.json"
           cat "$RUNNER_TEMP/verdict/verdict.json"
+
+          # The run page is where a human actually looks, so the distinction has
+          # to survive into prose and not only into a JSON field.
+          {
+            printf '### Safe outputs — `%s`\n\n' "$TICKET"
+            printf '**`%s`** — %s\n' "$verdict" "$detail"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the per-call verdict
         if: always() && steps.pre.outputs.configured == 'true'
@@ -410,5 +517,10 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}-verdict
           path: ${{ runner.temp }}/verdict
+          # `error`, not `warn`: the step above writes this file under
+          # `set -e` on every path, so nothing to upload means that step died.
+          # The caller's fallback for a missing verdict is deliberately coarse,
+          # and a warning that lets the run stay green is how it would be
+          # reached without anyone noticing.
+          if-no-files-found: error
           retention-days: 14
-          if-no-files-found: warn
