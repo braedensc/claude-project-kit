@@ -261,6 +261,26 @@ jobs:
                riskPaths: .autonomy.riskPaths, threshold: .budgets.reviewSeverityThreshold}' \
             <(git show "origin/$base:delivery.json") > REVIEW-RUBRIC.json
 
+          # §14's schema and the vendored validator that enforces it, staged from
+          # the DEFAULT BRANCH for the same reason the rubric above is: this job
+          # checked out the PR's own head, and a change that can loosen the schema
+          # its own review is held to has not been reviewed. Staged outside the
+          # worktree so the reviewer session cannot reach them either.
+          #
+          # Staged best-effort, and NOT with `set -e` semantics: a default branch
+          # that predates §14 has no schema to stage, and that must degrade to
+          # "this review is unusable" — which the normalize step already reports
+          # as *treat this PR as unreviewed* — rather than to a red job that
+          # explains nothing. Missing gate, no verdict; never missing gate, clean
+          # verdict.
+          mkdir -p "$RUNNER_TEMP/gate/scripts" "$RUNNER_TEMP/gate/schemas"
+          stage() { git show "origin/$base:$1" > "$2" 2>/dev/null || { rm -f "$2"; return 1; }; }
+          stage scripts/jsonschema_mini.py "$RUNNER_TEMP/gate/scripts/jsonschema_mini.py" &&
+          stage scripts/check_schemas.py   "$RUNNER_TEMP/gate/scripts/check_schemas.py" &&
+          stage schemas/review-findings.schema.json \
+                "$RUNNER_TEMP/gate/schemas/review-findings.schema.json" ||
+            echo "::warning::could not stage the §14 findings gate from origin/$base — the review will be reported UNUSABLE rather than judged unchecked."
+
           for f in REVIEW-DIFF.patch REVIEW-STAT.txt REVIEW-SNAPSHOT.json REVIEW-RUBRIC.json REVIEW-FINDINGS.json; do
             grep -qxF "$f" .git/info/exclude 2>/dev/null || echo "$f" >> .git/info/exclude
           done
@@ -334,9 +354,18 @@ jobs:
 
             `category` is one of correctness, security, tests, scope. Omit `line` if it
             does not apply. `detail` is read by the humans on this PR and by the fix
-            session that may follow; the six other fields are the ones contract §4
+            session that may follow; the five other fields are the ones contract §4
             stores as a `review_findings` row, so put the claim in `summary` and the
-            reasoning in `detail`. Do not post a comment, do not approve, do not push,
+            reasoning in `detail`.
+
+            THE SHAPE IS CHECKED, AND MALFORMED IS UNUSABLE — NEVER SMALLER. This file
+            is validated whole against `schemas/review-findings.schema.json` (§14). One
+            finding with a severity outside `low|medium|high|critical`, a missing
+            `detail`, or a field the schema does not define, and the ENTIRE review is
+            reported as unusable — the PR is treated as unreviewed, and everything you
+            did find is lost with it. Lower case, exact field names, nothing extra.
+
+            Do not post a comment, do not approve, do not push,
             do not modify any source file — you have no tools to do any of it, and the file
             above is the entire deliverable.
 
@@ -366,8 +395,19 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/findings"
           python3 - <<'PY'
-          import json, os
+          import json, os, sys
           RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+          # Contract §14, held to schemas/review-findings.schema.json — staged in
+          # the prep step from the DEFAULT BRANCH, never read out of the head this
+          # job checked out. An unreachable gate is itself a shape failure: a
+          # review must not be judged usable by a step that could not check it.
+          sys.path.insert(0, os.path.join(os.environ["RUNNER_TEMP"], "gate", "scripts"))
+          try:
+              from check_schemas import document_problems
+          except Exception as exc:
+              # Broad on purpose: however the import failed, the answer is the
+              # same one and it is reported through `usable`, not raised here.
+              document_problems, gate_error = None, exc
           out = {"schema": "pipeline-review/1",
                  "ticket_id": os.environ["TICKET"],
                  "dispatch_id": os.environ["DISPATCH_ID"],
@@ -377,13 +417,27 @@ jobs:
                  "summary": "", "findings": [], "max_severity": None,
                  "meets_threshold": False, "usable": False}
           try:
+              if document_problems is None:
+                  raise ValueError("the §14 gate could not be staged from the default "
+                                   "branch (%s)" % gate_error)
               doc = json.load(open("REVIEW-FINDINGS.json"))
-              if doc.get("schema") != "pipeline-review/1":
-                  raise ValueError("schema %r unrecognized" % doc.get("schema"))
-              findings = [f for f in doc.get("findings", [])
-                          if isinstance(f, dict) and f.get("severity") in RANK]
-              out["summary"] = str(doc.get("summary", ""))[:2000]
+              # THE WHOLE DOCUMENT, or none of it. This step used to keep the
+              # findings whose severity it recognized and drop the rest, so a
+              # reviewer that wrote "Critical" produced a run that had found
+              # something and reported that it had not — a review reading clean
+              # because its worst finding was unparseable is the one failure mode
+              # a review must never have. Malformed is UNUSABLE, never smaller.
+              problems = document_problems(doc, "review-findings")
+              if problems:
+                  raise ValueError("; ".join(problems[:5]))
+              findings = doc["findings"]
+              out["summary"] = doc["summary"][:2000]
               out["findings"] = findings[:50]
+              if len(findings) > 50:
+                  # A cap nobody logged reads as "that was all".
+                  print("::warning::the reviewer returned %d findings; the artifact "
+                        "carries the first 50. The severity below is computed over "
+                        "ALL of them." % len(findings))
               out["usable"] = True
               if findings:
                   top = max(findings, key=lambda f: RANK[f["severity"]])

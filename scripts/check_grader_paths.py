@@ -78,7 +78,11 @@ import urllib.request
 #      which §1 makes the only authority), and `scripts/jsonschema_mini.py` is
 #      the shape layer two gated graders validate through — neuter its
 #      `validate()` and `check_delivery_config.py`'s entire schema half goes
-#      dark with every gate still green.
+#      dark with every gate still green. `scripts/emit_document.py` joins them
+#      because it is the gate that decides whether a document may be WRITTEN at
+#      all, and one of the documents it installs is `delivery.json` — already on
+#      this floor, and BROKEN-fails-closed if the shape is wrong (§2). A gate
+#      that writes a gated file is a gated file.
 #   3. `templates/workflows/pipeline-*.yml`, the shipped source of those
 #      workflows. `.github/workflows/**` is already gated; these files become
 #      exactly that on the next sync, and one of them — pipeline-safe-outputs —
@@ -110,6 +114,7 @@ FLOOR = (
     "scripts/check_*.py",
     "scripts/pipeline_*.py",
     "scripts/jsonschema_mini.py",
+    "scripts/emit_document.py",
     "templates/workflows/pipeline-*.yml",
     "templates/hooks/**",
     "delivery.json",

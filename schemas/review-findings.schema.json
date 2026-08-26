@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/review-findings.schema.json",
+  "title": "Review findings file",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §14 — the ONE file a review session produces. The reviewer has no tools to comment, approve, push or reach the tracker; this document is its entire deliverable, and everything that gates money downstream is computed FROM it by CI rather than reported in it.",
+  "$comment": "AGENT-AUTHORED ⇒ REPORTING, NEVER AUTHORITY. Conforming here earns a review nothing: the workflow still decides `usable`, `max_severity` and `meets_threshold` itself, and the bounce tier still reads those computed values rather than anything the model wrote. What this schema buys is that a malformed finding is REFUSED rather than silently dropped — a `severity` the reviewer spelled `Critical` used to vanish from the list while the run still reported itself clean, which is the one failure mode a review must never have.",
+
+  "type": "object",
+  "required": ["schema", "summary", "findings"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": {
+      "const": "pipeline-review/1",
+      "description": "An unrecognized schema makes the review UNUSABLE — which the publish job reports as `treat this PR as unreviewed`, never as clean. A reader that does not recognize the schema refuses; it does not guess."
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "Two or three sentences a human can read in ten seconds. May be empty on a clean review, so no `\\S` floor here — an empty findings list with an empty summary is still a verdict."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Empty means the change is clean, and saying so with an empty list is the correct output for a clean change. There is no cap here on purpose: a review that found sixty things has found sixty things, and the artifact's own rendering limit is a downstream concern that reports what it shed.",
+      "items": {"$ref": "#/$defs/finding"}
+    }
+  },
+
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": ["severity", "category", "summary", "detail"],
+      "additionalProperties": false,
+      "description": "Six fields, and §4 stores the first five as a `review_findings` row so there is ONE finding shape in the system rather than two. `detail` is the one field §4 does not carry — it is prose for the humans on the PR and for the fix session that may follow, and it does not belong in a telemetry row.",
+      "properties": {
+        "severity": {
+          "enum": ["low", "medium", "high", "critical"],
+          "description": "Everything at or above the rubric's threshold starts a paid fix session, so this is the field that spends money. A value outside this enum used to be dropped from the list silently, leaving a run that had found something reporting that it had not."
+        },
+        "category": {
+          "type": "string",
+          "pattern": "\\S",
+          "description": "correctness, security, tests, scope. Free-form beyond those, and grouped as-is by dashboards."
+        },
+        "file": {
+          "type": ["string", "null"],
+          "description": "Where, when the reviewer could say. Null or absent when the finding is about the change as a whole."
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Omitted when it does not apply."
+        },
+        "summary": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 1000,
+          "description": "One line: the claim itself, with the reasoning in `detail`."
+        },
+        "detail": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 8000,
+          "description": "Why it is wrong and what would fix it. Read by the humans on the PR and by the fix session that may follow, so an empty one costs the next run the whole point of this one."
+        }
+      }
+    }
+  }
+}

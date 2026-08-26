@@ -136,6 +136,7 @@ npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
+npm run test:emit       # generation-side gate: every producer REFUSES to write a malformed doc
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
 npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
@@ -157,9 +158,9 @@ and each asserts its contract rows against synthetic fixtures.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the forbidden-paths gate,
-placeholder integrity, the DoR, delivery-config, auto-approve, auto-merge, grader-path,
-safe-outputs, telemetry, dashboard and weekly-review selftests, and secretlint on every
-PR. `main` is protected (that context required, admins enforced).
+placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
+auto-merge, grader-path, safe-outputs, telemetry, dashboard and weekly-review selftests,
+and secretlint on every PR. `main` is protected (that context required, admins enforced).
 
 **A component that can do nothing must say which nothing it did.** *Nothing to do* and
 *could not do it* have opposite meanings and identical symptoms — no output, no error,

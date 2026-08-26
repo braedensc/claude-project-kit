@@ -69,6 +69,7 @@ SCHEMAS = {
     "pin": ("pin.schema.json", "3.", "name"),
     "telemetry-block": ("telemetry-block.schema.json", "4.", "name"),
     "safe-outputs": ("safe-outputs.schema.json", "8.", "name"),
+    "review-findings": ("review-findings.schema.json", "14.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -376,13 +377,25 @@ def check_parity():
     return problems
 
 
-def validate_instance(path, name):
-    """Validate one document. Returns a list of human-readable problems."""
+def document_problems(document, name):
+    """Every way an IN-MEMORY document fails schemas/<name>.schema.json.
+
+    The one definition of "does this conform", so that every producer that has
+    to answer it before writing — the two dispatchers, the safe-outputs
+    appender, the review emitter — asks it the same way. Two hand-rolled copies
+    of one check are two things free to drift, which is the entire reason these
+    schemas exist rather than the prose alone.
+    """
     schema = load_schema(name)
+    return [f"{e['path'] or '<root>'} {e['message']} [{e['keyword']}]"
+            for e in jsm.validate(document, schema)]
+
+
+def validate_instance(path, name):
+    """Validate one document ON DISK. Returns a list of human-readable problems."""
     with open(path, encoding="utf-8") as handle:
         instance = json.load(handle)
-    return [f"{path}: {e['path'] or '<root>'} {e['message']} [{e['keyword']}]"
-            for e in jsm.validate(instance, schema)]
+    return [f"{path}: {problem}" for problem in document_problems(instance, name)]
 
 
 # --------------------------------------------------------------------------- #
@@ -484,6 +497,20 @@ VALID_SAFE_OUTPUTS = {
     ],
 }
 
+VALID_REVIEW_FINDINGS = {
+    "schema": "pipeline-review/1",
+    "summary": "One real security finding; the rest of the diff matches the criteria.",
+    "findings": [
+        {"severity": "high", "category": "security", "file": "src/auth.ts", "line": 42,
+         "summary": "The refresh path trusts an unverified `sub` claim.",
+         "detail": "verify() is called with {ignoreExpiration: true}; a replayed token "
+                   "reaches the session store. Verify before reading claims."},
+        {"severity": "low", "category": "scope", "file": None, "line": None,
+         "summary": "A drive-by formatting change the ticket did not ask for.",
+         "detail": "Harmless, but it is how a small ticket becomes an unreviewable diff."},
+    ],
+}
+
 
 def _without(document, *keys):
     copy = json.loads(json.dumps(document))
@@ -550,6 +577,33 @@ FIXTURES = [
     ("safe-outputs", "oversized-batch",
      _with(VALID_SAFE_OUTPUTS, "requests",
            [VALID_SAFE_OUTPUTS["requests"][0]] * 21), False, "maxItems"),
+
+    ("review-findings", "valid", VALID_REVIEW_FINDINGS, True, None),
+    ("review-findings", "clean-review-is-an-empty-list",
+     _with(_with(VALID_REVIEW_FINDINGS, "findings", []), "summary", ""), True, None),
+    ("review-findings", "wrong-marker",
+     _with(VALID_REVIEW_FINDINGS, "schema", "pipeline-review/2"), False, "const"),
+    # THE finding this schema exists for. A severity outside the enum used to be
+    # dropped from the list while the run still reported itself clean — a review
+    # that had found something reporting that it had not.
+    ("review-findings", "capitalized-severity",
+     _with(VALID_REVIEW_FINDINGS, "findings.0.severity", "Critical"), False, "enum"),
+    ("review-findings", "invented-severity",
+     _with(VALID_REVIEW_FINDINGS, "findings.0.severity", "blocker"), False, "enum"),
+    ("review-findings", "no-detail",
+     _without(VALID_REVIEW_FINDINGS, "findings", 0, "detail"), False, "required"),
+    ("review-findings", "empty-detail",
+     _with(VALID_REVIEW_FINDINGS, "findings.0.detail", "  "), False, "pattern"),
+    ("review-findings", "empty-finding-summary",
+     _with(VALID_REVIEW_FINDINGS, "findings.0.summary", ""), False, "pattern"),
+    ("review-findings", "line-zero",
+     _with(VALID_REVIEW_FINDINGS, "findings.0.line", 0), False, "minimum"),
+    # The workflow computes `usable`/`meets_threshold` itself. A model writing
+    # them into its own file must not read as having decided anything.
+    ("review-findings", "model-claims-usable",
+     _with(VALID_REVIEW_FINDINGS, "usable", True), False, "additionalProperties"),
+    ("review-findings", "no-findings-key",
+     _without(VALID_REVIEW_FINDINGS, "findings"), False, "required"),
 ]
 
 
@@ -623,7 +677,7 @@ def selftest():
             f"{len(documented)} field paths; the contract has far more"
         )
     note()
-    for number, floor in (("3.", 10), ("4.", 15), ("8.", 5)):
+    for number, floor in (("3.", 10), ("4.", 15), ("8.", 5), ("14.", 6)):
         if len(documented_names(read_contract(), number)) < floor:
             failures.append(f"§{number.rstrip('.')} table parser found fewer than {floor} fields")
 

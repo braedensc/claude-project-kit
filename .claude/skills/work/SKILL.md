@@ -226,19 +226,24 @@ until `/ship` has run (step 9). Write the request object to a scratch file, then
 
 ```bash
 # $REQ = a scratch file holding ONE request object as JSON
-python3 - "$PIPELINE_SAFE_OUTPUTS" "$REQ" <<'PY'
-import json, os, sys
-path, req = sys.argv[1], json.load(open(sys.argv[2]))
-doc = json.load(open(path)) if os.path.exists(path) else {"schema": "pipeline-safe-outputs/1", "requests": []}
-if doc.get("schema") != "pipeline-safe-outputs/1":
-    sys.exit("refusing to append to an unrecognized schema: %r" % doc.get("schema"))
-doc["requests"].append(req)
-os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-with open(path, "w") as fh:
-    json.dump(doc, fh, indent=2)
-print("queued %s (%d request(s) pending)" % (req.get("type"), len(doc["requests"])))
-PY
+python3 scripts/emit_document.py --append "$REQ"
 ```
+
+**Non-zero means the request was refused and the file is untouched** — the requests you
+already queued are still there. That is the whole reason to append through the gate
+rather than by hand: it validates the *resulting* batch against
+`schemas/safe-outputs.schema.json`, and any telemetry block inside it against
+`schemas/telemetry-block.schema.json`, **before** writing. §8 is all-or-nothing at the
+validator, so one malformed request written here would have cost you the telemetry block
+and the move to review as well — remotely, in a job that runs after you have ended, with
+nobody left to fix it. Read what it names, fix `$REQ`, run it again.
+
+It reads `$PIPELINE_SAFE_OUTPUTS` itself and exits 2 if that is unset, which is the case
+above: no validator is collecting, so print the batch and say plainly it was not
+delivered. Pass `--into <path>` only if you have a path for a reason other than guessing.
+
+Shape only, as ever. The validator still compares every `ticket_id` against the
+**dispatcher-supplied** pinned ID, and that is the check that matters.
 
 **One invalid request rejects the entire batch and nothing is applied** — an escape
 attempt earns no partial credit, and a half-applied batch leaves the tracker in a state
