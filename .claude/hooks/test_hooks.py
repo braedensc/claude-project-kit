@@ -823,6 +823,69 @@ def main():
         ("gh pr merge --auto blocked", bash("gh pr merge --auto --squash"), BLOCK, HOOK),
         ("gh pr merge --disable-auto allowed", bash("gh pr merge 7 --disable-auto"), ALLOW, HOOK),
 
+        # ── self-approval guard: an approval is a SECOND pair of eyes ─────────
+        # A session holds Bash and a working `gh` credential, so approving its own
+        # PR just works — and the approval is a claim to the next human that someone
+        # ELSE read the code. Blocked in every spelling that yields an APPROVE event;
+        # `--comment` and `--request-changes` stay reachable because neither
+        # manufactures a human signal. (Literal spellings here, exactly like the
+        # never-merge cases above: the guard makes them unmentionable in a shell
+        # command either way, so hiding them in this file would buy nothing.)
+        ("gh pr review --approve blocked", bash("gh pr review --approve"), BLOCK, HOOK),
+        ("gh pr review --approve with a body blocked",
+         bash('gh pr review 7 --approve --body "lgtm"'), BLOCK, HOOK),
+        ("gh pr review --approve --body-file blocked",
+         bash("gh pr review 7 --approve --body-file /tmp/r.md"), BLOCK, HOOK),
+        ("gh pr review -a (shorthand) blocked", bash("gh pr review 7 -a"), BLOCK, HOOK),
+        ("gh pr review -ab (pflag shorthand CLUSTER) blocked",
+         bash('gh pr review 7 -ab "lgtm"'), BLOCK, HOOK),
+        ("gh pr review --approve=true blocked",
+         bash("gh pr review --approve=true"), BLOCK, HOOK),
+        # No event flag at all = the interactive prompt, whose event this hook cannot
+        # see. Fails CLOSED, like the label guard's opaque `--input` payload.
+        ("bare gh pr review (interactive form) blocked",
+         bash("gh pr review 7"), BLOCK, HOOK),
+        ("gh api POST to /pulls/N/reviews with event=APPROVE blocked",
+         bash("gh api repos/o/r/pulls/7/reviews -f event=APPROVE"), BLOCK, HOOK),
+        ("gh api --method POST --field event=APPROVE blocked",
+         bash("gh api --method POST repos/o/r/pulls/7/reviews --field event=APPROVE"),
+         BLOCK, HOOK),
+        ("gh api /pulls/N/reviews with an OPAQUE --input body blocked",
+         bash("gh api -X POST repos/o/r/pulls/$N/reviews --input review.json"),
+         BLOCK, HOOK),
+        ("GraphQL addPullRequestReview with event: APPROVE blocked",
+         bash("gh api graphql -f query='mutation { addPullRequestReview("
+              'input: {pullRequestId: "x", event: APPROVE}) { clientMutationId } }\''),
+         BLOCK, HOOK),
+        # api.github.com is on the EGRESS allowlist, so nothing else in the hook
+        # stops a hand-rolled curl at the review-creation endpoint.
+        ("curl POST to the reviews endpoint with APPROVE blocked",
+         bash('curl -X POST -H "Authorization: bearer $T" '
+              "https://api.github.com/repos/o/r/pulls/7/reviews "
+              '-d \'{"event":"APPROVE"}\''), BLOCK, HOOK),
+        ("approve in a CHAINED command still blocked",
+         bash("git push && gh pr review 7 --approve"), BLOCK, HOOK),
+        # allow: the guard is about APPROVE, not about reviewing at all.
+        ("gh pr review --comment allowed",
+         bash('gh pr review --comment -b "one question about line 12"'), ALLOW, HOOK),
+        ("gh pr review --request-changes allowed",
+         bash('gh pr review 7 --request-changes -b "needs a test"'), ALLOW, HOOK),
+        ("gh pr review -c / -r shorthands allowed",
+         bash('gh pr review 7 -rb "needs a test"'), ALLOW, HOOK),
+        # `-R` (repo) is not `-r`, and an approve flag NAMED in review prose is not one
+        # handed to the parser — _strip_prose has already blanked the quoted body.
+        ("--approve inside a --comment BODY allowed (prose, not a flag)",
+         bash('gh pr review -R o/r 7 --comment -b "we should --approve once read"'),
+         ALLOW, HOOK),
+        ("gh api POST to /pulls/N/reviews with event=COMMENT allowed",
+         bash("gh api repos/o/r/pulls/7/reviews -f event=COMMENT -f body=x"), ALLOW, HOOK),
+        ("plain GET of a PR's reviews allowed",
+         bash("gh api repos/o/r/pulls/7/reviews --paginate"), ALLOW, HOOK),
+        ("reading reviews allowed (gh pr view --json)",
+         bash("gh pr view 7 --json reviewDecision,reviews"), ALLOW, HOOK),
+        ("requesting a REVIEWER allowed (asking for a review is not giving one)",
+         bash("gh pr edit 7 --add-reviewer someone"), ALLOW, HOOK),
+
         # ── protected-label guard: an acknowledgement is the human's to give ──
         # `hooks-change` is what turns the "Hooks change guard" job green, so a
         # session that can apply it can acknowledge its own guard-machinery change
@@ -1267,6 +1330,13 @@ def main():
         ("stderr reason: protected-label block routes to the human, like a hook edit",
          bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"),
          "print the command for the human", HOOK),
+        ("stderr reason: self-approval block routes to the human, like a hook edit",
+         bash("gh pr review 7 --approve"),
+         "print the command for the human", HOOK),
+        ("stderr reason: self-approval block says what stays allowed",
+         bash("gh pr review 7 --approve"), "`--comment` review is still allowed", HOOK),
+        ("stderr reason: the bare-review block names the event as the reason",
+         bash("gh pr review 7"), "interactive prompt", HOOK),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]

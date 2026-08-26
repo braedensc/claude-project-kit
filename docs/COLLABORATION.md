@@ -61,7 +61,11 @@ still never push to `main` directly.
 only — never `gh pr merge` in any form, including `--auto`; enabling auto-merge still
 means the agent caused the merge** (a real near-miss in production, 2026-07-03 — now
 hook-blocked). The repo-level `allow_auto_merge` *setting* may stay enabled for the
-human's own use — the boundary is the agent never invoking a merge, not the setting. **And watch CI to green before considering the task done:**
+human's own use — the boundary is the agent never invoking a merge, not the setting.
+**Approving is the human's too — never `gh pr review --approve`, least of all on your
+own PR.** An approval says *someone else read this*; a session that supplies its own
+makes that sentence false. Leaving a `--comment` review is fine. **And watch CI to
+green before considering the task done:**
 `gh pr checks <n> --watch`; if a check fails, read the failing job's log, fix, push,
 re-watch. Local checks passing is necessary but not sufficient — the PR's actual CI
 status is the source of truth.
@@ -282,6 +286,16 @@ Stop hook between them:
    - Blocks `gh pr merge` outright, including `--auto` — **merging is the human's
      action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
      only *undoes* an auto-merge.)
+   - Blocks **approving a PR** in every spelling — `gh pr review --approve`/`-a`
+     (including pflag shorthand clusters like `-ab`), the **bare** `gh pr review`,
+     `gh api`/GraphQL writes carrying `event: APPROVE`, and a hand-rolled `curl` at
+     `/pulls/<n>/reviews`. **An approval is the human's action for the same reason a
+     merge is:** it is a claim to the next reviewer that somebody *else* read the
+     code, and under branch protection it can be the thing that unlocks the merge.
+     Blocked → **print the command for the human**, like a hook edit. `--comment`
+     and `--request-changes` stay allowed (neither manufactures a human signal), as
+     do reading reviews and `--add-reviewer` — *asking* for a review is not giving
+     one. The bare form and an `--input`-hidden event fail **closed**.
    - **Config anchor** — blocks writing a protected git ref (`git update-ref`,
      `branch -f/-D main`, a fetch/pull **refspec** targeting `main`/`master`,
      `symbolic-ref`, `replace`, history rewriters), repointing `origin`
