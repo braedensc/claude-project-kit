@@ -68,19 +68,17 @@ diff if empty.
 
    ```bash
    # $REQ = a scratch file holding ONE request object as JSON
-   python3 - "$PIPELINE_SAFE_OUTPUTS" "$REQ" <<'PY'
-   import json, os, sys
-   path, req = sys.argv[1], json.load(open(sys.argv[2]))
-   doc = json.load(open(path)) if os.path.exists(path) else {"schema": "pipeline-safe-outputs/1", "requests": []}
-   if doc.get("schema") != "pipeline-safe-outputs/1":
-       sys.exit("refusing to append to an unrecognized schema: %r" % doc.get("schema"))
-   doc["requests"].append(req)
-   os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-   with open(path, "w") as fh:
-       json.dump(doc, fh, indent=2)
-   print("queued %s (%d request(s) pending)" % (req.get("type"), len(doc["requests"])))
-   PY
+   python3 scripts/emit_document.py --append "$REQ"
    ```
+
+   **Non-zero means the request was refused and the file is untouched** — whatever
+   `/work` already queued is still there. The gate validates the *resulting* batch
+   against `schemas/safe-outputs.schema.json`, and any telemetry block in it against
+   `schemas/telemetry-block.schema.json`, **before** writing. §8 is all-or-nothing at the
+   validator, so a malformed request written here would take the telemetry block and this
+   step's move to `review` down with it, in a job that runs after you have stopped. Read
+   what it names, fix `$REQ`, run it again. It reads `$PIPELINE_SAFE_OUTPUTS` itself and
+   exits 2 when that is unset — which is the "no validator is collecting" case above.
 
    Four things decide whether the batch survives:
    - **`to` is the canonical state key `review`** — from `linear.stateIds`, never a UUID

@@ -478,15 +478,24 @@ def validate_pin(pin):
     Shape only, and the schema says so itself; the semantic MUSTs (`worktree`
     is the derived root, `ticket` is present in `ticket` mode) are enforced
     above and by the hook that reads this back.
+
+    The check itself is `check_schemas.document_problems`, which is also what the
+    queue's dispatcher calls before it writes a pin. Tier 0 and tier 1 producing
+    the same document must be held to it the same way — two hand-rolled copies
+    of one check are two things free to drift, which is the whole reason the
+    schemas exist.
     """
-    path = os.path.join(kit_root(), PIN_SCHEMA_FILE)
     try:
-        with open(path, encoding="utf-8") as fh:
-            schema = json.load(fh)
+        from check_schemas import document_problems
+    except ImportError as exc:
+        die(f"cannot import scripts/check_schemas.py ({exc}) — it holds the pin "
+            f"to contract §3's schema, and this script will not write an "
+            f"unvalidated pin.")
+    try:
+        errors = document_problems(pin, "pin")
     except (OSError, ValueError) as exc:
-        die(f"cannot read {path} ({exc}) — it is the machine-readable form of "
-            f"contract §3 and this script will not write an unvalidated pin.")
-    errors = [f"{e['path']} {e['message']}" for e in jsm.validate(pin, schema)]
+        die(f"cannot read {PIN_SCHEMA_FILE} ({exc}) — it is the machine-readable "
+            f"form of contract §3 and this script will not write an unvalidated pin.")
     if errors:
         die("REFUSED: the pin this run built violates %s:\n  - %s\n"
             "\nNo pin was written. A `ticket.*` complaint usually means the ticket "
@@ -896,6 +905,75 @@ def _wf_label_checks(wf_src):
     ]
 
 
+def _wf_pin_gate_checks(wf_src):
+    """[(ok, message)] — the dispatch workflow validates the pin BEFORE writing it.
+
+    Tier 0 (this script) refuses to write a pin that fails §3's schema. Tier 1
+    is a workflow, and until it did the same the queue could bind a session to
+    a document no hook downstream can parse — the session then fails closed for
+    a reason visible nowhere.
+
+    Four properties, and the ORDERING one is the whole point: a check that runs
+    after the write is a diagnosis, not a gate. Line numbers out of the parsed
+    step are what makes that assertable at all.
+
+    `ast`, not grep, so a comment about validating pins cannot make this pass.
+    """
+    import ast
+    step = next((b for b in _wf_python_blocks(wf_src) if "ready_nodes" in b), None)
+    if step is None:
+        return [(False, f"{WORKFLOW_FILE}: no embedded Python step builds "
+                        f"`ready_nodes` — the select-and-claim step moved or was "
+                        f"renamed, and these checks now assert nothing.")]
+    try:
+        tree = ast.parse(step)
+    except SyntaxError as exc:
+        return [(False, f"{WORKFLOW_FILE}: the select-and-claim step is not "
+                        f"valid Python ({exc}).")]
+
+    imported = any(
+        isinstance(n, ast.ImportFrom) and n.module == "check_schemas"
+        and any(a.name == "document_problems" for a in n.names)
+        for n in ast.walk(tree))
+    checks = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "document_problems"]
+    # The one line that publishes a pin: json.dump(pin, open(...)).
+    writes = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and ast.unparse(n.func) == "json.dump"
+              and n.args and isinstance(n.args[0], ast.Name) and n.args[0].id == "pin"]
+    guards = [n for n in ast.walk(tree)
+              if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+              and n.test.id == "pin_problems"]
+    contained = bool(guards) and all(
+        guard.body and isinstance(guard.body[-1], ast.Continue)
+        and not any(isinstance(c, ast.Call) and ast.unparse(c.func).endswith("exit")
+                    for c in ast.walk(guard))
+        for guard in guards)
+    ordered = bool(checks) and bool(writes) and max(
+        n.lineno for n in checks) < min(n.lineno for n in writes)
+
+    return [
+        (imported, f"{WORKFLOW_FILE} no longer imports `document_problems` from "
+                   f"scripts/check_schemas.py — the queue's dispatcher would be "
+                   f"holding the pin to a private second idea of §3's shape, or "
+                   f"to none at all."),
+        (bool(checks), f"{WORKFLOW_FILE} imports `document_problems` but never "
+                       f"calls it — an unused import validates nothing."),
+        (bool(writes), f"{WORKFLOW_FILE}: no `json.dump(pin, …)` found in the "
+                       f"select-and-claim step. The pin write moved, and the "
+                       f"ordering check below now asserts nothing."),
+        (ordered, f"{WORKFLOW_FILE} validates the pin AFTER writing it (or not in "
+                  f"the same step). A check that runs after the write is a "
+                  f"diagnosis, not a gate — the malformed pin is already on disk "
+                  f"and already binding a session."),
+        (contained, f"{WORKFLOW_FILE} handles a malformed pin by exiting, or "
+                    f"without a `continue`. It must contain the failure to the ONE "
+                    f"ticket: this runs mid-queue and part-way through writing "
+                    f"labels."),
+    ]
+
+
 def _st_run(argv, agent_env=False):
     """Run this script as a subprocess. The default env is scrubbed of the agent
     markers, because the selftest simulates the HUMAN terminal this tool is for
@@ -965,6 +1043,13 @@ def selftest():
     #     that it CONTAINS a drifted ticket instead of exiting mid-queue.
     #     Structural, via ast — a text grep would pass on a comment.
     for ok, msg in _wf_label_checks(wf_src):
+        expect(ok, msg)
+
+    # 0c. …and the pin it writes is schema-checked BEFORE it is written, by the
+    #     same function this script uses. Both tiers produce the one document in
+    #     this system that is pure authority; holding them to §3's shape two
+    #     different ways is how they start disagreeing about what a pin is.
+    for ok, msg in _wf_pin_gate_checks(wf_src):
         expect(ok, msg)
 
     with tempfile.TemporaryDirectory() as tmp:

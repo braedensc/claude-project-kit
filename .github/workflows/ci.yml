@@ -92,6 +92,13 @@ jobs:
       - name: Validate this repo's JSON documents against schemas/
         run: python3 scripts/check_schemas.py
 
+      # The generation-side half: every producer of a schema'd document refuses
+      # to WRITE a malformed one, rather than writing it and being told later.
+      # Includes the two gates that live in workflow steps rather than in this
+      # script — the review normalizer is extracted and executed, not grepped.
+      - name: Generation-side gate selftest (contract §12, §14)
+        run: python3 scripts/emit_document.py --selftest
+
       # The kit ships no live delivery.json, so the validator is inert here by
       # design (contract §2: absent is OFF). --selftest is what has teeth in CI.
       - name: delivery.json validator selftest (contract §7)

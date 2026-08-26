@@ -11,11 +11,12 @@ second *rendering* of the one that already existed.
 | [`pin.schema.json`](pin.schema.json) | §3 pin file | the dispatcher | hooks, validators |
 | [`telemetry-block.schema.json`](telemetry-block.schema.json) | §4 telemetry block | the session agent, the review workflow | **the safe-outputs validator**, the collector, dashboards |
 | [`safe-outputs.schema.json`](safe-outputs.schema.json) | §8 safe-outputs request file | the session agent | the safe-outputs validator |
+| [`review-findings.schema.json`](review-findings.schema.json) | §14 review findings file | the review session | the review workflow's normalizer, then the bounce and merge tiers |
 
-`telemetry-block.schema.json` is the one that is enforced *at write time* as well as in
-CI: `scripts/telemetry_block.py` validates a block against it inside the safe-outputs
-validator, so a session's malformed telemetry is rejected while the session that wrote it
-is still there to fix it, rather than being dropped a row at a time by the collector.
+**Every one of them is enforced at write time, not only in CI.** A producer validates
+what it is about to write and refuses to write a document that does not conform — see
+*Generating a document* below. That is what stops a malformed document being something
+somebody has to find later, remotely, after the session that could have fixed it ended.
 
 ## Why they exist
 
@@ -48,27 +49,48 @@ Defense in depth. Conforming to a schema earns a document nothing.
 python3 scripts/check_schemas.py --instance delivery.json --schema delivery
 ```
 
-`--schema` takes `delivery`, `pin`, `telemetry-block` or `safe-outputs`; `--list` prints
-the table above. A bare run validates this repo's own instances and the contract⇄schema
+`--schema` takes `delivery`, `pin`, `telemetry-block`, `safe-outputs` or
+`review-findings`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
 parity, and `--selftest` is what CI runs.
 
 ## Generating a document
 
-Where a model produces one of these, constrain it **at generation** rather than asking
-for the shape in a prompt:
-
-- **Claude Code headless** — `claude -p "…" --json-schema schemas/<name>.schema.json`
-- **Agent SDK** — `outputFormat: { type: 'json_schema', schema }`
-
-Where a shell script or a workflow step produces one, validate before the file is used:
+**Validate before the write, never after.** A check that runs afterwards is a diagnosis:
+the malformed `delivery.json` is already on disk and already failing the hook closed.
+`scripts/emit_document.py` is the gate — it validates a candidate and writes the
+destination only if the candidate conforms, so a refused document is never a file.
 
 ```bash
-python3 scripts/check_schemas.py --instance "$OUT" --schema safe-outputs || exit 1
+# a whole document — installed only if it conforms, otherwise nothing is written
+python3 scripts/emit_document.py --schema delivery \
+  --candidate cand.json --install delivery.json
+
+# one §8 request — the RESULTING batch is validated before it replaces the old one,
+# so a malformed request costs that request rather than the batch around it
+python3 scripts/emit_document.py --append "$REQ"
 ```
 
-Structured outputs and a validation step are not alternatives to the consumer-side rules
-above. They move a whole class of malformed document from "discovered at dispatch time,
-remotely, expensively" to "cannot be produced".
+A step that builds a document in memory calls `check_schemas.document_problems(doc,
+name)` before writing it — one definition of "conforms", shared by both dispatchers and
+the review emitter rather than hand-rolled per caller.
+
+Where a **model** produces the document, the mechanism depends on how it hands it over,
+and the two are not interchangeable:
+
+- **The final assistant message is the document** — constrain it at generation. Claude
+  Code headless takes `--json-schema <file>`; the Agent SDK takes
+  `outputFormat: { type: 'json_schema', schema }`.
+- **The model writes a file with a tool** — neither of those binds a tool call, so the
+  document is refused at the boundary that reads it instead. §14's findings file is this
+  case, and its gate is the review workflow's normalize step.
+
+When the boundary lives under a ref an agent could have written, **stage the schema and
+the validator from the default branch**: a PR that can loosen the schema its own review
+is held to has not been reviewed.
+
+None of this replaces the consumer-side rules above. It moves a whole class of malformed
+document from "discovered at dispatch time, remotely, expensively" to "cannot be
+produced".
 
 ## The vendored validator
 

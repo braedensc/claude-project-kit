@@ -291,6 +291,18 @@ jobs:
               sys.exit("::error::cannot import scripts/pipeline_labels.py (%s). The "
                        "dispatcher will not fall back to resolving labels its own "
                        "way — a silent miss dispatches parked work." % exc)
+          # And ONE definition of "is this pin the shape §3 defines". Tier-0
+          # local dispatch refuses to write a pin that fails schemas/pin.schema.json,
+          # through this same function; the queue's dispatcher is held to it the
+          # same way. The pin is the one document here that is pure AUTHORITY —
+          # every guard downstream reads it and trusts it — so a malformed one is
+          # a binding no hook can parse and a session that fails closed for a
+          # reason nobody can see.
+          try:
+              from check_schemas import document_problems
+          except ImportError as exc:
+              sys.exit("::error::cannot import scripts/check_schemas.py (%s). The "
+                       "dispatcher will not write an unvalidated pin." % exc)
 
           API = "https://api.linear.app/graphql"
           now = datetime.now(timezone.utc)
@@ -613,6 +625,20 @@ jobs:
                   "pinned_by": "dispatcher:gha-run-%s" % os.environ["RUN_ID"],
                   "expires_at": (now + timedelta(minutes=int(eb["maxMinutes"]) + 30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
               }
+
+              # Shape-check the pin BEFORE anything is written or claimed. A pin
+              # that fails §3's schema is a bug in this step, not in the ticket,
+              # and writing it would bind a session to a document its hooks
+              # cannot read. Contained to the one ticket on purpose: this runs
+              # mid-queue and part-way through writing labels, so one bad pin
+              # must cost one slot, never the run.
+              pin_problems = document_problems(pin, "pin")
+              if pin_problems:
+                  print("::error::%s: the pin this run built violates "
+                        "schemas/pin.schema.json, so it was NOT written and the "
+                        "ticket was NOT claimed: %s" % (ident, "; ".join(pin_problems)))
+                  skipped.append("%s (malformed pin — a bug in this dispatcher)" % ident)
+                  continue
 
               # The BRIEF is what the session reads. Ticket prose is DATA and is
               # fenced as such — a description is text written outside this

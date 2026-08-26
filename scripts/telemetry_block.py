@@ -52,6 +52,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import check_schemas as cs  # noqa: E402
 import jsonschema_mini as jsm  # noqa: E402
 import telemetry_scrape as scrape  # noqa: E402
 
@@ -602,6 +603,55 @@ def selftest():
         check("usage_from(%s) yields zeros, not an exception" % label,
               zeros["cost_usd"] == 0.0 and zeros["turns"] == 0)
 
+    # ── The ENVELOPE is held to §8 before it is written ────────────────────
+    # `validate_block` already covered the §4 block. The batch carrying it was
+    # written unchecked, and it travels through the same all-or-nothing
+    # validator a session's batch does — so a shape error here loses the run
+    # row and every finding, remotely, in a job with nobody left to fix it.
+    check("the review batch conforms to §8",
+          not cs.document_problems(review_requests(GOOD_ARTIFACT, "body"), "safe-outputs"))
+
+    # The divergence this actually catches: §4 accepts any non-empty string as a
+    # ticket_id, §8 requires `TEAM-123`. A lowercased team key is not a strange
+    # thing to find in this pipeline — §branch MANDATES lowercasing it for the
+    # branch name — so a normalize step handing over a branch-derived id yields
+    # a block that validates and a batch that cannot.
+    for label, broken in (("a lowercased team key", "eng-123"),
+                          ("a display name", "Engineering 123"),
+                          ("no id at all", None)):
+        batch = review_requests(dict(GOOD_ARTIFACT, ticket_id=broken), "body")
+        check("a review batch with %s is caught before it is written" % label,
+              bool(cs.document_problems(batch, "safe-outputs")))
+
+    # …and end to end, because "the function returns problems" is not the same
+    # promise as "the CLI refuses and leaves no file behind".
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        artifact_path = os.path.join(tmp, "findings.json")
+        out_path = os.path.join(tmp, "requests.json")
+        with open(artifact_path, "w", encoding="utf-8") as handle:
+            json.dump(dict(GOOD_ARTIFACT, ticket_id="eng-123"), handle)
+        argv = ["--from-review", artifact_path, "--out", out_path,
+                "--team-key", "ENG", "--model", "claude-sonnet-5",
+                "--auth-mode", "api-key", "--run-id", "r_01JAV8Q2S6",
+                "--started-at", "2026-08-24T15:00:00Z",
+                "--ended-at", "2026-08-24T15:04:00Z"]
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+                                capture_output=True, text=True, timeout=120)
+        check("--from-review refuses a batch §8 would reject",
+              result.returncode == 1, result.stdout[-300:])
+        check("--from-review writes nothing when it refuses",
+              not os.path.exists(out_path))
+        # No new noise on good input: the same run with a conforming id writes.
+        with open(artifact_path, "w", encoding="utf-8") as handle:
+            json.dump(GOOD_ARTIFACT, handle)
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+                                capture_output=True, text=True, timeout=120)
+        check("--from-review still writes a conforming batch",
+              result.returncode == 0 and os.path.exists(out_path),
+              result.stdout[-300:] + result.stderr[-300:])
+
     if failures:
         print("FAIL: %d of %d telemetry-block case(s) failed:" % (len(failures), cases[0]))
         for line in failures:
@@ -684,6 +734,18 @@ def main():
         for line in notes:
             print("::notice::%s" % line)
         batch = review_requests(artifact, body)
+        # The block above is validated; the ENVELOPE carrying it was not, and it
+        # travels through the same all-or-nothing validator a session's batch
+        # does. A `ticket_id` the normalize step could not fill in (§8 requires
+        # the `TEAM-123` shape, and None is what an absent one becomes) would
+        # reject the whole batch remotely — losing the run row and the findings
+        # with it. Workflow-authored means a shape error here is OUR bug, so
+        # refuse to write the file rather than hand the validator a doomed one.
+        batch_problems = cs.document_problems(batch, "safe-outputs")
+        if batch_problems:
+            for line in batch_problems:
+                print("::error::review safe-outputs batch is malformed: %s" % line)
+            return 1
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(batch, handle, indent=2)

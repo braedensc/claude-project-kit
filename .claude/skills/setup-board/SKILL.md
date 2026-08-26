@@ -357,6 +357,27 @@ Rules that are not negotiable, because guards depend on them:
   (§3). This skill neither reads nor writes it, and **no ticket ID ever goes in
   `delivery.json`** — that file is committed per-project config, not per-run state.
 
+### Write it through the gate, never directly
+
+**Do not `Write` `delivery.json`.** Compose the merged document at a scratch path and
+install it with the generation-side gate, which validates the candidate against §1's
+schema and writes the destination **only if it conforms**:
+
+```bash
+python3 scripts/emit_document.py --schema delivery \
+  --candidate "$SCRATCH/delivery.candidate.json" --install delivery.json
+```
+
+Non-zero means nothing was written and `delivery.json` is exactly as it was — fix the
+candidate and run it again. That ordering is the point. A version-less or wrong-shaped
+config is **BROKEN, not off** (§2): the PreToolUse hook fails closed on every `Edit`,
+`Write` and `Bash` in the repo, *including* the edit that would repair the file. Writing
+first and validating afterwards is how a project gets handed over already bricked, with
+only a human at a terminal able to undo it. This gate is why that shape can no longer
+reach the file.
+
+Shape is all it checks. Step 7 is still where the meaning is judged.
+
 ---
 
 ## Step 7 — Validate before you hand it over
@@ -365,9 +386,9 @@ Contract §7's checklist is mechanized, and all fifteen rules already run in one
 A config that fails it is **broken**, not merely imperfect — §2 says a present-but-invalid
 `delivery.json` fails closed.
 
-**Run the shape check first.** It answers one question — is this the shape §1 defines? —
-against the schema itself, so a wrong-shaped file is caught before anything interprets
-its contents:
+**Run the shape check first.** Step 6's gate already refused to write a wrong shape, so
+this should be a formality — run it anyway, because it is the check that tells you the
+file on disk is the one the gate approved and not something edited since:
 
 ```bash
 python3 scripts/check_schemas.py --instance delivery.json --schema delivery

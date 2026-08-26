@@ -1112,7 +1112,7 @@ should be allowed to spend more, and then allows itself, does not have a budget.
 
 ## 12. Machine-readable schemas
 
-Every structure above is prose, and prose is what agents *read and try to follow*. Four
+Every structure above is prose, and prose is what agents *read and try to follow*. Five
 of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
 are not a second source of truth — they are this document in a form a machine can
 enforce. `scripts/check_schemas.py` fails CI if the two disagree about which fields
@@ -1124,6 +1124,7 @@ exist.
 | §3 pin file | `schemas/pin.schema.json` | bidirectional by field name |
 | §4 telemetry block | `schemas/telemetry-block.schema.json` | bidirectional by field name |
 | §8 safe-outputs request file | `schemas/safe-outputs.schema.json` | bidirectional by field name |
+| §14 review findings file | `schemas/review-findings.schema.json` | bidirectional by field name |
 
 **Amending one of those sections means amending its schema in the same PR.** That is not
 a convention here — CI names the missing half.
@@ -1153,14 +1154,36 @@ reporting, never authority** — including a document that validates.
 
 ### Generating, rather than requesting, the right shape
 
-Where a **model** produces one of these documents, the schema is passed at generation:
-Claude Code headless takes `--json-schema <file>`, and the Agent SDK takes
-`outputFormat: { type: 'json_schema', schema }`. Where a **shell step or workflow**
-produces one, its output is validated before anything consumes it:
+**A document is validated before it is written, never after.** A check that runs after
+the write is a diagnosis: the malformed `delivery.json` is already on disk and already
+failing the hook closed; the malformed request is already in the batch that §8 will
+reject whole. `scripts/emit_document.py` is the gate — it validates a candidate and
+writes the destination **only if the candidate conforms**, so a refused document is not
+a file anyone has to find.
 
 ```bash
-python3 scripts/check_schemas.py --instance "$FILE" --schema safe-outputs || exit 1
+# a whole document: validated, then installed — or nothing is written at all
+python3 scripts/emit_document.py --schema delivery \
+  --candidate cand.json --install delivery.json
+
+# one §8 request: the RESULTING batch is validated before it replaces the old one,
+# so a malformed request costs that request and not the batch around it
+python3 scripts/emit_document.py --append "$REQ"
 ```
+
+Which mechanism fits depends on what produces the document, and they are not
+interchangeable:
+
+| Producer | Mechanism |
+|---|---|
+| A skill or script that writes a file | `emit_document.py`, above. |
+| A step that builds a document in memory | `check_schemas.document_problems(doc, name)` before the write — one definition of "conforms", shared by both dispatchers and the review emitter. |
+| A model whose **final message** is the document | The schema at generation: Claude Code headless takes `--json-schema <file>`, the Agent SDK takes `outputFormat: { type: 'json_schema', schema }`. |
+| A model that writes a **file** with a tool | Neither of those constrains a tool call, so the file is refused at the boundary that reads it — see §14. |
+
+Where the boundary reads a document produced under a ref an agent could have written,
+**the schema and the validator are staged from the default branch**, exactly as a rubric
+is: a PR that could loosen the schema its own review is held to has not been reviewed.
 
 Asking for a shape in a prompt is a request. Constraining it at generation, or refusing
 it at the boundary, is a guarantee — of shape only, which is the whole point of the
@@ -1260,3 +1283,83 @@ The general rule is a **convention**, in the same sense as the source-agnostic r
 `CLAUDE.md`: no check can tell a benign `|| true` from a load-bearing one. What is
 mechanical is the reviewer's question, and it is short enough to actually get asked —
 *if this failed, what would go red?*
+
+---
+
+## 14. Review findings file
+
+A review session's **entire deliverable is one file**, `REVIEW-FINDINGS.json` in the
+repository root. The reviewer has no tools to comment, approve, push or reach the
+tracker; everything that gates money downstream — whether the review is usable, what its
+worst severity was, whether that meets the rubric's threshold — is computed **from** this
+file by the workflow, never reported **in** it.
+
+### Shape
+
+```json
+{
+  "schema": "pipeline-review/1",
+  "summary": "two or three sentences a human can read in ten seconds",
+  "findings": [
+    {
+      "severity": "high",
+      "category": "security",
+      "file": "src/x.ts",
+      "line": 42,
+      "summary": "one line — the claim",
+      "detail": "why it is wrong and what would fix it"
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | const `pipeline-review/1` | The marker. An unrecognized value makes the review **unusable**, which is reported as *treat this PR as unreviewed* — never as clean. |
+| `summary` | string | Two or three sentences. May be empty: an empty findings list with an empty summary is still a verdict. |
+| `findings` | array | Empty means the change is clean, and saying so with an empty list is the correct output. |
+
+Each finding:
+
+| Field | Type | Notes |
+|---|---|---|
+| `severity` | enum `low\|medium\|high\|critical` | The field that spends money — everything at or above the rubric's threshold starts a paid fix session. |
+| `category` | string | `correctness`, `security`, `tests`, `scope`. Free-form beyond those. |
+| `file` / `line` | string \| null, integer \| null | Where, when the reviewer could say. `line` is omitted when it does not apply. |
+| `summary` | string | One line: the claim. |
+| `detail` | string | Why it is wrong and what would fix it. Read by the humans on the PR and by the fix session that may follow. |
+
+The first five mirror §4's `review_findings` row exactly, so there is **one finding shape
+in the system, not two**. `detail` is the one field §4 does not carry: it is prose for a
+human, not a column to group by.
+
+### Malformed is unusable — never quietly smaller
+
+**A finding this document cannot express is a finding the review did not report.** The
+normalize step used to keep the findings whose `severity` it recognized and drop the
+rest, so a reviewer that wrote `Critical` produced a run that had found something and
+reported that it had not — the one failure mode a review must never have. The whole
+document is now held to the schema: it conforms and every finding survives, or the
+review is **unusable** and the PR is reported as unreviewed. Fail-closed on shape,
+fail-open on outcome — an unusable review must not read as clean, and must not wedge the
+PR either.
+
+### Why the boundary, and not `--json-schema`
+
+The reviewer writes a **file**, and neither `--json-schema` nor `outputFormat` constrains
+a tool call — both bind the final assistant message. So this document is refused at the
+boundary that reads it instead, in the workflow step that normalizes it, before anything
+downstream treats it as a review. The schema and the vendored validator are staged from
+the **default branch**, like the rubric beside them: read out of the checked-out head,
+they would let a PR loosen the schema its own review is held to.
+
+The published artifact is this document **enriched by CI** with the computed fields the
+bounce tier reads. Those fields are workflow-authored; none of them is read from the
+model's file, and a model that writes one gains nothing by it.
+
+### Shape is not a review
+
+Conforming here earns a review nothing. A schema-valid findings file can be wrong about
+every one of them, and no tier treats "the reviewer produced a well-formed document" as
+"the change is good". **Agent-authored ⇒ reporting, never authority**, exactly as
+everywhere else in this document.
