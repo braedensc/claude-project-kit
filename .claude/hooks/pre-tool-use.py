@@ -768,7 +768,26 @@ EGRESS_ALLOW_SUFFIXES = (
     # (worked example — a managed Postgres backend would add:)
     #   "supabase.co",
     #   "supabase.com",
-    "linear.app",          # api.linear.app
+    #
+    # `linear.app` is shipped ENABLED, in the slot rather than the core above.
+    # The call, written down because the alternative is defensible (KIT-1):
+    #   - It cannot ship OFF. `.claude/skills/setup-board/SKILL.md` instructs a
+    #     session to POST to api.linear.app/graphql for the seven MCP-less
+    #     operations, and this file is self-protected — a session that hit the
+    #     block could not lift it. Shipping a skill that trips the kit's own
+    #     guard is the bug, not the default.
+    #   - The core is for hosts no project may remove. Linear is one tracker
+    #     among many, and the pipeline that uses it is optional (contract §2),
+    #     so it does not belong there.
+    #   - The slot's cost as the ticket framed it — "the kit's copy diverges
+    #     from the shipped template" — does not apply: the kit ships exactly ONE
+    #     copy of this hook (there is no templates/hooks/pre-tool-use.py), so
+    #     there is nothing to diverge from.
+    # Be honest about what the slot does and does not buy: it is a review label,
+    # not a second file. This line ships enabled for every project instantiated
+    # from the kit, Linear or not. What the placement buys is a signpost that it
+    # is one line and yours to delete — BOOTSTRAP-PROMPT.md step 2 says so.
+    "linear.app",          # api.linear.app — see the note above before moving it
     # Add a battery case in test_hooks.py for every suffix you add.
 )
 NET_TOOL_RE = re.compile(r"(?<![\w./-])(?:curl|wget|scp|sftp|ncat|netcat|nc)(?![\w-])")
@@ -888,11 +907,14 @@ GRADER_PATH_HELP = (
     "session that can edit them can grade its own homework. Changes here need a "
     "human: describe the change in the PR body or file a follow-up ticket "
     "instead. (Configured via `autonomy.riskPaths` in delivery.json; hook "
-    "scripts and settings files are blocked unconditionally, pipeline or not.)"
+    "scripts and settings files are blocked unconditionally, pipeline or not. "
+    "`templates/**` counts: a staged workflow is the same bytes as the active "
+    "one, decided here and merely moved later.)"
 )
 GRADER_PATH_BASH_HELP = (
-    "🔒 That command would modify a risk-listed (grader) path — CI workflows, "
-    "`delivery.json`, or another glob in `autonomy.riskPaths`. In a pinned agent "
+    "🔒 That command would modify a risk-listed (grader) path — CI workflows "
+    "(active or staged under `templates/`), `delivery.json`, or another glob in "
+    "`autonomy.riskPaths`. In a pinned agent "
     "session those are human-only, for the same reason the hook scripts are: a "
     "session must not be able to edit the machinery that judges it. Reading them "
     "(cat/grep) is fine."
@@ -1295,7 +1317,22 @@ def _owned_label_hits(inp, cfg):
 # `.claude/hooks/**` and `.claude/settings*.json` are blocked UNCONDITIONALLY by
 # self-protection above, pipeline or not — nothing here makes that mode-scoped.
 # These are the ADDITIONAL paths a PINNED agent session may not touch.
-GRADER_PATH_FLOOR = (".github/workflows/**", DELIVERY_FILE)
+#
+# STAGING MIRRORS ARE ON THE FLOOR TOO (KIT-14). A guard that attaches when a
+# file becomes *visible* rather than when its contents are *decided* is not a
+# guard. `templates/` holds the inert copies that BECOME the guarded paths at
+# bootstrap — templates/README.md is the activation table — so the staged bytes
+# of a pipeline workflow are the exact bytes that later run in CI holding
+# repository secrets, and the activation is a bare `git mv` that reads in review
+# as "just a move". The rule, stated so a future mirror is covered by it rather
+# than needing its own patch: FOR EVERY FLOORED PATH, ITS STAGING COPY IS
+# FLOORED WITH IT. Two mirrors exist today, and both are here.
+GRADER_PATH_FLOOR = (
+    ".github/workflows/**",
+    "templates/workflows/**",  # → .github/workflows/** at bootstrap
+    "templates/hooks/**",      # → .claude/hooks/**, which is self-protected
+    DELIVERY_FILE,
+)
 
 
 def _grader_globs(cfg):
