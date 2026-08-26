@@ -396,14 +396,59 @@ def _selftest_wiring(fail, workflow_path):
              "(no ARTIFACT_PRESENT in its env) — so a present-but-empty artifact "
              "still reads as 'the session wrote nothing'")
 
-    if "unreadable" not in raw:
-        fail("wiring: the workflow never emits an `unreadable` verdict — "
-             "'could not read the requests' would still be reported as one of "
-             "'rejected' (the agent's batch was refused) or 'skipped' (clean)")
+    if "errored" not in raw:
+        fail("wiring: the workflow never emits an `errored` verdict — a failure "
+             "OF THIS JOB would still be reported as one of 'rejected' (the "
+             "agent's batch was refused) or 'skipped' (clean)")
     for token in ("steps.probe.outcome", "steps.dl.outcome"):
         if token not in raw:
             fail("wiring: the verdict is computed without %s, so a hard read "
                  "failure cannot be told apart from a rejected batch" % token)
+
+
+def _selftest_embedded_validator(fail, workflow_path):
+    """The validator is Python inlined in a YAML heredoc, so nothing compiles it
+    until it runs — inside the one job that holds the tracker credential. Parse
+    it here, and assert the two branches that make a failure to APPLY distinct
+    from a batch that was refused."""
+    import ast
+    import textwrap
+    try:
+        import yaml
+        with open(workflow_path, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh)
+    except (ImportError, OSError) as exc:
+        fail("embedded validator: cannot read %s (%s)" % (workflow_path, exc))
+        return
+
+    steps = _steps_of(doc)
+    run_step = next((s for s in steps if isinstance(s, dict) and s.get("id") == "run"), None)
+    if not run_step:
+        fail("embedded validator: no `id: run` step to inspect")
+        return
+    body = str(run_step.get("run") or "")
+    if "python3 - <<'PY'" not in body:
+        fail("embedded validator: the run step no longer inlines a python heredoc")
+        return
+    src = textwrap.dedent(body.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0])
+    try:
+        ast.parse(src)
+    except SyntaxError as exc:
+        fail("embedded validator: the inlined Python does not parse (line %s: %s)"
+             % (exc.lineno, exc.msg))
+        return
+
+    if 'out("verdict", "errored")' not in src:
+        fail("embedded validator: a failure to APPLY never sets `errored`, so it "
+             "falls back to `rejected` — which claims the batch was refused and "
+             "that nothing was applied, both false")
+    if 'os.environ.get("LINEAR_API_KEY")' not in src:
+        fail("embedded validator: LINEAR_API_KEY is never checked for emptiness — "
+             "an unset repository secret interpolates to '' and the resulting "
+             "anonymous 401 names no cause")
+    if "applied" not in src:
+        fail("embedded validator: nothing tracks how many requests were applied, "
+             "so a mid-plan failure cannot say how far it got")
 
 
 def selftest(workflow_path):
@@ -417,6 +462,7 @@ def selftest(workflow_path):
     with tempfile.TemporaryDirectory() as tmp:
         _selftest_exit_codes(fail, tmp)
     _selftest_wiring(fail, workflow_path)
+    _selftest_embedded_validator(fail, workflow_path)
 
     for msg in failures:
         print("FAIL: %s" % msg)

@@ -819,16 +819,26 @@ and both matter:
    why.
 
 The job reports a single verdict: `ok` (validated, executed), `rejected` (batch read and
-refused, nothing applied), `skipped` (nothing to apply and none required), or
-`unreadable` (the requests could not be read at all — expired artifact, denied API call,
-failed download).
+refused, nothing applied), `skipped` (nothing to apply and none required), or `errored`
+(**this job** failed — it could not read the requests, or could not reach the tracker to
+apply them).
 
 **`skipped` is the only clean way to have applied nothing, and it is only reachable by
 asking.** The validator queries the artifacts API for the collected artifact name
 *before* downloading it, because `download-artifact` fails on absence as well as on
 failure and so its own outcome can never tell the two apart. No artifact ⇒ `skipped`.
-An artifact that exists ⇒ the download must succeed, and anything else is `unreadable`.
-A caller MUST treat `unreadable` as a failure and never as an empty batch (§13).
+An artifact that exists ⇒ the download must succeed, and anything else is `errored`.
+
+**`errored` is deliberately wider than "could not read".** A missing credential and a
+tracker that stops answering halfway through a plan are the same fact to a caller: the
+requests may exist and have gone unapplied, or been applied only in part, and none of
+that is a statement about what the session wrote. One token that covers the class is
+what stops a fifth being invented for the next cause. A caller MUST treat `errored` as a
+failure, never as an empty batch, and never as a verdict on the batch's contents (§13).
+
+**All-or-nothing covers validation, not the network.** Nothing executes until every
+request has passed, so a *rejected* batch applies nothing. An `errored` batch may be
+partly applied, and the job says how far it got rather than implying it got nowhere.
 
 ### What is authority here, and what is not
 
@@ -1229,9 +1239,10 @@ one case at a time, which is precisely why it earns a section of its own:
 - §8 — a missing requests file with telemetry required is a **rejection, not a skip**,
   because "a session that reports nothing is indistinguishable from one that silently
   failed".
-- §8 — the safe-outputs verdicts are `ok`, `skipped`, `rejected` and **`unreadable`**.
-  The fourth exists because collapsing it into `skipped` reads as a clean run and
-  collapsing it into `rejected` says something false about a batch nobody could look at.
+- §8 — the safe-outputs verdicts are `ok`, `skipped`, `rejected` and **`errored`**. The
+  fourth exists because collapsing it into `skipped` reads as a clean run, and collapsing
+  it into `rejected` asserts two things that are false: that the batch was refused, and
+  that nothing was applied.
 - §12 — an unrecognized schema keyword is **an error, never a silent no-op**.
 
 ### What enforces it

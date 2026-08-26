@@ -41,8 +41,9 @@ name: Pipeline safe outputs
 # the one component whose job is being the trustworthy executor stops executing
 # in silence. The artifacts API is asked BEFORE the download for exactly that
 # reason: `download-artifact` fails on absence too, so its own outcome can never
-# distinguish the two. Verdicts: `skipped` (asked, nothing there) vs
-# `unreadable` (could not find out, or could not read what is there).
+# distinguish the two. Verdicts: `skipped` (asked, nothing there) vs `errored`
+# (this job could not find out, could not read what is there, or could not apply
+# it) — the second is never a statement about the batch's contents.
 #
 # ── Caller contract ───────────────────────────────────────────────────────────
 #   jobs:
@@ -103,13 +104,16 @@ on:
     outputs:
       verdict:
         description: |
-          ok | skipped | rejected | unreadable.
+          ok | skipped | rejected | errored.
 
           `skipped` is the ONLY clean way to have applied nothing: it means the
           artifacts API was asked and said the session published no requests.
-          `unreadable` means this job could not read what the session wrote —
-          expired artifact, denied API call, failed download — and a caller must
-          treat it as a failure, never as an empty batch (contract §13).
+          `errored` means THIS JOB failed — it could not read what the session
+          wrote (expired artifact, denied API call, failed download) or could not
+          reach the tracker to apply it (missing credential, API failure partway
+          through the plan). A caller must treat it as a failure, never as an
+          empty batch, and must not read it as a verdict on the batch's contents
+          (contract §13).
 
           CALLER BEWARE: a reusable workflow called from a MATRIX has one set of
           outputs shared by every leg, last writer wins — so this is only safe to
@@ -129,7 +133,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       # From the PUBLISH step, not the validator: the validator does not run at
-      # all on the `unreadable` path, and a job output left empty there would be
+      # all on some `errored` paths, and a job output left empty there would be
       # a fourth state this workflow promises to name and then does not. One
       # value, computed once, in both the output and the verdict artifact.
       verdict: ${{ steps.verdict.outputs.verdict }}
@@ -398,6 +402,31 @@ jobs:
               sys.exit(0)
 
           # ── Execute ─────────────────────────────────────────────────────────
+          # Everything from here on can fail for reasons that are NOT about the
+          # batch's contents, and those failures must not borrow `rejected`.
+          # `rejected` asserts two things — the batch was read and refused, and
+          # nothing was applied — and a tracker that stopped answering halfway
+          # through a plan makes both of them false (contract §13).
+          applied = 0
+
+          def errored(msg):
+              print("::error::%s" % msg)
+              print("::error::Applied %d of %d planned request(s) before this failure. "
+                    "The all-or-nothing guarantee covers VALIDATION, not the network: "
+                    "the tracker may be partly written." % (applied, len(plan)))
+              out("verdict", "errored")
+              sys.exit(1)
+
+          # A blank credential is its own diagnosis, and worth naming before the
+          # API turns it into an anonymous 401. The secret is declared required
+          # by this workflow, but an unset repository secret interpolates to the
+          # empty string rather than failing the call.
+          if not os.environ.get("LINEAR_API_KEY"):
+              errored("LINEAR_API_KEY is empty. This job holds the ONLY tracker credential "
+                      "in the pipeline, so without it the session's validated requests cannot "
+                      "be applied at all — set the repository secret. Nothing was applied, and "
+                      "this is not a verdict on the batch.")
+
           def gql(query, variables):
               body = json.dumps({"query": query, "variables": variables}).encode()
               req = urllib.request.Request(API, data=body, headers={
@@ -411,9 +440,11 @@ jobs:
                   with urllib.request.urlopen(req, timeout=30) as r:
                       payload = json.load(r)
               except urllib.error.HTTPError as e:
-                  sys.exit("::error::Linear API HTTP %s: %s" % (e.code, e.read()[:500]))
+                  errored("Linear API HTTP %s: %s" % (e.code, e.read()[:500]))
+              except (urllib.error.URLError, ValueError, OSError) as e:
+                  errored("Linear API call failed: %s" % e)
               if payload.get("errors"):
-                  sys.exit("::error::Linear API error: %s" % json.dumps(payload["errors"])[:500])
+                  errored("Linear API error: %s" % json.dumps(payload["errors"])[:500])
               return payload["data"]
 
           # Resolve the pinned identifier to Linear's UUID. Filtered by team key
@@ -443,6 +474,7 @@ jobs:
                   gql(M_ADD, {"id": issue_uuid, "labelId": value})
               elif kind == "label-remove":
                   gql(M_RM, {"id": issue_uuid, "labelId": value})
+              applied += 1
               print("  applied: %s" % kind)
 
           out("verdict", "ok")
@@ -453,8 +485,8 @@ jobs:
       # (see the `verdict` output's own description). `always()` so a rejected or
       # crashed validation still publishes a verdict: to the caller, "no verdict"
       # and an actual verdict must not look alike. This step is also where the
-      # verdict is DECIDED, because the paths that produce `unreadable` are
-      # exactly the ones on which the validator never runs.
+      # verdict is DECIDED, because the read-side paths that produce `errored`
+      # are exactly the ones on which the validator never runs at all.
       - name: Publish the per-call verdict
         id: verdict
         if: always() && steps.pre.outputs.configured == 'true'
@@ -474,16 +506,21 @@ jobs:
           #               an ANSWER, arrived at by asking the artifacts API
           #   rejected    the batch was read and REFUSED. Nothing was applied,
           #               and the reason is the session's own output
-          #   unreadable  we could not read what the session wrote. Not clean,
+          #   errored     THIS JOB failed — it could not read the requests, or
+          #               could not reach the tracker to apply them. Not clean,
           #               and not a statement about the batch's contents at all
           #
-          # Collapsing `unreadable` into either neighbour is the whole defect:
-          # into `skipped` it reads as a clean run, and into `rejected` it says
-          # something false about a batch nobody managed to look at.
+          # Collapsing `errored` into either neighbour is the whole defect: into
+          # `skipped` it reads as a clean run, and into `rejected` it asserts two
+          # things that are false — that the batch was refused, and that nothing
+          # was applied. The token is deliberately wider than "could not read":
+          # a credential that is missing and a tracker that stops answering
+          # mid-plan are the same fact to a caller, and one token that covers the
+          # class is what stops a fifth being invented for the next cause.
           verdict="${VERDICT:-}"
           if [ -z "$verdict" ]; then
             if [ "${PROBE_OUTCOME:-}" = "failure" ] || [ "${DL_OUTCOME:-}" = "failure" ]; then
-              verdict="unreadable"
+              verdict="errored"
             else
               verdict="rejected"
             fi
@@ -493,7 +530,7 @@ jobs:
             ok)         detail="requests validated against the pin and applied." ;;
             skipped)    detail="the session published no write-requests, and none were required. Nothing to apply." ;;
             rejected)   detail="the batch was read and refused — nothing was applied. See the errors above." ;;
-            unreadable) detail="the session's write-requests could NOT BE READ (probe: ${PROBE_STATE:-unknown}, download: ${DL_OUTCOME:-none}). This is a failure of this job, not of the session — the requests may exist and have gone unapplied." ;;
+            errored)    detail="THIS JOB failed, not the session (probe: ${PROBE_STATE:-unknown}, download: ${DL_OUTCOME:-none}). The requests may exist and have gone unapplied — see the errors above for whether they could not be read, or could not be applied." ;;
             *)          detail="unrecognized verdict." ;;
           esac
 

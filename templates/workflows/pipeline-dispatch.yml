@@ -1355,7 +1355,7 @@ jobs:
           else
             # DEFAULT-DENY on the safe-outputs verdict, rather than enumerating
             # the bad ones. Listing `rejected` alone meant every other token —
-            # `unreadable`, a typo, a value a later version of that workflow
+            # `errored`, a typo, a value a later version of that workflow
             # emits — read as success here, which is the same silent conflation
             # one layer up (contract §13). Only the two tokens that genuinely
             # mean "the tracker is in the state we asked for" pass.
@@ -1364,9 +1364,9 @@ jobs:
               rejected)
                 verdict="failed"
                 reason="the safe-outputs batch was rejected — nothing the session asked for was applied" ;;
-              unreadable)
+              errored)
                 verdict="failed"
-                reason="the safe-outputs job could not READ this session's write-requests — they may exist and have gone unapplied" ;;
+                reason="the safe-outputs job itself failed — this session's write-requests may exist and have gone unapplied, or been applied only in part" ;;
               *)
                 verdict="failed"
                 reason="unrecognized safe-outputs verdict '$safe_verdict' — refusing to read an unknown answer as success" ;;
