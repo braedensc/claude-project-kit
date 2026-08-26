@@ -90,7 +90,11 @@ human-only steps at the end.
 >    the template comment block and `docs/CLAUDE-template.md` itself.
 > 2. `.claude/hooks/pre-tool-use.py` (**self-protected — apply via a terminal command,
 >    per above**): replace the fenced STACK-SPECIFIC section for my datastore (keep the
->    shape: local/disposable frictionless, remote/irreplaceable hard-blocked). Compose
+>    shape: local/disposable frictionless, remote/irreplaceable hard-blocked). In the
+>    same pass, do the stack-specific `EGRESS_ALLOW_SUFFIXES` slot: add my backends,
+>    and **delete `linear.app` unless I use Linear** — it ships enabled for the kit's
+>    own `/setup-board` skill, and an allowlist entry no project of mine calls is
+>    default egress I never asked for. Compose
 >    the full new hook, hand me the `cp` command, and once I've run it: **update
 >    `test_hooks.py`** (NOT protected — edit it directly) with block/allow cases for
 >    every guard you changed, run the battery green, and commit both together.

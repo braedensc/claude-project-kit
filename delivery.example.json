@@ -96,6 +96,8 @@
       ".claude/skills/**",
       ".github/workflows/**",
       ".husky/**",
+      "templates/hooks/**",
+      "templates/workflows/**",
       "delivery.json",
       "**/*.pem",
       "**/*.key"

@@ -76,6 +76,14 @@ the three new globs are just the current instance of it.
 
 ### Deliberately not changed
 
+> **Amended 2026-08-25** by [A staging copy is floored with the path it
+> mirrors](2026-08-25-staging-mirrors-are-on-the-floor.md). The paragraph below
+> argued about *populations* and was silent on whether staged bytes are safe in a
+> pinned session; KIT-14 showed they are not. `GRADER_PATH_FLOOR` gains
+> `templates/workflows/**` and `templates/hooks/**`. The two floors still differ
+> — this one keeps `templates/workflows/pipeline-*.yml` rather than the whole
+> directory, on this ADR's own capability test.
+
 The PreToolUse hook's own `GRADER_PATH_FLOOR` is narrower (`.github/workflows/**`
 plus `delivery.json`) and stays so. The two are related, not mirrored: the hook
 blocks a *pinned session's local edits*, this gates *any PR from any author*. The

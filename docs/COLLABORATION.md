@@ -325,7 +325,12 @@ Stop hook between them:
      the session's to edit; tracker writes outside the session's own ticket,
      including creating tickets in `ticket` mode; editing the session's own
      in-progress acceptance criteria; Edit/Write/Bash mutations of grader paths
-     (`.github/workflows/**`, `delivery.json`, `autonomy.riskPaths`); work on a branch
+     (`.github/workflows/**`, `delivery.json`, `autonomy.riskPaths`, **and the
+     staging mirrors `templates/workflows/**` and `templates/hooks/**`** — the
+     inert copies that *become* the guarded paths at bootstrap, so gating only
+     the destination would attach the guard when a file becomes visible rather
+     than when its bytes are decided, leaving the activation a bare `git mv`
+     that reads in review as just a move); work on a branch
      that doesn't carry the pinned ticket ID when `branch.requireTicketId` is on; a
      `dispatch.pinsRoot` resolving inside the repo (a pins directory the session can
      write is a pin it can forge); and a malformed, unrecognized, foreign-worktree or
@@ -350,7 +355,7 @@ Stop hook between them:
    touches a grader path — `.claude/hooks/**`, `.claude/settings*.json`,
    `.github/workflows/**`, `scripts/check_*.py`, the dispatch path those graders
    import (`scripts/pipeline_*.py`, `scripts/jsonschema_mini.py`),
-   `templates/workflows/pipeline-*.yml`, and (when configured) `delivery.json`
+   `templates/workflows/pipeline-*.yml`, `templates/hooks/**`, and (when configured) `delivery.json`
    plus its `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
    `hooks-change` label — and, since that label is the *acknowledgement*, the job
    also checks **who applied it**: a machine identity can never supply it, and a

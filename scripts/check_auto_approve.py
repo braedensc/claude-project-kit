@@ -103,11 +103,19 @@ INTAKE_STATE = "raw"
 # correct even against a config that predates that rule or was hand-edited.
 # `.claude/skills/**` is here because skills ARE the prompts and rubrics — a
 # ticket that rewrites a grader must never ride an epic into `ready`.
+# `templates/**`'s two mirrors are here for the same reason the destinations
+# are: the kit ships the inert copies that BECOME `.github/workflows/**` and
+# `.claude/hooks/**` at bootstrap, so a ticket scoped to a staged workflow is a
+# ticket to choose the bytes CI will later run. Approving that without a person
+# because the file is not visible yet is the same defect as gating it only once
+# it is.
 RISK_PATH_FLOOR = (
     ".claude/hooks/**",
     ".claude/settings*.json",
     ".claude/skills/**",
     ".github/workflows/**",
+    "templates/workflows/**",
+    "templates/hooks/**",
     "delivery.json",
 )
 
@@ -786,6 +794,17 @@ def selftest():
         t = good_ticket()
         t["description"] = GOOD_DESCRIPTION.replace("`README.md`", "`.claude/hooks`")
         expect("riskPath directory form holds", decide(t), False, "risk-paths")
+        # Staging mirrors: a ticket scoped to the INERT copy is a ticket to
+        # choose the bytes CI later runs. Held with an emptied config list too —
+        # these are floor entries, not config the project can opt out of.
+        cfg = copy.deepcopy(GOOD_CONFIG)
+        cfg["autonomy"]["riskPaths"] = []
+        for staged in ("templates/workflows/pipeline-review.yml",
+                       "templates/hooks/session-start-provision-env.sh"):
+            t = good_ticket()
+            t["description"] = GOOD_DESCRIPTION.replace("`README.md`", "`%s`" % staged)
+            expect("staged mirror holds (%s)" % staged, decide(t, config=cfg),
+                   False, "risk-paths")
 
         # ── DoR ─────────────────────────────────────────────────────────────
         t = good_ticket()

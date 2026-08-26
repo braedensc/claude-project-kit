@@ -135,11 +135,41 @@ REQUIRED_LABEL_KEYS = (
     "agent:needs-human",
     "blocked:capacity",
 )
+# The paths every project's `autonomy.riskPaths` must declare. Two families,
+# and the second is the one that is easy to forget:
+#
+#   1. The guard machinery and the pipeline's own config.
+#   2. Their STAGING MIRRORS under `templates/`. The kit ships the inert copies
+#      that BECOME `.github/workflows/**` and `.claude/hooks/**` at bootstrap
+#      (templates/README.md is the activation table), so the staged bytes ARE
+#      the active bytes — chosen while staged, merely moved later. A floor that
+#      names only the destination protects a file from the moment it becomes
+#      visible rather than from the moment its contents are decided.
+#
+# The active and staged halves of a pair are inseparable: requiring the staged
+# workflows while leaving the active ones undeclared would be an incoherent
+# floor, so `.github/workflows/**` joins its mirror here.
+#
+# A project that deleted `templates/` at bootstrap carries two globs that match
+# nothing, which costs nothing. The project that keeps the directory — the one
+# adopting the pipeline in stages, holding `pipeline-*.yml` staged for later —
+# is exactly the at-risk case this floor is for.
 REQUIRED_RISK_PATHS = (
     ".claude/hooks/**",
+    "templates/hooks/**",
     ".claude/settings*.json",
+    ".github/workflows/**",
+    "templates/workflows/**",
     "delivery.json",
 )
+
+# The staging mirrors, and what each becomes. Used only to explain a floor
+# violation — a generic "missing glob" message does not tell a reader WHY a
+# directory of inert files is supervision-critical.
+STAGING_MIRRORS = {
+    "templates/workflows/**": ".github/workflows/**",
+    "templates/hooks/**": ".claude/hooks/**",
+}
 
 # §1 defines `telemetry`, and the schema therefore does too — but it is not a
 # §7 row and this validator says nothing about it. See the module docstring.
@@ -671,12 +701,22 @@ def check_autonomy(config, r):
     if isinstance(risk_paths, list):
         for needed in REQUIRED_RISK_PATHS:
             if needed not in risk_paths:
+                becomes = STAGING_MIRRORS.get(needed)
+                why = (
+                    f"'{needed}' holds the INERT COPIES that become "
+                    f"'{becomes}' at bootstrap (templates/README.md). Staged "
+                    f"workflows are the same bytes as active ones — the "
+                    f"activation is a bare `git mv` that reads in review as "
+                    f"just a move, so the bytes must be supervised where they "
+                    f"are DECIDED, not where they become visible."
+                    if becomes else
+                    "§1/§7: the guard machinery and delivery.json always need a "
+                    "human — a PR that edits supervision is not a routine edit."
+                )
                 r.err(
                     "autonomy.riskPaths",
                     f"autonomy.riskPaths is missing '{needed}' (exact glob "
-                    f"string). §1/§7: the guard machinery and delivery.json "
-                    f"always need a human — a PR that edits supervision is not a "
-                    f"routine edit.",
+                    f"string). {why}",
                 )
 
     auto_merge = autonomy.get("autoMergeMaxLines", MISSING)
@@ -1139,6 +1179,34 @@ CASES = [
         ["autonomy.riskPaths"],
     ),
     ("riskpaths-absent", lambda c: _drop(c, "autonomy.riskPaths"), ["autonomy.riskPaths"]),
+    # The staging halves, dropped ONE AT A TIME out of an otherwise-complete
+    # list. A config that declares every guarded destination and omits only the
+    # directory those files are staged in is the exact shape KIT-14 describes,
+    # and it must not validate.
+    (
+        "riskpaths-missing-staged-workflows",
+        lambda c: _set(
+            c, "autonomy.riskPaths",
+            [p for p in REQUIRED_RISK_PATHS if p != "templates/workflows/**"],
+        ),
+        ["autonomy.riskPaths"],
+    ),
+    (
+        "riskpaths-missing-staged-hooks",
+        lambda c: _set(
+            c, "autonomy.riskPaths",
+            [p for p in REQUIRED_RISK_PATHS if p != "templates/hooks/**"],
+        ),
+        ["autonomy.riskPaths"],
+    ),
+    (
+        "riskpaths-missing-active-workflows",
+        lambda c: _set(
+            c, "autonomy.riskPaths",
+            [p for p in REQUIRED_RISK_PATHS if p != ".github/workflows/**"],
+        ),
+        ["autonomy.riskPaths"],
+    ),
     (
         "automergemethod-unknown",
         lambda c: _set(c, "autonomy.autoMergeMethod", "fast-forward"),
@@ -1376,6 +1444,29 @@ def selftest():
                     f"{name}: expected a warning on [{rule}], got "
                     f"{sorted({f['rule'] for f in result['warnings']})}"
                 )
+
+        # 2c. A staging-mirror violation must SAY WHY. The rule name alone reads
+        #     as bureaucracy — "you omitted a glob" — when the actual finding is
+        #     that a directory of inert files decides what CI later runs. If the
+        #     message degrades to the generic text, the floor still holds but
+        #     nobody learns what it is for, so the explanation is asserted.
+        for name, staged in (("riskpaths-missing-staged-workflows", "templates/workflows/**"),
+                             ("riskpaths-missing-staged-hooks", "templates/hooks/**")):
+            note()
+            config = good_config()
+            dict(CASES_BY_NAME)[name](config)
+            result = run(config, "delivery.json", repo, roots, schema,
+                         live_types=live_types, live_source=HOOK_FILE)
+            said = " ".join(
+                f["message"] for f in result["errors"]
+                if f["rule"] == "autonomy.riskPaths"
+            )
+            for phrase in (staged, STAGING_MIRRORS[staged], "same bytes", "git mv"):
+                if phrase not in said:
+                    failures.append(
+                        f"{name}: the floor message must explain the staging "
+                        f"mirror; it omits {phrase!r}. Got: {said!r}"
+                    )
 
         # 3. Warnings alone do not fail; --strict promotes them.
         note()
