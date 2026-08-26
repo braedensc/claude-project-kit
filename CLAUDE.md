@@ -48,6 +48,12 @@ never work around it.** Full reference: `.claude/hooks/README.md`.
   the human's action only.** Open the PR (`gh pr create`) and stop. Never enable
   auto-merge. (Even *mentioning* `gh pr merge` in a shell command — e.g. a grep
   pattern — trips it; that's expected.)
+- **Self-approval guard** — **you cannot approve a PR** (`gh pr review --approve`/`-a`,
+  the bare `gh pr review`, or an `event: APPROVE` write via `gh api`/GraphQL/`curl`).
+  An approval claims that someone *else* read the code; supplying your own makes that
+  claim false. **Print the command for the human** instead. `--comment` and
+  `--request-changes` reviews, review reads, and `--add-reviewer` stay allowed. (Same
+  mention-trips-it friction as the merge guard.)
 - **Protected-label guard** — **you cannot apply or remove `hooks-change`, `agent:*`,
   `blocked:*` or `provenance:*`** (contract §6). Blocked in every `gh` spelling that
   writes them: `pr`/`issue edit --add-label`/`--remove-label`, `pr`/`issue create

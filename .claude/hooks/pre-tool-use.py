@@ -529,6 +529,99 @@ def _protected_label_in(cmd: str):
     return None
 
 
+# ── Self-approval guard: an approval is a SECOND pair of eyes, or it is nothing ──
+# Added 2026-08-25 (KIT-21). Second instance of the class PR #40 closed for labels,
+# and this one needs no accomplice job to pay off: a session holds Bash and a working
+# `gh` credential, so `gh pr review --approve` on its own PR simply works.
+#
+# An approval is not a status bit. It is a claim to the next human that somebody ELSE
+# read this code — and under branch protection it can be the very thing that unlocks
+# the merge. A session that approves its own work makes that claim false in exactly
+# the moment a tired reviewer leans on it. An action that grants permission belongs to
+# the human, for the same reason merging and `hooks-change` do.
+#
+# ONLY approve is refused, deliberately. A `--comment` review is ordinary writing and
+# is sometimes genuinely useful (an agent flagging its own uncertainty inline), and
+# `--request-changes` on your own PR is meaningless but harmless. Neither manufactures
+# a human signal, so the pattern is kept narrow enough to leave both reachable — and
+# wide enough that no spelling of approve slips past.
+#
+# Scope, as plainly as the label guard states it: a first line over command SHAPES,
+# not an exhaustive denylist of shell spellings. The durable half is server-side — a
+# branch-protection rule that will not count a review from the PR's own author, and
+# that lives in repository settings, outside anything a session can reach.
+_GH_PR_REVIEW_RE = re.compile(r"\bgh\s+pr\s+review\b([^#\n;&|]*)")
+_REVIEW_APPROVE_RE = re.compile(r"(?<![\w-])--approve(?![\w-])")
+_REVIEW_EVENT_RE = re.compile(r"(?<![\w-])--(?:approve|comment|request-changes)(?![\w-])")
+# pflag CLUSTERS shorthand flags, so `-a` need not be a token of its own: `gh pr
+# review -ab "lgtm"` approves just as well as `-a -b "lgtm"`. Collect the letters of
+# every single-dash token and look for the event shorthands among them (-a approve,
+# -c comment, -r request-changes). Long flags never match — the lookbehind rejects the
+# second dash of `--body` — and case is load-bearing, so `-R` (repo) is not `-r`.
+_SHORT_CLUSTER_RE = re.compile(r"(?<![\w-])-([a-zA-Z]+)(?![\w-])")
+# The REST endpoint that CREATES a review, plus the APPROVE event in its flag, JSON
+# and GraphQL spellings. Matched against the WHOLE command rather than only `gh api`:
+# api.github.com is on the egress allowlist, so a plain `curl -X POST` aimed at it is
+# not stopped by anything else in this file.
+_PR_REVIEWS_PATH_RE = re.compile(r"/pulls/[^/\s'\"]+/reviews\b")
+_REVIEW_EVENT_FIELD_RE = re.compile(r"event[\"']?\s*[=:]", re.I)
+_APPROVE_EVENT_RE = re.compile(r"event[\"']?\s*[=:]\s*[\"']?\s*APPROVE(?![\w-])", re.I)
+_GRAPHQL_REVIEW_RE = re.compile(r"(?<![\w-])(?:add|submit)PullRequestReview(?![\w-])")
+
+SELF_APPROVAL_HELP = (
+    "🔒 Approving a pull request is the human's action only — and a session approving "
+    "its OWN pull request is the whole point of this block. An approval is not a "
+    "status bit: it is a claim to the next reviewer that somebody else read the code, "
+    "and under branch protection it can be the thing that unlocks the merge. Claude "
+    "cannot make that claim about its own work, for the same reason it cannot merge a "
+    "PR and cannot apply `hooks-change`. Do not reach for another tool or a shell "
+    "workaround — instead, print the command for the human to run themselves:\n"
+    "  gh pr review <number> --approve\n"
+    "and let them run it. {why}"
+)
+_SELF_APPROVAL_WHY = {
+    "approve": "(A `--comment` review is still allowed, and so is `--request-changes` "
+               "— only APPROVE manufactures a signal a human is meant to produce. "
+               "Reading reviews, and `--add-reviewer` to ASK for one, are untouched.)",
+    "interactive": "(A bare `gh pr review` picks its event at an interactive prompt "
+                   "this hook cannot see, so it is refused too. Name the event you "
+                   "want: `gh pr review <number> --comment` is allowed.)",
+    "opaque": "(This is a write to the review-creation endpoint whose event lives in "
+              "a body this hook cannot read, so it fails closed. Pass the event as a "
+              "visible field instead of hiding it in a file.)",
+}
+
+
+def _self_approval_in(cmd: str):
+    """Why this command would APPROVE a pull request, else None.
+
+    Read paths never match: `gh pr view --json reviews`, a plain GET of the reviews
+    endpoint, and `--add-reviewer` (which REQUESTS a review rather than gives one) all
+    stay frictionless. `_strip_prose` has already blanked quoted `--body`/`-b` values
+    by the time this runs, so an approve flag merely NAMED inside review prose is not
+    mistaken for one handed to the parser."""
+    for m in _GH_PR_REVIEW_RE.finditer(cmd):
+        seg = m.group(1)
+        shorts = "".join(_SHORT_CLUSTER_RE.findall(seg))
+        if _REVIEW_APPROVE_RE.search(seg) or "a" in shorts:
+            return "approve"
+        # No event flag at all is the INTERACTIVE form, and the prompt it opens offers
+        # approve. Same call the label guard makes for an opaque payload: an unreadable
+        # event on a review-CREATING command fails closed.
+        if not (_REVIEW_EVENT_RE.search(seg) or "c" in shorts or "r" in shorts):
+            return "interactive"
+    if _APPROVE_EVENT_RE.search(cmd) and (
+            _PR_REVIEWS_PATH_RE.search(cmd) or _GRAPHQL_REVIEW_RE.search(cmd)):
+        return "approve"
+    for m in _GH_API_RE.finditer(cmd):
+        seg = m.group(1)
+        if not (_PR_REVIEWS_PATH_RE.search(seg) and _API_WRITE_RE.search(seg)):
+            continue
+        if not _REVIEW_EVENT_FIELD_RE.search(seg):
+            return "opaque"
+    return None
+
+
 # ── Config-anchor guard: the git ref store is a trust anchor, not scratch space ──
 # Added 2026-08-24 (docs/adr/2026-08-24-config-anchor-and-pin-expiry.md).
 # Several guards deliberately read a value from the DEFAULT BRANCH rather than from
@@ -1618,6 +1711,12 @@ def _dispatch(data) -> None:
                 "there. (`gh pr merge --disable-auto` is still allowed, to undo an "
                 "auto-merge that shouldn't have been enabled.)"
             )
+
+        # Approving a pull request is a SIGNAL TO A HUMAN that someone else looked at
+        # the work — the same class of action as merging it, and the same answer.
+        _approval = _self_approval_in(scan)
+        if _approval:
+            block(SELF_APPROVAL_HELP.format(why=_SELF_APPROVAL_WHY[_approval]))
 
         # Applying (or removing) a protected label is an ACKNOWLEDGEMENT, and an
         # acknowledgement is the human's action for the same reason a merge is:
