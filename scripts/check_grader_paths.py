@@ -96,7 +96,13 @@ import urllib.request
 #
 # NOTE: the PreToolUse hook has its own, narrower GRADER_PATH_FLOOR. The two are
 # deliberately not identical — the hook blocks a pinned session's local edits,
-# this gates any PR from any author — so they are related, not mirrored.
+# this gates any PR from any author — so they are related, not mirrored. Where
+# they now agree is the STAGING MIRRORS: `templates/` holds the inert copies that
+# become the gated paths at bootstrap, so bytes chosen there are the bytes CI
+# later runs. `templates/hooks/**` is fully gated here; `templates/workflows/`
+# is not, because family 3's capability test still answers "no supervision role"
+# for the nine stack templates, and THIS tier's cost is a human's label on every
+# PR from every author (docs/adr/2026-08-25-staging-mirrors-are-on-the-floor.md).
 FLOOR = (
     ".claude/hooks/**",
     ".claude/settings*.json",
@@ -105,6 +111,7 @@ FLOOR = (
     "scripts/pipeline_*.py",
     "scripts/jsonschema_mini.py",
     "templates/workflows/pipeline-*.yml",
+    "templates/hooks/**",
     "delivery.json",
 )
 
@@ -129,7 +136,13 @@ UNGATED = {
     "templates/workflows/pr-conflict-monitor.yml": "stack template; no supervision role",
 }
 # The directories UNGATED must account for, exhaustively.
-COVERED_DIRS = (("scripts", ".py"), ("templates/workflows", ".yml"))
+# `templates/hooks` joins the ledger because it was invisible to it: the
+# exhaustiveness assertion is what makes "we forgot to name it `check_`" a test
+# failure instead of silence, and a directory outside COVERED_DIRS gets neither
+# a glob nor that backstop. Its one file becomes `.claude/hooks/**` at
+# bootstrap, which FLOOR's first family already gates.
+COVERED_DIRS = (("scripts", ".py"), ("templates/workflows", ".yml"),
+                ("templates/hooks", ".sh"))
 DELIVERY_FILE = "delivery.json"
 API = "https://api.github.com"
 
@@ -378,6 +391,8 @@ def _selftest():
            gated("templates/workflows/pipeline-safe-outputs.yml"), True)
     expect("floor gates the dispatch template",
            gated("templates/workflows/pipeline-dispatch.yml"), True)
+    expect("floor gates the staged hook (→ .claude/hooks/** on sync)",
+           gated("templates/hooks/session-start-provision-env.sh"), True)
     # …and still leaves alone what carries no supervision authority (§4).
     expect("floor leaves telemetry alone", gated("scripts/telemetry_scrape.py"), False)
     expect("floor leaves stack templates alone",

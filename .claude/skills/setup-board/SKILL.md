@@ -33,10 +33,11 @@ Collecting those IDs by hand means clicking through settings pages transcribing 
    by name only (`$LINEAR_API_KEY`) — never read it out of a file, never echo it, never
    paste it into a PR or an issue. Linear personal keys go in the header **raw**, with
    no `Bearer` prefix (OAuth tokens use `Bearer`).
-4. **The egress guard will block your first curl.** `curl --data … https://api.linear.app/graphql`
-   is an upload to a non-allowlisted host, which is exactly the exfil shape
-   `.claude/hooks/pre-tool-use.py` exists to stop. It needs `linear.app` in that hook's
-   stack-specific `EGRESS_ALLOW_SUFFIXES` slot (a separate PR adds it). **If you are
+4. **The egress guard permits `api.linear.app` — but only that host.**
+   `curl --data … https://api.linear.app/graphql` is an upload, which is exactly the
+   exfil shape `.claude/hooks/pre-tool-use.py` exists to stop; it is allowed because
+   `linear.app` ships in that hook's stack-specific `EGRESS_ALLOW_SUFFIXES` slot. A
+   project that removed the entry, or any other host, still blocks. **If you are
    blocked, halt and print the fix — do not shim around it**, and note that the hook is
    self-protected: only the human can apply the change.
 
