@@ -569,6 +569,21 @@ jobs:
     name: Post the review's telemetry to the ticket
     needs: [snapshot, telemetry]
     if: always() && needs.telemetry.outputs.ready == 'true'
+    # A CALLED WORKFLOW'S TOKEN IS CAPPED BY THIS JOB'S. GitHub downgrades, it
+    # never elevates ("the GITHUB_TOKEN permissions passed from the caller
+    # workflow can be only downgraded (not elevated) by the called workflow").
+    # Without this block the job inherits the workflow-level `contents: read`
+    # above — which means `actions: none` — while pipeline-safe-outputs.yml
+    # declares `actions: read`. GitHub then cannot build the run graph and the
+    # ENTIRE RUN dies as `startup_failure`: no jobs, no annotations, no check
+    # run, and nothing in the PR's checks list saying anything is wrong. The
+    # workflow simply appears never to have run — the loudest failure in this
+    # file with the quietest symptom. So this set must stay a SUPERSET of the
+    # callee's declared block; scripts/check_workflow_calls.py holds the two in
+    # step, because nothing else ever will.
+    permissions:
+      contents: read   # callee checks out the default branch for delivery.json
+      actions: read    # callee's download-artifact@v4 reads the requests artifact
     uses: ./.github/workflows/pipeline-safe-outputs.yml
     with:
       artifact_name: pipeline-review-telemetry-${{ needs.snapshot.outputs.pr_number }}

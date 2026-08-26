@@ -92,6 +92,18 @@ jobs:
       - name: No home paths or real emails in tracked files
         run: python3 scripts/check_provenance.py
 
+      # A job doing `uses: ./…` whose permissions are narrower than the called
+      # workflow declares ends the WHOLE RUN as `startup_failure`: no jobs, no
+      # annotations, no check run — and so nothing in the PR's checks list to
+      # tell you. The pipeline workflows call each other, so this is a live risk
+      # the moment you activate them; it is decidable from the two files, and
+      # this is where it gets decided. Harmless if you run no reusable workflows
+      # (it reports zero call sites and exits 0).
+      - name: Reusable-workflow calls can start
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_workflow_calls.py
+
   # ── Adapt the three jobs below to your toolchain (script names are the
   #    contract: lint / format:check / typecheck / test). ─────────────────────
   lint:

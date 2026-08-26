@@ -54,6 +54,19 @@ jobs:
           sys.exit(1 if bad else 0)
           '
 
+      # Parsing proves a workflow is well-formed, not that it can START. A job
+      # doing `uses: ./…` whose permissions are narrower than the callee declares
+      # ends the whole RUN as `startup_failure` — no jobs, no annotations, no
+      # check run, nothing in the PR's checks list. This is the one class of
+      # workflow bug a checks list can never surface, and it is fully decidable
+      # from the two files, so it is checked here rather than discovered live.
+      # Runs immediately after the parse step, which is what installs pyyaml.
+      - name: Reusable-workflow call contracts selftest
+        run: python3 scripts/check_workflow_calls.py --selftest
+
+      - name: Reusable-workflow calls in this repo can start
+        run: python3 scripts/check_workflow_calls.py
+
       - name: Placeholder integrity (used == documented)
         run: python3 scripts/check_placeholders.py
 

@@ -138,6 +138,8 @@ npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
 npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
+npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selftest
+npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -153,9 +155,16 @@ broken: the validator exits 0 emitting nothing at all.
 and each asserts its contract rows against synthetic fixtures.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
-validation, the forbidden-paths gate, placeholder integrity, the DoR, delivery-config,
-auto-approve, auto-merge, grader-path, telemetry, dashboard and weekly-review
-selftests, and secretlint on every PR. `main` is protected (that context required, admins enforced).
+validation, the reusable-workflow call-contract check, the forbidden-paths gate,
+placeholder integrity, the DoR, delivery-config, auto-approve, auto-merge, grader-path,
+telemetry, dashboard and weekly-review selftests, and secretlint on every PR. `main` is
+protected (that context required, admins enforced).
+
+**A workflow that parses can still fail to start.** A job doing `uses: ./…` whose
+permissions are narrower than the called workflow declares ends the *whole run* as
+`startup_failure` — no jobs, no annotations, no check run, and so nothing in the PR's
+checks list. `check_workflow_calls.py` is the only thing that will ever tell you; see
+`docs/TESTING.md` § *Workflows are code, and one of their failures is silent*.
 
 ---
 
