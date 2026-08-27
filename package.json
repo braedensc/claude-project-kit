@@ -10,6 +10,7 @@
   "type": "module",
   "scripts": {
     "test:hooks": "python3 .claude/hooks/test_hooks.py",
+    "test:bypass": "python3 .claude/hooks/test_guard_bypass.py",
     "test:workflow-calls": "python3 scripts/check_workflow_calls.py --selftest",
     "lint:workflow-calls": "python3 scripts/check_workflow_calls.py",
     "test:dor": "python3 scripts/check_ticket_dor.py --selftest",

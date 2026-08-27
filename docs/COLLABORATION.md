@@ -248,9 +248,24 @@ Four layers — the three *security* layers of docs/SECURITY.md, plus a workflow
 Stop hook between them:
 
 1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
-   bypass it. Block reasons print to **stderr** (the only stream Claude Code relays
+   skip the hook. Block reasons print to **stderr** (the only stream Claude Code relays
    for a blocking exit 2), and an internal hook error **fails closed** (blocks)
-   instead of crashing to a non-blocking exit:
+   instead of crashing to a non-blocking exit.
+
+   > **Read this list as "catches mistakes", not "cannot be evaded".** The *invocation*
+   > is unbypassable; the **Bash** guards below are regular expressions over raw command
+   > text that bash rewrites before it runs — quote collapsing, `$IFS`, command
+   > substitution. Measured 2026-08-26 against the GuardFall research: **67 probes, all
+   > six Bash pattern guards classified advisory, none robust** (`npm run test:bypass`,
+   > full results and the layer-by-layer breakdown in docs/SECURITY.md §
+   > *What the pattern guards actually carry*). A cooperating agent that mistypes is
+   > still caught every time; a motivated caller is not. Each block below therefore
+   > names what it stops — and where a guarantee has to survive an adversary, the
+   > server-side layer named in item 4 is the one carrying it. The Edit/Write guards
+   > (self-protection, cross-worktree, branch) resolve real paths and refs rather than
+   > matching text, and are not in that class.
+
+   The blocks themselves:
    - **Protects itself**: blocks Edit/Write (and Bash mutations — redirects, `sed -i`,
      `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
      apply/rm/mv`, any interpreter invocation naming a protected path) of the hook
@@ -279,14 +294,21 @@ Stop hook between them:
      `*.key`, `id_rsa`, `credentials`) whatever the leading command — a path-target
      match, not a reader-verb list — and **egress/exfiltration shapes** (upload
      flags, `@file` payloads, `$VAR`-in-URL, `scp`/`nc` pushes) aimed at hosts
-     outside a domain-boundary allowlist; plain GETs stay allowed.
+     outside a domain-boundary allowlist; plain GETs stay allowed. Both match the
+     path/shape *as spelled*: the durable layers are `permissions.deny` for secret
+     reads and a sandbox network policy for egress. Worth knowing which half of the
+     egress guard is which — the **host allowlist** holds under variable expansion
+     (an unresolved `$H` is not on the list), the **exfil-shape denylist** does not
+     (a secret in a request header or a URL path is not an enumerated shape).
    - Blocks `git commit`/`git push` on a branch whose PR is already **merged** —
      pushes there are silently stranded (GitHub stops syncing the head and stops
      running CI). Fails open if `gh`/network is unavailable.
    - Blocks `gh pr merge` outright, including `--auto` — **merging is the human's
      action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
-     only *undoes* an auto-merge.)
-   - Blocks **approving a PR** in every spelling — `gh pr review --approve`/`-a`
+     only *undoes* an auto-merge.) The matcher knows the `gh pr merge` subcommand,
+     not the REST endpoint behind it; what makes the merge actually impossible is
+     branch protection plus the platform merge gate, in repository settings.
+   - Blocks the reachable spellings of **approving a PR** — `gh pr review --approve`/`-a`
      (including pflag shorthand clusters like `-ab`), the **bare** `gh pr review`,
      `gh api`/GraphQL writes carrying `event: APPROVE`, and a hand-rolled `curl` at
      `/pulls/<n>/reviews`. **An approval is the human's action for the same reason a
@@ -295,7 +317,13 @@ Stop hook between them:
      Blocked → **print the command for the human**, like a hook edit. `--comment`
      and `--request-changes` stay allowed (neither manufactures a human signal), as
      do reading reviews and `--add-reviewer` — *asking* for a review is not giving
-     one. The bare form and an `--input`-hidden event fail **closed**.
+     one. The bare form and an `--input`-hidden event fail **closed** — and that
+     fail-closed default is why this guard held best of the six under measurement:
+     mangling the *flag* leaves nothing recognizable, which reads as the interactive
+     form and is refused. What still gets through is mangling the *command word*,
+     respelling the API event value, or a `curl` whose event lives in a file. The
+     durable layer is a branch-protection rule that will not count a review from
+     the PR's own author.
    - **Config anchor** — blocks writing a protected git ref (`git update-ref`,
      `branch -f/-D main`, a fetch/pull **refspec** targeting `main`/`master`,
      `symbolic-ref`, `replace`, history rewriters), repointing `origin`

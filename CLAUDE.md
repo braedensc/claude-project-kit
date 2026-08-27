@@ -31,8 +31,16 @@ example (`.mcp.json.example`), Markdown docs, and a tiny `package.json`.
 ## The guardrails you're working under (know these — they're enforced, not advisory)
 
 The PreToolUse hook (`.claude/hooks/pre-tool-use.py`) **blocks** these in real time;
-the model cannot bypass them. A block is the system working — **branch/fix and retry,
+the model cannot skip the hook. A block is the system working — **branch/fix and retry,
 never work around it.** Full reference: `.claude/hooks/README.md`.
+
+One honest qualification, measured 2026-08-26 (`npm run test:bypass`, docs/SECURITY.md
+§ *What the pattern guards actually carry*): the **Bash** guards below match raw command
+text that bash rewrites before running it, and all six classify as **advisory** — a
+respelling gets past them. That is a fact about the threat model, **not a licence**.
+Working around a block is exactly the behaviour the guard exists to make visible, and
+the durable layers (branch protection, CI, `permissions.deny`, the sandbox) will catch
+it anyway. If a guard is in your way, say so and stop — never respell the command.
 
 - **Branch guard** — no `Edit`/`Write`/`git commit` on `main`/`master`. Branch first:
   `git checkout -b <type>/<short-kebab-desc>` (type ∈ feat|fix|chore|refactor|docs).
@@ -129,6 +137,8 @@ than blocks.
 
 ```bash
 npm run test:hooks      # the block/allow battery (must stay green; also runs in CI)
+npm run test:bypass     # GuardFall bypass battery — records what an adversarial
+                        #   speller gets past the Bash guards; red only on DRIFT
 npm run test:dor        # Definition-of-Ready gate selftest
 npm run test:delivery   # delivery.json validator selftest (PIPELINE-CONTRACT §7)
 npm run test:local-dispatch  # tier-0 local dispatcher selftest (§2, §3)
