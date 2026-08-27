@@ -35,6 +35,13 @@ jobs:
       - name: Hook battery (block/allow)
         run: python3 .claude/hooks/test_hooks.py
 
+      # Characterization, not aspiration: fails only when the RECORDED result of
+      # a GuardFall probe changes — a guard that started leaking, or one that was
+      # hardened without updating the record and the two docs. See the file's
+      # docstring and docs/SECURITY.md.
+      - name: GuardFall bypass battery (recorded results still hold)
+        run: python3 .claude/hooks/test_guard_bypass.py
+
       - name: Validate all tracked JSON/YAML
         run: |
           python3 -m pip install --quiet pyyaml

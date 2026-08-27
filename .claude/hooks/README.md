@@ -239,6 +239,37 @@ sync.**
 
 ---
 
+## The bypass battery — `test_guard_bypass.py`
+
+```
+python3 .claude/hooks/test_guard_bypass.py            # npm run test:bypass
+python3 .claude/hooks/test_guard_bypass.py --report   # + the markdown summary
+```
+
+A different question from the one above. `test_hooks.py` asks *does each guard do its
+job*; this asks *what can an adversarial speller get past it*, using the primitive
+classes from the June 2026 GuardFall research — the guard inspects raw command text,
+bash rewrites that text before executing it, and the two never see the same thing.
+
+67 probes across the six **Bash pattern** guards (secret paths, destructive ops, egress,
+never-merge, self-approval, protected labels), each recorded with the result observed on
+2026-08-26. Every probe recorded as getting through is then executed in a throwaway
+directory whose PATH holds **only generated shims** — `cat`, `rm`, `curl`, `gh`, `git`
+are inert scripts that log their own argv and exit 0 — so nothing runs, no network is
+reached and no file is read, while the recorded argv proves the shell really did build
+the forbidden command. A bypass is never just a regex that failed to match.
+
+It is a **characterization** test, not a pass/fail one: it goes red when a recorded
+result changes in *either* direction. A guard that starts leaking is a regression; a
+guard someone hardens must have its record — and docs/SECURITY.md § *What the pattern
+guards actually carry* — updated in the same PR. **All six guards currently classify as
+advisory; none is robust.** They stop a cooperating agent that mistypes, which is what
+they were written for; they do not stop a motivated caller, and the ladder in
+docs/SECURITY.md names the server-side or sandbox layer that carries each guarantee
+instead. **If you harden a Bash guard, update both batteries.**
+
+---
+
 ## Defense in depth
 
 (`.secretlintrc.json` — layer 2's config — is copied byte-for-byte from a build in
