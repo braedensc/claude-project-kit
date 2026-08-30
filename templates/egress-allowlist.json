@@ -1,0 +1,56 @@
+{
+  "_README": [
+    "Starter egress allowlist for the agentic delivery pipeline. INERT in this repo —",
+    "copy the 'sandbox' object into <cyrus-home>/config.json at bootstrap.",
+    "",
+    "This is the CORE list: the pipeline's own dependencies plus the universal source",
+    "and package hosts. It is deliberately NOT the union of every ecosystem — an",
+    "allowlist that allows everything is a comment, not a control. Add your stack's",
+    "hosts from the per-ecosystem menu in docs/EGRESS.md.",
+    "",
+    "MECHANICS THAT BITE (all measured, see docs/EGRESS.md):",
+    "  * Deny-by-default is triggered by the PRESENCE of 'allow'. Omitting networkPolicy,",
+    "    or setting it to {}, is ALLOW-ALL, silently.",
+    "  * Values must be arrays of objects: \"host\": [{}]. A list of strings will not parse.",
+    "  * Wildcards work but exclude the apex: *.example.com matches sub.example.com and",
+    "    NOT example.com. List both when you need both.",
+    "  * 'subnets' rules parse but are NOT enforced.",
+    "  * The policy is global, not per-repository.",
+    "",
+    "VERIFY IT PARSED. The config is never schema-validated; a typo produces silence and",
+    "an open policy. The daemon's startup banner is the only signal:",
+    "    [EgressProxy] Policy: deny-all with N allowed domain(s)   <- correct",
+    "    [EgressProxy] Policy: allow-all (no domain restrictions)  <- it did not parse",
+    "",
+    "TO DISABLE the network filter while keeping filesystem confinement, delete the",
+    "whole 'networkPolicy' key. Do NOT set enabled:false unless you also mean to drop",
+    "the filesystem sandbox. See docs/EGRESS.md for when disabling is the right call —",
+    "it usually is on a VM or dedicated host, and usually is not on a machine you also",
+    "use yourself.",
+    "",
+    "This key is ignored by the reader and exists only so the file can carry its own",
+    "instructions; JSON has no comments."
+  ],
+
+  "sandbox": {
+    "enabled": true,
+    "logRequests": true,
+    "networkPolicy": {
+      "allow": {
+        "api.anthropic.com": [{}],
+
+        "api.linear.app": [{}],
+        "mcp.linear.app": [{}],
+        "uploads.linear.app": [{}],
+
+        "github.com": [{}],
+        "api.github.com": [{}],
+        "codeload.github.com": [{}],
+        "objects.githubusercontent.com": [{}],
+        "raw.githubusercontent.com": [{}],
+
+        "registry.npmjs.org": [{}]
+      }
+    }
+  }
+}

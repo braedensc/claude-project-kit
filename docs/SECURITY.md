@@ -153,7 +153,7 @@ So which layer actually carries which guarantee:
 | Guarantee | Advisory (hook regex) | **Carried by** |
 |---|---|---|
 | Secrets are never read | `SENSITIVE_PATH_RE` | `permissions.deny` in `settings.json` (platform-enforced, not a regex over command text) + the devcontainer/OS sandbox |
-| No exfiltration | egress matcher | a network policy at the sandbox boundary, which does not care how the command was spelled |
+| No exfiltration | egress matcher | a network policy at the sandbox boundary, which does not care how the command was spelled — see `docs/EGRESS.md` for the pipeline's, including what it does **not** cover |
 | No destructive local op | `rm -rf` matcher | the blast radius being a disposable worktree; git history for anything committed |
 | Nothing lands on `main` | push guard | **branch protection** (server-side, GitHub) |
 | Claude never merges | `gh pr merge` matcher | **branch protection + the platform merge gate**, in repository settings, outside the repo tree |
