@@ -392,6 +392,16 @@ sandbox exposes filesystem and network controls, with no way to permit a Mach se
 `scripts/gh_fallback.py` is the fallback, and it reports which path it took so a silent
 substitution cannot hide either the day `gh` recovers or the day the fallback breaks.
 
+**A PR body is the wrong home for anything that must outlive review.** It is read once,
+by whoever approves, and then never again — so a finding recorded there is gone the moment
+the PR merges: not on the ticket, not in the backlog, not anywhere a weekly review looks. A
+dispatched session did this correctly and still lost the finding: it discovered two stale
+lines outside its ticket's file list, refused to widen its diff (right), and wrote them in
+the PR body (a dead end). The fix is not more discipline — the discipline was already
+perfect — it is naming a durable channel, which for a session is a ticket comment. Applies
+beyond agents: the same is true of anything a human notices mid-review and types into the
+description box.
+
 **`.env.local` does not enter worktrees** — and hooks (correctly) block Claude from
 copying it. Prefer tooling that resolves env **at runtime from the running stack**
 (one build's golden suite shells out to `supabase status -o env` — zero env files
