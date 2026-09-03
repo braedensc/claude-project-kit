@@ -29,6 +29,7 @@ and unchanged; app projects still activate it the normal way.
 | `scripts/check-migrations.mjs` | `scripts/check-migrations.mjs` | PR-time ordered-file guard: duplicate / out-of-order versions vs the base tip (pairs with the deploy's `--include-all`) |
 | `scripts/dev-worktree-login.sh` | `scripts/dev-worktree-login.sh` | Per-worktree env regeneration + dedicated test login (Supabase-flavored — port the pattern; delete if no local backend) |
 | `hooks/session-start-provision-env.sh` | `.claude/hooks/session-start-provision-env.sh` | SessionStart auto-provisioning of a fresh worktree's env (idempotent; secret stdout discarded, never enters model context) |
+| `egress-allowlist.json` | the `sandbox` key of the dispatcher's `config.json` — **not** a path inside the repo | **Pipeline**: starter egress allowlist. Core hosts only; per-ecosystem menu and the disable path in `docs/EGRESS.md`. Carries its own mechanics in a `_README` key, since JSON has no comments |
 
 The four `pipeline-*.yml` templates are the **optional agentic delivery
 pipeline** and are inert twice over: they no-op entirely unless a project has a

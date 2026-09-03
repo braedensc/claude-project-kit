@@ -69,6 +69,7 @@ other specific project by name. MIT licensed.
 | `docs/LESSONS.md` | The gotcha catalog — every entry cost a failed run or a deadlock |
 | `docs/adr/` | Date+slug ADR convention (no numbers — collision-proof) + the kit's own ADRs |
 | `docs/PIPELINE-CONTRACT.md` + `delivery.example.json` | **Optional** agentic delivery pipeline (tickets → sessions → PRs): the frozen `delivery.json` / pin-file / telemetry formats. Inert unless a project creates `delivery.json` |
+| `docs/EGRESS.md` + `templates/egress-allowlist.json` | **Pipeline only**: the network policy constraining a dispatched session's shell commands — mechanics, how to find your stack's hosts, the per-ecosystem menu, and when turning it off is the right call |
 | `schemas/` | The contract's four formats as JSON Schema — CI fails if a field exists in the schema and not the prose, or the reverse ([schemas/README.md](schemas/README.md)) |
 | `CLAUDE.md` | The kit's own auto-loaded context (guardrails + conventions) — a worked example; bootstrap replaces it with your project's |
 | `docs/CLAUDE-template.md` | Fill-in `CLAUDE.md` for the new project (Hard Rules verbatim) |
