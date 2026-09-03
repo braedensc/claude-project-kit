@@ -32,6 +32,12 @@ diff if empty.
 5. **Write the PR body to a scratch file** — 2–3 sentence what/why, one-line bullets,
    one verification line, depth in `<details>`, ≤ ~150 visible words — and open the PR
    with `gh pr create --body-file <file>`.
+
+   **If `gh` fails with a TLS or "invalid token" error, it is neither.** Inside the
+   dispatcher's sandbox `gh` cannot verify certificates (KIT-71) and misreports it as a bad
+   token. Use `python3 scripts/gh_fallback.py pr-create --title T --body-file F --base B`,
+   which tries `gh` first and falls back to the REST API, printing which path it took. Do
+   not disable TLS verification, and do not improvise your own REST calls.
 6. **Update the ticket — only if a pipeline is configured.** `delivery.json` at the repo
    root is the sole discriminator (`docs/PIPELINE-CONTRACT.md` §2). **Absent → skip this
    step completely: no output, no tool call, no diagnostic.** Most projects using this kit
@@ -121,7 +127,7 @@ diff if empty.
    `ci_green`, `merged` or `deployed` — those are observed after you stop, by CI or by
    the platform, and §4 forbids an agent-claimed merge outright.
 
-7. **Watch CI to green:** `gh pr checks <n> --watch`. If a check fails, read the log,
+7. **Watch CI to green:** `gh pr checks <n> --watch`, or `python3 scripts/gh_fallback.py pr-checks <n>` if `gh` is failing. If a check fails, read the log,
    fix, push, re-watch. A `DIRTY` PR is not green — rebase and force-push.
    **`Hooks change guard` red is a stop-and-report, not a task.** A PR touching
    `.claude/hooks/**` or `.claude/settings*.json` stays red until the `hooks-change`

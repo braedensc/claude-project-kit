@@ -358,6 +358,22 @@ exit status before piping (`cmd; RC=$?; printf '%s\n' "$out" | sed …`), or tes
 real command separately from the filter that formats its output — never attach a
 fallback or a status read to a pipeline whose last stage is a filter.
 
+**Go and everything else disagree about where trust comes from, and on macOS that
+splits a sandbox in half.** `gh` inside the Agent SDK sandbox fails every request with
+`tls: failed to verify certificate: x509: OSStatus -26276`, while `curl` to the same host
+succeeds — and `gh auth status` mislabels it *"The token in GH_TOKEN is invalid"*, which
+is a lie that costs an afternoon. Cause: Go on darwin ignores `SSL_CERT_FILE` and
+`CURL_CA_BUNDLE` (build-tag exclusion in `root_unix.go`) and calls the platform verifier,
+which consults all three trust-settings domains; inside the sandbox the user and admin
+domains answer `errSecNotAvailable` ("No keychain is available") where outside they answer
+the benign `errSecNoTrustSettings` ("No Trust Settings were found"). **Those two share an
+exit code and mean opposite things** — comparing exit codes rather than messages produced
+a confident wrong diagnosis before the messages were read. Not fixable from config: the
+sandbox exposes filesystem and network controls, with no way to permit a Mach service.
+`curl`, Python and Node all honour `SSL_CERT_FILE`, so anything but a Go binary works;
+`scripts/gh_fallback.py` is the fallback, and it reports which path it took so a silent
+substitution cannot hide either the day `gh` recovers or the day the fallback breaks.
+
 **`.env.local` does not enter worktrees** — and hooks (correctly) block Claude from
 copying it. Prefer tooling that resolves env **at runtime from the running stack**
 (one build's golden suite shells out to `supabase status -o env` — zero env files

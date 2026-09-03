@@ -115,6 +115,14 @@ FLOOR = (
     "scripts/pipeline_*.py",
     "scripts/jsonschema_mini.py",
     "scripts/emit_document.py",
+    # gh_fallback.py is not a grader — it gates nothing — and the tempting call is to
+    # excuse it below. That would be wrong. It holds the GitHub token and writes to the
+    # API, and the ONLY thing stopping it from merging is the endpoint set inside it.
+    # A session that could edit this file would gain the ability to merge, and the
+    # PreToolUse never-merge guard would not see it: that guard matches `gh pr merge`
+    # in a Bash command, and `python3 scripts/gh_fallback.py …` contains no such string.
+    # So the file itself is the boundary, and it belongs behind a human's label.
+    "scripts/gh_fallback.py",
     "templates/workflows/pipeline-*.yml",
     "templates/hooks/**",
     "delivery.json",

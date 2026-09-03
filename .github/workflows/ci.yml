@@ -141,6 +141,13 @@ jobs:
       - name: Grader-path gate selftest (floor + label identity)
         run: python3 scripts/check_grader_paths.py --selftest
 
+      # gh cannot verify TLS inside the sandbox (KIT-71): Go on darwin ignores
+      # SSL_CERT_FILE and asks a keychain service the sandbox blocks. This is the
+      # REST fallback sessions use instead; the selftest is offline and asserts,
+      # among other things, that it still cannot merge.
+      - name: GitHub REST fallback selftest (no merge capability)
+        run: python3 scripts/gh_fallback.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
