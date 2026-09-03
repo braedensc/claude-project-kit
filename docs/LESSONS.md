@@ -342,6 +342,22 @@ with the resolved bin dir; the pre-commit hook self-heals by globbing
 **Git runs hooks under `sh -e`.** Any unguarded non-zero exit aborts the hook: guard
 no-match greps with `|| true`; capture tool exits with `if ! cmd; then`.
 
+**A fallback or status read attached to a pipeline measures the last stage, not the
+command you meant to guard — and the last stage is usually a filter that succeeds on
+empty input.** `cmd | sed 's/^/  /' || echo "(none found)"` — the `||` binds to the
+whole pipeline, but the pipeline's exit status is `sed`'s, and `sed` exits 0 on empty
+input same as on real input, so the fallback is unreachable: an absent file, an empty
+result, and a working result all print nothing, and all three look identical. Same
+family, same cause: `cmd | head -5` then `RC=$?` reads `head`'s exit status, not
+`cmd`'s — `head` also succeeds on empty input. Both shapes fail in the direction that
+looks like success, which is what let one of them ship five times in one session, twice
+after being identified and fixed — and a review written specifically to catch this
+family missed the fifth instance because it searched for `$?` after a pipe and not
+`||` after a pipe; check for both shapes, not one. Fix: capture the real command's own
+exit status before piping (`cmd; RC=$?; printf '%s\n' "$out" | sed …`), or test the
+real command separately from the filter that formats its output — never attach a
+fallback or a status read to a pipeline whose last stage is a filter.
+
 **`.env.local` does not enter worktrees** — and hooks (correctly) block Claude from
 copying it. Prefer tooling that resolves env **at runtime from the running stack**
 (one build's golden suite shells out to `supabase status -o env` — zero env files
