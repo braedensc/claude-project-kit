@@ -339,6 +339,24 @@ get the nvm *default* Node — one build's default was v16; Vite 8 and secretlin
 with the resolved bin dir; the pre-commit hook self-heals by globbing
 `~/.nvm/versions/node/v{24,22,20}*`; permanent fix `nvm alias default 22`.
 
+**Multiple `python3` binaries can disagree, and the winner depends on how the shell
+was started — the node lesson above, one interpreter deeper.** `which -a python3` on
+one host (the dispatcher, 2026-08-27) turned up five: `/usr/local/bin/python3` (3.11.6),
+`/usr/bin/python3` (3.9.6), a homebrew `python@3.11` libexec copy, a miniconda copy, and
+`/opt/homebrew/bin/python3` (3.13.2) — and bare `python3` resolved to 3.11.6 in an
+interactive shell but 3.13.2 under the LaunchDaemon's PATH, on the same machine. That
+matters here because the hook battery, secretlint, and every `scripts/*.py` selftest are
+invoked as bare `python3` — including the PreToolUse hook's own
+`command -v python3 && python3 "$CLAUDE_PROJECT_DIR"/...` line — so PATH order alone
+decides which interpreter runs the guards, and PATH order is exactly what differs
+between a human's interactive shell and a daemon's non-interactive one. Worse than the
+nvm case above: nvm silently picks a *default* Node version, but here the shells don't
+even agree on which binary answers to the name. Both interpreters verified green on the
+host this was measured on — nothing was broken; this records the class of defect, not an
+outage. Same remedy shape as the node fix: verify a gate under the PATH the service will
+actually run it under, not just an interactive shell one — a check run by hand is not
+the check a background session runs.
+
 **Git runs hooks under `sh -e`.** Any unguarded non-zero exit aborts the hook: guard
 no-match greps with `|| true`; capture tool exits with `if ! cmd; then`.
 
