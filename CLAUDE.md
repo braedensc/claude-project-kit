@@ -152,6 +152,7 @@ npm run test:dashboard  # dashboard selftest (self-contained page, one summary o
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
 npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selftest
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
+npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook

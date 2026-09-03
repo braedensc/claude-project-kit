@@ -28,6 +28,7 @@
     "test:lifecycle": "python3 scripts/telemetry_lifecycle.py --selftest",
     "test:dashboard": "python3 scripts/telemetry_dashboard.py --selftest",
     "test:review": "python3 scripts/check_weekly_review.py --selftest",
+    "test:gh-fallback": "python3 scripts/gh_fallback.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },
