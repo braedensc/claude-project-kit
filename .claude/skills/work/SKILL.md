@@ -322,6 +322,23 @@ the telemetry `error_class`.
 > what a `riskPaths` change (guard machinery, CI workflows, git hooks, `delivery.json`,
 > key material) always is.
 
+**A finding is not a blocker, and it must not die in a PR body.** The rule above is for
+when you *cannot proceed*. The far more common case is that you can proceed perfectly well
+and simply noticed something true and unrelated — a stale line in a file you were not asked
+to touch, a comment citing an id that has since changed. Do **not** widen the diff to fix
+it, and do **not** escalate: the ticket is not blocked.
+
+Queue it as a `ticket-comment` instead, alongside your summary. Say what you found, where,
+and why it was out of scope. **A PR body is the wrong home for it** — a PR body is read once
+at review and then never again, so once the PR merges the finding is gone: not on the
+ticket, not in the backlog, not anywhere `/weekly-review` reads. A ticket comment survives
+where a person will see it.
+
+You **cannot** file the follow-up ticket yourself, and should not want to. Safe-outputs has
+no create-ticket kind and refuses `provenance:*` in `add` and `remove` alike (§8), because a
+session that files its own follow-up work is generating its own future backlog — the same
+shape §5 exists to prevent. You report; a person decides whether it becomes a ticket.
+
 A PR touching `.claude/hooks/**` or `.claude/settings*.json` additionally needs the
 `hooks-change` label before its required CI job can pass — and that label is **set by a
 human** (§6). Do not add it, in GitHub or in the tracker; say the PR needs it and stop.
