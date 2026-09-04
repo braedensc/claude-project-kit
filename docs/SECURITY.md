@@ -207,6 +207,26 @@ the hooks-change guard);
 when you write a new security rule for your project, write the scanner that
 detects its violation in the same PR.
 
+**A worked example of getting this wrong, from this kit's own history.** The
+dispatcher executes a `cyrus-setup.sh` found at a worktree root automatically on
+worktree creation — with the full daemon environment, **outside the OS sandbox**,
+before the agent session exists, and with no config key to opt out. It is
+discovered from the **checked-out branch**, so branch-write access to a managed
+repository is arbitrary code execution with every secret the daemon holds. None of
+the session guards are in the path: the pin, the egress allowlist, the sandbox
+profile and the never-merge hook all belong to a session that does not exist yet.
+
+The risk was written down correctly, in prose, and stated that neither repo had
+such a file. **That sentence had no expiry date.** Nothing re-checked it, no hook
+covered it, and no CI job would have noticed one appearing — for eight days, until
+someone re-read the document. It is now a pattern in the forbidden-paths gate.
+
+Two things generalise. **A guard cannot live in a PreToolUse hook when the thing it
+guards runs before the agent** — a hook constrains the model, and CI is the only
+layer that reads a branch's contents independently of who wrote them. And **"we
+don't have one of those today" is an observation, not a control**; the moment you
+write it down, write the check that keeps it true.
+
 ---
 
 ## The secrets model — three ISOLATED stores
