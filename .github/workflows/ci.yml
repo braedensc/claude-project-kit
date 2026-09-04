@@ -173,10 +173,22 @@ jobs:
       - name: Weekly-review limits selftest (no self-raised budgets or graders)
         run: python3 scripts/check_weekly_review.py --selftest
 
-      - name: Block forbidden paths (planning/, real .env, key material)
+      # The cyrus-setup/teardown patterns are here for a reason that is not obvious from
+      # the filename: if a worktree ROOT contains one, the dispatcher EXECUTES it on
+      # worktree creation — with the full daemon environment, OUTSIDE the OS sandbox,
+      # before the agent session exists, and with no config key to opt out. It is
+      # discovered from the checked-out BRANCH, so branch-write access to a managed
+      # repository would be arbitrary code execution with every secret the daemon holds.
+      #
+      # This cannot live in a PreToolUse hook: a hook constrains the agent, and this runs
+      # before there is an agent. CI is the only layer that reads a branch's contents
+      # independently of who wrote them. Matched in any directory rather than only the
+      # root — a file that can be moved to the root should not pass review either.
+      # (KIT-78; KIT-48 runbook Part 18, which recorded the surface on 2026-08-27.)
+      - name: Block forbidden paths (planning/, real .env, key material, setup scripts)
         run: |
           FORBIDDEN=$(git ls-files \
-            | grep -E '^planning/|(^|/)\.env|\.pem$|\.key$' \
+            | grep -E '^planning/|(^|/)\.env|\.pem$|\.key$|(^|/)cyrus-(setup|teardown)\.(sh|ps1|cmd|bat)$' \
             | grep -v -E '(^|/)\.env\.example$' \
             || true)
           if [ -n "$FORBIDDEN" ]; then
