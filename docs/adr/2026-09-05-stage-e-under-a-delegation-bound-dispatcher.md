@@ -47,6 +47,12 @@ The first slice — the reviewer core plus the publish-or-decline path
 (`scripts/pipeline_review_local.py`) — is built with this ADR and proven on a real PR
 (KIT-90). Everything else is filed as KIT-91 … KIT-95 under the KIT-89 epic.
 
+This is an **epic-level** ADR: it records the *direction* for all six decisions so the
+children are coherent, at `Status: Accepted` because that direction is Braeden's call and
+is settled. It does not pre-empt each child's implementation review — KIT-91 (trigger),
+KIT-93 (bounce) and KIT-95 (the daemon lift) are each built and reviewed on their own
+diff, and this ADR is amended if one of them forces a change of direction.
+
 ## Why
 
 The kit put review in GitHub Actions when the dispatcher was also in Actions: one trust
@@ -287,13 +293,22 @@ in the kit or in Phase 2?": **both, by role.**
 
 ## Verified
 
-- **The reviewer core is built and proven on a real PR.** `scripts/pipeline_review_local.py`
+- **The reviewer core is built and proven on a real PR (#63).** `scripts/pipeline_review_local.py`
   resolves a PR, gathers `base...head`, runs a fresh read-only `claude -p` review against a
   basis, normalizes the findings against `schemas/review-findings.schema.json`, and posts
-  one comment through `gh_fallback.py`. On PR #NN it posted a **review comment** and, run
-  against a PR it could not establish a basis for, a **distinct decline comment** with a
-  non-zero exit — both links in the PR description and the KIT-89 report. (Filled in when
-  the PR opens.)
+  one comment through `gh_fallback.py`. On PR #63 it posted, run with no basis, a **distinct
+  decline comment** (`## 🛑 Stage E — … was NOT reviewed`, exit 3), and, run with KIT-90's
+  acceptance criteria as the basis, a **genuine review comment** (4 findings, highest
+  `high`, exit 0).
+- **The reviewer earned its keep by reviewing its own PR.** That genuine review found a real
+  §13 hole in this very slice: `pr_diff()` and `post_comment()` were unguarded where
+  `pr_metadata()` was not, so a GitHub hiccup would have crashed with a traceback and posted
+  *nothing* — a silent could-not-review, exactly what the file exists to prevent. It was
+  fixed in the same PR (every "could not review" path now routes through one `decline()` that
+  posts a distinct comment and returns a documented exit code), and a driver-level
+  integration test was added so `--selftest` exercises `review()` and not only its helpers.
+  Catching, on its first run, the class of bug it was built to catch is the strongest
+  evidence the design works.
 - **The decline is not green.** `python3 scripts/pipeline_review_local.py --selftest`
   asserts the three outcomes have three different exit codes, that a malformed findings
   file is reported unusable rather than silently reduced, and that the script constructs no

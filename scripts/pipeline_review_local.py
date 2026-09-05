@@ -350,6 +350,55 @@ def post_comment(pr, body, repo, dry_run):
         os.unlink(body_file)
 
 
+def _post_or_fail(pr, body, repo, dry_run):
+    """Post the comment; 0 on success, EXIT_USAGE when DELIVERY itself failed.
+
+    A failure to deliver the verdict is a documented I/O error announced on stderr — never
+    a traceback and never a silently uncommented PR.
+    """
+    try:
+        post_comment(pr, body, repo, dry_run)
+        return 0
+    except IOError as e:
+        sys.stderr.write(f"FAIL: could not post the review comment: {e}\n")
+        return EXIT_USAGE
+
+
+def diffstat(diff):
+    """A real per-file `+added -removed` summary from a unified diff.
+
+    The reviewer prompt tells the model REVIEW-STAT.txt carries "files and line counts", so
+    it must actually carry them — a list of `diff --git` headers alone (the earlier version)
+    gave no size signal for judging whether a change is suspiciously large for its scope.
+    """
+    files, cur = [], None
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            if cur:
+                files.append(cur)
+            cur = {"path": None, "added": 0, "removed": 0}
+        elif cur is None:
+            continue
+        elif line.startswith("+++ b/"):
+            cur["path"] = line[6:]
+        elif line.startswith(("+++ ", "--- ", "@@")):
+            continue                      # diff headers are not content lines
+        elif line.startswith("+"):
+            cur["added"] += 1
+        elif line.startswith("-"):
+            cur["removed"] += 1
+    if cur:
+        files.append(cur)
+    named = [(f["path"] or "?", f["added"], f["removed"]) for f in files]
+    if not named:
+        return "(no files)"
+    w = max(len(p) for p, _, _ in named)
+    out = [f"{p.ljust(w)}  +{a} -{r}" for p, a, r in named]
+    ta, tr = sum(a for _, a, _ in named), sum(r for _, _, r in named)
+    out.append(f"{'TOTAL'.ljust(w)}  +{ta} -{tr}  ({len(named)} file(s))")
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
@@ -379,30 +428,41 @@ def review(args):
                "basis_tier": "inline"}
     basis = basis_from(raw)
 
-    if basis is None:
-        verdict = {"usable": False, "reason":
-                   "no review basis could be established (the ticket's acceptance criteria "
-                   "as of delegation time were not available)"}
-        body = render_comment(verdict, ticket, None)
-        post_comment(args.pr, body, repo, args.dry_run)
-        sys.stderr.write("DECLINED: no basis.\n")
-        return exit_code_for(verdict)
+    def decline(reason, note):
+        # Every "could not review" path lands here: a distinct comment, a documented exit
+        # code, never a traceback and never a silently uncommented PR (§13). If posting the
+        # decline itself fails, that surfaces as EXIT_USAGE on stderr — still not silent.
+        verdict = {"usable": False, "reason": reason}
+        body = render_comment(verdict, ticket, basis or None)
+        sys.stderr.write(f"NOT REVIEWED: {note}\n")
+        return _post_or_fail(args.pr, body, repo, args.dry_run) or exit_code_for(verdict)
 
-    diff = pr_diff(args.pr, repo)
-    stat = "\n".join(l for l in diff.splitlines() if l.startswith("diff --git")) or "(no files)"
+    if basis is None:
+        return decline("no review basis could be established (the ticket's acceptance "
+                       "criteria as of delegation time were not available)", "no basis")
+
+    # A GitHub read failure here is "could not review", not a crash — route it to the same
+    # loud decline as any other outcome. (This gap was caught by the reviewer's own review
+    # of PR #63: pr_diff and post_comment were unguarded while pr_metadata was not.)
+    try:
+        diff = pr_diff(args.pr, repo)
+    except IOError as e:
+        return decline(f"the pull request diff could not be fetched ({e})", "diff unavailable")
+
+    stat = diffstat(diff)
     bundle = args.bundle_dir or tempfile.mkdtemp(prefix="stage-e-review-")
     os.makedirs(bundle, exist_ok=True)
     doc = run_reviewer(bundle, diff, stat, basis, threshold, args.model,
                        args.reviewer_cmd or None, args.timeout)
     verdict = classify(doc, threshold)
     body = render_comment(verdict, ticket, basis)
-    post_comment(args.pr, body, repo, args.dry_run)
+    rc = _post_or_fail(args.pr, body, repo, args.dry_run)
     if verdict["usable"]:
         sys.stderr.write(f"REVIEWED {ticket or args.pr}: {len(verdict['findings'])} "
                          f"finding(s), max {verdict['max_severity']}.\n")
     else:
         sys.stderr.write(f"NOT REVIEWED: {verdict['reason']}\n")
-    return exit_code_for(verdict)
+    return rc or exit_code_for(verdict)
 
 
 # --------------------------------------------------------------------------- #
@@ -494,6 +554,61 @@ def selftest():
     # 6. the exit-code contract itself
     check("exit-reviewed", EXIT_REVIEWED, 0)
     check("exit-not-reviewed-nonzero", EXIT_NOT_REVIEWED != 0, True)
+
+    # 7. The DRIVER, end to end, with stubbed I/O. review() is where the three decline
+    #    reasons get wired to a posted comment and an exit code, and it was invisible to
+    #    the test until PR #63's own review flagged it. Now every "could not review" path is
+    #    proven to post a distinct comment AND return a documented code — never a traceback.
+    posted = []
+    saved = {k: globals()[k] for k in ("pr_metadata", "pr_diff", "post_comment")}
+
+    def ns(**kw):
+        base = dict(pr=1, repo=None, ticket=None, team_key=["KIT"], basis_file=None,
+                    acceptance=None, out_of_scope=None, threshold="high", model="m",
+                    reviewer_cmd="none", bundle_dir=None, timeout=5, dry_run=False)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    try:
+        globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x"}
+        globals()["pr_diff"] = lambda pr, repo: "diff --git a/x b/x\n+++ b/x\n+a\n-b\n"
+        globals()["post_comment"] = lambda pr, body, repo, dry: posted.append(body)
+
+        posted.clear()                                    # no basis -> decline
+        check("driver-nobasis-exit", review(ns()), EXIT_NOT_REVIEWED)
+        check("driver-nobasis-comment",
+              len(posted) == 1 and "was NOT reviewed" in posted[0], True)
+
+        posted.clear()                                    # diff fetch fails -> decline, not a crash
+        globals()["pr_diff"] = lambda pr, repo: (_ for _ in ()).throw(IOError("boom"))
+        check("driver-difffail-exit", review(ns(acceptance=["do it"])), EXIT_NOT_REVIEWED)
+        check("driver-difffail-comment",
+              len(posted) == 1 and "was NOT reviewed" in posted[0], True)
+
+        posted.clear()                                    # reviewer produced nothing -> unusable
+        globals()["pr_diff"] = lambda pr, repo: "diff --git a/x b/x\n+++ b/x\n+a\n"
+        check("driver-noreviewer-exit", review(ns(acceptance=["do it"])), EXIT_NOT_REVIEWED)
+        check("driver-noreviewer-comment",
+              len(posted) == 1 and "was NOT reviewed" in posted[0], True)
+
+        bundle = tempfile.mkdtemp(prefix="stage-e-selftest-")   # clean review -> reviewed, exit 0
+        with open(os.path.join(bundle, "REVIEW-FINDINGS.json"), "w") as fh:
+            json.dump({"schema": "pipeline-review/1", "summary": "clean", "findings": []}, fh)
+        posted.clear()
+        check("driver-clean-exit", review(ns(acceptance=["do it"], bundle_dir=bundle)), EXIT_REVIEWED)
+        check("driver-clean-comment",
+              len(posted) == 1 and "Stage E review" in posted[0], True)
+
+        # delivery failure is a documented I/O error (exit 2), announced — never silent
+        globals()["post_comment"] = lambda pr, body, repo, dry: (_ for _ in ()).throw(IOError("no net"))
+        check("driver-postfail-exit", review(ns()), EXIT_USAGE)
+    finally:
+        globals().update(saved)
+
+    # 8. diffstat carries real counts, not just file names
+    ds = diffstat("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n+one\n+two\n-old\n")
+    check("diffstat-counts", "+2 -1" in ds, True)
+    check("diffstat-empty", diffstat(""), "(no files)")
 
     if failures:
         print("FAIL pipeline_review_local selftest:")
