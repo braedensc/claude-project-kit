@@ -157,7 +157,7 @@ So which layer actually carries which guarantee:
 | No destructive local op | `rm -rf` matcher | the blast radius being a disposable worktree; git history for anything committed |
 | Nothing lands on `main` | push guard | **branch protection** (server-side, GitHub) |
 | Claude never merges | `gh pr merge` matcher | **branch protection + the platform merge gate**, in repository settings, outside the repo tree |
-| An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** |
+| An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** — ⚠️ **not currently switched on here; see below** |
 | A guard change is acknowledged by a person | protected-label matcher | **`scripts/check_grader_paths.py`**, which checks *who* applied the label, server-side |
 
 Every row's right-hand column is unreachable from a session. That is the design the
@@ -166,6 +166,21 @@ never-merge, self-approval and protected-label guards were each already document
 `pre-tool-use.py` as "a first line over command shapes, not an exhaustive denylist".
 What the measurement adds is the same honesty for the other three, and numbers behind
 all six.
+
+**One row's durable layer is not actually enabled, measured 2026-09-04.** The approval row
+names a branch-protection rule; the API says otherwise. On this repository `GET
+/branches/main/protection` omits `required_pull_request_reviews` entirely (its sub-endpoint
+still reports `1`, which is the inconsistency), and five consecutive pull requests — #57
+through #61 — were authored by one person, merged by that same person, and reviewed by
+nobody, under `enforce_admins: true`. A required review would have blocked all five. So
+that row is carried today by the hook matcher alone, which the table above rates advisory.
+
+This is not an outage: a person still merges every pull request by hand, and the merge
+guard blocks the agent in every spelling. It is a gap between what this file promises an
+adopter and what a fresh clone inherits. Whether a solo repository should require a review
+at all — a rule nobody can satisfy would be switched off within a day — is the open
+question in KIT-87, and this row should be rewritten once that is decided rather than
+quietly fixed.
 
 **Not measured (out of scope, KIT-36 step 1):** the Bash arm of *self-protection*
 (`_SELF_MUTATE_RE`) is built from the same regex scaffold and should be assumed to share

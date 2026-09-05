@@ -171,7 +171,8 @@ CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, telemetry, dashboard and weekly-review selftests,
-and secretlint on every PR. `main` is protected (that context required, admins enforced).
+and secretlint on every PR. `main` is protected: **three** contexts are required —
+**Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
 
 **A component that can do nothing must say which nothing it did.** *Nothing to do* and
 *could not do it* have opposite meanings and identical symptoms — no output, no error,
