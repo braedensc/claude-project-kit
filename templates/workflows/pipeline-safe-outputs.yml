@@ -231,8 +231,10 @@ jobs:
 
           API = "https://api.linear.app/graphql"
           # Hard caps. A runaway or hostile session must not be able to spray the
-          # tracker: bounded count, bounded size, at most one state move per run.
+          # tracker: bounded count, bounded size, at most one state move per run,
+          # at most three findings filed (contract §8 caps).
           MAX_REQUESTS, MAX_BODY, MAX_LABEL_OPS = 20, 16000, 10
+          MAX_CREATES, MAX_TITLE = 3, 200
 
           cfg = json.load(open("delivery.json"))
           if cfg.get("version") != 1:
@@ -242,6 +244,10 @@ jobs:
           label_ids = cfg["linear"]["labels"]["ids"]
           pinned = os.environ["PINNED_TICKET_ID"]
           team_key = cfg["linear"]["teamKey"]
+          # Opt-in: the `ticket-create` kind (§8's "Filing a finding") is available
+          # only when a project configures where findings land, who is notified,
+          # and the provenance label the executor — not the session — applies.
+          finding_cfg = (cfg["linear"].get("findingTicket") or None)
 
           def out(k, v):
               with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
@@ -309,7 +315,7 @@ jobs:
           # merge (§5/§6) — refuse them even if a caller passes them in.
           allowed_states -= {"raw", "ready", "done"}
 
-          errors, plan, telemetry_blocks = [], [], 0
+          errors, plan, telemetry_blocks, create_count = [], [], 0, 0
           seen_state_move = False
 
           for i, r in enumerate(reqs):
@@ -319,11 +325,14 @@ jobs:
               rtype = r.get("type")
 
               # THE central check: the agent names a ticket; we compare it to the
-              # pin and never use it. A mismatch is an attempted retarget.
-              tid = r.get("ticket_id")
+              # pin and never use it. A mismatch is an attempted retarget. A
+              # ticket-create names its SOURCE ticket the same way — the created
+              # ticket's own id is the tracker's to assign, never the session's.
+              tid = r.get("source_ticket_id") if rtype == "ticket-create" else r.get("ticket_id")
               if tid != pinned:
-                  errors.append("%s targets ticket %r but this session is pinned to %r"
-                                % (tag, tid, pinned))
+                  field = "source_ticket_id" if rtype == "ticket-create" else "ticket_id"
+                  errors.append("%s %s is %r but this session is pinned to %r"
+                                % (tag, field, tid, pinned))
                   continue
 
               if rtype == "ticket-comment":
@@ -376,6 +385,51 @@ jobs:
                       plan.append(("label-add", label_ids[k]))
                   for k in rm:
                       plan.append(("label-remove", label_ids[k]))
+
+              elif rtype == "ticket-create":
+                  # §8 "Filing a finding". The session NEVER creates the ticket
+                  # or sets any field that carries authority — state, provenance,
+                  # assignee are the executor's below. Here we validate only what
+                  # the session is allowed to author: a title, a body, and
+                  # ordinary labels to propose.
+                  if not finding_cfg:
+                      errors.append("%s: ticket-create is not enabled — linear.findingTicket "
+                                    "is not configured, so a session files no tickets on this "
+                                    "project (contract §8). Report the finding as a comment."
+                                    % tag); continue
+                  create_count += 1
+                  if create_count > MAX_CREATES:
+                      errors.append("%s: more than %d findings filed in one run — a session "
+                                    "reports what it met, it does not generate a backlog "
+                                    "(§8 caps)" % (tag, MAX_CREATES)); continue
+                  title = r.get("title")
+                  if not isinstance(title, str) or not title.strip():
+                      errors.append("%s: finding title must be a non-empty string" % tag); continue
+                  if len(title) > MAX_TITLE:
+                      errors.append("%s: finding title %d chars exceeds %d" % (tag, len(title), MAX_TITLE)); continue
+                  body = r.get("body")
+                  if not isinstance(body, str) or not body.strip():
+                      errors.append("%s: finding body must be a non-empty string" % tag); continue
+                  if len(body) > MAX_BODY:
+                      errors.append("%s: finding body %d chars exceeds %d" % (tag, len(body), MAX_BODY)); continue
+                  labels = r.get("labels") or []
+                  if not isinstance(labels, list):
+                      errors.append("%s: labels must be a list" % tag); continue
+                  if len(labels) > MAX_LABEL_OPS:
+                      errors.append("%s: too many labels" % tag); continue
+                  # A session cannot request provenance, supervision or hooks-change
+                  # on the ticket it files — the executor applies provenance:agent
+                  # itself, and nothing else in those classes is the session's to set.
+                  bad = [k for k in labels if k not in allowed_labels]
+                  if bad:
+                      errors.append("%s: labels %s are dispatcher/human-owned or unknown; a "
+                                    "filed finding carries provenance:agent, applied by the "
+                                    "executor, not the session (contract §5, §6)" % (tag, bad)); continue
+                  plan.append(("create", {
+                      "title": title,
+                      "body": body,
+                      "label_ids": [label_ids[k] for k in labels],
+                  }))
 
               else:
                   errors.append("%s: unknown request type %r" % (tag, rtype))
@@ -449,21 +503,59 @@ jobs:
 
           # Resolve the pinned identifier to Linear's UUID. Filtered by team key
           # + number so it is unambiguous, and it re-proves the ticket exists.
+          # The team UUID comes back too, because a filed finding is created in
+          # the SAME team as the session that met it.
           num = int(pinned.rsplit("-", 1)[1])
           found = gql("""
             query($teamKey: String!, $number: Float!) {
               issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $number } }, first: 1) {
-                nodes { id identifier }
+                nodes { id identifier team { id } }
               }
             }""", {"teamKey": team_key, "number": num})["issues"]["nodes"]
           if not found:
               die("pinned ticket %s not found in team %s" % (pinned, team_key))
           issue_uuid = found[0]["id"]
+          team_uuid = (found[0].get("team") or {}).get("id")
+
+          # ── Finding-ticket parameters, forced by the executor ────────────────
+          # Resolved once, only when a `ticket-create` is in the plan. Every value
+          # here is the executor's, not the session's: the landing state (backlog
+          # only), the provenance:agent label, the owner to notify. A config that
+          # cannot supply them is an ERROR (the batch validated; the tracker/config
+          # is what failed), never a silent skip (§13).
+          finding_state_id = provenance_agent_id = None
+          subscriber_ids, assignee_id = [], None
+          if any(kind == "create" for kind, _ in plan):
+              landing = (finding_cfg or {}).get("landing")
+              finding_state_id = state_ids.get(landing)
+              if not finding_state_id:
+                  errored("linear.findingTicket.landing %r does not resolve in linear.stateIds "
+                          "— cannot file a finding into a state that does not exist." % landing)
+              provenance_agent_id = label_ids.get("provenance:agent")
+              if not provenance_agent_id:
+                  errored("linear.labels.ids has no `provenance:agent` — the executor cannot "
+                          "mark a filed finding as agent-filed, so it refuses to file one "
+                          "unmarked (contract §5, §6).")
+              owner = (finding_cfg or {}).get("ownerUserId")
+              if not owner:
+                  errored("linear.findingTicket.ownerUserId is unset — a finding nobody is "
+                          "notified about is a finding that dies in the backlog.")
+              notify = (finding_cfg or {}).get("notify") or "subscribe"
+              if notify in ("subscribe", "both"):
+                  subscriber_ids = [owner]
+              if notify in ("assign", "both"):
+                  assignee_id = owner   # the OWNER — never the session's own identity
 
           M_COMMENT = "mutation($issueId: String!, $body: String!) { commentCreate(input: {issueId: $issueId, body: $body}) { success } }"
           M_STATE = "mutation($id: String!, $stateId: String!) { issueUpdate(id: $id, input: {stateId: $stateId}) { success } }"
           M_ADD = "mutation($id: String!, $labelId: String!) { issueAddLabel(id: $id, labelId: $labelId) { success } }"
           M_RM = "mutation($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }"
+          M_CREATE = ("mutation($teamId: String!, $title: String!, $description: String!, "
+                      "$stateId: String!, $labelIds: [String!], $subscriberIds: [String!], "
+                      "$assigneeId: String) { issueCreate(input: {teamId: $teamId, title: $title, "
+                      "description: $description, stateId: $stateId, labelIds: $labelIds, "
+                      "subscriberIds: $subscriberIds, assigneeId: $assigneeId}) "
+                      "{ success issue { identifier url } } }")
 
           for kind, value in plan:
               if kind == "comment":
@@ -474,6 +566,26 @@ jobs:
                   gql(M_ADD, {"id": issue_uuid, "labelId": value})
               elif kind == "label-remove":
                   gql(M_RM, {"id": issue_uuid, "labelId": value})
+              elif kind == "create":
+                  # The executor sets identity, state, provenance and notification;
+                  # the session supplied only title, body and ordinary labels.
+                  desc = ("> Filed by an agent session while working **%s**. "
+                          "Origin: `provenance:agent` (contract §8). Lands in the backlog, "
+                          "unreviewed, awaiting a person — it approves nothing and starts "
+                          "no session.\n\n%s" % (pinned, value["body"]))
+                  created = gql(M_CREATE, {
+                      "teamId": team_uuid,
+                      "title": value["title"],
+                      "description": desc,
+                      "stateId": finding_state_id,
+                      "labelIds": [provenance_agent_id] + value["label_ids"],
+                      "subscriberIds": subscriber_ids,
+                      "assigneeId": assignee_id,
+                  })["issueCreate"]
+                  ident = (created.get("issue") or {}).get("identifier") or "?"
+                  print("  applied: create -> %s (provenance:agent, backlog)" % ident)
+                  applied += 1
+                  continue
               applied += 1
               print("  applied: %s" % kind)
 

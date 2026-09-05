@@ -3,7 +3,7 @@
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/safe-outputs.schema.json",
   "title": "Safe-outputs request file",
   "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §8 — the write-REQUESTS a session emits in place of holding a tracker credential. A separate job that does hold the credential validates them against the dispatcher-supplied pinned ticket ID and executes only the survivors.",
-  "$comment": "EVERY FIELD HERE IS REPORTING, NEVER A FACT. Conforming to this schema earns a batch nothing: §8's validation rules run before any request executes, and they are the part that matters — every ticket_id must equal the DISPATCHER-SUPPLIED pinned ID; at most one ticket-state per run; raw/ready/done are never valid targets even when a caller passes them in allowed_to_states; agent:*, blocked:capacity, provenance:* and hooks-change are refused in add AND remove; add+remove ≤ 10 per request; exactly one telemetry block across all comments when required. None of those is expressible in a schema, and one invalid request rejects the ENTIRE batch.",
+  "$comment": "EVERY FIELD HERE IS REPORTING, NEVER A FACT. Conforming to this schema earns a batch nothing: §8's validation rules run before any request executes, and they are the part that matters — every ticket_id (and a ticket-create's source_ticket_id) must equal the DISPATCHER-SUPPLIED pinned ID; at most one ticket-state and at most 3 ticket-create per run; raw/ready/done are never valid targets even when a caller passes them in allowed_to_states; agent:*, blocked:capacity, provenance:* and hooks-change are refused in add AND remove (and in a ticket-create's labels); a filed finding lands in the backlog carrying provenance:agent, applied BY THE EXECUTOR, never requested by the session; add+remove ≤ 10 per request; exactly one telemetry block across all comments when required. None of those is expressible in a schema, and one invalid request rejects the ENTIRE batch.",
 
   "type": "object",
   "required": ["schema", "requests"],
@@ -22,7 +22,8 @@
         "oneOf": [
           {"$ref": "#/$defs/ticketComment"},
           {"$ref": "#/$defs/ticketState"},
-          {"$ref": "#/$defs/ticketLabel"}
+          {"$ref": "#/$defs/ticketLabel"},
+          {"$ref": "#/$defs/ticketCreate"}
         ]
       }
     }
@@ -76,6 +77,33 @@
         "ticket_id": {"$ref": "#/$defs/ticketId"},
         "add": {"$ref": "#/$defs/labelList"},
         "remove": {"$ref": "#/$defs/labelList"}
+      }
+    },
+
+    "ticketCreate": {
+      "type": "object",
+      "required": ["type", "source_ticket_id", "title", "body"],
+      "additionalProperties": false,
+      "description": "Ask a credential-holding executor to FILE a follow-up finding ticket. The session never creates the ticket itself: it names its OWN pinned ticket as `source_ticket_id` (compared to the pin, never used to address anything), and the executor creates a NEW ticket in the backlog (linear.findingTicket.landing), applies `provenance:agent`, notifies the owner, and refuses every dispatcher/human-owned label — none of which the session can set. At most 3 per run, and unavailable unless linear.findingTicket is configured (§8 caps).",
+      "properties": {
+        "type": {"const": "ticket-create"},
+        "source_ticket_id": {"$ref": "#/$defs/ticketId"},
+        "title": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 200,
+          "description": "One line: the finding stated as a title. The executor is the only party that sets the new ticket's identity, state, provenance and assignee."
+        },
+        "body": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 16000,
+          "description": "Non-empty markdown — what was found, where, and why it was out of scope. The executor prepends a provenance line naming the filing session's source ticket, so the new ticket always carries where it came from."
+        },
+        "labels": {
+          "$ref": "#/$defs/labelList",
+          "description": "Optional ordinary labels to propose (track:*, effort:*). Dispatcher/human-owned classes (agent:*, blocked:*, provenance:*, hooks-change) are excluded by labelList and refused by the executor. `provenance:agent` is applied BY THE EXECUTOR, never requested here — a session that could request its own provenance is the shape §5 exists to prevent."
+        }
       }
     },
 

@@ -55,14 +55,14 @@ BEGIN_MARKER = "<!-- BEGIN TICKET TEMPLATE -->"
 END_MARKER = "<!-- END TICKET TEMPLATE -->"
 
 EFFORTS = ("effort:S", "effort:M", "effort:L")
-PROVENANCE_CLASSES = ("epic", "monitor", "review", "retro-proposal", "human")
+PROVENANCE_CLASSES = ("epic", "monitor", "review", "retro-proposal", "human", "agent")
 # Dispatcher-owned lifecycle labels (contract §6). A session setting one is a
 # session editing its own supervision.
 FORBIDDEN_LABEL_RE = re.compile(r"^(agent:|blocked:capacity$)")
 
 TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
 PROVENANCE_RE = re.compile(
-    r"^(epic/[A-Z][A-Z0-9]*-\d+|monitor|review|retro-proposal|human)$"
+    r"^(epic/[A-Z][A-Z0-9]*-\d+|monitor|review|retro-proposal|human|agent)$"
 )
 HEADING_RE = re.compile(r"^##\s+(\S.*?)\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")

@@ -76,7 +76,7 @@
         "track": {"type": ["string", "null"], "pattern": "^track:", "description": "From the track:* label (§6). NULL when the ticket carried none — the same 'there is no value here' idiom this schema already uses for subject and ticket, and a faithful snapshot beats an invented default. A ticket without a track:* label is a Definition-of-Ready failure the gate is supposed to have caught (§7); the pin records that it happened rather than papering over it."},
         "provenance": {
           "type": "string",
-          "pattern": "^(epic/[A-Za-z0-9._-]+|monitor|review|retro-proposal|human)$",
+          "pattern": "^(epic/[A-Za-z0-9._-]+|monitor|review|retro-proposal|human|agent)$",
           "description": "The FULL value including the epic ID (§5 rule 4) — the label carries only the class. Guards match this, not the label."
         },
         "title": {"type": "string", "pattern": "\\S"},

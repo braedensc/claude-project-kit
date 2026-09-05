@@ -85,6 +85,34 @@
               "x-fix": "An array of canonical label keys from §6. Every entry must have an entry in labels.ids that resolves to a real ID — guards compare IDs, never display names (§1, §6). Must include §6's dispatcher-owned set (agent:queued, agent:working, agent:blocked, agent:needs-human, blocked:capacity) — a project may require more, never fewer (§7)."
             }
           }
+        },
+        "findingTicket": {
+          "type": "object",
+          "required": ["landing", "notify", "ownerUserId"],
+          "additionalProperties": false,
+          "x-tier-additionalProperties": "warning",
+          "x-rule": "linear.findingTicket",
+          "description": "Opt-in: enables the safe-outputs `ticket-create` kind (§8's \"Filing a finding\"). Absent → a session cannot file findings and reports them as ticket comments instead.",
+          "x-fix": "§8: to let a working session file follow-up findings, give the state they land in (backlog only), how the owner is notified, and the owner's Linear user id. The executor — never the session — applies provenance:agent and these fields.",
+          "properties": {
+            "landing": {
+              "enum": ["raw"],
+              "x-rule": "linear.findingTicket.landing",
+              "description": "The canonical state key a filed finding lands in — the backlog/intake state only. `ready` would be self-approval; `working`/`review`/`done` are not where an unreviewed finding belongs (§5, §8).",
+              "x-fix": "Use \"raw\" — the backlog/intake state. No other value is permitted: a finding must land unreviewed."
+            },
+            "notify": {
+              "enum": ["subscribe", "assign", "both"],
+              "x-rule": "linear.findingTicket.notify",
+              "description": "How the owner is notified: subscribe (a Linear notification), assign (owner becomes assignee), or both. The new ticket is never assigned to the session's own identity."
+            },
+            "ownerUserId": {
+              "type": "string",
+              "pattern": "\\S",
+              "x-rule": "linear.findingTicket.ownerUserId",
+              "description": "The Linear user id notified on each filed finding. A person, never the session."
+            }
+          }
         }
       }
     },

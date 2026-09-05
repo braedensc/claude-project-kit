@@ -258,8 +258,15 @@ The loop, when it *is* on:
 5b. **A finding is not a blocker.** Something true but outside the ticket — a stale
    comment, a wrong id in a file you weren't asked to touch — goes in a **ticket comment**,
    not a widened diff and not the PR body. A PR body is read once at review and then never
-   again; the finding dies with the merge. A session cannot file its own follow-up ticket
-   (safe-outputs has no such kind, and refuses `provenance:*`) — it reports, a person files.
+   again; the finding dies with the merge. **You never create a ticket directly.** Where
+   the project configures a finding executor (`linear.findingTicket`), you *request* a
+   follow-up ticket via the safe-outputs `ticket-create` kind (§8) and a credential-holding
+   executor files it into the **backlog** as `provenance:agent`, notifies the owner, and
+   refuses every protected label — none of which you can set; it never enters `ready` and
+   starts no session. Where no executor is configured — **this repo has no `delivery.json`,
+   so that is the case here** — report the finding as a ticket comment as before; a person
+   files. Either way the discipline holds: don't widen the diff, and `provenance:*`,
+   `agent:*`, `blocked:*` and `hooks-change` are never yours to apply.
 6. **Run the local gate** from `delivery.json` → `commands`, then `/ship`. Local
    green is necessary, not sufficient — CI is the real gate, and you still never merge.
 7. **Emit the telemetry block** (§4) on *every* terminal path, including escalations. It

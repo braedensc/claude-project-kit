@@ -27,6 +27,7 @@
         "provenance:review": "",
         "provenance:retro-proposal": "",
         "provenance:human": "",
+        "provenance:agent": "",
         "hooks-change": "",
         "meta": ""
       },
@@ -37,6 +38,11 @@
         "provenance:epic", "provenance:human",
         "hooks-change"
       ]
+    },
+    "findingTicket": {
+      "landing": "raw",
+      "notify": "subscribe",
+      "ownerUserId": "{{LINEAR_OWNER_USER_ID}}"
     }
   },
 

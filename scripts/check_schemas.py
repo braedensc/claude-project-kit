@@ -494,6 +494,11 @@ VALID_SAFE_OUTPUTS = {
         {"type": "ticket-state", "ticket_id": "ENG-123", "to": "review"},
         {"type": "ticket-label", "ticket_id": "ENG-123",
          "add": ["needs-design"], "remove": []},
+        {"type": "ticket-create", "source_ticket_id": "ENG-123",
+         "title": "notify.yml cites a pre-renumber migration id",
+         "body": "Found while working ENG-123: notify.yml:5 names a migration id "
+                 "that was renumbered. Out of this ticket's file list.",
+         "labels": ["needs-design"]},
     ],
 }
 
@@ -577,6 +582,16 @@ FIXTURES = [
     ("safe-outputs", "oversized-batch",
      _with(VALID_SAFE_OUTPUTS, "requests",
            [VALID_SAFE_OUTPUTS["requests"][0]] * 21), False, "maxItems"),
+    ("safe-outputs", "ticket-create-empty-title",
+     _with(VALID_SAFE_OUTPUTS, "requests.3.title", "  "), False, "pattern"),
+    ("safe-outputs", "ticket-create-missing-body",
+     _without(VALID_SAFE_OUTPUTS, "requests", 3, "body"), False, "required"),
+    ("safe-outputs", "ticket-create-requests-provenance-label",
+     _with(VALID_SAFE_OUTPUTS, "requests.3.labels", ["provenance:agent"]), False, "pattern"),
+    ("safe-outputs", "ticket-create-requests-hooks-change",
+     _with(VALID_SAFE_OUTPUTS, "requests.3.labels", ["hooks-change"]), False, "pattern"),
+    ("safe-outputs", "ticket-create-unknown-field",
+     _with(VALID_SAFE_OUTPUTS, "requests.3.assignee", "me"), False, "additionalProperties"),
 
     ("review-findings", "valid", VALID_REVIEW_FINDINGS, True, None),
     ("review-findings", "clean-review-is-an-empty-list",

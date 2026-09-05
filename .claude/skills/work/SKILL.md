@@ -328,16 +328,27 @@ and simply noticed something true and unrelated — a stale line in a file you w
 to touch, a comment citing an id that has since changed. Do **not** widen the diff to fix
 it, and do **not** escalate: the ticket is not blocked.
 
-Queue it as a `ticket-comment` instead, alongside your summary. Say what you found, where,
-and why it was out of scope. **A PR body is the wrong home for it** — a PR body is read once
-at review and then never again, so once the PR merges the finding is gone: not on the
-ticket, not in the backlog, not anywhere `/weekly-review` reads. A ticket comment survives
-where a person will see it.
+Queue it as a `ticket-comment` alongside your summary — say what you found, where, and why
+it was out of scope. **A PR body is the wrong home for it** — a PR body is read once at
+review and then never again, so once the PR merges the finding is gone: not on the ticket,
+not in the backlog, not anywhere `/weekly-review` reads. A ticket comment survives where a
+person will see it.
 
-You **cannot** file the follow-up ticket yourself, and should not want to. Safe-outputs has
-no create-ticket kind and refuses `provenance:*` in `add` and `remove` alike (§8), because a
-session that files its own follow-up work is generating its own future backlog — the same
-shape §5 exists to prevent. You report; a person decides whether it becomes a ticket.
+**Where the project runs a finding executor** (`linear.findingTicket` is set), you may also
+*request* a follow-up ticket with the safe-outputs `ticket-create` kind (§8): give a `title`
+and `body`, name your own pinned ticket as `source_ticket_id`, and a credential-holding
+executor files it into the **backlog** carrying `provenance:agent`, notifies the owner, and
+records where it came from. At most three per run. You **never create the ticket yourself**,
+and you set none of the fields that carry authority — the executor forces the state
+(backlog, never `ready`), the provenance (`provenance:agent`, never `provenance:human`) and
+the assignee (the owner, never you). Requesting a `provenance:*`, `agent:*`, `blocked:*` or
+`hooks-change` label on it is refused, because a session minting its own signal is the shape
+§5 exists to prevent. The filed finding approves nothing and starts no session — a person
+still triages it.
+
+**Where no executor is configured**, there is no `ticket-create` path: the `ticket-comment`
+is the whole channel, and a person decides whether it becomes a ticket. Either way you never
+hold the create.
 
 A PR touching `.claude/hooks/**` or `.claude/settings*.json` additionally needs the
 `hooks-change` label before its required CI job can pass — and that label is **set by a

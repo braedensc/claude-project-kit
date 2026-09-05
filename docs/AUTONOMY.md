@@ -437,12 +437,13 @@ All must pass, and all are recomputed from something a session cannot write:
 
 ### Why only `epic/*`
 
-`monitor`, `review`, `retro-proposal` and `human` never auto-approve. That is not a
-stylistic preference — those four are the classes an agent, or anything that can trip a
-probe or influence a diff, can cause to be filed. If any of them could approve itself,
-the pipeline could widen its own mandate by writing a ticket, and *"file a ticket asking
-for X"* is a capability every one of those paths has. `epic/*` is the only class whose
-approval traces back to something a person did.
+`monitor`, `review`, `retro-proposal`, `human` and `agent` never auto-approve. That is not
+a stylistic preference — those are the classes an agent, or anything that can trip a
+probe or influence a diff, can cause to be filed; `agent` most directly of all, since a
+working session files it as a follow-up finding (contract §8). If any of them could
+approve itself, the pipeline could widen its own mandate by writing a ticket, and *"file a
+ticket asking for X"* is a capability every one of those paths has. `epic/*` is the only
+class whose approval traces back to something a person did.
 
 ### Turning it on
 
