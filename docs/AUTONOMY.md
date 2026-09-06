@@ -79,6 +79,13 @@ Tier 0's column is deliberate, and [spelled out below](#tier-0--local-and-why-it
 nothing meters a human's own session, which is why `--attempt N` exists so a re-run can
 say which attempt it is honestly. It is the last column that surprises people.
 
+> **That last column is a deployed shape, not a thought experiment.** A dispatcher that
+> binds sessions by *a named person delegating a ticket* writes no pin, so it lands in that
+> column entire — and it is what a `local-daemon` backend looks like today
+> ([ADR 2026-09-05](adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md)). Read
+> the column as the live answer for that lane, and the tier-0 and tier-1 columns as what
+> you get by dispatching through something that writes a pin.
+
 ### The last column: a daemon that starts sessions from tracker events
 
 A daemon that watches the tracker, creates a worktree on assignment and starts a session
@@ -235,6 +242,12 @@ the other end: `/fix-ci` pushes and then watches a CI run that never starts.
 
 So the dispatcher and the bounce workflow push under a **different identity**, and both
 refuse to start (green, with a warning) until one is configured.
+
+> **This whole section describes the `github-actions` backend's chain.** A dispatcher-side
+> lane has the same *need* — a session's own token must not be the one that opens the PR,
+> or nothing downstream observes it — but its review and bounce are launched by a poller
+> rather than by `workflow_run`, so the specific dead-chain symptom above is a CI-backend
+> failure mode ([ADR 2026-09-05](adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md)).
 
 ### Option A — a GitHub App (preferred)
 
@@ -575,7 +588,7 @@ acts on comes from the side that owns the loop.*
 | `first_commit` | `agent` | the session, in its own §4 block | It made the commit; the timestamp is `git log`, not recollection. |
 | `pr_opened` | `agent` | the session — **and** the platform observer | Reported twice on purpose: the observer covers a run that died before it could report. Same natural key, so the store keeps one row. |
 | `ci_green` | `system` | the platform observer | Every check run on the head commit finished, none badly. Observed, never claimed. |
-| `review_posted` | `system` | `pipeline-review.yml`, beside the findings | The bounce *acts* on those findings, so the row comes from CI, not from the model that wrote the prose. |
+| `review_posted` | `system` | whichever review lane ran — `pipeline-review.yml` on the `github-actions` backend, the local reviewer's deterministic publisher on a dispatcher-side one | The bounce *acts* on those findings, so the row comes from the publisher, never from the model that wrote the prose. |
 | `bounce_started` | `system` | the bounce workflow | It owns `budgets.maxBounces` and the counter behind it. |
 | `merged` | `human` / `system` | the platform observer | §4 states it outright: **`merged` is never `agent`.** The collector refuses that row rather than skipping it, because believing it would corrupt every autonomy metric downstream. |
 | `deployed` | `system` | the deploy workflow | A deploy is a fact about an environment, not about a session. |

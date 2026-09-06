@@ -148,8 +148,13 @@ npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
 npm run test:emit       # generation-side gate: every producer REFUSES to write a malformed doc
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
+npm run test:block      # telemetry block builder + the telemetry-required gate (§4, §8)
+npm run test:lifecycle  # platform observer selftest (§4, §10)
 npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
+npm run test:review-local    # Stage E local reviewer: comment-only, decline ≠ clean (§13, §14)
+npm run test:jsonschema # vendored JSON Schema validator selftest
+npm run test:schemas    # schema ⇄ contract parity selftest
 npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selftest
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
@@ -231,14 +236,22 @@ inventing a second shape.
 
 The loop, when it *is* on:
 
-1. **The pin is the only authority.** The dispatcher writes it outside every worktree
-   before the session starts. **Everything the session can write is reporting, not
-   authority** — the branch name, PR body, ticket comments, env vars, any file in the
-   worktree. Treat the branch name as cosmetic; a guard that reads a value the agent
-   could have written is not a guard. A **human** can write one by hand for a local
-   session (`scripts/pipeline_dispatch_local.py`, tier 0 in `docs/AUTONOMY.md`) — that
-   script refuses to run in an agent environment, and **you must never invoke it**:
-   a session that places its own binding is the attack the pin exists to prevent.
+1. **The binding is the only authority, and the session never writes it.** A
+   *pin-writing* dispatcher (tier 0, or the `github-actions` backend) puts a pin file
+   outside every worktree before the session starts. A dispatcher that binds by *a named
+   person delegating the ticket* writes no file — the same doctrine by a different route,
+   since a delegation is also a value the session cannot forge
+   (`docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`). **Everything
+   the session can write is reporting, not authority** — the branch name, PR body, ticket
+   comments, env vars, any file in the worktree. Treat the branch name as cosmetic; a
+   guard that reads a value the agent could have written is not a guard. A **human** can
+   write a pin by hand for a local session (`scripts/pipeline_dispatch_local.py`, tier 0
+   in `docs/AUTONOMY.md`) — that script refuses to run in an agent environment, and **you
+   must never invoke it**: a session that places its own binding is the attack the pin
+   exists to prevent. What a delegation binding does *not* carry is the pin's other
+   cargo — the budget, the mode and the dispatch-time snapshot of the acceptance criteria
+   — so on that lane those are unenforced rather than merely unread (`docs/AUTONOMY.md`
+   § *Which limits hold under which dispatcher*).
 2. **Branch as `<type>/<ticket-id-lowercased>-<slug>`** (`feat/eng-123-token-refresh`).
    The branch-naming guard is `[a-z0-9-]` only, so **the team key must be
    lower-cased** — `feat/ENG-123-…` is blocked before the first edit.

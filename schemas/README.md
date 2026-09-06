@@ -8,10 +8,10 @@ second *rendering* of the one that already existed.
 | Schema | Defines | Written by | Read by |
 |---|---|---|---|
 | [`delivery.schema.json`](delivery.schema.json) | §1 `delivery.json` | human (bootstrap), `/setup-board` | dispatcher, hooks, skills, CI, collectors |
-| [`pin.schema.json`](pin.schema.json) | §3 pin file | the dispatcher | hooks, validators |
-| [`telemetry-block.schema.json`](telemetry-block.schema.json) | §4 telemetry block | the session agent, the review workflow | **the safe-outputs validator**, the collector, dashboards |
+| [`pin.schema.json`](pin.schema.json) | §3 pin file | a pin-writing dispatcher (tier 0, `github-actions`) | hooks, validators |
+| [`telemetry-block.schema.json`](telemetry-block.schema.json) | §4 telemetry block | the session agent, the review lane's publisher | **the safe-outputs validator**, the collector, dashboards |
 | [`safe-outputs.schema.json`](safe-outputs.schema.json) | §8 safe-outputs request file | the session agent | the safe-outputs validator |
-| [`review-findings.schema.json`](review-findings.schema.json) | §14 review findings file | the review session | the review workflow's normalizer, then the bounce and merge tiers |
+| [`review-findings.schema.json`](review-findings.schema.json) | §14 review findings file | the review session | the review lane's normalizer — the workflow on `github-actions`, `scripts/pipeline_review_local.py` on a dispatcher-side lane — then the bounce and merge tiers |
 
 **Every one of them is enforced at write time, not only in CI.** A producer validates
 what it is about to write and refuses to write a document that does not conform — see
@@ -82,7 +82,7 @@ and the two are not interchangeable:
   `outputFormat: { type: 'json_schema', schema }`.
 - **The model writes a file with a tool** — neither of those binds a tool call, so the
   document is refused at the boundary that reads it instead. §14's findings file is this
-  case, and its gate is the review workflow's normalize step.
+  case, and its gate is the review lane's normalize step.
 
 When the boundary lives under a ref an agent could have written, **stage the schema and
 the validator from the default branch**: a PR that can loosen the schema its own review
