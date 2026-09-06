@@ -37,14 +37,14 @@ They share a state directory and nothing else. Neither imports the other.
    — the ticket's acceptance criteria and out-of-scope as of delegation
    (`scripts/pipeline_review_basis.py`). No basis ⇒ it declines, loudly, with a PR comment
    that says *NOT reviewed*.
-3. It **asks Linear first** whether a review ticket for this PR already exists, and reuses
-   it if so. Then it **sanitizes** every string it copies — strips the dispatcher's routing
-   and model tags (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the
-   fence tags — and creates **and delegates**, in one Linear `issueCreate` carrying
-   `delegateId`, a review ticket in the **Reviews** team. The ticket body is the reviewer's
-   whole world: brief, criteria, threshold, output shape, and the diff inlined under a size
-   cap. It is never parented. It names the PR as `owner/repo#N` and never as a link, so
-   nothing can auto-attach it.
+3. It **sanitizes** every string it copies — strips the dispatcher's routing and model tags
+   (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. Then,
+   **before it creates anything**, it asks Linear whether a review ticket for this PR
+   already exists, and reuses it if so. Otherwise it creates **and delegates**, in one
+   Linear `issueCreate` carrying `delegateId`, a review ticket in the **Reviews** team. The
+   ticket body is the reviewer's whole world: brief, criteria, threshold, output shape, and
+   the diff inlined under a size cap. It is never parented. It names the PR as
+   `owner/repo#N` and never as a link, so nothing can auto-attach it.
 4. **The dispatcher** sees a delegation by the owner, routes it by team key to the Reviews
    entry, cuts a worktree from the default branch, and starts a session with **no Bash,
    Edit, Write or fetch tools**. The reviewer reads the ticket body and answers with one
@@ -250,7 +250,10 @@ Everything the two scripts remember lives under `~/.stage-e/state`:
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
-| `declines/`, `rereview/`, `telemetry/`, `bounces/` | both | said-once records and telemetry artifacts |
+| `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
+| `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | left after a bounce, so the poller may re-review the next push |
+| `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
+| `bounces/` | bounce driver | its telemetry artifacts |
 
 Never point `state_dir` at a repo checkout or a worktree. The bounce driver refuses one
 inside a git working tree: the ledger is the budget authority and a worktree is writable by
@@ -358,6 +361,17 @@ prints this and lists every key it accepts:
   out the ones it cannot — on a kit-derived repo, the grader-floor guard waits for a
   person's label. Leave the key out entirely and a whole bounce budget is spent on a check
   the session cannot fix.
+- **On most repositories that entry is mandatory, not merely useful.** The driver unions
+  the branch rulesets with classic branch protection. Rulesets read with plain repository
+  access; classic protection needs *Administration: read*, which the token above
+  deliberately does not have. A repository that keeps its required contexts in classic
+  protection therefore answers `403`, the required set is **unknown**, and every pass
+  reports *CANNOT EVALUATE*, comments on the PR and exits 2 — until you add the entry or
+  grant the token *Administration: read*. A repository with an entry can never reach
+  unknown.
+- `in_flight_hours` is a per-head cooldown, default 6. After a bounce is sent, the driver
+  waits that long before bouncing the same PR head again, so a session that has not yet
+  pushed is not re-prompted.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
   `delivery.json`.
 
@@ -365,7 +379,8 @@ Both files hold **names of environment variables**, never a value. The loaders r
 value that does not look like a variable name.
 
 **Nothing validates the driver's ids.** Its `validate_config` checks the two credential
-*names* and the two timeouts, and stops there. `reviews_team_id`, `dispatcher_app_user_id`,
+*names*, quietly resets `in_flight_hours` and `run_timeout_seconds` when they are not
+sensible numbers, and stops there. `reviews_team_id`, `dispatcher_app_user_id`,
 `model_label_id` and `dispatcher_repo_names` are loaded exactly as written. A config still
 carrying a fill-in placeholder loads clean and runs green for weeks; the string is first
 used the day a session cannot be resumed and a fallback fix ticket has to be minted — the
@@ -472,12 +487,22 @@ ticket, in the tracker.
 would do. With no outcomes yet it says so in words, and exits 0.
 
 The publisher has its own dry run, if you want to see a comment rendered from a block you
-saved by hand:
+saved by hand. Give it the criteria the reviewer was given: `--acceptance` once per
+criterion, and `--out-of-scope` the same way.
 
 ```bash
 python3 <scripts dir>/pipeline_review_local.py --pr <n> --repo OWNER/REPO \
-  --findings-file <the reviewer's saved response body> --dry-run
+  --findings-file <the reviewer's saved response body> \
+  --acceptance "<one acceptance criterion>" --acceptance "<the next one>" \
+  --out-of-scope "<one out-of-scope item>" --dry-run
 ```
+
+Add `--ticket <ID>` when the PR's branch carries no ticket id. `--basis-file <file>` takes
+the resolver's JSON instead, when you have it.
+
+**Without a basis the publisher refuses.** Pass neither flag and it renders the *NOT
+reviewed* decline and exits 3, because an empty basis is not a lenient review. Drop
+`--dry-run` from that and you have posted a decline on a real PR.
 
 ---
 
@@ -580,8 +605,8 @@ nor `--all`: it is the daemon's whole pass.
   `budgets.reviewSeverityThreshold` are read from `delivery.json` on the repo's
   **committed default branch**, fetched fresh. If that file is absent the bounce tier is
   **off and the driver says so** — do not give it a copy of its own. Present but
-  unreadable, or missing a valid `maxBounces`, is **broken**: exit 2, and it refuses
-  loudly.
+  unreadable, not a `version: 1` document, or missing a valid `maxBounces`, is **broken**:
+  exit 2, and it refuses loudly.
 - **The ledger** is `state/bounce-ledger.jsonl`, append-only, keyed by PR. The row is
   written **before** the comment is sent, so a crash costs one unsent bounce and never an
   under-count. A ledger that cannot be read, or that carries a malformed line, is refused —
@@ -592,20 +617,24 @@ nor `--all`: it is the daemon's whole pass.
   ledger does not have makes the driver refuse; it can never grant one.
 - **Which checks count.** The required contexts of the *base* branch — branch protection
   plus rulesets, unioned — or your `required_checks` override. A red optional check is not
-  the session's to fix. When the required set cannot be established, CI is *unknown*, and
-  unknown is not a trigger.
+  the session's to fix. When the required set cannot be established, CI is *unknown*.
+  Unknown never triggers a bounce — and it is never a quiet skip either: the verdict reads
+  *CANNOT EVALUATE*, the driver says so on the PR once per reason, and the pass exits 2.
 - **Confirm the override took.** `decide --pr <n> --repo OWNER/REPO --json` prints
-  `checks_source`: `config` means your override is what the driver is judging against;
-  `unknown` means it is missing or misspelled for that repository, `checks_note` names the
-  remedy, and the command exits 2. This is the only check on a block the whole CI half
-  depends on, so run it against a real PR once. If you get no JSON — only a `FAIL: …` line —
-  the driver refused the PR before it read any checks, which is not a `required_checks`
-  failure; pick another PR.
+  `checks_source`, one of three values. `config` means your override is what the driver is
+  judging against. `api` means the forge answered and your override did **not** apply — it
+  is missing or misspelled for that repository. `unknown` means nobody answered: no
+  override, and the forge refused. `checks_note` names the remedy, and on `unknown` the
+  command exits 2. This is the only check on a block the whole CI half depends on, so run
+  it against a real PR once. If you get no JSON — only a `FAIL: …` line — the driver refused
+  the PR before it read any checks, which is not a `required_checks` failure; pick another
+  PR.
 - **Whose ticket it is.** The driver takes the poller's outcome record first, Linear's own
   PR attachment second, and the branch name only third — and then only if Linear ties that
   ticket to this PR. Otherwise it declines. A branch name is a hint a session chose.
-- **Before every bounce** it reads the original ticket's state. Done or Canceled ⇒ skip,
-  with the reason logged: its worktree is gone.
+- **Before every bounce** it reads the original ticket's state. Any completed- or
+  canceled-type state ⇒ skip, with the reason logged: its worktree is gone. The test is the
+  state's *type*, so your own name for it does not matter.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
