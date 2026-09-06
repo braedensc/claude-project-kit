@@ -2061,8 +2061,17 @@ def run_once(cfg, dry_run):
 # One run: a wall-clock bound and a heartbeat, because the scheduler restarts the
 # process and nobody watches the log
 # --------------------------------------------------------------------------- #
-class RunTimeout(Exception):
-    """The run outlived its wall clock and was cut off."""
+class RunTimeout(BaseException):
+    """The run outlived its wall clock and was cut off.
+
+    BaseException, NOT Exception, and that is load-bearing. This file is full of
+    deliberate `except Exception` bug-catchers that turn one PR's crash into a bounded
+    `retry` so the other PRs continue — exactly the right thing for a bug, and exactly
+    the wrong thing for a deadline. As an Exception the alarm would be caught by
+    whichever PR happened to be in flight, recorded as that PR's fault, and the run
+    would sail past the wall clock it was given. Sitting beside KeyboardInterrupt and
+    SystemExit instead, it passes through every one of them to `run_command`.
+    """
 
 
 def heartbeat_path(state_dir):
@@ -3228,6 +3237,23 @@ def selftest():
             globals()["scan"] = real_scan
             # the alarm is disarmed afterwards: the next run is not cut off by the last one's clock
             check("the run timeout is disarmed after the run", run_command(dict(c), "scan", False, timeout=0), EXIT_OK)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # …and the deadline is NOT swallowed by the per-PR bug-catchers. Every driver
+            # here turns one PR's crash into a bounded `retry` so the others continue; if
+            # RunTimeout were an ordinary Exception it would be caught as that PR's fault
+            # and the run would carry on past the clock it was given.
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: time.sleep(30)
+            c = dict(cfg, state_dir=tmp)
+            check("a deadline inside one PR's work is not caught as that PR's bug",
+                  run_command(c, "scan", False, timeout=1), EXIT_TIMEOUT)
+            check("a deadline is not recorded as a PR-level retry",
+                  (load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("status"), None)
+            check("a deadline posts nothing", posted, [])
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
         # 7i. Workspace facts resolved BY NAME once per run; a name that resolves to
         #     nothing is a CONFIG error (exit 2), not a transport one and not a decline.
