@@ -163,6 +163,13 @@ jobs:
       # never constructs a Linear write mutation — read-only, like the reviewer it feeds.
       - name: Stage E basis resolver selftest (tier ordering, read-only against Linear)
         run: python3 scripts/pipeline_review_basis.py --selftest
+      # Stage E's poller (option 4): creates + delegates one review ticket per new pipeline
+      # PR, reads the reviewer's answer back and publishes it. Offline: asserts the
+      # sanitizer strips dispatcher routing tags and fence tokens, the ticket is never
+      # parented, malformed/tampered/timed-out read-backs decline loudly, one comment and
+      # one outcome per PR, and no approve/merge/label path exists.
+      - name: Stage E review poller selftest (sanitizer, decline paths, comment-only)
+        run: python3 scripts/pipeline_review_poller.py --selftest
 
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
