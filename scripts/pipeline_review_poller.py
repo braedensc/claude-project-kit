@@ -261,7 +261,11 @@ Exit: 0 = ran; every "nothing to do" is printed as what was asked and what the a
           written through stands; the next scheduled run resumes from it. Distinct from 1
           so a scheduler's log tells "slow/hung" from "tried and failed" at a glance
 
-Every one of those, timeout included, writes `<state_dir>/heartbeat.json` before exiting.
+Every one of those, timeout included, writes `<state_dir>/heartbeat.json` before exiting —
+with one exception worth knowing when you monitor that file: a config that cannot be read
+or parsed exits 2 having never learned where `state_dir` is, so it leaves no heartbeat at
+all. A heartbeat that stops updating therefore means "not running, or cannot read its
+config"; a fresh one with a non-`ok` result means "ran and could not do it".
 """
 import argparse
 import hashlib
