@@ -102,9 +102,22 @@ WHICH CHECKS COUNT, AND WHOSE TICKET THIS IS
   or the config's `required_checks` override — not every check run on the head. A red
   optional check is not the session's to fix (on a kit-derived repo the grader-floor
   guard stays red until a person applies a label; telling a session to fix that would
-  spend the whole budget on nothing). When the required set cannot be established, CI
-  is `unknown — required set unavailable` and is not a trigger: unknown is neither green
-  nor red (§13).
+  spend the whole budget on nothing).
+
+  That set is read in THREE distinguishable states, never two (§13). `required_checks`
+  returns the set AND its source: 'config' (an override named it), 'api' (GitHub
+  answered — either with contexts, or with a genuine nothing: no ruleset rule AND a
+  classic endpoint that answered), or 'unknown' (nobody answered). The shape that forced
+  the distinction is the real one: both managed repositories keep their required contexts
+  in CLASSIC branch protection with EMPTY rulesets, and the documented token has no
+  Administration permission — so the rulesets call returns `[]` (an answer about rulesets
+  and nothing else) and the classic call returns 403 (no answer at all). Reading that
+  pair as "requires nothing" made CI permanently unable to be red, with no error and
+  nothing to look at. It is UNKNOWN: CI is not a trigger, the verdict is CANNOT EVALUATE
+  rather than `skip`, it names the repository and the remedy, it is said on the PR, and
+  the run exits 2. The remedy is a `required_checks` entry for that repo in the config,
+  or Administration: read on the token — and a repo with an override never gets here.
+  The REVIEW half of the trigger keeps working while CI is unknown.
 
   The original ticket is identified in THREE ways, and always in this order (owner
   decision "C2": prefer what LINEAR records over what a session named):
@@ -184,12 +197,17 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
    "in_flight_hours": 6,                           a sent bounce blocks a repeat on the
                                                    same head for this long
    "run_timeout_seconds": 900,                     the one-shot `run` pass's own deadline
-   "required_checks": {"OWNER/REPO": ["Kit checks"]},   optional override of the base
-                                                   branch's required contexts (a plain
-                                                   list applies to every repo); use it to
+   "required_checks": {"OWNER/REPO": ["Kit checks"]},   override of the base branch's
+                                                   required contexts (a plain list
+                                                   applies to every repo). Two uses: to
                                                    EXCLUDE a required check a session can
                                                    never turn green (a grader-floor guard
-                                                   that waits for a person's label)
+                                                   that waits for a person's label), and
+                                                   as the documented REMEDY when the
+                                                   token cannot read classic branch
+                                                   protection — a repo listed here is
+                                                   answered from config and can never
+                                                   reach the 'unknown' state
    "poll_seconds": 300, "diff_cap_chars": 120000}  poller keys, same file
 
   Credentials are named by ENV VAR NAME only, and the loader refuses a value that does
@@ -209,9 +227,11 @@ Usage:
 Exit: 0 = decided / acted / bounce OFF (named) / nothing to do (named)
       2 = could not: broken committed config, an unreadable or corrupt ledger, GitHub or
           Linear unreachable, a missing credential, a head branch that is not a pipeline
-          branch, a branch-named ticket that does not own the PR, `exhaust` asked for
-          when the budget is not spent, or a send that failed after its ledger row was
-          written — loud, never the same token as "nothing to do" (contract §13). Where
+          branch, a branch-named ticket that does not own the PR, a base branch whose
+          REQUIRED-CHECK SET could not be read (CANNOT EVALUATE — never a quiet skip),
+          `exhaust` asked for when the budget is not spent, or a send that failed after
+          its ledger row was written — loud, never the same token as "nothing to do"
+          (contract §13). Where
           the PR is known (its lookup succeeded), open and ours, EVERY could-not also
           posts ONE PR comment saying so, deduplicated per reason — a missing credential,
           a Linear or GitHub error, a corrupt ledger or outcome record, a declined branch,
@@ -701,15 +721,24 @@ def render_decline_pr_comment(pr_number, reason):
     ])
 
 
-def checks_summary(runs, required):
+def checks_summary(runs, required, unknown_detail=""):
     """('red'|'green'|'pending'|'none'|'unknown', [failing names], note). Only the base
     branch's REQUIRED contexts are judged — a red optional check is not the session's to
-    fix. `required` None ⇒ 'unknown' (the set could not be established; CI is not a
-    trigger); [] ⇒ 'none' (the base requires nothing; CI cannot be terminally red). A
-    required context with no run yet is pending, not green — and a context served by a
+    fix.
+
+    THREE states, never two. `required` None ⇒ 'unknown': the set could not be
+    established, so CI cannot be evaluated at all — that is a could-not, and it is
+    reported as one. `required` [] ⇒ 'none': GitHub answered and the base genuinely
+    requires nothing, so CI cannot be terminally red. Collapsing the first into the
+    second is the §13 defect this signature exists to make impossible — the caller passes
+    the SOURCE-bearing answer from `required_checks`, and `unknown_detail` carries the
+    remedy through to the PR comment and to --json.
+
+    A required context with no run yet is pending, not green — and a context served by a
     legacy commit status rather than a check run stays pending here, conservatively."""
     if required is None:
-        return "unknown", [], "required set unavailable — CI is not a trigger until it is"
+        return "unknown", [], (unknown_detail
+                               or "required set unavailable — CI is not a trigger until it is")
     if not required:
         return "none", [], "the base branch requires no status checks"
     by_name = {str(run.get("name") or ""): run for run in (runs or [])}
@@ -742,27 +771,40 @@ def outcome_is_fresh(outcome, head_sha, last_spent):
     return True, ""
 
 
-def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason):
-    """(trigger_ok, reason, kind). Red checks win; a review counts only when usable,
-    fresh and at/above threshold — a decline is never a finding."""
+def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot_note=""):
+    """(trigger_ok, reason, kind, cannot_evaluate). Red checks win; a review counts only
+    when usable, fresh and at/above threshold — a decline is never a finding.
+
+    `cannot_evaluate` is the fourth thing this returns and the reason it has a fourth
+    thing: when `checks_status` is 'unknown' the CI half of the trigger did not come back
+    false, it did not come back at all. A red base branch would have triggered and we
+    cannot see it. So 'unknown' is never folded into the ordinary "no trigger" reason —
+    it rides out separately, `decide` turns it into its own verdict, and the run exits
+    non-zero (contract §13). The REVIEW half is unaffected: a fresh, usable,
+    at-or-above-threshold outcome still triggers a bounce while CI is unknown, because
+    that half of the evidence did come back."""
+    cannot = (cannot_note or "the required-checks set could not be established, so CI "
+                             "cannot be evaluated") if checks_status == "unknown" else ""
     if checks_status == "red":
-        return True, "required checks are terminally red (%s)" % ", ".join(failing[:5]), "ci"
+        return True, "required checks are terminally red (%s)" % ", ".join(failing[:5]), "ci", ""
     if outcome is not None and fresh:
         if not outcome.get("usable"):
-            return False, "the review declined (unusable) — a decline is not a finding", None
+            return False, "the review declined (unusable) — a decline is not a finding", None, cannot
         if outcome.get("meets_threshold"):
             return True, ("review findings meet the severity threshold (highest %s)"
-                          % outcome.get("max_severity")), "review"
-        return False, "review findings are below the threshold (highest %s)" % outcome.get("max_severity"), None
+                          % outcome.get("max_severity")), "review", cannot
+        return False, ("review findings are below the threshold (highest %s)"
+                       % outcome.get("max_severity")), None, cannot
     if checks_status == "pending":
-        return False, "checks are still running — nothing terminal to react to yet", None
+        return False, "checks are still running — nothing terminal to react to yet", None, ""
     if outcome is not None:
-        return False, fresh_reason, None
-    return False, "checks are %s and no review outcome is recorded" % checks_status, None
+        return False, fresh_reason, None, cannot
+    return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
 def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger_ok,
-           trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced):
+           trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced,
+           cannot_evaluate=""):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
     fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
     then the budget: bounce `prior + 1` while budget remains, exhaust when
@@ -770,7 +812,16 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     the named no-op. The budget is compared first on purpose: when a person raises
     `budgets.maxBounces` on the default branch (the intended human answer to an
     exhaustion notice) the driver bounces again on the next trigger, instead of holding
-    "already announced" forever against a ledger nobody may edit."""
+    "already announced" forever against a ledger nobody may edit.
+
+    `cannot_evaluate` is the §13 third state. It only ever fires where the driver would
+    otherwise have returned the quiet `skip` — i.e. where nothing else triggered — and it
+    returns action 'unknown', which run_one exits 2 on and says on the PR. It is
+    deliberately ranked BELOW the four holds above it: a closed, forked, draft or
+    terminally-ticketed PR is genuinely nothing to evaluate, and an unreadable required
+    set does not change that. It is ranked ABOVE the plain no-trigger skip, because there
+    the difference is the whole point: "nothing was wrong" and "we could not see whether
+    anything was wrong" are not the same answer."""
     def hold(action, reason, bounce_no=None):
         return {"action": action, "reason": reason, "bounce_no": bounce_no}
 
@@ -785,6 +836,8 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
                             "its session cannot be resumed; nothing to re-prompt"
                             % (ticket_state or "closed"))
     if not trigger_ok:
+        if cannot_evaluate:
+            return hold("unknown", cannot_evaluate)
         return hold("skip", trigger_reason)
     if in_flight:
         return hold("skip", "bounce %d was already sent for head %s (%s); waiting for a push"
@@ -1108,47 +1161,91 @@ def check_runs(head_sha, owner_repo, cfg):
             for r in ((data or {}).get("check_runs") or [])]
 
 
+def required_checks_remedy(owner_repo):
+    """The one sentence a person needs to turn 'unknown' back into an answer. Named once
+    so the reason on the PR, the reason in --json and the docs cannot drift apart."""
+    return ("add a 'required_checks' entry for %s to the driver config, or grant the "
+            "token Administration: read on that repository" % owner_repo)
+
+
 def required_checks(base_branch, owner_repo, cfg):
-    """The names of the checks `base_branch` REQUIRES, or None when the set cannot be
-    established. Precedence: the config's `required_checks` override (a list, or a map
-    keyed by OWNER/REPO); else the union of the rulesets API (`/rules/branches/<base>`,
-    readable with read access; `[]` is an answer meaning no ruleset rule) and the classic
-    branch-protection API (`/branches/<base>/protection/required_status_checks`; a 404 is
-    the answer "not protected", a 403 is no answer). None only when NEITHER answered —
-    then CI is 'unknown — required set unavailable' and never a trigger."""
+    """(names | None, source, detail) — the checks `base_branch` REQUIRES, and HOW that
+    answer was reached. `source` is one of:
+
+      'config'  — the config's `required_checks` override (a list, or a map keyed by
+                  OWNER/REPO) named the set. It always wins, and a repo with an override
+                  can never reach 'unknown'.
+      'api'     — GitHub answered. Either POSITIVELY (the rulesets API returned a rule,
+                  or the classic branch-protection endpoint answered 200) or with a
+                  genuine nothing: rulesets `[]` AND the classic endpoint answered — 200
+                  with no contexts, or 404, which is the answer "this branch carries no
+                  classic protection".
+      'unknown' — names is None. Nobody established the set: the classic endpoint
+                  REFUSED (403/401, or any error that is not a 404) or errored while the
+                  rulesets side produced no rule. `detail` says which endpoint refused
+                  and names the remedy.
+
+    Both managed repositories keep their required contexts in CLASSIC branch protection
+    with EMPTY rulesets, and the documented token deliberately has no Administration
+    permission — so the shape this function exists to separate is exactly `rules == []`
+    (an answer about rulesets, and about nothing else) plus a 403 from the endpoint that
+    holds the real answer. Reading that pair as an empty required set would make CI
+    permanently, silently green-ish: `checks_summary` would say "none", `compute_trigger`
+    could never see red, and the CI half of bounce would be dead with no error, nothing
+    red, and no line anyone would look at (contract §13). It is UNKNOWN, and unknown is
+    loud."""
     override = cfg.get("required_checks")
     if isinstance(override, dict):
         override = override.get(owner_repo)
     if isinstance(override, list):
-        return [str(x) for x in override]
+        return [str(x) for x in override], "config", ""
     owner, repo = owner_repo.split("/", 1)
-    names, answered = set(), False
+    names, unread = set(), []
+
+    # 1. Rulesets: readable with plain repo read access. `[]` answers "no ruleset rule" —
+    #    it does NOT answer what classic protection requires, so it is never enough alone.
+    rules_answered = False
     try:
         rules = _api_json("/repos/%s/%s/rules/branches/%s" % (owner, repo, base_branch), cfg)
-    except BounceError:
-        rules = None
+    except BounceError as exc:
+        rules, unread = None, unread + ["the rulesets API could not be read (%s)" % exc]
     if isinstance(rules, list):
-        answered = True
+        rules_answered = True
         for rule in rules:
             if isinstance(rule, dict) and rule.get("type") == "required_status_checks":
                 for chk in ((rule.get("parameters") or {}).get("required_status_checks") or []):
                     if isinstance(chk, dict) and chk.get("context"):
                         names.add(str(chk["context"]))
+
+    # 2. Classic branch protection: needs Administration: read. 404 = "not protected"
+    #    (an answer); ANY other failure — 403, 401, 5xx — is no answer at all.
+    classic = "refused"
     try:
         prot = _api_json("/repos/%s/%s/branches/%s/protection/required_status_checks"
                          % (owner, repo, base_branch), cfg)
     except NotFound:
-        prot, answered = None, True
-    except BounceError:
+        prot, classic = None, "absent"
+    except BounceError as exc:
         prot = None
+        unread.append("the token cannot read classic branch protection for %s (%s)"
+                      % (owner_repo, exc))
     if isinstance(prot, dict):
-        answered = True
+        classic = "ok"
         for ctx in prot.get("contexts") or []:
             names.add(str(ctx))
         for chk in prot.get("checks") or []:
             if isinstance(chk, dict) and chk.get("context"):
                 names.add(str(chk["context"]))
-    return sorted(names) if answered else None
+
+    if names:
+        return sorted(names), "api", ""                     # a positive read
+    if classic == "ok":
+        return [], "api", ""                                # the authoritative endpoint said nothing
+    if classic == "absent" and rules_answered:
+        return [], "api", ""                                # both answered, both empty
+    return None, "unknown", "%s — %s" % ("; ".join(unread) or
+                                         "the required set for %s could not be established" % owner_repo,
+                                         required_checks_remedy(owner_repo))
 
 
 def repo_default_branch(owner_repo, cfg):
@@ -1581,10 +1678,12 @@ def _gather_after_pr(sit, cfg, state_dir):
         raise Decline("no pipeline ticket identified for branch %r (its team key is not one this "
                       "driver manages) — a bounce needs a ticket to re-prompt" % sit["branch"], sit)
 
-    required = required_checks(str(meta.get("baseRefName") or default), owner_repo, cfg)
+    required, checks_source, checks_detail = required_checks(
+        str(meta.get("baseRefName") or default), owner_repo, cfg)
     runs = check_runs(sit["head_sha"], owner_repo, cfg) if (sit["head_sha"] and required) else []
-    sit["required_checks"] = required
-    sit["checks_status"], sit["failing_checks"], sit["checks_note"] = checks_summary(runs, required)
+    sit["required_checks"], sit["checks_source"] = required, checks_source
+    sit["checks_status"], sit["failing_checks"], sit["checks_note"] = checks_summary(
+        runs, required, checks_detail)
 
     sit.update(ledger_view(ledger_path(state_dir), owner_repo, pr_number))
 
@@ -1620,9 +1719,19 @@ def decision_for(sit, cfg):
                           "this driver would have to invent" % (DELIVERY_FILE, sit.get("config_state"))}
 
     fresh, fresh_reason = outcome_is_fresh(sit.get("outcome"), sit.get("head_sha"), sit.get("last_spent"))
-    trigger_ok, trigger_reason, kind = compute_trigger(sit.get("checks_status"), sit.get("failing_checks") or [],
-                                                       sit.get("outcome"), fresh, fresh_reason)
-    if sit.get("checks_note") and not trigger_ok:
+    unknown_checks = sit.get("checks_status") == "unknown"
+    cannot_note = ""
+    if unknown_checks:
+        cannot_note = ("CI cannot be evaluated for %s: %s"
+                       % (sit.get("repo") or "this repository",
+                          sit.get("checks_note") or required_checks_remedy(sit.get("repo") or "the repository")))
+    trigger_ok, trigger_reason, kind, cannot_evaluate = compute_trigger(
+        sit.get("checks_status"), sit.get("failing_checks") or [], sit.get("outcome"),
+        fresh, fresh_reason, cannot_note)
+    # The note rides along on an ordinary skip as before — and ALSO on a bounce that a
+    # review triggered while CI stayed unreadable, so "we bounced, but half the evidence
+    # was never available" is said rather than implied.
+    if sit.get("checks_note") and (not trigger_ok or unknown_checks):
         trigger_reason += " [%s]" % sit["checks_note"]
 
     in_flight = None
@@ -1643,9 +1752,11 @@ def decision_for(sit, cfg):
                      ticket_state=sit.get("ticket_state_name"), trigger_ok=trigger_ok,
                      trigger_reason=trigger_reason, prior=sit.get("prior", 0),
                      max_bounces=sit.get("max_bounces", 0), in_flight=in_flight,
-                     head_sha=sit.get("head_sha"), exhausted_announced=announced)
+                     head_sha=sit.get("head_sha"), exhausted_announced=announced,
+                     cannot_evaluate=cannot_evaluate)
     verdict["trigger"] = kind if trigger_ok else None
     verdict["trigger_reason"] = trigger_reason
+    verdict["cannot_evaluate"] = cannot_evaluate or None
     return verdict
 
 
@@ -1658,6 +1769,8 @@ def describe(sit, verdict):
         head = "BOUNCE %d of %d" % (verdict["bounce_no"], sit.get("max_bounces", 0))
     elif action == "exhaust":
         head = "EXHAUST"
+    elif action == "unknown":
+        head = "CANNOT EVALUATE"     # never the same word as `skip`: that was the defect
     else:
         head = action
     return "%s: %s — %s" % (tag, head, verdict["reason"])
@@ -1884,11 +1997,23 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
             print(json.dumps({"repo": owner_repo, "pr": pr_number, "ticket_id": sit.get("ticket_id"),
                               "prior": sit.get("prior"), "max_bounces": sit.get("max_bounces"),
                               "threshold": sit.get("threshold"), "threshold_source": sit.get("threshold_source"),
-                              "checks": sit.get("checks_status"),
+                              "checks": sit.get("checks_status"), "checks_source": sit.get("checks_source"),
+                              "checks_note": sit.get("checks_note") or None,
                               "ticket_state": sit.get("ticket_state_name"), **verdict}, sort_keys=True))
         else:
             print(describe(sit, verdict))
+        # Read-only, and still exit 2: `decide` reporting a clean 0 on a PR whose CI could
+        # not be read is the same conflation the verdict exists to break (contract §13).
+        # The line above is printed FIRST so --json still carries the whole answer.
+        if verdict["action"] == "unknown":
+            sys.stderr.write("FAIL: %s\n" % describe(sit, verdict))
+            return EXIT_USAGE
         return EXIT_OK
+    # An acting mode: the could-not is said where a person will see it, once per reason.
+    if verdict["action"] == "unknown":
+        sys.stderr.write("FAIL: %s\n" % describe(sit, verdict))
+        announce_could_not(sit, verdict["reason"], state_dir, dry_run)
+        return EXIT_USAGE
     if mode == "exhaust":
         # `exhaust` is not a lever: it announces a budget the VERDICT says is spent, and
         # nothing else. On any other verdict it refuses — never a label, never a comment,
@@ -2293,8 +2418,23 @@ def selftest():
     check("a required context with no run is pending", checks_summary(runs_mixed, ["Kit checks", "Provenance scan"])[0], "pending")
     check("unknown required set is unknown, with a note", checks_summary(runs_mixed, None)[0::2],
           ("unknown", "required set unavailable — CI is not a trigger until it is"))
+    check("checks_summary carries the caller's unknown detail through",
+          checks_summary(runs_mixed, None, "403 — grant Administration: read")[2],
+          "403 — grant Administration: read")
     check("no required checks is none", checks_summary(runs_mixed, [])[0], "none")
     check("unknown never triggers", compute_trigger("unknown", [], None, False, "")[0], False)
+    check("unknown is a CANNOT-EVALUATE, not a bare no-trigger",
+          bool(compute_trigger("unknown", [], None, False, "", "n/a")[3]), True)
+    check("'none' is NOT a cannot-evaluate", compute_trigger("none", [], None, False, "")[3], "")
+    check("a fresh above-threshold review still triggers while CI is unknown",
+          compute_trigger("unknown", [], {"usable": True, "meets_threshold": True, "max_severity": "high"},
+                          True, "", "n/a")[0::2], (True, "review"))
+
+    # 9b-i. required_checks: the SET and the SOURCE, and the four states kept apart.
+    #       The 403 case is the live one — both managed repositories keep their required
+    #       contexts in classic protection with EMPTY rulesets, and the documented token
+    #       has no Administration permission, so `[] + 403` is what production actually
+    #       produces. Read as "none" it silently kills the CI half of bounce forever.
     saved_api = globals()["_api_json"]
     api_world = {}
 
@@ -2310,14 +2450,74 @@ def selftest():
             {"context": "Kit checks", "integration_id": 1}]}}, {"type": "deletion"}],
             protection={"contexts": ["Provenance scan"], "checks": [{"context": "Provenance scan", "app_id": 1}]})
         check("required set is the union of rulesets and classic protection",
-              required_checks("main", "o/r", {}), ["Kit checks", "Provenance scan"])
+              required_checks("main", "o/r", {})[:2], (["Kit checks", "Provenance scan"], "api"))
+        api_world.update(rules=[{"type": "required_status_checks", "parameters": {"required_status_checks": [
+            {"context": "Kit checks"}]}}], protection=BounceError("GitHub API GET … -> HTTP 403"))
+        check("a NON-EMPTY rulesets read is a positive answer even when classic refuses",
+              required_checks("main", "o/r", {})[:2], (["Kit checks"], "api"))
         api_world.update(rules=[], protection=NotFound("404"))
-        check("no rules + not protected ⇒ an EMPTY required set (an answer)", required_checks("main", "o/r", {}), [])
+        check("no rules + not protected ⇒ an EMPTY required set (an answer)",
+              required_checks("main", "o/r", {})[:2], ([], "api"))
+        api_world.update(rules=[], protection={"contexts": [], "checks": []})
+        check("no rules + classic 200 with no contexts ⇒ 'none', genuinely",
+              required_checks("main", "o/r", {})[:2], ([], "api"))
+        check("…and checks_summary reads that as 'none'",
+              checks_summary(runs_mixed, *[required_checks("main", "o/r", {})[i] for i in (0, 2)])[0], "none")
+        api_world.update(rules=[], protection=BounceError("GitHub API GET … -> HTTP 403"))
+        got, source, detail = required_checks("main", "o/r", {})
+        check("THE LIVE SHAPE: rulesets [] + classic 403 ⇒ UNKNOWN, never an empty set",
+              (got, source), (None, "unknown"))
+        check("…and the detail names the repository and the exact remedy",
+              ("o/r" in detail and "403" in detail and "required_checks" in detail
+               and "Administration: read" in detail), True)
+        check("…and checks_summary reads that as 'unknown', never 'none'",
+              checks_summary(runs_mixed, got, detail)[0], "unknown")
         api_world.update(rules=BounceError("403"), protection=BounceError("403"))
-        check("neither endpoint answered ⇒ None (unknown)", required_checks("main", "o/r", {}), None)
-        check("config override wins, per repo",
-              required_checks("main", "o/r", {"required_checks": {"o/r": ["Kit checks"]}}), ["Kit checks"])
-        check("config override wins, plain list", required_checks("main", "o/r", {"required_checks": ["A"]}), ["A"])
+        check("neither endpoint answered ⇒ None (unknown)",
+              required_checks("main", "o/r", {})[:2], (None, "unknown"))
+        api_world.update(rules=BounceError("500"), protection=NotFound("404"))
+        check("rulesets unreadable + classic 404 ⇒ still unknown (half an answer is none)",
+              required_checks("main", "o/r", {})[:2], (None, "unknown"))
+        api_world.update(rules=[], protection=BounceError("HTTP 403"))
+        check("config override wins, per repo — and rescues the 403 repo",
+              required_checks("main", "o/r", {"required_checks": {"o/r": ["Kit checks"]}})[:2],
+              (["Kit checks"], "config"))
+        check("config override wins, plain list",
+              required_checks("main", "o/r", {"required_checks": ["A"]})[:2], (["A"], "config"))
+
+        # 9b-ii. The mutation proof. `reverted` is the PRE-FIX logic, faithful in the one
+        #     line that caused the defect: an empty rulesets list counted as the whole
+        #     answer, so a 403 from the endpoint holding the real answer was swallowed.
+        #     Both run against the SAME stub. The assertion is on the DIFFERENCE between
+        #     them, so reverting the 403 branch makes the two agree and turns THIS check
+        #     red — a copy of the old logic cannot satisfy it.
+        def reverted(base_branch, owner_repo, cfg):
+            names, answered = set(), False
+            try:
+                rules = _api_json("/repos/%s/rules/branches/%s" % (owner_repo, base_branch), cfg)
+            except BounceError:
+                rules = None
+            if isinstance(rules, list):
+                answered = True                    # ← the defect, verbatim
+            try:
+                prot = _api_json("/repos/%s/branches/%s/protection/required_status_checks"
+                                 % (owner_repo, base_branch), cfg)
+            except NotFound:
+                prot, answered = None, True
+            except BounceError:
+                prot = None
+            if isinstance(prot, dict):
+                answered = True
+                for ctx in prot.get("contexts") or []:
+                    names.add(str(ctx))
+            return sorted(names) if answered else None
+
+        api_world.update(rules=[], protection=BounceError("GitHub API GET … -> HTTP 403"))
+        check("the pre-fix logic really did answer 'none' here (the defect, reproduced)",
+              checks_summary(runs_mixed, reverted("main", "o/r", {}))[0], "none")
+        check("the shipped logic disagrees with it — reverting the 403 branch turns this red",
+              (checks_summary(runs_mixed, required_checks("main", "o/r", {})[0])[0],
+               checks_summary(runs_mixed, reverted("main", "o/r", {}))[0]), ("unknown", "none"))
     finally:
         globals()["_api_json"] = saved_api
 
@@ -2515,7 +2715,12 @@ def selftest():
         globals()["committed_delivery_json"] = lambda repo, default, cfg: world["delivery"]
         globals()["pr_view"] = lambda pr, repo, cfg: dict(world["pr"])
         globals()["check_runs"] = lambda sha, repo, cfg: list(world.get("runs") or [])
-        globals()["required_checks"] = lambda base, repo, cfg: world.get("required")
+        # The stub answers with the SET AND ITS SOURCE, exactly as the real one now does:
+        # a stub that still returned a bare list would hide the very collapse under test.
+        globals()["required_checks"] = lambda base, repo, cfg: (
+            world.get("required"),
+            world.get("checks_source") or ("unknown" if world.get("required") is None else "api"),
+            world.get("checks_detail") or "")
         globals()["linear_issue"] = lambda ticket, cfg: dict(world["issue"])
         globals()["linear_ticket_for_pr_url"] = lambda url, cfg: world.get("attachment_ticket", "")
 
@@ -2876,15 +3081,47 @@ def selftest():
             check("red NON-required check: exit 0, nothing sent, nothing spent",
                   (rc, calls, os.path.exists(ledger_path(tmp))), (EXIT_OK, [], False))
             check("red NON-required check: checks read as green", "checks are green" in buf.getvalue(), True)
-        world["required"] = None
-        with tempfile.TemporaryDirectory() as tmp:
+        # 10o-ii. THE §13 CASE. An unreadable required set is a CANNOT-EVALUATE, not a
+        #      skip: exit 2 (a run whose only outcome is this is not a clean no-op), one
+        #      PR comment naming the repo and the remedy, no Linear write, no ledger row,
+        #      and the same answer under --json where an operator would look.
+        world["required"], world["checks_source"] = None, "unknown"
+        world["checks_detail"] = ("the token cannot read classic branch protection for o/r "
+                                  "(HTTP 403) — " + required_checks_remedy("o/r"))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("unknown required set: exit 0, nothing sent", (rc, calls), (EXIT_OK, []))
-            check("unknown required set: the reason says so", "required set unavailable" in buf.getvalue(), True)
-        world["required"] = ["Kit checks"]
+            check("unknown required set: exit 2, one PR comment, nothing to Linear, nothing spent",
+                  (rc, kinds(), linear_writes(), os.path.exists(ledger_path(tmp))),
+                  (EXIT_USAGE, ["prComment"], [], False))
+            check("unknown required set: the PR comment names the repo and the remedy",
+                  ("o/r" in body_of("prComment") and "required_checks" in body_of("prComment")
+                   and "Administration: read" in body_of("prComment")), True)
+            check("unknown required set: the verdict is CANNOT EVALUATE, never 'skip'",
+                  ("CANNOT EVALUATE" in buf.getvalue() or "CANNOT EVALUATE" in err.getvalue(),
+                   "skip" in buf.getvalue()), (True, False))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "decide", False, as_json=True)
+            doc = json.loads(buf.getvalue().strip())
+            check("unknown required set under --json: exit 2, visible, and never a write",
+                  (rc, doc["action"], doc["checks"], doc["checks_source"], bool(doc["cannot_evaluate"]), calls),
+                  (EXIT_USAGE, "unknown", "unknown", "unknown", True, []))
+        # …and the REVIEW half of the trigger still works while CI is unreadable: a
+        # fresh, at-threshold review record bounces, exit 0, exactly as with green CI.
+        with tempfile.TemporaryDirectory() as tmp:
+            calls.clear()
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"),
+                       dict(poller_record, head_sha="aaaa1111"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("CI unknown does not disable the review half of the trigger",
+                  (rc, kinds()), (EXIT_OK, ["reply", "telemetry"]))
+        world["required"], world["checks_source"], world["checks_detail"] = ["Kit checks"], "api", ""
         world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "failure"}]
 
         # 10p. A head branch outside the pipeline alphabet (`=` here) ⇒ decline: exit 2, zero
@@ -3161,7 +3398,10 @@ def selftest():
           "known is one PR comment (missing credential, corrupt record; unreachability exempt), "
           "no dispatcher app user ⇒ no thread route, credential shapes never reach Linear and "
           "spend nothing, git stderr never reaches the PR, `exhaust` refuses unless the verdict "
-          "is exhaust, only REQUIRED checks count (unknown set ⇒ no trigger), branch-named "
+          "is exhaust, only REQUIRED checks count and the required SET has three states — "
+          "config / api / unknown, with rulesets [] + a classic 403 UNKNOWN and never "
+          "'none' (exit 2, CANNOT EVALUATE, one PR comment naming the repo and the "
+          "remedy, review half of the trigger unaffected), branch-named "
           "ticket must own the PR in Linear's record, non-pipeline branch declined, BROKEN "
           "budget said once on the PR, comments paginated, terminal ticket skipped with reason, "
           "absent delivery.json ⇒ OFF and named, missing thread ⇒ fallback fix ticket with "
