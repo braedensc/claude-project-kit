@@ -346,7 +346,8 @@ def default_fix_argv(pr_number, model, max_turns):
         "skip, or delete a test assertion to make something pass. Stay inside the "
         "ticket's scope — a bounce is not a chance to refactor. NEVER merge: `gh pr "
         "merge` is hook-blocked in every form, `--auto` included." % pr_number)
-    return ["claude", "-p", prompt, "--max-turns", str(max_turns), "--model", model,
+    return ["claude", "-p", prompt, "--setting-sources", "user,project",
+            "--max-turns", str(max_turns), "--model", model,
             "--allowedTools", "Read,Grep,Glob,Write,Edit,Bash"]
 
 
