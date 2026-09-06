@@ -261,11 +261,17 @@ Exit: 0 = ran; every "nothing to do" is printed as what was asked and what the a
           written through stands; the next scheduled run resumes from it. Distinct from 1
           so a scheduler's log tells "slow/hung" from "tried and failed" at a glance
 
-Every one of those, timeout included, writes `<state_dir>/heartbeat.json` before exiting —
-with one exception worth knowing when you monitor that file: a config that cannot be read
-or parsed exits 2 having never learned where `state_dir` is, so it leaves no heartbeat at
-all. A heartbeat that stops updating therefore means "not running, or cannot read its
-config"; a fresh one with a non-`ok` result means "ran and could not do it".
+Every one of those, timeout included, writes `<state_dir>/heartbeat.json` before exiting.
+An unexpected exception — a bug that escaped every per-item catcher — is caught in
+`run_command` for exactly this reason: it is logged with its traceback, exits 1, and still
+leaves a heartbeat, so a crash is never mistaken for a dead daemon.
+
+Two cases still leave no heartbeat at all, and they are worth knowing when you monitor that
+file: a config that cannot be read or parsed exits 2 having never learned where `state_dir`
+is; and KeyboardInterrupt or SIGTERM (somebody, or the scheduler, stopping the process on
+purpose) passes straight through. A heartbeat that stops updating therefore means "not
+running, cannot read its config, or was stopped"; a fresh one with a non-`ok` result means
+"ran and could not do it".
 """
 import argparse
 import hashlib
@@ -588,6 +594,13 @@ def select_new_reviews(prs, seen_keys, team_keys, owner_repo, hints=None, hints_
     a draft is not ready; and a PR already in the seen-set was handled on a prior pass,
     whatever the outcome — the opened-only rule, so bounce pushes never multiply cost.
 
+    The fork guard fails CLOSED, the way the publisher's does: a row with no
+    `isCrossRepository`, or a null one, is UNKNOWN, and unknown is treated as a fork and
+    said on the log. `gh pr list --json` always returns the field today and the REST
+    fallback computes it, so this costs nothing now — but a renamed field or a row built
+    somewhere else must not be the reason an attacker-authored diff is copied into a
+    ticket, and "the field was missing" is not a fact anyone would notice going by.
+
     Where the TICKET ID comes from is what discovery changed. `hints` maps a PR number to
     the identifier of the Linear issue the dispatcher actually worked, read from that
     issue's own PR attachment; it is authority, and a branch is only a hint the session
@@ -602,10 +615,17 @@ def select_new_reviews(prs, seen_keys, team_keys, owner_repo, hints=None, hints_
     for pr in prs or []:
         if not isinstance(pr, dict):
             continue
-        if pr.get("isCrossRepository") or pr.get("isDraft"):
-            continue
         number = pr.get("number")
         if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        cross = pr.get("isCrossRepository")
+        if cross is None:
+            log("NOTE: %s#%d carries no 'isCrossRepository' — whether it is a fork cannot be "
+                "told, so it is treated as one and not reviewed. If this repeats, the PR "
+                "listing has changed shape and list_open_prs needs updating"
+                % (owner_repo, number))
+            continue
+        if cross or pr.get("isDraft"):
             continue
         if pr_key(owner_repo, number) in seen_keys:
             continue
@@ -837,29 +857,54 @@ def fenced_blocks(text):
 
 
 def extract_findings_doc(text):
-    """The first fenced block that parses as JSON with "schema" == pipeline-review/1, or a
-    bare object with that schema, or None. Shape is NOT judged here — `classify` holds
-    the document to the schema whole; this only finds it."""
+    """The LAST fenced block that parses as JSON with "schema" == pipeline-review/1 — or,
+    only when no fenced block carries one, a bare object with that schema. Else None.
+    Shape is NOT judged here — `classify` holds the document to the schema whole; this
+    only finds it.
+
+    LAST, not first, and that is load-bearing (correction C4). A reviewer's final message
+    is prose it wrote while thinking, and two shapes of it are ordinary:
+
+      * a PRELIMINARY block — "nothing on a first read", `findings: []` — emitted before
+        the reviewer had finished, followed by the real verdict; and
+      * the TEMPLATE shape restated out of its own ticket body, whose severity is the
+        literal `low|medium|high|critical` placeholder.
+
+    Both parse. Taking the first would publish "0 findings, clean" over a critical finding,
+    or declare the whole review unusable over a placeholder — in either case silently,
+    because a first-match reader has nothing left to disagree with. The reviewer's LAST
+    word is its verdict, so that is the one that is published.
+    """
     if not isinstance(text, str) or not text.strip():
         return None
-    candidates = fenced_blocks(text) + [text.strip()]
-    for chunk in candidates:
+    found = None
+    for chunk in fenced_blocks(text):
         try:
             doc = json.loads(chunk)
         except ValueError:
             continue
         if isinstance(doc, dict) and doc.get("schema") == FINDINGS_SCHEMA:
-            return doc
-    return None
+            found = doc                      # keep going: the last one wins
+    if found is not None:
+        return found
+    try:                                     # a reviewer that fenced nothing at all
+        bare = json.loads(text.strip())
+    except ValueError:
+        return None
+    return bare if isinstance(bare, dict) and bare.get("schema") == FINDINGS_SCHEMA else None
 
 
 def ingest_findings(text):
     """The findings document in a reviewer's final message, or None.
 
-    This file's fence-pairing extractor runs first; when the publisher grows its own
-    `ingest_findings` (the option-4 rework of the reviewer core) it is consulted only for
-    a text the local extractor found nothing in — either way `classify` validates the
-    result whole, so accepting a document from either reader costs nothing."""
+    `text` is the reviewer's final `response` activity body and nothing else — never the
+    ticket, never its comments (C4); `collect_entry` is the only caller and passes exactly
+    that. This file's fence-pairing extractor runs first because it is the one guaranteed
+    to apply the last-block rule above; the publisher's own `ingest_findings` (the option-4
+    rework of the reviewer core) is consulted only for a text the local extractor found
+    nothing in, so its answer can never displace a block this file already chose. Either
+    way `classify` validates the result whole.
+    """
     doc = extract_findings_doc(text)
     if doc is not None:
         return doc
@@ -1234,13 +1279,56 @@ def ensure_workspace(cfg, api_key):
 # --------------------------------------------------------------------------- #
 # Discovery — ask Linear what the dispatcher worked, never a hardcoded repo list
 # --------------------------------------------------------------------------- #
-def pr_from_attachments(issue):
-    """(owner_repo, number) for the first GitHub PR among an issue's attachments, else None."""
+# Only the GitHub INTEGRATION's own attachments are a discovery signal. Every dispatched
+# session keeps the Linear MCP tools (owner decision 2), so a session can attach any URL it
+# likes to its own ticket — and an attachment a session wrote is a value the agent chose,
+# which is exactly what a guard must not read. `sourceType` is written by whatever created
+# the attachment, so it separates the two. Compared with the punctuation and case stripped,
+# because Linear has spelled integration source types both ways over time.
+GITHUB_ATTACHMENT_SOURCES = ("github", "githubpullrequest", "githubpr", "githubissue",
+                             "githubcommit", "githubbranch")
+
+
+def _source_key(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def prs_from_attachments(issue):
+    """Every GitHub PR the INTEGRATION attached to an issue, as ('owner/repo', number), in
+    attachment order and without duplicates.
+
+    All of them, not the first: a ticket whose first PR was closed and superseded still
+    carries both attachments, and returning whichever the API listed first would hint the
+    dead one while the live PR — the one actually needing a review — is never discovered
+    and nothing says a PR was skipped.
+
+    A PR URL on an attachment the integration did NOT write is dropped and NAMED on the
+    log; if Linear ever renames its source type, that line is what says why discovery went
+    quiet, instead of the silence of an empty work list (§13).
+    """
+    out = []
     for att in (((issue or {}).get("attachments") or {}).get("nodes")) or []:
-        parsed = parse_pr_url((att or {}).get("url"))
-        if parsed:
-            return parsed
-    return None
+        att = att or {}
+        parsed = parse_pr_url(att.get("url"))
+        if not parsed:
+            continue
+        if _source_key(att.get("sourceType")) not in GITHUB_ATTACHMENT_SOURCES:
+            log("NOTE: %s has a pull-request attachment whose sourceType is %r, not the "
+                "GitHub integration's — a session can attach any URL to its own ticket, so "
+                "it is NOT a discovery signal and %s#%d is not discovered from it"
+                % ((issue or {}).get("identifier") or "an issue", att.get("sourceType"),
+                   parsed[0], parsed[1]))
+            continue
+        if parsed not in out:
+            out.append(parsed)
+    return out
+
+
+def pr_from_attachments(issue):
+    """The first integration-attached GitHub PR on an issue, or None. Kept for callers that
+    want one; discovery uses `prs_from_attachments` and takes them all."""
+    found = prs_from_attachments(issue)
+    return found[0] if found else None
 
 
 def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
@@ -1252,9 +1340,17 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
     else — those are this poller's own review tickets, which are delegated and therefore
     have agent sessions of their own; without this they would discover themselves.
 
+    EVERY pull request the GitHub integration attached to an issue is a hit, not just the
+    first, so a ticket whose first PR was superseded still discovers the live one. Only the
+    integration's own attachments count: a session keeps the Linear MCP tools and could
+    attach any URL to its own ticket, and a hint the agent wrote is not a hint (see
+    `prs_from_attachments`, which names on the log every PR URL it drops for that reason).
+
     A transport failure propagates: "could not ask what the work is" must never arrive as
     an empty work list (§13). The bounded second signal is applied after the attachment
-    pass so it only ever costs a query for an issue the integration did not cover.
+    pass so it only ever costs a query for an issue the integration did not cover — and it
+    is confined to the repositories `repos` names, or failing that the ones the integration
+    itself attached, because the text it reads is text a session wrote.
     """
     reviews_team = cfg.get("reviews_team_id")
     found, seen_issues, unattached = {}, {}, []
@@ -1274,10 +1370,11 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
             if reviews_team and ((issue.get("team") or {}).get("id")) == reviews_team:
                 continue                      # our own review tickets
             seen_issues[iid] = ident
-            parsed = pr_from_attachments(issue)
+            parsed = prs_from_attachments(dict(issue, identifier=ident))
             if parsed:
-                attached += 1
-                found.setdefault(parsed[0], {})[parsed[1]] = ident
+                attached += len(parsed)
+                for owner_repo, number in parsed:
+                    found.setdefault(owner_repo, {})[number] = ident
             else:
                 unattached.append({"session_id": node.get("id"), "issue": ident})
         info = conn.get("pageInfo") or {}
@@ -1286,7 +1383,15 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
             break
         after = info.get("endCursor")
 
-    probed, probed_hits, ambiguous = 0, 0, 0
+    # The second signal reads a PR URL out of text the SESSION wrote, so it is held to the
+    # repositories already known to be the dispatcher's work: `repos` when configured, else
+    # the ones the GitHub integration itself attached this pass. A session's prose may point
+    # at a PR NUMBER inside a repo the dispatcher demonstrably works — that is the gap the
+    # probe exists to cover — but it may not introduce a repository nobody worked, which is
+    # how a made-up URL would get a stranger's diff inlined into a ticket and reviewed
+    # against that ticket's acceptance criteria.
+    allowed_repos = {r for r in (cfg.get("repos") or []) if r} or set(found)
+    probed, probed_hits, ambiguous, off_repo = 0, 0, 0, 0
     for row in unattached[:probe_max]:
         probed += 1
         try:
@@ -1308,19 +1413,27 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
                 % (row["issue"], len(urls)))
             continue
         if urls:
+            owner_repo, number = urls[0]
+            if owner_repo not in allowed_repos:
+                off_repo += 1
+                log("NOTE: %s has no PR attachment and the only pull request its final "
+                    "response names is on %s, which no integration attachment and no "
+                    "configured 'repos' entry covers — a session writes that text itself, so "
+                    "it is NOT discovered" % (row["issue"], owner_repo))
+                continue
             probed_hits += 1
-            found.setdefault(urls[0][0], {}).setdefault(urls[0][1], row["issue"])
+            found.setdefault(owner_repo, {}).setdefault(number, row["issue"])
 
     stats = {"pages": pages, "sessions": sessions, "issues": len(seen_issues),
              "attached": attached, "unattached": len(unattached), "probed": probed,
-             "probed_hits": probed_hits, "ambiguous": ambiguous,
+             "probed_hits": probed_hits, "ambiguous": ambiguous, "off_repo": off_repo,
              "unprobed": max(0, len(unattached) - probed), "more_pages": more}
     log("discovery: %d session(s) over %d page(s) → %d issue(s); %d PR(s) from attachments, "
-        "%d unattached (%d probed, %d found, %d ambiguous, %d left unprobed at the %d cap); "
-        "more history beyond the window: %s"
+        "%d unattached (%d probed, %d found, %d ambiguous, %d on an unworked repo, %d left "
+        "unprobed at the %d cap); more history beyond the window: %s"
         % (stats["sessions"], stats["pages"], stats["issues"], stats["attached"],
            stats["unattached"], stats["probed"], stats["probed_hits"], stats["ambiguous"],
-           stats["unprobed"], probe_max, "yes" if more else "no"))
+           stats["off_repo"], stats["unprobed"], probe_max, "yes" if more else "no"))
     return found, stats
 
 
@@ -2117,6 +2230,15 @@ def run_command(cfg, command, dry_run, timeout=None):
     run that hangs is cut off here rather than left to overlap its successor. Everything
     this file writes is written THROUGH the moment it happens, so a cut-off run leaves a
     consistent state dir and the next run resumes at the first stage that did not finish.
+
+    A run that ends on an UNEXPECTED exception — a bug outside every per-PR catcher — is
+    caught here too, and that is not tidiness. Left to propagate it would exit non-zero
+    with a traceback and no heartbeat, so a monitor reading `heartbeat.json` would report
+    "the poller is dead" for a run that had in fact started and crashed: the exact
+    conflation of "not running" with "ran and could not do it" that the heartbeat exists
+    to prevent (§13). It is logged with its traceback, exits 1 like every other retryable
+    failure, and leaves a fresh heartbeat saying so. Only KeyboardInterrupt and SystemExit
+    still pass through without one — those are somebody stopping the process on purpose.
     """
     fn = {"scan": scan, "collect": collect, "run": run_once}[command]
     seconds = int(timeout if timeout is not None else cfg.get("run_timeout_seconds")
@@ -2142,6 +2264,14 @@ def run_command(cfg, command, dry_run, timeout=None):
             "has more work than one interval can carry — raise 'run_timeout_seconds' or "
             "lengthen the scheduler's interval" % seconds)
         code = EXIT_TIMEOUT
+    except Exception:
+        # A bug that escaped every per-item catcher. Recorded, not swallowed: it exits
+        # non-zero and the heartbeat below says the run ran and failed, so nobody reads a
+        # crash as a dead daemon. The traceback is the poller's log, never a PR comment.
+        log("FAIL: the '%s' run ended on an unexpected error — that is a bug in this file, "
+            "not a condition it handles. Whatever was written through stands and the next "
+            "scheduled run resumes from it. Traceback:\n%s" % (command, traceback.format_exc()))
+        code = EXIT_ERROR
     finally:
         if armed:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -2256,12 +2386,23 @@ class _FakeLinear:
 
 
 def selftest():
+    import io
     import tempfile
     failures = []
 
     def check(name, got, want):
         if got != want:
             failures.append("%s: got %r, want %r" % (name, got, want))
+
+    def said(fn):
+        """Run `fn`, return what it wrote to stderr. The drivers narrate; the cases below
+        that assert on a log line need it captured before the block-wide redirect starts."""
+        err, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            fn()
+            return sys.stderr.getvalue()
+        finally:
+            sys.stderr = err
 
     # 1. Selection: fork, draft, non-ticket, seen, new → exactly the new same-repo ticket PR.
     fixture = [
@@ -2281,6 +2422,23 @@ def selftest():
     check("wrong team key filtered", select_new_reviews(
         [{"number": 9, "headRefName": "feat/tod-9-x", "isCrossRepository": False}], set(), ["KIT"], "o/r"), [])
     check("garbage rows ignored", select_new_reviews([None, 42, "x", {"number": True}], set(), [], "o/r"), [])
+    # The fork guard fails CLOSED: a row that does not SAY whether it is a fork is unknown,
+    # and unknown is a fork — the same rule the publisher's guard is held to. A renamed or
+    # dropped field must never be the reason an attacker-authored diff is copied into a
+    # ticket, and it must be said, not silently skipped.
+    unknown_fork = []
+    fork_said = said(lambda: unknown_fork.extend(
+        select_new_reviews([{"number": 11, "headRefName": "feat/kit-11-x", "isDraft": False},
+                            {"number": 12, "headRefName": "feat/kit-12-x",
+                             "isCrossRepository": None, "isDraft": False}],
+                           set(), ["KIT"], "o/r")))
+    check("an absent or null isCrossRepository is treated as a fork", unknown_fork, [])
+    check("an unknown fork flag is said, not silently skipped",
+          "whether it is a fork cannot be told" in fork_said, True)
+    check("an unknown fork flag names both PRs", ("o/r#11" in fork_said, "o/r#12" in fork_said), (True, True))
+    check("an explicit False is still reviewed", [p["number"] for p in select_new_reviews(
+        [{"number": 13, "headRefName": "feat/kit-13-x", "isCrossRepository": False, "isDraft": False}],
+        set(), ["KIT"], "o/r")], [13])
     # scan() feeds select_new_reviews every seen key EXCEPT `retry` ones, so a transient
     # failure is re-selected; every other status — pending, publish-failed, declined — is not.
     seen_mixed = {pr_key("o/r", 4): {"status": "retry"}, pr_key("o/r", 5): {"status": "publish-failed"}}
@@ -2365,6 +2523,97 @@ def selftest():
           fenced_blocks("```python\nassert x == ```\nmore\n```\nafter"), ["assert x == ", "assert x == ```\nmore"])
     check("fenced_blocks: a shorter run does not close a longer fence", fenced_blocks("````\n```\nx\n````"), ["```\nx"])
     check("fenced_blocks: mixed fence chars do not close", fenced_blocks("```\n~~~\nx\n```"), ["~~~\nx"])
+    # …and the LAST pipeline-review/1 block is the verdict (C4). A reviewer thinks out loud:
+    # a preliminary "nothing yet" block, or the template shape restated out of its own
+    # ticket body, comes BEFORE the real answer and parses just as well. Taking the first
+    # would publish the draft and discard the verdict, silently.
+    draft = {"schema": FINDINGS_SCHEMA, "summary": "No issues found on a first read.", "findings": []}
+    verdict_doc = {"schema": FINDINGS_SCHEMA, "summary": "one critical", "findings": [
+        {"severity": "critical", "category": "security", "file": "a.py", "line": 1,
+         "summary": "token logged", "detail": "d"}]}
+    two = "First pass:\n```json\n%s\n```\nOn a closer read:\n```json\n%s\n```\n" % (
+        json.dumps(draft), json.dumps(verdict_doc))
+    check("two blocks → the LAST one is the verdict", extract_findings_doc(two), verdict_doc)
+    check("two blocks → ingest_findings agrees", ingest_findings(two), verdict_doc)
+    check("the last block is what classify() judges",
+          prl.classify(extract_findings_doc(two), "high")["max_severity"], "critical")
+    template = {"schema": FINDINGS_SCHEMA, "summary": "...",
+                "findings": [{"severity": "low|medium|high|critical", "category": "...",
+                              "file": "...", "line": 1, "summary": "...", "detail": "..."}]}
+    restated = "The shape I must return:\n```json\n%s\n```\nMy review:\n```json\n%s\n```" % (
+        json.dumps(template), json.dumps(good))
+    check("a restated template does not become the verdict", extract_findings_doc(restated), good)
+    check("a restated template does not make the review unusable",
+          prl.classify(extract_findings_doc(restated), "high")["usable"], True)
+    check("one block is still that block", extract_findings_doc(
+        "```json\n%s\n```" % json.dumps(verdict_doc)), verdict_doc)
+    check("a bare object is the fallback, not a rival: a fenced verdict wins over trailing prose",
+          extract_findings_doc("```json\n%s\n```\n%s" % (json.dumps(verdict_doc), json.dumps(draft))),
+          verdict_doc)
+    check("a bare object is still read when nothing was fenced", extract_findings_doc(json.dumps(draft)), draft)
+    check("three blocks → the third", extract_findings_doc(
+        "```json\n%s\n```\n```json\n{\"schema\":\"other\"}\n```\n```json\n%s\n```"
+        % (json.dumps(draft), json.dumps(verdict_doc))), verdict_doc)
+
+    # 4b. WHERE THE STATE AND THE CREDENTIAL LIVE (C1) — the one thing this revision is
+    #     mostly about, and until now asserted nowhere. The delegation-capable Linear key
+    #     belongs in the poller's OWN env file under the role account's home: not in the
+    #     dispatcher's env file (copied unscrubbed into every session) and not under its
+    #     state root (session readability unmeasured). A default silently rewritten back to
+    #     an owner-account path — a merge, a copy-paste from the bounce driver — would move
+    #     that key's state into the owner's account with nothing going red.
+    check("state defaults to the role account's own home, not the owner's",
+          DEFAULT_STATE_DIR, "~/.stage-e/state")
+    check("the default state dir is not an owner-account pipeline path",
+          "claude" in DEFAULT_STATE_DIR.lower() or DEFAULT_STATE_DIR.startswith("/opt"), False)
+    try:
+        credential({"linear_key_env": "STAGE_E_NO_SUCH_VAR_FOR_SELFTEST"}, "linear_key_env")
+        failures.append("credential() accepted an unset env var")
+    except PollerError as exc:
+        msg = str(exc)
+        check("a missing credential names the env var", "STAGE_E_NO_SUCH_VAR_FOR_SELFTEST" in msg, True)
+        check("a missing credential points at the poller's own env file",
+              "<home>/.stage-e/env" in msg, True)
+        check("a missing credential forbids the dispatcher's env file",
+              "Never in the dispatcher's env file" in msg, True)
+        check("a missing credential forbids the dispatcher's state root",
+              "never under the dispatcher's state" in msg, True)
+        check("a missing credential says why the env file is copied into sessions",
+              "copied unscrubbed into every session" in msg, True)
+
+    # 4c. Discovery attachments: only the GitHub INTEGRATION's own, and ALL of them.
+    #     Every session keeps the Linear MCP tools (owner decision 2), so a session can
+    #     attach any URL to its own ticket; a hint the agent wrote is not a hint.
+    def _att(url, source="github"):
+        return {"url": url, "sourceType": source, "title": "PR"}
+
+    GH_URL = "https://github.com/o/r/pull/%d"
+    check("an integration attachment is a hit",
+          prs_from_attachments({"identifier": "KIT-1", "attachments": {"nodes": [_att(GH_URL % 5)]}}),
+          [("o/r", 5)])
+    forged = {"identifier": "KIT-1", "attachments": {"nodes": [
+        _att("https://github.com/other/repo/pull/1", source="linear"),
+        _att("https://github.com/other/repo/pull/2", source=None),
+        _att("https://github.com/other/repo/pull/3", source="url")]}}
+    forged_hits = []
+    forged_said = said(lambda: forged_hits.extend(prs_from_attachments(forged)))
+    check("an attachment a session could have written is NOT a discovery signal", forged_hits, [])
+    check("a dropped attachment is named on the log, not silently ignored",
+          "not the GitHub integration's" in forged_said, True)
+    check("a dropped attachment names the PR it did not discover", "other/repo#1" in forged_said, True)
+    check("integration source types are matched past case and punctuation",
+          prs_from_attachments({"attachments": {"nodes": [
+              _att(GH_URL % 6, source="GitHub_PullRequest")]}}), [("o/r", 6)])
+    # …and EVERY attached PR is a hit, not the first: a ticket whose first PR was closed
+    # and superseded still carries both, and the live one must not be the one left out.
+    check("every attached PR is discovered, in order",
+          prs_from_attachments({"attachments": {"nodes": [
+              _att(GH_URL % 7), _att("https://figma.example/f/1"), _att(GH_URL % 8),
+              _att(GH_URL % 7 + "/files")]}}), [("o/r", 7), ("o/r", 8)])
+    check("no attachments at all", (prs_from_attachments({}), prs_from_attachments(None)), ([], []))
+    check("pr_from_attachments still answers with the first",
+          pr_from_attachments({"attachments": {"nodes": [_att(GH_URL % 7), _att(GH_URL % 8)]}}),
+          ("o/r", 7))
 
     # 5. Config: NAMES not ids, env var NAMES only, unknown keys refused, defaults applied.
     with tempfile.TemporaryDirectory() as tmp:
@@ -2420,7 +2669,6 @@ def selftest():
     # 6. The drivers end to end — GitHub, Linear, the publisher, the basis resolver and the
     #    telemetry sibling all stubbed. Happy path posts exactly one comment, creates exactly
     #    one ticket, writes exactly one outcome, closes exactly one ticket.
-    import io
     fake = _FakeLinear()
     posted, telemetry = [], []
     saved = {k: globals()[k] for k in ("list_open_prs", "fetch_pr_diff", "linear_graphql",
@@ -2536,6 +2784,38 @@ def selftest():
             check("malformed → fixed reason posted", "did not conform to pipeline-review/1" in posted[0][1], True)
             check("malformed → reviewer's values NOT posted", "Critical" in posted[0][1], False)
             check("malformed → reviewer's values logged", "Critical" in sys.stderr.getvalue(), True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A reviewer that thinks out loud: a preliminary "clean" block, then its real
+            # verdict. The LAST block is what is published (C4) — end to end, through
+            # collect → classify → the comment, the outcome file and the bounce driver's
+            # `meets_threshold`. First-block would post "0 findings, clean" over a critical
+            # finding and the bounce driver would never fire.
+            c = fresh_state(tmp)
+            fake.respond("rev-uuid-1", "First pass:\n```json\n%s\n```\nOn a closer read:\n"
+                                       "```json\n%s\n```\n" % (json.dumps(draft), json.dumps(verdict_doc)))
+            check("two blocks → collect exits OK", collect(c, False), EXIT_OK)
+            out = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("two blocks → the LAST block's severity reaches the outcome", out["max_severity"], "critical")
+            check("two blocks → the outcome meets the threshold", out["meets_threshold"], True)
+            check("two blocks → the outcome carries the LAST block's summary", out["summary"], "one critical")
+            check("two blocks → the LAST block's finding is the one published",
+                  "token logged" in (posted[0][1] if posted else ""), True)
+            check("two blocks → the preliminary 'clean' verdict is NOT published",
+                  "No issues found on a first read" in (posted[0][1] if posted else "x"), False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # …and the mirror: the reviewer restates the template shape from its own ticket
+            # body before answering. First-block would classify the literal placeholder
+            # severity as malformed and discard a perfectly good review.
+            c = fresh_state(tmp)
+            fake.respond("rev-uuid-1", "The shape I must return:\n```json\n%s\n```\nMy review:\n"
+                                       "```json\n%s\n```" % (json.dumps(template), json.dumps(findings)))
+            check("a restated template → collect exits OK, not declined", collect(c, False), EXIT_OK)
+            check("a restated template → the real review is published",
+                  "was NOT reviewed" in (posted[0][1] if posted else "x"), False)
+            check("a restated template → the real severity reaches the outcome",
+                  json.load(open(outcome_path(tmp, "o/r", 5)))["max_severity"], "high")
 
         with tempfile.TemporaryDirectory() as tmp:   # no block at all → decline
             c = fresh_state(tmp)
@@ -3019,7 +3299,7 @@ def selftest():
         #     carrying a repo list. From a fixture of agent sessions and their issues'
         #     attachments it must find every dispatcher-worked PR — and then select exactly
         #     the one that is open, unreviewed and not a fork or a draft.
-        def _sess(sid, ident, team_id, urls, status="complete"):
+        def _sess(sid, ident, team_id, urls, status="complete", source="github"):
             # The ISSUE id is keyed on the identifier, so two sessions on the same ticket
             # (a re-prompt) really are the same issue, the way Linear would return them.
             return {"id": sid, "status": status, "createdAt": "2026-09-06T00:00:00Z",
@@ -3027,7 +3307,7 @@ def selftest():
                     "issue": {"id": "issue-" + ident, "identifier": ident,
                               "team": {"id": team_id, "key": ident.split("-")[0]},
                               "attachments": {"nodes": [
-                                  {"url": u, "sourceType": "github", "title": "PR"} for u in urls]}}}
+                                  {"url": u, "sourceType": source, "title": "PR"} for u in urls]}}}
 
         GH = "https://github.com/o/r/pull/%d"
         discovery_fixture = [
@@ -3039,6 +3319,12 @@ def selftest():
             _sess("s8", "KIT-8", "kit-team", ["https://figma.example/f/1"]),   # no PR attached
             _sess("s5b", "KIT-5", "kit-team", [GH % 5]),                 # a re-prompt: same issue
             _sess("s6", "KIT-6", "kit-team", ["https://github.com.evil.test/o/r/pull/6"]),
+            # A session attaching a PR on a repo nobody worked, to its OWN ticket — every
+            # session keeps the Linear MCP tools, so this is reachable, not hypothetical.
+            _sess("s7", "KIT-7", "kit-team", ["https://github.com/other/repo/pull/1"],
+                  source="linear"),
+            # A ticket whose first PR was closed and superseded: BOTH are attached.
+            _sess("s3", "KIT-3", "kit-team", [GH % 30, GH % 31]),
         ]
         fake.__init__()
         fake.discovery = list(discovery_fixture)
@@ -3054,9 +3340,20 @@ def selftest():
         found, stats = discover_pipeline_prs(dcfg, "x")
         check("discovery reads the repo out of the PR URL", sorted(found), ["o/r"])
         check("discovery maps every worked PR to its ticket", found.get("o/r"),
-              {5: "KIT-5", 4: "KIT-4", 1: "KIT-1", 2: "KIT-2", 8: "KIT-8"})
+              {5: "KIT-5", 4: "KIT-4", 1: "KIT-1", 2: "KIT-2", 8: "KIT-8", 30: "KIT-3", 31: "KIT-3"})
         check("discovery excludes our own review tickets by team", 99 in (found.get("o/r") or {}), False)
-        check("discovery counts an issue once however many sessions it had", stats["issues"], 6)
+        # A PR URL a SESSION attached to its own ticket is not a discovery signal — the
+        # repo is never even listed, so its diff is never inlined into a review ticket
+        # against some other ticket's acceptance criteria.
+        check("a session-attached PR URL discovers nothing", "other/repo" in found, False)
+        check("a session-attached PR URL is named on the log",
+              "not the GitHub integration's" in sys.stderr.getvalue(), True)
+        # Both PRs on a superseded ticket are hinted; the closed one simply never appears
+        # in an open-PR listing, and the live one is no longer the one left out.
+        check("both PRs on one ticket are discovered",
+              (found["o/r"].get(30), found["o/r"].get(31)), ("KIT-3", "KIT-3"))
+        check("discovery counts an issue once however many sessions it had", stats["issues"], 8)
+        check("discovery counts attached PRs, not attached issues", stats["attached"], 6)
         check("discovery used the second signal for the unattached issue", stats["probed_hits"], 1)
         check("discovery says how much it left unprobed", stats["unprobed"], 0)
         check("a lookalike host is not github.com", parse_pr_url("https://github.com.evil.test/o/r/pull/6"), None)
@@ -3076,9 +3373,24 @@ def selftest():
         check("an ambiguous second signal is counted", amb_stats["ambiguous"], 1)
         check("an ambiguous second signal is explained on the log",
               "which one is its own cannot be told" in sys.stderr.getvalue(), True)
+        # The second signal reads text the SESSION wrote, so it may not introduce a
+        # repository nobody worked — the same rule the attachment filter applies, applied to
+        # the other agent-authored channel. A PR NUMBER inside a worked repo is still fine:
+        # that is the gap the probe exists to cover.
+        fake.activities["s8"] = [{"id": "a1", "createdAt": "2026-09-06T00:04:00Z",
+                                  "content": {"__typename": "AgentActivityResponseContent",
+                                              "body": "Opened https://github.com/other/repo/pull/1"}}]
+        off_found, off_stats = discover_pipeline_prs(dict(dcfg, repos=[]), "x")
+        check("a second signal on a repo nobody worked is not discovered", "other/repo" in off_found, False)
+        check("a second signal on an unworked repo is counted", off_stats["off_repo"], 1)
+        check("a second signal on an unworked repo is explained",
+              "which no integration attachment and no configured 'repos' entry covers"
+              in sys.stderr.getvalue(), True)
         fake.activities["s8"] = [{"id": "a1", "createdAt": "2026-09-06T00:04:00Z",
                                   "content": {"__typename": "AgentActivityResponseContent",
                                               "body": "Opened %s for review." % (GH % 8)}}]
+        check("a second signal inside a worked repo is still discovered",
+              discover_pipeline_prs(dict(dcfg, repos=[]), "x")[0]["o/r"].get(8), "KIT-8")
         # …and a discovery transport failure is LOUD, never an empty work list (§13) —
         # in the function AND, which is what actually matters, in the driver that calls it.
         fake.fail_all = True
@@ -3241,6 +3553,46 @@ def selftest():
             globals()["scan"] = real_scan
             # the alarm is disarmed afterwards: the next run is not cut off by the last one's clock
             check("the run timeout is disarmed after the run", run_command(dict(c), "scan", False, timeout=0), EXIT_OK)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A bug that escapes every per-item catcher must still leave a heartbeat. Left
+            # to propagate it exits non-zero with a traceback and a STALE heartbeat, and a
+            # monitor reads "the poller is dead" for a run that started and crashed —
+            # exactly the conflation the heartbeat exists to prevent (§13).
+            real_scan = globals()["scan"]
+
+            def _boom(cfg_, dry):
+                raise TypeError("a bug outside every per-PR catcher")
+
+            globals()["scan"] = _boom
+            c = dict(cfg, state_dir=tmp)
+            escaped, crash_code = None, None
+            try:
+                crash_code = run_command(c, "scan", False)
+            except Exception as exc:      # what the fix exists to stop: it would take the
+                escaped = exc             # heartbeat and the exit code down with it
+            check("an unexpected crash does not escape run_command", escaped, None)
+            check("an unexpected crash → the retryable exit code, not a traceback",
+                  crash_code, EXIT_ERROR)
+            check("an unexpected crash still writes the heartbeat",
+                  os.path.exists(heartbeat_path(tmp)), True)
+            hb = json.load(open(heartbeat_path(tmp))) if os.path.exists(heartbeat_path(tmp)) else {}
+            check("an unexpected crash's heartbeat names the run and its result",
+                  (hb.get("command"), hb.get("result")), ("scan", "error"))
+            check("an unexpected crash timestamps the run it actually made",
+                  bool(hb.get("started_at") and hb.get("ended_at")), True)
+            check("an unexpected crash is logged as a bug, with its traceback",
+                  ("that is a bug in this file" in sys.stderr.getvalue(),
+                   "a bug outside every per-PR catcher" in sys.stderr.getvalue()), (True, True))
+            check("an unexpected crash posts nothing", posted, [])
+            # …and a deliberate stop is NOT swallowed: it passes through, heartbeat or not.
+            globals()["scan"] = lambda cfg_, dry: (_ for _ in ()).throw(KeyboardInterrupt())
+            try:
+                run_command(dict(c), "scan", False)
+                failures.append("run_command swallowed a KeyboardInterrupt")
+            except KeyboardInterrupt:
+                pass
+            globals()["scan"] = real_scan
 
         with tempfile.TemporaryDirectory() as tmp:
             # …and the deadline is NOT swallowed by the per-PR bug-catchers. Every driver
