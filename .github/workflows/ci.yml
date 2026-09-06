@@ -188,6 +188,15 @@ jobs:
       # and fence tags from every copied text, the ONLY label ever written is
       # agent:needs-human on exhaustion, and the source builds no merge/approve/auto-merge
       # path and launches no agent session.
+      # Also the three owner corrections of 2026-09-06: the driver runs as the dispatcher's
+      # role account under a system daemon, so ONE config file serves it and the poller
+      # (their key spellings aliased, unknown keys ignored), a state dir inside a git
+      # working tree is REFUSED and one outside the account's home warns, and the one-shot
+      # `run` pass leaves a heartbeat on every path, isolates one PR's crash from the pass
+      # and reports a deadline as PARTIAL rather than clean; the original ticket is named
+      # by LINEAR'S attachment record before the branch name, whose fallback says why; and
+      # the ledger stays the budget authority while the re-prompt carries a visible record
+      # that can make the driver REFUSE but can never grant it a bounce.
       - name: Stage E bounce driver selftest (ledger-first re-prompt, one label, no merge)
         run: python3 scripts/pipeline_bounce_local.py --selftest
 
