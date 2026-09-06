@@ -610,8 +610,9 @@ event; a genuinely repeated event (a second `bounce_started`) carries a distinct
 
 A `review`-stage run may carry a third array, so what the reviewer found is queryable
 alongside what the run cost. Every field mirrors the `pipeline-review/1` finding shape
-the review workflow already publishes, so there is one finding shape in the system and
-not two.
+the review lane already publishes (§14 — the review workflow on `github-actions`, the
+local publisher on a dispatcher-side lane), so there is one finding shape in the system
+and not two.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -1341,7 +1342,15 @@ A review session's **entire deliverable is one file**, `REVIEW-FINDINGS.json` in
 repository root. The reviewer has no tools to comment, approve, push or reach the
 tracker; everything that gates money downstream — whether the review is usable, what its
 worst severity was, whether that meets the rubric's threshold — is computed **from** this
-file by the workflow, never reported **in** it.
+file by a deterministic publisher, never reported **in** it.
+
+> **Which publisher depends on the backend, and the separation is what matters, not the
+> location.** On `github-actions` it is the review workflow's normalize step; on a
+> dispatcher-side lane it is `scripts/pipeline_review_local.py`'s publisher. Both are
+> deterministic code rather than the reviewing model, which is the one piece of the cloud
+> design that survives the move unchanged
+> ([ADR 2026-09-05](adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md) § 4).
+> The shape below is unchanged by either.
 
 ### Shape
 
