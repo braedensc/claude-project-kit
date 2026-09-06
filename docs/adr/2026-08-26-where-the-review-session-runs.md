@@ -2,6 +2,17 @@
 
 **Date:** 2026-08-26 · **Status:** Accepted · **Context:** `docs/kit-20-where-review-runs`, KIT-20. Reverses the review half of [Pipeline guards, dispatcher-anchored](2026-08-24-pipeline-guards-dispatcher-anchored.md) for the `local-daemon` backend, and extends [Budgets belong to whatever writes the pin](2026-08-25-external-daemon-budget-enforcement.md), which established what a daemon-started session does and does not inherit.
 
+> **Update (2026-09-05) — the `local-daemon` half is superseded by
+> [Stage E under a delegation-bound dispatcher](2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md).**
+> This ADR's "Building it" plan assumed the dispatcher still writes a pin and that a local
+> watcher posts a mention comment to trigger a Cyrus review session. Cyrus writes no pin,
+> and its comment lane carries a *"make changes and push"* prompt with a reused worktree —
+> wrong for a reviewer. The new ADR keeps this one's core findings (review on the
+> dispatcher's machine; read the rubric from the default branch; the four surviving
+> isolation vectors; comment-not-approve) and replaces the trigger, the pin-based snapshot,
+> and the watcher-posts-a-comment mechanism. **The `github-actions` backend guidance below
+> is unaffected and this ADR stays Accepted for it.**
+
 ## Decision
 
 **Review moves to the machine the dispatcher runs on.** When `dispatch.backend` is

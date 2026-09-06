@@ -148,6 +148,13 @@ jobs:
       - name: GitHub REST fallback selftest (no merge capability)
         run: python3 scripts/gh_fallback.py --selftest
 
+      # Stage E's local reviewer core (docs/adr/2026-09-05-…). Offline: asserts a
+      # decline is never a clean green (§13/TOD-112), a malformed findings file is
+      # unusable not silently smaller (§14), and the script builds no approve/merge/
+      # label path — the same "cannot escalate" guarantee gh_fallback makes.
+      - name: Stage E local reviewer selftest (comment-only, decline≠clean)
+        run: python3 scripts/pipeline_review_local.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
