@@ -1755,9 +1755,15 @@ def selftest():
         {"id": "c2", "parent": None, "agentSession": {"id": "s2", "createdAt": "2026-01-02T00:00:00Z", "appUser": {"id": "app"}}},
         {"id": "c3", "parent": {"id": "c2"}, "agentSession": {"id": "s3", "createdAt": "2026-01-03T00:00:00Z", "appUser": {"id": "app"}}},
         {"id": "c4", "parent": None, "agentSession": {"id": "s4", "createdAt": "2026-01-04T00:00:00Z", "appUser": {"id": "other"}}},
+        # c5 is the case that makes the "no configured app user" check below MEAN something:
+        # an app user Linear reported without an id. Comparing it against an unset config
+        # ("" == "") would MATCH, so only the explicit refusal at the top of
+        # pick_agent_thread keeps the newest session of an unnamed app from being picked.
+        {"id": "c5", "parent": None, "agentSession": {"id": "s5", "createdAt": "2026-01-05T00:00:00Z", "appUser": {"id": ""}}},
     ]}}
     check("newest root thread of our app user", pick_agent_thread(issue, "app")[0], "c2")
     check("another app user's thread is never picked", pick_agent_thread(issue, "nobody")[0], None)
+    check("an id-less app user is never ours", pick_agent_thread(issue, "app")[0] != "c5", True)
     check("NO configured app user picks nothing (never 'the newest session of any app')",
           pick_agent_thread(issue, "")[0], None)
     check("no comments -> no thread", pick_agent_thread({"comments": {"nodes": []}}, "app")[0], None)
