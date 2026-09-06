@@ -353,6 +353,14 @@ prints this and lists every key it accepts:
 Both files hold **names of environment variables**, never a value. The loaders refuse a
 value that does not look like a variable name.
 
+**Nothing validates the driver's ids.** Its `validate_config` checks the two credential
+*names* and the two timeouts, and stops there. `reviews_team_id`, `dispatcher_app_user_id`,
+`model_label_id` and `dispatcher_repo_names` are loaded exactly as written. A config still
+carrying a fill-in placeholder loads clean and runs green for weeks; the string is first
+used the day a session cannot be resumed and a fallback fix ticket has to be minted — the
+one moment the system is already in trouble. Grep your own config for the placeholder text
+before you load the daemons. The poller has no such hole: it refuses a key it does not know.
+
 ### 3d. Two system LaunchDaemons
 
 One-shot jobs. Each pass is scan → act → exit; the interval belongs to launchd, not to the
@@ -391,6 +399,13 @@ set -a; . "$HOME/.stage-e/env"; set +a; exec python3 <scripts dir>/pipeline_boun
 `<scripts dir>` is the `scripts/` directory of a plain clone of the kit-derived repository
 — a clone, never a dispatcher worktree. The poller passes `--repo OWNER/REPO` on every
 GitHub call, so neither script cares what directory it is started in.
+
+**That clone does not update itself, and nothing will tell you it is old.** Both daemons
+exec out of it, so a fix merged to the default branch is inert on the machine until someone
+pulls. Neither the heartbeats nor the logs mention the code's version. Pull it with both
+jobs unloaded, never under a running pass, re-run the dry run afterwards, and compare its
+`git rev-parse --short HEAD` against your own clone whenever behaviour surprises you. A
+stale daemon clone looks exactly like a bug.
 
 **Set `HOME` explicitly.** A system daemon inherits no login environment, and both the env
 file and the config paths above are written relative to it.
@@ -457,7 +472,9 @@ Record which passed in your private runbook. Each is a claim this design makes t
 live system can confirm.
 
 1. **An owner-key delegation passes the delegator check.** Create and delegate one review
-   ticket with the poller (or by hand in Linear, delegating to the agent as yourself).
+   ticket **with the poller** — a `scan` without `--dry-run`. Delegating by hand in the
+   tracker also proves this test, but the ticket is then one the poller will never collect,
+   so test 4 becomes unreachable.
    Expect: the dispatcher log admits the session with **your** name as creator, and a
    worktree appears under its worktree root keyed by the review ticket's identifier.
    Fail — *user not allowed*: your id is not in `allowedUsers`. Fail — *creator missing*
@@ -471,10 +488,19 @@ live system can confirm.
    within `collect_timeout_seconds`, a `response` activity on the review ticket whose text
    contains a fenced JSON block with `"schema": "pipeline-review/1"`. A summary saying the
    diff is missing means the sanitizer or the cap removed it — check the dry-run body.
-4. **The poller reads the response activity back.** Expect a PR comment (findings or
-   clean) and an outcome record under `state/outcomes/`, exit 0. A timeout or a malformed
-   block gives a distinct *NOT reviewed* comment and exit 3 — also a pass for this test,
-   since loud is the requirement.
+4. **The poller reads the response activity back, and the comment lands on the PR.** This
+   is the whole point, and nothing before it has tested it. The poller has three commands:
+   `scan` creates and delegates, `collect` reads the answer back and publishes, `run` does
+   both — and `run` is the only one the daemon uses, so a hand test must name `collect`
+   itself. Run `... pipeline_review_poller.py --config ~/.stage-e/poller.json collect`.
+   Expect a `published review of OWNER/REPO#N (TICKET): …` line, a PR comment (findings or
+   clean) with a basis line under the summary, an outcome record under `state/outcomes/`,
+   and exit 0. Not answered yet ⇒ a *still pending … nothing to publish yet* line; wait and
+   re-run. A timeout or a malformed block gives a distinct *NOT reviewed* comment and exit
+   3 — also a pass for this test, since loud is the requirement. Exit 1 means the verdict is
+   settled but the comment did not land, and the next pass re-posts it.
+   **A review ticket you created by hand is not collected** — the poller publishes only the
+   tickets it created itself, so use `scan` for this test, not the tracker's UI.
 5. **`disallowedTools` really removes Bash from the model's tool list.** Add one line to
    the throwaway review ticket asking the reviewer to run `git status` and to report
    whether it has a Bash tool. Expect *no Bash tool available* in its response and no
@@ -541,6 +567,13 @@ nor `--all`: it is the daemon's whole pass.
   plus rulesets, unioned — or your `required_checks` override. A red optional check is not
   the session's to fix. When the required set cannot be established, CI is *unknown*, and
   unknown is not a trigger.
+- **Confirm the override took.** `decide --pr <n> --repo OWNER/REPO --json` prints
+  `checks_source`: `config` means your override is what the driver is judging against;
+  `unknown` means it is missing or misspelled for that repository, `checks_note` names the
+  remedy, and the command exits 2. This is the only check on a block the whole CI half
+  depends on, so run it against a real PR once. If you get no JSON — only a `FAIL: …` line —
+  the driver refused the PR before it read any checks, which is not a `required_checks`
+  failure; pick another PR.
 - **Whose ticket it is.** The driver takes the poller's outcome record first, Linear's own
   PR attachment second, and the branch name only third — and then only if Linear ties that
   ticket to this PR. Otherwise it declines. A branch name is a hint a session chose.

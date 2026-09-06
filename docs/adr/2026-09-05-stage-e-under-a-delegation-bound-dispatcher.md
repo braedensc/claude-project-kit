@@ -445,8 +445,12 @@ it can fetch nothing.**
 **Decision: a PR comment, never an approval, and a decline that is loud and distinct.**
 
 The reviewer's whole deliverable is one document in the §14 shape — under option 4, the
-first fenced `pipeline-review/1` JSON block in its final message, read back from the
-review ticket's `response` activity, since a reviewer with no `Write` produces no file. A
+**last** fenced `pipeline-review/1` JSON block in its final message, read back from the
+review ticket's `response` activity, since a reviewer with no `Write` produces no file.
+Last, not first: a reviewer that restates the template early and writes its real finding
+later must not have the template published. That rule is safe only because the input is one
+activity, written by one author. Over a whole thread, "last" would mean whoever commented
+most recently, and any session holding tracker tools can comment there. A
 **deterministic publisher** — not the model — validates it whole against the schema,
 computes `usable` / `max_severity` / `meets_threshold`, and posts **one** PR comment
 through `scripts/gh_fallback.py` (which has no merge endpoint by construction). This reuses
