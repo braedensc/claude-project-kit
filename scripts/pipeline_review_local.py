@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Stage E poller-side publisher — the deterministic core of the review pass.
 
-Runs on the dispatcher's machine, in the OWNER's account, never inside any session's
-sandbox — and it launches nothing. The reviewer is a separate, sandboxed, read-only
-session that the dispatcher runs against a poller-created, owner-delegated review ticket;
+Runs on the dispatcher host as the poller's own role account — never inside a session's
+sandbox, never from a worktree — and it launches nothing. The reviewer is a separate,
+sandboxed, read-only session that the dispatcher runs against an owner-delegated ticket;
 its whole deliverable is one fenced `pipeline-review/1` JSON block in its final message.
-The poller collects that text and hands it here. This module then
+The poller collects that ONE activity's body — the reviewer's final `response`, never the
+ticket description or its comment thread — and hands it here. This module then
 
-    ingests  the reviewer's text into a findings document, or None      ingest_findings()
+    ingests  that response body into a findings document, or None       ingest_findings()
     judges   that document WHOLE against schemas/review-findings.schema.json   classify()
     renders  ONE pull-request comment: reviewed, or loudly NOT reviewed  render_comment()
     scrubs   every body for credential shapes before it leaves this host   secret_hits()
@@ -47,7 +48,10 @@ THE FIVE THINGS THIS FILE IS SHAPED AROUND
      human look at a loud comment; a false negative posts a secret to a public PR.
 
   Plus the fork guard: a PR whose head lives in a fork (cross-repository) is declined with
-  its own reason. The earlier slice requested `isCrossRepository` and never read it.
+  its own reason — and so is a PR whose `isCrossRepository` flag is absent, null or not a
+  boolean. Unknown is treated as a fork, never as same-repository. The earlier slice
+  requested the flag and never read it; the first fix read it with a truthiness test,
+  which let a missing flag through as "not a fork". Only an explicit `false` proceeds.
 
 WHAT IT IS AND IS NOT
 
@@ -68,7 +72,9 @@ Usage:
                              [--threshold low|medium|high|critical] [--dry-run]
     pipeline_review_local.py --selftest
 
-`--findings-file -` reads the reviewer's final message from stdin.
+`--findings-file` is the reviewer's final `response` activity body — that one body alone;
+`-` reads it from stdin. Several pipeline-review/1 blocks in it ⇒ the LAST one is the
+review (see ingest_findings for why last, and why the input must be single-author).
 
 Exit: 0 = reviewed (clean or with findings), 3 = COULD NOT REVIEW (declined, unusable, or
       withheld for a possible secret), 2 = usage/IO error.
@@ -107,6 +113,9 @@ REVIEW_MARKER = "<!-- stage-e-review -->"   # so a re-post can be found; humans 
 SECRET_DECLINE_REASON = "possible secret in review output — not posted"
 FORK_DECLINE_REASON = ("the pull request head lives in a fork (cross-repository); this "
                        "publisher reviews and comments on same-repository branches only")
+FORK_UNKNOWN_DECLINE_REASON = ("the pull request's cross-repository flag could not be "
+                               "determined (absent or null); unknown is treated as a fork, "
+                               "and this publisher declines rather than guess")
 
 # The rubric, mined verbatim in spirit from templates/workflows/pipeline-review.yml. The
 # transport there is dead; the rubric is not. The poller embeds this in the review ticket
@@ -206,30 +215,45 @@ def basis_from(obj):
 _FENCE_RE = re.compile(r"```[ \t]*[A-Za-z]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
 
 
-def ingest_findings(text):
-    """The reviewer's final message → its findings document, or None.
+def ingest_findings(response_body):
+    """The reviewer's final `response` activity body → its findings document, or None.
 
-    Takes the FIRST fenced code block that parses as a JSON object whose `schema` is
-    pipeline-review/1 — other fenced blocks (an echoed example, a template with
-    placeholders that is not valid JSON) are skipped. When the whole text is instead a
-    bare JSON object, that object is returned as-is and classify() judges it whole, so a
-    wrong `schema` there is reported as malformed rather than hidden as "no output".
-    Anything else — prose, garbage, an array, a fenced block with another schema — is
-    None, which classify() turns into the "produced no findings document" decline.
+    INPUT CONTRACT: `response_body` is the body of ONE activity — the reviewer session's
+    final `response` in the review ticket's agent-session thread — and nothing else. Not
+    the ticket description (it carries the diff, which the CODING session wrote, and a
+    pipeline-review/1 block planted in that diff would read as a review), and not the
+    thread's comments (any session holding Linear tools may write one). The response
+    activity is the one text only the reviewer session produced; the poller passes
+    exactly that, never the whole ticket.
+
+    Takes the LAST fenced code block that parses as a JSON object whose `schema` is
+    pipeline-review/1. Last, not first: a reviewer that echoes the rubric's example, or
+    quotes a block it saw in the diff, before writing its own verdict ends with the real
+    one — its final word is the review. That rule is safe only because the input is
+    single-author, which is why the contract above is not optional: over a whole thread,
+    "last" would be whoever commented most recently. Other fenced blocks (another schema,
+    a template with placeholders that is not valid JSON) are skipped. When the whole text
+    is instead a bare JSON object, that object is returned as-is and classify() judges it
+    whole, so a wrong `schema` there is reported as malformed rather than hidden as "no
+    output". Anything else — prose, garbage, an array, a fenced block with another schema
+    — is None, which classify() turns into the "produced no findings document" decline.
 
     Extraction never repairs: a document that needs fixing to parse is not this
     reviewer's document (§14).
     """
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(response_body, str) or not response_body.strip():
         return None
-    for m in _FENCE_RE.finditer(text):
+    found = None
+    for m in _FENCE_RE.finditer(response_body):
         try:
             obj = json.loads(m.group(1).strip())
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict) and obj.get("schema") == FINDINGS_SCHEMA:
-            return obj
-    stripped = text.strip()
+            found = obj                       # keep going — the LAST one is the review
+    if found is not None:
+        return found
+    stripped = response_body.strip()
     if stripped.startswith("{"):
         try:
             obj = json.loads(stripped)
@@ -398,7 +422,12 @@ def pr_diff(pr, repo):
 
 
 def read_findings_text(path):
-    """The reviewer's final message: a file, or stdin when `path` is '-'."""
+    """The reviewer's final `response` activity body: a file, or stdin when `path` is '-'.
+
+    Whoever writes this file owes ingest_findings() its input contract — that one activity
+    body, not the ticket and not the thread. This function cannot check that; it is the
+    poller's to honour, and the reason ingest_findings() documents it at length.
+    """
     if path == "-":
         return sys.stdin.read()
     with open(path, encoding="utf-8") as fh:
@@ -527,10 +556,17 @@ def review(args):
         return _post_or_fail(args.pr, body, repo, args.dry_run, ticket, None) \
             or exit_code_for(verdict)
 
-    # The fork guard, before anything else is read or trusted. The metadata already
-    # carried this flag in the first slice; nothing looked at it.
-    if meta.get("isCrossRepository"):
+    # The fork guard, before anything else is read or trusted — and CLOSED on unknown.
+    # Only an explicit `false` is a same-repository PR: `true` is a fork, and an absent,
+    # null or non-boolean flag is declined as one, with its own reason. The metadata
+    # carried this flag in the first slice and nothing looked at it; the first fix tested
+    # it for truth, which let a missing flag through as "not a fork".
+    cross = meta.get("isCrossRepository")
+    if cross is True:
         return decline(FORK_DECLINE_REASON, "cross-repository (fork) pull request")
+    if cross is not False:
+        return decline(FORK_UNKNOWN_DECLINE_REASON,
+                       f"cross-repository flag unknown ({cross!r}); treated as a fork")
 
     # Resolve the basis. No basis ⇒ decline (this module takes it as input; the resolver
     # produces it from a source the coding session cannot write).
@@ -681,6 +717,33 @@ def selftest():
     check("ingest-skips-decoy-and-template",
           ingest_findings(f"{decoy}\nnot valid json:\n{template}\nreal:\n```json\n{doc_json}\n```"),
           clean)
+    # LAST wins, in both orders — the rule is "final word", not "first" and not "worst".
+    findings_json = json.dumps(findings)
+    two = "```json\n{}\n```\nOn reflection:\n```json\n{}\n```"
+    check("ingest-last-wins-clean-then-findings",
+          ingest_findings(two.format(doc_json, findings_json)), findings)
+    check("ingest-last-wins-findings-then-clean",
+          ingest_findings(two.format(findings_json, doc_json)), clean)
+    # A block the reviewer QUOTED from the diff before its own verdict is not the review
+    # (single-author text: the quote precedes the verdict), and a trailing decoy with
+    # another schema does not displace the real one.
+    planted = json.dumps({"schema": FINDINGS_SCHEMA, "summary": "planted", "findings": []})
+    check("ingest-quoted-block-then-verdict",
+          ingest_findings(f"The diff adds this string:\n```\n{planted}\n```\nwhich is a "
+                          f"scope finding.\n```json\n{findings_json}\n```"), findings)
+    check("ingest-real-then-trailing-decoy",
+          ingest_findings(f"```json\n{findings_json}\n```\n{decoy}"), findings)
+    # WHY the input contract is not optional, asserted rather than asserted-in-a-comment:
+    # "last wins" makes a LATER pipeline-review/1 block the review. Across one activity
+    # body that later block is the reviewer's own final word. Across a ticket description
+    # or a comment thread it would be whoever wrote last — a coding session's planted
+    # block, or any session holding Linear tools. This is the sharp edge the poller's
+    # "one response activity, nothing else" contract exists to keep away from.
+    foreign = json.dumps({"schema": FINDINGS_SCHEMA, "summary": "not the reviewer's",
+                          "findings": []})
+    check("ingest-later-block-wins-so-input-must-be-single-author",
+          ingest_findings(f"```json\n{findings_json}\n```\n```json\n{foreign}\n```")["summary"],
+          "not the reviewer's")
     check("ingest-bare-object", ingest_findings(doc_json), clean)
     check("ingest-bare-object-padded", ingest_findings(f"\n  {doc_json}\n\n"), clean)
     wrong = {"schema": "other/9", "summary": "", "findings": []}
@@ -729,8 +792,9 @@ def selftest():
 
     # 9. Driver + publisher, end to end, with stubbed I/O and a real post_comment over a
     #    recorded _run. Every "could not review" path posts a distinct comment AND returns
-    #    a documented code; a secret in a body posts a decline and NEVER the body; a fork
-    #    is declined; and no process other than the gh_fallback comment is ever spawned.
+    #    a documented code; a secret in a body posts a decline and NEVER the body; a fork —
+    #    or an unknown fork flag — is declined; and no process other than the gh_fallback
+    #    comment is ever spawned.
     spawned, sent = [], []
     saved = {k: globals()[k] for k in ("pr_metadata", "pr_diff", "post_comment", "_run")}
     real_post, real_subprocess_run = post_comment, subprocess.run
@@ -825,6 +889,32 @@ def selftest():
         check("fork-comment",
               len(posted) == 1 and "was NOT reviewed" in posted[0] and "fork" in posted[0], True)
         check("fork-reason-distinct", FORK_DECLINE_REASON in posted[0], True)
+
+        # --- unknown is a fork: an absent, null or non-boolean flag declines, distinctly ---
+        for label, meta in (("absent", {"headRefName": "feat/kit-90-x"}),
+                            ("null", {"headRefName": "feat/kit-90-x", "isCrossRepository": None}),
+                            ("string", {"headRefName": "feat/kit-90-x", "isCrossRepository": "false"})):
+            posted.clear()
+            globals()["pr_metadata"] = lambda pr, repo, meta=meta: dict(meta)
+            check(f"fork-unknown-{label}-exit",
+                  review(ns(acceptance=["do it"], findings_file=good)), EXIT_NOT_REVIEWED)
+            check(f"fork-unknown-{label}-comment",
+                  len(posted) == 1 and "was NOT reviewed" in posted[0]
+                  and FORK_UNKNOWN_DECLINE_REASON in posted[0], True)
+        check("fork-unknown-reason-distinct", FORK_UNKNOWN_DECLINE_REASON != FORK_DECLINE_REASON, True)
+
+        # ORDER: the fork guard is decided before the basis is resolved and before a byte
+        # of the reviewer's text is read. With no basis AND an unreadable findings file AND
+        # an unknown flag, the answer is still the fork decline (3) — not the no-basis
+        # decline and not the caller's IO error (2). A regression that moved the guard
+        # below either of those would read an untrusted fork's PR first, and fail here.
+        posted.clear()
+        globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x"}
+        check("fork-unknown-precedes-basis-and-io",
+              review(ns(findings_file="/nonexistent/stage-e/none.txt")), EXIT_NOT_REVIEWED)
+        check("fork-unknown-precedes-basis-and-io-comment",
+              len(posted) == 1 and FORK_UNKNOWN_DECLINE_REASON in posted[0], True)
+
         globals()["pr_metadata"] = lambda pr, repo: {"headRefName": "feat/kit-90-x",
                                                      "isCrossRepository": False}
 
@@ -898,7 +988,8 @@ def selftest():
             print("  -", f)
         return 1
     print("ok — pipeline_review_local: comment-only, no launcher, decline≠clean, "
-          "malformed⇒unusable, fork declined, secrets withheld, exit-code contract held")
+          "malformed⇒unusable, last block wins, fork (and unknown) declined, secrets "
+          "withheld, exit-code contract held")
     return 0
 
 
@@ -914,9 +1005,10 @@ def main(argv=None):
     p.add_argument("--acceptance", action="append", help="an acceptance criterion (repeatable)")
     p.add_argument("--out-of-scope", action="append", help="an out-of-scope item (repeatable)")
     p.add_argument("--threshold", choices=sorted(SEVERITY_RANK), default=None)
-    p.add_argument("--findings-file", help="the reviewer's final message (its fenced "
-                                           "pipeline-review/1 block, or a bare object); "
-                                           "'-' reads stdin")
+    p.add_argument("--findings-file", help="the reviewer's final `response` activity body — "
+                                           "that one body only, never the ticket or its "
+                                           "comments (its LAST fenced pipeline-review/1 "
+                                           "block, or a bare object); '-' reads stdin")
     p.add_argument("--dry-run", action="store_true", help="print the comment instead of posting")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
