@@ -205,7 +205,10 @@ template it restated earlier.
 
 ### What a review ticket body looks like
 
-The poller writes it; you will see it in a dry run. In order:
+The poller writes it. **A dry run does not show it** — it prints the create input with the
+description omitted, because the body carries the whole diff and a dry run must not spill
+that to a terminal or a log. The first and only chance to read it is the first real review
+ticket, in the tracker (live test 3). In order:
 
 1. The brief: *You are a review-only session. You cannot run commands or edit files. Your
    entire deliverable is one fenced json block in your final message.*
@@ -275,8 +278,14 @@ Scope the GitHub token like `docs/AUTONOMY.md` scopes the push credential: nothi
 needs *Administration*, *Workflows*, or *Pull requests: write*. Every write goes through
 `scripts/gh_fallback.py`, which has no merge endpoint.
 
-The scripts read the values from the environment variables their config **names**. Rename
-them freely; change `github_token_env` and `linear_key_env` to match.
+The scripts read the values from the environment variables their config **names**.
+
+**Only the Linear one may be renamed.** Change `linear_key_env` (poller) and
+`linear_api_key_env` (driver) to match, and it works. **Leave the GitHub variable called
+`GH_TOKEN`.** The shared comment transport `scripts/gh_fallback.py` reads `GH_TOKEN` and
+`GITHUB_TOKEN` and nothing else. The poller mirrors a renamed variable into `GH_TOKEN` for
+its own process; the bounce driver does not, so every comment the driver posts fails with
+*no GitHub token*.
 
 ### 3c. Two config files, not one
 
@@ -343,9 +352,11 @@ prints this and lists every key it accepts:
   fallback fix ticket's `[repo=<name>#<branch>]` tag. Without it there is no fallback.
 - `repo_roots` is optional: a local clone makes the `delivery.json` read a
   `git show origin/<default>:delivery.json`; without it the driver uses the contents API.
-- **`required_checks` is the one you will actually need.** Use it to exclude a required
-  check no session can ever turn green — on a kit-derived repo, the grader-floor guard
-  waits for a person's label. Leave it out and a whole bounce budget is spent on a check
+- **`required_checks` is the one you will actually need, and it does not subtract.** An
+  entry for a repository **replaces** the whole required set the driver would otherwise
+  read from the forge. So write out every context a session actually controls, and leave
+  out the ones it cannot — on a kit-derived repo, the grader-floor guard waits for a
+  person's label. Leave the key out entirely and a whole bounce budget is spent on a check
   the session cannot fix.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
   `delivery.json`.
@@ -447,10 +458,15 @@ python3 <scripts dir>/pipeline_review_poller.py --config ~/.stage-e/poller.json 
 python3 <scripts dir>/pipeline_bounce_local.py decide --all --json
 ```
 
-A poller dry run lists the PRs discovery found, prints the review ticket body it would
-create — read it: the brief, the criteria, the diff, and confirm no `[repo=` survived —
-creates nothing, posts nothing, and says how many candidates it saw. Silence is not a pass.
-A dry run still needs both credentials, because it still reads.
+A poller dry run says how many open PRs it saw, how many discovery calls dispatcher-worked,
+and how many are new to review — that last count is exactly how many tickets a live `scan`
+would create. It then prints the create input for each **without the description**, plus its
+length and hash. It creates nothing and posts nothing. Silence is not a pass. A dry run still
+needs both credentials, because it still reads.
+
+**The body itself is deliberately not printed** — it carries the whole diff. Confirming the
+brief, the criteria, the fence and that no routing tag survived happens on the first real
+ticket, in the tracker.
 
 `decide --all` prints one line per PR that has a review outcome on file and says what it
 would do. With no outcomes yet it says so in words, and exits 0.
@@ -475,6 +491,13 @@ live system can confirm.
    ticket **with the poller** — a `scan` without `--dry-run`. Delegating by hand in the
    tracker also proves this test, but the ticket is then one the poller will never collect,
    so test 4 becomes unreachable.
+   **`scan` is not scoped to your throwaway.** It has no `--pr` and no per-PR filter: it
+   opens a review ticket for *every* eligible PR it discovers, and each is a paid session
+   and a public comment. The dry run's new-to-review count is exactly how many it will
+   create. If that is more than one, narrow the pass first — setting `repos` to the one
+   repository holding the throwaway is the only lever, it also opts that repository back
+   into the branch-name fallback, and the dry run is what confirms the count. Put `repos`
+   back afterwards.
    Expect: the dispatcher log admits the session with **your** name as creator, and a
    worktree appears under its worktree root keyed by the review ticket's identifier.
    Fail — *user not allowed*: your id is not in `allowedUsers`. Fail — *creator missing*
@@ -486,8 +509,9 @@ live system can confirm.
    `repos` is your fallback.
 3. **The sandboxed reviewer receives the inlined diff and returns the block.** Expect,
    within `collect_timeout_seconds`, a `response` activity on the review ticket whose text
-   contains a fenced JSON block with `"schema": "pipeline-review/1"`. A summary saying the
-   diff is missing means the sanitizer or the cap removed it — check the dry-run body.
+   contains a fenced JSON block with `"schema": "pipeline-review/1"`. **This is where you
+   read the ticket body** — the dry run does not print it, so this is the first and only
+   chance. A summary saying the diff is missing means the sanitizer or the cap removed it.
 4. **The poller reads the response activity back, and the comment lands on the PR.** This
    is the whole point, and nothing before it has tested it. The poller has three commands:
    `scan` creates and delegates, `collect` reads the answer back and publishes, `run` does
@@ -523,8 +547,11 @@ live system can confirm.
    resume, any session can re-prompt any other session on this workspace, and the only
    thing standing between them is the brief. Record the result; it is the trigger for
    putting `mcp__linear` into `disallowedTools`.
-8. **Closing the review ticket deletes only its own worktree.** Move the throwaway review
-   ticket to Done. Expect its worktree gone and the coding ticket's worktree untouched.
+8. **Closing the review ticket deleted only its own worktree.** You move nothing here —
+   test 4 already did. Publishing closes the review ticket as its last step, so by now the
+   dispatcher has seen it reach a completed state. List the worktree root: expect the review
+   ticket's worktree gone and the coding ticket's still there. If the review ticket is
+   somehow still open, `collect` did not settle — go back to test 4.
    From here on, never move an original ticket by hand while a bounce could still run.
 9. *(Optional, before relying on it)* **The fix-ticket fallback lands on the PR branch.**
    Create a Reviews ticket whose description carries `[repo=<managed-repo name>#<pr-head-branch>]`
