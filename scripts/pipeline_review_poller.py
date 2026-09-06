@@ -66,11 +66,15 @@ WHY THE TEXT IT COPIES IS SANITIZED FIRST
 LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
 
   - The review ticket's agent session is found through `Query.agentSessions` filtered
-    CLIENT-SIDE on `issue { id }`, paging newest-first: the @linear/sdk 64.0.0 typings
+    CLIENT-SIDE on `issue { id }`, paging `orderBy: updatedAt` and ASSUMING newest-first
+    (the sort direction is not stated in the typings): the @linear/sdk 64.0.0 typings
     this was verified against expose no `Issue.agentSessions` field and no
     `AgentSessionFilter`, so the spec's "issue.agentSessions" read could not be confirmed.
-    If the live schema has grown that field, `find_sessions_for_issue` is the one place
-    to switch.
+    In a busy workspace a session can fall outside the SESSION_MAX_PAGES × page window;
+    when none is found the poller logs how many pages it read, the oldest `updatedAt`
+    it saw and whether more pages existed, so an operator can tell "not started yet"
+    from "outside the window". If the live schema has grown `Issue.agentSessions`,
+    `find_sessions_for_issue` is the one place to switch.
   - `AgentActivity.content` is a union; the response/error bodies are read through inline
     fragments on `AgentActivityResponseContent` / `AgentActivityErrorContent`. The
     typings confirm the type names and the `body` field. The activities connection is
@@ -95,17 +99,33 @@ THE SEEN-SET IS A STATE MACHINE, AND DELIVERY IS PART OF EVERY OUTCOME
 
     pending         review ticket created + delegated; `collect` reads it back
     retry           `scan` hit a TRANSIENT failure (the original ticket or the diff could
-                    not be read, or the issueCreate failed); re-selected next pass and
-                    declined for good after SCAN_RETRY_PASSES passes. Terminal reasons —
-                    no basis by any tier, an empty diff, over the cap, the resolver not
-                    installed — decline at once
+                    not be read, the issueCreate failed, or an unexpected error escaped);
+                    re-selected next pass and declined for good after SCAN_RETRY_PASSES
+                    passes. Terminal reasons — no basis by any tier, an empty diff, over
+                    the cap — decline at once
+    delivering      the verdict is settled and `settle` is mid-way (comment, outcome,
+                    close, telemetry — each flag persisted as it flips); a pass that
+                    died here is resumed by the next `collect` at the first unset stage
     publish-failed  the verdict is settled but the PR comment did not land (a GitHub
                     outage, an expired token); `collect` re-posts it from the stored
-                    verdict next pass — a PR is never left silent
+                    verdict next pass — a PR is never left silent, so this one is NOT
+                    bounded: it stays exit 1 until the comment lands or a person acts
     close-pending   the comment landed but the review ticket could not be moved to Done;
-                    `collect` retries the close (the dispatcher keeps that ticket's
-                    worktree until it lands)
+                    `collect` retries the close CLOSE_RETRY_PASSES times, then settles
+                    with `close_failed: true` and names the ticket a person must close
+                    by hand (the dispatcher keeps that ticket's worktree until then)
     declined / collected   terminal; the outcome file holds the verdict
+
+  THE SEEN-SET IS WRITTEN THROUGH, NEVER BATCHED. Every change to a record — the ticket
+  created, the comment landed, the outcome written, the close attempted — is saved to
+  disk the instant it happens (`persist()`), the same "append the ledger row FIRST" rule
+  the bounce driver follows. Saving once at the end of a pass was the bug: one PR's
+  unexpected exception threw away every earlier PR's record, and the next pass opened a
+  second paid reviewer session for a PR that already had one. For the same reason each
+  PR's work is isolated in the drivers: an exception that is not a PollerError is logged
+  with its traceback, counted, and the OTHER PRs continue; a PR that keeps hitting one is
+  declined after SCAN_RETRY_PASSES passes with a fixed reason, so a persistent bug is
+  loud and bounded, never an infinite exit-1 loop.
 
   A seen-set that cannot be read, or is not this file's schema, stops the pass BEFORE any
   read or write: the file is the only pointer to every open review ticket, and "could not
@@ -113,9 +133,24 @@ THE SEEN-SET IS A STATE MACHINE, AND DELIVERY IS PART OF EVERY OUTCOME
   would open a second review ticket for every open PR.
 
   Every reason posted to a PR is fixed text authored in this file. Text authored outside
-  the repo — a reviewer session's error body, a Linear or GitHub error payload — goes to
-  stderr (the owner's log) only; a public PR comment is not the place for a dispatcher's
-  machine paths.
+  the repo — a reviewer session's error body, a Linear or GitHub error payload, the
+  field values a malformed findings document quoted — goes to stderr (the owner's log)
+  only; a public PR comment is not the place for a dispatcher's machine paths.
+
+NOTHING LEAVES THIS HOST WITH A SECRET IN IT
+
+  The reviewer keeps the Linear MCP (an owner decision, recorded in the ADR), so its
+  `summary` and `detail` strings can echo whatever it read. Before ANY body reaches
+  `post_comment` — reviewed, declined, dry-run — `publish()` scans it for credential
+  shapes (`secret_hits`: GitHub / Anthropic / Linear / AWS tokens, private-key blocks,
+  JWTs, URL-embedded passwords, long blobs next to key/token/secret words). A hit posts a
+  DECLINE with the fixed reason `possible secret in review output — not posted`, replaces
+  the stored verdict with that decline BEFORE anything else happens, and never prints or
+  logs the withheld text. The publisher's own scrub (`pipeline_review_local.secret_hits`
+  / `SecretInBody`, the option-4 rework of the reviewer core) is preferred whenever the
+  installed publisher has one; the mirror here is the floor for a publisher that does
+  not, and the selftest drives the REAL `render_comment → post_comment` path over a
+  stubbed transport to prove nothing is sent either way.
 
 Usage:
     pipeline_review_poller.py --config CONFIG.json scan|collect|run [--dry-run] [--loop]
@@ -127,9 +162,14 @@ Exit: 0 = ran; every "nothing to do" is printed as what was asked and what the a
           comment was posted where a PR exists; the seen-set records the reason)
       1 = could not do something it WILL retry: a PR list or ticket read failed, a
           transient scan failure was recorded as `retry`, a comment or a ticket close did
-          not land (`publish-failed` / `close-pending`), or the seen-set is unreadable
-          (nothing ran — refusing is the only way not to re-review every open PR)
-      2 = usage/config/import error — nothing was touched
+          not land (`publish-failed` / `close-pending`), an unexpected error escaped one
+          PR's work (the others continued), a close was given up on (a person must close
+          that review ticket), or the seen-set is unreadable (nothing ran — refusing is
+          the only way not to re-review every open PR)
+      2 = usage/config/import error — nothing was touched. Includes the basis resolver
+          (scripts/pipeline_review_basis.py) not being installed: that is checked ONCE
+          at the start of `scan`, before anything is listed, so a deployment-wide
+          misconfiguration never consumes each PR's single review as a decline
 """
 import argparse
 import hashlib
@@ -139,6 +179,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -171,11 +212,69 @@ DEFAULT_THRESHOLD = "high"
 DEFAULT_LIST_LIMIT = 100
 LINEAR_API = "https://api.linear.app/graphql"
 
-# How many scan passes a TRANSIENT failure (a Linear/GitHub read, the issueCreate) is
-# retried before the PR is declined for good. Terminal reasons never wait.
+# How many scan passes a TRANSIENT failure (a Linear/GitHub read, the issueCreate, an
+# unexpected exception) is retried before the PR is declined for good. Terminal reasons
+# never wait. The same bound caps unexpected exceptions in `collect`.
 SCAN_RETRY_PASSES = 3
+# How many passes a failing `issueUpdate` (moving the review ticket to Done) is retried
+# before the record settles with `close_failed` and a person is asked to close it.
+CLOSE_RETRY_PASSES = 3
+# Agent-session listing window: pages × page size. Beyond it, "not found" is logged with
+# what was read so the operator can tell "not started yet" from "outside the window".
+SESSION_PAGE_SIZE = 100
+SESSION_MAX_PAGES = 5
 # Seen-set statuses `collect` has work for; everything else is terminal or `retry`.
-COLLECT_STATUSES = ("pending", "publish-failed", "close-pending")
+COLLECT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
+# The sibling this poller cannot review without: the reviewer has no tools, so a basis
+# that cannot be resolved is a decline — and a resolver that is not installed at all is a
+# deployment error checked once at startup, never per PR.
+BASIS_RESOLVER_MODULE = "pipeline_review_basis"
+
+# --------------------------------------------------------------------------- #
+# The secret gate. The publisher's own scrub is preferred when the installed
+# `pipeline_review_local` has one (its `secret_hits` / `SecretInBody` / reason); the
+# mirror below is the floor for a publisher that does not. Patterns are written so that
+# their own source text does not match them — the repo's write hook scans every file
+# write for the same shapes, and the selftest builds its fakes at runtime for that reason.
+# --------------------------------------------------------------------------- #
+SECRET_DECLINE_REASON = getattr(prl, "SECRET_DECLINE_REASON",
+                                "possible secret in review output — not posted")
+_KEYWORD = r"(?:key|token|secret|passw(?:or)?d|credential)"
+_BLOB = r"[A-Za-z0-9+/=]{40,}"
+_SECRET_SHAPES = (
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"), "GitHub token"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{22,}"), "GitHub fine-grained token"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "Anthropic API key"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "AWS access key id"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "private key block"),
+    (re.compile(r"lin_(?:api|oauth)_[A-Za-z0-9]{20,}"), "Linear API key"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}"), "JWT"),
+    (re.compile(r"[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s@]{6,}@"), "URL with embedded credentials"),
+    (re.compile(_KEYWORD + r"[^\n]{0,40}?" + _BLOB, re.IGNORECASE), "long blob next to a key/token/secret word"),
+    (re.compile(_BLOB + r"[^\n]{0,40}?" + _KEYWORD, re.IGNORECASE), "long blob next to a key/token/secret word"),
+)
+
+
+def _local_secret_hits(text):
+    hits = []
+    for pattern, label in _SECRET_SHAPES:
+        if pattern.search(text or "") and label not in hits:
+            hits.append(label)
+    return hits
+
+
+def secret_hits(text):
+    """The LABELS of every credential shape in `text` (never the matched text). Empty
+    means clean. The publisher's scanner when it has one, else the mirror above."""
+    fn = getattr(prl, "secret_hits", None)
+    return list(fn(text)) if callable(fn) else _local_secret_hits(text)
+
+
+class _NeverRaised(Exception):
+    """Placeholder for a publisher without its own scrub, so `except` has a class."""
+
+
+SECRET_IN_BODY = getattr(prl, "SecretInBody", _NeverRaised)
 
 # Every config key this script reads. `--example-config` prints them; load_config refuses
 # unknown ones so a typo cannot silently fall back to a default.
@@ -715,17 +814,20 @@ def list_open_prs(owner_repo, limit=DEFAULT_LIST_LIMIT):
 
 
 def fetch_pr_diff(owner_repo, number):
+    """The PR's unified diff: `gh pr diff`, else the REST diff media type. Every failure
+    — `gh` absent AND no token included — is a PollerError (a transient `retry`), never
+    a `gh_fallback.Failure` escaping into the driver."""
     ok, out, _ = gh_fallback.try_gh(["pr", "diff", str(number), "--repo", owner_repo])
     if ok:
         return out
     owner, repo = owner_repo.split("/", 1)
-    req = urllib.request.Request(
-        "%s/repos/%s/%s/pulls/%d" % (gh_fallback.API, owner, repo, number),
-        headers={"Authorization": "Bearer %s" % gh_fallback.token(),
-                 "Accept": "application/vnd.github.diff",
-                 "X-GitHub-Api-Version": "2022-11-28",
-                 "User-Agent": "claude-project-kit-review-poller"})
     try:
+        req = urllib.request.Request(
+            "%s/repos/%s/%s/pulls/%d" % (gh_fallback.API, owner, repo, number),
+            headers={"Authorization": "Bearer %s" % gh_fallback.token(),
+                     "Accept": "application/vnd.github.diff",
+                     "X-GitHub-Api-Version": "2022-11-28",
+                     "User-Agent": "claude-project-kit-review-poller"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             return resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
@@ -733,7 +835,7 @@ def fetch_pr_diff(owner_repo, number):
     except urllib.error.URLError as exc:
         raise PollerError("could not reach GitHub for the diff: %s" % exc.reason)
     except gh_fallback.Failure as exc:
-        raise PollerError(str(exc))
+        raise PollerError("gh could not fetch the diff and the REST fallback has no token: %s" % exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -849,19 +951,35 @@ def read_review_ticket(issue_id, api_key):
     return issue
 
 
-def find_sessions_for_issue(issue_id, api_key, page_size=100, max_pages=5):
-    """Agent sessions on `issue_id`, newest-updated first — client-side filtered."""
-    found, after = [], None
+def find_sessions_for_issue(issue_id, api_key, page_size=SESSION_PAGE_SIZE, max_pages=SESSION_MAX_PAGES):
+    """Agent sessions on `issue_id`, newest-created first — client-side filtered over a
+    workspace-wide listing (live-test: see the module docstring).
+
+    When nothing is found the window that was searched is LOGGED — pages read, rows seen,
+    the oldest `updatedAt` reached, whether more pages existed — so a pending ticket that
+    "never answers" can be told apart from one whose session fell outside the window."""
+    found, after, pages, rows, oldest, more = [], None, 0, 0, None, False
     for _ in range(max_pages):
         data = linear_graphql(LIST_AGENT_SESSIONS, {"first": page_size, "after": after}, api_key)
         conn = data.get("agentSessions") or {}
+        pages += 1
         for node in conn.get("nodes") or []:
+            rows += 1
+            ts = node.get("updatedAt") or ""
+            if ts and (oldest is None or ts < oldest):
+                oldest = ts
             if ((node.get("issue") or {}).get("id")) == issue_id:
                 found.append(node)
         info = conn.get("pageInfo") or {}
-        if found or not info.get("hasNextPage"):
+        more = bool(info.get("hasNextPage"))
+        if found or not more:
             break
         after = info.get("endCursor")
+    if not found:
+        log("NOTE: no agent session on review ticket %s in %d page(s) / %d session(s) read "
+            "(oldest updatedAt seen: %s; more pages beyond the window: %s) — a young ticket has "
+            "not started yet; an old one may have fallen outside the %d×%d listing window"
+            % (issue_id, pages, rows, oldest or "none", "yes" if more else "no", max_pages, page_size))
     found.sort(key=lambda s: s.get("createdAt") or "", reverse=True)
     return found
 
@@ -927,16 +1045,26 @@ def _optional_module(name):
         return None
 
 
+def basis_resolver_missing():
+    """The FAIL line to print when the basis resolver is not installed, or "" when it is.
+    `scan` asks this ONCE before listing anything: a missing sibling is a deployment
+    error (exit 2, nothing touched), never a per-PR decline that spends a PR's one review."""
+    if _optional_module(BASIS_RESOLVER_MODULE) is not None:
+        return ""
+    return ("the review basis resolver (scripts/%s.py) is not installed alongside this poller "
+            "— nothing was listed, declined or marked seen; install it and rerun" % BASIS_RESOLVER_MODULE)
+
+
 def resolve_basis_for(cfg, ticket_id, api_key):
-    """(basis or None, TERMINAL reason). Uses scripts/pipeline_review_basis.py when present;
-    the reviewer has no tools, so an unresolvable basis is a decline, not a lenient review.
+    """(basis or None, TERMINAL reason). Uses scripts/pipeline_review_basis.py; the
+    reviewer has no tools, so an unresolvable basis is a decline, not a lenient review.
 
     A transport failure reading the original ticket raises PollerError instead — that is
-    transient, and the caller retries it for a bounded number of passes."""
-    mod = _optional_module("pipeline_review_basis")
+    transient, and the caller retries it for a bounded number of passes. So does the
+    resolver going missing mid-run (`scan` already refused to start without it)."""
+    mod = _optional_module(BASIS_RESOLVER_MODULE)
     if mod is None:
-        return None, ("the review basis resolver (scripts/pipeline_review_basis.py) is not "
-                      "installed alongside this poller")
+        raise PollerError("the review basis resolver (scripts/%s.py) is not installed" % BASIS_RESOLVER_MODULE)
     team_key = ticket_id.split("-", 1)[0]
     try:
         issue = mod.fetch_issue(ticket_id, team_key, api_key)
@@ -988,15 +1116,32 @@ def emit_telemetry(cfg, artifact, dry_run, started_at):
 # Publish — through the ONE publisher, never a second comment path
 # --------------------------------------------------------------------------- #
 def publish(owner_repo, number, verdict, ticket_id, basis, dry_run):
-    """render_comment → post_comment. Returns True when delivered (or dry-run printed).
-    A delivery failure is announced on stderr and returned, never raised past here."""
+    """render_comment → secret gate → post_comment. One of three words, never a raise:
+
+      "posted"    delivered (or, on --dry-run, printed by the publisher)
+      "withheld"  the body carried a credential shape — it was NOT posted, printed or
+                  logged; the caller settles a decline with SECRET_DECLINE_REASON instead
+      "failed"    delivery itself failed (announced on stderr); the caller retries
+
+    The gate runs here, before the publisher, so a publisher without a scrub of its own
+    still posts nothing; a publisher WITH one (`SecretInBody`) is honoured the same way.
+    """
     body = prl.render_comment(verdict, ticket_id, basis)
+    hits = secret_hits(body)
+    if hits:
+        log("WITHHELD: %s#%d — %s (%s); the body was not posted, printed or logged"
+            % (owner_repo, number, SECRET_DECLINE_REASON, ", ".join(hits)))
+        return "withheld"
     try:
         prl.post_comment(number, body, owner_repo, dry_run)
-        return True
+        return "posted"
+    except SECRET_IN_BODY as exc:
+        log("WITHHELD: %s#%d — %s (publisher's scrub: %s); nothing was posted"
+            % (owner_repo, number, SECRET_DECLINE_REASON, exc))
+        return "withheld"
     except IOError as exc:
         log("FAIL: could not post the review comment on %s#%d: %s" % (owner_repo, number, exc))
-        return False
+        return "failed"
 
 
 def decline_verdict(cfg, reason):
@@ -1027,16 +1172,29 @@ class PassResult:
         return EXIT_OK
 
 
+def persist(cfg, seen, key, record, dry_run):
+    """Write the record THROUGH to the seen-set file now. Called after every change, so a
+    record is durable the instant the issueCreate or the comment lands — never at the end
+    of a pass, where one later PR's exception would discard it. No-op on --dry-run."""
+    if dry_run:
+        return
+    seen[key] = record
+    save_seen(seen_path(cfg["state_dir"]), seen)
+
+
 def settle(cfg, key, record, seen, linear_key, dry_run, result):
     """Deliver a settled verdict, stage by stage, resuming where an earlier pass stopped.
 
     The record carries `verdict` (from `classify`, or `decline_verdict`) and `final_status`
     (`collected` | `declined`). Stages, in order — publish the PR comment, write the outcome
     file, close the review ticket (only when one exists), emit telemetry — each flip a flag
-    in the record when they succeed, so nothing is posted, written or emitted twice, and a
-    stage that fails leaves the record in `publish-failed` or `close-pending` for the next
-    `collect` pass to resume. Delivery is part of the outcome: the outcome file the bounce
-    driver reads exists only once the PR carries the comment.
+    in the record when they succeed AND persist it at once, so nothing is posted, written
+    or emitted twice, and a stage that fails leaves the record in `publish-failed` or
+    `close-pending` for the next `collect` pass to resume. Delivery is part of the
+    outcome: the outcome file the bounce driver reads exists only once the PR carries
+    the comment. A body the secret gate withholds turns the verdict into a decline
+    BEFORE anything else is written, so the withheld text never reaches the outcome
+    file (the bounce driver would re-prompt it into a ticket) or the PR.
     """
     owner_repo, number, ticket_id = record["repo"], record["pr"], record["ticket_id"]
     pr = {"number": number, "headRefName": record.get("head_branch", ""), "url": record.get("pr_url", "")}
@@ -1048,13 +1206,32 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         record["status"] = status
         if reason is not None:
             record["reason"] = reason
-        if not dry_run:
-            seen[key] = record
+        persist(cfg, seen, key, record, dry_run)
+
+    if record.get("status") not in ("publish-failed", "close-pending"):
+        # In flight from here: a pass that dies mid-delivery leaves `delivering`, and the
+        # next `collect` resumes at the first stage whose flag is not set.
+        record["status"] = "delivering"
 
     if not record.get("published"):
         if final == "declined":
             log("NOT REVIEWED %s#%d (%s): %s" % (owner_repo, number, ticket_id, verdict.get("reason")))
-        if not publish(owner_repo, number, verdict, ticket_id, basis, dry_run):
+        outcome = publish(owner_repo, number, verdict, ticket_id, basis, dry_run)
+        if outcome == "withheld":
+            if verdict.get("reason") == SECRET_DECLINE_REASON:
+                # The fixed decline text tripped the gate — cannot happen, but if it does
+                # the answer is still "post nothing", loudly, and try again next pass.
+                log("FAIL: %s#%d — the decline comment itself tripped the secret gate; nothing "
+                    "posted, recorded as publish-failed" % (owner_repo, number))
+                save("publish-failed", SECRET_DECLINE_REASON)
+                result.errors += 1
+                return
+            verdict, final = decline_verdict(cfg, SECRET_DECLINE_REASON), "declined"
+            record.update(verdict=verdict, final_status=final, withheld=True)
+            persist(cfg, seen, key, record, dry_run)     # the withheld text is gone from state first
+            log("NOT REVIEWED %s#%d (%s): %s" % (owner_repo, number, ticket_id, SECRET_DECLINE_REASON))
+            outcome = publish(owner_repo, number, verdict, ticket_id, basis, dry_run)
+        if outcome != "posted":
             record["publish_attempts"] = int(record.get("publish_attempts") or 0) + 1
             log("FAIL: %s#%d verdict (%s) is settled but NOT on the PR yet — recorded as "
                 "publish-failed, re-posted next pass" % (owner_repo, number, final))
@@ -1062,30 +1239,46 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
             result.errors += 1
             return
         record["published"] = True
+        persist(cfg, seen, key, record, dry_run)
     artifact = outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict,
                                 verdict.get("reason"), record.get("reviewer_outcome") or "success")
     if not dry_run and not record.get("outcome_written"):
         write_outcome(cfg["state_dir"], artifact)
         record["outcome_written"] = True
-    close_failed = False
-    if issue_id and issue_id != "dry-run" and not record.get("closed"):
+        persist(cfg, seen, key, record, dry_run)
+    close_pending = gave_up_close = False
+    if issue_id and issue_id != "dry-run" and not record.get("closed") and not record.get("close_failed"):
         try:
             close_review_ticket(cfg, issue_id, linear_key, dry_run)
             record["closed"] = True
         except PollerError as exc:
-            log("FAIL: review ticket %s could not be closed (%s) — recorded as close-pending, "
-                "retried next pass; the dispatcher keeps its worktree until then" % (review_ticket, exc))
-            close_failed = True
+            attempts = int(record.get("close_attempts") or 0) + 1
+            record["close_attempts"] = attempts
+            if attempts >= CLOSE_RETRY_PASSES:
+                record["close_failed"] = True
+                gave_up_close = True
+                log("FAIL: review ticket %s could not be moved to Done after %d passes (%s) — giving "
+                    "up; CLOSE IT BY HAND: the dispatcher keeps its worktree until the ticket reaches "
+                    "Done or Canceled" % (review_ticket, attempts, exc))
+            else:
+                close_pending = True
+                log("FAIL: review ticket %s could not be closed (%s) — recorded as close-pending, "
+                    "retried next pass (%d of %d); the dispatcher keeps its worktree until then"
+                    % (review_ticket, exc, attempts, CLOSE_RETRY_PASSES))
+        persist(cfg, seen, key, record, dry_run)
     if not record.get("telemetry_emitted"):
         emit_telemetry(cfg, artifact, dry_run, started_at)
         record["telemetry_emitted"] = True
-    if close_failed:
+        persist(cfg, seen, key, record, dry_run)
+    if close_pending:
         save("close-pending")
         result.errors += 1
         return
     record["settled_at"] = _now_iso()
     record.pop("verdict", None)          # the outcome file holds it; keep the seen-set small
     save(final, verdict.get("reason") or "")
+    if gave_up_close:
+        result.errors += 1               # terminal for the poller, but a person has a chore
     if final == "declined":
         result.declined += 1
     else:
@@ -1095,14 +1288,52 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         result.published += 1
 
 
-def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
-    """One selected PR: basis → diff → body → create+delegate → seen.
+def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
+    """basis → diff → body → create+delegate, as a DECISION and no state change:
 
-    Two kinds of "could not": a TERMINAL reason (no basis by any tier, an empty diff, over
-    the cap, the resolver not installed) declines at once through `settle`; a TRANSIENT
-    one (a Linear or GitHub read failed, the issueCreate failed) is recorded as `retry`
-    and re-selected next pass, declining only after SCAN_RETRY_PASSES — so a five-minute
-    outage does not turn every PR opened during it into a human-only review."""
+      ("decline", reason, basis)          a TERMINAL reason — no basis by any tier, an
+                                          empty diff, over the cap
+      ("retry", reason, detail, basis)    a TRANSIENT one — a Linear or GitHub read
+                                          failed, the issueCreate failed
+      ("created", issue, basis, body)     the review ticket exists (and is paid for)
+
+    Kept free of every write so `scan_pr` can wrap it in one bug-catcher without ever
+    wrapping a `settle` — a decline whose comment already landed must never be turned
+    into a `retry` by an exception that came after it."""
+    number = pr["number"]
+    try:
+        basis, why = resolve_basis_for(cfg, ticket_id, linear_key)
+    except PollerError as exc:
+        return "retry", "the original ticket %s could not be read from Linear" % ticket_id, exc, None
+    if basis is None:
+        return "decline", why, None
+    try:
+        diff = fetch_pr_diff(owner_repo, number)
+    except PollerError as exc:
+        return "retry", "the pull request diff could not be fetched from GitHub", exc, basis
+    if not diff.strip():
+        return "decline", "the pull request diff is empty", basis
+    body = build_review_body(owner_repo, pr, ticket_id, basis, cfg["threshold"], diff)
+    if len(body) > cfg["diff_cap_chars"]:
+        return "decline", ("diff too large to deliver (%d chars of review-ticket body > the %d-char "
+                           "cap)" % (len(body), cfg["diff_cap_chars"])), basis
+    title = REVIEW_TITLE_FMT % (number, ticket_id)
+    try:
+        issue = create_review_ticket(cfg, title, body, linear_key, dry_run)
+    except PollerError as exc:
+        return "retry", "the review ticket could not be created (Linear API error)", exc, basis
+    return "created", issue, basis, body
+
+
+def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
+    """One selected PR: `prepare_review` → decline / retry / record as pending.
+
+    Two kinds of "could not": a TERMINAL reason declines at once through `settle`; a
+    TRANSIENT one is recorded as `retry` and re-selected next pass, declining only after
+    SCAN_RETRY_PASSES — so a five-minute outage does not turn every PR opened during it
+    into a human-only review. An exception that is not a PollerError is a bug, and a bug
+    is handled like an outage: logged with its traceback (the owner's log), bounded by
+    the same SCAN_RETRY_PASSES, then a fixed-reason decline."""
     started_at = _now_iso()
     number, ticket_id = pr["number"], pr["ticket_id"]
     key = pr_key(owner_repo, number)
@@ -1123,42 +1354,32 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
             return declined("%s — gave up after %d passes" % (reason, attempts), basis)
         log("RETRY %s#%d: attempt %d of %d, re-selected next pass" % (owner_repo, number, attempts, SCAN_RETRY_PASSES))
         record.update(status="retry", reason=reason, attempts=attempts)
-        if not dry_run:
-            seen[key] = record
+        persist(cfg, seen, key, record, dry_run)
         result.retried += 1
         result.errors += 1
 
     try:
-        basis, why = resolve_basis_for(cfg, ticket_id, linear_key)
-    except PollerError as exc:
-        return retry_later("the original ticket %s could not be read from Linear" % ticket_id, exc)
-    if basis is None:
-        return declined(why)
-    try:
-        diff = fetch_pr_diff(owner_repo, number)
-    except PollerError as exc:
-        return retry_later("the pull request diff could not be fetched from GitHub", exc, basis)
-    if not diff.strip():
-        return declined("the pull request diff is empty", basis)
-    body = build_review_body(owner_repo, pr, ticket_id, basis, cfg["threshold"], diff)
-    if len(body) > cfg["diff_cap_chars"]:
-        return declined("diff too large to deliver (%d chars of review-ticket body > the %d-char "
-                        "cap)" % (len(body), cfg["diff_cap_chars"]), basis)
-    title = REVIEW_TITLE_FMT % (number, ticket_id)
-    try:
-        issue = create_review_ticket(cfg, title, body, linear_key, dry_run)
-    except PollerError as exc:
-        return retry_later("the review ticket could not be created (Linear API error)", exc, basis)
+        decision = prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run)
+    except Exception as exc:  # noqa: BLE001 — a bug in one PR's preparation must not be silent or unbounded
+        log(traceback.format_exc())
+        decision = ("retry", "the poller hit an unexpected error preparing the review",
+                    "%s: %s" % (type(exc).__name__, exc), None)
+    kind = decision[0]
+    if kind == "decline":
+        return declined(decision[1], decision[2])
+    if kind == "retry":
+        return retry_later(decision[1], decision[2], decision[3])
+    _, issue, basis, body = decision
     stored = issue.get("description")
     record.update(status="pending", basis=basis, review_ticket_id=issue.get("id"),
                   review_ticket=issue.get("identifier"), review_ticket_url=issue.get("url") or "",
                   body_sha256=body_sha256(body),
                   stored_sha256=body_sha256(stored) if isinstance(stored, str) and stored else None)
+    # Durable BEFORE anything else happens: the ticket exists and is paid for from here.
+    persist(cfg, seen, key, record, dry_run)
     print("created review ticket %s for %s#%d (%s), %d chars%s"
           % (issue.get("identifier"), owner_repo, number, ticket_id, len(body),
              " [dry-run — nothing created]" if dry_run else ""))
-    if not dry_run:
-        seen[key] = record
     result.created += 1
 
 
@@ -1177,6 +1398,12 @@ def scan(cfg, dry_run):
     except PollerError as exc:
         log("FAIL: %s" % exc)
         return EXIT_USAGE
+    missing = basis_resolver_missing()
+    if missing:
+        # Checked ONCE, before anything is listed: a deployment without the resolver is a
+        # usage error, not a reason to spend every open PR's single review on a decline.
+        log("FAIL: %s" % missing)
+        return EXIT_USAGE
     # A `retry` record is not "seen": it is re-selected until it settles or gives up.
     seen_keys = {k for k, v in seen.items() if v.get("status") != "retry"}
     for owner_repo in cfg["repos"]:
@@ -1191,9 +1418,14 @@ def scan(cfg, dry_run):
         print("scan %s: %d open PR(s), %d new pipeline PR(s) to review"
               % (owner_repo, len(prs), len(selected)))
         for pr in selected:
-            scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result)
-        if not dry_run:
-            save_seen(seen_file, seen)
+            try:
+                scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result)
+            except Exception as exc:  # noqa: BLE001 — the last resort: one PR's crash never aborts the pass
+                log(traceback.format_exc())
+                log("FAIL: %s#%d hit an unexpected %s outside its retry bound (%s) — skipped this pass, "
+                    "the other PRs continue; whatever was persisted before it stands"
+                    % (owner_repo, pr.get("number"), type(exc).__name__, exc))
+                result.errors += 1
     return result.exit_code()
 
 
@@ -1256,10 +1488,16 @@ def collect_entry(cfg, key, record, seen, linear_key, dry_run, result):
                         "it was created (sha256 %s… ≠ %s…)" % (actual[:12], expected[:12]))
 
     doc = ingest_findings(body)
+    if doc is None:
+        return declined("the reviewer's final message carried no pipeline-review/1 block")
     verdict = prl.classify(doc, cfg["threshold"])
     if not verdict["usable"]:
-        return declined(verdict["reason"] or "the reviewer's response carried no usable "
-                        "pipeline-review/1 block")
+        # The publisher's reason quotes the reviewer's own field values; those are
+        # reviewer-authored text and stay in the owner's log. The PR gets fixed text.
+        log("reviewer document on %s did not conform (not posted verbatim): %s"
+            % (review_ticket, verdict.get("reason") or "no reason given"))
+        return declined("the reviewer's document did not conform to pipeline-review/1 — the whole "
+                        "review is unusable (detail in the poller log; see review ticket %s)" % review_ticket)
     settle_as(verdict, "collected")
 
 
@@ -1282,18 +1520,45 @@ def collect(cfg, dry_run):
         log("FAIL: %s" % exc)
         return EXIT_USAGE
     for key, record in work:
-        if record.get("status") != "pending":
-            # publish-failed / close-pending: the verdict is settled; resume its delivery.
-            settle(cfg, key, record, seen, linear_key, dry_run, result)
-            continue
-        if record.get("review_ticket_id") in (None, "dry-run"):
-            log("NOTE: %s has no review ticket id recorded — skipping" % key)
-            continue
-        collect_entry(cfg, key, record, seen, linear_key, dry_run, result)
-    if not dry_run:
-        save_seen(seen_file, seen)
+        try:
+            if record.get("status") != "pending":
+                # publish-failed / close-pending: the verdict is settled; resume its delivery.
+                settle(cfg, key, record, seen, linear_key, dry_run, result)
+            elif record.get("review_ticket_id") in (None, "dry-run"):
+                # A pending record with no ticket to read is a "could not", not a "nothing
+                # to do" (§13): the PR gets its NOT-reviewed comment and the record ends.
+                log("FAIL: %s is pending but has no review ticket id in state — declining it" % key)
+                record.update(verdict=decline_verdict(cfg, "review ticket id missing from state"),
+                              final_status="declined", reviewer_outcome="cancelled")
+                settle(cfg, key, record, seen, linear_key, dry_run, result)
+            else:
+                collect_entry(cfg, key, record, seen, linear_key, dry_run, result)
+        except Exception as exc:  # noqa: BLE001 — one entry's crash never aborts the pass for the others
+            log(traceback.format_exc())
+            faults = int(record.get("faults") or 0) + 1
+            record["faults"] = faults
+            if record.get("status") == "pending" and faults >= SCAN_RETRY_PASSES:
+                # Bounded like scan's retries: the give-up pass is a DECLINE (exit 3) whose
+                # comment lands, not one more error — unless declining itself fails.
+                log("FAIL: %s hit an unexpected %s on %d passes — declining it with a fixed reason"
+                    % (key, type(exc).__name__, faults))
+                record.update(verdict=decline_verdict(cfg, "the poller hit an unexpected error reading the "
+                                                      "review back — gave up after %d passes (see the "
+                                                      "poller log)" % faults),
+                              final_status="declined", reviewer_outcome="cancelled")
+                try:
+                    settle(cfg, key, record, seen, linear_key, dry_run, result)
+                    continue
+                except Exception as exc2:  # noqa: BLE001
+                    log(traceback.format_exc())
+                    log("FAIL: %s could not even be declined (%s: %s)" % (key, type(exc2).__name__, exc2))
+            else:
+                log("FAIL: %s hit an unexpected %s (%s) — fault %d of %d, the other entries continue"
+                    % (key, type(exc).__name__, exc, faults, SCAN_RETRY_PASSES))
+            result.errors += 1
+            persist(cfg, seen, key, record, dry_run)
     print("collect: %d published, %d declined, %d still pending, %d error(s) (read failed, "
-          "comment or close not delivered — retried next pass)"
+          "comment or close not delivered, or an unexpected error — retried next pass)"
           % (result.published, result.declined, result.waiting, result.errors))
     return result.exit_code()
 
@@ -1321,13 +1586,17 @@ class _FakeLinear:
         self.tamper = None
         self.fail_reads = False
         self.fail_close_once = False
+        self.fail_close = False       # permanent: the ticket was deleted / access revoked
+        self.crash_reads = set()      # review ticket ids whose read raises a NON-PollerError
         self.n = 0
 
     def __call__(self, query, variables, api_key):
         op = re.search(r"^\s*(?:mutation|query)\s+(\w+)", query, re.MULTILINE).group(1)
         if self.fail_reads and op.startswith(("Read", "List")):
             raise PollerError("simulated Linear outage")
-        if self.fail_close_once and op == "CloseReviewTicket":
+        if op == "ReadReviewTicket" and variables.get("id") in self.crash_reads:
+            raise RuntimeError("simulated bug while reading %s" % variables["id"])
+        if (self.fail_close_once or self.fail_close) and op == "CloseReviewTicket":
             self.fail_close_once = False
             raise PollerError("simulated issueUpdate failure")
         if op == "CreateReviewTicket":
@@ -1514,8 +1783,8 @@ def selftest():
     fake = _FakeLinear()
     posted, telemetry = [], []
     saved = {k: globals()[k] for k in ("list_open_prs", "fetch_pr_diff", "linear_graphql",
-                                       "resolve_basis_for", "emit_telemetry")}
-    saved_post = prl.post_comment
+                                       "resolve_basis_for", "emit_telemetry", "basis_resolver_missing")}
+    saved_post, saved_prl_run = prl.post_comment, getattr(prl, "_run", None)
     os.environ["LINEAR_KEY_TEST_91"] = "x"
     os.environ["GH_TOKEN_TEST_91"] = "y"
     # The drivers narrate on stdout/stderr; the selftest's own verdict is the only line
@@ -1527,6 +1796,7 @@ def selftest():
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
         globals()["linear_graphql"] = fake
         globals()["resolve_basis_for"] = lambda cfg, tid, key: (basis, "")
+        globals()["basis_resolver_missing"] = lambda: ""       # the sibling is "installed" here
         globals()["emit_telemetry"] = lambda cfg, art, dry, started: telemetry.append(art) or True
         prl.post_comment = lambda pr, body, repo, dry: posted.append((pr, body, repo, dry))
         completed_state_id.__defaults__[0].clear()
@@ -1566,6 +1836,10 @@ def selftest():
             check("collect (no session) exits OK", collect(cfg, False), EXIT_OK)
             check("collect (no session) posts nothing", posted, [])
             check("collect (no session) stays pending", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "pending")
+            # …and the window that was searched is on the log, so "not started yet" and
+            # "fell outside the listing window" are distinguishable by an operator.
+            check("collect (no session) logs the window searched",
+                  "no agent session on review ticket rev-uuid-1 in 1 page(s) / 0 session(s)" in sys.stderr.getvalue(), True)
 
             # happy path: a well-formed response → one comment, one outcome, ticket closed
             findings = {"schema": FINDINGS_SCHEMA, "summary": "found things", "findings": [
@@ -1616,6 +1890,11 @@ def selftest():
             check("malformed → outcome unusable", json.load(open(outcome_path(tmp, "o/r", 5)))["usable"], False)
             check("malformed → ticket still closed", len(fake.updated), 1)
             check("malformed → seen declined", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "declined")
+            # The publisher's reason quotes the reviewer's own field values ("Critical");
+            # the PR gets fixed text and the quoted values stay in the owner's log.
+            check("malformed → fixed reason posted", "did not conform to pipeline-review/1" in posted[0][1], True)
+            check("malformed → reviewer's values NOT posted", "Critical" in posted[0][1], False)
+            check("malformed → reviewer's values logged", "Critical" in sys.stderr.getvalue(), True)
 
         with tempfile.TemporaryDirectory() as tmp:   # no block at all → decline
             c = fresh_state(tmp)
@@ -1684,12 +1963,41 @@ def selftest():
             fake.__init__()
             posted.clear()
             save_seen(seen_path(tmp), dict(seen0))
-            globals()["resolve_basis_for"] = lambda cfg, tid, key: (None, "the review basis resolver is not installed")
+            globals()["resolve_basis_for"] = lambda cfg, tid, key: (None, "no review basis could be established for KIT-5")
             c = dict(cfg, state_dir=tmp)
             check("no basis → declined exit", scan(c, False), EXIT_DECLINED)
             check("no basis → no ticket", fake.created, [])
-            check("no basis → reason posted", "basis resolver" in (posted[0][1] if posted else ""), True)
+            check("no basis → reason posted", "no review basis could be established" in (posted[0][1] if posted else ""), True)
             globals()["resolve_basis_for"] = lambda cfg, tid, key: (basis, "")
+
+        with tempfile.TemporaryDirectory() as tmp:   # resolver NOT INSTALLED → usage exit before anything is listed
+            fake.__init__()
+            posted.clear()
+            listed = []
+            save_seen(seen_path(tmp), dict(seen0))
+            globals()["basis_resolver_missing"] = saved["basis_resolver_missing"]     # the real check…
+            real_import = globals()["_optional_module"]
+            globals()["_optional_module"] = lambda name: None                          # …over an absent module
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: listed.append(owner_repo) or fixture
+            c = dict(cfg, state_dir=tmp)
+            check("resolver missing → usage exit", scan(c, False), EXIT_USAGE)
+            check("resolver missing → nothing listed", listed, [])
+            check("resolver missing → nothing created", fake.created, [])
+            check("resolver missing → nothing posted", posted, [])
+            check("resolver missing → nothing marked seen", load_seen(seen_path(tmp)), seen0)
+            check("resolver missing → names the sibling", "pipeline_review_basis.py) is not installed" in sys.stderr.getvalue(), True)
+            check("resolver missing → run_once stops the loop (usage wins)", run_once(c, False), EXIT_USAGE)
+            # the per-ticket wrapper, reached only if the module vanished mid-run, is transient
+            globals()["resolve_basis_for"] = saved["resolve_basis_for"]
+            try:
+                resolve_basis_for(c, "KIT-5", "x")
+                failures.append("resolve_basis_for did not raise with the module absent")
+            except PollerError as exc:
+                check("resolver vanished mid-run → transient PollerError", "not installed" in str(exc), True)
+            globals()["resolve_basis_for"] = lambda cfg, tid, key: (basis, "")
+            globals()["_optional_module"] = real_import
+            globals()["basis_resolver_missing"] = lambda: ""
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
 
         def raiser(msg, exc=PollerError):
             def _raise(*a, **kw):
@@ -1803,6 +2111,236 @@ def selftest():
             check("close retry → no second telemetry", len(telemetry), 1)
             check("close retry → status collected", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "collected")
 
+        with tempfile.TemporaryDirectory() as tmp:   # close fails FOREVER → bounded, then settled with close_failed
+            c = fresh_state(tmp)
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(findings))
+            fake.fail_close = True
+            for n in range(1, CLOSE_RETRY_PASSES):
+                check("permanent close failure pass %d → error exit" % n, collect(c, False), EXIT_ERROR)
+                rec = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
+                check("permanent close failure pass %d → close-pending" % n, rec["status"], "close-pending")
+                check("permanent close failure pass %d → attempts counted" % n, rec.get("close_attempts"), n)
+            check("permanent close failure → giving-up pass is loud", collect(c, False), EXIT_ERROR)
+            rec = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
+            check("permanent close failure → settled anyway", rec["status"], "collected")
+            check("permanent close failure → close_failed recorded", rec.get("close_failed"), True)
+            check("permanent close failure → operator told which ticket, by hand",
+                  "review ticket REV-1 could not be moved to Done after %d passes" % CLOSE_RETRY_PASSES
+                  in sys.stderr.getvalue() and "CLOSE IT BY HAND" in sys.stderr.getvalue(), True)
+            check("permanent close failure → exactly one comment", len(posted), 1)
+            check("permanent close failure → exactly one telemetry", len(telemetry), 1)
+            check("permanent close failure → no issueUpdate landed", fake.updated, [])
+            check("permanent close failure → terminal: next pass is clean", collect(c, False), EXIT_OK)
+            fake.fail_close = False
+
+        with tempfile.TemporaryDirectory() as tmp:   # pending record with NO review ticket id → a decline, not a silent skip (§13)
+            fake.__init__()
+            posted.clear()
+            telemetry.clear()
+            orphan = {"status": "pending", "repo": "o/r", "pr": 5, "ticket_id": "KIT-5", "head_branch": "feat/kit-5-x",
+                      "review_ticket_id": None, "review_ticket": None, "created_at": _now_iso()}
+            save_seen(seen_path(tmp), {pr_key("o/r", 5): orphan})
+            c = dict(cfg, state_dir=tmp)
+            check("orphan pending → declined exit", collect(c, False), EXIT_DECLINED)
+            check("orphan pending → NOT-reviewed comment with the fixed reason",
+                  len(posted) == 1 and "review ticket id missing from state" in posted[0][1], True)
+            check("orphan pending → status declined", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "declined")
+            check("orphan pending → outcome unusable", json.load(open(outcome_path(tmp, "o/r", 5)))["usable"], False)
+            check("orphan pending → no issueUpdate", fake.updated, [])
+            check("orphan pending → terminal", collect(c, False), EXIT_OK)
+
+        # 7d. One PR's crash never costs another PR its record — the seen-set is written
+        #     THROUGH, and the drivers isolate each PR. This is the "second paid reviewer
+        #     session per pass" bug: before, one late exception discarded every record the
+        #     pass had made, and the next pass created REV-2 for a PR that already had REV-1.
+        fixture2 = fixture + [{"number": 6, "headRefName": "feat/kit-6-second", "isCrossRepository": False,
+                               "isDraft": False, "title": "Second", "url": "https://github.com/o/r/pull/6"}]
+
+        def crash_for_six(*a, **kw):
+            raise RuntimeError("simulated bug in the diff fetch for #6")
+
+        with tempfile.TemporaryDirectory() as tmp:   # a NON-PollerError in #6's preparation: #5's ticket is safe
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture2
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: crash_for_six() if n == 6 else diff
+            c = dict(cfg, state_dir=tmp)
+            check("crash in #6 pass 1 → error exit", scan(c, False), EXIT_ERROR)
+            check("crash in #6 pass 1 → exactly one ticket (for #5)", [i.get("title") for i in fake.created], ["Review PR #5 — KIT-5"])
+            seen = load_seen(seen_path(tmp))
+            check("crash in #6 pass 1 → #5 durable as pending", (seen.get(pr_key("o/r", 5)) or {}).get("status"), "pending")
+            check("crash in #6 pass 1 → #6 bounded as retry", (seen.get(pr_key("o/r", 6)) or {}).get("status"), "retry")
+            check("crash in #6 pass 1 → traceback logged", "RuntimeError: simulated bug" in sys.stderr.getvalue(), True)
+            check("crash in #6 pass 2 → error exit", scan(c, False), EXIT_ERROR)
+            check("crash in #6 pass 2 → STILL exactly one ticket", len(fake.created), 1)
+            check("crash in #6 pass 2 → #5 still pending", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "pending")
+            check("crash in #6 pass 3 → declined exit (bounded)", scan(c, False), EXIT_DECLINED)
+            check("crash in #6 pass 3 → one NOT-reviewed comment on #6 with a fixed reason",
+                  [(p[0], "unexpected error preparing the review" in p[1] and "was NOT reviewed" in p[1]) for p in posted], [(6, True)])
+            check("crash in #6 pass 3 → bug text NOT posted", "simulated bug" in (posted[0][1] if posted else "x"), False)
+            check("crash in #6 → still exactly one ticket", len(fake.created), 1)
+
+        with tempfile.TemporaryDirectory() as tmp:   # a crash that ESCAPES scan_pr (inside settle): the driver isolates it
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
+            globals()["resolve_basis_for"] = lambda cfg, tid, key: (basis, "") if tid == "KIT-5" else (None, "no basis for %s" % tid)
+
+            def post_crashing_on_six(pr, body, repo, dry):
+                if pr == 6:
+                    raise RuntimeError("simulated bug in the publisher")   # not an IOError: escapes publish()
+                posted.append((pr, body, repo, dry))
+            prl.post_comment = post_crashing_on_six
+            c = dict(cfg, state_dir=tmp)
+            check("escaping crash pass 1 → error exit", scan(c, False), EXIT_ERROR)
+            check("escaping crash pass 1 → #5's ticket created once", [i.get("title") for i in fake.created], ["Review PR #5 — KIT-5"])
+            check("escaping crash pass 1 → #5 durable on disk", load_seen(seen_path(tmp)).get(pr_key("o/r", 5), {}).get("status"), "pending")
+            check("escaping crash pass 1 → said so", "hit an unexpected RuntimeError" in sys.stderr.getvalue(), True)
+            check("escaping crash pass 2 → error exit", scan(c, False), EXIT_ERROR)
+            check("escaping crash pass 2 → no second ticket for #5", len(fake.created), 1)
+            prl.post_comment = lambda pr, body, repo, dry: posted.append((pr, body, repo, dry))
+            check("publisher fixed → #6's decline lands", scan(c, False), EXIT_DECLINED)
+            check("publisher fixed → one comment, on #6", [p[0] for p in posted], [6])
+            check("publisher fixed → still one ticket", len(fake.created), 1)
+            globals()["resolve_basis_for"] = lambda cfg, tid, key: (basis, "")
+
+        with tempfile.TemporaryDirectory() as tmp:   # collect: #6's read crashes; #5's verdict is delivered and durable
+            fake.__init__()
+            posted.clear()
+            telemetry.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp)
+            check("two pending → scan OK", scan(c, False), EXIT_OK)
+            check("two pending → two tickets", [i.get("title") for i in fake.created], ["Review PR #5 — KIT-5", "Review PR #6 — KIT-6"])
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(findings))
+            fake.crash_reads = {"rev-uuid-2"}
+            check("collect with #6 crashing → error exit", collect(c, False), EXIT_ERROR)
+            check("collect with #6 crashing → #5's comment posted", [p[0] for p in posted], [5])
+            seen = load_seen(seen_path(tmp))
+            check("collect with #6 crashing → #5 durable as collected", seen[pr_key("o/r", 5)]["status"], "collected")
+            check("collect with #6 crashing → #6 still pending, fault counted",
+                  (seen[pr_key("o/r", 6)]["status"], seen[pr_key("o/r", 6)].get("faults")), ("pending", 1))
+            check("collect with #6 crashing → #5 closed once", fake.updated, [("rev-uuid-1", {"stateId": "done-1"})])
+            check("collect with #6 crashing pass 2 → error exit", collect(c, False), EXIT_ERROR)
+            check("collect with #6 crashing pass 2 → no second comment on #5", [p[0] for p in posted], [5])
+            check("collect with #6 crashing pass 3 → bounded: declined exit", collect(c, False), EXIT_DECLINED)
+            check("collect with #6 crashing pass 3 → NOT-reviewed comment on #6 with a fixed reason",
+                  [(p[0], "unexpected error reading the review back" in p[1]) for p in posted], [(5, False), (6, True)])
+            check("collect with #6 crashing → #6 declined", load_seen(seen_path(tmp))[pr_key("o/r", 6)]["status"], "declined")
+            check("collect with #6 crashing → terminal", collect(c, False), EXIT_OK)
+            fake.crash_reads = set()
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+
+        # The concrete trigger the verifier reproduced: gh unusable AND no token. The REAL
+        # fetch_pr_diff must turn gh_fallback.Failure into a PollerError (a `retry`), never
+        # let it escape into the driver.
+        globals()["fetch_pr_diff"] = saved["fetch_pr_diff"]
+        saved_gh = (gh_fallback.try_gh, gh_fallback.token)
+        gh_fallback.try_gh = lambda argv: (False, "", "gh is not installed")
+        gh_fallback.token = raiser("no GitHub token: set GH_TOKEN", gh_fallback.Failure)
+        try:
+            fetch_pr_diff("o/r", 5)
+            failures.append("fetch_pr_diff with no gh and no token did not raise")
+        except PollerError as exc:
+            check("no gh + no token → PollerError naming the token", "no token" in str(exc), True)
+        except Exception as exc:  # noqa: BLE001
+            failures.append("fetch_pr_diff let a %s escape: %s" % (type(exc).__name__, exc))
+        finally:
+            gh_fallback.try_gh, gh_fallback.token = saved_gh
+        globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
+
+        # 7e. The secret gate, over the REAL render_comment → post_comment path with the
+        #     transport (the publisher's `_run`) stubbed: a reviewer whose `detail` carries a
+        #     token gets a DECLINE with the fixed reason; the token reaches no comment, no
+        #     stdout, no log, no outcome file and no seen-set. The fake is assembled at
+        #     runtime so this file never carries a token shape.
+        fake_token = "ghp_" + "A" * 40
+        sent = []
+
+        def fake_transport(argv, **kw):
+            body_file = argv[argv.index("--body-file") + 1] if "--body-file" in argv else None
+            sent.append({"argv": list(argv), "body": open(body_file).read() if body_file else ""})
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        if saved_prl_run is None:
+            failures.append("the publisher has no _run to stub; the secret-gate case cannot drive the real post_comment")
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                c = fresh_state(tmp)
+                prl.post_comment = saved_post          # the REAL publisher…
+                prl._run = fake_transport              # …over a recorded transport
+                leaky = {"schema": FINDINGS_SCHEMA, "summary": "found a thing", "findings": [
+                    {"severity": "high", "category": "security", "file": "x", "line": 1,
+                     "summary": "token committed", "detail": "the value is %s in x" % fake_token}]}
+                fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(leaky))
+                check("secret → declined exit", collect(c, False), EXIT_DECLINED)
+                check("secret → exactly one comment sent", len(sent), 1)
+                check("secret → it is the decline with the fixed reason",
+                      "was NOT reviewed" in (sent[0]["body"] if sent else "") and SECRET_DECLINE_REASON in (sent[0]["body"] if sent else ""), True)
+                check("secret → the token is in NO sent body", any(fake_token in s["body"] for s in sent), False)
+                check("secret → the token is NOT on stdout", fake_token in sys.stdout.getvalue(), False)
+                check("secret → the token is NOT in the log", fake_token in sys.stderr.getvalue(), False)
+                check("secret → the withholding is logged with its label only",
+                      "WITHHELD" in sys.stderr.getvalue() and "GitHub token" in sys.stderr.getvalue(), True)
+                with open(outcome_path(tmp, "o/r", 5)) as fh:
+                    outcome_text = fh.read()
+                check("secret → outcome unusable with the fixed reason",
+                      (json.loads(outcome_text)["usable"], json.loads(outcome_text)["reason"]), (False, SECRET_DECLINE_REASON))
+                check("secret → outcome carries no findings (the bounce driver must never see them)", json.loads(outcome_text)["findings"], [])
+                check("secret → the token is NOT in the outcome file", fake_token in outcome_text, False)
+                with open(seen_path(tmp)) as fh:
+                    seen_text = fh.read()
+                check("secret → the token is NOT in the seen-set", fake_token in seen_text, False)
+                rec = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
+                check("secret → record declined + withheld", (rec["status"], rec.get("withheld")), ("declined", True))
+                check("secret → review ticket still closed", len(fake.updated), 1)
+                check("secret → telemetry once", len(telemetry), 1)
+                check("secret → terminal", collect(c, False), EXIT_OK)
+                check("secret → still one comment", len(sent), 1)
+                # A publisher with a scrub of its own raises SecretInBody from inside
+                # post_comment; the poller honours that the same way — decline, never the body.
+                sent.clear()
+                fake.__init__()
+                posted.clear()
+                telemetry.clear()
+                save_seen(seen_path(tmp), dict(seen0))
+                check("publisher-scrub setup scan", scan(c, False), EXIT_OK)
+                fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(findings))
+                calls = []
+
+                def scrubbing_publisher(pr, body, repo, dry):
+                    calls.append(body)
+                    if len(calls) == 1:
+                        raise SECRET_IN_BODY("GitHub token")
+                    posted.append((pr, body, repo, dry))
+                prl.post_comment = scrubbing_publisher
+                check("publisher scrub → declined exit", collect(c, False), EXIT_DECLINED)
+                check("publisher scrub → the decline was posted instead", len(posted) == 1 and SECRET_DECLINE_REASON in posted[0][1], True)
+                check("publisher scrub → record declined + withheld",
+                      (load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], load_seen(seen_path(tmp))[pr_key("o/r", 5)].get("withheld")),
+                      ("declined", True))
+                prl.post_comment = lambda pr, body, repo, dry: posted.append((pr, body, repo, dry))
+                prl._run = saved_prl_run
+        # the mirror scanner itself: every shape hits, ordinary review prose does not
+        for name, shape in (("ghp", fake_token), ("gho", "gho_" + "b" * 36), ("pat", "github_pat_" + "Z" * 22 + "_" + "y" * 40),
+                            ("anthropic", "sk-ant-" + "api03-" + "k" * 40), ("aws", "AKIA" + "0" * 16),
+                            ("pem", "-----BEGIN " + "PRIVATE KEY-----"), ("linear", "lin_api_" + "x" * 40),
+                            ("jwt", "eyJ" + "a" * 30 + "." + "b" * 30 + "." + "c" * 30),
+                            ("url-creds", "postgres://app:" + "s3cretpw" + "@db.internal/x"),
+                            ("blob-after-word", "api key = " + "Q" * 48), ("blob-before-word", "Q" * 48 + " is the token")):
+            check("mirror scrub hits %s" % name, bool(_local_secret_hits("note: %s here" % shape)), True)
+        for name, benign in (("env-names", "read `LINEAR_OWNER_API_KEY` and `GITHUB_TOKEN` from the environment"),
+                             ("paths", "see scripts/pipeline_review_poller.py:42 and docs/adr/2026-09-05-stage-e.md"),
+                             ("rendered decline", prl.render_comment(decline_verdict(cfg, "diff too large to deliver"), "KIT-5", basis)),
+                             ("rendered review", prl.render_comment(prl.classify(findings, "high"), "KIT-5", basis)),
+                             ("short blob", "key " + "Q" * 39), ("prefix only", "ghp_ is the classic prefix"),
+                             ("urls", "https://github.com/o/r/pull/7 and https://api.linear.app/graphql")):
+            check("mirror scrub clean on %s" % name, _local_secret_hits(benign), [])
+        check("secret_hits returns labels, never text",
+              any(fake_token in label for label in secret_hits("x " + fake_token)), False)
+
         # 7c. A seen-set that cannot be read stops the pass before any read or write (§13):
         #     'could not read state' must never look like 'nothing seen yet'.
         for label, garbage in (("corrupt json", "{corrupt"),
@@ -1864,17 +2402,20 @@ def selftest():
             check("telemetry credential by env NAME", _Mod.calls[0].api_key_env if _Mod.calls else None, "LINEAR_KEY_TEST_91")
             check("telemetry team key from the ticket", _Mod.calls[0].team_key if _Mod.calls else None, "KIT")
         globals()["_optional_module"] = real_import
-        # basis: the real resolver wrapper, with no module → a named decline reason
-        globals()["resolve_basis_for"] = saved["resolve_basis_for"]
+        # basis_resolver_missing: "" when the sibling imports, a FAIL line naming it when not
+        globals()["basis_resolver_missing"] = saved["basis_resolver_missing"]
         globals()["_optional_module"] = lambda name: None
-        b, why = resolve_basis_for(cfg, "KIT-5", "x")
-        check("basis module absent → None", b, None)
-        check("basis module absent → reason", "not installed" in why, True)
+        check("basis_resolver_missing names the sibling", "pipeline_review_basis.py" in basis_resolver_missing(), True)
+        globals()["_optional_module"] = lambda name: _Mod
+        check("basis_resolver_missing is empty when installed", basis_resolver_missing(), "")
         globals()["_optional_module"] = real_import
+        globals()["basis_resolver_missing"] = lambda: ""
     finally:
         sys.stdout, sys.stderr = real_out, real_err
         globals().update(saved)
         prl.post_comment = saved_post
+        if saved_prl_run is not None:
+            prl._run = saved_prl_run
         os.environ.pop("LINEAR_KEY_TEST_91", None)
         os.environ.pop("GH_TOKEN_TEST_91", None)
         completed_state_id.__defaults__[0].clear()
