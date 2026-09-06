@@ -85,11 +85,17 @@ WHAT THIS FILE NEVER DOES
 
 STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either way)
 
-  <state_dir>/outcomes/<OWNER>__<REPO>/pr-<n>.json   written by the poller after a review:
-      {"pr", "repo", "ticket", "usable", "max_severity", "meets_threshold",
-       "review_ticket", "at", "head_sha"?, "threshold"?, "summary"?, "findings"?}
-      `head_sha` lets a review of an older head never trigger a second bounce; without
-      it, an outcome older than the last bounce is treated as stale.
+  <state_dir>/outcomes/<OWNER>__<REPO>__pr-<n>.json   written by the poller after a review
+      (`pipeline_review_poller.outcome_path`, its committed shape; the older spellings
+      `outcomes/<OWNER>__<REPO>/pr-<n>.json` and `outcomes/pr-<n>.json` are still read):
+      {"outcome_schema": "pipeline-review-outcome/1", "repo", "pr", "ticket_id" (or the
+       older "ticket"), "head_branch", "usable", "max_severity", "meets_threshold",
+       "review_ticket", "threshold", "summary", "findings", "reason", "at", "head_sha"?}
+      A record carrying a DIFFERENT `outcome_schema`, or one that cannot be read, is
+      REFUSED — exit 2 and a PR comment — never read as "no review" (§13): the
+      difference between "never reviewed" and "reviewed, record unreadable" is the whole
+      trigger. `head_sha` lets a review of an older head never trigger a second bounce;
+      without it, an outcome older than the last bounce is treated as stale.
   <state_dir>/bounce-ledger.jsonl                     written ONLY by this file
   <state_dir>/rereview/<OWNER>__<REPO>/pr-<n>.json    left after a bounce so the poller
       may re-review the next push — bounded, since bounces are
@@ -137,9 +143,14 @@ Exit: 0 = decided / acted / bounce OFF (named) / nothing to do (named)
           branch, a branch-named ticket that does not own the PR, `exhaust` asked for
           when the budget is not spent, or a send that failed after its ledger row was
           written — loud, never the same token as "nothing to do" (contract §13). Where
-          the PR is known, open and ours, a could-not also posts ONE PR comment saying so
-          (deduplicated per reason); transient read failures upstream of the PR do not,
-          since a comment per poll cycle during an outage would be noise, not signal.
+          the PR is known (its lookup succeeded), open and ours, EVERY could-not also
+          posts ONE PR comment saying so, deduplicated per reason — a missing credential,
+          a Linear or GitHub error, a corrupt ledger or outcome record, a declined branch,
+          a credential shape in a body — because stderr under launchd is nobody's inbox.
+          Two exemptions only: a failure upstream of the PR lookup (nothing to say it on)
+          and plain network unreachability (`Unreachable`), which during an outage would
+          be a comment per poll cycle, not a signal. A PR comment never carries a local
+          path: where a message names a file, `BounceError.public` is what is posted.
 """
 import argparse
 import base64
@@ -164,6 +175,9 @@ EXIT_USAGE = 2
 DEFAULT_STATE_DIR = "~/.claude/pipeline/stage-e"
 DEFAULT_CONFIG_PATH = "~/.claude/pipeline/stage-e/config.json"
 LEDGER_SCHEMA = "pipeline-bounce-ledger/1"
+# The poller's outcome record (`pipeline_review_poller.OUTCOME_SCHEMA`) — the one shape
+# this driver reads; any other value is refused, never read as best-effort.
+OUTCOME_SCHEMA = "pipeline-review-outcome/1"
 DELIVERY_FILE = "delivery.json"
 # Linear WorkflowState.type values that mean "this ticket will not be worked further".
 TERMINAL_STATE_TYPES = ("completed", "canceled")
@@ -196,11 +210,26 @@ PIPELINE_BRANCH_RE = re.compile(r"^[a-z]+/[a-z][a-z0-9]*-\d+-[a-z0-9-]+$")
 
 
 class BounceError(Exception):
-    """A read or a write failed for a reason worth naming. Always exit 2, never silent."""
+    """A read or a write failed for a reason worth naming. Always exit 2, never silent.
+    `public` is the path-free wording for the PR comment, set wherever the message itself
+    names a local file (a ledger or outcome path is the operator's, never the public's).
+    `sit` is attached by gather() once the PR is known, so run_one can say the could-not
+    ON the PR (announce_could_not) instead of only on stderr."""
+
+    def __init__(self, message, public=None):
+        super().__init__(message)
+        self.public = public
+        self.sit = None
 
 
 class NotFound(BounceError):
     """A GitHub 404 — the one failure that means ABSENT rather than BROKEN."""
+
+
+class Unreachable(BounceError):
+    """A plain network failure — GitHub or Linear could not be reached at all. Exit 2 like
+    every could-not, but NOT announced on the PR: an outage would be one comment per poll
+    cycle, and the next cycle answers it. Every other could-not IS announced."""
 
 
 class Decline(BounceError):
@@ -285,6 +314,45 @@ def sanitize_untrusted(text):
     the fence it sits inside."""
     text = _ROUTING_TAG_RE.sub(lambda m: m.group(1) + ":", str(text))
     return _FENCE_RE.sub(lambda m: "<" + m.group(1) + "untrusted_", text)
+
+
+# Credential shapes a body must never carry to Linear (the ticket thread and the fallback
+# fix ticket are read by a session whose whole environment is the ticket). The reviewer
+# core's scrub is the same list and is preferred when present (`prl.secret_hits`), so the
+# two publishers cannot disagree; this fallback exists so a Linear-bound body is never
+# unscanned while that core is older. Patterns are written so their own source text does
+# not match them — the repository's PreToolUse hook scans every file write for the same
+# shapes, and the selftest builds its fakes at runtime for the same reason.
+_SECRET_KEYWORD = r"(?:key|token|secret|passw(?:or)?d|credential)"
+_SECRET_BLOB = r"[A-Za-z0-9+/=]{40,}"
+_FALLBACK_SECRET_SHAPES = (
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{36,}"), "GitHub token"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{22,}"), "GitHub fine-grained token"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "Anthropic API key"),
+    (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "AWS access key id"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----"), "private key block"),
+    (re.compile(r"lin_(?:api|oauth)_[A-Za-z0-9]{20,}"), "Linear API key"),
+    (re.compile(_SECRET_KEYWORD + r"[^\n]{0,40}?" + _SECRET_BLOB, re.IGNORECASE),
+     "long blob next to a key/token/secret word"),
+    (re.compile(_SECRET_BLOB + r"[^\n]{0,40}?" + _SECRET_KEYWORD, re.IGNORECASE),
+     "long blob next to a key/token/secret word"),
+)
+SECRET_DECLINE_REASON = getattr(prl, "SECRET_DECLINE_REASON",
+                                "possible secret in review output — not posted")
+
+
+def secret_hits(text):
+    """The labels of every credential shape in `text`, de-duplicated; empty means clean.
+    A non-empty answer means the body is NOT sent anywhere — not to the thread, not to a
+    fix ticket, not to the PR — and no bounce is spent on it (perform_bounce)."""
+    fn = getattr(prl, "secret_hits", None)
+    if callable(fn):
+        return list(fn(text or ""))
+    hits = []
+    for pattern, label in _FALLBACK_SECRET_SHAPES:
+        if pattern.search(text or "") and label not in hits:
+            hits.append(label)
+    return hits
 
 
 def render_findings_block(outcome, checks_status, failing_checks, head_sha):
@@ -374,6 +442,12 @@ def render_fix_ticket(*, repo_name, branch, pr_number, pr_url, ticket_id, bounce
         "or remove a label; do not move %s to any state. If a finding is wrong or out of "
         "scope, say so in a comment on THIS ticket and stop. Nobody is watching live — never "
         "try to ask an interactive user." % (branch, ticket_id or "the original ticket"),
+        "",
+        "Your local branch name is cosmetic — the dispatcher checked out THIS ticket's "
+        "suggested branch, which the repository's branch-naming guard may reject — so rename "
+        "it before the first edit (`git branch -m fix/<ticket>-<slug>`); only `git push origin "
+        "HEAD:%s` matters. The repository's docs/SESSION-BRIEF.md, where present, is the full "
+        "runbook for a dispatched session." % branch,
     ])
     return title, description
 
@@ -488,9 +562,13 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason):
 def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger_ok,
            trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
-    fork, draft, exhaustion already announced, terminal ticket, no trigger, a bounce
-    already in flight for this head); then the budget: bounce `prior + 1` while budget
-    remains, exhaust when `prior >= max_bounces`."""
+    fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
+    then the budget: bounce `prior + 1` while budget remains, exhaust when
+    `prior >= max_bounces` — and only THERE does an already-announced exhaustion become
+    the named no-op. The budget is compared first on purpose: when a person raises
+    `budgets.maxBounces` on the default branch (the intended human answer to an
+    exhaustion notice) the driver bounces again on the next trigger, instead of holding
+    "already announced" forever against a ledger nobody may edit."""
     def hold(action, reason, bounce_no=None):
         return {"action": action, "reason": reason, "bounce_no": bounce_no}
 
@@ -500,9 +578,6 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
         return hold("skip", "cross-repository PR — a fork is never ours to bounce (fork guard)")
     if is_draft:
         return hold("skip", "draft PR — not reviewed, not bounced")
-    if exhausted_announced:
-        return hold("noop", "bounce budget exhaustion (%d of %d) is already announced; "
-                            "waiting for a person" % (prior, max_bounces))
     if ticket_terminal:
         return hold("skip", "the original ticket is %s (terminal) — its worktree is gone and "
                             "its session cannot be resumed; nothing to re-prompt"
@@ -515,6 +590,10 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
                                in_flight.get("at") or "?"))
     bounce_no = prior + 1
     if prior >= max_bounces:
+        if exhausted_announced:
+            return hold("noop", "bounce budget exhaustion (%d of %d) is already announced; "
+                                "waiting for a person (or a higher budgets.maxBounces on the "
+                                "default branch)" % (prior, max_bounces))
         return {"action": "exhaust", "bounce_no": bounce_no,
                 "reason": "bounce budget exhausted (%d of %d spent) — %s"
                           % (prior, max_bounces, trigger_reason)}
@@ -524,7 +603,11 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
 
 def parse_delivery(raw):
     """(max_bounces, threshold, needs_human_label_id, state) from committed JSON text.
-    `state` is 'ok' or 'broken:<why>' — absence was decided before we got here."""
+    `state` is 'ok' or 'broken:<why>' — absence was decided before we got here.
+    `threshold` is None when `budgets.reviewSeverityThreshold` is unset or not a severity
+    (the committed validator rejects the latter): then the threshold the review was
+    actually judged at (the outcome record's) applies, and the publisher's default only
+    after that — gather() resolves the three in that order."""
     try:
         cfg = json.loads(raw)
     except ValueError as exc:
@@ -537,7 +620,7 @@ def parse_delivery(raw):
         return None, None, None, "broken:budgets.maxBounces is missing or not a non-negative integer"
     threshold = budgets.get("reviewSeverityThreshold")
     if threshold not in prl.SEVERITY_RANK:
-        threshold = prl.DEFAULT_THRESHOLD
+        threshold = None
     ids = ((cfg.get("linear") or {}).get("labels") or {}).get("ids") or {}
     return max_bounces, threshold, str(ids.get(NEEDS_HUMAN_KEY) or ""), "ok"
 
@@ -546,13 +629,17 @@ def pick_agent_thread(issue, dispatcher_app_user_id):
     """(root_comment_id, session) of the newest agent session on the issue that belongs
     to the configured dispatcher app user — or (None, None). Only ROOT comments carry a
     session (the thread model is one session per comment thread); a session owned by a
-    different app user is not ours to prompt, so it is never picked."""
+    different app user is not ours to prompt, so it is never picked — and with NO app
+    user configured nothing is picked at all, since "the newest session of any app" could
+    hand the owner-authored re-prompt, findings and all, to a foreign agent's thread."""
     best = None
+    if not dispatcher_app_user_id:
+        return None, None
     for c in ((issue or {}).get("comments") or {}).get("nodes") or []:
         sess = c.get("agentSession")
         if not sess or c.get("parent"):
             continue
-        if dispatcher_app_user_id and (sess.get("appUser") or {}).get("id") != dispatcher_app_user_id:
+        if (sess.get("appUser") or {}).get("id") != dispatcher_app_user_id:
             continue
         if best is None or str(sess.get("createdAt") or "") > str(best[1].get("createdAt") or ""):
             best = (c.get("id"), sess)
@@ -594,17 +681,24 @@ def read_ledger(path):
                     row = json.loads(line)
                 except ValueError as exc:
                     raise BounceError("could not read the ledger %s: line %d is not valid JSON (%s) — "
-                                      "refusing to count a budget from a corrupt ledger" % (path, n, exc))
+                                      "refusing to count a budget from a corrupt ledger" % (path, n, exc),
+                                      public="the bounce ledger is corrupt (line %d is not valid JSON); "
+                                             "the budget cannot be counted, so nothing was sent" % n)
                 if not isinstance(row, dict) or row.get("schema") != LEDGER_SCHEMA:
                     raise BounceError("could not read the ledger %s: line %d is not a %s row — "
                                       "refusing to count a budget from a ledger this reader does "
-                                      "not understand" % (path, n, LEDGER_SCHEMA))
+                                      "not understand" % (path, n, LEDGER_SCHEMA),
+                                      public="the bounce ledger carries a row this driver does not "
+                                             "understand (line %d); the budget cannot be counted, so "
+                                             "nothing was sent" % n)
                 rows.append(row)
     except FileNotFoundError:
         return []
     except OSError as exc:
         raise BounceError("could not read the ledger %s: %s — refusing to treat an unreadable "
-                          "budget as zero" % (path, exc))
+                          "budget as zero" % (path, exc),
+                          public="the bounce ledger could not be read (%s); the budget cannot be "
+                                 "counted, so nothing was sent" % exc.__class__.__name__)
     return rows
 
 
@@ -638,49 +732,87 @@ def append_row(path, **fields):
 
 
 def outcome_paths(state_dir, owner_repo, pr_number):
-    return [os.path.join(state_dir, "outcomes", repo_slug(owner_repo), "pr-%d.json" % pr_number),
-            os.path.join(state_dir, "outcomes", "pr-%d.json" % pr_number)]
+    """Where the poller's outcome record for one PR may sit: its committed shape first
+    (`pipeline_review_poller.outcome_path`: `outcomes/<OWNER>__<REPO>__pr-<n>.json`), then
+    the two older spellings this driver documented before the poller landed."""
+    base = os.path.join(state_dir, "outcomes")
+    return [os.path.join(base, "%s__pr-%d.json" % (repo_slug(owner_repo), pr_number)),
+            os.path.join(base, repo_slug(owner_repo), "pr-%d.json" % pr_number),
+            os.path.join(base, "pr-%d.json" % pr_number)]
+
+
+def outcome_ticket(outcome):
+    """The original ticket the poller verified for this PR — its `ticket_id` (the
+    committed key) or the older `ticket`."""
+    outcome = outcome or {}
+    return str(outcome.get("ticket_id") or outcome.get("ticket") or "")
 
 
 def read_outcome(state_dir, owner_repo, pr_number):
-    """(outcome or None, note). A malformed file is None WITH a note — the reader must
-    be able to tell "never reviewed" from "reviewed, record unreadable" (§13)."""
+    """The poller's outcome record for this PR, or None for "never reviewed". A record
+    that exists but cannot be read, is not an object, or carries an `outcome_schema`
+    other than OUTCOME_SCHEMA is REFUSED — BounceError, exit 2, said on the PR — never
+    read as "no review": that would turn "reviewed, record unreadable" into "nothing to
+    do", the §13 defect, and a meets-threshold review would silently never bounce."""
     for path in outcome_paths(state_dir, owner_repo, pr_number):
         if not os.path.exists(path):
             continue
+        public = ("the review outcome record for this PR %s; the driver cannot tell a "
+                  "meets-threshold review from none, so nothing was sent")
         try:
             with open(path, encoding="utf-8") as fh:
                 doc = json.load(fh)
         except (OSError, ValueError) as exc:
-            return None, "outcome file %s is unreadable (%s)" % (path, exc)
+            raise BounceError("outcome file %s is unreadable (%s) — refusing to read a broken review "
+                              "record as 'never reviewed'" % (path, exc),
+                              public=public % "cannot be read")
         if not isinstance(doc, dict):
-            return None, "outcome file %s is not an object" % path
+            raise BounceError("outcome file %s is not an object — refusing to read it as 'never "
+                              "reviewed'" % path, public=public % "is not a JSON object")
+        schema = doc.get("outcome_schema")
+        if schema is not None and schema != OUTCOME_SCHEMA:
+            raise BounceError("outcome file %s carries outcome_schema %r; this driver reads %r — "
+                              "refusing to guess at a record it does not understand"
+                              % (path, schema, OUTCOME_SCHEMA),
+                              public=public % ("carries outcome_schema %r, not the %r this driver reads"
+                                               % (schema, OUTCOME_SCHEMA)))
         if doc.get("repo") and doc.get("repo") != owner_repo:
             continue
-        return doc, ""
-    return None, ""
+        return doc
+    return None
+
+
+_OUTCOME_FILE_RE = re.compile(r"^(?:(?P<slug>.+?)__)?pr-(?P<n>\d+)\.json$")
 
 
 def list_outcomes(state_dir, cfg):
-    """[(owner_repo, pr_number)] for every outcome file the poller left."""
-    found = []
-    for path in sorted(glob.glob(os.path.join(state_dir, "outcomes", "*", "pr-*.json"))
-                       + glob.glob(os.path.join(state_dir, "outcomes", "pr-*.json"))):
-        m = re.search(r"pr-(\d+)\.json$", path)
+    """[(owner_repo, pr_number)] for every outcome file the poller left, in any of the
+    three spellings outcome_paths() reads, each PR once. The record's own `repo` key is
+    the authority; the path's `<OWNER>__<REPO>` (an owner name cannot carry `_`, so the
+    first `__` is the slash) is the fallback for a record that lacks it."""
+    base = os.path.join(state_dir, "outcomes")
+    found, seen = [], set()
+    for path in sorted(glob.glob(os.path.join(base, "*__pr-*.json"))
+                       + glob.glob(os.path.join(base, "*", "pr-*.json"))
+                       + glob.glob(os.path.join(base, "pr-*.json"))):
+        m = _OUTCOME_FILE_RE.match(os.path.basename(path))
         if not m:
             continue
         parent = os.path.basename(os.path.dirname(path))
-        repo = parent.replace("__", "/", 1) if parent != "outcomes" else None
-        if repo is None:
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    repo = (json.load(fh) or {}).get("repo")
-            except (OSError, ValueError):
-                repo = None
-            if not repo and len(cfg.get("repos") or []) == 1:
-                repo = cfg["repos"][0]
-        if repo:
-            found.append((repo, int(m.group(1))))
+        slug = m.group("slug") or (parent if parent != "outcomes" else None)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                repo = (json.load(fh) or {}).get("repo")
+        except (OSError, ValueError):
+            repo = None
+        if not repo and slug:
+            repo = slug.replace("__", "/", 1)
+        if not repo and len(cfg.get("repos") or []) == 1:
+            repo = cfg["repos"][0]
+        key = (repo, int(m.group("n")))
+        if repo and key not in seen:
+            seen.add(key)
+            found.append(key)
     return found
 
 
@@ -720,7 +852,7 @@ def _rest_get(path, cfg):
             raise NotFound("GitHub API GET %s -> HTTP 404" % path)
         raise BounceError("GitHub API GET %s -> HTTP %d" % (path, exc.code))
     except urllib.error.URLError as exc:
-        raise BounceError("could not reach GitHub: %s" % exc.reason)
+        raise Unreachable("could not reach GitHub: %s" % exc.reason)
 
 
 def pr_view(pr_number, owner_repo, cfg):
@@ -839,7 +971,10 @@ def committed_delivery_json(owner_repo, default_branch, cfg):
     """(raw text or None, 'ok'|'absent'|'broken:<why>') for delivery.json ON THE
     COMMITTED DEFAULT BRANCH. A configured local checkout is fetched fresh and read with
     `git show origin/<default>:delivery.json`; otherwise the contents API at ref=<default>.
-    Only a genuine "no such path" is ABSENT; any other failure is BROKEN."""
+    Only a genuine "no such path" is ABSENT; any other failure is BROKEN. The `why` is
+    FIXED wording — it ends up in a PR comment on a public repository, and git's own
+    stderr names the operator's checkout path; that text goes to the driver's stderr
+    only (the source-agnostic rule, applied to what the driver says out loud)."""
     root = (cfg.get("repo_roots") or {}).get(owner_repo)
     if root:
         root = os.path.expanduser(root)
@@ -847,17 +982,26 @@ def committed_delivery_json(owner_repo, default_branch, cfg):
             fetched = subprocess.run(["git", "-C", root, "fetch", "--quiet", "origin", default_branch],
                                      capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.SubprocessError) as exc:
-            return None, "broken:git fetch failed (%s)" % exc
+            sys.stderr.write("NOTE: git fetch in the configured checkout for %s could not run: %s\n"
+                             % (owner_repo, exc))
+            return None, "broken:git fetch of %s could not run in the configured checkout — see the driver log" % default_branch
         if fetched.returncode != 0:
-            return None, "broken:git fetch origin %s failed: %s" % (default_branch, fetched.stderr.strip()[:200])
-        shown = subprocess.run(["git", "-C", root, "show", "origin/%s:%s" % (default_branch, DELIVERY_FILE)],
-                               capture_output=True, text=True, timeout=30)
+            sys.stderr.write("NOTE: git fetch origin %s in the configured checkout for %s failed: %s\n"
+                             % (default_branch, owner_repo, fetched.stderr.strip()[:400]))
+            return None, "broken:git fetch of %s in the configured checkout failed — see the driver log" % default_branch
+        try:
+            shown = subprocess.run(["git", "-C", root, "show", "origin/%s:%s" % (default_branch, DELIVERY_FILE)],
+                                   capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            sys.stderr.write("NOTE: git show origin/%s:%s could not run: %s\n" % (default_branch, DELIVERY_FILE, exc))
+            return None, "broken:git show of %s on %s could not run — see the driver log" % (DELIVERY_FILE, default_branch)
         if shown.returncode == 0:
             return shown.stdout, "ok"
         err = shown.stderr
         if "does not exist" in err or "exists on disk, but not in" in err:
             return None, "absent"
-        return None, "broken:git show failed: %s" % err.strip()[:200]
+        sys.stderr.write("NOTE: git show origin/%s:%s failed: %s\n" % (default_branch, DELIVERY_FILE, err.strip()[:400]))
+        return None, "broken:git show of %s on %s failed — see the driver log" % (DELIVERY_FILE, default_branch)
     owner, repo = owner_repo.split("/", 1)
     path = "/repos/%s/%s/contents/%s?ref=%s" % (owner, repo, DELIVERY_FILE, default_branch)
     ok, out, err = _gh(["api", path.lstrip("/")])
@@ -875,10 +1019,13 @@ def committed_delivery_json(owner_repo, default_branch, cfg):
             data = _rest_get(path, cfg)
         except NotFound:
             return None, "absent"
+    if not isinstance(data, dict):
+        # A directory at that path answers with a LIST; anything but a file object is broken.
+        return None, "broken:contents API returned a non-file payload for %s" % DELIVERY_FILE
     try:
         return base64.b64decode(data.get("content") or "").decode("utf-8"), "ok"
     except (ValueError, UnicodeDecodeError) as exc:
-        return None, "broken:contents API payload undecodable (%s)" % exc
+        return None, "broken:contents API payload undecodable (%s)" % exc.__class__.__name__
 
 
 def _linear_key(cfg):
@@ -901,7 +1048,7 @@ def linear_graphql(query, variables, cfg):
     except urllib.error.HTTPError as exc:
         raise BounceError("Linear GraphQL -> HTTP %d" % exc.code)
     except urllib.error.URLError as exc:
-        raise BounceError("could not reach Linear: %s" % exc.reason)
+        raise Unreachable("could not reach Linear: %s" % exc.reason)
     except ValueError as exc:
         raise BounceError("Linear returned unparseable JSON: %s" % exc)
     if payload.get("errors"):
@@ -1055,8 +1202,9 @@ def announce_could_not(sit, reason, state_dir, dry_run):
         return False
     try:
         post_pr_comment(sit["pr"], render_decline_pr_comment(sit["pr"], reason), sit["repo"], False)
-    except (IOError, BounceError) as exc:
-        sys.stderr.write("NOTE: could not post the could-not comment on PR #%d: %s\n" % (sit["pr"], exc))
+    except Exception as exc:    # best effort: delivery failed (IOError), or the publisher's own
+        sys.stderr.write("NOTE: could not post the could-not comment on PR #%d: %s: %s\n"    # scrub refused
+                         % (sit["pr"], exc.__class__.__name__, exc))
         return False
     reasons[reason] = _now_iso()
     os.makedirs(os.path.dirname(marker), exist_ok=True)
@@ -1100,7 +1248,11 @@ def emit_telemetry(state_dir, artifact, cfg):
 # --------------------------------------------------------------------------- #
 def gather(pr_number, owner_repo, cfg, state_dir):
     """Every fact a decision needs, read once. Raises BounceError when a fact cannot be
-    established — that is "could not", exit 2, never a guess."""
+    established — that is "could not", exit 2, never a guess. Once the PR is known the
+    partial situation rides on the exception (`.sit`), so run_one can say the could-not
+    ON the PR: a missing credential or a corrupt ledger past this point would otherwise
+    be a launchd stderr line nobody reads, with the PR sitting unbounced and looking
+    clean."""
     sit = {"repo": owner_repo, "pr": pr_number}
     default = repo_default_branch(owner_repo, cfg)
     sit["default_branch"] = default
@@ -1111,7 +1263,16 @@ def gather(pr_number, owner_repo, cfg, state_dir):
     sit["head_sha"] = str(meta.get("headRefOid") or "")
     sit["branch"] = str(meta.get("headRefName") or "")
     sit["pr_url"] = str(meta.get("url") or "")
+    try:
+        return _gather_after_pr(sit, cfg, state_dir)
+    except BounceError as exc:
+        if exc.sit is None:
+            exc.sit = sit
+        raise
 
+
+def _gather_after_pr(sit, cfg, state_dir):
+    owner_repo, pr_number, meta, default = sit["repo"], sit["pr"], sit["pr_meta"], sit["default_branch"]
     raw, cstate = committed_delivery_json(owner_repo, default, cfg)
     if cstate == "absent":
         sit["config_state"] = "off"
@@ -1123,7 +1284,9 @@ def gather(pr_number, owner_repo, cfg, state_dir):
     if pstate != "ok":
         sit["config_state"] = pstate
         return sit
-    sit.update(config_state="ok", max_bounces=max_bounces, threshold=threshold,
+    sit.update(config_state="ok", max_bounces=max_bounces,
+               threshold=threshold or prl.DEFAULT_THRESHOLD,
+               threshold_source="delivery" if threshold else "default",
                needs_human_label_id=cfg.get("needs_human_label_id") or needs_human_id)
 
     # A closed, draft or cross-repository PR is decide()'s "skip" whatever else is true;
@@ -1136,13 +1299,17 @@ def gather(pr_number, owner_repo, cfg, state_dir):
                       "[a-z0-9-] only) — not this driver's to bounce, and a character outside "
                       "that alphabet would break the fallback ticket's routing tag" % sit["branch"], sit)
 
-    outcome, note = read_outcome(state_dir, owner_repo, pr_number)
-    sit["outcome"], sit["outcome_note"] = outcome, note
-    if outcome and outcome.get("threshold") in prl.SEVERITY_RANK and not threshold:
-        sit["threshold"] = outcome["threshold"]
+    outcome = read_outcome(state_dir, owner_repo, pr_number)
+    sit["outcome"] = outcome
+    if not threshold and outcome and outcome.get("threshold") in prl.SEVERITY_RANK:
+        # The committed budget names no threshold: the one the review was actually
+        # judged at wins over the publisher's default, so the instruction the session
+        # reads ("at or above …") is the bar its findings were measured against.
+        sit["threshold"], sit["threshold_source"] = outcome["threshold"], "review"
 
-    if (outcome or {}).get("ticket"):
-        sit["ticket_id"], sit["ticket_source"] = str(outcome["ticket"]), "outcome"
+    ticket = outcome_ticket(outcome)
+    if ticket:
+        sit["ticket_id"], sit["ticket_source"] = ticket, "outcome"
     else:
         sit["ticket_id"], sit["ticket_source"] = prl.resolve_ticket(sit["branch"], cfg.get("team_keys") or []), "branch"
     if not sit["ticket_id"]:
@@ -1180,8 +1347,6 @@ def decision_for(sit, cfg):
     fresh, fresh_reason = outcome_is_fresh(sit.get("outcome"), sit.get("head_sha"), sit.get("last_spent"))
     trigger_ok, trigger_reason, kind = compute_trigger(sit.get("checks_status"), sit.get("failing_checks") or [],
                                                        sit.get("outcome"), fresh, fresh_reason)
-    if sit.get("outcome_note") and not trigger_ok:
-        trigger_reason += " [%s]" % sit["outcome_note"]
     if sit.get("checks_note") and not trigger_ok:
         trigger_reason += " [%s]" % sit["checks_note"]
 
@@ -1226,14 +1391,37 @@ def describe(sit, verdict):
 def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     """Ledger row FIRST, then the thread reply; the fix ticket only when the thread is
     missing or the reply fails. A send that fails after the row exists is exit 2 — the
-    bounce is spent and a person must know why nothing arrived."""
+    bounce is spent and a person must know why nothing arrived. Two refusals come BEFORE
+    the row, because neither is a bounce: no configured dispatcher app user (the thread
+    route could not tell the dispatcher's session from another app's, and the fallback
+    could not delegate), and a credential shape in what would be sent (nothing goes to
+    Linear, the PR is told, no bounce is spent). Both are Decline — exit 2 and one PR
+    comment — and the ledger is untouched."""
+    app_user = cfg.get("dispatcher_app_user_id") or ""
+    if not app_user:
+        raise Decline("config 'dispatcher_app_user_id' is unset — the driver cannot tell the "
+                      "dispatcher's agent session from another app's on the ticket, and cannot "
+                      "delegate a fallback fix ticket; nothing was sent and no bounce was spent", sit)
     block = render_findings_block(sit.get("outcome"), sit.get("checks_status"),
                                   sit.get("failing_checks") or [], sit.get("head_sha"))
     body = render_reprompt(bounce_no=verdict["bounce_no"], max_bounces=sit["max_bounces"],
                            threshold=sit["threshold"], branch=sit["branch"], pr_number=sit["pr"],
                            pr_url=sit["pr_url"], findings_block=block)
+    repo_name = (cfg.get("dispatcher_repo_names") or {}).get(sit["repo"]) or sit["repo"].split("/", 1)[-1]
+    title, description = render_fix_ticket(
+        repo_name=repo_name, branch=sit["branch"], pr_number=sit["pr"], pr_url=sit["pr_url"],
+        ticket_id=sit.get("ticket_id"), bounce_no=verdict["bounce_no"],
+        max_bounces=sit["max_bounces"], threshold=sit["threshold"], findings_block=block)
+    hits = secret_hits("\n".join((body, title, description)))
+    if hits:
+        # Never the scrubbed text either: a body that carried one shape is not trusted to
+        # carry nothing else. The PR gets the reason; the ticket gets nothing.
+        sys.stderr.write("WITHHELD: %s (%s) — nothing sent to Linear, no bounce spent\n"
+                         % (SECRET_DECLINE_REASON, ", ".join(hits)))
+        raise Decline("%s (%s); the reviewer's text was not sent to the ticket thread or a fix "
+                      "ticket, and no bounce was spent" % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
     issue = sit.get("issue") or {}
-    thread_id, session = pick_agent_thread(issue, cfg.get("dispatcher_app_user_id") or "")
+    thread_id, session = pick_agent_thread(issue, app_user)
 
     if dry_run:
         print("[dry-run] %s" % describe(sit, verdict))
@@ -1262,11 +1450,6 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
         sys.stderr.write("NOTE: %s — falling back to a fix ticket\n" % error)
 
     if via is None:
-        repo_name = (cfg.get("dispatcher_repo_names") or {}).get(sit["repo"]) or sit["repo"].split("/", 1)[-1]
-        title, description = render_fix_ticket(
-            repo_name=repo_name, branch=sit["branch"], pr_number=sit["pr"], pr_url=sit["pr_url"],
-            ticket_id=sit.get("ticket_id"), bounce_no=verdict["bounce_no"],
-            max_bounces=sit["max_bounces"], threshold=sit["threshold"], findings_block=block)
         try:
             ticket = linear_create_fix_ticket(title, description, cfg)
             ref, via = ticket.get("identifier") or ticket.get("id"), "fix-ticket"
@@ -1318,6 +1501,12 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
                  "label": bool(prev.get("label"))}
     pr_body = render_exhaustion_pr_comment(sit.get("ticket_id"), sit["pr"], spent, max_bounces, reason)
     ticket_body = render_exhaustion_ticket_comment(sit["pr"], sit.get("pr_url") or "", spent, max_bounces, reason)
+    hits = secret_hits("\n".join((pr_body, ticket_body)))
+    if hits:    # the reason carries check names and a severity — cheap to scan, and the same gate everywhere
+        sys.stderr.write("WITHHELD: %s (%s) — the exhaustion notice was not posted\n"
+                         % (SECRET_DECLINE_REASON, ", ".join(hits)))
+        raise Decline("%s (%s); the exhaustion notice was not posted to the ticket or the PR"
+                      % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
 
     if dry_run:
         print("[dry-run] %s" % describe(sit, verdict))
@@ -1346,9 +1535,6 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
         label_id = sit.get("needs_human_label_id") or ""
         if not issue.get("id"):
             problems.append("label: no original ticket resolved for this PR")
-        elif sit.get("ticket_state_type") in TERMINAL_STATE_TYPES:
-            announced["label"] = True    # a terminal ticket needs no hand-off label
-            sys.stderr.write("NOTE: original ticket is terminal; %s not applied\n" % NEEDS_HUMAN_KEY)
         elif not label_id:
             problems.append("label: no id for %s (set linear.labels.ids in the committed "
                             "delivery.json or needs_human_label_id in the config)" % NEEDS_HUMAN_KEY)
@@ -1378,17 +1564,32 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
 
 def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False):
     """mode ∈ decide | bounce | exhaust. Returns an exit code; prints one line per PR.
-    `decide` is the read-only mode: it never posts, not even a could-not comment."""
-    try:
-        sit = gather(pr_number, owner_repo, cfg, state_dir)
-    except Decline as exc:
+    `decide` is the read-only mode: it never posts, not even a could-not comment. In the
+    acting modes every could-not with a PR to say it on is said there (announce_could_not,
+    once per reason) — the one exemption is plain unreachability, see Unreachable."""
+    def declined(exc):
         sys.stderr.write("FAIL: %s#%d: declined — %s\n" % (owner_repo, pr_number, exc))
         if mode != "decide":
             announce_could_not(exc.sit, str(exc), state_dir, dry_run)
         return EXIT_USAGE
+
+    try:
+        sit = gather(pr_number, owner_repo, cfg, state_dir)
+    except Decline as exc:
+        return declined(exc)
     except BounceError as exc:
         sys.stderr.write("FAIL: could not gather the facts for %s#%d: %s\n" % (owner_repo, pr_number, exc))
+        if mode != "decide" and exc.sit is not None and not isinstance(exc, Unreachable):
+            announce_could_not(exc.sit, "could not gather the facts a bounce needs — %s"
+                               % (exc.public or str(exc)), state_dir, dry_run)
         return EXIT_USAGE
+
+    def act(perform):
+        try:
+            return perform(sit, verdict, cfg, state_dir, dry_run)
+        except Decline as exc:
+            return declined(exc)    # raised before any write: no ledger row, nothing sent
+
     verdict = decision_for(sit, cfg)
     if verdict["action"] == "off":
         print("%s (%s) — the bounce tier is off here; nothing to do (contract §2)"
@@ -1406,7 +1607,8 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         if as_json:
             print(json.dumps({"repo": owner_repo, "pr": pr_number, "ticket_id": sit.get("ticket_id"),
                               "prior": sit.get("prior"), "max_bounces": sit.get("max_bounces"),
-                              "threshold": sit.get("threshold"), "checks": sit.get("checks_status"),
+                              "threshold": sit.get("threshold"), "threshold_source": sit.get("threshold_source"),
+                              "checks": sit.get("checks_status"),
                               "ticket_state": sit.get("ticket_state_name"), **verdict}, sort_keys=True))
         else:
             print(describe(sit, verdict))
@@ -1417,7 +1619,7 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         # never exit 0 — because "exhaust" run on a PR with budget left, a fork or a closed
         # PR would be the one label write outside exhaustion and a fork-guard bypass.
         if verdict["action"] == "exhaust":
-            return perform_exhaust(sit, verdict, cfg, state_dir, dry_run)
+            return act(perform_exhaust)
         if verdict["action"] == "noop":
             print(describe(sit, verdict))
             return EXIT_OK
@@ -1428,9 +1630,9 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         return EXIT_USAGE
     # mode == "bounce": act on the decision, whatever it is
     if verdict["action"] == "bounce":
-        return perform_bounce(sit, verdict, cfg, state_dir, dry_run)
+        return act(perform_bounce)
     if verdict["action"] == "exhaust":
-        return perform_exhaust(sit, verdict, cfg, state_dir, dry_run)
+        return act(perform_exhaust)
     print(describe(sit, verdict))
     return EXIT_OK
 
@@ -1482,6 +1684,8 @@ def selftest():
     check("fix ticket says push to the same branch", "git push origin HEAD:feat/eng-41-x" in desc, True)
     check("fix ticket forbids a new PR", "Do NOT create a pull request" in desc, True)
     check("fix ticket title names PR and ticket", "Fix PR #41 — ENG-41" in title, True)
+    check("fix ticket tells the session its local branch is cosmetic and to rename it",
+          "git branch -m fix/" in desc and "docs/SESSION-BRIEF.md" in desc, True)
 
     # 4. Trigger and freshness.
     check("red checks trigger", compute_trigger("red", ["ci"], None, False, "")[0], True)
@@ -1521,6 +1725,10 @@ def selftest():
     check("in-flight head never bounces again",
           decide(prior=1, **dict(base, in_flight={"bounce_no": 1, "at": "t"}))["action"], "skip")
     check("announced exhaustion is a named no-op", decide(prior=3, **dict(base, exhausted_announced=True))["action"], "noop")
+    d = decide(prior=3, **dict(base, max_bounces=4, exhausted_announced=True))
+    check("a RAISED budget after an announced exhaustion bounces again (4 of 4)", (d["action"], d["bounce_no"]), ("bounce", 4))
+    check("announced exhaustion never outranks a cleared trigger",
+          decide(prior=3, **dict(base, trigger_ok=False, trigger_reason="clean", exhausted_announced=True))["action"], "skip")
 
     # 6. parse_delivery: OK / BROKEN shapes (absence is decided before parsing).
     ok_cfg = json.dumps({"version": 1, "budgets": {"maxBounces": 2, "reviewSeverityThreshold": "medium"},
@@ -1528,8 +1736,10 @@ def selftest():
     check("delivery ok", parse_delivery(ok_cfg), (2, "medium", "lbl-nh", "ok"))
     check("delivery without maxBounces is BROKEN", parse_delivery('{"version":1,"budgets":{}}')[3].startswith("broken:"), True)
     check("unparseable delivery is BROKEN", parse_delivery("{not json")[3].startswith("broken:"), True)
-    check("bad threshold falls back to the default", parse_delivery(
-        '{"version":1,"budgets":{"maxBounces":1,"reviewSeverityThreshold":"HIGH"}}')[1], prl.DEFAULT_THRESHOLD)
+    check("unset threshold is None (the review's own threshold, then the default, apply)",
+          parse_delivery('{"version":1,"budgets":{"maxBounces":1}}')[1], None)
+    check("a non-severity threshold is None too (the committed validator rejects it)", parse_delivery(
+        '{"version":1,"budgets":{"maxBounces":1,"reviewSeverityThreshold":"HIGH"}}')[1], None)
 
     # 7. Config: credential keys are env var NAMES, never values.
     check("env var name accepted", validate_config(dict(CONFIG_DEFAULTS))["linear_api_key_env"], "LINEAR_OWNER_API_KEY")
@@ -1548,6 +1758,8 @@ def selftest():
     ]}}
     check("newest root thread of our app user", pick_agent_thread(issue, "app")[0], "c2")
     check("another app user's thread is never picked", pick_agent_thread(issue, "nobody")[0], None)
+    check("NO configured app user picks nothing (never 'the newest session of any app')",
+          pick_agent_thread(issue, "")[0], None)
     check("no comments -> no thread", pick_agent_thread({"comments": {"nodes": []}}, "app")[0], None)
 
     # 9. The ledger: only 'spent' rows count; a missing file is zero; an unreadable file or
@@ -1659,6 +1871,121 @@ def selftest():
                  render_decline_pr_comment(1, "why [repo=evil#main]")):
         check("renderer sanitizes the reason", "[repo=" in text or "</untrusted-review-findings>" in text, False)
 
+    import contextlib
+    import io
+    err = io.StringIO()          # the stubbed runs' stderr: asserted below, never shown
+
+    # 9d. The outcome record: the POLLER'S committed spelling and key set are read first
+    #     (`outcomes/<OWNER>__<REPO>__pr-<n>.json`, `ticket_id`, `outcome_schema`), the two
+    #     older spellings still are, `--all` lists each PR once across them, and a record
+    #     that exists but cannot be understood is REFUSED with a path-free public reason.
+    poller_record = {"schema": "pipeline-review/1", "outcome_schema": OUTCOME_SCHEMA, "repo": "o/r", "pr": 41,
+                     "head_branch": "feat/eng-41-x", "ticket_id": "ENG-41", "review_ticket": "REV-3",
+                     "threshold": "high", "usable": True, "max_severity": "high", "meets_threshold": True,
+                     "summary": "s", "findings": [{"severity": "high", "category": "scope",
+                                                   "summary": "drive-by", "detail": "d"}],
+                     "reason": "", "reviewer_outcome": "success", "at": "2026-01-01T00:00:00Z"}
+
+    def write_json(path, doc):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ppath = os.path.join(tmp, "outcomes", "o__r__pr-41.json")
+        check("the poller's spelling is the first path read", outcome_paths(tmp, "o/r", 41)[0], ppath)
+        check("never reviewed reads as None", read_outcome(tmp, "o/r", 41), None)
+        write_json(ppath, poller_record)
+        got = read_outcome(tmp, "o/r", 41)
+        check("the poller's record reads back", (got or {}).get("review_ticket"), "REV-3")
+        check("ticket comes from the poller's ticket_id", outcome_ticket(got), "ENG-41")
+        check("the older `ticket` key still resolves", outcome_ticket({"ticket": "ENG-7"}), "ENG-7")
+        write_json(os.path.join(tmp, "outcomes", "o__r", "pr-41.json"), dict(poller_record, review_ticket="OLD"))
+        write_json(os.path.join(tmp, "outcomes", "pr-41.json"), dict(poller_record, review_ticket="OLDER"))
+        write_json(os.path.join(tmp, "outcomes", "x__y", "pr-9.json"), {"pr": 9, "repo": "x/y"})
+        write_json(os.path.join(tmp, "outcomes", "pr-12.json"), {"pr": 12})
+        check("--all lists every spelling, each PR once, the record's own repo first",
+              sorted(list_outcomes(tmp, {"repos": ["o/r"]})), [("o/r", 12), ("o/r", 41), ("x/y", 9)])
+        check("the poller's record wins over the older spellings", read_outcome(tmp, "o/r", 41)["review_ticket"], "REV-3")
+        try:
+            import pipeline_review_poller as _poller    # present once the poller lands beside this file
+        except ImportError:
+            _poller = None
+        if _poller is not None:
+            check("the poller's own outcome_path is the path this driver reads first",
+                  _poller.outcome_path(tmp, "o/r", 41), outcome_paths(tmp, "o/r", 41)[0])
+            art = _poller.outcome_artifact("o/r", {"number": 41, "headRefName": "feat/eng-41-x"}, "ENG-41", "REV-3",
+                                           {"usable": True, "max_severity": "high", "meets_threshold": True,
+                                            "threshold": "high", "summary": "s", "findings": []})
+            check("the poller's own artifact carries the schema and ticket this driver reads",
+                  (art.get("outcome_schema"), outcome_ticket(art), art.get("meets_threshold")),
+                  (OUTCOME_SCHEMA, "ENG-41", True))
+        write_json(ppath, dict(poller_record, outcome_schema="pipeline-review-outcome/9"))
+        try:
+            read_outcome(tmp, "o/r", 41)
+            failures.append("an outcome record with a foreign outcome_schema was read instead of refused")
+        except BounceError as exc:
+            check("foreign outcome_schema is refused by name", "outcome_schema" in str(exc)
+                  and "pipeline-review-outcome/9" in (exc.public or ""), True)
+            check("…with a public reason that carries no path", tmp in (exc.public or ""), False)
+        with open(ppath, "w", encoding="utf-8") as fh:
+            fh.write('{"pr": 41, "repo": "o/r", "usable": tr')      # a torn write
+        try:
+            read_outcome(tmp, "o/r", 41)
+            failures.append("an unreadable outcome record was read as 'never reviewed'")
+        except BounceError as exc:
+            check("unreadable outcome record is refused, path-free in public",
+                  "cannot be read" in (exc.public or "") and tmp not in (exc.public or ""), True)
+
+    # 9e. committed_delivery_json: git's own stderr (which names the operator's checkout)
+    #     stays on the driver's stderr; the `broken:` state a PR comment is built from is
+    #     fixed wording. And a contents-API LIST (a directory at the path) is a named
+    #     broken state, not a traceback.
+    class _Proc:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    home = "/Us" + "ers/x"      # an operator's home, built at runtime: the provenance scan reads source
+    leaked = "fatal: could not read from '%s/src/kit/.git': Permission denied" % home
+    saved_run, saved_gh = subprocess.run, globals()["_gh"]
+    subprocess.run = lambda argv, **kw: _Proc(128, "", leaked) if "fetch" in argv else _Proc(0, "{}", "")
+    try:
+        with contextlib.redirect_stderr(err):
+            raw, leaked_state = committed_delivery_json("o/r", "main", {"repo_roots": {"o/r": home + "/src/kit"}})
+        check("git fetch failure is BROKEN", (raw, leaked_state.startswith("broken:")), (None, True))
+        check("…with a fixed, path-free reason that points at the log",
+              home not in leaked_state and "see the driver log" in leaked_state, True)
+        check("…and the raw stderr went to the driver's stderr", leaked in err.getvalue(), True)
+        subprocess.run = lambda argv, **kw: _Proc(0) if "fetch" in argv else _Proc(128, "", leaked)
+        with contextlib.redirect_stderr(err):
+            _, show_state = committed_delivery_json("o/r", "main", {"repo_roots": {"o/r": home + "/src/kit"}})
+        check("git show failure is BROKEN and path-free", show_state.startswith("broken:") and home not in show_state, True)
+    finally:
+        subprocess.run = saved_run
+    globals()["_gh"] = lambda argv, timeout=60: (True, json.dumps([{"name": DELIVERY_FILE, "type": "file"}]), "")
+    try:
+        check("contents API list payload (a directory) is a NAMED broken state",
+              committed_delivery_json("o/r", "main", {}),
+              (None, "broken:contents API returned a non-file payload for %s" % DELIVERY_FILE))
+        globals()["_gh"] = lambda argv, timeout=60: (True, json.dumps(
+            {"content": base64.b64encode(b'{"version": 1}').decode("ascii"), "encoding": "base64"}), "")
+        check("contents API file payload decodes", committed_delivery_json("o/r", "main", {}), ('{"version": 1}', "ok"))
+    finally:
+        globals()["_gh"] = saved_gh
+
+    # 9f. The secret scrub: every shape is built at runtime (the hook scans file writes for
+    #     the same shapes), the fallback scanner sees each, and a clean re-prompt is clean.
+    fake_secrets = {"GitHub token": "gh" + "p_" + "A" * 40,
+                    "Anthropic API key": "sk-" + "ant-" + "b" * 24,
+                    "Linear API key": "lin_" + "api_" + "c" * 24,
+                    "AWS access key id": "AK" + "IA" + "B" * 16}
+    for label, fake in fake_secrets.items():
+        check("fallback scanner sees a %s" % label,
+              [lab for pat, lab in _FALLBACK_SECRET_SHAPES if pat.search("see " + fake + " here")], [label])
+        check("secret_hits sees a %s" % label, bool(secret_hits("detail: " + fake)), True)
+    check("secret_hits: a clean re-prompt body is clean", secret_hits(body), [])
+    check("secret_hits: a clean fix ticket is clean", secret_hits(desc), [])
+
     # 10. The driver end to end with every read and write stubbed and recorded.
     calls = []
     world = {}
@@ -1718,9 +2045,6 @@ def selftest():
                 return c[2] if len(c) > 2 else ""
         return ""
 
-    import contextlib
-    import io
-    err = io.StringIO()          # the stubbed runs' stderr: asserted below, never shown
     install()
     try:
         # 10a. Absent delivery.json ⇒ OFF, named, exit 0, nothing written.
@@ -1830,6 +2154,19 @@ def selftest():
             check("announced exhaustion: exit 0, nothing sent", (rc, calls), (EXIT_OK, []))
             check("announced exhaustion is named", "already announced" in buf.getvalue(), True)
 
+            # 10g'. A person raises budgets.maxBounces on the default branch — the intended
+            #       answer to the notice — and the announced exhaustion no longer holds:
+            #       bounce 3 of 4 goes out on the next run, the ledger untouched by hand.
+            world["delivery"] = (json.dumps({"version": 1, "budgets": {"maxBounces": 4, "reviewSeverityThreshold": "medium"},
+                                             "linear": {"labels": {"ids": {NEEDS_HUMAN_KEY: "lbl-nh"}}}}), "ok")
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("raised budget after an announced exhaustion: bounces again", (rc, kinds()), (EXIT_OK, ["reply", "telemetry"]))
+            check("…as bounce 3 of 4", "Bounce 3 of 4." in (calls[0][3] if calls else ""), True)
+            check("…counted from the same ledger", ledger_view(ledger_path(tmp), "o/r", 41)["prior"], 3)
+            world["delivery"] = delivery_ok
+
         # 10h. No agent session on the original ticket ⇒ FALLBACK fix ticket with the tag.
         world.update(pr=open_pr, issue=dict(live_issue, comments={"nodes": []}))
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
@@ -1858,32 +2195,95 @@ def selftest():
             check("terminal ticket: nothing spent", os.path.exists(ledger_path(tmp)), False)
         world["issue"] = live_issue
 
-        # 10j. A review outcome at threshold (green CI) triggers; a stale one for an older head does not.
-        world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "success"}]
+        # 10j. A review outcome at threshold (green CI) triggers — read from the POLLER'S
+        #      committed record: its path and its exact key set (`ticket_id`, `outcome_schema`,
+        #      `head_branch`, no `head_sha`). Without a head recorded, the same record must
+        #      not spend bounce 2 after the fix pushes: freshness falls back to `at`.
+        green = [{"name": "Kit checks", "status": "completed", "conclusion": "success"}]
+        world["runs"] = green
         with tempfile.TemporaryDirectory() as tmp:
-            odir = os.path.join(tmp, "outcomes", "o__r")
-            os.makedirs(odir)
-            outcome = {"pr": 41, "repo": "o/r", "ticket": "ENG-41", "usable": True, "max_severity": "high",
-                       "meets_threshold": True, "review_ticket": "REV-3", "at": "2026-01-01T00:00:00Z",
-                       "head_sha": "aaaa1111", "summary": "s", "findings": [
-                           {"severity": "high", "category": "scope", "summary": "drive-by", "detail": "d"}]}
-            with open(os.path.join(odir, "pr-41.json"), "w", encoding="utf-8") as fh:
-                json.dump(outcome, fh)
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), poller_record)
+            check("--all finds the poller's record", list_outcomes(tmp, cfg), [("o/r", 41)])
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("review outcome at threshold bounces", (rc, kinds()), (EXIT_OK, ["reply", "telemetry"]))
-            check("review bounce carries the finding", "drive-by" in calls[0][3], True)
-            check("review bounce recorded trigger=review", read_ledger(ledger_path(tmp))[0]["trigger"], "review")
-            # the fix pushed a new head; the old outcome must not spend bounce 2
+            check("the poller's outcome at threshold BOUNCES", (rc, kinds()), (EXIT_OK, ["reply", "telemetry"]))
+            check("review bounce carries the finding", "drive-by" in (calls[0][3] if calls else ""), True)
+            rows = read_ledger(ledger_path(tmp))
+            check("review bounce recorded trigger=review, ticket from ticket_id",
+                  (rows[0]["trigger"], rows[0]["ticket_id"]) if rows else None, ("review", "ENG-41"))
             world["pr"] = dict(open_pr, headRefOid="dddd4444")
             calls.clear()
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("stale outcome: exit 0, nothing sent", (rc, calls), (EXIT_OK, []))
-            check("stale outcome: reason says older head", "older head" in buf.getvalue(), True)
+            check("stale outcome (no head recorded, predates the bounce): exit 0, nothing sent", (rc, calls), (EXIT_OK, []))
+            check("stale outcome: reason says it predates the last bounce", "predates the last bounce" in buf.getvalue(), True)
             world["pr"] = open_pr
+        #      …and with a head recorded, a review of an OLDER head is stale by that head.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), dict(poller_record, head_sha="aaaa1111"))
+            world["pr"] = dict(open_pr, headRefOid="dddd4444")
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("outcome for an older head: exit 0, nothing sent", (rc, calls), (EXIT_OK, []))
+            check("outcome for an older head: reason says older head", "older head" in buf.getvalue(), True)
+            world["pr"] = open_pr
+        #      A record this driver cannot understand is a could-not: exit 2, said on the PR
+        #      (path-free), nothing to Linear, no ledger — never "nothing to do".
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), dict(poller_record, outcome_schema="pipeline-review-outcome/9"))
+            calls.clear()
+            rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("foreign outcome_schema: exit 2, nothing to Linear, no ledger",
+                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+            check("foreign outcome_schema: one PR comment naming the schema, no path",
+                  kinds() == ["prComment"] and "pipeline-review-outcome/9" in body_of("prComment")
+                  and tmp not in body_of("prComment"), True)
+
+        # 10j'. The threshold the session is told: delivery.json's when it names one; else
+        #       the one the review was judged at (the outcome's); else the default.
+        with tempfile.TemporaryDirectory() as tmp:
+            world["delivery"] = (json.dumps({"version": 1, "budgets": {"maxBounces": 2}}), "ok")
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"),
+                       dict(poller_record, threshold="medium", max_severity="medium"))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("no committed threshold: the review's own threshold is the bar the session is told",
+                  (rc, "at or above medium" in (calls[0][3] if calls else "")), (EXIT_OK, True))
+        with tempfile.TemporaryDirectory() as tmp:
+            world["delivery"] = delivery_ok    # names "medium"
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"),
+                       dict(poller_record, threshold="low", max_severity="high"))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("a committed threshold wins over the review's", (rc, "at or above medium" in (calls[0][3] if calls else "")), (EXIT_OK, True))
+
+        # 10j''. A credential shape in a finding ⇒ NOTHING goes to Linear (not the thread, not
+        #        a fix ticket), no bounce is spent, and the PR is told why — never the text.
+        for label, fake in fake_secrets.items():
+            with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+                write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), dict(poller_record, findings=[
+                    {"severity": "high", "category": "security", "summary": "fixture leaks a %s" % label,
+                     "detail": "the fixture reads %s verbatim" % fake}]))
+                calls.clear()
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                check("%s in a finding: exit 2, zero Linear writes, no bounce spent" % label,
+                      (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+                check("%s in a finding: one PR comment carrying the decline reason" % label,
+                      kinds() == ["prComment"] and SECRET_DECLINE_REASON in body_of("prComment"), True)
+                check("%s in a finding: the value is nowhere in anything recorded" % label, fake in json.dumps(calls), False)
+                # and the no-thread FALLBACK is refused the same way, before any fix ticket
+                world["issue"] = dict(live_issue, comments={"nodes": []})
+                calls.clear()
+                check("%s in a finding, no thread: still zero Linear writes" % label,
+                      (run_one(41, "o/r", cfg, tmp, "bounce", False), linear_writes()), (EXIT_USAGE, []))
+                world["issue"] = live_issue
+        check("the scrub said WITHHELD on stderr", "WITHHELD" in err.getvalue(), True)
 
         # 10k. Fork and closed PRs never bounce; dry-run writes nothing.
         world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "failure"}]
@@ -1992,8 +2392,64 @@ def selftest():
                 fh.write('{"schema": "%s", "repo": "o/r", "pr": 41, "outcome": "spent"}\n{"trunc' % LEDGER_SCHEMA)
             calls.clear()
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("corrupt ledger: exit 2, nothing sent", (rc, calls), (EXIT_USAGE, []))
+            check("corrupt ledger: exit 2, nothing to Linear, nothing spent", (rc, linear_writes()), (EXIT_USAGE, []))
             check("corrupt ledger: the row count was not reset", "could not read the ledger" in err.getvalue(), True)
+            check("corrupt ledger: said on the PR, once, WITHOUT the ledger's path",
+                  kinds() == ["prComment"] and "corrupt" in body_of("prComment") and tmp not in body_of("prComment"), True)
+            calls.clear()
+            check("corrupt ledger again: exit 2, not repeated", (run_one(41, "o/r", cfg, tmp, "bounce", False), calls), (EXIT_USAGE, []))
+
+        # 10r. A could-not AFTER the PR is known is said ON the PR (exit 2 + one comment):
+        #      a missing Linear credential — a launchd env-file slip that would otherwise leave
+        #      the PR unbounced forever, looking clean. Named by env var, said once, no ledger.
+        globals()["linear_issue"] = saved["linear_issue"]    # the real reader: it reaches _linear_key before any network
+        key_env = "STAGE_E_BOUNCE_SELFTEST_UNSET_KEY"
+        os.environ.pop(key_env, None)
+        cfg_nokey = dict(cfg, linear_api_key_env=key_env)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            rc = run_one(41, "o/r", cfg_nokey, tmp, "bounce", False)
+            check("missing Linear key: exit 2, one PR comment, nothing to Linear", (rc, kinds()), (EXIT_USAGE, ["prComment"]))
+            check("missing Linear key: the comment names the env var and the could-not",
+                  "$" + key_env in body_of("prComment") and "could not gather" in body_of("prComment"), True)
+            check("missing Linear key: no ledger", os.path.exists(ledger_path(tmp)), False)
+            calls.clear()
+            check("missing Linear key again: said once", (run_one(41, "o/r", cfg_nokey, tmp, "bounce", False), calls), (EXIT_USAGE, []))
+            calls.clear()
+            check("missing Linear key under decide: exit 2, nothing posted",
+                  (run_one(41, "o/r", cfg_nokey, tmp, "decide", False), calls), (EXIT_USAGE, []))
+        #      …but plain unreachability is NOT a PR comment: an outage is one per poll cycle.
+        def unreachable(ticket, cfg):
+            raise Unreachable("could not reach Linear: [Errno 8] nodename nor servname provided")
+        globals()["linear_issue"] = unreachable
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            check("Linear unreachable: exit 2, nothing posted anywhere",
+                  (run_one(41, "o/r", cfg, tmp, "bounce", False), calls), (EXIT_USAGE, []))
+        install()
+
+        # 10s. No dispatcher app user configured ⇒ the thread route is never taken (it could
+        #      not tell the dispatcher's session from another app's): exit 2, no reply, no fix
+        #      ticket, no ledger, one PR comment naming the key.
+        cfg_noapp = dict(cfg, dispatcher_app_user_id="")
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            rc = run_one(41, "o/r", cfg_noapp, tmp, "bounce", False)
+            check("no dispatcher app user: exit 2, zero Linear writes, one PR comment",
+                  (rc, linear_writes(), kinds()), (EXIT_USAGE, [], ["prComment"]))
+            check("no dispatcher app user: the reason names the key", "dispatcher_app_user_id" in body_of("prComment"), True)
+            check("no dispatcher app user: no bounce spent", os.path.exists(ledger_path(tmp)), False)
+
+        # 10t. A BROKEN budget whose cause was a git failure in the operator's checkout: the
+        #      PR comment carries the fixed reason, never the path git printed (9e).
+        world["delivery"] = (None, leaked_state)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("git-broken budget: exit 2, one PR comment", (rc, kinds()), (EXIT_USAGE, ["prComment"]))
+            check("git-broken budget: the comment names the failure, never the checkout path",
+                  "see the driver log" in body_of("prComment") and home not in body_of("prComment"), True)
+        world["delivery"] = delivery_ok
         with tempfile.TemporaryDirectory() as tmp:
             calls.clear()
             buf = io.StringIO()
@@ -2042,15 +2498,21 @@ def selftest():
         for f in failures:
             print("  -", f)
         return 1
-    print("ok — pipeline_bounce_local: N-1/N/N+1 ⇒ bounce/bounce/exhaust, ledger row before "
-          "the send (a failed send is still spent and told to the PR), unreadable/corrupt ledger "
-          "refused (never zero), `exhaust` refuses unless the verdict is exhaust, only REQUIRED "
-          "checks count (unknown set ⇒ no trigger), branch-named ticket must own the PR in Linear's "
-          "record, non-pipeline branch declined, BROKEN budget said once on the PR, comments "
-          "paginated, terminal ticket skipped with reason, absent delivery.json ⇒ OFF and named, "
-          "missing thread ⇒ fallback fix ticket with [repo=name#branch] + push instruction, "
-          "sanitizer strips routing tags and fence tags everywhere, the only label written is "
-          "agent:needs-human on exhaustion, no merge/approve/auto-merge/launch path")
+    print("ok — pipeline_bounce_local: N-1/N/N+1 ⇒ bounce/bounce/exhaust, a raised budget "
+          "re-bounces after an announced exhaustion, ledger row before the send (a failed send "
+          "is still spent and told to the PR), unreadable/corrupt ledger refused (never zero) "
+          "and said on the PR, the poller's outcome record (its path, ticket_id, outcome_schema) "
+          "triggers a bounce and a foreign schema is refused, every could-not after the PR is "
+          "known is one PR comment (missing credential, corrupt record; unreachability exempt), "
+          "no dispatcher app user ⇒ no thread route, credential shapes never reach Linear and "
+          "spend nothing, git stderr never reaches the PR, `exhaust` refuses unless the verdict "
+          "is exhaust, only REQUIRED checks count (unknown set ⇒ no trigger), branch-named "
+          "ticket must own the PR in Linear's record, non-pipeline branch declined, BROKEN "
+          "budget said once on the PR, comments paginated, terminal ticket skipped with reason, "
+          "absent delivery.json ⇒ OFF and named, missing thread ⇒ fallback fix ticket with "
+          "[repo=name#branch] + push + rename instruction, sanitizer strips routing tags and "
+          "fence tags everywhere, the only label written is agent:needs-human on exhaustion, "
+          "no merge/approve/auto-merge/launch path")
     return 0
 
 
