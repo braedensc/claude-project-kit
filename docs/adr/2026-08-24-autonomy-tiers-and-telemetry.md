@@ -13,6 +13,12 @@ is decided by `scripts/check_auto_merge.py` — which **never merges**: it asks 
 enable *its own* auto-merge, so the platform performs the merge under branch protection
 rules that live in repository settings.
 
+**Update (2026-09-06):** "verified out of intake" was too loose — the gate approved on any
+non-`raw` epic state. It now requires the epic to sit in **exactly `ready`**, so a human
+parking an epic in `working` or a board automation nudging it forward no longer releases
+the child tree. See [Approve tier gates epic approval on
+`ready`](2026-09-06-approve-tier-epic-approval-state.md).
+
 Alongside them, a telemetry path: `scripts/telemetry_scrape.py` sweeps the §4 blocks
 sessions post as ticket comments into three Postgres tables (§10);
 `scripts/telemetry_dashboard.py` renders one summary object into both a self-contained

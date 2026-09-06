@@ -440,8 +440,10 @@ All must pass, and all are recomputed from something a session cannot write:
 
 - **provenance resolves to `epic/<ID>`** (§5 rule 4 — the class from the label, the ID
   from the parent link)
-- **that epic exists and is itself out of intake** (§5 rule 2 — otherwise
-  `epic/<anything>` would be a self-serve approval)
+- **that epic exists and sits in the human-approval state `ready`** — not merely any
+  state out of intake, so a human parking the epic in `working` or a board automation
+  nudging it forward never releases the child tree (§5 rule 2 — otherwise
+  `epic/<anything>`, or any stray forward move, would be a self-serve approval)
 - the ticket is in `raw`
 - it carries no dispatcher-owned `agent:*` / `blocked:*` label, and no human-applied
   `hooks-change`
