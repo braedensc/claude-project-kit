@@ -173,6 +173,17 @@ jobs:
       # path exists.
       - name: Stage E review poller selftest (sanitizer, decline paths, comment-only)
         run: python3 scripts/pipeline_review_poller.py --selftest
+      # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
+      # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
+      # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent),
+      # a terminal ticket is skipped with a reason, an absent committed delivery.json is
+      # OFF and NAMED (§2/§13, never silent), a ticket with no agent-session thread gets
+      # the fallback fix ticket with its [repo=name#branch] tag and push instruction, the
+      # sanitizer strips routing tags and fence tags, the ONLY label ever written is
+      # agent:needs-human on exhaustion, and the source builds no merge/approve/auto-merge
+      # path and launches no agent session.
+      - name: Stage E bounce driver selftest (ledger-first re-prompt, one label, no merge)
+        run: python3 scripts/pipeline_bounce_local.py --selftest
 
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
