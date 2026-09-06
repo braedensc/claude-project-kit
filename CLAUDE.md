@@ -309,4 +309,6 @@ self-protection, runbooks) ·
 `docs/COLLABORATION.md` (branch/worktree/parallel-session protocol + the enforcement
 list) · `docs/TESTING.md` · `docs/LESSONS.md` (every gotcha, incl. the self-protection
 build-before-lock lesson) · `docs/STACK-RATIONALE.md` · `.claude/hooks/README.md` ·
-`docs/adr/` (why the kit is shaped as it is).
+`docs/adr/` (why the kit is shaped as it is) · `docs/STAGE-E-OPERATOR.md` (Stage E's
+launchd/config/credential activation steps, generic — a real deployment's specifics
+live outside this repo).

@@ -321,3 +321,42 @@ in the kit or in Phase 2?": **both, by role.**
   this ADR wires it, and the gate to reopen it is stated above.
 - No `delivery.json` ships in the kit, so every pipeline script — including the new one —
   is inert here; its `--selftest` is what has teeth, and it runs in CI.
+
+## Update, same day: KIT-91–95 built, and the KIT-92 spike answered
+
+The remaining children shipped as four scripts (`pipeline_review_poller.py`,
+`pipeline_review_basis.py`, `pipeline_telemetry_local.py`, `pipeline_bounce_local.py`) plus
+`docs/STAGE-E-OPERATOR.md`, each its own PR against this ADR's decisions.
+
+**The KIT-92 spike's answer: tier 1 (Linear history) is not implementable from what is
+verifiable from this codebase, so tier 3 (live ticket + edit-after-delegation flag) is the
+shipped default.** No tool in the Linear MCP surface available to a session exposes issue
+history or an as-of-timestamp read, and this build had no live Linear credential or
+confirmed egress to test a raw history query against Linear's schema directly — a
+documented best-effort finding, not a live measurement, stated as such rather than guessed
+past. `pipeline_review_basis.py`'s tier-1 interface (`resolve_tier1`) is real and tested
+against a fake backend regardless: its signature accepts no live issue at all, which is
+the forgery-resistance argument made concrete, so wiring in a verified query later changes
+one function's body, not any caller. Tier 2 (an independent reconciler) ships as a
+consumer-only stub, per this ADR's own "filed as future work" — no reconciler daemon
+exists yet.
+
+Two narrowings from what the cloud template (and this ADR's prose) describe, both stated
+where they were decided rather than left implicit:
+
+- **The bounce loop applies no label, ever — not even `agent:needs-human` on
+  exhaustion.** `templates/workflows/pipeline-bounce.yml`'s `announce` job does apply that
+  label, from a trusted CI position holding the Linear credential directly. This round's
+  build narrowed Stage E's own scripts to comment-only across the board; `agent:needs-
+  human` on exhaustion is a manual follow-up a human applies from the bounce loop's PR
+  comment, not a gap in the design.
+- **The bounce loop's "is this ticket already terminal" check (KIT-51 safety) is
+  caller-supplied (`--ticket-status-type`), not a live Linear lookup.** Accepted because
+  the actual safety property — a bounce can never lose work to a force-deleted worktree —
+  is already structural: every fix session runs in a worktree Stage E creates and removes
+  itself, never the dispatcher's. Skipping the live check costs at most one wasted attempt
+  against an already-closed ticket, not data loss.
+
+Machine-specific activation (the launchd service, real credentials, the real deployment's
+paths) is deliberately outside this repo — see the standalone phase document handed to the
+owner alongside these PRs, which is where those specifics live.
