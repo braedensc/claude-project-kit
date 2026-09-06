@@ -168,9 +168,20 @@ jobs:
         run: python3 scripts/telemetry_scrape.py --selftest
 
       # The producer side of §4: the block builder, and the `telemetry-required`
-      # gate that now validates shape instead of string-matching a marker.
+      # gate that now validates shape instead of string-matching a marker. Now also
+      # covers the bounce-stage emitter (bounce_block/bounce_comment, KIT-94) added
+      # alongside the review one — one builder, both stages.
       - name: Telemetry block selftest (contract §4, §8)
         run: python3 scripts/telemetry_block.py --selftest
+
+      # Stage E's telemetry publisher (docs/adr/2026-09-05-…, decision 4). Offline:
+      # builds via telemetry_block.py (one definition, review AND bounce), posts
+      # exactly one comment to the pinned ticket (stubbed here — no real credential
+      # or network in CI), and the source names no Linear mutation beyond
+      # commentCreate — the same "cannot escalate" guarantee gh_fallback.py makes,
+      # applied to the one place this kit writes to Linear directly.
+      - name: Stage E telemetry publisher selftest (comment-only against Linear)
+        run: python3 scripts/pipeline_telemetry_local.py --selftest
 
       - name: Lifecycle observer selftest (contract §4, §10)
         run: python3 scripts/telemetry_lifecycle.py --selftest
