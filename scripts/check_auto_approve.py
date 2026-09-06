@@ -31,7 +31,8 @@ rather than making an operator fix them one at a time.
   state         the ticket is actually sitting in linear.stateIds.raw
   supervision   no dispatcher-owned agent:*/blocked:* label, no hooks-change (§6)
   provenance    resolves to epic/<ID> per §5 rule 4 (label class + parent link)
-  epic          that epic exists and a human moved it out of intake (§5 rule 2)
+  epic          that epic exists and a human moved it into the approval state
+                (`ready`), not merely out of intake (§5 rule 2)
   dor           scripts/check_ticket_dor.py passes, in --strict mode
   risk-paths    nothing the ticket names matches autonomy.riskPaths (§1)
 
@@ -95,9 +96,20 @@ SUPERVISED_LABEL_RE = re.compile(r"^(agent:|blocked:)")
 # a human has already said needs eyes.
 HUMAN_ONLY_LABELS = ("hooks-change",)
 
-# The epic must have been moved OUT of intake by a person. Every state except
-# `raw` means someone acted; `raw` is where things land unreviewed.
+# Intake: where proposals land unreviewed. An epic sitting here has been approved
+# by nobody, so nothing decomposed from it inherits approval.
 INTAKE_STATE = "raw"
+
+# The ONE state that reads as "a human approved this epic's decomposition" — NOT
+# "any state that isn't `raw`". Moving an epic to `working` ("I'm looking at
+# this"), or a Linear board automation nudging it to `review`/`done`, is not an
+# approval; treating it as one would release the epic's whole child tree to
+# auto-approval off a signal no person deliberately gave. `ready` is the
+# contract's approved state (§1 stateIds: "Approved and dispatchable") and the
+# exact state the children are themselves released *into* — so the epic reaching
+# it is the same "approved" gesture, one level up (§5 rule 2). See
+# docs/adr/2026-09-06-approve-tier-epic-approval-state.md.
+EPIC_APPROVAL_STATE = "ready"
 
 # Always-risky regardless of what a project's `autonomy.riskPaths` says. §7
 # already requires the first three to be present, and this floor makes the gate
@@ -424,11 +436,15 @@ def _why_not(cls):
 
 
 def check_epic(value, epics, config, v):
-    """§5 rule 2: the referenced epic exists and is itself human-approved.
+    """§5 rule 2: the referenced epic exists and sits in the human-approval state.
 
-    Without this, `epic/<anything>` is a self-serve approval: a fabricated ID
-    would mint autonomy, because the string alone is what the provenance gate
-    matched on.
+    Two failures this closes. Without the *existence* check, `epic/<anything>` is
+    a self-serve approval: a fabricated ID would mint autonomy, because the string
+    alone is what the provenance gate matched on. Without the *state* check being
+    specific — exactly `EPIC_APPROVAL_STATE`, not "any state out of intake" — any
+    forward nudge of the epic (a human parking it in `working`, a board automation
+    advancing it) would read as approval and release the whole child tree off a
+    gesture no person deliberately made.
     """
     epic_id = value.split("/", 1)[1]
     epic = epics.get(epic_id)
@@ -451,11 +467,19 @@ def check_epic(value, epics, config, v):
             "epic %s is in state %r, which matches none of linear.stateIds — an "
             "unclassifiable state cannot be read as approval" % (epic_id, got),
         )
-    if key == INTAKE_STATE:
+    if key != EPIC_APPROVAL_STATE:
+        if key == INTAKE_STATE:
+            return v.gate(
+                "epic", False,
+                "epic %s is still in intake (`raw`) — nobody has approved it, so nothing "
+                "decomposed from it inherits approval" % epic_id,
+            )
         return v.gate(
             "epic", False,
-            "epic %s is still in intake (`raw`) — nobody has approved it, so nothing "
-            "decomposed from it inherits approval" % epic_id,
+            "epic %s is in `%s`, not the human-approval state `%s` — moving an epic out of "
+            "intake into any OTHER state (a human parking it, a board automation advancing "
+            "it) is not the deliberate approval this gate requires (§5 rule 2)"
+            % (epic_id, key, EPIC_APPROVAL_STATE),
         )
     epic_labels = [str(x) for x in (epic.get("labels") or [])]
     blocked = sorted(l for l in epic_labels if SUPERVISED_LABEL_RE.match(l))
@@ -465,7 +489,10 @@ def check_epic(value, epics, config, v):
             "epic %s carries %s — its own supervision is unresolved"
             % (epic_id, ", ".join(blocked)),
         )
-    return v.gate("epic", True, "epic %s is in `%s` — a human moved it out of intake" % (epic_id, key))
+    return v.gate(
+        "epic", True,
+        "epic %s is in `%s` — a human approved it out of intake" % (epic_id, key),
+    )
 
 
 def check_dor(ticket, config_path, repo_root, strict, v):
@@ -653,7 +680,7 @@ def good_ticket():
 
 
 def good_epics():
-    return {"ENG-100": {"id": "ENG-100", "stateId": "state-working", "labels": ["track:platform"]}}
+    return {"ENG-100": {"id": "ENG-100", "stateId": "state-ready", "labels": ["track:platform"]}}
 
 
 def selftest():
@@ -719,16 +746,34 @@ def selftest():
             decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-raw"}}),
             False, "epic",
         )
+        # §5 rule 2 tightened: ONLY the approval state (`ready`) reads as approval.
+        expect(
+            "epic in ready approves",
+            decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-ready"}}),
+            True,
+        )
+        # Any OTHER out-of-intake state is not the deliberate gesture — a human
+        # parking the epic in `working`, a board automation nudging it to
+        # `review`/`done` — and must hold the whole child tree. This is the
+        # regression guard for the "any non-`raw` = approved" defect.
+        for weak in ("working", "review", "done"):
+            expect(
+                "epic in %s holds (out of intake is not approval)" % weak,
+                decide(good_ticket(), {"ENG-100": {"id": "ENG-100",
+                                                   "stateId": "state-%s" % weak}}),
+                False, "epic",
+            )
         # An epic in a state matching no configured ID is unclassifiable.
         expect(
             "epic in unknown state holds",
             decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-mystery"}}),
             False, "epic",
         )
-        # A blocked epic drags its supervision down the tree.
+        # A blocked epic drags its supervision down the tree — even sitting in the
+        # approval state, an unresolved supervision label holds it.
         expect(
             "blocked epic holds",
-            decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-working",
+            decide(good_ticket(), {"ENG-100": {"id": "ENG-100", "stateId": "state-ready",
                                                "labels": ["agent:needs-human"]}}),
             False, "epic",
         )

@@ -24,8 +24,9 @@ name: Pipeline auto-approve
 # are the classes an agent (or anything that can trip a probe, or edit a diff)
 # can cause to be filed — so if any of them could approve itself, the pipeline
 # could widen its own mandate by writing a ticket. And an `epic/<ID>` reference
-# is not taken on faith: the epic is fetched and must itself be out of intake,
-# or `epic/<anything>` would be a self-serve approval.
+# is not taken on faith: the epic is fetched and must itself sit in the
+# human-approval state `ready` (not merely any state out of intake), or
+# `epic/<anything>` — or a stray forward move — would be a self-serve approval.
 #
 # ── Setup (repo → Settings → Secrets and variables → Actions) ────────────────
 #   Secret  LINEAR_API_KEY                 Linear personal API key
@@ -184,9 +185,10 @@ jobs:
           # fetching its epic for nothing is wasted API budget.
           tickets = [t for t in tickets if t["stateId"] == raw_state]
 
-          # §5 rule 2: the referenced epic must exist and be out of intake. Fetch
-          # every distinct parent named by the backlog — the gate treats an epic
-          # it was not shown as a fabricated one.
+          # §5 rule 2: the referenced epic must exist and sit in the human-approval
+          # state `ready` (the gate decides; here we only supply the epic's state).
+          # Fetch every distinct parent named by the backlog — the gate treats an
+          # epic it was not shown as a fabricated one.
           epic_ids = sorted({t["parentId"] for t in tickets if t["parentId"]})
           epics = {}
           for eid in epic_ids:

@@ -653,9 +653,16 @@ Rules:
 1. **Only `epic/*` may ever auto-approve.** Everything else waits in `raw` for a person.
    The agent-facing consequence: an agent cannot widen its own mandate by filing tickets
    for itself, because nothing it files carries `epic/*` provenance.
-2. Auto-approval additionally requires that the referenced epic **exists and is itself in
-   a human-approved state**. Without that check, `epic/<anything>` is a self-serve
-   approval — a fabricated ID would mint autonomy.
+2. Auto-approval additionally requires that the referenced epic **exists and sits in the
+   human-approval state `ready`** — the same state its children are released into, reached
+   by a person's deliberate move. Any *other* out-of-intake state (`working`, `review`,
+   `done`) is **not** approval: a human parking an epic in `working` ("I'm looking at
+   this"), or a Linear board automation advancing it, must not release the child tree.
+   Without the existence check, `epic/<anything>` is a self-serve approval — a fabricated
+   ID would mint autonomy; without the *state* being specific, any forward nudge would.
+   (The PreToolUse approval guard denies a session writing `ready`; this reads it. A
+   session forging the signal by writing some *other* state buys nothing, because no
+   other state approves — see `docs/adr/2026-09-06-approve-tier-epic-approval-state.md`.)
 3. `autonomy.autoApproveProvenance` must be a subset of `["epic"]`. A validator hard-fails
    any other value, so the rule is mechanically checked and not merely documented.
 4. **Two representations, one value.** Linear labels are a fixed vocabulary and cannot
@@ -1095,8 +1102,9 @@ every rung above the first is off by default.
 ### The approve tier
 
 Every gate must pass, and each is recomputed from a source the session cannot write:
-provenance resolves to `epic/<ID>` (§5 rule 4); that epic exists and is itself out of
-intake (§5 rule 2); the ticket is in `raw`; it carries no dispatcher-owned `agent:*` /
+provenance resolves to `epic/<ID>` (§5 rule 4); that epic exists and sits in the
+human-approval state `ready` — not merely any state out of intake (§5 rule 2); the ticket
+is in `raw`; it carries no dispatcher-owned `agent:*` /
 `blocked:*` label and no human-applied `hooks-change`; the Definition-of-Ready gate
 passes in `--strict`; and nothing the ticket names matches `autonomy.riskPaths`.
 
