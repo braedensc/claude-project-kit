@@ -21,12 +21,22 @@ WHAT THIS IS
 
   Two subcommands, and `run` does both:
 
-    scan     list open PRs on the managed repos → select new same-repo, non-draft ticket
-             PRs → fetch diff → resolve the review basis → build + sanitize the ticket body
-             → create AND delegate the review ticket → record it in the seen-set
+    scan     DISCOVER the pipeline PRs from Linear → list those repos' open PRs → select
+             new same-repo, non-draft ones → fetch diff → resolve the review basis → build
+             + sanitize the ticket body → ask LINEAR whether a review ticket already exists
+             → create AND delegate one if not → record it in the seen-set
     collect  for every review ticket still pending: read its agent session's activities →
              extract the `pipeline-review/1` block → tamper-check the description hash →
              classify → publish → write the outcome → close the ticket → emit telemetry
+
+  ONE RUN IS ONE PASS AND THEN AN EXIT. There is no internal loop: the scheduler (a system
+  LaunchDaemon with `StartInterval`, `RunAtLoad` and NO `KeepAlive`) starts a fresh process
+  every interval, and each process does scan → collect → exit under a wall-clock
+  `--timeout`. A hung run therefore cannot wedge the next one, a reboot resumes polling
+  without anyone logging in, and a sleep/wake gap is caught up by the scheduler's own
+  missed-interval behaviour. Every completed run — including a failed one — writes a
+  HEARTBEAT file, so "the poller is dead" and "the poller ran and could not do it" are
+  distinguishable without reading a log (contract §13).
 
 WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script asserts it)
 
@@ -41,15 +51,91 @@ WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script as
   No code path here launches a Claude session as the owner — that is the whole reason
   option 4 exists, and the retired owner-account headless launcher is not reintroduced.
 
-WHERE ITS STATE LIVES, AND WHY THAT IS THE POINT
+WHERE IT RUNS, WHERE ITS STATE LIVES, AND WHY THAT IS THE POINT
 
-  Everything durable is under `state_dir` (default `~/.claude/pipeline/stage-e/`) in the
-  OWNER's account: the seen-set, the outcome files, the telemetry artifacts. A sandboxed
-  session cannot read the owner's home, so nothing a session can write is ever read back
-  as authority here. The same goes for credentials: they are read from the environment
-  variables NAMED in the config (`github_token_env`, `linear_key_env`), never from a value
-  in a file — and that environment is the owner's launchd environment, never the
-  dispatcher's, because the dispatcher copies its whole process env into every session.
+  The poller runs as THE DISPATCHER'S ROLE ACCOUNT — the same non-admin account the
+  dispatcher itself runs as — under a system LaunchDaemon, not as the owner. A
+  user-domain agent only runs while the owner is logged in, so after a reboot to the
+  login window the dispatcher would be back and the poller would not; a system daemon
+  with `UserName` set to the role account starts at boot with nobody logged in.
+
+  Three rules follow, and they are the whole security story of this file:
+
+    1. Its credentials live in the poller's OWN env file under that role account's home
+       (`<home>/.stage-e/env`, mode 600) — a path the dispatcher's sandbox denies to
+       every session (`denyRead ['~/']`).
+    2. NEVER in the dispatcher's own env file. The dispatcher copies its whole process
+       environment into every session it starts, unscrubbed; a delegation-capable Linear
+       key placed there is a key every reviewed session can read.
+    3. NEVER under the dispatcher's state root. Session readability of that tree is
+       unmeasured, and an unmeasured boundary is not a boundary.
+
+  Everything durable is under `state_dir` (default `~/.stage-e/state`, i.e. inside the
+  same denied home): the seen-set, the outcome files, the heartbeat, the telemetry
+  artifacts. Credentials are read from the environment variables NAMED in the config
+  (`github_token_env`, `linear_key_env`), never from a value in a file.
+
+  THE ACCEPTED RESIDUAL, stated plainly: poller and dispatcher share a uid, so the
+  delegation key is protected from sessions by the sandbox's deny-read of that home and
+  by nothing else. Revisit the moment either of two things is true — a non-Claude runner
+  label appears (a runner outside that sandbox), or the session Linear token is tightened
+  to read-only (which would make a separate role account cheap). Then move the poller to
+  a role account of its own. The ADR records this as an accepted risk, not an oversight.
+
+HOW IT FINDS WORK: LINEAR-DRIVEN DISCOVERY, NOT A HARDCODED REPO LIST
+
+  A repo list is a second place to keep the truth and a guaranteed source of drift. The
+  poller instead asks LINEAR what the dispatcher actually worked on: it pages the
+  workspace's agent sessions, takes each session's ISSUE, and looks for a GitHub pull
+  request among that issue's ATTACHMENTS. Linear's GitHub integration attaches a PR to an
+  issue whenever the branch name carries the issue id — which the kit's branch rule
+  (`<type>/<team>-<n>-<slug>`) guarantees. The repository is then read out of the PR URL.
+  A SECOND SIGNAL covers an issue whose integration attachment is missing: a PR URL in
+  the coding session's own final `response` activity. That probe costs one query per
+  unattached issue, so it is bounded by `DISCOVERY_PROBE_MAX` and says on the log how
+  many issues it probed and how many it had to leave unprobed.
+
+  Two consequences worth stating:
+
+    - A HUMAN-AUTHORED PR IS NOT AUTO-REVIEWED. No agent session, no discovery, no review
+      ticket. The owner can still request one by hand — delegate a review ticket in the
+      Reviews team the way this poller would.
+    - The poller's OWN review tickets are excluded by team: they live in the Reviews team
+      and they are delegated, so they have agent sessions of their own and would otherwise
+      discover themselves.
+
+  `repos` is therefore OPTIONAL, and it does two jobs when set: it RESTRICTS discovery to
+  those repositories, and it is the FALLBACK for a workspace with no GitHub integration —
+  those repos are additionally scanned the old way, by branch name. Leave it empty
+  wherever the integration is live and only dispatcher-worked PRs will ever be reviewed.
+
+  WORKSPACE FACTS ARE RESOLVED BY NAME, ONCE PER RUN. The config holds the Reviews team
+  KEY, the dispatcher agent's DISPLAY NAME and the model label's NAME — not UUIDs copied
+  out of a URL bar, which rot silently and are unreadable in review. Each is resolved
+  against Linear at the start of a run and cached for that run; a UUID may still be given
+  as an explicit override when a name is ambiguous. A name that resolves to nothing is a
+  CONFIG error (exit 2, nothing touched), not a per-PR decline.
+
+LINEAR IS THE SOURCE OF TRUTH; THE SEEN-SET IS A REBUILDABLE CACHE
+
+  Before creating a review ticket the poller SEARCHES the Reviews team for one that
+  already exists for this PR — by the exact title it would have written, confirmed by the
+  `owner/repo#N` marker in the description — and reuses it. So a crash between
+  `issueCreate` and the write-through, a restored-from-nothing state dir, or a brand-new
+  machine can never open a SECOND paid reviewer session for a PR that already has one.
+  The local seen-set is a cache that makes the common pass cheap, not the authority.
+
+  Two honest consequences. First, the search must SUCCEED before a create: a search that
+  errors is treated as transient and retried, because "could not ask" and "asked, nothing
+  there" differ by exactly one duplicate paid session (§13). Second, reusing a ticket that
+  was already answered AND published, after a total loss of local state, re-publishes one
+  PR comment — the outcome file the bounce driver reads has to be rebuilt somehow. A
+  duplicate comment is strictly the lesser harm, and it is bounded at one.
+
+  A note on why the search matches a MARKER and not a URL: the review ticket names the PR
+  as `owner/repo#N` and never as a link, precisely so Linear's GitHub integration has
+  nothing to auto-attach and a review ticket can never become PR-linked by its own
+  description. The dedup key had to be something already in the body, and that marker is.
 
 WHY THE TEXT IT COPIES IS SANITIZED FIRST
 
@@ -153,29 +239,36 @@ NOTHING LEAVES THIS HOST WITH A SECRET IN IT
   stubbed transport to prove nothing is sent either way.
 
 Usage:
-    pipeline_review_poller.py --config CONFIG.json scan|collect|run [--dry-run] [--loop]
+    pipeline_review_poller.py --config CONFIG.json scan|collect|run [--dry-run] [--timeout N]
     pipeline_review_poller.py --example-config
     pipeline_review_poller.py --selftest
 
 Exit: 0 = ran; every "nothing to do" is printed as what was asked and what the answer was
       3 = ran, and at least one PR was DECLINED this pass (a distinct "NOT reviewed"
           comment was posted where a PR exists; the seen-set records the reason)
-      1 = could not do something it WILL retry: a PR list or ticket read failed, a
-          transient scan failure was recorded as `retry`, a comment or a ticket close did
-          not land (`publish-failed` / `close-pending`), an unexpected error escaped one
-          PR's work (the others continued), a close was given up on (a person must close
-          that review ticket), or the seen-set is unreadable (nothing ran — refusing is
-          the only way not to re-review every open PR)
+      1 = could not do something it WILL retry: discovery, a PR list or a ticket read
+          failed, a transient scan failure was recorded as `retry`, a comment or a ticket
+          close did not land (`publish-failed` / `close-pending`), an unexpected error
+          escaped one PR's work (the others continued), a close was given up on (a person
+          must close that review ticket), or the seen-set is unreadable (nothing ran —
+          refusing is the only way not to re-review every open PR)
       2 = usage/config/import error — nothing was touched. Includes the basis resolver
-          (scripts/pipeline_review_basis.py) not being installed: that is checked ONCE
-          at the start of `scan`, before anything is listed, so a deployment-wide
+          (scripts/pipeline_review_basis.py) not being installed, and a workspace name
+          (team key, agent display name, model label) that resolves to nothing: both are
+          checked ONCE at the start, before anything is listed, so a deployment-wide
           misconfiguration never consumes each PR's single review as a decline
+      4 = the run hit its wall-clock --timeout and was cut off. Whatever had already been
+          written through stands; the next scheduled run resumes from it. Distinct from 1
+          so a scheduler's log tells "slow/hung" from "tried and failed" at a glance
+
+Every one of those, timeout included, writes `<state_dir>/heartbeat.json` before exiting.
 """
 import argparse
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -199,15 +292,22 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_DECLINED = 3
+EXIT_TIMEOUT = 4
 
 SEEN_SCHEMA = "pipeline-review-poller-seen/2"
 OUTCOME_SCHEMA = "pipeline-review-outcome/1"
 FINDINGS_SCHEMA = "pipeline-review/1"
+HEARTBEAT_SCHEMA = "pipeline-review-poller-heartbeat/1"
 
-DEFAULT_STATE_DIR = "~/.claude/pipeline/stage-e"
+# Inside the role account's home, which the dispatcher's sandbox denies to every session.
+# NOT under the dispatcher's state root, and NOT in the owner's account — see the module
+# docstring's "WHERE IT RUNS" for why each of those is wrong rather than merely different.
+DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_DIFF_CAP_CHARS = 120000
-DEFAULT_POLL_SECONDS = 300
 DEFAULT_COLLECT_TIMEOUT_SECONDS = 3600
+# Wall clock for ONE run. The scheduler restarts the process every interval, so a run that
+# outlives this is cut off (exit 4) rather than left to overlap the next one.
+DEFAULT_RUN_TIMEOUT_SECONDS = 900
 DEFAULT_THRESHOLD = "high"
 DEFAULT_LIST_LIMIT = 100
 LINEAR_API = "https://api.linear.app/graphql"
@@ -223,6 +323,16 @@ CLOSE_RETRY_PASSES = 3
 # what was read so the operator can tell "not started yet" from "outside the window".
 SESSION_PAGE_SIZE = 100
 SESSION_MAX_PAGES = 5
+# Discovery window: how much of the workspace's agent-session history one run reads to
+# find the PRs the dispatcher worked. Wider than the per-issue lookup above, because this
+# one has to see every recent session rather than stop at a match.
+DISCOVERY_PAGE_SIZE = 100
+DISCOVERY_MAX_PAGES = 10
+# Attachments read per discovered issue. The GitHub integration adds one per linked PR.
+DISCOVERY_ATTACHMENTS = 25
+# The second discovery signal costs one query per issue with no PR attachment, so it is
+# bounded; what it could not look at is logged, never silently dropped (§13).
+DISCOVERY_PROBE_MAX = 10
 # Seen-set statuses `collect` has work for; everything else is terminal or `retry`.
 COLLECT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
 # The sibling this poller cannot review without: the reviewer has no tools, so a basis
@@ -279,41 +389,53 @@ SECRET_IN_BODY = getattr(prl, "SecretInBody", _NeverRaised)
 # Every config key this script reads. `--example-config` prints them; load_config refuses
 # unknown ones so a typo cannot silently fall back to a default.
 CONFIG_KEYS = {
-    "repos": "list of OWNER/NAME strings — the managed repositories to poll",
-    "reviews_team_id": "Linear team UUID of the Reviews team (no PR/commit automations)",
-    "cyrus_agent_user_id": "Linear app-user UUID of the dispatcher's agent (the delegateId)",
-    "model_label_id": "Linear label UUID that selects the cheap reviewer model ('' = none)",
-    "state_dir": "owner-account directory for the seen-set, outcomes and telemetry",
-    "poll_seconds": "seconds between passes when run with --loop",
+    "reviews_team_key": "Linear team KEY of the Reviews team, e.g. 'REV' (no PR/commit automations)",
+    "agent_user_name": "DISPLAY NAME of the dispatcher's Linear agent user (becomes the delegateId)",
+    "model_label_name": "optional: NAME of the label that selects the cheap reviewer model",
+    "reviews_team_id": "optional override: the Reviews team's UUID, when the key is ambiguous",
+    "cyrus_agent_user_id": "optional override: the agent user's UUID, when the name is ambiguous",
+    "model_label_id": "optional override: the model label's UUID ('' = attach no label)",
+    "repos": "optional: OWNER/NAME list — RESTRICTS discovery, and branch-scans these as a fallback",
+    "state_dir": "role-account directory for the seen-set, outcomes, heartbeat and telemetry",
     "diff_cap_chars": "max chars of the whole review-ticket description; over it → decline",
     "threshold": "severity at or above which findings start a fix pass (low|medium|high|critical)",
     "github_token_env": "NAME of the env var holding the GitHub token (never the value)",
-    "linear_key_env": "NAME of the env var holding the OWNER-scoped Linear API key",
+    "linear_key_env": "NAME of the env var holding the delegation-capable Linear API key",
     "team_keys": "optional: managed team keys for branch→ticket routing ([] = any team)",
     "collect_timeout_seconds": "optional: how long a review ticket may stay unanswered",
+    "run_timeout_seconds": "optional: wall clock for ONE run before it is cut off (exit 4)",
     "reviewer_model": "optional: model id to record in telemetry (default: label:<label id>)",
     "basis_snapshot_dir": "optional: tier-2 snapshot dir handed to the basis resolver",
 }
-REQUIRED_CONFIG_KEYS = ("repos", "reviews_team_id", "cyrus_agent_user_id")
+# Each pair is (name key, id override key): one of the two must be given. Names are the
+# documented way — a UUID pasted from a URL bar rots silently and reads as noise.
+REQUIRED_CONFIG_PAIRS = (("reviews_team_key", "reviews_team_id"),
+                         ("agent_user_name", "cyrus_agent_user_id"))
 
 EXAMPLE_CONFIG = {
-    "repos": ["example-org/example-app"],
-    "reviews_team_id": "00000000-0000-0000-0000-000000000000",
-    "cyrus_agent_user_id": "00000000-0000-0000-0000-000000000000",
-    "model_label_id": "00000000-0000-0000-0000-000000000000",
+    "reviews_team_key": "REV",
+    "agent_user_name": "Dispatcher Agent",
+    "model_label_name": "haiku",
+    "repos": [],
     "state_dir": DEFAULT_STATE_DIR,
-    "poll_seconds": DEFAULT_POLL_SECONDS,
     "diff_cap_chars": DEFAULT_DIFF_CAP_CHARS,
     "threshold": DEFAULT_THRESHOLD,
     "github_token_env": "GH_TOKEN",
-    "linear_key_env": "LINEAR_OWNER_API_KEY",
+    "linear_key_env": "STAGE_E_LINEAR_API_KEY",
     "team_keys": [],
     "collect_timeout_seconds": DEFAULT_COLLECT_TIMEOUT_SECONDS,
+    "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
 }
 
 
 class PollerError(Exception):
     """A read or write failed for a reason worth naming — never a silent None."""
+
+
+class ConfigError(PollerError):
+    """The deployment is wrong, not the network: a name that resolves to nothing, a key
+    that names no team. Exits 2 (nothing touched) rather than 1 (will retry), because
+    retrying a typo every five minutes forever is not a recovery strategy."""
 
 
 def _now_iso():
@@ -355,24 +477,29 @@ def load_config(path):
     unknown = sorted(set(raw) - set(CONFIG_KEYS))
     if unknown:
         raise PollerError("unknown config key(s): %s (see --example-config)" % ", ".join(unknown))
-    for key in REQUIRED_CONFIG_KEYS:
-        if not raw.get(key):
-            raise PollerError("config key %r is required" % key)
-    repos = raw["repos"]
+    for name_key, id_key in REQUIRED_CONFIG_PAIRS:
+        if not raw.get(name_key) and not raw.get(id_key):
+            raise PollerError("config needs %r (preferred) or %r as an override" % (name_key, id_key))
+    repos = raw.get("repos") or []
     if not isinstance(repos, list) or not all(
             isinstance(r, str) and r.count("/") == 1 and all(r.split("/")) for r in repos):
         raise PollerError("config 'repos' must be a list of OWNER/NAME strings")
     cfg = {
         "repos": repos,
-        "reviews_team_id": str(raw["reviews_team_id"]),
-        "cyrus_agent_user_id": str(raw["cyrus_agent_user_id"]),
+        "reviews_team_key": str(raw.get("reviews_team_key") or ""),
+        "agent_user_name": str(raw.get("agent_user_name") or ""),
+        "model_label_name": str(raw.get("model_label_name") or ""),
+        # Filled in by resolve_workspace() at the start of a run; an override short-circuits
+        # the lookup for that one fact only.
+        "reviews_team_id": str(raw.get("reviews_team_id") or ""),
+        "cyrus_agent_user_id": str(raw.get("cyrus_agent_user_id") or ""),
         "model_label_id": str(raw.get("model_label_id") or ""),
         "state_dir": os.path.realpath(os.path.expanduser(raw.get("state_dir") or DEFAULT_STATE_DIR)),
-        "poll_seconds": int(raw.get("poll_seconds") or DEFAULT_POLL_SECONDS),
+        "run_timeout_seconds": int(raw.get("run_timeout_seconds") or DEFAULT_RUN_TIMEOUT_SECONDS),
         "diff_cap_chars": int(raw.get("diff_cap_chars") or DEFAULT_DIFF_CAP_CHARS),
         "threshold": raw.get("threshold") or DEFAULT_THRESHOLD,
         "github_token_env": raw.get("github_token_env") or "GH_TOKEN",
-        "linear_key_env": raw.get("linear_key_env") or "LINEAR_OWNER_API_KEY",
+        "linear_key_env": raw.get("linear_key_env") or "STAGE_E_LINEAR_API_KEY",
         "team_keys": list(raw.get("team_keys") or []),
         "collect_timeout_seconds": int(raw.get("collect_timeout_seconds")
                                        or DEFAULT_COLLECT_TIMEOUT_SECONDS),
@@ -394,8 +521,12 @@ def credential(cfg, key):
     name = cfg[key]
     val = os.environ.get(name, "").strip()
     if not val:
-        raise PollerError("$%s is unset — export it in the OWNER account's environment "
-                          "(never in the dispatcher's); --dry-run still needs it for reads" % name)
+        raise PollerError(
+            "$%s is unset — export it in the POLLER'S OWN env file under the role account's "
+            "home (<home>/.stage-e/env, mode 600). Never in the dispatcher's env file, which "
+            "is copied unscrubbed into every session, and never under the dispatcher's state "
+            "root, where session readability is unmeasured. --dry-run still needs it for reads"
+            % name)
     return val
 
 
@@ -414,15 +545,55 @@ def pr_key(owner_repo, number):
     return "%s#%d" % (owner_repo, number)
 
 
-def select_new_reviews(prs, seen_keys, team_keys, owner_repo):
+# The one place a PR is named inside a review ticket: `owner/repo#N`, never a link, so
+# Linear's GitHub integration has nothing to auto-attach. It doubles as the dedup marker
+# the Reviews-team search confirms a candidate ticket by.
+def pr_marker(owner_repo, number):
+    return "- Pull request: %s#%d" % (owner_repo, number)
+
+
+_PR_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)\b")
+
+
+def parse_pr_urls(text):
+    """Every DISTINCT GitHub pull request named in `text`, as ('owner/repo', number), in
+    the order they appear. Anchored at the host, so a lookalike (`github.com.evil.test`,
+    `notgithub.com`) never matches, and tolerant of a trailing `/files`, a query or a
+    fragment — an integration attachment and a session's prose both write those.
+    """
+    out = []
+    for m in _PR_URL_RE.finditer(text if isinstance(text, str) else ""):
+        item = ("%s/%s" % (m.group(1), m.group(2)), int(m.group(3)))
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def parse_pr_url(url):
+    """('owner/repo', number) for the first GitHub PR URL in `url`, else None."""
+    found = parse_pr_urls(url)
+    return found[0] if found else None
+
+
+def select_new_reviews(prs, seen_keys, team_keys, owner_repo, hints=None, hints_only=False):
     """The PRs this pass should open a review ticket for, in list order.
 
-    Four filters: a fork PR is never ours to review (its branch name is attacker-reachable
-    text on a public repo and the diff would be copied into a ticket); a draft is not
-    ready; a branch `resolve_ticket` does not recognise was not dispatched by this
-    pipeline; and a PR already in the seen-set was handled on a prior pass, whatever the
-    outcome — the opened-only rule, so bounce pushes never multiply review cost.
+    The filters that never change: a fork PR is never ours to review (its branch name is
+    attacker-reachable text on a public repo and the diff would be copied into a ticket);
+    a draft is not ready; and a PR already in the seen-set was handled on a prior pass,
+    whatever the outcome — the opened-only rule, so bounce pushes never multiply cost.
+
+    Where the TICKET ID comes from is what discovery changed. `hints` maps a PR number to
+    the identifier of the Linear issue the dispatcher actually worked, read from that
+    issue's own PR attachment; it is authority, and a branch is only a hint the session
+    itself chose. With `hints_only` (the Linear-driven default) a PR with no hint is not
+    reviewed at all — that is the rule that keeps human-authored PRs out. Without it (the
+    `repos` fallback, for a workspace with no GitHub integration) an unhinted PR falls
+    back to `resolve_ticket` on the branch name, exactly as before.
     """
+    hints = hints or {}
+    managed = {k.upper() for k in team_keys or []}
     selected = []
     for pr in prs or []:
         if not isinstance(pr, dict):
@@ -434,7 +605,13 @@ def select_new_reviews(prs, seen_keys, team_keys, owner_repo):
             continue
         if pr_key(owner_repo, number) in seen_keys:
             continue
-        ticket = prl.resolve_ticket(pr.get("headRefName") or "", team_keys or [])
+        ticket = hints.get(number)
+        if ticket is None:
+            if hints_only:
+                continue
+            ticket = prl.resolve_ticket(pr.get("headRefName") or "", team_keys or [])
+        elif managed and ticket.split("-", 1)[0].upper() not in managed:
+            continue
         if ticket is None:
             continue
         row = dict(pr)
@@ -535,7 +712,7 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
         "",
         "## What you are reviewing",
         "",
-        "- Pull request: %s#%d" % (owner_repo, number),
+        pr_marker(owner_repo, number),
         "- PR title: %s" % (title or "_(none)_"),
         "- Head branch: `%s`" % branch,
         "- Original ticket: **%s** (the ticket whose work this PR claims to complete)" % ticket_id,
@@ -839,9 +1016,56 @@ def fetch_pr_diff(owner_repo, number):
 
 
 # --------------------------------------------------------------------------- #
-# Linear I/O — one transport, four documents. Mutations: issueCreate, issueUpdate. That
-# is the complete list; --selftest asserts no other mutation name appears in this file.
+# Linear I/O — one transport, and exactly TWO mutations: issueCreate, issueUpdate.
+# --selftest asserts, over the source, that no third `mutation` document exists here.
+# Everything else below is a read. Filters are passed as whole typed variables
+# (`$filter: IssueFilter!` and friends) rather than assembled inline, so the shapes are
+# the ones the @linear/sdk 64.0.0 typings declare and nothing is guessed.
 # --------------------------------------------------------------------------- #
+FIND_TEAM_BY_KEY = """
+query FindTeamByKey($filter: TeamFilter!) {
+  teams(filter: $filter, first: 10) { nodes { id key name } }
+}"""
+
+FIND_AGENT_USER = """
+query FindAgentUser($filter: UserFilter!) {
+  users(filter: $filter, first: 10) { nodes { id name displayName active } }
+}"""
+
+FIND_MODEL_LABEL = """
+query FindModelLabel($filter: IssueLabelFilter!) {
+  issueLabels(filter: $filter, first: 10) { nodes { id name team { id } } }
+}"""
+
+# Discovery: the workspace's agent sessions, each with the ISSUE it worked and that
+# issue's attachments. Linear's GitHub integration writes one attachment per linked PR,
+# and the kit's branch rule is what makes the link happen. `agentSessions` takes no
+# filter argument in the typings, so the shape below is all of it — paged, then read.
+DISCOVER_SESSIONS = """
+query DiscoverSessions($first: Int!, $after: String, $attachments: Int!) {
+  agentSessions(first: $first, after: $after, orderBy: updatedAt) {
+    nodes {
+      id status createdAt updatedAt
+      issue {
+        id identifier
+        team { id key }
+        attachments(first: $attachments) { nodes { url sourceType title } }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+
+# The dedup search (Linear is the authority, the seen-set is a cache): the exact title
+# this poller would have written, inside the Reviews team, archived ones included — a
+# ticket someone archived by hand still means "this PR already cost a reviewer session".
+FIND_REVIEW_TICKET = """
+query FindReviewTicket($filter: IssueFilter!) {
+  issues(filter: $filter, first: 25, includeArchived: true) {
+    nodes { id identifier url description state { id name type } }
+  }
+}"""
+
 CREATE_REVIEW_TICKET = """
 mutation CreateReviewTicket($input: IssueCreateInput!) {
   issueCreate(input: $input) {
@@ -920,6 +1144,203 @@ def linear_graphql(query, variables, api_key):
         log("Linear API error payload: %s" % json.dumps(payload["errors"])[:600])
         raise PollerError("Linear API error (payload logged)")
     return payload.get("data") or {}
+
+
+# --------------------------------------------------------------------------- #
+# Workspace facts, resolved BY NAME once per run
+# --------------------------------------------------------------------------- #
+def _one_node(data, field, what, wanted):
+    """The single node a by-name lookup found, or raise ConfigError naming the problem.
+
+    Zero and many are both deployment errors, and they are DIFFERENT deployment errors:
+    "no team has key REV" and "three users are called Dispatcher Agent, give the UUID"
+    need different fixes, so they get different sentences (§13 applied to config).
+    """
+    nodes = ((data.get(field) or {}).get("nodes")) or []
+    if not nodes:
+        raise ConfigError("no %s in this workspace matches %s — check the config, or give the "
+                          "UUID override" % (what, wanted))
+    if len(nodes) > 1:
+        raise ConfigError("%d %ss match %s; the name is ambiguous, so give the UUID override "
+                          "instead" % (len(nodes), what, wanted))
+    return nodes[0]
+
+
+def resolve_workspace(cfg, api_key):
+    """{reviews_team_id, cyrus_agent_user_id, model_label_id} resolved from the config.
+
+    An explicit UUID override short-circuits that one lookup; every other fact is looked
+    up by name. Transport failures propagate as PollerError (transient, exit 1); a name
+    that matches nothing or matches several raises ConfigError (exit 2).
+    """
+    out = {}
+    if cfg.get("reviews_team_id"):
+        out["reviews_team_id"] = cfg["reviews_team_id"]
+    else:
+        key = cfg["reviews_team_key"]
+        data = linear_graphql(FIND_TEAM_BY_KEY, {"filter": {"key": {"eq": key}}}, api_key)
+        out["reviews_team_id"] = _one_node(data, "teams", "team", "key %r" % key)["id"]
+
+    if cfg.get("cyrus_agent_user_id"):
+        out["cyrus_agent_user_id"] = cfg["cyrus_agent_user_id"]
+    else:
+        name = cfg["agent_user_name"]
+        # `app: true` keeps a human who happens to share the display name out of the
+        # result — delegating a review to a person would be a very quiet failure.
+        data = linear_graphql(FIND_AGENT_USER,
+                              {"filter": {"displayName": {"eq": name}, "app": {"eq": True}}}, api_key)
+        out["cyrus_agent_user_id"] = _one_node(data, "users", "agent user",
+                                               "display name %r" % name)["id"]
+
+    if cfg.get("model_label_id"):
+        out["model_label_id"] = cfg["model_label_id"]
+    elif cfg.get("model_label_name"):
+        name = cfg["model_label_name"]
+        data = linear_graphql(FIND_MODEL_LABEL, {"filter": {"name": {"eq": name}}}, api_key)
+        nodes = ((data.get("issueLabels") or {}).get("nodes")) or []
+        if len(nodes) > 1:
+            # A workspace label and a team-scoped one can share a name; the Reviews team's
+            # own wins, because that is the team the ticket is created in.
+            scoped = [n for n in nodes
+                      if ((n.get("team") or {}).get("id")) == out["reviews_team_id"]]
+            nodes = scoped or nodes
+        out["model_label_id"] = _one_node({"issueLabels": {"nodes": nodes}}, "issueLabels",
+                                          "label", "name %r" % name)["id"]
+    else:
+        out["model_label_id"] = ""      # no label configured: the dispatcher's default model
+    return out
+
+
+def ensure_workspace(cfg, api_key):
+    """Resolve the workspace facts into `cfg` once per run and remember that we did.
+
+    `cfg` is a per-run dict, so this cache lives exactly as long as the run does — which
+    is the whole point of a one-shot process: a renamed team or a rotated label is picked
+    up on the next interval, never held stale across a daemon's lifetime.
+    """
+    if cfg.get("_workspace_resolved"):
+        return cfg
+    cfg.update(resolve_workspace(cfg, api_key))
+    cfg["_workspace_resolved"] = True
+    log("resolved workspace: Reviews team %s, agent user %s, model label %s"
+        % (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"], cfg["model_label_id"] or "(none)"))
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Discovery — ask Linear what the dispatcher worked, never a hardcoded repo list
+# --------------------------------------------------------------------------- #
+def pr_from_attachments(issue):
+    """(owner_repo, number) for the first GitHub PR among an issue's attachments, else None."""
+    for att in (((issue or {}).get("attachments") or {}).get("nodes")) or []:
+        parsed = parse_pr_url((att or {}).get("url"))
+        if parsed:
+            return parsed
+    return None
+
+
+def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
+    """{owner/repo: {pr_number: TICKET-ID}} for every PR the dispatcher worked, and a
+    stats dict describing exactly what was and was not looked at.
+
+    Sessions are paged newest-first; each one's issue is taken once (an issue re-prompted
+    ten times is still one issue). Issues in the REVIEWS team are dropped before anything
+    else — those are this poller's own review tickets, which are delegated and therefore
+    have agent sessions of their own; without this they would discover themselves.
+
+    A transport failure propagates: "could not ask what the work is" must never arrive as
+    an empty work list (§13). The bounded second signal is applied after the attachment
+    pass so it only ever costs a query for an issue the integration did not cover.
+    """
+    reviews_team = cfg.get("reviews_team_id")
+    found, seen_issues, unattached = {}, {}, []
+    after, pages, sessions, more, attached = None, 0, 0, False, 0
+    for _ in range(DISCOVERY_MAX_PAGES):
+        data = linear_graphql(DISCOVER_SESSIONS,
+                              {"first": DISCOVERY_PAGE_SIZE, "after": after,
+                               "attachments": DISCOVERY_ATTACHMENTS}, api_key)
+        conn = data.get("agentSessions") or {}
+        pages += 1
+        for node in conn.get("nodes") or []:
+            sessions += 1
+            issue = node.get("issue") or {}
+            iid, ident = issue.get("id"), issue.get("identifier")
+            if not iid or not ident or iid in seen_issues:
+                continue
+            if reviews_team and ((issue.get("team") or {}).get("id")) == reviews_team:
+                continue                      # our own review tickets
+            seen_issues[iid] = ident
+            parsed = pr_from_attachments(issue)
+            if parsed:
+                attached += 1
+                found.setdefault(parsed[0], {})[parsed[1]] = ident
+            else:
+                unattached.append({"session_id": node.get("id"), "issue": ident})
+        info = conn.get("pageInfo") or {}
+        more = bool(info.get("hasNextPage"))
+        if not more:
+            break
+        after = info.get("endCursor")
+
+    probed, probed_hits, ambiguous = 0, 0, 0
+    for row in unattached[:probe_max]:
+        probed += 1
+        try:
+            session = read_agent_session(row["session_id"], api_key)
+        except PollerError as exc:
+            log("NOTE: discovery could not read session %s for %s (%s) — that issue is not "
+                "discovered this pass" % (row["session_id"], row["issue"], exc))
+            continue
+        _, body = latest_reviewer_output(session)
+        urls = parse_pr_urls(body or "")
+        if len(urls) > 1:
+            # A response that names several pull requests cannot say which one is its own,
+            # and guessing would review some other PR against this ticket's criteria. Say
+            # so and leave it: a wrong review is worse than a missing one.
+            ambiguous += 1
+            log("NOTE: %s has no PR attachment and its final response names %d different "
+                "pull requests — which one is its own cannot be told, so it is not "
+                "discovered; the GitHub integration is the reliable signal here"
+                % (row["issue"], len(urls)))
+            continue
+        if urls:
+            probed_hits += 1
+            found.setdefault(urls[0][0], {}).setdefault(urls[0][1], row["issue"])
+
+    stats = {"pages": pages, "sessions": sessions, "issues": len(seen_issues),
+             "attached": attached, "unattached": len(unattached), "probed": probed,
+             "probed_hits": probed_hits, "ambiguous": ambiguous,
+             "unprobed": max(0, len(unattached) - probed), "more_pages": more}
+    log("discovery: %d session(s) over %d page(s) → %d issue(s); %d PR(s) from attachments, "
+        "%d unattached (%d probed, %d found, %d ambiguous, %d left unprobed at the %d cap); "
+        "more history beyond the window: %s"
+        % (stats["sessions"], stats["pages"], stats["issues"], stats["attached"],
+           stats["unattached"], stats["probed"], stats["probed_hits"], stats["ambiguous"],
+           stats["unprobed"], probe_max, "yes" if more else "no"))
+    return found, stats
+
+
+# --------------------------------------------------------------------------- #
+# Dedup — Linear is the authority on "has this PR already been reviewed?"
+# --------------------------------------------------------------------------- #
+def find_existing_review_ticket(cfg, owner_repo, number, ticket_id, api_key):
+    """The review ticket that already exists for this PR, or None. Raises on a failed
+    search — "could not ask" is not "nothing there", and the difference is one duplicate
+    paid reviewer session.
+
+    Matched on the exact title this poller writes, then CONFIRMED by the `owner/repo#N`
+    marker in the description, so a hand-written ticket that merely shares a title cannot
+    be mistaken for one of ours (and so a title collision across repositories cannot).
+    """
+    title = REVIEW_TITLE_FMT % (number, ticket_id)
+    data = linear_graphql(FIND_REVIEW_TICKET,
+                          {"filter": {"team": {"id": {"eq": cfg["reviews_team_id"]}},
+                                      "title": {"eq": title}}}, api_key)
+    marker = pr_marker(owner_repo, number)
+    for node in ((data.get("issues") or {}).get("nodes")) or []:
+        if marker in (node.get("description") or ""):
+            return node
+    return None
 
 
 def create_review_ticket(cfg, title, body, api_key, dry_run):
@@ -1289,17 +1710,24 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
 
 
 def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
-    """basis → diff → body → create+delegate, as a DECISION and no state change:
+    """basis → diff → body → ask Linear → create+delegate, as a DECISION and no state change:
 
-      ("decline", reason, basis)          a TERMINAL reason — no basis by any tier, an
-                                          empty diff, over the cap
-      ("retry", reason, detail, basis)    a TRANSIENT one — a Linear or GitHub read
-                                          failed, the issueCreate failed
-      ("created", issue, basis, body)     the review ticket exists (and is paid for)
+      ("decline", reason, basis)                 a TERMINAL reason — no basis by any tier,
+                                                 an empty diff, over the cap
+      ("retry", reason, detail, basis)           a TRANSIENT one — a Linear or GitHub read
+                                                 failed, the dedup search failed, the
+                                                 issueCreate failed
+      ("created", issue, basis, body, reused)    the review ticket exists (and is paid for)
 
     Kept free of every write so `scan_pr` can wrap it in one bug-catcher without ever
     wrapping a `settle` — a decline whose comment already landed must never be turned
-    into a `retry` by an exception that came after it."""
+    into a `retry` by an exception that came after it.
+
+    The dedup search runs BEFORE the create and AFTER the body is built, so a reuse still
+    proves the basis and the diff were reachable this pass, and the ticket that comes back
+    is returned in place of a new one. When it hits, the body that matters is the one
+    LINEAR holds — that is what the reviewer read — so the caller hashes that, not ours.
+    """
     number = pr["number"]
     try:
         basis, why = resolve_basis_for(cfg, ticket_id, linear_key)
@@ -1317,12 +1745,20 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
     if len(body) > cfg["diff_cap_chars"]:
         return "decline", ("diff too large to deliver (%d chars of review-ticket body > the %d-char "
                            "cap)" % (len(body), cfg["diff_cap_chars"])), basis
+    try:
+        existing = find_existing_review_ticket(cfg, owner_repo, number, ticket_id, linear_key)
+    except PollerError as exc:
+        # NOT a create-anyway: an unanswered search is exactly the case that would open a
+        # second paid reviewer session for a PR that already has one.
+        return "retry", "the Reviews team could not be searched for an existing review ticket", exc, basis
+    if existing is not None:
+        return "created", existing, basis, (existing.get("description") or ""), True
     title = REVIEW_TITLE_FMT % (number, ticket_id)
     try:
         issue = create_review_ticket(cfg, title, body, linear_key, dry_run)
     except PollerError as exc:
         return "retry", "the review ticket could not be created (Linear API error)", exc, basis
-    return "created", issue, basis, body
+    return "created", issue, basis, body, False
 
 
 def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
@@ -1369,16 +1805,17 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
         return declined(decision[1], decision[2])
     if kind == "retry":
         return retry_later(decision[1], decision[2], decision[3])
-    _, issue, basis, body = decision
+    _, issue, basis, body, reused = decision
     stored = issue.get("description")
     record.update(status="pending", basis=basis, review_ticket_id=issue.get("id"),
                   review_ticket=issue.get("identifier"), review_ticket_url=issue.get("url") or "",
-                  body_sha256=body_sha256(body),
+                  reused=bool(reused), body_sha256=body_sha256(body),
                   stored_sha256=body_sha256(stored) if isinstance(stored, str) and stored else None)
     # Durable BEFORE anything else happens: the ticket exists and is paid for from here.
     persist(cfg, seen, key, record, dry_run)
-    print("created review ticket %s for %s#%d (%s), %d chars%s"
-          % (issue.get("identifier"), owner_repo, number, ticket_id, len(body),
+    print("%s review ticket %s for %s#%d (%s), %d chars%s"
+          % ("REUSED existing" if reused else "created", issue.get("identifier"), owner_repo,
+             number, ticket_id, len(body),
              " [dry-run — nothing created]" if dry_run else ""))
     result.created += 1
 
@@ -1404,9 +1841,43 @@ def scan(cfg, dry_run):
         # usage error, not a reason to spend every open PR's single review on a decline.
         log("FAIL: %s" % missing)
         return EXIT_USAGE
+    try:
+        ensure_workspace(cfg, linear_key)
+    except ConfigError as exc:
+        log("FAIL: %s — nothing was listed, created or declined" % exc)
+        return EXIT_USAGE
+    except PollerError as exc:
+        log("FAIL: the workspace could not be resolved from Linear (%s) — nothing was listed, "
+            "created or declined; the next run retries" % exc)
+        return EXIT_ERROR
+    try:
+        discovered, _stats = discover_pipeline_prs(cfg, linear_key)
+    except PollerError as exc:
+        # "Could not ask what the work is" is never "there is no work" (§13). Nothing is
+        # listed and nothing is written; the next scheduled run tries again.
+        log("FAIL: could not discover pipeline PRs from Linear (%s) — nothing was listed, "
+            "created or declined; the next run retries" % exc)
+        return EXIT_ERROR
+    configured = list(cfg["repos"])
+    if configured:
+        # `repos` RESTRICTS discovery…
+        allowed = set(configured)
+        dropped = sorted(set(discovered) - allowed)
+        if dropped:
+            log("NOTE: discovery found PRs on %s, outside the configured 'repos' — not reviewed"
+                % ", ".join(dropped))
+        discovered = {r: v for r, v in discovered.items() if r in allowed}
+        repos_to_scan = configured
+    else:
+        repos_to_scan = sorted(discovered)
+    if not repos_to_scan:
+        print("scan: discovery found no repository with a dispatcher-worked pull request, and "
+              "no 'repos' are configured — nothing to review this pass")
+        return result.exit_code()
     # A `retry` record is not "seen": it is re-selected until it settles or gives up.
     seen_keys = {k for k, v in seen.items() if v.get("status") != "retry"}
-    for owner_repo in cfg["repos"]:
+    for owner_repo in repos_to_scan:
+        hints = discovered.get(owner_repo) or {}
         try:
             prs = list_open_prs(owner_repo)
         except PollerError as exc:
@@ -1414,9 +1885,13 @@ def scan(cfg, dry_run):
             log("FAIL: could not list open PRs on %s: %s" % (owner_repo, exc))
             result.errors += 1
             continue
-        selected = select_new_reviews(prs, seen_keys, cfg["team_keys"], owner_repo)
-        print("scan %s: %d open PR(s), %d new pipeline PR(s) to review"
-              % (owner_repo, len(prs), len(selected)))
+        # With no `repos` configured we are purely Linear-driven, so an unhinted PR — a
+        # human's — is not reviewed. `repos` opts that repo back into the branch-name
+        # fallback, which is what a workspace with no GitHub integration relies on.
+        selected = select_new_reviews(prs, seen_keys, cfg["team_keys"], owner_repo,
+                                      hints=hints, hints_only=not configured)
+        print("scan %s: %d open PR(s), %d dispatcher-worked by discovery, %d new pipeline "
+              "PR(s) to review" % (owner_repo, len(prs), len(hints), len(selected)))
         for pr in selected:
             try:
                 scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result)
@@ -1519,6 +1994,17 @@ def collect(cfg, dry_run):
     except PollerError as exc:
         log("FAIL: %s" % exc)
         return EXIT_USAGE
+    try:
+        # Needed here too: closing a review ticket asks the Reviews team for its completed
+        # state, and `run` resolves once for both halves of the pass.
+        ensure_workspace(cfg, linear_key)
+    except ConfigError as exc:
+        log("FAIL: %s — nothing was read or posted" % exc)
+        return EXIT_USAGE
+    except PollerError as exc:
+        log("FAIL: the workspace could not be resolved from Linear (%s) — nothing was read or "
+            "posted; the next run retries" % exc)
+        return EXIT_ERROR
     for key, record in work:
         try:
             if record.get("status") != "pending":
@@ -1572,26 +2058,117 @@ def run_once(cfg, dry_run):
 
 
 # --------------------------------------------------------------------------- #
+# One run: a wall-clock bound and a heartbeat, because the scheduler restarts the
+# process and nobody watches the log
+# --------------------------------------------------------------------------- #
+class RunTimeout(Exception):
+    """The run outlived its wall clock and was cut off."""
+
+
+def heartbeat_path(state_dir):
+    return os.path.join(state_dir, "heartbeat.json")
+
+
+RESULT_BY_CODE = {EXIT_OK: "ok", EXIT_ERROR: "error", EXIT_USAGE: "usage",
+                  EXIT_DECLINED: "declined", EXIT_TIMEOUT: "timeout"}
+
+
+def write_heartbeat(state_dir, command, code, started_at, started_mono, dry_run):
+    """Record that a run FINISHED and what it decided. Best effort by design: a heartbeat
+    that could not be written must never change a run's exit code, or the liveness probe
+    becomes a second way to fail. Not written on --dry-run — a dry pass leaves no state.
+
+    This is the file that separates "the poller is dead" (a stale timestamp) from "the
+    poller ran and could not do it" (a fresh timestamp with a non-ok result). A monitor
+    that only checks the process is checking the wrong thing.
+    """
+    if dry_run:
+        return False
+    doc = {"schema": HEARTBEAT_SCHEMA, "command": command,
+           "result": RESULT_BY_CODE.get(code, "unknown"), "exit_code": code,
+           "started_at": started_at, "ended_at": _now_iso(),
+           "duration_seconds": round(time.monotonic() - started_mono, 3), "pid": os.getpid()}
+    try:
+        _atomic_write_json(heartbeat_path(state_dir), doc)
+        return True
+    except OSError as exc:
+        log("NOTE: the heartbeat could not be written to %s (%s); the run's own result "
+            "stands" % (heartbeat_path(state_dir), exc))
+        return False
+
+
+def run_command(cfg, command, dry_run, timeout=None):
+    """ONE pass of `command`, bounded by a wall clock, ending in a heartbeat.
+
+    There is no internal loop: the scheduler starts a fresh process every interval, so a
+    run that hangs is cut off here rather than left to overlap its successor. Everything
+    this file writes is written THROUGH the moment it happens, so a cut-off run leaves a
+    consistent state dir and the next run resumes at the first stage that did not finish.
+    """
+    fn = {"scan": scan, "collect": collect, "run": run_once}[command]
+    seconds = int(timeout if timeout is not None else cfg.get("run_timeout_seconds")
+                  or DEFAULT_RUN_TIMEOUT_SECONDS)
+    started_at, started_mono = _now_iso(), time.monotonic()
+    armed = False
+
+    def _fired(_signum, _frame):
+        raise RunTimeout()
+
+    previous = None
+    if seconds > 0 and hasattr(signal, "SIGALRM"):
+        previous = signal.signal(signal.SIGALRM, _fired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        armed = True
+    elif seconds > 0:
+        log("NOTE: this platform has no SIGALRM, so the %ds run timeout is not enforced" % seconds)
+    try:
+        code = fn(cfg, dry_run)
+    except RunTimeout:
+        log("FAIL: the run was cut off at its %ds timeout. Whatever was written through "
+            "stands and the next scheduled run resumes from it; if this repeats, the pass "
+            "has more work than one interval can carry — raise 'run_timeout_seconds' or "
+            "lengthen the scheduler's interval" % seconds)
+        code = EXIT_TIMEOUT
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+    write_heartbeat(cfg["state_dir"], command, code, started_at, started_mono, dry_run)
+    return code
+
+
+# --------------------------------------------------------------------------- #
 # Selftest — offline, every network call stubbed
 # --------------------------------------------------------------------------- #
 class _FakeLinear:
-    """Answers the five GraphQL documents above by operation name and records writes."""
+    """Answers every GraphQL document above by operation name and records writes."""
 
     def __init__(self):
-        self.issues = {}          # id -> {identifier, description, state}
+        self.issues = {}          # id -> {identifier, title, description, state}
         self.sessions = {}        # issue id -> [session]
         self.activities = {}      # session id -> [activity]
         self.created = []
         self.updated = []
         self.tamper = None
         self.fail_reads = False
+        self.fail_all = False         # every op raises: the whole API is unreachable
+        self.fail_create = False      # only the issueCreate raises
+        self.fail_discovery = False   # only the discovery listing raises
         self.fail_close_once = False
         self.fail_close = False       # permanent: the ticket was deleted / access revoked
         self.crash_reads = set()      # review ticket ids whose read raises a NON-PollerError
         self.n = 0
+        # Workspace facts, resolved by name — the ids the older cases assert on.
+        self.teams = [{"id": "team-1", "key": "REV", "name": "Reviews"}]
+        self.users = [{"id": "agent-1", "name": "Dispatcher Agent",
+                       "displayName": "Dispatcher Agent", "active": True}]
+        self.labels = [{"id": "label-1", "name": "haiku", "team": None}]
+        self.discovery = []           # agentSessions nodes, newest first
 
     def __call__(self, query, variables, api_key):
         op = re.search(r"^\s*(?:mutation|query)\s+(\w+)", query, re.MULTILINE).group(1)
+        if self.fail_all:
+            raise PollerError("simulated total Linear outage")
         if self.fail_reads and op.startswith(("Read", "List")):
             raise PollerError("simulated Linear outage")
         if op == "ReadReviewTicket" and variables.get("id") in self.crash_reads:
@@ -1599,12 +2176,34 @@ class _FakeLinear:
         if (self.fail_close_once or self.fail_close) and op == "CloseReviewTicket":
             self.fail_close_once = False
             raise PollerError("simulated issueUpdate failure")
+        if self.fail_create and op == "CreateReviewTicket":
+            raise PollerError("simulated issueCreate failure")
+        if self.fail_discovery and op == "DiscoverSessions":
+            raise PollerError("simulated discovery outage")
+        if op == "FindTeamByKey":
+            want = ((variables["filter"].get("key") or {}).get("eq"))
+            return {"teams": {"nodes": [t for t in self.teams if t["key"] == want]}}
+        if op == "FindAgentUser":
+            want = ((variables["filter"].get("displayName") or {}).get("eq"))
+            return {"users": {"nodes": [u for u in self.users if u["displayName"] == want]}}
+        if op == "FindModelLabel":
+            want = ((variables["filter"].get("name") or {}).get("eq"))
+            return {"issueLabels": {"nodes": [x for x in self.labels if x["name"] == want]}}
+        if op == "DiscoverSessions":
+            return {"agentSessions": {"nodes": list(self.discovery),
+                                      "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+        if op == "FindReviewTicket":
+            want = ((variables["filter"].get("title") or {}).get("eq"))
+            team = (((variables["filter"].get("team") or {}).get("id") or {}).get("eq"))
+            return {"issues": {"nodes": [dict(i) for i in self.issues.values()
+                                         if i.get("title") == want and i.get("team_id") == team]}}
         if op == "CreateReviewTicket":
             self.n += 1
             inp = variables["input"]
             self.created.append(inp)
             iid = "rev-uuid-%d" % self.n
             self.issues[iid] = {"id": iid, "identifier": "REV-%d" % self.n,
+                                "title": inp["title"], "team_id": inp.get("teamId"),
                                 "description": inp["description"], "url": "https://example.invalid/REV"}
             return {"issueCreate": {"success": True, "issue": dict(self.issues[iid])}}
         if op == "ReadReviewTicket":
@@ -1618,7 +2217,9 @@ class _FakeLinear:
             return {"agentSessions": {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}
         if op == "ReadAgentSession":
             sid = variables["id"]
-            sess = next(s for ss in self.sessions.values() for s in ss if s["id"] == sid)
+            sess = next((s for ss in self.sessions.values() for s in ss if s["id"] == sid), None)
+            if sess is None:      # discovery probes sessions it has never listed
+                return {"agentSession": None}
             return {"agentSession": dict(sess, activities={"nodes": self.activities.get(sid, [])})}
         if op == "TeamCompletedState":
             return {"team": {"states": {"nodes": [
@@ -1752,11 +2353,11 @@ def selftest():
     check("fenced_blocks: a shorter run does not close a longer fence", fenced_blocks("````\n```\nx\n````"), ["```\nx"])
     check("fenced_blocks: mixed fence chars do not close", fenced_blocks("```\n~~~\nx\n```"), ["~~~\nx"])
 
-    # 5. Config: env var NAMES only; unknown keys refused; defaults applied.
+    # 5. Config: NAMES not ids, env var NAMES only, unknown keys refused, defaults applied.
     with tempfile.TemporaryDirectory() as tmp:
         cfg_path = os.path.join(tmp, "c.json")
-        base = {"repos": ["o/r"], "reviews_team_id": "team-1", "cyrus_agent_user_id": "agent-1",
-                "model_label_id": "label-1", "state_dir": os.path.join(tmp, "state"),
+        base = {"repos": ["o/r"], "reviews_team_key": "REV", "agent_user_name": "Dispatcher Agent",
+                "model_label_name": "haiku", "state_dir": os.path.join(tmp, "state"),
                 "github_token_env": "GH_TOKEN_TEST_91", "linear_key_env": "LINEAR_KEY_TEST_91",
                 "team_keys": ["KIT"], "collect_timeout_seconds": 100}
         with open(cfg_path, "w") as fh:
@@ -1764,10 +2365,26 @@ def selftest():
         cfg = load_config(cfg_path)
         check("config defaults threshold", cfg["threshold"], "high")
         check("config defaults cap", cfg["diff_cap_chars"], DEFAULT_DIFF_CAP_CHARS)
+        check("config defaults the run timeout", cfg["run_timeout_seconds"], DEFAULT_RUN_TIMEOUT_SECONDS)
+        check("config leaves the ids unresolved", (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"]), ("", ""))
+        # `repos` is optional now: a config with none is Linear-driven, not invalid.
+        no_repos = dict(base)
+        no_repos.pop("repos")
+        with open(cfg_path, "w") as fh:
+            json.dump(no_repos, fh)
+        check("config without 'repos' loads (discovery is the default)", load_config(cfg_path)["repos"], [])
+        # …and a UUID override is accepted in place of each name.
+        by_id = {k: v for k, v in base.items() if k not in ("reviews_team_key", "agent_user_name")}
+        by_id.update(reviews_team_id="team-1", cyrus_agent_user_id="agent-1")
+        with open(cfg_path, "w") as fh:
+            json.dump(by_id, fh)
+        check("config accepts UUID overrides instead of names", load_config(cfg_path)["reviews_team_id"], "team-1")
         for bad, want in ((dict(base, linear_key_env="lin_api_abc123"), "ENV VAR NAME"),
                           (dict(base, unknown_key=1), "unknown config key"),
                           (dict(base, repos=["nope"]), "OWNER/NAME"),
-                          (dict(base, threshold="severe"), "threshold")):
+                          (dict(base, threshold="severe"), "threshold"),
+                          ({k: v for k, v in base.items() if k != "reviews_team_key"}, "reviews_team_key"),
+                          ({k: v for k, v in base.items() if k != "agent_user_name"}, "agent_user_name")):
             with open(cfg_path, "w") as fh:
                 json.dump(bad, fh)
             try:
@@ -1775,6 +2392,17 @@ def selftest():
                 failures.append("config accepted a bad value: %r" % want)
             except PollerError as exc:
                 check("config refusal names the problem (%s)" % want, want in str(exc), True)
+        # the old poll_seconds key is gone with --loop: an unknown key must not be ignored
+        with open(cfg_path, "w") as fh:
+            json.dump(dict(base, poll_seconds=300), fh)
+        try:
+            load_config(cfg_path)
+            failures.append("config still accepts the retired poll_seconds key")
+        except PollerError as exc:
+            check("retired poll_seconds is refused, not ignored", "poll_seconds" in str(exc), True)
+        with open(cfg_path, "w") as fh:
+            json.dump(base, fh)
+        cfg = load_config(cfg_path)
 
     # 6. The drivers end to end — GitHub, Linear, the publisher, the basis resolver and the
     #    telemetry sibling all stubbed. Happy path posts exactly one comment, creates exactly
@@ -2046,12 +2674,12 @@ def selftest():
             fake.__init__()
             posted.clear()
             save_seen(seen_path(tmp), dict(seen0))
-            globals()["linear_graphql"] = raiser("Linear API error (payload logged)")
+            fake.fail_create = True         # only the mutation fails; the reads still work
             c = dict(cfg, state_dir=tmp)
             check("issueCreate failure → error exit, retry", scan(c, False), EXIT_ERROR)
             check("issueCreate failure → nothing posted", posted, [])
             check("issueCreate failure → status retry", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "retry")
-            globals()["linear_graphql"] = fake
+            fake.fail_create = False
 
         # 7b. Delivery is part of the outcome: a comment that does not land is publish-failed
         #     (exit 1, retried), never a silent 'declined'/'collected'.
@@ -2374,6 +3002,275 @@ def selftest():
             check("no credential → nothing created", fake.created, [])
             os.environ["LINEAR_KEY_TEST_91"] = saved_key
 
+        # 7f. DISCOVERY (C2): the poller asks LINEAR what the dispatcher worked instead of
+        #     carrying a repo list. From a fixture of agent sessions and their issues'
+        #     attachments it must find every dispatcher-worked PR — and then select exactly
+        #     the one that is open, unreviewed and not a fork or a draft.
+        def _sess(sid, ident, team_id, urls, status="complete"):
+            # The ISSUE id is keyed on the identifier, so two sessions on the same ticket
+            # (a re-prompt) really are the same issue, the way Linear would return them.
+            return {"id": sid, "status": status, "createdAt": "2026-09-06T00:00:00Z",
+                    "updatedAt": "2026-09-06T00:05:00Z",
+                    "issue": {"id": "issue-" + ident, "identifier": ident,
+                              "team": {"id": team_id, "key": ident.split("-")[0]},
+                              "attachments": {"nodes": [
+                                  {"url": u, "sourceType": "github", "title": "PR"} for u in urls]}}}
+
+        GH = "https://github.com/o/r/pull/%d"
+        discovery_fixture = [
+            _sess("s5", "KIT-5", "kit-team", [GH % 5]),                  # the new one
+            _sess("s4", "KIT-4", "kit-team", [GH % 4 + "/files"]),       # already reviewed
+            _sess("s1", "KIT-1", "kit-team", [GH % 1]),                  # a fork PR
+            _sess("s2", "KIT-2", "kit-team", [GH % 2]),                  # a draft PR
+            _sess("s9", "REV-9", "team-1", [GH % 99]),                   # OUR OWN review ticket
+            _sess("s8", "KIT-8", "kit-team", ["https://figma.example/f/1"]),   # no PR attached
+            _sess("s5b", "KIT-5", "kit-team", [GH % 5]),                 # a re-prompt: same issue
+            _sess("s6", "KIT-6", "kit-team", ["https://github.com.evil.test/o/r/pull/6"]),
+        ]
+        fake.__init__()
+        fake.discovery = list(discovery_fixture)
+        # KIT-8's session mentions its PR in its final response — the second signal.
+        fake.activities["s8"] = [{"id": "a1", "createdAt": "2026-09-06T00:04:00Z",
+                                  "content": {"__typename": "AgentActivityResponseContent",
+                                              "body": "Opened %s for review." % (GH % 8)}}]
+        fake.sessions["issue-KIT-8"] = [{"id": "s8", "status": "complete",
+                                         "createdAt": "2026-09-06T00:00:00Z",
+                                         "updatedAt": "2026-09-06T00:05:00Z", "endedAt": None}]
+        dcfg = dict(cfg, reviews_team_id="team-1", cyrus_agent_user_id="agent-1",
+                    model_label_id="label-1", _workspace_resolved=True)
+        found, stats = discover_pipeline_prs(dcfg, "x")
+        check("discovery reads the repo out of the PR URL", sorted(found), ["o/r"])
+        check("discovery maps every worked PR to its ticket", found.get("o/r"),
+              {5: "KIT-5", 4: "KIT-4", 1: "KIT-1", 2: "KIT-2", 8: "KIT-8"})
+        check("discovery excludes our own review tickets by team", 99 in (found.get("o/r") or {}), False)
+        check("discovery counts an issue once however many sessions it had", stats["issues"], 6)
+        check("discovery used the second signal for the unattached issue", stats["probed_hits"], 1)
+        check("discovery says how much it left unprobed", stats["unprobed"], 0)
+        check("a lookalike host is not github.com", parse_pr_url("https://github.com.evil.test/o/r/pull/6"), None)
+        check("parse_pr_url reads owner/repo and number", parse_pr_url(GH % 5 + "/files"), ("o/r", 5))
+        check("parse_pr_url ignores an issue link", parse_pr_url("https://github.com/o/r/issues/5"), None)
+        check("parse_pr_url on junk", (parse_pr_url(None), parse_pr_url("")), (None, None))
+        check("parse_pr_urls collects distinct PRs in order",
+              parse_pr_urls("see %s and %s and %s again" % (GH % 5, GH % 9, GH % 5)),
+              [("o/r", 5), ("o/r", 9)])
+        # A response naming SEVERAL pull requests cannot say which is its own; guessing
+        # would review someone else's PR against this ticket's criteria, so it is skipped.
+        fake.activities["s8"] = [{"id": "a1", "createdAt": "2026-09-06T00:04:00Z",
+                                  "content": {"__typename": "AgentActivityResponseContent",
+                                              "body": "Opened %s, see also %s" % (GH % 8, GH % 12)}}]
+        amb_found, amb_stats = discover_pipeline_prs(dcfg, "x")
+        check("an ambiguous second signal is not guessed at", 8 in (amb_found.get("o/r") or {}), False)
+        check("an ambiguous second signal is counted", amb_stats["ambiguous"], 1)
+        check("an ambiguous second signal is explained on the log",
+              "which one is its own cannot be told" in sys.stderr.getvalue(), True)
+        fake.activities["s8"] = [{"id": "a1", "createdAt": "2026-09-06T00:04:00Z",
+                                  "content": {"__typename": "AgentActivityResponseContent",
+                                              "body": "Opened %s for review." % (GH % 8)}}]
+        # …and a discovery transport failure is LOUD, never an empty work list (§13) —
+        # in the function AND, which is what actually matters, in the driver that calls it.
+        fake.fail_all = True
+        try:
+            discover_pipeline_prs(dcfg, "x")
+            failures.append("discovery swallowed a transport failure as an empty result")
+        except PollerError:
+            pass
+        fake.fail_all = False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            fake.fail_discovery = True          # only discovery is down; everything else works
+            listed = []
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: listed.append(owner_repo) or fixture
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp)
+            check("discovery failure → error exit, NOT 'nothing to do'", scan(c, False), EXIT_ERROR)
+            check("discovery failure → nothing listed", listed, [])
+            check("discovery failure → nothing created or posted", (fake.created, posted), ([], []))
+            check("discovery failure → the seen-set is untouched", load_seen(seen_path(tmp)), seen0)
+            check("discovery failure → said which read failed",
+                  "could not discover pipeline PRs from Linear" in sys.stderr.getvalue(), True)
+            fake.fail_discovery = False
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+
+        with tempfile.TemporaryDirectory() as tmp:   # …and end to end, with NO 'repos' configured
+            fake.__init__()
+            posted.clear()
+            fake.discovery = list(discovery_fixture)
+            save_seen(seen_path(tmp), dict(seen0))          # PR #4 was handled on a prior pass
+            human = {"number": 7, "headRefName": "feat/kit-7-human", "isCrossRepository": False,
+                     "isDraft": False, "title": "A person wrote this", "url": "https://github.com/o/r/pull/7"}
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture + [human]
+            c = dict(cfg, state_dir=tmp, repos=[])
+            check("linear-driven scan exits OK", scan(c, False), EXIT_OK)
+            check("linear-driven scan reviewed exactly the open, unreviewed, agent-worked PR",
+                  [i.get("title") for i in fake.created], ["Review PR #5 — KIT-5"])
+            check("linear-driven scan did not review the human PR (no agent session, no hint)",
+                  pr_key("o/r", 7) in load_seen(seen_path(tmp)), False)
+            check("linear-driven scan posted nothing", posted, [])
+            check("linear-driven scan found the repo without being told it",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 5)]["repo"], "o/r")
+            # With no discovery and no repos there is simply nothing to do — and it says so.
+            fake.__init__()
+            check("no discovery + no repos → OK and says what it asked", scan(dict(c, repos=[]), False), EXIT_OK)
+            check("no discovery + no repos → nothing created", fake.created, [])
+            check("no discovery + no repos → said so",
+                  "discovery found no repository" in sys.stdout.getvalue(), True)
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+
+        with tempfile.TemporaryDirectory() as tmp:   # 'repos' RESTRICTS discovery
+            fake.__init__()
+            fake.discovery = [_sess("sx", "KIT-5", "kit-team", ["https://github.com/other/repo/pull/5"])]
+            save_seen(seen_path(tmp), dict(seen0))
+            listed = []
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: listed.append(owner_repo) or fixture
+            c = dict(cfg, state_dir=tmp)          # repos = ["o/r"]
+            check("repos restricts discovery → the outside repo is never listed", scan(c, False), EXIT_OK)
+            check("repos restricts discovery → only the configured repo listed", listed, ["o/r"])
+            check("repos restricts discovery → said what it dropped",
+                  "outside the configured 'repos'" in sys.stderr.getvalue(), True)
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+
+        # 7g. LINEAR IS THE AUTHORITY (C3): the seen-set is a cache, so a lost state dir
+        #     must not buy a second paid reviewer session for a PR that already has one.
+        with tempfile.TemporaryDirectory() as tmp:
+            c = fresh_state(tmp)                        # creates REV-1 for PR #5
+            check("dedup setup → one ticket", len(fake.created), 1)
+            os.remove(seen_path(tmp))                   # the whole local cache is lost
+            check("state lost → scan still exits OK", scan(c, False), EXIT_OK)
+            # Losing the cache does re-select every PR (that is what a cache loss means);
+            # what must NOT happen is a second paid reviewer session for PR #5.
+            check("state lost → the existing review ticket is REUSED, not duplicated",
+                  [i.get("title") for i in fake.created].count("Review PR #5 — KIT-5"), 1)
+            rec = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
+            check("state lost → the record points at the existing ticket", rec["review_ticket"], "REV-1")
+            check("state lost → the reuse is recorded", rec.get("reused"), True)
+            check("state lost → said so on stdout", "REUSED existing review ticket REV-1" in sys.stdout.getvalue(), True)
+            check("state lost → the hash is the one LINEAR holds, not our fresh render",
+                  rec["stored_sha256"], body_sha256(fake.issues["rev-uuid-1"]["description"]))
+            # A ticket that merely shares a title is not ours: the marker must confirm it.
+            fake.issues["rev-uuid-1"]["description"] = "someone rewrote this by hand"
+            os.remove(seen_path(tmp))
+            check("title match without the marker → not reused", scan(c, False), EXIT_OK)
+            check("title match without the marker → a real ticket is created",
+                  [i.get("title") for i in fake.created].count("Review PR #5 — KIT-5"), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:   # the search FAILING is never "nothing there"
+            fake.__init__()
+            posted.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            real_find = globals()["find_existing_review_ticket"]
+            globals()["find_existing_review_ticket"] = raiser("Linear API error (payload logged)")
+            c = dict(cfg, state_dir=tmp)
+            check("dedup search failure → error exit, retry", scan(c, False), EXIT_ERROR)
+            check("dedup search failure → NOTHING created (never a create-anyway)", fake.created, [])
+            check("dedup search failure → status retry", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "retry")
+            check("dedup search failure → nothing posted", posted, [])
+            globals()["find_existing_review_ticket"] = real_find
+
+        # 7h. ONE RUN, BOUNDED, WITH A HEARTBEAT (C1). The scheduler restarts the process;
+        #     this file's job is to finish, say what it decided, and get out of the way.
+        with tempfile.TemporaryDirectory() as tmp:   # a normal run writes the heartbeat
+            fake.__init__()
+            posted.clear()
+            telemetry.clear()
+            save_seen(seen_path(tmp), dict(seen0))
+            c = dict(cfg, state_dir=tmp)
+            check("run_command(scan) exits OK", run_command(c, "scan", False), EXIT_OK)
+            hb = json.load(open(heartbeat_path(tmp)))
+            check("heartbeat schema", hb["schema"], HEARTBEAT_SCHEMA)
+            check("heartbeat names the command", hb["command"], "scan")
+            check("heartbeat records the result", (hb["result"], hb["exit_code"]), ("ok", EXIT_OK))
+            check("heartbeat timestamps the run", bool(hb["started_at"] and hb["ended_at"]), True)
+            check("heartbeat carries a duration", isinstance(hb["duration_seconds"], float), True)
+            # …on a DECLINING run too: 'ran and could not' must be visible without a log.
+            fake.respond("rev-uuid-1", "not a findings document at all")
+            check("run_command(collect) declines", run_command(c, "collect", False), EXIT_DECLINED)
+            hb = json.load(open(heartbeat_path(tmp)))
+            check("heartbeat records a declining run", (hb["command"], hb["result"]), ("collect", "declined"))
+            # …and --dry-run still writes nothing at all, heartbeat included.
+            os.remove(heartbeat_path(tmp))
+            check("dry-run run_command exits OK", run_command(dict(c), "scan", True), EXIT_OK)
+            check("dry-run writes no heartbeat", os.path.exists(heartbeat_path(tmp)), False)
+
+        with tempfile.TemporaryDirectory() as tmp:   # APIs unreachable → non-zero, NO state
+            fake.__init__()
+            posted.clear()
+            fake.fail_all = True
+            globals()["list_open_prs"] = raiser("could not reach GitHub")
+            c = dict(cfg, state_dir=tmp)
+            c.pop("_workspace_resolved", None)
+            c.update(reviews_team_id="", cyrus_agent_user_id="", model_label_id="")
+            rc = run_command(c, "run", False)
+            check("APIs unreachable → non-zero exit", rc != EXIT_OK, True)
+            check("APIs unreachable → it is the retryable code, not a usage error", rc, EXIT_ERROR)
+            check("APIs unreachable → no seen-set written", os.path.exists(seen_path(tmp)), False)
+            check("APIs unreachable → no outcome written", os.path.exists(os.path.join(tmp, "outcomes")), False)
+            check("APIs unreachable → nothing created or posted", (fake.created, posted), ([], []))
+            check("APIs unreachable → the heartbeat still records the failed run",
+                  json.load(open(heartbeat_path(tmp)))["result"], "error")
+            check("APIs unreachable → said which read failed",
+                  "workspace could not be resolved" in sys.stderr.getvalue(), True)
+            fake.fail_all = False
+            globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
+
+        with tempfile.TemporaryDirectory() as tmp:   # a hung pass is cut off, not left to overlap
+            real_scan = globals()["scan"]
+            globals()["scan"] = lambda cfg_, dry: time.sleep(30)
+            c = dict(cfg, state_dir=tmp)
+            check("a run over its wall clock → EXIT_TIMEOUT", run_command(c, "scan", False, timeout=1), EXIT_TIMEOUT)
+            hb = json.load(open(heartbeat_path(tmp)))
+            check("timeout → the heartbeat says timeout, distinctly", (hb["result"], hb["exit_code"]),
+                  ("timeout", EXIT_TIMEOUT))
+            check("timeout → said what to do about it", "raise 'run_timeout_seconds'" in sys.stderr.getvalue(), True)
+            check("timeout is distinct from every other exit code",
+                  EXIT_TIMEOUT not in (EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED), True)
+            globals()["scan"] = real_scan
+            # the alarm is disarmed afterwards: the next run is not cut off by the last one's clock
+            check("the run timeout is disarmed after the run", run_command(dict(c), "scan", False, timeout=0), EXIT_OK)
+
+        # 7i. Workspace facts resolved BY NAME once per run; a name that resolves to
+        #     nothing is a CONFIG error (exit 2), not a transport one and not a decline.
+        fake.__init__()
+        # An earlier pass already resolved `cfg`, so clear the ids or every lookup below
+        # would short-circuit on the override and prove nothing.
+        wcfg = dict(cfg, reviews_team_id="", cyrus_agent_user_id="", model_label_id="")
+        wcfg.pop("_workspace_resolved", None)
+        ids = resolve_workspace(dict(wcfg), "x")
+        check("team resolved by key", ids["reviews_team_id"], "team-1")
+        check("agent user resolved by display name", ids["cyrus_agent_user_id"], "agent-1")
+        check("model label resolved by name", ids["model_label_id"], "label-1")
+        check("an explicit UUID override wins over the lookup",
+              resolve_workspace(dict(wcfg, reviews_team_id="team-override"), "x")["reviews_team_id"],
+              "team-override")
+        check("no model label configured → none attached",
+              resolve_workspace(dict(wcfg, model_label_name=""), "x")["model_label_id"], "")
+        for label, broken, want in (("unknown team key", dict(wcfg, reviews_team_key="NOPE"), "key 'NOPE'"),
+                                    ("unknown agent name", dict(wcfg, agent_user_name="Nobody"), "display name 'Nobody'"),
+                                    ("unknown label", dict(wcfg, model_label_name="mystery"), "name 'mystery'")):
+            try:
+                resolve_workspace(broken, "x")
+                failures.append("resolve_workspace accepted an unresolvable %s" % label)
+            except ConfigError as exc:
+                check("unresolvable %s names what it looked for" % label, want in str(exc), True)
+        check("a ConfigError is a PollerError the drivers can still catch",
+              issubclass(ConfigError, PollerError), True)
+        fake.teams = fake.teams + [{"id": "team-2", "key": "REV", "name": "Reviews (old)"}]
+        try:
+            resolve_workspace(dict(wcfg), "x")
+            failures.append("resolve_workspace accepted an ambiguous team key")
+        except ConfigError as exc:
+            check("an ambiguous name asks for the UUID override", "UUID override" in str(exc), True)
+        fake.__init__()
+        with tempfile.TemporaryDirectory() as tmp:   # …and the driver turns that into exit 2
+            posted.clear()
+            c = dict(cfg, state_dir=tmp, reviews_team_key="NOPE")
+            c.pop("_workspace_resolved", None)
+            c.update(reviews_team_id="", cyrus_agent_user_id="", model_label_id="")
+            check("unresolvable workspace → usage exit", scan(c, False), EXIT_USAGE)
+            check("unresolvable workspace → nothing created or posted", (fake.created, posted), ([], []))
+            check("unresolvable workspace → no seen-set written", os.path.exists(seen_path(tmp)), False)
+
         # 8. Telemetry absence is said, never silent — with the real emit_telemetry and no module.
         globals()["emit_telemetry"] = saved["emit_telemetry"]
         real_import = globals()["_optional_module"]
@@ -2446,8 +3343,15 @@ def selftest():
                      "addPullRequestReview", "createReview", "submitPullRequestReview",
                      "auto-merge", "auto_merge", "autoMerge", "enableAutoMerge",
                      "enablePullRequestAutoMerge", 'pulls/{number}/merge', 'pulls/%d/merge',
-                     '/merge"', "/merge'", "issueAddLabel", "addLabels", "pr edit --add-label",
-                     "agent:needs-human", "issueLabel", "commentCreate", "issueArchive",
+                     '/merge"', "/merge'", "issueAddLabel", "issueRemoveLabel", "addLabels",
+                     "pr edit --add-label", "agent:needs-human",
+                     # Label WRITES only. Reading `issueLabels` is how the model label is
+                     # resolved by name (C2); the blunt `issueLabel` token used to ban that
+                     # read too, which is a guard banning the wrong thing. The sanctioned —
+                     # and only — way a label reaches an issue here is `labelIds` inside the
+                     # issueCreate input, asserted positively below.
+                     "issueLabelCreate", "issueLabelUpdate", "issueLabelDelete",
+                     "issueLabelArchive", "commentCreate", "issueArchive",
                      "issueDelete", "claude -p", "--permission-mode")
     for banned in banned_tokens:
         if code.count(banned):
@@ -2455,6 +3359,17 @@ def selftest():
     for mutation in ("issueCreate", "issueUpdate"):
         if code.count(mutation) < 1:
             failures.append("expected mutation %r is missing" % mutation)
+    # The complete list of Linear MUTATIONS in this file is those two, and the check is
+    # over the source rather than over a list someone has to remember to update: every
+    # `mutation <Name>` GraphQL document here must be one of the two we authored.
+    mutation_docs = sorted(set(re.findall(r"^\s*mutation\s+(\w+)", code, re.MULTILINE)))
+    check("exactly two GraphQL mutations exist in this file", mutation_docs,
+          ["CloseReviewTicket", "CreateReviewTicket"])
+    # A label is only ever attached AT CREATION, never applied to an existing issue: the
+    # one assignment lives in the issueCreate input and there is no second one.
+    check("labelIds is set exactly once, in the issueCreate input", code.count('inp["labelIds"]'), 1)
+    check("the label read is a query, not a mutation",
+          "query FindModelLabel" in code and "issueLabels(filter:" in code, True)
     # The ORIGINAL ticket is never moved: issueUpdate is sent from exactly one call site,
     # its variables are exactly {id, {stateId}}, and that site is only ever handed a review
     # ticket id (`record["review_ticket_id"]` via close_review_ticket).
@@ -2471,13 +3386,19 @@ def selftest():
         for f in failures:
             print("  -", f)
         return 1
-    print("ok — pipeline_review_poller: opened-only selection (fork/draft/non-ticket/seen skipped), "
-          "sanitizer strips routing tags + fence tokens, ticket text fenced + one line per item, "
-          "PR named not linked, fences paired, body capped, create+delegate in one call (never "
-          "parented), read-back validated whole, tamper/malformed/timeout/error → loud decline "
-          "with fixed reasons, transient scan failures retried then declined, publish-failed / "
+    print("ok — pipeline_review_poller: Linear-driven discovery (agent-worked PRs only, own review "
+          "tickets and human PRs excluded, 'repos' restricts + branch-scans as fallback), workspace "
+          "resolved by name once per run (unresolvable ⇒ exit 2), Linear checked for an existing "
+          "review ticket before every create (a lost cache never buys a second reviewer session; a "
+          "failed search never creates anyway), opened-only selection (fork/draft/non-ticket/seen "
+          "skipped), sanitizer strips routing tags + fence tokens, ticket text fenced + one line per "
+          "item, PR named not linked, fences paired, body capped, create+delegate in one call (never "
+          "parented), read-back validated whole, tamper/malformed/timeout/error → loud decline with "
+          "fixed reasons, transient scan failures retried then declined, publish-failed / "
           "close-pending resumed (one comment, one outcome, one close per PR), corrupt seen-set "
-          "refuses to run, dry-run writes nothing, no approve/merge/label path")
+          "refuses to run, one-shot run bounded by a wall clock (exit 4) with a heartbeat on every "
+          "completed run, unreachable APIs exit non-zero writing no state, dry-run writes nothing, "
+          "no approve/merge/label path")
     return 0
 
 
@@ -2491,7 +3412,9 @@ def main(argv=None):
     p.add_argument("--config", help="JSON config file (see --example-config)")
     p.add_argument("--dry-run", action="store_true",
                    help="print every Linear/GitHub write that would be made; perform none")
-    p.add_argument("--loop", action="store_true", help="repeat every poll_seconds until killed")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="wall clock for THIS run in seconds; 0 disables (default: "
+                        "run_timeout_seconds, else %d)" % DEFAULT_RUN_TIMEOUT_SECONDS)
     p.add_argument("--example-config", action="store_true", help="print an example config and exit")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
@@ -2512,15 +3435,16 @@ def main(argv=None):
         log("FAIL: %s" % exc)
         return EXIT_USAGE
     export_github_token(cfg)
-    os.makedirs(cfg["state_dir"], exist_ok=True)
-
-    fn = {"scan": scan, "collect": collect, "run": run_once}[args.command]
-    while True:
-        rc = fn(cfg, args.dry_run)
-        if not args.loop or rc == EXIT_USAGE:
-            return rc
-        log("sleeping %ds" % cfg["poll_seconds"])
-        time.sleep(cfg["poll_seconds"])
+    try:
+        os.makedirs(cfg["state_dir"], exist_ok=True)
+    except OSError as exc:
+        log("FAIL: the state directory %s could not be created (%s) — nothing ran"
+            % (cfg["state_dir"], exc))
+        return EXIT_USAGE
+    # One pass, then exit: the scheduler owns the interval (a system LaunchDaemon with
+    # StartInterval, RunAtLoad and no KeepAlive). A daemon that looped internally would
+    # stop polling the moment one pass hung, which is exactly what the timeout prevents.
+    return run_command(cfg, args.command, args.dry_run, args.timeout)
 
 
 if __name__ == "__main__":
