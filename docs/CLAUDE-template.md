@@ -21,6 +21,17 @@ that must always hold (one real example: "fully usable without AI") -->
 **Reference material** (under `planning/`, gitignored — read it to port logic, never
 commit it): {{REFERENCE_MATERIAL_LIST_OR_DELETE}}
 
+**If a dispatcher started this session — a ticket delegated you and nobody is watching —
+read `docs/SESSION-BRIEF.md` first.** It came with the template and it is generic on
+purpose: your ticket is your authority and the branch name is cosmetic; you run in a
+sandbox that allows writes only in your worktree, behind a network allowlist, with a home
+you cannot read; the never-do list (merge, approve, protected labels, moving tickets,
+editing guards); what the review stage will do to your PR (a fresh reviewer, a possible
+re-prompt in your ticket's thread, a bounce budget); and the runbook for the unexpected.
+Never try to ask a user who is not there — comment on the ticket and ask for the blocked
+label instead. <!-- keep this paragraph even if the project runs no pipeline yet; it costs
+one read and it is what makes an unattended session safe the day one is dispatched -->
+
 ---
 
 ## Stack

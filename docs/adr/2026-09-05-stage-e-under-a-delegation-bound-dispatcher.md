@@ -8,35 +8,103 @@ pin and that a local watcher would post a trigger comment. The dispatcher chosen
 Cyrus, writes no pin and its comment lane is disqualified for a reviewer. This ADR
 redesigns Stage E for what actually runs.
 
+> **Update (2026-09-06) — option 4: the reviewer is a dispatcher session; the poller
+> only speaks.** Reading the dispatcher's *source* (v0.2.69) and the Linear SDK typings,
+> rather than their docs, changed four of the six decisions below. The text of decisions
+> 1, 3, 5 and 6 and of the Verified section is amended in place; decision 2 (the basis)
+> and decision 4 (comment, never approval; loud decline) stand.
+>
+> - **Trigger (1).** The poller no longer launches anything. For each newly-opened
+>   pipeline PR it creates **and delegates, in one `issueCreate{…, delegateId}`**, a
+>   review ticket in a dedicated *Reviews* team, with the diff inlined in the description.
+>   The dispatcher's ordinary Linear lane starts the reviewer. **No code path launches a
+>   Claude session as the owner** — the owner-account `claude -p` launcher that shipped in
+>   the merged reviewer core is removed, and the reasons are recorded under
+>   [Trigger](#1-trigger) as *option 3, rejected*.
+> - **Independence (3).** Enforced by the operating system, not by a prompt: the
+>   dispatcher runs every session as a dedicated non-admin account inside a sandbox that
+>   allows writes only in the worktree and `TMPDIR` and denies reads of `~`
+>   (`RunnerConfigBuilder.ts:558-579`), and the per-repository-entry **`disallowedTools`**
+>   list removes `Bash`, `Edit`, `Write` and the fetch tools from the reviewer. Two
+>   corrections, to this ADR and to the 2026-08-26 one: **`allowedTools` restricts
+>   nothing** — the dispatcher's permission callback allows every tool except
+>   `AskUserQuestion` (`ClaudeRunner.ts:321-328`); and **`promptTemplatePath` is
+>   stripped** by the CLI config loader before it is ever read (`ConfigService.ts:47-58`).
+>   The reviewer's brief travels in the per-entry `appendInstruction`
+>   (`PromptBuilder.ts:958-966`).
+> - **Bounce (5).** A bounce is a **re-prompt of the original coding session**: a comment
+>   in that ticket's agent-session thread resumes the same Claude session, in the same
+>   worktree, on the same branch (`EdgeWorker.ts:7256-7443`,
+>   `RunnerConfigBuilder.ts:431-437`). E cuts no fix worktree of its own. A fix ticket
+>   whose description pins the base branch is the fallback for a session that cannot be
+>   resumed.
+> - **Coupling (6).** The seam is no longer one fact. It is a **named set of dispatcher
+>   knobs** — per-entry `disallowedTools`, `appendInstruction`, `teamKeys` routing, the
+>   description-tag base-branch override, label-based model selection, and the
+>   agent-session re-prompt — and the poller touches none of them: it creates and
+>   delegates tickets, reads activities, posts comments.
+> - **Accepted risks (owner, 2026-09-06), monitored not closed:** the Linear MCP tools
+>   stay available to every session, the reviewer included; the re-prompt access check
+>   tests the *delegator*, not the commenter (`EdgeWorker.ts:5281-5290, 6726-6745`); the
+>   poller's owner-scoped Linear key lives outside the dispatcher's environment because
+>   the dispatcher copies its whole process env into every session unscrubbed
+>   (`session-env.ts:51-53`); the mid-work criteria-edit gap of decision 2 is unchanged.
+> - **A bug in the merged reviewer.** `pr_metadata()` requests `isCrossRepository` and
+>   nothing ever reads it, so a fork PR would have been reviewed and commented on. Fixed
+>   in the reviewer-core change that accompanies this update: cross-repository ⇒ decline,
+>   distinct reason, selftest.
+> - **Every dispatched session and every reviewer is briefed.** Nobody watches an
+>   autonomous session, so it must never try to ask an interactive user. The committed,
+>   generic brief is `docs/SESSION-BRIEF.md`; `CLAUDE.md` points at it.
+>
+> Operator steps: `docs/STAGE-E-OPERATOR.md`.
+
 ## Decision
 
-**Stage E is a dispatcher-side service that is independent of Cyrus.** Six decisions:
+**Stage E is a poller in the owner's account that speaks to the dispatcher only through
+Linear, plus a review lane the dispatcher runs under its own sandbox.** Six decisions:
 
-1. **Trigger** — a **PR poller on the dispatcher's Mac** lists newly-opened pipeline PRs
-   through the GitHub API and launches a review session for each. The GitHub webhook side
-   of Cyrus stays **unwired**. The poller *is* the thing that speaks first.
+1. **Trigger** *(amended 2026-09-06)* — a **PR poller in the owner's account** lists
+   newly-opened pipeline PRs through the GitHub API and, for each, **creates and delegates
+   one review ticket** in a dedicated Reviews team, diff inlined, in a single
+   `issueCreate{delegateId}`. The dispatcher starts the reviewer exactly as it starts any
+   delegated session. The GitHub webhook side of Cyrus stays **unwired**. The poller *is*
+   the thing that speaks first — and it only ever speaks; **nothing launches a Claude
+   session as the owner.**
 2. **Basis** — the reviewer compares the diff against the ticket's acceptance criteria and
    out-of-scope **as of delegation time**, resolved from a source the coding session
    cannot write, and **declines loudly** when it cannot establish one.
-3. **Independence** — a **fresh worktree** (never Cyrus's branch-keyed reuse), rubric and
-   schema read from the **committed default branch**, and a **read-only toolset** with no
-   approve capability. Same host and credential family are accepted.
+3. **Independence** *(amended 2026-09-06)* — **OS-enforced** by the dispatcher's sandbox
+   (dedicated non-admin account; writes only in the worktree and `TMPDIR`; `~` unreadable;
+   shell network only through an allowlisting proxy) and by the per-entry
+   **`disallowedTools`** list, which is the *only* tool fence the dispatcher honours. The
+   reviewer has no `Bash`, no `Edit`/`Write`, no fetch; its worktree is a checkout of the
+   **default branch**, never the PR head; the diff, the criteria and the schema arrive in
+   the ticket body. Same host and Claude credential family are accepted. The Linear MCP
+   tools remain available to it — an accepted, monitored risk.
 4. **Verdict** — a **PR comment** (and a Linear telemetry comment), **never an approval**;
    a review that *could not run* is a visibly different, loud outcome from one that ran and
    found nothing.
-5. **Bounce** — the same poller notices red CI or threshold findings and starts a
-   **bounded fix session**; `maxBounces` is read from `delivery.json` **on the committed
-   default branch**, and the count lives in a **daemon-owned ledger** the session cannot
-   write.
-6. **Coupling** — E reads **GitHub and Linear and nothing inside Cyrus**, so it survives
-   Cyrus's Phase-2 replacement. The one Cyrus-specific fact it must respect
-   (worktree force-deletion on ticket close, KIT-51) is isolated to a single assumption.
+5. **Bounce** *(amended 2026-09-06)* — the poller notices red CI or threshold findings and
+   **re-prompts the original coding session** in its agent-session thread with fenced
+   findings and a fixed instruction; the session resumes in its own worktree on its own
+   branch. `maxBounces` is read from `delivery.json` **on the committed default branch**
+   (absent ⇒ the bounce tier is **off, and says so**), and the count lives in a
+   **poller-owned append-only ledger** the session cannot write, appended *before* the
+   bounce is sent. A fix ticket pinned to the PR branch is the fallback when the session
+   cannot be resumed.
+6. **Coupling** *(amended 2026-09-06)* — the poller reads **GitHub and Linear and nothing
+   inside Cyrus**: it creates and delegates tickets, reads agent-session activities, and
+   posts comments. Everything dispatcher-specific is **configuration on the dispatcher's
+   side of Linear**, named exhaustively in [Coupling](#6-coupling), so a replacement
+   dispatcher needs those knobs ported and the poller untouched.
 
-**Mechanism ships in the kit** as tested `scripts/` (the deterministic reviewer shell,
-publisher, decline logic, findings normalizer, bounce counter) — the same seam the rest of
-the pipeline uses. **Activation** (the launchd poller, its config, its credentials) is a
-**dispatcher-side operator step handed to Braeden**, and belongs with the Phase 2 seed
-`~/clawdispatch-setup`; no session installs or edits a service.
+**Mechanism ships in the kit** as tested `scripts/` (the poller-side publisher, decline
+logic, findings validator, sanitizer, bounce ledger) — the same seam the rest of the
+pipeline uses. **Activation** (the Reviews team, the dispatcher's second repository entry,
+the launchd poller, its env file) is an **operator step for the owner**, written up
+generically in `docs/STAGE-E-OPERATOR.md`; no session installs or edits a service, and
+deployment-specific values stay out of this repository.
 
 **The GitHub webhook side of Cyrus is not wired by this ADR, and this ADR does not
 authorize wiring it.** That remains refused for the reason the audit gave — see
@@ -79,19 +147,50 @@ neither usefully. So the design is redone from the events and credentials that e
 - **The GitHub side is deliberately unwired for security.** Both repos are public, so a
   fork's branch name and a stranger's comment are attacker-reachable text, and the audit's
   primary mitigation — private repos only — is unavailable (KIT-25, Urgent, open).
-- **Sessions are sandboxed** under `_clawdispatch` with a 19-host egress allowlist, and
-  `gh` cannot verify TLS inside the sandbox; a REST fallback exists (`scripts/gh_fallback.py`,
-  KIT-75) and every GitHub write E makes goes through it (field guide §06–07).
+- **Sessions are sandboxed** under a dedicated service account with a short egress
+  allowlist, and `gh` cannot verify TLS inside the sandbox; a REST fallback exists
+  (`scripts/gh_fallback.py`, KIT-75) and every GitHub write E makes goes through it.
 
 ### 1. Trigger
 
-**Decision: a poller on the dispatcher's Mac, GitHub webhook unwired.**
+**Decision (amended 2026-09-06): a poller in the owner's account that creates and
+delegates a review ticket per PR; the dispatcher runs the reviewer; GitHub webhook
+unwired.**
 
-The poller lists open PRs via the GitHub API, selects those opened since its last run
-whose head branch is a pipeline ticket branch, and launches a review session per PR. Its
-seen-set is a daemon-owned file outside every worktree, so a PR is reviewed once and a
-restart does not re-review the backlog. It preserves the cloud template's `opened`-only
-rule (never re-review on every push) so review cost does not multiply with bounce pushes.
+The poller lists open PRs via the GitHub API, selects same-repository, non-draft PRs
+opened since its last run whose head branch is a pipeline ticket branch, and skips forks.
+For each it fetches the diff, resolves the basis (decision 2), **sanitizes** every string
+it is about to copy — stripping the dispatcher's routing and model tags (`[repo=`,
+`repo=`, `repos=`, `[model=`, `[agent=`) and neutralizing the `<untrusted-ticket-data>`
+fence tags — and then creates **and** delegates, in one `issueCreate{…, delegateId}`
+carrying an owner-scoped Linear key, a review ticket in a dedicated Reviews team: title
+`Review PR #<n> — <TICKET-ID>`, description = the review brief with the diff inlined under
+a size cap (above the cap ⇒ decline, reason *diff too large to deliver*), **never
+parented** (a sub-issue would be based on its parent's branch), never linked to the PR by
+branch, title or body. The dispatcher sees a delegation by the owner and starts a session
+in the Reviews entry, exactly as it starts any other. The poller then reads that ticket's
+agent-session activities until a `response` (or `error`) activity appears or a timeout
+passes, extracts the first fenced JSON block whose `schema` is `pipeline-review/1`,
+re-reads the ticket description and compares its hash to the one it stored at creation
+(a mismatch is *basis tampered* ⇒ decline), and hands the document to the deterministic
+publisher (decision 4). It then moves the **review** ticket to Done, which deletes only
+that ticket's worktree; the original ticket is never moved by E.
+
+Its seen-set, hashes, outcomes and ledger are files in a state directory **inside the
+owner's account** — a home the sandbox denies to every session, which is the point — so a
+PR is reviewed once and a restart does not re-review the backlog. It preserves the cloud
+template's `opened`-only rule (never re-review on every push) so review cost does not
+multiply with bounce pushes; a deliberate re-review after a bounce is the bounce driver's
+call, and bounded.
+
+**Why the delegation must be the owner's, and why the poller must not be a session.** The
+dispatcher admits a delegation only when the webhook signature checks out *and* the
+delegating user is on the entry's `allowedUsers` list; a delegation made through the
+Linear MCP token a session holds arrives with no creator and is **blocked**
+(`UserAccessControl.ts:31-43`). So a coding session cannot delegate its own review — the
+2026-08-26 ADR's vector #5 is closed by the dispatcher itself — and the poller must carry
+the owner's identity. That key is the reason the poller runs in the owner's account and
+nowhere a session can read.
 
 **Rejected — a GitHub Action that posts a mention comment** (the 2026-08-26 ADR's own
 "Building it" path). It works and is the cheapest wiring, but it (a) keeps a cloud
@@ -111,12 +210,38 @@ reviewer's trigger. It is self-approval-adjacent by construction — the party u
 does not get to set the terms of its review — and is rejected on the same grounds the pin
 doctrine exists.
 
-**Why not route the review through Cyrus at all.** Cyrus's Linear lane *could* run a
-review-shaped prompt template, but doing so (a) couples E to Cyrus internals, which
-decision 6 forbids, (b) hands the session Cyrus's unconditional workspace-scoped Linear
-write token and a full toolset, and (c) dies when Cyrus is replaced in Phase 2. So E
-launches its own review session directly. This makes E a second, tiny dispatcher whose
-only job is review and bounce — a real operational cost, accepted for decoupling.
+**Rejected (2026-09-06) — option 3, the owner-account launcher.** The 2026-09-05 text of
+this section refused to route review through the dispatcher's Linear lane and had E launch
+its own `claude -p` session instead, on three grounds: (a) coupling to dispatcher internals,
+(b) a full toolset plus the dispatcher's Linear token, (c) death on dispatcher replacement.
+Read against the source, (a) and (c) reduce to *configuration* — the lane is shaped
+entirely by per-entry config the poller never touches (decision 6) — and (b) is answered
+by `disallowedTools`, which the dispatcher's runner applies as a hard tool fence
+(decision 3); the Linear token half of (b) is accepted as a risk rather than answered. The
+launcher, meanwhile, fails on **four grounds, each resting on a verified fact:**
+
+1. **No sandbox.** The dedicated account, the Seatbelt profile that allows writes only in
+   the worktree and `TMPDIR`, the `~` read-deny and the egress proxy are all applied by the
+   dispatcher's runner (`RunnerConfigBuilder.ts:558-579`). A session the poller launched
+   would have none of them — and the reviewer's input is diff text from a **public**
+   repository, i.e. attacker-reachable, read with the owner's whole home and network.
+2. **The wrong credentials in the wrong process.** A child inherits its parent's
+   environment. The poller holds the owner-scoped Linear key and a GitHub token — the two
+   credentials the design puts outside every session. The dispatcher's own unscrubbed env
+   copy (`session-env.ts:51-53`) is the same fact seen from the other side, and is why
+   those keys stay out of the dispatcher's environment too.
+3. **The wrong identity on the record.** A session running as the owner writes as the
+   owner. Its PR comment and any Linear write would carry the identity of the person whose
+   merge is the control, and the record could not tell reviewer from approver. This is
+   the human-signal defect class the kit is shaped against, and no prompt fixes it.
+4. **A second dispatcher for one lane.** Worktree lifecycle, tool fencing, model
+   selection, session resume and deletion-on-close already exist as configuration in the
+   dispatcher that is running. The 2026-09-05 text accepted rebuilding them as "a real
+   operational cost"; with the fence verified, the cost buys nothing.
+
+So the rule is stated as an invariant, and the reviewer core's selftest holds it: **no
+daemon may ever launch a Claude session as the owner.** The poller creates tickets, reads
+activities and posts comments — that is its whole vocabulary.
 
 ### 2. What the reviewer compares against — the snapshot problem
 
@@ -166,44 +291,78 @@ a snapshot a session could plant.
 
 ### 3. Independence
 
+**Decision (amended 2026-09-06): independence is enforced by the operating system and by
+the dispatcher's one real tool fence, and the reviewer is fed everything it needs because
+it can fetch nothing.**
+
 **What is actually achieved:**
 
-- **Fresh worktree** cut per review, never Cyrus's branch-keyed reuse — closes the
-  dirty-worktree inheritance vector (#4 of the 2026-08-26 ADR).
-- **Rubric, `schemas/review-findings.schema.json`, and the criteria basis read from the
-  committed default branch or from Linear server-side** — never from the PR head working
-  tree, closing the rubric-edit vectors (#1, #2). The diff is handed to the session as a
-  **file** and the working tree is declared untrusted data, so a `CLAUDE.md` on the branch
-  is not loaded as instructions (vector #3).
-- **Read-only toolset** — the session runs with `Read, Grep, Glob, Write` (Write scoped to
-  its findings file) and no `Bash`, no `gh`, no tracker MCP. It has no tool with which to
-  approve, label, push, or merge. This is backed by the self-approval guard already in
-  `.claude/hooks/pre-tool-use.py` (KIT-21, closed) as a second layer.
+- **Its own worktree, keyed on its own ticket.** The dispatcher cuts one worktree per
+  issue identifier, from `origin/<baseBranch>` (`GitService.ts:734-736, 833-899`); the
+  review ticket is a different ticket from the coding ticket, so the reviewer can never
+  land in the coding session's tree — closing the dirty-worktree inheritance vector (#4 of
+  the 2026-08-26 ADR) without E cutting anything itself. Two conditions keep that true and
+  are the poller's to hold: the review ticket is **never parented** under the coding
+  ticket (a sub-issue is based on its parent's branch if one exists,
+  `GitService.ts:452-477`), and every string copied into the ticket has the
+  `[repo=<name>#<branch>]` base-branch override stripped (`RepositoryRouter.ts:451-452`),
+  or the reviewed party could steer the reviewer's checkout onto the PR head.
+- **The checkout is the default branch, not the PR head.** The Reviews entry's
+  `baseBranch` is the default branch, so any `CLAUDE.md` the reviewer's runtime loads is
+  the committed one (vector #3), and the rubric and `schemas/review-findings.schema.json`
+  it could read are the committed ones (vectors #1, #2). The diff arrives **inline in the
+  ticket body**, inside an `<untrusted-diff>` fence with a treat-as-data preamble, because
+  the reviewer has no tool that could fetch it.
+- **A tool fence the dispatcher actually enforces.** The Reviews entry's
+  **`disallowedTools`** removes `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebFetch`,
+  `WebSearch`, `Task`, `EnterWorktree` and `ExitWorktree`; the dispatcher passes that list
+  through to the runner (`RunnerConfigBuilder.ts:439`, `ClaudeRunner.ts:563, 701`). Two
+  facts corrected here, and in the 2026-08-26 ADR's "Building it" step 3 which relied on
+  an allowlist: **`allowedTools` restricts nothing** — the permission callback allows
+  every tool except `AskUserQuestion` (`ClaudeRunner.ts:321-328`) — and
+  **`promptTemplatePath` is stripped** by the CLI config loader before use
+  (`ConfigService.ts:47-58`), so the reviewer's brief goes in the entry's
+  **`appendInstruction`** (`PromptBuilder.ts:958-966`). The reviewer has no tool with
+  which to approve, label, push, or merge, and no shell from which `WebFetch` — which
+  **bypasses** the egress proxy — could be reached either.
+- **OS-level sandbox.** Dedicated non-admin account; Seatbelt profile allowing writes only
+  in the worktree and `TMPDIR`, denying reads of `~` (`RunnerConfigBuilder.ts:558-579`);
+  shell network only through the allowlisting proxy. The poller's state directory sits
+  inside the owner's home precisely because that home is unreadable from here.
 - **Fresh context** — a new session with no memory of the work; a stranger to it by
-  construction.
-- **A cheaper model** — the reviewer runs on a cheaper model than the coding default
-  (field guide §12 model labels), because review is a bounded read, not open-ended
-  construction.
+  construction. Its whole deliverable is one fenced `pipeline-review/1` block in its final
+  message, which the dispatcher posts as a `response` activity
+  (`AgentSessionManager.ts:1269-1281`) and the poller reads back.
+- **A cheaper model**, chosen by the poller through a **label** on the review ticket —
+  model selection on the Linear lane is label-driven — because review is a bounded read,
+  not open-ended construction.
 
-**What is accepted as lost, versus the cloud design:**
+**What is accepted as lost, or as risk:**
 
 - **Structural token scoping.** The cloud reviewer's `pull-requests: read` token *could
-  not* approve. Locally, "cannot approve" is enforced by the toolset and the hook, not a
-  token scope — weaker, because config can be edited by a human in a hurry where a token
-  scope cannot. Accepted, same as the 2026-08-26 ADR accepted it.
+  not* approve. Here "cannot approve" is a config list the dispatcher enforces — weaker,
+  because config can be edited by a human in a hurry where a token scope cannot. Accepted,
+  as before.
+- **The Linear MCP tools stay in the reviewer** (owner decision, 2026-09-06). They are
+  not added to `disallowedTools`, so the reviewer *could* read other tickets and comment
+  across sessions. The reviewer's brief tells it not to; the brief is not a boundary.
+  Accepted "for now" and monitored: the review ticket's activity log is what to watch, and
+  a single `mcp__linear` entry in `disallowedTools` is the closure if it is ever needed.
 - **A separate trust domain.** Same host as the dispatcher and the coding sessions;
-  isolation is process + account + fresh worktree + read-only toolset, not a separate
+  isolation is account + sandbox + per-ticket worktree + tool fence, not a separate
   machine.
 - **An independent credential.** Same Claude credential family. `auth.review: api-key`
   remains available for anyone who would rather pay than contend for the subscription
-  window; this ADR does not force it, and recommends the reviewer run metered on a cheap
-  model so an unattended review cannot drain the interactive window.
+  window; this ADR does not force it, and recommends the reviewer run on a cheap model so
+  an unattended review cannot drain the interactive window.
 
 ### 4. How the verdict lands, and how a decline looks
 
 **Decision: a PR comment, never an approval, and a decline that is loud and distinct.**
 
-The reviewer's whole deliverable is `REVIEW-FINDINGS.json` in the §14 shape. A
+The reviewer's whole deliverable is one document in the §14 shape — under option 4, the
+first fenced `pipeline-review/1` JSON block in its final message, read back from the
+review ticket's `response` activity, since a reviewer with no `Write` produces no file. A
 **deterministic publisher** — not the model — validates it whole against the schema,
 computes `usable` / `max_severity` / `meets_threshold`, and posts **one** PR comment
 through `scripts/gh_fallback.py` (which has no merge endpoint by construction). This reuses
@@ -227,79 +386,187 @@ queue.
 
 ### 5. Bounce
 
-**Decision: the poller drives a bounded fix loop; the bound and the count live where the
-session cannot reach.**
+**Decision (amended 2026-09-06): a bounce is a re-prompt of the original coding session;
+the bound and the count live where the session cannot reach; a fix ticket is the
+fallback.**
 
 - **Who notices, who starts it:** the poller watches open pipeline PRs' check-runs and
   review outcomes; a terminally-red required check, or review findings at or above the
-  threshold, starts one fix session running `/fix-ci` per bounce, in E's own fresh
-  worktree.
-- **Where the bound lives now:** `maxBounces` and `reviewSeverityThreshold` are read from
+  threshold, is a bounce candidate. Before acting it reads the **original** ticket's state
+  through Linear: terminal (Done/Canceled) ⇒ skip, with the reason logged — the
+  dispatcher deletes a worktree only when its issue reaches Done/Canceled/deleted
+  (`EdgeWorker.ts:3488-3530` → `GitService.ts:1001-1083`), so a terminal ticket's tree is
+  gone and nothing can resume there.
+- **The primary bounce is a comment, not a session.** The poller posts, as the owner, one
+  comment in the original ticket's agent-session thread (`issue.agentSessions` → the
+  session's root comment; `commentCreate{issueId, parentId, body}` — the exact parent
+  shape is marked for the live test). The dispatcher treats a new comment in that thread
+  as a `prompted` event and **resumes the same Claude session in the same worktree on the
+  same branch** (`EdgeWorker.ts:7256-7443`, `RunnerConfigBuilder.ts:431-437`); the resumed
+  session's prompt is only the new comment, wrapped as `<new_comment>` with author and
+  timestamp. The comment carries the findings inside an `<untrusted-review-findings>`
+  fence and a fixed instruction block: *Bounce n of max. Fix the findings at or above the
+  threshold with the smallest change; stay inside the ticket scope; push to the same
+  branch; do not open a new PR; do not edit the PR title or body; never merge or approve;
+  if a finding is wrong or out of scope, say so in this thread and stop.* After a daemon
+  restart the session record is reloaded from state; a missing Claude session id degrades
+  to a fresh session with just the comment, worktree still reused.
+- **The ledger row is appended first**, then the comment is sent — a crash between the two
+  costs one unsent bounce, never an under-count.
+- **Where the bound lives:** `maxBounces` and `reviewSeverityThreshold` are read from
   `delivery.json` **on the repo's committed default branch**, fetched fresh — the same
   "config from the default branch" anchor the rest of the pipeline already trusts, and not
-  writable by the PR head, the branch, the session, or the dispatcher. This replaces the
-  dead path where bounce read `delivery.json` from a dispatcher that never opens it.
-- **How it is counted:** from a **daemon-owned append-only ledger keyed by PR number**,
-  outside every worktree, so the fix session has no write path to the number that decides
-  whether to spend another one. (The cloud template counted from Actions run history for
-  the same reason; on the Mac the ledger is that unforgeable record.) After `maxBounces`
-  the daemon — not the session — applies `agent:needs-human` and stops.
-- **KIT-51 trap:** a merged fix PR makes Linear move the ticket to Done, and Cyrus
-  force-deletes *its* worktree. E runs bounces in **its own** worktree, so that deletion
-  cannot pull work out from under a fix session; and E **skips a bounce whose ticket is
-  already terminal** (its Cyrus worktree may be gone). Above all, **E never merges** and
-  never enables auto-merge, so E never triggers the Done transition — the human's merge
-  does, and the timing hazard is KIT-51's to own.
+  writable by the PR head, the branch, the session, or the dispatcher. **Absent ⇒ the
+  bounce tier is off, and the poller says so** (contract §13); present but unreadable ⇒
+  broken, and it refuses loudly.
+- **How it is counted:** from a **poller-owned append-only ledger keyed by PR number** in
+  the owner's account, outside every worktree, so the fix session has no write path to the
+  number that decides whether to spend another one. On exhaustion the poller posts one
+  comment on the PR and one on the original ticket saying the budget is spent and a person
+  is needed; **it may apply `agent:needs-human`** — the one label E ever writes, written by
+  a dispatcher-side component and never by a session — and stops.
+- **Fallback — a fix ticket.** Only when the original ticket has no agent session, or the
+  re-prompt cannot be delivered: the poller creates and delegates a fix ticket in the
+  Reviews team whose description carries `[repo=<repo-name>#<pr-head-branch>]` so the
+  dispatcher cuts the worktree from the PR branch, with the instruction to push to that
+  branch and open no PR. Implemented minimally and marked clearly as the fallback path.
+- **The re-prompt access check tests the delegator, not the commenter**
+  (`EdgeWorker.ts:5281-5290, 6726-6745`) — accepted by the owner for now, and one reason
+  the original ticket's delegation must be the owner's.
+- **KIT-51, restated:** E cuts no worktree of its own, so the only trees in play are the
+  dispatcher's, deleted on *their own* ticket's terminal transition. **E never moves the
+  original ticket to Done**, never merges, never enables auto-merge, so E never triggers
+  that deletion — the human's merge does, and the timing hazard is KIT-51's to own.
+  Closing the *review* ticket deletes only the reviewer's tree.
 
 ### 6. Coupling
 
-**Decision: E talks to GitHub and Linear and reaches into Cyrus for nothing.** No Cyrus
-import, no read of `/opt/clawdispatch`, no assumption that a Cyrus worktree exists. The
-**single coupling seam** is one fact, isolated and named: *Cyrus force-deletes its own
-worktree when a ticket reaches a terminal state* (KIT-51). E's response to that seam is to
-own its own worktrees and treat the coding session's worktree as possibly-absent — which
-is a one-line assumption, not a dependency. When Phase 2 replaces Cyrus (KIT-10), E is
-unaffected, because a replacement dispatcher still opens PRs and still has tickets, which
-is all E reads.
+**Decision (amended 2026-09-06): the poller talks to GitHub and Linear and reaches into
+the dispatcher for nothing; everything dispatcher-specific is configuration, named here in
+full.** No dispatcher import, no read of its state directory, no assumption about its
+worktree layout. The poller's whole vocabulary is: create-and-delegate a ticket, read a
+ticket's agent-session activities, read a ticket's state, post a comment, and (on
+exhaustion) apply one label. A replacement dispatcher that honours a Linear delegation
+and posts its result as a `response` activity needs the poller changed nowhere.
+
+**The coupling seam is exactly these dispatcher knobs**, all of them set by the operator
+on the dispatcher's side and none of them read or written by the poller:
+
+| Knob | What E relies on it for |
+|---|---|
+| per-entry `disallowedTools` | the reviewer's tool fence (decision 3) |
+| per-entry `appendInstruction` | the reviewer's brief — `promptTemplatePath` is stripped |
+| `teamKeys` routing | a delegation in the Reviews team lands in the Reviews entry |
+| description-tag base-branch override (`[repo=<name>#<branch>]`) | the fix-ticket fallback's checkout; and the reason the poller strips the tag from everything else |
+| label-based model selection | the reviewer's cheap model |
+| agent-session re-prompt on a thread comment | the primary bounce (decision 5) |
+| delegator check on `allowedUsers`; app-actor delegation blocked | why the poller's key is owner-scoped, and why a session cannot trigger its own review |
+| worktree per issue id, deleted only on terminal state | the reviewer's tree is its own; closing the review ticket deletes only that tree |
+
+Change dispatchers and this table is the porting checklist. The one Cyrus fact the old
+text isolated — *worktree force-deletion on ticket close* (KIT-51) — is the last row, now
+one of eight rather than the only one, and E's answer is unchanged: never move the
+original ticket, never merge.
 
 ## Where Stage E lives
 
 E is split the way the whole pipeline already splits, and the split answers "does E belong
 in the kit or in Phase 2?": **both, by role.**
 
-- **Mechanism → the kit.** The deterministic reviewer shell, publisher, decline logic,
-  findings normalizer and bounce counter are `scripts/`, source-agnostic and CI-tested,
-  beside `gh_fallback.py` and `check_schemas.py`. The cloud templates E supersedes already
-  live in `templates/workflows/`; their rubric, severity logic, findings shape and bounce
+- **Mechanism → the kit.** The poller-side publisher, decline logic, findings validator,
+  sanitizer and bounce ledger are `scripts/`, source-agnostic and CI-tested, beside
+  `gh_fallback.py` and `check_schemas.py`. The cloud templates E supersedes already live in
+  `templates/workflows/`; their rubric, severity logic, findings shape and bounce
   accounting are mined, and their transport discarded.
-- **Activation → the dispatcher / Phase 2 seed.** The poller loop, the launchd service,
-  the daemon config and the credentials are operator steps for the dispatcher machine,
-  handed to Braeden and destined for `~/clawdispatch-setup` (KIT-95). No session installs
-  or edits a service. This is the same mechanism-in-repo / activation-per-deployment seam
-  `docs/AUTONOMY.md` already documents, and it is what keeps E liftable into the Phase 2
-  standalone project unchanged.
+- **Activation → the deployment.** The Reviews team, the dispatcher's second repository
+  entry, the launchd poller in the owner's account and its env file are operator steps,
+  written generically in `docs/STAGE-E-OPERATOR.md` and filled in privately per
+  deployment (KIT-95). No session installs or edits a service. This is the same
+  mechanism-in-repo / activation-per-deployment seam `docs/AUTONOMY.md` already documents,
+  and it is what keeps E liftable to a replacement dispatcher unchanged.
 
 ## What is accepted as lost, versus the original Stage E
 
 - The **dispatch-time snapshot** as a hard, unforgeable, pin-carried fact. Replaced by a
   best-available basis with a loud decline, and an explicit edit-flag. Weaker; honest.
-- **Structural non-approval** via a scoped token. Replaced by a read-only toolset plus a
-  hook. Weaker; a config edit can widen it where a token scope cannot.
-- **CI as a free fresh, isolated runner.** Replaced by a same-host session with a fresh
-  worktree. Weaker isolation; accepted with the reasoning the 2026-08-26 ADR recorded.
+- **Structural non-approval** via a scoped token. Replaced by a dispatcher-enforced tool
+  fence (`disallowedTools`) plus the sandbox. Weaker; a config edit can widen it where a
+  token scope cannot.
+- **CI as a free fresh, isolated runner.** Replaced by a same-host sandboxed session in
+  its own per-ticket worktree. Weaker isolation; accepted with the reasoning the
+  2026-08-26 ADR recorded.
 - **Budgets, WIP and the attempt counter on the review lane.** Not restored here — those
   are the rest of KIT-18. The review lane is bounded by its toolset and a cheap model, not
   by a pinned budget.
 
 ## Verified
 
+**Added 2026-09-06 — read from source, not docs.** Every dispatcher claim in the Update
+block and in decisions 1, 3, 5 and 6 is `file:line` against the published dispatcher
+package **v0.2.69** and the Linear SDK **64.0.0** typings, both extracted read-only to a
+scratch directory outside this repository:
+
+- **Session start:** webhook signature checked; `agentSession.creator` (the delegator)
+  must be in `userAccessControl.allowedUsers`; routing by team key to a repository entry;
+  `git fetch origin` then `git worktree add --track -b <linear-branch> <home>/worktrees/<ISSUE-ID> origin/<baseBranch>`
+  (`GitService.ts:734-736, 833-899`). The worktree *path* is keyed on the issue
+  identifier; the branch is Linear's suggested name and no API field sets it. A sub-issue
+  bases on its parent's branch when one exists (`GitService.ts:452-477`); a
+  `[repo=<name>#<branch>]` description tag overrides the base branch and routes to every
+  entry whose `githubUrl` matches (`RepositoryRouter.ts:451-452`).
+- **Sandbox:** dedicated non-admin account; Seatbelt `allowWrite [worktree, TMPDIR]`,
+  `denyRead ['~/']` (`RunnerConfigBuilder.ts:558-579`); shell network only through the
+  allowlisting proxy; `WebFetch` bypasses the proxy. The whole process env is copied into
+  every session unscrubbed (`session-env.ts:51-53`).
+- **Tools:** the permission callback allows every tool but `AskUserQuestion`
+  (`ClaudeRunner.ts:321-328`), so `allowedTools` restricts nothing; `disallowedTools`
+  reaches the runner (`RunnerConfigBuilder.ts:439`, `ClaudeRunner.ts:563, 701`);
+  `promptTemplatePath` is stripped (`ConfigService.ts:47-58`); `appendInstruction` is
+  appended inside a `<repository-specific-instruction>` element
+  (`PromptBuilder.ts:958-966`). Model selection on the Linear lane is by ticket label.
+- **Result and resume:** the final result is posted as a `response` activity
+  (`AgentSessionManager.ts:1269-1281`); no finishing state is written to Linear; there is
+  no review or CI loop. A new comment in the agent-session thread (`prompted`) resumes the
+  same session — same worktree, same branch, `cwd = session.workspace.path`,
+  `resume = claudeSessionId` — with only the new comment as the prompt
+  (`EdgeWorker.ts:7256-7443`, `RunnerConfigBuilder.ts:431-437`). The `prompted` access
+  check tests `agentSession.creator`, not the commenter (`EdgeWorker.ts:5281-5290,
+  6726-6745`). App-actor delegation arrives with no creator and is blocked
+  (`UserAccessControl.ts:31-43`).
+- **Deletion:** worktrees are removed only when the issue reaches Done/Canceled/deleted
+  (`EdgeWorker.ts:3488-3530` → `GitService.ts:1001-1083`).
+- **Linear's GitHub integration** links a PR to an issue by branch name, PR title, or
+  magic words in the PR *description* — not by PR comments — and by default moves the
+  linked issue to In Progress on open and Done on merge. Hence the Reviews team runs with
+  those automations **off**, and the review ticket appears nowhere a link could form.
+- **The SDK typings** carry `IssueCreateInput.delegateId`, `CommentCreateInput.parentId`,
+  `AgentSession.comment` (the thread root) and `AgentSession.activities`. Whether a
+  `commentCreate` under that root is what produces the `prompted` event end-to-end is
+  **not confirmable from typings** and is live test 5 in `docs/STAGE-E-OPERATOR.md`.
+- **Unverified until the live tests run:** every row of that numbered list — the
+  owner-key delegation passing the delegator check, the sandboxed reviewer receiving the
+  inlined diff and returning the block, the poller reading the `response` activity back,
+  `disallowedTools` removing `Bash` from the model's tool list, a re-prompt resuming the
+  original session and pushing to the same branch, and closing the review ticket deleting
+  only its own worktree. This ADR records the design as verified against source and the
+  deployment as **not yet exercised**.
+- **The fork-guard bug** is a finding *about* the merged reviewer, made while reading it
+  for this update: `isCrossRepository` requested, never checked. It is fixed with a selftest
+  in the accompanying reviewer-core change, and recorded here because a review lane that
+  reviews fork PRs on a public repository is the one thing the webhook-unwired decision
+  exists to prevent.
+
+**From 2026-09-05:**
+
 - **The reviewer core is built and proven on a real PR (#63).** `scripts/pipeline_review_local.py`
-  resolves a PR, gathers `base...head`, runs a fresh read-only `claude -p` review against a
-  basis, normalizes the findings against `schemas/review-findings.schema.json`, and posts
-  one comment through `gh_fallback.py`. On PR #63 it posted, run with no basis, a **distinct
-  decline comment** (`## 🛑 Stage E — … was NOT reviewed`, exit 3), and, run with KIT-90's
-  acceptance criteria as the basis, a **genuine review comment** (4 findings, highest
-  `high`, exit 0).
+  resolves a PR, gathers `base...head`, normalizes the findings against
+  `schemas/review-findings.schema.json`, and posts one comment through `gh_fallback.py`.
+  On PR #63 it posted, run with no basis, a **distinct decline comment** (`## 🛑 Stage E —
+  … was NOT reviewed`, exit 3), and, run with KIT-90's acceptance criteria as the basis, a
+  **genuine review comment** (4 findings, highest `high`, exit 0). *(At that point it also
+  ran the review itself through an owner-account `claude -p`; option 4 removes that path —
+  see Trigger — and the core becomes the poller-side publisher, ingesting a findings
+  document instead of producing one.)*
 - **The reviewer earned its keep by reviewing its own PR.** That genuine review found a real
   §13 hole in this very slice: `pr_diff()` and `post_comment()` were unguarded where
   `pr_metadata()` was not, so a GitHub hiccup would have crashed with a traceback and posted

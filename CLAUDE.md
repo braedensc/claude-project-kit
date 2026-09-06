@@ -26,6 +26,15 @@ POSIX `sh` git hooks (`.husky/`), GitHub Actions (`.github/workflows/` + inert
 `templates/workflows/`), skills (`.claude/skills/`), a devcontainer, a project-MCP
 example (`.mcp.json.example`), Markdown docs, and a tiny `package.json`.
 
+**If a dispatcher started this session — a ticket delegated you and nobody is watching —
+read `docs/SESSION-BRIEF.md` first.** It is the committed, generic brief: who you are
+(your ticket is your authority; the branch name is cosmetic), where you run (a sandbox
+that allows writes only in your worktree, a network allowlist, a home you cannot read),
+what you can and cannot do, what Stage E will do to your PR (a fresh reviewer; a possible
+re-prompt in your ticket's thread with fenced findings; a bounce budget), and the runbook
+for the unexpected. Its one rule to carry even into an interactive session: never try to
+ask a user who is not there — comment on the ticket and ask for the blocked label instead.
+
 ---
 
 ## The guardrails you're working under (know these — they're enforced, not advisory)
