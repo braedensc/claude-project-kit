@@ -167,6 +167,9 @@ npm run test:schemas    # schema ⇄ contract parity selftest
 npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selftest
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
+npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
+npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
+npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -180,6 +183,12 @@ broken: the validator exits 0 emitting nothing at all.
 **The autonomy and telemetry scripts are inert here for the same reason** — no
 `delivery.json`, no telemetry store. Their `--selftest` batteries are what has teeth,
 and each asserts its contract rows against synthetic fixtures.
+
+**Stage E** — automated review and a bounded fix re-prompt of dispatcher-opened PRs — is
+the same shape: three scripts (publisher, review poller, bounce driver) whose three
+selftests above are the whole of what runs in this repo. Nothing is scheduled here; the
+deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
+`docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the forbidden-paths gate,
