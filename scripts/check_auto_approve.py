@@ -12,12 +12,13 @@ there by an out-of-session automation that holds the tracker credential.
 
 THE DISCRIMINATOR IS THE WHOLE POINT (contract §5). A ticket auto-approves only
 when its provenance is `epic/<ID>` — decomposed from an epic a human already
-approved. `monitor`, `review`, `retro-proposal` and `human` never auto-approve,
-and the reason is adversarial, not stylistic: those are exactly the paths an
-attacker-influenced payload takes into the backlog. A monitor files what a
+approved. `monitor`, `review`, `retro-proposal`, `human` and `agent` never
+auto-approve, and the reason is adversarial, not stylistic: those are exactly the
+paths an attacker-influenced payload takes into the backlog. A monitor files what a
 failing probe told it; a review pass files what it read in a diff; a retro
-proposes what it inferred from its own telemetry. If any of those could approve
-itself, the pipeline could widen its own mandate by writing a ticket — and
+proposes what it inferred from its own telemetry; an `agent` files a finding it met
+mid-session (§8 ticket-create). If any of those could approve itself, the pipeline
+could widen its own mandate by writing a ticket — and
 "write a ticket that asks for X" is a capability every one of those paths has.
 `epic/*` is the only class whose approval is anchored in something a human did.
 
@@ -84,7 +85,7 @@ SUPPORTED_VERSION = 1  # §1: an unrecognized version refuses to run, it does no
 # constant so the "subset of [epic]" rule is one literal, not a spelled-out
 # assumption in three places.
 APPROVABLE_CLASS = "epic"
-NEVER_APPROVE = ("monitor", "review", "retro-proposal", "human")
+NEVER_APPROVE = ("monitor", "review", "retro-proposal", "human", "agent")
 
 # §6: dispatcher-owned lifecycle labels. A ticket already under supervision is
 # not a candidate — whatever put `agent:needs-human` on it is a decision this
@@ -304,7 +305,7 @@ def resolve_provenance(ticket):
     if not dor.PROVENANCE_RE.match(value):
         return None, label_class, (
             "%r is not a contract §5 provenance value (epic/<ID>, monitor, review, "
-            "retro-proposal, human)" % value
+            "retro-proposal, human, agent)" % value
         )
     cls = APPROVABLE_CLASS if value.startswith(APPROVABLE_CLASS + "/") else value
     if label_class and cls != label_class:
@@ -416,6 +417,9 @@ def _why_not(cls):
                           "would let the pipeline widen its mandate by writing a ticket.",
         "human": "A person already decided — a human-filed ticket enters `ready` directly, "
                  "and does not need this gate.",
+        "agent": "A working session filed this finding (§8 ticket-create); approving it "
+                 "would let a session queue its own next work, which is exactly the loop "
+                 "the finding channel is shaped to avoid.",
     }.get(cls, "")
 
 

@@ -108,6 +108,10 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 | `stateIds.done` | string (UUID) | dispatcher | Merged/closed. |
 | `labels.ids` | object → string (UUID) | dispatcher, guards | Map of **canonical key → Linear label ID**. The key is the stable name used in code; the Linear display name may drift from it. |
 | `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. **Floored at §6's dispatcher-owned set** (`agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity`) — a project may require more, never fewer. |
+| `findingTicket` | object \| absent | safe-outputs executor | **Opt-in.** Present ⇒ the `ticket-create` kind (§8) is available: a session may *request* a follow-up finding ticket. Absent ⇒ that kind is refused and findings stay `ticket-comment`s. |
+| `findingTicket.landing` | enum `raw` | safe-outputs executor | The state a filed finding lands in — the backlog/intake state only. Restricted to `raw`: never `ready` (self-approval), never `working`/`review`/`done` (§5, §8). |
+| `findingTicket.notify` | enum `subscribe`\|`assign`\|`both` | safe-outputs executor | How `ownerUserId` is notified. The new ticket is never assigned to the session's own identity. |
+| `findingTicket.ownerUserId` | string | safe-outputs executor | Linear **user ID** notified on each filed finding. A person, never the session. |
 
 > **States and labels are referenced by ID, never by display name.** A rename in the
 > Linear UI must not silently desync a guard — with names, a renamed "Ready" state stops
@@ -641,6 +645,7 @@ Every ticket carries exactly one provenance value — where the work came from.
 | `review` | Raised by an automated review pass | No |
 | `retro-proposal` | Proposed by a retrospective run | No |
 | `human` | A person wrote it | No — a human already decided; it enters `ready` directly |
+| `agent` | Filed by a working session as a follow-up finding it met (§8 `ticket-create`) | No — a session filing its own next work is the loop §11 bars |
 
 Rules:
 
@@ -675,6 +680,7 @@ compare IDs; nothing compares display text.
 | `agent:needs-human` | dispatcher | `maxBounces` or `totalAttempts` exhausted, or a `riskPaths` change. Terminal until a person acts. |
 | `blocked:capacity` | dispatcher | Provider capacity, paired with `agent:blocked`. Cleared on retry; does **not** consume an attempt. |
 | `provenance:epic` \| `provenance:monitor` \| `provenance:review` \| `provenance:retro-proposal` \| `provenance:human` | dispatcher / human | Origin class (§5). Exactly one per ticket. |
+| `provenance:agent` | the safe-outputs **executor** (§8) | Origin class (§5): a working session filed this as a finding. Applied by the executor on `ticket-create`, never by the session — `provenance:*` is refused in every session-facing label field. Never auto-approves. |
 | `hooks-change` | human | The change touches guard machinery. |
 | `meta` | human | The pipeline working on itself. Excluded from throughput metrics so pipeline overhead never reads as delivery. |
 
@@ -766,7 +772,8 @@ write path.
   "requests": [
     { "type": "ticket-comment", "ticket_id": "ENG-123", "body": "…markdown…" },
     { "type": "ticket-state",   "ticket_id": "ENG-123", "to": "review" },
-    { "type": "ticket-label",   "ticket_id": "ENG-123", "add": ["needs-design"], "remove": [] }
+    { "type": "ticket-label",   "ticket_id": "ENG-123", "add": ["needs-design"], "remove": [] },
+    { "type": "ticket-create",  "source_ticket_id": "ENG-123", "title": "…one line…", "body": "…markdown…", "labels": ["track:infra"] }
   ]
 }
 ```
@@ -776,10 +783,48 @@ write path.
 | `ticket-comment` | `ticket_id`, `body` | `body` is non-empty markdown. The telemetry block (§4) travels as one of these. |
 | `ticket-state` | `ticket_id`, `to` | `to` is a **canonical state key** from `linear.stateIds` (`working`, `review`, …), never a UUID and never a display name. |
 | `ticket-label` | `ticket_id`, `add[]`, `remove[]` | Canonical label keys from `linear.labels.ids` (§6). Either list may be empty. |
+| `ticket-create` | `source_ticket_id`, `title`, `body`, `labels[]` | **Files a follow-up finding ticket.** `source_ticket_id` is the session's OWN pinned ID (compared to the pin, never used to address anything); `title` is one line; `body` is non-empty markdown; `labels[]` is optional. The new ticket's identity, state, provenance and assignee are the **executor's** to set, never the session's — see *Filing a finding* below. Available only when `linear.findingTicket` is configured. |
 
 An unrecognized `schema`, an unrecognized `type`, or `requests` that is not a list
 rejects the batch. A reader that does not recognize the schema refuses; it does not
 guess.
+
+### Filing a finding — the one kind that creates a ticket, and how it stays safe
+
+A session that meets a real bug outside its ticket used to have nowhere durable to put
+it: the PR body dies at merge, and a session filing its own ticket is the *agent
+producing a human's signal* defect this document is built against (§5). `ticket-create`
+resolves that without reopening it, by the same move every other write here makes — **the
+session requests, a credential-holding executor decides.** The session never holds the
+create: it names its own pinned ticket as `source_ticket_id` and writes a `title` and
+`body`; the executor creates the new ticket and **forces every field that could carry
+authority**:
+
+- **Lands in the backlog only.** `linear.findingTicket.landing` — restricted to `raw`
+  (intake). Never `ready` (that would be self-approval, §5), never `working`/`review`/`done`.
+- **Carries `provenance:agent`** (§5), applied by the executor. The session cannot request
+  a provenance label — `labelList` excludes the whole `provenance:*` class — so it cannot
+  mint `provenance:human` or any other origin. `provenance:agent` never auto-approves (§5,
+  §11): a filed finding waits in the backlog for a person exactly like `monitor` and
+  `review` do.
+- **Notifies the owner, never the session.** `linear.findingTicket.notify` subscribes
+  and/or assigns `linear.findingTicket.ownerUserId`. The new ticket is **never** assigned
+  to the session's own identity.
+- **Records where it came from.** The executor prepends a provenance line naming the
+  filing session's `source_ticket_id` to the body, so the finding always carries its origin.
+- **A finding cannot authorise the session's own next step.** A new backlog ticket moves
+  nothing; it starts no session (it is not `ready`, and `provenance:agent` bars
+  auto-approval). "File a ticket asking to approve my PR" produces a backlog item a human
+  must still act on, which is the whole point.
+
+**The kind is off unless a project turns it on.** Absent `linear.findingTicket`, a
+`ticket-create` request is refused and a session reports findings as `ticket-comment`s as
+before (§5b in the kit's `CLAUDE.md`, the work skill). And it rides whatever executor holds
+the credential: the GitHub-Actions safe-outputs job here, or a local-daemon backend's
+equivalent once one ships. No executor for a backend ⇒ the kind is unavailable there ⇒
+findings stay comments. A session holding a *direct* tracker credential (a local-daemon
+MCP session) must still never create a ticket itself; that path is closed by the guard
+(§8's companion in `.claude/hooks/pre-tool-use.py`), not by this file.
 
 ### Validation rules
 
@@ -787,8 +832,10 @@ Every rule is a MUST, and all of them run **before any request executes**.
 
 | Rule | Rationale |
 |---|---|
-| Every `ticket_id` equals the **dispatcher-supplied** pinned ID | The central check. The agent *names* a ticket and the validator *compares* it — the value is never used to address anything. A mismatch is an attempted retarget, not a typo. |
+| Every `ticket_id` — and a `ticket-create`'s `source_ticket_id` — equals the **dispatcher-supplied** pinned ID | The central check. The agent *names* a ticket and the validator *compares* it — the value is never used to address anything. A mismatch is an attempted retarget, not a typo. A finding is provably *from this session* before it is filed. |
 | At most **one** `ticket-state` per run | A run advances the ticket once. Several transitions in one batch is either confusion or an attempt to land somewhere by way of somewhere else. |
+| At most **3** `ticket-create` per run, and only if `linear.findingTicket` is configured | A session reports the findings it happened to meet, not a backlog. The cap bounds a runaway or hostile session; the config gate keeps the kind off until a project opts in. |
+| A `ticket-create` lands in `linear.findingTicket.landing` (backlog only), carries executor-applied `provenance:agent`, and is refused any `provenance:*`/`agent:*`/`blocked:*`/`hooks-change` in its `labels` | The session sets none of the fields that carry authority — state, provenance, assignee. The executor forces them, so the invariant is structural, not a prompt (see *Filing a finding*). |
 | `raw`, `ready` and `done` are **never** valid targets | `ready` would be self-approval (§5); `done` would be a session claiming its own merge (§5, §6). Refused **even when a caller passes them in `allowed_to_states`** — a belt the caller cannot unbuckle. |
 | Targets are otherwise limited to the caller's `allowed_to_states` | Default `review`. The stage decides what a session may do, not the session. |
 | `agent:*`, `blocked:capacity`, `provenance:*` and `hooks-change` labels are refused, in `add` **and** `remove` | Dispatcher- and human-owned (§5, §6). A session setting `agent:needs-human` — or clearing `agent:blocked` — is a session editing its own supervision. `remove` matters as much as `add`. |
@@ -802,8 +849,10 @@ Every rule is a MUST, and all of them run **before any request executes**.
 | Cap | Value | Why |
 |---|---|---|
 | Requests per batch | 20 | A runaway or hostile session must not spray the tracker. |
-| Comment body | 16 000 chars | Bounded cost, bounded blast radius. |
-| Label ops per request | 10 | `add` + `remove` combined. |
+| Comment body, and a finding's `body` | 16 000 chars | Bounded cost, bounded blast radius. |
+| Finding `title` | 200 chars | A title is one line, not a report. |
+| `ticket-create` per run | 3 | A session reports what it met; it does not generate a backlog. |
+| Label ops per request | 10 | `add` + `remove` combined, and a finding's `labels`. |
 
 ### All-or-nothing
 

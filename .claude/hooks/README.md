@@ -120,7 +120,7 @@ of every row):
 |---|---|---|---|
 | pipeline off, or no pin (a human's ad-hoc session) | allow | allow | allow |
 | `ticket` mode | allow | **deny** | **deny** for issue writes (fail closed); allow for comments |
-| `ticket` mode, **create**-type call (no target) | — | — | **deny** — file out-of-scope bugs through a safe-outputs request instead |
+| `ticket` mode, **create**-type call (no target) | — | — | **deny** — a session never creates a ticket *directly*. File a finding through the safe-outputs `ticket-create` request (contract §8), which a credential-holding executor applies into the backlog as `provenance:agent`, out of session |
 | `ticket` mode, pin carries **no ticket ID** | **deny every tracker write** | **deny** | **deny** |
 | `planning` / `diagnosis` / `maintenance` | allow | allow **in-team**; deny another team's key | allow |
 
