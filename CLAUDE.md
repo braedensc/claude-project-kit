@@ -266,7 +266,11 @@ The loop, when it *is* on:
    starts no session. Where no executor is configured — **this repo has no `delivery.json`,
    so that is the case here** — report the finding as a ticket comment as before; a person
    files. Either way the discipline holds: don't widen the diff, and `provenance:*`,
-   `agent:*`, `blocked:*` and `hooks-change` are never yours to apply.
+   `agent:*`, `blocked:*` and `hooks-change` are never yours to apply. In a configured
+   project the guard **enforces** both — a direct `create_issue`/`save_issue`-with-no-target,
+   and a `save_issue(labels=[…])` naming any protected class, are blocked on the tracker-MCP
+   path exactly as `gh` is. That block is **expected, not an error to route around**: take
+   it as the signal to use the request path (or a comment), not to find another spelling.
 6. **Run the local gate** from `delivery.json` → `commands`, then `/ship`. Local
    green is necessary, not sufficient — CI is the real gate, and you still never merge.
 7. **Emit the telemetry block** (§4) on *every* terminal path, including escalations. It

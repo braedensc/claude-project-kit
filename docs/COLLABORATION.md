@@ -348,10 +348,13 @@ Stop hook between them:
      in-session exception** — only `epic/*` provenance auto-approves and only *out of
      session*, through `scripts/check_auto_approve.py`, which can read the epic;
      `autonomy.autoApproveProvenance` configures that out-of-session tier and is not
-     a permission a session holds); any tracker write **naming** an `agent:*` or
-     `blocked:*` label, which is the dispatcher's supervision of the session and not
-     the session's to edit; tracker writes outside the session's own ticket,
-     including creating tickets in `ticket` mode; editing the session's own
+     a permission a session holds); any tracker write **naming** a protected label —
+     `agent:*`, `blocked:*`, `provenance:*` or the exact `hooks-change` — which is
+     supervision or a human/executor signal and not the session's to edit (the same
+     set the gh/Bash path refuses, enforced on the tracker-MCP path too); tracker
+     writes outside the session's own ticket, including creating tickets directly in
+     `ticket` mode (a finding is *requested* through the safe-outputs `ticket-create`
+     kind instead, §8); editing the session's own
      in-progress acceptance criteria; Edit/Write/Bash mutations of grader paths
      (`.github/workflows/**`, `delivery.json`, `autonomy.riskPaths`, **and the
      staging mirrors `templates/workflows/**` and `templates/hooks/**`** — the

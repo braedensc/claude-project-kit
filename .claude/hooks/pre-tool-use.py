@@ -941,14 +941,16 @@ READY_HELP = (
     "approval instead."
 )
 LIFECYCLE_LABEL_HELP = (
-    "🔒 This write sets or clears {labels} — a dispatcher-owned lifecycle label. "
-    "`agent:*` and `blocked:*` are the pipeline's supervision OF this session "
-    "(docs/PIPELINE-CONTRACT.md §6): a session that can apply `agent:needs-human`, "
-    "or clear `agent:blocked`, is editing the record of whether it is allowed to "
-    "run — and one that can apply `agent:queued` is queueing its own next dispatch. "
-    "A session ASKS for a lifecycle label in a comment; it never applies one. "
-    "Adding and removing count the same, exactly as §8's safe-outputs validator "
-    "treats them."
+    "🔒 This write sets or clears {labels} — a PROTECTED label, and none of the "
+    "protected classes is a session's to apply or remove (docs/PIPELINE-CONTRACT.md "
+    "§5, §6). `agent:*` and `blocked:*` are the pipeline's supervision OF this session "
+    "(applying `agent:needs-human`, clearing `agent:blocked`, or queueing your own "
+    "next dispatch with `agent:queued`); `provenance:*` is the origin class — a session "
+    "setting `provenance:human` is faking a human's signal, and `provenance:agent` is "
+    "the safe-outputs executor's to apply on a filed finding (§8), not yours to request; "
+    "`hooks-change` is a human's guard-change acknowledgement. This is the same set the "
+    "gh/Bash path refuses, enforced here on the tracker-MCP path too. A session ASKS for "
+    "a label in a comment; it never applies one. Adding and removing count the same."
 )
 OWN_TICKET_HELP = (
     "🔒 This session is pinned to {ticket} and may not write to {targets}. "
@@ -970,10 +972,14 @@ NO_PINNED_TICKET_HELP = (
     "(docs/PIPELINE-CONTRACT.md §3)."
 )
 CREATE_TICKET_HELP = (
-    "🔒 A `ticket`-mode session may not create tickets. An agent that can file "
-    "its own work items can widen its own mandate one ticket at a time. Put the "
-    "out-of-scope bug in your PR body or emit a safe-outputs request; a human (or "
-    "the dispatcher, out of session) files it."
+    "🔒 A `ticket`-mode session may not create tickets directly. An agent that can "
+    "file its own work items can widen its own mandate one ticket at a time. This is "
+    "EXPECTED — it is not an error to work around. To file a follow-up finding, emit a "
+    "safe-outputs `ticket-create` REQUEST (docs/PIPELINE-CONTRACT.md §8): a "
+    "credential-holding executor creates it in the backlog as `provenance:agent`, "
+    "notifies the owner, and refuses every protected label — you set none of that. "
+    "Where no finding executor is configured, report the finding as a ticket comment "
+    "instead; a person files."
 )
 TEAM_SCOPE_HELP = (
     "🔒 This session's team is `{team}`; the write targets {targets}. "
@@ -1214,7 +1220,8 @@ _TRACKER_OTHER_WRITE_TOOLS = frozenset({
     "save_comment", "create_comment", "update_comment", "delete_comment",
     "save_document", "save_project", "save_milestone", "save_release",
     "save_release_note", "save_status_update", "delete_status_update",
-    "create_issue_label", "save_diff_comment", "delete_diff_comment",
+    "create_issue_label", "save_issue_label", "save_project_label",
+    "save_diff_comment", "delete_diff_comment",
     "submit_diff_review", "resolve_diff_thread", "merge_diff",
     "create_attachment", "create_attachment_from_upload",
     "prepare_attachment_upload", "delete_attachment",
@@ -1278,15 +1285,21 @@ def _ac_fields_present(inp):
     return sorted(set(hit))
 
 
-# ── lifecycle labels (contract §6) ────────────────────────────────────────────
-# `agent:*` and `blocked:*` are DISPATCHER-owned: they record whether this session
-# is allowed to run. Matched on the canonical KEY as well as on the configured ID,
-# because a tracker MCP may take either — and because key matching still works when
-# `linear.labels.ids` is blank or unresolved, which is the error path this guard
-# has to fail CLOSED on. §6 names `blocked:capacity`; the class is matched whole, so
-# a later `blocked:*` label is dispatcher-owned by construction rather than by
-# someone remembering to add it here.
-_OWNED_LABEL_RE = re.compile(r"^(?:agent|blocked):[\w][\w.-]*$", re.IGNORECASE)
+# ── protected labels (contract §6) ────────────────────────────────────────────
+# The four classes that mean "a person (or the dispatcher) decided this":
+# `agent:*` and `blocked:*` are DISPATCHER-owned supervision; `provenance:*` is the
+# origin class, set at intake or by the safe-outputs executor (§5, §8), never by a
+# session — a session minting `provenance:human` is the agent-produces-a-human's-signal
+# defect this whole design is against, and `provenance:agent` is the executor's to apply,
+# not the session's to request; `hooks-change` is the human's guard-change acknowledgement.
+# This is the SAME set the gh/Bash protected-label guard covers — matched here on the
+# tracker-MCP path too, so `mcp__linear__save_issue(labels=[...])` cannot set one where
+# `gh issue edit --add-label` is already blocked. Matched on the canonical KEY as well as
+# on the configured ID, because a tracker MCP may take either — and key matching still
+# works when `linear.labels.ids` is blank or unresolved, the error path this guard fails
+# CLOSED on. The classes are matched WHOLE, so a later `agent:*`/`blocked:*`/`provenance:*`
+# label is covered by construction rather than by someone remembering to add it here.
+_OWNED_LABEL_RE = re.compile(r"^(?:(?:agent|blocked|provenance):[\w][\w.-]*|hooks-change)$", re.IGNORECASE)
 
 
 def _owned_label_hits(inp, cfg):
