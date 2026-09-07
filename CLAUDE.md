@@ -26,6 +26,15 @@ POSIX `sh` git hooks (`.husky/`), GitHub Actions (`.github/workflows/` + inert
 `templates/workflows/`), skills (`.claude/skills/`), a devcontainer, a project-MCP
 example (`.mcp.json.example`), Markdown docs, and a tiny `package.json`.
 
+**If a dispatcher started this session — a ticket delegated you and nobody is watching —
+read `docs/SESSION-BRIEF.md` first.** It is the committed, generic brief: who you are
+(your ticket is your authority; the branch name is cosmetic), where you run (a sandbox
+that allows writes only in your worktree, a network allowlist, a home you cannot read),
+what you can and cannot do, what Stage E will do to your PR (a fresh reviewer; a possible
+re-prompt in your ticket's thread with fenced findings; a bounce budget), and the runbook
+for the unexpected. Its one rule to carry even into an interactive session: never try to
+ask a user who is not there — comment on the ticket and ask for the blocked label instead.
+
 ---
 
 ## The guardrails you're working under (know these — they're enforced, not advisory)
@@ -158,6 +167,9 @@ npm run test:schemas    # schema ⇄ contract parity selftest
 npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selftest
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
+npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
+npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
+npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -171,6 +183,12 @@ broken: the validator exits 0 emitting nothing at all.
 **The autonomy and telemetry scripts are inert here for the same reason** — no
 `delivery.json`, no telemetry store. Their `--selftest` batteries are what has teeth,
 and each asserts its contract rows against synthetic fixtures.
+
+**Stage E** — automated review and a bounded fix re-prompt of dispatcher-opened PRs — is
+the same shape: three scripts (publisher, review poller, bounce driver) whose three
+selftests above are the whole of what runs in this repo. Nothing is scheduled here; the
+deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
+`docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the forbidden-paths gate,

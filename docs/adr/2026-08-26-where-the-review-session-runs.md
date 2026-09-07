@@ -13,6 +13,14 @@
 > and the watcher-posts-a-comment mechanism. **The `github-actions` backend guidance below
 > is unaffected and this ADR stays Accepted for it.**
 
+> **Correction (2026-09-06).** "Building it" step 3 below proposed narrowing
+> `githubAllowedTools` to a read-only set. Read from the dispatcher's source (v0.2.69), an
+> *allow* list restricts nothing there — its permission callback allows every tool except
+> `AskUserQuestion` — and `promptTemplatePath` is stripped by the CLI config loader before
+> it is ever read. The tool fence that holds is the per-repository-entry
+> **`disallowedTools`** list. Recorded with citations in the 2026-09-05 ADR's Update
+> block; the text below is left as written.
+
 ## Decision
 
 **Review moves to the machine the dispatcher runs on.** When `dispatch.backend` is
