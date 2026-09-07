@@ -44,7 +44,7 @@ checks your work and carries on. It never asks you to type `y`.
 | `run` | do everything possible, in order, idempotently; stop at the first card |
 | `run --dry-run` | the same pass with apply **off**: names what would change, changes nothing — not a file, not a daemon, not one tracker object |
 | `status` | where the install got to, what blocks it, and the one command that clears it |
-| `verify` | read-only drift check — measures every step, changes nothing, asks nothing |
+| `verify` | read-only drift check — measures every step, changes nothing, asks nothing, and on a healthy machine exits 0 |
 | `card CK-3` | print any checkpoint card in full, at any time |
 | `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
 
@@ -56,9 +56,15 @@ only you know whether that number is the one you meant); and watch one real tick
 reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
-(`CK-4`), and a code host that would not name a repository's required checks (`CK-6`). You
-also paste each secret at a hidden prompt during the run — that is not a card, it is one
-keystroke sequence inside one step.
+(`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
+
+**You type each secret once, ever.** The two values are asked for at a hidden prompt on the
+run that has none, written straight into the role account's own env file at mode 600, and
+from then on **read back out of that file** — so a second `run`, a `run --dry-run` and
+`verify` ask you for nothing at all. Nothing prints a value; what you see back is the name,
+the length and the class. If the tracker later refuses a stored key, that is reported as a
+*rejected* key rather than a missing one — the file is there and its contents are not
+accepted — and only `run` offers to replace it.
 
 **The git automations are read, not assumed.** They are `Team.gitAutomationStates` in
 Linear's API — the same five rules as *Team settings → Issue statuses and automations → git

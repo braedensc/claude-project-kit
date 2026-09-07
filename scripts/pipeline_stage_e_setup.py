@@ -38,6 +38,24 @@ one.  A step that could not measure itself BLOCKS; it never passes quietly.
         failure: the thing may be fine and nothing here can tell.  It blocks.
     10  BLOCKED-ON-HUMAN — a checkpoint card is printed; do it and re-run
 
+`verify` USES THE SAME FOUR, AND THE CHOICE IS DELIBERATE.  On a healthy,
+fully-installed machine it exits 0 and says so — a read-only reassurance
+command that can never report clean is not reassurance, and a "could not
+measure" present on every single run is exactly the §13 signal that gets
+normalised into noise.  So:
+
+    0   every step re-measures as done.  Nothing is outstanding.
+    10  DRIFT: something is outstanding, or a checkpoint waits on a person.
+    4   a step COULD NOT BE MEASURED — the one row `verify` cannot avoid is
+        the tracker when no key can be read.  It is deliberately NOT 0 (a
+        machine nothing could measure is not a machine known to be clean) and
+        deliberately NOT 10 (it is not drift either; drift is a thing this
+        command saw and 4 is a thing it did not).  It names the file it would
+        have read and the command that puts a key there.
+    1   a step is broken.
+
+The worst row anywhere wins, in that order of severity.
+
 WHY THIS FILE IS NAMED `pipeline_*`.  It writes the dispatcher's config and
 installs system daemons — supervision machinery — so it sits on the kit's
 grader floor (`scripts/pipeline_*.py`) and a change to it must carry the human
@@ -65,6 +83,16 @@ WHAT IT REFUSES
     unscrubbed into every session), never under the dispatcher's state root
     (reachable by the very sessions the ledger counts).  Secrets are typed at a
     hidden prompt and reported by NAME, length and class — never by value.
+  * ASKING TWICE FOR THE SAME SECRET.  Each credential is resolved AT MOST ONCE
+    per process, and READ before it is asked for: the env file this installer
+    itself wrote, at mode 600 under the role account's home, is the first place
+    it looks.  So a re-run with nothing left to do asks nothing, `--dry-run`
+    asks nothing, and `verify` asks nothing and can still measure the tracker.
+    The read goes through `sudo -u <role account>`, which every other probe in
+    this file already needs, so it grants no capability the caller did not have;
+    the value reaches this process and one request header and nothing else.  A
+    stored key the tracker REJECTS is reported as a rejected key, which is not
+    the same fact as an absent one, and is replaced only where asking is allowed.
 
 THE STATE THIS KEEPS is under YOUR home at `~/.stage-e-setup/`: a ledger of
 step outcomes, the ids resolved out of the tracker, and your attestations.  It
@@ -517,6 +545,12 @@ M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
 M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
                    "{ teamMembershipCreate(input: $input) { success } }")
+# The cheapest question the tracker will answer, asked ONCE per process, purely
+# to learn whether it accepts this key at all. It runs before any step starts
+# creating things, so a bad key is named as a bad key rather than as a failure
+# halfway through a build-out — and it is what lets a REJECTED stored key be
+# told apart from an ABSENT one, which are different facts with the same silence.
+Q_VIEWER = "query Viewer { viewer { id } }"
 
 
 def mutation_ok(data, field):
@@ -849,6 +883,16 @@ class Ctx(object):
         # command that prompts for a credential is not read-only.
         self.may_prompt = True
         self._linear = None
+        # Every credential this process resolved, by env-var NAME, and where
+        # each came from. One entry per name for the life of the process: the
+        # same secret is never requested twice in a run.
+        self._secrets = {}
+        self._sources = {}
+        # Names whose STORED value this run replaced. The env file looks
+        # complete to the probe — right length, mode 600, right owner — and is
+        # wrong, so the credentials step has to be told, or the replacement
+        # never lands and the next run asks all over again.
+        self.replaced = set()
         self.role_home = None
         self.dispatcher = {}     # facts read out of the dispatcher's own config
         # Daemons this run stopped and has not started again. A run that ends
@@ -863,26 +907,166 @@ class Ctx(object):
     def stage_home(self):
         return "$HOME/.stage-e"
 
-    def linear(self):
-        """One prompt per run, at most. The key lives in this process and in one
-        request header; it is never written, logged, hashed or printed."""
-        if self._linear is None:
+    # -- credentials --------------------------------------------------------- #
+    # READ BEFORE YOU ASK, AND ASK AT MOST ONCE.
+    #
+    # The old shape asked for the tracker key on the FIRST LINE of the tracker
+    # step, so every pass paid for it: a re-run with nothing left to do, a
+    # `--dry-run`, and a first run that then asked for the SAME key a second
+    # time in the credentials step. Three prompts on a first run, two of them
+    # for one secret, and one on every run afterwards, forever.
+    #
+    # The key is already on the machine — this installer put it there, at mode
+    # 600 under the role account's home — so the first place to look for it is
+    # the file it was written to. Reading what you wrote is not a shortcut;
+    # asking again for what you already stored is the defect.
+
+    def _stored_secret(self, name):
+        """(value, None) or (None, why-not) — one value out of the role
+        account's own env file, read as that account.
+
+        Exit 9 is "there is no env file" and exit 8 is "that name is not in it".
+        Both are ABSENT and both are answers. Anything else is "I could not
+        look", which is a different fact with the same silence and is returned
+        as its own sentence rather than folded into the other two."""
+        res = self.runner.as_role(
+            self.account, ENV_VALUE_SH % (shlex.quote(name), self.stage_home))
+        if res.rc == 9:
+            return None, "there is no env file at %s/env" % self.stage_home
+        if res.rc == 8:
+            return None, "%s is not set in %s/env" % (name, self.stage_home)
+        if not res.ok:
+            return None, ("%s/env could not be read as %s (exit %d): %s"
+                          % (self.stage_home, self.account, res.rc,
+                             (res.err or res.out).strip()[:140]))
+        val = (res.out or "").strip()
+        if len(val) < 20:
+            return None, ("%s in %s/env is %d characters, too short to be a credential"
+                          % (name, self.stage_home, len(val)))
+        return val, None
+
+    def secret(self, name, prompt_text, force_prompt=False):
+        """(value, where-it-came-from), or (None, why-it-could-not-be-resolved).
+
+        Three places, in order, and the order is the whole point: what this
+        process already holds, then the role account's env file, then a hidden
+        prompt. `verify` and `run --dry-run` never reach the third — they set
+        `may_prompt` False, so an unresolvable value is UNMEASURED and says so
+        rather than stopping a read-only command to ask a person for a secret.
+
+        Nothing here prints the value. What is said out loud is the shape:
+        the NAME, the length, the class its prefix puts it in, and a verdict."""
+        if not force_prompt:
+            if name in self._secrets:
+                return self._secrets[name], self._sources[name]
+            val, why_not = self._stored_secret(name)
+            if val is not None:
+                self._secrets[name] = val
+                self._sources[name] = "the role account's env file"
+                say("  %s  — read from %s/env, not asked for"
+                    % (secret_shape(name, val), self.stage_home))
+                return val, self._sources[name]
             if not self.may_prompt:
-                raise Unknown(
-                    "the tracker was not read: `verify` never asks for a credential, so "
-                    "the Reviews team, the labels and the ids are UNMEASURED here",
-                    "measure them with the command that is allowed to ask:\n"
-                    "    python3 %s run" % _self_path())
+                return None, why_not
             if not self.tty:
                 raise Blocked("CK-2")
-            key = self.key_reader("paste the tracker API key for %s (hidden, used for this "
-                                  "run only): " % self.conf["OWNER_LINEAR_EMAIL"])
-            key = (key or "").strip()
-            if len(key) < 20:
-                raise SetupError("that key is %d characters, which is too short to be one. "
-                                 "Nothing was sent. (The value is not shown.)" % len(key))
-            self._linear = self.linear_factory(key)
-        return self._linear
+        elif not (self.may_prompt and self.tty):
+            return None, "this command does not ask for credentials"
+        reader = (self.key_reader if name == self.conf.get("LINEAR_KEY_ENV")
+                  else self.secret_reader)
+        val = (reader(prompt_text) or "").strip()
+        say("  %s" % secret_shape(name, val))
+        if len(val) < 20:
+            raise SetupError("%s is %d characters, too short to be a credential. Nothing "
+                             "was written or sent. (The value is not shown.)"
+                             % (name, len(val)))
+        if "\n" in val or "\r" in val:
+            raise SetupError("%s carries a newline. Nothing was written." % name)
+        self._secrets[name] = val
+        self._sources[name] = "typed at a hidden prompt"
+        return val, self._sources[name]
+
+    def linear(self):
+        """The tracker client, built LAZILY and at most once per process.
+
+        Nothing is constructed and nothing is authenticated until a step
+        actually calls the tracker, and by then the key has been looked for in
+        the role account's env file. The key lives in this process and in one
+        request header; it is never written, logged, hashed or printed."""
+        if self._linear is not None:
+            return self._linear
+        name = self.conf["LINEAR_KEY_ENV"]
+        key, source = self.secret(
+            name,
+            "paste the tracker API key for %s (hidden — it is stored at mode 600 under "
+            "the role account's home, so this is the last time): "
+            % self.conf["OWNER_LINEAR_EMAIL"])
+        if key is None:
+            raise Unknown(
+                "the tracker was not read: %s, and this command never asks for a "
+                "credential. The Reviews team, the labels and the ids are UNMEASURED "
+                "here — that is not the same as saying they are wrong." % source,
+                "the key is read as %s out of %s/env, which is the file `run` writes at\n"
+                "mode 600. Put one there with the one command that is allowed to ask:\n"
+                "    python3 %s run" % (self.account, self.stage_home, _self_path()))
+        api = self.linear_factory(key)
+        rejected = _key_rejected(api)
+        if rejected:
+            if source == "typed at a hidden prompt":
+                raise SetupError("the tracker refused the %s you just typed (%s). Nothing "
+                                 "was written or created. (No value is shown.)"
+                                 % (name, rejected))
+            # A STORED KEY THE TRACKER WILL NOT TAKE. Not a missing key: the
+            # file is there, at mode 600, and its contents are not accepted.
+            # Saying "no key" here would send someone to look for a file that
+            # exists.
+            if self.may_prompt and self.tty:
+                say("")
+                say("  THE STORED %s WAS REJECTED BY THE TRACKER (%s)." % (name, rejected))
+                say("  That is a rejected key, not a missing one: %s/env is there and the"
+                    % self.stage_home)
+                say("  tracker will not take what is in it — revoked, expired, or for")
+                say("  another workspace. Paste a replacement and the credentials step")
+                say("  writes it back over the old one.")
+                self._secrets.pop(name, None)
+                self._sources.pop(name, None)
+                key, source = self.secret(
+                    name, "  paste a replacement %s (hidden): " % name, force_prompt=True)
+                api = self.linear_factory(key)
+                again = _key_rejected(api)
+                if again:
+                    raise SetupError("the replacement %s was refused too (%s). Nothing was "
+                                     "written or created. (No value is shown.)"
+                                     % (name, again))
+                # The credentials step must now REWRITE a file its own probe
+                # will call complete. Without this the replacement lives for
+                # one process and the next run asks again — the exact defect.
+                self.replaced.add(name)
+            else:
+                raise Unknown(
+                    "the %s stored in %s/env was REJECTED by the tracker (%s). The file is "
+                    "there and its contents are not accepted, which is a different fact "
+                    "from having no key at all." % (name, self.stage_home, rejected),
+                    "replace it with the one command that is allowed to ask:\n"
+                    "    python3 %s run" % _self_path())
+        self._linear = api
+        return api
+
+
+def _key_rejected(api):
+    """The reason the tracker will not accept this key, or None.
+
+    One cheap query. Only a 401/403 is a REJECTION; unreachable, a redirect or
+    a malformed answer are re-raised untouched, because "I could not ask" is
+    not "the answer was no" and reporting the first as the second would send
+    someone to replace a key that is fine."""
+    try:
+        api.post(Q_VIEWER)
+    except SetupError as exc:
+        if "refused the key" in str(exc):
+            return str(exc).split(".")[0].strip()
+        raise
+    return None
 
 
 class Blocked(Exception):
@@ -1051,6 +1235,11 @@ def step_tracker(ctx, apply_it):
     ids = dict(st.data.get("ids") or {})
     key = conf["REVIEWS_TEAM_KEY"]
 
+    # The client is built HERE, where the first tracker call is about to be
+    # made, and not one line earlier — and building it reads the key out of the
+    # role account's env file before it asks anyone for one. That is why a pass
+    # with nothing left to do, and a `--dry-run`, and `verify`, all get this far
+    # without a prompt.
     api = ctx.linear()
 
     def teams():
@@ -1271,6 +1460,24 @@ ENV_PROBE_SH = (
 )
 
 
+# ONE value out of the same file, for the same account, so the installer can
+# READ a credential it already stored instead of asking for it again. It prints
+# the value and nothing else — no mode line, no names, no other entry — and the
+# caller never prints, logs or ledgers what comes back.
+#
+# Three exits, three different facts, because §13: 0 is the value, 9 is "there
+# is no env file", 8 is "that name is not in it", and anything else is "I could
+# not look". The first three are answers; the last is the absence of one.
+#
+# `n=<NAME>` leads deliberately: it is the substring the offline battery matches
+# on, and it carries no quote character, so it survives shell-quoting intact.
+ENV_VALUE_SH = (
+    "n=%s; f=%s/env; [ -f \"$f\" ] || exit 9; "
+    "while IFS='=' read -r k v; do "
+    "if [ \"$k\" = \"$n\" ]; then printf '%%s' \"$v\"; exit 0; fi; done < \"$f\"; exit 8"
+)
+
+
 def parse_env_probe(text):
     """(names->length, mode, owner) out of ENV_PROBE_SH's output."""
     seen, mode, owner = {}, "", ""
@@ -1304,7 +1511,12 @@ def step_credentials(ctx, apply_it):
     seen, mode, owner = parse_env_probe(probe.out if probe.ok else "")
 
     missing = [n for n in names if seen.get(n, 0) < 20]
-    if probe.ok and not missing and mode == "600" and owner == ctx.account:
+    # A value this RUN replaced, because the tracker refused the stored one.
+    # The probe cannot see it: the old key is the right length, in the right
+    # file, at the right mode, and rejected. Trusting the probe here would keep
+    # the bad value and make the next run ask for a replacement all over again.
+    replaced = [n for n in names if n in ctx.replaced]
+    if probe.ok and not missing and not replaced and mode == "600" and owner == ctx.account:
         return True, "env file present, mode 600, owned by %s, both names set (%s)" % (
             ctx.account, ", ".join("%s=%d chars" % (n, seen[n]) for n in names)), []
 
@@ -1315,7 +1527,7 @@ def step_credentials(ctx, apply_it):
             "to do. Move or remove it as that owner, then run this again."
             % (ctx.stage_home, owner, ctx.account))
 
-    if probe.ok and not missing and mode != "600":
+    if probe.ok and not missing and not replaced and mode != "600":
         if not apply_it:
             return False, "env file is mode %s, want 600" % mode, []
         res = r.as_role(ctx.account, "chmod 600 %s/env" % ctx.stage_home,
@@ -1326,26 +1538,32 @@ def step_credentials(ctx, apply_it):
         return False, "env file re-tightened to mode 600", []
 
     if not apply_it:
+        if replaced:
+            return False, ("would rewrite %s/env with the replacement %s"
+                           % (ctx.stage_home, ", ".join(replaced))), []
         return False, "env file missing or incomplete (want %s)" % ", ".join(names), []
     if not ctx.tty:
         raise Blocked("CK-2")
 
     say("")
-    say("  Two values, typed once. Each goes straight into %s/env at mode 600 under the"
+    say("  Two values. Each goes straight into %s/env at mode 600 under the"
         % ctx.stage_home)
     say("  role account's home. Never into the dispatcher's own env file, which is copied")
     say("  unscrubbed into every session; never under its state root, which the sessions")
     say("  the ledger counts can reach. Nothing is echoed, logged or kept here.")
+    say("  A value this run has ALREADY resolved is reused, not asked for again — so a")
+    say("  key the tracker step needed a moment ago is not typed a second time.")
     say("")
     lines = []
     for name in names:
-        val = (ctx.secret_reader("  paste the value for %s (hidden): " % name) or "").strip()
-        say("    %s" % secret_shape(name, val))
-        if len(val) < 20:
-            raise SetupError("%s is too short to be a credential. Nothing was written. "
-                             "(The value is not shown.)" % name)
-        if "\n" in val or "\r" in val:
-            raise SetupError("%s carries a newline. Nothing was written." % name)
+        val, source = ctx.secret(name, "  paste the value for %s (hidden): " % name)
+        if val is None:
+            # Only reachable if the ask itself was unavailable; `apply_it` is on
+            # here and the not-a-terminal case blocked on CK-2 above. Reported
+            # rather than assumed away.
+            raise Unknown("%s could not be resolved: %s" % (name, source),
+                          "run this again from a terminal, where it can ask:\n"
+                          "    python3 %s run" % _self_path())
         lines.append("%s=%s" % (name, val))
     body = "\n".join(lines) + "\n"
     res = r.as_role(ctx.account,
@@ -2108,12 +2326,22 @@ def _print_rows(rows):
 def cmd_run(ctx, dry_run):
     if not dry_run:
         refuse_if_agent("run")
+    # A DRY RUN ASKS FOR NOTHING. It measures, so it will READ a credential the
+    # role account's env file already holds — but a run that changes nothing
+    # has no business stopping a person to type a secret, and a hidden prompt
+    # inside a session is a prompt whose answer the session sees. With no
+    # stored key the tracker row is UNMEASURED and says which file it looked in.
+    if dry_run:
+        ctx.may_prompt = False
     say("Stage E installer — %s" % ("DRY RUN: nothing will be changed" if dry_run
                                     else "the only command that changes this machine"))
     say("  conf          %s" % ctx.conf.get("__source__", "stage-e.conf"))
     say("  role account  %s" % ctx.account)
     say("  dispatcher    %s" % ctx.conf["DISPATCHER_SERVICE"])
     say("  daemons       %s" % ", ".join(daemon_labels(ctx.conf)))
+    say("  credentials   read as %s from %s/env%s"
+        % (ctx.account, ctx.stage_home,
+           "; this run asks for nothing" if dry_run else "; asked for only if absent"))
     say("  utc           %s" % now_iso())
     # A DRY RUN IS `apply_it=False`, NOT "apply, but skip the Runner".
     # `Runner.write` was the only dry-run seam, and every tracker mutation goes
@@ -2121,7 +2349,13 @@ def cmd_run(ctx, dry_run):
     # old spelling really created the team, its states, the label and the
     # membership under a banner that said nothing would be changed. Not
     # applying is the only shape that cannot be undone by adding a call site.
-    code, rows = run_steps(ctx, apply_it=not dry_run,
+    # A DRY RUN KEEPS GOING. `run` stops at the first row a person must clear,
+    # because carrying on would build the next step on a foundation nobody has
+    # laid — but a dry run builds nothing, so stopping only costs the reader
+    # the other seven rows and another pass to see them. That matters most on
+    # the very first dry run, when no key is stored yet and the tracker row is
+    # the one that cannot be measured.
+    code, rows = run_steps(ctx, apply_it=not dry_run, keep_going=dry_run,
                            resume="run --dry-run" if dry_run else "run")
     _unloaded_notice(ctx)
     if dry_run:
@@ -2131,9 +2365,19 @@ def cmd_run(ctx, dry_run):
                 % len(ctx.runner.writes))
             return EX_FAILED
         would = sum(1 for _s, o, _d in rows if o == WOULD_CHANGE)
+        unmeasured = [s for s, o, _d in rows if o == UNKNOWN]
         say("DRY RUN: nothing was changed — not on this machine and not in the tracker.")
         say("%d of %d step(s) would change something; the rows above marked %s say which."
             % (would, len(STEPS), WOULD_CHANGE))
+        if unmeasured:
+            # §13. A row nothing could measure is not a row that passed, and a
+            # summary that counted only WOULD-CHANGE would report it as neither.
+            say("%d step(s) could NOT be measured (%s) — read the reason above; this "
+                "command asks for nothing, so a missing credential is one of them."
+                % (len(unmeasured), ", ".join(unmeasured)))
+        say("Nothing here asked you for a credential. Run the same command again after")
+        say("clearing a row above:")
+        say("    python3 %s run --dry-run" % _self_path())
         return code
     if code == EX_OK:
         done = sum(1 for _, o, _ in rows if o in (DONE, ALREADY_DONE))
@@ -2171,8 +2415,16 @@ def cmd_verify(ctx):
         1   a step is broken
         4   a step could not be measured — which blocks, and is not a pass
         10  work is outstanding, or a checkpoint is waiting on a person
+
+    IT CAN REACH 0. Not asking is not the same as not looking: the tracker key
+    is READ out of the role account's env file, so a healthy, fully-installed
+    machine measures clean and says so. A `could not measure` that appeared on
+    every single run — which is what this command did while the tracker step
+    demanded a prompt it was forbidden to make — is a §13 signal that gets
+    normalised into noise, and then the one run that means it is ignored too.
     """
-    say("Stage E verify — read-only drift check. Nothing is changed, and nothing is asked.")
+    say("Stage E verify — read-only drift check. Nothing is changed, and nothing is asked;")
+    say("the tracker key is read from %s/env as %s." % (ctx.stage_home, ctx.account))
     ctx.may_prompt = False
     code, rows = run_steps(ctx, apply_it=False, keep_going=True)
     if ctx.runner.writes:
@@ -2288,7 +2540,7 @@ class FakeRunner(Runner):
 
 class FakeLinear(object):
     def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
-                 no_field=()):
+                 no_field=(), reject_key=False):
         self.teams = teams if teams is not None else []
         self.labels = labels if labels is not None else []
         self.users = users if users is not None else []
@@ -2298,12 +2550,22 @@ class FakeLinear(object):
         # workspace's schema does not expose, which arrive as a GraphQL error.
         self.refuse = set(refuse or ())
         self.no_field = set(no_field or ())
+        # A workspace that answers 401/403 to this key — the shape a revoked or
+        # expired stored key arrives in.
+        self.reject_key = bool(reject_key)
         self.created = []
+        self.asked = []
         self._n = 0
 
     def post(self, query, variables=None):
         variables = variables or {}
         op = query.split()[1].split("(")[0]
+        self.asked.append(op)
+        if op == "Viewer":
+            if self.reject_key:
+                raise SetupError("the tracker refused the key (HTTP 401). The value is not "
+                                 "shown; re-run and paste it again.")
+            return {"viewer": {"id": "u-me"}}
         if op in self.no_field:
             raise SetupError("the tracker returned an error: Cannot query field on Team")
         if op == "TeamGitAutomations":
@@ -2599,7 +2861,7 @@ def selftest():
     ctx4.linear_factory = lambda key: empty
     ctx4.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx4.tty = True
-    ok, detail, _x = step_tracker(ctx4, apply_it=True)
+    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx4, apply_it=True))
     expect("tracker-creates", ok is False and "created" in detail,
            "an empty workspace was not built out: %s" % detail)
     expect("tracker-creates", "team" in empty.created and "label" in empty.created
@@ -2608,7 +2870,7 @@ def selftest():
     expect("tracker-creates", not ctx4.state.attested("A-AUTOMATIONS"),
            "the happy path still demands a hand sign-off for the automations")
     before = list(empty.created)
-    ok, detail, _x = step_tracker(ctx4, apply_it=True)
+    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx4, apply_it=True))
     expect("tracker-idempotent", ok is True and "nothing to create" in detail,
            "the second tracker pass was not already-done: %s" % detail)
     expect("tracker-idempotent", empty.created == before,
@@ -2640,7 +2902,7 @@ def selftest():
     ctx5.linear_factory = lambda key: autos
     ctx5.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx5.tty = True
-    ok, detail, _x = step_tracker(ctx5, apply_it=True)
+    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx5, apply_it=True))
     expect("automations-read", ok is False and "turned off 1 git automation" in detail,
            "the live automation was not turned off: %s" % detail)
     expect("automations-read",
@@ -2648,7 +2910,7 @@ def selftest():
            "the wrong rules were deleted: %s" % autos.teams[0]["automations"])
     expect("automations-read", not ctx5.state.attested("A-AUTOMATIONS"),
            "the installer signed off a checkpoint on the owner's behalf")
-    ok2, detail2, _x = step_tracker(ctx5, apply_it=True)
+    (ok2, detail2, _x), _n = _quiet(lambda: step_tracker(ctx5, apply_it=True))
     expect("automations-read", ok2 is True and "nothing to create" in detail2,
            "the second pass was not already-done: %s" % detail2)
     # …and a dry run reports them without deleting one.
@@ -2659,7 +2921,7 @@ def selftest():
     ctx5b.linear_factory = lambda key: autos_b
     ctx5b.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx5b.tty = True
-    ok, detail, _x = step_tracker(ctx5b, apply_it=False)
+    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx5b, apply_it=False))
     expect("automations-read", ok is False and "live git automation" in detail,
            "a dry run did not report the live automation: %s" % detail)
     expect("automations-read", autos_b.created == [],
@@ -2673,13 +2935,13 @@ def selftest():
     ctx5c.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx5c.tty = True
     try:
-        step_tracker(ctx5c, apply_it=True)
+        _quiet(lambda: step_tracker(ctx5c, apply_it=True))
         failures.append("automations-fallback: a workspace whose API would not name the "
                         "automations was passed as if they were off")
     except Blocked as exc:
         expect("automations-fallback", exc.card_id == "CK-3", "blocked on %s" % exc.card_id)
     ctx5c.state.attest("A-AUTOMATIONS", "bc")
-    ok, _d, _x = step_tracker(ctx5c, apply_it=True)
+    (ok, _d, _x), _n = _quiet(lambda: step_tracker(ctx5c, apply_it=True))
     expect("automations-fallback", ok is True, "a signed-off board still blocked")
 
     # -- 11c. a SUB-TEAM is fatal, and it is read rather than left on a card -
@@ -2691,7 +2953,7 @@ def selftest():
     ctx5d.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx5d.tty = True
     try:
-        step_tracker(ctx5d, apply_it=True)
+        _quiet(lambda: step_tracker(ctx5d, apply_it=True))
         failures.append("sub-team: a nested Reviews team was accepted")
     except SetupError as exc:
         expect("sub-team", "SUB-TEAM" in str(exc) and "ENG" in str(exc),
@@ -2706,7 +2968,7 @@ def selftest():
     ctx5e.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx5e.tty = True
     try:
-        step_tracker(ctx5e, apply_it=True)
+        _quiet(lambda: step_tracker(ctx5e, apply_it=True))
         failures.append("state-read-back: `success: false` with no error was reported as "
                         "three created workflow states")
     except SetupError as exc:
@@ -2830,6 +3092,33 @@ def selftest():
     expect("env-probe", missing_probe.rc == 9,
            "an absent env file must be its own exit (9), not an empty success: rc=%d"
            % missing_probe.rc)
+
+    # -- 15b'. so is the ONE-VALUE reader — the fragment that lets this thing
+    # stop asking for a key it already stored. Same rule: run it, do not
+    # reason about it. Its three exits are three different facts.
+    cases += 1
+
+    def _value(name, where=envdir):
+        return Runner().read(["/bin/sh", "-c",
+                              ENV_VALUE_SH % (shlex.quote(name), where)])
+
+    got = _value("STAGE_E_LINEAR_API_KEY")
+    expect("env-value", got.rc == 0 and got.out.strip() == ENVSECRET,
+           "the value reader returned rc=%d, %d character(s)" % (got.rc, len(got.out)))
+    expect("env-value", _value("GH_TOKEN").out.strip() == "g" * 40,
+           "the second name did not read back")
+    expect("env-value", _value("NOT_IN_THE_FILE").rc == 8,
+           "a name that is not in the file must be its own exit (8), not an empty "
+           "success: rc=%d" % _value("NOT_IN_THE_FILE").rc)
+    expect("env-value", _value("STAGE_E_LINEAR_API_KEY", envdir + "-absent").rc == 9,
+           "an absent env file must be exit 9 here too")
+    # A value carrying an `=` survives whole: `IFS='=' read -r k v` puts the
+    # rest of the line in v, and a reader that split on every `=` would hand
+    # the tracker a truncated key and report it as refused.
+    with open(os.path.join(envdir, "env"), "a", encoding="utf-8") as fh:
+        fh.write("PADDED=abc=def=%s\n" % ("z" * 20))
+    expect("env-value", _value("PADDED").out.strip() == "abc=def=" + "z" * 20,
+           "a value containing `=` was truncated: %r" % _value("PADDED").out)
 
     # -- 15c. credentials are refused inside the dispatcher's own tree -------
     cases += 1
@@ -2972,24 +3261,302 @@ def selftest():
     expect("unloaded-notice", _quiet(lambda: _unloaded_notice(_settled_ctx(conf)[0]))[1] == "",
            "a run that unloaded nothing still printed the notice")
 
-    # -- 16. verify measures everything, changes nothing, and asks nothing ---
+    # ------------------------------------------------------------------ #
+    # 16. THE CREDENTIAL IS ASKED FOR AT MOST ONCE, AND READ BEFORE IT IS
+    # ASKED FOR AT ALL.  The old shape prompted on the first line of the
+    # tracker step, so a settled re-run, a `--dry-run` and a first run all
+    # paid — the first run twice over, for one secret.
+    # ------------------------------------------------------------------ #
+    def _counted(c):
+        """Every credential this context asks a PERSON for, by env-var name.
+        A stored value that was read rather than requested appears nowhere in
+        this list, which is the whole point of it."""
+        asked = []
+        c.key_reader = lambda p: (asked.append(conf["LINEAR_KEY_ENV"]), STORED_KEY)[1]
+        c.secret_reader = lambda p: (asked.append(conf["GITHUB_TOKEN_ENV"]),
+                                     STORED_TOKEN)[1]
+        c.tty = True
+        return asked
+
+    # -- 16a. a re-run with the tracker step already done asks NOTHING ------
     cases += 1
-    ctx9, fake9 = _settled_ctx(conf)
-    ctx9.linear_factory = lambda key: FakeLinear()
-    prompted = []
-    ctx9.key_reader = lambda prompt: (prompted.append(prompt), "x")[1]
-    ctx9.secret_reader = ctx9.key_reader
-    code, rows = _quiet(lambda: cmd_verify(ctx9))[0], None
+    ctxK, fakeK, apiK = _healthy_ctx(conf)
+    keysK = []
+    ctxK.linear_factory = lambda key: (keysK.append(key), apiK)[1]
+    askedK = _counted(ctxK)
+    (codeK, rowsK), _pK = _quiet(lambda: run_steps(ctxK, apply_it=True, keep_going=True))
+    expect("no-reprompt-on-settled-rerun", askedK == [],
+           "a pass with nothing left to do still asked for %s" % askedK)
+    expect("no-reprompt-on-settled-rerun", codeK == EX_OK,
+           "a settled machine did not re-measure clean (exit %s): %s"
+           % (codeK, [(s, o) for s, o, _d in rowsK if o not in (DONE, ALREADY_DONE)]))
+    expect("no-reprompt-on-settled-rerun", not fakeK.writes,
+           "a settled re-run wrote: %s" % [w["why"] for w in fakeK.writes])
+    # …and the key it used is the STORED one, read out of the env file rather
+    # than requested. Same value, different provenance, and only one of the two
+    # costs the owner a keystroke on every single pass.
+    expect("stored-key-is-reused", keysK == [STORED_KEY],
+           "the tracker client was built with %d key(s) that were not the stored one"
+           % len([k for k in keysK if k != STORED_KEY]))
+    expect("stored-key-is-reused",
+           ctxK._sources.get(conf["LINEAR_KEY_ENV"]) == "the role account's env file",
+           "the key was resolved from %r" % ctxK._sources.get(conf["LINEAR_KEY_ENV"]))
+
+    # mutant: the old spelling — a tracker client that cannot read what this
+    # installer stored, and so has nothing to do but ask. It must turn 16a red.
+    cases += 1
+    ctxL, _fL, apiL = _healthy_ctx(conf)
+    ctxL._stored_secret = lambda name: (None, "the old spelling never looked")
+    askedL = _counted(ctxL)
+    _quiet(lambda: run_steps(ctxL, apply_it=True, keep_going=True))
+    expect("no-reprompt-mutant", askedL == [conf["LINEAR_KEY_ENV"]],
+           "an installer that never reads the stored key asked for %s — the zero-prompt "
+           "check cannot see the defect it exists to catch" % askedL)
+
+    # -- 16b. ONE secret, ONE request, however many steps want it -----------
+    # The tracker step needs the tracker key; the credentials step needs it
+    # again to write the env file. Two steps, one keystroke.
+    cases += 1
+    ctxM, fakeM, _apiM = _healthy_ctx(conf, stored_env=False)
+    fakeM.answers = list(fakeM.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    askedM = _counted(ctxM)
+    _quiet(lambda: run_steps(ctxM, apply_it=True, keep_going=True))
+    expect("secret-asked-once", askedM.count(conf["LINEAR_KEY_ENV"]) == 1,
+           "the tracker key was requested %d times in one process: %s"
+           % (askedM.count(conf["LINEAR_KEY_ENV"]), askedM))
+    expect("secret-asked-once", sorted(askedM) == sorted([conf["LINEAR_KEY_ENV"],
+                                                          conf["GITHUB_TOKEN_ENV"]]),
+           "a first run asked for %d value(s), not one per secret: %s"
+           % (len(askedM), askedM))
+    wroteM = [w for w in fakeM.writes if "env file" in w["why"]]
+    expect("secret-asked-once", len(wroteM) == 1 and wroteM[0]["stdin"] == "<hidden>",
+           "the env file was not written once with a hidden body: %s" % wroteM)
+
+    # mutant: a process that forgets a secret between steps must ask twice.
+    cases += 1
+    ctxN, fakeN, _apiN = _healthy_ctx(conf, stored_env=False)
+    fakeN.answers = list(fakeN.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    askedN = _counted(ctxN)
+    _quiet(lambda: step_tracker(ctxN, apply_it=True))
+    ctxN._secrets, ctxN._sources = {}, {}          # the forgetting
+    _quiet(lambda: step_credentials(ctxN, apply_it=True))
+    expect("secret-asked-once-mutant", askedN.count(conf["LINEAR_KEY_ENV"]) == 2,
+           "a process that shares nothing between steps asked %d times — the "
+           "asked-once check cannot see a second request"
+           % askedN.count(conf["LINEAR_KEY_ENV"]))
+
+    # -- 16c. `--dry-run` asks for nothing at all ---------------------------
+    cases += 1
+    ctxP, fakeP, apiP = _unsettled_ctx(conf, stored_env=False)
+    askedP = _counted(ctxP)
+    ctxP.runner.dry_run = True
+    codeP, printedP = _quiet(lambda: cmd_run(ctxP, dry_run=True))
+    expect("dry-run-asks-nothing", askedP == [],
+           "a dry run asked for %s" % askedP)
+    expect("dry-run-asks-nothing", apiP.created == [] and not fakeP.writes,
+           "a dry run changed something: %s / %s"
+           % (apiP.created, [w["why"] for w in fakeP.writes]))
+    expect("dry-run-asks-nothing", codeP == EX_UNKNOWN,
+           "a dry run with no readable key exited %s — it measured nothing about the "
+           "tracker and must say so" % codeP)
+    expect("dry-run-asks-nothing", "/env" in printedP and "run" in printedP,
+           "the dry run never said which file it would have read the key out of")
+    expect("dry-run-asks-nothing", "could NOT be measured" in printedP,
+           "the dry run's summary counted only what would change, so the row it could "
+           "not measure was reported as neither a pass nor a change")
+    # …and it MEASURED THE REST anyway. A dry run builds nothing, so stopping
+    # at the first unmeasurable row costs the reader every row after it and a
+    # second pass to see them.
+    expect("dry-run-keeps-going", {s for s, _t, _f in STEPS} <= set(ctxP.state.data["steps"]),
+           "a dry run stopped after %d of %d steps"
+           % (len(ctxP.state.data["steps"]), len(STEPS)))
+    # …and with a key on the machine it measures the tracker for real, still
+    # without asking and still without creating one object in it.
+    cases += 1
+    ctxQ, fakeQ, apiQ = _unsettled_ctx(conf)
+    askedQ = _counted(ctxQ)
+    ctxQ.runner.dry_run = True
+    codeQ, _pQ = _quiet(lambda: cmd_run(ctxQ, dry_run=True))
+    expect("dry-run-asks-nothing", askedQ == [] and apiQ.created == [],
+           "a dry run that could read the key asked %s and created %s"
+           % (askedQ, apiQ.created))
+    expect("dry-run-asks-nothing", codeQ == EX_BLOCKED,
+           "a readable dry run over an empty workspace exited %s, not %s (it measured "
+           "the tracker, so its verdict is drift, not `could not look`)"
+           % (codeQ, EX_BLOCKED))
+
+    # mutant: the old spelling — a dry run that may prompt. It must ask.
+    cases += 1
+    ctxR, _fR, _apiR = _unsettled_ctx(conf, stored_env=False)
+    askedR = _counted(ctxR)
+    ctxR.runner.dry_run = True
+    _quiet(lambda: run_steps(ctxR, apply_it=False))     # cmd_run's guard skipped
+    expect("dry-run-asks-nothing-mutant", askedR == [conf["LINEAR_KEY_ENV"]],
+           "a dry run left free to prompt asked for %s — the no-prompt check cannot see "
+           "the defect it exists to catch" % askedR)
+
+    # ------------------------------------------------------------------ #
+    # 17. `verify` MEASURES EVERYTHING, CHANGES NOTHING, ASKS NOTHING — AND
+    # CAN REPORT CLEAN.  It could not before: the tracker step demanded a
+    # prompt that `verify` is forbidden to make, so a healthy machine always
+    # came back `COULD NOT MEASURE at tracker`, exit 4.  A "could not" that is
+    # always there is the §13 signal that gets normalised into noise.
+    # ------------------------------------------------------------------ #
+    cases += 1
+    ctx9, fake9, _api9 = _healthy_ctx(conf)
+    asked9 = _counted(ctx9)
+    ctx9.runner.dry_run = True
+    code, printed9 = _quiet(lambda: cmd_verify(ctx9))
     expect("verify-read-only", not fake9.writes,
            "verify made %d mutation(s)" % len(fake9.writes))
-    expect("verify-read-only", not prompted,
-           "verify asked a person for a credential: %s" % prompted)
-    expect("verify-read-only", code != EX_OK,
-           "verify passed a machine whose tracker was never read (exit %s)" % code)
+    expect("verify-read-only", asked9 == [],
+           "verify asked a person for a credential: %s" % asked9)
+    expect("verify-can-be-clean", code == EX_OK,
+           "a healthy, fully-installed machine did not verify clean (exit %s): %s"
+           % (code, {s: r["outcome"] for s, r in ctx9.state.data["steps"].items()
+                     if r["outcome"] not in (DONE, ALREADY_DONE)}))
+    expect("verify-can-be-clean",
+           not [s for s, r in ctx9.state.data["steps"].items() if r["outcome"] == UNKNOWN],
+           "a healthy machine still carried a COULD-NOT-MEASURE row")
+    expect("verify-can-be-clean", "No drift" in printed9,
+           "verify did not say clean in its own words")
     # It must reach the LAST step, not stop at the first outstanding one.
     reached = set(ctx9.state.data["steps"])
     expect("verify-keeps-going", {s for s, _t, _f in STEPS} <= reached,
            "verify stopped early: measured %d of %d steps" % (len(reached), len(STEPS)))
+
+    # mutant: the pre-fix spelling — a `verify` that may not prompt and never
+    # looks in the env file, so the tracker is unmeasurable on EVERY machine,
+    # healthy or not, and exit 4 is the only answer it can give. It must turn
+    # the clean-verify check red.
+    cases += 1
+    ctxV, _fV, _apiV = _healthy_ctx(conf)
+    _counted(ctxV)
+    ctxV._stored_secret = lambda name: (None, "the old spelling never looked")
+    ctxV.runner.dry_run = True
+    codeV, _pV = _quiet(lambda: cmd_verify(ctxV))
+    expect("verify-can-be-clean-mutant", codeV == EX_UNKNOWN,
+           "an installer that cannot read the stored key still verified clean (exit %s) — "
+           "the clean-verify check cannot see the defect it exists to catch" % codeV)
+
+    # -- 17b. no readable key: ONE could-not row, distinct and never silent --
+    cases += 1
+    ctxS, fakeS, _apiS = _healthy_ctx(conf, stored_env=False)
+    askedS = _counted(ctxS)
+    ctxS.runner.dry_run = True
+    codeS, printedS = _quiet(lambda: cmd_verify(ctxS))
+    unknownS = [s for s, r in ctxS.state.data["steps"].items() if r["outcome"] == UNKNOWN]
+    expect("verify-one-could-not-row", unknownS == ["tracker"],
+           "a machine with no readable key reported %d COULD-NOT row(s): %s"
+           % (len(unknownS), unknownS))
+    expect("verify-one-could-not-row", askedS == [] and not fakeS.writes,
+           "verify asked for %s or wrote %s" % (askedS, fakeS.writes))
+    expect("verify-one-could-not-row", codeS == EX_UNKNOWN,
+           "could-not-measure exited %s: it is not clean (%s) and it is not drift (%s)"
+           % (codeS, EX_OK, EX_BLOCKED))
+    expect("verify-one-could-not-row", EX_UNKNOWN not in (EX_OK, EX_BLOCKED),
+           "`could not measure` shares an exit code with clean or with drift")
+    # NOT SILENT. §13: the one thing worse than a red row is a row nobody sees.
+    expect("verify-one-could-not-row", "UNKNOWN at step `tracker`" in printedS,
+           "the could-not row was not explained in the output")
+    expect("verify-one-could-not-row",
+           "/env" in printedS and "python3" in printedS,
+           "the could-not row named neither the file it would read nor the command that "
+           "fills it")
+    expect("verify-one-could-not-row", STORED_KEY not in printedS,
+           "verify printed a credential")
+
+    # -- 17c. a stored key the tracker REJECTS is not a missing key ---------
+    cases += 1
+    ctxT, _fT, _apiT = _healthy_ctx(conf, linear=FakeLinear(reject_key=True))
+    askedT = _counted(ctxT)
+    ctxT.may_prompt = False                         # as `verify` and `--dry-run` are
+    try:
+        _quiet(lambda: ctxT.linear())
+        failures.append("rejected-key-is-not-missing: a rejected stored key was accepted")
+    except SetupError as exc:
+        failures.append("rejected-key-is-not-missing: a stored key was reported the way a "
+                        "freshly typed one is, so nobody is told the file is the problem: "
+                        "%s" % str(exc)[:120])
+    except Unknown as exc:
+        expect("rejected-key-is-not-missing", "REJECTED" in exc.what,
+               "the reason did not say the key was rejected: %s" % exc.what)
+        expect("rejected-key-is-not-missing", "different fact" in exc.what,
+               "a rejected key was worded the same as a missing one: %s" % exc.what)
+    expect("rejected-key-is-not-missing", askedT == [],
+           "a command that may not prompt asked anyway: %s" % askedT)
+    # …and where asking IS allowed, it asks for a replacement, once.
+    cases += 1
+    ctxU, _fU, _apiU = _healthy_ctx(conf, linear=FakeLinear(reject_key=True))
+    askedU = _counted(ctxU)
+    goodU = FakeLinear()
+    calls = []
+
+    def _factoryU(key):
+        calls.append(key)
+        return _apiU if len(calls) == 1 else goodU
+
+    ctxU.linear_factory = _factoryU
+    try:
+        got, printedU = _quiet(lambda: ctxU.linear())
+    except (SetupError, Unknown) as exc:
+        # A battery that dies on a mutant reports nothing about the twelve
+        # cases after it. It records the failure and carries on instead.
+        got, printedU = None, ""
+        failures.append("rejected-key-is-not-missing: the replacement path raised instead "
+                        "of handing back a working client: %s" % str(exc)[:120])
+    expect("rejected-key-is-not-missing", got is goodU,
+           "the replacement key was not the one the run went on to use")
+    expect("rejected-key-is-not-missing", askedU == [conf["LINEAR_KEY_ENV"]],
+           "the replacement was requested %d times: %s" % (len(askedU), askedU))
+    expect("rejected-key-is-not-missing", "REJECTED" in printedU
+           and "not a missing one" in printedU,
+           "the owner was not told the stored key was rejected: %r" % printedU[:200])
+    expect("rejected-key-is-not-missing", STORED_KEY not in printedU,
+           "the rejection printed the credential")
+
+    # mutant: an installer that never asks the tracker whether it takes the key
+    # cannot tell a rejected one from a good one, and 17c must go red.
+    cases += 1
+    expect("rejected-key-mutant", _key_rejected(FakeLinear(reject_key=True)) is not None,
+           "the rejection probe cannot see a key the tracker refuses")
+    expect("rejected-key-mutant", _key_rejected(FakeLinear()) is None,
+           "the rejection probe calls a working key rejected")
+
+    # -- 17d. …and the replacement REACHES THE FILE -------------------------
+    # The env probe sees a complete, mode-600, correctly-owned file, because
+    # the value in it is the right length. It is also the value the tracker
+    # just refused. A credentials step that believed the probe would keep the
+    # bad key and make the NEXT run ask for a replacement all over again.
+    cases += 1
+    ctxW, fakeW, _apiW = _healthy_ctx(conf)
+    fakeW.answers = list(fakeW.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    askedW = _counted(ctxW)
+    ctxW.replaced.add(conf["LINEAR_KEY_ENV"])       # as ctx.linear() marks it
+    ok, detailW, _x = _quiet(lambda: step_credentials(ctxW, apply_it=True))[0]
+    wroteW = [w for w in fakeW.writes if "env file" in w["why"]]
+    expect("replacement-reaches-the-file", ok is False and len(wroteW) == 1,
+           "a replaced key did not rewrite the env file (%r, %d write(s))"
+           % (detailW, len(wroteW)))
+    expect("replacement-reaches-the-file", askedW == [],
+           "the rewrite asked for a value it already held: %s" % askedW)
+    expect("replacement-reaches-the-file", wroteW and wroteW[0]["stdin"] == "<hidden>",
+           "the rewrite recorded the credential in the ledger")
+    # …and a dry run names the rewrite without making it.
+    cases += 1
+    ctxX, fakeX, _apiX = _healthy_ctx(conf)
+    ctxX.replaced.add(conf["LINEAR_KEY_ENV"])
+    okX, detailX, _x = _quiet(lambda: step_credentials(ctxX, apply_it=False))[0]
+    expect("replacement-reaches-the-file",
+           okX is False and "replacement" in detailX and not fakeX.writes,
+           "a dry run over a replaced key said %r and wrote %s" % (detailX, fakeX.writes))
+    # mutant: without the `replaced` term the probe wins and nothing is written.
+    cases += 1
+    ctxY, fakeY, _apiY = _healthy_ctx(conf)
+    okY, _dY, _x = _quiet(lambda: step_credentials(ctxY, apply_it=True))[0]
+    expect("replacement-reaches-the-file-mutant", okY is True and not fakeY.writes,
+           "the same fixture WITHOUT a replacement already rewrites the file, so the "
+           "check above cannot see a step that ignores `ctx.replaced`")
 
     # -- 17. `status` names what is next and exits on the worst row ---------
     cases += 1
@@ -3069,6 +3636,11 @@ def _settled_ctx(conf):
         ("launchctl print system/com.example.dispatcher", 0, "\tstate = running\n"),
         ("workspace_base_dirs", 0, json.dumps(ctx.dispatcher)),
         ("stat -f", 9, ""),                     # the env probe's own "no file"
+        # …and the same "no file" for the one-value read, so this fixture's
+        # credentials are ABSENT rather than unreadable. Two names, two needles:
+        # the value reader leads with `n=<NAME>`.
+        ("n=" + conf["LINEAR_KEY_ENV"], 9, ""),
+        ("n=" + conf["GITHUB_TOKEN_ENV"], 9, ""),
         ("scan --dry-run", 0, "resolved workspace ws-1\nwould open 0 review ticket(s)\n"),
         ("decide --dry-run", 0, "checks_source: config\nnothing to bounce\n"),
     ]
@@ -3076,10 +3648,89 @@ def _settled_ctx(conf):
     return ctx, fake
 
 
-def _unsettled_ctx(conf, linear=None):
-    """A settled machine whose TRACKER is empty and whose dispatcher config
-    carries no reviews entry — the state in which `run` has the most to do, and
-    therefore the state a dry run has the most chance to change by accident."""
+# A credential-shaped fixture value, assembled rather than spelled: a whole
+# token-shaped literal in a tracked file is what `npm run lint:secrets` exists
+# to stop. Long enough to pass the 20-character floor, and recognisable to
+# `secret_shape` as a tracker personal API key.
+STORED_KEY = "lin_" + "api_" + "STOREDSELFTESTKEYNOTREAL0123456789"
+STORED_TOKEN = "ghp_" + "STOREDSELFTESTTOKENNOTREAL0123456789"
+
+
+def _with_stored_env(ctx, fake, conf, key=None, token=None):
+    """Put a mode-600 env file, holding both names, in front of the fixture —
+    the state a machine is in AFTER the credentials step has run once. This is
+    what makes a re-run, a dry run and `verify` able to read the tracker key
+    instead of asking for it."""
+    key = STORED_KEY if key is None else key
+    token = STORED_TOKEN if token is None else token
+    keep = [a for a in fake.answers
+            if a[0] not in ("stat -f", "n=" + conf["LINEAR_KEY_ENV"],
+                            "n=" + conf["GITHUB_TOKEN_ENV"])]
+    keep += [
+        ("stat -f", 0, "mode=600 owner=%s\nname=%s len=%d\nname=%s len=%d\n"
+         % (conf["ROLE_ACCOUNT"], conf["LINEAR_KEY_ENV"], len(key),
+            conf["GITHUB_TOKEN_ENV"], len(token))),
+        ("n=" + conf["LINEAR_KEY_ENV"], 0, key),
+        ("n=" + conf["GITHUB_TOKEN_ENV"], 0, token),
+    ]
+    fake.answers = keep
+    return ctx, fake
+
+
+def _healthy_ctx(conf, linear=None, stored_env=True):
+    """A machine on which EVERY step holds: the clone, the tracker, the env
+    file, both configs, the entry and its proof, both plists, both dry runs
+    signed off, both daemons loaded with heartbeats, and the handover signed.
+
+    This is the fixture `verify` must be able to call clean. Before the fix
+    there was no such fixture, because there was no such outcome."""
+    ctx, fake = _settled_ctx(conf)
+    api = linear if linear is not None else FakeLinear(
+        teams=[{"id": "t1", "key": "REV", "name": "Reviews",
+                "states": [{"id": "s-%s" % n, "name": n, "type": t}
+                           for n, t in REQUIRED_STATES],
+                "automations": []}],
+        labels=[{"id": "l1", "name": "haiku", "team": None}],
+        users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
+               {"id": "u-owner", "email": "owner@example.com", "active": True}],
+        members=[{"id": "u-agent", "displayName": "dispatcher-agent"}])
+    ctx.linear_factory = lambda key: api
+    poller_label, bounce_label = daemon_labels(conf)
+    fake.answers = list(fake.answers) + [
+        ("ls $HOME/.stage-e/kit/scripts", 0, "\n".join(REQUIRED_SCRIPTS) + "\n"),
+        ("rev-parse --short HEAD", 0, "abc1234\n"),
+        ("launchctl print system/" + poller_label, 0, "\tstate = not running\n"),
+        ("launchctl print system/" + bounce_label, 0, "\tstate = not running\n"),
+        ("heartbeat.json", 0, "heartbeat.json ok\nbounce-heartbeat.json ok\n"),
+    ]
+    # The dispatcher already carries a matching reviews entry, and its load was
+    # proven once, so nothing here bounces a live dispatcher to re-learn it.
+    already = dict(reviews_entry(ctx))
+    already["allowedUsers"] = already.pop("userAccessControl")["allowedUsers"]
+    ctx.dispatcher["entries"].append(already)
+    # …and preflight re-reads the dispatcher's config into ctx.dispatcher, so
+    # the fixture's answer has to carry the entry too. A snapshot taken before
+    # the append would be silently undone by the first step of every pass.
+    fake.answers = [a for a in fake.answers if a[0] != "workspace_base_dirs"] + [
+        ("workspace_base_dirs", 0, json.dumps(ctx.dispatcher))]
+    ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = "loaded repository reviews"
+    if stored_env:
+        _with_stored_env(ctx, fake, conf)
+    ctx.state.attest("A-DRY-RUN", "xx", "count read: 0")
+    ctx.state.attest("A-FIRST-TICKET", "xx")
+    return ctx, fake, api
+
+
+def _unsettled_ctx(conf, linear=None, stored_env=True):
+    """A machine whose credentials are in place but whose TRACKER is empty and
+    whose dispatcher config carries no reviews entry — the state in which `run`
+    has the most to do, and therefore the state a dry run has the most chance
+    to change by accident.
+
+    The env file is there by default because that is the interesting case: a
+    dry run that CAN reach the tracker and still creates nothing. Pass
+    `stored_env=False` for the other one — no key anywhere, nothing to ask,
+    and a tracker row that must say so."""
     ctx, fake = _settled_ctx(conf)
     api = linear if linear is not None else FakeLinear(
         users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
@@ -3088,6 +3739,8 @@ def _unsettled_ctx(conf, linear=None):
     ctx.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx.secret_reader = lambda prompt: "ghp_" + "s" * 36
     ctx.tty = True
+    if stored_env:
+        _with_stored_env(ctx, fake, conf)
     return ctx, fake, api
 
 
