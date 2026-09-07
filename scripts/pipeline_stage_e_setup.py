@@ -2754,8 +2754,14 @@ def cmd_verify(ctx):
     demanded a prompt it was forbidden to make — is a §13 signal that gets
     normalised into noise, and then the one run that means it is ignored too.
     """
-    say("Stage E verify — read-only drift check. Nothing is changed, and nothing is asked;")
-    say("the tracker key is read from %s/env as %s." % (ctx.stage_home, ctx.account))
+    # "NOTHING IS ASKED" IS NOT THE CLAIM THIS COMMAND CAN MAKE. `verify` is in
+    # PRIVILEGED_COMMANDS, so main() has already called `acquire_privilege` by
+    # the time this prints — the login-password box may have appeared directly
+    # above this banner. What is true is the narrower thing: no CREDENTIAL is
+    # ever asked for here, because the tracker key is read, never prompted.
+    say("Stage E verify — read-only drift check. Nothing is changed, and no credential is")
+    say("ever asked for; your login password may be, once, to re-measure as root.")
+    say("The tracker key is read from %s/env as %s." % (ctx.stage_home, ctx.account))
     _agent_credential_notice()
     ctx.may_prompt = False
     code, rows = run_steps(ctx, apply_it=False, keep_going=True)

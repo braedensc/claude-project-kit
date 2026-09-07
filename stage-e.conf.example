@@ -81,7 +81,10 @@ DISPATCHER_CONFIG=/opt/example-dispatch/config.json
 # The clone URL the two daemons exec out of.  The installer clones it under the
 # role account at `~/.stage-e/kit`, SEPARATE from whatever clone the dispatcher
 # cuts worktrees from, so a fetch never moves code under a running pass.  It
-# also refreshes it on later runs, with both jobs unloaded.
+# touches that clone again only when one of the scripts the daemons exec has
+# gone missing from it — then, with both jobs unloaded, it fast-forwards
+# (`fetch` + `pull --ff-only`).  A run that finds every script present leaves
+# the clone alone, so later runs do NOT update it for you.
 #
 # RULE: an https git URL.  Not a path, not ssh — the role account has no keys.
 KIT_REPO_URL=https://github.com/example-org/claude-project-kit

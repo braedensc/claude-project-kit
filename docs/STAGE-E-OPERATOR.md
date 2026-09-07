@@ -44,7 +44,7 @@ checks your work and carries on. It never asks you to type `y`.
 | `run` | do everything possible, in order, idempotently; stop at the first card |
 | `run --dry-run` | the same pass with apply **off**: names what would change, changes nothing — not a file, not a daemon, not one tracker object |
 | `status` | where the install got to, what blocks it, and the one command that clears it |
-| `verify` | read-only drift check — measures every step, changes nothing, asks nothing, and on a healthy machine exits 0 |
+| `verify` | read-only drift check — measures every step, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
 | `card CK-3` | print any checkpoint card in full, at any time |
 | `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
 
