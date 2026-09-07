@@ -162,6 +162,7 @@ npm run test:lifecycle  # platform observer selftest (§4, §10)
 npm run test:dashboard  # dashboard selftest (self-contained page, one summary object)
 npm run test:review     # /weekly-review's three limits (no self-raised budgets/graders)
 npm run test:review-local    # Stage E local reviewer: comment-only, decline ≠ clean (§13, §14)
+npm run test:review-poller   # Stage E poller selftest (sanitizer, decline paths, comment-only)
 npm run test:jsonschema # vendored JSON Schema validator selftest
 npm run test:schemas    # schema ⇄ contract parity selftest
 npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selftest
