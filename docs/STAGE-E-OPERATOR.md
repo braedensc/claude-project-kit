@@ -41,29 +41,38 @@ checks your work and carries on. It never asks you to type `y`.
 
 | Command | What it is |
 |---|---|
-| `run [--dry-run]` | do everything possible, in order, idempotently; stop at the first card |
+| `run` | do everything possible, in order, idempotently; stop at the first card |
+| `run --dry-run` | the same pass with apply **off**: names what would change, changes nothing — not a file, not a daemon, not one tracker object |
 | `status` | where the install got to, what blocks it, and the one command that clears it |
 | `verify` | read-only drift check — measures every step, changes nothing, asks nothing |
 | `card CK-3` | print any checkpoint card in full, at any time |
 | `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
 
-**Seven cards exist and four are usual:** merge the pull requests that carry Stage E
+**Seven cards exist and three are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
-installer checks and prints, and has no code path to either); turn the Reviews team's
-code-host automations off (`CK-3` — a dashboard toggle no API here could read, so it is
-reported UNKNOWN rather than assumed off); read the dry-run count before anything is
-switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and only you know
-whether that number is the one you meant); and watch one real ticket become a reviewed pull
-request (`CK-7`). The other three appear only when the automated path could not do the
-work: no terminal to paste a credential at (`CK-2`), an API that would not add the agent to
-the team (`CK-4`), and a code host that would not name a repository's required checks
-(`CK-6`). You also paste each secret at a hidden prompt during the run — that is not a
-card, it is one keystroke sequence inside one step.
+installer checks and prints, and has no code path to either); read the dry-run count before
+anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
+only you know whether that number is the one you meant); and watch one real ticket become a
+reviewed pull request (`CK-7`). The other four appear only when the automated path could
+not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
+the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
+(`CK-4`), and a code host that would not name a repository's required checks (`CK-6`). You
+also paste each secret at a hidden prompt during the run — that is not a card, it is one
+keystroke sequence inside one step.
+
+**The git automations are read, not assumed.** They are `Team.gitAutomationStates` in
+Linear's API — the same five rules as *Team settings → Issue statuses and automations → git
+automations* — so the installer reads them and deletes every rule that would move a ticket,
+then re-reads to confirm. `Team.parent` is read the same way, so a Reviews team nested under
+another is refused by name rather than left to you to notice. `CK-3` is what a workspace
+whose API will not answer falls back to; it is not the normal path.
 
 **The sections below stay the reference** for what each step does and why each absent key
 is absent. Read them when a card blocks you, when you want to know what the installer just
-wrote, or when you are changing it. The installer refuses to run under a model at all; a
-session that installs its own supervision is exactly what that refusal exists to prevent.
+wrote, or when you are changing it. `run` refuses to do anything under a model — a session
+that installs its own supervision is exactly what that refusal exists to prevent. Only
+`run --dry-run`, `verify`, `status` and `card` stay available there, and each of them
+measures without applying.
 
 ---
 
@@ -147,14 +156,21 @@ working tree, and warns when one sits outside the account's home.
 
 ## Step 1 — Linear: a Reviews team with automations off
 
+**The installer does all four of these** (`step_tracker`). They are here as the reference
+for what it did, and for a workspace whose API declines one of them.
+
 1. Create a team named **Reviews**. Any key works; you route on it (`REV` below).
-2. **Turn off** every GitHub and PR automation for that team: no state change on PR
-   open, on merge, or on branch push. A review ticket must never link to the PR and never
-   move because of it.
+2. **Turn off** every git automation for that team: no state change when a PR opens, when a
+   review is requested, or when one merges. A review ticket must never move because a pull
+   request moved. These are `Team.gitAutomationStates` — one rule per Git event, a null
+   `state` meaning "fire and do nothing" — so the installer reads them, deletes every rule
+   that carries a state, and re-reads to confirm none survived. It never reports them off
+   without looking: a workspace whose API will not answer raises `CK-3` instead.
 3. Make sure a cheap-model label exists in the workspace. The dispatcher picks the model
    from a ticket label (`haiku`, `sonnet`, `opus`, `fable`).
 4. Do **not** make Reviews a sub-team of anything, and never parent a review ticket. A
-   sub-issue is based on its parent's branch.
+   sub-issue is based on its parent's branch. `Team.parent` is read, and a nested Reviews
+   team stops the run by name.
 
 Write down both spellings of the same three facts. **The poller takes names; the bounce
 driver takes ids.**
@@ -215,8 +231,18 @@ removes every tool that could act.
 | `model` | The poller picks the model with a ticket label; a fixed model here would fight it. |
 | `mcp__linear…` in `disallowedTools` | **Owner decision 2026-09-06:** the Linear MCP tools stay available to every session, the reviewer included. Accepted and monitored. Add them here if that changes. |
 
-Then **restart the dispatcher**. Do not rely on hot reload for a new entry. Confirm in its
-log that the `reviews` entry loaded and that the runner reports nine disallowed tools.
+Then **restart the dispatcher**, once, *because the file changed*. Do not rely on hot
+reload for a new entry. Confirm in its log that the `reviews` entry loaded and that the
+runner reports nine disallowed tools.
+
+The installer restarts it on exactly that condition: a pass that finds the entry already
+byte-identical does **not** bounce the service, because a restart kills every in-flight
+coding session and you are told to re-run the same command to clear the cards downstream of
+here. Whether the entry matches and whether its load has been proven are recorded
+separately, so a re-run re-reads the log without re-starting anything. If the log names it
+nowhere, the run reports `UNKNOWN` and prints the restart-and-re-read commands; signing off
+`A-ENTRY-LOADED` is the other way out, and watching `CK-7` is a third — slower, because it
+is downstream of this step.
 
 Multi-repo: routing is by team key and one entry has one `repositoryPath`, so each managed
 repo gets its own Reviews team key and its own entry. Start with one.
@@ -412,6 +438,12 @@ prints this and lists every key it accepts:
   reports *CANNOT EVALUATE*, comments on the PR and exits 2 — until you add the entry or
   grant the token *Administration: read*. A repository with an entry can never reach
   unknown.
+- **The installer writes that entry for you**, with YOUR `gh` login rather than the
+  daemon's token: it reads classic protection first, falls back to the branch's effective
+  ruleset rules (`repos/OWNER/NAME/rules/branches/BRANCH`, which needs no administration
+  read), and takes the contexts out of every `required_status_checks` rule it finds. It
+  raises `CK-6` only when neither shape answers, and it never writes an empty set — an
+  empty set means *requires nothing*, which is the one answer that must never be guessed.
 - `in_flight_hours` is a per-head cooldown, default 6. After a bounce is sent, the driver
   waits that long before bouncing the same PR head again, so a session that has not yet
   pushed is not re-prompted.

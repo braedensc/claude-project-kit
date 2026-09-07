@@ -97,7 +97,9 @@ KIT_REPO_URL=https://github.com/example-org/claude-project-kit
 # branch, and a review must never share a branch with the code it judges.
 #
 # The installer creates this team if it is absent, adds the workflow states,
-# and never deletes anything.
+# reads its git automations and turns off every rule that would move a review
+# ticket, and refuses outright if the team turns out to be nested.  The one
+# thing it never deletes is your work: no team, state, label or ticket.
 #
 # RULE: 1–5 upper-case letters or digits.  It becomes a branch prefix, so it
 # must not collide with a team key you already dispatch work to.

@@ -15,7 +15,9 @@ dispatcher's own config, and two system LaunchDaemons running one-shot passes.
 
 SUBCOMMANDS
 
-    run [--dry-run]        do everything possible; stop at the first card
+    run                    do everything possible; stop at the first card
+    run --dry-run          the same pass with apply OFF: measures, names what
+                           would change, and changes nothing anywhere
     status                 where the install got to, what blocks it, and THE ONE
                            COMMAND that clears it
     verify                 read-only drift check: re-measures every step against
@@ -49,6 +51,11 @@ WHAT IT REFUSES
     constant is IMPORTED from there, never copied, so the two can never drift.
     A session that installs its own supervision is the attack the refusal
     exists to prevent.  `verify`, `status`, `card` and `--dry-run` still run.
+    `--dry-run` is exempt because it MEASURES ONLY: it runs every step with
+    apply off, so no file, no daemon and no tracker object is touched, and it
+    is never handed a credential prompt.  That is a property of the code path,
+    not a promise in a banner — the old spelling passed apply=True and really
+    created the team.
   * MERGING, APPROVING, LABELLING.  There is no code path to any of them.  The
     installer CHECKS whether the pull requests are merged and PRINTS the exact
     commands for a person.  `--selftest` asserts the banned tokens are absent
@@ -480,9 +487,21 @@ def _fmt(argv):
 # The tracker transport.  One real, one fake; both answer post(query, vars).
 # --------------------------------------------------------------------------- #
 Q_TEAM_BY_KEY = ("query FindTeamByKey($filter: TeamFilter!) "
-                 "{ teams(filter: $filter, first: 10) { nodes { id key name } } }")
+                 "{ teams(filter: $filter, first: 10) "
+                 "{ nodes { id key name parent { id key name } } } }")
 Q_TEAM_STATES = ("query TeamStates($id: String!) { team(id: $id) "
                  "{ id key name states(first: 100) { nodes { id name type } } } }")
+# The git automations, READ rather than assumed. `Team.gitAutomationStates` is
+# the API behind the dashboard's "git automations": one rule per Git event
+# (draft|start|review|mergeable|merge), `state` naming the workflow state a
+# linked issue is moved into, and a null `state` meaning the rule fires and
+# does nothing. A rule with a non-null state is a rule that would move a review
+# ticket, which is the thing that must not happen.
+Q_TEAM_AUTOMATIONS = ("query TeamGitAutomations($id: String!) { team(id: $id) "
+                      "{ gitAutomationStates(first: 100) { nodes { id event "
+                      "state { id name } targetBranch { id branchPattern } } } } }")
+M_AUTOMATION_DELETE = ("mutation GitAutomationDelete($id: String!) "
+                       "{ gitAutomationStateDelete(id: $id) { success } }")
 Q_LABELS = ("query FindLabel($filter: IssueLabelFilter!) "
             "{ issueLabels(filter: $filter, first: 10) { nodes { id name team { id } } } }")
 Q_AGENT_USER = ("query FindAgentUser($filter: UserFilter!) "
@@ -498,6 +517,16 @@ M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
 M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
                    "{ teamMembershipCreate(input: $input) { success } }")
+
+
+def mutation_ok(data, field):
+    """False when the payload said `success: false`.
+
+    A mutation can answer HTTP 200 with no GraphQL error and `success: false`,
+    which is the shape that turns an assumed success into a reported one. This
+    is the cheap half of the check; every mutation here is ALSO read back."""
+    payload = (data or {}).get(field)
+    return not (isinstance(payload, dict) and payload.get("success") is False)
 
 
 class _NoRedirect(object):
@@ -634,25 +663,28 @@ CARDS = {
         "attest": None,
     },
     "CK-3": {
-        "title": "Turn every code-host automation OFF for the Reviews team",
-        "why": ("A review ticket must never link to a pull request and never move because "
-                "one moved: an automation that closes a review when its PR merges destroys "
-                "the record the poller reads back. These toggles live in the tracker's own "
-                "dashboard and this installer could not read them through the API — so it "
-                "reports UNKNOWN rather than telling you they are off. \"I could not look\" "
-                "is a different answer from \"there was nothing to look at\"."),
-        "do": ["In the tracker: Team settings -> Integrations -> your code host.",
-               "Turn OFF, for the Reviews team only:",
-               "  - state change when a pull request opens",
-               "  - state change when a pull request merges",
-               "  - state change on branch push",
-               "While you are there, confirm the Reviews team is not a SUB-TEAM of anything:",
-               "a sub-issue is based on its parent's branch, and a review must never share a",
-               "branch with the code it judges.",
-               "Then sign it off — nothing here can see a dashboard toggle:",
+        "title": "Turn the Reviews team's git automations off by hand",
+        "why": ("A review ticket must never move because a pull request moved: an "
+                "automation that closes a review when its PR merges destroys the record "
+                "the poller reads back. THIS IS NORMALLY AUTOMATIC — the rules are "
+                "`Team.gitAutomationStates` in the tracker's API, and the installer reads "
+                "them and deletes every rule that would move a ticket. You are seeing this "
+                "card because that read did not answer on this workspace, or because a "
+                "rule survived the delete. Nothing here knows what those rules are now, "
+                "and \"I could not look\" is a different answer from \"there was nothing "
+                "to look at\"."),
+        "do": ["In the tracker: Team settings -> Issue statuses and automations ->",
+               "git automations, for the Reviews team ONLY.",
+               "Set every one of the five to no action:",
+               "  - branch created / draft pull request opened",
+               "  - pull request opened",
+               "  - review requested",
+               "  - pull request ready to merge",
+               "  - pull request merged",
+               "Then sign it off — this run could not read them for you:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-AUTOMATIONS "
                "--initials xx"],
-        "good": "the review ticket shows no PR link and stays put when you merge",
+        "good": "the review ticket stays put when its pull request opens and when it merges",
         "attest": "A-AUTOMATIONS",
     },
     "CK-4": {
@@ -689,13 +721,15 @@ CARDS = {
         "why": ("The bounce driver must know which CI contexts are required. The daemon's "
                 "token deliberately has no administration permission, so its own read of "
                 "that endpoint returns 403 — and the driver refuses to read a 403 as "
-                "\"requires nothing\". This installer tried YOUR login instead and still "
-                "could not get an answer, so it will not invent an empty set."),
-        "do": ["Read the contexts yourself, per repository:",
+                "\"requires nothing\". This installer tried YOUR login against BOTH shapes "
+                "a repository can use — classic branch protection and the effective "
+                "ruleset rules — and neither answered, so it will not invent an empty "
+                "set."),
+        "do": ["Read the contexts yourself, per repository. Branch protection:",
                "    gh api repos/<OWNER>/<NAME>/branches/<BRANCH>/protection/"
                "required_status_checks --jq .contexts",
-               "If that 404s, the repository uses rulesets:",
-               "    gh api repos/<OWNER>/<NAME>/rulesets",
+               "…or, if the repository uses rulesets, the rules in force on that branch:",
+               "    gh api repos/<OWNER>/<NAME>/rules/branches/<BRANCH>",
                "Put the exact context names into the driver's config, under",
                "`required_checks`, keyed by OWNER/NAME. An entry REPLACES the set the",
                "driver would read from the code host; it never subtracts from it.",
@@ -729,7 +763,8 @@ CARDS = {
 }
 
 ATTESTATIONS = {
-    "A-AUTOMATIONS": "the Reviews team's code-host automations are off (CK-3)",
+    "A-AUTOMATIONS": ("the Reviews team's git automations are off — the fallback for a "
+                      "workspace whose API would not name them (CK-3)"),
     "A-DRY-RUN": "the dry-run count is the number you meant (CK-5)",
     "A-FIRST-TICKET": "one real ticket ran end to end and was reviewed (CK-7)",
     "A-ENTRY-LOADED": ("the dispatcher really loaded the reviews entry — the behavioural "
@@ -816,6 +851,9 @@ class Ctx(object):
         self._linear = None
         self.role_home = None
         self.dispatcher = {}     # facts read out of the dispatcher's own config
+        # Daemons this run stopped and has not started again. A run that ends
+        # early with these set has switched the review loop OFF, and must say so.
+        self.unloaded = []
 
     @property
     def account(self):
@@ -972,6 +1010,12 @@ def step_code(ctx, apply_it):
         # only the second matters.
         r.as_root(["launchctl", "bootout", "system/" + label],
                   why="unload %s before the clone moves under it" % label)
+    if not r.dry_run:
+        # Loading them again is the `enable` step, which is several checkpoints
+        # downstream. If this run stops before it, the review and bounce loops
+        # are OFF and the only thing that says so is the notice cmd_run prints
+        # off this list.
+        ctx.unloaded = [poller_label, bounce_label]
 
     if head.ok and head.out.strip():
         res = r.as_role(ctx.account,
@@ -1014,7 +1058,7 @@ def step_tracker(ctx, apply_it):
         return ((d.get("teams") or {}).get("nodes")) or []
 
     found = teams()
-    created = []
+    created, changed = [], []
     if not found:
         if not apply_it:
             return False, "the Reviews team %s does not exist yet" % key, []
@@ -1029,15 +1073,50 @@ def step_tracker(ctx, apply_it):
     team = found[0]
     ids["reviews_team_id"] = team["id"]
 
+    # A SUB-TEAM is fatal, and it is machine-readable — `Team.parent` — so it is
+    # read rather than left on a card. A sub-issue is based on its parent's
+    # branch, and a review must never share a branch with the code it judges.
+    parent = team.get("parent") or {}
+    if parent.get("id"):
+        raise SetupError(
+            "team %s is a SUB-TEAM of %s. A sub-issue is based on its parent's branch, so "
+            "a review ticket in a nested team would share a branch with the code it is "
+            "judging. Move %s to the top level, or point REVIEWS_TEAM_KEY at a team that "
+            "is not nested." % (key, parent.get("key") or parent.get("name") or parent["id"],
+                                key))
+
     d = api.post(Q_TEAM_STATES, {"id": team["id"]})
     states = (((d.get("team") or {}).get("states") or {}).get("nodes")) or []
     have_states = {s["name"].lower() for s in states}
     want_states = [(n, t) for n, t in REQUIRED_STATES if n.lower() not in have_states]
-    if want_states and apply_it:
+    if want_states:
+        if not apply_it:
+            return False, "team %s is missing workflow state(s): %s" % (
+                key, ", ".join(n for n, _t in want_states)), []
+        refused = []
         for name, stype in want_states:
-            api.post(M_STATE_CREATE, {"input": {"teamId": team["id"], "name": name,
-                                                "type": stype, "color": STATE_COLOR}})
+            res = api.post(M_STATE_CREATE, {"input": {"teamId": team["id"], "name": name,
+                                                      "type": stype, "color": STATE_COLOR}})
+            if not mutation_ok(res, "workflowStateCreate"):
+                refused.append(name)
             created.append("state %s" % name)
+        # READ BACK. This was the one mutation here nothing re-queried, so a
+        # create that answered `success: false` with no GraphQL error was
+        # reported as a state that exists. It self-heals next run — and the run
+        # that failed said it succeeded, which is the one signal that would
+        # bring anyone to look.
+        d = api.post(Q_TEAM_STATES, {"id": team["id"]})
+        states = (((d.get("team") or {}).get("states") or {}).get("nodes")) or []
+        have_states = {s["name"].lower() for s in states}
+        absent = [n for n, _t in REQUIRED_STATES if n.lower() not in have_states]
+        if absent:
+            why = ""
+            if refused:
+                why = " (the create itself answered success:false for %s)" % ", ".join(refused)
+            raise SetupError(
+                "these workflow states are not in team %s on a re-read after creating "
+                "them: %s%s. Nothing here reports a create it could not see."
+                % (key, ", ".join(absent), why))
         want_states = []
 
     d = api.post(Q_LABELS, {"filter": {"name": {"eq": conf["MODEL_LABEL"]}}})
@@ -1104,17 +1183,68 @@ def step_tracker(ctx, apply_it):
                                   "is not a member of")
 
     st.data["ids"] = ids
-    # The automations live in a dashboard. Nothing was read, so nothing is
-    # claimed: UNKNOWN blocks until a person signs it off.
-    if not st.attested("A-AUTOMATIONS"):
-        raise Blocked("CK-3", "the code-host automations for team %s could not be read "
-                              "through the API" % key)
 
-    detail = "team %s=%s, agent=%s, label=%s, owner=%s" % (
-        key, team["id"], ids["agent_user_id"], ids["model_label_id"], ids["owner_user_id"])
-    if created:
-        return False, detail + "; created " + ", ".join(created), []
+    live, why_not = git_automations(api, team["id"])
+    if live is None:
+        # The API on THIS workspace would not name them. That is UNKNOWN, not
+        # off, so the card is still there — as the fallback it always should
+        # have been, not as the unconditional path.
+        if not st.attested("A-AUTOMATIONS"):
+            raise Blocked("CK-3", "the git automations for team %s could not be read "
+                                  "through the API (%s)" % (key, (why_not or "")[:110]))
+        automations = "git automations signed off by hand (the API would not name them)"
+    elif live:
+        events = ", ".join(sorted(str(rule.get("event") or "?") for rule in live))
+        if not apply_it:
+            return False, "team %s has %d live git automation(s) (%s) that would move a " \
+                          "review ticket" % (key, len(live), events), []
+        for rule in live:
+            res = api.post(M_AUTOMATION_DELETE, {"id": rule["id"]})
+            if not mutation_ok(res, "gitAutomationStateDelete"):
+                warn("the tracker declined to delete the %r git automation on team %s"
+                     % (rule.get("event"), key))
+        still, why_not = git_automations(api, team["id"])
+        if still is None:
+            raise Unknown("the git automations for team %s could not be re-read after "
+                          "turning them off (%s)" % (key, (why_not or "")[:110]),
+                          "run the same command again; a read that failed once is not a "
+                          "rule that is off")
+        if still:
+            raise Blocked("CK-3", "these git automations survived the delete: %s"
+                          % ", ".join(sorted(str(r.get("event") or "?") for r in still)))
+        changed.append("turned off %d git automation(s) (%s)" % (len(live), events))
+        automations = "no git automation moves a %s ticket" % key
+    else:
+        automations = "no git automation moves a %s ticket" % key
+
+    detail = "team %s=%s, agent=%s, label=%s, owner=%s; %s" % (
+        key, team["id"], ids["agent_user_id"], ids["model_label_id"], ids["owner_user_id"],
+        automations)
+    parts = (["created " + ", ".join(created)] if created else []) + changed
+    if parts:
+        return False, detail + "; " + "; ".join(parts), []
     return True, detail + "; nothing to create", []
+
+
+def git_automations(api, team_id):
+    """(rules-that-would-move-a-ticket, None), or (None, why-it-could-not-be-read).
+
+    A rule whose `state` is null fires and does nothing; it is left alone,
+    because deleting an explicit "take no action" override would change the
+    board for no gain. Only a rule with a state is a rule that moves a ticket.
+
+    A workspace whose API does not expose the field answers with a GraphQL
+    error, which arrives here as SetupError. That is UNKNOWN — the caller falls
+    back to the checkpoint card — and never "there is nothing to turn off"."""
+    try:
+        d = api.post(Q_TEAM_AUTOMATIONS, {"id": team_id})
+    except SetupError as exc:
+        return None, str(exc)
+    team = (d or {}).get("team")
+    if not isinstance(team, dict) or not isinstance(team.get("gitAutomationStates"), dict):
+        return None, "the answer carried no gitAutomationStates object"
+    nodes = (team["gitAutomationStates"].get("nodes")) or []
+    return [r for r in nodes if (r.get("state") or {}).get("id")], None
 
 
 # The env file, measured without reading it. It prints the mode, the owner, and
@@ -1394,28 +1524,65 @@ def _required_checks(ctx):
         head = r.read(["gh", "api", "repos/%s" % repo, "--jq", ".default_branch"])
         if head.ok and head.out.strip():
             branch = head.out.strip()
-        got = r.read(["gh", "api",
-                      "repos/%s/branches/%s/protection/required_status_checks" % (repo, branch),
-                      "--jq", ".contexts"])
-        contexts = None
-        if got.ok:
-            try:
-                contexts = json.loads(got.out or "[]")
-            except ValueError:
-                contexts = None
+        contexts, why = _contexts_from_protection(r, repo, branch)
         if contexts is None:
-            rs = r.read(["gh", "api", "repos/%s/rulesets" % repo])
-            if rs.ok and (rs.out or "").strip() not in ("", "[]"):
-                unreadable.append("%s (rulesets present; read the contexts by hand)" % repo)
+            # RULESETS ARE THE OTHER WAY a repository requires a check, and
+            # `rules/branches/<b>` answers the effective set for both shapes
+            # without the administration permission `…/protection/…` demands.
+            # Reading it is the difference between a config row this installer
+            # writes and a card the owner fills in by hand.
+            contexts, why2 = _contexts_from_rules(r, repo, branch)
+            if contexts is None:
+                unreadable.append("%s (branch protection: %s; rules: %s)"
+                                  % (repo, why, why2))
                 continue
-            unreadable.append("%s (%s)" % (repo, (got.err or "no answer").strip()[:80]))
-            continue
         if not contexts:
-            unreadable.append("%s (the code host named no required context — an empty set "
-                              "is exactly what must not be guessed)" % repo)
+            unreadable.append("%s (neither branch protection nor a ruleset named one "
+                              "required context on %s — an empty set is exactly what must "
+                              "not be guessed)" % (repo, branch))
             continue
-        checks[repo] = sorted(contexts)
+        checks[repo] = sorted(set(contexts))
     return checks, unreadable
+
+
+def _contexts_from_protection(r, repo, branch):
+    """(contexts, None) or (None, why). The classic branch-protection shape."""
+    got = r.read(["gh", "api",
+                  "repos/%s/branches/%s/protection/required_status_checks" % (repo, branch),
+                  "--jq", ".contexts"])
+    if not got.ok:
+        return None, (got.err or "no answer").strip()[:80]
+    try:
+        parsed = json.loads(got.out or "[]")
+    except ValueError:
+        return None, "the answer was not JSON"
+    return (parsed if isinstance(parsed, list) else None), "the answer was not a list"
+
+
+def _contexts_from_rules(r, repo, branch):
+    """(contexts, None) or (None, why). The rulesets shape, read through the
+    EFFECTIVE-rules endpoint: one flat array of the rules that actually apply to
+    that branch, from every ruleset at once, so nothing has to be assembled by
+    hand or by id."""
+    got = r.read(["gh", "api", "repos/%s/rules/branches/%s" % (repo, branch)])
+    if not got.ok:
+        return None, (got.err or "no answer").strip()[:80]
+    try:
+        rules = json.loads(got.out or "[]")
+    except ValueError:
+        return None, "the answer was not JSON"
+    if not isinstance(rules, list):
+        return None, "the answer was not a list of rules"
+    contexts = []
+    for rule in rules:
+        if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+            continue
+        params = rule.get("parameters") or {}
+        for check in (params.get("required_status_checks") or []):
+            name = (check or {}).get("context")
+            if name:
+                contexts.append(name)
+    return contexts, None
 
 
 def reviews_entry(ctx):
@@ -1470,11 +1637,19 @@ def step_dispatcher_entry(ctx, apply_it):
                   "disallowedTools", "appendInstruction")) and (
         (have.get("allowedUsers") or []) == want["userAccessControl"]["allowedUsers"])
 
-    if same and ctx.state.outcome("dispatcher-entry") in (DONE, ALREADY_DONE):
-        return True, "the reviews entry is present and matches, and its load was proven", []
+    # The banner proof is recorded SEPARATELY from "the entry matches". They are
+    # different facts, and folding them into one ledger row is what made a
+    # re-run bounce a live dispatcher to re-learn something it already knew.
+    proof = (ctx.state.data.get("notes") or {}).get(ENTRY_PROOF_NOTE)
+    if same and (proof or ctx.state.attested("A-ENTRY-LOADED")):
+        return True, "the reviews entry is present and matches, and its load was proven " \
+                     "(%s)" % (proof or "signed off by hand"), []
     if not apply_it:
-        return False, ("the reviews entry is absent" if not have
-                       else "the reviews entry differs from what this conf produces"), []
+        if not have:
+            return False, "the reviews entry is absent", []
+        if not same:
+            return False, "the reviews entry differs from what this conf produces", []
+        return False, "the reviews entry matches; its load has not been proven yet", []
 
     if not same:
         body = json.dumps(want, indent=2, sort_keys=True) + "\n"
@@ -1497,32 +1672,58 @@ def step_dispatcher_entry(ctx, apply_it):
                                  % (res.err or res.out).strip()[:300])
             say("  " + res.out.strip())
 
-    # bootout THEN bootstrap. `kickstart -k` restarts the process without
-    # re-reading the plist, and confusing the two once left a front-door proxy
-    # on a stale config for four days.
-    r.as_root(["launchctl", "bootout", "system/" + conf["DISPATCHER_SERVICE"]],
-              why="stop the dispatcher (config is read only at process start)")
-    boot = r.as_root(["launchctl", "bootstrap", "system",
-                      _dispatcher_plist(conf["DISPATCHER_SERVICE"])],
-                     why="start the dispatcher again so it re-reads its config")
-    if not boot.ok and not boot.skipped:
-        raise SetupError("the dispatcher did not come back: %s"
-                         % (boot.err or boot.out).strip()[:300])
+        # RESTART ONLY WHEN THE FILE ACTUALLY CHANGED. A restart kills every
+        # in-flight coding session, and the owner is told to re-run this same
+        # command to clear the cards downstream of here — so an unconditional
+        # bounce meant every one of those re-runs cost a session.
+        #
+        # bootout THEN bootstrap. `kickstart -k` restarts the process without
+        # re-reading the plist, and confusing the two once left a front-door
+        # proxy on a stale config for four days.
+        r.as_root(["launchctl", "bootout", "system/" + conf["DISPATCHER_SERVICE"]],
+                  why="stop the dispatcher (config is read only at process start)")
+        boot = r.as_root(["launchctl", "bootstrap", "system",
+                          _dispatcher_plist(conf["DISPATCHER_SERVICE"])],
+                         why="start the dispatcher again so it re-reads its config")
+        if not boot.ok and not boot.skipped:
+            raise SetupError("the dispatcher did not come back: %s"
+                             % (boot.err or boot.out).strip()[:300])
+    else:
+        say("  the `reviews` entry already matches this conf, so the dispatcher was NOT "
+            "restarted;")
+        say("  only its load is still unproven, and re-reading a log proves that without "
+            "killing")
+        say("  an in-flight session.")
     if ctx.runner.dry_run:
         return False, "would write the entry and restart the dispatcher", []
 
     proven, how = _banner_proves_entry(ctx)
-    if not proven:
-        if ctx.state.attested("A-ENTRY-LOADED"):
-            return False, "entry written; load signed off by hand (%s)" % how, []
-        raise Unknown(
-            "the dispatcher's startup banner did not name the `reviews` entry (%s).\n"
-            "  This is the KNOWN failure mode: the loader drops keys it does not\n"
-            "  recognise at process start, and the file you just read back is only the\n"
-            "  file you wrote thirty seconds ago. Not claiming success." % how,
-            "watch a review ticket produce a session with no Bash (checkpoint CK-7), then:\n"
-            "    python3 %s attest A-ENTRY-LOADED --initials xx" % _self_path())
-    return False, "entry written and the dispatcher's banner names it (%s)" % how, []
+    if proven:
+        ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = how
+        return False, "entry present and the dispatcher's log names it (%s)" % how, []
+    if ctx.state.attested("A-ENTRY-LOADED"):
+        return False, "entry present; load signed off by hand (%s)" % how, []
+    raise Unknown(
+        "the dispatcher's log never names the `reviews` entry (%s).\n"
+        "  This is the KNOWN failure mode: the loader drops keys it does not\n"
+        "  recognise at process start, and the file you just read back is only the\n"
+        "  file you wrote thirty seconds ago. Not claiming success." % how,
+        # Reachable FROM HERE. The old remedy pointed at CK-7, which is
+        # downstream of this very step, so the only way out of the block was
+        # through the thing the block prevented.
+        "Make the dispatcher print a fresh banner and read it. This restarts it, so do\n"
+        "it when no coding session is in flight:\n"
+        "    sudo launchctl bootout system/%s\n"
+        "    sudo launchctl bootstrap system %s\n"
+        "    python3 %s run\n"
+        "If its log still says nothing either way, look at what the running process\n"
+        "actually loaded, then record what you saw:\n"
+        "    python3 %s attest A-ENTRY-LOADED --initials xx --note \"...\"\n"
+        "Watching one review ticket produce a session with no Bash (CK-7) is the same\n"
+        "proof, behaviourally — but it is downstream of this step, so it is the slower\n"
+        "way out, not the only one."
+        % (conf["DISPATCHER_SERVICE"], _dispatcher_plist(conf["DISPATCHER_SERVICE"]),
+           _self_path(), _self_path()))
 
 
 def _dispatcher_plist(label):
@@ -1554,9 +1755,18 @@ def _upsert_entry_py(path):
         "print(what, 'entry', e['id'])\n" % path)
 
 
+ENTRY_PROOF_NOTE = "dispatcher-entry-banner"
+
+
 def _banner_proves_entry(ctx):
     """(proven, how). Reads the dispatcher's own log for a line naming the
-    reviews entry. Absence is never read as success."""
+    reviews entry. Absence is never read as success.
+
+    The WHOLE log is searched, not the tail: this is called on a re-run that
+    deliberately did NOT restart the dispatcher, so the banner it is looking for
+    may be thousands of lines back. A tail would then report "nothing named it"
+    about a log that names it, and the only way to make the tail true again
+    would be to bounce a live service to re-print a line it already printed."""
     r, conf = ctx.runner, ctx.conf
     logpath = r.read(["/usr/libexec/PlistBuddy", "-c", "Print :StandardOutPath",
                       _dispatcher_plist(conf["DISPATCHER_SERVICE"])])
@@ -1564,15 +1774,17 @@ def _banner_proves_entry(ctx):
         return False, "its plist names no StandardOutPath"
     path = logpath.out.strip().splitlines()[0]
     for _ in range(10):
-        tail = r.as_root(["tail", "-200", path])
-        if tail.ok:
-            for line in tail.out.splitlines()[::-1]:
-                low = line.lower()
-                if "reviews" in low and ("repositor" in low or "entr" in low
-                                         or "disallow" in low):
-                    return True, line.strip()[:120]
+        # -i so a capitalised banner still counts; the last 60 matching lines so
+        # a busy log cannot bury the most recent start.
+        hits = r.as_root(["/bin/sh", "-c",
+                          "grep -i -e reviews %s 2>/dev/null | tail -60" % shlex.quote(path)])
+        for line in (hits.out or "").splitlines()[::-1]:
+            low = line.lower()
+            if "reviews" in low and ("repositor" in low or "entr" in low
+                                     or "disallow" in low):
+                return True, line.strip()[:120]
         time.sleep(1)
-    return False, "nothing in the last 200 lines of %s named it" % path
+    return False, "no line in %s named it" % path
 
 
 PLIST = """<?xml version="1.0" encoding="UTF-8"?>
@@ -1729,6 +1941,7 @@ def step_enable(ctx, apply_it):
     have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
 
     if not missing and len(have_beats) == 2:
+        ctx.unloaded = []
         return True, "both daemons loaded and both heartbeats present", []
     if not apply_it:
         return False, "would load %s; heartbeats present: %s" % (
@@ -1742,6 +1955,7 @@ def step_enable(ctx, apply_it):
                         why="load %s" % label)
         if not res.ok and not res.skipped:
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
+    ctx.unloaded = []
     if ctx.runner.dry_run:
         return False, "would load both daemons and wait for their heartbeats", []
 
@@ -1794,7 +2008,7 @@ _VERIFY_EXIT = {FAILED: EX_FAILED, UNKNOWN: EX_UNKNOWN, BLOCKED: EX_BLOCKED,
                 SKIPPED: EX_OK}
 
 
-def run_steps(ctx, apply_it, keep_going=False):
+def run_steps(ctx, apply_it, keep_going=False, resume=None):
     """(exit_code, rows). One pass over every step, in order.
 
     `run` STOPS at the first row a person must clear: carrying on past a
@@ -1803,6 +2017,9 @@ def run_steps(ctx, apply_it, keep_going=False):
     outstanding in one read, and it changes nothing, so nothing downstream can
     be corrupted by measuring it.
     """
+    # The command that resumes THIS pass. A dry run also has apply off, so
+    # deriving it from apply_it alone sent a dry run's reader to `verify`.
+    resume = resume or ("run" if apply_it else "verify")
     rows, deferred = [], []
     for sid, title, fn in STEPS:
         try:
@@ -1818,7 +2035,7 @@ def run_steps(ctx, apply_it, keep_going=False):
             print_card(exc.card_id, ctx.conf)
             say("Do that, then run the same command again — it checks your work and carries "
                 "on:")
-            say("    python3 %s %s" % (_self_path(), "run" if apply_it else "verify"))
+            say("    python3 %s %s" % (_self_path(), resume))
             return EX_BLOCKED, rows
         except Unknown as exc:
             rows.append((sid, UNKNOWN, exc.what))
@@ -1898,16 +2115,52 @@ def cmd_run(ctx, dry_run):
     say("  dispatcher    %s" % ctx.conf["DISPATCHER_SERVICE"])
     say("  daemons       %s" % ", ".join(daemon_labels(ctx.conf)))
     say("  utc           %s" % now_iso())
-    code, rows = run_steps(ctx, apply_it=True)
+    # A DRY RUN IS `apply_it=False`, NOT "apply, but skip the Runner".
+    # `Runner.write` was the only dry-run seam, and every tracker mutation goes
+    # straight out through the transport, which the Runner never sees — so the
+    # old spelling really created the team, its states, the label and the
+    # membership under a banner that said nothing would be changed. Not
+    # applying is the only shape that cannot be undone by adding a call site.
+    code, rows = run_steps(ctx, apply_it=not dry_run,
+                           resume="run --dry-run" if dry_run else "run")
+    _unloaded_notice(ctx)
+    if dry_run:
+        say("")
+        if ctx.runner.writes:
+            say("BUG: a dry run recorded %d mutation(s); that is a defect in this file."
+                % len(ctx.runner.writes))
+            return EX_FAILED
+        would = sum(1 for _s, o, _d in rows if o == WOULD_CHANGE)
+        say("DRY RUN: nothing was changed — not on this machine and not in the tracker.")
+        say("%d of %d step(s) would change something; the rows above marked %s say which."
+            % (would, len(STEPS), WOULD_CHANGE))
+        return code
     if code == EX_OK:
         done = sum(1 for _, o, _ in rows if o in (DONE, ALREADY_DONE))
         say("")
         say("DONE — %d of %d steps hold. Nothing merged, nothing approved, no label "
             "applied." % (done, len(STEPS)))
-        if dry_run:
-            say("This was a dry run: %d change(s) were printed and none were made."
-                % len(ctx.runner.writes))
     return code
+
+
+def _unloaded_notice(ctx):
+    """Say it out loud when a run ends with the two loops switched off.
+
+    `code` stops both daemons before it moves the clone under them, and only
+    the far-downstream `enable` step starts them again. A run that blocks in
+    between leaves review and bounce OFF, and silence there looks exactly like
+    a healthy install."""
+    if not ctx.unloaded:
+        return
+    say("")
+    say("BOTH STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
+    say("under them, and did not get as far as the step that loads them again — so review")
+    say("and bounce are OFF until it does:")
+    for label in ctx.unloaded:
+        say("    %s" % label)
+    say("Clear the row above and run the same command again, or load them yourself:")
+    for label in ctx.unloaded:
+        say("    sudo launchctl bootstrap system %s" % _dispatcher_plist(label))
 
 
 def cmd_verify(ctx):
@@ -2034,17 +2287,40 @@ class FakeRunner(Runner):
 
 
 class FakeLinear(object):
-    def __init__(self, teams=None, labels=None, users=None, members=None):
+    def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
+                 no_field=()):
         self.teams = teams if teams is not None else []
         self.labels = labels if labels is not None else []
         self.users = users if users is not None else []
         self.members = members if members is not None else []
+        # `refuse`: operations that answer `success: false` and do nothing —
+        # HTTP 200, no GraphQL error, no change. `no_field`: operations this
+        # workspace's schema does not expose, which arrive as a GraphQL error.
+        self.refuse = set(refuse or ())
+        self.no_field = set(no_field or ())
         self.created = []
         self._n = 0
 
     def post(self, query, variables=None):
         variables = variables or {}
         op = query.split()[1].split("(")[0]
+        if op in self.no_field:
+            raise SetupError("the tracker returned an error: Cannot query field on Team")
+        if op == "TeamGitAutomations":
+            for t in self.teams:
+                if t["id"] == variables["id"]:
+                    return {"team": {"gitAutomationStates":
+                                     {"nodes": list(t.get("automations", []))}}}
+            return {"team": None}
+        if op == "GitAutomationDelete":
+            if "GitAutomationDelete" in self.refuse:
+                self.created.append("automation-delete(refused)")
+                return {"gitAutomationStateDelete": {"success": False}}
+            for t in self.teams:
+                t["automations"] = [a for a in t.get("automations", [])
+                                    if a["id"] != variables["id"]]
+            self.created.append("automation-delete")
+            return {"gitAutomationStateDelete": {"success": True}}
         if op == "FindTeamByKey":
             key = variables["filter"]["key"]["eq"]
             return {"teams": {"nodes": [t for t in self.teams if t["key"] == key]}}
@@ -2071,6 +2347,11 @@ class FakeLinear(object):
             self.created.append("team")
             return {"teamCreate": {"success": True, "team": t}}
         if op == "StateCreate":
+            if "StateCreate" in self.refuse:
+                # HTTP 200, no error, `success: false`, no state. This is the
+                # shape that used to be reported as "created state Ready".
+                self.created.append("state(refused)")
+                return {"workflowStateCreate": {"success": False, "workflowState": None}}
             for t in self.teams:
                 if t["id"] == variables["input"]["teamId"]:
                     t.setdefault("states", []).append(
@@ -2318,12 +2599,14 @@ def selftest():
     ctx4.linear_factory = lambda key: empty
     ctx4.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx4.tty = True
-    ctx4.state.attest("A-AUTOMATIONS", "xx")
     ok, detail, _x = step_tracker(ctx4, apply_it=True)
     expect("tracker-creates", ok is False and "created" in detail,
            "an empty workspace was not built out: %s" % detail)
     expect("tracker-creates", "team" in empty.created and "label" in empty.created
            and "member" in empty.created, "created: %s" % empty.created)
+    # …and it needed NO sign-off to get there: the git automations were read.
+    expect("tracker-creates", not ctx4.state.attested("A-AUTOMATIONS"),
+           "the happy path still demands a hand sign-off for the automations")
     before = list(empty.created)
     ok, detail, _x = step_tracker(ctx4, apply_it=True)
     expect("tracker-idempotent", ok is True and "nothing to create" in detail,
@@ -2331,36 +2614,143 @@ def selftest():
     expect("tracker-idempotent", empty.created == before,
            "the second pass created something: %s" % empty.created)
 
-    # -- 11. the automations UNKNOWN blocks until it is signed off ----------
+    # -- 11. the git automations are READ, and every live one is turned off --
+    # They are `Team.gitAutomationStates`, not a toggle nothing can see. The
+    # card survives only for a workspace whose API will not name them.
     cases += 1
+
+    def _stocked_team(automations):
+        return {"id": "t1", "key": "REV", "name": "Reviews",
+                "states": [{"id": "s", "name": n, "type": t} for n, t in REQUIRED_STATES],
+                "automations": list(automations)}
+
+    def _stocked(**kw):
+        return FakeLinear(
+            labels=[{"id": "l1", "name": "haiku", "team": None}],
+            users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
+                   {"id": "u-owner", "email": "owner@example.com", "active": True}],
+            members=[{"id": "u-agent", "displayName": "dispatcher-agent"}], **kw)
+
     ctx5, _f5 = _settled_ctx(conf)
-    ctx5.linear_factory = lambda key: FakeLinear(
-        teams=[{"id": "t1", "key": "REV", "name": "Reviews",
-                "states": [{"id": "s", "name": n, "type": t} for n, t in REQUIRED_STATES]}],
-        labels=[{"id": "l1", "name": "haiku", "team": None}],
-        users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
-               {"id": "u-owner", "email": "owner@example.com", "active": True}],
-        members=[{"id": "u-agent", "displayName": "dispatcher-agent"}])
+    autos = _stocked(teams=[_stocked_team([
+        # one rule that would move a review ticket, and one that fires and does
+        # nothing — an explicit "no action" override, which is left alone.
+        {"id": "ga-merge", "event": "merge", "state": {"id": "s9", "name": "Done"}},
+        {"id": "ga-start", "event": "start", "state": None}])])
+    ctx5.linear_factory = lambda key: autos
     ctx5.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx5.tty = True
+    ok, detail, _x = step_tracker(ctx5, apply_it=True)
+    expect("automations-read", ok is False and "turned off 1 git automation" in detail,
+           "the live automation was not turned off: %s" % detail)
+    expect("automations-read",
+           [a["id"] for a in autos.teams[0]["automations"]] == ["ga-start"],
+           "the wrong rules were deleted: %s" % autos.teams[0]["automations"])
+    expect("automations-read", not ctx5.state.attested("A-AUTOMATIONS"),
+           "the installer signed off a checkpoint on the owner's behalf")
+    ok2, detail2, _x = step_tracker(ctx5, apply_it=True)
+    expect("automations-read", ok2 is True and "nothing to create" in detail2,
+           "the second pass was not already-done: %s" % detail2)
+    # …and a dry run reports them without deleting one.
+    cases += 1
+    ctx5b, _f5b = _settled_ctx(conf)
+    autos_b = _stocked(teams=[_stocked_team(
+        [{"id": "ga-merge", "event": "merge", "state": {"id": "s9", "name": "Done"}}])])
+    ctx5b.linear_factory = lambda key: autos_b
+    ctx5b.key_reader = lambda prompt: "lin_api_" + "k" * 30
+    ctx5b.tty = True
+    ok, detail, _x = step_tracker(ctx5b, apply_it=False)
+    expect("automations-read", ok is False and "live git automation" in detail,
+           "a dry run did not report the live automation: %s" % detail)
+    expect("automations-read", autos_b.created == [],
+           "a dry run deleted an automation: %s" % autos_b.created)
+
+    # -- 11b. …and CK-3 survives ONLY as the fallback for an API that cannot -
+    cases += 1
+    ctx5c, _f5c = _settled_ctx(conf)
+    blind = _stocked(teams=[_stocked_team([])], no_field={"TeamGitAutomations"})
+    ctx5c.linear_factory = lambda key: blind
+    ctx5c.key_reader = lambda prompt: "lin_api_" + "k" * 30
+    ctx5c.tty = True
     try:
-        step_tracker(ctx5, apply_it=True)
-        failures.append("automations-block: a dashboard toggle nobody read was passed")
+        step_tracker(ctx5c, apply_it=True)
+        failures.append("automations-fallback: a workspace whose API would not name the "
+                        "automations was passed as if they were off")
     except Blocked as exc:
-        expect("automations-block", exc.card_id == "CK-3", "blocked on %s" % exc.card_id)
-    ctx5.state.attest("A-AUTOMATIONS", "bc")
-    ok, _d, _x = step_tracker(ctx5, apply_it=True)
-    expect("automations-block", ok is True, "a signed-off board still blocked")
+        expect("automations-fallback", exc.card_id == "CK-3", "blocked on %s" % exc.card_id)
+    ctx5c.state.attest("A-AUTOMATIONS", "bc")
+    ok, _d, _x = step_tracker(ctx5c, apply_it=True)
+    expect("automations-fallback", ok is True, "a signed-off board still blocked")
+
+    # -- 11c. a SUB-TEAM is fatal, and it is read rather than left on a card -
+    cases += 1
+    ctx5d, _f5d = _settled_ctx(conf)
+    nested = _stocked_team([])
+    nested["parent"] = {"id": "t0", "key": "ENG", "name": "Engineering"}
+    ctx5d.linear_factory = lambda key: _stocked(teams=[nested])
+    ctx5d.key_reader = lambda prompt: "lin_api_" + "k" * 30
+    ctx5d.tty = True
+    try:
+        step_tracker(ctx5d, apply_it=True)
+        failures.append("sub-team: a nested Reviews team was accepted")
+    except SetupError as exc:
+        expect("sub-team", "SUB-TEAM" in str(exc) and "ENG" in str(exc),
+               "the refusal did not name the parent: %s" % exc)
+
+    # -- 11d. a workflow state nobody could see created is never reported ----
+    cases += 1
+    ctx5e, _f5e = _settled_ctx(conf)
+    liar = _stocked(teams=[{"id": "t1", "key": "REV", "name": "Reviews", "states": [],
+                            "automations": []}], refuse={"StateCreate"})
+    ctx5e.linear_factory = lambda key: liar
+    ctx5e.key_reader = lambda prompt: "lin_api_" + "k" * 30
+    ctx5e.tty = True
+    try:
+        step_tracker(ctx5e, apply_it=True)
+        failures.append("state-read-back: `success: false` with no error was reported as "
+                        "three created workflow states")
+    except SetupError as exc:
+        expect("state-read-back", "on a re-read" in str(exc)
+               and all(n in str(exc) for n, _t in REQUIRED_STATES),
+               "the failure did not name the states that are not there: %s" % exc)
 
     # -- 12. an empty required-check set is never invented -------------------
     cases += 1
     ctx6, fake6 = _settled_ctx(conf)
     fake6.answers = [("gh api repos/example-org/kit --jq", 0, "main\n"),
                      ("required_status_checks", 0, "[]\n"),
-                     ("rulesets", 0, "[]\n")]
+                     ("rules/branches", 0, "[]\n")]
     checks, unreadable = _required_checks(ctx6)
     expect("no-empty-checks", not checks and unreadable,
            "an empty required-check set was written as if it meant `requires nothing`")
+
+    # …and a repository that uses RULESETS is read, not handed to the owner.
+    # This was the branch that gave up with "read the contexts by hand".
+    cases += 1
+    ctx6b, fake6b = _settled_ctx(conf)
+    fake6b.answers = [
+        ("gh api repos/example-org/kit --jq", 0, "main\n"),
+        ("required_status_checks", 1, ""),      # 403/404: no administration read
+        ("rules/branches", 0, json.dumps([
+            {"type": "deletion"},
+            {"type": "required_status_checks", "parameters": {
+                "required_status_checks": [{"context": "Kit checks"},
+                                           {"context": "Provenance scan"}]}},
+        ])),
+    ]
+    checks, unreadable = _required_checks(ctx6b)
+    expect("rulesets-are-read",
+           checks == {"example-org/kit": ["Kit checks", "Provenance scan"]} and not unreadable,
+           "a ruleset-protected repository was not read: %s / %s" % (checks, unreadable))
+    # …and when NEITHER shape answers, it is still a card and never an empty set.
+    cases += 1
+    ctx6c, fake6c = _settled_ctx(conf)
+    fake6c.answers = [("gh api repos/example-org/kit --jq", 0, "main\n"),
+                      ("required_status_checks", 1, ""),
+                      ("rules/branches", 1, "")]
+    checks, unreadable = _required_checks(ctx6c)
+    expect("no-empty-checks", not checks and unreadable,
+           "a repository neither endpoint answered for was given a set anyway: %s" % checks)
 
     # -- 13. every card and sign-off is reachable and complete ---------------
     cases += 1
@@ -2481,6 +2871,107 @@ def selftest():
     expect("env-absent-vs-unreadable", ok is False and "missing or incomplete" in detail,
            "an absent env file did not read as absent: %s" % detail)
 
+    # -- 15e. A DRY RUN CHANGES NOTHING — including in the tracker -----------
+    # Case 8 above cannot see this: it drives FakeRunner.write only, and every
+    # tracker mutation goes out through the transport, which the Runner never
+    # sees. This drives the WHOLE of `run --dry-run` against an empty workspace
+    # — the state with the most to create — and asserts the tracker was not
+    # touched and no step was recorded as DONE.
+    cases += 1
+    ctxD, fakeD, apiD = _unsettled_ctx(conf)
+    ctxD.runner.dry_run = True
+    codeD, printedD = _quiet(lambda: cmd_run(ctxD, dry_run=True))
+    expect("dry-run-touches-no-tracker", apiD.created == [],
+           "a dry run created %s in the tracker" % apiD.created)
+    expect("dry-run-touches-no-tracker", not fakeD.writes,
+           "a dry run recorded %d mutation(s): %s"
+           % (len(fakeD.writes), [w["why"] for w in fakeD.writes]))
+    recorded = {sid: (row or {}).get("outcome")
+                for sid, row in ctxD.state.data["steps"].items()}
+    expect("dry-run-records-no-done", DONE not in recorded.values(),
+           "a dry run wrote DONE rows into the ledger: %s"
+           % sorted(s for s, o in recorded.items() if o == DONE))
+    expect("dry-run-records-no-done", WOULD_CHANGE in recorded.values(),
+           "a dry run recorded nothing as %s, so it measured nothing: %s"
+           % (WOULD_CHANGE, recorded))
+    expect("dry-run-touches-no-tracker", codeD != EX_OK,
+           "a dry run over an empty workspace exited 0, as if nothing were outstanding")
+    expect("dry-run-touches-no-tracker", "nothing was changed" in printedD,
+           "the dry run did not say so in its own words")
+    expect("dry-run-touches-no-tracker", "run --dry-run" in printedD,
+           "a blocked dry run sent its reader to a different command than the one they ran")
+    # mutant: the OLD spelling — apply on, only the Runner suppressed — must
+    # turn this red. It is the exact defect, reproduced against the same fakes.
+    cases += 1
+    ctxE, _fE, apiE = _unsettled_ctx(conf)
+    ctxE.runner.dry_run = True
+    _quiet(lambda: run_steps(ctxE, apply_it=True))
+    expect("dry-run-mutant", apiE.created,
+           "the tracker check cannot see a mutation made under a dry-run runner, so it "
+           "would have passed the defect it exists to catch")
+
+    # -- 15f. a matching dispatcher entry is NOT a reason to bounce it -------
+    # A restart kills every in-flight coding session, and the owner is told to
+    # re-run this command to clear the cards downstream.
+    cases += 1
+    ctxG, fakeG = _settled_ctx(conf)
+    already = dict(reviews_entry(ctxG))
+    already["allowedUsers"] = already.pop("userAccessControl")["allowedUsers"]
+    ctxG.dispatcher["entries"].append(already)
+    def _entry_once(c):
+        try:
+            step_dispatcher_entry(c, apply_it=True)
+        except (Unknown, SetupError):
+            pass                               # the banner is unreadable here; fine
+
+    _quiet(lambda: _entry_once(ctxG))
+    expect("no-needless-restart", not fakeG.writes,
+           "a byte-identical entry still wrote: %s" % [w["why"] for w in fakeG.writes])
+    # …and once the banner has been read once, the row is settled from a note,
+    # not from the step's own outcome, so a later re-run re-reads nothing.
+    ctxG.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = "loaded repository reviews"
+    ok, detail, _x = step_dispatcher_entry(ctxG, apply_it=True)
+    expect("no-needless-restart", ok is True and "was proven" in detail,
+           "a proven entry did not settle: %s" % detail)
+    # complement: an entry that DIFFERS must still stop and restart it.
+    cases += 1
+    ctxH, fakeH = _settled_ctx(conf)
+    fakeH.answers = list(fakeH.answers) + [
+        ("cp -a /opt/example-dispatch/config.json", 0, ""),
+        ("json.load(sys.stdin)", 0, "added entry reviews\n"),
+        ("launchctl bootstrap system /Library/LaunchDaemons/com.example.dispatcher.plist",
+         0, ""),
+    ]
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxH, apply_it=True))
+    except (Unknown, SetupError):
+        pass
+    whys = [w["why"] for w in fakeH.writes]
+    expect("restart-when-changed", any("stop the dispatcher" in w for w in whys)
+           and any("re-reads its config" in w for w in whys),
+           "an absent entry was written without restarting the dispatcher: %s" % whys)
+
+    # -- 15g. a run that ends with the daemons unloaded says so --------------
+    cases += 1
+    ctxI, fakeI = _settled_ctx(conf)
+    fakeI.answers = [("ls $HOME/.stage-e/kit/scripts", 0, "\n"),
+                     ("rev-parse --short HEAD", 1, ""),
+                     ("git clone --quiet", 0, "")]
+    try:
+        step_code(ctxI, apply_it=True)
+        failures.append("unloaded-notice: a clone with no scripts did not stop")
+    except Blocked as exc:
+        expect("unloaded-notice", exc.card_id == "CK-1", "blocked on %s" % exc.card_id)
+    expect("unloaded-notice", ctxI.unloaded == list(daemon_labels(conf)),
+           "step_code stopped both daemons and recorded %s" % ctxI.unloaded)
+    _rv, notice = _quiet(lambda: _unloaded_notice(ctxI))
+    for label in daemon_labels(conf):
+        expect("unloaded-notice", label in notice, "the notice never named %s" % label)
+    expect("unloaded-notice", "launchctl bootstrap" in notice,
+           "the notice did not print the command that loads them again")
+    expect("unloaded-notice", _quiet(lambda: _unloaded_notice(_settled_ctx(conf)[0]))[1] == "",
+           "a run that unloaded nothing still printed the notice")
+
     # -- 16. verify measures everything, changes nothing, and asks nothing ---
     cases += 1
     ctx9, fake9 = _settled_ctx(conf)
@@ -2569,9 +3060,35 @@ def _settled_ctx(conf):
         ("cat $HOME/.stage-e/config.json", 0, json.dumps(bounce)),
         ("gh api repos/example-org/kit --jq", 0, "main\n"),
         ("required_status_checks", 0, '["Kit checks", "Provenance scan"]\n'),
+        # …and everything preflight reads, so a WHOLE pass can be driven with
+        # no machine. A settled machine passes preflight; a fixture that could
+        # not would stop every end-to-end case at the first step.
+        ("dscl . -read", 0, "NFSHomeDirectory: %s\n" % ctx.role_home),
+        ("/usr/bin/python3 -V", 0, "Python 3.9.6\n"),
+        ("gh auth status", 0, "Logged in to github.com\n"),
+        ("launchctl print system/com.example.dispatcher", 0, "\tstate = running\n"),
+        ("workspace_base_dirs", 0, json.dumps(ctx.dispatcher)),
+        ("stat -f", 9, ""),                     # the env probe's own "no file"
+        ("scan --dry-run", 0, "resolved workspace ws-1\nwould open 0 review ticket(s)\n"),
+        ("decide --dry-run", 0, "checks_source: config\nnothing to bounce\n"),
     ]
     fake.answers = answers
     return ctx, fake
+
+
+def _unsettled_ctx(conf, linear=None):
+    """A settled machine whose TRACKER is empty and whose dispatcher config
+    carries no reviews entry — the state in which `run` has the most to do, and
+    therefore the state a dry run has the most chance to change by accident."""
+    ctx, fake = _settled_ctx(conf)
+    api = linear if linear is not None else FakeLinear(
+        users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
+               {"id": "u-owner", "email": "owner@example.com", "active": True}])
+    ctx.linear_factory = lambda key: api
+    ctx.key_reader = lambda prompt: "lin_api_" + "k" * 30
+    ctx.secret_reader = lambda prompt: "ghp_" + "s" * 36
+    ctx.tty = True
+    return ctx, fake, api
 
 
 # --------------------------------------------------------------------------- #
@@ -2587,7 +3104,8 @@ def build_parser():
     p.add_argument("--conf", default="stage-e.conf")
     p.add_argument("--state", default=DEFAULT_STATE_HOME)
     p.add_argument("--dry-run", action="store_true",
-                   help="print every change `run` would make, and make none")
+                   help="measure every step and change nothing: name what `run` would "
+                        "do, on this machine and in the tracker, and do none of it")
     p.add_argument("--initials", default="", help="attest: 2-4 letters, your word")
     p.add_argument("--note", default="", help="attest: what you are recording")
     p.add_argument("--selftest", action="store_true")
@@ -2636,8 +3154,12 @@ def main(argv=None):
             say("")
             say("Fix them all, then run the same command again.")
             return EX_USAGE
+        # `--dry-run` is the one `run` spelling a model may use. It must also
+        # never be handed the owner's credential prompt: a hidden prompt in a
+        # session is a prompt whose answer the session sees.
         ctx = Ctx(conf, Runner(dry_run=args.dry_run), state,
-                  tty=sys.stdin.isatty() and sys.stdout.isatty())
+                  tty=(sys.stdin.isatty() and sys.stdout.isatty()
+                       and not agent_env_markers_present()))
         if args.command == "status":
             return cmd_status(ctx)
         if args.command == "verify":
