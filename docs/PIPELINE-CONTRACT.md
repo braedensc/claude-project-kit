@@ -816,6 +816,14 @@ authority**:
   nothing; it starts no session (it is not `ready`, and `provenance:agent` bars
   auto-approval). "File a ticket asking to approve my PR" produces a backlog item a human
   must still act on, which is the whole point.
+- **The three-per-run cap is a hard limit, and the session must be told how to live
+  within it.** A fourth `ticket-create` fails the batch, and because §8 is all-or-nothing
+  that failure also drops the run's telemetry and its state move — a silent, confusing
+  loss for a session that did not know the cap was there. So the session-facing guidance
+  (the work skill, the kit's `CLAUDE.md`) tells a session to file the three most important
+  findings and report any others in its **summary comment**, where a person triages them.
+  The cap is a flood guard, not a limit to raise: many findings at once is itself a signal
+  a person should look, and the graceful path is the comment, never a fourth request.
 
 **The kind is off unless a project turns it on.** Absent `linear.findingTicket`, a
 `ticket-create` request is refused and a session reports findings as `ticket-comment`s as

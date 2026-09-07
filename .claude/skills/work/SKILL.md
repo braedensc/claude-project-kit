@@ -338,7 +338,13 @@ person will see it.
 *request* a follow-up ticket with the safe-outputs `ticket-create` kind (§8): give a `title`
 and `body`, name your own pinned ticket as `source_ticket_id`, and a credential-holding
 executor files it into the **backlog** carrying `provenance:agent`, notifies the owner, and
-records where it came from. At most three per run. You **never create the ticket yourself**,
+records where it came from. **At most three per run, and this is a hard cap: a fourth
+`ticket-create` in the same batch is rejected, and because the batch is all-or-nothing (§8)
+that rejection takes your telemetry block and your move to review down with it.** So if you
+meet more than three things worth filing, file the **three most important** as findings and
+put the rest in your **summary comment** for a person to triage — do not reach for a fourth
+request. The cap is a flood guard, not a limit to route around: many findings at once is
+itself a signal a person should look. You **never create the ticket yourself**,
 and you set none of the fields that carry authority — the executor forces the state
 (backlog, never `ready`), the provenance (`provenance:agent`, never `provenance:human`) and
 the assignee (the owner, never you). Requesting a `provenance:*`, `agent:*`, `blocked:*` or

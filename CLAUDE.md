@@ -271,6 +271,10 @@ The loop, when it *is* on:
    and a `save_issue(labels=[…])` naming any protected class, are blocked on the tracker-MCP
    path exactly as `gh` is. That block is **expected, not an error to route around**: take
    it as the signal to use the request path (or a comment), not to find another spelling.
+   The request path is **capped at three findings per run** — a fourth rejects the whole
+   batch (all-or-nothing, §8), taking your telemetry and review move with it — so file the
+   three that matter and comment the rest; the cap is a flood guard, not a thing to work
+   around.
 6. **Run the local gate** from `delivery.json` → `commands`, then `/ship`. Local
    green is necessary, not sufficient — CI is the real gate, and you still never merge.
 7. **Emit the telemetry block** (§4) on *every* terminal path, including escalations. It
