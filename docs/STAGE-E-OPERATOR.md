@@ -24,6 +24,49 @@ They share a state directory and nothing else. Neither imports the other.
 
 ---
 
+## Do not type the steps below by hand
+
+`scripts/pipeline_stage_e_setup.py` performs every step in this document that a computer
+can perform. **What you type is one command, repeated.**
+
+```sh
+cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
+$EDITOR stage-e.conf                                  # ten values, none of them secret
+python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
+```
+
+It stops at the first step only a person can do, prints a numbered checkpoint card saying
+exactly what to do, and exits 10. Do that one thing and run the same command again: it
+checks your work and carries on. It never asks you to type `y`.
+
+| Command | What it is |
+|---|---|
+| `run [--dry-run]` | do everything possible, in order, idempotently; stop at the first card |
+| `status` | where the install got to, what blocks it, and the one command that clears it |
+| `verify` | read-only drift check — measures every step, changes nothing, asks nothing |
+| `card CK-3` | print any checkpoint card in full, at any time |
+| `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
+
+**Seven cards exist and four are usual:** merge the pull requests that carry Stage E
+(`CK-1` — applying a protected label and merging are a human's signal by design, so the
+installer checks and prints, and has no code path to either); turn the Reviews team's
+code-host automations off (`CK-3` — a dashboard toggle no API here could read, so it is
+reported UNKNOWN rather than assumed off); read the dry-run count before anything is
+switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and only you know
+whether that number is the one you meant); and watch one real ticket become a reviewed pull
+request (`CK-7`). The other three appear only when the automated path could not do the
+work: no terminal to paste a credential at (`CK-2`), an API that would not add the agent to
+the team (`CK-4`), and a code host that would not name a repository's required checks
+(`CK-6`). You also paste each secret at a hidden prompt during the run — that is not a
+card, it is one keystroke sequence inside one step.
+
+**The sections below stay the reference** for what each step does and why each absent key
+is absent. Read them when a card blocks you, when you want to know what the installer just
+wrote, or when you are changing it. The installer refuses to run under a model at all; a
+session that installs its own supervision is exactly what that refusal exists to prevent.
+
+---
+
 ## How it works, in one pass
 
 1. **The poller** asks **Linear** what the dispatcher worked on. It pages the workspace's

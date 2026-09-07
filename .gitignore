@@ -14,6 +14,12 @@ planning/
 *.key
 .provenance-denylist
 
+# The Stage E installer's filled-in settings. It holds no credential — the
+# loader refuses a value with a credential shape — but it does hold the shape
+# of one deployment: an account name, a service label, real repositories.
+# stage-e.conf.example is the committed one.
+stage-e.conf
+
 # Dependencies
 node_modules/
 

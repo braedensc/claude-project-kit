@@ -174,6 +174,15 @@ jobs:
       - name: Stage E review poller selftest (sanitizer, decline paths, comment-only)
         run: python3 scripts/pipeline_review_poller.py --selftest
 
+      # Stage E's installer — the one command an operator runs. Offline, every
+      # transport stubbed: the conf validator reports EVERY bad value in one pass
+      # (a first-error-wins mutant turns it red), a settled machine is written to
+      # zero times, an agent environment is refused BEFORE the conf is read, the
+      # six §13 outcomes each carry their own exit code, no credential reaches any
+      # output, and the source carries no merge/approve/protected-label path.
+      - name: Stage E installer selftest (idempotent, agent-refused, §13 exit codes)
+        run: python3 scripts/pipeline_stage_e_setup.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
