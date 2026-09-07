@@ -1122,9 +1122,19 @@ def step_tracker(ctx, apply_it):
 # cannot reach this process, its stdout, or a transcript. `%s` is the Stage E
 # home. `--selftest` runs this exact text through /bin/sh against a real file:
 # a shell fragment nobody has executed is a guess about a shell.
+#
+# `stat` IS BRANCHED ON `uname`, NOT ON A `||` FALLBACK. BSD stat wants
+# `-f %Lp`; GNU stat wants `-c %a`. Spelling it `stat -f … || stat -c …` looks
+# portable and is not: GNU's `-f` means "filesystem status", so it EXITS 0
+# printing something useless and the fallback never fires — a mode of `?p` read
+# as a fact. The deployment is macOS, but the selftest that executes this text
+# runs on Linux, and a check that cannot run where CI runs is a check nobody has.
 ENV_PROBE_SH = (
     "f=%s/env; [ -f \"$f\" ] || exit 9; "
-    "printf 'mode=%%s owner=%%s\\n' \"$(stat -f %%Lp \"$f\")\" \"$(stat -f %%Su \"$f\")\"; "
+    "case \"$(uname)\" in "
+    "Darwin) m=$(stat -f %%Lp \"$f\"); o=$(stat -f %%Su \"$f\");; "
+    "*) m=$(stat -c %%a \"$f\"); o=$(stat -c %%U \"$f\");; esac; "
+    "printf 'mode=%%s owner=%%s\\n' \"$m\" \"$o\"; "
     "while IFS='=' read -r k v; do "
     "case \"$k\" in ''|\\#*) continue;; esac; "
     "printf 'name=%%s len=%%s\\n' \"$k\" \"${#v}\"; done < \"$f\""
@@ -2414,8 +2424,10 @@ def selftest():
     expect("env-probe", probe.ok, "the probe fragment failed: rc=%d %s"
            % (probe.rc, probe.err[:200]))
     seen, mode, owner = parse_env_probe(probe.out)
-    expect("env-probe", mode == "600", "mode read as %r" % mode)
-    expect("env-probe", owner, "no owner was read")
+    expect("env-probe", mode == "600", "mode read as %r on %s — the `stat` branch for "
+           "this platform is wrong, and a wrong mode reads as a fact"
+           % (mode, sys.platform))
+    expect("env-probe", owner and owner != "?", "owner read as %r" % owner)
     expect("env-probe", seen.get("STAGE_E_LINEAR_API_KEY") == len(ENVSECRET),
            "length read as %r, want %d" % (seen.get("STAGE_E_LINEAR_API_KEY"),
                                            len(ENVSECRET)))
