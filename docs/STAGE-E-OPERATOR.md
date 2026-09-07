@@ -24,6 +24,121 @@ They share a state directory and nothing else. Neither imports the other.
 
 ---
 
+## Do not type the steps below by hand
+
+`scripts/pipeline_stage_e_setup.py` performs every step in this document that a computer
+can perform. **What you type is one command, repeated.**
+
+```sh
+cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
+$EDITOR stage-e.conf                                  # ten values, none of them secret
+python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
+```
+
+It stops at the first step only a person can do, prints a numbered checkpoint card saying
+exactly what to do, and exits 10. Do that one thing and run the same command again: it
+checks your work and carries on. It never asks you to type `y`.
+
+| Command | What it is |
+|---|---|
+| `run` | do everything possible, in order, idempotently; stop at the first card |
+| `run --dry-run` | the same pass with apply **off**: names what would change, changes nothing — not a file, not a daemon, not one tracker object |
+| `status` | where the install got to, what blocks it, and the one command that clears it |
+| `verify` | read-only drift check — measures every step, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
+| `card CK-3` | print any checkpoint card in full, at any time |
+| `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
+
+**Seven cards exist and three are usual:** merge the pull requests that carry Stage E
+(`CK-1` — applying a protected label and merging are a human's signal by design, so the
+installer checks and prints, and has no code path to either); read the dry-run count before
+anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
+only you know whether that number is the one you meant); and watch one real ticket become a
+reviewed pull request (`CK-7`). The other four appear only when the automated path could
+not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
+the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
+(`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
+
+**You type each secret once — plus once more if a stored one stops working.** The two
+values are asked for at a hidden prompt on the run that has none, written straight into the
+role account's own env file at mode 600, and from then on **read back out of that file** —
+so a second `run`, a `run --dry-run` and `verify` ask you for nothing at all. Nothing prints
+a value; what you see back is the name, the length and the class.
+
+The exception is real and worth knowing before it happens: **if the tracker refuses a key
+that was read out of that file**, that is a *rejected* key, not a missing one — the file is
+there and its contents are not accepted — and `run` asks you for a replacement and writes it
+back over the old one. Revoke a key, let one expire, or point the installer at another
+workspace and you will type that one secret a second time. `verify` and `run --dry-run`
+never ask; they report the rejection and name `run` as the command that can fix it.
+
+**Your login password is asked for once, at the start, and not again.** `run` and `verify`
+both read this machine as the role account (`sudo -u …`) and as root, dozens of times per
+pass, and macOS forgets a sudo timestamp after a few minutes. So both acquire administrator
+access **once, deliberately, before the first probe**, print the reason on the line above the
+prompt, and keep the timestamp fresh until the command exits — no second prompt arrives
+mid-run, and in particular none arrives right after the hidden prompt for a tracker key,
+where two password boxes in a row look alike. `status` and `card` read nothing privileged
+and never ask. If `sudo` is missing or you decline it, the command **stops there with exit 5
+having done nothing** rather than half-running: "you did not give me a password" and "your
+install is broken" look identical once a pass is half-finished, and they need opposite fixes.
+The command it then tells you to re-run is **the spelling you typed**, flag and all — decline
+the prompt on `run --dry-run` and it says to run `run --dry-run` again, never the bare `run`
+that would change the machine you had only asked it to measure.
+
+**The git automations are read, not assumed.** They are `Team.gitAutomationStates` in
+Linear's API — the same five rules as *Team settings → Issue statuses and automations → git
+automations* — so the installer reads them and deletes every rule that would move a ticket,
+then re-reads to confirm. `Team.parent` is read the same way, so a Reviews team nested under
+another is refused by name rather than left to you to notice. `CK-3` is what a workspace
+whose API will not answer falls back to; it is not the normal path.
+
+**The sections below stay the reference** for what each step does and why each absent key
+is absent. Read them when a card blocks you, when you want to know what the installer just
+wrote, or when you are changing it. `run` refuses to do anything under a model — a session
+that installs its own supervision is exactly what that refusal exists to prevent. Only
+`run --dry-run`, `verify`, `status` and `card` stay available there, and each of them
+measures without applying.
+
+**Under a model, no stored credential is read either, and that is a separate guarantee from
+the one above.** "`--dry-run` is never handed a credential *prompt*" is true and was never
+enough: reading a key out of the env file is not a prompt, and for one round `verify` and
+`run --dry-run` did exactly that — pulling the live tracker key into a session's own process
+through `sudo -u`, and making eight authenticated tracker requests with it. The read is now
+gated on the same agent markers everything else refuses on, so a session gets an
+**UNMEASURED** row at the tracker step (exit 4, naming the file it did not read) instead of
+the key. A person running the identical command reads it and measures normally. Nothing
+acquires the administrator password under a model either.
+
+**How much those two gates are worth: tamper-evident, not tamper-proof.** Both read
+environment variables — `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_PROJECT_DIR`,
+`AI_AGENT` — and a session's shell runs as **you** and can unset its own environment. Run
+the installer with those four removed and it reads the stored key and measures the tracker,
+because at that point nothing in the script can tell it from your own terminal. That is not
+a hole in the script; it is the ceiling on what a script can promise about the environment
+it is handed, and the module it imports the markers from
+(`scripts/pipeline_dispatch_local.py`) has said so about the same tuple from the start. The
+gates are still worth having: they stop the accident, and clearing four variables to get
+past one is a deliberate act that shows up in the transcript as exactly that. What they are
+not is a boundary.
+
+**The two boundaries that do hold** are outside the script and outside anything a session
+can edit:
+
+- **The `PreToolUse` hook** (`.claude/hooks/pre-tool-use.py`), which is self-protected. A
+  deny rule for a Bash command that invokes this installer with a marker unset or emptied is
+  the enforcement version of the refusal above. **It is not shipped** — a hook change is a
+  human's to make, and an agent that added its own would be writing the rule it is meant to
+  be bound by. Add it if you want the stronger claim.
+- **The role account's file permissions.** The credential lives at mode 600 under *that*
+  account's home and is reached only through `sudo -u`, which is why an installer running as
+  the role account is the only thing that can read it at all.
+
+One thing that is now closed: a marker set to the **empty string** counts as present. Both
+`env -u CLAUDECODE … python3 …` and the cheaper `CLAUDECODE= python3 …` used to walk past the
+gate; only the first does now.
+
+---
+
 ## How it works, in one pass
 
 1. **The poller** asks **Linear** what the dispatcher worked on. It pages the workspace's
@@ -104,14 +219,21 @@ working tree, and warns when one sits outside the account's home.
 
 ## Step 1 — Linear: a Reviews team with automations off
 
+**The installer does all four of these** (`step_tracker`). They are here as the reference
+for what it did, and for a workspace whose API declines one of them.
+
 1. Create a team named **Reviews**. Any key works; you route on it (`REV` below).
-2. **Turn off** every GitHub and PR automation for that team: no state change on PR
-   open, on merge, or on branch push. A review ticket must never link to the PR and never
-   move because of it.
+2. **Turn off** every git automation for that team: no state change when a PR opens, when a
+   review is requested, or when one merges. A review ticket must never move because a pull
+   request moved. These are `Team.gitAutomationStates` — one rule per Git event, a null
+   `state` meaning "fire and do nothing" — so the installer reads them, deletes every rule
+   that carries a state, and re-reads to confirm none survived. It never reports them off
+   without looking: a workspace whose API will not answer raises `CK-3` instead.
 3. Make sure a cheap-model label exists in the workspace. The dispatcher picks the model
    from a ticket label (`haiku`, `sonnet`, `opus`, `fable`).
 4. Do **not** make Reviews a sub-team of anything, and never parent a review ticket. A
-   sub-issue is based on its parent's branch.
+   sub-issue is based on its parent's branch. `Team.parent` is read, and a nested Reviews
+   team stops the run by name.
 
 Write down both spellings of the same three facts. **The poller takes names; the bounce
 driver takes ids.**
@@ -172,8 +294,18 @@ removes every tool that could act.
 | `model` | The poller picks the model with a ticket label; a fixed model here would fight it. |
 | `mcp__linear…` in `disallowedTools` | **Owner decision 2026-09-06:** the Linear MCP tools stay available to every session, the reviewer included. Accepted and monitored. Add them here if that changes. |
 
-Then **restart the dispatcher**. Do not rely on hot reload for a new entry. Confirm in its
-log that the `reviews` entry loaded and that the runner reports nine disallowed tools.
+Then **restart the dispatcher**, once, *because the file changed*. Do not rely on hot
+reload for a new entry. Confirm in its log that the `reviews` entry loaded and that the
+runner reports nine disallowed tools.
+
+The installer restarts it on exactly that condition: a pass that finds the entry already
+byte-identical does **not** bounce the service, because a restart kills every in-flight
+coding session and you are told to re-run the same command to clear the cards downstream of
+here. Whether the entry matches and whether its load has been proven are recorded
+separately, so a re-run re-reads the log without re-starting anything. If the log names it
+nowhere, the run reports `UNKNOWN` and prints the restart-and-re-read commands; signing off
+`A-ENTRY-LOADED` is the other way out, and watching `CK-7` is a third — slower, because it
+is downstream of this step.
 
 Multi-repo: routing is by team key and one entry has one `repositoryPath`, so each managed
 repo gets its own Reviews team key and its own entry. Start with one.
@@ -369,6 +501,12 @@ prints this and lists every key it accepts:
   reports *CANNOT EVALUATE*, comments on the PR and exits 2 — until you add the entry or
   grant the token *Administration: read*. A repository with an entry can never reach
   unknown.
+- **The installer writes that entry for you**, with YOUR `gh` login rather than the
+  daemon's token: it reads classic protection first, falls back to the branch's effective
+  ruleset rules (`repos/OWNER/NAME/rules/branches/BRANCH`, which needs no administration
+  read), and takes the contexts out of every `required_status_checks` rule it finds. It
+  raises `CK-6` only when neither shape answers, and it never writes an empty set — an
+  empty set means *requires nothing*, which is the one answer that must never be guessed.
 - `in_flight_hours` is a per-head cooldown, default 6. After a bounce is sent, the driver
   waits that long before bouncing the same PR head again, so a session that has not yet
   pushed is not re-prompted.

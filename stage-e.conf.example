@@ -1,0 +1,217 @@
+# stage-e.conf.example — every value the Stage E installer asks you for.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
+#   $EDITOR stage-e.conf                             # eleven values, none of them secret
+#   python3 scripts/pipeline_stage_e_setup.py run    # the only command you type
+#
+# `run` validates this file before it touches anything, and reports EVERY bad
+# value in one pass — not the first one it meets. Fix them all, run it again.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
+#
+#   FORMAT.  `KEY=value`, one per line.  `#` starts a comment ONLY at the start
+#   of a line: everything after the first `=` is the value.  No quotes, no line
+#   continuations, no `export`, no `$(…)`, no backticks.
+#
+#   IT IS PARSED, NEVER SOURCED.  A conf that can execute code is a conf that
+#   executes it under `sudo`, and this one is read by a process that holds it.
+#
+#   A DUPLICATE KEY IS A HARD ERROR, naming both line numbers.  Last-wins hides
+#   the effective value, and an invisible effective value is the defect class
+#   this whole kit is shaped against.
+#
+#   NO KEY HERE EVER HOLDS A CREDENTIAL.  The loader refuses to start if any
+#   value carries a credential shape, and it names the KEY only, never the
+#   value.  Both secrets are typed at a hidden prompt, once, and written
+#   straight into the role account's own env file at mode 600.  Nothing about
+#   them is stored here, printed, or logged — only the env var NAME.
+#
+#   MODE 600.  This file holds no secret, but it does hold the shape of your
+#   deployment.  `stage-e.conf` is gitignored; this example is committed.
+#
+#   EVERY EXAMPLE VALUE BELOW IS RESERVED OR SYNTHETIC.  The organisation is
+#   `example-org`, the domain is `example.com` (RFC 2606, deliverable to
+#   nobody), the role account is the namespaced `_exdispatch`.  Two values are
+#   deliberately left as placeholders that the validator REFUSES by name, so a
+#   conf nobody edited cannot be run by accident: OWNER_LINEAR_EMAIL and
+#   REVIEW_REPOS.
+#
+# ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 1.  THE MACHINE — who Stage E runs as, and where the dispatcher already lives
+# ===========================================================================
+
+# The non-admin macOS account the dispatcher runs as, and that Stage E's two
+# daemons will run as too.  NOT your login account: a user LaunchAgent only
+# runs while you are logged in, so a poller under your account stops the moment
+# you log out while the dispatcher keeps opening pull requests — reviews would
+# stop silently.  The installer reads this account's home from the directory
+# service; you never type a home path.
+#
+# RULE: an existing local account, resolvable by `dscl . -read /Users/<name>`.
+# The installer never creates it — if it is missing, that is the dispatcher
+# install, not this one.
+ROLE_ACCOUNT=_exdispatch
+
+# The launchd label of the dispatcher's own system daemon.  The installer
+# restarts it (unload-then-load) after writing the reviews entry, and reads its
+# startup banner back.  It is also the source of the Stage E daemon labels: the
+# reverse-DNS prefix is reused, so `com.example.dispatcher` yields
+# `com.example.stage-e-poller` and `com.example.stage-e-bounce`.
+#
+# RULE: reverse-DNS, at least two dot-separated segments, and a service that
+# `launchctl print system/<label>` can find.
+DISPATCHER_SERVICE=com.example.dispatcher
+
+# The dispatcher's config file — the one holding its `repositories` array.  The
+# installer backs it up, inserts or updates ONE entry in it (`id: reviews`),
+# and validates that the result still parses.  It writes nothing else there.
+#
+# RULE: an absolute path to a readable JSON file owned by ROLE_ACCOUNT.  The
+# installer reads `workspaceBaseDir`, `linearWorkspaceId`, `repositoryPath` and
+# every entry `name` out of it, so you type none of those.
+DISPATCHER_CONFIG=/opt/example-dispatch/config.json
+
+# The clone URL the two daemons exec out of.  The installer clones it under the
+# role account at `~/.stage-e/kit`, SEPARATE from whatever clone the dispatcher
+# cuts worktrees from, so a fetch never moves code under a running pass.  It
+# touches that clone again only when one of the scripts the daemons exec has
+# gone missing from it — then, with both jobs unloaded, it fast-forwards
+# (`fetch` + `pull --ff-only`).  A run that finds every script present leaves
+# the clone alone, so later runs do NOT update it for you.
+#
+# RULE: an https git URL.  Not a path, not ssh — the role account has no keys.
+KIT_REPO_URL=https://github.com/example-org/claude-project-kit
+
+
+# ===========================================================================
+# 2.  THE TRACKER — the review team, the agent, and you
+# ===========================================================================
+
+# The Linear team key review tickets live under.  Review tickets must sit away
+# from real work, so a review can never be mistaken for a task, and the team
+# must not be a sub-team of anything — a sub-issue is based on its parent's
+# branch, and a review must never share a branch with the code it judges.
+#
+# The installer creates this team if it is absent, adds the workflow states,
+# reads its git automations and turns off every rule that would move a review
+# ticket, and refuses outright if the team turns out to be nested.  The one
+# thing it never deletes is your work: no team, state, label or ticket.
+#
+# RULE: 1–5 upper-case letters or digits.  It becomes a branch prefix, so it
+# must not collide with a team key you already dispatch work to.
+REVIEWS_TEAM_KEY=REV
+
+# What that team is called, used only if the team has to be created.
+REVIEWS_TEAM_NAME=Reviews
+
+# The DISPLAY NAME of the dispatcher's Linear agent user — the identity a
+# review ticket is delegated to.  This is usually lower-case and is NOT the
+# capitalised label the members list shows you.
+#
+# RULE: matches exactly one active app user in the workspace.  If the name is
+# ambiguous the installer stops and names both, rather than guessing.
+AGENT_DISPLAY_NAME=dispatcher-agent
+
+# The workspace label that selects the reviewer's model.  A review is a cheap,
+# bounded read, so the cheap model is the right default; the poller attaches
+# this label when it creates each review ticket.
+#
+# RULE: an existing WORKSPACE-level label.  A team-scoped label with the same
+# name does not count — the dispatcher reads labels off a ticket by name, and a
+# label scoped to one team is invisible to every other team's tickets.  The
+# installer says so explicitly rather than counting it.
+MODEL_LABEL=haiku
+
+# Your own Linear account, by email.  The installer resolves it to a user id
+# and writes that id into the reviews entry's `userAccessControl.allowedUsers`,
+# so only delegations made by you can start a reviewer session.
+#
+# RULE: an address that resolves to exactly one active member.  LEFT INVALID ON
+# PURPOSE — `you@example.com` is refused by name, so an unedited conf cannot
+# run.
+OWNER_LINEAR_EMAIL=you@example.com
+
+# The team keys whose tickets Stage E treats as pipeline work, comma-separated.
+# Reviews are discovered through Linear (what the agent worked on), so this is
+# a routing hint for branch→ticket matching, not a repository list.
+#
+# RULE: comma-separated team keys, same alphabet as REVIEWS_TEAM_KEY.  Leave it
+# empty to accept any team.
+MANAGED_TEAM_KEYS=KIT,TOD
+
+
+# ===========================================================================
+# 3.  THE REPOSITORIES under review
+# ===========================================================================
+
+# The repositories whose pull requests may be reviewed and bounced, as
+# OWNER/NAME, comma-separated.
+#
+# WHAT THE INSTALLER DOES WITH THIS.  For each one it reads the branch's
+# REQUIRED CHECK CONTEXTS from GitHub using YOUR `gh` login — which has the
+# administration read your daemon token deliberately does not — and writes them
+# into the bounce driver's `required_checks` map.  That map is LOAD-BEARING,
+# not tuning: the daemon token gets a 403 from the protection endpoint, the
+# driver refuses to read that as "requires nothing", and every pass would exit
+# 2 and say so on the pull request.  A repository answered from config can
+# never reach that state.
+#
+# If GitHub will not name the contexts for a repository, the installer does NOT
+# invent an empty set: it raises checkpoint card CK-6 with the exact command,
+# and blocks.
+#
+# RULE: OWNER/NAME entries, comma-separated, each readable by your `gh` login.
+# LEFT INVALID ON PURPOSE — `example-org/repo-name` is refused by name.
+REVIEW_REPOS=example-org/repo-name
+
+
+# ===========================================================================
+# 4.  OPTIONAL — every one of these has a working default
+# ===========================================================================
+
+# How often each one-shot pass runs, in seconds.  They are offset so the two
+# jobs rarely start together.  Both jobs are one-shot (scan → act → exit) with
+# no KeepAlive: KeepAlive would restart a one-shot process in a tight loop.
+POLL_INTERVAL_SECONDS=300
+BOUNCE_INTERVAL_SECONDS=360
+
+# The severity at or above which review findings are called out in the pull
+# request comment.  The BOUNCE threshold is a different number and comes from
+# each repository's own `delivery.json` on its committed default branch.  Keep
+# the two equal, or a comment saying *below threshold, comments only* can be
+# followed minutes later by a bounce.
+#
+# RULE: one of low | medium | high | critical.
+SEVERITY_THRESHOLD=medium
+
+# The NAMES — never the values — of the two environment variables the daemons
+# read their credentials from.  The installer writes both into the role
+# account's own env file (mode 600, under that account's home), and refuses to
+# write into the dispatcher's env file or under its state root: the dispatcher's
+# env file is copied unscrubbed into every session, and the state root is
+# reachable by the very sessions the ledger counts.
+#
+# You may rename the Linear one freely.  LEAVE THE GITHUB ONE AS `GH_TOKEN`:
+# the shared comment transport reads `GH_TOKEN` and `GITHUB_TOKEN` and nothing
+# else, and the bounce driver does not mirror a renamed variable — rename it
+# and its reads keep working while every comment it posts fails, weeks later,
+# at exhaustion time.
+#
+# RULE: an environment variable NAME (`[A-Z][A-Z0-9_]*`).  A value with a
+# credential shape here is refused, by key name.
+LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
+GITHUB_TOKEN_ENV=GH_TOKEN
+
+# The ceiling on the whole review-ticket description, including the diff.  Over
+# it the poller declines and says so on the pull request rather than delivering
+# a truncated diff a reviewer would judge as if it were whole.
+#
+# RULE: a positive integer.
+DIFF_CAP_CHARS=120000
