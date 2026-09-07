@@ -106,6 +106,29 @@ WHAT IT REFUSES
     UNMEASURED row at `tracker` and reads nothing.  A person's shell still
     reads it.  A read gate is the only shape that helps: a prompt gate cannot
     stop a value that was never prompted for.
+
+    WHAT THAT REFUSAL IS WORTH — SAY IT HERE, NOT ONLY IN THE MODULE IT COMES
+    FROM.  Both gates above are TAMPER-EVIDENT, NOT TAMPER-PROOF, and for
+    exactly the reason `scripts/pipeline_dispatch_local.py` states about the
+    same tuple: the markers live in an ENVIRONMENT, a session's shell runs as
+    the same user, and a user can scrub their own environment.  `env -u
+    CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_PROJECT_DIR -u AI_AGENT
+    python3 <this file> verify` reads the stored key and measures the tracker,
+    because at that point nothing here can tell it from the owner's own shell.
+    The gate is worth having anyway — it is the difference between a session
+    doing this accidentally and a session doing it deliberately, and the
+    deliberate version leaves a command in the transcript that says what it
+    was for.  But it is not a boundary, and writing it as one is how a
+    guarantee ends up narrower than its own wording.
+
+    THE DURABLE BOUNDARIES ARE ELSEWHERE, AND THEY ARE THE ONES TO RELY ON:
+    the PreToolUse hook, which is self-protected and which a session cannot
+    edit (a deny rule for this file invoked with a marker unset or emptied is
+    a HUMAN's change to make, deliberately not attempted from here); and the
+    role account's own file permissions, which is why the credential lives at
+    mode 600 under ITS home and is reached only through `sudo -u`.  A machine
+    whose owner wants the stronger claim adds the first; this file's job is to
+    state which claim it is actually making.
   * MERGING, APPROVING, LABELLING.  There is no code path to any of them.  The
     installer CHECKS whether the pull requests are merged and PRINTS the exact
     commands for a person.  `--selftest` asserts the banned tokens are absent
@@ -278,13 +301,31 @@ class SetupError(Exception):
 
 def agent_env_markers_present(env=None):
     """The markers a model's environment sets, in the order found. Empty = a
-    person's shell. The tuple itself is imported, never redefined here."""
+    person's shell. The tuple itself is imported, never redefined here.
+
+    PRESENCE, NOT TRUTHINESS, AND THE DIFFERENCE IS A WHOLE SPELLING. A name
+    set to the empty string is a name that is SET, and `env.get(m)` read it as
+    absent — so `CLAUDECODE= CLAUDE_CODE_ENTRYPOINT= … python3 <this file> run`
+    walked through every gate below without removing anything, while
+    `env -u CLAUDECODE …` had to actually unset four variables. Two spellings
+    of the same scrub, one of them free. `m in env` closes the free one.
+
+    It does not make the gate tamper-proof, and nothing here can — see WHAT
+    THAT REFUSAL IS WORTH in the module docstring. It closes the cheaper of the
+    two tampers, which is worth doing even though the other one remains."""
     env = os.environ if env is None else env
-    return [m for m in AGENT_ENV_MARKERS if env.get(m)]
+    return [m for m in AGENT_ENV_MARKERS if m in env]
 
 
 def refuse_if_agent(action, env=None):
-    """Refuse a MUTATING action under a model. Returns None, or raises."""
+    """Refuse a MUTATING action under a model. Returns None, or raises.
+
+    TAMPER-EVIDENT, NOT TAMPER-PROOF. The markers are environment variables and
+    a session's shell can unset its own environment, so this stops the accident
+    and records the deliberate act; it is not a boundary. The boundary, if the
+    machine wants one, is a PreToolUse deny rule — self-protected, and a
+    human's to write. Said out loud in the module docstring too, because a
+    guarantee stated more broadly than it holds is the defect, not the gap."""
     found = agent_env_markers_present(env)
     if not found:
         return None
@@ -293,7 +334,8 @@ def refuse_if_agent(action, env=None):
         "  A session that installs its own supervision — its own daemons, its own\n"
         "  dispatcher entry, its own credentials — is the thing this refusal exists to\n"
         "  prevent. There is no override flag; an escape hatch documented in --help is\n"
-        "  not a refusal.\n"
+        "  not a refusal. (Scrubbing these variables is not an override either: it is\n"
+        "  the deliberate act this refusal exists to make visible.)\n"
         "  A PERSON runs this, in a terminal:  python3 %s %s\n"
         "  Read-only meanwhile:  verify | status | card <CK-id> | run --dry-run"
         % (action, ", ".join(found), _self_path(), action))
@@ -715,12 +757,21 @@ def acquire_privilege(ctx, command, dry_run):
     home and `card` reads only this file, so neither may interrupt you for a
     password. Under a model nothing is acquired at all — a session cannot be
     handed the owner's administrator access, and the probes that would have
-    used it fail as themselves."""
+    used it fail as themselves.
+
+    THE RESUME LINE IS THE SPELLING YOU TYPED, NOT THE SUBCOMMAND. A declined
+    sudo on `run --dry-run` used to end with "run the same command again:
+    python3 … run" — which is not the same command, it is the ONE command that
+    changes the machine, printed to someone who had just asked to measure it
+    and been stopped by a password box. `run_steps` already carries the
+    spelling through as its own `resume`; this is the same fact, said by the
+    only other thing that prints one."""
     if command not in PRIVILEGED_COMMANDS:
         return False
     if agent_env_markers_present():
         return False
-    ctx.sudo.acquire(_privilege_reason(command, dry_run, ctx.account), command)
+    resume = command + (" --dry-run" if dry_run else "")
+    ctx.sudo.acquire(_privilege_reason(command, dry_run, ctx.account), resume)
     return True
 
 
@@ -1155,7 +1206,11 @@ class Ctx(object):
         agent check happens FIRST, on the same imported markers everything
         else in this file refuses on, and the caller gets the ordinary "could
         not resolve it" answer — a §13 UNMEASURED row at `tracker`, naming a
-        thing that was not measured rather than passing it quietly.
+        thing that was not measured rather than passing it quietly.  Like every
+        other use of those markers this is TAMPER-EVIDENT, NOT TAMPER-PROOF: a
+        shell that scrubs its own environment reads the key exactly as a person
+        does.  The mode-600 file under the role account's home is the boundary;
+        this is the gate.  See WHAT THAT REFUSAL IS WORTH at the top.
 
         Exit 9 is "there is no env file" and exit 8 is "that name is not in it".
         Both are ABSENT and both are answers. Anything else is "I could not
@@ -3040,6 +3095,38 @@ def _selftest_body():
            [m for m in () if {"CLAUDECODE": "1"}.get(m)] == [],
            "an emptied marker tuple still detected an agent environment")
 
+    # -- 4b. A MARKER SET TO THE EMPTY STRING IS A MARKER THAT IS SET --------
+    #
+    # There are two spellings of the same scrub and they used to cost different
+    # amounts. `env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_PROJECT_DIR
+    # -u AI_AGENT python3 …` removes four variables; `CLAUDECODE= … python3 …`
+    # merely blanks them, and a `.get()` test read the blank as absent — so the
+    # cheaper spelling was free. Neither is stopped by anything in this file
+    # (see WHAT THAT REFUSAL IS WORTH in the module docstring), but a gate that
+    # a blank walks through is not the gate this file says it is.
+    cases += 1
+    emptied = dict.fromkeys(AGENT_ENV_MARKERS, "")
+    expect("agent-refusal-emptied",
+           agent_env_markers_present(emptied) == list(AGENT_ENV_MARKERS),
+           "markers set to the empty string read as ABSENT (%s) — `CLAUDECODE= python3 "
+           "…` then walks every gate in this file without unsetting anything"
+           % agent_env_markers_present(emptied))
+    for marker in AGENT_ENV_MARKERS:
+        try:
+            refuse_if_agent("run", {marker: ""})
+            failures.append("agent-refusal-emptied: %s='' did not refuse `run`" % marker)
+        except Refusal:
+            pass
+    expect("agent-refusal-emptied", agent_env_markers_present({}) == [],
+           "an environment with no markers at all was read as an agent environment")
+
+    # mutant: the truthiness read. Present-but-empty is invisible to it.
+    cases += 1
+    expect("agent-refusal-emptied-mutant",
+           [m for m in AGENT_ENV_MARKERS if emptied.get(m)] == [],
+           "the truthiness spelling still saw an emptied marker, so the check above "
+           "cannot see the gate being loosened back to it")
+
     # …and the refusal must land BEFORE the conf is read, so a session cannot
     # even learn what it would have installed. A missing conf would normally be
     # exit 2; under a model it must still be exit 3.
@@ -3930,6 +4017,23 @@ def _selftest_body():
                not any(("n=" + conf["LINEAR_KEY_ENV"]) in _fmt(a) for a in fakeZ2.reads),
                "the agent check came AFTER the read: %d probe(s) ran" % len(fakeZ2.reads))
 
+        # …and it closes on a marker that is merely BLANKED, not unset — the
+        # cheaper of the two scrubs, and the one that used to be free. Driven
+        # through os.environ, which is what the gate actually reads.
+        for marker in AGENT_ENV_MARKERS:
+            os.environ.pop(marker, None)
+        os.environ[AGENT_ENV_MARKERS[0]] = ""
+        ctxZ3, fakeZ3 = _with_stored_env(*(_settled_ctx(conf) + (conf,)))
+        valZ3, whyZ3 = ctxZ3._stored_secret(conf["LINEAR_KEY_ENV"])
+        expect("agent-cannot-read-the-key",
+               valZ3 is None and "agent environment" in whyZ3
+               and not any(("n=" + conf["LINEAR_KEY_ENV"]) in _fmt(a)
+                           for a in fakeZ3.reads),
+               "with %s set to the empty string the stored key was read anyway (%r) — "
+               "blanking a marker is not unsetting it"
+               % (AGENT_ENV_MARKERS[0], whyZ3))
+        os.environ[AGENT_ENV_MARKERS[0]] = "1"
+
         # mutant: the gate removed — the exact pre-fix spelling, against the
         # same fixtures. It must turn every assertion above red.
         cases += 1
@@ -3953,7 +4057,7 @@ def _selftest_body():
                "tracker operation(s) ran — the check above cannot see the defect it "
                "exists to catch" % len(apiM2.asked))
 
-        # 19d. …and nothing hands a session the owner's ADMINISTRATOR access
+        # 18b. …and nothing hands a session the owner's ADMINISTRATOR access
         # either. Under a model there is no acquisition at all.
         cases += 1
         ctxAG, _fAG, _apiAG = _healthy_ctx(conf)
@@ -4035,6 +4139,52 @@ def _selftest_body():
            "a missing password is caught by the SetupError handler and reported as a "
            "configuration mistake (exit %s)" % EX_USAGE)
 
+    # …AND THE COMMAND IT TELLS YOU TO RE-RUN IS THE SPELLING YOU TYPED.
+    # Someone who asked to MEASURE the machine, was stopped by a password box
+    # and followed the printed instruction must not thereby run the one command
+    # that CHANGES it. The reason line above it already says "`run --dry-run` …
+    # It changes nothing", which is what makes a bare `run` underneath easy to
+    # miss. Read off the LAST line, not out of the whole message: the reason
+    # text contains the flag too, so a search of the body can never fail.
+    cases += 1
+
+    def _resume_line(ctx_, command, dry_run):
+        try:
+            _quiet(lambda: acquire_privilege(ctx_, command, dry_run))
+        except NoPrivilege as exc_:
+            return str(exc_).strip().splitlines()[-1].strip()
+        return ""
+
+    ctxDR, fakeDR, apiDR = _healthy_ctx(conf)
+    ctxDR.sudo = SudoSession(validate=lambda: 1, refresh=lambda: 0)
+    lineDR = _resume_line(ctxDR, "run", True)
+    expect("sudo-refused-spelling", lineDR.endswith("run --dry-run"),
+           "a declined sudo on `run --dry-run` ended with %r — following it runs the one "
+           "command that changes the machine" % lineDR)
+    expect("sudo-refused-spelling", not (fakeDR.writes or apiDR.created),
+           "the declined dry run still wrote something")
+    ctxVR, _fVR, _aVR = _healthy_ctx(conf)
+    ctxVR.sudo = SudoSession(validate=lambda: 1, refresh=lambda: 0)
+    expect("sudo-refused-spelling", _resume_line(ctxVR, "verify", False).endswith("verify"),
+           "a declined sudo on `verify` no longer names `verify`")
+
+    # mutant: the old spelling — the SUBCOMMAND passed as the resume string.
+    cases += 1
+    ctxRV, _fRV, _aRV = _healthy_ctx(conf)
+    ctxRV.sudo = SudoSession(validate=lambda: 1, refresh=lambda: 0)
+    lineRV = ""
+    try:
+        _quiet(lambda: ctxRV.sudo.acquire(
+            _privilege_reason("run", True, ctxRV.account), "run"))   # the reversion
+        failures.append("sudo-refused-spelling-mutant: a refused sudo did not stop")
+    except NoPrivilege as exc:
+        lineRV = str(exc).strip().splitlines()[-1].strip()
+    expect("sudo-refused-spelling-mutant", lineRV.endswith("run"),
+           "the reversion did not produce a resume line at all: %r" % lineRV)
+    expect("sudo-refused-spelling-mutant", not lineRV.endswith("--dry-run"),
+           "the subcommand passed as the resume string still printed --dry-run, so the "
+           "spelling check cannot see the flag being dropped")
+
     # mutant: privilege ASSUMED rather than checked — the command carries on.
     cases += 1
     ctxSV, fakeSV, _apiSV = _healthy_ctx(conf)
@@ -4087,6 +4237,100 @@ def _selftest_body():
     expect("no-privilege-command-mutant", ctxNQ.sudo.acquisitions == 1,
            "an acquisition that ignored the command name still asked for nothing — the "
            "no-privilege check cannot see `status` prompting for a password")
+
+    # -- 19d. THE WIRING, driven through main() rather than around it --------
+    #
+    # Every case in this section so far calls `acquire_privilege` or
+    # `SudoSession.acquire` ITSELF, so every one of them stays green with the
+    # single call site in `main()` deleted — and that one line is the whole of
+    # what makes any of this live on a real machine. "Acquired once" and
+    # "acquired before the first probe" have to hold where they actually
+    # happen, so this case drives `main()` and asserts nothing else.
+    #
+    # It is arranged so nothing here can touch the machine: `Runner` is
+    # replaced module-wide by a FakeRunner that answers nothing and merely
+    # RECORDS each `sudo`-shelled argv, and `_sudo_validate`/`_sudo_refresh`
+    # (which `SudoSession.__init__` resolves as globals) by counters. The
+    # probes all fail; that is fine — this case is about order and count.
+    cases += 1
+    order = []
+    _RealRunner = Runner        # captured before the global is replaced below
+
+    class _OrderRunner(FakeRunner):
+        """Records the position of every sudo-shelled probe, answers none."""
+
+        def __init__(self, dry_run=False):
+            # Deliberately NOT `FakeRunner.__init__`: that reaches the module
+            # global `Runner`, which `_drive` has replaced by then, so the base
+            # initialiser would silently become object's and leave this without
+            # its `reads`/`writes` lists.
+            _RealRunner.__init__(self, dry_run=dry_run)
+            self.answers = []
+            self.applied = []
+
+        def _exec(self, argv, stdin, timeout):
+            if argv and argv[0] == "sudo":
+                order.append("probe")
+            return FakeRunner._exec(self, argv, stdin, timeout)
+
+    main_tmp = tempfile.mkdtemp(prefix="stage-e-main.")
+    main_conf = os.path.join(main_tmp, "stage-e.conf")
+    with open(main_conf, "w") as fh:
+        fh.write(GOOD_CONF)
+
+    def _drive(argv):
+        """Run main(argv) with the machine stubbed out; return (rc, order)."""
+        del order[:]
+        g = globals()
+        saved_globals = {k: g[k] for k in ("Runner", "_sudo_validate", "_sudo_refresh")}
+        g["Runner"] = lambda dry_run=False: _OrderRunner(dry_run=dry_run)
+        g["_sudo_validate"] = lambda: (order.append("acquire"), 0)[1]
+        g["_sudo_refresh"] = lambda: 0
+        try:
+            rc, _printed = _quiet(lambda: main(list(argv) + [
+                "--conf", main_conf, "--state", os.path.join(main_tmp, "state")]))
+        finally:
+            g.update(saved_globals)
+        return rc, list(order)
+
+    _rcV, orderV = _drive(["verify"])
+    expect("main-acquires-once", orderV.count("acquire") == 1,
+           "`verify` through main() validated sudo %d time(s), not once — every other "
+           "case in this section calls acquire_privilege directly and would stay green "
+           "with main()'s call site deleted" % orderV.count("acquire"))
+    expect("main-acquires-once", "probe" in orderV,
+           "`verify` through main() shelled sudo for no probe at all, so the ordering "
+           "assertion below proves nothing")
+    expect("main-acquires-once", orderV[:1] == ["acquire"],
+           "the first privileged thing `verify` did was %r, not the one deliberate "
+           "acquisition — a probe that reaches sudo first is the prompt storm"
+           % (orderV[:1] or ["nothing"]))
+    _rcD, orderD = _drive(["run", "--dry-run"])
+    expect("main-acquires-once", orderD.count("acquire") == 1 and orderD[:1] == ["acquire"],
+           "`run --dry-run` through main() acquired %d time(s) and began with %r"
+           % (orderD.count("acquire"), (orderD[:1] or ["nothing"])))
+    for read_only in (["status"], ["card", "CK-1"]):
+        _rcQ, orderQ = _drive(read_only)
+        expect("main-acquires-once", orderQ.count("acquire") == 0,
+               "`%s` through main() asked for a password %d time(s) — it is not in "
+               "PRIVILEGED_COMMANDS and must never interrupt anyone"
+               % (" ".join(read_only), orderQ.count("acquire")))
+
+    # mutant: main()'s one call site removed. `acquire_privilege` is looked up
+    # as a global at call time, so replacing it here is exactly that deletion.
+    cases += 1
+    saved_acquire = globals()["acquire_privilege"]
+    globals()["acquire_privilege"] = lambda ctx, command, dry_run: False  # the reversion
+    try:
+        _rcM, orderM = _drive(["verify"])
+    finally:
+        globals()["acquire_privilege"] = saved_acquire
+    expect("main-acquires-once-mutant",
+           orderM.count("acquire") == 0 and "probe" in orderM,
+           "with main()'s acquisition removed, `verify` still validated sudo %d time(s) "
+           "over %d probe(s) — the wiring check cannot see the one line that makes the "
+           "whole of section 19 live"
+           % (orderM.count("acquire"), orderM.count("probe")))
 
     # -- 19e. the timestamp stays fresh, and the keeper cannot orphan --------
     cases += 1

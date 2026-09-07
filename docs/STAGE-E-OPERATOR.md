@@ -81,6 +81,9 @@ where two password boxes in a row look alike. `status` and `card` read nothing p
 and never ask. If `sudo` is missing or you decline it, the command **stops there with exit 5
 having done nothing** rather than half-running: "you did not give me a password" and "your
 install is broken" look identical once a pass is half-finished, and they need opposite fixes.
+The command it then tells you to re-run is **the spelling you typed**, flag and all — decline
+the prompt on `run --dry-run` and it says to run `run --dry-run` again, never the bare `run`
+that would change the machine you had only asked it to measure.
 
 **The git automations are read, not assumed.** They are `Team.gitAutomationStates` in
 Linear's API — the same five rules as *Team settings → Issue statuses and automations → git
@@ -103,8 +106,36 @@ enough: reading a key out of the env file is not a prompt, and for one round `ve
 through `sudo -u`, and making eight authenticated tracker requests with it. The read is now
 gated on the same agent markers everything else refuses on, so a session gets an
 **UNMEASURED** row at the tracker step (exit 4, naming the file it did not read) instead of
-the key. A person running the identical command reads it and measures normally. A session
-does not acquire the administrator password either.
+the key. A person running the identical command reads it and measures normally. Nothing
+acquires the administrator password under a model either.
+
+**How much those two gates are worth: tamper-evident, not tamper-proof.** Both read
+environment variables — `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_PROJECT_DIR`,
+`AI_AGENT` — and a session's shell runs as **you** and can unset its own environment. Run
+the installer with those four removed and it reads the stored key and measures the tracker,
+because at that point nothing in the script can tell it from your own terminal. That is not
+a hole in the script; it is the ceiling on what a script can promise about the environment
+it is handed, and the module it imports the markers from
+(`scripts/pipeline_dispatch_local.py`) has said so about the same tuple from the start. The
+gates are still worth having: they stop the accident, and clearing four variables to get
+past one is a deliberate act that shows up in the transcript as exactly that. What they are
+not is a boundary.
+
+**The two boundaries that do hold** are outside the script and outside anything a session
+can edit:
+
+- **The `PreToolUse` hook** (`.claude/hooks/pre-tool-use.py`), which is self-protected. A
+  deny rule for a Bash command that invokes this installer with a marker unset or emptied is
+  the enforcement version of the refusal above. **It is not shipped** — a hook change is a
+  human's to make, and an agent that added its own would be writing the rule it is meant to
+  be bound by. Add it if you want the stronger claim.
+- **The role account's file permissions.** The credential lives at mode 600 under *that*
+  account's home and is reached only through `sudo -u`, which is why an installer running as
+  the role account is the only thing that can read it at all.
+
+One thing that is now closed: a marker set to the **empty string** counts as present. Both
+`env -u CLAUDECODE … python3 …` and the cheaper `CLAUDECODE= python3 …` used to walk past the
+gate; only the first does now.
 
 ---
 
