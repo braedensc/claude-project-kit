@@ -31,6 +31,7 @@
     "test:gh-fallback": "python3 scripts/gh_fallback.py --selftest",
     "test:review-local": "python3 scripts/pipeline_review_local.py --selftest",
     "test:review-basis": "python3 scripts/pipeline_review_basis.py --selftest",
+    "test:telemetry-local": "python3 scripts/pipeline_telemetry_local.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },

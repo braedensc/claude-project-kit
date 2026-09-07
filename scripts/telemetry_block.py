@@ -41,6 +41,10 @@ Usage:
                        --team-key ENG --model claude-sonnet-5 --auth-mode api-key \
                        --run-id r_... --started-at ISO --ended-at ISO \
                        [--usage EXECUTION.json] [--reviewer-outcome success]
+    telemetry_block.py --from-bounce ARTIFACT.json --out REQUESTS.json \
+                       --team-key ENG --model claude-sonnet-5 --auth-mode api-key \
+                       --run-id r_... --started-at ISO --ended-at ISO \
+                       [--usage EXECUTION.json]
     telemetry_block.py --selftest
 
 Exit: 0 = valid, 1 = rejected, 2 = usage/IO error.
@@ -343,6 +347,110 @@ def review_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
     return block
 
 
+# --------------------------------------------------------------------------- #
+# The bounce emitter — a fix-session outcome -> a §4 block (KIT-93/KIT-94)
+# --------------------------------------------------------------------------- #
+# §4's mode/stage table is explicit that a BOUNCE run reports under
+# `session_mode: "ticket"` (the same mode a dev session runs under — a bounce IS a
+# ticket session, just one the poller started rather than a person), never
+# "maintenance" — that mode is reserved for `review`/`retro`. Getting this backwards
+# is exactly the kind of contract violation the collector is built to flag, so it is
+# hardcoded here rather than left to a caller to remember.
+BOUNCE_OUTCOMES = ("completed", "blocked", "timeout", "capacity", "error", "budget")
+_NEEDS_ERROR_CLASS = ("blocked", "error", "timeout", "capacity", "budget")
+
+
+def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended_at,
+                 dispatch_id=None, execution=None, schema=None):
+    """The block a bounce (fix) session posts: what it cost, that it ran, the outcome.
+
+    `artifact` is daemon-authored (KIT-93's own facts about the run it started), not
+    self-reported by the fix session — the same "workflow computes it, the model
+    never reports its own verdict" discipline `review_block` already holds to.
+    Expected keys: `ticket_id`, `pr` (int), `outcome`, and optionally `error_class`,
+    `bounce_no`, `max_bounces`, `reason`, `files_changed`, `lines_added`,
+    `lines_removed`. Unlike a review, a bounce WRITES code — the fix session's own
+    commits — so files/lines are real numbers when the caller has them; zero is the
+    honest default when it does not.
+    """
+    outcome = artifact.get("outcome")
+    if outcome not in BOUNCE_OUTCOMES:
+        outcome = "error"
+    error_class = artifact.get("error_class") or None
+    if outcome in _NEEDS_ERROR_CLASS:
+        # §4: error_class is null ONLY when outcome doesn't require one. A caller
+        # that reported e.g. "error" but forgot to say why still gets a NON-null,
+        # stable slug here — never a null the collector would have to guess at.
+        error_class = str(error_class) if error_class else ("bounce_%s" % outcome)
+    else:
+        error_class = None
+
+    usage = usage_from(execution) if execution is not None else {
+        "tokens_in": 0, "tokens_out": 0, "tokens_cache_read": 0,
+        "tokens_cache_write": 0, "cost_usd": 0.0, "turns": 0,
+    }
+    pr_number = artifact.get("pr") if isinstance(artifact.get("pr"), int) else None
+
+    def counter(key):
+        v = artifact.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+    run = {
+        "run_id": run_id,
+        "dispatch_id": dispatch_id or artifact.get("dispatch_id") or None,
+        "session_mode": "ticket",
+        "ticket_id": artifact.get("ticket_id"),
+        "team_key": team_key,
+        "stage": "bounce",
+        "model": model,
+        "auth_mode": auth_mode,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "tokens_in": usage["tokens_in"],
+        "tokens_out": usage["tokens_out"],
+        "tokens_cache_read": usage["tokens_cache_read"],
+        "tokens_cache_write": usage["tokens_cache_write"],
+        "cost_usd": usage["cost_usd"],
+        "turns": usage["turns"],
+        "outcome": outcome,
+        "error_class": error_class,
+        "files_changed": counter("files_changed"),
+        "lines_added": counter("lines_added"),
+        "lines_removed": counter("lines_removed"),
+        "pr_number": pr_number,
+    }
+    events = [{
+        "ticket_id": artifact.get("ticket_id"),
+        "event": "bounce_started",
+        "at": started_at,
+        # §4: the bounce WORKFLOW owns budgets.maxBounces and the counter behind
+        # it (docs/AUTONOMY.md's producer table) — never the model it starts.
+        "actor": "system",
+    }]
+    return {"schema": scrape.TELEMETRY_SCHEMA, "runs": [run], "ticket_events": events}
+
+
+def bounce_comment(artifact, block, notes=None):
+    """The ticket comment body carrying a bounce `block`. Mirrors `review_comment`'s
+    shape; a bounce block carries no per-item array to shed under §8's 16 000-char
+    cap, so an over-cap block is reported rather than silently truncated — it would
+    be a bug in the caller, not routine growth the way review findings are."""
+    notes = notes if notes is not None else []
+    head = ["**Pipeline bounce** — PR #%s" % artifact.get("pr")]
+    bounce_no, max_bounces = artifact.get("bounce_no"), artifact.get("max_bounces")
+    if bounce_no is not None and max_bounces is not None:
+        head.append("bounce %s of %s" % (bounce_no, max_bounces))
+    reason = str(artifact.get("reason") or "").strip()
+    if reason:
+        head += ["", reason[:1500]]
+    body = "\n".join(head + ["", "```json", json.dumps(block, indent=2), "```", ""])
+    if len(body) > MAX_BODY:
+        notes.append("bounce comment is %d chars, over the %d-char cap (§8) — this "
+                     "block has no array to shed, so the caller should look at why "
+                     "it grew this large" % (len(body), MAX_BODY))
+    return body
+
+
 def review_comment(artifact, block, notes=None):
     """The ticket comment body carrying `block`, trimmed to §8's cap out loud."""
     notes = notes if notes is not None else []
@@ -596,6 +704,87 @@ def selftest():
     check("end-to-end: both findings land", swept["stats"]["review_findings"] == 2,
           json.dumps(swept["stats"]))
 
+    # ── The bounce emitter produces a block that passes its own gate ────────
+    import subprocess
+    import tempfile
+    GOOD_BOUNCE = {"ticket_id": "ENG-123", "pr": 41, "bounce_no": 2, "max_bounces": 3,
+                  "reason": "review findings met the severity threshold",
+                  "outcome": "completed", "files_changed": 3, "lines_added": 12,
+                  "lines_removed": 4}
+    bblock = bounce_block(GOOD_BOUNCE, "ENG", "claude-sonnet-5", "api-key",
+                          "r_bounce_1_1", "2026-08-24T16:00:00Z", "2026-08-24T16:10:00Z",
+                          execution=EXECUTION_LOG)
+    check("the bounce block conforms to §4", validate_block(bblock) == [],
+          "; ".join(validate_block(bblock)))
+    check("a bounce run reports stage bounce", bblock["runs"][0]["stage"] == "bounce")
+    check("a bounce run is session_mode ticket (§4's mode/stage table)",
+          bblock["runs"][0]["session_mode"] == "ticket")
+    check("a completed bounce carries no error_class",
+          bblock["runs"][0]["error_class"] is None)
+    check("a completed bounce carries the real file/line counts",
+          (bblock["runs"][0]["files_changed"], bblock["runs"][0]["lines_added"],
+           bblock["runs"][0]["lines_removed"]) == (3, 12, 4))
+    check("bounce_started is emitted by the system, never the agent",
+          bblock["ticket_events"][0]["event"] == "bounce_started"
+          and bblock["ticket_events"][0]["actor"] == "system")
+
+    exhausted = dict(GOOD_BOUNCE, outcome="error", bounce_no=3)
+    eblock = bounce_block(exhausted, "ENG", "claude-sonnet-5", "api-key", "r_bounce_2_1",
+                          "2026-08-24T16:00:00Z", "2026-08-24T16:05:00Z")
+    check("an errored bounce gets a NON-null, stable error_class",
+          eblock["runs"][0]["error_class"] == "bounce_error")
+    check("an errored bounce conforms too", validate_block(eblock) == [])
+
+    check("an unrecognized outcome is normalized to error, not rejected",
+          bounce_block(dict(GOOD_BOUNCE, outcome="vibed"), "ENG", "m", "api-key",
+                      "r", "2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z"
+                      )["runs"][0]["outcome"], "error")
+
+    bnotes = []
+    bbody = bounce_comment(GOOD_BOUNCE, bblock, bnotes)
+    check("the bounce comment carries exactly one block", gate([bbody], True)["ok"],
+          "; ".join(gate([bbody], True)["errors"]))
+    check("nothing was silently dropped from the bounce comment", not bnotes, bnotes)
+
+    bbatch = review_requests(GOOD_BOUNCE, bbody)  # generic envelope, reused unchanged
+    check("the bounce batch is a §8 document", bbatch["schema"] == SAFE_OUTPUTS_SCHEMA)
+    check("the bounce batch names the pinned ticket",
+          bbatch["requests"][0]["ticket_id"] == "ENG-123")
+    check("the bounce batch's own comment passes the gate",
+          gate(comment_bodies(bbatch), True)["ok"])
+    check("the bounce batch conforms to §8",
+          not cs.document_problems(review_requests(GOOD_BOUNCE, "body"), "safe-outputs"))
+
+    bsink = scrape.DrySink("pipeline")
+    bswept = scrape.sweep([scrape.comment(bbody, cid="c-bounce", ticket="ENG-123")], bsink)
+    check("bounce end-to-end: nothing is skipped", bswept["stats"]["skipped"] == 0,
+          "; ".join(bswept["skipped"]))
+    check("bounce end-to-end: the bounce run lands", bswept["stats"]["runs"] == 1)
+    check("bounce end-to-end: bounce_started lands", bswept["stats"]["ticket_events"] == 1)
+
+    # …and end to end via the CLI, exactly as --from-review is proven above.
+    with tempfile.TemporaryDirectory() as tmp:
+        artifact_path = os.path.join(tmp, "bounce.json")
+        out_path = os.path.join(tmp, "requests.json")
+        with open(artifact_path, "w", encoding="utf-8") as handle:
+            json.dump(dict(GOOD_BOUNCE, ticket_id="eng-123"), handle)  # lowercased -> rejected
+        argv = ["--from-bounce", artifact_path, "--out", out_path,
+                "--team-key", "ENG", "--model", "claude-sonnet-5",
+                "--auth-mode", "api-key", "--run-id", "r_01JAV8Q2S7",
+                "--started-at", "2026-08-24T16:00:00Z", "--ended-at", "2026-08-24T16:05:00Z"]
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+                                capture_output=True, text=True, timeout=120)
+        check("--from-bounce refuses a batch §8 would reject",
+              result.returncode == 1, result.stdout[-300:])
+        check("--from-bounce writes nothing when it refuses", not os.path.exists(out_path))
+        with open(artifact_path, "w", encoding="utf-8") as handle:
+            json.dump(GOOD_BOUNCE, handle)
+        result = subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+                                capture_output=True, text=True, timeout=120)
+        check("--from-bounce writes a conforming batch",
+              result.returncode == 0 and os.path.exists(out_path),
+              result.stdout[-300:] + result.stderr[-300:])
+
     # ── usage_from is forgiving by design ──────────────────────────────────
     for label, payload in (("None", None), ("an empty dict", {}),
                            ("a stray string", "not a log"), ("a list of noise", [1, 2, 3])):
@@ -671,7 +860,9 @@ def main():
                     help="with --gate: zero blocks is allowed")
     ap.add_argument("--from-review", metavar="FINDINGS",
                     help="build a batch from a pipeline-review/1 findings artifact")
-    ap.add_argument("--out", help="with --from-review: where to write the batch")
+    ap.add_argument("--from-bounce", metavar="ARTIFACT",
+                    help="build a batch from a daemon-authored bounce-outcome artifact")
+    ap.add_argument("--out", help="with --from-review/--from-bounce: where to write the batch")
     ap.add_argument("--team-key", default="")
     ap.add_argument("--model", default="")
     ap.add_argument("--auth-mode", default="api-key")
@@ -751,6 +942,47 @@ def main():
             json.dump(batch, handle, indent=2)
         print("Wrote %s: 1 comment, %d finding(s), %d char(s)."
               % (args.out, len(block.get("review_findings") or []), len(body)))
+        return 0
+
+    if args.from_bounce:
+        if not args.out:
+            print("--from-bounce needs --out", file=sys.stderr)
+            return 2
+        try:
+            with open(args.from_bounce, encoding="utf-8") as handle:
+                artifact = json.load(handle)
+        except (OSError, ValueError) as exc:
+            print("::error::bounce artifact unreadable: %s" % exc)
+            return 2
+        execution = None
+        if args.usage and os.path.exists(args.usage):
+            try:
+                with open(args.usage, encoding="utf-8") as handle:
+                    execution = json.load(handle)
+            except (OSError, ValueError) as exc:
+                print("::notice::execution log unreadable (%s) — reporting zero cost." % exc)
+        block = bounce_block(artifact, args.team_key, args.model, args.auth_mode,
+                             args.run_id, args.started_at, args.ended_at,
+                             dispatch_id=args.dispatch_id or None, execution=execution)
+        problems = validate_block(block)
+        if problems:
+            for line in problems:
+                print("::error::bounce telemetry block is malformed: %s" % line)
+            return 1
+        notes = []
+        body = bounce_comment(artifact, block, notes)
+        for line in notes:
+            print("::notice::%s" % line)
+        batch = review_requests(artifact, body)  # generic: only reads `ticket_id`
+        batch_problems = cs.document_problems(batch, "safe-outputs")
+        if batch_problems:
+            for line in batch_problems:
+                print("::error::bounce safe-outputs batch is malformed: %s" % line)
+            return 1
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump(batch, handle, indent=2)
+        print("Wrote %s: 1 comment, %d char(s)." % (args.out, len(body)))
         return 0
 
     ap.print_help()
