@@ -242,7 +242,28 @@ def resolve_pins_root(cfg, session_root):
 
 
 def refuse_if_agent():
-    present = [k for k in AGENT_ENV_MARKERS if os.environ.get(k)]
+    # PRESENCE, NOT TRUTHINESS, AND THE DIFFERENCE IS A WHOLE SPELLING. A name
+    # set to the EMPTY STRING is a name that is SET, and `os.environ.get(k)`
+    # read it as absent — so
+    #     CLAUDECODE= CLAUDE_CODE_ENTRYPOINT= CLAUDE_PROJECT_DIR= AI_AGENT= \
+    #         python3 scripts/pipeline_dispatch_local.py ENG-123 …
+    # walked this gate having removed nothing, while `env -u CLAUDECODE -u …`
+    # had to actually unset four names. Two spellings of one scrub, one of them
+    # free; `k in os.environ` closes the free one. This module OWNS the tuple,
+    # and `scripts/pipeline_stage_e_setup.py` imports it and tests presence the
+    # same way — keep the two in step rather than letting them drift.
+    #
+    # WHAT THAT DOES NOT BUY, SAID PLAINLY. It does not make this a boundary,
+    # and nothing inside a Python script can be one here: the markers live in
+    # an ENVIRONMENT, a session's shell runs as the same user, and a shell that
+    # fully UNSETS them is indistinguishable from a person's terminal to
+    # anything reading `os.environ`. What closes is the cheaper of the two
+    # tampers; the remaining one leaves a command in the transcript that says
+    # what it was for, which is the whole of "tamper-evident". The durable
+    # boundaries are elsewhere and are the ones to rely on: the self-protected
+    # PreToolUse hook (a deny rule a human adds), the role account's own file
+    # permissions, and the sandbox.
+    present = [k for k in AGENT_ENV_MARKERS if k in os.environ]
     if not present:
         return
     die("REFUSED: this looks like an agent session (%s set).\n"
@@ -974,17 +995,30 @@ def _wf_pin_gate_checks(wf_src):
     ]
 
 
-def _st_run(argv, agent_env=False):
+def _st_run(argv, agent_env=False, blank_markers=False, script=None):
     """Run this script as a subprocess. The default env is scrubbed of the agent
     markers, because the selftest simulates the HUMAN terminal this tool is for
     — and because CI (and a Claude Code session running the battery) would
-    otherwise hit the refusal on every case."""
+    otherwise hit the refusal on every case.
+
+    `blank_markers` is the OTHER spelling of that scrub: every marker present
+    and empty, which is what `os.environ.get` used to read as an unset
+    environment. `script` runs a mutated COPY of this file instead — it lives
+    outside `scripts/`, so `PYTHONPATH` has to carry the real directory for its
+    module-level imports."""
     env = dict(os.environ)
     for k in AGENT_ENV_MARKERS:
         env.pop(k, None)
     if agent_env:
         env["CLAUDECODE"] = "1"
-    return subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+    if blank_markers:
+        for k in AGENT_ENV_MARKERS:
+            env[k] = ""
+    if script:
+        here = os.path.dirname(os.path.abspath(__file__))
+        env["PYTHONPATH"] = os.pathsep.join([here] + ([env["PYTHONPATH"]]
+                                                      if env.get("PYTHONPATH") else []))
+    return subprocess.run([sys.executable, script or os.path.abspath(__file__), *argv],
                           capture_output=True, text=True, env=env, timeout=120)
 
 
@@ -1223,6 +1257,44 @@ def selftest():
         r = _st_run(["--session-root", root8, "--show"], agent_env=True)
         expect(r.returncode == 0,
                "--show is read-only and must stay available in any environment")
+
+        # 8b. A BLANKED marker is still a marker. `CLAUDECODE= … python3 <this>`
+        #     sets all four to the empty string, and a truthiness test read that
+        #     as a person's terminal — the free spelling of the scrub, walking
+        #     the one gate that stands between a session and its own pin. The
+        #     refusal must fire and name every marker it saw.
+        root8b, pins8b, tf8b = _st_repo(tmp)
+        r = _st_run(["ENG-123", "--session-root", root8b, "--ticket-file", tf8b],
+                    blank_markers=True)
+        expect(r.returncode == 1 and "REFUSED" in r.stderr
+               and all(m in r.stderr for m in AGENT_ENV_MARKERS),
+               f"blanked markers must still be refused, and named: "
+               f"{r.returncode} {r.stderr[-300:]}")
+        expect(not os.path.exists(os.path.join(pins8b, pin_key(root8b) + ".json")),
+               "a blanked-marker refusal must leave no pin behind")
+        #     …and the case has teeth: revert the presence test to the
+        #     truthiness one and this same run places a pin. A mutation that
+        #     no longer applies is asserted, not skipped — reword the line and
+        #     this fails here rather than passing on a check it never made.
+        with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+            src = fh.read()
+        #     (Both spellings are split across a `+` so that neither appears
+        #     whole in this file — a literal here would be a second occurrence
+        #     and `count(...) == 1` would fail on the mutation's own text.)
+        stem = "present = [k for k in AGENT_ENV_MARKERS if "
+        old = stem + "k in os.environ]"
+        expect(src.count(old) == 1,
+               "the presence test moved or was reworded; case 8b's mutation is stale")
+        mutant = os.path.join(tmp, "mutant_truthiness_dispatch.py")
+        with open(mutant, "w", encoding="utf-8") as fh:
+            fh.write(src.replace(old, stem + "os.environ.get(k)]"))
+        root8c, pins8c, tf8c = _st_repo(tmp)
+        r = _st_run(["ENG-123", "--session-root", root8c, "--ticket-file", tf8c],
+                    blank_markers=True, script=mutant)
+        expect("REFUSED" not in r.stderr
+               and os.path.exists(os.path.join(pins8c, pin_key(root8c) + ".json")),
+               f"the truthiness mutant must walk the gate and write a pin, or "
+               f"case 8b proves nothing: {r.returncode} {r.stderr[-300:]}")
 
         # 9. Guards on the caller's own arguments.
         r = _st_run(["ENG-999", "--session-root", root8, "--ticket-file", tf8])
