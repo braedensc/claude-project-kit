@@ -155,6 +155,15 @@ jobs:
       - name: Stage E local reviewer selftest (comment-only, decline≠clean)
         run: python3 scripts/pipeline_review_local.py --selftest
 
+      # Stage E's basis resolver (docs/adr/2026-09-05-…, decision 2 — "the snapshot
+      # problem"). Offline: tier ordering (history > reconciler > live), tier 1 proven
+      # immune to a post-delegation edit BY CONSTRUCTION (its signature accepts no live
+      # issue), the edit-after-delegation flag computed from the live ticket regardless
+      # of which tier answered, an honestly empty basis is not a crash, and the script
+      # never constructs a Linear write mutation — read-only, like the reviewer it feeds.
+      - name: Stage E basis resolver selftest (tier ordering, read-only against Linear)
+        run: python3 scripts/pipeline_review_basis.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
