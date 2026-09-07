@@ -58,13 +58,29 @@ not do the work: no terminal to paste a credential at (`CK-2`), an API that woul
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
 (`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
 
-**You type each secret once, ever.** The two values are asked for at a hidden prompt on the
-run that has none, written straight into the role account's own env file at mode 600, and
-from then on **read back out of that file** — so a second `run`, a `run --dry-run` and
-`verify` ask you for nothing at all. Nothing prints a value; what you see back is the name,
-the length and the class. If the tracker later refuses a stored key, that is reported as a
-*rejected* key rather than a missing one — the file is there and its contents are not
-accepted — and only `run` offers to replace it.
+**You type each secret once — plus once more if a stored one stops working.** The two
+values are asked for at a hidden prompt on the run that has none, written straight into the
+role account's own env file at mode 600, and from then on **read back out of that file** —
+so a second `run`, a `run --dry-run` and `verify` ask you for nothing at all. Nothing prints
+a value; what you see back is the name, the length and the class.
+
+The exception is real and worth knowing before it happens: **if the tracker refuses a key
+that was read out of that file**, that is a *rejected* key, not a missing one — the file is
+there and its contents are not accepted — and `run` asks you for a replacement and writes it
+back over the old one. Revoke a key, let one expire, or point the installer at another
+workspace and you will type that one secret a second time. `verify` and `run --dry-run`
+never ask; they report the rejection and name `run` as the command that can fix it.
+
+**Your login password is asked for once, at the start, and not again.** `run` and `verify`
+both read this machine as the role account (`sudo -u …`) and as root, dozens of times per
+pass, and macOS forgets a sudo timestamp after a few minutes. So both acquire administrator
+access **once, deliberately, before the first probe**, print the reason on the line above the
+prompt, and keep the timestamp fresh until the command exits — no second prompt arrives
+mid-run, and in particular none arrives right after the hidden prompt for a tracker key,
+where two password boxes in a row look alike. `status` and `card` read nothing privileged
+and never ask. If `sudo` is missing or you decline it, the command **stops there with exit 5
+having done nothing** rather than half-running: "you did not give me a password" and "your
+install is broken" look identical once a pass is half-finished, and they need opposite fixes.
 
 **The git automations are read, not assumed.** They are `Team.gitAutomationStates` in
 Linear's API — the same five rules as *Team settings → Issue statuses and automations → git
@@ -79,6 +95,16 @@ wrote, or when you are changing it. `run` refuses to do anything under a model �
 that installs its own supervision is exactly what that refusal exists to prevent. Only
 `run --dry-run`, `verify`, `status` and `card` stay available there, and each of them
 measures without applying.
+
+**Under a model, no stored credential is read either, and that is a separate guarantee from
+the one above.** "`--dry-run` is never handed a credential *prompt*" is true and was never
+enough: reading a key out of the env file is not a prompt, and for one round `verify` and
+`run --dry-run` did exactly that — pulling the live tracker key into a session's own process
+through `sudo -u`, and making eight authenticated tracker requests with it. The read is now
+gated on the same agent markers everything else refuses on, so a session gets an
+**UNMEASURED** row at the tracker step (exit 4, naming the file it did not read) instead of
+the key. A person running the identical command reads it and measures normally. A session
+does not acquire the administrator password either.
 
 ---
 

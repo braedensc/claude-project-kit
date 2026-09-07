@@ -36,7 +36,27 @@ one.  A step that could not measure itself BLOCKS; it never passes quietly.
     3   REFUSED — an agent environment asked for a mutating action
     4   UNKNOWN — a step could not measure itself.  Not a pass and not a
         failure: the thing may be fine and nothing here can tell.  It blocks.
+    5   NO ADMINISTRATOR ACCESS — `sudo` is absent or was declined, so nothing
+        was attempted.  Its own code because "you did not give me a password"
+        and "your install is broken" need opposite fixes and would otherwise
+        arrive as the same red.
     10  BLOCKED-ON-HUMAN — a checkpoint card is printed; do it and re-run
+
+ADMINISTRATOR ACCESS IS ASKED FOR ONCE, DELIBERATELY, AT THE START.  Nearly
+every probe in this file runs as the role account (`sudo -u …`) or as root
+(`launchctl`, `install`), dozens of times across a pass that takes ten to
+twenty minutes.  macOS forgets a sudo timestamp after a few minutes, so
+leaving each of those to prompt on its own means the login-password box
+arrives at unpredictable moments for the whole run — including immediately
+after the hidden prompt for a tracker key, which is exactly where a person
+pastes the wrong secret into the wrong box.  So `run` and `verify` acquire it
+ONCE, up front, with the reason printed on the line before the prompt, and a
+daemon-thread keep-alive re-stamps the timestamp (`sudo -n -v`, which can
+never prompt) until this process exits.  If `sudo` is missing or declined the
+command STOPS THERE, at exit 5: half a pass, some probes answered and the rest
+refused, reads on screen like a broken install rather than a missing password.
+`status` and `card` read nothing privileged and acquire nothing.  Under a
+model nothing is acquired at all.
 
 `verify` USES THE SAME FOUR, AND THE CHOICE IS DELIBERATE.  On a healthy,
 fully-installed machine it exits 0 and says so — a read-only reassurance
@@ -70,10 +90,22 @@ WHAT IT REFUSES
     A session that installs its own supervision is the attack the refusal
     exists to prevent.  `verify`, `status`, `card` and `--dry-run` still run.
     `--dry-run` is exempt because it MEASURES ONLY: it runs every step with
-    apply off, so no file, no daemon and no tracker object is touched, and it
-    is never handed a credential prompt.  That is a property of the code path,
-    not a promise in a banner — the old spelling passed apply=True and really
-    created the team.
+    apply off, so no file, no daemon and no tracker object is touched.  That
+    is a property of the code path, not a promise in a banner — the old
+    spelling passed apply=True and really created the team.
+  * READING A STORED CREDENTIAL UNDER A MODEL.  "Never handed a credential
+    PROMPT" is a narrower claim than it sounds, and for one round it was the
+    only one this file could make: `_stored_secret` consulted the role
+    account's env file BEFORE both the prompt gate and the tty gate, so a
+    session running `verify` or `run --dry-run` on an installed machine read
+    the owner's live tracker key out of that file through `sudo -u <account>`,
+    into its own process, and issued authenticated tracker requests with it.
+    Measured: the key reached the process and EIGHT tracker operations ran.
+    `_stored_secret` now returns "not read, this is an agent environment"
+    before it looks, so a model-run `verify`/`--dry-run` reports the §13
+    UNMEASURED row at `tracker` and reads nothing.  A person's shell still
+    reads it.  A read gate is the only shape that helps: a prompt gate cannot
+    stop a value that was never prompted for.
   * MERGING, APPROVING, LABELLING.  There is no code path to any of them.  The
     installer CHECKS whether the pull requests are merged and PRINTS the exact
     commands for a person.  `--selftest` asserts the banned tokens are absent
@@ -88,11 +120,17 @@ WHAT IT REFUSES
     itself wrote, at mode 600 under the role account's home, is the first place
     it looks.  So a re-run with nothing left to do asks nothing, `--dry-run`
     asks nothing, and `verify` asks nothing and can still measure the tracker.
-    The read goes through `sudo -u <role account>`, which every other probe in
-    this file already needs, so it grants no capability the caller did not have;
-    the value reaches this process and one request header and nothing else.  A
-    stored key the tracker REJECTS is reported as a rejected key, which is not
-    the same fact as an absent one, and is replaced only where asking is allowed.
+    The read goes through `sudo -u <role account>`, and happens only in a
+    person's shell (above); the value reaches this process and one request
+    header and nothing else.
+
+    THERE IS EXACTLY ONE EXCEPTION, AND "TYPE IT ONCE, EVER" IS FALSE WITHOUT
+    IT.  When the tracker REJECTS the stored key — revoked, expired, or for
+    another workspace — that is a rejected key, which is not the same fact as
+    an absent one, and `run` asks for a replacement and writes it back over
+    the old one.  So: once per credential, plus once more each time a stored
+    one stops being accepted.  Every message that mentions the storing says
+    so; an absolute the code does not keep is worse than the extra clause.
 
 THE STATE THIS KEEPS is under YOUR home at `~/.stage-e-setup/`: a ledger of
 step outcomes, the ids resolved out of the tracker, and your attestations.  It
@@ -100,6 +138,7 @@ holds no credential.  The role account's own state lives under ITS home, where
 your sessions cannot read it.
 """
 import argparse
+import atexit
 import getpass
 import json
 import os
@@ -108,6 +147,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -129,6 +169,10 @@ EX_FAILED = 1
 EX_USAGE = 2
 EX_REFUSED = 3
 EX_UNKNOWN = 4
+# Administrator access was not granted, so NOTHING was attempted. Its own code
+# on purpose: "give me your password" and "your install is broken" are opposite
+# problems and sharing a number would make the first look like the second.
+EX_NOPRIV = 5
 EX_BLOCKED = 10
 
 # Step outcomes. DONE and ALREADY_DONE both exit 0 and are never printed the
@@ -512,6 +556,175 @@ def _fmt(argv):
 
 
 # --------------------------------------------------------------------------- #
+# Administrator access.  ASKED FOR ONCE, OUT LOUD, BEFORE ANYTHING RUNS.
+#
+# The defect this replaces: `as_role` and `as_root` above shell `sudo` on nearly
+# every probe — fifteen times on a settled machine, more on a first pass — and
+# macOS re-asks for the login password whenever its sudo timestamp lapses. So
+# the owner was interrupted repeatedly, at unpredictable moments, across a run
+# that takes ten to twenty minutes. Worst of all, one of those moments is
+# immediately after the hidden prompt for a tracker key: two password boxes in
+# a row, one wanting a login password and one wanting a credential, and the
+# person cannot tell from the screen which is which.
+#
+# One acquisition, one reason printed on the line before it, and a keep-alive
+# for the rest of the process. Nothing else in this file may shell `sudo`
+# without that having happened first in a person's shell.
+# --------------------------------------------------------------------------- #
+SUDO_REFRESH_SECONDS = 60
+
+# The commands that will shell `sudo`, and therefore the only ones that may ask
+# for a password. `card` prints a card out of this file's own tables; `status`
+# reads the ledger under YOUR home. Neither touches the role account, the
+# dispatcher or the daemons, so neither is allowed to interrupt you for one.
+PRIVILEGED_COMMANDS = ("run", "verify")
+
+
+class NoPrivilege(Exception):
+    """Exit 5. Administrator access was refused or is unavailable, and NOTHING
+    was attempted. Deliberately not a SetupError: a missing password is not a
+    configuration mistake, and must not be reported as one."""
+
+
+def _sudo_validate():
+    """`sudo -v`: prove administrator access and stamp the timestamp, running
+    no command. Streams are INHERITED, never captured — a password prompt
+    nobody can see is a prompt nobody answers."""
+    try:
+        return subprocess.run(["sudo", "-v"]).returncode
+    except FileNotFoundError:
+        return 127
+
+
+def _sudo_refresh():
+    """`sudo -n -v`: re-stamp the timestamp and NEVER prompt. `-n` is what makes
+    this safe from a background thread — without it a keep-alive could pop a
+    password prompt behind whatever the foreground is doing, which is the
+    defect this whole section exists to remove."""
+    try:
+        return subprocess.run(["sudo", "-n", "-v"], capture_output=True).returncode
+    except FileNotFoundError:
+        return 127
+
+
+class SudoSession(object):
+    """Administrator access for the life of one process: acquired at most once,
+    kept fresh until the process ends, and never re-acquired behind your back.
+
+    The keep-alive is a DAEMON THREAD, not a child shell running `while true`.
+    A child would survive this process and go on re-stamping a timestamp for a
+    run that finished; a daemon thread cannot outlive the interpreter, and
+    `release()` (registered with atexit) stops it promptly rather than leaving
+    it to be killed mid-sleep.
+    """
+
+    def __init__(self, validate=None, refresh=None, interval=SUDO_REFRESH_SECONDS):
+        self._validate = validate or _sudo_validate
+        self._refresh = refresh or _sudo_refresh
+        self._interval = interval
+        self.acquisitions = 0     # `--selftest` asserts this never exceeds 1
+        self.refreshes = 0
+        self.held = False
+        self._stop = None
+        self._thread = None
+
+    def acquire(self, why, resume):
+        """Hold administrator access, or raise NoPrivilege and leave the machine
+        untouched. Idempotent: the second call through any path is a no-op, so
+        no code path can turn this back into a prompt per probe."""
+        if self.held:
+            return True
+        self.acquisitions += 1
+        say("")
+        say("-" * 74)
+        say("ADMINISTRATOR PASSWORD — asked for ONCE, here, and not again this run.")
+        say("-" * 74)
+        say("macOS forgets a sudo timestamp after a few minutes, and this command runs")
+        say("dozens of probes as another account and as root. Asked for as it went, it")
+        say("would interrupt you at unpredictable moments for the whole run — including")
+        say("right after the hidden prompt for a tracker key, where two password boxes in")
+        say("a row look alike and the wrong secret goes in the wrong one. So: once, now,")
+        say("kept fresh until this process exits. Nothing has been changed yet.")
+        say("")
+        say("WHY IT IS NEEDED: %s" % why)
+        rc = self._validate()
+        if rc != 0:
+            raise NoPrivilege(
+                "NO ADMINISTRATOR ACCESS — nothing was attempted, and nothing was changed.\n"
+                "  %s\n"
+                "  What could not be done without it: %s\n"
+                "  It stops here on purpose. A half-run — some probes answered and the rest\n"
+                "  refused — reads on screen like a broken install rather than a missing\n"
+                "  password, and those two need opposite fixes.\n"
+                "  Fix that and run the same command again:\n"
+                "      python3 %s %s"
+                % ("`sudo` is not on this machine, or not on PATH." if rc == 127 else
+                   "`sudo` refused (exit %d): no password was given, it was wrong, or this "
+                   "login is not an administrator." % rc,
+                   why, _self_path(), resume))
+        self.held = True
+        self._start_keepalive()
+        return True
+
+    def _start_keepalive(self):
+        # At most one keeper at a time. `acquire` already guards on `held`, so
+        # this cannot fire in practice — but a keeper whose stop event has been
+        # replaced out from under it is unstoppable, and "unstoppable" is the
+        # one property this whole design exists to avoid.
+        self.release()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._keepalive, name="sudo-keepalive")
+        self._thread.daemon = True      # cannot outlive this process: no orphan
+        self._thread.start()
+        atexit.register(self.release)
+
+    def _keepalive(self):
+        while not self._stop.wait(self._interval):
+            if self._refresh() != 0:
+                # Lost it. Say nothing here — a background thread shouting over
+                # a foreground prompt is its own defect — and let the probe that
+                # actually needs it report the failure in its own words.
+                return
+            self.refreshes += 1
+
+    def release(self):
+        """Stop re-stamping. Safe to call twice, and safe to call on a session
+        that never acquired anything. The timestamp itself is left alone: it is
+        the caller's shell's, not this process's, to invalidate."""
+        if self._stop is not None:
+            self._stop.set()
+
+
+def _privilege_reason(command, dry_run, account):
+    """The one line printed immediately before the password prompt."""
+    if command == "verify":
+        return ("`verify` re-measures this machine as the %s role account and as root. "
+                "It changes nothing." % account)
+    if dry_run:
+        return ("`run --dry-run` measures this machine as the %s role account and as "
+                "root. It changes nothing." % account)
+    return ("`run` reads and writes files as the %s role account, edits the dispatcher's "
+            "config, and installs and loads two system LaunchDaemons." % account)
+
+
+def acquire_privilege(ctx, command, dry_run):
+    """Take administrator access for the whole of a privileged command, before
+    its first probe — or raise NoPrivilege and run nothing.
+
+    Not every command needs it: `status` reads only the ledger under your own
+    home and `card` reads only this file, so neither may interrupt you for a
+    password. Under a model nothing is acquired at all — a session cannot be
+    handed the owner's administrator access, and the probes that would have
+    used it fail as themselves."""
+    if command not in PRIVILEGED_COMMANDS:
+        return False
+    if agent_env_markers_present():
+        return False
+    ctx.sudo.acquire(_privilege_reason(command, dry_run, ctx.account), command)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # The tracker transport.  One real, one fake; both answer post(query, vars).
 # --------------------------------------------------------------------------- #
 Q_TEAM_BY_KEY = ("query FindTeamByKey($filter: TeamFilter!) "
@@ -871,10 +1084,13 @@ def _wrap(text, width=70):
 # --------------------------------------------------------------------------- #
 class Ctx(object):
     def __init__(self, conf, runner, state, linear_factory=None, key_reader=None,
-                 secret_reader=None, tty=True):
+                 secret_reader=None, tty=True, sudo=None):
         self.conf = conf
         self.runner = runner
         self.state = state
+        # Administrator access, taken once at the start of a privileged command
+        # and held for the run. Constructing it asks for nothing.
+        self.sudo = sudo or SudoSession()
         self.linear_factory = linear_factory or (lambda key: LinearTransport(key))
         self.key_reader = key_reader or (lambda prompt: getpass.getpass(prompt))
         self.secret_reader = secret_reader or (lambda prompt: getpass.getpass(prompt))
@@ -925,10 +1141,33 @@ class Ctx(object):
         """(value, None) or (None, why-not) — one value out of the role
         account's own env file, read as that account.
 
+        NOTHING IS READ UNDER A MODEL, AND THE GATE IS HERE RATHER THAN AT THE
+        PROMPT.  `verify` and `run --dry-run` are the two commands a session
+        may run, and both are read-only in the sense that matters for the
+        machine — but this function is a READ OF THE OWNER'S LIVE CREDENTIAL.
+        For one round it ran before both the `may_prompt` gate and the tty
+        gate and consulted neither, so a session on an installed machine
+        pulled the tracker key out of the role account's env file through
+        `sudo -u <account>`, into its own process, and made eight
+        authenticated tracker requests with it. "It is never handed a
+        credential PROMPT" was true the whole time and protected nothing: a
+        prompt gate cannot stop a value that was never prompted for. So the
+        agent check happens FIRST, on the same imported markers everything
+        else in this file refuses on, and the caller gets the ordinary "could
+        not resolve it" answer — a §13 UNMEASURED row at `tracker`, naming a
+        thing that was not measured rather than passing it quietly.
+
         Exit 9 is "there is no env file" and exit 8 is "that name is not in it".
         Both are ABSENT and both are answers. Anything else is "I could not
         look", which is a different fact with the same silence and is returned
         as its own sentence rather than folded into the other two."""
+        markers = agent_env_markers_present()
+        if markers:
+            return None, (
+                "a stored credential is never READ into an agent environment (%s set), so "
+                "%s was not fetched out of %s/env and no request carried it. A person "
+                "running this same command reads it and measures the tracker."
+                % (", ".join(markers), name, self.stage_home))
         res = self.runner.as_role(
             self.account, ENV_VALUE_SH % (shlex.quote(name), self.stage_home))
         if res.rc == 9:
@@ -953,6 +1192,17 @@ class Ctx(object):
         prompt. `verify` and `run --dry-run` never reach the third — they set
         `may_prompt` False, so an unresolvable value is UNMEASURED and says so
         rather than stopping a read-only command to ask a person for a secret.
+
+        "ONCE, EVER" HAS ONE EXCEPTION AND THIS IS WHERE IT LIVES.  The second
+        place is durable, so in the ordinary case a credential is typed on the
+        run that has none and never again. But `force_prompt` exists, and
+        `ctx.linear()` uses it: when the tracker REJECTS a key that was read
+        out of the env file, the cached value is dropped and a replacement is
+        asked for. That is correct — a stored key the tracker will not take is
+        worth exactly nothing — and it means the honest promise is "once per
+        credential, plus once more whenever a stored one stops being accepted".
+        Say the second half wherever the first half is said; an absolute the
+        code does not keep costs more trust than the clause costs words.
 
         Nothing here prints the value. What is said out loud is the shape:
         the NAME, the length, the class its prefix puts it in, and a verdict."""
@@ -992,14 +1242,22 @@ class Ctx(object):
         Nothing is constructed and nothing is authenticated until a step
         actually calls the tracker, and by then the key has been looked for in
         the role account's env file. The key lives in this process and in one
-        request header; it is never written, logged, hashed or printed."""
+        request header; it is never written, logged, hashed or printed.
+
+        THIS IS THE ONE PLACE THAT CAN ASK FOR A SECRET A SECOND TIME. If the
+        stored key is rejected, the cache is popped and a replacement is
+        requested — so "type it once, ever" is true only until a key is
+        revoked, expires, or turns out to belong to another workspace. The
+        behaviour is right and the absolute is not; both the message below and
+        the operator guide state the exception rather than imply it away."""
         if self._linear is not None:
             return self._linear
         name = self.conf["LINEAR_KEY_ENV"]
         key, source = self.secret(
             name,
             "paste the tracker API key for %s (hidden — it is stored at mode 600 under "
-            "the role account's home, so this is the last time): "
+            "the role account's home and read back from there, so nothing asks again "
+            "unless the tracker stops accepting it): "
             % self.conf["OWNER_LINEAR_EMAIL"])
         if key is None:
             raise Unknown(
@@ -1028,6 +1286,9 @@ class Ctx(object):
                 say("  tracker will not take what is in it — revoked, expired, or for")
                 say("  another workspace. Paste a replacement and the credentials step")
                 say("  writes it back over the old one.")
+                say("  THIS IS THE ONE TIME THIS THING ASKS TWICE. A stored key is read")
+                say("  back on every later run, so you type each secret once — plus once")
+                say("  more, here, whenever the tracker stops accepting the stored one.")
                 self._secrets.pop(name, None)
                 self._sources.pop(name, None)
                 key, source = self.secret(
@@ -2323,6 +2584,20 @@ def _print_rows(rows):
         say("  %-18s %-13s %s" % (sid, outcome, detail[:96]))
 
 
+def _agent_credential_notice():
+    """Say it in the banner, not only in the row that fails.
+
+    A model may run `verify` and `run --dry-run`, and under a model no stored
+    credential is read at all — so the tracker cannot be measured, and a banner
+    that promised to read the key would be describing a different run."""
+    markers = agent_env_markers_present()
+    if not markers:
+        return
+    say("                AGENT ENVIRONMENT (%s): no stored credential is read, so the"
+        % ", ".join(markers))
+    say("                tracker row will report UNMEASURED. A person's shell reads it.")
+
+
 def cmd_run(ctx, dry_run):
     if not dry_run:
         refuse_if_agent("run")
@@ -2342,6 +2617,7 @@ def cmd_run(ctx, dry_run):
     say("  credentials   read as %s from %s/env%s"
         % (ctx.account, ctx.stage_home,
            "; this run asks for nothing" if dry_run else "; asked for only if absent"))
+    _agent_credential_notice()
     say("  utc           %s" % now_iso())
     # A DRY RUN IS `apply_it=False`, NOT "apply, but skip the Runner".
     # `Runner.write` was the only dry-run seam, and every tracker mutation goes
@@ -2425,6 +2701,7 @@ def cmd_verify(ctx):
     """
     say("Stage E verify — read-only drift check. Nothing is changed, and nothing is asked;")
     say("the tracker key is read from %s/env as %s." % (ctx.stage_home, ctx.account))
+    _agent_credential_notice()
     ctx.may_prompt = False
     code, rows = run_steps(ctx, apply_it=False, keep_going=True)
     if ctx.runner.writes:
@@ -2661,6 +2938,30 @@ def _quiet(fn):
 
 
 def selftest():
+    """THE BATTERY OWNS ITS OWN ENVIRONMENT, and that is not a detail.
+
+    Several assertions here turn on whether agent markers are set — the
+    stored-credential gate above most of all, and the administrator-access
+    acquisition beside it. This file is run BOTH by CI, where no marker is set,
+    and by a session, where three of them are. A battery whose verdict depends
+    on who ran it is not a battery: it would go green in CI and red in the very
+    session that is changing the file, and the honest reading of that red is
+    impossible to tell from a real regression.
+
+    So the markers are scrubbed for the whole run and restored on the way out,
+    and every case that needs one sets it itself, explicitly, in a try/finally
+    of its own."""
+    saved_env = dict(os.environ)
+    for marker in AGENT_ENV_MARKERS:
+        os.environ.pop(marker, None)
+    try:
+        return _selftest_body()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def _selftest_body():
     failures, cases = [], 0
 
     def expect(name, cond, detail=""):
@@ -2765,8 +3066,11 @@ def selftest():
     # -- 5. §13: every outcome has its OWN exit code ------------------------
     cases += 1
     expect("exit-codes-distinct", len({EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED,
-                                       EX_UNKNOWN, EX_BLOCKED}) == 6,
+                                       EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED}) == 7,
            "two outcomes share an exit code")
+    expect("exit-codes-distinct", EX_NOPRIV not in (EX_OK, EX_UNKNOWN, EX_BLOCKED),
+           "`no administrator access` shares a code with nothing-to-do, could-not-measure "
+           "or drifted — the three §13 says must never arrive as the same red")
     expect("exit-codes-distinct", _OUTCOME_EXIT[UNKNOWN] != _OUTCOME_EXIT[ALREADY_DONE],
            "`could not measure it` and `nothing to do` share an exit code")
     expect("exit-codes-distinct", _OUTCOME_EXIT[UNKNOWN] != _OUTCOME_EXIT[FAILED],
@@ -3577,6 +3881,243 @@ def selftest():
     expect("status-worst-wins", code == EX_BLOCKED,
            "waiting on a person exited %s, not %s" % (code, EX_BLOCKED))
 
+    # ------------------------------------------------------------------ #
+    # 18. A SESSION CANNOT READ THE OWNER'S LIVE TRACKER KEY.
+    #
+    # `verify` and `run --dry-run` are the two commands a model may run, and
+    # for one round both READ the stored key: `_stored_secret` consulted the
+    # role account's env file BEFORE the `may_prompt` gate and BEFORE the tty
+    # gate, and consulted neither. Measured on the pre-fix code with agent
+    # markers set: the key reached the process and EIGHT authenticated tracker
+    # operations ran under it. "Never handed a credential prompt" stayed true
+    # the whole time, which is what makes it the wrong guarantee to hold.
+    # ------------------------------------------------------------------ #
+    cases += 1
+    saved = dict(os.environ)
+    try:
+        os.environ[AGENT_ENV_MARKERS[0]] = "1"
+        for label, drive in (("verify", lambda c: cmd_verify(c)),
+                             ("run --dry-run", lambda c: cmd_run(c, dry_run=True))):
+            ctxZ, fakeZ, apiZ = _healthy_ctx(conf)
+            askedZ = _counted(ctxZ)
+            ctxZ.tty = False                    # what main() sets under a model
+            ctxZ.runner.dry_run = True
+            codeZ, printedZ = _quiet(lambda c=ctxZ, d=drive: d(c))
+            expect("agent-cannot-read-the-key",
+                   ctxZ._secrets.get(conf["LINEAR_KEY_ENV"]) is None,
+                   "`%s` under a model pulled the owner's key into the process" % label)
+            expect("agent-cannot-read-the-key", apiZ.asked == [],
+                   "`%s` under a model made %d authenticated tracker request(s): %s"
+                   % (label, len(apiZ.asked), apiZ.asked))
+            expect("agent-cannot-read-the-key", askedZ == [] and not fakeZ.writes,
+                   "`%s` under a model asked for %s or wrote %s"
+                   % (label, askedZ, [w["why"] for w in fakeZ.writes]))
+            expect("agent-cannot-read-the-key", codeZ == EX_UNKNOWN,
+                   "`%s` under a model exited %s — a tracker nothing could measure is "
+                   "§13's UNKNOWN, never a pass" % (label, codeZ))
+            unknownZ = [s for s, rec in ctxZ.state.data["steps"].items()
+                        if rec["outcome"] == UNKNOWN]
+            expect("agent-cannot-read-the-key", unknownZ == ["tracker"],
+                   "`%s` reported %s as unmeasured, not just the tracker" % (label, unknownZ))
+            expect("agent-cannot-read-the-key", STORED_KEY not in printedZ,
+                   "`%s` printed a credential" % label)
+        # …and the gate is BEFORE the read, not after it: nothing even ran.
+        ctxZ2, fakeZ2 = _with_stored_env(*(_settled_ctx(conf) + (conf,)))
+        valZ, whyZ = ctxZ2._stored_secret(conf["LINEAR_KEY_ENV"])
+        expect("agent-cannot-read-the-key", valZ is None and "agent environment" in whyZ,
+               "the stored read under a model answered %r / %r" % (valZ, whyZ))
+        expect("agent-cannot-read-the-key",
+               not any(("n=" + conf["LINEAR_KEY_ENV"]) in _fmt(a) for a in fakeZ2.reads),
+               "the agent check came AFTER the read: %d probe(s) ran" % len(fakeZ2.reads))
+
+        # mutant: the gate removed — the exact pre-fix spelling, against the
+        # same fixtures. It must turn every assertion above red.
+        cases += 1
+
+        def _ungated(c, name):
+            res = c.runner.as_role(c.account,
+                                   ENV_VALUE_SH % (shlex.quote(name), c.stage_home))
+            val = (res.out or "").strip()
+            return (val, None) if res.ok and len(val) >= 20 else (None, "absent")
+
+        ctxM2, _fM2, apiM2 = _healthy_ctx(conf)
+        _counted(ctxM2)
+        ctxM2.tty = False
+        ctxM2.runner.dry_run = True
+        ctxM2._stored_secret = lambda name: _ungated(ctxM2, name)
+        _quiet(lambda: cmd_verify(ctxM2))
+        expect("agent-cannot-read-the-key-mutant",
+               ctxM2._secrets.get(conf["LINEAR_KEY_ENV"]) == STORED_KEY
+               and len(apiM2.asked) >= 8,
+               "with the agent gate removed the key was still unreachable and only %d "
+               "tracker operation(s) ran — the check above cannot see the defect it "
+               "exists to catch" % len(apiM2.asked))
+
+        # 19d. …and nothing hands a session the owner's ADMINISTRATOR access
+        # either. Under a model there is no acquisition at all.
+        cases += 1
+        ctxAG, _fAG, _apiAG = _healthy_ctx(conf)
+        ctxAG.sudo = SudoSession(validate=lambda: 0, refresh=lambda: 0)
+        tookAG = acquire_privilege(ctxAG, "verify", False)
+        expect("agent-takes-no-privilege",
+               tookAG is False and ctxAG.sudo.acquisitions == 0,
+               "a session acquired the owner's administrator access")
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+    # ------------------------------------------------------------------ #
+    # 19. ADMINISTRATOR ACCESS: ONCE, DELIBERATELY, OR NOT AT ALL.
+    #
+    # `as_role` and `as_root` shell `sudo` on nearly every probe — fifteen
+    # times on a settled machine — and macOS re-asks whenever its timestamp
+    # lapses. The owner was therefore interrupted repeatedly across a ten-to-
+    # twenty-minute run, at moments nothing on screen predicted, one of which
+    # is right after a hidden credential prompt.
+    # ------------------------------------------------------------------ #
+    # -- 19a. at most one acquisition per process, whatever asks -------------
+    cases += 1
+    validations, tail_at_prompt = [], {}
+
+    def _val_ok():
+        # What the reader had in front of them at the instant sudo was invoked.
+        tail_at_prompt["printed"] = sys.stdout.getvalue()
+        validations.append(1)
+        return 0
+
+    sudo1 = SudoSession(validate=_val_ok, refresh=lambda: 0, interval=3600)
+    _v1, printed1 = _quiet(lambda: [sudo1.acquire("because %d" % i, "run")
+                                    for i in range(3)])
+    sudo1.release()
+    expect("sudo-once", sudo1.acquisitions == 1 and len(validations) == 1,
+           "three acquisitions ran %d sudo validation(s) — the password is asked for per "
+           "call, which is the defect" % len(validations))
+    tail = [l for l in tail_at_prompt.get("printed", "").splitlines() if l.strip()]
+    expect("sudo-once", tail and tail[-1].startswith("WHY IT IS NEEDED:")
+           and "because 0" in tail[-1],
+           "the reason was not the last thing on screen before the password prompt: %r"
+           % (tail[-1] if tail else ""))
+    expect("sudo-once", "ONCE" in printed1 and "not again" in printed1,
+           "the acquisition never told the reader it happens once")
+
+    # mutant: a session that forgets it already holds access asks every time.
+    cases += 1
+    validations2 = []
+    sudo2 = SudoSession(validate=lambda: (validations2.append(1), 0)[1],
+                        refresh=lambda: 0, interval=3600)
+    for i in range(3):
+        _quiet(lambda i=i: sudo2.acquire("because %d" % i, "run"))
+        sudo2.held = False                      # the reversion
+    sudo2.release()
+    expect("sudo-once-mutant", sudo2.acquisitions == 3 and len(validations2) == 3,
+           "a session that forgets it holds access still validated %d time(s) — the "
+           "at-most-once check cannot see a prompt per probe" % len(validations2))
+
+    # -- 19b. sudo refused: stop at once, distinctly, having done nothing ----
+    cases += 1
+    ctxSU, fakeSU, apiSU = _healthy_ctx(conf)
+    ctxSU.sudo = SudoSession(validate=lambda: 1, refresh=lambda: 0)
+    readsSU, opsSU = len(fakeSU.reads), len(apiSU.asked)
+    try:
+        _quiet(lambda: acquire_privilege(ctxSU, "verify", False))
+        failures.append("sudo-refused-stops: a refused sudo did not stop the command")
+    except NoPrivilege as exc:
+        expect("sudo-refused-stops", "nothing was attempted" in str(exc),
+               "the refusal did not say nothing was attempted: %s" % str(exc)[:140])
+        expect("sudo-refused-stops", "verify" in str(exc) and "role account" in str(exc),
+               "the refusal did not name what could not be done: %s" % str(exc)[:200])
+    expect("sudo-refused-stops",
+           len(fakeSU.reads) == readsSU and not fakeSU.writes
+           and len(apiSU.asked) == opsSU,
+           "a refused sudo still ran %d probe(s) and %d tracker operation(s)"
+           % (len(fakeSU.reads) - readsSU, len(apiSU.asked) - opsSU))
+    expect("sudo-refused-stops", not issubclass(NoPrivilege, SetupError),
+           "a missing password is caught by the SetupError handler and reported as a "
+           "configuration mistake (exit %s)" % EX_USAGE)
+
+    # mutant: privilege ASSUMED rather than checked — the command carries on.
+    cases += 1
+    ctxSV, fakeSV, _apiSV = _healthy_ctx(conf)
+    ctxSV.sudo = SudoSession(validate=lambda: 1, refresh=lambda: 0)
+    ctxSV.sudo.held = True                      # the reversion
+    ctxSV.runner.dry_run = True
+    readsSV = len(fakeSV.reads)
+    try:
+        _quiet(lambda: acquire_privilege(ctxSV, "verify", False))
+        _quiet(lambda: cmd_verify(ctxSV))
+    except NoPrivilege:
+        # A battery that DIES on a mutant reports nothing about the cases after
+        # it, so this is recorded and the run carries on — same rule as 17c.
+        failures.append("sudo-refused-stops-mutant: `held` no longer suppresses a second "
+                        "acquisition, so a session that already holds access was asked "
+                        "again")
+    expect("sudo-refused-stops-mutant", len(fakeSV.reads) > readsSV,
+           "with the check skipped the run still probed nothing — the stop-immediately "
+           "check cannot see a command that half-runs without administrator access")
+
+    # -- 19c. a command that needs no privilege acquires none ----------------
+    cases += 1
+    ctxNP, fakeNP = _settled_ctx(conf)
+    ctxNP.sudo = SudoSession(validate=lambda: 0, refresh=lambda: 0)
+    readsNP = len(fakeNP.reads)
+    tookNP = acquire_privilege(ctxNP, "status", False)
+    _quiet(lambda: cmd_status(ctxNP))
+    expect("no-privilege-command", tookNP is False and ctxNP.sudo.acquisitions == 0,
+           "`status` asked for a password it has no use for")
+    expect("no-privilege-command", len(fakeNP.reads) == readsNP,
+           "`status` ran %d probe(s) — it reads the ledger under your own home and "
+           "nothing privileged at all" % (len(fakeNP.reads) - readsNP))
+    expect("no-privilege-command", sorted(PRIVILEGED_COMMANDS) == ["run", "verify"],
+           "the privileged set is %s — `card` and `status` must not be in it"
+           % (PRIVILEGED_COMMANDS,))
+    ctxPR, _fPR, _apiPR = _healthy_ctx(conf)
+    ctxPR.sudo = SudoSession(validate=lambda: 0, refresh=lambda: 0, interval=3600)
+    _quiet(lambda: acquire_privilege(ctxPR, "run", False))
+    _quiet(lambda: acquire_privilege(ctxPR, "run", True))
+    ctxPR.sudo.release()
+    expect("no-privilege-command", ctxPR.sudo.acquisitions == 1,
+           "`run` acquired %d time(s), not once" % ctxPR.sudo.acquisitions)
+
+    # mutant: an acquisition blind to the command name asks for everything.
+    cases += 1
+    ctxNQ, _fNQ = _settled_ctx(conf)
+    ctxNQ.sudo = SudoSession(validate=lambda: 0, refresh=lambda: 0, interval=3600)
+    _quiet(lambda: ctxNQ.sudo.acquire("every command, privileged or not", "status"))
+    ctxNQ.sudo.release()
+    expect("no-privilege-command-mutant", ctxNQ.sudo.acquisitions == 1,
+           "an acquisition that ignored the command name still asked for nothing — the "
+           "no-privilege check cannot see `status` prompting for a password")
+
+    # -- 19e. the timestamp stays fresh, and the keeper cannot orphan --------
+    cases += 1
+    refreshed = []
+    sudoK = SudoSession(validate=lambda: 0,
+                        refresh=lambda: (refreshed.append(1), 0)[1], interval=0.01)
+    _quiet(lambda: sudoK.acquire("keep the timestamp fresh for the whole run", "run"))
+    deadline = time.time() + 5
+    while not refreshed and time.time() < deadline:
+        time.sleep(0.01)
+    expect("sudo-stays-fresh", bool(refreshed),
+           "the timestamp was never re-stamped, so a later probe would prompt again")
+    expect("sudo-stays-fresh", sudoK._thread is not None and sudoK._thread.daemon,
+           "the keep-alive is not a daemon thread — it could outlive this process")
+    sudoK.release()
+    sudoK._thread.join(timeout=5)
+    expect("sudo-stays-fresh", not sudoK._thread.is_alive(),
+           "the keep-alive did not stop when released; that is an orphan")
+    # …and the real refresher can never prompt: `-n` is the whole guarantee.
+    # Read out of the two FUNCTIONS, not out of this file: a scan of the whole
+    # source for `-n` would be satisfied by the literal in this very assertion,
+    # which is a check that can never fail — the trap the banned-token scan
+    # above dodges with a marker comment.
+    import inspect
+    expect("sudo-stays-fresh", '"-n"' in inspect.getsource(_sudo_refresh),
+           "the background refresher no longer passes -n, so it could pop a password "
+           "prompt from a thread, behind whatever the foreground is doing")
+    expect("sudo-stays-fresh", '"-n"' not in inspect.getsource(_sudo_validate),
+           "the one deliberate acquisition passes -n too, so it can never ask for the "
+           "password it exists to ask for — and every probe after it would prompt instead")
+
     say("")
     if failures:
         for f in failures:
@@ -3813,6 +4354,12 @@ def main(argv=None):
         ctx = Ctx(conf, Runner(dry_run=args.dry_run), state,
                   tty=(sys.stdin.isatty() and sys.stdout.isatty()
                        and not agent_env_markers_present()))
+        # ADMINISTRATOR ACCESS, ONCE, BEFORE THE FIRST PROBE. `status` and
+        # `card` are not in PRIVILEGED_COMMANDS and acquire nothing. Doing this
+        # here rather than lazily inside a probe is the whole fix: a command
+        # that asks on demand asks whenever the timestamp lapsed, which is
+        # every few minutes of a twenty-minute run.
+        acquire_privilege(ctx, args.command, args.dry_run)
         if args.command == "status":
             return cmd_status(ctx)
         if args.command == "verify":
@@ -3822,6 +4369,10 @@ def main(argv=None):
     except Refusal as exc:
         say(str(exc))
         return EX_REFUSED
+    except NoPrivilege as exc:
+        say("")
+        say(str(exc))
+        return EX_NOPRIV
     except SetupError as exc:
         say("FAILED: " + str(exc))
         return EX_USAGE
