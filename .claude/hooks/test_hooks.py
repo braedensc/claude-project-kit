@@ -1221,6 +1221,32 @@ def main():
          mcp("save_issue", id="ENG-123", labels=["agent:blocked"]), BLOCK, pl_nolbl),
         ("lifecycle-label: an EXPIRED planning pin still blocks (a lapse grants nothing)",
          mcp("save_issue", id="ENG-777", labels=["agent:queued"]), BLOCK, pl_expplan),
+        # PROTECTED labels beyond agent:*/blocked: — the tracker-MCP path must refuse the
+        # SAME set the gh/Bash path does. A session minting `provenance:human` fakes a
+        # human's signal; `provenance:agent` is the safe-outputs executor's to apply on a
+        # filed finding (§8), never the session's to request; `hooks-change` is a human's
+        # guard-change acknowledgement.
+        ("protected-label: setting provenance:human via MCP labels blocked",
+         mcp("save_issue", id="ENG-123", labels=["provenance:human"]), BLOCK, pl_hook),
+        ("protected-label: setting provenance:agent (the executor's own) via MCP blocked",
+         mcp("save_issue", id="ENG-123", labels=["provenance:agent"]), BLOCK, pl_hook),
+        ("protected-label: setting hooks-change via MCP labels blocked",
+         mcp("save_issue", id="ENG-123", labels=["hooks-change"]), BLOCK, pl_hook),
+        ("protected-label: REMOVING provenance:human blocked too (add and remove alike)",
+         mcp("save_issue", id="ENG-123", removeLabels=["provenance:human"]), BLOCK, pl_hook),
+        ("protected-label: UNPINNED session unaffected (a WITHHOLDING check fails open)",
+         mcp("save_issue", id="ENG-123", labels=["provenance:human"]), ALLOW, pl_nopin),
+        # Label-DEFINITION twins: `create_issue_label` was guarded but the current
+        # `save_issue_label`/`save_project_label` upsert verbs were not — so defining or
+        # renaming a protected-named label slipped through the tracker-MCP path. Same
+        # treatment now, so both twins are covered (the gh path guards neither — defining
+        # a label there is setup — but this MCP asymmetry was a real coverage gap).
+        ("protected-label: save_issue_label defining a protected name blocked",
+         mcp("save_issue_label", name="provenance:agent"), BLOCK, pl_hook),
+        ("protected-label: save_issue_label defining hooks-change blocked",
+         mcp("save_issue_label", name="hooks-change"), BLOCK, pl_hook),
+        ("protected-label: save_issue_label with a benign name allowed",
+         mcp("save_issue_label", name="bug"), ALLOW, pl_hook),
 
         # ══ CONFIG ANCHOR: the git ref store is human-only ════════════════════
         # Guards read `delivery.json`, the merged-PR base and the changed-file set
