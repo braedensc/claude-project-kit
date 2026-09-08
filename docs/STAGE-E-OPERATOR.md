@@ -183,6 +183,11 @@ gate; only the first does now.
    The dispatcher resumes that session — same worktree, same branch — with the findings as
    its prompt. Budget spent ⇒ one comment on the PR, one on the ticket, optionally the
    `agent:needs-human` label, stop.
+7. **Each delivered bounce leaves a re-review request** naming the head it bounced. On its
+   next pass the poller re-reviews that PR **if the head has moved** — the session actually
+   pushed — filing a new review ticket under its own title, posting a second PR comment, and
+   deleting the request. That new outcome is what lets the driver bounce again, so a
+   `maxBounces` above 1 is real. No push, no re-review, no cost.
 
 What neither script ever does: merge, enable auto-merge, approve, edit a PR, move the
 original ticket, apply any label but `agent:needs-human`, or launch a Claude session.
@@ -466,19 +471,48 @@ Everything the two scripts remember lives under `~/.stage-e/state`:
 
 | Path | Written by | What it is |
 |---|---|---|
-| `seen-prs.json` | poller | one record per PR: the review ticket, the body hash, how far delivery got |
+| `seen-prs.json` | poller | one record per PR: the review ticket, the body hash, the head it judged, how far delivery got |
 | `outcomes/<OWNER>__<REPO>__pr-<n>.json` | poller | the verdict the bounce driver reads |
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
-| `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | written after a bounce. **Nothing reads it yet** — the poller has no code for it, so a PR is reviewed once, when it is opened |
+| `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
 | `bounces/` | bounce driver | its telemetry artifacts |
 
 Never point `state_dir` at a repo checkout or a worktree. The bounce driver refuses one
 inside a git working tree: the ledger is the budget authority and a worktree is writable by
 the sessions it counts.
+
+**Each `seen-prs.json` record carries a `status`.** Most are self-explanatory —
+`pending` (waiting on the reviewer), `delivering`, `publish-failed`, `close-pending`,
+`collected`, `declined`. Two mean *not finished, select it again next pass*, and they are
+two because they mean different things:
+
+| Status | What it means | Gives up? |
+|---|---|---|
+| `retry` | a **failure** is being re-attempted — a Linear or GitHub read, or the `issueCreate`, did not answer | yes, after 3 passes, then the PR is declined |
+| `rereview` | a bounce asked for a **second look**, and the head moved. Not a failure | no — it never expires and spends no retries |
+
+**What you see when a re-review happens: a second review comment on the same pull
+request.** It does not edit or replace the first — both stay, in order, so the PR reads as
+the history it is. In Linear a **new** review ticket appears, titled
+`Review PR #<n> — <TICKET> (re-review after bounce <k>)`; the original review ticket stays
+closed and is never reopened.
+
+**How often a PR can be reviewed, and why that is bounded.** Once when it is opened, then
+once per **delivered** bounce whose re-prompted session actually pushed. A bounce writes one
+request file; a request buys one review and is deleted the moment the new review ticket
+exists. So the worst case is `1 + maxBounces` reviewer sessions — **four** at
+`maxBounces: 3` — and only if the session pushes after every single bounce. If the session
+pushes nothing, the request simply waits and costs nothing. A push that no bounce asked
+about is never reviewed, which is what stops a PR someone is iterating on from buying a
+reviewer per commit.
+
+If a request file is corrupt or missing its `head_before`, the poller **says so and the run
+goes red** rather than quietly skipping it — a lost re-review would otherwise strand every
+later bounce with no symptom. Delete the file to clear it.
 
 ### 3b. An env file of names
 
@@ -910,6 +944,13 @@ nor `--all`: it is the daemon's whole pass.
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
   Nothing else labels.
+- **Re-review, which is what makes a budget above 1 mean anything.** A bounce is only a
+  trigger while the review outcome judged the *current* head, so after bounce 1 the driver
+  waits for a fresh one. Every delivered bounce therefore leaves
+  `state/rereview/<OWNER>__<REPO>/pr-<n>.json`, and the poller re-reviews that PR on its
+  next pass **if the head has moved**. Nothing pushed ⇒ no re-review and no spend. The
+  request is deleted only once the new review ticket exists, so a crash retries rather than
+  losing it, and it buys exactly one review.
 - **Fallback**: only when the original ticket has no agent session or the re-prompt cannot
   be delivered, a fix ticket in the Reviews team pinned to the PR branch by the description
   tag, delegated the same way, instructed to push to that branch and open no PR.

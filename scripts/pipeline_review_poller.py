@@ -21,10 +21,12 @@ WHAT THIS IS
 
   Two subcommands, and `run` does both:
 
-    scan     DISCOVER the pipeline PRs from Linear → list those repos' open PRs → select
-             new same-repo, non-draft ones → fetch diff → resolve the review basis → build
-             + sanitize the ticket body → ask LINEAR whether a review ticket already exists
-             → create AND delegate one if not → record it in the seen-set
+    scan     DISCOVER the pipeline PRs from Linear → list those repos' open PRs → reopen
+             any whose bounce left a re-review request AND whose head has since moved →
+             select those plus the new same-repo, non-draft ones → fetch diff → resolve the
+             review basis → build + sanitize the ticket body → ask LINEAR whether a review
+             ticket already exists → create AND delegate one if not → record it in the
+             seen-set, spending the re-review request only once the ticket exists
     collect  for every review ticket still pending: read its agent session's activities →
              extract the `pipeline-review/1` block → tamper-check the description hash →
              classify → publish → write the outcome → close the ticket → emit telemetry
@@ -115,6 +117,25 @@ HOW IT FINDS WORK: LINEAR-DRIVEN DISCOVERY, NOT A HARDCODED REPO LIST
   against Linear at the start of a run and cached for that run; a UUID may still be given
   as an explicit override when a name is ambiguous. A name that resolves to nothing is a
   CONFIG error (exit 2, nothing touched), not a per-PR decline.
+
+HOW OFTEN A PR IS REVIEWED, AND WHAT BOUNDS IT
+
+  A PR is reviewed once when it is opened, and then ONLY when a bounce asks. The opened-only
+  rule is what keeps a session's fix pushes from multiplying review cost, and it is not
+  relaxed here: a new push is not, by itself, a reason to pay for a reviewer.
+
+  `pipeline_bounce_local` leaves one request file per DELIVERED bounce, naming the head it
+  bounced. This poller re-reviews a PR when that request exists AND the head has since moved
+  — the re-prompted session actually pushed something. The record goes back to the
+  `rereview` status, which is re-selectable in exactly the way `retry` is, and the request is
+  DELETED once the new review ticket exists. So the arithmetic is closed: one bounce writes
+  one request, one request buys one review, and a PR can never be reviewed more times than
+  `1 + bounces spent`. At `maxBounces = 3` that is at most four reviewer sessions, and only
+  if the session pushes after every one of them.
+
+  Without this, the loop was open at the other end: a PR was reviewed once ever, so the
+  bounce driver's `outcome_is_fresh` never saw an outcome for the new head and bounces
+  2..maxBounces could not fire at all — a budget above 1 was a number with no behaviour.
 
 LINEAR IS THE SOURCE OF TRUTH; THE SEEN-SET IS A REBUILDABLE CACHE
 
@@ -352,8 +373,18 @@ DISCOVERY_ATTACHMENTS = 25
 # The second discovery signal costs one query per issue with no PR attachment, so it is
 # bounded; what it could not look at is logged, never silently dropped (§13).
 DISCOVERY_PROBE_MAX = 10
-# Seen-set statuses `collect` has work for; everything else is terminal or `retry`.
+# Seen-set statuses `collect` has work for; everything else is terminal or re-selectable.
 COLLECT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
+# The two statuses that mean "this record is NOT settled — select it again next pass", and
+# they are two because they are two different facts (contract §13). `retry` is a FAILURE
+# being re-attempted: it counts `attempts` and gives up after SCAN_RETRY_PASSES. `rereview`
+# is not a failure at all — the bounce driver asked for a second look at a head the first
+# review never saw — so it must not consume that retry budget and must never expire.
+REREVIEW_STATUS = "rereview"
+RESELECTABLE_STATUSES = ("retry", REREVIEW_STATUS)
+# The shape of the file `pipeline_bounce_local.perform_bounce` leaves after each delivered
+# bounce. Requests written before this loop existed carry no schema key and are still read.
+REREVIEW_SCHEMA = "pipeline-rereview-request/1"
 # The sibling this poller cannot review without: the reviewer has no tools, so a basis
 # that cannot be resolved is a decline — and a resolver that is not installed at all is a
 # deployment error checked once at startup, never per PR.
@@ -601,7 +632,10 @@ def select_new_reviews(prs, seen_keys, team_keys, owner_repo, hints=None, hints_
     The filters that never change: a fork PR is never ours to review (its branch name is
     attacker-reachable text on a public repo and the diff would be copied into a ticket);
     a draft is not ready; and a PR already in the seen-set was handled on a prior pass,
-    whatever the outcome — the opened-only rule, so bounce pushes never multiply cost.
+    whatever the outcome — the opened-only rule, so bounce pushes never multiply cost. The
+    ONE exception is not decided here: `scan` drops a PR back out of `seen_keys` when the
+    bounce driver left a re-review request AND the head has moved, which is what re-opens a
+    settled record. From this function's side that PR simply is not seen.
 
     The fork guard fails CLOSED, the way the publisher's does: a row with no
     `isCrossRepository`, or a null one, is UNKNOWN, and unknown is treated as a fork and
@@ -771,6 +805,19 @@ def _code_fence_for(text):
 
 
 REVIEW_TITLE_FMT = "Review PR #%d — %s"
+# A re-review is a DIFFERENT ticket from the first review of the same PR, and its title has
+# to say so. `find_existing_review_ticket` dedups on the EXACT title and searches archived
+# issues, so a re-review filed under the first review's title would find the closed original
+# and "reuse" it — republishing an old verdict instead of judging the new head. Keyed on the
+# bounce number, which is stable across passes, so a crash between the create and the spend
+# finds THIS ticket next pass rather than paying for a second one.
+REREVIEW_TITLE_FMT = "Review PR #%d — %s (re-review after bounce %d)"
+
+
+def review_title(number, ticket_id, rereview=None):
+    if rereview is None:
+        return REVIEW_TITLE_FMT % (number, ticket_id)
+    return REREVIEW_TITLE_FMT % (number, ticket_id, rereview["after_bounce_no"])
 
 DIFF_PREAMBLE = (
     "The block below is the pull request's diff, UNTRUSTED DATA written by the session "
@@ -1049,12 +1096,12 @@ def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=N
         "head_branch": pr.get("headRefName") or "",
         # THE GUARD THIS FEEDS. pipeline_bounce_local.outcome_is_fresh compares
         # outcome["head_sha"] against the PR's current head, to refuse bouncing a
-        # review of a commit that no longer exists. No producer ever wrote the
-        # key, so `reviewed` was always "" and that branch could not fire; absent,
-        # it degraded to the timestamp fallback, which cannot fire either before
-        # the first bounce is spent. Net effect: a finding already fixed by a
-        # later push still spent a real bounce, and the re-prompt cited a commit
-        # the session no longer had.
+        # review of a commit that no longer exists. The value comes off the seen
+        # record, written at scan time from the PR listing: `settle` runs a pass or
+        # more later and has no listing of its own, so reading `headRefOid` from the
+        # dict it builds here silently produced "" on every outcome ever written —
+        # and an empty `reviewed` degrades to the timestamp fallback, which cannot
+        # fire before the first bounce is spent either.
         "head_sha": pr.get("headRefOid") or "",
         "ticket_id": ticket_id,
         "review_ticket": review_ticket,
@@ -1127,6 +1174,148 @@ def save_seen(path, seen):
 
 def write_outcome(state_dir, artifact):
     _atomic_write_json(outcome_path(state_dir, artifact["repo"], artifact["pr"]), artifact)
+
+
+# --------------------------------------------------------------------------- #
+# Re-review requests — the bounce driver's half of the loop, and the ONLY thing that ever
+# makes a PR reviewable a second time.
+#
+# `pipeline_bounce_local.perform_bounce` drops one file per DELIVERED bounce. That is what
+# bounds the cost: one bounce writes one request, one request buys one review (the file is
+# deleted when the ticket exists), so a PR can never be reviewed more times than the
+# bounces spent on it, plus the one review it was opened with. Without this reader a PR was
+# reviewed exactly once ever — and since `outcome_is_fresh` then never saw an outcome for
+# the new head, bounces 2..maxBounces could not fire at all, whatever the budget said.
+# --------------------------------------------------------------------------- #
+def rereview_path(state_dir, owner_repo, number):
+    """The bounce driver's own spelling, read off `perform_bounce`: `rereview/` then
+    `repo_slug(repo)` — `owner/repo` with the slash doubled to `__` — then `pr-<n>.json`.
+    The two scripts agreeing on this path is asserted in --selftest against the driver's
+    own `repo_slug`, so a rename on either side fails a test rather than a live bounce."""
+    return os.path.join(state_dir, "rereview", owner_repo.replace("/", "__"),
+                        "pr-%d.json" % number)
+
+
+def read_rereview_request(state_dir, owner_repo, number):
+    """(request, problem): the request the bounce driver left for this PR, `(None, "")` when
+    there is none, and `(None, why)` when there is one that cannot be acted on.
+
+    A request that is unreadable, of another schema, or missing the head it was written
+    against is NEVER read as "no request" (§13). A lost re-review and a PR nobody bounced
+    look identical from here — no output, no error, nothing red — and only one of them is a
+    problem. The caller says so on the log and counts an error; the file is left alone, and
+    the fix is for a person to repair or delete it.
+
+    `head_before` is required rather than defaulted because it is the whole eligibility
+    rule: without it the head cannot be known to have moved, and "re-review anyway" would
+    buy a paid reviewer session on every single pass, forever.
+
+    `rereview_schema` is absent from requests written before this loop existed. Those are
+    read — they carry the field that matters — because refusing them would strand exactly
+    the bounces this change exists to unblock. Only a DIFFERENT schema is refused.
+    """
+    path = rereview_path(state_dir, owner_repo, number)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return None, ""
+    except (OSError, ValueError) as exc:
+        return None, ("re-review request %s is unreadable (%s) — the bounce it belongs to "
+                      "will not be re-reviewed, and no later bounce can fire, until the file "
+                      "is repaired or deleted" % (path, exc))
+    if not isinstance(doc, dict):
+        return None, "re-review request %s is not a JSON object — refusing to guess" % path
+    schema = doc.get("rereview_schema")
+    if schema is not None and schema != REREVIEW_SCHEMA:
+        return None, ("re-review request %s carries rereview_schema %r; this poller reads %r "
+                      "— refusing to guess at a record it does not understand"
+                      % (path, schema, REREVIEW_SCHEMA))
+    head_before = doc.get("head_before")
+    if not isinstance(head_before, str) or not head_before:
+        return None, ("re-review request %s records no 'head_before', so whether the head has "
+                      "moved cannot be told — refusing to re-review, because the alternative "
+                      "is a paid reviewer session every pass" % path)
+    bounce_no = doc.get("after_bounce_no")
+    if not isinstance(bounce_no, int) or isinstance(bounce_no, bool) or bounce_no < 1:
+        return None, ("re-review request %s records no usable 'after_bounce_no' (%r), which is "
+                      "what makes the new review ticket's title distinct from the first "
+                      "review's" % (path, bounce_no))
+    return {"head_before": head_before, "after_bounce_no": bounce_no,
+            "requested_at": doc.get("requested_at") or ""}, ""
+
+
+def due_rereviews(state_dir, owner_repo, prs):
+    """({pr number: request}, [problem, …]) — the PRs a re-review is DUE for this pass.
+
+    ELIGIBILITY IS EXACTLY ONE THING: a request exists AND the PR's head has MOVED off the
+    head that bounce was delivered against. If the re-prompted session pushed nothing there
+    is no new code to judge, so there is no review and no cost — the request just waits.
+
+    The rule is deliberately NOT "any new push". A PR a person is iterating on would then
+    buy a paid reviewer session per push, without bound, and nothing in the design would
+    stop it. Tying eligibility to a bounce's own request is what makes the spend countable.
+
+    A PR whose head cannot be read is not due, and says so: an unknown head is not a moved
+    one, and the difference between them costs money.
+    """
+    due, problems = {}, []
+    for pr in prs or []:
+        if not isinstance(pr, dict):
+            continue
+        number = pr.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        request, problem = read_rereview_request(state_dir, owner_repo, number)
+        if problem:
+            problems.append(problem)
+            continue
+        if request is None:
+            continue
+        head = pr.get("headRefOid")
+        if not isinstance(head, str) or not head:
+            problems.append("%s#%d has a re-review request but the PR listing carries no "
+                            "'headRefOid', so whether the head moved cannot be told — not "
+                            "re-reviewed this pass" % (owner_repo, number))
+            continue
+        if head == request["head_before"]:
+            continue          # the re-prompted session pushed nothing: nothing new to judge
+        due[number] = request
+    return due, problems
+
+
+def consume_rereview_request(state_dir, owner_repo, number, request):
+    """Spend the request — AFTER the review ticket exists, never before. Returns what
+    happened, for the log.
+
+    The ordering is the whole point. Delete first and the re-review is lost silently the one
+    time the create fails; delete after, and a crash in between leaves the request on disk
+    so the next pass tries again — where the Reviews-team dedup search finds the ticket that
+    was just made and reuses it, so no second reviewer is ever paid for. Removing the file
+    is also what makes a request buy exactly ONE review: nothing else stops the next pass
+    from finding the same moved head.
+
+    A file that no longer matches the request that was acted on is LEFT ALONE: a newer
+    bounce wrote it while this review was being prepared, and that bounce has its own
+    re-review coming.
+    """
+    path = rereview_path(state_dir, owner_repo, number)
+    current, problem = read_rereview_request(state_dir, owner_repo, number)
+    if problem:
+        return "left in place: %s" % problem
+    if current is None:
+        return "already spent"
+    if (current["after_bounce_no"], current["head_before"]) != (request["after_bounce_no"],
+                                                                request["head_before"]):
+        return ("left in place: a newer request (after bounce %d) arrived while this review "
+                "was being prepared" % current["after_bounce_no"])
+    try:
+        os.remove(path)
+    except OSError as exc:
+        return ("could NOT be removed (%s) — the next pass finds the review ticket already "
+                "made and reuses it, so no second reviewer is paid for; delete it by hand"
+                % exc)
+    return "spent"
 
 
 # --------------------------------------------------------------------------- #
@@ -1571,7 +1760,7 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
 # --------------------------------------------------------------------------- #
 # Dedup — Linear is the authority on "has this PR already been reviewed?"
 # --------------------------------------------------------------------------- #
-def find_existing_review_ticket(cfg, owner_repo, number, ticket_id, api_key):
+def find_existing_review_ticket(cfg, owner_repo, number, ticket_id, api_key, title=None):
     """The review ticket that already exists for this PR, or None. Raises on a failed
     search — "could not ask" is not "nothing there", and the difference is one duplicate
     paid reviewer session.
@@ -1579,8 +1768,13 @@ def find_existing_review_ticket(cfg, owner_repo, number, ticket_id, api_key):
     Matched on the exact title this poller writes, then CONFIRMED by the `owner/repo#N`
     marker in the description, so a hand-written ticket that merely shares a title cannot
     be mistaken for one of ours (and so a title collision across repositories cannot).
+
+    `title` is the title being filed under, and a RE-REVIEW passes its own — which is how
+    a second look at the same PR finds only its own ticket. Searching under the first
+    review's title would match the closed original (the search includes archived issues)
+    and reuse it, republishing that verdict instead of judging the new head.
     """
-    title = REVIEW_TITLE_FMT % (number, ticket_id)
+    title = title or REVIEW_TITLE_FMT % (number, ticket_id)
     data = linear_graphql(FIND_REVIEW_TICKET,
                           {"filter": {"team": {"id": {"eq": cfg["reviews_team_id"]}},
                                       "title": {"eq": title}}}, api_key)
@@ -1874,7 +2068,8 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
     file (the bounce driver would re-prompt it into a ticket) or the PR.
     """
     owner_repo, number, ticket_id = record["repo"], record["pr"], record["ticket_id"]
-    pr = {"number": number, "headRefName": record.get("head_branch", ""), "url": record.get("pr_url", "")}
+    pr = {"number": number, "headRefName": record.get("head_branch", ""),
+          "url": record.get("pr_url", ""), "headRefOid": record.get("head_sha", "")}
     verdict, final = record["verdict"], record["final_status"]
     basis, review_ticket, issue_id = record.get("basis"), record.get("review_ticket"), record.get("review_ticket_id")
     started_at = record.get("created_at") or _now_iso()
@@ -1965,7 +2160,7 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
         result.published += 1
 
 
-def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
+def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview=None):
     """basis → diff → body → ask Linear → create+delegate, as a DECISION and no state change:
 
       ("decline", reason, basis)                 a TERMINAL reason — no basis by any tier,
@@ -1983,6 +2178,10 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
     proves the basis and the diff were reachable this pass, and the ticket that comes back
     is returned in place of a new one. When it hits, the body that matters is the one
     LINEAR holds — that is what the reviewer read — so the caller hashes that, not ours.
+
+    `rereview`, when set, is the bounce driver's request: it changes only the TITLE, so the
+    search and the create both address this re-review's own ticket rather than the settled
+    first review's. It is not consumed here — this function performs no state change.
     """
     number = pr["number"]
     try:
@@ -2001,15 +2200,15 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
     if len(body) > cfg["diff_cap_chars"]:
         return "decline", ("diff too large to deliver (%d chars of review-ticket body > the %d-char "
                            "cap)" % (len(body), cfg["diff_cap_chars"])), basis
+    title = review_title(number, ticket_id, rereview)
     try:
-        existing = find_existing_review_ticket(cfg, owner_repo, number, ticket_id, linear_key)
+        existing = find_existing_review_ticket(cfg, owner_repo, number, ticket_id, linear_key, title)
     except PollerError as exc:
         # NOT a create-anyway: an unanswered search is exactly the case that would open a
         # second paid reviewer session for a PR that already has one.
         return "retry", "the Reviews team could not be searched for an existing review ticket", exc, basis
     if existing is not None:
         return "created", existing, basis, (existing.get("description") or ""), True
-    title = REVIEW_TITLE_FMT % (number, ticket_id)
     try:
         issue = create_review_ticket(cfg, title, body, linear_key, dry_run)
     except PollerError as exc:
@@ -2017,8 +2216,13 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run):
     return "created", issue, basis, body, False
 
 
-def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
+def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=None):
     """One selected PR: `prepare_review` → decline / retry / record as pending.
+
+    `rereview` is the bounce driver's request when this pass is a SECOND look at a PR whose
+    head moved after a bounce. It changes two things and nothing else: the review ticket's
+    title, and the fact that the request is spent — after the record is durable, so a crash
+    anywhere before that retries instead of losing the re-review.
 
     Two kinds of "could not": a TERMINAL reason declines at once through `settle`; a
     TRANSIENT one is recorded as `retry` and re-selected next pass, declining only after
@@ -2032,7 +2236,15 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
     prior = seen.get(key) or {}
     record = {"repo": owner_repo, "pr": number, "ticket_id": ticket_id,
               "head_branch": pr.get("headRefName") or "", "pr_url": pr.get("url") or "",
+              # The COMMIT the reviewer is about to judge, recorded here because `settle`
+              # runs a pass or more later with no PR listing to read it from. It is what
+              # `pipeline_bounce_local.outcome_is_fresh` compares against the current head
+              # to refuse bouncing a review of code that has already been replaced.
+              "head_sha": pr.get("headRefOid") or "",
               "threshold": cfg["threshold"], "created_at": started_at}
+    if rereview is not None:
+        record["rereview_after_bounce"] = rereview["after_bounce_no"]
+        record["rereview_of_head"] = rereview["head_before"]
 
     def declined(reason, basis=None):
         record.update(basis=basis, verdict=decline_verdict(cfg, reason), final_status="declined",
@@ -2051,7 +2263,7 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
         result.errors += 1
 
     try:
-        decision = prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run)
+        decision = prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview)
     except Exception as exc:  # noqa: BLE001 — a bug in one PR's preparation must not be silent or unbounded
         log(traceback.format_exc())
         decision = ("retry", "the poller hit an unexpected error preparing the review",
@@ -2069,8 +2281,20 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result):
                   stored_sha256=body_sha256(stored) if isinstance(stored, str) and stored else None)
     # Durable BEFORE anything else happens: the ticket exists and is paid for from here.
     persist(cfg, seen, key, record, dry_run)
-    print("%s review ticket %s for %s#%d (%s), %d chars%s"
-          % ("REUSED existing" if reused else "created", issue.get("identifier"), owner_repo,
+    # ONLY NOW. The request is the one thing that would buy this review again, so it is
+    # spent after the record is durable and never before: a crash above this line retries,
+    # a crash below it is covered by the dedup search on the next pass.
+    if rereview is not None:
+        if dry_run:
+            print("[dry-run] the re-review request for %s#%d would be spent here — nothing removed"
+                  % (owner_repo, number))
+        else:
+            log("re-review request for %s#%d (after bounce %d): %s"
+                % (owner_repo, number, rereview["after_bounce_no"],
+                   consume_rereview_request(cfg["state_dir"], owner_repo, number, rereview)))
+    print("%s %sreview ticket %s for %s#%d (%s), %d chars%s"
+          % ("REUSED existing" if reused else "created",
+             "RE-" if rereview is not None else "", issue.get("identifier"), owner_repo,
              number, ticket_id, len(body),
              " [dry-run — nothing created]" if dry_run else ""))
     result.created += 1
@@ -2130,8 +2354,6 @@ def scan(cfg, dry_run):
         print("scan: discovery found no repository with a dispatcher-worked pull request, and "
               "no 'repos' are configured — nothing to review this pass")
         return result.exit_code()
-    # A `retry` record is not "seen": it is re-selected until it settles or gives up.
-    seen_keys = {k for k, v in seen.items() if v.get("status") != "retry"}
     for owner_repo in repos_to_scan:
         hints = discovered.get(owner_repo) or {}
         try:
@@ -2141,16 +2363,67 @@ def scan(cfg, dry_run):
             log("FAIL: could not list open PRs on %s: %s" % (owner_repo, exc))
             result.errors += 1
             continue
+        # THE RE-REVIEW LOOP. A settled record is never selected again on its own — the
+        # opened-only rule, and what keeps a bounce's pushes from multiplying review cost.
+        # The bounce driver's request, plus a head that has actually moved, is the ONE thing
+        # that reopens it: the record goes back to `rereview`, which is re-selectable the
+        # same way `retry` is and for an entirely different reason.
+        due, problems = due_rereviews(cfg["state_dir"], owner_repo, prs)
+        for problem in problems:
+            # A re-review that cannot be evaluated is a lost bounce, and every LATER bounce
+            # with it. It goes red rather than passing quietly as "nothing to do" (§13).
+            log("FAIL: %s" % problem)
+            result.errors += 1
+        due_keys = {pr_key(owner_repo, n) for n in due}
+        for number in sorted(due):
+            key = pr_key(owner_repo, number)
+            record = seen.get(key)
+            if record is None or record.get("status") in RESELECTABLE_STATUSES:
+                continue          # nothing to reopen, or already re-selectable
+            record = dict(record, status=REREVIEW_STATUS,
+                          rereview_from=record.get("status"),
+                          rereview_after_bounce=due[number]["after_bounce_no"])
+            # A re-review is not a failed attempt: it starts the retry budget fresh, and it
+            # never expires the way SCAN_RETRY_PASSES expires a `retry`.
+            record.pop("attempts", None)
+            seen[key] = record              # in memory always, so a --dry-run still REPORTS it…
+            if not dry_run:                 # …on disk only when this is a real pass
+                save_seen(seen_path(cfg["state_dir"]), seen)
+            log("RE-REVIEW due: %s#%d — bounce %d was delivered against head %s and the head "
+                "has since moved, so the settled review is reopened"
+                % (owner_repo, number, due[number]["after_bounce_no"],
+                   due[number]["head_before"][:12]))
+        # …and the reverse: a `rereview` mark with no request behind it any more (deleted by
+        # hand, or spent by a pass that then failed before selection) must NOT read as a
+        # fresh review. That would find the ORIGINAL ticket under the original title, reuse
+        # it, and republish its verdict as a second PR comment for nothing.
+        for key, record in list(seen.items()):
+            if record.get("status") != REREVIEW_STATUS or key in due_keys:
+                continue
+            if not key.startswith(owner_repo + "#"):
+                continue
+            restored = dict(record, status=record.get("rereview_from") or "collected")
+            restored.pop("rereview_from", None)
+            seen[key] = restored
+            if not dry_run:
+                save_seen(seen_path(cfg["state_dir"]), seen)
+            log("NOTE: %s carried a `rereview` mark with no request behind it — restored to "
+                "`%s`, not reviewed again" % (key, restored["status"]))
+        # Neither a `retry` record nor a `rereview` one is "seen": both are re-selected,
+        # the first until it settles or gives up, the second until its request is spent.
+        seen_keys = {k for k, v in seen.items() if v.get("status") not in RESELECTABLE_STATUSES}
         # With no `repos` configured we are purely Linear-driven, so an unhinted PR — a
         # human's — is not reviewed. `repos` opts that repo back into the branch-name
         # fallback, which is what a workspace with no GitHub integration relies on.
         selected = select_new_reviews(prs, seen_keys, cfg["team_keys"], owner_repo,
                                       hints=hints, hints_only=not configured)
-        print("scan %s: %d open PR(s), %d dispatcher-worked by discovery, %d new pipeline "
-              "PR(s) to review" % (owner_repo, len(prs), len(hints), len(selected)))
+        print("scan %s: %d open PR(s), %d dispatcher-worked by discovery, %d re-review(s) "
+              "due, %d pipeline PR(s) to review"
+              % (owner_repo, len(prs), len(hints), len(due), len(selected)))
         for pr in selected:
             try:
-                scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result)
+                scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result,
+                        rereview=due.get(pr["number"]))
             except Exception as exc:  # noqa: BLE001 — the last resort: one PR's crash never aborts the pass
                 log(traceback.format_exc())
                 log("FAIL: %s#%d hit an unexpected %s outside its retry bound (%s) — skipped this pass, "
@@ -2859,6 +3132,67 @@ def selftest():
             json.dump(base, fh)
         cfg = load_config(cfg_path)
 
+    # 5b. Re-review requests — the file the bounce driver leaves, read on this side.
+    #     Eligibility is "the head MOVED", so a bounce whose session pushed nothing costs
+    #     nothing at all; an unreadable or headless request is a LOUD problem and never
+    #     "no request" (§13), because a lost re-review and an un-bounced PR look identical
+    #     from here and only one of them needs a person.
+    with tempfile.TemporaryDirectory() as rr_tmp:
+        def write_request(number, doc):
+            path = rereview_path(rr_tmp, "o/r", number)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+            return path
+
+        good = {"pr": 1, "repo": "o/r", "requested_at": "2026-09-08T00:00:00Z",
+                "after_bounce_no": 1, "head_before": "aaaa1111"}
+        write_request(1, good)
+        check("a request is read", read_rereview_request(rr_tmp, "o/r", 1)[0],
+              {"head_before": "aaaa1111", "after_bounce_no": 1,
+               "requested_at": "2026-09-08T00:00:00Z"})
+        check("no request at all is not a problem", read_rereview_request(rr_tmp, "o/r", 99), (None, ""))
+        write_request(2, "{not json")
+        check("an unreadable request is a problem, never 'no request'",
+              (read_rereview_request(rr_tmp, "o/r", 2)[0],
+               "unreadable" in read_rereview_request(rr_tmp, "o/r", 2)[1]), (None, True))
+        write_request(3, dict(good, head_before=""))
+        check("no head_before ⇒ refused, not guessed at (it would cost a session per pass)",
+              "whether the head has moved cannot be told" in read_rereview_request(rr_tmp, "o/r", 3)[1], True)
+        write_request(4, dict(good, rereview_schema="something-else/9"))
+        check("a request of another schema is refused",
+              "refusing to guess" in read_rereview_request(rr_tmp, "o/r", 4)[1], True)
+        write_request(5, dict(good, rereview_schema=REREVIEW_SCHEMA))
+        check("the current schema is read", read_rereview_request(rr_tmp, "o/r", 5)[0]["after_bounce_no"], 1)
+        write_request(6, dict(good, after_bounce_no=None))
+        check("no bounce number ⇒ refused (it is what makes the new title distinct)",
+              "after_bounce_no" in read_rereview_request(rr_tmp, "o/r", 6)[1], True)
+
+        due, problems = due_rereviews(rr_tmp, "o/r", [
+            {"number": 1, "headRefOid": "aaaa1111"},     # a request, head UNCHANGED
+            {"number": 5, "headRefOid": "bbbb2222"},     # a request, head MOVED
+            {"number": 7, "headRefOid": "cccc3333"},     # no request at all
+            {"number": 3, "headRefOid": "dddd4444"}])    # a request that cannot be read
+        check("only a MOVED head is due", sorted(due), [5])
+        check("the due PR carries its bounce number", due[5]["after_bounce_no"], 1)
+        check("the broken request is reported, not swallowed", len(problems), 1)
+        headless, hproblems = due_rereviews(rr_tmp, "o/r", [{"number": 1}])
+        check("a PR whose head cannot be read is not due", headless, {})
+        check("…and says why, rather than guessing",
+              "cannot be told" in (hproblems[0] if hproblems else ""), True)
+
+        # Spending: exactly once, and never a request that belongs to a later bounce.
+        req = read_rereview_request(rr_tmp, "o/r", 1)[0]
+        check("spending removes the file",
+              (consume_rereview_request(rr_tmp, "o/r", 1, req),
+               os.path.exists(rereview_path(rr_tmp, "o/r", 1))), ("spent", False))
+        check("a spent request cannot be spent twice — one request buys one review",
+              consume_rereview_request(rr_tmp, "o/r", 1, req), "already spent")
+        write_request(1, dict(good, after_bounce_no=2, head_before="bbbb2222"))
+        check("a NEWER request is not consumed by an older review's spend",
+              (consume_rereview_request(rr_tmp, "o/r", 1, req).startswith("left in place"),
+               os.path.exists(rereview_path(rr_tmp, "o/r", 1))), (True, True))
+
     # 6. The drivers end to end — GitHub, Linear, the publisher, the basis resolver and the
     #    telemetry sibling all stubbed. Happy path posts exactly one comment, creates exactly
     #    one ticket, writes exactly one outcome, closes exactly one ticket.
@@ -2949,6 +3283,144 @@ def selftest():
             # a third collect has nothing pending — a real answer, not a failure
             check("collect (nothing pending) exits OK", collect(cfg, False), EXIT_OK)
             check("collect (nothing pending) posts nothing more", len(posted), 1)
+
+        # 6b. THE RE-REVIEW LOOP, end to end — the reason the bounce driver writes a request
+        #     at all. A settled PR is never selected again on its own; a delivered bounce
+        #     plus a head that has actually moved is the one thing that reopens it. The last
+        #     step asserts the PROPERTY that was broken — that the bounce driver then sees a
+        #     fresh outcome, so bounce 2 becomes available — through the driver's own reader,
+        #     because no per-unit assertion states it.
+        import pipeline_bounce_local as pbl
+
+        head = {"sha": "aaaa1111"}
+        globals()["list_open_prs"] = lambda owner_repo, limit=100: [
+            {"number": 7, "headRefName": "feat/kit-7-rereview", "isCrossRepository": False,
+             "isDraft": False, "title": "The thing", "url": "https://github.com/o/r/pull/7",
+             "headRefOid": head["sha"]}]
+        one_high = {"schema": FINDINGS_SCHEMA, "summary": "one high finding", "findings": [
+            {"severity": "high", "category": "correctness", "file": "a.py", "line": 1,
+             "summary": "wrong", "detail": "why"}]}
+
+        def created(i, key):
+            """The i-th issueCreate's field, or None when there was no i-th create — so a
+            case that should have made a ticket and did not reports as a failed check
+            rather than aborting the block on an IndexError."""
+            return fake.created[i].get(key) if i < len(fake.created) else None
+
+        def request_after_bounce(root, bounce_no, head_before, number=7, repo="o/r"):
+            """Exactly what pipeline_bounce_local.perform_bounce writes — and WHERE it writes
+            it, built through the DRIVER's own slug, so a rename on either side of this
+            cross-script contract fails here instead of on a live bounce."""
+            path = os.path.join(root, "rereview", pbl.repo_slug(repo), "pr-%d.json" % number)
+            check("the two scripts agree on the request path", path,
+                  rereview_path(root, repo, number))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump({"rereview_schema": pbl.REREVIEW_SCHEMA, "pr": number, "repo": repo,
+                           "requested_at": "2026-09-08T00:00:00Z",
+                           "after_bounce_no": bounce_no, "head_before": head_before}, fh)
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            telemetry.clear()
+            c = dict(cfg, state_dir=tmp)
+            check("re-review setup: the opening review is created",
+                  (scan(c, False), len(fake.created)), (EXIT_OK, 1))
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(one_high))
+            check("re-review setup: the opening review is published", collect(c, False), EXIT_OK)
+            check("re-review setup: one PR comment so far", len(posted), 1)
+            first = json.load(open(outcome_path(tmp, "o/r", 7)))
+            check("re-review setup: the outcome records the head it judged", first["head_sha"], "aaaa1111")
+
+            # (a) SELF-LIMITING. A bounce is delivered and the session pushes NOTHING.
+            #     No new code to judge ⇒ no re-review, no ticket, no comment, no cost.
+            path1 = request_after_bounce(tmp, 1, "aaaa1111")
+            check("head unchanged ⇒ nothing is due",
+                  due_rereviews(tmp, "o/r", [{"number": 7, "headRefOid": "aaaa1111"}])[0], {})
+            check("head unchanged ⇒ scan creates nothing",
+                  (scan(c, False), len(fake.created)), (EXIT_OK, 1))
+            check("head unchanged ⇒ no second comment", len(posted), 1)
+            check("head unchanged ⇒ the request waits, it is not spent", os.path.exists(path1), True)
+            check("head unchanged ⇒ the record stays settled",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "collected")
+
+            # (b) The session pushes. Now it is due — once, and a dry run spends nothing.
+            head["sha"] = "bbbb2222"
+            check("head moved ⇒ a dry run creates nothing and spends nothing",
+                  (scan(c, True), len(fake.created), os.path.exists(path1)), (EXIT_OK, 1, True))
+            check("head moved ⇒ a dry run leaves the seen-set alone",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "collected")
+            check("head moved ⇒ scan exits OK", scan(c, False), EXIT_OK)
+            check("head moved ⇒ a SECOND review ticket, not the first one reused", len(fake.created), 2)
+            check("the re-review's title is distinct from the first review's",
+                  [i["title"] for i in fake.created],
+                  ["Review PR #7 — KIT-7", "Review PR #7 — KIT-7 (re-review after bounce 1)"])
+            check("the re-review ticket is delegated and still not parented",
+                  (created(1, "delegateId"), created(1, "parentId") is not None), ("agent-1", False))
+            check("the request is spent once the ticket exists", os.path.exists(path1), False)
+            check("the record is pending again",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "pending")
+            check("scanning a re-review posts nothing", len(posted), 1)
+            check("a further pass finds nothing: one request bought one review",
+                  (scan(c, False), len(fake.created)), (EXIT_OK, 2))
+
+            # (c) The re-review settles: its OWN comment, its OWN outcome, at the new head.
+            fake.respond("rev-uuid-2", "```json\n%s\n```" % json.dumps(one_high))
+            check("the re-review collects OK", collect(c, False), EXIT_OK)
+            check("the re-review posts its own SECOND comment", len(posted), 2)
+            check("both comments go to the same PR, neither edits the other",
+                  [(p[0], p[2]) for p in posted], [(7, "o/r"), (7, "o/r")])
+            check("each review ticket was closed exactly once", sorted(fake.updated),
+                  [("rev-uuid-1", {"stateId": "done-1"}), ("rev-uuid-2", {"stateId": "done-1"})])
+            second = json.load(open(outcome_path(tmp, "o/r", 7)))
+            check("the new outcome judges the NEW head", second["head_sha"], "bbbb2222")
+            check("the new outcome names the new review ticket", second["review_ticket"], "REV-2")
+            check("the new outcome postdates the first", second["at"] >= first["at"], True)
+            check("still exactly one outcome file for the PR",
+                  sorted(os.listdir(os.path.join(tmp, "outcomes"))),
+                  [os.path.basename(outcome_path(tmp, "o/r", 7))])
+            check("the re-review emitted its own telemetry", len(telemetry), 2)
+
+            # (d) THE POINT. Read back through the BOUNCE DRIVER's own reader: the outcome is
+            #     now fresh for the current head, so bounce 2 is available. Before this loop
+            #     existed it never could be, whatever maxBounces said.
+            spent_at = {"at": "2026-09-08T00:00:00Z"}
+            via_driver = pbl.read_outcome(tmp, "o/r", 7)
+            check("the bounce driver reads the poller's new outcome", via_driver["head_sha"], "bbbb2222")
+            check("bounce 1's outcome was NOT fresh for the new head — the deadlock",
+                  pbl.outcome_is_fresh(first, "bbbb2222", spent_at)[0], False)
+            check("after the re-review the outcome IS fresh ⇒ bounce 2 is available",
+                  pbl.outcome_is_fresh(via_driver, "bbbb2222", spent_at), (True, ""))
+
+            # (e) A crash between reading the request and creating the ticket must leave the
+            #     request intact: the re-review is retried, never silently lost.
+            head["sha"] = "cccc3333"
+            path2 = request_after_bounce(tmp, 2, "bbbb2222")
+            fake.fail_create = True
+            check("issueCreate fails ⇒ the pass is non-zero", scan(c, False), EXIT_ERROR)
+            check("issueCreate fails ⇒ no ticket", len(fake.created), 2)
+            check("issueCreate fails ⇒ the request survives", os.path.exists(path2), True)
+            fake.fail_create = False
+            check("the next pass makes the ticket", (scan(c, False), len(fake.created)), (EXIT_OK, 3))
+            check("…and only then is the request spent", os.path.exists(path2), False)
+            check("the retried re-review names its own bounce",
+                  created(2, "title"), "Review PR #7 — KIT-7 (re-review after bounce 2)")
+            check("a re-review does not consume the retry budget",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 7)].get("attempts"), None)
+
+            # (f) A `rereview` mark whose request vanished must not read as a fresh review —
+            #     that would reuse the ORIGINAL ticket and republish its verdict for nothing.
+            stale = load_seen(seen_path(tmp))
+            stale[pr_key("o/r", 7)] = dict(stale[pr_key("o/r", 7)], status=REREVIEW_STATUS,
+                                           rereview_from="collected")
+            save_seen(seen_path(tmp), stale)
+            check("a stale rereview mark creates nothing", (scan(c, False), len(fake.created)), (EXIT_OK, 3))
+            check("…and the record is restored to what it was",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "collected")
+
+        globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
 
         # 7. Declines — each is a distinct NOT-reviewed comment, non-zero exit, recorded.
         def fresh_state(tmp):
@@ -3966,7 +4438,11 @@ def selftest():
           "resolved by name once per run (unresolvable ⇒ exit 2), Linear checked for an existing "
           "review ticket before every create (a lost cache never buys a second reviewer session; a "
           "failed search never creates anyway), opened-only selection (fork/draft/non-ticket/seen "
-          "skipped), sanitizer strips routing tags + fence tokens, ticket text fenced + one line per "
+          "skipped) plus the RE-REVIEW loop (a delivered bounce's request re-opens a settled PR "
+          "only when its head has MOVED, buys exactly one new ticket under its own title, is spent "
+          "only after that ticket exists and never twice, and leaves a fresh outcome at the new head "
+          "so the bounce driver's next bounce can fire; an unreadable request is loud, a dry run "
+          "spends nothing), sanitizer strips routing tags + fence tokens, ticket text fenced + one line per "
           "item, PR named not linked, fences paired, body capped, create+delegate in one call (never "
           "parented), read-back validated whole, tamper/malformed/timeout/error → loud decline with "
           "fixed reasons, transient scan failures retried then declined, publish-failed / "
