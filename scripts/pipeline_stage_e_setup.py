@@ -1005,6 +1005,8 @@ CARDS = {
                 "bill you did not mean. Nothing can decide for you whether that number is "
                 "the number you meant."),
         "do": ["Read the counts the installer just printed above.",
+               "Subtract any NOT REVIEWED line it printed: a declined pull request",
+               "costs no session, so it is not part of the number you are signing.",
                "If it is more than you meant, narrow it: put a single repository in",
                "REVIEW_REPOS, re-run, and read the count again.",
                "When the number is what you meant, sign it off and re-run — the installer",
@@ -1165,6 +1167,10 @@ class Ctx(object):
         # Daemons this run stopped and has not started again. A run that ends
         # early with these set has switched the review loop OFF, and must say so.
         self.unloaded = []
+        # …and the same fact about the DISPATCHER, which is worse: with it
+        # down, no ticket starts a session at all. Set only by a restart that
+        # could not put it back; read by the banner at the very end of a run.
+        self.dispatcher_down = None
 
     @property
     def account(self):
@@ -2188,13 +2194,17 @@ def step_dispatcher_entry(ctx, apply_it):
     if not same:
         body = json.dumps(want, indent=2, sort_keys=True) + "\n"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup = r.as_role(ctx.account, "cp -a %s %s.bak-%s"
+        backup_path = "%s.bak-%s" % (conf["DISPATCHER_CONFIG"], stamp)
+        backup = r.as_role(ctx.account, "cp -a %s %s"
                            % (shlex.quote(conf["DISPATCHER_CONFIG"]),
-                              shlex.quote(conf["DISPATCHER_CONFIG"]), stamp),
+                              shlex.quote(backup_path)),
                            why="back up the dispatcher config before touching it")
         if not backup.ok and not backup.skipped:
             raise SetupError("refusing to write the dispatcher config with no backup: %s"
                              % (backup.err or "").strip()[:200])
+        # A dry run copied nothing, so there is no file to name in a banner.
+        if backup.skipped:
+            backup_path = None
         res = r.as_role(ctx.account,
                         "/usr/bin/python3 -c " + shlex.quote(
                             _upsert_entry_py(conf["DISPATCHER_CONFIG"])),
@@ -2214,14 +2224,7 @@ def step_dispatcher_entry(ctx, apply_it):
         # bootout THEN bootstrap. `kickstart -k` restarts the process without
         # re-reading the plist, and confusing the two once left a front-door
         # proxy on a stale config for four days.
-        r.as_root(["launchctl", "bootout", "system/" + conf["DISPATCHER_SERVICE"]],
-                  why="stop the dispatcher (config is read only at process start)")
-        boot = r.as_root(["launchctl", "bootstrap", "system",
-                          _dispatcher_plist(conf["DISPATCHER_SERVICE"])],
-                         why="start the dispatcher again so it re-reads its config")
-        if not boot.ok and not boot.skipped:
-            raise SetupError("the dispatcher did not come back: %s"
-                             % (boot.err or boot.out).strip()[:300])
+        _restart_dispatcher(ctx, backup_path)
     else:
         say("  the `reviews` entry already matches this conf, so the dispatcher was NOT "
             "restarted;")
@@ -2264,6 +2267,190 @@ def _dispatcher_plist(label):
     return "/Library/LaunchDaemons/%s.plist" % label
 
 
+# --------------------------------------------------------------------------- #
+# RESTARTING THE DISPATCHER — the most dangerous thing this installer does.
+#
+# What the old four lines cost, once: the step wrote the entry, ran `launchctl
+# bootout`, and one line later ran `launchctl bootstrap`. The bootstrap
+# answered `Bootstrap failed: 5: Input/output error`, the step raised, the
+# installer exited — and the dispatcher stayed down. No retry, no restore, and
+# no banner: the whole delivery pipeline was off and the only thing saying so
+# was one FAILED row among ten.
+#
+# Three defects, one shape — a stop nobody read, a start that raced it, and a
+# failure indistinguishable from every other failed step:
+#
+#   * `bootout` returns when launchd has ACCEPTED the request, not when the job
+#     has died. launchd sends SIGTERM and waits up to the plist's own
+#     ExitTimeOut before SIGKILL (launchd.plist(5)); 120 seconds is an ordinary
+#     value. So the service is still in the domain long after the command
+#     returns, and its exit code says nothing about that either way.
+#   * Bootstrapping into a domain that still holds the service is the classic
+#     source of errno 5, EIO — `launchctl error 5` prints `Input/output error`.
+#     The remedy for that one failure is to wait and try again; every other
+#     bootstrap failure is a fact about the plist or the domain, and repeating
+#     it only delays the news.
+#   * And when it will not come back at all, the run has to end shouting.
+#
+# Every number here is bounded on purpose. A restart this installer cannot
+# finish is a fact for a person, not something to poll at forever.
+# --------------------------------------------------------------------------- #
+DEFAULT_EXIT_TIMEOUT = 120       # launchd.plist(5): absent means system-defined
+EXIT_TIMEOUT_HEADROOM = 30       # the SIGKILL, and launchd's own teardown after it
+BOOTOUT_POLL_SECONDS = 2
+BOOTSTRAP_ATTEMPTS = 3
+BOOTSTRAP_RETRY_SECONDS = 10
+
+# `Bootstrap failed: 5: Input/output error`, matched on the errno AND on its
+# text: the bare number occurs all over launchd's output, and the text is
+# absent in a non-English locale.
+_EIO = re.compile(r"(bootstrap failed:\s*5\b|input/output error)", re.I)
+
+
+def _pause(seconds):
+    """Every wait in the restart goes through one function, so the battery can
+    walk the whole sequence — poll, time out, retry, give up — without sleeping
+    for the two real minutes the live thing is bounded by."""
+    time.sleep(seconds)
+
+
+def _service_in_domain(r, label):
+    """Does launchd still hold `label`? This, and not the process table, is the
+    question `bootstrap` is about to ask: launchd keeps the service record for
+    the whole SIGTERM-to-SIGKILL window, so a job whose process has already
+    exited can still make a bootstrap fail."""
+    return r.as_root(["launchctl", "print", "system/" + label]).ok
+
+
+def _exit_timeout(r, plist):
+    """The plist's own ExitTimeOut, in seconds — how long launchd will wait
+    before it resorts to SIGKILL. Absent means system-defined and 0 means
+    infinity (launchd.plist(5)); neither is a number anything can wait on, so
+    both fall back to a value long enough for the ordinary case."""
+    got = r.read(["/usr/libexec/PlistBuddy", "-c", "Print :ExitTimeOut", plist])
+    if not got.ok:
+        return DEFAULT_EXIT_TIMEOUT
+    try:
+        seconds = int(got.out.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return DEFAULT_EXIT_TIMEOUT
+    return DEFAULT_EXIT_TIMEOUT if seconds <= 0 else seconds
+
+
+def _wait_until_gone(r, label, limit):
+    """(gone, seconds_waited). Poll until launchd no longer holds the service.
+
+    Bounded by a count of POLLS rather than by the wall clock, so the battery —
+    whose `_pause` does nothing — walks the same path in the same number of
+    steps instead of spinning for the real limit."""
+    polls = max(1, int(limit / float(BOOTOUT_POLL_SECONDS)) + 1)
+    for n in range(polls):
+        if not _service_in_domain(r, label):
+            return True, n * BOOTOUT_POLL_SECONDS
+        if n < polls - 1:
+            _pause(BOOTOUT_POLL_SECONDS)
+    return False, (polls - 1) * BOOTOUT_POLL_SECONDS
+
+
+def _restart_dispatcher(ctx, backup):
+    """Stop the dispatcher, wait for it to REALLY be gone, start it again.
+
+    Raises SetupError on every path that ends with the service not running —
+    but never before recording what a person has to do about it on `ctx`, so
+    the banner at the very bottom of the run names the service, the exact
+    command that starts it, and the config backup this step took moments
+    earlier.
+
+    IT DOES NOT RESTORE THAT BACKUP BY ITSELF. A restore starts nothing, so an
+    automatic one would hand the operator a dispatcher that is still down AND
+    now silently missing the entry the run reported writing — two failures, one
+    of them invisible. The file is also the only evidence for why the service
+    would not come back, and EIO from `bootstrap` is a domain error raised
+    before any config is read, so the config is the wrong suspect in exactly
+    the case that has actually happened. The banner prints the restore command;
+    the choice stays the operator's."""
+    r, conf = ctx.runner, ctx.conf
+    label = conf["DISPATCHER_SERVICE"]
+    plist = _dispatcher_plist(label)
+
+    out = r.as_root(["launchctl", "bootout", "system/" + label],
+                    why="stop the dispatcher (config is read only at process start)")
+    if out.skipped:
+        return                      # a dry run stops nothing, so it starts nothing
+    # THE RESULT IS READ, NEVER DISCARDED. `bootout` exits non-zero both when
+    # there was nothing to unload and when the unload failed — opposite facts —
+    # so it is reported here and the wait below is what decides, because only
+    # "is it still in the domain" answers the question `bootstrap` will ask.
+    stop_said = (out.err or out.out).strip()
+    if not out.ok:
+        say("  launchctl bootout exited %d: %s"
+            % (out.rc, (stop_said.splitlines() or ["no output"])[0][:160]))
+
+    limit = _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM
+    gone, waited = _wait_until_gone(r, label, limit)
+    if not gone:
+        ctx.dispatcher_down = {
+            "label": label, "plist": plist, "backup": backup, "state": "stuck",
+            "error": stop_said[:200] or "bootout exited %d" % out.rc}
+        # Written as several short lines on purpose: the FAILED row takes the
+        # first line, and the rest is printed under it one line at a time.
+        raise SetupError(
+            "the dispatcher was told to stop and launchd still holds it %ds later.\n"
+            "That is its ExitTimeOut plus headroom, so this is not impatience.\n"
+            "It was NOT started again: bootstrapping into a service the domain still\n"
+            "holds is what returns `Bootstrap failed: 5: Input/output error`.\n"
+            "Whether it is still serving is UNKNOWN — read the banner below." % waited)
+    if waited:
+        say("  the dispatcher took about %ds to leave the domain; bootstrapping into a "
+            "job that is still terminating is what returns EIO." % waited)
+
+    said, attempt = "", 0
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        if attempt > 1:
+            # THE RETRY IS ANOTHER WAIT, and it LOOKS again rather than merely
+            # sleeping: if the domain still holds the job, a further bootstrap
+            # would answer EIO for the same reason as the last one, and the
+            # banner is the useful thing now.
+            _pause(BOOTSTRAP_RETRY_SECONDS)
+            if not _wait_until_gone(r, label, limit)[0]:
+                said = ("launchd still holds %s; the job never left the domain, so "
+                        "bootstrapping again would only answer EIO again" % label)
+                break
+        boot = r.as_root(["launchctl", "bootstrap", "system", plist],
+                         why="start the dispatcher again so it re-reads its config")
+        if boot.skipped:
+            return
+        # "launchctl accepted it" is not "the dispatcher is back". The domain
+        # is asked, for the same reason the wait above asks it.
+        if boot.ok and _service_in_domain(r, label):
+            if attempt > 1:
+                say("  the dispatcher came back on attempt %d of %d."
+                    % (attempt, BOOTSTRAP_ATTEMPTS))
+            return
+        said = (boot.err or boot.out).strip()
+        if boot.ok:
+            said = ("launchctl accepted the bootstrap and the service is still not in "
+                    "the domain")
+        # EIO IS THE ONE FAILURE WORTH TRYING AGAIN — it is what a domain that
+        # still holds the outgoing job answers, and more waiting is its remedy.
+        # Every other failure is a fact about the plist or the domain, and
+        # repeating it only delays the news.
+        if not _EIO.search(said):
+            break
+        if attempt < BOOTSTRAP_ATTEMPTS:
+            say("  bootstrap attempt %d of %d: %s"
+                % (attempt, BOOTSTRAP_ATTEMPTS, (said.splitlines() or [""])[0][:120]))
+            say("  that is launchd still holding the old job; waiting and looking again.")
+
+    detail = (said.splitlines() or ["no output"])[0][:200] or "no output"
+    ctx.dispatcher_down = {
+        "label": label, "plist": plist, "backup": backup, "state": "stopped",
+        "error": detail, "attempts": attempt}
+    raise SetupError("the dispatcher did not come back after %d bootstrap attempt(s).\n"
+                     "launchd said: %s\n"
+                     "It is STOPPED — read the banner below." % (attempt, detail))
+
+
 def _upsert_entry_py(path):
     """Insert-or-update by `id`, atomically, from stdin. Idempotent: an entry
     already equal to the one on stdin is reported and nothing is rewritten."""
@@ -2291,10 +2478,47 @@ def _upsert_entry_py(path):
 
 ENTRY_PROOF_NOTE = "dispatcher-entry-banner"
 
+# THE BANNER IS A REGION, NOT A LINE, and reading it as a line is what made
+# this step unclearable. A dispatcher prints what it loaded as a header with
+# the count, then one bullet per entry:
+#
+#     📦 Managing 3 repositories:
+#        • <id> (<path/to/clone>)
+#        • reviews (<path/to/clone>)
+#
+# The old test demanded the entry id AND one of `repositor`/`entr`/`disallow`
+# ON THE SAME LINE. That shape can never satisfy it — the word "repositories"
+# is on the header and the id is on a bullet below — so the step reported
+# UNKNOWN forever on a dispatcher that had loaded the entry perfectly, and a
+# person had to sign `A-ENTRY-LOADED` by hand every single time. It failed in
+# the SAFE direction, which is why it survived; that is what made it a
+# usability defect rather than an incident. Observed against a real log
+# 2026-09-08, and the shape below is derived from that sample rather than
+# guessed at — docs/LESSONS.md carries the standing rule the old conjunction
+# broke: never write a pattern over log text before printing one real line.
+BANNER_HEADER = "managing.*repositor"    # the header, as a grep BRE
+BANNER_AFTER = 20                        # bullet lines kept after each header
+BANNER_TAIL = 300                        # …and how much of that is read back
+BANNER_TRIES = 10
 
-def _banner_proves_entry(ctx):
-    """(proven, how). Reads the dispatcher's own log for a line naming the
-    reviews entry. Absence is never read as success.
+
+def _entry_named(entry):
+    """`   • reviews (/path/to/clone)` — the id as its own word on a LIST line:
+    a bullet before it, or its clone path in parentheses after it.
+
+    The list shape is load-bearing. Inside a region a bare substring would
+    match any log line that happens to carry the word — a ticket title, a
+    branch name, "posting 2 reviews" — and that is the one direction this
+    function must not fail in, since a false proof is recorded as a note and
+    never looked at again."""
+    tok = re.escape(entry)
+    return re.compile(r"(?:[•●▪·*+\-]\s*%s\b|\b%s\b\s*\()"
+                      % (tok, tok), re.I)
+
+
+def _banner_proves_entry(ctx, entry="reviews"):
+    """(proven, how). Reads the dispatcher's own log for proof that it loaded
+    the reviews entry. ABSENCE IS NEVER READ AS SUCCESS.
 
     The WHOLE log is searched, not the tail: this is called on a re-run that
     deliberately did NOT restart the dispatcher, so the banner it is looking for
@@ -2307,18 +2531,33 @@ def _banner_proves_entry(ctx):
     if not logpath.ok or not logpath.out.strip():
         return False, "its plist names no StandardOutPath"
     path = logpath.out.strip().splitlines()[0]
-    for _ in range(10):
-        # -i so a capitalised banner still counts; the last 60 matching lines so
-        # a busy log cannot bury the most recent start.
-        hits = r.as_root(["/bin/sh", "-c",
-                          "grep -i -e reviews %s 2>/dev/null | tail -60" % shlex.quote(path)])
-        for line in (hits.out or "").splitlines()[::-1]:
-            low = line.lower()
-            if "reviews" in low and ("repositor" in low or "entr" in low
-                                     or "disallow" in low):
+    names = _entry_named(entry)
+    for _ in range(BANNER_TRIES):
+        # THE REGION. `-A` keeps the bullet lines that FOLLOW each header, which
+        # is the whole fix: the old grep filtered the log down to lines
+        # containing the id and threw the header away before anything could read
+        # it. -i so a capitalised banner still counts.
+        region = r.as_root(["/bin/sh", "-c",
+                            "grep -i -A %d -e %s %s 2>/dev/null | tail -%d"
+                            % (BANNER_AFTER, shlex.quote(BANNER_HEADER),
+                               shlex.quote(path), BANNER_TAIL)])
+        for line in (region.out or "").splitlines()[::-1]:
+            if names.search(line):
                 return True, line.strip()[:120]
-        time.sleep(1)
-    return False, "no line in %s named it" % path
+        # …and the one-line shape, kept. It has never been seen to pass against
+        # the dispatcher this kit was built beside, but this is a template: a
+        # dispatcher that names both concepts on one line is still proof, and
+        # deleting the old rule would regress it for no gain.
+        same = r.as_root(["/bin/sh", "-c",
+                          "grep -i -e %s %s 2>/dev/null | tail -60"
+                          % (shlex.quote(entry), shlex.quote(path))])
+        for line in (same.out or "").splitlines()[::-1]:
+            low = line.lower()
+            if entry in low and ("repositor" in low or "entr" in low
+                                 or "disallow" in low):
+                return True, line.strip()[:120]
+        _pause(1)
+    return False, "no banner in %s named it" % path
 
 
 PLIST = """<?xml version="1.0" encoding="UTF-8"?>
@@ -2413,6 +2652,47 @@ def step_daemons(ctx, apply_it):
     return False, "installed " + ", ".join(sorted(stale)) + " (not loaded yet — CK-5)", []
 
 
+# Exit 3 is DECLINED in BOTH Stage E components (`EXIT_DECLINED` in each). It is
+# named here rather than imported, because this file has to stay runnable while
+# the role account's clone of those very scripts is the thing being installed —
+# but the battery imports the real modules and asserts the number still agrees,
+# so the two cannot drift apart quietly.
+COMPONENT_EXIT_DECLINED = 3
+
+# The bounce driver's dry-run arguments, as a LIST, so the battery can hand the
+# driver's own parser the very arguments this file sends it.
+#
+#   `decide`   the verdict, printed, acting on nothing.
+#   `--all`    REQUIRED. The driver refuses `decide` with neither --pr nor
+#              --all ("--pr is required (or --all with decide)"), so the old
+#              invocation had never once parsed — and because step_dry_run
+#              checked the POLLER first and raised, that usage error was
+#              invisible: half of Stage E had never been exercised at all.
+#   no --config — its default already IS this stage home's config.json, which
+#              is the same resolution the daemon's own `run` uses. Passing one
+#              here would measure a path that never executes in production.
+BOUNCE_DRY_RUN_ARGS = ("decide", "--all", "--dry-run")
+
+
+def _say_declines(text):
+    """Put every decline on screen VERBATIM rather than through a tally this
+    file would have to keep in step with the poller's wording. CK-5 is a cost
+    sign-off, and "2 would be reviewed" and "1 would be reviewed, 1 declined"
+    are different numbers to sign."""
+    say("  THE POLLER DECLINED AT LEAST ONE PULL REQUEST (exit %d), and that is the poller"
+        % COMPONENT_EXIT_DECLINED)
+    say("  working: it posts a loud NOT REVIEWED rather than review a change it cannot")
+    say("  establish a basis for. A declined pull request is NOT one of the sessions you")
+    say("  are about to pay for — count it out of the number you sign off:")
+    shown = [line.strip() for line in text.splitlines() if "NOT REVIEWED" in line]
+    for line in shown[:20]:
+        say("    " + line[:160])
+    if not shown:
+        say("    (its output named no NOT REVIEWED line — read the dry run above)")
+    elif len(shown) > 20:
+        say("    …and %d more" % (len(shown) - 20))
+
+
 def step_dry_run(ctx, apply_it):
     """Both components' own dry runs, shape-checked. This is what CK-5 reads."""
     r = ctx.runner
@@ -2422,8 +2702,8 @@ def step_dry_run(ctx, apply_it):
                              "--config %s/poller.json scan --dry-run"
                        % (ctx.stage_home, ctx.stage_home), timeout=600)
     bounce = r.as_role(ctx.account,
-                       env + "/usr/bin/python3 %s/kit/scripts/pipeline_bounce_local.py "
-                             "decide --dry-run" % ctx.stage_home, timeout=600)
+                       env + "/usr/bin/python3 %s/kit/scripts/pipeline_bounce_local.py %s"
+                       % (ctx.stage_home, " ".join(BOUNCE_DRY_RUN_ARGS)), timeout=600)
     blob = (poller.out + poller.err + bounce.out + bounce.err)
     say("")
     say("  -- the poller's dry run --")
@@ -2433,9 +2713,32 @@ def step_dry_run(ctx, apply_it):
     for line in (bounce.out + bounce.err).strip().splitlines()[-14:]:
         say("    " + line)
     say("")
-    if not poller.ok:
-        raise SetupError("the poller's dry run failed (exit %d). Nothing was created: %s"
-                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
+    # BOTH COMPONENTS ARE JUDGED BEFORE EITHER IS REPORTED. Raising on the
+    # poller first is exactly how a bounce driver that had never once parsed
+    # its own arguments stayed hidden behind the poller's legitimate decline:
+    # one half of the system was totally broken and nothing said so, because
+    # the check that would have said it was never reached. (§13.)
+    #
+    # THREE STATES, NOT TWO. Exit 3 is DECLINED, and declining is the poller
+    # doing its job — its contract is to post a loud NOT REVIEWED rather than
+    # review a pull request it cannot establish a basis for. Reading that as a
+    # failure made Stage E impossible to switch on while ANY open PR's ticket
+    # lacked acceptance criteria, and a research ticket or an ADR has none by
+    # nature: a property of the backlog, not of Stage E. The bounce driver was
+    # always read this way; the poller was not.
+    ok_codes = (0, COMPONENT_EXIT_DECLINED)
+    problems = []
+    if poller.rc not in ok_codes:
+        problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
+                        % (poller.rc, (poller.err or poller.out).strip()[-400:]))
+    if bounce.rc not in ok_codes:
+        problems.append("the bounce driver's dry run failed (exit %d): %s"
+                        % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
+    if problems:
+        raise SetupError("\n".join(problems))
+    declined = poller.rc == COMPONENT_EXIT_DECLINED
+    if declined:
+        _say_declines(poller.out + poller.err)
     if "resolved workspace" not in blob:
         raise Unknown("the poller's dry run never printed `resolved workspace`, so no name "
                       "was proved to resolve",
@@ -2446,12 +2749,11 @@ def step_dry_run(ctx, apply_it):
     if '"unknown"' in blob or "checks_source: unknown" in blob:
         raise Blocked("CK-6", "the bounce driver reports its required-check source as "
                               "UNKNOWN for at least one repository")
-    if bounce.rc not in (0, 3):
-        raise SetupError("the bounce driver's dry run exited %d: %s"
-                         % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off")
-    return True, "both dry runs are clean and the count is signed off", []
+    return True, ("both dry runs ran and the count is signed off; "
+                  + ("the poller declined at least one pull request"
+                     if declined else "neither declined")), []
 
 
 def step_enable(ctx, apply_it):
@@ -2689,6 +2991,9 @@ def cmd_run(ctx, dry_run):
     code, rows = run_steps(ctx, apply_it=not dry_run, keep_going=dry_run,
                            resume="run --dry-run" if dry_run else "run")
     _unloaded_notice(ctx)
+    # LAST, so it is the final thing on the screen. It is the most serious
+    # state this command can end in, and the two notices can both be true.
+    _dispatcher_down_notice(ctx)
     if dry_run:
         say("")
         if ctx.runner.writes:
@@ -2736,6 +3041,45 @@ def _unloaded_notice(ctx):
     say("Clear the row above and run the same command again, or load them yourself:")
     for label in ctx.unloaded:
         say("    sudo launchctl bootstrap system %s" % _dispatcher_plist(label))
+
+
+def _dispatcher_down_notice(ctx):
+    """Say it loudest of all when a run leaves the DISPATCHER stopped.
+
+    The notice above covers the review and bounce loops. This covers the thing
+    they run beside: with the dispatcher down, no ticket starts a session at
+    all — not review, not coding — and without this, the only thing on screen
+    saying so is one FAILED row among ten. §13: a run that could not do the
+    thing must not be mistakable for one that had nothing to do."""
+    down = ctx.dispatcher_down
+    if not down:
+        return
+    stuck = down.get("state") == "stuck"
+    say("")
+    say("=" * 74)
+    if stuck:
+        say("THE DISPATCHER WAS TOLD TO STOP AND LAUNCHD STILL HOLDS IT. It was NOT")
+        say("started again, so whether it is serving is UNKNOWN. Do not assume either way:")
+    else:
+        say("THE DISPATCHER IS STOPPED AND DID NOT COME BACK. While it is down no ticket")
+        say("starts a session at all — not a review, not a coding session:")
+    say("    %s" % down["label"])
+    if down.get("error"):
+        say("  launchd said: %s" % down["error"])
+    say("")
+    say("Start it yourself, and read its log if it refuses again:")
+    if stuck:
+        say("    sudo launchctl bootout system/%s" % down["label"])
+    say("    sudo launchctl bootstrap system %s" % down["plist"])
+    say("    sudo launchctl print system/%s" % down["label"])
+    if down.get("backup"):
+        say("")
+        say("This run had just written the `reviews` entry into its config. That change")
+        say("was NOT undone: a restore starts nothing, and the file is the evidence for")
+        say("why it would not come back. If you decide the entry is the cause:")
+        say("    sudo -u %s cp -a %s %s"
+            % (ctx.account, down["backup"], ctx.conf["DISPATCHER_CONFIG"]))
+    say("=" * 74)
 
 
 def cmd_verify(ctx):
@@ -2874,6 +3218,70 @@ class FakeRunner(Runner):
                     self.applied.append(needle)
                 return Result(rc, out, "")
         return Result(1, "", "FakeRunner: nothing scripted for %s" % line[:120])
+
+
+class FakeLaunchd(FakeRunner):
+    """A FakeRunner that answers `launchctl` the way a domain does, because a
+    static table cannot: whether the service is there is the whole subject of
+    the restart, and it has to CHANGE across the sequence.
+
+    Four knobs, one per thing the restart has to survive:
+      `bootout_rc`  what the stop reports — non-zero covers both "there was
+                    nothing to unload" and "the unload failed".
+      `linger`      how many polls the job stays in the domain after the stop.
+                    This is ExitTimeOut in miniature, and it is the state the
+                    old code bootstrapped straight into.
+      `stuck`       the job never leaves at all.
+      `bootstrap`   an rc per attempt, the last repeating. Non-zero answers
+                    with launchd's own EIO text unless `bootstrap_err` says
+                    otherwise.
+      `bootstrap_lies`  exit 0 and start nothing — the shape in which "the
+                    command succeeded" is not "the dispatcher is back".
+      `resurrect`   a FAILED bootstrap leaves a half-registered record in the
+                    domain, so the next attempt would answer EIO for the same
+                    reason. This is why a retry has to look again, not sleep."""
+
+    def __init__(self, answers=None, bootout_rc=0, linger=0, stuck=False,
+                 bootstrap=(0,), bootstrap_err="Bootstrap failed: 5: Input/output error",
+                 bootstrap_lies=False, resurrect=False):
+        FakeRunner.__init__(self, answers)
+        self.bootout_rc, self.linger, self.stuck = bootout_rc, linger, stuck
+        self.bootstrap = list(bootstrap) or [0]
+        self.bootstrap_err = bootstrap_err
+        self.bootstrap_lies = bootstrap_lies
+        self.resurrect = resurrect
+        self.present = True
+        self.draining = 0
+        self.polls = 0
+        self.attempts = 0
+
+    def _exec(self, argv, stdin, timeout):
+        line = _fmt(argv)
+        if "launchctl bootout system/" in line:
+            if not self.stuck:
+                self.draining = self.linger
+                if not self.linger:
+                    self.present = False
+            return Result(self.bootout_rc, "",
+                          "" if not self.bootout_rc
+                          else "Boot-out failed: 3: No such process")
+        if "launchctl print system/" in line:
+            self.polls += 1
+            if self.draining:
+                self.draining -= 1
+                if not self.draining:
+                    self.present = False
+            return (Result(0, "\tstate = running\n", "") if self.present
+                    else Result(113, "", "Could not find service"))
+        if "launchctl bootstrap system" in line:
+            self.attempts += 1
+            rc = self.bootstrap[min(self.attempts, len(self.bootstrap)) - 1]
+            if not rc:
+                self.present = not self.bootstrap_lies
+                return Result(0, "", "")
+            self.present = self.present or self.resurrect
+            return Result(rc, "", self.bootstrap_err)
+        return FakeRunner._exec(self, argv, stdin, timeout)
 
 
 class FakeLinear(object):
@@ -3621,17 +4029,8 @@ def _selftest_body():
            "a proven entry did not settle: %s" % detail)
     # complement: an entry that DIFFERS must still stop and restart it.
     cases += 1
-    ctxH, fakeH = _settled_ctx(conf)
-    fakeH.answers = list(fakeH.answers) + [
-        ("cp -a /opt/example-dispatch/config.json", 0, ""),
-        ("json.load(sys.stdin)", 0, "added entry reviews\n"),
-        ("launchctl bootstrap system /Library/LaunchDaemons/com.example.dispatcher.plist",
-         0, ""),
-    ]
-    try:
-        _quiet(lambda: step_dispatcher_entry(ctxH, apply_it=True))
-    except (Unknown, SetupError):
-        pass
+    ctxH, fakeH = _restart_ctx(conf)
+    _quiet(lambda: _entry_once(ctxH))
     whys = [w["why"] for w in fakeH.writes]
     expect("restart-when-changed", any("stop the dispatcher" in w for w in whys)
            and any("re-reads its config" in w for w in whys),
@@ -3657,6 +4056,343 @@ def _selftest_body():
            "the notice did not print the command that loads them again")
     expect("unloaded-notice", _quiet(lambda: _unloaded_notice(_settled_ctx(conf)[0]))[1] == "",
            "a run that unloaded nothing still printed the notice")
+
+    # -- 15h. the restart cannot strand the dispatcher ----------------------- #
+    # THE INCIDENT THIS SECTION EXISTS FOR: the step wrote the entry, ran
+    # `launchctl bootout`, and one line later ran `launchctl bootstrap`. The
+    # bootstrap answered `Bootstrap failed: 5: Input/output error`, the step
+    # raised, and the dispatcher stayed down — no wait, no retry, no banner.
+    #
+    # `_pause` is stubbed for the whole section so the battery walks the real
+    # sequence — poll, time out, retry, give up — in no time at all. The paths
+    # are the same ones; only the sleeping is not.
+    import inspect
+    _saved_pause = globals()["_pause"]
+    globals()["_pause"] = lambda _s: None
+
+    def _entry_raises(c):
+        """The step's terminal exception, or None. BOTH SetupError and Unknown
+        end it, and WHICH one is exactly what several of these cases assert:
+        a restart that failed must fail as a restart, not arrive downstream as
+        an unreadable banner."""
+        try:
+            step_dispatcher_entry(c, apply_it=True)
+        except (SetupError, Unknown) as exc:
+            return exc
+        return None
+
+    try:
+        # (a) THE STOP IS WAITED ON. A job that lingers is all ExitTimeOut
+        # means, and it is precisely what the old code bootstrapped into.
+        cases += 1
+        ctxR1, ldR1 = _restart_ctx(conf, linger=3)
+        _quiet(lambda: _entry_once(ctxR1))
+        expect("restart-waits", ldR1.attempts == 1 and ldR1.present,
+               "the dispatcher was not started exactly once and left running "
+               "(attempts=%d present=%s)" % (ldR1.attempts, ldR1.present))
+        expect("restart-waits", ldR1.polls >= 3,
+               "the domain was asked %d time(s) about a job that took 3 polls to leave "
+               "— the stop was not waited on" % ldR1.polls)
+        expect("restart-waits", ctxR1.dispatcher_down is None,
+               "a restart that worked still reported the dispatcher down")
+
+        # (b) A STOP THAT NEVER TOOK IS SURFACED, NOT SWALLOWED. The old call
+        # assigned its result to nothing, so a failed stop and a clean one
+        # produced identical runs — and only one of them can be bootstrapped.
+        cases += 1
+        ctxR2, ldR2 = _restart_ctx(conf, bootout_rc=3, stuck=True)
+        excR2, printedR2 = _quiet(lambda: _entry_raises(ctxR2))
+        expect("bootout-surfaced", ldR2.attempts == 0,
+               "it bootstrapped into a service launchd still holds — that IS the EIO")
+        expect("bootout-surfaced", isinstance(excR2, SetupError)
+               and "still holds it" in str(excR2),
+               "the failure never said the service is still in the domain: %r" % excR2)
+        expect("bootout-surfaced", "bootout exited 3" in printedR2,
+               "the stop's own exit code went nowhere: %r" % printedR2[-300:])
+        expect("bootout-surfaced", (ctxR2.dispatcher_down or {}).get("state") == "stuck",
+               "a stop that could not finish left no banner to print")
+
+        # …and the other half of the same fact. "There was nothing to unload"
+        # and "the unload failed" are opposite facts wearing the same exit
+        # code, and only the domain tells them apart — so a non-zero stop is
+        # reported and the run carries on when the service really did go.
+        cases += 1
+        ctxR3, ldR3 = _restart_ctx(conf, bootout_rc=113)
+        _rvR3, printedR3 = _quiet(lambda: _entry_once(ctxR3))
+        expect("bootout-surfaced", "bootout exited 113" in printedR3,
+               "a non-zero stop was swallowed: %r" % printedR3[-300:])
+        expect("bootout-surfaced", ldR3.attempts == 1 and ctxR3.dispatcher_down is None,
+               "'nothing to unload' was treated as a failure to unload")
+
+        # (c) EIO IS RETRIED — it is what a domain still holding the outgoing
+        # job answers, and waiting is its remedy.
+        cases += 1
+        ctxR4, ldR4 = _restart_ctx(conf, bootstrap=(5, 5, 0))
+        _quiet(lambda: _entry_once(ctxR4))
+        expect("bootstrap-retries-eio", ldR4.attempts == 3 and ldR4.present,
+               "EIO was not retried through to a start: attempts=%d present=%s"
+               % (ldR4.attempts, ldR4.present))
+        expect("bootstrap-retries-eio", ctxR4.dispatcher_down is None,
+               "a dispatcher that came back on attempt 3 was still reported down")
+        # …bounded, never forever.
+        cases += 1
+        ctxR5, ldR5 = _restart_ctx(conf, bootstrap=(5,))
+        excR5 = _quiet(lambda: _entry_raises(ctxR5))[0]
+        expect("bootstrap-retries-eio", isinstance(excR5, SetupError)
+               and "did not come back" in str(excR5),
+               "endless EIO did not end as a failed restart: %r" % excR5)
+        expect("bootstrap-retries-eio", ldR5.attempts == BOOTSTRAP_ATTEMPTS,
+               "EIO was tried %d time(s), not the bounded %d"
+               % (ldR5.attempts, BOOTSTRAP_ATTEMPTS))
+        # …and the retry LOOKS again rather than merely sleeping. A job back in
+        # the domain would answer EIO a second time for the same reason, so the
+        # useful move is the banner, not another bootstrap.
+        cases += 1
+        ctxR5b, ldR5b = _restart_ctx(conf, bootstrap=(5,), resurrect=True)
+        excR5b = _quiet(lambda: _entry_raises(ctxR5b))[0]
+        expect("bootstrap-retries-eio", ldR5b.attempts == 1
+               and "never left the domain" in str(excR5b),
+               "a job that was back in the domain was bootstrapped at again "
+               "(attempts=%d): %r" % (ldR5b.attempts, excR5b))
+        # …and a failure that is NOT EIO is a fact about the plist or the
+        # domain. Repeating it only delays the banner.
+        cases += 1
+        ctxR6, ldR6 = _restart_ctx(
+            conf, bootstrap=(112,),
+            bootstrap_err="Bootstrap failed: 112: Could not find specified service")
+        excR6 = _quiet(lambda: _entry_raises(ctxR6))[0]
+        expect("bootstrap-retries-eio", isinstance(excR6, SetupError),
+               "a permanent bootstrap failure did not end the step: %r" % excR6)
+        expect("bootstrap-retries-eio", ldR6.attempts == 1,
+               "a non-EIO bootstrap failure was retried %d time(s)" % ldR6.attempts)
+
+        # (d) "launchctl accepted it" is not "the dispatcher is back".
+        cases += 1
+        ctxR7, ldR7 = _restart_ctx(conf, bootstrap_lies=True)
+        excR7 = _quiet(lambda: _entry_raises(ctxR7))[0]
+        expect("restart-proves-it", isinstance(excR7, SetupError),
+               "a bootstrap that started nothing was not reported as one: %r" % excR7)
+        expect("restart-proves-it", (ctxR7.dispatcher_down or {}).get("state") == "stopped",
+               "an exit code of 0 was taken as proof the dispatcher is running")
+        expect("restart-proves-it", ldR7.attempts == 1,
+               "an empty success was retried %d time(s)" % ldR7.attempts)
+
+        # (e) THE WAIT READS ExitTimeOut OUT OF THE PLIST. A job whose plist
+        # says it may take two minutes to die must not be given up on in ten
+        # seconds, and the number may never be guessed here.
+        cases += 1
+        ctxRT, ldRT = _restart_ctx(conf, stuck=True)
+        ldRT.answers = list(ldRT.answers) + [("Print :ExitTimeOut", 0, "10\n")]
+        _quiet(lambda: _entry_raises(ctxRT))
+        ctxRL, ldRL = _restart_ctx(conf, stuck=True)      # plist names no ExitTimeOut
+        _quiet(lambda: _entry_raises(ctxRL))
+        expect("restart-respects-exit-timeout",
+               ldRT.polls == int((10 + EXIT_TIMEOUT_HEADROOM) / BOOTOUT_POLL_SECONDS) + 1,
+               "a 10s ExitTimeOut was waited on for %d poll(s), not ExitTimeOut plus "
+               "headroom" % ldRT.polls)
+        expect("restart-respects-exit-timeout", ldRL.polls > ldRT.polls,
+               "a plist naming no ExitTimeOut was waited on no longer than one naming "
+               "10s (%d vs %d polls) — the plist's number is not being read"
+               % (ldRL.polls, ldRT.polls))
+
+        # (f) AND WHEN IT WILL NOT COME BACK, THE RUN ENDS SHOUTING. This is
+        # the whole difference between the incident and a bad afternoon.
+        cases += 1
+        _rvR8, banner = _quiet(lambda: _dispatcher_down_notice(ctxR5))
+        expect("stranded-banner", "DID NOT COME BACK" in banner,
+               "no banner for a dispatcher this run stopped and could not start")
+        expect("stranded-banner", conf["DISPATCHER_SERVICE"] in banner,
+               "the banner never named the service")
+        expect("stranded-banner",
+               ("sudo launchctl bootstrap system %s"
+                % _dispatcher_plist(conf["DISPATCHER_SERVICE"])) in banner,
+               "the banner never printed the command that starts it")
+        expect("stranded-banner", ".bak-" in banner and conf["DISPATCHER_CONFIG"] in banner,
+               "the banner never named the config backup this step had just taken")
+        expect("stranded-banner", "Input/output error" in banner,
+               "the banner never quoted what launchd actually said")
+        # The other shape says the state is UNKNOWN, because it is, and offers
+        # the stop again before the start.
+        _rvR9, stuck_banner = _quiet(lambda: _dispatcher_down_notice(ctxR2))
+        expect("stranded-banner", "UNKNOWN" in stuck_banner
+               and "sudo launchctl bootout system/" in stuck_banner,
+               "the stuck banner claimed to know the state, or never offered the stop")
+        # A restart that worked prints nothing at all…
+        expect("stranded-banner", _quiet(lambda: _dispatcher_down_notice(ctxR4))[1] == "",
+               "a healthy restart still printed the stranded-dispatcher banner")
+        # …and `run` is the thing that prints it, or nothing ever would.
+        expect("stranded-banner", "_dispatcher_down_notice(ctx)" in
+               inspect.getsource(cmd_run),
+               "cmd_run does not print the banner, so a stranded dispatcher would end "
+               "the run as one FAILED row among ten")
+        # -- 15i. the banner proof can actually pass ------------------------ #
+        # The dispatcher prints the count on a header and each entry id on a
+        # bullet below it. The old test wanted both concepts on ONE line, so it
+        # reported UNKNOWN forever on a dispatcher that had loaded the entry —
+        # safe, but unclearable by anything except a person's signature.
+        cases += 1
+        ctxB1, _fB1 = _banner_ctx(conf, region=BANNER_SAMPLE)
+        proven, how = _banner_proves_entry(ctxB1)
+        expect("banner-region", proven is True and "reviews" in how,
+               "the verbatim log sample did not prove the entry: %r" % how)
+        expect("banner-region", "•" in how or "(" in how,
+               "the proof quoted back is not the bullet line: %r" % how)
+        # …and the exact defect: the proving line names none of the three words
+        # the old conjunction demanded of it.
+        line = [l for l in BANNER_SAMPLE.splitlines() if "reviews" in l][0]
+        expect("banner-region",
+               not any(w in line.lower() for w in ("repositor", "entr", "disallow")),
+               "the sample no longer reproduces the defect — the bullet line now "
+               "carries one of the old words, so this case proves nothing: %r" % line)
+
+        # ABSENCE IS STILL UNKNOWN. This is the property that made the defect
+        # survivable, and it must not be traded away for the fix.
+        cases += 1
+        ctxB2, _fB2 = _banner_ctx(conf, region=BANNER_SAMPLE_ABSENT)
+        provenB2, howB2 = _banner_proves_entry(ctxB2)
+        expect("banner-absence", provenB2 is False and "no banner" in howB2,
+               "an entry that genuinely is not in the log was reported as proven: %r"
+               % howB2)
+        # …and the step it feeds still refuses to claim success.
+        ctxB2.dispatcher["entries"].append(
+            dict(reviews_entry(ctxB2), allowedUsers=["u-owner"]))
+        ctxB2.dispatcher["entries"][-1].pop("userAccessControl", None)
+        try:
+            _quiet(lambda: step_dispatcher_entry(ctxB2, apply_it=True))
+            failures.append("banner-absence: an unproven entry settled the step")
+        except Unknown as exc:
+            expect("banner-absence", "never names" in exc.what,
+                   "the step's UNKNOWN no longer says the log named nothing: %s" % exc.what)
+
+        # A LINE THAT MERELY SAYS THE WORD IS NOT PROOF. Widening the region
+        # without narrowing what counts inside it would have swapped an
+        # unclearable step for a false one, which is the worse trade: a false
+        # proof is written to the ledger as a note and never looked at again.
+        cases += 1
+        ctxB3, _fB3 = _banner_ctx(conf, region=BANNER_SAMPLE_MENTIONS)
+        provenB3, howB3 = _banner_proves_entry(ctxB3)
+        expect("banner-not-any-mention", provenB3 is False,
+               "a log line that merely mentions the word was taken as proof: %r" % howB3)
+
+        # The one-line shape a different dispatcher might print still proves —
+        # the old rule is kept, not replaced.
+        cases += 1
+        ctxB4, _fB4 = _banner_ctx(
+            conf, region="",
+            same="[INFO] loaded repository reviews with 9 disallowed tools\n")
+        provenB4, howB4 = _banner_proves_entry(ctxB4)
+        expect("banner-one-line-still-works", provenB4 is True and "reviews" in howB4,
+               "a dispatcher naming both concepts on one line stopped counting: %r" % howB4)
+    finally:
+        globals()["_pause"] = _saved_pause
+
+    # -- 15j. a DECLINE is not a failure, and neither half hides the other -- #
+    # Exit 3 is EXIT_DECLINED in both components. The poller declines when it
+    # cannot establish a review basis — a ticket with no acceptance criteria,
+    # which a research ticket or an ADR has by nature — and reading that as a
+    # failure made Stage E impossible to switch on for a property of the
+    # BACKLOG. The bounce driver was always read correctly; the poller was not.
+    cases += 1
+    import pipeline_review_poller as _poller_mod
+    import pipeline_bounce_local as _bounce_mod
+    expect("declined-is-not-failed",
+           COMPONENT_EXIT_DECLINED == _poller_mod.EXIT_DECLINED,
+           "this file says exit %d is DECLINED and the poller says %d — a number copied "
+           "out of another module has drifted"
+           % (COMPONENT_EXIT_DECLINED, _poller_mod.EXIT_DECLINED))
+    declined_out = ("resolved workspace ws-1\nwould open 1 review ticket(s)\n"
+                    "NOT REVIEWED example-org/kit#75 (KIT-1): no review basis could be "
+                    "established\n")
+    def _dry_run_row(c):
+        """The step's row, or the exception that ended it — so a decline read
+        as a failure arrives as a named FAIL rather than as a traceback out of
+        the whole battery."""
+        try:
+            return step_dry_run(c, apply_it=True)
+        except (SetupError, Unknown, Blocked) as exc:
+            return exc
+
+    ctxD1, _fD1 = _dry_run_ctx(conf, poller=(COMPONENT_EXIT_DECLINED, declined_out))
+    rowD1, printedD1 = _quiet(lambda: _dry_run_row(ctxD1))
+    okD1 = isinstance(rowD1, tuple) and rowD1[0] is True
+    detailD1 = rowD1[1] if isinstance(rowD1, tuple) else str(rowD1)
+    expect("declined-is-not-failed", okD1,
+           "a poller that declined stopped the install: %s" % detailD1)
+    expect("declined-is-not-failed", okD1 and "declined" in detailD1,
+           "the row hid the decline behind a clean-sounding verdict: %s" % detailD1)
+    expect("declined-is-not-failed", "NOT REVIEWED example-org/kit#75" in printedD1
+           and "count it out of the number you sign off" in printedD1,
+           "CK-5 was asked to sign a count with the declines invisible: %r"
+           % printedD1[-400:])
+    # …while a real failure is still a failure, in both spellings.
+    for rc, what in ((1, "error"), (2, "usage")):
+        cases += 1
+        ctxD2, _fD2 = _dry_run_ctx(conf, poller=(rc, "boom\n"))
+        try:
+            _quiet(lambda: step_dry_run(ctxD2, apply_it=True))
+            failures.append("declined-is-not-failed: poller exit %d (%s) was accepted"
+                            % (rc, what))
+        except SetupError as exc:
+            expect("declined-is-not-failed", "exit %d" % rc in str(exc),
+                   "the poller's %s exit was not named: %s" % (what, exc))
+
+    # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
+    # It never was. `decide` with neither --pr nor --all is a usage error, and
+    # because the poller was judged first and raised, that error was invisible:
+    # one half of Stage E had never once parsed its own command line. Asserted
+    # against the driver's REAL parser, so a copy here cannot drift from it.
+    cases += 1
+
+    def _parses(argv):
+        """Does the bounce driver's own parser accept `argv`? `load_config` is
+        stubbed to a state dir with nothing in it, so `decide --all` walks to
+        its real early return and this test reaches the network never.
+
+        BOTH streams are captured, not just stdout: argparse writes its refusal
+        to stderr under this file's own `prog`, and a green battery that prints
+        another script's usage text reads like a failure."""
+        import io
+        tmp = tempfile.mkdtemp(prefix="stage-e-selftest.")
+        saved = _bounce_mod.load_config
+        _bounce_mod.load_config = lambda _p: {"state_dir": tmp}
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = io.StringIO()
+        try:
+            _bounce_mod.main(list(argv))
+            return True
+        except SystemExit:
+            return False          # argparse rejected the arguments themselves
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+            _bounce_mod.load_config = saved
+
+    expect("bounce-args-parse", _parses(BOUNCE_DRY_RUN_ARGS),
+           "the bounce driver rejects the arguments this installer sends it: %s"
+           % " ".join(BOUNCE_DRY_RUN_ARGS))
+    expect("bounce-args-parse", not _parses(("decide", "--dry-run")),
+           "`decide --dry-run` now parses, so this case no longer reproduces the defect "
+           "— the driver used to refuse it for want of --pr or --all")
+    # …and the installer really sends that list, not a string beside it.
+    ctxD3, fakeD3 = _dry_run_ctx(conf)
+    _quiet(lambda: _dry_run_row(ctxD3))
+    sent = [_fmt(a) for a in fakeD3.reads if "pipeline_bounce_local.py" in _fmt(a)]
+    expect("bounce-args-parse",
+           any(" ".join(BOUNCE_DRY_RUN_ARGS) in line for line in sent),
+           "the invocation and the checked argument list have drifted apart: %s" % sent)
+
+    # NEITHER HALF HIDES THE OTHER. Both components are judged before either is
+    # reported, which is the ordering defect that kept the above invisible.
+    cases += 1
+    ctxD4, _fD4 = _dry_run_ctx(conf, poller=(1, "poller boom\n"),
+                               bounce=(2, "usage: ...\n"))
+    try:
+        _quiet(lambda: step_dry_run(ctxD4, apply_it=True))
+        failures.append("both-halves-reported: two broken components passed")
+    except SetupError as exc:
+        expect("both-halves-reported",
+               "poller" in str(exc) and "bounce driver" in str(exc),
+               "only one of two broken components was reported — the other stays hidden "
+               "exactly as the bounce driver did: %s" % exc)
 
     # ------------------------------------------------------------------ #
     # 16. THE CREDENTIAL IS ASKED FOR AT MOST ONCE, AND READ BEFORE IT IS
@@ -4433,10 +5169,76 @@ def _settled_ctx(conf):
         ("n=" + conf["LINEAR_KEY_ENV"], 9, ""),
         ("n=" + conf["GITHUB_TOKEN_ENV"], 9, ""),
         ("scan --dry-run", 0, "resolved workspace ws-1\nwould open 0 review ticket(s)\n"),
-        ("decide --dry-run", 0, "checks_source: config\nnothing to bounce\n"),
+        # The needle is the WHOLE invocation, not a prefix of it: `decide
+        # --dry-run` matched happily while the real command was missing the
+        # `--all` the driver requires, so the fixture answered a command the
+        # driver would have rejected. Spelled from the constant for that reason.
+        (" ".join(BOUNCE_DRY_RUN_ARGS), 0, "checks_source: config\nnothing to bounce\n"),
     ]
     fake.answers = answers
     return ctx, fake
+
+
+# THE REAL SHAPE, observed 2026-09-08 against a live dispatcher: the header
+# carries the count and each entry id is on a bullet BELOW it, which is exactly
+# why a one-line conjunction can never match. Names and paths are this file's
+# own placeholders — the kit is a public template and never names a real
+# deployment — but the SHAPE is what this fixture exists to hold, down to the
+# header arriving on its own line with no log prefix of its own.
+BANNER_SAMPLE = (
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI] \n"
+    "\U0001f4e6 Managing 3 repositories:\n"
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI]    • app (/Users/<role-account>/app)\n"
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI]    • kit (/Users/<role-account>/kit)\n"
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI]    • reviews (/Users/<role-account>/kit)\n")
+
+# The same region with the entry genuinely absent — the state in which UNKNOWN
+# is the only honest answer — and one that merely says the word.
+BANNER_SAMPLE_ABSENT = "\n".join(
+    l for l in BANNER_SAMPLE.splitlines() if "reviews" not in l) + "\n"
+BANNER_SAMPLE_MENTIONS = (BANNER_SAMPLE_ABSENT
+                          + "2026-09-08T03:24:26.000Z [INFO ] [CLI] posting 2 reviews\n")
+
+
+def _banner_ctx(conf, region="", same=""):
+    """A settled machine whose dispatcher log answers the two banner greps:
+    `region` is what `grep -A` returns around the "Managing N repositories"
+    header, `same` what the legacy one-line grep returns. Both needles go in
+    FRONT of the settled table, which answers neither."""
+    ctx, fake = _settled_ctx(conf)
+    fake.answers = [("Print :StandardOutPath", 0, "/var/log/dispatcher.log\n"),
+                    (BANNER_HEADER, 0, region),
+                    ("-e reviews", 0, same)] + list(fake.answers)
+    return ctx, fake
+
+
+_CLEAN_POLLER = (0, "resolved workspace ws-1\nwould open 2 review ticket(s)\n")
+_CLEAN_BOUNCE = (0, "checks_source: config\nnothing to bounce\n")
+
+
+def _dry_run_ctx(conf, poller=_CLEAN_POLLER, bounce=_CLEAN_BOUNCE):
+    """A settled machine whose two components answer scripted (rc, output) for
+    their dry runs. Signed off, so the step reaches its own verdict rather than
+    stopping at CK-5."""
+    ctx, fake = _settled_ctx(conf)
+    fake.answers = [("scan --dry-run", poller[0], poller[1]),
+                    (" ".join(BOUNCE_DRY_RUN_ARGS), bounce[0], bounce[1])] + [
+        a for a in fake.answers
+        if a[0] not in ("scan --dry-run", " ".join(BOUNCE_DRY_RUN_ARGS))]
+    ctx.state.attest("A-DRY-RUN", "xx", "count read: 2")
+    return ctx, fake
+
+
+def _restart_ctx(conf, **kw):
+    """A settled machine whose dispatcher config carries NO `reviews` entry —
+    so the step writes one and restarts the service — driven by a launchd that
+    changes state instead of a table that cannot. `kw` goes to FakeLaunchd."""
+    ctx, fake = _settled_ctx(conf)
+    ctx.runner = FakeLaunchd(answers=list(fake.answers) + [
+        ("cp -a %s" % conf["DISPATCHER_CONFIG"], 0, ""),
+        ("json.load(sys.stdin)", 0, "added entry reviews\n"),
+    ], **kw)
+    return ctx, ctx.runner
 
 
 # A credential-shaped fixture value, assembled rather than spelled: a whole
