@@ -35,6 +35,11 @@ $EDITOR stage-e.conf                                  # ten values, none of them
 python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
 ```
 
+**Run the first pass when no coding session is in flight.** Writing the review entries
+restarts the dispatcher, and a restart kills every session mid-work. It restarts only when
+the entries actually change, so later re-runs are usually free — and `run --dry-run` tells
+you in advance, printing `WOULD stop the dispatcher` if this pass would.
+
 It stops at the first step only a person can do, prints a numbered checkpoint card saying
 exactly what to do, and exits 10. Do that one thing and run the same command again: it
 checks your work and carries on. It never asks you to type `y`.
@@ -467,7 +472,7 @@ Everything the two scripts remember lives under `~/.stage-e/state`:
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
-| `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | left after a bounce, so the poller may re-review the next push |
+| `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | written after a bounce. **Nothing reads it yet** — the poller has no code for it, so a PR is reviewed once, when it is opened |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
 | `bounces/` | bounce driver | its telemetry artifacts |
 
@@ -483,6 +488,7 @@ Values go in this file; only **names** go in this document, in the repo, and in 
 ```bash
 cat > ~/.stage-e/env <<'EOF'
 STAGE_E_LINEAR_API_KEY=   # a personal API key on the OWNER's Linear account — the delegator
+                          # NOTE: creating the Reviews team is ADMIN-scoped. See below.
 GH_TOKEN=                 # Contents read; Pull requests WRITE; Issues write — see below
 EOF
 chmod 600 ~/.stage-e/env
@@ -704,7 +710,18 @@ Input/output error` and leaves you with nothing loaded. Poll
 **Monitor the heartbeats, not the log.** `state/heartbeat.json` and
 `state/bounce-heartbeat.json` carry a timestamp and a result on every terminal path,
 including a failed one. A stale heartbeat means *not running*; a fresh one with a non-`ok`
-result means *ran and could not do it*. Two cases leave no poller heartbeat at all: a
+result means *ran and could not do it*. Both files live under the **role account's** home,
+not yours, so reading them takes `sudo -u`:
+
+```sh
+sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json'
+```
+
+The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours —
+and the `cd /` suppresses the `shell-init: … getcwd … Permission denied` lines that
+otherwise appear, harmlessly, because that account cannot traverse your home.
+
+Two cases leave no poller heartbeat at all: a
 config that cannot be read (it exits 2 before it learns where the state directory is), and
 somebody stopping the process on purpose.
 

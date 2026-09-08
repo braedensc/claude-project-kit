@@ -1744,8 +1744,16 @@ def resolve_basis_for(cfg, ticket_id, api_key):
     raw = mod.resolve_basis(ticket_id, issue, cfg.get("basis_snapshot_dir") or None)
     basis = prl.basis_from(raw)
     if basis is None:
+        # NAME THE SHAPE, at the moment of failure. Read beside a ticket that
+        # visibly HAS a checklist, the bare sentence points at the basis resolver
+        # rather than at the heading — the wrong diagnosis, and the one the first
+        # live install actually made.
         return None, ("no review basis could be established for %s (no acceptance criteria "
-                      "reachable by any tier; tier tried: %s)" % (ticket_id, (raw or {}).get("basis_tier")))
+                      "reachable by any tier; tier tried: %s). Stage E reads exactly one "
+                      "section: a top-level `## Acceptance criteria` heading with `- [ ]` "
+                      "checkbox items. A `###` heading, a renamed heading such as "
+                      "`## Deliverable`, a trailing colon, bold, or plain bullets all read as "
+                      "none." % (ticket_id, (raw or {}).get("basis_tier")))
     return basis, ""
 
 

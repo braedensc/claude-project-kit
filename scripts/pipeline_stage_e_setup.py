@@ -884,6 +884,52 @@ M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
 M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
                    "{ teamMembershipCreate(input: $input) { success } }")
+
+# WHICH CALL WAS REFUSED, AND WHAT TO DO ABOUT IT.
+#
+# An anonymous "the tracker returned an error: Access denied" is a stop nobody
+# can act on: it names neither what was attempted nor what is missing. Measured
+# on a first live install, where it ended the run at step 3 of 10 and the
+# operator had to read this source to learn that creating a team is admin-scoped
+# — then work around it by hand with no guidance that hand-creating even works.
+#
+# A key with read+write on all workspace data passes the liveness probe and every
+# read, so this is NOT the "bad key" shape the probe already catches. The key is
+# valid; the OPERATION needs more than it has. Those are different sentences and
+# they must not share one.
+_ADMIN_SCOPED = {
+    "teamCreate":
+        "Creating a team is ADMIN-scoped in the tracker. A personal key with read+write on all\n"
+        "  workspace data is NOT enough, and this is not a rejected key — every read just\n"
+        "  succeeded. Either use a key whose user is a workspace admin, or create the team by\n"
+        "  hand in the tracker's UI (its key and name are the ones in your conf) and run this\n"
+        "  again: the tracker step finds an existing team and carries on from there.",
+    "workflowStateCreate":
+        "Creating a workflow state is admin-scoped in the tracker. Add the missing states to the\n"
+        "  Reviews team by hand, then run this again — it re-reads them and carries on.",
+    "issueLabelCreate":
+        "Creating a label is admin-scoped in the tracker. Create the model label by hand at\n"
+        "  WORKSPACE scope (a team-scoped label of the same name does not count), then re-run.",
+}
+
+
+def _operation_name(query):
+    """The field being called, e.g. `teamCreate`, out of a GraphQL document."""
+    m = re.search(r"\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\(", query or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"^\s*(?:query|mutation)\s+([A-Za-z][A-Za-z0-9_]*)", query or "")
+    return m.group(1) if m else ""
+
+
+def _refusal_hint(query, msgs):
+    """The remedy for a refusal that is about SCOPE, not about the key."""
+    low = (msgs or "").lower()
+    if "denied" not in low and "not authorized" not in low and "not authorised" not in low:
+        return ""
+    hint = _ADMIN_SCOPED.get(_operation_name(query))
+    return ("\n  " + hint) if hint else ""
+
 # The cheapest question the tracker will answer, asked ONCE per process, purely
 # to learn whether it accepts this key at all. It runs before any step starts
 # creating things, so a bad key is named as a bad key rather than as a failure
@@ -944,7 +990,10 @@ class LinearTransport(object):
             raise SetupError("the tracker's answer was not JSON")
         if doc.get("errors"):
             msgs = "; ".join(str(e.get("message", "?"))[:120] for e in doc["errors"][:3])
-            raise SetupError("the tracker returned an error: %s" % msgs)
+            op = _operation_name(query)
+            raise SetupError("the tracker refused %s: %s%s"
+                             % ("`%s`" % op if op else "a call", msgs,
+                                _refusal_hint(query, msgs)))
         data = doc.get("data")
         if not isinstance(data, dict):
             raise SetupError("the tracker's answer carried no data object")
@@ -3145,10 +3194,32 @@ def step_enable(ctx, apply_it):
         return False, "would load %s; heartbeats present: %s" % (
             ", ".join(missing) or "none", ", ".join(have_beats) or "none"), []
 
+    # THIS STEP RE-ARMS A DAEMON YOU STOPPED ON PURPOSE, and says so before it
+    # does. `launchctl bootout` is the documented way to pause one half — but the
+    # pause lives in launchd, not on disk, so the next `run` reaches here and
+    # loads both again. The rendered plist sets RunAtLoad, so the reloaded job
+    # takes a full pass within seconds, not at its next interval. Measured on a
+    # first live install: a deliberately paused bounce driver was reloaded by an
+    # unrelated re-run and spent a real bounce twelve seconds later.
+    if not r.dry_run:
+        say("")
+        say("  LOADING both daemons. Each takes a full pass within seconds of loading.")
+        say("  If you stopped one on purpose with `launchctl bootout`, that pause does NOT")
+        say("  survive this step — stop it again after this run, or let it run.")
+        say("")
     for label in labels:
-        r.as_root(["launchctl", "bootout", "system/" + label],
-                  why="unload %s before loading it (bootstrap does not re-read a "
-                      "loaded plist)" % label)
+        out = r.as_root(["launchctl", "bootout", "system/" + label],
+                        why="unload %s before loading it (bootstrap does not re-read a "
+                            "loaded plist)" % label)
+        # WAIT, THEN LOAD. `bootout` is asynchronous, and bootstrapping into a job
+        # the domain still holds is exactly what answers `Bootstrap failed: 5:
+        # Input/output error`. `_restart_dispatcher` spends eighty lines getting
+        # this right for the dispatcher; this loop used to do back-to-back what
+        # the operator guide tells a person never to do by hand.
+        if not out.skipped:
+            _wait_until_gone(r, label,
+                             _exit_timeout(r, _dispatcher_plist(label))
+                             + EXIT_TIMEOUT_HEADROOM)
         res = r.as_root(["launchctl", "bootstrap", "system", _dispatcher_plist(label)],
                         why="load %s" % label)
         if not res.ok and not res.skipped:
