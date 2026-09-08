@@ -105,6 +105,7 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 | `stateIds.ready` | string (UUID) | dispatcher | Approved and dispatchable. |
 | `stateIds.working` | string (UUID) | dispatcher | A session holds it. Counts against `budgets.wipLimit`. |
 | `stateIds.review` | string (UUID) | dispatcher, reviewer | PR open, awaiting review/CI — the "waiting on a human" lane that keeps it distinguishable from `working`. Reached by the tracker's *pull request opened* git automation and/or a session's §8 `ticket-state` request; same target, so the two do not race, and on a lane with no safe-outputs executor the automation is the only mechanism. Neither authorises anything — approval is `ready` and is read specifically (§5). |
+| `stateIds.needsApproval` | string (UUID) | Stage E bounce driver | **Provisioned as type `unstarted` — never `started`, never `completed`** (see below). AI review has concluded and a person should accept the work: the findings were clean or below `budgets.reviewSeverityThreshold`, or the bounce budget is spent (then `agent:needs-human` is on the ticket too, and that label is what tells the two apart). Reached ONLY by the bounce driver's own move — no git automation, and never a session: the `ticket-state` kind (§8) excludes it, because the conclusion of a review is not something the reviewed party may report. It authorises nothing; approval is `ready` and is read specifically (§5). |
 | `stateIds.done` | string (UUID) | dispatcher | Merged/closed. |
 | `labels.ids` | object → string (UUID) | dispatcher, guards | Map of **canonical key → Linear label ID**. The key is the stable name used in code; the Linear display name may drift from it. |
 | `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. **Floored at §6's dispatcher-owned set** (`agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity`) — a project may require more, never fewer. |
@@ -144,10 +145,24 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 >
 > Corollary: `labels.ids` values are **resolved**, not authored. They ship as `""`
 > (unresolved) and a setup step fills them by looking each display name up once. The
-> five `stateIds` are placeholder tokens instead — a closed, mandatory set of exactly
-> five, where a missing value stalls the whole queue; labels are an open set
+> six `stateIds` are placeholder tokens instead — a closed, mandatory set of exactly
+> six, where a missing value stalls the whole queue; labels are an open set
 > (`track:*` grows per project) that no fixed token list can cover. §6 fixes the scope
 > those labels are created at.
+>
+> **`needsApproval` is provisioned `unstarted`. Never `started`, never `completed`.**
+> This is not cosmetic, and it is the reason the key carries a type at all:
+>
+> - The dispatcher moves every new session's issue to the **lowest-ordered `started`-type
+>   state**, unconditionally — no flag disables it and its failures are swallowed. A
+>   second `started` lane beside `working` and `review` adds a third contender to an
+>   ordering nothing in the kit pins, records or checks, and when it goes wrong there is
+>   no error anywhere to bring someone to look.
+> - A `completed` lane is worse. The dispatcher deletes a worktree when its issue reaches
+>   a terminal state, and the bounce driver skips any ticket already in one, so every
+>   subsequent bounce would become a silent no-op with the worktree already gone.
+> - `unstarted` removes the lane from that contest entirely, and matches how the kit
+>   already models `ready` — its other "waiting on a human" state.
 
 ### `github`
 
@@ -789,7 +804,7 @@ write path.
 | Type | Fields | Notes |
 |---|---|---|
 | `ticket-comment` | `ticket_id`, `body` | `body` is non-empty markdown. The telemetry block (§4) travels as one of these. |
-| `ticket-state` | `ticket_id`, `to` | `to` is a **canonical state key** from `linear.stateIds` (`working`, `review`, …), never a UUID and never a display name. |
+| `ticket-state` | `ticket_id`, `to` | `to` is a **canonical state key** from `linear.stateIds` — only `working` or `review`, never a UUID and never a display name. `raw`, `ready`, `done` and `needsApproval` are all refused: the last of those is the conclusion of the review, and a session reporting it would be issuing a verdict on its own work (§5). |
 | `ticket-label` | `ticket_id`, `add[]`, `remove[]` | Canonical label keys from `linear.labels.ids` (§6). Either list may be empty. |
 | `ticket-create` | `source_ticket_id`, `title`, `body`, `labels[]` | **Files a follow-up finding ticket.** `source_ticket_id` is the session's OWN pinned ID (compared to the pin, never used to address anything); `title` is one line; `body` is non-empty markdown; `labels[]` is optional. The new ticket's identity, state, provenance and assignee are the **executor's** to set, never the session's — see *Filing a finding* below. Available only when `linear.findingTicket` is configured. |
 

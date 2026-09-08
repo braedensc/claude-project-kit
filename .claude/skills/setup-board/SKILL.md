@@ -124,6 +124,8 @@ Concern              Exists                    Contract wants          Action
 Team                 ENG "Engineering"         ENG                     ok
 Status: In Review    — (no state of type       "In Review" (started)   CREATE
                        `started` named that)
+Status: Needs        — (none)                  "Needs Approval"        CREATE
+        Approval                               (UNSTARTED)
 Label: agent:queued  agent:queued (workspace)  workspace               ok
 Label: effort:M      effort:M (team ENG)       workspace               ASK — rescope?
 Label: risk/high     risk-high (team ENG)      workspace group `risk`  ASK — rename?
@@ -224,7 +226,14 @@ mutation AddWebhook($teamId: String!, $url: String!, $types: [String!]!) {
 - `GitAutomationStates` events are `draft`, `start`, `review`, `mergeable`, `merge`.
   Scope one to a branch with `gitAutomationTargetBranchCreate` (`branchPattern`,
   `isRegex`) and pass the resulting `targetBranchId`.
-- **Wire two of the five: `review` → `stateIds.review`, `merge` → `stateIds.done`.**
+- **`needsApproval` is created as type `unstarted`, and wired to no automation.** Two
+  types are actively wrong here and neither fails loudly. `started` joins the
+  dispatcher's unconditional move of a new session's issue to the *lowest-ordered*
+  `started` state — an ordering nothing in the kit pins or checks, whose failures are
+  swallowed. `completed` makes the dispatcher delete the worktree and every later Stage E
+  bounce a silent no-op. Nothing moves a ticket here but the bounce driver, which does it
+  once when review concludes; a session may never request it (§8).
+- **Wire two of the five automations: `review` → `stateIds.review`, `merge` → `stateIds.done`.**
   Leave `draft`, `start` and `mergeable` at no action unless the project asks. `review`
   is the one boards forget, and forgetting it costs the distinction the lane exists for:
   without it a ticket sits in `working` from the moment a session starts until someone
@@ -306,7 +315,7 @@ tokens inside the `linear` block with the real IDs you read in step 1:
 | You fill | With |
 |---|---|
 | `linear.teamKey` / `linear.workspace` | the team key (uppercase) and the org `urlKey` |
-| `linear.stateIds.{raw,ready,working,review,done}` | the five workflow-state **UUIDs** |
+| `linear.stateIds.{raw,ready,working,review,needsApproval,done}` | the six workflow-state **UUIDs** |
 | `linear.labels.ids.<canonical key>` | each label's Linear **UUID**, as a bare string |
 
 **Every other section — `version`, `github`, `branch`, `stack`, `commands`, `budgets`,
@@ -328,6 +337,7 @@ So the file you hand over is the example, with the `linear` block resolved:
       "ready":   "2b40…",
       "working": "c7d9…",
       "review":  "51ae…",
+      "needsApproval": "6b7f…",
       "done":    "e034…"
     },
     "labels": {
@@ -350,10 +360,10 @@ Rules that are not negotiable, because guards depend on them:
   whose `version` it does not recognize as **BROKEN** and fails closed — blocking every
   `Edit`, `Write` and `Bash` in the repo until a human repairs the file by hand. Handing
   over a `delivery.json` without `version` bricks the project you were setting up.
-- **Keys are canonical, values are ID strings.** `stateIds` is the closed five-key map
-  `raw/ready/working/review/done` — never keyed by the display name a state happens to
-  have in the UI. If the `review` state is called "In Review", that name belongs in the
-  step-8 report, not in the file. Labels the same: `"agent:queued": "<uuid>"`, never
+- **Keys are canonical, values are ID strings.** `stateIds` is the closed six-key map
+  `raw/ready/working/review/needsApproval/done` — never keyed by the display name a
+  state happens to have in the UI. If the `review` state is called "In Review", that
+  name belongs in the step-8 report, not in the file. Labels the same: `"agent:queued": "<uuid>"`, never
   `"agent:queued": {"id": …}` — every consumer indexes `labels.ids[key]` and expects a
   string. This is §1's corollary: states and labels are referenced by ID, never by
   display name, so a rename in the UI cannot silently desync a guard.
@@ -445,7 +455,8 @@ canonical key it corresponds to:
 ```
 Workspace   acme (org 8f1c…), gitBranchFormat feat/{issueIdentifier}-{issueTitle}
 Team        ENG "Engineering" (2b40…)
-States      raw "Ideas" · ready "Ready" · working "In Progress" · review "In Review" · done "Done"
+States      raw "Ideas" · ready "Ready" · working "In Progress" · review "In Review"
+            needsApproval "Needs Approval" (unstarted) · done "Done"
 Automations pull request opened → "In Review" (created this run) · merged → "Done"
 Projects    Ideas (c7d9…)  — triage target, created this run
 Schema      python3 scripts/check_schemas.py --instance delivery.json --schema delivery → OK
