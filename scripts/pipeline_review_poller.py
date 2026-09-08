@@ -942,6 +942,15 @@ def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=N
         "repo": owner_repo,
         "pr": pr["number"],
         "head_branch": pr.get("headRefName") or "",
+        # THE GUARD THIS FEEDS. pipeline_bounce_local.outcome_is_fresh compares
+        # outcome["head_sha"] against the PR's current head, to refuse bouncing a
+        # review of a commit that no longer exists. No producer ever wrote the
+        # key, so `reviewed` was always "" and that branch could not fire; absent,
+        # it degraded to the timestamp fallback, which cannot fire either before
+        # the first bounce is spent. Net effect: a finding already fixed by a
+        # later push still spent a real bounce, and the re-prompt cited a commit
+        # the session no longer had.
+        "head_sha": pr.get("headRefOid") or "",
         "ticket_id": ticket_id,
         "review_ticket": review_ticket,
         "threshold": verdict.get("threshold"),
@@ -1021,7 +1030,7 @@ def write_outcome(state_dir, artifact):
 def list_open_prs(owner_repo, limit=DEFAULT_LIST_LIMIT):
     ok, out, _ = gh_fallback.try_gh([
         "pr", "list", "--repo", owner_repo, "--state", "open",
-        "--json", "number,title,headRefName,isCrossRepository,isDraft,createdAt,url",
+        "--json", "number,title,headRefName,headRefOid,isCrossRepository,isDraft,createdAt,url",
         "--limit", str(limit)])
     if ok:
         try:
@@ -1046,6 +1055,7 @@ def list_open_prs(owner_repo, limit=DEFAULT_LIST_LIMIT):
             "number": p.get("number"),
             "title": p.get("title") or "",
             "headRefName": head.get("ref") or "",
+            "headRefOid": head.get("sha") or "",
             # A deleted fork reads as cross-repo too: unknown provenance is not "ours".
             "isCrossRepository": head_repo != owner_repo,
             "isDraft": bool(p.get("draft")),
