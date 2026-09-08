@@ -43,6 +43,20 @@ and the PRD document rather than restating them.>
       passes">
 - [ ] <...>
 
+**The heading and the checkboxes are both load-bearing.** One parser reads this
+section — a top-level `## Acceptance criteria` heading with `- [ ]` items — and
+the dispatcher pins what it returns. A `###` heading, a renamed heading such as
+`## Deliverable`, a trailing colon, bold, or plain bullets all read as **no
+criteria at all**, silently: the ticket looks fine, and the review of its pull
+request declines as unreviewable. Measured on a real ticket, 2026-09-08.
+
+**A criterion requiring a change under `.github/workflows/` cannot be met by a
+session.** The pipeline's push credential deliberately lacks the Workflows
+permission — a session that can rewrite CI can switch off the guards that
+supervise it (`docs/AUTONOMY.md`). Neither `git push` nor the REST contents API
+gets round it. Split that change out for a person, or the review will correctly
+report the criterion unmet and a fix pass will be spent failing at it.
+
 ## Out of scope
 
 - <A thing a reasonable reader would assume is included, and is not. This is the

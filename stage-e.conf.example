@@ -104,6 +104,14 @@ KIT_REPO_URL=https://github.com/example-org/claude-project-kit
 # ticket, and refuses outright if the team turns out to be nested.  The one
 # thing it never deletes is your work: no team, state, label or ticket.
 #
+# CREATING A TEAM IS ADMIN-SCOPED.  A personal key with read+write on all
+# workspace data passes every read and every liveness check, and is then REFUSED
+# at `teamCreate` — which is not a bad key, and the installer now says which call
+# was refused and what to do.  If the key's user is not a workspace admin, create
+# this team by hand in the tracker's UI first, with exactly this key and the name
+# below: the installer finds an existing team and carries on from there.  The same
+# is true of the workflow states and the model label.
+#
 # RULE: 1–5 upper-case letters or digits.  It becomes a branch prefix, so it
 # must not collide with a team key you already dispatch work to.
 REVIEWS_TEAM_KEY=REV
