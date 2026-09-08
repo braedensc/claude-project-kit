@@ -1005,6 +1005,8 @@ CARDS = {
                 "bill you did not mean. Nothing can decide for you whether that number is "
                 "the number you meant."),
         "do": ["Read the counts the installer just printed above.",
+               "Subtract any NOT REVIEWED line it printed: a declined pull request",
+               "costs no session, so it is not part of the number you are signing.",
                "If it is more than you meant, narrow it: put a single repository in",
                "REVIEW_REPOS, re-run, and read the count again.",
                "When the number is what you meant, sign it off and re-run — the installer",
@@ -2476,10 +2478,47 @@ def _upsert_entry_py(path):
 
 ENTRY_PROOF_NOTE = "dispatcher-entry-banner"
 
+# THE BANNER IS A REGION, NOT A LINE, and reading it as a line is what made
+# this step unclearable. A dispatcher prints what it loaded as a header with
+# the count, then one bullet per entry:
+#
+#     📦 Managing 3 repositories:
+#        • <id> (<path/to/clone>)
+#        • reviews (<path/to/clone>)
+#
+# The old test demanded the entry id AND one of `repositor`/`entr`/`disallow`
+# ON THE SAME LINE. That shape can never satisfy it — the word "repositories"
+# is on the header and the id is on a bullet below — so the step reported
+# UNKNOWN forever on a dispatcher that had loaded the entry perfectly, and a
+# person had to sign `A-ENTRY-LOADED` by hand every single time. It failed in
+# the SAFE direction, which is why it survived; that is what made it a
+# usability defect rather than an incident. Observed against a real log
+# 2026-09-08, and the shape below is derived from that sample rather than
+# guessed at — docs/LESSONS.md carries the standing rule the old conjunction
+# broke: never write a pattern over log text before printing one real line.
+BANNER_HEADER = "managing.*repositor"    # the header, as a grep BRE
+BANNER_AFTER = 20                        # bullet lines kept after each header
+BANNER_TAIL = 300                        # …and how much of that is read back
+BANNER_TRIES = 10
 
-def _banner_proves_entry(ctx):
-    """(proven, how). Reads the dispatcher's own log for a line naming the
-    reviews entry. Absence is never read as success.
+
+def _entry_named(entry):
+    """`   • reviews (/path/to/clone)` — the id as its own word on a LIST line:
+    a bullet before it, or its clone path in parentheses after it.
+
+    The list shape is load-bearing. Inside a region a bare substring would
+    match any log line that happens to carry the word — a ticket title, a
+    branch name, "posting 2 reviews" — and that is the one direction this
+    function must not fail in, since a false proof is recorded as a note and
+    never looked at again."""
+    tok = re.escape(entry)
+    return re.compile(r"(?:[•●▪·*+\-]\s*%s\b|\b%s\b\s*\()"
+                      % (tok, tok), re.I)
+
+
+def _banner_proves_entry(ctx, entry="reviews"):
+    """(proven, how). Reads the dispatcher's own log for proof that it loaded
+    the reviews entry. ABSENCE IS NEVER READ AS SUCCESS.
 
     The WHOLE log is searched, not the tail: this is called on a re-run that
     deliberately did NOT restart the dispatcher, so the banner it is looking for
@@ -2492,18 +2531,33 @@ def _banner_proves_entry(ctx):
     if not logpath.ok or not logpath.out.strip():
         return False, "its plist names no StandardOutPath"
     path = logpath.out.strip().splitlines()[0]
-    for _ in range(10):
-        # -i so a capitalised banner still counts; the last 60 matching lines so
-        # a busy log cannot bury the most recent start.
-        hits = r.as_root(["/bin/sh", "-c",
-                          "grep -i -e reviews %s 2>/dev/null | tail -60" % shlex.quote(path)])
-        for line in (hits.out or "").splitlines()[::-1]:
-            low = line.lower()
-            if "reviews" in low and ("repositor" in low or "entr" in low
-                                     or "disallow" in low):
+    names = _entry_named(entry)
+    for _ in range(BANNER_TRIES):
+        # THE REGION. `-A` keeps the bullet lines that FOLLOW each header, which
+        # is the whole fix: the old grep filtered the log down to lines
+        # containing the id and threw the header away before anything could read
+        # it. -i so a capitalised banner still counts.
+        region = r.as_root(["/bin/sh", "-c",
+                            "grep -i -A %d -e %s %s 2>/dev/null | tail -%d"
+                            % (BANNER_AFTER, shlex.quote(BANNER_HEADER),
+                               shlex.quote(path), BANNER_TAIL)])
+        for line in (region.out or "").splitlines()[::-1]:
+            if names.search(line):
                 return True, line.strip()[:120]
-        time.sleep(1)
-    return False, "no line in %s named it" % path
+        # …and the one-line shape, kept. It has never been seen to pass against
+        # the dispatcher this kit was built beside, but this is a template: a
+        # dispatcher that names both concepts on one line is still proof, and
+        # deleting the old rule would regress it for no gain.
+        same = r.as_root(["/bin/sh", "-c",
+                          "grep -i -e %s %s 2>/dev/null | tail -60"
+                          % (shlex.quote(entry), shlex.quote(path))])
+        for line in (same.out or "").splitlines()[::-1]:
+            low = line.lower()
+            if entry in low and ("repositor" in low or "entr" in low
+                                 or "disallow" in low):
+                return True, line.strip()[:120]
+        _pause(1)
+    return False, "no banner in %s named it" % path
 
 
 PLIST = """<?xml version="1.0" encoding="UTF-8"?>
@@ -2598,6 +2652,47 @@ def step_daemons(ctx, apply_it):
     return False, "installed " + ", ".join(sorted(stale)) + " (not loaded yet — CK-5)", []
 
 
+# Exit 3 is DECLINED in BOTH Stage E components (`EXIT_DECLINED` in each). It is
+# named here rather than imported, because this file has to stay runnable while
+# the role account's clone of those very scripts is the thing being installed —
+# but the battery imports the real modules and asserts the number still agrees,
+# so the two cannot drift apart quietly.
+COMPONENT_EXIT_DECLINED = 3
+
+# The bounce driver's dry-run arguments, as a LIST, so the battery can hand the
+# driver's own parser the very arguments this file sends it.
+#
+#   `decide`   the verdict, printed, acting on nothing.
+#   `--all`    REQUIRED. The driver refuses `decide` with neither --pr nor
+#              --all ("--pr is required (or --all with decide)"), so the old
+#              invocation had never once parsed — and because step_dry_run
+#              checked the POLLER first and raised, that usage error was
+#              invisible: half of Stage E had never been exercised at all.
+#   no --config — its default already IS this stage home's config.json, which
+#              is the same resolution the daemon's own `run` uses. Passing one
+#              here would measure a path that never executes in production.
+BOUNCE_DRY_RUN_ARGS = ("decide", "--all", "--dry-run")
+
+
+def _say_declines(text):
+    """Put every decline on screen VERBATIM rather than through a tally this
+    file would have to keep in step with the poller's wording. CK-5 is a cost
+    sign-off, and "2 would be reviewed" and "1 would be reviewed, 1 declined"
+    are different numbers to sign."""
+    say("  THE POLLER DECLINED AT LEAST ONE PULL REQUEST (exit %d), and that is the poller"
+        % COMPONENT_EXIT_DECLINED)
+    say("  working: it posts a loud NOT REVIEWED rather than review a change it cannot")
+    say("  establish a basis for. A declined pull request is NOT one of the sessions you")
+    say("  are about to pay for — count it out of the number you sign off:")
+    shown = [line.strip() for line in text.splitlines() if "NOT REVIEWED" in line]
+    for line in shown[:20]:
+        say("    " + line[:160])
+    if not shown:
+        say("    (its output named no NOT REVIEWED line — read the dry run above)")
+    elif len(shown) > 20:
+        say("    …and %d more" % (len(shown) - 20))
+
+
 def step_dry_run(ctx, apply_it):
     """Both components' own dry runs, shape-checked. This is what CK-5 reads."""
     r = ctx.runner
@@ -2607,8 +2702,8 @@ def step_dry_run(ctx, apply_it):
                              "--config %s/poller.json scan --dry-run"
                        % (ctx.stage_home, ctx.stage_home), timeout=600)
     bounce = r.as_role(ctx.account,
-                       env + "/usr/bin/python3 %s/kit/scripts/pipeline_bounce_local.py "
-                             "decide --dry-run" % ctx.stage_home, timeout=600)
+                       env + "/usr/bin/python3 %s/kit/scripts/pipeline_bounce_local.py %s"
+                       % (ctx.stage_home, " ".join(BOUNCE_DRY_RUN_ARGS)), timeout=600)
     blob = (poller.out + poller.err + bounce.out + bounce.err)
     say("")
     say("  -- the poller's dry run --")
@@ -2618,9 +2713,32 @@ def step_dry_run(ctx, apply_it):
     for line in (bounce.out + bounce.err).strip().splitlines()[-14:]:
         say("    " + line)
     say("")
-    if not poller.ok:
-        raise SetupError("the poller's dry run failed (exit %d). Nothing was created: %s"
-                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
+    # BOTH COMPONENTS ARE JUDGED BEFORE EITHER IS REPORTED. Raising on the
+    # poller first is exactly how a bounce driver that had never once parsed
+    # its own arguments stayed hidden behind the poller's legitimate decline:
+    # one half of the system was totally broken and nothing said so, because
+    # the check that would have said it was never reached. (§13.)
+    #
+    # THREE STATES, NOT TWO. Exit 3 is DECLINED, and declining is the poller
+    # doing its job — its contract is to post a loud NOT REVIEWED rather than
+    # review a pull request it cannot establish a basis for. Reading that as a
+    # failure made Stage E impossible to switch on while ANY open PR's ticket
+    # lacked acceptance criteria, and a research ticket or an ADR has none by
+    # nature: a property of the backlog, not of Stage E. The bounce driver was
+    # always read this way; the poller was not.
+    ok_codes = (0, COMPONENT_EXIT_DECLINED)
+    problems = []
+    if poller.rc not in ok_codes:
+        problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
+                        % (poller.rc, (poller.err or poller.out).strip()[-400:]))
+    if bounce.rc not in ok_codes:
+        problems.append("the bounce driver's dry run failed (exit %d): %s"
+                        % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
+    if problems:
+        raise SetupError("\n".join(problems))
+    declined = poller.rc == COMPONENT_EXIT_DECLINED
+    if declined:
+        _say_declines(poller.out + poller.err)
     if "resolved workspace" not in blob:
         raise Unknown("the poller's dry run never printed `resolved workspace`, so no name "
                       "was proved to resolve",
@@ -2631,12 +2749,11 @@ def step_dry_run(ctx, apply_it):
     if '"unknown"' in blob or "checks_source: unknown" in blob:
         raise Blocked("CK-6", "the bounce driver reports its required-check source as "
                               "UNKNOWN for at least one repository")
-    if bounce.rc not in (0, 3):
-        raise SetupError("the bounce driver's dry run exited %d: %s"
-                         % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off")
-    return True, "both dry runs are clean and the count is signed off", []
+    return True, ("both dry runs ran and the count is signed off; "
+                  + ("the poller declined at least one pull request"
+                     if declined else "neither declined")), []
 
 
 def step_enable(ctx, apply_it):
@@ -4108,8 +4225,174 @@ def _selftest_body():
                inspect.getsource(cmd_run),
                "cmd_run does not print the banner, so a stranded dispatcher would end "
                "the run as one FAILED row among ten")
+        # -- 15i. the banner proof can actually pass ------------------------ #
+        # The dispatcher prints the count on a header and each entry id on a
+        # bullet below it. The old test wanted both concepts on ONE line, so it
+        # reported UNKNOWN forever on a dispatcher that had loaded the entry —
+        # safe, but unclearable by anything except a person's signature.
+        cases += 1
+        ctxB1, _fB1 = _banner_ctx(conf, region=BANNER_SAMPLE)
+        proven, how = _banner_proves_entry(ctxB1)
+        expect("banner-region", proven is True and "reviews" in how,
+               "the verbatim log sample did not prove the entry: %r" % how)
+        expect("banner-region", "•" in how or "(" in how,
+               "the proof quoted back is not the bullet line: %r" % how)
+        # …and the exact defect: the proving line names none of the three words
+        # the old conjunction demanded of it.
+        line = [l for l in BANNER_SAMPLE.splitlines() if "reviews" in l][0]
+        expect("banner-region",
+               not any(w in line.lower() for w in ("repositor", "entr", "disallow")),
+               "the sample no longer reproduces the defect — the bullet line now "
+               "carries one of the old words, so this case proves nothing: %r" % line)
+
+        # ABSENCE IS STILL UNKNOWN. This is the property that made the defect
+        # survivable, and it must not be traded away for the fix.
+        cases += 1
+        ctxB2, _fB2 = _banner_ctx(conf, region=BANNER_SAMPLE_ABSENT)
+        provenB2, howB2 = _banner_proves_entry(ctxB2)
+        expect("banner-absence", provenB2 is False and "no banner" in howB2,
+               "an entry that genuinely is not in the log was reported as proven: %r"
+               % howB2)
+        # …and the step it feeds still refuses to claim success.
+        ctxB2.dispatcher["entries"].append(
+            dict(reviews_entry(ctxB2), allowedUsers=["u-owner"]))
+        ctxB2.dispatcher["entries"][-1].pop("userAccessControl", None)
+        try:
+            _quiet(lambda: step_dispatcher_entry(ctxB2, apply_it=True))
+            failures.append("banner-absence: an unproven entry settled the step")
+        except Unknown as exc:
+            expect("banner-absence", "never names" in exc.what,
+                   "the step's UNKNOWN no longer says the log named nothing: %s" % exc.what)
+
+        # A LINE THAT MERELY SAYS THE WORD IS NOT PROOF. Widening the region
+        # without narrowing what counts inside it would have swapped an
+        # unclearable step for a false one, which is the worse trade: a false
+        # proof is written to the ledger as a note and never looked at again.
+        cases += 1
+        ctxB3, _fB3 = _banner_ctx(conf, region=BANNER_SAMPLE_MENTIONS)
+        provenB3, howB3 = _banner_proves_entry(ctxB3)
+        expect("banner-not-any-mention", provenB3 is False,
+               "a log line that merely mentions the word was taken as proof: %r" % howB3)
+
+        # The one-line shape a different dispatcher might print still proves —
+        # the old rule is kept, not replaced.
+        cases += 1
+        ctxB4, _fB4 = _banner_ctx(
+            conf, region="",
+            same="[INFO] loaded repository reviews with 9 disallowed tools\n")
+        provenB4, howB4 = _banner_proves_entry(ctxB4)
+        expect("banner-one-line-still-works", provenB4 is True and "reviews" in howB4,
+               "a dispatcher naming both concepts on one line stopped counting: %r" % howB4)
     finally:
         globals()["_pause"] = _saved_pause
+
+    # -- 15j. a DECLINE is not a failure, and neither half hides the other -- #
+    # Exit 3 is EXIT_DECLINED in both components. The poller declines when it
+    # cannot establish a review basis — a ticket with no acceptance criteria,
+    # which a research ticket or an ADR has by nature — and reading that as a
+    # failure made Stage E impossible to switch on for a property of the
+    # BACKLOG. The bounce driver was always read correctly; the poller was not.
+    cases += 1
+    import pipeline_review_poller as _poller_mod
+    import pipeline_bounce_local as _bounce_mod
+    expect("declined-is-not-failed",
+           COMPONENT_EXIT_DECLINED == _poller_mod.EXIT_DECLINED,
+           "this file says exit %d is DECLINED and the poller says %d — a number copied "
+           "out of another module has drifted"
+           % (COMPONENT_EXIT_DECLINED, _poller_mod.EXIT_DECLINED))
+    declined_out = ("resolved workspace ws-1\nwould open 1 review ticket(s)\n"
+                    "NOT REVIEWED example-org/kit#75 (KIT-1): no review basis could be "
+                    "established\n")
+    def _dry_run_row(c):
+        """The step's row, or the exception that ended it — so a decline read
+        as a failure arrives as a named FAIL rather than as a traceback out of
+        the whole battery."""
+        try:
+            return step_dry_run(c, apply_it=True)
+        except (SetupError, Unknown, Blocked) as exc:
+            return exc
+
+    ctxD1, _fD1 = _dry_run_ctx(conf, poller=(COMPONENT_EXIT_DECLINED, declined_out))
+    rowD1, printedD1 = _quiet(lambda: _dry_run_row(ctxD1))
+    okD1 = isinstance(rowD1, tuple) and rowD1[0] is True
+    detailD1 = rowD1[1] if isinstance(rowD1, tuple) else str(rowD1)
+    expect("declined-is-not-failed", okD1,
+           "a poller that declined stopped the install: %s" % detailD1)
+    expect("declined-is-not-failed", okD1 and "declined" in detailD1,
+           "the row hid the decline behind a clean-sounding verdict: %s" % detailD1)
+    expect("declined-is-not-failed", "NOT REVIEWED example-org/kit#75" in printedD1
+           and "count it out of the number you sign off" in printedD1,
+           "CK-5 was asked to sign a count with the declines invisible: %r"
+           % printedD1[-400:])
+    # …while a real failure is still a failure, in both spellings.
+    for rc, what in ((1, "error"), (2, "usage")):
+        cases += 1
+        ctxD2, _fD2 = _dry_run_ctx(conf, poller=(rc, "boom\n"))
+        try:
+            _quiet(lambda: step_dry_run(ctxD2, apply_it=True))
+            failures.append("declined-is-not-failed: poller exit %d (%s) was accepted"
+                            % (rc, what))
+        except SetupError as exc:
+            expect("declined-is-not-failed", "exit %d" % rc in str(exc),
+                   "the poller's %s exit was not named: %s" % (what, exc))
+
+    # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
+    # It never was. `decide` with neither --pr nor --all is a usage error, and
+    # because the poller was judged first and raised, that error was invisible:
+    # one half of Stage E had never once parsed its own command line. Asserted
+    # against the driver's REAL parser, so a copy here cannot drift from it.
+    cases += 1
+
+    def _parses(argv):
+        """Does the bounce driver's own parser accept `argv`? `load_config` is
+        stubbed to a state dir with nothing in it, so `decide --all` walks to
+        its real early return and this test reaches the network never.
+
+        BOTH streams are captured, not just stdout: argparse writes its refusal
+        to stderr under this file's own `prog`, and a green battery that prints
+        another script's usage text reads like a failure."""
+        import io
+        tmp = tempfile.mkdtemp(prefix="stage-e-selftest.")
+        saved = _bounce_mod.load_config
+        _bounce_mod.load_config = lambda _p: {"state_dir": tmp}
+        real_out, real_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = io.StringIO()
+        try:
+            _bounce_mod.main(list(argv))
+            return True
+        except SystemExit:
+            return False          # argparse rejected the arguments themselves
+        finally:
+            sys.stdout, sys.stderr = real_out, real_err
+            _bounce_mod.load_config = saved
+
+    expect("bounce-args-parse", _parses(BOUNCE_DRY_RUN_ARGS),
+           "the bounce driver rejects the arguments this installer sends it: %s"
+           % " ".join(BOUNCE_DRY_RUN_ARGS))
+    expect("bounce-args-parse", not _parses(("decide", "--dry-run")),
+           "`decide --dry-run` now parses, so this case no longer reproduces the defect "
+           "— the driver used to refuse it for want of --pr or --all")
+    # …and the installer really sends that list, not a string beside it.
+    ctxD3, fakeD3 = _dry_run_ctx(conf)
+    _quiet(lambda: _dry_run_row(ctxD3))
+    sent = [_fmt(a) for a in fakeD3.reads if "pipeline_bounce_local.py" in _fmt(a)]
+    expect("bounce-args-parse",
+           any(" ".join(BOUNCE_DRY_RUN_ARGS) in line for line in sent),
+           "the invocation and the checked argument list have drifted apart: %s" % sent)
+
+    # NEITHER HALF HIDES THE OTHER. Both components are judged before either is
+    # reported, which is the ordering defect that kept the above invisible.
+    cases += 1
+    ctxD4, _fD4 = _dry_run_ctx(conf, poller=(1, "poller boom\n"),
+                               bounce=(2, "usage: ...\n"))
+    try:
+        _quiet(lambda: step_dry_run(ctxD4, apply_it=True))
+        failures.append("both-halves-reported: two broken components passed")
+    except SetupError as exc:
+        expect("both-halves-reported",
+               "poller" in str(exc) and "bounce driver" in str(exc),
+               "only one of two broken components was reported — the other stays hidden "
+               "exactly as the bounce driver did: %s" % exc)
 
     # ------------------------------------------------------------------ #
     # 16. THE CREDENTIAL IS ASKED FOR AT MOST ONCE, AND READ BEFORE IT IS
@@ -4886,9 +5169,63 @@ def _settled_ctx(conf):
         ("n=" + conf["LINEAR_KEY_ENV"], 9, ""),
         ("n=" + conf["GITHUB_TOKEN_ENV"], 9, ""),
         ("scan --dry-run", 0, "resolved workspace ws-1\nwould open 0 review ticket(s)\n"),
-        ("decide --dry-run", 0, "checks_source: config\nnothing to bounce\n"),
+        # The needle is the WHOLE invocation, not a prefix of it: `decide
+        # --dry-run` matched happily while the real command was missing the
+        # `--all` the driver requires, so the fixture answered a command the
+        # driver would have rejected. Spelled from the constant for that reason.
+        (" ".join(BOUNCE_DRY_RUN_ARGS), 0, "checks_source: config\nnothing to bounce\n"),
     ]
     fake.answers = answers
+    return ctx, fake
+
+
+# THE REAL SHAPE, observed 2026-09-08 against a live dispatcher: the header
+# carries the count and each entry id is on a bullet BELOW it, which is exactly
+# why a one-line conjunction can never match. Names and paths are this file's
+# own placeholders — the kit is a public template and never names a real
+# deployment — but the SHAPE is what this fixture exists to hold, down to the
+# header arriving on its own line with no log prefix of its own.
+BANNER_SAMPLE = (
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI] \n"
+    "\U0001f4e6 Managing 3 repositories:\n"
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI]    • app (/Users/<role-account>/app)\n"
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI]    • kit (/Users/<role-account>/kit)\n"
+    "2026-09-08T03:24:25.056Z [INFO ] [CLI]    • reviews (/Users/<role-account>/kit)\n")
+
+# The same region with the entry genuinely absent — the state in which UNKNOWN
+# is the only honest answer — and one that merely says the word.
+BANNER_SAMPLE_ABSENT = "\n".join(
+    l for l in BANNER_SAMPLE.splitlines() if "reviews" not in l) + "\n"
+BANNER_SAMPLE_MENTIONS = (BANNER_SAMPLE_ABSENT
+                          + "2026-09-08T03:24:26.000Z [INFO ] [CLI] posting 2 reviews\n")
+
+
+def _banner_ctx(conf, region="", same=""):
+    """A settled machine whose dispatcher log answers the two banner greps:
+    `region` is what `grep -A` returns around the "Managing N repositories"
+    header, `same` what the legacy one-line grep returns. Both needles go in
+    FRONT of the settled table, which answers neither."""
+    ctx, fake = _settled_ctx(conf)
+    fake.answers = [("Print :StandardOutPath", 0, "/var/log/dispatcher.log\n"),
+                    (BANNER_HEADER, 0, region),
+                    ("-e reviews", 0, same)] + list(fake.answers)
+    return ctx, fake
+
+
+_CLEAN_POLLER = (0, "resolved workspace ws-1\nwould open 2 review ticket(s)\n")
+_CLEAN_BOUNCE = (0, "checks_source: config\nnothing to bounce\n")
+
+
+def _dry_run_ctx(conf, poller=_CLEAN_POLLER, bounce=_CLEAN_BOUNCE):
+    """A settled machine whose two components answer scripted (rc, output) for
+    their dry runs. Signed off, so the step reaches its own verdict rather than
+    stopping at CK-5."""
+    ctx, fake = _settled_ctx(conf)
+    fake.answers = [("scan --dry-run", poller[0], poller[1]),
+                    (" ".join(BOUNCE_DRY_RUN_ARGS), bounce[0], bounce[1])] + [
+        a for a in fake.answers
+        if a[0] not in ("scan --dry-run", " ".join(BOUNCE_DRY_RUN_ARGS))]
+    ctx.state.attest("A-DRY-RUN", "xx", "count read: 2")
     return ctx, fake
 
 

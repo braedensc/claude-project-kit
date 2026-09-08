@@ -649,6 +649,17 @@ needs both credentials, because it still reads.
 brief, the criteria, the fence and that no routing tag survived happens on the first real
 ticket, in the tracker.
 
+**Exit 3 is a decline, and a decline is not a broken install.** The poller exits 3 when it
+could not establish a review basis for at least one pull request — no acceptance criteria
+reachable on its ticket, which a research ticket or an ADR has none of by nature. It posts a
+loud *NOT reviewed* rather than review a change it cannot judge, which is the whole point.
+The installer reads exit 3 the same way it has always read the bounce driver's: a run to
+carry on from, not a failure. It prints every `NOT REVIEWED` line before `CK-5`, because a
+declined PR is **not** one of the sessions you are about to pay for — subtract them from
+the number you sign off. Exits 1 and 2 are still failures. If exit 3 stopped the install,
+Stage E could never be switched on while any open PR's ticket lacked criteria, which is a
+property of your backlog, not of Stage E.
+
 `decide --all` prints one line per PR that has a review outcome on file and says what it
 would do. With no outcomes yet it says so in words, and exits 0.
 
