@@ -196,6 +196,28 @@ def bullets(lines):
     return [m.group(1).strip() for m in map(BULLET_RE.match, lines or []) if m]
 
 
+def scope_items(lines):
+    """Out-of-scope entries, written EITHER way, in document order.
+
+    THE DEFECT THIS REPLACES. `bullets()` carries a negative lookahead that
+    deliberately excludes checkbox items, and Out of scope was parsed with it
+    alone. But the section immediately ABOVE it requires checkboxes, and
+    Linear's editor emits the same syntax for both — so an author who wrote
+    `- [ ] not this`, the natural thing to do, had every exclusion silently
+    dropped. Nothing said so: no decline, no warning, no log line. The review
+    ticket then rendered the scope fence as "_(none listed)_", and the reviewer
+    — one of whose four mandated dimensions IS scope — judged the change against
+    a fence that had been written and thrown away. A deliberate exclusion became
+    indistinguishable from an unrequested drive-by, in both directions.
+    """
+    found = []
+    for line in (lines or []):
+        m = CHECKLIST_RE.match(line) or BULLET_RE.match(line)
+        if m and m.group(1).strip():
+            found.append(m.group(1).strip())
+    return found
+
+
 def pin_fields(description):
     """Contract §3 "Ticket → pin field mapping": the two lists a pin snapshots.
 
@@ -210,7 +232,7 @@ def pin_fields(description):
     sections = split_sections(description)
     return {
         "acceptance_criteria": checklist_items(body_of(sections, "Acceptance criteria")),
-        "out_of_scope": bullets(body_of(sections, "Out of scope")),
+        "out_of_scope": scope_items(body_of(sections, "Out of scope")),
     }
 
 
@@ -380,7 +402,7 @@ def check_acceptance(sections, r, strict):
 
 def check_scope_and_tests(sections, r, strict):
     oos = body_of(sections, "Out of scope")
-    if oos is not None and not bullets(oos):
+    if oos is not None and not scope_items(oos):
         (r.err if strict else r.warn)(
             "out-of-scope", "'## Out of scope' has no bullets — the ticket has no scope fence"
         )

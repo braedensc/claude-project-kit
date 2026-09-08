@@ -708,6 +708,25 @@ def _one_line(text):
     return " ".join(sanitize_text(text).split())
 
 
+def _criteria_changed_line(flag):
+    """The basis flag has THREE states and they must not share a rendering.
+
+    A true flag tells the reviewer, in the next clause, that the edit "is itself
+    a `scope` finding worth raising" — so rendering UNKNOWN as `true` invents
+    findings, and rendering it as `false` asserts an absence nothing established.
+    Only a tier that saw the criteria at delegation can answer; tier 3 (`live`)
+    never can. See `_criteria_changed` in pipeline_review_basis.py.
+    """
+    if flag is True:
+        return ("- criteria_changed_after_delegation: `true` — the criteria were edited AFTER "
+                "work was delegated; that is itself a `scope` finding worth raising")
+    if flag is False:
+        return "- criteria_changed_after_delegation: `false`"
+    return ("- criteria_changed_after_delegation: `unknown` — no tier could see what the "
+            "criteria said at delegation. This is NOT evidence that they changed, and NOT "
+            "evidence that they did not; raise no `scope` finding from it either way")
+
+
 def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
     """The review ticket's description — the reviewer's ENTIRE world.
 
@@ -744,10 +763,7 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
         "## What the ticket asked — the review basis",
         "",
         "- basis_tier: `%s`" % (basis.get("basis_tier") or "unspecified"),
-        "- criteria_changed_after_delegation: `%s`%s" % (
-            "true" if basis.get("criteria_changed_after_delegation") else "false",
-            " — the criteria were edited AFTER work was delegated; that is itself a `scope` "
-            "finding worth raising" if basis.get("criteria_changed_after_delegation") else ""),
+        _criteria_changed_line(basis.get("criteria_changed_after_delegation")),
         "",
         TICKET_TEXT_PREAMBLE,
         "",
@@ -926,6 +942,15 @@ def outcome_artifact(owner_repo, pr, ticket_id, review_ticket, verdict, reason=N
         "repo": owner_repo,
         "pr": pr["number"],
         "head_branch": pr.get("headRefName") or "",
+        # THE GUARD THIS FEEDS. pipeline_bounce_local.outcome_is_fresh compares
+        # outcome["head_sha"] against the PR's current head, to refuse bouncing a
+        # review of a commit that no longer exists. No producer ever wrote the
+        # key, so `reviewed` was always "" and that branch could not fire; absent,
+        # it degraded to the timestamp fallback, which cannot fire either before
+        # the first bounce is spent. Net effect: a finding already fixed by a
+        # later push still spent a real bounce, and the re-prompt cited a commit
+        # the session no longer had.
+        "head_sha": pr.get("headRefOid") or "",
         "ticket_id": ticket_id,
         "review_ticket": review_ticket,
         "threshold": verdict.get("threshold"),
@@ -1005,7 +1030,7 @@ def write_outcome(state_dir, artifact):
 def list_open_prs(owner_repo, limit=DEFAULT_LIST_LIMIT):
     ok, out, _ = gh_fallback.try_gh([
         "pr", "list", "--repo", owner_repo, "--state", "open",
-        "--json", "number,title,headRefName,isCrossRepository,isDraft,createdAt,url",
+        "--json", "number,title,headRefName,headRefOid,isCrossRepository,isDraft,createdAt,url",
         "--limit", str(limit)])
     if ok:
         try:
@@ -1030,6 +1055,7 @@ def list_open_prs(owner_repo, limit=DEFAULT_LIST_LIMIT):
             "number": p.get("number"),
             "title": p.get("title") or "",
             "headRefName": head.get("ref") or "",
+            "headRefOid": head.get("sha") or "",
             # A deleted fork reads as cross-repo too: unknown provenance is not "ours".
             "isCrossRepository": head_repo != owner_repo,
             "isDraft": bool(p.get("draft")),

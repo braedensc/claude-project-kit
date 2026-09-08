@@ -1492,6 +1492,35 @@ def _read_dispatcher_facts_py(path):
         "}))\n" % path)
 
 
+def _clone_differs_from_origin(ctx):
+    """(differs, why_unknown). True / False / None — and None is not False.
+
+    Read-only on purpose: `ls-remote` asks origin what its HEAD is without
+    writing a single ref, so this is safe under `--dry-run` and under `verify`.
+
+    THE DEFECT THIS REPLACES. step_code decided whether the clone needed work by
+    listing FILENAMES: all six scripts present -> ALREADY-DONE, return. The only
+    `git pull` in this file sat below that return, reachable only when a script
+    was MISSING — and the six names never change when their contents do. So on
+    any machine that had completed one install the update path was dead code. A
+    fix merged upstream stayed inert while `run` printed "clone at <sha>, all 6
+    scripts present" and `verify` printed no drift and exited 0. Both daemons
+    went on exec'ing the old code with every command on the box agreeing they
+    were current.
+    """
+    r = ctx.runner
+    local = r.as_role(ctx.account, "git -C %s/kit rev-parse HEAD 2>/dev/null" % ctx.stage_home)
+    if not local.ok or not local.out.strip():
+        return None, "the clone has no HEAD to compare"
+    remote = r.as_role(ctx.account,
+                       "git -C %s/kit ls-remote origin HEAD 2>/dev/null | head -1"
+                       % ctx.stage_home)
+    fields = (remote.out or "").split()
+    if not remote.ok or not fields:
+        return None, "origin would not name its HEAD (no network, or no such remote)"
+    return local.out.strip() != fields[0], None
+
+
 def step_code(ctx, apply_it):
     """The role account's own clone, and the scripts the daemons exec."""
     r, conf = ctx.runner, ctx.conf
@@ -1500,13 +1529,27 @@ def step_code(ctx, apply_it):
     missing = [s for s in REQUIRED_SCRIPTS if s not in have]
     head = r.as_role(ctx.account, "git -C %s/kit rev-parse --short HEAD 2>/dev/null"
                      % ctx.stage_home)
-    if not missing:
-        return True, "clone at %s/kit is at %s, all %d scripts present" % (
-            ctx.stage_home, head.out.strip() or "?", len(REQUIRED_SCRIPTS)), []
+    differs, why_unknown = _clone_differs_from_origin(ctx)
+    if not missing and differs is False:
+        return True, "clone at %s/kit is at %s, level with origin HEAD, all %d scripts " \
+                     "present" % (ctx.stage_home, head.out.strip() or "?",
+                                  len(REQUIRED_SCRIPTS)), []
+    if not missing and differs is None:
+        raise Unknown(
+            "could not tell whether the role account's clone is current: %s.\n"
+            "  Both daemons exec out of that clone, so an UNMEASURED clone is an unmeasured\n"
+            "  deployment. That is not the same fact as an up-to-date one." % why_unknown,
+            "prove the role account can reach origin, then run this again:\n"
+            "    sudo -u %s -H /bin/sh -c 'cd / && git -C %s/kit ls-remote origin HEAD'"
+            % (ctx.account, ctx.stage_home))
 
     if not apply_it:
-        return False, "clone missing or %d script(s) absent: %s" % (
-            len(missing), ", ".join(missing)), []
+        if missing:
+            return False, "clone missing or %d script(s) absent: %s" % (
+                len(missing), ", ".join(missing)), []
+        return False, "the clone at %s/kit is at %s, which is NOT origin HEAD — both daemons " \
+                      "would go on exec'ing that code" % (ctx.stage_home,
+                                                          head.out.strip() or "?"), []
 
     poller_label, bounce_label = daemon_labels(conf)
     for label in (poller_label, bounce_label):
@@ -1547,7 +1590,17 @@ def step_code(ctx, apply_it):
     if missing:
         raise Blocked("CK-1", "the clone is current and these are still absent: %s"
                       % ", ".join(missing))
-    return False, "clone placed; all %d scripts present" % len(REQUIRED_SCRIPTS), []
+    # READ BACK. A fast-forward that answered ok but left the clone behind origin
+    # would otherwise be reported as a placed clone — the same false "current"
+    # this step used to print unconditionally.
+    still, _why = _clone_differs_from_origin(ctx)
+    if still:
+        raise SetupError(
+            "the clone at %s/kit is still not at origin HEAD after fast-forwarding. Something "
+            "else moved it — a local commit, a detached HEAD, or a diverged branch. Look before "
+            "forcing anything: both daemons exec from here." % ctx.stage_home)
+    return False, "clone placed and level with origin; all %d scripts present" % len(
+        REQUIRED_SCRIPTS), []
 
 
 def step_tracker(ctx, apply_it):
@@ -4425,6 +4478,36 @@ def _selftest_body():
            % (codeK, [(s, o) for s, o, _d in rowsK if o not in (DONE, ALREADY_DONE)]))
     expect("no-reprompt-on-settled-rerun", not fakeK.writes,
            "a settled re-run wrote: %s" % [w["why"] for w in fakeK.writes])
+
+    # -- 16a-bis. A CLONE BEHIND ORIGIN IS NOT A SETTLED MACHINE -------------
+    # The regression. step_code used to decide by FILENAME: six scripts present
+    # -> ALREADY-DONE, and the only `git pull` in this file sat below that
+    # return. The names never change when the contents do, so on any machine
+    # that had finished one install the update path was dead code — a merged fix
+    # stayed inert while `run` said "all 6 scripts present" and `verify` said no
+    # drift, exit 0. Same six filenames here; only origin's HEAD differs.
+    cases += 1
+    ctxS, fakeS, _apiS = _healthy_ctx(conf)
+    fakeS.answers = ([("ls-remote origin HEAD",
+                       0, "beef000000000000000000000000000000000000\tHEAD\n")]
+                     + [a for a in fakeS.answers if a[0] != "ls-remote origin HEAD"])
+    (_codeS, rowsS), _pS = _quiet(lambda: run_steps(ctxS, apply_it=False, keep_going=True))
+    codeRowS = dict((st, o) for st, o, _d in rowsS).get("code")
+    expect("stale-clone-is-not-settled", codeRowS != ALREADY_DONE,
+           "a clone behind origin still reported %s" % codeRowS)
+    detailS = dict((st, d) for st, _o, d in rowsS).get("code") or ""
+    expect("stale-clone-is-not-settled", "origin" in detailS.lower(),
+           "the stale-clone row does not mention origin: %r" % detailS[:120])
+
+    # …and when origin's HEAD MATCHES, the very same fixture settles. Without
+    # this pair the case above would pass against a step that never settles.
+    cases += 1
+    ctxL, fakeL, _apiL = _healthy_ctx(conf)
+    (_codeL, rowsL), _pL = _quiet(lambda: run_steps(ctxL, apply_it=False, keep_going=True))
+    expect("level-clone-does-settle",
+           dict((st, o) for st, o, _d in rowsL).get("code") == ALREADY_DONE,
+           "a clone level with origin did not settle: %s"
+           % dict((st, o) for st, o, _d in rowsL).get("code"))
     # …and the key it used is the STORED one, read out of the env file rather
     # than requested. Same value, different provenance, and only one of the two
     # costs the owner a keystroke on every single pass.
@@ -5292,6 +5375,13 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
     fake.answers = list(fake.answers) + [
         ("ls $HOME/.stage-e/kit/scripts", 0, "\n".join(REQUIRED_SCRIPTS) + "\n"),
         ("rev-parse --short HEAD", 0, "abc1234\n"),
+        # A SETTLED machine is one whose clone is LEVEL WITH ORIGIN, and the
+        # fixture now has to say so. It used to be settled by virtue of six
+        # filenames existing, which is exactly the thing that let a stale clone
+        # report itself current.
+        ("rev-parse HEAD", 0, "abc1234000000000000000000000000000000000\n"),
+        ("ls-remote origin HEAD", 0,
+         "abc1234000000000000000000000000000000000\tHEAD\n"),
         ("launchctl print system/" + poller_label, 0, "\tstate = not running\n"),
         ("launchctl print system/" + bounce_label, 0, "\tstate = not running\n"),
         ("heartbeat.json", 0, "heartbeat.json ok\nbounce-heartbeat.json ok\n"),

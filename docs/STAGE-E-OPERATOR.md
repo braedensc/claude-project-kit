@@ -424,7 +424,7 @@ Values go in this file; only **names** go in this document, in the repo, and in 
 ```bash
 cat > ~/.stage-e/env <<'EOF'
 STAGE_E_LINEAR_API_KEY=   # a personal API key on the OWNER's Linear account — the delegator
-GH_TOKEN=                 # Contents + Pull requests read; Issues write (PR comments)
+GH_TOKEN=                 # Contents read; Pull requests WRITE; Issues write — see below
 EOF
 chmod 600 ~/.stage-e/env
 ```
@@ -435,8 +435,26 @@ identity can start a reviewer. That is why this key exists at all, and why the t
 above are rules.
 
 Scope the GitHub token like `docs/AUTONOMY.md` scopes the push credential: nothing here
-needs *Administration*, *Workflows*, or *Pull requests: write*. Every write goes through
-`scripts/gh_fallback.py`, which has no merge endpoint.
+needs *Administration* or *Workflows*. Every write goes through `scripts/gh_fallback.py`,
+which has no merge endpoint.
+
+**It does need *Pull requests: write*, and this is a trap worth stating once.** The review
+comment is posted to `POST /repos/{owner}/{repo}/issues/{n}/comments` — the *issues* route —
+so *Issues: write* looks like the permission it wants. It is not. The resource being
+commented on is a pull request, and GitHub scopes the check to the resource, not the route.
+A token with *Issues: write* and *Pull requests: read* answers every read correctly, creates
+the review ticket, collects the verdict, and then fails at the last step only, with:
+
+    HTTP 403: Resource not accessible by personal access token
+
+which is recorded `publish-failed` and retried every pass, forever. Measured 2026-09-08 on a
+first live install, where it held two settled verdicts off their pull requests indefinitely.
+
+Accept the cost knowingly: *Pull requests: write* also permits **submitting a review**, which
+is how a token could approve. No code path here submits one — the poller's own battery
+asserts there is no approve, merge or label path — and merging additionally needs *Contents:
+write*, which stays read. But the guarantee thins from *impossible* to *not implemented*, and
+those are different guarantees.
 
 The scripts read the values from the environment variables their config **names**.
 
