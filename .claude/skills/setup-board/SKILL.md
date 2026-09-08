@@ -127,6 +127,8 @@ Status: In Review    — (no state of type       "In Review" (started)   CREATE
 Label: agent:queued  agent:queued (workspace)  workspace               ok
 Label: effort:M      effort:M (team ENG)       workspace               ASK — rescope?
 Label: risk/high     risk-high (team ENG)      workspace group `risk`  ASK — rename?
+Automation: review   — (no rule)               PR opened → "In Review" CREATE
+Automation: merge    merge → "Done"            merge → "Done"          ok
 gitBranchFormat      (null → Linear default)   feat/{issueIdentifier}… CONFIRM (org-wide)
 Webhook              — none                    <contract URL>          NEEDS SECRET
 Ideas project        — none                    "Ideas"                 HUMAN
@@ -222,6 +224,24 @@ mutation AddWebhook($teamId: String!, $url: String!, $types: [String!]!) {
 - `GitAutomationStates` events are `draft`, `start`, `review`, `mergeable`, `merge`.
   Scope one to a branch with `gitAutomationTargetBranchCreate` (`branchPattern`,
   `isRegex`) and pass the resulting `targetBranchId`.
+- **Wire two of the five: `review` → `stateIds.review`, `merge` → `stateIds.done`.**
+  Leave `draft`, `start` and `mergeable` at no action unless the project asks. `review`
+  is the one boards forget, and forgetting it costs the distinction the lane exists for:
+  without it a ticket sits in `working` from the moment a session starts until someone
+  merges, so *an agent is still working* and *this is done and waiting for you* look
+  identical. The state §1 already defines as "PR open, awaiting review/CI" is simply
+  never reached.
+- **It fires only when the tracker can link the PR, which it does by finding the ticket
+  ID in the branch name.** That is exactly the pipeline's `<type>/<ticket-id>-<slug>`
+  convention (§2) — a branch without the ID gets no link and no move, and the symptom is
+  a ticket stranded in `working` under a merged PR. Check a couple of real branches
+  before concluding a rule is broken.
+- **An automation authorises nothing, and does not race the session's own move.** It can
+  only reach `review`/`done`; approval is `ready` and is read specifically (§5), so no
+  board automation releases work. Where a safe-outputs executor is configured the session
+  *also* requests `ticket-state → review` (§8) — same target, so whichever lands second
+  is a no-op. On a lane with no executor the automation is the only mechanism, which is
+  why it is provisioned here rather than left to the session.
 - Labels go through the MCP `create_issue_label`. **Do not pass a team — every taxonomy
   label is workspace-scoped (§6), and omitting the team is what makes it one.** You are
   holding a `teamId` from step 1, and every neighbouring mutation on this page takes
@@ -426,6 +446,7 @@ canonical key it corresponds to:
 Workspace   acme (org 8f1c…), gitBranchFormat feat/{issueIdentifier}-{issueTitle}
 Team        ENG "Engineering" (2b40…)
 States      raw "Ideas" · ready "Ready" · working "In Progress" · review "In Review" · done "Done"
+Automations pull request opened → "In Review" (created this run) · merged → "Done"
 Projects    Ideas (c7d9…)  — triage target, created this run
 Schema      python3 scripts/check_schemas.py --instance delivery.json --schema delivery → OK
 Validator   python3 scripts/check_delivery_config.py → OK, 0 errors, 0 warnings

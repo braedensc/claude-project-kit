@@ -104,7 +104,7 @@ booleans and enums carry real defaults instead. `~` in a path value is expanded 
 | `stateIds.raw` | string (UUID) | approval gate | Intake: proposals land here, human-gated. |
 | `stateIds.ready` | string (UUID) | dispatcher | Approved and dispatchable. |
 | `stateIds.working` | string (UUID) | dispatcher | A session holds it. Counts against `budgets.wipLimit`. |
-| `stateIds.review` | string (UUID) | dispatcher, reviewer | PR open, awaiting review/CI. |
+| `stateIds.review` | string (UUID) | dispatcher, reviewer | PR open, awaiting review/CI — the "waiting on a human" lane that keeps it distinguishable from `working`. Reached by the tracker's *pull request opened* git automation and/or a session's §8 `ticket-state` request; same target, so the two do not race, and on a lane with no safe-outputs executor the automation is the only mechanism. Neither authorises anything — approval is `ready` and is read specifically (§5). |
 | `stateIds.done` | string (UUID) | dispatcher | Merged/closed. |
 | `labels.ids` | object → string (UUID) | dispatcher, guards | Map of **canonical key → Linear label ID**. The key is the stable name used in code; the Linear display name may drift from it. |
 | `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. **Floored at §6's dispatcher-owned set** (`agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity`) — a project may require more, never fewer. |
