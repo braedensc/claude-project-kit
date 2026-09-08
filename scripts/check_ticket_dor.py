@@ -76,6 +76,24 @@ DRAFT_RE = re.compile(r"\b(TBD|TKTK)\b|\{\{[A-Z0-9_]+\}\}")
 # needs a leading letter and an internal space, so `<div>`, `List<T>` and a bare
 # `<you>` do not match, and neither does prose like "if x < 5 and y > 3".
 ANGLE_PROMPT_RE = re.compile(r"<[A-Za-z][^<>]*?\s[^<>]*?>", re.DOTALL)
+# Linear rewrites a bare sibling ID typed into a description into inline-mention
+# markup and serves that markup back over the API verbatim:
+#     <issue id="00000000-…" href="https://linear.app/…/ENG-99">ENG-99</issue>
+#     <linear-embed node-type="video">{…}</linear-embed>
+# Both satisfy ANGLE_PROMPT_RE (leading letter, internal whitespace), so a ticket
+# that merely CITES a sibling read as N unfilled template prompts — the author
+# never typed the thing they were blamed for.
+#
+# Keyed on structure, not on a list of tag names: the tracker documents no tag
+# set (`issue` and `linear-embed` are what its API actually returns today), so a
+# name allowlist would silently re-break the day it emits a form that was not on
+# it. A generated tag has a lowercase HTML-ish name and at least one quoted
+# `attr="value"`; a template prompt is prose in angle brackets and has no
+# attribute syntax, so the genuine check is untouched.
+GENERATED_TAG_RE = re.compile(
+    r"""<[a-z][a-z0-9-]*(?:\s+[A-Za-z_:][\w.:-]*\s*=\s*(?:"[^"]*"|'[^']*'))+\s*/?>"""
+    r"|</[a-z][a-z0-9-]*\s*>"
+)
 # These are also real words in ticket prose ("remove the TODO in foo.ts"), so they
 # only count as residue OUTSIDE an inline code span.
 MARKER_RE = re.compile(r"\b(TODO|FIXME|XXX)\b")
@@ -241,9 +259,13 @@ def prose_only(text):
 
     Markers like TODO and angle-bracket prompts are residue in prose and
     perfectly legitimate inside code — judging them needs the code stripped.
+
+    Tracker-generated markup goes too: it is not something an author typed, so
+    it can be neither residue nor an unfilled prompt. The tag is dropped and its
+    inner text kept, leaving the `ENG-99` a reader actually sees.
     """
     out, fence = [], None
-    for line in (text or "").splitlines():
+    for line in GENERATED_TAG_RE.sub("", text or "").splitlines():
         f = FENCE_RE.match(line)
         if f:
             token = f.group(1)
@@ -273,13 +295,40 @@ EXTENSIONLESS = {
 }
 
 
+# A slash-less code span is a file only if its suffix is a real file extension.
+# Without this, any dotted identifier is a "path" — `vi.mock`, `Date.now`,
+# `github.ref` — and check_pointers reports it as a pointer that does not exist.
+# Deliberately absent: `env`, `log` and `map`, because `process.env`,
+# `console.log` and `Array.map` appear in pointer prose far more often than the
+# files do. A real one still resolves through path_exists, which is authoritative.
+PATH_EXTENSIONS = {
+    # code
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rb", "go", "rs", "java",
+    "kt", "swift", "c", "h", "cc", "cpp", "hpp", "cs", "php", "sh", "bash",
+    "zsh", "sql", "lua", "pl", "ex", "exs", "dart", "scala", "sc",
+    # web
+    "html", "htm", "css", "scss", "sass", "less", "vue", "svelte", "astro",
+    # data + config
+    "json", "jsonc", "yml", "yaml", "toml", "ini", "cfg", "conf", "xml", "csv",
+    "tsv", "lock", "plist", "proto", "graphql", "gql", "nvmrc", "npmrc",
+    # docs
+    "md", "mdx", "txt", "rst", "adoc", "pdf",
+    # assets
+    "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "woff", "woff2",
+    "ttf", "otf", "mp4", "webm",
+}
+
+
 def looks_like_path(span):
     """A code span that is plausibly a repo path rather than a command."""
     if not span or span.startswith(("$", "#", "-")) or " " in span:
         return False
     if span.lower() in EXTENSIONLESS:
         return True
-    return "/" in span or re.search(r"\.[A-Za-z0-9]{1,6}$", span) is not None
+    if "/" in span:
+        return True
+    ext = re.search(r"\.([A-Za-z0-9]{1,6})$", span)
+    return ext is not None and ext.group(1).lower() in PATH_EXTENSIONS
 
 
 def within(repo_root, path):
@@ -719,6 +768,7 @@ GOOD_CONFIG = {
                 "effort:M": "lbl-m",
                 "effort:L": "lbl-l",
                 "provenance:epic": "lbl-prov",
+                "provenance:agent": "lbl-prov-agent",
                 "agent:queued": "lbl-queued",
             }
         },
@@ -932,6 +982,79 @@ def selftest():
 
         t = good_ticket(); t.pop("provenance"); t["parentId"] = None
         expect("round-trip-provenance-no-parent", t, ["provenance"])
+
+        # 9b. provenance:agent (KIT-96): the class an agent-filed finding ticket
+        #     carries. A copy lacking the class rejects the ticket with an
+        #     unknown-class error, so this case bites the exact drift a downstream
+        #     copy still has.
+        t = good_ticket()
+        t["labels"] = ["track:platform", "effort:M", "provenance:agent"]
+        t.pop("provenance")
+        t["parentId"] = None
+        expect("provenance-agent", t, [])
+
+        # 9c. Linear rewrites a bare sibling ID typed into a description into
+        #     inline-mention markup and serves it back over the API. Before the
+        #     markup carve-out, a body that merely CITED a sibling cost one
+        #     "template prompt left unfilled" error per mention.
+        MENTION = (
+            '<issue id="00000000-0000-4000-8000-000000000000" '
+            'href="https://linear.app/acme/issue/ENG-99/a-sibling-ticket">'
+            "ENG-99</issue>"
+        )
+        EMBED = '<linear-embed node-type="video">{"uploadState":"finished"}</linear-embed>'
+
+        note()
+        if ANGLE_PROMPT_RE.search(prose_only(MENTION + "\n" + EMBED)):
+            failures.append("tracker-generated mention markup read as an unfilled prompt")
+        note()
+        if "ENG-99" not in prose_only(MENTION):
+            failures.append("stripping the mention tag also dropped the text a reader sees")
+
+        # End to end, on the shape a ticket actually has: a sibling cited in
+        # both prose and a scope bullet is clean, warnings included.
+        t = good_ticket()
+        t["description"] = t["description"].replace(
+            "- Refresh-token rotation", f"- Rotation and reuse detection — that is {MENTION}"
+        ).replace(
+            "Tokens refresh only after a 401,",
+            f"Follow-on from {MENTION}. Tokens refresh only after a 401,",
+        )
+        expect("linear-mention-markup", t, [])
+        note()
+        if rules(check(t))[1]:
+            failures.append(f"linear mention markup raised warnings: {rules(check(t))[1]}")
+
+        # The genuine rule still fires when the markup is present too, so the
+        # carve-out is not an off switch.
+        t["description"] = t["description"].replace(
+            "## Test plan\n\n- `npm test`",
+            "## Test plan\n\n- <How the change is proven, in the order someone would run it>\n- `npm test`",
+        )
+        expect("linear-mention-plus-real-stub", t, ["no-placeholders"])
+
+        # 9d. A dotted, slash-free code span is an identifier far more often than
+        #     a file. Before PATH_EXTENSIONS, `vi.mock` in a Pointers bullet
+        #     failed the section with "pointer path(s) do not exist: vi.mock".
+        t = good_ticket()
+        t["description"] = t["description"].replace(
+            "- `session.ts` — the reactive refresh this replaces",
+            "- `session.ts` — stub it with `vi.mock`; see `process.env` and `github.ref`",
+        )
+        note()
+        errs, warns = rules(check(t))
+        if errs or warns:
+            failures.append(f"dotted identifier read as a pointer path: errors={errs} warnings={warns}")
+
+        # ...but narrowing must not blind the rule: a real extension that does
+        # not exist is still reported, with or without a directory component.
+        for bad in ("does-not-exist.ts", "src/does-not-exist.ts"):
+            t = good_ticket()
+            t["description"] = t["description"].replace("`session.ts`", f"`{bad}`")
+            note()
+            errs, warns = rules(check(t))
+            if warns != ["pointers"]:
+                failures.append(f"missing pointer {bad!r} no longer reported: warnings={warns}")
 
     # 10. An unrecognized delivery.json version refuses; it does not guess.
     with tempfile.TemporaryDirectory() as tmp2:

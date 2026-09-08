@@ -141,6 +141,10 @@ Planning maps onto this cleanly, and in two places is *simpler* than review.
   verdict under the live dispatcher.** Eight tickets already carry `provenance:epic` without
   passing it. An autonomous planner filing dozens of tickets makes that systematic unless the
   gate is (a) correct and (b) enforced on the output.
+  _(Update, 2026-09-08 — KIT-102 reconciled the kit copy: it now carries both the
+  `provenance:agent` class and a carve-out that tolerates the tracker's inline-mention
+  markup, with battery cases for each. The **(a) correct** half is done; **(b) enforced**
+  — nothing reads the verdict — is KIT-104, still open.)_
 
 ### 1. Trigger
 
