@@ -293,11 +293,13 @@ The loop, when it *is* on:
    comment, a wrong id in a file you weren't asked to touch — goes in a **ticket comment**,
    not a widened diff and not the PR body. A PR body is read once at review and then never
    again; the finding dies with the merge. **You never create a ticket directly.** Where
-   the project configures a finding executor (`linear.findingTicket`), you *request* a
-   follow-up ticket via the safe-outputs `ticket-create` kind (§8) and a credential-holding
-   executor files it into the **backlog** as `provenance:agent`, notifies the owner, and
-   refuses every protected label — none of which you can set; it never enters `ready` and
-   starts no session. Where no executor is configured — **this repo has no `delivery.json`,
+   the project configures a finding executor, you *request* a follow-up ticket and a
+   credential-holding executor files it into the **backlog** as `provenance:agent`, notifies
+   the owner, and refuses every protected label — none of which you can set; it never enters
+   `ready` and starts no session. On a **github-actions** backend the request is a
+   safe-outputs `ticket-create` kind (§8); on a **local-daemon** backend it is a
+   `pipeline-finding/1` **comment** on your own ticket that the finding poller files
+   (`docs/FINDING-POLLER.md`). Where no executor is configured — **this repo has no `delivery.json`,
    so that is the case here** — report the finding as a ticket comment as before; a person
    files. Either way the discipline holds: don't widen the diff, and `provenance:*`,
    `agent:*`, `blocked:*` and `hooks-change` are never yours to apply. In a configured

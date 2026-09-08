@@ -173,6 +173,12 @@ jobs:
       # path exists.
       - name: Stage E review poller selftest (sanitizer, decline paths, comment-only)
         run: python3 scripts/pipeline_review_poller.py --selftest
+      # Stage E's finding poller (KIT-96 local backend): a session's pipeline-finding/1
+      # comment becomes a backlog ticket, filed by the role account, forcing state,
+      # provenance:agent, owner-subscribe; never ready, never a protected label, never an
+      # assignee. Offline selftest asserts the parse, dedup, both flood caps, and shape.
+      - name: Stage E finding poller selftest (create-shape, dedup, flood caps)
+        run: python3 scripts/pipeline_finding_poller.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
       # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
       # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent,

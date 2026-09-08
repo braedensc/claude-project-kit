@@ -34,6 +34,7 @@
     "test:stage-e-setup": "python3 scripts/pipeline_stage_e_setup.py --selftest",
     "test:telemetry-local": "python3 scripts/pipeline_telemetry_local.py --selftest",
     "test:review-poller": "python3 scripts/pipeline_review_poller.py --selftest",
+    "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
     "test:bounce": "python3 scripts/pipeline_bounce_local.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
