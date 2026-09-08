@@ -96,6 +96,42 @@ redesigns Stage E for what actually runs.
 >
 > Operator steps: `docs/STAGE-E-OPERATOR.md`.
 
+> **Update (2026-09-08) — the reviewer is routed to the repository it is judging.**
+> Routing by the Reviews team key alone landed *every* review in whichever single entry
+> claimed that key, and that entry's `repositoryPath` was copied from the first entry in
+> the dispatcher's config that had one. So a reviewer judging a diff from one repository
+> sat in a clone of another. It keeps `Read`, `Grep` and `Glob` — removing them is the
+> worse fix, since a worktree cut from the *correct* default branch is genuinely good
+> review context — so it opens a file named in the diff and finds nothing, or finds a
+> same-named file from the wrong codebase and reasons about it confidently. A wrong
+> finding can bounce the coding session.
+>
+> - **N entries, one team.** One dispatcher entry per reviewed repository, named
+>   `reviews-<repo name>`, each with that repository's own clone and base branch. A
+>   Reviews team *per repository* was rejected on the owner's constraint: tracker teams
+>   are capped by subscription tier, so they cost money and have to be remembered at every
+>   new repository.
+> - **The poller writes the routing tag.** `[repo=reviews-<name>]` on the review ticket's
+>   first line, in the poller's own trusted header, outside every fence. Description-tag
+>   routing is **priority 1** in `RepositoryRouter` (verified against cyrus-edge-worker
+>   0.2.69), ahead of labels, projects and team keys.
+> - **This does not weaken the sanitizer, and the two are checked against each other.**
+>   Everything inside `<untrusted-ticket-data>` and `<untrusted-diff>` still has its
+>   directives stripped; the poller refuses to file a description carrying any directive
+>   but its own one. The tag names the **review entry**, never the repository: a tag
+>   matches by `githubUrl` tail, name or id, the router starts a session in *every* match,
+>   and `[repo=<the repository>]` would also match the coding entry — which has Bash and
+>   Write. The installer refuses to write an entry whose name another entry could answer
+>   to.
+> - **The fallback stays where it was.** Exactly one review entry keeps `teamKeys`, so a
+>   ticket that somehow arrives with no tag degrades to the old behaviour — a read-only
+>   reviewer, possibly in the wrong clone — rather than falling through to catch-all
+>   routing. The others carry a routing label that must never exist, which is what keeps
+>   them from *becoming* the catch-all.
+> - **Which clone is which is read, not inferred.** The installer matches a repository to
+>   an entry with `git -C <path> remote get-url origin`. A path basename is not evidence
+>   of identity, and that class of guess is what this update removes.
+
 ## Decision
 
 **Stage E is a poller running as the dispatcher's own role account that speaks to the
@@ -218,7 +254,8 @@ skipping a PR whose cross-repository flag is absent, because unknown is not "not
 For each it fetches the diff, resolves the basis (decision 2), **sanitizes** every string
 it is about to copy — stripping the dispatcher's routing and model tags (`[repo=`,
 `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizing the `<untrusted-ticket-data>`
-fence tags — and then creates **and** delegates, in one `issueCreate{…, delegateId}`
+fence tags; it writes exactly one routing tag of its own, in its trusted header
+(amended 2026-09-08) — and then creates **and** delegates, in one `issueCreate{…, delegateId}`
 carrying an owner-scoped Linear key, a review ticket in a dedicated Reviews team: title
 `Review PR #<n> — <TICKET-ID>`, description = the review brief with the diff inlined under
 a size cap (above the cap ⇒ decline, reason *diff too large to deliver*), **never
@@ -552,8 +589,9 @@ on the dispatcher's side and none of them read or written by the poller:
 |---|---|
 | per-entry `disallowedTools` | the reviewer's tool fence (decision 3) |
 | per-entry `appendInstruction` | the reviewer's brief — `promptTemplatePath` is stripped |
-| `teamKeys` routing | a delegation in the Reviews team lands in the Reviews entry |
-| description-tag base-branch override (`[repo=<name>#<branch>]`) | the fix-ticket fallback's checkout; and the reason the poller strips the tag from everything else |
+| `teamKeys` routing | the fallback when a review ticket carries no routing tag (amended 2026-09-08) |
+| description-tag routing, ahead of team keys | which repository's clone the reviewer reads (amended 2026-09-08) |
+| description-tag base-branch override (`[repo=<name>#<branch>]`) | the fix-ticket fallback's checkout; and the reason the poller strips the tag from everything it copies |
 | label-based model selection | the reviewer's cheap model |
 | agent-session re-prompt on a thread comment | the primary bounce (decision 5) |
 | delegator check on `allowedUsers`; app-actor delegation blocked | why the poller's key is owner-scoped, and why a session cannot trigger its own review |

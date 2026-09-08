@@ -233,6 +233,62 @@ _BANNED_MARK = "banned-token-list"
 DISALLOWED_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch",
                     "WebSearch", "Task", "EnterWorktree", "ExitWorktree"]
 
+# --------------------------------------------------------------------------- #
+# ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and one Reviews team.
+#
+# A review session's worktree is cut from ONE entry's clone. While there was a
+# single `reviews` entry, its `repositoryPath` was copied from the first entry
+# in the dispatcher's config that happened to have one, so a reviewer judging a
+# pull request from repository A sat in a clone of repository B. It keeps Read,
+# Grep and Glob — removing those is the worse fix, since a worktree cut from the
+# CORRECT default branch is genuinely good review context — so it would open a
+# file named in the diff and find nothing, or find a same-named file from the
+# wrong codebase and reason about it confidently. A wrong finding can bounce the
+# coding session.
+#
+# The fix is N entries and a description tag, NOT N Reviews teams: teams are
+# capped by tracker subscription tier, so a team per repository costs money and
+# has to be remembered at every new repository. The poller writes
+# `[repo=reviews-<name>]` into the review ticket it files, and the dispatcher's
+# router reads description tags FIRST — before labels, projects and team keys.
+#
+# THE NAME IS THE REVIEW ENTRY'S, NEVER THE REPOSITORY'S. A tag matches an entry
+# by githubUrl tail, by name or by id, and the router starts a session in EVERY
+# entry it matches, so `[repo=<the repository>]` would also match the CODING
+# entry — the one with Bash and Write. `_tag_ambiguity` refuses to write an
+# entry whose name any other entry could answer to.
+REVIEW_ENTRY_PREFIX = "reviews-"
+
+# The id the single-entry installer wrote. A pass that finds it REMOVES it: left
+# in place it still claims the Reviews team key, and the router hands the key to
+# whichever entry claims it first — which would be the one this change exists to
+# retire, pointed at the wrong clone.
+LEGACY_REVIEW_ENTRY_ID = "reviews"
+
+# WHY EVERY REVIEW ENTRY CARRIES A ROUTING LABEL THAT MUST NEVER EXIST.
+# The router's last resort before giving up is a "catch-all": the first entry
+# with no teamKeys, no routingLabels and no projectKeys. Exactly one review
+# entry carries the Reviews team key (below), so without this the others would
+# be catch-all candidates — and a ticket from some unconfigured team, which
+# today raises a "which repository?" prompt, would silently start a reviewer
+# session instead. The label names itself: creating it in the tracker is the
+# only way to route by it, and nobody has a reason to.
+REVIEW_ENTRY_NEVER_LABEL = "stage-e-review-entry-never-label-routed"
+
+# The characters the dispatcher's bracketed-tag pattern accepts, minus `/` and
+# `#`, which mean something else inside a tag. Kept identical to the poller's
+# `_ENTRY_NAME_OK`; the selftest pins the two together.
+_ENTRY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def review_entry_name(repo):
+    """`reviews-<name>` for an OWNER/NAME repository — the dispatcher entry a
+    review of it runs in, and the tag the poller writes to get there. Spelled
+    the same way in `pipeline_review_poller.review_entry_name`, which the
+    selftest asserts against this one."""
+    return REVIEW_ENTRY_PREFIX + str(repo or "").split("/")[-1]
+
+
 # The scripts the two daemons exec. Their absence from the role account's clone
 # means the pull requests carrying them are not merged yet (card CK-1).
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
@@ -484,6 +540,25 @@ def validate_conf(values):
     for r in repos:
         if not _REPO_RE.match(r):
             errors.append("REVIEW_REPOS entry %r is not OWNER/NAME" % r)
+        elif not _ENTRY_NAME_RE.match(review_entry_name(r)):
+            errors.append("REVIEW_REPOS entry %r would need the dispatcher entry name %r, "
+                          "which carries a character the tag parser cuts the name at — a "
+                          "tag that routes somewhere unintended rather than one that fails"
+                          % (r, review_entry_name(r)))
+    # TWO REPOSITORIES WITH THE SAME NAME under different owners would want ONE
+    # entry name, and the poller derives the tag from the name alone: whichever
+    # review landed second would be read in the other one's clone — this bug
+    # again, one layer down. Said here, where every conf error is said at once,
+    # rather than discovered on the first review of the second repository.
+    by_name = {}
+    for r in repos:
+        by_name.setdefault(review_entry_name(r).lower(), []).append(r)
+    for name, sharing in sorted(by_name.items()):
+        if len(sharing) > 1:
+            errors.append("REVIEW_REPOS names %s, which differ only by owner, so both want "
+                          "the dispatcher entry %r. Review one of them from a second "
+                          "installation, or rename the repository."
+                          % (" and ".join(sharing), name))
     for key in ("LINEAR_KEY_ENV", "GITHUB_TOKEN_ENV"):
         if not _ENV_NAME_RE.match(conf.get(key, "")):
             errors.append("%s must be the NAME of an environment variable, never a value "
@@ -1050,6 +1125,11 @@ CARDS = {
                "  1. a worktree for the coding ticket, and a pull request",
                "  2. a review ticket in the Reviews team, delegated to the agent",
                "  3. a reply on it carrying one fenced pipeline-review/1 block",
+               "     …and, if you review more than one repository, that the review",
+               "     session's worktree is under a clone of the SAME repository as the",
+               "     pull request. Routing that lands in another repository's clone is",
+               "     invisible in the review comment and produces confident wrong",
+               "     findings.",
                "  4. ONE comment on the pull request, with a Basis line",
                "  5. the review ticket closed, and only its own worktree gone",
                "Read the two heartbeat files rather than the logs: a stale timestamp means",
@@ -1067,7 +1147,7 @@ ATTESTATIONS = {
                       "workspace whose API would not name them (CK-3)"),
     "A-DRY-RUN": "the dry-run count is the number you meant (CK-5)",
     "A-FIRST-TICKET": "one real ticket ran end to end and was reviewed (CK-7)",
-    "A-ENTRY-LOADED": ("the dispatcher really loaded the reviews entry — the behavioural "
+    "A-ENTRY-LOADED": ("the dispatcher really loaded the review entries — the behavioural "
                        "proof, when its startup banner says nothing"),
 }
 
@@ -1164,6 +1244,10 @@ class Ctx(object):
         self.replaced = set()
         self.role_home = None
         self.dispatcher = {}     # facts read out of the dispatcher's own config
+        # repositoryPath -> the OWNER/NAME its `origin` remote names, asked of
+        # git once per path per run. Which repository a clone IS decides which
+        # entry a review runs in, so it is read, never inferred from the path.
+        self.origin_slugs = {}
         # Daemons this run stopped and has not started again. A run that ends
         # early with these set has switched the review loop OFF, and must say so.
         self.unloaded = []
@@ -1484,6 +1568,7 @@ def _read_dispatcher_facts_py(path):
         "               'baseBranch': r.get('baseBranch'),\n"
         "               'githubUrl': r.get('githubUrl'),\n"
         "               'teamKeys': r.get('teamKeys'),\n"
+        "               'routingLabels': r.get('routingLabels'),\n"
         "               'disallowedTools': r.get('disallowedTools'),\n"
         "               'allowedUsers': (r.get('userAccessControl') or {})"
         ".get('allowedUsers'),\n"
@@ -2030,22 +2115,80 @@ def step_configs(ctx, apply_it):
                    % ", ".join(sorted(stale))), []
 
 
-def _dispatcher_repo_names(ctx):
-    """OWNER/NAME -> the dispatcher entry `name` that owns it. Read out of the
-    dispatcher's config, never typed: the fallback fix ticket routes on it."""
+def _repo_slug(url):
+    """OWNER/NAME out of a git remote or a browser URL, lower-cased — or None.
+
+    `https://host/o/n(.git)`, `ssh://git@host/o/n`, `git@host:o/n.git`, trailing slash or
+    not. A bare filesystem path answers None on purpose: `/srv/clones/kit` says nothing
+    about which repository that clone IS, and reading it as if it did is the defect this
+    function replaces."""
+    text = (url or "").strip()
+    if not text:
+        return None
+    text = text.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    if "://" in text:
+        rest = text.split("://", 1)[1].split("/", 1)
+        text = rest[1] if len(rest) > 1 else ""
+    elif ":" in text and "@" in text.split(":", 1)[0]:
+        text = text.split(":", 1)[1]            # scp-style git@host:owner/name
+    else:
+        return None                             # a path, or something unparseable
+    parts = [p for p in text.split("/") if p]
+    if len(parts) < 2:
+        return None
+    return "/".join(parts[-2:]).lower()
+
+
+def _origin_slug(ctx, path):
+    """Which repository the clone at `path` IS, asked of git. Cached per run: this is a
+    `sudo` round trip and the answer cannot change mid-run."""
+    if not path:
+        return None
+    if path not in ctx.origin_slugs:
+        got = ctx.runner.as_role(
+            ctx.account, "git -C %s remote get-url origin" % shlex.quote(path))
+        first = (got.out or "").strip().splitlines()
+        ctx.origin_slugs[path] = _repo_slug(first[0]) if got.ok and first else None
+    return ctx.origin_slugs[path]
+
+
+def _entries_by_repo(ctx):
+    """{OWNER/NAME lower-cased: the dispatcher entry that manages that repository}, over
+    the entries this installer does NOT own.
+
+    IDENTITY IS THE CLONE'S `origin` REMOTE, with the entry's own `githubUrl` as a second
+    authority — both of which NAME the repository. The matcher this replaces compared a
+    path basename and a substring of a URL; a basename is not evidence of identity, and
+    that class of guess is what put reviewers in the wrong checkout. Ties go to the first
+    entry in file order: two entries for one repository are two clones of the same code,
+    so either is a correct place to read it."""
     out = {}
+    for entry in ctx.dispatcher.get("entries", []) or []:
+        if _owns_review_entry(entry):
+            continue
+        slug = (_origin_slug(ctx, entry.get("repositoryPath"))
+                or _repo_slug(entry.get("githubUrl")))
+        if slug and slug not in out:
+            out[slug] = entry
+    return out
+
+
+def _dispatcher_repo_names(ctx):
+    """OWNER/NAME -> the CODING entry `name` that manages it. Read out of the dispatcher's
+    config, never typed: the fallback fix ticket routes on it, and it must land in the
+    entry that can actually push a fix — never in a read-only review entry."""
+    out = {}
+    known = _entries_by_repo(ctx)
     for repo in split_list(ctx.conf["REVIEW_REPOS"]):
-        tail = repo.split("/", 1)[1]
-        for entry in ctx.dispatcher.get("entries", []) or []:
-            url = (entry.get("githubUrl") or "")
-            path = (entry.get("repositoryPath") or "")
-            if repo in url or os.path.basename(path.rstrip("/")) == tail:
-                if entry.get("name"):
-                    out[repo] = entry["name"]
-                break
-        if repo not in out:
-            warn("no dispatcher entry matches %s, so the fallback fix ticket for it has "
-                 "nowhere to route. The primary re-prompt is unaffected." % repo)
+        entry = known.get(repo.lower())
+        if entry and entry.get("name"):
+            out[repo] = entry["name"]
+        else:
+            warn("no dispatcher entry's clone has %s as its `origin`, so the fallback fix "
+                 "ticket for it has nowhere to route. The primary re-prompt is "
+                 "unaffected." % repo)
     return out
 
 
@@ -2125,74 +2268,198 @@ def _contexts_from_rules(r, repo, branch):
     return contexts, None
 
 
-def reviews_entry(ctx):
-    """The one repository entry this installer writes into the dispatcher's
-    config. Every ABSENT key is absent for a reason; see the operator doc."""
+# The first sentence of the brief — the fingerprint of an entry this installer
+# wrote. It decides which entries a pass may REPLACE and REMOVE, so it must not
+# be a name anyone could pick by accident.
+REVIEW_BRIEF_FINGERPRINT = REVIEWER_BRIEF.split(".", 1)[0]
+
+# The keys a present entry is compared on. Everything this installer writes and
+# the config reader reads back; a key it writes but never compares is a key a
+# hand edit can quietly win.
+ENTRY_COMPARE_KEYS = ("name", "repositoryPath", "baseBranch", "teamKeys",
+                      "routingLabels", "disallowedTools", "appendInstruction")
+
+
+def _owns_review_entry(entry):
+    """True for an entry THIS installer wrote — the only ones a pass may replace or
+    remove. Ownership is the id's shape AND the brief's first sentence: an entry that
+    merely sits under the same name, written by hand or by something else, is left alone
+    and reported, never deleted."""
+    eid = (entry.get("id") or "")
+    if not (eid == LEGACY_REVIEW_ENTRY_ID or eid.startswith(REVIEW_ENTRY_PREFIX)):
+        return False
+    return (entry.get("appendInstruction") or "").startswith(REVIEW_BRIEF_FINGERPRINT)
+
+
+def _entry_matches(have, want):
+    """The present entry is the one this conf produces. `allowedUsers` is compared
+    through the flattened key the config reader emits, not the nested one written."""
+    if not have:
+        return False
+    if any(have.get(k) != want.get(k) for k in ENTRY_COMPARE_KEYS):
+        return False
+    return (have.get("allowedUsers") or []) == want["userAccessControl"]["allowedUsers"]
+
+
+def _tag_ambiguity(entries, wanted, dead=()):
+    """Every way an entry OTHER than the intended one could answer to a review tag.
+
+    The router matches `[repo=x]` against an entry's githubUrl tail, its name
+    (case-insensitively) and its id — and starts a session in EVERY entry that matches.
+    One extra match is a review session running in an entry that has Bash and Write, so
+    this is a refusal rather than a warning. `dead` names entries this pass is about to
+    remove; they cannot match anything afterwards."""
+    problems = []
+    ours = {w["id"] for w in wanted} | set(dead)
+    for want in wanted:
+        tag = want["name"]
+        for entry in entries:
+            if entry.get("id") in ours:
+                continue
+            hits = []
+            url = entry.get("githubUrl") or ""
+            if url.endswith("/" + tag) or url.endswith("/" + tag + ".git"):
+                hits.append("its githubUrl %s" % url)
+            if (entry.get("name") or "").lower() == tag.lower():
+                hits.append("its name")
+            if entry.get("id") == tag:
+                hits.append("its id")
+            if hits:
+                problems.append("[repo=%s] would ALSO match the entry %r by %s"
+                                % (tag, entry.get("id") or entry.get("name"),
+                                   " and ".join(hits)))
+    return problems
+
+
+def reviews_entries(ctx):
+    """The repository entries this installer writes — ONE PER REVIEWED REPOSITORY, so a
+    review is read in a clone of the repository the diff came from.
+
+    Every ABSENT key is absent for a reason; see the operator doc. `githubUrl` is the one
+    that matters most here: with none, no `[repo=<the repository>]` tag anywhere can pull
+    a review into these entries, and no tag naming one of them can be answered by a
+    coding entry."""
     conf, st = ctx.conf, ctx.state
     ids = st.data.get("ids") or {}
-    entries = ctx.dispatcher.get("entries", []) or []
-    # ONE entry supplies BOTH the clone path and its base branch. Taking the
-    # path from one entry and the branch from another would cut review
-    # worktrees from a branch that does not exist in that clone.
-    model = next((e for e in entries if e.get("repositoryPath")), None)
+    repos = split_list(conf["REVIEW_REPOS"])
+    known = _entries_by_repo(ctx)
     bases = ctx.dispatcher.get("workspace_base_dirs") or []
     spaces = ctx.dispatcher.get("workspace_ids") or []
-    if not model or not bases or not spaces:
-        raise Unknown("the dispatcher's config named no repositoryPath, workspaceBaseDir "
-                      "or workspace id to copy",
-                      "read it as the role account and check it has at least one entry")
+    if not known or not bases or not spaces:
+        raise Unknown("the dispatcher's config named no repository it manages, no "
+                      "workspaceBaseDir or no workspace id to copy",
+                      "read it as the role account and check it has at least one entry "
+                      "whose clone answers `git remote get-url origin`")
     if len(bases) > 1:
         raise SetupError("the dispatcher's entries disagree about workspaceBaseDir (%s). "
                          "Worktree deletion is hardcoded to that path, so guessing leaves "
                          "worktrees nothing removes." % ", ".join(bases))
     if len(spaces) > 1:
         raise SetupError("the dispatcher's entries name %d different workspace ids — "
-                         "refusing to guess which the reviews entry belongs to" % len(spaces))
-    return {
-        "id": "reviews",
-        "name": "reviews",
-        "repositoryPath": model["repositoryPath"],
-        "baseBranch": (model.get("baseBranch") or "main"),
-        "workspaceBaseDir": bases[0],
-        "linearWorkspaceId": spaces[0],
-        "teamKeys": [conf["REVIEWS_TEAM_KEY"]],
-        "isActive": True,
-        "disallowedTools": list(DISALLOWED_TOOLS),
-        "userAccessControl": {"allowedUsers": [ids.get("owner_user_id", "")]},
-        "appendInstruction": REVIEWER_BRIEF,
-    }
+                         "refusing to guess which the review entries belong to" % len(spaces))
+    missing = [r for r in repos if not (known.get(r.lower()) or {}).get("repositoryPath")]
+    if missing:
+        raise SetupError(
+            "the dispatcher manages no clone of %s, so a review of it would have no "
+            "correct checkout to read — which is the whole defect this entry exists to "
+            "fix. Give the dispatcher an entry whose clone's `origin` is that repository, "
+            "or drop it from REVIEW_REPOS." % ", ".join(missing))
+
+    out = []
+    for at, repo in enumerate(repos):
+        # ONE entry supplies BOTH the clone path and its base branch — the entry
+        # that manages THIS repository. Taking the path from one entry and the
+        # branch from another would cut review worktrees from a branch that does
+        # not exist in that clone.
+        model = known[repo.lower()]
+        entry = {
+            "id": review_entry_name(repo),
+            "name": review_entry_name(repo),
+            "repositoryPath": model["repositoryPath"],
+            "baseBranch": (model.get("baseBranch") or "main"),
+            "workspaceBaseDir": bases[0],
+            "linearWorkspaceId": spaces[0],
+            "routingLabels": [REVIEW_ENTRY_NEVER_LABEL],
+            "isActive": True,
+            "disallowedTools": list(DISALLOWED_TOOLS),
+            "userAccessControl": {"allowedUsers": [ids.get("owner_user_id", "")]},
+            "appendInstruction": REVIEWER_BRIEF,
+        }
+        # THE TEAM KEY GOES ON EXACTLY ONE ENTRY, and it is the fallback for a
+        # review ticket that somehow carries no routing tag. Team routing takes
+        # the FIRST entry claiming the key, so two claimants would make which
+        # clone a reviewer reads depend on file order. With one, a missing tag
+        # degrades to the old behaviour — a read-only reviewer, possibly in the
+        # wrong repository — instead of falling through to catch-all routing and
+        # starting a session in an entry that has Bash and Write.
+        if at == 0:
+            entry["teamKeys"] = [conf["REVIEWS_TEAM_KEY"]]
+        out.append(entry)
+    return out
 
 
 def step_dispatcher_entry(ctx, apply_it):
     r, conf = ctx.runner, ctx.conf
-    want = reviews_entry(ctx)
-    have = None
-    for entry in ctx.dispatcher.get("entries", []) or []:
-        if entry.get("id") == "reviews":
-            have = entry
-            break
-    same = bool(have) and all(
-        have.get(k) == want[k]
-        for k in ("name", "repositoryPath", "baseBranch", "teamKeys",
-                  "disallowedTools", "appendInstruction")) and (
-        (have.get("allowedUsers") or []) == want["userAccessControl"]["allowedUsers"])
+    want = reviews_entries(ctx)
+    names = [w["name"] for w in want]
+    entries = ctx.dispatcher.get("entries", []) or []
+    wanted_ids = {w["id"] for w in want}
+    owned = [e for e in entries if _owns_review_entry(e)]
+    have_by_id = {e.get("id"): e for e in owned}
+    # A review entry for a repository this conf no longer reviews — and the
+    # single `reviews` entry an older installer wrote. Left in place, either one
+    # still claims the Reviews team key and still points at a clone this conf
+    # never chose, and team routing hands the key to whichever claims it first.
+    stale = sorted(i for i in have_by_id if i not in wanted_ids)
 
-    # The banner proof is recorded SEPARATELY from "the entry matches". They are
+    # A review entry this installer did NOT write, still claiming the key. It is
+    # not ours to delete and it would fight the fallback, so the run stops and
+    # names it rather than silently leaving two claimants.
+    foreign = [e.get("id") or e.get("name") for e in entries
+               if not _owns_review_entry(e)
+               and conf["REVIEWS_TEAM_KEY"] in (e.get("teamKeys") or [])]
+    if foreign:
+        raise SetupError(
+            "the dispatcher config already has %s claiming the Reviews team key %s, and "
+            "this installer did not write %s (the reviewer brief is not in its "
+            "appendInstruction). Two claimants make which clone a reviewer reads depend "
+            "on file order. Remove or re-key %s by hand, then re-run."
+            % (", ".join(repr(f) for f in foreign), conf["REVIEWS_TEAM_KEY"],
+               "them" if len(foreign) > 1 else "it",
+               "them" if len(foreign) > 1 else "it"))
+
+    problems = _tag_ambiguity(entries, want, dead=stale)
+    if problems:
+        raise SetupError(
+            "refusing to write review entries whose routing tag is ambiguous — the router "
+            "starts a session in EVERY entry a tag matches, and one of these matches an "
+            "entry that can write:\n%s\nRename the other entry, or drop that repository "
+            "from REVIEW_REPOS." % "\n".join("  - " + p for p in problems))
+
+    differs = [w["id"] for w in want if not _entry_matches(have_by_id.get(w["id"]), w)]
+    same = not differs and not stale
+
+    # The banner proof is recorded SEPARATELY from "the entries match". They are
     # different facts, and folding them into one ledger row is what made a
     # re-run bounce a live dispatcher to re-learn something it already knew.
     proof = (ctx.state.data.get("notes") or {}).get(ENTRY_PROOF_NOTE)
-    if same and (proof or ctx.state.attested("A-ENTRY-LOADED")):
-        return True, "the reviews entry is present and matches, and its load was proven " \
-                     "(%s)" % (proof or "signed off by hand"), []
+    if same and (_proof_covers(proof, names) or ctx.state.attested("A-ENTRY-LOADED")):
+        return True, "%d review entr%s present and matching, and the load was proven " \
+                     "(%s)" % (len(want), "y is" if len(want) == 1 else "ies are",
+                               (proof or {}).get("how") if _proof_covers(proof, names)
+                               else "signed off by hand"), []
     if not apply_it:
-        if not have:
-            return False, "the reviews entry is absent", []
-        if not same:
-            return False, "the reviews entry differs from what this conf produces", []
-        return False, "the reviews entry matches; its load has not been proven yet", []
+        absent = [i for i in differs if i not in have_by_id]
+        if absent or stale:
+            return False, "would write %s and remove %s" % (
+                ", ".join(differs) or "nothing", ", ".join(stale) or "nothing"), []
+        if differs:
+            return False, "%s differ(s) from what this conf produces" % ", ".join(differs), []
+        return False, "the review entries match; their load has not been proven yet", []
 
     if not same:
-        body = json.dumps(want, indent=2, sort_keys=True) + "\n"
+        body = json.dumps({"entries": want, "remove": stale},
+                          indent=2, sort_keys=True) + "\n"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         backup_path = "%s.bak-%s" % (conf["DISPATCHER_CONFIG"], stamp)
         backup = r.as_role(ctx.account, "cp -a %s %s"
@@ -2207,9 +2474,9 @@ def step_dispatcher_entry(ctx, apply_it):
             backup_path = None
         res = r.as_role(ctx.account,
                         "/usr/bin/python3 -c " + shlex.quote(
-                            _upsert_entry_py(conf["DISPATCHER_CONFIG"])),
+                            _reconcile_entries_py(conf["DISPATCHER_CONFIG"])),
                         stdin=body,
-                        why="insert or update the `reviews` entry in the dispatcher config")
+                        why="reconcile the review entries in the dispatcher config")
         if not res.skipped:
             if not res.ok:
                 raise SetupError("could not write the dispatcher config: %s"
@@ -2226,22 +2493,23 @@ def step_dispatcher_entry(ctx, apply_it):
         # proxy on a stale config for four days.
         _restart_dispatcher(ctx, backup_path)
     else:
-        say("  the `reviews` entry already matches this conf, so the dispatcher was NOT "
+        say("  the review entries already match this conf, so the dispatcher was NOT "
             "restarted;")
-        say("  only its load is still unproven, and re-reading a log proves that without "
+        say("  only their load is still unproven, and re-reading a log proves that without "
             "killing")
         say("  an in-flight session.")
     if ctx.runner.dry_run:
-        return False, "would write the entry and restart the dispatcher", []
+        return False, "would write the entries and restart the dispatcher", []
 
-    proven, how = _banner_proves_entry(ctx)
+    proven, how = _banner_proves_entry(ctx, names)
     if proven:
-        ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = how
-        return False, "entry present and the dispatcher's log names it (%s)" % how, []
+        ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = {"names": names,
+                                                                    "how": how}
+        return False, "entries present and the dispatcher's log names them (%s)" % how, []
     if ctx.state.attested("A-ENTRY-LOADED"):
-        return False, "entry present; load signed off by hand (%s)" % how, []
+        return False, "entries present; load signed off by hand (%s)" % how, []
     raise Unknown(
-        "the dispatcher's log never names the `reviews` entry (%s).\n"
+        "the dispatcher's log never names every review entry (%s).\n"
         "  This is the KNOWN failure mode: the loader drops keys it does not\n"
         "  recognise at process start, and the file you just read back is only the\n"
         "  file you wrote thirty seconds ago. Not claiming success." % how,
@@ -2451,29 +2719,41 @@ def _restart_dispatcher(ctx, backup):
                      "It is STOPPED — read the banner below." % (attempt, detail))
 
 
-def _upsert_entry_py(path):
-    """Insert-or-update by `id`, atomically, from stdin. Idempotent: an entry
-    already equal to the one on stdin is reported and nothing is rewritten."""
+def _reconcile_entries_py(path):
+    """Insert-or-update N entries by `id` and remove a named set, in ONE atomic
+    rewrite, from stdin (`{"entries": [...], "remove": [id, ...]}`).
+
+    One write, not one per entry: a config left half-reconciled by a failure in
+    the middle would have two entries claiming the Reviews team key, which is
+    the state this whole change exists to make impossible. Idempotent — a file
+    already holding exactly these entries is reported and not rewritten."""
     return (
         "import json,os,sys,tempfile\n"
         "p=%r\n"
-        "e=json.load(sys.stdin)\n"
+        "d=json.load(sys.stdin)\n"
+        "es=d['entries']; drop=set(d.get('remove') or [])\n"
         "c=json.load(open(p))\n"
         "rs=c.setdefault('repositories',[])\n"
-        "at=[i for i,r in enumerate(rs) if r.get('id')==e['id']]\n"
-        "if at and rs[at[0]]==e:\n"
+        "did=[]\n"
+        "for e in es:\n"
+        "    at=[i for i,r in enumerate(rs) if r.get('id')==e['id']]\n"
+        "    if at and rs[at[0]]==e: continue\n"
+        "    if at: rs[at[0]]=e; did.append('replaced '+e['id'])\n"
+        "    else: rs.append(e); did.append('added '+e['id'])\n"
+        "keep=[r for r in rs if r.get('id') not in drop]\n"
+        "if len(keep)!=len(rs): did.append('removed '+','.join(sorted(drop)))\n"
+        "c['repositories']=keep\n"
+        "if not did:\n"
         "    print('already present and identical, nothing changed')\n"
         "    sys.exit(0)\n"
-        "if at: rs[at[0]]=e; what='replaced'\n"
-        "else: rs.append(e); what='added'\n"
-        "d=os.path.dirname(p)\n"
-        "fd,t=tempfile.mkstemp(dir=d)\n"
+        "t=os.path.dirname(p)\n"
+        "fd,t=tempfile.mkstemp(dir=t)\n"
         "os.write(fd, (json.dumps(c, indent=2)+chr(10)).encode())\n"
         "os.close(fd)\n"
         "os.chmod(t, os.stat(p).st_mode & 0o777)\n"
         "json.load(open(t))\n"
         "os.replace(t, p)\n"
-        "print(what, 'entry', e['id'])\n" % path)
+        "print('; '.join(did))\n" % path)
 
 
 ENTRY_PROOF_NOTE = "dispatcher-entry-banner"
@@ -2516,9 +2796,21 @@ def _entry_named(entry):
                       % (tok, tok), re.I)
 
 
-def _banner_proves_entry(ctx, entry="reviews"):
+def _proof_covers(note, names):
+    """A recorded banner proof settles this step only when it names EVERY entry this conf
+    wants. A ledger written by the single-entry installer holds a bare string, which
+    proves the load of an entry this pass is removing — so it settles nothing now, and a
+    new repository never inherits the proof of an old one."""
+    if not isinstance(note, dict):
+        return False
+    return set(note.get("names") or []) >= set(names)
+
+
+def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,)):
     """(proven, how). Reads the dispatcher's own log for proof that it loaded
-    the reviews entry. ABSENCE IS NEVER READ AS SUCCESS.
+    EVERY named review entry. ABSENCE IS NEVER READ AS SUCCESS, and a partial
+    answer is an absence: one entry missing from the banner is one repository
+    whose reviews would fall back to another entry's clone.
 
     The WHOLE log is searched, not the tail: this is called on a re-run that
     deliberately did NOT restart the dispatcher, so the banner it is looking for
@@ -2531,7 +2823,8 @@ def _banner_proves_entry(ctx, entry="reviews"):
     if not logpath.ok or not logpath.out.strip():
         return False, "its plist names no StandardOutPath"
     path = logpath.out.strip().splitlines()[0]
-    names = _entry_named(entry)
+    wanted = list(entries)
+    found = {}
     for _ in range(BANNER_TRIES):
         # THE REGION. `-A` keeps the bullet lines that FOLLOW each header, which
         # is the whole fix: the old grep filtered the log down to lines
@@ -2541,23 +2834,39 @@ def _banner_proves_entry(ctx, entry="reviews"):
                             "grep -i -A %d -e %s %s 2>/dev/null | tail -%d"
                             % (BANNER_AFTER, shlex.quote(BANNER_HEADER),
                                shlex.quote(path), BANNER_TAIL)])
-        for line in (region.out or "").splitlines()[::-1]:
-            if names.search(line):
-                return True, line.strip()[:120]
+        for entry in wanted:
+            if entry in found:
+                continue
+            names = _entry_named(entry)
+            for line in (region.out or "").splitlines()[::-1]:
+                if names.search(line):
+                    found[entry] = line.strip()[:120]
+                    break
+        if len(found) == len(wanted):
+            break
         # …and the one-line shape, kept. It has never been seen to pass against
         # the dispatcher this kit was built beside, but this is a template: a
         # dispatcher that names both concepts on one line is still proof, and
         # deleting the old rule would regress it for no gain.
-        same = r.as_root(["/bin/sh", "-c",
-                          "grep -i -e %s %s 2>/dev/null | tail -60"
-                          % (shlex.quote(entry), shlex.quote(path))])
-        for line in (same.out or "").splitlines()[::-1]:
-            low = line.lower()
-            if entry in low and ("repositor" in low or "entr" in low
-                                 or "disallow" in low):
-                return True, line.strip()[:120]
+        for entry in wanted:
+            if entry in found:
+                continue
+            same = r.as_root(["/bin/sh", "-c",
+                              "grep -i -e %s %s 2>/dev/null | tail -60"
+                              % (shlex.quote(entry), shlex.quote(path))])
+            for line in (same.out or "").splitlines()[::-1]:
+                low = line.lower()
+                if entry.lower() in low and ("repositor" in low or "entr" in low
+                                             or "disallow" in low):
+                    found[entry] = line.strip()[:120]
+                    break
+        if len(found) == len(wanted):
+            break
         _pause(1)
-    return False, "no banner in %s named it" % path
+    missing = [e for e in wanted if e not in found]
+    if missing:
+        return False, "no banner in %s named %s" % (path, ", ".join(missing))
+    return True, "; ".join(found[e] for e in wanted)
 
 
 PLIST = """<?xml version="1.0" encoding="UTF-8"?>
@@ -2824,7 +3133,8 @@ STEPS = (
     ("tracker", "the Reviews team, the labels and every id", step_tracker),
     ("credentials", "the role account's own env file, mode 600", step_credentials),
     ("configs", "the poller's config and the driver's", step_configs),
-    ("dispatcher-entry", "the reviews entry, and proof it loaded", step_dispatcher_entry),
+    ("dispatcher-entry", "one review entry per repository, and proof they loaded",
+     step_dispatcher_entry),
     ("daemons", "both plists, rendered, linted and installed", step_daemons),
     ("dry-run", "both dry runs, read before anything is on", step_dry_run),
     ("enable", "load both daemons and see both heartbeats", step_enable),
@@ -3074,9 +3384,9 @@ def _dispatcher_down_notice(ctx):
     say("    sudo launchctl print system/%s" % down["label"])
     if down.get("backup"):
         say("")
-        say("This run had just written the `reviews` entry into its config. That change")
+        say("This run had just written the review entries into its config. That change")
         say("was NOT undone: a restore starts nothing, and the file is the evidence for")
-        say("why it would not come back. If you decide the entry is the cause:")
+        say("why it would not come back. If you decide the entries are the cause:")
         say("    sudo -u %s cp -a %s %s"
             % (ctx.account, down["backup"], ctx.conf["DISPATCHER_CONFIG"]))
     say("=" * 74)
@@ -3832,22 +4142,157 @@ def _selftest_body():
            "a sign-off exists that no card asks for: %s"
            % (set(ATTESTATIONS) - referenced - {"A-ENTRY-LOADED"}))
 
-    # -- 14. the reviewer entry has exactly the shape that was settled -------
+    # -- 14. the reviewer entries have exactly the shape that was settled ----
     cases += 1
     ctx7, _f7 = _settled_ctx(conf)
-    entry = reviews_entry(ctx7)
-    for absent in ("githubUrl", "routingLabels", "projectKeys", "labelPrompts",
-                   "promptTemplatePath", "allowedTools", "model"):
-        expect("entry-shape", absent not in entry,
-               "%s must stay ABSENT from the reviews entry" % absent)
-    expect("entry-shape", entry["disallowedTools"] == DISALLOWED_TOOLS
-           and len(DISALLOWED_TOOLS) == 9, "the tool fence changed shape")
-    expect("entry-shape", not any(t.startswith("mcp__") for t in entry["disallowedTools"]),
-           "the tracker's MCP tools were fenced — that is an owner decision, not this "
-           "installer's")
-    expect("entry-shape", entry["teamKeys"] == ["REV"], "routing is by team key only")
-    expect("entry-shape", "REVIEW-ONLY session" in entry["appendInstruction"],
-           "the reviewer brief is not in appendInstruction")
+    entries7 = reviews_entries(ctx7)
+    expect("entry-shape", [e["name"] for e in entries7] == ["reviews-kit"],
+           "one repository should make one entry: %s" % [e["id"] for e in entries7])
+    for entry in entries7:
+        for absent in ("githubUrl", "projectKeys", "labelPrompts",
+                       "promptTemplatePath", "allowedTools", "model"):
+            expect("entry-shape", absent not in entry,
+                   "%s must stay ABSENT from a review entry" % absent)
+        expect("entry-shape", entry["disallowedTools"] == DISALLOWED_TOOLS
+               and len(DISALLOWED_TOOLS) == 9, "the tool fence changed shape")
+        expect("entry-shape", not any(t.startswith("mcp__") for t in entry["disallowedTools"]),
+               "the tracker's MCP tools were fenced — that is an owner decision, not this "
+               "installer's")
+        expect("entry-shape", entry["id"] == entry["name"],
+               "a tag matches by name OR id, and both must name the same entry")
+        expect("entry-shape", "REVIEW-ONLY session" in entry["appendInstruction"],
+               "the reviewer brief is not in appendInstruction")
+    expect("entry-shape", entries7[0]["teamKeys"] == ["REV"],
+           "the fallback team key is not on the first entry")
+
+    # -- 14b. N REPOSITORIES, N ENTRIES, EACH IN ITS OWN CLONE --------------- #
+    # THE DEFECT, stated as a case: every review session was cut from ONE clone
+    # — the first entry in the dispatcher's config that happened to have a
+    # `repositoryPath` — so a reviewer judging a diff from one repository read
+    # files from another, with Read, Grep and Glob still in its hand.
+    cases += 1
+    ctx14, fake14 = _settled_ctx(conf)
+    ctx14.conf = dict(conf, REVIEW_REPOS="example-org/kit, example-org/app")
+    ctx14.dispatcher["entries"].append(
+        {"id": "app", "name": "app", "repositoryPath": "/x/app", "baseBranch": "trunk",
+         "teamKeys": ["APP"]})
+    # …in the scp-style spelling, so the second URL shape is exercised too.
+    fake14.answers += [("git -C /x/app remote get-url origin", 0,
+                        "git@example.com:example-org/app.git\n")]
+    multi = reviews_entries(ctx14)
+    expect("entry-per-repo", [e["name"] for e in multi] == ["reviews-kit", "reviews-app"],
+           "one entry per reviewed repository: %s" % [e["name"] for e in multi])
+    expect("entry-per-repo",
+           [e["repositoryPath"] for e in multi] == ["/x/kit", "/x/app"],
+           "an entry was given another repository's clone: %s"
+           % [(e["name"], e["repositoryPath"]) for e in multi])
+    expect("entry-per-repo", multi[1]["baseBranch"] == "trunk",
+           "the base branch came from a different entry than the path did — a worktree "
+           "cut from a branch that may not exist in that clone")
+    expect("entry-per-repo", [bool(e.get("teamKeys")) for e in multi] == [True, False],
+           "the Reviews team key is on %d entries; two claimants make the no-tag fallback "
+           "depend on file order" % sum(1 for e in multi if e.get("teamKeys")))
+    # …and the clone's identity is READ, never inferred: the `app` entry has no
+    # githubUrl at all, and its path's basename is the only other thing that
+    # could have matched it — so only `git remote get-url origin` can have.
+    app_entry = [e for e in ctx14.dispatcher["entries"] if e.get("id") == "app"][0]
+    expect("entry-per-repo", "githubUrl" not in app_entry,
+           "the fixture's app entry has a githubUrl, so this case no longer proves the "
+           "remote was read")
+    ctx14.origin_slugs.clear()
+    fake14.answers = [a for a in fake14.answers if "/x/app remote" not in a[0]]
+    try:
+        reviews_entries(ctx14)
+        failures.append("entry-per-repo: a clone whose origin cannot be read still "
+                        "matched a repository — by its path, which names nothing")
+    except SetupError as exc:
+        expect("entry-per-repo", "example-org/app" in str(exc),
+               "the refusal does not name the repository: %s" % exc)
+
+    # -- 14c. the tag names the REVIEW entry, and nothing else answers to it - #
+    # `[repo=<the repository>]` matches the CODING entry too — by name and by
+    # githubUrl — and the router starts a session in EVERY match, which would be
+    # a review running with Bash and Write.
+    cases += 1
+    expect("tag-unambiguous", not _tag_ambiguity(ctx14.dispatcher["entries"], multi),
+           "a review tag is already answerable by another entry: %s"
+           % _tag_ambiguity(ctx14.dispatcher["entries"], multi))
+    for name in ("reviews-kit", "reviews-app"):
+        expect("tag-unambiguous", name.startswith(REVIEW_ENTRY_PREFIX)
+               and name[len(REVIEW_ENTRY_PREFIX):] in ("kit", "app"),
+               "%s is not <prefix><repository name>" % name)
+    trap = list(ctx14.dispatcher["entries"]) + [
+        {"id": "other", "name": "reviews-kit", "repositoryPath": "/x/other"},
+        {"id": "byurl", "name": "byurl", "githubUrl": "https://example.com/x/reviews-app"}]
+    caught = _tag_ambiguity(trap, multi)
+    expect("tag-unambiguous", len(caught) == 2 and any("its name" in c for c in caught)
+           and any("githubUrl" in c for c in caught),
+           "an entry that could answer to a review tag was not caught: %s" % caught)
+    expect("tag-unambiguous", not _tag_ambiguity(trap, multi, dead=["other", "byurl"]),
+           "entries this pass is about to REMOVE were still counted as matches")
+    # NO REVIEW ENTRY IS THE WORKSPACE CATCH-ALL. The router's last resort is
+    # the first entry with no teamKeys, no routingLabels and no projectKeys —
+    # so without the never-routed label the second entry would quietly swallow
+    # every ticket from an unconfigured team, which today raises a prompt.
+    for entry in multi:
+        expect("never-catch-all",
+               entry.get("teamKeys") or entry.get("routingLabels") or entry.get("projectKeys"),
+               "%s is a catch-all candidate" % entry["name"])
+    expect("never-catch-all", all(e.get("routingLabels") == [REVIEW_ENTRY_NEVER_LABEL]
+                                  for e in multi),
+           "the never-routed label is missing or changed shape: %s"
+           % [e.get("routingLabels") for e in multi])
+
+    # -- 14d. the two files spell the entry name the same way ---------------- #
+    # The installer WRITES the entry and the poller writes the TAG that finds
+    # it. A drift between them is a review in the wrong clone with nothing red
+    # anywhere, so the two spellings are pinned to each other here — the same
+    # way the two files' exit codes are.
+    cases += 1
+    import pipeline_review_poller as _poller_names
+    for repo in ("example-org/kit", "other-org/app.js", "o/UPPER"):
+        expect("name-parity",
+               review_entry_name(repo) == _poller_names.review_entry_name(repo),
+               "the installer says %r and the poller says %r for %s"
+               % (review_entry_name(repo), _poller_names.review_entry_name(repo), repo))
+    expect("name-parity", REVIEW_ENTRY_PREFIX == _poller_names.REVIEW_ENTRY_PREFIX,
+           "the two files disagree about the review-entry prefix")
+    expect("name-parity",
+           _poller_names.routing_tag("example-org/kit") == "[repo=reviews-kit]",
+           "the tag the poller writes is not the entry this file names")
+    expect("name-parity", REVIEW_BRIEF_FINGERPRINT
+           and REVIEWER_BRIEF.startswith(REVIEW_BRIEF_FINGERPRINT),
+           "the ownership fingerprint is not the brief's own first sentence")
+
+    # -- 14e. two repositories that differ only by owner are REFUSED --------- #
+    # They would want one entry name, and the poller derives the tag from the
+    # name alone: the second repository's reviews would be read in the first
+    # one's clone. This bug again, one layer down — so it is a conf error, said
+    # with every other conf error rather than found on a live review.
+    cases += 1
+    _v, dupe_errs = validate_conf(parse_conf(
+        GOOD_CONF.replace("REVIEW_REPOS=example-org/kit",
+                          "REVIEW_REPOS=example-org/kit, other-org/kit"))[0])
+    expect("same-name-repos", any("differ only by owner" in e for e in dupe_errs),
+           "two repositories sharing a name were accepted: %s" % dupe_errs)
+    _v, ok_errs = validate_conf(parse_conf(
+        GOOD_CONF.replace("REVIEW_REPOS=example-org/kit",
+                          "REVIEW_REPOS=example-org/kit, example-org/app"))[0])
+    expect("same-name-repos", not ok_errs,
+           "two ordinary repositories were refused: %s" % ok_errs)
+
+    # -- 14f. a repository the dispatcher manages no clone of is refused ----- #
+    # Guessing a clone is exactly the defect. There is nothing to fall back to.
+    cases += 1
+    ctx14f, _f14f = _settled_ctx(conf)
+    ctx14f.conf = dict(conf, REVIEW_REPOS="example-org/kit, example-org/nowhere")
+    try:
+        reviews_entries(ctx14f)
+        failures.append("no-clone-no-guess: an unmanaged repository was given some other "
+                        "repository's clone")
+    except SetupError as exc:
+        expect("no-clone-no-guess", "example-org/nowhere" in str(exc),
+               "the refusal does not name the repository: %s" % exc)
 
     # -- 15. the plists are one-shot, role-owned, and lint-shaped ------------
     cases += 1
@@ -4009,9 +4454,7 @@ def _selftest_body():
     # re-run this command to clear the cards downstream.
     cases += 1
     ctxG, fakeG = _settled_ctx(conf)
-    already = dict(reviews_entry(ctxG))
-    already["allowedUsers"] = already.pop("userAccessControl")["allowedUsers"]
-    ctxG.dispatcher["entries"].append(already)
+    _install_review_entries(ctxG)
     def _entry_once(c):
         try:
             step_dispatcher_entry(c, apply_it=True)
@@ -4023,10 +4466,103 @@ def _selftest_body():
            "a byte-identical entry still wrote: %s" % [w["why"] for w in fakeG.writes])
     # …and once the banner has been read once, the row is settled from a note,
     # not from the step's own outcome, so a later re-run re-reads nothing.
-    ctxG.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = "loaded repository reviews"
+    ctxG.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = _proof_note(ctxG)
     ok, detail, _x = step_dispatcher_entry(ctxG, apply_it=True)
     expect("no-needless-restart", ok is True and "was proven" in detail,
            "a proven entry did not settle: %s" % detail)
+    # A PROOF NAMES WHAT IT PROVED. The note recorded above is the load of the
+    # entries this conf wanted THEN; adding a repository must not inherit it,
+    # or the new entry's load is claimed without ever having been read.
+    cases += 1
+    ctxG.conf = dict(conf, REVIEW_REPOS="example-org/kit, example-org/app")
+    ctxG.dispatcher["entries"].append(
+        {"id": "app", "name": "app", "repositoryPath": "/x/app", "teamKeys": ["APP"]})
+    fakeG.answers += [("git -C /x/app remote get-url origin", 0,
+                       "https://github.com/example-org/app\n")]
+    expect("proof-names-what-it-proved",
+           not _proof_covers(ctxG.state.data["notes"][ENTRY_PROOF_NOTE],
+                             ["reviews-kit", "reviews-app"]),
+           "a proof of one entry's load settled another entry that was never read")
+    expect("proof-names-what-it-proved", not _proof_covers("loaded repository reviews",
+                                                           ["reviews-kit"]),
+           "a single-entry installer's bare-string note still settles the step")
+
+    # -- 15f2. a stale review entry is REMOVED, not left claiming the key ---- #
+    # The single `reviews` entry an older installer wrote still claims the
+    # Reviews team key and still points at whichever clone it was given. Left
+    # behind, team routing could hand a tagless ticket to it — the wrong clone,
+    # which is the whole defect — so a pass that finds it takes it out.
+    cases += 1
+    ctxS, fakeS = _restart_ctx(conf)
+    legacy = dict(reviews_entries(ctxS)[0], id=LEGACY_REVIEW_ENTRY_ID,
+                  name=LEGACY_REVIEW_ENTRY_ID, repositoryPath="/x/somewhere-else")
+    legacy["allowedUsers"] = legacy.pop("userAccessControl")["allowedUsers"]
+    ctxS.dispatcher["entries"].append(legacy)
+    _quiet(lambda: _entry_once(ctxS))
+    wrote = [w for w in fakeS.writes if "reconcile the review entries" in (w["why"] or "")]
+    expect("stale-entry-removed", len(wrote) == 1,
+           "the reconcile did not run once: %s" % [w["why"] for w in fakeS.writes])
+    sent = json.loads(wrote[0]["stdin"]) if wrote else {}
+    expect("stale-entry-removed", sent.get("remove") == [LEGACY_REVIEW_ENTRY_ID],
+           "the legacy entry was not removed: %r" % (sent.get("remove"),))
+    expect("stale-entry-removed",
+           [e["id"] for e in sent.get("entries") or []] == ["reviews-kit"],
+           "the wanted entries are wrong: %r" % (sent.get("entries"),))
+    # …and one write does BOTH, because a config left half-reconciled would have
+    # two entries claiming the Reviews team key.
+    #
+    # THE PROGRAM IS RUN, not merely read. It is a string this file generates and
+    # nothing else in the battery executes, which is exactly the shape that breaks
+    # in production with every test green.
+    cases += 1
+    cfg_dir = tempfile.mkdtemp(prefix="stage-e-reconcile.")
+    cfg_path = os.path.join(cfg_dir, "config.json")
+    with open(cfg_path, "w") as fh:
+        json.dump({"other": "untouched",
+                   "repositories": [{"id": "kit", "name": "kit", "teamKeys": ["KIT"]},
+                                    {"id": LEGACY_REVIEW_ENTRY_ID, "name": "reviews",
+                                     "teamKeys": ["REV"]}]}, fh)
+    prog = _reconcile_entries_py(cfg_path)
+    expect("reconcile-runs", prog.count("os.replace") == 1,
+           "the reconcile writes the config more than once")
+    payload = json.dumps({"entries": [{"id": "reviews-kit", "name": "reviews-kit"}],
+                          "remove": [LEGACY_REVIEW_ENTRY_ID]})
+    first = subprocess.run([sys.executable, "-c", prog], input=payload,
+                           capture_output=True, text=True)
+    after = json.load(open(cfg_path))
+    expect("reconcile-runs", first.returncode == 0,
+           "the reconcile program failed: %s" % (first.stderr or "")[:300])
+    expect("reconcile-runs", [r["id"] for r in after["repositories"]]
+           == ["kit", "reviews-kit"],
+           "one atomic rewrite did not both add and remove: %s" % after["repositories"])
+    expect("reconcile-runs", after.get("other") == "untouched",
+           "the rewrite dropped a key it does not own")
+    expect("reconcile-runs", "added reviews-kit" in first.stdout
+           and "removed reviews" in first.stdout,
+           "the program did not say what it did: %r" % first.stdout)
+    again = subprocess.run([sys.executable, "-c", prog], input=payload,
+                           capture_output=True, text=True)
+    expect("reconcile-runs", "nothing changed" in again.stdout,
+           "a second identical pass was not a no-op: %r" % again.stdout)
+
+    # -- 15f3. a review entry this installer did not write is never deleted -- #
+    # It is not ours, and it would fight the fallback, so the run stops and
+    # names it rather than silently leaving two claimants or removing a
+    # stranger's entry.
+    cases += 1
+    ctxF, _fF = _settled_ctx(conf)
+    _install_review_entries(ctxF)
+    ctxF.dispatcher["entries"].append(
+        {"id": "reviews-by-hand", "name": "reviews-by-hand", "repositoryPath": "/x/kit",
+         "teamKeys": ["REV"], "appendInstruction": "something a person wrote"})
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxF, apply_it=True))
+        failures.append("foreign-entry: a second claimant of the Reviews team key was "
+                        "accepted")
+    except SetupError as exc:
+        expect("foreign-entry", "reviews-by-hand" in str(exc) and "by hand" in str(exc),
+               "the refusal does not name it or say who removes it: %s" % exc)
+
     # complement: an entry that DIFFERS must still stop and restart it.
     cases += 1
     ctxH, fakeH = _restart_ctx(conf)
@@ -4254,9 +4790,7 @@ def _selftest_body():
                "an entry that genuinely is not in the log was reported as proven: %r"
                % howB2)
         # …and the step it feeds still refuses to claim success.
-        ctxB2.dispatcher["entries"].append(
-            dict(reviews_entry(ctxB2), allowedUsers=["u-owner"]))
-        ctxB2.dispatcher["entries"][-1].pop("userAccessControl", None)
+        _install_review_entries(ctxB2)
         try:
             _quiet(lambda: step_dispatcher_entry(ctxB2, apply_it=True))
             failures.append("banner-absence: an unproven entry settled the step")
@@ -5115,6 +5649,27 @@ def _selftest_body():
     return 0
 
 
+def _install_review_entries(ctx):
+    """Put the entries this conf wants into the fixture's dispatcher config, in the shape
+    the config READER emits — `userAccessControl` flattened to `allowedUsers` — and hand
+    them back. A fixture that stored the written shape instead would make every
+    already-matching case compare two things neither the installer nor the dispatcher
+    ever sees together."""
+    made = []
+    for want in reviews_entries(ctx):
+        row = dict(want)
+        row["allowedUsers"] = row.pop("userAccessControl")["allowedUsers"]
+        ctx.dispatcher["entries"].append(row)
+        made.append(row)
+    return made
+
+
+def _proof_note(ctx):
+    """The ledger note a pass writes once the dispatcher's log has named every entry."""
+    return {"names": [e["name"] for e in reviews_entries(ctx)],
+            "how": "loaded repository reviews-kit"}
+
+
 def _settled_ctx(conf):
     """A context whose machine already holds everything a settled install has.
     Used to prove a second pass writes nothing."""
@@ -5154,6 +5709,12 @@ def _settled_ctx(conf):
         ("cat $HOME/.stage-e/config.json", 0, json.dumps(bounce)),
         ("gh api repos/example-org/kit --jq", 0, "main\n"),
         ("required_status_checks", 0, '["Kit checks", "Provenance scan"]\n'),
+        # WHICH REPOSITORY A CLONE IS, asked of git rather than read off the
+        # path. The fixture's entry also carries a githubUrl, so a case that
+        # drops this answer still matches — through the second authority, which
+        # is the point of having one.
+        ("git -C /x/kit remote get-url origin", 0,
+         "https://github.com/example-org/kit\n"),
         # …and everything preflight reads, so a WHOLE pass can be driven with
         # no machine. A settled machine passes preflight; a fixture that could
         # not would stop every end-to-end case at the first step.
@@ -5230,13 +5791,13 @@ def _dry_run_ctx(conf, poller=_CLEAN_POLLER, bounce=_CLEAN_BOUNCE):
 
 
 def _restart_ctx(conf, **kw):
-    """A settled machine whose dispatcher config carries NO `reviews` entry —
-    so the step writes one and restarts the service — driven by a launchd that
+    """A settled machine whose dispatcher config carries NO review entry — so
+    the step writes them and restarts the service — driven by a launchd that
     changes state instead of a table that cannot. `kw` goes to FakeLaunchd."""
     ctx, fake = _settled_ctx(conf)
     ctx.runner = FakeLaunchd(answers=list(fake.answers) + [
         ("cp -a %s" % conf["DISPATCHER_CONFIG"], 0, ""),
-        ("json.load(sys.stdin)", 0, "added entry reviews\n"),
+        ("json.load(sys.stdin)", 0, "added reviews-kit\n"),
     ], **kw)
     return ctx, ctx.runner
 
@@ -5296,17 +5857,15 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
         ("launchctl print system/" + bounce_label, 0, "\tstate = not running\n"),
         ("heartbeat.json", 0, "heartbeat.json ok\nbounce-heartbeat.json ok\n"),
     ]
-    # The dispatcher already carries a matching reviews entry, and its load was
+    # The dispatcher already carries matching review entries, and their load was
     # proven once, so nothing here bounces a live dispatcher to re-learn it.
-    already = dict(reviews_entry(ctx))
-    already["allowedUsers"] = already.pop("userAccessControl")["allowedUsers"]
-    ctx.dispatcher["entries"].append(already)
+    _install_review_entries(ctx)
     # …and preflight re-reads the dispatcher's config into ctx.dispatcher, so
     # the fixture's answer has to carry the entry too. A snapshot taken before
     # the append would be silently undone by the first step of every pass.
     fake.answers = [a for a in fake.answers if a[0] != "workspace_base_dirs"] + [
         ("workspace_base_dirs", 0, json.dumps(ctx.dispatcher))]
-    ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = "loaded repository reviews"
+    ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = _proof_note(ctx)
     if stored_env:
         _with_stored_env(ctx, fake, conf)
     ctx.state.attest("A-DRY-RUN", "xx", "count read: 0")
