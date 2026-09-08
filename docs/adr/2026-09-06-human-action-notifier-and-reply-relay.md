@@ -1,0 +1,228 @@
+# Human-action events leave the tracker through a dispatcher-side notifier; replies re-enter only as session-thread comments
+
+**Date:** 2026-09-06 · **Status:** Proposed — awaiting the owner's decisions listed at the end
+· **Context:** the notification-channel investigation (KIT-106), branch
+`docs/kit-106-notification-channel-adr`. Extends build record §15 (*Where a person actually
+lives in this*); builds on
+[Stage E under a delegation-bound dispatcher](2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md)
+and [Fencing tracker text as untrusted data](2026-08-24-untrusted-ticket-data-fence.md).
+
+## Decision
+
+**The events that need a person are pushed to a dedicated chat channel by a small
+dispatcher-side job, not by a session.** The job is the Stage E poller's sibling: same
+account, same env-file rule, same state directory, same one-tick-per-interval shape. It reads
+the tracker and the code host for the marks the pipeline already writes, and it sends one
+short message per event. It runs outside the session sandbox, so **the session egress
+allowlist is not widened** and the channel credential never enters a session's environment.
+
+**Replies are the second step, and a reply can only ever become one comment in one
+session's thread.** The job polls the channel for replies, keeps only those from the one
+pinned human account that are replies to a message it sent itself, resolves the target session
+from its own state file, and posts the text as a comment in that session's agent thread —
+through the same re-prompt function the bounce driver uses. No command grammar exists.
+Approving, merging, labelling and state changes never transit the channel.
+
+**The channel for the reference deployment is a Telegram bot in a private one-person chat.**
+The property that decides it is that its reply API is a plain outbound poll: no inbound URL, no
+open port, no persistent connection, so the same one-shot job can send and receive. The
+decision is written against that property, not the product; any channel with the same
+property fits.
+
+**Ships one-way first.** The one-way half is a day's work and carries no new authority; the
+reply half is a designed step with the security model below, built and reviewed on its own,
+and gated on the same live re-prompt test Stage E's bounce driver is gated on.
+
+## Why
+
+### The problem is delivery, not classification
+
+Every human-action event is already distinguishable. A stopped session begins its comment with
+the escalation marker `<!-- pipeline-escalation: agent:blocked -->` and reports `outcome:
+blocked` (`/work` step 5, contract §4). A session that asks a question through the harness's
+own ask-the-user tool becomes a tracker-side elicitation activity in the session thread, which
+the tracker mirrors as a thread comment. A bounce budget spent is `agent:needs-human` (§6),
+applied by the bounce driver. A review that could not run is a distinct "NOT reviewed"
+comment with a non-zero exit (§13, §14). A PR ready to merge is a review verdict plus green
+required checks. What is missing is a channel that carries only those. Build record §15
+reasoned that ticket decisions belong in the tracker and that a chat tool is only justified for
+ad-hoc questions; this ADR keeps both conclusions and adds one thing: the *ping* that a
+decision is waiting must not compete with bookkeeping.
+
+### Who sends — three candidates, one survivor
+
+- **The session — rejected.** The dispatcher copies its whole environment into every session,
+  so a channel credential in that environment is a credential every session holds. A session
+  could then page the owner with any text, including text a stranger placed in a public PR.
+  It would also need the channel host on the session allowlist, which hands every session an
+  arbitrary-text sink (the KIT-83 finding: a grant cannot be scoped to a port or path). And a
+  session announcing "PR ready, please merge" is the *agent producing a human's signal*
+  defect class this kit is built against.
+- **The safe-outputs executor — not available on this lane.** The executor exists on the
+  GitHub-Actions backend. The live dispatcher runs none; there is nothing to attach a kind to.
+- **A dispatcher-side job — chosen.** Outside the sandbox, so unproxied and unallowlisted;
+  reads the tracker and the code host and nothing inside the dispatcher, so it survives the
+  dispatcher's replacement; and its credential lives in the same file, mode and home the
+  Stage E poller's key already lives in — no new credential class.
+
+### Channel — assessed on the reply path, not the app
+
+| Channel | Reply path | Verdict |
+|---|---|---|
+| Telegram bot | Outbound long-poll for updates; no inbound URL, no persistent connection; mutually exclusive with a webhook, so a poll-only bot has no inbound surface at all | Chosen |
+| Slack | Socket Mode needs a persistent WebSocket to a host chosen at runtime, and events sent while disconnected can be lost; the Events API needs a public URL. One-way is zero-code only if the tracker's own Slack integration can post a label-filtered view to a channel — and that fires only when an issue *enters* the view, which needs the label to be applied first | One-way fallback; a dead end for replies |
+| Discord | The Gateway is a persistent WebSocket; interactions need a public URL; a bot can DM a user only with a shared server | No advantage |
+| iMessage | No API. A daemon has no access to the window server, so the dispatcher account cannot drive the Messages app. A helper in the owner's own login session runs only while logged in and does not return after a reboot with FileVault on; it would run as the owner, outside the sandbox | Rejected: the shape Stage E's first design was rejected for |
+| Push-only services (ntfy, Pushover) | None | One-way only; cannot grow into replies |
+
+A public URL is a new inbound surface on a machine whose front door is deliberately a
+three-path allowlist; a persistent connection is a new long-running process to supervise.
+The poll-based reply API needs neither, which is why it fits the job that already exists.
+
+### The reply path is not a new instruction source
+
+Contract §3 and the untrusted-data ADR settle that everything a session can write is reporting
+and that tracker text is data, not instruction. A reply relay runs straight into that doctrine
+if it lets a channel message become an instruction. It does not, because of six facts, each
+resting on something outside the chat:
+
+1. **Sender pinning.** The job keeps only messages whose sender id is the one configured human
+   account. The channel's servers produce every update the bot receives; the API exposes no
+   method by which anyone, token holder included, injects an update with a chosen sender.
+   Forging a reply therefore requires the owner's channel account — phone plus password and
+   second factor — which is the same standing as the owner's tracker login on the same phone.
+2. **Reply-to addressing.** A message is acted on only if it is a reply to a message the job
+   sent, and the target session is looked up from the job's own state file, never parsed from
+   the text. There is no command grammar to abuse.
+3. **The only effect is a comment.** The relayed text lands as one comment in one session
+   thread, prefixed so the record shows it came through the channel. That is what the owner
+   could already type in the tracker. The session it reaches is still sandboxed and still
+   guard-bound; it cannot merge, approve, label or edit its guards regardless of what the
+   comment says. The channel adds no authority a tracker comment lacks, and tracker comments
+   carry none.
+4. **The bot token's blast radius is confidentiality and phishing, not command.** A token
+   holder can read the owner's replies, send the owner messages, and redirect delivery so the
+   job stops hearing replies. Every genuine notification links only to the tracker and the
+   code host, where the platform authenticates the owner; the highest-authority signals
+   (approve, merge, label, state) never transit the channel. Revoking the token ends the
+   exposure.
+5. **The job's tracker key is the poller's key.** Commenting and delegating as the owner is
+   already what the Stage E poller can do, with the same file and the same accepted risk. No
+   new key class is introduced.
+6. **Bounded and idempotent.** One notification per event, keyed on the comment or activity
+   that caused it so a restart resends nothing; a size and rate cap on relayed replies, above
+   which the job logs and drops; angle brackets stripped from relayed text, because the
+   dispatcher pastes a comment into its prompt inside an unescaped XML wrapper.
+
+**Accepted, and named:** the dispatcher's re-prompt access check tests the *delegator*, not
+the *commenter* — it never reads the commenter's id, and four of its re-prompt paths (the
+stop signal, a re-prompt on a parked session, a repository-selection answer, and the answer
+to a pending ask-the-user question) run with no check at all. Already accepted for the bounce
+driver; the relay is one more writer in the same thread under the same acceptance, and in a
+one-person workspace the only other writers are the owner's own tools. And the channel
+provider stores the message text: a blocked-session question, which may quote code, sits on a
+third party's servers. That is the owner's call and is listed below.
+
+### One gap this closes as a side effect
+
+Under a dispatcher that writes no pin, **nothing applies `agent:blocked`.** The session
+requests it (§6 says it never applies it); on the GitHub-Actions backend the dispatch
+workflow greps the marker and applies the label; on the live dispatcher no component reads the
+marker, so a blocked ticket looks like any other in-progress ticket. The notifier must grep the
+same marker to notify, and it is a dispatcher-side component, which is exactly the writer §6
+names. This ADR proposes it applies the label as it sends, and that §6 gains one line saying
+so for pin-less dispatchers. It is the owner's decision (below) because it makes a new job a
+label writer. It is also what would make the tracker's own view-based routing usable at all.
+
+### What stays in the tracker, on purpose
+
+Ticket creation and state moves, plan and summary comments, finding tickets, clean review
+verdicts, the tracker's own "your agent finished" notification to the delegator, post-merge
+failure and conflict issues (already GitHub issues assigned to the owner), auto-merges (the
+weekly review) and system-level events (the pinned status issue, per §15). The channel
+carries the decisions that are the owner's and nothing else, or it becomes the noise it
+exists to escape.
+
+## Verified
+
+Read this week from primary sources — the channel vendors' current documentation, the
+tracker's developer documentation and SDK schema, the installed dispatcher's source
+(v0.2.69), and the kit — by six readers, with two skeptics per load-bearing claim. Nothing
+was wired: no bot, no token, no allowlist edit, no test message.
+
+- **The dispatcher checks the session creator on a re-prompt, not the commenter.** The
+  prompted-webhook handler calls an access check that reads `webhook.agentSession.creator`;
+  the activity's author id is present in the payload and never read. The check runs only on
+  the ordinary-continuation branch; the stop, parked-re-prompt, repository-selection and
+  ask-the-user-answer branches return before it. Confirmed by both skeptics at the cited lines.
+- **A re-prompt resumes the same session in the same worktree**, verbatim, with the comment
+  body pasted unescaped into an XML wrapper (`resumeSessionId` → the harness's `resume`; cwd
+  = the session's worktree). If the runner is still streaming, the text is injected live.
+- **The dispatcher turns a harness ask-the-user call into a tracker elicitation** with a
+  `select` signal, holds the pending question in memory only, and resolves it from the next
+  prompted webhook. A daemon restart mid-question loses it; the eventual answer is then
+  handled as an ordinary re-prompt. The dispatcher writes no session status on the tracker
+  lane; the tracker sets state itself from the last activity.
+- **The egress proxy is scoped to the session, not the daemon.** No proxy environment
+  variable exists anywhere in the dispatcher's packages; the proxy ports reach the harness
+  subprocess only as a per-session sandbox option, and the code's own comments say the proxy
+  covers shell-spawned traffic only. A launchd job in the same account outside the dispatcher
+  is neither sandboxed nor proxied. Confirmed by both skeptics.
+- **No component under the live dispatcher reads the escalation marker or applies
+  `agent:blocked`.** The only reader is the inert GitHub-Actions lifecycle job. Under an
+  unpinned session the lifecycle-label and own-ticket guards stand down and the session
+  holds a workspace-scoped tracker token, so today every `agent:*` label is session-writable
+  in practice. Confirmed by both skeptics.
+- **Telegram.** One host, `api.telegram.org`; free, with per-chat rate limits and a
+  4,096-character message cap; `getUpdates` is a bot-initiated pull needing no reachable
+  server, mutually exclusive with a webhook; the token gives full control (read, send,
+  redirect) and is revocable; no API method injects an update; `reply_to_message` carries the
+  original message id; bot chats are cloud chats stored on the vendor's servers, not
+  end-to-end encrypted; anyone can message a bot first, so the relay must drop every other
+  sender. Confirmed by both skeptics on the live pages (Bot API 10.3).
+- **Tracker-native routing.** A Slack channel or a person can subscribe to a custom view,
+  and the only per-view triggers are "issue added to the view" and "completed/canceled";
+  personal notifications are per-channel × per-category with no label filter; webhooks
+  filter by team and resource type only. Thread sync is bidirectional only for explicitly
+  synced threads; a reply under a channel notification post is not documented as syncing.
+  An OAuth scope `comments:create` exists and personal API keys can be scoped to comments
+  and teams. Confirmed by both skeptics.
+- **Slack, Discord, push services.** Socket Mode needs a persistent WebSocket to a host
+  returned at runtime and loses events while disconnected; the Events API needs a public
+  URL; the Discord Gateway is a persistent WebSocket and interactions need a public URL;
+  ntfy and Pushover have no reply feature. Read from the vendors' current pages.
+- **iMessage.** A daemon has no access to the window server (Apple, *Designing Daemons* and
+  TN2083; a 2024 Apple DTS answer says the rule stands); a LaunchAgent defaults to the Aqua
+  session type and runs only while that user is logged in; automatic login is unavailable
+  with FileVault on, which it is on the reference machine; the owner's Messages database is
+  unreadable by the role account before TCC is consulted. One skeptic held that "cannot launch
+  a GUI application" over-reads a 2016 page for a root daemon; the window-server conclusion
+  stood.
+
+**Not verified, and named as the gate on the reply half:**
+
+- **That a comment created through the API in the session thread produces a prompt-type
+  activity and so a re-prompt.** The tracker's docs say a re-prompt fires when a user creates
+  a prompt-type activity, that agents cannot create one, and that the mutation for creating
+  one directly is internal; they are silent on whether an API comment counts, or whether the
+  actor type matters. The bounce driver rests on the same claim from the dispatcher's source
+  and is gated on a live test (KIT-99). The relay is gated on the same test. **The one-way
+  half does not depend on it.**
+- Whether the tracker marks a session "awaiting input" on an elicitation. It publishes no
+  activity-to-state table; the notifier keys on the elicitation activity being last, not on
+  the state name.
+- Whether the tracker restricts who may post into a session thread beyond workspace
+  membership. Moot for one person; a question for the day a second joins.
+- That the deployed dispatcher's sandbox is on: the startup banner read "deny-all with 19
+  allowed domains" on 2026-09-03 per the field guide; the config file was not re-read here.
+
+## Owner decisions this ADR waits on
+
+1. The channel itself (an account tied to a phone number), or the zero-code one-way fallback
+   — which still needs the label writer.
+2. Whether the question text may transit the channel provider, or only a title and a link.
+3. One-way first as a separate step, or both halves in one build.
+4. Whether the notifier applies `agent:blocked` (the §6 amendment).
+5. Which PR event is the human moment until Stage E is on ("opened") and after ("reviewed
+   and green").
+6. Where the job lives: beside the Stage E poller, in whichever account that lands in.
