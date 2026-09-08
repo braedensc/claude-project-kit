@@ -231,6 +231,32 @@ def resolve_tier3(issue):
             "out_of_scope": fields["out_of_scope"]}
 
 
+def _criteria_changed(tier, data, issue):
+    """True, False, or None — AND NONE IS NOT FALSE.
+
+    Answerable only by a tier that saw the criteria as they stood at delegation:
+    compare that list against the live one. Tier 3 reads the ticket as it is NOW
+    and holds no record of what it said before, so it cannot answer either way
+    and must say so.
+
+    THE DEFECT THIS REPLACES. This was `issue.updatedAt > issue.startedAt`. That
+    is the RECORD's modification time — bumped by a state move, a label, an
+    assignee, or the pull-request attachment the poller discovers the work by —
+    so it was true on very nearly every reviewed pull request. The reviewer is
+    told in the same breath that a true flag "is itself a `scope` finding worth
+    raising", so a signal that fires always was manufacturing scope findings on
+    clean pull requests, and a finding at or above the threshold spends a real
+    bounce. A flag that is always on is not a flag; worse, it made the one case
+    it exists for — a session that really did rewrite its own acceptance
+    criteria — indistinguishable from every other pull request.
+    """
+    if tier not in ("history", "reconciler"):
+        return None
+    at_delegation = [str(s) for s in (data.get("acceptance_criteria") or [])]
+    live = [str(s) for s in (resolve_tier3(issue).get("acceptance_criteria") or [])]
+    return at_delegation != live
+
+
 def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
     """The basis dict, in the exact shape `pipeline_review_local.py --basis-file`
     already reads: acceptance_criteria[], out_of_scope[], basis_tier,
@@ -244,15 +270,12 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
     empty list regardless of which tier produced it, so naming the tier here is for
     the human reading the eventual PR comment, not for any downstream branching.
 
-    `criteria_changed_after_delegation` is computed ONCE, from the live ticket,
-    regardless of which tier supplied the criteria list — the ADR is explicit that
-    this flag rides along no matter which tier answered.
+    `criteria_changed_after_delegation` is TRUE, FALSE or NONE, and None is not
+    False: only a tier that can see what the criteria said AT DELEGATION can
+    answer it at all. See `_criteria_changed`.
     """
     issue = issue or {}
     delegated_at_str = issue.get("startedAt") or issue.get("createdAt")
-    delegated_at = _parse_iso(delegated_at_str)
-    updated_at = _parse_iso(issue.get("updatedAt"))
-    changed = bool(updated_at and delegated_at and updated_at > delegated_at)
 
     fetcher = history_fetcher or _history_unavailable
     tier, data = None, None
@@ -266,6 +289,8 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
             tier, data = "reconciler", t2
     if data is None:
         tier, data = "live", resolve_tier3(issue)
+
+    changed = _criteria_changed(tier, data, issue)
 
     return {
         "acceptance_criteria": data.get("acceptance_criteria") or [],
@@ -415,18 +440,31 @@ def selftest():
     check("basis falls through to tier 'live' when 1 and 2 are unavailable",
           basis_t3["basis_tier"], "live")
     check("basis carries tier3's criteria", basis_t3["acceptance_criteria"], ["do the thing"])
-    check("basis: updatedAt before startedAt -> NOT changed after delegation",
-          basis_t3["criteria_changed_after_delegation"], False)
+    check("tier 'live' cannot see the criteria at delegation -> UNKNOWN, never False",
+          basis_t3["criteria_changed_after_delegation"], None)
 
+    # THE REGRESSION THIS FILE EXISTS TO HOLD. `updatedAt` is the RECORD's mtime:
+    # a state move, a label, an assignee, or the pull-request attachment the poller
+    # discovers the work by all bump it. Deriving the flag from it read True on
+    # very nearly every reviewed pull request. Bumping it must now change nothing.
     issue_edited_after = dict(issue_with_ac, updatedAt="2026-09-05T11:00:00Z")  # AFTER startedAt
     basis_edited = resolve_basis("KIT-8", issue_edited_after, history_fetcher=_history_unavailable)
-    check("basis: updatedAt after startedAt -> changed after delegation flagged",
-          basis_edited["criteria_changed_after_delegation"], True)
+    check("a bumped updatedAt no longer manufactures a criteria-edit flag",
+          basis_edited["criteria_changed_after_delegation"], None)
 
     basis_t1 = resolve_basis("KIT-8", issue_with_ac, history_fetcher=fake_history)
     check("basis prefers tier 1 when it answers", basis_t1["basis_tier"], "history")
-    check("basis still computes the edit flag when tier 1 answers",
-          basis_t1["criteria_changed_after_delegation"], False)
+    # fake_history says ["as it was at delegation"]; the live ticket says ["do the
+    # thing"]. They differ, so the criteria really were edited — evidence, not mtime.
+    check("tier 1 whose criteria differ from live -> changed",
+          basis_t1["criteria_changed_after_delegation"], True)
+
+    def _history_matching_live(ticket_id, delegated_at):
+        return {"acceptance_criteria": ["do the thing"], "out_of_scope": ["not this"]}
+
+    basis_same = resolve_basis("KIT-8", issue_with_ac, history_fetcher=_history_matching_live)
+    check("tier 1 whose criteria match live -> NOT changed",
+          basis_same["criteria_changed_after_delegation"], False)
 
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "KIT-9.json"), "w", encoding="utf-8") as fh:

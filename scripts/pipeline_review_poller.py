@@ -708,6 +708,25 @@ def _one_line(text):
     return " ".join(sanitize_text(text).split())
 
 
+def _criteria_changed_line(flag):
+    """The basis flag has THREE states and they must not share a rendering.
+
+    A true flag tells the reviewer, in the next clause, that the edit "is itself
+    a `scope` finding worth raising" — so rendering UNKNOWN as `true` invents
+    findings, and rendering it as `false` asserts an absence nothing established.
+    Only a tier that saw the criteria at delegation can answer; tier 3 (`live`)
+    never can. See `_criteria_changed` in pipeline_review_basis.py.
+    """
+    if flag is True:
+        return ("- criteria_changed_after_delegation: `true` — the criteria were edited AFTER "
+                "work was delegated; that is itself a `scope` finding worth raising")
+    if flag is False:
+        return "- criteria_changed_after_delegation: `false`"
+    return ("- criteria_changed_after_delegation: `unknown` — no tier could see what the "
+            "criteria said at delegation. This is NOT evidence that they changed, and NOT "
+            "evidence that they did not; raise no `scope` finding from it either way")
+
+
 def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
     """The review ticket's description — the reviewer's ENTIRE world.
 
@@ -744,10 +763,7 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
         "## What the ticket asked — the review basis",
         "",
         "- basis_tier: `%s`" % (basis.get("basis_tier") or "unspecified"),
-        "- criteria_changed_after_delegation: `%s`%s" % (
-            "true" if basis.get("criteria_changed_after_delegation") else "false",
-            " — the criteria were edited AFTER work was delegated; that is itself a `scope` "
-            "finding worth raising" if basis.get("criteria_changed_after_delegation") else ""),
+        _criteria_changed_line(basis.get("criteria_changed_after_delegation")),
         "",
         TICKET_TEXT_PREAMBLE,
         "",

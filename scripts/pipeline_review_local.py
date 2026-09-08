@@ -207,7 +207,12 @@ def basis_from(obj):
         "acceptance_criteria": ac,
         "out_of_scope": [s for s in (obj.get("out_of_scope") or []) if str(s).strip()],
         "basis_tier": obj.get("basis_tier") or "unspecified",
-        "criteria_changed_after_delegation": bool(obj.get("criteria_changed_after_delegation")),
+        # Tri-state: True, False or None. `bool()` collapsed "no tier could tell"
+        # into "it did not happen" — the safe-LOOKING half of a SS13 conflation,
+        # which is still a conflation.
+        "criteria_changed_after_delegation": (
+            obj.get("criteria_changed_after_delegation")
+            if obj.get("criteria_changed_after_delegation") in (True, False) else None),
     }
 
 
@@ -321,7 +326,7 @@ def render_comment(verdict, ticket, basis):
     lines.append("")
     if basis and basis.get("basis_tier"):
         note = f"_Basis: acceptance criteria via `{basis['basis_tier']}`._"
-        if basis.get("criteria_changed_after_delegation"):
+        if basis.get("criteria_changed_after_delegation") is True:
             note += " ⚠️ _The ticket's criteria were edited after work was delegated._"
         lines += [note, ""]
     if not verdict["findings"]:
