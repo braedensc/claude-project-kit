@@ -153,16 +153,19 @@ gate; only the first does now.
    (`scripts/pipeline_review_basis.py`). No basis ⇒ it declines, loudly, with a PR comment
    that says *NOT reviewed*.
 3. It **sanitizes** every string it copies — strips the dispatcher's routing and model tags
-   (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. Then,
+   (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. It
+   writes **one** routing tag of its own, on the ticket's first line, outside every fence:
+   `[repo=reviews-<repo name>]`, which puts the reviewer in a clone of the repository the
+   diff came from. It refuses to file a ticket carrying any other one. Then,
    **before it creates anything**, it asks Linear whether a review ticket for this PR
    already exists, and reuses it if so. Otherwise it creates **and delegates**, in one
    Linear `issueCreate` carrying `delegateId`, a review ticket in the **Reviews** team. The
    ticket body is the reviewer's whole world: brief, criteria, threshold, output shape, and
    the diff inlined under a size cap. It is never parented. It names the PR as
    `owner/repo#N` and never as a link, so nothing can auto-attach it.
-4. **The dispatcher** sees a delegation by the owner, routes it by team key to the Reviews
-   entry, cuts a worktree from the default branch, and starts a session with **no Bash,
-   Edit, Write or fetch tools**. The reviewer reads the ticket body and answers with one
+4. **The dispatcher** sees a delegation by the owner, reads that tag, routes it to that
+   repository's review entry, cuts a worktree from the entry's default branch, and starts
+   a session with **no Bash, Edit, Write or fetch tools**. The reviewer reads the ticket body and answers with one
    fenced JSON block.
 5. The poller reads that block back from the ticket's agent-session `response` activity,
    checks the ticket body was not edited since it wrote it, validates the document whole,
@@ -256,21 +259,44 @@ Not: a review ticket that jumped to Done when the PR merged — an automation is
 
 ---
 
-## Step 2 — The dispatcher: a second repository entry for reviews
+## Step 2 — The dispatcher: one review entry per reviewed repository
 
-Add one entry to the dispatcher's `repositories` array. It points at a plain clone of the
-managed repository (a separate clone from the coding entry's is tidier), bases on the
-default branch, routes on the Reviews team key, admits only you as a delegator, and
-removes every tool that could act.
+Add **one entry per repository you review** to the dispatcher's `repositories` array. Each
+points at a clone of **that** repository (a separate clone from the coding entry's is
+tidier), bases on its default branch, admits only you as a delegator, and removes every
+tool that could act.
+
+**Why one each, and not one shared entry.** A review session's worktree is cut from one
+entry's clone. With a single shared entry, a reviewer judging a pull request from one
+repository sits in a clone of another. It still has Read, Grep and Glob, so it opens a
+file named in the diff and finds nothing — or finds a same-named file from the wrong
+codebase and reasons about it with confidence. That is a wrong finding, and a wrong
+finding can bounce the coding session.
+
+**It is still one Reviews team.** Teams cost money by subscription tier and you would have
+to remember a new one per repository. What tells the dispatcher which entry to use is a
+tag the poller writes into the ticket: `[repo=reviews-<repo name>]`, on the first line.
+The dispatcher reads description tags before labels, projects and team keys.
+
+The name matters. `reviews-kit` names the review entry. A tag naming the repository itself
+(`[repo=kit]`) would also match the **coding** entry for it — by name and by `githubUrl` —
+and the dispatcher starts a session in *every* entry a tag matches. That session would
+have Bash and Write. The installer refuses to write an entry whose name any other entry
+could answer to.
+
+Below is **the first** of those entries — the one that keeps `teamKeys`. Copy it per
+repository, changing the name and the clone, and drop `teamKeys` from every copy after the
+first (why, two paragraphs down).
 
 ```json
 {
-  "id": "reviews",
-  "name": "reviews",
-  "repositoryPath": "<absolute path to a clone of the managed repo, for the review lane>",
+  "id": "reviews-<repo name>",
+  "name": "reviews-<repo name>",
+  "repositoryPath": "<absolute path to a clone of THAT repo, for the review lane>",
   "baseBranch": "main",
   "workspaceBaseDir": "<the dispatcher's worktree root>",
   "linearWorkspaceId": "<your Linear workspace id>",
+  "routingLabels": ["stage-e-review-entry-never-label-routed"],
   "teamKeys": ["REV"],
   "isActive": true,
   "disallowedTools": [
@@ -283,29 +309,54 @@ removes every tool that could act.
 }
 ```
 
+**Two keys that need a word first.**
+
+`teamKeys` goes on **exactly one** review entry — the first repository in `REVIEW_REPOS`.
+It is the fallback for a review ticket that somehow arrives with no routing tag. Team
+routing takes the *first* entry claiming a key, so two claimants would make which clone a
+reviewer reads depend on the order of a file. With one, a missing tag degrades to the old
+behaviour — a read-only reviewer, possibly in the wrong repository — instead of falling
+through to catch-all routing and starting a session in an entry that can write.
+
+`routingLabels` carries a label that **must never exist** in your tracker. It is not a way
+in; it is what keeps these entries out of catch-all routing. The dispatcher's last resort
+before giving up is the first entry with no `teamKeys`, no `routingLabels` and no
+`projectKeys` — so without it, the review entries that carry no team key would quietly
+swallow every delegated ticket from a team you have not configured. Today that raises a
+"which repository?" prompt, which is the answer you want. Do not create this label.
+
 **Leave out** — on purpose, each for a reason:
 
 | Key | Why it must be absent |
 |---|---|
-| `githubUrl` | A `[repo=…]` description tag routes to *every* entry whose `githubUrl` matches. With none, no tag can pull a review into this entry. The poller strips the tags anyway. |
-| `routingLabels`, `projectKeys`, `labelPrompts` | Routing is by team key only. No second path in. |
+| `githubUrl` | A `[repo=…]` tag routes to *every* entry whose `githubUrl` ends in that name. With none, no tag naming a repository can pull a review into these entries — and no coding entry can answer to a tag naming one of them. |
+| `projectKeys`, `labelPrompts` | The routing tag is the way in. No third path. |
 | `promptTemplatePath` | Stripped by the dispatcher's CLI config loader before it is read. Setting it does nothing. The brief lives in `appendInstruction`. |
 | `allowedTools` | Restricts nothing — the dispatcher's permission callback allows every tool but `AskUserQuestion`. Only `disallowedTools` fences. |
 | `model` | The poller picks the model with a ticket label; a fixed model here would fight it. |
 | `mcp__linear…` in `disallowedTools` | **Owner decision 2026-09-06:** the Linear MCP tools stay available to every session, the reviewer included. Accepted and monitored. Add them here if that changes. |
 
 Then **restart the dispatcher**, once, *because the file changed*. Do not rely on hot
-reload for a new entry. Confirm in its log that the `reviews` entry loaded and that the
-runner reports nine disallowed tools.
+reload for a new entry. Confirm in its log that **every** `reviews-…` entry loaded and
+that the runner reports nine disallowed tools. One missing entry is one repository whose
+reviews fall back to another repository's clone.
 
-The installer restarts it on exactly that condition: a pass that finds the entry already
-byte-identical does **not** bounce the service, because a restart kills every in-flight
-coding session and you are told to re-run the same command to clear the cards downstream of
-here. Whether the entry matches and whether its load has been proven are recorded
-separately, so a re-run re-reads the log without re-starting anything. If the log names it
-nowhere, the run reports `UNKNOWN` and prints the restart-and-re-read commands; signing off
-`A-ENTRY-LOADED` is the other way out, and watching `CK-7` is a third — slower, because it
-is downstream of this step.
+The installer restarts it on exactly that condition: a pass that finds every entry already
+byte-identical, with nothing left to remove, does **not** bounce the service, because a
+restart kills every in-flight coding session and you are told to re-run the same command to
+clear the cards downstream of here. Whether the entries match and whether their load has
+been proven are recorded separately, so a re-run re-reads the log without re-starting
+anything. A recorded proof names the entries it proved, so adding a repository does not
+inherit it. If the log names one of them nowhere, the run reports `UNKNOWN` and prints the
+restart-and-re-read commands; signing off `A-ENTRY-LOADED` is the other way out, and
+watching `CK-7` is a third — slower, because it is downstream of this step.
+
+The installer writes and removes in **one** rewrite of the config, and it removes two
+things: a review entry for a repository you no longer review, and the single `reviews`
+entry an older installer wrote. Both would otherwise go on claiming the Reviews team key
+while pointing at a clone this conf never chose. It will **not** delete a `reviews-…` entry
+that does not carry the reviewer brief — that one is someone else's, so the run stops and
+names it instead.
 
 **`bootout` does not mean the job is gone yet, and that is what makes this dangerous.**
 `launchctl bootout` returns when launchd has *accepted* the request. launchd then sends
@@ -332,8 +383,11 @@ yours.
 Do the same by hand: never `bootout` and `bootstrap` on consecutive lines. Wait for
 `sudo launchctl print system/<label>` to fail before you bootstrap.
 
-Multi-repo: routing is by team key and one entry has one `repositoryPath`, so each managed
-repo gets its own Reviews team key and its own entry. Start with one.
+Multi-repo: `python3 <scripts dir>/pipeline_stage_e_setup.py run` writes and reconciles
+these entries for you, one per repository in `REVIEW_REPOS`. It matches each to a clone by
+asking `git -C <path> remote get-url origin` what that clone *is* — never by the name of
+its directory. A repository the dispatcher manages no clone of is a refusal, not a guess:
+guessing a clone is the defect this whole shape exists to remove.
 
 ### The reviewer brief — the value of `appendInstruction`
 
@@ -367,6 +421,11 @@ description omitted, because the body carries the whole diff and a dry run must 
 that to a terminal or a log. The first and only chance to read it is the first real review
 ticket, in the tracker (live test 3). In order:
 
+0. One routing tag, alone on the first line: `[repo=reviews-<repo name>] — routes this
+   review to…`. It is the only dispatcher directive the whole body is allowed to carry;
+   every other one, in quoted ticket text or in the diff, is replaced with
+   `(removed-routing-tag)`. If you ever see a second one, the poller has a bug — it
+   refuses to file such a ticket, so the review will have failed rather than shipped.
 1. The brief: *You are a review-only session. You cannot run commands or edit files. Your
    entire deliverable is one fenced json block in your final message.*
 2. The PR as `owner/repo#N`, and the original ticket id.
@@ -858,9 +917,11 @@ file, or under its state root. See the three rules in *What runs where*.
 
 The poller reads GitHub and Linear and nothing inside the dispatcher. Everything
 dispatcher-specific is the configuration in Step 2 and the behaviours it relies on:
-per-entry `disallowedTools`, `appendInstruction`, `teamKeys` routing, the description-tag
-base-branch override, label-based model selection, the agent-session re-prompt, the
-delegator check, and worktree-per-issue deleted only on a terminal state. Discovery adds
+per-entry `disallowedTools`, `appendInstruction`, `teamKeys` routing, **description-tag
+routing and its priority over team keys** (this is what puts a reviewer in the right
+clone), the description-tag base-branch override, label-based model selection, the
+agent-session re-prompt, the delegator check, and worktree-per-issue deleted only on a
+terminal state. Discovery adds
 one more: that the dispatcher's work leaves an **agent session on the ticket**. A
 replacement dispatcher that honours a Linear delegation, records an agent session, and
 posts its result as a `response` activity needs the poller changed nowhere.
