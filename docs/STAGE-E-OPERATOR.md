@@ -307,6 +307,31 @@ nowhere, the run reports `UNKNOWN` and prints the restart-and-re-read commands; 
 `A-ENTRY-LOADED` is the other way out, and watching `CK-7` is a third — slower, because it
 is downstream of this step.
 
+**`bootout` does not mean the job is gone yet, and that is what makes this dangerous.**
+`launchctl bootout` returns when launchd has *accepted* the request. launchd then sends
+`SIGTERM` and waits up to the plist's own `ExitTimeOut` — two minutes is an ordinary
+value — before it resorts to `SIGKILL`. Bootstrapping into a service the domain still
+holds is the classic source of `Bootstrap failed: 5: Input/output error` (errno 5, EIO;
+`launchctl error 5` will tell you so). A dispatcher stopped and never started again is the
+worst state this machine has: no ticket starts a session at all, and it is silent.
+
+So the installer's restart is: stop it, **poll `launchctl print` until launchd no longer
+holds it** (bounded by that plist's `ExitTimeOut` plus headroom), then bootstrap — retrying
+a bounded number of times on EIO, and asking the domain afterwards, because an exit code of
+`0` is not the same fact as a running dispatcher. If it still will not come back, the run
+ends with a banner naming the service, the exact `sudo launchctl bootstrap` command, and
+the config backup it took a moment earlier.
+
+**It does not restore that backup for you**, deliberately. A restore starts nothing, so an
+automatic one would hand you a dispatcher that is still down *and* now silently missing the
+entry the run just reported writing; and the file is your only evidence for why the service
+would not come back. EIO is a domain error raised before any config is read, so the config
+is usually the wrong suspect anyway. The banner prints the restore command. The call is
+yours.
+
+Do the same by hand: never `bootout` and `bootstrap` on consecutive lines. Wait for
+`sudo launchctl print system/<label>` to fail before you bootstrap.
+
 Multi-repo: routing is by team key and one entry has one `repositoryPath`, so each managed
 repo gets its own Reviews team key and its own entry. Start with one.
 
@@ -582,7 +607,10 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.stage-e-polle
 
 Editing a plist later needs `sudo launchctl bootout system/com.example.stage-e-poller`
 and then `bootstrap` again. `launchctl kickstart -k` restarts the process but does **not**
-re-read the plist.
+re-read the plist. **Wait between the two** — `bootout` returns before the job has died,
+and bootstrapping into a service launchd still holds answers `Bootstrap failed: 5:
+Input/output error` and leaves you with nothing loaded. Poll
+`sudo launchctl print system/<label>` until it fails, then bootstrap.
 
 **What this buys you, and what it does not:**
 
