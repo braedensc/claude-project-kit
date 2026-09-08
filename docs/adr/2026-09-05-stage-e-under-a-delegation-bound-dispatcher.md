@@ -648,7 +648,14 @@ scratch directory outside this repository:
   identifier; the branch is Linear's suggested name and no API field sets it. A sub-issue
   bases on its parent's branch when one exists (`GitService.ts:452-477`); a
   `[repo=<name>#<branch>]` description tag overrides the base branch and routes to every
-  entry whose `githubUrl` matches (`RepositoryRouter.ts:451-452`).
+  entry it matches — **and it matches on three things, not one** (re-read 2026-09-08 in
+  v0.2.69's shipped `dist/RepositoryRouter.js:253-269`, correcting an earlier reading of
+  this line that said `githubUrl` only): a `githubUrl` ending in `/<tag>` or `/<tag>.git`,
+  then `repo.name` compared case-insensitively, then `repo.id` exactly. Description-tag
+  routing is **priority 1**, ahead of labels, projects and team keys (`:110-161`). The
+  review entries carry no `githubUrl` at all, so the NAME match is the one that puts a
+  reviewer in the right clone; a reading of this line as githubUrl-only would have made
+  that mechanism inert.
 - **Sandbox:** dedicated non-admin account; Seatbelt `allowWrite [worktree, TMPDIR]`,
   `denyRead ['~/']` (`RunnerConfigBuilder.ts:558-579`); shell network only through the
   allowlisting proxy; `WebFetch` bypasses the proxy. The whole process env is copied into

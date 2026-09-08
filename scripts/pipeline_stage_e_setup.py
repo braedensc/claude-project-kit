@@ -2383,10 +2383,18 @@ ENTRY_COMPARE_KEYS = ("name", "repositoryPath", "baseBranch", "teamKeys",
 
 
 def _owns_review_entry(entry):
-    """True for an entry THIS installer wrote — the only ones a pass may replace or
-    remove. Ownership is the id's shape AND the brief's first sentence: an entry that
-    merely sits under the same name, written by hand or by something else, is left alone
-    and reported, never deleted."""
+    """True for an entry THIS installer wrote. Ownership is the id's shape AND the
+    brief's first sentence.
+
+    WHAT OWNERSHIP GATES, precisely: REMOVAL, and nothing else. An entry sitting at an id
+    this conf wants — written by hand, or by an older version — is still REPLACED, because
+    replace-by-id is the only upgrade path there is, and because an unowned entry answering
+    to a review tag is the state `_tag_ambiguity` exists to prevent. That is reported
+    (`replaced <id>`, echoed from the reconcile, and named as `would write <id>` on a dry
+    run) and it is recoverable (the config is backed up in the same run, and the step
+    refuses to write at all if the backup fails). What ownership prevents is a pass
+    DELETING an entry it did not write; a stranger claiming the Reviews team key stops the
+    run instead."""
     eid = (entry.get("id") or "")
     if not (eid == LEGACY_REVIEW_ENTRY_ID or eid.startswith(REVIEW_ENTRY_PREFIX)):
         return False
@@ -2884,18 +2892,42 @@ BANNER_TAIL = 300                        # …and how much of that is read back
 BANNER_TRIES = 10
 
 
+# The characters an entry name is made of. A boundary between them is NOT a
+# boundary between names — which is the whole of the defect below.
+_ENTRY_NAME_CHAR = r"[A-Za-z0-9._-]"
+
+
+def _name_token(entry):
+    """`entry` as a WHOLE name, as a regex fragment.
+
+    `\\b` CANNOT EXPRESS THIS, and reading it as if it could was a real defect.
+    `-` and `.` are non-word characters, so `\\b` is satisfied the moment one
+    follows: `reviews-kit\\b` matches inside `reviews-kit-docs`, and
+    `reviews-app\\b` inside `reviews-app.js`. While there was one review entry
+    called `reviews` there was no sibling to collide with; the moment entry
+    names became `reviews-<repo name>`, two ordinary repositories (kit and
+    kit-docs, api and api-client) made the collision reachable — and it fails in
+    the one direction a proof must not, since a false proof is written to the
+    ledger and never looked at again.
+
+    Lookarounds against the name's own character set instead. The left one also
+    stops a longer name's own hyphen from serving as the bullet in
+    `_entry_named`: in `• my-reviews-kit (/x)` the character before `reviews` is
+    `-`, so nothing there can prove `reviews-kit`."""
+    return r"(?<!%s)%s(?!%s)" % (_ENTRY_NAME_CHAR, re.escape(entry), _ENTRY_NAME_CHAR)
+
+
 def _entry_named(entry):
-    """`   • reviews (/path/to/clone)` — the id as its own word on a LIST line:
-    a bullet before it, or its clone path in parentheses after it.
+    """`   • reviews-kit (/path/to/clone)` — the id as a WHOLE NAME on a LIST
+    line: a bullet before it, or its clone path in parentheses after it.
 
     The list shape is load-bearing. Inside a region a bare substring would
     match any log line that happens to carry the word — a ticket title, a
     branch name, "posting 2 reviews" — and that is the one direction this
     function must not fail in, since a false proof is recorded as a note and
     never looked at again."""
-    tok = re.escape(entry)
-    return re.compile(r"(?:[•●▪·*+\-]\s*%s\b|\b%s\b\s*\()"
-                      % (tok, tok), re.I)
+    name = _name_token(entry)
+    return re.compile(r"(?:[•●▪·*+\-]\s*%s|%s\s*\()" % (name, name), re.I)
 
 
 def _proof_covers(note, names):
@@ -2956,10 +2988,15 @@ def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,)):
             same = r.as_root(["/bin/sh", "-c",
                               "grep -i -e %s %s 2>/dev/null | tail -60"
                               % (shlex.quote(entry), shlex.quote(path))])
+            # The grep is a substring PREFILTER; what counts is the whole name.
+            # A bare `entry in line` here had the same hole as the old `\b`:
+            # "loaded repository reviews-kit-docs with 9 disallowed tools" names
+            # all three concepts and would have proved `reviews-kit`.
+            token = re.compile(_name_token(entry), re.I)
             for line in (same.out or "").splitlines()[::-1]:
                 low = line.lower()
-                if entry.lower() in low and ("repositor" in low or "entr" in low
-                                             or "disallow" in low):
+                if token.search(line) and ("repositor" in low or "entr" in low
+                                           or "disallow" in low):
                     found[entry] = line.strip()[:120]
                     break
         if len(found) == len(wanted):
@@ -4941,6 +4978,56 @@ def _selftest_body():
         provenB4, howB4 = _banner_proves_entry(ctxB4)
         expect("banner-one-line-still-works", provenB4 is True and "reviews" in howB4,
                "a dispatcher naming both concepts on one line stopped counting: %r" % howB4)
+
+        # -- 15i-b. A SIBLING NAME IS NOT THIS NAME ------------------------- #
+        # One review entry per repository made the entry names siblings, and
+        # `\b` is satisfied by the `-` or `.` that starts the next segment — so
+        # a banner naming only `reviews-kit-docs` proved `reviews-kit`, wrote
+        # that to the ledger, and every later pass settled on it without
+        # re-reading the log. The false direction, on a guard whose whole job is
+        # to fail in the true one. Two ordinary repositories (kit and kit-docs)
+        # are all it takes.
+        cases += 1
+        sibling_only = (
+            "\U0001f4e6 Managing 3 repositories:\n"
+            "   • kit (/Users/<role-account>/kit)\n"
+            "   • reviews-kit-docs (/Users/<role-account>/kit-docs)\n"
+            "   • my-reviews-kit (/Users/<role-account>/elsewhere)\n")
+        ctxB5, _fB5 = _banner_ctx(conf, region=sibling_only)
+        provenB5, howB5 = _banner_proves_entry(ctxB5, ["reviews-kit"])
+        expect("banner-sibling-is-not-proof", provenB5 is False,
+               "a banner naming only a LONGER sibling proved the shorter entry: %r" % howB5)
+        # …and the same hole in the one-line shape, which named all three of the
+        # words that rule looks for.
+        cases += 1
+        ctxB6, _fB6 = _banner_ctx(
+            conf, region="",
+            same="[INFO] loaded repository reviews-kit-docs with 9 disallowed tools\n")
+        provenB6, howB6 = _banner_proves_entry(ctxB6, ["reviews-kit"])
+        expect("banner-sibling-is-not-proof", provenB6 is False,
+               "the one-line rule proved a name it only contains: %r" % howB6)
+        # The complement: the entry's OWN bullet still proves it, so the fix did
+        # not buy strictness by making the step unclearable again.
+        cases += 1
+        ctxB7, _fB7 = _banner_ctx(conf, region=(
+            "\U0001f4e6 Managing 3 repositories:\n"
+            "   • reviews-kit-docs (/Users/<role-account>/kit-docs)\n"
+            "   • reviews-kit (/Users/<role-account>/kit)\n"))
+        provenB7, howB7 = _banner_proves_entry(ctxB7, ["reviews-kit", "reviews-kit-docs"])
+        expect("banner-sibling-is-not-proof", provenB7 is True and "reviews-kit" in howB7,
+               "the real bullets stopped proving their own entries: %r" % howB7)
+        # PARTIAL IS ABSENT. One entry missing from the banner is one repository
+        # whose reviews fall back to another entry's clone, so a proof of the
+        # others is not a proof.
+        cases += 1
+        ctxB8, _fB8 = _banner_ctx(conf, region=(
+            "\U0001f4e6 Managing 2 repositories:\n"
+            "   • reviews-kit (/Users/<role-account>/kit)\n"))
+        provenB8, howB8 = _banner_proves_entry(ctxB8, ["reviews-kit", "reviews-app"])
+        expect("banner-partial-is-absent",
+               provenB8 is False and "reviews-app" in howB8 and "reviews-kit" not in howB8,
+               "a banner naming one of two entries was read as proving both, or the "
+               "refusal did not name the missing one: %r" % howB8)
     finally:
         globals()["_pause"] = _saved_pause
 
