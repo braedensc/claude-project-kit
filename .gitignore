@@ -20,6 +20,10 @@ planning/
 # stage-e.conf.example is the committed one.
 stage-e.conf
 
+# The Stage A (idea-gate) installer's filled-in settings — same reasoning as
+# stage-e.conf. stage-a.conf.example is the committed one.
+stage-a.conf
+
 # Dependencies
 node_modules/
 

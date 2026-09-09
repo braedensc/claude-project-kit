@@ -155,6 +155,7 @@ npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
+npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13)
 npm run test:emit       # generation-side gate: every producer REFUSES to write a malformed doc
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
 npm run test:block      # telemetry block builder + the telemetry-required gate (§4, §8)
@@ -173,6 +174,8 @@ npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-an
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
+npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
+                             #   (no Linear MCP), agent-refused, conf-all-errors, human gates
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook

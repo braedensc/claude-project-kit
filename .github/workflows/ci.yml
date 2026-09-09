@@ -209,6 +209,13 @@ jobs:
       - name: Stage E installer selftest (idempotent, agent-refused, §13 exit codes)
         run: python3 scripts/pipeline_stage_e_setup.py --selftest
 
+      # The Stage A (idea-gate) installer: the fallback-(b) tool-fence composition
+      # (no Linear MCP attached; Write kept), agent-env refusal, conf-all-errors,
+      # and no move/approve/merge verb in its own source. Composes-and-hands-off
+      # the dispatcher entry; never turns the gate on.
+      - name: Stage A installer selftest (fence composition, agent-refused, human gates)
+        run: python3 scripts/pipeline_stage_a_setup.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 

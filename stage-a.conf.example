@@ -1,0 +1,55 @@
+# stage-a.conf.example — every value the Stage A (idea-gate) installer asks you for.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp stage-a.conf.example stage-a.conf && chmod 600 stage-a.conf
+#   $EDITOR stage-a.conf                              # six values, none of them secret
+#   python3 scripts/pipeline_stage_a_setup.py run     # the only command you type
+#
+# `run` validates this file before it touches anything, and reports EVERY bad
+# value in one pass — not the first one it meets. Fix them all, run it again.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
+#
+#   FORMAT.  `KEY=value`, one per line.  `#` starts a comment ONLY at the start
+#   of a line.  It is PARSED, never SOURCED — no `$(…)`, no backticks, no export.
+#
+#   NO KEY HERE EVER HOLDS A CREDENTIAL.  The executor's Linear key is named
+#   here, never valued: the installer writes the value into the role account's
+#   own env file at mode 600, and this file records only the env-var NAME.
+#
+#   MODE 600.  It holds no secret, but it holds the shape of your deployment.
+#   `stage-a.conf` is gitignored; this example is committed.  Every value below
+#   is synthetic (`example.com`, the namespaced `_planclaw`); edit them all.
+# ---------------------------------------------------------------------------
+
+
+# The non-admin local account the executor runs as — NOT your login. A job under
+# your login stops when you log out; the executor would then file no plans while
+# the dispatcher kept starting planning sessions. The installer never creates it.
+ROLE_ACCOUNT=_planclaw
+
+# The Linear team key you delegate idea tickets into. Being on this team is what
+# makes a session a PLANNING session — the job kind comes from the team, never
+# from a label or text inside the ticket.
+PLANNING_TEAM_KEY=PLAN
+
+# The Linear workspace slug (builds ticket URLs).
+LINEAR_WORKSPACE=example
+
+# Your own Linear USER ID — the person notified on every filed plan and named as
+# the subscriber on each epic. A plan nobody is notified about dies in the
+# backlog. This is the user id, not an email.
+OWNER_USER_ID=REPLACE_WITH_YOUR_LINEAR_USER_ID
+
+# The NAME — never the value — of the environment variable the executor reads its
+# Linear key from. The installer writes the value into the role account's env
+# file (mode 600); a value here would be a leaked key.
+LINEAR_KEY_ENV=STAGE_A_LINEAR_API_KEY
+
+# The https clone URL the role account fetches the kit from (the executor runs
+# scripts/pipeline_plan_executor.py out of it). Not ssh — the role account has no
+# keys.
+KIT_REPO_URL=https://github.com/example-org/claude-project-kit
