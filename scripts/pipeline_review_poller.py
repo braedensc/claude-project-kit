@@ -134,8 +134,12 @@ HOW OFTEN A PR IS REVIEWED, AND WHAT BOUNDS IT
   if the session pushes after every one of them.
 
   Without this, the loop was open at the other end: a PR was reviewed once ever, so the
-  bounce driver's `outcome_is_fresh` never saw an outcome for the new head and bounces
-  2..maxBounces could not fire at all — a budget above 1 was a number with no behaviour.
+  bounce driver's `outcome_is_fresh` never saw an outcome for the new head and the REVIEW
+  half of its trigger could not fire again — a budget above 1 bought nothing on findings.
+  (The CI half was unaffected throughout: `compute_trigger` returns true on terminally-red
+  required checks before it looks at the outcome at all, so a red PR could always spend its
+  whole budget. It is findings that could not, and the conclusion path — clean, or below
+  threshold — could not be reached after a bounce either, for exactly the same reason.)
 
 LINEAR IS THE SOURCE OF TRUTH; THE SEEN-SET IS A REBUILDABLE CACHE
 
@@ -382,6 +386,14 @@ COLLECT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
 # review never saw — so it must not consume that retry budget and must never expire.
 REREVIEW_STATUS = "rereview"
 RESELECTABLE_STATUSES = ("retry", REREVIEW_STATUS)
+# The only statuses a re-review may re-open. A record in any OTHER state is either
+# mid-flight (`pending`, `delivering`, `publish-failed`, `close-pending` — its review
+# ticket is live and `collect` still owes it a comment, an outcome or a close) or already
+# re-selectable. Re-marking one would rebuild the record from scratch in `scan_pr` and
+# throw away the `review_ticket_id` it points at, orphaning a delegated ticket and buying
+# a second paid reviewer session. Reachable for real: a terminally-red CI check bounces a
+# PR whose first review is still pending, so a request can exist before any outcome does.
+SETTLED_STATUSES = ("collected", "declined")
 # The shape of the file `pipeline_bounce_local.perform_bounce` leaves after each delivered
 # bounce. Requests written before this loop existed carry no schema key and are still read.
 REREVIEW_SCHEMA = "pipeline-rereview-request/1"
@@ -1185,7 +1197,9 @@ def write_outcome(state_dir, artifact):
 # deleted when the ticket exists), so a PR can never be reviewed more times than the
 # bounces spent on it, plus the one review it was opened with. Without this reader a PR was
 # reviewed exactly once ever — and since `outcome_is_fresh` then never saw an outcome for
-# the new head, bounces 2..maxBounces could not fire at all, whatever the budget said.
+# the new head, the REVIEW half of its trigger could never fire again — nor could the
+# conclusion path, which needs a FRESH outcome too. (Red CI still bounced: that half of
+# `compute_trigger` never consults the outcome.)
 # --------------------------------------------------------------------------- #
 def rereview_path(state_dir, owner_repo, number):
     """The bounce driver's own spelling, read off `perform_bounce`: `rereview/` then
@@ -2246,10 +2260,30 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
         record["rereview_after_bounce"] = rereview["after_bounce_no"]
         record["rereview_of_head"] = rereview["head_before"]
 
+    def spend_request(what):
+        """Spend the re-review request on a TERMINAL path, and only there. A `retry` is not
+        terminal — the request has to survive it so the next pass re-attempts — but a
+        decline is: the reviewer's answer was "not reviewed, and here is why", it was
+        published as a PR comment and written to the outcome file, and the request paid for
+        that. Leaving it unspent makes the same decline re-fire every pass forever, posting
+        an identical duplicate comment each time, with no bound and no self-healing."""
+        if rereview is None:
+            return
+        if dry_run:
+            print("[dry-run] the re-review request for %s#%d would be spent here (%s) — "
+                  "nothing removed" % (owner_repo, number, what))
+            return
+        log("re-review request for %s#%d (after bounce %d, %s): %s"
+            % (owner_repo, number, rereview["after_bounce_no"], what,
+               consume_rereview_request(cfg["state_dir"], owner_repo, number, rereview)))
+
     def declined(reason, basis=None):
         record.update(basis=basis, verdict=decline_verdict(cfg, reason), final_status="declined",
                       reviewer_outcome="success")
         settle(cfg, key, record, seen, linear_key, dry_run, result)
+        # AFTER settle, for the same reason the created path spends after `persist`: the
+        # comment and the outcome are what the request bought, so the spend follows them.
+        spend_request("declined at scan")
 
     def retry_later(reason, detail, basis=None):
         attempts = int(prior.get("attempts") or 0) + 1
@@ -2284,14 +2318,7 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
     # ONLY NOW. The request is the one thing that would buy this review again, so it is
     # spent after the record is durable and never before: a crash above this line retries,
     # a crash below it is covered by the dedup search on the next pass.
-    if rereview is not None:
-        if dry_run:
-            print("[dry-run] the re-review request for %s#%d would be spent here — nothing removed"
-                  % (owner_repo, number))
-        else:
-            log("re-review request for %s#%d (after bounce %d): %s"
-                % (owner_repo, number, rereview["after_bounce_no"],
-                   consume_rereview_request(cfg["state_dir"], owner_repo, number, rereview)))
+    spend_request("ticket created")
     print("%s %sreview ticket %s for %s#%d (%s), %d chars%s"
           % ("REUSED existing" if reused else "created",
              "RE-" if rereview is not None else "", issue.get("identifier"), owner_repo,
@@ -2375,11 +2402,22 @@ def scan(cfg, dry_run):
             log("FAIL: %s" % problem)
             result.errors += 1
         due_keys = {pr_key(owner_repo, n) for n in due}
+        marked = set()
         for number in sorted(due):
             key = pr_key(owner_repo, number)
             record = seen.get(key)
             if record is None or record.get("status") in RESELECTABLE_STATUSES:
                 continue          # nothing to reopen, or already re-selectable
+            if record.get("status") not in SETTLED_STATUSES:
+                # Mid-flight: its review ticket is live and `collect` still owes it a
+                # comment, an outcome or a close. Re-marking would rebuild the record and
+                # lose the ticket id. The request is NOT spent — this PR is due again the
+                # moment its first review settles.
+                log("RE-REVIEW deferred: %s#%d is due but its first review is still %s — "
+                    "waiting for it to settle so its review ticket is not orphaned"
+                    % (owner_repo, number, record.get("status")))
+                continue
+            marked.add(key)
             record = dict(record, status=REREVIEW_STATUS,
                           rereview_from=record.get("status"),
                           rereview_after_bounce=due[number]["after_bounce_no"])
@@ -2417,6 +2455,24 @@ def scan(cfg, dry_run):
         # fallback, which is what a workspace with no GitHub integration relies on.
         selected = select_new_reviews(prs, seen_keys, cfg["team_keys"], owner_repo,
                                       hints=hints, hints_only=not configured)
+        # A record marked `rereview` that selection then DROPS — the PR went draft, its
+        # fork flag is unknown, discovery lost its hint, its team is unmanaged — would sit
+        # in `rereview` forever: `collect` ignores that status, the restore loop above
+        # skips it because it IS due, and nothing counts an error. That is a silent stall
+        # holding up the bounce driver too (§13), so it is undone and said out loud.
+        chosen = {pr_key(owner_repo, p["number"]) for p in selected}
+        for key in sorted(marked - chosen):
+            record = seen[key]
+            restored = dict(record, status=record.get("rereview_from") or "collected")
+            restored.pop("rereview_from", None)
+            seen[key] = restored
+            if not dry_run:
+                save_seen(seen_path(cfg["state_dir"]), seen)
+            log("FAIL: %s is due for re-review but this pass could not select it (draft, "
+                "fork flag unknown, no discovery hint, or an unmanaged team) — restored to "
+                "`%s`, request left unspent, and the bounce driver waits behind it"
+                % (key, restored["status"]))
+            result.errors += 1
         print("scan %s: %d open PR(s), %d dispatcher-worked by discovery, %d re-review(s) "
               "due, %d pipeline PR(s) to review"
               % (owner_repo, len(prs), len(hints), len(due), len(selected)))
@@ -3292,11 +3348,11 @@ def selftest():
         #     because no per-unit assertion states it.
         import pipeline_bounce_local as pbl
 
-        head = {"sha": "aaaa1111"}
+        head = {"sha": "aaaa1111", "draft": False}
         globals()["list_open_prs"] = lambda owner_repo, limit=100: [
             {"number": 7, "headRefName": "feat/kit-7-rereview", "isCrossRepository": False,
-             "isDraft": False, "title": "The thing", "url": "https://github.com/o/r/pull/7",
-             "headRefOid": head["sha"]}]
+             "isDraft": head["draft"], "title": "The thing",
+             "url": "https://github.com/o/r/pull/7", "headRefOid": head["sha"]}]
         one_high = {"schema": FINDINGS_SCHEMA, "summary": "one high finding", "findings": [
             {"severity": "high", "category": "correctness", "file": "a.py", "line": 1,
              "summary": "wrong", "detail": "why"}]}
@@ -3419,6 +3475,87 @@ def selftest():
             check("a stale rereview mark creates nothing", (scan(c, False), len(fake.created)), (EXIT_OK, 3))
             check("…and the record is restored to what it was",
                   load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "collected")
+
+        # 6c. The three ways a re-review can go wrong that are NOT "the ticket got made",
+        #     each of which was a real defect before it was a test.
+        def settled_at(root, sha="aaaa1111"):
+            """A PR reviewed once and settled, at `sha` — the state every case below starts
+            from. Returns the config."""
+            fake.__init__()
+            posted.clear()
+            telemetry.clear()
+            head["sha"], head["draft"] = sha, False
+            c = dict(cfg, state_dir=root)
+            scan(c, False)
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(one_high))
+            collect(c, False)
+            return c
+
+        with tempfile.TemporaryDirectory() as tmp:   # (g) a re-review that DECLINES
+            # A decline is a completed re-review, not a failure to do one: the reviewer's
+            # answer was "not reviewed, and here is why", and it was published. If the
+            # request survives that, the identical decline re-fires every pass forever and
+            # posts a duplicate PR comment each time — unbounded, and nothing self-heals.
+            c = settled_at(tmp)
+            path = request_after_bounce(tmp, 1, "aaaa1111")
+            head["sha"] = "bbbb2222"
+            saved_diff = globals()["fetch_pr_diff"]
+            globals()["fetch_pr_diff"] = lambda owner_repo, n: ""      # ⇒ TERMINAL decline
+            try:
+                check("a declining re-review exits declined", scan(c, False), EXIT_DECLINED)
+            finally:
+                globals()["fetch_pr_diff"] = saved_diff
+            check("a declining re-review made no ticket", len(fake.created), 1)
+            check("a declining re-review posted its one NOT-reviewed comment",
+                  (len(posted), "was NOT reviewed" in (posted[-1][1] if posted else "")), (2, True))
+            check("a DECLINE spends the request too", os.path.exists(path), False)
+            check("…so the next pass does not re-decline and duplicate the comment",
+                  (scan(c, False), len(posted)), (EXIT_OK, 2))
+
+        with tempfile.TemporaryDirectory() as tmp:   # (h) a request while the FIRST review is live
+            # Reachable for real: a terminally-red required check bounces a PR whose first
+            # review has not settled, so a request can exist before any outcome does.
+            # Re-marking there rebuilds the record in scan_pr and throws away the
+            # review_ticket_id, orphaning a delegated ticket and paying for a second one.
+            fake.__init__()
+            posted.clear()
+            head["sha"], head["draft"] = "aaaa1111", False
+            c = dict(cfg, state_dir=tmp)
+            check("setup: the first review is pending", (scan(c, False), len(fake.created)), (EXIT_OK, 1))
+            live = load_seen(seen_path(tmp))[pr_key("o/r", 7)]
+            check("setup: it points at a live ticket", (live["status"], live["review_ticket_id"]),
+                  ("pending", "rev-uuid-1"))
+            path = request_after_bounce(tmp, 1, "aaaa1111")
+            head["sha"] = "bbbb2222"
+            check("a mid-flight record is NOT re-marked", (scan(c, False), len(fake.created)), (EXIT_OK, 1))
+            still = load_seen(seen_path(tmp))[pr_key("o/r", 7)]
+            check("…its review ticket is not orphaned",
+                  (still["status"], still.get("review_ticket_id")), ("pending", "rev-uuid-1"))
+            check("…and the request is left for when it settles", os.path.exists(path), True)
+            # Once it settles, the same request is honoured — deferred, not dropped.
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(one_high))
+            check("collect settles it", collect(c, False), EXIT_OK)
+            check("the deferred re-review then happens", (scan(c, False), len(fake.created)), (EXIT_OK, 2))
+            check("…and only then is the request spent", os.path.exists(path), False)
+
+        with tempfile.TemporaryDirectory() as tmp:   # (i) due, but selection drops it
+            # Marked `rereview` and then filtered out (draft here; a missing discovery hint
+            # or an unknown fork flag do the same). `collect` ignores that status and the
+            # restore loop skips it because it IS due, so it would sit there forever while
+            # the bounce driver waits behind it — and the pass would exit 0 saying nothing.
+            c = settled_at(tmp)
+            path = request_after_bounce(tmp, 1, "aaaa1111")
+            head["sha"], head["draft"] = "bbbb2222", True
+            said_it = said(lambda: check("an unselectable re-review is an ERROR, not a quiet skip",
+                                         scan(c, False), EXIT_ERROR))
+            check("…it says which PR and why", "o/r#7 is due for re-review" in said_it, True)
+            check("…it creates nothing", len(fake.created), 1)
+            check("…the record is restored, not left pinned in `rereview`",
+                  load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "collected")
+            check("…and the request is not spent", os.path.exists(path), True)
+            head["draft"] = False
+            check("un-drafting it lets the re-review through",
+                  (scan(c, False), len(fake.created), os.path.exists(path)), (EXIT_OK, 2, False))
 
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
 

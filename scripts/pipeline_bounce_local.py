@@ -815,16 +815,30 @@ def checks_summary(runs, required, unknown_detail=""):
 
 
 def outcome_is_fresh(outcome, head_sha, last_spent):
-    """A review outcome triggers a bounce only when it judged the CURRENT head, or —
-    when the poller recorded no head — when it postdates the last bounce. Otherwise a
-    review of the pre-fix code would spend a second bounce on a push it never saw."""
+    """A review outcome is a trigger only when it is BOTH about the current head AND newer
+    than the last bounce. Two guards, and each catches what the other cannot:
+
+      the HEAD guard   — a review of code that has since been replaced must not spend a
+                         bounce on a push it never saw.
+      the CLOCK guard  — a review the last bounce was already spent on must not spend a
+                         second one. Nothing new was learned, so there is nothing to react
+                         to; only a NEW review of the same head may trigger again.
+
+    The clock guard used to be conditional on the poller having recorded no head — which
+    was every outcome ever written, since no producer filled the key, so in practice it
+    always ran. Now that the poller does record one, making it conditional would quietly
+    retire it: a review of the CURRENT head would stay "fresh" indefinitely and buy another
+    bounce every time the in-flight window lapsed, burning the whole budget on one review.
+    So it applies unconditionally. A genuine re-review postdates the bounce that asked for
+    it and passes both.
+    """
     if not outcome:
         return False, "no review outcome is recorded for this PR"
     reviewed = str(outcome.get("head_sha") or "")
     if reviewed and head_sha and reviewed != head_sha:
         return False, ("the review outcome is for an older head (%s); not a trigger for %s "
                        "until re-reviewed" % (reviewed[:12], head_sha[:12]))
-    if not reviewed and last_spent and str(last_spent.get("at") or "") >= str(outcome.get("at") or ""):
+    if last_spent and str(last_spent.get("at") or "") >= str(outcome.get("at") or ""):
         return False, "the review outcome predates the last bounce; not a trigger until re-reviewed"
     return True, ""
 
@@ -2501,6 +2515,17 @@ def selftest():
           outcome_is_fresh(above, "bbb", {"at": "2026-01-03T00:00:00Z"})[0], False)
     check("outcome newer than the last bounce is fresh (no head recorded)",
           outcome_is_fresh(above, "bbb", {"at": "2026-01-01T00:00:00Z"})[0], True)
+    # BOTH guards, always. The clock guard used to be conditional on no head being
+    # recorded — which was every outcome ever written, so it always ran. Once the poller
+    # started recording one, leaving it conditional would have retired it silently: a
+    # review OF THE CURRENT HEAD would stay fresh forever and buy another bounce each time
+    # the in-flight window lapsed, spending the whole budget on one review the session
+    # never answered with a push.
+    check("a review of the current head is NOT fresh again once a bounce was spent on it",
+          outcome_is_fresh(dict(above, head_sha="bbb"), "bbb", {"at": "2026-01-03T00:00:00Z"})[0], False)
+    check("…but a genuine RE-review of that head, postdating the bounce, is",
+          outcome_is_fresh(dict(above, head_sha="bbb", at="2026-01-04T00:00:00Z"), "bbb",
+                           {"at": "2026-01-03T00:00:00Z"})[0], True)
 
     # 4b. The CONCLUSION — the answer this driver used to compute, print and throw away.
     #     Every None below is a refusal to hand a person work the reviewer never finished.

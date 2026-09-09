@@ -152,7 +152,8 @@ gate; only the first does now.
    carries the issue id, which the kit's branch rule guarantees. The repository comes out
    of the PR URL. A second signal covers a missing attachment: a PR URL in the coding
    session's own final response. **There is no repository list to keep in step.**
-2. It selects same-repo, non-draft, not-yet-reviewed PRs. Forks are skipped, and an
+2. It selects same-repo, non-draft, not-yet-reviewed PRs — plus, per step 7, any whose
+   bounce asked for a second look and whose head has since moved. Forks are skipped, and an
    unknown fork flag is skipped too. It fetches the diff and resolves the **review basis**
    — the ticket's acceptance criteria and out-of-scope as of delegation
    (`scripts/pipeline_review_basis.py`). No basis ⇒ it declines, loudly, with a PR comment
@@ -955,14 +956,22 @@ nor `--all`: it is the daemon's whole pass.
 - **Before every bounce** it reads the original ticket's state. Any completed- or
   canceled-type state ⇒ skip, with the reason logged: its worktree is gone. The test is the
   state's *type*, so your own name for it does not matter.
-- **Re-review, which is what makes a budget above 1 mean anything.** A bounce triggers only
-  while the review outcome judged the *current* head, so after bounce 1 the driver waits for
-  a fresh one. Every delivered bounce therefore leaves
-  `state/rereview/<OWNER>__<REPO>/pr-<n>.json`, and the poller re-reviews that PR on its
-  next pass **if the head has moved**. Nothing pushed ⇒ no re-review and no spend. The
-  request is deleted only once the new review ticket exists, so a crash retries rather than
-  losing it, and it buys exactly one review. Without this the driver would wait forever and
-  a `maxBounces` above 1 would never be reached — nor, therefore, would exhaustion.
+- **Re-review, which is what makes a budget above 1 mean anything on findings.** The
+  *review* half of the trigger counts only while the outcome judged the **current** head, so
+  after bounce 1 the driver waits for a fresh one. (The *CI* half is unaffected — a
+  terminally-red required check bounces without consulting the review at all.) Every
+  delivered bounce therefore leaves `state/rereview/<OWNER>__<REPO>/pr-<n>.json`, and the
+  poller re-reviews that PR on its next pass **if the head has moved**. Nothing pushed ⇒ no
+  re-review and no spend. The request is deleted only once the new review ticket exists, so
+  a crash retries rather than losing it, and it buys exactly one review. Without it, a PR
+  bounced on findings could never be bounced again — and could never **conclude** either,
+  since a conclusion also needs a fresh outcome.
+- **Three ways a re-review does not happen, each said out loud.** The head has not moved
+  (the session pushed nothing — no review, no cost, the request waits). The PR's first
+  review is still in flight (deferred until it settles, so its review ticket is not
+  orphaned). Or the PR is now a draft, a fork, or lost its discovery hint — that one is an
+  **error**, not a quiet skip: the pass exits non-zero and names the PR, because the bounce
+  driver is waiting behind it.
 - **Conclusion**: a usable review of the current head, below the severity threshold, with
   the required checks green ⇒ one `concluded` ledger row (basis `clean` or
   `below-threshold`) and one move of the coding ticket to `linear.stateIds.needsApproval`.
