@@ -394,8 +394,11 @@ Stop hook between them:
    you tried) and then stops blocking, emitting a non-blocking notice per commit so a
    spent budget never renders as a clean one (`docs/PIPELINE-CONTRACT.md` §13). A PR
    observed with nothing red clears the ledger, so a later failure gets its own three.
-   Red **only** on a human-pending check neither spends the budget nor clears it —
-   `HUMAN_PENDING_CHECKS` stays the single list of those, read by everything.
+   Red **only** on a human-pending check neither spends the budget nor clears it.
+   `HUMAN_PENDING_CHECKS` is the single list of those **for this hook** — say that
+   precisely: the Stage E bounce driver judges the same redness without consulting it,
+   so a PR red only on a label-pending check can still trigger a bounce. A real gap,
+   recorded rather than asserted away.
 3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
 4. **CI + branch protection** — the unbypassable gate. All changes land via PR with

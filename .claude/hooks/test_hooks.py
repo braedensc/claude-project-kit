@@ -234,6 +234,18 @@ RED_VIEW = '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}
 GREEN_VIEW = '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}'
 PENDING_VIEW = ('{"statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"},'
                 '{"name":"Hooks change guard","conclusion":"FAILURE"}]}')
+# CI queued or mid-flight: `status` set, `conclusion` still null. This is the most
+# common state at the exact moment a fix-and-push turn ends.
+INFLIGHT_VIEW = ('{"statusCheckRollup":[{"name":"Kit checks","status":"IN_PROGRESS",'
+                 '"conclusion":null}]}')
+DIRTY_VIEW = '{"mergeStateStatus":"DIRTY","statusCheckRollup":[]}'
+# One check, re-run: the rollup carries BOTH runs, oldest first — the real shape,
+# copied from this kit's own PR #92 on 2026-09-09, where a green PR still advertised
+# its superseded FAILURE.
+RERUN_GREEN_VIEW = (
+    '{"statusCheckRollup":['
+    '{"name":"Kit checks","conclusion":"FAILURE","startedAt":"2026-09-09T03:25:02Z"},'
+    '{"name":"Kit checks","conclusion":"SUCCESS","startedAt":"2026-09-09T03:30:35Z"}]}')
 
 
 def _say(name, ok, detail=""):
@@ -320,6 +332,98 @@ def check_budget_cleared(root, hook_path, env, view_file):
     out = turn()
     ok = "attempt 1 of 3" in out.get("reason", "")
     failures += _say("stop: green clears the ledger, so a later red starts at 1 again",
+                     ok, "" if ok else f" (got: {out})")
+    return ran, failures
+
+
+def check_budget_not_cleared_prematurely(root, hook_path, env, view_file):
+    """The two ways a NOT-green PR used to read as clearable, each of which quietly
+    reset the bound and made it unreachable in practice. Returns (assertions, failures)."""
+    failures, ran = 0, 4
+
+    def turn():
+        advance(root)
+        return run_stop_hook_json({}, hook_path, env=env)
+
+    with open(view_file, "w") as f:
+        f.write(RED_VIEW)
+    out = turn()
+    failures += _say("stop: (setup) first red spends attempt 1",
+                     "attempt 1 of 3" in out.get("reason", ""),
+                     "" if "attempt 1 of 3" in out.get("reason", "") else f" (got: {out})")
+
+    # CI queued has no FAILING conclusions — and neither does a green PR. Reading the
+    # absence of failure as success reset the ledger on the commonest turn in the whole
+    # loop (push a fix, CI queues, turn ends), so the bound was never reached.
+    with open(view_file, "w") as f:
+        f.write(INFLIGHT_VIEW)
+    out = turn()
+    failures += _say("stop: in-flight CI ends the turn quietly WITHOUT clearing the budget",
+                     out == {}, "" if out == {} else f" (got: {out})")
+
+    with open(view_file, "w") as f:
+        f.write(RED_VIEW)
+    out = turn()
+    ok = "attempt 2 of 3" in out.get("reason", "")
+    failures += _say("stop: …so the next red is attempt 2, not a restarted 1",
+                     ok, "" if ok else f" (got: {out})")
+
+    # A re-run check appears twice in the rollup, old conclusion and new. Taking the
+    # list at face value reads a genuinely green PR as red — observed on PR #92.
+    with open(view_file, "w") as f:
+        f.write(RERUN_GREEN_VIEW)
+    out = turn()
+    failures += _say("stop: a re-run check's stale FAILURE does not make a green PR red",
+                     out == {}, "" if out == {} else f" (got: {out})")
+    return ran, failures
+
+
+def check_budget_is_shared(root, hook_path, env, view_file):
+    """The change's headline claim: `ci-failing` and `pr-dirty` draw on ONE budget.
+    Every earlier sequence assertion is red-CI only, so nothing yet proves a conflict
+    spends the same counter — or that clearing it forgets the exhausted marker too.
+    Returns (assertions, failures)."""
+    failures, ran = 0, 4
+
+    def turn():
+        advance(root)
+        return run_stop_hook_json({}, hook_path, env=env)
+
+    with open(view_file, "w") as f:
+        f.write(DIRTY_VIEW)
+    out = turn()
+    ok = "attempt 1 of 3" in out.get("reason", "") and "rebase" in out.get("reason", "")
+    failures += _say("stop: a DIRTY turn spends from the same budget as red CI",
+                     ok, "" if ok else f" (got: {out})")
+
+    with open(view_file, "w") as f:
+        f.write(RED_VIEW)
+    out = turn()
+    ok = "attempt 2 of 3" in out.get("reason", "")
+    failures += _say("stop: …so red CI after a conflict continues at 2, not at 1",
+                     ok, "" if ok else f" (got: {out})")
+
+    # Same commit, second look: the ledger is keyed by sha, so a reason switch on ONE
+    # commit must not charge it twice. No advance() here — that is the whole point.
+    with open(view_file, "w") as f:
+        f.write(DIRTY_VIEW)
+    out = run_stop_hook_json({}, hook_path, env=env)
+    ok = "attempt 3 of 3" not in out.get("reason", "")
+    failures += _say("stop: a reason switch on ONE commit does not charge it twice",
+                     ok, "" if ok else f" (got: {out})")
+
+    # Drive to exhaustion, then go green: clearing must forget the exhausted marker as
+    # well as the attempts, or the branch stays permanently past its bound.
+    for _ in range(4):
+        turn()
+    with open(view_file, "w") as f:
+        f.write(GREEN_VIEW)
+    turn()
+    with open(view_file, "w") as f:
+        f.write(RED_VIEW)
+    out = turn()
+    ok = out.get("decision") == "block" and "attempt 1 of 3" in out.get("reason", "")
+    failures += _say("stop: clearing after exhaustion restores blocking, not just the count",
                      ok, "" if ok else f" (got: {out})")
     return ran, failures
 
@@ -674,6 +778,14 @@ def main():
             '[{"number":7,"state":"OPEN"}]',
             '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
     stop_clear_root, stop_clear, stop_clear_env, stop_clear_view = \
+        make_stop_flip_sandbox(
+            '[{"number":7,"state":"OPEN"}]',
+            '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
+    stop_prem_root, stop_prem, stop_prem_env, stop_prem_view = \
+        make_stop_flip_sandbox(
+            '[{"number":7,"state":"OPEN"}]',
+            '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
+    stop_shared_root, stop_shared, stop_shared_env, stop_shared_view = \
         make_stop_flip_sandbox(
             '[{"number":7,"state":"OPEN"}]',
             '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
@@ -1598,6 +1710,10 @@ def main():
             stop_budget_root, stop_budget, stop_budget_env, stop_budget_view),
         check_budget_cleared(
             stop_clear_root, stop_clear, stop_clear_env, stop_clear_view),
+        check_budget_not_cleared_prematurely(
+            stop_prem_root, stop_prem, stop_prem_env, stop_prem_view),
+        check_budget_is_shared(
+            stop_shared_root, stop_shared, stop_shared_env, stop_shared_view),
     ):
         seq_ran += ran
         failures += failed
@@ -1669,6 +1785,7 @@ def main():
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,
               stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
               stop_dirtyred_root, stop_msgred_root, stop_budget_root, stop_clear_root,
+              stop_prem_root, stop_shared_root,
               *pl_cleanup):
         shutil.rmtree(r, ignore_errors=True)
 
