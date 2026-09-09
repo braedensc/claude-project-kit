@@ -196,12 +196,14 @@ gate; only the first does now.
    makes.
 
 What neither script ever does: merge, enable auto-merge, approve, edit a PR, apply any
-label but `agent:needs-human`, or launch a Claude session. The one ticket move either
-makes is the bounce driver's, into the **needs-approval** lane
+label but `agent:needs-human`, or launch a Claude session. The one move of a **coding**
+ticket either makes is the bounce driver's, into the **needs-approval** lane
 (`linear.stateIds.needsApproval`), once, when review concludes — clean, below the
 threshold, or out of budget. That is the only state it can write, and a project that has
 not provisioned the lane simply does not get the move: the conclusion is still recorded
-and said, and nothing else changes.
+and said, and nothing else changes. (The poller also closes its **own** review tickets —
+one per review, so one more per re-review — which is what frees the reviewer's worktree.
+Those are Reviews-team tickets, never anybody's coding ticket.)
 
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
@@ -972,6 +974,11 @@ nor `--all`: it is the daemon's whole pass.
   orphaned). Or the PR is now a draft, a fork, or lost its discovery hint — that one is an
   **error**, not a quiet skip: the pass exits non-zero and names the PR, because the bounce
   driver is waiting behind it.
+- **A conclusion ends the re-review loop too.** Handing the PR to a person retires any
+  outstanding re-review request. That matters without anyone pushing: a bounce leaves a
+  request naming the head it bounced, and a flaky required check re-running green at that
+  same head concludes. A request surviving that would open a second review ticket and post
+  another review comment on a pull request somebody already owns.
 - **Conclusion**: a usable review of the current head, below the severity threshold, with
   the required checks green ⇒ one `concluded` ledger row (basis `clean` or
   `below-threshold`) and one move of the coding ticket to `linear.stateIds.needsApproval`.
