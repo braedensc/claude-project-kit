@@ -378,6 +378,24 @@ Stop hook between them:
    then never runs the required CI, so side checks like CodeQL/Vercel can make a
    conflicted PR look green). Dedups per (branch, reason, commit) so it can't loop;
    fails open like the PreToolUse guards.
+
+   A hook cannot make the model run anything — it can block, and it can inject text —
+   so the two not-green messages **name `/fix-ci`**, the loop the kit already ships,
+   rather than leaving the session to improvise one. The block is the enforcement;
+   naming the tool is what stops the enforcement producing a worse fix.
+
+   Those two reasons also share **one bounded budget per branch** (`MAX_FIX_ATTEMPTS`,
+   3 — the same number as `/fix-ci`'s own bound and `budgets.fixIterations`' default).
+   The per-commit dedup only stops a loop on an *unchanged* commit; a session pushing
+   fixes gets a fresh sha each time and was nagged forever, including for failures no
+   session can clear — a change under `.github/workflows/`, which its push credential
+   deliberately may not land, or a rebase the sandbox refuses. After three commits the
+   hook **escalates once** (block: stop fixing, report every check still red and what
+   you tried) and then stops blocking, emitting a non-blocking notice per commit so a
+   spent budget never renders as a clean one (`docs/PIPELINE-CONTRACT.md` §13). A PR
+   observed with nothing red clears the ledger, so a later failure gets its own three.
+   Red **only** on a human-pending check neither spends the budget nor clears it —
+   `HUMAN_PENDING_CHECKS` stays the single list of those, read by everything.
 3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
 4. **CI + branch protection** — the unbypassable gate. All changes land via PR with
