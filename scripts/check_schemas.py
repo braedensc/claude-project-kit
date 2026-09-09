@@ -502,6 +502,25 @@ VALID_SAFE_OUTPUTS = {
     ],
 }
 
+# A tree-shaped ticket-create (§8 "Filing a plan"): one epic, two children, one
+# dependency edge. The same `type` as a finding, discriminated by epic+children.
+VALID_PLAN_TREE = {
+    "schema": "pipeline-safe-outputs/1",
+    "requests": [
+        {"type": "ticket-create", "source_ticket_id": "KIT-777",
+         "epic": {"title": "Safe follow-up ticket filing",
+                  "body": "## Context\nThe PRD for the epic."},
+         "children": [
+             {"title": "Add the ticket-create safe-output kind",
+              "body": "## Acceptance criteria\n- [ ] it lands",
+              "labels": ["track:meta", "effort:M"]},
+             {"title": "Executor: create, force provenance, notify owner",
+              "body": "## Acceptance criteria\n- [ ] it forces the fields",
+              "labels": ["track:meta", "effort:M"], "depends_on": [0]},
+         ]},
+    ],
+}
+
 VALID_REVIEW_FINDINGS = {
     "schema": "pipeline-review/1",
     "summary": "One real security finding; the rest of the diff matches the criteria.",
@@ -592,6 +611,29 @@ FIXTURES = [
      _with(VALID_SAFE_OUTPUTS, "requests.3.labels", ["hooks-change"]), False, "pattern"),
     ("safe-outputs", "ticket-create-unknown-field",
      _with(VALID_SAFE_OUTPUTS, "requests.3.assignee", "me"), False, "additionalProperties"),
+
+    # ── ticket-create (plan) — the tree shape, §8 "Filing a plan" ──────────── #
+    ("safe-outputs", "plan-tree-valid", VALID_PLAN_TREE, True, None),
+    ("safe-outputs", "plan-tree-no-epic",
+     _without(VALID_PLAN_TREE, "requests", 0, "epic"), False, "required"),
+    ("safe-outputs", "plan-tree-epic-missing-body",
+     _without(VALID_PLAN_TREE, "requests", 0, "epic", "body"), False, "required"),
+    ("safe-outputs", "plan-tree-no-children",
+     _without(VALID_PLAN_TREE, "requests", 0, "children"), False, "required"),
+    ("safe-outputs", "plan-tree-empty-children",
+     _with(VALID_PLAN_TREE, "requests.0.children", []), False, "minItems"),
+    ("safe-outputs", "plan-tree-child-protected-label",
+     _with(VALID_PLAN_TREE, "requests.0.children.0.labels", ["provenance:epic"]),
+     False, "pattern"),
+    ("safe-outputs", "plan-tree-depends_on-not-integer",
+     _with(VALID_PLAN_TREE, "requests.0.children.1.depends_on", ["0"]), False, "type"),
+    ("safe-outputs", "plan-tree-child-unknown-field",
+     _with(VALID_PLAN_TREE, "requests.0.children.0.parentId", "KIT-1"),
+     False, "additionalProperties"),
+    # A tree also carrying flat finding fields matches NEITHER ticket-create
+    # branch — the two shapes are mutually exclusive, not a superset.
+    ("safe-outputs", "plan-tree-plus-flat-title-ambiguous",
+     _with(VALID_PLAN_TREE, "requests.0.title", "x"), False, "additionalProperties"),
 
     ("review-findings", "valid", VALID_REVIEW_FINDINGS, True, None),
     ("review-findings", "clean-review-is-an-empty-list",

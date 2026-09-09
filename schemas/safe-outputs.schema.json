@@ -23,7 +23,8 @@
           {"$ref": "#/$defs/ticketComment"},
           {"$ref": "#/$defs/ticketState"},
           {"$ref": "#/$defs/ticketLabel"},
-          {"$ref": "#/$defs/ticketCreate"}
+          {"$ref": "#/$defs/ticketCreate"},
+          {"$ref": "#/$defs/planCreate"}
         ]
       }
     }
@@ -84,7 +85,7 @@
       "type": "object",
       "required": ["type", "source_ticket_id", "title", "body"],
       "additionalProperties": false,
-      "description": "Ask a credential-holding executor to FILE a follow-up finding ticket. The session never creates the ticket itself: it names its OWN pinned ticket as `source_ticket_id` (compared to the pin, never used to address anything), and the executor creates a NEW ticket in the backlog (linear.findingTicket.landing), applies `provenance:agent`, notifies the owner, and refuses every dispatcher/human-owned label — none of which the session can set. At most 3 per run, and unavailable unless linear.findingTicket is configured (§8 caps).",
+      "description": "The FLAT finding shape of `ticket-create`: ask a credential-holding executor to FILE a single follow-up finding ticket. Discriminated from `planCreate` (the tree shape) by carrying `title`+`body` rather than `epic`+`children` — both are `type: ticket-create`, and exactly one branch matches. The session never creates the ticket itself: it names its OWN pinned ticket as `source_ticket_id` (compared to the pin, never used to address anything), and the executor creates a NEW ticket in the backlog (linear.findingTicket.landing), applies `provenance:agent`, notifies the owner, and refuses every dispatcher/human-owned label — none of which the session can set. At most 3 per run, and unavailable unless linear.findingTicket is configured (§8 caps).",
       "properties": {
         "type": {"const": "ticket-create"},
         "source_ticket_id": {"$ref": "#/$defs/ticketId"},
@@ -103,6 +104,78 @@
         "labels": {
           "$ref": "#/$defs/labelList",
           "description": "Optional ordinary labels to propose (track:*, effort:*). Dispatcher/human-owned classes (agent:*, blocked:*, provenance:*, hooks-change) are excluded by labelList and refused by the executor. `provenance:agent` is applied BY THE EXECUTOR, never requested here — a session that could request its own provenance is the shape §5 exists to prevent."
+        }
+      }
+    },
+
+    "planCreate": {
+      "type": "object",
+      "required": ["type", "source_ticket_id", "epic", "children"],
+      "additionalProperties": false,
+      "description": "The TREE shape of `ticket-create`: a planning session PROPOSES an epic and its children as one request; a credential-holding executor validates the tree, runs the Definition-of-Ready gate on every child, and materialises it. Discriminated from the flat finding shape by carrying `epic`+`children` rather than `title`+`body`. The session sets NO field that carries authority: the executor files the epic in the backlog (linear.findingTicket.landing) with executor-applied `provenance:agent`, files each child in the same backlog with `provenance:epic` and `parentId` FORCED to the epic it just created in this batch, and turns `depends_on` ordinals into blockedBy relations. Nothing becomes dispatchable until a person moves the epic out of intake (§4/§5). One malformed or DoR-failing child rejects the WHOLE tree — nothing is created (§8 all-or-nothing). Available only when linear.findingTicket is configured; at most one plan per run.",
+      "properties": {
+        "type": {"const": "ticket-create"},
+        "source_ticket_id": {"$ref": "#/$defs/ticketId"},
+        "epic": {"$ref": "#/$defs/planEpic"},
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "The child tickets, in dependency order. The hard schema ceiling is 20; the executor enforces its own tighter per-run cap (MAX_PLAN_CHILDREN, mirroring the flat kind's cap-of-3 as a code constant rather than a delivery.json budget). A plan legitimately IS a tree, so the cap is one epic and a bounded number of children — a flood guard, not a limit to raise.",
+          "items": {"$ref": "#/$defs/planChild"}
+        }
+      }
+    },
+
+    "planEpic": {
+      "type": "object",
+      "required": ["title", "body"],
+      "additionalProperties": false,
+      "description": "The epic the tree hangs from. The executor creates it in the backlog with `provenance:agent` — an epic a session drafted is agent-authored, and by §5 rule 1 `provenance:agent` never auto-approves, so the epic cannot approve itself. The session supplies only the words; identity, state, provenance and assignee are the executor's.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 200,
+          "description": "One line — the epic stated as a title."
+        },
+        "body": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 16000,
+          "description": "The PRD/epic markdown that becomes the epic's description."
+        }
+      }
+    },
+
+    "planChild": {
+      "type": "object",
+      "required": ["title", "body"],
+      "additionalProperties": false,
+      "description": "One child ticket. `body` is the full markdown with the template's `## Acceptance criteria` etc.; the executor runs check_ticket_dor.py --strict on the built ticket and REFUSES to create any child that fails, rejecting the whole tree. The executor forces `provenance:epic` and the parent link — the session cannot supply a parent id, which would otherwise let it name an already-approved epic and have its children auto-approve.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 200,
+          "description": "One line — the child stated as a title. The DoR gate enforces its own tighter title limit."
+        },
+        "body": {
+          "type": "string",
+          "pattern": "\\S",
+          "maxLength": 16000,
+          "description": "Non-empty markdown carrying the template's five sections. The DoR gate judges it."
+        },
+        "labels": {
+          "$ref": "#/$defs/labelList",
+          "description": "Ordinary labels only (track:*, effort:*). Dispatcher/human-owned classes are excluded by labelList; `provenance:epic` is applied BY THE EXECUTOR, never requested here."
+        },
+        "depends_on": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 20,
+          "items": {"type": "integer", "minimum": 0},
+          "description": "0-indexed ordinals into THIS request's `children` array (child at index 1 with `depends_on: [0]` is blocked by child index 0). The executor turns them into Linear blockedBy relations, refusing any ordinal out of range, self-referential, or forming a cycle."
         }
       }
     },

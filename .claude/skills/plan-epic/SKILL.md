@@ -252,6 +252,31 @@ Report: the epic URL, the ticket list with IDs, any unresolved rubric findings v
 any config gaps found in step 0b/3, and the sentence that the tickets are in the backlog
 awaiting **their** approval.
 
+### Unattended mode — the idea gate
+
+The steps above are the **interactive** path: a person runs `/plan-epic`, and the skill
+writes to Linear directly. There is also an **unattended** path — the *idea gate* — where
+an idea ticket is delegated into a Planning team and a sandboxed session runs this same
+procedure with **no tracker tool at all** (the security fence is structural: no Linear MCP
+is attached; see `docs/adr/2026-09-06-stage-a-triggered-from-linear.md`). Two differences,
+and only two:
+
+- **It files nothing itself.** Instead of steps 1/5/6's `mcp__linear` writes, it **emits
+  the whole tree as one safe-outputs request** — a `ticket-create` (plan) per
+  `docs/PIPELINE-CONTRACT.md` §8 "Filing a plan": `{ epic: {title, body}, children: [{title,
+  body, labels, depends_on}] }`, written to the run's safe-outputs file. A
+  credential-holding executor (`scripts/pipeline_plan_executor.py`) validates it, runs the
+  DoR gate on every child, and materialises epic-then-children with every authority field
+  forced — the epic as `provenance:agent`, each child's parent as the just-created epic.
+- **The epic is `provenance:agent`, not `provenance:human`.** A session drafted it, so it
+  is agent-authored, and by §5 it never auto-approves. The human gate is identical: move
+  the epic out of intake to release the tree.
+
+Everything else — the PRD read from real code, the decomposition, the rubric panel, the
+DoR gate — is the same. The interactive path stays the default; the unattended path is what
+the Planning dispatcher entry runs, and it is the only way a session with no tracker tool
+reaches the board.
+
 ### Cost shape
 
 Opus for the PRD, architecture, and UX passes; Sonnet for decomposition and security;
