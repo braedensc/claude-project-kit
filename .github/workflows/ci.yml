@@ -215,6 +215,13 @@ jobs:
       - name: Stage E installer selftest (idempotent, agent-refused, §13 exit codes)
         run: python3 scripts/pipeline_stage_e_setup.py --selftest
 
+      # The Stage A (idea-gate) installer: the fallback-(b) tool-fence composition
+      # (no Linear MCP attached; Write kept), agent-env refusal, conf-all-errors,
+      # and no move/approve/merge verb in its own source. Composes-and-hands-off
+      # the dispatcher entry; never turns the gate on.
+      - name: Stage A installer selftest (fence composition, agent-refused, human gates)
+        run: python3 scripts/pipeline_stage_a_setup.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
@@ -244,6 +251,13 @@ jobs:
       # still reports success for a failure.
       - name: Safe-outputs absence-vs-failure selftest (contract §13, §8)
         run: python3 scripts/pipeline_safe_outputs_probe.py --selftest
+
+      # The idea-gate executor: it materialises a planning session's proposed
+      # epic tree (§8 "Filing a plan"), forcing every authority field, gating
+      # every child through the DoR gate, all-or-nothing. Inert here (no
+      # delivery.json, no live dispatcher); --selftest is what has teeth.
+      - name: Plan-tree executor selftest (forced fields, DoR gate, §8/§13 verdicts)
+        run: python3 scripts/pipeline_plan_executor.py --selftest
 
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
