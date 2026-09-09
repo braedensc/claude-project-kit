@@ -910,6 +910,34 @@ backlog — and the tree shape adds these:
 - **The executor posts a summary comment** on the idea ticket so the owner can read the plan
   and approve the epic — the one human gate that releases the tree.
 
+**The planning session's only channel is this file, so a QUESTION rides it too.** Because the
+session holds no tracker tool, every way it reaches the owner travels through the executor. A
+session that needs a design decision it cannot resolve from the code emits a `ticket-comment`
+(§8's ordinary kind) in the same batch, naming its own pinned ticket. The executor posts it on
+the idea ticket:
+
+- **A plan plus questions** — the plan is filed and the questions ride along as notes (the
+  session's open questions also belong in the epic PRD; these are top-level asides).
+- **Questions and no plan** — the executor surfaces them as a **needs-input escalation**: the
+  planner could not decompose the idea and is asking. A legitimate terminal, not a failure —
+  but a question the executor *cannot deliver* (no credential, tracker down) is a loud
+  `errored`, because a question nobody sees is worse than none.
+- **Nothing at all** — a session that produces no file is not left **silent** on the board
+  (§13): when the pinned ticket is known, the executor leaves a visible *no-output* note so the
+  owner sees the miss rather than a plan that never arrives.
+
+Every comment the executor posts — summary, rejection, escalation, no-output — carries an
+invisible `<!-- pipeline-escalation: <label> -->` mark, the same shape a stopped session's
+comment uses, so the **human-action notifier** (`docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md`)
+can grep the tracker and page the owner. The idea gate is the *producer* of those marks for the
+planning lane; the notifier is the *consumer*. The executor **neutralizes any `<!--` sequence
+in the session's own text** (question bodies, notes, titles) before embedding it, so a session
+cannot forge a mark inside content it supplies — only executor-authored marks survive the grep.
+A `ticket-comment` in a planning batch obeys the same §8 rules as anywhere else (its
+`ticket_id` is compared to the pin — §6/§8 still bar it from touching a `provenance:*`/`agent:*`
+label or state) and is capped at a few per run — a planner asks the questions that block it,
+not a wall.
+
 The executor is `scripts/pipeline_plan_executor.py` — deterministic, model-free, the direct
 analog of the review publisher (§14). It runs on the dispatcher host as an owner-scoped role
 account holding the tracker credential; the planning session never does. Reuses
