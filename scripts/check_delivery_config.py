@@ -9,7 +9,7 @@ TWO LAYERS, ONE DEFINITION OF SHAPE
 
     SHAPE comes from `schemas/delivery.schema.json` — a real JSON Schema, and
     the single machine-readable rendering of contract §1. This file no longer
-    re-implements "stateIds is an object with exactly five string values" in
+    re-implements "stateIds is an object with exactly six string values" in
     Python; it validates against the schema and translates each violation into
     the rule vocabulary and tier §7 uses (via the schema's own `x-rule`,
     `x-tier` and `x-fix` annotations). `scripts/check_schemas.py` fails CI if
@@ -116,7 +116,8 @@ HOOK_STRING_RE = re.compile(r"""[rRbBuUfF]{0,2}(\"\"\"|'''|"|')(.*?)\1""", re.DO
 # `|` so it cannot latch onto `(?P<ticket>…)` or any other single-token group.
 HOOK_TYPES_RE = re.compile(r"\((?:\?:)?([a-z]+(?:\|[a-z]+)+)\)")
 
-STATE_KEYS = ("raw", "ready", "working", "review", "done")  # §1: closed, mandatory set
+STATE_KEYS = ("raw", "ready", "working", "review", "done",
+              "needsApproval")  # §1: closed, mandatory set
 COMMAND_KEYS = ("lint", "typecheck", "test", "e2e", "preview")
 AUTH_CONTEXTS = ("devSessions", "scheduled", "review")
 # §9: the only backend with a durable store of its own (the `pipeline-state`
@@ -516,7 +517,7 @@ def check_shape(config, schema, r):
 def check_state_ids(config, r):
     """§7: any `linear.stateIds.*` empty or still a token.
 
-    The schema already said "five keys, string values". Whether a string is a
+    The schema already said "six keys, string values". Whether a string is a
     RESOLVED Linear ID is the part it cannot see.
     """
     state_ids = dig(config, "linear", "stateIds")
@@ -1014,6 +1015,13 @@ CASES = [
         ["linear.stateIds"],
     ),
     ("stateid-missing", lambda c: _drop(c, "linear.stateIds.working"), ["linear.stateIds"]),
+    # The sixth key is enforced exactly like the other five: a project that
+    # never provisioned the needs-approval lane fails the gate rather than
+    # silently losing the transition Stage E writes there (§1).
+    ("stateid-needs-approval-missing",
+     lambda c: _drop(c, "linear.stateIds.needsApproval"), ["linear.stateIds"]),
+    ("stateid-needs-approval-empty",
+     lambda c: _set(c, "linear.stateIds.needsApproval", ""), ["linear.stateIds"]),
     ("stateid-null", lambda c: _set(c, "linear.stateIds.review", None), ["linear.stateIds"]),
     ("stateids-absent", lambda c: _drop(c, "linear.stateIds"), ["linear.stateIds"]),
     # The /setup-board regression, at field granularity: a state map keyed by
@@ -1022,7 +1030,7 @@ CASES = [
         "stateids-keyed-by-display-name",
         lambda c: _set(c, "linear.stateIds",
                        {"Ideas": "a", "Ready": "b", "In Progress": "c",
-                        "In Review": "d", "Done": "e"}),
+                        "In Review": "d", "Needs Approval": "e", "Done": "f"}),
         ["linear.stateIds"],
     ),
 

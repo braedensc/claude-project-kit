@@ -48,18 +48,19 @@
         },
         "stateIds": {
           "type": "object",
-          "required": ["raw", "ready", "working", "review", "done"],
+          "required": ["raw", "ready", "working", "review", "done", "needsApproval"],
           "additionalProperties": false,
           "x-tier-additionalProperties": "warning",
           "x-rule": "linear.stateIds",
-          "description": "The five workflow-state IDs. A closed, mandatory set.",
-          "x-fix": "States are referenced by ID, never by display name (§1) — a rename in the UI must not silently desync a guard. Run /setup-board to resolve the five UUIDs; a missing value stalls the whole queue.",
+          "description": "The six workflow-state IDs. A closed, mandatory set.",
+          "x-fix": "States are referenced by ID, never by display name (§1) — a rename in the UI must not silently desync a guard. Run /setup-board to resolve the six UUIDs; a missing value stalls the whole queue.",
           "properties": {
             "raw": {"type": "string", "description": "Intake: proposals land here, human-gated."},
             "ready": {"type": "string", "description": "Approved and dispatchable."},
             "working": {"type": "string", "description": "A session holds it. Counts against budgets.wipLimit."},
             "review": {"type": "string", "description": "PR open, awaiting review/CI."},
-            "done": {"type": "string", "description": "Merged/closed."}
+            "done": {"type": "string", "description": "Merged/closed."},
+            "needsApproval": {"type": "string", "description": "AI review has concluded and a person should accept the work. Provisioned as type unstarted, never started (it would join the dispatcher's unconditional move to the lowest-ordered started state) and never completed (the dispatcher deletes the worktree, and every later bounce becomes a silent no-op). Written only by the Stage E bounce driver; never by a session (§8)."}
           }
         },
         "labels": {

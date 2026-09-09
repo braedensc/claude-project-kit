@@ -183,9 +183,19 @@ gate; only the first does now.
    The dispatcher resumes that session — same worktree, same branch — with the findings as
    its prompt. Budget spent ⇒ one comment on the PR, one on the ticket, optionally the
    `agent:needs-human` label, stop.
+7. **When there is nothing left to bounce** — the review came back clean or below the
+   threshold and the required checks are green, or the budget ran out — the driver writes
+   one `concluded` row to its ledger and moves the coding ticket to the **needs-approval**
+   lane. That is Stage E handing the work to a person, and it is the only ticket move it
+   makes.
 
-What neither script ever does: merge, enable auto-merge, approve, edit a PR, move the
-original ticket, apply any label but `agent:needs-human`, or launch a Claude session.
+What neither script ever does: merge, enable auto-merge, approve, edit a PR, apply any
+label but `agent:needs-human`, or launch a Claude session. The one ticket move either
+makes is the bounce driver's, into the **needs-approval** lane
+(`linear.stateIds.needsApproval`), once, when review concludes — clean, below the
+threshold, or out of budget. That is the only state it can write, and a project that has
+not provisioned the lane simply does not get the move: the conclusion is still recorded
+and said, and nothing else changes.
 
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
@@ -620,6 +630,11 @@ prints this and lists every key it accepts:
   pushed is not re-prompted.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
   `delivery.json`.
+- `needs_approval_state_id` is optional the same way; without it the driver reads
+  `linear.stateIds.needsApproval` from `delivery.json`. Unset in **both** ⇒ the lane is
+  off: the driver still writes its `concluded` ledger row and says on stdout that it
+  moved nothing. Provision the lane as type **`unstarted`** — see the contract §1 note;
+  `started` and `completed` both break the dispatcher in ways that produce no error.
 
 Both files hold **names of environment variables**, never a value. The loaders refuse a
 value that does not look like a variable name.
@@ -906,10 +921,18 @@ nor `--all`: it is the daemon's whole pass.
 - **Before every bounce** it reads the original ticket's state. Any completed- or
   canceled-type state ⇒ skip, with the reason logged: its worktree is gone. The test is the
   state's *type*, so your own name for it does not matter.
+- **Conclusion**: a usable review of the current head, below the severity threshold, with
+  the required checks green ⇒ one `concluded` ledger row (basis `clean` or
+  `below-threshold`) and one move of the coding ticket to `linear.stateIds.needsApproval`.
+  Once per PR — a second pass says "already concluded" and writes nothing. No comment, no
+  label. A pending or unreadable CI result, or a review that DECLINED, is never a
+  conclusion: the driver waits.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
-  Nothing else labels.
+  Nothing else labels. Exhaustion also concludes (basis `exhausted`) and moves the ticket
+  to the same lane, so the label is what tells "we ran out of road" from "nothing needed
+  fixing" when you look at the board.
 - **Fallback**: only when the original ticket has no agent session or the re-prompt cannot
   be delivered, a fix ticket in the Reviews team pinned to the PR branch by the description
   tag, delegated the same way, instructed to push to that branch and open no PR.

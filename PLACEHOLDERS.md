@@ -38,6 +38,7 @@ Phase 4 replaces them all, deletes this file, and re-runs the script with
 | `{{LINEAR_STATE_ID_READY}}` | `delivery.example.json` | Workflow-state ID for approved/dispatchable |
 | `{{LINEAR_STATE_ID_WORKING}}` | `delivery.example.json` | Workflow-state ID for in-progress |
 | `{{LINEAR_STATE_ID_REVIEW}}` | `delivery.example.json` | Workflow-state ID for PR open / in review |
+| `{{LINEAR_STATE_ID_NEEDS_APPROVAL}}` | `delivery.example.json` | Workflow-state ID for AI review concluded / awaiting a person's acceptance — **type `unstarted`** |
 | `{{LINEAR_STATE_ID_DONE}}` | `delivery.example.json` | Workflow-state ID for merged/closed |
 | `{{LINEAR_OWNER_USER_ID}}` | `delivery.example.json` | Linear **user ID** notified on agent-filed findings (`linear.findingTicket`, §8). A person, never the session. Delete the whole `findingTicket` block to keep findings as ticket comments |
 | `{{DEFAULT_TRACK}}` | `delivery.example.json` | The one `track:*` label that must exist, e.g. `platform` — add a row per extra track |
