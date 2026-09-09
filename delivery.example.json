@@ -9,6 +9,7 @@
       "ready": "{{LINEAR_STATE_ID_READY}}",
       "working": "{{LINEAR_STATE_ID_WORKING}}",
       "review": "{{LINEAR_STATE_ID_REVIEW}}",
+      "needsApproval": "{{LINEAR_STATE_ID_NEEDS_APPROVAL}}",
       "done": "{{LINEAR_STATE_ID_DONE}}"
     },
     "labels": {

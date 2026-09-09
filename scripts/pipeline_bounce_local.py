@@ -27,6 +27,34 @@ WHAT A BOUNCE IS NOW (and what it is no longer)
   — only the owner's identity can start a session, which is why this file's Linear key is
   OWNER-SCOPED even though the process that holds it is not the owner's (see below).
 
+WHAT HAPPENS WHEN NOTHING NEEDS BOUNCING (the conclusion)
+
+  A review that came back usable, judged the CURRENT head, and landed BELOW the severity
+  threshold — with no findings at all, or with findings that do not meet the bar — while
+  the base branch's REQUIRED checks are green is Stage E finishing, not "nothing to do".
+  It used to be neither: both halves of that answer were computed, printed and thrown
+  away into the same quiet `skip` as "no review yet", so the single most valuable
+  transition in the pipeline left no trace anywhere, and the only durable "the AI is
+  done" record was EXHAUSTION — the failure case.
+
+  It is now recorded once, as a `concluded` ledger row carrying repo, PR, ticket id and
+  the BASIS (`clean` | `below-threshold` | `exhausted`), and the original coding ticket
+  is moved once into the NEEDS-APPROVAL lane (`linear.stateIds.needsApproval`, contract
+  §1). That state is the only one this file can write and that move is the only ticket
+  move it makes; nothing else about the conclusion changes anything — no comment, no
+  label, no approval, no merge. Exhaustion concludes the same way and additionally
+  applies `agent:needs-human`, which is what separates "we ran out of road" from
+  "nothing needed fixing" on the board.
+
+  Three refusals keep it honest, each a §13 distinction: a DECLINED review is a
+  could-not and never a clean bill; CI that is pending or unreadable has not finished
+  speaking, so nothing is concluded until it has; and a project that never provisioned
+  the lane is OFF, not broken — the row is still written and the absent move is SAID.
+  The lane itself is provisioned `unstarted` deliberately: a `started` lane would join
+  the dispatcher's unconditional move of a new session's issue to the lowest-ordered
+  started state, and a `completed` one would make the dispatcher delete the worktree and
+  turn every later bounce into a silent no-op.
+
 WHERE THIS RUNS, AND WHERE ITS CREDENTIALS LIVE (owner decision 2026-09-06, "C1")
 
   As the DISPATCHER'S OWN ROLE ACCOUNT — the same account the dispatcher runs as — not
@@ -202,6 +230,13 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
    "dispatcher_repo_names": {"OWNER/REPO": "<repository entry name>"},
    "repo_roots": {"OWNER/REPO": "/a/local/checkout"},   optional; else the contents API
    "needs_human_label_id": "…",                    optional; else delivery.json's ids
+   "needs_approval_state_id": "…",                 optional; else delivery.json's
+                                                   linear.stateIds.needsApproval. UNSET
+                                                   EVERYWHERE ⇒ the needs-approval lane
+                                                   is OFF: a conclusion is still recorded
+                                                   in the ledger and SAID, the ticket is
+                                                   simply not moved (§2/§13 — off, never
+                                                   broken)
    "in_flight_hours": 6,                           a sent bounce blocks a repeat on the
                                                    same head for this long
    "run_timeout_seconds": 900,                     the one-shot `run` pass's own deadline
@@ -237,8 +272,9 @@ Exit: 0 = decided / acted / bounce OFF (named) / nothing to do (named)
           Linear unreachable, a missing credential, a head branch that is not a pipeline
           branch, a branch-named ticket that does not own the PR, a base branch whose
           REQUIRED-CHECK SET could not be read (CANNOT EVALUATE — never a quiet skip),
-          `exhaust` asked for when the budget is not spent, or a send that failed after
-          its ledger row was written — loud, never the same token as "nothing to do"
+          `exhaust` asked for when the budget is not spent, a send that failed after
+          its ledger row was written, or a needs-approval move Linear refused after the
+          conclusion was recorded — loud, never the same token as "nothing to do"
           (contract §13). Where
           the PR is known (its lookup succeeded), open and ours, EVERY could-not also
           posts ONE PR comment saying so, deduplicated per reason — a missing credential,
@@ -300,6 +336,14 @@ DELIVERY_FILE = "delivery.json"
 # Linear WorkflowState.type values that mean "this ticket will not be worked further".
 TERMINAL_STATE_TYPES = ("completed", "canceled")
 NEEDS_HUMAN_KEY = "agent:needs-human"
+# The canonical `linear.stateIds` key (contract §1) for the lane a CONCLUDED review
+# hands to a person. This driver writes that state and no other, and the lane is
+# provisioned `unstarted` on purpose: a `started` lane would join the dispatcher's
+# unconditional move of a new session's issue to the LOWEST-ORDERED started state (an
+# ordering nothing here pins, with failures swallowed), and a `completed` one would
+# make the dispatcher delete the worktree and turn every later bounce into a silent
+# no-op — TERMINAL_STATE_TYPES above is exactly what skips such a ticket.
+NEEDS_APPROVAL_STATE_KEY = "needsApproval"
 FINDINGS_FENCE = "untrusted-review-findings"
 # The VISIBLE record of a bounce (owner decision "C3"). Stamped on every re-prompt and
 # fallback fix ticket, and read back only as a cross-check that can refuse — never as a
@@ -322,6 +366,7 @@ CONFIG_DEFAULTS = {
     "dispatcher_repo_names": {},
     "repo_roots": {},
     "needs_human_label_id": "",
+    "needs_approval_state_id": "",
     "in_flight_hours": DEFAULT_IN_FLIGHT_HOURS,
     "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
     "telemetry_model": "unknown",
@@ -709,8 +754,9 @@ def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reas
         "trip(s) (%d spent); the last trigger still stands: %s." % (pr_number, pr_url, max_bounces, spent, reason),
         "",
         "No further re-prompts will be sent. A person needs to take this over. The bounce "
-        "driver applies `%s` alongside this comment; it never moves the ticket, never "
-        "merges and never approves." % NEEDS_HUMAN_KEY,
+        "driver applies `%s` alongside this comment and moves this ticket to the "
+        "needs-approval lane where the project configures one; it never merges, never "
+        "approves, and moves the ticket nowhere else." % NEEDS_HUMAN_KEY,
     ])
 
 
@@ -814,9 +860,53 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
+def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
+    """'clean' | 'below-threshold' | None — the basis for a DURABLE conclusion, or None
+    when there is nothing to conclude yet. This is the answer the driver used to compute,
+    print and throw away: "the review came back and nothing needs fixing" is the single
+    most valuable transition in Stage E and it left no trace at all, while the only
+    durable "AI is done" record was exhaustion — the failure case.
+
+    Every clause is a refusal to conclude too early:
+      * `trigger_ok` — a bounce is being sent; the review is not done with this PR.
+      * no outcome, or not `fresh` — nothing was reviewed, or what was reviewed is not
+        this head. A conclusion drawn from a review of the pre-fix code would hand a
+        person work the reviewer never looked at.
+      * not `usable` — a DECLINE is a could-not, never a clean bill (§13). The one
+        confusion this whole file exists to prevent.
+      * `meets_threshold` — findings stand; that is a bounce, not a conclusion.
+      * checks neither 'green' nor 'none' — 'pending' means CI is still speaking and may
+        yet go red, and 'unknown' is its own verdict that exits 2. Only a base branch
+        that answered, and answered clear, ends the wait."""
+    if trigger_ok or not outcome or not fresh:
+        return None
+    if not outcome.get("usable") or outcome.get("meets_threshold"):
+        return None
+    if checks_status not in ("green", "none"):
+        return None
+    return "below-threshold" if (outcome.get("findings") or outcome.get("max_severity")) else "clean"
+
+
+def conclusion_pending(row, lane_configured):
+    """Whether a conclusion still has work to do — the idempotency rule, so the ledger
+    row is written and the lane move happens exactly once per PR.
+
+    Three states, kept apart (§13). Never concluded ⇒ pending. Concluded AND moved ⇒
+    done, forever. Concluded but NOT moved ⇒ pending only if the lane is configured
+    NOW: a project that has not provisioned `linear.stateIds.needsApproval` is *off*,
+    so the conclusion settles without a move rather than re-attempting one every pass
+    and appending a ledger row each time — and the day the lane is provisioned, the same
+    rule picks the move back up."""
+    if not row:
+        return True
+    if row.get("moved"):
+        return False
+    return bool(lane_configured)
+
+
 def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger_ok,
            trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced,
-           cannot_evaluate=""):
+           cannot_evaluate="", conclusion=None, settled_conclusion=None):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
     fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
     then the budget: bounce `prior + 1` while budget remains, exhaust when
@@ -833,7 +923,15 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     terminally-ticketed PR is genuinely nothing to evaluate, and an unreadable required
     set does not change that. It is ranked ABOVE the plain no-trigger skip, because there
     the difference is the whole point: "nothing was wrong" and "we could not see whether
-    anything was wrong" are not the same answer."""
+    anything was wrong" are not the same answer.
+
+    `conclusion` is the third thing that can sit where the quiet `skip` used to. When the
+    review came back and nothing needs fixing (`conclusion_basis`), that is not "nothing
+    to do" either — it is Stage E finishing, and it is recorded once and handed to a
+    person. It is ranked BELOW `cannot_evaluate` (we must be able to see CI before we can
+    say it is clean) and it never outranks a live trigger, a fork, a closed or draft PR
+    or a terminal ticket. `settled_conclusion` is the already-written ledger row: with
+    one, the conclusion becomes the named no-op instead of repeating."""
     def hold(action, reason, bounce_no=None):
         return {"action": action, "reason": reason, "bounce_no": bounce_no}
 
@@ -850,6 +948,16 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     if not trigger_ok:
         if cannot_evaluate:
             return hold("unknown", cannot_evaluate)
+        if settled_conclusion:
+            return hold("noop", "Stage E already concluded this PR (%s); %s"
+                                % (settled_conclusion.get("basis") or "concluded",
+                                   "the ticket is in the needs-approval lane and a person has it"
+                                   if settled_conclusion.get("moved") else
+                                   "the ticket was NOT moved — no linear.stateIds.%s is "
+                                   "configured for this repository" % NEEDS_APPROVAL_STATE_KEY))
+        if conclusion:
+            return {"action": "conclude", "bounce_no": None, "basis": conclusion,
+                    "reason": "Stage E concluded (%s) — %s" % (conclusion, trigger_reason)}
         return hold("skip", trigger_reason)
     if in_flight:
         return hold("skip", "bounce %d was already sent for head %s (%s); waiting for a push"
@@ -869,7 +977,8 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
 
 
 def parse_delivery(raw):
-    """(max_bounces, threshold, needs_human_label_id, state) from committed JSON text.
+    """(max_bounces, threshold, needs_human_label_id, needs_approval_state_id, state)
+    from committed JSON text.
     `state` is 'ok' or 'broken:<why>' — absence was decided before we got here.
     `threshold` is None when `budgets.reviewSeverityThreshold` is unset or not a severity
     (the committed validator rejects the latter): then the threshold the review was
@@ -878,18 +987,27 @@ def parse_delivery(raw):
     try:
         cfg = json.loads(raw)
     except ValueError as exc:
-        return None, None, None, "broken:%s is not valid JSON (%s)" % (DELIVERY_FILE, exc)
+        return None, None, None, None, "broken:%s is not valid JSON (%s)" % (DELIVERY_FILE, exc)
     if not isinstance(cfg, dict) or cfg.get("version") != 1:
-        return None, None, None, "broken:%s is not a version-1 object" % DELIVERY_FILE
+        return None, None, None, None, "broken:%s is not a version-1 object" % DELIVERY_FILE
     budgets = cfg.get("budgets") or {}
     max_bounces = budgets.get("maxBounces")
     if not isinstance(max_bounces, int) or isinstance(max_bounces, bool) or max_bounces < 0:
-        return None, None, None, "broken:budgets.maxBounces is missing or not a non-negative integer"
+        return None, None, None, None, "broken:budgets.maxBounces is missing or not a non-negative integer"
     threshold = budgets.get("reviewSeverityThreshold")
     if threshold not in prl.SEVERITY_RANK:
         threshold = None
-    ids = ((cfg.get("linear") or {}).get("labels") or {}).get("ids") or {}
-    return max_bounces, threshold, str(ids.get(NEEDS_HUMAN_KEY) or ""), "ok"
+    lin = cfg.get("linear") or {}
+    ids = (lin.get("labels") or {}).get("ids") or {}
+    # THE ONE READ OF THE STATE MAP IN THIS FILE, and it takes exactly one key. Every
+    # other canonical state — `done` and any cancelled lane above all — is unreachable
+    # from here by construction rather than by care, which is what lets the narrowed
+    # source-level guard in --selftest be an assertion instead of a hope. An absent or
+    # empty `needsApproval` is the lane being OFF, never BROKEN: only maxBounces above
+    # can break this file, because only maxBounces is a budget it would have to invent.
+    states = lin.get("stateIds") or {}
+    return (max_bounces, threshold, str(ids.get(NEEDS_HUMAN_KEY) or ""),
+            str(states.get(NEEDS_APPROVAL_STATE_KEY) or ""), "ok")
 
 
 def pick_agent_thread(issue, dispatcher_app_user_id):
@@ -970,11 +1088,16 @@ def read_ledger(path):
 
 
 def ledger_view(path, owner_repo, pr_number):
-    """{'prior', 'last_spent', 'exhausted'} for one PR. Only `outcome == "spent"` rows
-    count — those are appended BEFORE a send, so a failed send still spent its bounce
-    (over-count, never under-count). A missing ledger reads as zero; an unreadable or
-    corrupt one raises (read_ledger) rather than resetting the budget."""
-    prior, last_spent, exhausted = 0, None, None
+    """{'prior', 'last_spent', 'exhausted', 'concluded'} for one PR. Only
+    `outcome == "spent"` rows count toward the budget — those are appended BEFORE a send,
+    so a failed send still spent its bounce (over-count, never under-count). A missing
+    ledger reads as zero; an unreadable or corrupt one raises (read_ledger) rather than
+    resetting the budget.
+
+    `concluded` is the LAST such row, not a count: a conclusion whose lane move failed
+    appends another on the retry, exactly as a partly-announced exhaustion does, and the
+    newest row is the current state of it."""
+    prior, last_spent, exhausted, concluded = 0, None, None, None
     for row in read_ledger(path):
         if row.get("repo") != owner_repo or row.get("pr") != pr_number:
             continue
@@ -983,7 +1106,10 @@ def ledger_view(path, owner_repo, pr_number):
             last_spent = row
         elif row.get("outcome") == "exhausted":
             exhausted = row
-    return {"prior": prior, "last_spent": last_spent, "exhausted": exhausted}
+        elif row.get("outcome") == "concluded":
+            concluded = row
+    return {"prior": prior, "last_spent": last_spent, "exhausted": exhausted,
+            "concluded": concluded}
 
 
 def append_row(path, **fields):
@@ -1525,6 +1651,24 @@ mutation($id: String!, $input: IssueUpdateInput!) {
     return True
 
 
+def linear_set_state(issue_id, state_id, cfg):
+    """THE ONLY STATE WRITE IN THIS FILE: the original coding ticket into the
+    NEEDS-APPROVAL lane, once, when Stage E has concluded and nothing more will be
+    bounced. `state_id` can only have come from `linear.stateIds.needsApproval` on the
+    committed default branch (or the operator's `needs_approval_state_id` override) —
+    `parse_delivery` reads that one key and this file reads the state map nowhere else —
+    so no terminal state is reachable through here. Nothing here merges, approves,
+    labels or comments; the lane move IS the whole signal."""
+    mutation = """
+mutation($issueId: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $issueId, input: $input) { success }
+}"""
+    data = linear_graphql(mutation, {"issueId": issue_id, "input": {"stateId": state_id}}, cfg)
+    if not (data.get("issueUpdate") or {}).get("success"):
+        raise BounceError("issueUpdate (%s lane) did not report success" % NEEDS_APPROVAL_STATE_KEY)
+    return True
+
+
 def post_pr_comment(pr_number, body, owner_repo, dry_run):
     """The ONE GitHub write, through the reviewer core's publisher → gh_fallback.py
     (no merge endpoint by construction; its secret scrub and fork guard live there)."""
@@ -1636,14 +1780,15 @@ def _gather_after_pr(sit, cfg, state_dir):
     if cstate != "ok":
         sit["config_state"] = cstate
         return sit
-    max_bounces, threshold, needs_human_id, pstate = parse_delivery(raw)
+    max_bounces, threshold, needs_human_id, needs_approval_id, pstate = parse_delivery(raw)
     if pstate != "ok":
         sit["config_state"] = pstate
         return sit
     sit.update(config_state="ok", max_bounces=max_bounces,
                threshold=threshold or prl.DEFAULT_THRESHOLD,
                threshold_source="delivery" if threshold else "default",
-               needs_human_label_id=cfg.get("needs_human_label_id") or needs_human_id)
+               needs_human_label_id=cfg.get("needs_human_label_id") or needs_human_id,
+               needs_approval_state_id=cfg.get("needs_approval_state_id") or needs_approval_id)
 
     # A closed, draft or cross-repository PR is decide()'s "skip" whatever else is true;
     # nothing below is read for it, and nothing below may be written about it.
@@ -1757,6 +1902,14 @@ def decision_for(sit, cfg):
     ex = sit.get("exhausted") or {}
     announced = bool(ex.get("announced")) and all(bool(v) for v in ex["announced"].values())
 
+    # The conclusion, and whether one is already on the ledger. `lane_on` is read from
+    # the situation, never from the verdict: a project with no needs-approval lane still
+    # gets the durable record, it just gets no move (§2 — off is not broken).
+    basis = conclusion_basis(sit.get("checks_status"), sit.get("outcome"), fresh, trigger_ok)
+    prior_conclusion = sit.get("concluded")
+    lane_on = bool(sit.get("needs_approval_state_id"))
+    settled = None if conclusion_pending(prior_conclusion, lane_on) else prior_conclusion
+
     meta = sit.get("pr_meta") or {}
     verdict = decide(pr_open=bool(meta.get("open")), is_draft=bool(meta.get("isDraft")),
                      is_fork=bool(meta.get("isCrossRepository")),
@@ -1765,7 +1918,8 @@ def decision_for(sit, cfg):
                      trigger_reason=trigger_reason, prior=sit.get("prior", 0),
                      max_bounces=sit.get("max_bounces", 0), in_flight=in_flight,
                      head_sha=sit.get("head_sha"), exhausted_announced=announced,
-                     cannot_evaluate=cannot_evaluate)
+                     cannot_evaluate=cannot_evaluate, conclusion=basis,
+                     settled_conclusion=settled)
     verdict["trigger"] = kind if trigger_ok else None
     verdict["trigger_reason"] = trigger_reason
     verdict["cannot_evaluate"] = cannot_evaluate or None
@@ -1781,6 +1935,8 @@ def describe(sit, verdict):
         head = "BOUNCE %d of %d" % (verdict["bounce_no"], sit.get("max_bounces", 0))
     elif action == "exhaust":
         head = "EXHAUST"
+    elif action == "conclude":
+        head = "CONCLUDE (%s)" % (verdict.get("basis") or "clean")
     elif action == "unknown":
         head = "CANNOT EVALUATE"     # never the same word as `skip`: that was the defect
     else:
@@ -1892,17 +2048,97 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
+def record_conclusion(sit, cfg, state_dir, basis, dry_run):
+    """The durable "Stage E is done with this PR" record, and the lane move that follows
+    it. Returns (settled, problems).
+
+    ONE append-only ledger row — `outcome: "concluded"`, carrying repo, PR, ticket id and
+    the BASIS (`clean` | `below-threshold` | `exhausted`) — and ONE state write of the
+    original coding ticket into the needs-approval lane. It is the only caller of
+    `linear_set_state`, which is the only state write in this file.
+
+    Three outcomes, kept distinguishable because two of them look identical from outside
+    (§13): MOVED (row written, the ticket is a person's now), lane OFF (row written, no
+    move, SAID on stdout — a project that has not provisioned
+    `linear.stateIds.needsApproval` is off, not broken, and a later pass makes the move
+    once it is), and FAILED (row written, Linear refused the move — a problem, exit 2,
+    retried next pass). Never a label, never a comment, never a merge, never an
+    approval."""
+    state_id = str(sit.get("needs_approval_state_id") or "")
+    issue_id = str((sit.get("issue") or {}).get("id") or "")
+    note, problems = "", []
+    if not state_id:
+        lane = "off"
+        note = ("the needs-approval lane is not configured for %s — no linear.stateIds.%s "
+                "on the committed %s and no needs_approval_state_id in the driver config; "
+                "the conclusion is recorded and the ticket was NOT moved"
+                % (sit["repo"], NEEDS_APPROVAL_STATE_KEY, DELIVERY_FILE))
+    elif not issue_id:
+        lane = "failed"
+        problems.append("needs-approval move: no original ticket resolved for this PR")
+    else:
+        lane = "moved"
+    if dry_run:
+        print("[dry-run] would record a `concluded` row (basis %s) for %s#%d and %s — "
+              "nothing written"
+              % (basis, sit["repo"], sit["pr"],
+                 "move %s to the needs-approval lane (state id %r)" % (sit.get("ticket_id"), state_id)
+                 if lane == "moved" else "move nothing (%s)" % (note or "; ".join(problems))))
+        return True, []
+    if lane == "moved":
+        try:
+            linear_set_state(issue_id, state_id, cfg)
+        except BounceError as exc:
+            lane, problems = "failed", ["needs-approval move: %s" % exc]
+    append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"],
+               ticket_id=sit.get("ticket_id"), outcome="concluded", basis=basis,
+               moved=(lane == "moved"), lane=lane, note=note, problems=problems)
+    if note:
+        print("NOTE: %s#%d: %s" % (sit["repo"], sit["pr"], note))
+    return lane != "failed", problems
+
+
+def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
+    """Stage E reviewed this PR and nothing needs fixing: record it once, hand the ticket
+    to a person. The lane move is the entire signal — no comment, no label, no approval,
+    no merge. `agent:needs-human` stays exactly what it was (a spent budget), so the two
+    ways Stage E ends stay distinguishable on the board."""
+    basis = verdict.get("basis") or "clean"
+    _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run)
+    if dry_run:
+        return EXIT_OK
+    emit_status = emit_telemetry(state_dir, {
+        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+        "outcome": "completed", "bounce_no": 0, "max_bounces": sit.get("max_bounces", 0),
+        "reason": verdict["reason"]}, cfg)
+    if problems:
+        sys.stderr.write("FAIL: %s#%d concluded (%s) but the needs-approval move did not land "
+                         "(%s); the conclusion is on the ledger and the next run retries the "
+                         "move. telemetry: %s\n"
+                         % (sit["repo"], sit["pr"], basis, "; ".join(problems), emit_status))
+        return EXIT_USAGE
+    print("%s — recorded; telemetry: %s" % (describe(sit, verdict), emit_status))
+    return EXIT_OK
+
+
 def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
-    """The two budget-spent comments and the ONE label, each done once: a previous
-    partial announcement is completed, not repeated. Recorded as an 'exhausted' row
-    whose `announced` map says which steps landed."""
+    """The two budget-spent comments, the ONE label and the conclusion, each done once:
+    a previous partial announcement is completed, not repeated. Recorded as an 'exhausted'
+    row whose `announced` map says which steps landed.
+
+    Exhaustion is a conclusion too — Stage E is done with this PR and a person must take
+    it — so it writes the same `concluded` row (basis `exhausted`) and moves the ticket
+    to the same lane. What tells the two apart on the board is `agent:needs-human`, which
+    only this path applies: needs-approval + the label is "we ran out of road", the lane
+    alone is "nothing needed fixing"."""
     spent, max_bounces = sit.get("prior", 0), sit.get("max_bounces", 0)
     reason = verdict.get("trigger_reason") or verdict.get("reason") or "budget exhausted"
     issue = sit.get("issue") or {}
     prev = ((sit.get("exhausted") or {}).get("announced")) or {}
     announced = {"pr_comment": bool(prev.get("pr_comment")),
                  "ticket_comment": bool(prev.get("ticket_comment")),
-                 "label": bool(prev.get("label"))}
+                 "label": bool(prev.get("label")),
+                 "concluded": bool(prev.get("concluded"))}
     pr_body = render_exhaustion_pr_comment(sit.get("ticket_id"), sit["pr"], spent, max_bounces, reason)
     ticket_body = render_exhaustion_ticket_comment(sit["pr"], sit.get("pr_url") or "", spent, max_bounces, reason)
     hits = secret_hits("\n".join((pr_body, ticket_body)))
@@ -1917,6 +2153,7 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
         print("=== [dry-run] PR comment ===\n%s\n=== [dry-run] ticket comment ===\n%s" % (pr_body, ticket_body))
         print("[dry-run] would apply %s (label id %r) to %s — nothing written"
               % (NEEDS_HUMAN_KEY, sit.get("needs_human_label_id") or "", sit.get("ticket_id")))
+        record_conclusion(sit, cfg, state_dir, "exhausted", True)
         return EXIT_OK
 
     problems = []
@@ -1948,6 +2185,11 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
                 announced["label"] = True
             except BounceError as exc:
                 problems.append("label: %s" % exc)
+
+    if not announced["concluded"]:
+        settled, conclusion_problems = record_conclusion(sit, cfg, state_dir, "exhausted", False)
+        announced["concluded"] = settled
+        problems += conclusion_problems
 
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                bounce_no=verdict.get("bounce_no"), outcome="exhausted", announced=announced,
@@ -2049,6 +2291,8 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         return act(perform_bounce)
     if verdict["action"] == "exhaust":
         return act(perform_exhaust)
+    if verdict["action"] == "conclude":
+        return act(perform_conclude)
     print(describe(sit, verdict))
     return EXIT_OK
 
@@ -2258,6 +2502,31 @@ def selftest():
     check("outcome newer than the last bounce is fresh (no head recorded)",
           outcome_is_fresh(above, "bbb", {"at": "2026-01-01T00:00:00Z"})[0], True)
 
+    # 4b. The CONCLUSION — the answer this driver used to compute, print and throw away.
+    #     Every None below is a refusal to hand a person work the reviewer never finished.
+    below = {"usable": True, "meets_threshold": False, "max_severity": "low",
+             "findings": [{"severity": "low"}], "at": "2026-01-02T00:00:00Z"}
+    spotless = {"usable": True, "meets_threshold": False, "max_severity": None, "findings": [],
+                "at": "2026-01-02T00:00:00Z"}
+    check("a fresh clean review on green CI concludes", conclusion_basis("green", spotless, True, False), "clean")
+    check("a base branch that requires nothing concludes too", conclusion_basis("none", spotless, True, False), "clean")
+    check("findings below the threshold conclude, and the basis says which",
+          conclusion_basis("green", below, True, False), "below-threshold")
+    check("a review that TRIGGERS a bounce never concludes", conclusion_basis("green", below, True, True), None)
+    check("an at-threshold review never concludes", conclusion_basis("green", above, True, False), None)
+    check("a DECLINE is a could-not, never a clean bill", conclusion_basis("green", {"usable": False}, True, False), None)
+    check("a stale review never concludes", conclusion_basis("green", spotless, False, False), None)
+    check("no review at all never concludes", conclusion_basis("green", None, True, False), None)
+    for status in ("pending", "red", "unknown"):
+        check("CI %s never concludes — CI has not finished speaking" % status,
+              conclusion_basis(status, spotless, True, False), None)
+    check("nothing concluded yet is pending", conclusion_pending(None, True), True)
+    check("concluded AND moved is done, forever", conclusion_pending({"moved": True}, True), False)
+    check("concluded without the move is pending while the lane is configured",
+          conclusion_pending({"moved": False}, True), True)
+    check("…and settles when the lane is not configured (off, never broken)",
+          conclusion_pending({"moved": False}, False), False)
+
     # 5. The counter, exactly at N-1 / N / N+1 (bounce numbers) against maxBounces = N = 3.
     base = dict(pr_open=True, is_draft=False, is_fork=False, ticket_terminal=False, ticket_state="In Progress",
                 trigger_ok=True, trigger_reason="red", max_bounces=3, in_flight=None, head_sha="h",
@@ -2285,12 +2554,49 @@ def selftest():
     check("announced exhaustion never outranks a cleared trigger",
           decide(prior=3, **dict(base, trigger_ok=False, trigger_reason="clean", exhausted_announced=True))["action"], "skip")
 
+    # 5b. Where a conclusion sits in that order. It replaces the quiet `skip` and nothing
+    #     else: never a live trigger, never a hold that means "not ours to judge".
+    cleared = dict(base, trigger_ok=False, trigger_reason="review findings are below the threshold")
+    d = decide(prior=0, **dict(cleared, conclusion="below-threshold"))
+    check("a cleared trigger with a basis CONCLUDES instead of skipping",
+          (d["action"], d["basis"]), ("conclude", "below-threshold"))
+    check("a LIVE trigger always outranks a conclusion",
+          decide(prior=0, **dict(base, conclusion="clean"))["action"], "bounce")
+    check("CANNOT EVALUATE outranks a conclusion — we cannot call it clean unseen",
+          decide(prior=0, **dict(cleared, conclusion="clean", cannot_evaluate="CI unreadable"))["action"], "unknown")
+    for label, over in (("fork", {"is_fork": True}), ("closed PR", {"pr_open": False}),
+                        ("draft", {"is_draft": True}), ("terminal ticket", {"ticket_terminal": True})):
+        check("a %s never concludes" % label,
+              decide(prior=0, **dict(cleared, conclusion="clean", **over))["action"], "skip")
+    settled_moved = {"basis": "clean", "moved": True}
+    check("a settled conclusion is a named no-op, never a second move",
+          decide(prior=0, **dict(cleared, conclusion="clean", settled_conclusion=settled_moved))["action"], "noop")
+    check("…and the no-op says WHERE the ticket is",
+          "needs-approval lane" in decide(prior=0, **dict(cleared, conclusion="clean",
+                                                          settled_conclusion=settled_moved))["reason"], True)
+    check("a conclusion settled with the lane OFF says the ticket was NOT moved",
+          "was NOT moved" in decide(prior=0, **dict(cleared, conclusion="clean",
+                                                    settled_conclusion={"basis": "clean", "moved": False}))["reason"], True)
+
     # 6. parse_delivery: OK / BROKEN shapes (absence is decided before parsing).
     ok_cfg = json.dumps({"version": 1, "budgets": {"maxBounces": 2, "reviewSeverityThreshold": "medium"},
                          "linear": {"labels": {"ids": {NEEDS_HUMAN_KEY: "lbl-nh"}}}})
-    check("delivery ok", parse_delivery(ok_cfg), (2, "medium", "lbl-nh", "ok"))
-    check("delivery without maxBounces is BROKEN", parse_delivery('{"version":1,"budgets":{}}')[3].startswith("broken:"), True)
-    check("unparseable delivery is BROKEN", parse_delivery("{not json")[3].startswith("broken:"), True)
+    # The second fixture names ALL SIX canonical states (§1). Every state-write assertion
+    # below runs against it, so a driver that reached for the wrong key — `done` above
+    # all — would write a visibly different id rather than merely a plausible one.
+    lane_cfg = json.dumps({"version": 1, "budgets": {"maxBounces": 2, "reviewSeverityThreshold": "medium"},
+                           "linear": {"labels": {"ids": {NEEDS_HUMAN_KEY: "lbl-nh"}},
+                                      "stateIds": {"raw": "st-raw", "ready": "st-ready",
+                                                   "working": "st-working", "review": "st-review",
+                                                   "done": "st-done",
+                                                   NEEDS_APPROVAL_STATE_KEY: "st-needs-approval"}}})
+    check("delivery ok", parse_delivery(ok_cfg), (2, "medium", "lbl-nh", "", "ok"))
+    check("a delivery.json with no needs-approval lane is OFF, never BROKEN",
+          parse_delivery(ok_cfg)[3:], ("", "ok"))
+    check("the needs-approval lane is read from the state map, and it is the ONLY key read",
+          parse_delivery(lane_cfg)[3:], ("st-needs-approval", "ok"))
+    check("delivery without maxBounces is BROKEN", parse_delivery('{"version":1,"budgets":{}}')[4].startswith("broken:"), True)
+    check("unparseable delivery is BROKEN", parse_delivery("{not json")[4].startswith("broken:"), True)
     check("unset threshold is None (the review's own threshold, then the default, apply)",
           parse_delivery('{"version":1,"budgets":{"maxBounces":1}}')[1], None)
     check("a non-severity threshold is None too (the committed validator rejects it)", parse_delivery(
@@ -2721,8 +3027,8 @@ def selftest():
     world = {}
     stubbed = ("repo_default_branch", "committed_delivery_json", "pr_view", "check_runs", "required_checks",
                "linear_issue", "linear_ticket_for_pr_url", "linear_reply_in_thread",
-               "linear_create_fix_ticket", "linear_comment", "linear_add_label", "post_pr_comment",
-               "emit_telemetry")
+               "linear_create_fix_ticket", "linear_comment", "linear_add_label", "linear_set_state",
+               "post_pr_comment", "emit_telemetry")
     saved = {name: globals()[name] for name in stubbed}
 
     def install():
@@ -2751,8 +3057,15 @@ def selftest():
                 raise BounceError("simulated issueCreate failure")
             return {"id": "fix-uuid", "identifier": "REV-7", "url": "u"}
 
+        def set_state(issue_id, state_id, cfg):
+            calls.append(("state", issue_id, state_id))
+            if world.get("state_fails"):
+                raise BounceError("simulated issueUpdate failure")
+            return True
+
         globals()["linear_reply_in_thread"] = reply
         globals()["linear_create_fix_ticket"] = create
+        globals()["linear_set_state"] = set_state
         globals()["linear_comment"] = lambda issue_id, body, cfg: calls.append(("ticketComment", issue_id, body)) or "c"
         globals()["linear_add_label"] = lambda issue_id, label_id, cfg: calls.append(("label", issue_id, label_id)) or True
         globals()["post_pr_comment"] = lambda pr, body, repo, dry: calls.append(("prComment", pr, body))
@@ -2767,12 +3080,13 @@ def selftest():
                   "comments": {"nodes": [{"id": "root-c", "parent": None, "agentSession": {
                       "id": "s1", "createdAt": "2026-01-01T00:00:00Z", "appUser": {"id": "app"}}}]}}
     delivery_ok = (ok_cfg, "ok")
+    delivery_lane = (lane_cfg, "ok")
 
     def kinds():
         return [c[0] for c in calls]
 
     def linear_writes():
-        return [c[0] for c in calls if c[0] in ("reply", "issueCreate", "ticketComment", "label")]
+        return [c[0] for c in calls if c[0] in ("reply", "issueCreate", "ticketComment", "label", "state")]
 
     def body_of(kind):
         """The body of the first recorded call of `kind`, or "" — so a missing call fails
@@ -2888,9 +3202,12 @@ def selftest():
             for word in ("approve", "Approved", "LGTM", "merge this"):
                 if word in pr_comment:
                     failures.append("exhaustion comment contains %r" % word)
-            check("exhausted row recorded with all steps announced",
+            check("exhausted row recorded with all steps announced (the conclusion among them)",
                   ledger_view(ledger_path(tmp), "o/r", 41)["exhausted"]["announced"],
-                  {"pr_comment": True, "ticket_comment": True, "label": True})
+                  {"pr_comment": True, "ticket_comment": True, "label": True, "concluded": True})
+            check("exhaustion under a delivery.json with no lane still records the conclusion",
+                  [(r["basis"], r["moved"], r["lane"]) for r in read_ledger(ledger_path(tmp))
+                   if r["outcome"] == "concluded"], [("exhausted", False, "off")])
 
             # 10g. Announced exhaustion ⇒ named no-op, nothing sent again.
             calls.clear()
@@ -3030,6 +3347,196 @@ def selftest():
                       (run_one(41, "o/r", cfg, tmp, "bounce", False), linear_writes()), (EXIT_USAGE, []))
                 world["issue"] = live_issue
         check("the scrub said WITHHELD on stderr", "WITHHELD" in err.getvalue(), True)
+
+        # 10jc. THE CONCLUSION, end to end. A fresh, usable review that did NOT meet the
+        #       threshold, with the required checks green, is not "nothing to do" — it is
+        #       Stage E finishing. Before this it collapsed into the same quiet skip as
+        #       "no review yet", leaving no ledger row, no lane move and no trace at all;
+        #       the only durable "AI is done" record was exhaustion, the failure case.
+        clean_record = dict(poller_record, max_severity=None, meets_threshold=False,
+                            findings=[], head_sha="aaaa1111")
+        low_record = dict(poller_record, max_severity="low", meets_threshold=False,
+                          findings=[{"severity": "low", "category": "style",
+                                     "summary": "nit", "detail": "d"}], head_sha="aaaa1111")
+        world.update(runs=green, delivery=delivery_lane, pr=open_pr, required=["Kit checks"])
+        for label, record, basis in (("clean", clean_record, "clean"),
+                                     ("below-threshold", low_record, "below-threshold")):
+            with tempfile.TemporaryDirectory() as tmp:
+                write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), record)
+                calls.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                check("%s review CONCLUDES: exit 0, the lane move, then telemetry" % label,
+                      (rc, kinds()), (EXIT_OK, ["state", "telemetry"]))
+                check("%s review: the ORIGINAL ticket moved, to the needs-approval id" % label,
+                      [c[1:] for c in calls if c[0] == "state"], [("iss-uuid", "st-needs-approval")])
+                check("%s review: one concluded row carrying repo, PR, ticket and basis" % label,
+                      [(r["repo"], r["pr"], r["ticket_id"], r["basis"], r["moved"])
+                       for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"],
+                      [("o/r", 41, "ENG-41", basis, True)])
+                check("%s review: the verdict is CONCLUDE, never the word skip" % label,
+                      ("CONCLUDE" in buf.getvalue(), "skip" in buf.getvalue()), (True, False))
+                check("%s review: no bounce was spent and no label was written" % label,
+                      (ledger_view(ledger_path(tmp), "o/r", 41)["prior"],
+                       [c for c in calls if c[0] == "label"]), (0, []))
+                #   …and EXACTLY ONCE per PR: the next pass is a named no-op that moves nothing.
+                calls.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                check("%s review: the second pass writes nothing at all" % label, (rc, calls), (EXIT_OK, []))
+                check("%s review: …and NAMES the nothing (§13)" % label,
+                      "already concluded" in buf.getvalue(), True)
+                check("%s review: still exactly one concluded row" % label,
+                      len([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"]), 1)
+
+        #       EVERY TERMINAL STATE REMAINS BANNED. The fixture names all six canonical
+        #       states; the driver can reach exactly one of them. `done` is the one that
+        #       matters most — a coding ticket in a terminal state makes the dispatcher
+        #       delete the worktree, so every later bounce becomes a silent no-op.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_one(41, "o/r", cfg, tmp, "bounce", False)
+            written = {c[2] for c in calls if c[0] == "state"}
+            check("no terminal state id is ever written",
+                  written & {"st-done", "st-raw", "st-ready", "st-working", "st-review"}, set())
+            check("…and the one id that IS written is the needs-approval lane's",
+                  written, {"st-needs-approval"})
+
+        #       A conclusion waits for CI to finish speaking: 'pending' may still go red,
+        #       and a ticket already handed to a person would have to be handed back.
+        for label, runs in (("a pending required check", []),
+                            ("a red required check", [{"name": "Kit checks", "status": "completed",
+                                                       "conclusion": "failure"}])):
+            world["runs"] = runs
+            with tempfile.TemporaryDirectory() as tmp:
+                write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    run_one(41, "o/r", cfg, tmp, "bounce", False)
+                check("%s never concludes" % label, [c for c in calls if c[0] == "state"], [])
+        world["runs"] = green
+
+        #       A DECLINE and a stale review are could-nots, not clean bills.
+        for label, record in (("an unusable review", dict(clean_record, usable=False, reason="declined")),
+                              ("a review of an older head", dict(clean_record, head_sha="9999zzzz"))):
+            with tempfile.TemporaryDirectory() as tmp:
+                write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), record)
+                calls.clear()
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                check("%s never concludes" % label, (rc, calls), (EXIT_OK, []))
+                check("%s: CONCLUDE is not printed either" % label, "CONCLUDE" in buf.getvalue(), False)
+
+        #       §2/§13: a project that has not provisioned the lane is OFF, not broken.
+        #       The durable record is still written, the missing move is SAID, and the
+        #       next pass does not churn a second row — but the day the lane appears, the
+        #       same PR gets its move without a fresh conclusion to authorise it.
+        world["delivery"] = delivery_ok
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("lane off: exit 0, the row is written, nothing is moved",
+                  (rc, [c for c in calls if c[0] == "state"]), (EXIT_OK, []))
+            check("lane off: the nothing is NAMED, with the config key",
+                  ("needs-approval lane is not configured" in buf.getvalue()
+                   and "linear.stateIds.needsApproval" in buf.getvalue()), True)
+            row = ledger_view(ledger_path(tmp), "o/r", 41)["concluded"]
+            check("lane off: the row records the basis and that it did not move",
+                  (row["basis"], row["moved"], row["lane"]), ("clean", False, "off"))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("lane off: the next pass does not append a second row",
+                  (rc, len([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"])),
+                  (EXIT_OK, 1))
+            world["delivery"] = delivery_lane
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("lane provisioned later: the move happens, to the needs-approval id",
+                  (rc, [c[1:] for c in calls if c[0] == "state"]),
+                  (EXIT_OK, [("iss-uuid", "st-needs-approval")]))
+
+        #       A move Linear refuses is a could-not, not a conclusion quietly dropped:
+        #       exit 2, loud, the record survives, and the next pass retries the move.
+        world["state_fails"] = True
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("a refused move exits 2", rc, EXIT_USAGE)
+            row = ledger_view(ledger_path(tmp), "o/r", 41)["concluded"]
+            check("a refused move still records the conclusion, marked not-moved",
+                  (row["basis"], row["moved"], row["lane"]), ("clean", False, "failed"))
+            world["state_fails"] = False
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("…and the next pass retries the move",
+                  (rc, [c[1:] for c in calls if c[0] == "state"]),
+                  (EXIT_OK, [("iss-uuid", "st-needs-approval")]))
+        check("a refused move is loud on stderr",
+              "needs-approval move did not land" in err.getvalue(), True)
+
+        #       EXHAUSTION IS A CONCLUSION TOO — the same row (basis `exhausted`) and the
+        #       same lane. What tells the two apart on the board is agent:needs-human,
+        #       which only this path applies: lane + label is "we ran out of road", the
+        #       lane alone is "nothing needed fixing".
+        world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "failure"}]
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            append_row(ledger_path(tmp), repo="o/r", pr=41, bounce_no=1, head_sha="p", outcome="spent")
+            append_row(ledger_path(tmp), repo="o/r", pr=41, bounce_no=2, head_sha="q", outcome="spent")
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("exhaustion concludes too: two comments, the one label, the lane move",
+                  (rc, kinds()), (EXIT_OK, ["prComment", "ticketComment", "label", "state", "telemetry"]))
+            row = ledger_view(ledger_path(tmp), "o/r", 41)["concluded"]
+            check("exhaustion's conclusion carries basis `exhausted`, the ticket and the move",
+                  (row["basis"], row["moved"], row["ticket_id"]), ("exhausted", True, "ENG-41"))
+            check("exhaustion still writes only the needs-approval state id",
+                  [c[2] for c in calls if c[0] == "state"], ["st-needs-approval"])
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("exhaustion announced: nothing is repeated and the ticket is not re-moved",
+                  (rc, calls), (EXIT_OK, []))
+        world["runs"] = green
+
+        #       `decide` stays read-only, `exhaust` still refuses a verdict that is not
+        #       exhaust, and a dry run writes nothing anywhere.
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "decide", False, as_json=True)
+            doc = json.loads(buf.getvalue().strip())
+            check("decide reports the conclusion and its basis, and writes nothing",
+                  (rc, doc["action"], doc["basis"], calls, os.path.exists(ledger_path(tmp))),
+                  (EXIT_OK, "conclude", "clean", [], False))
+            calls.clear()
+            check("`exhaust` refuses a conclusion — it is not a lever",
+                  (run_one(41, "o/r", cfg, tmp, "exhaust", False), calls,
+                   os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", True)
+            check("conclude dry-run: exit 0, nothing written anywhere",
+                  (rc, calls, os.path.exists(ledger_path(tmp))), (EXIT_OK, [], False))
+            check("conclude dry-run names the move it would make",
+                  "needs-approval lane" in buf.getvalue(), True)
+        world.update(delivery=delivery_ok, runs=green)
 
         # 10k. Fork and closed PRs never bounce; dry-run writes nothing.
         world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "failure"}]
@@ -3392,13 +3899,45 @@ def selftest():
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     for banned in ("gh pr merge", "--approve", "issueAddLabel", "addLabels", "pr edit --add-label",
                    "createReview", "enable-auto-merge", "enablePullRequestAutoMerge", "pulls/{number}/merge",
-                   "mergePullRequest", "issueArchive", "removedLabelIds", "stateId", "\"claude\", \"-p\"",
+                   "mergePullRequest", "issueArchive", "removedLabelIds", "\"claude\", \"-p\"",
                    "claude -p"):
         if src.count(banned) > 1:
             failures.append("source names a forbidden path: %r" % banned)
+
+    # 11b. THE NARROWED STATE-WRITE RULE — a deliberate loosening, not an oversight.
+    #      `stateId` used to sit in the ban list above: this file could not name it at
+    #      all. The stated rationale was always about TERMINAL states — a coding ticket
+    #      reaching Done makes the dispatcher delete the worktree the fix still needs, so
+    #      every later bounce becomes a silent no-op — but the enforcement was broader
+    #      than the rationale, and a move to a NON-terminal lane fires none of it. The ban
+    #      is therefore narrowed to exactly what the rationale covers, and these checks
+    #      are what replaces it. Each is the belt for one clause:
+    #        (i)   exactly ONE state mutation exists in this file;
+    #        (ii)  it writes the `stateId` field, and it has exactly ONE call site;
+    #        (iii) the id it writes can only have come from ONE key of the state map,
+    #              which this file reads exactly once;
+    #        (iv)  that key is the needs-approval lane and can never be a terminal one,
+    #              and a ticket already in a terminal state is still skipped outright;
+    #        (v)   the label mutation is still a DIFFERENT mutation, so neither can be
+    #              mistaken for the other or quietly grow into it.
+    #      The braces are behavioural: 10jc drives the whole driver against a config
+    #      naming all six canonical states and asserts the only id ever written is the
+    #      needs-approval one. Every needle here is built from parts so no check counts
+    #      itself.
+    check("exactly one state mutation in the source", src.count("issueUpdate(" + "id: $issueId"), 1)
+    check("exactly one write of the stateId field", src.count('"state' + 'Id":'), 1)
+    check("the state mutation has exactly one call site (its def, and record_conclusion)",
+          src.count("linear_set" + "_state("), 2)
+    check("the state map is read exactly once, and only with the needs-approval key",
+          (src.count('lin.get("state' + 'Ids")'), src.count("states.get(NEEDS_APPROVAL_STATE" + "_KEY)")),
+          (1, 1))
+    check("the needs-approval key is never a terminal — or any other — canonical state",
+          NEEDS_APPROVAL_STATE_KEY not in ("raw", "ready", "working", "review", "done", "canceled"), True)
+    check("a ticket already in a terminal state is still skipped outright",
+          TERMINAL_STATE_TYPES, ("completed", "canceled"))
     #     The needles below are built from parts so this check does not count itself.
-    check("exactly one label mutation in the source (issueUpdate for agent:needs-human)",
-          src.count("issueUpdate(" + "id: $id"), 1)
+    check("exactly one label mutation in the source, distinct from the state mutation "
+          "(issueUpdate for agent:needs-human)", src.count("issueUpdate(" + "id: $id"), 1)
     check("the label mutation is additive", "added" + "LabelIds" in src, True)
     check("labelIds on create appears once (the model label for a ticket this file mints)",
           src.count('payload["label' + 'Ids"]'), 1)
@@ -3431,7 +3970,13 @@ def selftest():
           "absent delivery.json ⇒ OFF and named, missing thread ⇒ fallback fix ticket with "
           "[repo=name#branch] + push + rename instruction, sanitizer strips routing tags and "
           "fence tags everywhere, the only label written is agent:needs-human on exhaustion, "
-          "no merge/approve/auto-merge/launch path; C1: one config file serves both components "
+          "no merge/approve/auto-merge/launch path; a clean or below-threshold review on "
+          "green CI CONCLUDES — one ledger row carrying the basis and one move of the "
+          "original ticket into the needs-approval lane, exactly once, with exhaustion "
+          "concluding the same way; the ONLY state id this driver can write is that lane's "
+          "(every terminal state stays banned, a pending/red/unknown CI or a declined or "
+          "stale review never concludes, an unprovisioned lane is off and said, a refused "
+          "move is loud and retried); C1: one config file serves both components "
           "(poller key spellings aliased, unknown keys ignored), a state dir inside a git "
           "worktree is refused and one outside the account's home warns, the one-shot `run` "
           "pass leaves a heartbeat on every path, isolates one PR's crash and reports a "
