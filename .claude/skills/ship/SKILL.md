@@ -127,8 +127,16 @@ diff if empty.
    `ci_green`, `merged` or `deployed` — those are observed after you stop, by CI or by
    the platform, and §4 forbids an agent-claimed merge outright.
 
-7. **Watch CI to green:** `gh pr checks <n> --watch`, or `python3 scripts/gh_fallback.py pr-checks <n>` if `gh` is failing. If a check fails, read the log,
-   fix, push, re-watch. A `DIRTY` PR is not green — rebase and force-push.
+7. **Watch CI to green:** `gh pr checks <n> --watch`, or `python3 scripts/gh_fallback.py pr-checks <n>` if `gh` is failing.
+
+   **Red? Run `/fix-ci`.** Do not improvise a fix loop here — the kit ships that one,
+   and it already knows the parts that are easy to get wrong: a `DIRTY` PR is triaged
+   as a conflict *before* any code is touched (while conflicted the required CI never
+   ran, so there is no log to read), a flaky-shaped failure gets exactly one rerun,
+   and the whole thing is bounded to ~3 iterations and then reports. Come back here
+   when it returns. If it exhausts its bound, say plainly that the PR is **not** green
+   and what is still red — then step 8.
+
    **`Hooks change guard` red is a stop-and-report, not a task.** A PR touching
    `.claude/hooks/**` or `.claude/settings*.json` stays red until the `hooks-change`
    label is added, and that label is **set by a human** (`docs/PIPELINE-CONTRACT.md`
