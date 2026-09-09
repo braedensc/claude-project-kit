@@ -196,8 +196,16 @@ STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either w
   <state_dir>/bounce-heartbeat.json                   the one-shot `run` pass's last start,
       last finish and result — how an operator tells "ran, nothing to do" from "did not
       run" without reading a launchd log
-  <state_dir>/rereview/<OWNER>__<REPO>/pr-<n>.json    left after a bounce so the poller
-      may re-review the next push — bounded, since bounces are
+  <state_dir>/rereview/<OWNER>__<REPO>/pr-<n>.json    written after each DELIVERED bounce
+      and READ by the poller — the half of the loop that makes a budget above 1 real:
+      {"rereview_schema": "pipeline-rereview-request/1", "pr", "repo", "requested_at",
+       "after_bounce_no", "head_before"}
+      `head_before` is the head this bounce was delivered against. The poller re-reviews
+      the PR on its next pass IF the current head differs — the re-prompted session
+      actually pushed — and DELETES the file once the new review ticket exists. One bounce
+      writes one request and one request buys one review, so review cost can never exceed
+      the bounces spent plus the review the PR was opened with. A request written before
+      that loop existed carries no `rereview_schema`; the poller reads those too
   <state_dir>/declines/<OWNER>__<REPO>/pr-<n>.json    which could-not reasons were already
       said on the PR, so a five-minute poller says each once, not 288 times a day
   <state_dir>/bounces/…                               §4 telemetry artifacts, handed to
@@ -317,6 +325,10 @@ CREDENTIAL_HOME_NOTE = ("it belongs in the driver's own env file (%s, mode 600) 
 HEARTBEAT_SCHEMA = "pipeline-bounce-heartbeat/1"
 DEFAULT_RUN_TIMEOUT_SECONDS = 900
 LEDGER_SCHEMA = "pipeline-bounce-ledger/1"
+# The re-review request left for the poller after each delivered bounce. It is the only
+# thing that ever makes a PR reviewable a second time, so its shape is a cross-script
+# contract: scripts/pipeline_review_poller.py reads exactly these keys.
+REREVIEW_SCHEMA = "pipeline-rereview-request/1"
 # The poller's outcome record (`pipeline_review_poller.OUTCOME_SCHEMA`) — the one shape
 # this driver reads; any other value is refused, never read as best-effort.
 OUTCOME_SCHEMA = "pipeline-review-outcome/1"
@@ -803,16 +815,30 @@ def checks_summary(runs, required, unknown_detail=""):
 
 
 def outcome_is_fresh(outcome, head_sha, last_spent):
-    """A review outcome triggers a bounce only when it judged the CURRENT head, or —
-    when the poller recorded no head — when it postdates the last bounce. Otherwise a
-    review of the pre-fix code would spend a second bounce on a push it never saw."""
+    """A review outcome is a trigger only when it is BOTH about the current head AND newer
+    than the last bounce. Two guards, and each catches what the other cannot:
+
+      the HEAD guard   — a review of code that has since been replaced must not spend a
+                         bounce on a push it never saw.
+      the CLOCK guard  — a review the last bounce was already spent on must not spend a
+                         second one. Nothing new was learned, so there is nothing to react
+                         to; only a NEW review of the same head may trigger again.
+
+    The clock guard used to be conditional on the poller having recorded no head — which
+    was every outcome ever written, since no producer filled the key, so in practice it
+    always ran. Now that the poller does record one, making it conditional would quietly
+    retire it: a review of the CURRENT head would stay "fresh" indefinitely and buy another
+    bounce every time the in-flight window lapsed, burning the whole budget on one review.
+    So it applies unconditionally. A genuine re-review postdates the bounce that asked for
+    it and passes both.
+    """
     if not outcome:
         return False, "no review outcome is recorded for this PR"
     reviewed = str(outcome.get("head_sha") or "")
     if reviewed and head_sha and reviewed != head_sha:
         return False, ("the review outcome is for an older head (%s); not a trigger for %s "
                        "until re-reviewed" % (reviewed[:12], head_sha[:12]))
-    if not reviewed and last_spent and str(last_spent.get("at") or "") >= str(outcome.get("at") or ""):
+    if last_spent and str(last_spent.get("at") or "") >= str(outcome.get("at") or ""):
         return False, "the review outcome predates the last bounce; not a trigger until re-reviewed"
     return True, ""
 
@@ -2021,8 +2047,11 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
                outcome="delivered", via=via, ref=ref, note=error)
     rr_dir = os.path.join(state_dir, "rereview", repo_slug(sit["repo"]))
     os.makedirs(rr_dir, exist_ok=True)
+    # The poller's half of the loop: it re-reviews this PR on its next pass IF the head has
+    # moved off `head_before`, then deletes this file. One bounce, one request, one review.
     with open(os.path.join(rr_dir, "pr-%d.json" % sit["pr"]), "w", encoding="utf-8") as fh:
-        json.dump({"pr": sit["pr"], "repo": sit["repo"], "requested_at": _now_iso(),
+        json.dump({"rereview_schema": REREVIEW_SCHEMA,
+                   "pr": sit["pr"], "repo": sit["repo"], "requested_at": _now_iso(),
                    "after_bounce_no": verdict["bounce_no"], "head_before": sit.get("head_sha")}, fh)
     emit_status = emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
@@ -2486,6 +2515,17 @@ def selftest():
           outcome_is_fresh(above, "bbb", {"at": "2026-01-03T00:00:00Z"})[0], False)
     check("outcome newer than the last bounce is fresh (no head recorded)",
           outcome_is_fresh(above, "bbb", {"at": "2026-01-01T00:00:00Z"})[0], True)
+    # BOTH guards, always. The clock guard used to be conditional on no head being
+    # recorded — which was every outcome ever written, so it always ran. Once the poller
+    # started recording one, leaving it conditional would have retired it silently: a
+    # review OF THE CURRENT HEAD would stay fresh forever and buy another bounce each time
+    # the in-flight window lapsed, spending the whole budget on one review the session
+    # never answered with a push.
+    check("a review of the current head is NOT fresh again once a bounce was spent on it",
+          outcome_is_fresh(dict(above, head_sha="bbb"), "bbb", {"at": "2026-01-03T00:00:00Z"})[0], False)
+    check("…but a genuine RE-review of that head, postdating the bounce, is",
+          outcome_is_fresh(dict(above, head_sha="bbb", at="2026-01-04T00:00:00Z"), "bbb",
+                           {"at": "2026-01-03T00:00:00Z"})[0], True)
 
     # 4b. The CONCLUSION — the answer this driver used to compute, print and throw away.
     #     Every None below is a refusal to hand a person work the reviewer never finished.
@@ -3129,8 +3169,17 @@ def selftest():
             rows = read_ledger(ledger_path(tmp))
             check("ledger: spent then delivered", [r["outcome"] for r in rows], ["spent", "delivered"])
             check("ledger spent row records head and trigger", (rows[0]["head_sha"], rows[0]["trigger"]), ("aaaa1111", "ci"))
-            check("a re-review request was left for the poller",
-                  os.path.exists(os.path.join(tmp, "rereview", "o__r", "pr-41.json")), True)
+            rr_path = os.path.join(tmp, "rereview", "o__r", "pr-41.json")
+            check("a re-review request was left for the poller", os.path.exists(rr_path), True)
+            # Its SHAPE is a cross-script contract: pipeline_review_poller re-reviews this PR
+            # only when the current head differs from `head_before`, so a request without one
+            # would strand every later bounce. The poller's own battery reads it back.
+            with open(rr_path) as fh:
+                rr_doc = json.load(fh)
+            check("the request names its schema, its bounce and the head it bounced",
+                  (rr_doc.get("rereview_schema"), rr_doc.get("after_bounce_no"),
+                   rr_doc.get("head_before"), rr_doc.get("repo"), rr_doc.get("pr")),
+                  (REREVIEW_SCHEMA, 1, "aaaa1111", "o/r", 41))
 
             # 10d. Same head again ⇒ in flight, no second send.
             calls.clear()
@@ -3958,7 +4007,9 @@ def selftest():
           "pass leaves a heartbeat on every path, isolates one PR's crash and reports a "
           "deadline as PARTIAL; C2: Linear's attachment names the ticket before the branch "
           "does and the branch fallback says why; C3: the ledger is the budget and the "
-          "re-prompt carries its visible record, which can refuse but never grant a bounce")
+          "re-prompt carries its visible record, which can refuse but never grant a bounce; "
+          "every delivered bounce leaves a re-review request naming the head it bounced, which "
+          "is what lets the poller re-review and a budget above 1 mean anything")
     return 0
 
 
