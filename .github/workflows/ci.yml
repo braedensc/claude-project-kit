@@ -239,6 +239,13 @@ jobs:
       - name: Safe-outputs absence-vs-failure selftest (contract §13, §8)
         run: python3 scripts/pipeline_safe_outputs_probe.py --selftest
 
+      # The idea-gate executor: it materialises a planning session's proposed
+      # epic tree (§8 "Filing a plan"), forcing every authority field, gating
+      # every child through the DoR gate, all-or-nothing. Inert here (no
+      # delivery.json, no live dispatcher); --selftest is what has teeth.
+      - name: Plan-tree executor selftest (forced fields, DoR gate, §8/§13 verdicts)
+        run: python3 scripts/pipeline_plan_executor.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 

@@ -1,18 +1,23 @@
 # Stage A triggered from Linear — an idea ticket becomes a pending-approval epic tree
 
-**Date:** 2026-09-06 · **Status:** Proposed · **Context:** KIT-105, branch
+**Date:** 2026-09-06 · **Status:** Accepted (2026-09-08) · **Context:** KIT-105, branch
 `docs/kit-105-linear-triggered-planning-adr`. Extends
 [Stage E under a delegation-bound dispatcher](2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md)
 — the same transport, pointed at planning instead of review.
 
-> **Why Proposed, not Accepted.** This ADR records a *direction*. Its build is gated on
-> four things that do not exist yet (Stage E landing, KIT-102, KIT-96's executor enabled
-> on the dispatcher, and Stage A proven by hand once — KIT-104), and several mechanism
-> choices below can only be settled against Stage E's *built* behaviour, not against
-> documents. The end-to-end proof KIT-105 also asks for is a **later session's**, once the
-> dependencies are met. What is settled here is the shape and the security *argument*; what
-> is not — including the one control the whole security argument rests on — is called out in
-> [What could not be settled from documents](#what-could-not-be-settled-from-documents).
+> **Accepted, and the kit-side mechanism is now built.** The owner authorised the build.
+> The **source-agnostic mechanism** ships in the kit: contract §8's `ticket-create`
+> extended to a tree, `schemas/safe-outputs.schema.json` in lockstep, and the deterministic
+> executor `scripts/pipeline_plan_executor.py` — all CI-tested by `--selftest` and inert
+> here (no `delivery.json`). **Activation is a separate operator step and is NOT done by
+> this or any session**: the Planning team, its dispatcher entry (with the tool-fence
+> resolved below), the owner-scoped executor credential and job. And the load-bearing
+> security choice — item 1 of
+> [What could not be settled](#what-could-not-be-settled-from-documents) — is now
+> **resolved to fallback (b)** on evidence from the *built* Stage E installer, recorded
+> there. What remains gated is only what always was: the end-to-end proof is a **later
+> session's**, once KIT-102 lands and the gate is run by hand once (KIT-104), and the owner
+> turns the gate on.
 
 > **Section-number convention.** `§N` always cites `docs/PIPELINE-CONTRACT.md`. This ADR's
 > own subsections are referred to by name (e.g. "the approval-gate section"), never by a
@@ -483,12 +488,36 @@ holds the pen at filing time* changes.
 The honest list — where the build session should expect the real risk, because it needs Stage
 E's *built* behaviour or an open decision to resolve. **Item 1 is the load-bearing one.**
 
-1. **Per-tool tracker fencing — the linchpin.** Whether the dispatcher's `disallowedTools` can
-   remove *individual* Linear tools (`save_issue` but keep `save_comment` and the read tools)
-   is unverified — the reviewer left *all* of Linear MCP in "by owner decision," so nothing has
-   demonstrated it. The entire security argument's "contingent" rows stand or fall on this. If
-   it is not name-granular, take fallback (b) (no Linear MCP; `Write`-to-artifact) rather than
-   the weak PreToolUse-only stopgap. **Measure this first.**
+1. **Per-tool tracker fencing — the linchpin. RESOLVED (2026-09-08): fallback (b).** Whether
+   the dispatcher's `disallowedTools` can remove *individual* Linear tools (`save_issue` but
+   keep `save_comment` and the read tools) was the open question. The build session read the
+   **built** Stage E installer (`scripts/pipeline_stage_e_setup.py`) for the answer the running
+   system actually gives, and it is decisive against name-granular fencing being *demonstrated*:
+   the review entry's `disallowedTools` names **only built-in tool categories**
+   (`Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, Task, EnterWorktree, ExitWorktree`),
+   names **no `mcp__` tool at all**, and the installer's own `--selftest` **forbids any `mcp__`
+   entry in the fence** ("the tracker's MCP tools were fenced — that is an owner decision, not
+   this installer's"). So per-tool MCP fencing is not proven anywhere in the kit, and resting
+   the whole no-self-approval guarantee on it would be resting it on an unverified capability.
+   **Therefore the Planning lane takes fallback (b): the planning session is attached NO Linear
+   MCP server at all** — it holds `Read`/`Grep`/`Glob` to decompose against real code and
+   `Write` to emit its tree, and nothing that can reach the tracker. It reads the idea ticket
+   from its **delegated/injected context** (the dispatcher binds the ticket; the session-start
+   brief carries the title + acceptance criteria behind the untrusted-data fence), and emits its
+   proposed epic+children tree as a **`Write` artifact** — a `pipeline-safe-outputs/1` request
+   file — that the owner-scoped executor (`scripts/pipeline_plan_executor.py`) reads, validates,
+   DoR-gates and materialises.
+
+   **Why this is stronger than (a), not a retreat.** Fallback (b) is *structural and
+   independent of MCP granularity*: a session that holds no tracker tool cannot call
+   `save_issue` regardless of what `disallowedTools` can express, what the PreToolUse guard
+   pattern-matches, or **which runner loaded** — so it closes the KIT-41 runner-selection hole
+   for the tracker-write vector too (a non-Claude runner that loads no guards still has no
+   tracker tool). The consequence the ADR named for (b) — losing the in-session Linear dedupe
+   pass — is absorbed as designed: the executor is the deterministic party that can run dedupe,
+   and the human reads the summary comment before approving. The build is designed and the
+   installer configured around (b); the `disallowedTools` entry additionally names the tracker
+   tools as belt-and-braces, but the guarantee does not depend on that naming working.
 2. **The two kit-code fixes (A: specific/actor-checked approval state; B: planning-mode +
    update-covering tracker guard).** Both are stated above as required; neither exists yet, and
    whether A is done by gating on `ready` vs a dedicated `approved` state is an open call.
@@ -496,10 +525,19 @@ E's *built* behaviour or an open decision to resolve. **Item 1 is the load-beari
    Linear. A plan is an epic plus a dozen children with full bodies — potentially past a comment
    size limit, or needing multiple comments or the artifact channel. Untested at this size;
    fallback (b)'s artifact transport may be the better fit.
-4. **Gate/create sequencing.** The DoR gate checks parent existence, but the children reference
-   an epic that does not exist until the executor creates it. Whether to create the epic first
-   then gate children against the real id (leaving a childless epic in `raw` on failure), or to
-   gate the whole tree against a pending ref, needs the *fixed* gate (KIT-102) in hand.
+4. **Gate/create sequencing. RESOLVED (2026-09-08): gate against a pending ref, create nothing
+   until every child passes.** The executor builds each child ticket object with a *pending*
+   epic reference — parent `<TEAMKEY>-0` (a well-formed but impossible id; real Linear numbers
+   start at 1), provenance `epic/<TEAMKEY>-0`, a placeholder project, and the real landing
+   state — and runs `check_ticket_dor.py --strict` on the whole set **before creating anything**.
+   This is sound because the DoR gate checks a child's *internal* consistency (parent link ↔
+   provenance ↔ project ↔ state ↔ sections ↔ acceptance criteria), which does not depend on the
+   epic's real id — it has no API and never checks that the epic *exists* in Linear. So gating
+   against the sentinel is equivalent to gating against the real id, and it leaves **no orphan
+   epic** on failure (the "create epic first" alternative would). If any child fails, the whole
+   tree is rejected and reported back (all-or-nothing, §8). This holds against the gate on
+   `main` at build time and does not fight KIT-102, which changes *what* the gate checks, not
+   that it checks internal consistency.
 5. **KIT-98's brief text.** The planning `appendInstruction` does not exist yet (KIT-98 is
    not-started). The routing mechanism is settled; the words it delivers are not.
 6. **KIT-41's closure shape.** Until description-borne runner tags are namespaced or ignored,
@@ -510,19 +548,21 @@ E's *built* behaviour or an open decision to resolve. **Item 1 is the load-beari
    Stage E landing, KIT-102, the KIT-96 executor enabled, and Stage A run by hand once
    (KIT-104). None is done. This ADR is the design and the security argument only.
 
-## Doc-impact list — when the feature is built (not now)
+## Doc-impact list — build status
 
-Describing unbuilt behaviour as real is the failure this project keeps catching, so **none of
-these is rewritten now.** At most each gets a one-line forward-reference to this ADR; the
-substantive edits land with the build.
+The mechanism landed 2026-09-08. Rows marked **✓ built** are done in this PR; the rest stay
+forward-references until activation and the end-to-end proof (a later session's).
 
-| Doc | Change, when built |
-|---|---|
-| `docs/PIPELINE-CONTRACT.md` §8 (+ `schemas/safe-outputs.schema.json`, §12 parity) | The tree-shaped `ticket-create`: `epic`/`children`/`depends_on` fields, the new per-run child cap, the executor-sets-parent rule, `provenance:agent` on the epic. Amend prose + schema in lockstep. |
-| `docs/PIPELINE-CONTRACT.md` §5 / §11 | Note that an idea-triggered epic is `provenance:agent` and gates the tree via rule 2; **and that the approve tier must gate on a *specific* human-approval state (build-fix A), not merely "out of intake."** |
-| `scripts/check_auto_approve.py` | **Build-fix A:** gate epic approval on a specific approval state + ideally an actor check on the transition. Add the case to `test:approve`. |
-| `.claude/hooks/pre-tool-use.py` (+ `test_hooks.py`) | **Build-fix B:** extend the tracker-write guard to planning mode and to `save_issue` update. Guard-change → `hooks-change` label + the CI job. |
-| `.claude/skills/plan-epic/SKILL.md` | An unattended mode: emit a proposed tree as a safe-outputs request instead of raw `mcp__linear` writes; keep the interactive path. |
+| Doc | Change | Status |
+|---|---|---|
+| `docs/PIPELINE-CONTRACT.md` §8 (+ `schemas/safe-outputs.schema.json`, §12 parity) | The tree-shaped `ticket-create`: `epic`/`children`/`depends_on` fields, the per-run child cap (an executor constant `MAX_PLAN_CHILDREN`, not a budget), the executor-sets-parent rule, `provenance:agent` on the epic. Prose + schema amended in lockstep; `check_schemas.py` parity + fixtures added. | **✓ built** |
+| `scripts/pipeline_plan_executor.py` (+ `test:plan-executor` in CI) | The deterministic executor: validate whole → DoR-gate every child → materialise epic/children with forced fields → summary comment; all-or-nothing; `ok`/`rejected`/`errored` verdicts (§13). | **✓ built** |
+| `.claude/skills/plan-epic/SKILL.md` | An unattended mode: emit a proposed tree as a safe-outputs request instead of raw `mcp__linear` writes; keep the interactive path. | **✓ built** |
+| `scripts/check_auto_approve.py` | **Build-fix A:** gate epic approval on a specific approval state (`EPIC_APPROVAL_STATE = "ready"`), not merely "out of intake." | **✓ shipped earlier** (PR #77) |
+| `.claude/hooks/pre-tool-use.py` (+ `test_hooks.py`) | **Build-fix B** (planning-mode + update-covering tracker guard). **Under fallback (b) this is no longer load-bearing** — the planning session holds no tracker tool at all, so there is nothing for a PreToolUse guard to catch on that path. It remains available as optional defence-in-depth for a *coding* session on a direct-credential backend (where the KIT-96 protected-label guard already lives, PR #78), but the idea gate does not depend on it. | **not needed for (b)** |
+| Activation: Planning team, dispatcher entry (fence = no Linear MCP + brief), owner-scoped executor credential/job | An operator installer (`scripts/pipeline_stage_a_setup.py`) mirroring the Stage E installer, run by a person, refusing in an agent environment. | pending (Build 2/3) |
+| `.claude/skills/plan-epic/SKILL.md` `appendInstruction` (KIT-98) | The planning brief the Planning entry delivers. | pending (KIT-98) |
+| End-to-end proof (idea → session → epic + DoR-passing child through the executor) | KIT-105's third deliverable, gated on KIT-102 + KIT-104 + the owner turning the gate on. | pending |
 | KIT-98's `docs/SESSION-BRIEF.md` / the planning `appendInstruction` | The planning brief itself. |
 | The pipeline field guide (`§12` model labels / session kinds) | A planning session is a distinct, executor-mediated session kind with a pinned Claude runner — forward-reference only. |
 | Build record (artifact) §7A / §17 / §18 roadmap | Stage A moves from "built, never exercised" toward "startable from Linear"; the governance gap narrows. Forward-reference only until proven. |

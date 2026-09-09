@@ -806,7 +806,8 @@ write path.
 | `ticket-comment` | `ticket_id`, `body` | `body` is non-empty markdown. The telemetry block (§4) travels as one of these. |
 | `ticket-state` | `ticket_id`, `to` | `to` is a **canonical state key** from `linear.stateIds` — only `working` or `review`, never a UUID and never a display name. `raw`, `ready`, `done` and `needsApproval` are all refused: the last of those is the conclusion of the review, and a session reporting it would be issuing a verdict on its own work (§5). |
 | `ticket-label` | `ticket_id`, `add[]`, `remove[]` | Canonical label keys from `linear.labels.ids` (§6). Either list may be empty. |
-| `ticket-create` | `source_ticket_id`, `title`, `body`, `labels[]` | **Files a follow-up finding ticket.** `source_ticket_id` is the session's OWN pinned ID (compared to the pin, never used to address anything); `title` is one line; `body` is non-empty markdown; `labels[]` is optional. The new ticket's identity, state, provenance and assignee are the **executor's** to set, never the session's — see *Filing a finding* below. Available only when `linear.findingTicket` is configured. |
+| `ticket-create` (finding) | `source_ticket_id`, `title`, `body`, `labels[]` | **Files a follow-up finding ticket.** `source_ticket_id` is the session's OWN pinned ID (compared to the pin, never used to address anything); `title` is one line; `body` is non-empty markdown; `labels[]` is optional. The new ticket's identity, state, provenance and assignee are the **executor's** to set, never the session's — see *Filing a finding* below. Available only when `linear.findingTicket` is configured. |
+| `ticket-create` (plan) | `source_ticket_id`, `epic`, `children[]` | **Proposes an epic tree** (`epic` = `{title, body}`; each `children[]` entry = `{title, body, labels[]?, depends_on[]?}`). Same `type` as the finding, discriminated by carrying `epic`+`children` rather than `title`+`body`. The executor files the epic and every child in the backlog, forcing every authority field, and turns `depends_on` ordinals into blockedBy relations — see *Filing a plan* below. This is the idea-gate's output: a planning session holds no tracker tool, so a proposed tree is the only way it reaches the board. |
 
 An unrecognized `schema`, an unrecognized `type`, or `requests` that is not a list
 rejects the batch. A reader that does not recognize the schema refuses; it does not
@@ -857,6 +858,65 @@ findings stay comments. A session holding a *direct* tracker credential (a local
 MCP session) must still never create a ticket itself; that path is closed by the guard
 (§8's companion in `.claude/hooks/pre-tool-use.py`), not by this file.
 
+### Filing a plan — the tree shape of `ticket-create`
+
+A **planning session** (the idea-gate: an idea ticket delegated into a Planning team, run
+sandboxed by the dispatcher) does not file findings — it proposes a whole **epic tree**.
+It holds no tracker tool at all, so it cannot write to the board directly; its only output
+is a proposed tree, which a credential-holding executor validates and materialises. The
+tree is the *same* `ticket-create` type, carrying `epic` and `children` instead of a flat
+`title`/`body`:
+
+```json
+{
+  "schema": "pipeline-safe-outputs/1",
+  "requests": [
+    {
+      "type": "ticket-create",
+      "source_ticket_id": "KIT-777",
+      "epic": { "title": "…one line…", "body": "…the PRD/epic markdown…" },
+      "children": [
+        { "title": "child A — the prerequisite", "body": "…## Acceptance criteria …",
+          "labels": ["track:meta", "effort:M"] },
+        { "title": "child B — depends on A", "body": "…",
+          "labels": ["track:meta", "effort:S"], "depends_on": [0] }
+      ]
+    }
+  ]
+}
+```
+
+`depends_on` holds **0-indexed ordinals into this request's `children` array** (child B at
+index 1 depends on child A at index 0); the executor turns them into Linear `blockedBy`
+relations. Every finding-shape guarantee above is **kept verbatim** — `source_ticket_id`
+equals the pinned ID, the session sets no authority field, nothing lands outside the
+backlog — and the tree shape adds these:
+
+- **The epic carries `provenance:agent`.** An epic a session drafted is agent-authored, and
+  by §5 rule 1 `provenance:agent` never auto-approves, so the epic cannot approve itself; it
+  waits for the human to move it out of intake (§4). A human-written epic (manual
+  `/plan-epic`) stays `provenance:human`; an idea-triggered one is `provenance:agent`.
+- **The executor sets each child's parent**, forced to the epic it created in this same
+  batch. The session cannot supply a parent id — which would otherwise let it name an
+  *already-approved* epic and have its children auto-approve. Each child carries
+  `provenance:epic` pointing at that just-created, unapproved epic (§5 rule 4).
+- **The executor runs the Definition-of-Ready gate** (`check_ticket_dor.py --strict`) on
+  every proposed child and **refuses the whole tree if any child fails** — a partial epic
+  looks decomposed and is not. Nothing is created; the executor reports each failing child
+  and its errors back on the idea ticket for a re-plan.
+- **The per-run cap is one epic and a bounded number of children** (`MAX_PLAN_CHILDREN`, an
+  executor constant like the flat kind's cap-of-3 — not a `delivery.json` budget), still
+  all-or-nothing: one malformed or DoR-failing child rejects the whole tree.
+- **The executor posts a summary comment** on the idea ticket so the owner can read the plan
+  and approve the epic — the one human gate that releases the tree.
+
+The executor is `scripts/pipeline_plan_executor.py` — deterministic, model-free, the direct
+analog of the review publisher (§14). It runs on the dispatcher host as an owner-scoped role
+account holding the tracker credential; the planning session never does. Reuses
+`linear.findingTicket` for its landing state, owner and notification, so the plan kind is
+off on the same discriminator the finding kind is: absent `linear.findingTicket`, a
+`ticket-create` (plan) request is refused exactly as the flat kind is.
+
 ### Validation rules
 
 Every rule is a MUST, and all of them run **before any request executes**.
@@ -865,8 +925,11 @@ Every rule is a MUST, and all of them run **before any request executes**.
 |---|---|
 | Every `ticket_id` — and a `ticket-create`'s `source_ticket_id` — equals the **dispatcher-supplied** pinned ID | The central check. The agent *names* a ticket and the validator *compares* it — the value is never used to address anything. A mismatch is an attempted retarget, not a typo. A finding is provably *from this session* before it is filed. |
 | At most **one** `ticket-state` per run | A run advances the ticket once. Several transitions in one batch is either confusion or an attempt to land somewhere by way of somewhere else. |
-| At most **3** `ticket-create` per run, and only if `linear.findingTicket` is configured | A session reports the findings it happened to meet, not a backlog. The cap bounds a runaway or hostile session; the config gate keeps the kind off until a project opts in. |
+| At most **3** flat `ticket-create` (finding) per run, and only if `linear.findingTicket` is configured | A session reports the findings it happened to meet, not a backlog. The cap bounds a runaway or hostile session; the config gate keeps the kind off until a project opts in. |
 | A `ticket-create` lands in `linear.findingTicket.landing` (backlog only), carries executor-applied `provenance:agent`, and is refused any `provenance:*`/`agent:*`/`blocked:*`/`hooks-change` in its `labels` | The session sets none of the fields that carry authority — state, provenance, assignee. The executor forces them, so the invariant is structural, not a prompt (see *Filing a finding*). |
+| At most **one** `ticket-create` (plan) tree per run; its `children` are capped at `MAX_PLAN_CHILDREN` and each child's `labels` are refused any `provenance:*`/`agent:*`/`blocked:*`/`hooks-change` | A run proposes one decomposition, not many. The executor forces the epic's `provenance:agent`, each child's `provenance:epic`, and each child's parent — see *Filing a plan*. |
+| Every `depends_on` ordinal is in range for the tree's `children`, not self-referential, and forms no cycle | The executor turns them into blockedBy relations; a dangling or circular edge is a malformed tree, not a relation. |
+| A `ticket-create` (plan) child that fails `check_ticket_dor.py --strict` rejects the **whole tree** | A partial epic reads as decomposed and is not; the executor creates nothing and reports the failing children back for a re-plan (§5, §13). |
 | `raw`, `ready` and `done` are **never** valid targets | `ready` would be self-approval (§5); `done` would be a session claiming its own merge (§5, §6). Refused **even when a caller passes them in `allowed_to_states`** — a belt the caller cannot unbuckle. |
 | Targets are otherwise limited to the caller's `allowed_to_states` | Default `review`. The stage decides what a session may do, not the session. |
 | `agent:*`, `blocked:capacity`, `provenance:*` and `hooks-change` labels are refused, in `add` **and** `remove` | Dispatcher- and human-owned (§5, §6). A session setting `agent:needs-human` — or clearing `agent:blocked` — is a session editing its own supervision. `remove` matters as much as `add`. |
@@ -881,9 +944,11 @@ Every rule is a MUST, and all of them run **before any request executes**.
 |---|---|---|
 | Requests per batch | 20 | A runaway or hostile session must not spray the tracker. |
 | Comment body, and a finding's `body` | 16 000 chars | Bounded cost, bounded blast radius. |
-| Finding `title` | 200 chars | A title is one line, not a report. |
-| `ticket-create` per run | 3 | A session reports what it met; it does not generate a backlog. |
-| Label ops per request | 10 | `add` + `remove` combined, and a finding's `labels`. |
+| Finding `title`, an epic's or child's `title` | 200 chars (schema); the DoR gate enforces its own tighter title limit on plan children | A title is one line, not a report. |
+| flat `ticket-create` (finding) per run | 3 | A session reports what it met; it does not generate a backlog. |
+| `ticket-create` (plan) trees per run | 1 | A run proposes one decomposition. |
+| Plan `children` per tree | `MAX_PLAN_CHILDREN` (executor constant; schema hard-ceiling 20) | A plan is a tree, not a backlog; the executor's constant is the operative flood guard. |
+| Label ops per request | 10 | `add` + `remove` combined, and a finding's or child's `labels`. |
 
 ### All-or-nothing
 
