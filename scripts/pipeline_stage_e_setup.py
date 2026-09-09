@@ -293,7 +293,8 @@ def review_entry_name(repo):
 # means the pull requests carrying them are not merged yet (card CK-1).
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_review_local.py", "pipeline_review_basis.py",
-                    "pipeline_telemetry_local.py", "gh_fallback.py")
+                    "pipeline_telemetry_local.py", "pipeline_finding_poller.py",
+                    "gh_fallback.py")
 
 # The workflow states a Reviews team needs beyond the stock set. `Ready`
 # authorises nothing here — review tickets are delegated on creation — but the
@@ -439,6 +440,7 @@ CONF_DEFAULTS = {
     "MANAGED_TEAM_KEYS": "",
     "POLL_INTERVAL_SECONDS": "300",
     "BOUNCE_INTERVAL_SECONDS": "360",
+    "FINDING_INTERVAL_SECONDS": "300",
     "SEVERITY_THRESHOLD": "medium",
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
@@ -571,7 +573,8 @@ def validate_conf(values):
     if conf.get("SEVERITY_THRESHOLD") not in ("low", "medium", "high", "critical"):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
-    for key in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS", "DIFF_CAP_CHARS"):
+    for key in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS",
+                "FINDING_INTERVAL_SECONDS", "DIFF_CAP_CHARS"):
         val = conf.get(key, "")
         if not val.isdigit() or int(val) <= 0:
             errors.append("%s must be a positive integer (got %r)" % (key, val))
@@ -599,6 +602,19 @@ def daemon_labels(conf):
     typed, three derived: a prefix typed twice is a prefix that disagrees."""
     prefix = conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0]
     return prefix + ".stage-e-poller", prefix + ".stage-e-bounce"
+
+
+def finding_label(conf):
+    """The finding poller's launchd label (KIT-96 local backend), beside the two
+    review/bounce labels. Kept a SEPARATE function so `daemon_labels`' two-tuple
+    signature — unpacked in a dozen callers — never changes."""
+    return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-finding"
+
+
+def all_daemon_labels(conf):
+    """Every Stage E daemon label, review + bounce + finding — for the loops that
+    install, load and check all of them uniformly."""
+    return daemon_labels(conf) + (finding_label(conf),)
 
 
 # --------------------------------------------------------------------------- #
@@ -1067,8 +1083,8 @@ CARDS = {
                "the three required contexts go green, and merge it. Rebase each branch on",
                "updated main before the one after it.",
                "Then let the role account's clone pick the change up — `run` does that for",
-               "you on its next pass, with both daemons unloaded."],
-        "good": "the role account's clone carries all six required scripts",
+               "you on its next pass, with the daemons unloaded."],
+        "good": "the role account's clone carries every required script",
         "attest": None,
     },
     "CK-2": {
@@ -1134,7 +1150,7 @@ CARDS = {
                "If it is more than you meant, narrow it: put a single repository in",
                "REVIEW_REPOS, re-run, and read the count again.",
                "When the number is what you meant, sign it off and re-run — the installer",
-               "then loads both daemons and confirms their heartbeats:",
+               "then loads the daemons and confirms their heartbeats:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-DRY-RUN "
                "--initials xx --note \"count read: N\""],
         "good": "the count you attested is the count you meant",
@@ -1181,7 +1197,7 @@ CARDS = {
                "     findings.",
                "  4. ONE comment on the pull request, with a Basis line",
                "  5. the review ticket closed, and only its own worktree gone",
-               "Read the two heartbeat files rather than the logs: a stale timestamp means",
+               "Read the heartbeat files rather than the logs: a stale timestamp means",
                "NOT RUNNING; a fresh one with a non-ok result means RAN AND COULD NOT.",
                "Then sign it off:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-FIRST-TICKET "
@@ -1671,7 +1687,7 @@ def step_code(ctx, apply_it):
     if not missing and differs is None:
         raise Unknown(
             "could not tell whether the role account's clone is current: %s.\n"
-            "  Both daemons exec out of that clone, so an UNMEASURED clone is an unmeasured\n"
+            "  Every daemon execs out of that clone, so an UNMEASURED clone is an unmeasured\n"
             "  deployment. That is not the same fact as an up-to-date one." % why_unknown,
             "prove the role account can reach origin, then run this again:\n"
             "    sudo -u %s -H /bin/sh -c 'cd / && git -C %s/kit ls-remote origin HEAD'"
@@ -1681,13 +1697,14 @@ def step_code(ctx, apply_it):
         if missing:
             return False, "clone missing or %d script(s) absent: %s" % (
                 len(missing), ", ".join(missing)), []
-        return False, "the clone at %s/kit is at %s, which is NOT origin HEAD — both daemons " \
+        return False, "the clone at %s/kit is at %s, which is NOT origin HEAD — the daemons " \
                       "would go on exec'ing that code" % (ctx.stage_home,
                                                           head.out.strip() or "?"), []
 
-    poller_label, bounce_label = daemon_labels(conf)
-    for label in (poller_label, bounce_label):
-        # Unload before touching the code both jobs exec out of. `bootout` on a
+    stop_labels = all_daemon_labels(conf)
+    for label in stop_labels:
+        # Unload before touching the code every job execs out of — the finding
+        # poller runs from the same clone as review and bounce. `bootout` on a
         # service that was never loaded is not an error here — "there was
         # nothing to unload" is a different fact from "unloading failed", and
         # only the second matters.
@@ -1695,10 +1712,10 @@ def step_code(ctx, apply_it):
                   why="unload %s before the clone moves under it" % label)
     if not r.dry_run:
         # Loading them again is the `enable` step, which is several checkpoints
-        # downstream. If this run stops before it, the review and bounce loops
-        # are OFF and the only thing that says so is the notice cmd_run prints
-        # off this list.
-        ctx.unloaded = [poller_label, bounce_label]
+        # downstream. If this run stops before it, the review, bounce and finding
+        # loops are OFF and the only thing that says so is the notice cmd_run
+        # prints off this list.
+        ctx.unloaded = list(stop_labels)
 
     if head.ok and head.out.strip():
         res = r.as_role(ctx.account,
@@ -1732,7 +1749,7 @@ def step_code(ctx, apply_it):
         raise SetupError(
             "the clone at %s/kit is still not at origin HEAD after fast-forwarding. Something "
             "else moved it — a local commit, a detached HEAD, or a diverged branch. Look before "
-            "forcing anything: both daemons exec from here." % ctx.stage_home)
+            "forcing anything: the daemons exec from here." % ctx.stage_home)
     return False, "clone placed and level with origin; all %d scripts present" % len(
         REQUIRED_SCRIPTS), []
 
@@ -1839,6 +1856,25 @@ def step_tracker(ctx, apply_it):
              "labels off a ticket by name, and a label scoped to one team is invisible to "
              "every other team's tickets." % (scoped, conf["MODEL_LABEL"]))
     ids["model_label_id"] = workspace_labels[0]["id"]
+
+    # KIT-96: the finding poller marks every ticket it files `provenance:agent`, and
+    # a session can request no provenance (§5, §8). Ensure that label exists at
+    # WORKSPACE scope — the poller resolves it by name per team and refuses to file
+    # a finding it cannot mark. Same read-back-after-create discipline as above.
+    d = api.post(Q_LABELS, {"filter": {"name": {"eq": "provenance:agent"}}})
+    prov = [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
+            if not (x.get("team") or {}).get("id")]
+    if not prov:
+        if not apply_it:
+            return False, "the provenance:agent label does not exist at workspace scope", []
+        api.post(M_LABEL_CREATE, {"input": {"name": "provenance:agent", "color": STATE_COLOR}})
+        created.append("label provenance:agent")
+        d = api.post(Q_LABELS, {"filter": {"name": {"eq": "provenance:agent"}}})
+        prov = [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
+                if not (x.get("team") or {}).get("id")]
+        if not prov:
+            raise SetupError("label 'provenance:agent' is still absent at workspace scope "
+                             "after create")
 
     d = api.post(Q_AGENT_USER, {"filter": {"displayName": {"eq": conf["AGENT_DISPLAY_NAME"]}}})
     users = [u for u in (((d.get("users") or {}).get("nodes")) or []) if u.get("active")]
@@ -2178,7 +2214,24 @@ def step_configs(ctx, apply_it):
         "dispatcher_repo_names": _dispatcher_repo_names(ctx),
         "required_checks": checks,
     }
-    wanted = {"poller.json": poller, "config.json": bounce}
+    # KIT-96 finding poller config. It scans the WORK teams (not the reviews team)
+    # for pipeline-finding/1 comments, trusts only the dispatcher's agent user, and
+    # files into the source team's backlog. Its state is isolated under
+    # ~/.stage-e/finding so its heartbeat.json cannot collide with the review poller's.
+    finding = {
+        "teams": [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])],
+        "owner_user_id": ids["owner_user_id"],
+        "agent_user_id": ids["agent_user_id"],
+        "provenance_agent_label": "provenance:agent",
+        "backlog_state_name": "Backlog",
+        "linear_key_env": conf["LINEAR_KEY_ENV"],
+        "state_dir": "~/.stage-e/finding",
+        "lookback_hours": 72,
+        "max_per_source": 3,
+        "max_per_run": 20,
+    }
+    wanted = {"poller.json": poller, "config.json": bounce,
+              "finding/poller.json": finding}
 
     current = {}
     for fname in wanted:
@@ -2191,9 +2244,18 @@ def step_configs(ctx, apply_it):
 
     stale = [f for f, want in wanted.items() if current.get(f) != want]
     if not stale:
-        return True, "both config files match what this conf produces", []
+        return True, "all %d config files match what this conf produces" % len(wanted), []
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), []
+
+    # A `finding/…` file lands in a subdir cat cannot create; make it first (its
+    # own state dir doubles as its config dir), mode 700 like the rest.
+    if any("/" in f for f in stale):
+        mk = r.as_role(ctx.account, "umask 077; mkdir -p %s/finding" % ctx.stage_home,
+                       why="create the finding poller's state/config dir")
+        if not mk.ok and not mk.skipped:
+            raise SetupError("could not create %s/finding: %s"
+                             % (ctx.stage_home, (mk.err or "")[:200]))
 
     for fname in sorted(stale):
         body = json.dumps(wanted[fname], indent=2, sort_keys=True) + "\n"
@@ -3037,7 +3099,7 @@ DAEMON_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 def _plists(ctx):
-    """Both plists, rendered. `$HOME` reaches the file LITERALLY and is resolved
+    """Every plist, rendered. `$HOME` reaches the file LITERALLY and is resolved
     by /bin/sh at daemon runtime — a system daemon inherits no login
     environment, so HOME is also set explicitly above."""
     conf = ctx.conf
@@ -3056,11 +3118,20 @@ def _plists(ctx):
             command=(common + '"$HOME/.stage-e/kit/scripts/pipeline_bounce_local.py" run'),
             interval=int(conf["BOUNCE_INTERVAL_SECONDS"]),
             log=home + "/.stage-e/bounce.log"),
+        # KIT-96 finding poller — a session's pipeline-finding/1 comment becomes a
+        # backlog ticket. Isolated state under ~/.stage-e/finding/ (its own
+        # heartbeat.json, so no collision with the review poller's).
+        finding_label(conf): PLIST.format(
+            label=finding_label(conf), account=ctx.account, home=home, path=DAEMON_PATH,
+            command=(common + '"$HOME/.stage-e/kit/scripts/pipeline_finding_poller.py" '
+                              'scan --config "$HOME/.stage-e/finding/poller.json"'),
+            interval=int(conf["FINDING_INTERVAL_SECONDS"]),
+            log=home + "/.stage-e/finding/poller.log"),
     }
 
 
 def step_daemons(ctx, apply_it):
-    """Render, lint and install both plists — but do NOT load them. Loading is
+    """Render, lint and install every plist — but do NOT load them. Loading is
     the moment real tickets and real money start, and that is CK-5's to
     authorise."""
     r = ctx.runner
@@ -3073,7 +3144,7 @@ def step_daemons(ctx, apply_it):
         if not got.ok or got.out != body:
             stale.append(label)
     if not stale:
-        return True, "both plists are installed and current (%s)" % ", ".join(sorted(want)), []
+        return True, "the plists are installed and current (%s)" % ", ".join(sorted(want)), []
     if not apply_it:
         return False, "would install: " + ", ".join(sorted(stale)), []
 
@@ -3152,6 +3223,10 @@ def step_dry_run(ctx, apply_it):
     bounce = r.as_role(ctx.account,
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_bounce_local.py %s"
                        % (ctx.stage_home, " ".join(BOUNCE_DRY_RUN_ARGS)), timeout=600)
+    finding = r.as_role(ctx.account,
+                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_finding_poller.py "
+                              "scan --config %s/finding/poller.json --dry-run"
+                        % (ctx.stage_home, ctx.stage_home), timeout=600)
     blob = (poller.out + poller.err + bounce.out + bounce.err)
     say("")
     say("  -- the poller's dry run --")
@@ -3159,6 +3234,9 @@ def step_dry_run(ctx, apply_it):
         say("    " + line)
     say("  -- the bounce driver's dry run --")
     for line in (bounce.out + bounce.err).strip().splitlines()[-14:]:
+        say("    " + line)
+    say("  -- the finding poller's dry run --")
+    for line in (finding.out + finding.err).strip().splitlines()[-14:]:
         say("    " + line)
     say("")
     # BOTH COMPONENTS ARE JUDGED BEFORE EITHER IS REPORTED. Raising on the
@@ -3182,6 +3260,11 @@ def step_dry_run(ctx, apply_it):
     if bounce.rc not in ok_codes:
         problems.append("the bounce driver's dry run failed (exit %d): %s"
                         % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
+    # The finding poller has no DECLINE state — 0 is the only success; anything
+    # else is a real failure (a bad config, an unresolvable team/label, the API).
+    if finding.rc != 0:
+        problems.append("the finding poller's dry run failed (exit %d). Nothing was "
+                        "created: %s" % (finding.rc, (finding.err or finding.out).strip()[-400:]))
     if problems:
         raise SetupError("\n".join(problems))
     declined = poller.rc == COMPONENT_EXIT_DECLINED
@@ -3199,16 +3282,16 @@ def step_dry_run(ctx, apply_it):
                               "UNKNOWN for at least one repository")
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off")
-    return True, ("both dry runs ran and the count is signed off; "
+    return True, ("all three dry runs ran and the count is signed off; "
                   + ("the poller declined at least one pull request"
-                     if declined else "neither declined")), []
+                     if declined else "the poller did not decline")), []
 
 
 def step_enable(ctx, apply_it):
-    """Load both daemons and prove each ran — a loaded job that never wrote a
+    """Load every daemon and prove each ran — a loaded job that never wrote a
     heartbeat is not a working job, it is an untested one."""
     r, conf = ctx.runner, ctx.conf
-    labels = daemon_labels(conf)
+    labels = all_daemon_labels(conf)
     missing = []
     for label in labels:
         # LOADED, not "running". Both jobs are one-shot — scan, act, exit — so
@@ -3219,14 +3302,15 @@ def step_enable(ctx, apply_it):
         if not got.ok:
             missing.append(label)
     beats = r.as_role(ctx.account,
-                      "for f in heartbeat.json bounce-heartbeat.json; do "
-                      "[ -f %s/state/$f ] && printf '%%s ok\\n' \"$f\" || "
+                      "for f in state/heartbeat.json state/bounce-heartbeat.json "
+                      "finding/heartbeat.json; do "
+                      "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
                       "printf '%%s missing\\n' \"$f\"; done" % ctx.stage_home)
     have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
 
-    if not missing and len(have_beats) == 2:
+    if not missing and len(have_beats) == 3:
         ctx.unloaded = []
-        return True, "both daemons loaded and both heartbeats present", []
+        return True, "all three daemons loaded and all heartbeats present", []
     if not apply_it:
         return False, "would load %s; heartbeats present: %s" % (
             ", ".join(missing) or "none", ", ".join(have_beats) or "none"), []
@@ -3240,7 +3324,7 @@ def step_enable(ctx, apply_it):
     # unrelated re-run and spent a real bounce twelve seconds later.
     if not r.dry_run:
         say("")
-        say("  LOADING both daemons. Each takes a full pass within seconds of loading.")
+        say("  LOADING the daemons. Each takes a full pass within seconds of loading.")
         say("  If you stopped one on purpose with `launchctl bootout`, that pause does NOT")
         say("  survive this step — stop it again after this run, or let it run.")
         say("")
@@ -3263,19 +3347,20 @@ def step_enable(ctx, apply_it):
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
     ctx.unloaded = []
     if ctx.runner.dry_run:
-        return False, "would load both daemons and wait for their heartbeats", []
+        return False, "would load the daemons and wait for their heartbeats", []
 
     deadline = time.time() + 90
     while time.time() < deadline:
         beats = r.as_role(ctx.account,
-                          "for f in heartbeat.json bounce-heartbeat.json; do "
-                          "[ -f %s/state/$f ] && printf '%%s ok\\n' \"$f\" || "
+                          "for f in state/heartbeat.json state/bounce-heartbeat.json "
+                          "finding/heartbeat.json; do "
+                          "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
                           "printf '%%s missing\\n' \"$f\"; done" % ctx.stage_home)
         have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
-        if len(have_beats) == 2:
-            return False, "both daemons loaded; both heartbeats appeared", []
+        if len(have_beats) == 3:
+            return False, "all three daemons loaded; all heartbeats appeared", []
         time.sleep(5)
-    raise Unknown("both daemons were loaded and only %d of 2 heartbeats appeared within 90s "
+    raise Unknown("the daemons were loaded and only %d of 3 heartbeats appeared within 90s "
                   "(%s)" % (len(have_beats), ", ".join(have_beats) or "none"),
                   "read the two logs under the role account's ~/.stage-e/; a stale "
                   "timestamp means NOT RUNNING, a fresh one with a non-ok result means "
@@ -3290,15 +3375,15 @@ def step_handover(ctx, apply_it):
 
 STEPS = (
     ("preflight", "the machine, the dispatcher and your conf", step_preflight),
-    ("code", "the role account's clone and the six scripts", step_code),
+    ("code", "the role account's clone and its scripts", step_code),
     ("tracker", "the Reviews team, the labels and every id", step_tracker),
     ("credentials", "the role account's own env file, mode 600", step_credentials),
     ("configs", "the poller's config and the driver's", step_configs),
     ("dispatcher-entry", "one review entry per repository, and proof they loaded",
      step_dispatcher_entry),
-    ("daemons", "both plists, rendered, linted and installed", step_daemons),
-    ("dry-run", "both dry runs, read before anything is on", step_dry_run),
-    ("enable", "load both daemons and see both heartbeats", step_enable),
+    ("daemons", "the plists, rendered, linted and installed", step_daemons),
+    ("dry-run", "the dry runs, read before anything is on", step_dry_run),
+    ("enable", "load the daemons and see their heartbeats", step_enable),
     ("handover", "one real ticket, watched end to end", step_handover),
 )
 
@@ -3441,7 +3526,7 @@ def cmd_run(ctx, dry_run):
     say("  conf          %s" % ctx.conf.get("__source__", "stage-e.conf"))
     say("  role account  %s" % ctx.account)
     say("  dispatcher    %s" % ctx.conf["DISPATCHER_SERVICE"])
-    say("  daemons       %s" % ", ".join(daemon_labels(ctx.conf)))
+    say("  daemons       %s" % ", ".join(all_daemon_labels(ctx.conf)))
     say("  credentials   read as %s from %s/env%s"
         % (ctx.account, ctx.stage_home,
            "; this run asks for nothing" if dry_run else "; asked for only if absent"))
@@ -3495,18 +3580,18 @@ def cmd_run(ctx, dry_run):
 
 
 def _unloaded_notice(ctx):
-    """Say it out loud when a run ends with the two loops switched off.
+    """Say it out loud when a run ends with the loops switched off.
 
-    `code` stops both daemons before it moves the clone under them, and only
+    `code` stops every daemon before it moves the clone under them, and only
     the far-downstream `enable` step starts them again. A run that blocks in
-    between leaves review and bounce OFF, and silence there looks exactly like
-    a healthy install."""
+    between leaves review, bounce and finding OFF, and silence there looks
+    exactly like a healthy install."""
     if not ctx.unloaded:
         return
     say("")
-    say("BOTH STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
-    say("under them, and did not get as far as the step that loads them again — so review")
-    say("and bounce are OFF until it does:")
+    say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
+    say("under them, and did not get as far as the step that loads them again — so review,")
+    say("bounce and finding are OFF until it does:")
     for label in ctx.unloaded:
         say("    %s" % label)
     say("Clear the row above and run the same command again, or load them yourself:")
@@ -3865,6 +3950,17 @@ MANAGED_TEAM_KEYS=KIT
 """
 
 
+# The workspace labels a settled tracker already carries. `haiku` is the model
+# label (MODEL_LABEL); `provenance:agent` is the one step_tracker ensures for the
+# finding poller (KIT-96) — the poller marks every ticket it files with it and
+# refuses to file one it cannot mark. Both are workspace-scoped (team None). A
+# fixture that stocked only the model label would make a settled machine read as
+# WOULD-CHANGE, and step_tracker's dry run would return at the provenance check
+# before its user look-ups ever ran.
+STOCKED_WS_LABELS = [{"id": "l1", "name": "haiku", "team": None},
+                     {"id": "lp", "name": "provenance:agent", "team": None}]
+
+
 def _quiet(fn):
     """Run fn with stdout captured; return (value, printed)."""
     import io
@@ -4120,6 +4216,38 @@ def _selftest_body():
     ok2, _d, _x = step_configs(ctx2, apply_it=True)
     expect("idempotent", ok2 is True, "configs did not read as already-done")
     expect("idempotent", not fake2.writes, "configs were rewritten when they already matched")
+
+    # -- 9b. the finding config lands in its OWN subdir, made first ----------
+    # It is the only config under ~/.stage-e/finding, which `cat >` cannot
+    # create. step_configs must mkdir that dir BEFORE the write, and must not
+    # rewrite the two configs that already match. (KIT-96 fold-in.)
+    cases += 1
+    ctxCF, fakeCF = _settled_ctx(conf)
+    fakeCF.answers = [
+        ("cat $HOME/.stage-e/finding/poller.json", 0, ""),  # ONLY finding is stale
+        ("mkdir -p", 0, ""),
+        ("cat > ", 0, ""),
+    ] + list(fakeCF.answers)
+    okCF, detailCF, _x = step_configs(ctxCF, apply_it=True)
+    fwrites = [w for w in fakeCF.writes
+               if "cat >" in _fmt(w["argv"]) and "finding/poller.json" in _fmt(w["argv"])]
+    others = [w for w in fakeCF.writes
+              if "cat >" in _fmt(w["argv"]) and "finding/poller.json" not in _fmt(w["argv"])]
+    mkdir_idx = next((i for i, w in enumerate(fakeCF.writes)
+                      if "mkdir -p" in _fmt(w["argv"]) and "/finding" in _fmt(w["argv"])), None)
+    write_idx = next((i for i, w in enumerate(fakeCF.writes)
+                      if "cat >" in _fmt(w["argv"])
+                      and "finding/poller.json" in _fmt(w["argv"])), None)
+    expect("configs-finding-subdir", len(fwrites) == 1 and okCF is False,
+           "the finding config was not written exactly once: %s" % detailCF)
+    expect("configs-finding-subdir", not others,
+           "a config that already matched was rewritten: %s"
+           % [w["why"] for w in others])
+    expect("configs-finding-subdir",
+           mkdir_idx is not None and write_idx is not None and mkdir_idx < write_idx,
+           "the finding subdir was not created before its config was written (mkdir=%s "
+           "write=%s)" % (mkdir_idx, write_idx))
+
     # mutant: a step that always applies must turn this red.
     cases += 1
     ctx3, fake3 = _settled_ctx(conf)
@@ -4164,7 +4292,7 @@ def _selftest_body():
 
     def _stocked(**kw):
         return FakeLinear(
-            labels=[{"id": "l1", "name": "haiku", "team": None}],
+            labels=[dict(x) for x in STOCKED_WS_LABELS],
             users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
                    {"id": "u-owner", "email": "owner@example.com", "active": True}],
             members=[{"id": "u-agent", "displayName": "dispatcher-agent"}], **kw)
@@ -4744,10 +4872,10 @@ def _selftest_body():
         failures.append("unloaded-notice: a clone with no scripts did not stop")
     except Blocked as exc:
         expect("unloaded-notice", exc.card_id == "CK-1", "blocked on %s" % exc.card_id)
-    expect("unloaded-notice", ctxI.unloaded == list(daemon_labels(conf)),
-           "step_code stopped both daemons and recorded %s" % ctxI.unloaded)
+    expect("unloaded-notice", ctxI.unloaded == list(all_daemon_labels(conf)),
+           "step_code stopped every daemon and recorded %s" % ctxI.unloaded)
     _rv, notice = _quiet(lambda: _unloaded_notice(ctxI))
-    for label in daemon_labels(conf):
+    for label in all_daemon_labels(conf):
         expect("unloaded-notice", label in notice, "the notice never named %s" % label)
     expect("unloaded-notice", "launchctl bootstrap" in notice,
            "the notice did not print the command that loads them again")
@@ -5945,9 +6073,20 @@ def _settled_ctx(conf):
         "dispatcher_repo_names": {"example-org/kit": "kit"},
         "required_checks": {"example-org/kit": ["Kit checks", "Provenance scan"]},
     }
+    finding = {
+        "teams": ["KIT"], "owner_user_id": "u-owner", "agent_user_id": "u-agent",
+        "provenance_agent_label": "provenance:agent", "backlog_state_name": "Backlog",
+        "linear_key_env": "STAGE_E_LINEAR_API_KEY", "state_dir": "~/.stage-e/finding",
+        "lookback_hours": 72, "max_per_source": 3, "max_per_run": 20,
+    }
     answers += [
+        # The finding poller's dry run — keyed on its OWN script name and placed
+        # before "scan --dry-run" below, because that needle is a substring of the
+        # finding command too (it also ends `scan … --dry-run`). First-match wins.
+        ("pipeline_finding_poller.py", 0, "pass complete: 0 filed, 0 skipped (dry-run)\n"),
         ("cat $HOME/.stage-e/poller.json", 0, json.dumps(poller)),
         ("cat $HOME/.stage-e/config.json", 0, json.dumps(bounce)),
+        ("cat $HOME/.stage-e/finding/poller.json", 0, json.dumps(finding)),
         ("gh api repos/example-org/kit --jq", 0, "main\n"),
         ("required_status_checks", 0, '["Kit checks", "Provenance scan"]\n'),
         # WHICH REPOSITORY A CLONE IS, asked of git rather than read off the
@@ -6074,8 +6213,9 @@ def _with_stored_env(ctx, fake, conf, key=None, token=None):
 
 def _healthy_ctx(conf, linear=None, stored_env=True):
     """A machine on which EVERY step holds: the clone, the tracker, the env
-    file, both configs, the entry and its proof, both plists, both dry runs
-    signed off, both daemons loaded with heartbeats, and the handover signed.
+    file, all three configs, the entry and its proof, all three plists, all
+    three dry runs signed off, every daemon loaded with heartbeats, and the
+    handover signed.
 
     This is the fixture `verify` must be able to call clean. Before the fix
     there was no such fixture, because there was no such outcome."""
@@ -6085,7 +6225,7 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
                 "states": [{"id": "s-%s" % n, "name": n, "type": t}
                            for n, t in REQUIRED_STATES],
                 "automations": []}],
-        labels=[{"id": "l1", "name": "haiku", "team": None}],
+        labels=[dict(x) for x in STOCKED_WS_LABELS],
         users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
                {"id": "u-owner", "email": "owner@example.com", "active": True}],
         members=[{"id": "u-agent", "displayName": "dispatcher-agent"}])
@@ -6103,7 +6243,9 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
          "abc1234000000000000000000000000000000000\tHEAD\n"),
         ("launchctl print system/" + poller_label, 0, "\tstate = not running\n"),
         ("launchctl print system/" + bounce_label, 0, "\tstate = not running\n"),
-        ("heartbeat.json", 0, "heartbeat.json ok\nbounce-heartbeat.json ok\n"),
+        ("launchctl print system/" + finding_label(conf), 0, "\tstate = not running\n"),
+        ("heartbeat.json", 0, "state/heartbeat.json ok\nstate/bounce-heartbeat.json ok\n"
+                              "finding/heartbeat.json ok\n"),
     ]
     # The dispatcher already carries matching review entries, and their load was
     # proven once, so nothing here bounces a live dispatcher to re-learn it.
