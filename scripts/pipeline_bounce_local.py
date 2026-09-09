@@ -431,6 +431,56 @@ def repo_slug(owner_repo):
     return owner_repo.replace("/", "__")
 
 
+def rereview_request_path(state_dir, owner_repo, pr_number):
+    """Where the poller looks for this PR's re-review request. One spelling, used by the
+    write, the retire and the selftest — scripts/pipeline_review_poller.rereview_path is
+    its other half, and both batteries assert the two agree."""
+    return os.path.join(state_dir, "rereview", repo_slug(owner_repo), "pr-%d.json" % pr_number)
+
+
+def write_rereview_request(state_dir, owner_repo, pr_number, bounce_no, head_before):
+    """Ask the poller for a second look at this PR once its head moves off `head_before`.
+
+    Written write-then-rename, because a reader now exists and a half-written file is no
+    longer harmless: the poller REFUSES a malformed request rather than skipping it (a
+    lost re-review would otherwise strand every later bounce silently), so a crash during
+    a plain in-place write would leave a truncated document that reddens every poller pass
+    until a person deletes it. os.replace is atomic, so a reader sees the whole file or no
+    file at all."""
+    path = rereview_request_path(state_dir, owner_repo, pr_number)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"rereview_schema": REREVIEW_SCHEMA, "pr": pr_number, "repo": owner_repo,
+                   "requested_at": _now_iso(), "after_bounce_no": bounce_no,
+                   "head_before": head_before}, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def retire_rereview_request(state_dir, owner_repo, pr_number):
+    """Drop any outstanding request for this PR. Called when Stage E CONCLUDES.
+
+    A conclusion is the hand-off to a person, so a queued re-review must not outlive it. It
+    can: a bounce writes a request naming the head it bounced, and if the PR then goes green
+    with NO push — a flaky required check re-run is enough — the driver concludes while that
+    request is still on disk. The next push would open a second review ticket and post
+    another review comment on a pull request somebody already owns.
+
+    Best-effort and never fatal: the conclusion is already recorded, and a request that
+    cannot be removed costs one extra review, not a wrong hand-off."""
+    path = rereview_request_path(state_dir, owner_repo, pr_number)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return "could not retire the re-review request %s (%s); it may buy one more review" % (path, exc)
+    return "retired the outstanding re-review request for %s#%d" % (owner_repo, pr_number)
+
+
 def state_dir_of(cfg):
     return os.path.realpath(os.path.expanduser(cfg.get("state_dir") or DEFAULT_STATE_DIR))
 
@@ -2045,14 +2095,10 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
 
     append_row(lpath, repo=sit["repo"], pr=sit["pr"], bounce_no=verdict["bounce_no"],
                outcome="delivered", via=via, ref=ref, note=error)
-    rr_dir = os.path.join(state_dir, "rereview", repo_slug(sit["repo"]))
-    os.makedirs(rr_dir, exist_ok=True)
     # The poller's half of the loop: it re-reviews this PR on its next pass IF the head has
     # moved off `head_before`, then deletes this file. One bounce, one request, one review.
-    with open(os.path.join(rr_dir, "pr-%d.json" % sit["pr"]), "w", encoding="utf-8") as fh:
-        json.dump({"rereview_schema": REREVIEW_SCHEMA,
-                   "pr": sit["pr"], "repo": sit["repo"], "requested_at": _now_iso(),
-                   "after_bounce_no": verdict["bounce_no"], "head_before": sit.get("head_sha")}, fh)
+    write_rereview_request(state_dir, sit["repo"], sit["pr"], verdict["bounce_no"],
+                           sit.get("head_sha"))
     emit_status = emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "completed", "bounce_no": verdict["bounce_no"],
@@ -2107,6 +2153,11 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run):
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"],
                ticket_id=sit.get("ticket_id"), outcome="concluded", basis=basis,
                moved=(lane == "moved"), lane=lane, note=note, problems=problems)
+    # The hand-off is done, so no queued re-review may outlive it and post a second review
+    # comment on a pull request a person already owns.
+    retired = retire_rereview_request(state_dir, sit["repo"], sit["pr"])
+    if retired:
+        print("NOTE: %s#%d: %s" % (sit["repo"], sit["pr"], retired))
     if note:
         print("NOTE: %s#%d: %s" % (sit["repo"], sit["pr"], note))
     return lane != "failed", problems
@@ -2430,6 +2481,7 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
 # --------------------------------------------------------------------------- #
 def selftest():
     import contextlib
+    import inspect
     import io
     import tempfile
     failures = []
@@ -2526,6 +2578,35 @@ def selftest():
     check("…but a genuine RE-review of that head, postdating the bounce, is",
           outcome_is_fresh(dict(above, head_sha="bbb", at="2026-01-04T00:00:00Z"), "bbb",
                            {"at": "2026-01-03T00:00:00Z"})[0], True)
+
+    # 4a2. A conclusion RETIRES any outstanding re-review request. Reachable without any
+    #      push at all: a bounce leaves a request naming the head it bounced, a flaky
+    #      required check then re-runs green at that same head, and the driver concludes.
+    #      A request that outlived that hand-off would open a second review ticket and post
+    #      another review comment on a pull request a person already owns.
+    with tempfile.TemporaryDirectory() as tmp:
+        p = write_rereview_request(tmp, "o/r", 41, 1, "aaaa1111")
+        check("a request written is a request readable", os.path.exists(p), True)
+        check("retiring it removes it",
+              (retire_rereview_request(tmp, "o/r", 41).startswith("retired"),
+               os.path.exists(p)), (True, False))
+        check("retiring a request that is not there is silent, not an error",
+              retire_rereview_request(tmp, "o/r", 41), "")
+        check("retiring one PR's request leaves another's alone",
+              (write_rereview_request(tmp, "o/r", 42, 1, "bbbb") and
+               retire_rereview_request(tmp, "o/r", 41) == "" and
+               os.path.exists(rereview_request_path(tmp, "o/r", 42))), True)
+
+    # …and the write is ATOMIC, asserted over the source the way this file asserts its
+    # other invariants: no behavioural check can see the difference until a process dies
+    # mid-write, and by then it is a poller that goes red every pass until someone deletes
+    # the file. The poller REFUSES a malformed request rather than skipping it, which is
+    # exactly what makes a torn write expensive.
+    _wrr = inspect.getsource(write_rereview_request)
+    check("the request is written to a temp path, then renamed",
+          ("os.replace(tmp, path)" in _wrr, 'tmp = "%s.tmp-%d"' in _wrr), (True, True))
+    check("…and never opened at its final path directly",
+          'open(path, "w"' in _wrr, False)
 
     # 4b. The CONCLUSION — the answer this driver used to compute, print and throw away.
     #     Every None below is a refusal to hand a person work the reviewer never finished.
@@ -3180,6 +3261,13 @@ def selftest():
                   (rr_doc.get("rereview_schema"), rr_doc.get("after_bounce_no"),
                    rr_doc.get("head_before"), rr_doc.get("repo"), rr_doc.get("pr")),
                   (REREVIEW_SCHEMA, 1, "aaaa1111", "o/r", 41))
+            check("both scripts build the request path the same way", rr_path,
+                  rereview_request_path(tmp, "o/r", 41))
+            # Written write-then-rename: the poller REFUSES a malformed request rather than
+            # skipping it, so a half-written one would redden every pass until someone
+            # deleted it. No temp file may survive the write either.
+            check("the request is written atomically, leaving no temp file behind",
+                  [f for f in os.listdir(os.path.dirname(rr_path)) if ".tmp" in f], [])
 
             # 10d. Same head again ⇒ in flight, no second send.
             calls.clear()
@@ -3388,12 +3476,22 @@ def selftest():
                                      ("below-threshold", low_record, "below-threshold")):
             with tempfile.TemporaryDirectory() as tmp:
                 write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), record)
+                # An outstanding re-review request, which a real conclusion can absolutely
+                # find on disk: a bounce leaves one naming the head it bounced, and a flaky
+                # required check re-running green at that SAME head concludes with no push
+                # in between. Surviving the hand-off, it would open a second review ticket
+                # and post another review comment on a PR a person already owns.
+                left_over = write_rereview_request(tmp, "o/r", 41, 1, "aaaa1111")
                 calls.clear()
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
                 check("%s review CONCLUDES: exit 0, the lane move, then telemetry" % label,
                       (rc, kinds()), (EXIT_OK, ["state", "telemetry"]))
+                check("%s review: the hand-off RETIRES the outstanding re-review request" % label,
+                      os.path.exists(left_over), False)
+                check("%s review: …and says so, so the operator can see it happen" % label,
+                      "retired the outstanding re-review request" in buf.getvalue(), True)
                 check("%s review: the ORIGINAL ticket moved, to the needs-approval id" % label,
                       [c[1:] for c in calls if c[0] == "state"], [("iss-uuid", "st-needs-approval")])
                 check("%s review: one concluded row carrying repo, PR, ticket and basis" % label,
