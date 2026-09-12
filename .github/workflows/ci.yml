@@ -205,6 +205,19 @@ jobs:
       # that can make the driver REFUSE but can never grant it a bounce.
       - name: Stage E bounce driver selftest (ledger-first re-prompt, one label, no merge)
         run: python3 scripts/pipeline_bounce_local.py --selftest
+      # The human-action notifier (KIT-115): one ping per event that needs a person,
+      # keyed on the escalation marks the pipeline already writes. Offline, every transport
+      # stubbed: asserts the mark table matches the ADR and an informational note never
+      # pages, an HTML-escaped (executor-neutralized) mark does NOT page so a session cannot
+      # forge one, needs-human wins over blocked, build_message structurally cannot carry a
+      # comment body (decision 2), the agent:blocked mapping is exactly decision 4's, a
+      # credential value in the config and a state dir inside a worktree are both refused
+      # with every config error reported in one pass, the three §13 states carry three
+      # different exit codes, a corrupt seen-set refuses to run rather than re-paging, dry
+      # run writes nothing, a heartbeat is left on the failing path, and no merge/approve/
+      # state-change path exists — the only tracker mutation is one label.
+      - name: Human-action notifier selftest (marks, §13 states, label-only mutation)
+        run: python3 scripts/pipeline_notify_local.py --selftest
 
       # Stage E's installer — the one command an operator runs. Offline, every
       # transport stubbed: the conf validator reports EVERY bad value in one pass
