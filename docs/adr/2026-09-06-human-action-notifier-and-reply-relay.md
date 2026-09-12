@@ -226,3 +226,83 @@ was wired: no bot, no token, no allowlist edit, no test message.
 5. Which PR event is the human moment until Stage E is on ("opened") and after ("reviewed
    and green").
 6. Where the job lives: beside the Stage E poller, in whichever account that lands in.
+
+## Recommended decisions (proposed 2026-09-09 — the owner ratifies)
+
+These are recommendations, not rulings: each is a call the owner makes, and the ADR stays
+**Proposed** until they do. They are written against this ADR's own *Verified* facts and
+against the idea gate, whose executor (`scripts/pipeline_plan_executor.py`, shipped) is now a
+concrete **producer** of the marks this notifier consumes. One synergy runs through all of
+them: **the escalation content already lives in the tracker** — the executor posts the plan,
+the rejection, the question, or the no-output note as a tracker comment carrying an invisible
+mark — so the channel only ever has to carry the *ping*, never the content.
+
+1. **Channel — Telegram, reply-capable, but shipped one-way first.** The ADR's own channel
+   table already rejects every alternative on the reply path: Slack/Discord need a public URL
+   or a supervised socket, push services can't reply, iMessage is the sandbox-escape shape
+   Stage E was rejected for, and the zero-code tracker-view fallback is a dead end for replies
+   *and* fires only after a label is applied — so it needs the label writer anyway and still
+   can't answer. Telegram's poll-only reply API is the only one that grows into replies with
+   no new inbound surface. Pick Telegram; build the one-way half now (decision 3).
+
+2. **Content — the ping carries a title and a link, never the question text.** A blocked-session
+   question can quote code, and Telegram bot chats are **not end-to-end encrypted** — the
+   provider can read them (Verified, above). It does not
+   need to: the executor already writes the question as a tracker comment, so the notification
+   is "**Planning needs your input on KIT-777** → <link>", and the owner clicks through to read
+   and answer *in the tracker*, where the platform authenticates them. This keeps code off a
+   third party by construction, not by a redaction rule that can miss. (On the reply half the
+   owner's own short answer does transit Telegram — capped and angle-bracket-stripped per the
+   security model's fact 6; a one-line "yes, rotate on reuse" is the low-sensitivity case, and
+   anything longer belongs in the tracker comment the link points at.)
+
+3. **Sequencing — one-way first, as its own build.** It is a day's work, adds no new authority,
+   and does not depend on the unverified "an API comment produces a re-prompt" claim (KIT-99)
+   that gates the reply half. Ship the ping; it delivers exactly the "will the planning team
+   ask for my input" capability, and it de-risks the reply relay, which lands behind the same
+   live test Stage E's bounce driver is gated on.
+
+4. **`agent:blocked` — yes, the notifier applies it, and §6 gains one line.** Under a pin-less
+   dispatcher nothing else is positioned to: the notifier is the dispatcher-side writer §6
+   already names, and without a writer a blocked ticket is indistinguishable from an
+   in-progress one (and the tracker's own view routing never fires). The session still only
+   *requests* the label — it never applies it — so the §6 invariant holds. **Mapping for the
+   planning lane** (the marks the executor now writes, and the principle behind each — see the
+   table below): apply `agent:blocked` on `planning-needs-input` and `planning-no-output` (the
+   run needs the owner, and no-output is the §13 silent case a label makes visible); do **not**
+   apply it on `epic-awaiting-approval` (a normal approval, not a block) or `planning-rejected`
+   (a loud, self-explaining comment already carries its own cue).
+   **Named honestly:** this ADR's *Verified* section found that under the live unpinned
+   dispatcher every `agent:*` label is session-writable in practice, so applying the label
+   gives it a real writer but not yet integrity — tightening that is separate hardening, not
+   this build.
+
+5. **The PR human-moment — "opened" until Stage E is live, "reviewed and green" after.** A
+   config toggle the notifier reads. Before the review lane looks first, "opened" is the only
+   human moment; once the review lane handles opened→reviewed, ping only when it is actually the
+   owner's turn, so the channel does not fire twice for one PR.
+
+6. **Where it lives — beside the Stage E poller, in the same role account.** The ADR designs it
+   as the poller's sibling: same env-file rule, same state directory, same one-tick shape, same
+   credential class. No new account, no new credential, and it moves with the poller when the
+   dispatcher is replaced (Phase 2).
+
+### The marks the notifier greps (the producer ⇄ consumer contract)
+
+The notifier keys on marks the pipeline *already writes*, so the two never share a second
+shape. The idea gate's executor writes these on the tracker today (invisible HTML comments,
+`<!-- pipeline-escalation: <label> -->`), and the stopped-session escalation and the bounce
+lane write the rest:
+
+| Mark | Written by | The human moment | Apply `agent:blocked`? |
+|---|---|---|---|
+| `epic-awaiting-approval` | plan executor (idea gate) | a plan is filed; approve the epic | no — it is an approval, not a block |
+| `planning-needs-input` | plan executor (idea gate) | the planner asked a question, filed no plan | yes |
+| `planning-no-output` | plan executor (idea gate) | a planning run produced nothing | **yes** — this is the §13 silent-failure case; without the label a run that vanished is invisible on the board, so it needs the forced human look a block gives |
+| `planning-rejected` | plan executor (idea gate) | a plan was refused; re-plan | no — unlike no-output, a rejection is a loud, self-explaining comment naming what failed; the owner already has their cue, so no `agent:blocked` is needed to make it visible |
+| `agent:blocked` (marker) | a stopped working session (`/work` step 5) | a session is blocked on a decision | yes (this is the case §6 already names) |
+| `agent:needs-human` | bounce driver | the bounce budget is spent | yes |
+| review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision |
+
+New producer marks are added to this table in the same PR that ships them, so a mark the
+notifier cannot page on never exists silently.

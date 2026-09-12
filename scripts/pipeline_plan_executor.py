@@ -11,10 +11,21 @@ one `pipeline-safe-outputs/1` request file carrying a tree-shaped `ticket-create
 (§8 "Filing a plan"). This module, run on the dispatcher host as an owner-scoped
 role account that DOES hold the credential, then
 
-    validates   the batch WHOLE against schemas/safe-outputs.schema.json     find_plan / validate_plan
+    validates   the batch WHOLE against schemas/safe-outputs.schema.json     find_requests / validate_plan
     gates        every proposed child through check_ticket_dor.py --strict   run_dor
     materialises epic → children → blockedBy relations, forcing every field   materialise
-    reports      a summary comment back on the idea ticket, for the owner     render_*_comment
+    reports      a comment back on the idea ticket, for the owner, ALWAYS    render_*_comment
+
+The session holds no tracker tool, so EVERY way it reaches the owner travels
+through this executor. Besides a plan, a session may also emit QUESTION(s) as
+ticket-comments in the same file (§8) — the executor posts them on the idea
+ticket. If a run produces a plan, its questions ride along as notes; if it
+produces only questions, the executor surfaces them as a `needs-input`
+escalation; if it produces nothing at all, the executor still leaves a visible
+`no-output` note, because absence must not be silent (§13). Every comment carries
+a `<!-- pipeline-escalation: <label> -->` mark the human-action notifier
+(docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md) greps to page a
+person — this executor is the producer of those marks for the planning lane.
 
 THE THINGS THIS FILE IS SHAPED AROUND
 
@@ -38,11 +49,13 @@ THE THINGS THIS FILE IS SHAPED AROUND
      A partial epic reads as decomposed and is not. The failing children and
      their errors are reported back on the idea ticket for a re-plan.
 
-  4. "Could not do it" is never "nothing to do" (contract §13). A tree that was
-     read and REFUSED (schema-invalid, a DoR failure, a retarget attempt) exits
-     `rejected`; a tracker/config failure THIS executor hit exits `errored`; a
-     genuinely absent request file exits `skipped`. Three different facts, three
-     different exit codes, never collapsed.
+  4. "Could not do it" is never "nothing to do" (contract §13). A tree read and
+     REFUSED (schema-invalid, a DoR failure, a retarget attempt) exits `rejected`;
+     a tracker/config failure THIS executor hit — including a question it could
+     not deliver — exits `errored`; a run that produced a plan or delivered a
+     question exits 0. A genuinely absent file is `skipped` (exit 0), but even
+     then, when the ticket is known, the executor leaves a visible note rather
+     than vanishing. Distinct facts, distinct exit codes, never collapsed.
 
   5. The gate is staged where the session cannot reach it. This executor runs on
      the trusted dispatcher host over its own checkout — never inside the
@@ -69,8 +82,9 @@ Usage:
                               [--repo-root DIR] [--dry-run]
     pipeline_plan_executor.py --selftest
 
-Exit: 0 = materialised (or nothing to do), 3 = tree REJECTED (read and refused —
-      reported back, nothing created), 2 = usage/config/tracker error.
+Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
+      (read and refused — reported back, nothing created); 2 = usage/config/tracker
+      error, including a question that could not be delivered.
 """
 import argparse
 import json
@@ -115,6 +129,43 @@ SAFE_OUTPUTS_SCHEMA = "safe-outputs"
 # "What could not be settled" item 4.
 PENDING_PROJECT = "pending-project-gated-before-create"
 
+# A planning session's only channel is this file, so a QUESTION it needs answered
+# rides as a ticket-comment the executor posts on the idea ticket (the session
+# holds no tracker tool). A few, not a wall.
+MAX_PLAN_COMMENTS = 3
+
+# Escalation markers — invisible HTML comments the future human-action notifier
+# greps for (docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md: it
+# reads "the marks the pipeline already writes"). Same
+# `<!-- pipeline-escalation: <label> -->` shape a stopped session's comment uses,
+# so one grep on the tracker catches every human-moment this executor produces.
+ESC_AWAITING_APPROVAL = "epic-awaiting-approval"   # a plan is filed; approve it
+ESC_NEEDS_INPUT = "planning-needs-input"           # the planner asked a question
+ESC_REJECTED = "planning-rejected"                 # a plan was refused; re-plan
+ESC_NO_OUTPUT = "planning-no-output"               # the run produced nothing
+
+
+def _marker(label):
+    return "<!-- pipeline-escalation: %s -->" % label
+
+
+def _sanitize(text):
+    """Neutralize any HTML-comment sequence in SESSION-supplied text before it is
+    embedded in a comment the executor marks.
+
+    The executor writes `<!-- pipeline-escalation: <label> -->` marks that a
+    human-action notifier greps to page a person and apply `agent:blocked`. A
+    session's only channel is this file, so without this a session could smuggle a
+    FORGED mark inside a question body, a note, or a ticket title and make the
+    notifier page the owner (or block a ticket) on text the executor never
+    authored. Breaking the `<!--` / `-->` sequence renders the text visibly and
+    defeats the grep — the same angle-bracket discipline the notifier ADR applies
+    to relayed replies. Executor-authored marks are added AFTER sanitizing, so
+    only they survive as real marks."""
+    if not isinstance(text, str):
+        return text
+    return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
 
 class ExecutorError(Exception):
     """This executor / its config / the tracker failed — verdict `errored`."""
@@ -143,30 +194,51 @@ def load_requests(path):
         return None, "errored", "request file %s could not be read: %s" % (path, exc)
 
 
-def find_plan(doc):
-    """Validate the batch WHOLE, then extract the one plan tree.
+def find_requests(doc):
+    """Validate the batch WHOLE, then partition it into (plan, comments, errors).
 
-    Returns (plan_request, errors). A non-empty errors list means the batch is
-    refused (verdict `rejected`); the whole document conforms or none of it is
-    trusted (contract §8, §12).
+    A planning session emits at most one plan tree and any number of QUESTIONS
+    (ticket-comments) — nothing else. A non-empty errors list refuses the whole
+    batch (verdict `rejected`); the document conforms or none of it is trusted
+    (contract §8, §12).
     """
-    errors = []
     if not isinstance(doc, dict):
-        return None, ["the request file is not a JSON object"]
+        return None, [], ["the request file is not a JSON object"]
     problems = check_schemas.document_problems(doc, SAFE_OUTPUTS_SCHEMA)
     if problems:
-        return None, ["malformed safe-outputs batch: " + p for p in problems[:8]]
+        return None, [], ["malformed safe-outputs batch: " + p for p in problems[:8]]
 
-    plans = [r for r in doc["requests"]
-             if r.get("type") == "ticket-create" and "epic" in r]
-    if not plans:
-        return None, ["no plan tree in the batch — a ticket-create carrying "
-                      "`epic` and `children` is the planning session's only output "
-                      "(§8 'Filing a plan')"]
+    plans, comments, errors = [], [], []
+    for i, r in enumerate(doc["requests"]):
+        rtype = r.get("type")
+        if rtype == "ticket-create" and "epic" in r:
+            plans.append(r)
+        elif rtype == "ticket-comment":
+            comments.append(r)
+        else:
+            errors.append("requests[%d] type %r is not valid in a planning batch — a "
+                          "planning session emits a plan tree (ticket-create with "
+                          "`epic`/`children`) and/or questions (ticket-comment), "
+                          "nothing else" % (i, rtype))
     if len(plans) > 1:
-        return None, ["%d plan trees in one batch — a run proposes exactly one "
-                      "decomposition (§8 caps)" % len(plans)]
-    return plans[0], []
+        errors.append("%d plan trees in one batch — a run proposes exactly one "
+                      "decomposition (§8 caps)" % len(plans))
+    return (plans[0] if plans else None), comments, errors
+
+
+def comment_errors(comments, pinned):
+    """A session's questions must name its OWN pinned ticket (the same central
+    check the plan gets), and there is a small cap — a planner asks the few things
+    that block it, not a wall (§8 caps)."""
+    errors = []
+    if len(comments) > MAX_PLAN_COMMENTS:
+        errors.append("%d questions in one run exceeds the cap of %d — ask the few "
+                      "that block you (§8 caps)" % (len(comments), MAX_PLAN_COMMENTS))
+    for i, c in enumerate(comments):
+        if c.get("ticket_id") != pinned:
+            errors.append("question %d names ticket %r but this session is pinned to "
+                          "%r — a retarget, not a typo" % (i, c.get("ticket_id"), pinned))
+    return errors
 
 
 def dependency_errors(children):
@@ -269,6 +341,7 @@ def build_child_tickets(plan, team_key, landing_state_id):
 def render_success_comment(idea_id, epic, children):
     """One markdown comment posted back on the idea ticket, for the owner."""
     lines = [
+        _marker(ESC_AWAITING_APPROVAL),
         "### Epic plan ready — awaiting your approval",
         "",
         "A planning session decomposed **%s** into an epic and %d "
@@ -277,7 +350,7 @@ def render_success_comment(idea_id, epic, children):
         % (idea_id, len(children)),
         "",
         "- **Epic** [%s](%s) — `%s` (`provenance:agent`)"
-        % (epic["identifier"], epic.get("url") or "", epic["title"]),
+        % (epic["identifier"], epic.get("url") or "", _sanitize(epic["title"])),
     ]
     for created, child in children:
         dep = ""
@@ -286,7 +359,7 @@ def render_success_comment(idea_id, epic, children):
                 "#%d" % d for d in child["depends_on"])
         lines.append("  - [%s](%s) — `%s`%s"
                      % (created["identifier"], created.get("url") or "",
-                        child["title"], dep))
+                        _sanitize(child["title"]), dep))
     lines += [
         "",
         "Approve the epic to release the tree; each child re-checks the "
@@ -298,6 +371,7 @@ def render_success_comment(idea_id, epic, children):
 def render_rejection_comment(idea_id, reason, detail_lines):
     """One markdown comment reporting a refused tree back for a re-plan."""
     lines = [
+        _marker(ESC_REJECTED),
         "### Proposed epic plan REJECTED — nothing was created",
         "",
         "The plan a session proposed for **%s** was refused whole, so no epic and "
@@ -306,8 +380,36 @@ def render_rejection_comment(idea_id, reason, detail_lines):
         "**%s**" % reason,
         "",
     ]
-    lines.extend(detail_lines)
+    # detail_lines carry DoR messages and validation errors that quote SESSION
+    # values (a child title, a bad id) — sanitize before the marked comment.
+    lines.extend(_sanitize(line) for line in detail_lines)
     return "\n".join(lines)
+
+
+def render_question_comment(idea_id, body):
+    """A question the session filed no plan for — surfaced on the idea ticket and
+    marked so the notifier can page the owner. It is the owner's to answer before
+    the idea can be decomposed."""
+    return ("%s\n> A planning session raised this while working **%s**, and filed no "
+            "plan — it needs your input before it can decompose the idea.\n\n%s"
+            % (_marker(ESC_NEEDS_INPUT), idea_id, _sanitize(body)))
+
+
+def render_note_comment(idea_id, body):
+    """A note the session left ALONGSIDE a plan it did file — surfaced as context,
+    not an escalation (the plan itself is the awaiting-approval event)."""
+    return ("<!-- planning-note -->\n> A note from the planning session that proposed "
+            "the plan for **%s**:\n\n%s" % (idea_id, _sanitize(body)))
+
+
+def render_no_output_comment(idea_id):
+    """The run produced nothing. Absence must not be SILENT on the board (§13):
+    the owner is told the miss, marked so the notifier can surface it."""
+    return ("%s\n### No plan was produced\n\nThe planning session for **%s** finished "
+            "without proposing a plan and left no message. It may have failed, hit its "
+            "budget, or judged the idea impossible to decompose as written. Nothing was "
+            "filed — re-run, or add detail to the idea and hand it off again."
+            % (_marker(ESC_NO_OUTPUT), idea_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -494,26 +596,37 @@ def materialise(args, client=None):
     team_key = cfg["linear"]["teamKey"]
     finding_cfg = cfg["linear"].get("findingTicket")
 
-    # ── Load and validate the batch ────────────────────────────────────────
+    # ── Load the batch. Absence is not silence (§13). ──────────────────────
     doc, verdict, message = load_requests(args.requests)
-    if verdict == "skipped":
-        print("::notice:: %s" % message)
-        return EXIT_OK
     if verdict == "errored":
         print("::error:: %s" % message, file=sys.stderr)
         return EXIT_ERRORED
+    if verdict == "skipped":
+        return _no_output(args, client, cfg, team_key, finding_cfg, message)
 
-    plan, errors = find_plan(doc)
+    # ── Validate the batch WHOLE, partition into plan + questions ──────────
+    plan, comments, errors = find_requests(doc)
+    pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
+    if not errors and plan:
+        errors = validate_plan(plan, pinned, bool(finding_cfg))
     if not errors:
-        errors = validate_plan(plan, args.pinned or (plan or {}).get("source_ticket_id"),
-                               bool(finding_cfg))
+        errors = comment_errors(comments, pinned)
+    if not errors and not plan and not comments:
+        errors = ["the batch carried neither a plan nor a question"]
+    if not errors and (plan or comments) and pinned is None:
+        errors = ["no dispatcher-pinned ticket id — cannot verify the target; the "
+                  "dispatcher supplies it via --pinned"]
     if errors:
+        # All-or-nothing: a refused batch posts only its rejection, never the
+        # session's questions (§8). The report goes to the pinned/own ticket.
         return _reject(args, client, cfg, team_key, finding_cfg,
-                       (plan or {}).get("source_ticket_id"),
-                       "the proposed tree was refused before any create",
+                       pinned or (plan or {}).get("source_ticket_id"),
+                       "the batch was refused before any create",
                        ["- %s" % e for e in errors])
 
-    pinned = args.pinned or plan["source_ticket_id"]
+    # ── No plan, only question(s): the planner needs the owner's input ─────
+    if not plan:
+        return _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments)
 
     # ── The DoR gate over every child (§5) ─────────────────────────────────
     children = plan["children"]
@@ -532,7 +645,8 @@ def materialise(args, client=None):
     # ── Everything passed. Create. (dry-run stops here.) ───────────────────
     if args.dry_run:
         print("::notice:: [dry-run] tree for %s valid and DoR-clean: 1 epic, %d "
-              "children — nothing created." % (pinned, len(children)))
+              "children, %d note(s) — nothing created."
+              % (pinned, len(children), len(comments)))
         return EXIT_OK
 
     try:
@@ -548,7 +662,7 @@ def materialise(args, client=None):
               "was created, and this is not a verdict on the tree.", file=sys.stderr)
         return EXIT_ERRORED
 
-    return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan)
+    return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments)
 
 
 def _landing_state_or_placeholder(cfg, finding_cfg):
@@ -559,6 +673,60 @@ def _landing_state_or_placeholder(cfg, finding_cfg):
         if state:
             return state
     return cfg["linear"]["stateIds"].get("raw") or "state-raw-unresolved"
+
+
+def _no_output(args, client, cfg, team_key, finding_cfg, message):
+    """A planning session that produced nothing must not be SILENT on the board
+    (§13). When the ticket is known (a real dispatch: --pinned), leave a visible
+    'no plan produced' comment so the owner sees the miss. Without a pinned ticket
+    (a local or dry run) it stays a quiet notice — there is nobody's ticket to
+    notify. `skipped` (exit 0) either way: this is an answer, not a failure."""
+    print("::notice:: %s" % message)
+    target = args.pinned
+    if args.dry_run or not target or not finding_cfg:
+        return EXIT_OK
+    client = client or _live_client()
+    if client is None:
+        print("::warning:: no credential — could not surface the empty run on %s"
+              % target, file=sys.stderr)
+        return EXIT_OK
+    try:
+        src = client.resolve_source(team_key, target.rsplit("-", 1)[1])
+        client.post_comment(src["id"], render_no_output_comment(target))
+        print("::notice:: verdict=skipped (surfaced): the empty run is now visible on %s"
+              % target)
+    except (ExecutorError, IndexError) as exc:
+        print("::warning:: could not surface the empty run on %s: %s" % (target, exc),
+              file=sys.stderr)
+    return EXIT_OK
+
+
+def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
+    """The session asked question(s) and filed no plan. Surface them on the idea
+    ticket, marked so the notifier can page the owner — a legitimate terminal
+    ('the planner needs you'), never a failure and never silent. A delivery that
+    FAILS, though, is a genuine could-not-do-it and is loud (`errored`)."""
+    print("::notice:: verdict=escalated — the planning session raised %d question(s) "
+          "on %s and filed no plan." % (len(comments), pinned))
+    if args.dry_run:
+        return EXIT_OK
+    client = client or _live_client()
+    if client is None:
+        print("::error:: no credential — the planner's question(s) on %s could not be "
+              "delivered. A question nobody sees is worse than none." % pinned,
+              file=sys.stderr)
+        return EXIT_ERRORED
+    try:
+        src = client.resolve_source(team_key, pinned.rsplit("-", 1)[1])
+        for c in comments:
+            client.post_comment(src["id"], render_question_comment(pinned, c["body"]))
+    except (ExecutorError, IndexError) as exc:
+        print("::error:: could not deliver the planner's question(s) on %s: %s"
+              % (pinned, exc), file=sys.stderr)
+        return EXIT_ERRORED
+    print("::notice:: delivered %d question(s) on %s — awaiting the owner." %
+          (len(comments), pinned))
+    return EXIT_OK
 
 
 def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_lines):
@@ -584,10 +752,11 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     return EXIT_REJECTED
 
 
-def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan):
+def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None):
     """The only path that mutates. Any failure here is `errored`, never
     `rejected` — the tree was accepted; the tracker is what failed, and it may be
     partly written (§8, §13)."""
+    comments = comments or []
     created_count = 0
 
     def errored(msg):
@@ -636,16 +805,21 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan):
                 client.create_relation(created_children[j][0]["id"],
                                        created_children[i][0]["id"])
 
-        # Report the plan back on the idea ticket for the owner.
+        # Report the plan back on the idea ticket for the owner, then any notes the
+        # session left alongside it (its open questions ride in the epic PRD; these
+        # are top-level asides). The plan is filed either way — a note never blocks.
         client.post_comment(src["id"], render_success_comment(pinned, epic, created_children))
+        for c in comments:
+            client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
     except ExecutorError as exc:
         return errored(str(exc))
     except (KeyError, IndexError) as exc:
         return errored("unexpected tracker response shape: %s" % exc)
 
     print("::notice:: filed epic %s and %d child(ren) for %s (all backlog, "
-          "provenance:agent/epic) — awaiting the owner's approval."
-          % (epic["identifier"], len(created_children), pinned))
+          "provenance:agent/epic)%s — awaiting the owner's approval."
+          % (epic["identifier"], len(created_children), pinned,
+             " + %d note(s)" % len(comments) if comments else ""))
     return EXIT_OK
 
 
@@ -693,6 +867,8 @@ class FakeLinear:
         self.relations.append((blocker_id, blocked_id))
 
     def post_comment(self, issue_id, body):
+        if getattr(self, "fail_post", False):
+            raise ExecutorError("simulated tracker failure on comment")
         self.comments.append((issue_id, body))
 
 
@@ -812,6 +988,8 @@ def selftest():
         check("summary-comment-on-idea", len(fake.comments), 1)
         check("summary-comment-target", fake.comments[0][0], "src-KIT-777")
         check("summary-names-approval", "move the epic out of intake" in fake.comments[0][1], True)
+        check("summary-carries-approval-marker",
+              _marker(ESC_AWAITING_APPROVAL) in fake.comments[0][1], True)
 
         # 3. dry-run creates nothing.
         fake2 = FakeLinear()
@@ -887,13 +1065,24 @@ def selftest():
         check("no-tree-rejected", run(flat, client=fake9), EXIT_REJECTED)
         check("no-tree-no-create", len(fake9.issues), 0)
 
-        # 11. Absent request file → skipped (nothing to do), never a create.
+        # 11. Absent request file → skipped (exit 0), never a create — but NOT
+        #     silent: with the ticket known, a visible no-output note is posted (§13).
         fakeA = FakeLinear()
         args = argparse.Namespace(requests=os.path.join(tmp, "nope.json"),
                                   config=cfg_path, repo_root=tmp, dry_run=False,
                                   pinned="KIT-777")
         check("absent-skipped", materialise(args, client=fakeA), EXIT_OK)
         check("absent-no-create", len(fakeA.issues), 0)
+        check("absent-surfaced", len(fakeA.comments), 1)
+        check("absent-carries-no-output-marker",
+              _marker(ESC_NO_OUTPUT) in fakeA.comments[0][1], True)
+        # …but a dry run stays quiet (nobody's ticket to notify on a measurement).
+        fakeA2 = FakeLinear()
+        args2 = argparse.Namespace(requests=os.path.join(tmp, "nope.json"),
+                                   config=cfg_path, repo_root=tmp, dry_run=True,
+                                   pinned="KIT-777")
+        check("absent-dry-run-quiet", materialise(args2, client=fakeA2), EXIT_OK)
+        check("absent-dry-run-no-comment", len(fakeA2.comments), 0)
 
         # 12. findingTicket unconfigured → the plan kind is off → rejected.
         fakeB = FakeLinear()
@@ -923,6 +1112,88 @@ def selftest():
         json.dump(_tree(), open(os.path.join(tmp, "requests.json"), "w"))
         check("no-config-off", materialise(args, client=fakeD), EXIT_OK)
         check("no-config-no-create", len(fakeD.issues), 0)
+
+        # ── The escalation / question channel ──────────────────────────────
+        def _comment(body, tid="KIT-777"):
+            return {"type": "ticket-comment", "ticket_id": tid, "body": body}
+
+        def _batch(*reqs):
+            return {"schema": "pipeline-safe-outputs/1", "requests": list(reqs)}
+
+        # 15. A question with NO plan → escalated (exit 0), delivered on the idea
+        #     ticket with the needs-input marker, nothing created.
+        fakeE = FakeLinear()
+        q = _batch(_comment("Should tokens rotate on reuse, or only on expiry? It "
+                            "changes the whole store design and the idea does not say."))
+        check("question-only-escalated", run(q, client=fakeE), EXIT_OK)
+        check("question-only-no-create", len(fakeE.issues), 0)
+        check("question-only-delivered", len(fakeE.comments), 1)
+        check("question-only-on-idea", fakeE.comments[0][0], "src-KIT-777")
+        check("question-only-marked",
+              _marker(ESC_NEEDS_INPUT) in fakeE.comments[0][1], True)
+
+        # 16. A plan WITH a note → tree materialises AND the note is posted (summary
+        #     + note = 2 comments); the note carries the planning-note marker.
+        fakeF = FakeLinear()
+        tree_note = _tree()
+        tree_note["requests"].append(_comment("Heads up: child B assumes the new "
+                                              "endpoint from the other epic."))
+        check("plan-plus-note-ok", run(tree_note, client=fakeF), EXIT_OK)
+        check("plan-plus-note-created", len(fakeF.issues), 3)
+        check("plan-plus-note-two-comments", len(fakeF.comments), 2)
+        check("plan-plus-note-marked",
+              "planning-note" in fakeF.comments[1][1], True)
+
+        # 17. A question naming a DIFFERENT ticket than the pin → rejected.
+        fakeG = FakeLinear()
+        check("question-retarget-rejected",
+              run(_batch(_comment("q", tid="KIT-999")), client=fakeG), EXIT_REJECTED)
+        check("question-retarget-no-deliver",
+              all(_marker(ESC_NEEDS_INPUT) not in b for _, b in fakeG.comments), True)
+
+        # 18. A question the executor CANNOT deliver (tracker fails) → errored, not
+        #     a quiet success. A question nobody sees is worse than none.
+        fakeH = FakeLinear(); fakeH.fail_post = True
+        check("question-delivery-failed-errored",
+              run(_batch(_comment("q")), client=fakeH), EXIT_ERRORED)
+
+        # 19. A request type a planning session may not emit (ticket-state) → rejected.
+        fakeI = FakeLinear()
+        state_req = _batch({"type": "ticket-state", "ticket_id": "KIT-777", "to": "review"})
+        check("disallowed-type-rejected", run(state_req, client=fakeI), EXIT_REJECTED)
+        check("disallowed-type-no-create", len(fakeI.issues), 0)
+
+        # 20. An empty batch (neither plan nor question) → rejected.
+        fakeJ = FakeLinear()
+        check("empty-batch-rejected", run(_batch(), client=fakeJ), EXIT_REJECTED)
+
+        # 21. Over the question cap → rejected (all-or-nothing, nothing delivered).
+        fakeK = FakeLinear()
+        many_q = _batch(*[_comment("q%d" % i) for i in range(MAX_PLAN_COMMENTS + 1)])
+        check("over-question-cap-rejected", run(many_q, client=fakeK), EXIT_REJECTED)
+        check("over-question-cap-no-deliver",
+              all(_marker(ESC_NEEDS_INPUT) not in b for _, b in fakeK.comments), True)
+
+        # 22. A session must not FORGE an escalation mark by embedding it in text
+        #     the executor posts (a question body, a note, or a ticket title). The
+        #     forged mark is neutralized; only the executor's own mark survives.
+        forged = _marker("agent:needs-human")  # what a session would try to smuggle
+        fakeL = FakeLinear()
+        check("forged-in-question-escalated",
+              run(_batch(_comment("Please block this. " + forged)), client=fakeL), EXIT_OK)
+        posted = fakeL.comments[0][1]
+        check("forged-question-neutralized", forged in posted, False)
+        check("forged-question-real-mark-survives",
+              _marker(ESC_NEEDS_INPUT) in posted, True)
+        # …and via a child title in a materialised plan's summary comment.
+        fakeM = FakeLinear()
+        forged_tree = _tree()
+        forged_tree["requests"][0]["children"][0]["title"] = "Do it " + forged
+        check("forged-title-ok", run(forged_tree, client=fakeM), EXIT_OK)
+        summary = fakeM.comments[0][1]
+        check("forged-title-neutralized", forged in summary, False)
+        check("forged-title-real-mark-survives",
+              _marker(ESC_AWAITING_APPROVAL) in summary, True)
 
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
