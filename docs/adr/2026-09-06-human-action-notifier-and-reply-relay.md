@@ -1,6 +1,7 @@
 # Human-action events leave the tracker through a dispatcher-side notifier; replies re-enter only as session-thread comments
 
-**Date:** 2026-09-06 · **Status:** Proposed — awaiting the owner's decisions listed at the end
+**Date:** 2026-09-06 · **Status:** **Accepted** — all six decisions ratified by the owner
+2026-09-11; decision 1 amended from Telegram to **Slack**, decision 3 refined
 · **Context:** the notification-channel investigation (KIT-106), branch
 `docs/kit-106-notification-channel-adr`. Extends build record §15 (*Where a person actually
 lives in this*); builds on
@@ -23,11 +24,14 @@ from its own state file, and posts the text as a comment in that session's agent
 through the same re-prompt function the bounce driver uses. No command grammar exists.
 Approving, merging, labelling and state changes never transit the channel.
 
-**The channel for the reference deployment is a Telegram bot in a private one-person chat.**
-The property that decides it is that its reply API is a plain outbound poll: no inbound URL, no
-open port, no persistent connection, so the same one-shot job can send and receive. The
-decision is written against that property, not the product; any channel with the same
-property fits.
+**The channel for the reference deployment is Slack, in a private one-person channel**
+(ratified 2026-09-11; see decision 1, which records the error that first pointed elsewhere).
+The property that decides it is that the channel can be **read by polling** — a plain
+authenticated GET with a timestamp and a cursor — so no inbound URL, no open port and no
+persistent connection are needed, and the same one-shot job can send and receive. The decision
+is written against that property, not the product; any channel with the same property fits.
+Slack adds two things on top of it: the channel is the durable store, so an offline stretch
+costs nothing, and membership extends to a second person without a rebuild.
 
 **Ships one-way first.** The one-way half is a day's work and carries no new authority; the
 reply half is a designed step with the security model below, built and reviewed on its own,
@@ -69,8 +73,8 @@ decision is waiting must not compete with bookkeeping.
 
 | Channel | Reply path | Verdict |
 |---|---|---|
-| Telegram bot | Outbound long-poll for updates; no inbound URL, no persistent connection; mutually exclusive with a webhook, so a poll-only bot has no inbound surface at all | Chosen |
-| Slack | Socket Mode needs a persistent WebSocket to a host chosen at runtime, and events sent while disconnected can be lost; the Events API needs a public URL. One-way is zero-code only if the tracker's own Slack integration can post a label-filtered view to a channel — and that fires only when an issue *enters* the view, which needs the label to be applied first | One-way fallback; a dead end for replies |
+| Slack | **The Web API can simply be polled**: `conversations.history` / `conversations.replies` are plain authenticated GETs taking an `oldest` timestamp and a cursor, so a one-shot job reads the channel with no socket, no inbound URL and no long-running process. Its push transports (Socket Mode, Events API) do need a supervised socket or a public URL — but nothing obliges an app to use them. The channel itself is the durable store, so an offline stretch is recovered by asking again from the last timestamp | **Chosen** (2026-09-11) |
+| Telegram bot | Outbound long-poll for updates; no inbound URL, no persistent connection; mutually exclusive with a webhook, so a poll-only bot has no inbound surface at all. **Its cost is retention**: undelivered updates are discarded after 24 hours and a bot has no history API, so a laptop offline for a long weekend loses them permanently | Viable; rejected on retention and on the multi-person path |
 | Discord | The Gateway is a persistent WebSocket; interactions need a public URL; a bot can DM a user only with a shared server | No advantage |
 | iMessage | No API. A daemon has no access to the window server, so the dispatcher account cannot drive the Messages app. A helper in the owner's own login session runs only while logged in and does not return after a reboot with FileVault on; it would run as the owner, outside the sandbox | Rejected: the shape Stage E's first design was rejected for |
 | Push-only services (ntfy, Pushover) | None | One-way only; cannot grow into replies |
@@ -173,6 +177,18 @@ was wired: no bot, no token, no allowlist edit, no test message.
   unpinned session the lifecycle-label and own-ticket guards stand down and the session
   holds a workspace-scoped tracker token, so today every `agent:*` label is session-writable
   in practice. Confirmed by both skeptics.
+- **Slack** (added 2026-09-07, the correction behind decision 1). `conversations.history` and
+  `conversations.replies` are plain authenticated GETs taking `oldest` + `cursor`, so a
+  process that is offline between calls still retrieves everything posted in the interim — the
+  channel is the durable store, bounded only by plan retention (90 days on free). Nothing in
+  Slack's docs or terms obliges an app to use Socket Mode or the Events API; those are
+  alternatives for *event delivery* only. Internal (non-distributed) workspace apps keep Tier 3
+  limits — 50+ requests/minute, `limit` up to 999 — the May 2025 tightening applying only to
+  commercially distributed apps. An **incoming webhook returns no message id**, so threading
+  and tracking need a bot token rather than a webhook URL. On the free plan **guests are
+  paid-only** and per-channel posting restrictions exist **only for `#general`**, so channel
+  membership is the only access control — hence the private channel. Confirmed by two
+  independent skeptics against the live pages.
 - **Telegram.** One host, `api.telegram.org`; free, with per-chat rate limits and a
   4,096-character message cap; `getUpdates` is a bot-initiated pull needing no reachable
   server, mutually exclusive with a webhook; the token gives full control (read, send,
@@ -216,10 +232,12 @@ was wired: no bot, no token, no allowlist edit, no test message.
 - That the deployed dispatcher's sandbox is on: the startup banner read "deny-all with 19
   allowed domains" on 2026-09-03 per the field guide; the config file was not re-read here.
 
-## Owner decisions this ADR waits on
+## Owner decisions — all six ratified 2026-09-11
 
-1. The channel itself (an account tied to a phone number), or the zero-code one-way fallback
-   — which still needs the label writer.
+*Kept as the record of what was asked. Every one is now answered in the section below; nothing
+here is outstanding.*
+
+1. The channel itself, or the zero-code one-way fallback — which still needs the label writer.
 2. Whether the question text may transit the channel provider, or only a title and a link.
 3. One-way first as a separate step, or both halves in one build.
 4. Whether the notifier applies `agent:blocked` (the §6 amendment).
@@ -227,40 +245,71 @@ was wired: no bot, no token, no allowlist edit, no test message.
    and green").
 6. Where the job lives: beside the Stage E poller, in whichever account that lands in.
 
-## Recommended decisions (proposed 2026-09-09 — the owner ratifies)
+## The decisions, as ratified (proposed 2026-09-09, ratified 2026-09-11)
 
-These are recommendations, not rulings: each is a call the owner makes, and the ADR stays
-**Proposed** until they do. They are written against this ADR's own *Verified* facts and
+These were recommendations when written; **the owner ratified all six on 2026-09-11**, and the
+ADR moved to *Accepted*. Decision 1 changed in the ratification — from Telegram to Slack — and
+decision 3 was refined; both carry a dated amendment note in place. They are written against this ADR's own *Verified* facts and
 against the idea gate, whose executor (`scripts/pipeline_plan_executor.py`, shipped) is now a
 concrete **producer** of the marks this notifier consumes. One synergy runs through all of
 them: **the escalation content already lives in the tracker** — the executor posts the plan,
 the rejection, the question, or the no-output note as a tracker comment carrying an invisible
 mark — so the channel only ever has to carry the *ping*, never the content.
 
-1. **Channel — Telegram, reply-capable, but shipped one-way first.** The ADR's own channel
-   table already rejects every alternative on the reply path: Slack/Discord need a public URL
-   or a supervised socket, push services can't reply, iMessage is the sandbox-escape shape
-   Stage E was rejected for, and the zero-code tracker-view fallback is a dead end for replies
-   *and* fires only after a label is applied — so it needs the label writer anyway and still
-   can't answer. Telegram's poll-only reply API is the only one that grows into replies with
-   no new inbound surface. Pick Telegram; build the one-way half now (decision 3).
+1. **Channel — Slack.** *Ratified by the owner 2026-09-11.*
+
+   > **Amended 2026-09-11.** This decision originally read *Telegram*, and it rested on a
+   > factual error in this ADR's own channel table: the Slack row assessed only Slack's
+   > **push** transports (Socket Mode, the Events API) and concluded it needed a supervised
+   > socket or a public URL. **Slack can simply be polled.** `conversations.history` and
+   > `conversations.replies` are plain authenticated GETs with `oldest` + cursor, so the same
+   > one-shot job that sends can also read — the exact property that made Telegram look
+   > unique. The table row is corrected above. Verified 2026-09-07 against live vendor
+   > documentation by two independent skeptics, along with: an internal (non-distributed)
+   > workspace app keeps Tier 3 limits — 50+ requests/minute, up to 999 messages a page —
+   > because the May 2025 tightening targets commercially distributed apps only.
+
+   Three reasons, in order of weight. **Retention:** the Slack channel is the durable store
+   (90 days on the free plan), where Telegram discards undelivered bot updates after 24 hours
+   with no history API to recover them — so a laptop offline for a weekend loses nothing on
+   one and everything on the other. **The multi-person path:** Slack is the only option whose
+   model extends to a second person without rebuilding, which the owner wants to keep open.
+   **The reply path costs the same either way** now that polling is on the table.
+
+   Discord remains rejected (a persistent gateway or a public URL, and a bot can only DM
+   inside a shared server), iMessage remains the sandbox-escape shape Stage E was rejected
+   for, and push-only services still cannot reply.
+
+   **One Slack-specific requirement this adds: the bot lives in a *private* channel.** On the
+   free plan guest roles are paid-only and per-channel posting restrictions exist only for
+   `#general`, so **channel membership is the only access control available** — and it is
+   what supplies the identity gate the dispatcher's chat lane structurally lacks, since its
+   user allowlist is never consulted on the Slack path. A public channel would let any second
+   workspace member join uninvited and drive the agent with the owner's authority.
 
 2. **Content — the ping carries a title and a link, never the question text.** A blocked-session
-   question can quote code, and Telegram bot chats are **not end-to-end encrypted** — the
-   provider can read them (Verified, above). It does not
-   need to: the executor already writes the question as a tracker comment, so the notification
-   is "**Planning needs your input on KIT-777** → <link>", and the owner clicks through to read
-   and answer *in the tracker*, where the platform authenticates them. This keeps code off a
-   third party by construction, not by a redaction rule that can miss. (On the reply half the
-   owner's own short answer does transit Telegram — capped and angle-bracket-stripped per the
-   security model's fact 6; a one-line "yes, rotate on reuse" is the low-sensitivity case, and
-   anything longer belongs in the tracker comment the link points at.)
+   question can quote code, and no mainstream chat provider stores it end-to-end encrypted —
+   Slack holds message content on its servers under its own keys, as Telegram does for bot
+   chats (Verified, above). It does not need to: the executor already writes the question as a
+   tracker comment, so the notification is "**Planning needs your input on KIT-777** → <link>",
+   and the owner clicks through to read and answer *in the tracker*, where the platform
+   authenticates them. This keeps code off a third party by construction, not by a redaction
+   rule that can miss. (On the reply half the owner's own short answer does transit the
+   provider — capped and angle-bracket-stripped per the security model's fact 6; a one-line
+   "yes, rotate on reuse" is the low-sensitivity case, and anything longer belongs in the
+   tracker comment the link points at.)
 
-3. **Sequencing — one-way first, as its own build.** It is a day's work, adds no new authority,
-   and does not depend on the unverified "an API comment produces a re-prompt" claim (KIT-99)
-   that gates the reply half. Ship the ping; it delivers exactly the "will the planning team
-   ask for my input" capability, and it de-risks the reply relay, which lands behind the same
-   live test Stage E's bounce driver is gated on.
+3. **Sequencing — three pieces, not two.** *Refined 2026-09-11, because "two-way" was doing
+   double duty and the ambiguity read as a conflict with the owner's stated requirement.*
+
+   | Piece | When | Why there |
+   |---|---|---|
+   | **Notifier** — the ping plus a link | **First** | A day's work, adds no new authority, depends on nothing unproven |
+   | **Conversational channel** — asking it questions, seeding an idea | **In the MVP** | This is what the owner means by "two-way". It needs no relay and does **not** depend on the re-prompt claim |
+   | **Reply relay** — a reply waking a blocked session | **Deferred** | Gated on the same live re-prompt test as the bounce driver (KIT-99). The owner separately prefers tapping the link through to the tracker |
+
+   So one-way-first and two-way-in-the-MVP were never actually in tension: only the *relay* is
+   deferred, and it is the piece the owner wants least.
 
 4. **`agent:blocked` — yes, the notifier applies it, and §6 gains one line.** Under a pin-less
    dispatcher nothing else is positioned to: the notifier is the dispatcher-side writer §6
