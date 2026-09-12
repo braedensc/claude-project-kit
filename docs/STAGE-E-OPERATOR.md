@@ -1028,8 +1028,22 @@ posts its result as a `response` activity needs the poller changed nowhere.
 
 ## What's on vs. off right now
 
-**Mechanism:** the scripts, tested, wired into this kit's own CI.
-**Activation: OFF.** Nothing above has been run by merging this. No team exists, no entry
-is loaded, no daemon is bootstrapped, no key is anywhere, and no PR has been reviewed or
-bounced by a running instance of this code. Turning it on is the five steps above, on your
-own machine, in your own time — dry run first, live tests second, the daemons last.
+**Mechanism:** the scripts, tested, wired into this kit's own CI — and, since 2026-09-08,
+run end to end against live pull requests on a production deployment.
+
+**Activation: OFF in a fresh copy.** Merging this changes nothing on your machine: no team
+exists, no entry is loaded, no daemon is bootstrapped, and no key is anywhere. Turning it on
+is the five steps above, on your own machine, in your own time — dry run first, live tests
+second, the daemons last.
+
+What the live run established, in order, over 2026-09-08 to 2026-09-12: a review comment on
+an opened pull request; a bounce delivered into the ticket thread when findings met the
+threshold; then **no** re-review and no spend at all for the ten hours the re-prompted
+session pushed nothing; a re-review with its own ticket, its own title and its own second PR
+comment once the head finally moved; and a conclusion that moved the coding ticket into the
+needs-approval lane — including one conclusion held, correctly, for three days until that
+lane was provisioned, then completed on the next pass without anyone touching it.
+
+Two of those had never run outside the test battery: a PR had only ever been reviewed once,
+so the review half of the bounce trigger could not fire again, and the conclusion path could
+not be reached after a bounce either. Both needed the re-review loop to exist first.
