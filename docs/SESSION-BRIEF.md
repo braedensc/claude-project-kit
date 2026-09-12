@@ -109,8 +109,8 @@ Three things about that loop are worth knowing before you meet it:
   and whether you think a session can fix it at all. An unfinished job and a finished one
   must never look alike.
 
-One check is not yours: a red **hooks-change guard** is waiting on a person's label, not on
-a fix. Say so and stop; the hook already knows not to nag you about it.
+One check is not yours: a red **Hooks change guard** is waiting on a person's `hooks-change`
+label, not on a fix. Say so and stop; the hook already knows not to nag you about it.
 
 Then, without you:
 

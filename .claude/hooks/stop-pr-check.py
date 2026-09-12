@@ -52,13 +52,15 @@ FAILING_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "
 #   `hooks-change` label to a PR touching .claude/hooks/** or settings*.json.
 # Keep this set TINY and only for checks whose sole failure mode is an absent
 # human action; anything that can fail for a second reason belongs above.
-# THE ONE LIST. A second "these need a person" set anywhere would drift out of
-# step with this one; every consumer reads this.
+# THE ONE LIST *for this hook* — never add a second one beside it. Be precise about
+# the scope of that claim: the Stage E bounce driver judges the same redness without
+# consulting this set, so a PR red only on a label-pending check can still trigger a
+# bounce. That is a real gap, not a thing this comment can close by asserting it away.
 HUMAN_PENDING_CHECKS = {"Hooks change guard"}
 
 # How many commits this hook will demand a fix for on one branch before it
 # escalates instead. Deliberately equal to `/fix-ci`'s own ~3-iteration bound
-# and to `budgets.fixIterations`' default in docs/PIPELINE-CONTRACT.md §7 —
+# and to `budgets.fixIterations`' default in docs/PIPELINE-CONTRACT.md §1 —
 # three places, one number, so change them together. This bound is the coarser
 # of the two: `/fix-ci` bounds the cycles inside one skill invocation, this
 # bounds how many turns a session may spend on the same red PR however it
@@ -279,7 +281,31 @@ try:
     info = json.loads(out or "{}")
 except Exception:
     sys.exit(0)
-checks = info.get("statusCheckRollup", [])
+raw_checks = info.get("statusCheckRollup", [])
+
+
+def _latest_per_name(entries):
+    """statusCheckRollup returns one entry per RUN, not per check name, so a check
+    that was red and has since been re-run green appears TWICE — old conclusion and
+    new. Taking the list at face value reads a genuinely green PR as red: observed
+    2026-09-09 on this kit's own PR, where a re-run `Hooks change guard` reported
+    both FAILURE and SUCCESS while `gh pr checks` said pass and mergeStateStatus was
+    CLEAN. Before the budget existed that cost a spurious nag; now it would also
+    spend an attempt and could exhaust a branch's budget on a PR that was never red.
+    Keep the newest run per name — `startedAt` when present, array order otherwise,
+    which is the order the API already returns them in."""
+    latest = {}
+    for i, c in enumerate(entries or []):
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        key = (c.get("startedAt") or "", i)
+        if name not in latest or key > latest[name][0]:
+            latest[name] = (key, c)
+    return [v[1] for v in latest.values()]
+
+
+checks = _latest_per_name(raw_checks)
 
 # ── classify: is this PR not-green, and for which reason? ────────────────────
 # DIRTY = merge conflicts with the base branch. GitHub can't build the merge ref, so the
@@ -329,9 +355,17 @@ elif fixable:
         f"{FIX_CI_HINT}\n{UNFIXABLE_HINT}"
     )
 else:
-    # Green, still running, or red only on a human-pending check. Only the first
-    # of those is evidence the fix loop worked, so only it clears the budget.
-    if not failing:
+    # Green, still running, or red only on a human-pending check. Only the first is
+    # evidence the fix loop worked, and "not failing" is NOT that evidence: a rollup
+    # whose checks are still queued has no failing conclusions either, and so did an
+    # empty one. Clearing on that would reset the ledger on the single commonest turn
+    # in the whole loop — push a fix, CI queues, the turn ends — and the bound would
+    # then almost never be reached. Require the positive form instead: checks exist,
+    # every one has finished, and none of them failed.
+    settled = bool(checks) and all(
+        c.get("conclusion") not in (None, "") for c in checks
+    )
+    if settled and not failing:
         _clear_budget(branch)
     sys.exit(0)
 
