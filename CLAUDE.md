@@ -172,6 +172,8 @@ npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
 npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
+npm run test:notifier        # human-action notifier: marks table, the three §13
+                             #   states, label-only tracker mutation (KIT-115)
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
