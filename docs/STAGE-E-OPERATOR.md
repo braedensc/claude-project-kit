@@ -189,6 +189,17 @@ gate; only the first does now.
    pushed — filing a new review ticket under its own title, posting a second PR comment, and
    deleting the request. That new outcome is what lets the driver bounce again, so a
    `maxBounces` above 1 is real. No push, no re-review, no cost.
+7b. **If nothing is ever pushed, the driver stops waiting and calls you.** A bounce that
+   was delivered, on a head that has not moved, more than `blocked_after_seconds` later
+   (default six hours) gets **one top-level comment on the coding ticket** and the
+   `agent:needs-human` label. Once per bounce. **No bounce is spent** and the ticket is
+   not moved — this says a person is needed, not that the review is over. Without it, a
+   session that stops mid-bounce is silent for as long as you leave it: the findings still
+   stand, but the trigger is gone until a re-review, a re-review needs a push, and the only
+   thing that ever called you was a *spent* budget. The three facts it reads — a
+   `delivered` ledger row, the head GitHub reports, and the clock — are all things the
+   session cannot write. It never reads the reply, so a session saying "I pushed it" does
+   not silence it, and a session saying "I am stuck" does not summon it early.
 8. **When there is nothing left to bounce** — the review came back clean or below the
    threshold and the required checks are green, or the budget ran out — the driver writes
    one `concluded` row to its ledger and moves the coding ticket to the **needs-approval**
@@ -196,10 +207,14 @@ gate; only the first does now.
    makes.
 
 What neither script ever does: merge, enable auto-merge, approve, edit a PR, apply any
-label but `agent:needs-human`, or launch a Claude session. The one move of a **coding**
+label but `agent:needs-human`, or launch a Claude session. That label goes on in exactly
+two cases, both the bounce driver's: the budget is spent, or a delivered bounce was never
+answered with a push (step 7b). The one move of a **coding**
 ticket either makes is the bounce driver's, into the **needs-approval** lane
 (`linear.stateIds.needsApproval`), once, when review concludes — clean, below the
-threshold, or out of budget. That is the only state it can write, and a project that has
+threshold, or out of budget. **A stopped session is not one of those:** it gets the
+comment and the label, and the ticket stays where it is. That is the only state it can
+write, and a project that has
 not provisioned the lane simply does not get the move: the conclusion is still recorded
 and said, and nothing else changes. (The poller also closes its **own** review tickets —
 one per review, so one more per re-review — which is what frees the reviewer's worktree.
@@ -631,6 +646,7 @@ prints this and lists every key it accepts:
   "dispatcher_repo_names": { "OWNER/REPO": "<the dispatcher's repository entry name>" },
   "repo_roots": { "OWNER/REPO": "<a plain clone, for reading delivery.json>" },
   "in_flight_hours": 6,
+  "blocked_after_seconds": 21600,
   "run_timeout_seconds": 900,
   "required_checks": { "OWNER/REPO": ["Kit checks"] }
 }
@@ -665,6 +681,14 @@ prints this and lists every key it accepts:
 - `in_flight_hours` is a per-head cooldown, default 6. After a bounce is sent, the driver
   waits that long before bouncing the same PR head again, so a session that has not yet
   pushed is not re-prompted.
+- `blocked_after_seconds` is how long it keeps waiting before it calls you, default 21600
+  (six hours). Past that, a delivered bounce whose head has not moved gets one comment on
+  the coding ticket and the `agent:needs-human` label, once, at no cost to the budget.
+  Raise it if your sessions are slow; there is no way to switch it off, because the state
+  it catches is invisible by construction. A value that is not a positive number quietly
+  resets to the default. It is a **different question** from `in_flight_hours` — one is
+  "how soon may I re-prompt", the other is "when has waiting become silence" — so the two
+  are separate keys and neither implies the other.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
   `delivery.json`.
 - `needs_approval_state_id` is optional the same way; without it the driver reads
@@ -985,6 +1009,13 @@ nor `--all`: it is the daemon's whole pass.
   Once per PR — a second pass says "already concluded" and writes nothing. No comment, no
   label. A pending or unreadable CI result, or a review that DECLINED, is never a
   conclusion: the driver waits.
+- **A bounced session that never pushes.** The one state that used to produce nothing at
+  all. Past `blocked_after_seconds` on an unmoved head, a delivered bounce becomes one
+  top-level comment on the coding ticket and `agent:needs-human` — once per bounce, no
+  budget spent, no ticket move, no conclusion. `decide` reports it as **BLOCKED**; the
+  ledger row (`outcome: "blocked"`) is what makes it once, and a later bounce that is also
+  ignored signals again. Where one half lands and the other does not — a missing label id
+  is the usual cause — the pass exits 2 and the next one writes only the missing half.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
@@ -1039,9 +1070,10 @@ second, the daemons last.
 What the live run established, in order, over 2026-09-08 to 2026-09-12: a review comment on
 an opened pull request; a bounce delivered into the ticket thread when findings met the
 threshold; then **no** re-review and no spend at all for the ten hours the re-prompted
-session pushed nothing; a re-review with its own ticket, its own title and its own second PR
-comment once the head finally moved; and a conclusion that moved the coding ticket into the
-needs-approval lane — including one conclusion held, correctly, for three days until that
+session pushed nothing — correct on cost, and the reason step 7b exists, since nothing
+called a person for those ten hours either; a re-review with its own ticket, its own title
+and its own second PR comment once the head finally moved; and a conclusion that moved the
+coding ticket into the needs-approval lane — including one conclusion held, correctly, for three days until that
 lane was provisioned, then completed on the next pass without anyone touching it.
 
 Two of those had never run outside the test battery: a PR had only ever been reviewed once,

@@ -555,6 +555,14 @@ fallback.**
   comment on the PR and one on the original ticket saying the budget is spent and a person
   is needed; **it may apply `agent:needs-human`** — the one label E ever writes, written by
   a dispatcher-side component and never by a session — and stops.
+- **Amended 2026-09-13: the label has a second occasion, and the invariant is unchanged.**
+  A session that stops after a bounce reaches exhaustion never, so the budget could not be
+  what called a person. A bounce that was *delivered*, whose head has not moved, more than
+  `blocked_after_seconds` later now gets one top-level comment on the coding ticket and the
+  same label — once per bounce, spending no budget and moving no ticket. The condition is
+  the ledger, the head and the clock; deliberately not the session's reply, which is a
+  string the counted party writes. Still one label, still dispatcher-side, still never a
+  session: only the occasion is broader.
 - **Fallback — a fix ticket.** Only when the original ticket has no agent session, or the
   re-prompt cannot be delivered: the poller creates and delegates a fix ticket in the
   Reviews team whose description carries `[repo=<repo-name>#<pr-head-branch>]` so the
@@ -578,7 +586,8 @@ worktree layout — and note that sharing the dispatcher's *role account* (see d
 is a deployment placement, not a coupling: nothing in the poller reads a dispatcher file.
 The poller's whole vocabulary is: list agent sessions and their issues' attachments,
 create-and-delegate a ticket, read a ticket's agent-session activities, read a ticket's
-state, post a comment, and (on exhaustion) apply one label. A replacement dispatcher that
+state, post a comment, and apply one label (on exhaustion, or on a delivered bounce that
+was never answered with a push). A replacement dispatcher that
 honours a Linear delegation, records an agent session on the ticket it works, and posts
 its result as a `response` activity needs the poller changed nowhere.
 
