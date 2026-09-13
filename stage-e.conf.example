@@ -70,7 +70,8 @@ ROLE_ACCOUNT=_exdispatch
 DISPATCHER_SERVICE=com.example.dispatcher
 
 # The dispatcher's config file — the one holding its `repositories` array.  The
-# installer backs it up, inserts or updates ONE entry in it (`id: reviews`),
+# installer backs it up under the role account's own home (never beside this
+# file — see CONFIG_BACKUPS_KEPT), inserts or updates ONE entry in it (`id: reviews`),
 # and validates that the result still parses.  It writes nothing else there.
 #
 # RULE: an absolute path to a readable JSON file owned by ROLE_ACCOUNT.  The
@@ -216,6 +217,22 @@ SEVERITY_THRESHOLD=medium
 # credential shape here is refused, by key name.
 LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
 GITHUB_TOKEN_ENV=GH_TOKEN
+
+# How many copies of the dispatcher's config to keep.  Before it rewrites that
+# file the installer copies it — into the ROLE ACCOUNT'S OWN HOME, at
+# `~/.stage-e/backups/<config name>.<timestamp>`, mode 600 in a mode-700
+# directory — and then deletes all but the newest this many.
+#
+# WHY NOT BESIDE THE ORIGINAL, which is where you would put it by hand: that
+# config holds the dispatcher's tracker OAuth access and refresh tokens, so
+# every copy is another live credential on disk.  The sandbox denies sessions
+# the role account's home and nothing else, so a copy anywhere in the
+# dispatcher's own tree is a copy every session can read — and copies that
+# nothing prunes only accumulate.  Make yours in the same place.
+#
+# RULE: a positive integer.  Zero would delete the copy the installer just
+# took, which is the one thing it refuses to rewrite the config without.
+CONFIG_BACKUPS_KEPT=5
 
 # The ceiling on the whole review-ticket description, including the diff.  Over
 # it the poller declines and says so on the pull request rather than delivering

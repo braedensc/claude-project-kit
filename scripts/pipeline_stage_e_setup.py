@@ -445,6 +445,7 @@ CONF_DEFAULTS = {
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
     "DIFF_CAP_CHARS": "120000",
+    "CONFIG_BACKUPS_KEPT": "5",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 
@@ -574,7 +575,10 @@ def validate_conf(values):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
     for key in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS",
-                "FINDING_INTERVAL_SECONDS", "DIFF_CAP_CHARS"):
+                "FINDING_INTERVAL_SECONDS", "DIFF_CAP_CHARS",
+                # A retention of ZERO would delete the copy it just took, which
+                # is the one thing the whole step refuses to proceed without.
+                "CONFIG_BACKUPS_KEPT"):
         val = conf.get(key, "")
         if not val.isdigit() or int(val) <= 0:
             errors.append("%s must be a positive integer (got %r)" % (key, val))
@@ -2570,6 +2574,91 @@ def reviews_entries(ctx):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# THE CONFIG BACKUP — a copy of a credential, so it lives where credentials do.
+#
+# This step rewrites the dispatcher's config and refuses to do that without
+# copying the file first. The copy is itself the hazard: that config holds the
+# dispatcher's tracker OAuth ACCESS AND REFRESH TOKENS, so every backup is
+# another live credential on disk. The first version of this wrote it beside
+# the original as `<config>.bak-<stamp>` — one more every run, for ever.
+#
+# Two facts make that the wrong place, and neither is about tidiness:
+#
+#   * The sandbox denies sessions the ROLE ACCOUNT'S HOME, and nothing else.
+#     The dispatcher's own tree is not denied — that is the same rule that puts
+#     the poller's env file under this home rather than beside the dispatcher's
+#     (see `credential_home_problem`) — so a copy there is a copy every session
+#     can read.
+#   * Nothing removed one. The count only ever went up.
+#
+# So the copy goes under the role account's home, in its own directory, at the
+# modes the env file beside it already uses (700/600, owned by that account
+# because this runs AS that account), and the oldest are pruned to
+# CONFIG_BACKUPS_KEPT. `%s`, in order: the Stage E home (unquoted — `$HOME` has
+# to expand in the ROLE account's shell), the config's basename, the stamp, how
+# many to keep, the config path.
+#
+# IT PRINTS THE PATH IT WROTE, as its only output, and the caller uses that
+# instead of re-deriving one: `$HOME` here is the role account's home, so a
+# banner telling the operator to restore `$HOME/.stage-e/backups/…` would name
+# a file in THEIR home, which is a different file, or none.
+#
+# The prune runs after the copy and counts the new file, so `n` is how many
+# exist afterwards. It matches `<config name>.` with `case`, never a glob over
+# the whole directory: a copy an operator took by hand under that same name is
+# pruned with the rest, which is right — it is the same file — and anything
+# named differently is never touched.
+#
+# `--selftest` runs this exact text through /bin/sh against real files, for the
+# reason 15b gives: a shell fragment nobody has executed is a guess about a
+# shell.
+# --------------------------------------------------------------------------- #
+CONFIG_BACKUP_SH = (
+    "umask 077; h=\"%s\"; b=%s; s=%s; n=%s; c=%s; d=\"$h/backups\"; "
+    "mkdir -p \"$d\" && chmod 700 \"$h\" \"$d\" && "
+    "cp \"$c\" \"$d/$b.$s\" && chmod 600 \"$d/$b.$s\" || exit 1; "
+    "k=0; ls -1 \"$d\" 2>/dev/null | sort -r | while IFS= read -r f; do "
+    "case \"$f\" in \"$b\".*) ;; *) continue;; esac; "
+    "k=$((k+1)); [ \"$k\" -le \"$n\" ] || rm -f -- \"$d/$f\"; done; "
+    "printf '%%s\\n' \"$d/$b.$s\""
+)
+
+
+def back_up_dispatcher_config(ctx, stamp):
+    """Copy the dispatcher's config under the role account's home, prune the
+    old copies, and return the path that was written — or None on a dry run.
+
+    Raises rather than returning a guess. "There is a backup somewhere" is not
+    a fact this step may proceed on: the whole reason it copies first is that
+    the next thing it does is rewrite the original."""
+    r, conf = ctx.runner, ctx.conf
+    # The backup holds a credential, so it answers to the same rule the env
+    # file does. Checked HERE as well, because this step can be reached on a
+    # pass that had nothing to do in the credentials step.
+    _refuse_bad_credential_home(ctx)
+    res = r.as_role(
+        ctx.account,
+        CONFIG_BACKUP_SH % (ctx.stage_home,
+                            shlex.quote(os.path.basename(conf["DISPATCHER_CONFIG"])),
+                            shlex.quote(stamp),
+                            shlex.quote(str(conf["CONFIG_BACKUPS_KEPT"])),
+                            shlex.quote(conf["DISPATCHER_CONFIG"])),
+        why="copy the dispatcher config into the role account's own home before "
+            "touching it")
+    if res.skipped:
+        return None                 # a dry run copied nothing to name
+    if not res.ok:
+        raise SetupError("refusing to write the dispatcher config with no backup: %s"
+                         % (res.err or "").strip()[:200])
+    lines = [ln.strip() for ln in (res.out or "").splitlines() if ln.strip()]
+    if not lines:
+        raise SetupError(
+            "the backup reported success and named no file, so where the copy of the "
+            "dispatcher config went is unknown — refusing to write the original")
+    return lines[-1]
+
+
 def step_dispatcher_entry(ctx, apply_it):
     r, conf = ctx.runner, ctx.conf
     want = reviews_entries(ctx)
@@ -2633,17 +2722,11 @@ def step_dispatcher_entry(ctx, apply_it):
         body = json.dumps({"entries": want, "remove": stale},
                           indent=2, sort_keys=True) + "\n"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = "%s.bak-%s" % (conf["DISPATCHER_CONFIG"], stamp)
-        backup = r.as_role(ctx.account, "cp -a %s %s"
-                           % (shlex.quote(conf["DISPATCHER_CONFIG"]),
-                              shlex.quote(backup_path)),
-                           why="back up the dispatcher config before touching it")
-        if not backup.ok and not backup.skipped:
-            raise SetupError("refusing to write the dispatcher config with no backup: %s"
-                             % (backup.err or "").strip()[:200])
-        # A dry run copied nothing, so there is no file to name in a banner.
-        if backup.skipped:
-            backup_path = None
+        # Under the ROLE ACCOUNT'S home, at 700/600, pruned — never beside the
+        # original, where the config's OAuth tokens would sit in a tree the
+        # sandbox does not deny to sessions. None on a dry run, which copied
+        # nothing and so has no file to name in a banner.
+        backup_path = back_up_dispatcher_config(ctx, stamp)
         res = r.as_role(ctx.account,
                         "/usr/bin/python3 -c " + shlex.quote(
                             _reconcile_entries_py(conf["DISPATCHER_CONFIG"])),
@@ -2799,7 +2882,8 @@ def _restart_dispatcher(ctx, backup):
     but never before recording what a person has to do about it on `ctx`, so
     the banner at the very bottom of the run names the service, the exact
     command that starts it, and the config backup this step took moments
-    earlier.
+    earlier — by its real path under the role account's home, because that is
+    the only spelling of it a command in the operator's own shell can use.
 
     IT DOES NOT RESTORE THAT BACKUP BY ITSELF. A restore starts nothing, so an
     automatic one would hand the operator a dispatcher that is still down AND
@@ -3632,8 +3716,13 @@ def _dispatcher_down_notice(ctx):
         say("")
         say("This run had just written the review entries into its config. That change")
         say("was NOT undone: a restore starts nothing, and the file is the evidence for")
-        say("why it would not come back. If you decide the entries are the cause:")
-        say("    sudo -u %s cp -a %s %s"
+        say("why it would not come back. The copy it took first is at")
+        say("    %s" % down["backup"])
+        say("owned by %s and readable by nobody else — it holds that config's tracker"
+            % ctx.account)
+        say("tokens, which is why it is there and not beside the original. If you decide")
+        say("the entries are the cause:")
+        say("    sudo -u %s cp %s %s"
             % (ctx.account, down["backup"], ctx.conf["DISPATCHER_CONFIG"]))
     say("=" * 74)
 
@@ -4659,6 +4748,159 @@ def _selftest_body():
     expect("env-value", _value("PADDED").out.strip() == "abc=def=" + "z" * 20,
            "a value containing `=` was truncated: %r" % _value("PADDED").out)
 
+    # -- 15b''. THE CONFIG BACKUP, run for real: where it lands, what it is
+    # readable as, and that the copies do not pile up.
+    #
+    # The dispatcher's config holds its tracker OAuth tokens, so each backup is
+    # another credential on disk. It used to be written beside the original —
+    # in a tree the sandbox does NOT deny to sessions — and never removed. Same
+    # rule as 15b: run the fragment, do not reason about it.
+    cases += 1
+    cfgdir = tempfile.mkdtemp(prefix="stage-e-dispatch.")
+    homedir = tempfile.mkdtemp(prefix="stage-e-home.")
+    cfgpath = os.path.join(cfgdir, "config.json")
+    CFGSECRET = "lin_" + "oauth_" + "NEVER_IN_BACKUP_OUTPUT_0123456789"
+    with open(cfgpath, "w", encoding="utf-8") as fh:
+        json.dump({"repositories": [], "linearToken": CFGSECRET,
+                   "linearRefreshToken": CFGSECRET + "-r"}, fh)
+    os.chmod(cfgpath, 0o644)        # the dispatcher's own mode; not ours to keep
+
+    def _backup(stamp, keep=5, home=homedir, config=cfgpath):
+        return Runner().read(["/bin/sh", "-c", CONFIG_BACKUP_SH % (
+            home, shlex.quote(os.path.basename(config)), shlex.quote(stamp),
+            shlex.quote(str(keep)), shlex.quote(config))])
+
+    first = _backup("20260101T000000Z")
+    wrote = (first.out or "").strip()
+    expect("config-backup", first.ok, "the backup fragment failed: rc=%d %s"
+           % (first.rc, first.err[:200]))
+    expect("config-backup", wrote == os.path.join(homedir, "backups",
+                                                  "config.json.20260101T000000Z"),
+           "it printed %r, not the path under the role account's home" % wrote)
+    expect("config-backup", os.path.isfile(wrote), "%r is not a file" % wrote)
+
+    def _mode(path):
+        """The mode, or None — a path that is not there is a FAILURE to report,
+        never a traceback that takes the rest of the battery with it."""
+        try:
+            return os.stat(path).st_mode & 0o777
+        except OSError:
+            return None
+
+    def _modestr(path):
+        m = _mode(path)
+        return "absent" if m is None else "%o" % m
+
+    if os.path.isfile(wrote):
+        expect("config-backup", open(wrote, encoding="utf-8").read()
+               == open(cfgpath, encoding="utf-8").read(),
+               "the backup is not a copy of the config")
+    # NOTHING BESIDE THE ORIGINAL. This is the whole defect.
+    expect("config-backup", sorted(os.listdir(cfgdir)) == ["config.json"],
+           "a copy was left in the dispatcher's own tree: %s" % sorted(os.listdir(cfgdir)))
+    expect("config-backup", _mode(wrote) == 0o600,
+           "the backup is mode %s — a 644 copy of an OAuth token is readable by every "
+           "account on the machine" % _modestr(wrote))
+    for d in (homedir, os.path.join(homedir, "backups")):
+        expect("config-backup", _mode(d) == 0o700,
+               "%s is mode %s, not 700" % (d, _modestr(d)))
+    expect("secret-never-printed", CFGSECRET not in first.out and CFGSECRET not in first.err,
+           "the backup fragment printed a credential out of the config")
+
+    # PRUNING. Eight runs, keep five: the five newest stamps survive, in a
+    # directory nothing else tidies.
+    cases += 1
+    stamps = ["202601%02dT000000Z" % d for d in range(2, 10)]
+    for s in stamps:
+        _backup(s)
+    stray = os.path.join(homedir, "backups", "operator-notes.txt")
+    os.makedirs(os.path.dirname(stray), mode=0o700, exist_ok=True)   # …even if 15b'' failed
+    with open(stray, "w", encoding="utf-8") as fh:
+        fh.write("not mine to delete\n")
+    _backup("20260110T000000Z")
+    left = sorted(n for n in os.listdir(os.path.join(homedir, "backups"))
+                  if n.startswith("config.json."))
+    expect("config-backup-pruned", len(left) == 5,
+           "%d backups survive a retention of 5 — the copies pile up: %s" % (len(left), left))
+    expect("config-backup-pruned",
+           left == ["config.json." + s for s in stamps[-4:]] + ["config.json.20260110T000000Z"],
+           "the wrong five survived: %s" % left)
+    expect("config-backup-pruned", os.path.isfile(stray),
+           "the prune deleted a file it did not write")
+    # …and a different retention is a different number, or the value is decoration.
+    cases += 1
+    _backup("20260111T000000Z", keep=2)
+    left2 = sorted(n for n in os.listdir(os.path.join(homedir, "backups"))
+                   if n.startswith("config.json."))
+    expect("config-backup-pruned", left2 == ["config.json.20260110T000000Z",
+                                             "config.json.20260111T000000Z"],
+           "CONFIG_BACKUPS_KEPT=2 left %s" % left2)
+
+    # A COPY THAT DID NOT HAPPEN FAILS, or the caller's refusal to rewrite the
+    # original without one has nothing to fire on.
+    cases += 1
+    absent = _backup("20260112T000000Z", config=os.path.join(cfgdir, "not-there.json"))
+    expect("config-backup", not absent.ok and not (absent.out or "").strip(),
+           "a config that could not be copied reported rc=%d and printed %r"
+           % (absent.rc, absent.out))
+
+    # …and the caller turns each of those into the right kind of outcome.
+    cases += 1
+    _bkctx, _bkfake = _settled_ctx(conf)
+    _bkfake.answers = [("$h/backups", 0, "  %s  \n" % FAKE_BACKUP_PATH)] + list(
+        _bkfake.answers)
+    expect("config-backup-caller",
+           back_up_dispatcher_config(_bkctx, "20260101T000000Z") == FAKE_BACKUP_PATH,
+           "the caller did not take the path the fragment printed")
+    _bkctx2, _bkfake2 = _settled_ctx(conf)
+    _bkfake2.answers = [("$h/backups", 0, "\n")] + list(_bkfake2.answers)
+    try:
+        back_up_dispatcher_config(_bkctx2, "20260101T000000Z")
+        expect("config-backup-caller", False,
+               "a backup that named no file was accepted, so the original would be "
+               "rewritten with the copy's whereabouts unknown")
+    except SetupError as exc:
+        expect("config-backup-caller", "unknown" in str(exc),
+               "the refusal did not say the copy's whereabouts are unknown: %r" % exc)
+    _bkctx3, _bkfake3 = _settled_ctx(conf)
+    _bkfake3.answers = [("$h/backups", 1, "")] + list(_bkfake3.answers)
+    try:
+        back_up_dispatcher_config(_bkctx3, "20260101T000000Z")
+        expect("config-backup-caller", False, "a failed copy did not stop the step")
+    except SetupError as exc:
+        expect("config-backup-caller", "no backup" in str(exc),
+               "the refusal did not name the missing backup: %r" % exc)
+    # A DRY RUN COPIES NOTHING and says so by naming no file at all.
+    _bkctx4, _bkfake4 = _settled_ctx(conf)
+    _bkctx4.runner = FakeRunner(answers=list(_bkfake4.answers), dry_run=True)
+    expect("config-backup-caller",
+           _quiet(lambda: back_up_dispatcher_config(_bkctx4, "20260101T000000Z"))[0] is None,
+           "a dry run claimed a backup it did not take")
+
+    # …AND THE STEP IS WIRED TO IT. Everything above proves the fragment and
+    # its caller; this proves the one write the step actually records is that
+    # copy, going to that directory, with no sibling of the config anywhere.
+    cases += 1
+
+    def _entry_wired(c):
+        try:
+            step_dispatcher_entry(c, apply_it=True)
+        except (SetupError, Unknown):
+            pass
+
+    ctxW, fakeW = _restart_ctx(conf)
+    _quiet(lambda: _entry_wired(ctxW))
+    copies = [_fmt(w["argv"]) for w in fakeW.writes if "backups" in _fmt(w["argv"])]
+    expect("config-backup-wired", len(copies) == 1,
+           "the step recorded %d backup command(s), not one" % len(copies))
+    expect("config-backup-wired",
+           copies and ('h="%s"' % ctxW.stage_home) in copies[0]
+           and 'd="$h/backups"' in copies[0],
+           "the backup destination is not the role account's own home: %s" % copies[:1])
+    expect("config-backup-wired",
+           not any(".bak-" in _fmt(w["argv"]) for w in fakeW.writes),
+           "the step still writes a copy beside the dispatcher's own config")
+
     # -- 15c. credentials are refused inside the dispatcher's own tree -------
     cases += 1
     expect("credential-home",
@@ -5032,8 +5274,19 @@ def _selftest_body():
                ("sudo launchctl bootstrap system %s"
                 % _dispatcher_plist(conf["DISPATCHER_SERVICE"])) in banner,
                "the banner never printed the command that starts it")
-        expect("stranded-banner", ".bak-" in banner and conf["DISPATCHER_CONFIG"] in banner,
+        expect("stranded-banner",
+               FAKE_BACKUP_PATH in banner and conf["DISPATCHER_CONFIG"] in banner,
                "the banner never named the config backup this step had just taken")
+        # …and it names it by the path that EXISTS. A banner naming
+        # `<config>.bak-…` would send the operator to the old location, and one
+        # spelling the role account's home as `$HOME` would send them to their
+        # own. Both are files that are not there.
+        expect("stranded-banner", ".bak-" not in banner and "$HOME" not in banner,
+               "the banner named the backup by a path nobody can restore from")
+        expect("stranded-banner",
+               ("sudo -u %s cp %s %s" % (conf["ROLE_ACCOUNT"], FAKE_BACKUP_PATH,
+                                         conf["DISPATCHER_CONFIG"])) in banner,
+               "the restore command does not point at the backup that was taken")
         expect("stranded-banner", "Input/output error" in banner,
                "the banner never quoted what launchd actually said")
         # The other shape says the state is UNKNOWN, because it is, and offers
@@ -6170,13 +6423,20 @@ def _dry_run_ctx(conf, poller=_CLEAN_POLLER, bounce=_CLEAN_BOUNCE):
     return ctx, fake
 
 
+# What the backup fragment prints back on a fixture: the ONE path it wrote,
+# under the role account's home — never beside the dispatcher's config.
+FAKE_BACKUP_PATH = "/Users/<role-account>/.stage-e/backups/config.json.20260101T000000Z"
+
+
 def _restart_ctx(conf, **kw):
     """A settled machine whose dispatcher config carries NO review entry — so
     the step writes them and restarts the service — driven by a launchd that
     changes state instead of a table that cannot. `kw` goes to FakeLaunchd."""
     ctx, fake = _settled_ctx(conf)
     ctx.runner = FakeLaunchd(answers=list(fake.answers) + [
-        ("cp -a %s" % conf["DISPATCHER_CONFIG"], 0, ""),
+        # The backup fragment answers with the ONE path it wrote, because that
+        # is what the caller reads and what the banner prints.
+        ("$h/backups", 0, FAKE_BACKUP_PATH + "\n"),
         ("json.load(sys.stdin)", 0, "added reviews-kit\n"),
     ], **kw)
     return ctx, ctx.runner
