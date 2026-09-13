@@ -148,12 +148,23 @@ WHAT IT REFUSES
     header and nothing else.
 
     THERE IS EXACTLY ONE EXCEPTION, AND "TYPE IT ONCE, EVER" IS FALSE WITHOUT
-    IT.  When the tracker REJECTS the stored key — revoked, expired, or for
-    another workspace — that is a rejected key, which is not the same fact as
-    an absent one, and `run` asks for a replacement and writes it back over
-    the old one.  So: once per credential, plus once more each time a stored
-    one stops being accepted.  Every message that mentions the storing says
-    so; an absolute the code does not keep is worse than the extra clause.
+    IT.  When the tracker REJECTS the stored key, or the CODE HOST rejects the
+    stored token — revoked, expired, or for another workspace — that is a
+    rejected credential, which is not the same fact as an absent one, and `run`
+    asks for a replacement and writes it back over the old one.  So: once per
+    credential, plus once more each time a stored one stops being accepted.
+    Every message that mentions the storing says so; an absolute the code does
+    not keep is worse than the extra clause.
+  * TREATING A CREDENTIAL THAT IS PRESENT AS ONE THAT WORKS.  Both values are
+    asked about, not merely counted.  The env probe can only see a name and a
+    length, and the code-host token EXPIRES — a fine-grained one within a year
+    — so a file that is complete, mode 600 and correctly owned is not evidence
+    that either credential still works.  The tracker key proves itself by being
+    used; the token is proved by one read-only request to an endpoint that
+    needs no permission, so a 401 means the TOKEN is dead while the 403 that
+    shows up at the comments endpoint means its SCOPE is too narrow.  Those two
+    arrive at the poller as the same `publish-failed` line, which is why naming
+    which one it is, is the whole job.
 
 THE STATE THIS KEEPS is under YOUR home at `~/.stage-e-setup/`: a ledger of
 step outcomes, the ids resolved out of the tracker, and your attestations.  It
@@ -1017,6 +1028,111 @@ class LinearTransport(object):
 
 
 # --------------------------------------------------------------------------- #
+# The code host.  ONE endpoint, asked for ONE reason: is the stored token still
+# alive?
+#
+# WHY THIS EXISTS.  For one round the tracker key was the only credential with a
+# rejection path, and the asymmetry was invisible: both values live in the same
+# mode-600 file and look identical to the env probe — a name and a length — and
+# the one with no path is the one that EXPIRES.  A fine-grained token lasts at
+# most a year, so this is a certainty with a date on it rather than a risk.
+# When it dies, `run`, `verify` and `--dry-run` all measure the credentials step
+# as done (the file is there, both names set, mode 600, right owner) while the
+# review poller records `publish-failed` on every pass, forever, and nothing
+# anywhere says which credential to replace.
+#
+# Worse than silent: MISLEADING.  That is the same symptom as a token whose
+# scope is too narrow — a confusion a live install met in production on
+# 2026-09-08, where it held two settled verdicts off their pull requests. So
+# the one signal anybody sees points at a fix that changes nothing.  Telling
+# the two apart is most of the value here, and is why the probe asks an
+# endpoint that needs no permission at all.
+GITHUB_API = "https://api.github.com"
+
+# The cheapest authenticated question the code host answers: it needs no
+# permission, names no repository, and costs no rate-limit budget of its own.
+# So it measures the TOKEN and nothing else — a fine-grained token with every
+# permission removed still answers 200 here, and a revoked or expired one
+# answers 401.
+GH_LIVENESS_PATH = "/rate_limit"
+
+# Three verdicts, never two (§13).  "The code host says no" and "I could not ask
+# the code host" are opposite facts that arrive as the same silence, and only
+# the first is a reason to go and mint a new token.
+GH_LIVE = "live"
+GH_REJECTED = "rejected"
+GH_UNMEASURED = "unmeasured"
+
+
+class GitHubTransport(object):
+    """The same transport family as `scripts/gh_fallback.py` — urllib, Python's
+    own TLS (which honours SSL_CERT_FILE, unlike the Go verifier `gh` uses and
+    which fails inside the dispatcher's sandbox), Bearer auth, the versioned
+    Accept header.
+
+    READ-ONLY BY CONSTRUCTION.  One fixed path, which is not a parameter, so
+    there is no call site that could name a mutating endpoint — the same reason
+    the fallback script enumerates its three.  The token goes in one header and
+    nowhere else: never a URL, never a query string, never a log line.
+    """
+
+    def __init__(self, token):
+        import urllib.request
+        base = urllib.request.HTTPRedirectHandler
+        handler = type("_NR", (base,), {"redirect_request": _NoRedirect.redirect_request})()
+        self._opener = urllib.request.build_opener(handler)
+        self._auth = "Bearer " + token
+
+    def liveness(self):
+        """(verdict, detail).  Never raises: every answer, including no answer
+        at all, comes back as one of the three verdicts."""
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(GITHUB_API + GH_LIVENESS_PATH, method="GET")
+        req.add_header("Authorization", self._auth)
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("User-Agent", "claude-project-kit-stage-e-setup")
+        try:
+            self._opener.open(req, timeout=30).close()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                return GH_REJECTED, "the code host refused the token (HTTP 401)"
+            if exc.code == 403:
+                # NOT the 403 a live install has already met, and saying which is
+                # the difference between the right fix and a wasted afternoon.
+                # THAT one arrives at the comments endpoint and means the token
+                # lacks *Pull requests: write* — a permission fact about a token
+                # that is otherwise perfectly alive.  A 403 HERE, on an endpoint
+                # that needs no permission, is about the ACCOUNT: single-sign-on
+                # not authorised for this token, an organisation blocking it, or
+                # a secondary rate limit.  Minting a new token fixes neither.
+                return GH_UNMEASURED, (
+                    "the code host answered HTTP 403 at %s, an endpoint that needs no "
+                    "permission at all. That is NOT the wrong-scope 403 the review poller "
+                    "reports when it cannot comment — that one is at the comments "
+                    "endpoint and means the token lacks Pull requests: write. A 403 here "
+                    "is about the account: single-sign-on not authorised for this token, "
+                    "an organisation blocking it, or a secondary rate limit"
+                    % GH_LIVENESS_PATH)
+            return GH_UNMEASURED, ("the code host answered HTTP %d at %s"
+                                   % (exc.code, GH_LIVENESS_PATH))
+        except urllib.error.URLError as exc:
+            return GH_UNMEASURED, ("the code host was unreachable (%s)"
+                                   % str(exc.reason)[:120])
+        except SetupError as exc:            # the redirect handler's own refusal
+            return GH_UNMEASURED, str(exc)
+        return GH_LIVE, "HTTP 200 from %s" % GH_LIVENESS_PATH
+
+
+def _github_transport(token):
+    """The default factory, as a named seam: the offline battery replaces THIS
+    and so can prove that no case in it ever builds a transport that would
+    reach the network."""
+    return GitHubTransport(token)
+
+
+# --------------------------------------------------------------------------- #
 # Installer state — under YOUR home, never the role account's, never a worktree.
 # Holds ids and attestations. Holds no credential, ever.
 # --------------------------------------------------------------------------- #
@@ -1282,7 +1398,7 @@ def _wrap(text, width=70):
 # --------------------------------------------------------------------------- #
 class Ctx(object):
     def __init__(self, conf, runner, state, linear_factory=None, key_reader=None,
-                 secret_reader=None, tty=True, sudo=None):
+                 secret_reader=None, tty=True, sudo=None, github_factory=None):
         self.conf = conf
         self.runner = runner
         self.state = state
@@ -1290,6 +1406,7 @@ class Ctx(object):
         # and held for the run. Constructing it asks for nothing.
         self.sudo = sudo or SudoSession()
         self.linear_factory = linear_factory or (lambda key: LinearTransport(key))
+        self.github_factory = github_factory or _github_transport
         self.key_reader = key_reader or (lambda prompt: getpass.getpass(prompt))
         self.secret_reader = secret_reader or (lambda prompt: getpass.getpass(prompt))
         self.tty = tty
@@ -1297,6 +1414,7 @@ class Ctx(object):
         # command that prompts for a credential is not read-only.
         self.may_prompt = True
         self._linear = None
+        self._github = None
         # Every credential this process resolved, by env-var NAME, and where
         # each came from. One entry per name for the life of the process: the
         # same secret is never requested twice in a run.
@@ -1521,6 +1639,117 @@ class Ctx(object):
                     "replace it with the one command that is allowed to ask:\n"
                     "    python3 %s run" % _self_path())
         self._linear = api
+        return api
+
+    def github(self):
+        """The code-host client, built LAZILY and at most once per process, and
+        the ONE place the stored token is proved to still work.
+
+        Shaped like `linear()` above on purpose: the failure it catches is the
+        same failure, a credential that is PRESENT, correctly stored, and no
+        longer accepted. Where the two differ is which way the three §13 states
+        fall, and that is worth stating rather than inheriting:
+
+          REJECTED, and asking is allowed — ask for a replacement, once, and
+            mark the name so the credentials step rewrites the file over the
+            dead value. Identical to the tracker key.
+
+          REJECTED, and asking is not allowed (`verify`, `--dry-run`) — FAILED,
+            where the tracker's twin reports UNKNOWN. The difference is not
+            style. A refused tracker key takes the whole tracker MEASUREMENT
+            with it: the team, the labels and the ids become things nothing
+            could look at, so UNKNOWN is the honest row. A dead code-host token
+            takes no measurement with it — the rejection IS the measurement,
+            the file named in the row is the thing to fix, and reporting
+            something you measured as something you could not is its own §13
+            defect.
+
+          COULD NOT ASK — UNKNOWN, in those words. Offline, a proxy, or a 403
+            about the account rather than the token: it may be perfectly fine
+            and nothing here can tell.
+
+        Nothing in any of those paths prints, logs or ledgers the value."""
+        if self._github is not None:
+            return self._github
+        name = self.conf["GITHUB_TOKEN_ENV"]
+        token, source = self.secret(
+            name,
+            "paste the code-host token for the role account (hidden — it is stored at "
+            "mode 600 under that account's home and read back from there, so nothing asks "
+            "again unless the code host stops accepting it): ")
+        if token is None:
+            raise Unknown(
+                "the code-host token was not read: %s — so nothing here could ask whether "
+                "it still works. An expired token leaves this file looking exactly as it "
+                "looks now: present, right length, right mode. The only place the "
+                "difference shows is the review poller, as `publish-failed` on every "
+                "pass." % source,
+                "the token is read as %s out of %s/env, which is the file `run` writes at\n"
+                "mode 600. Put one there with the one command that is allowed to ask:\n"
+                "    python3 %s run" % (self.account, self.stage_home, _self_path()))
+        api = self.github_factory(token)
+        verdict, detail = api.liveness()
+        if verdict == GH_UNMEASURED:
+            raise Unknown(
+                "COULD NOT MEASURE whether the stored %s still works: %s. The token may "
+                "be perfectly fine; nothing here can tell, and that is a different answer "
+                "from either yes or no." % (name, detail),
+                "if this machine is offline or behind a proxy, run the same command again\n"
+                "when it is not. Nothing was written and no credential was replaced.")
+        if verdict == GH_REJECTED:
+            if source == "typed at a hidden prompt":
+                raise SetupError(
+                    "the code host refused the %s you just typed (%s). Nothing was "
+                    "written — which also means the tracker key typed in this run is not "
+                    "stored yet, so the next pass asks for both again. (No value is "
+                    "shown.)" % (name, detail))
+            if self.may_prompt and self.tty:
+                say("")
+                say("  THE STORED %s WAS REJECTED BY THE CODE HOST (%s)." % (name, detail))
+                say("  That is a DEAD token, not a missing one: %s/env is there and what"
+                    % self.stage_home)
+                say("  is in it is not accepted — revoked, or expired. A fine-grained")
+                say("  token lasts at most a year, so this arrives on a date rather than")
+                say("  by bad luck.")
+                say("  It is NOT the token being scoped too narrowly. That one answers")
+                say("  every read correctly and fails only when the poller tries to")
+                say("  comment, with a 403 — a permission to widen, not a token to mint.")
+                say("  Paste a replacement and the credentials step writes it back over")
+                say("  the old one.")
+                self._secrets.pop(name, None)
+                self._sources.pop(name, None)
+                token, source = self.secret(
+                    name, "  paste a replacement %s (hidden): " % name, force_prompt=True)
+                api = self.github_factory(token)
+                verdict, detail = api.liveness()
+                if verdict == GH_REJECTED:
+                    raise SetupError("the replacement %s was refused too (%s). Nothing was "
+                                     "written. (No value is shown.)" % (name, detail))
+                if verdict == GH_UNMEASURED:
+                    raise Unknown(
+                        "COULD NOT MEASURE the replacement %s: %s." % (name, detail),
+                        "run the same command again when the code host can be reached.\n"
+                        "Nothing was written.")
+                # The credentials step must now REWRITE a file its own probe
+                # calls complete: the dead token is the right length, in the
+                # right file, at the right mode. Without this the replacement
+                # lives for one process and the next run asks all over again.
+                self.replaced.add(name)
+            else:
+                raise SetupError(
+                    "the %s stored in %s/env was REJECTED by the code host (%s). The file "
+                    "is there and what is in it is not accepted — revoked, or expired; a "
+                    "fine-grained token lasts at most a year. Until it is replaced every "
+                    "review the poller settles records `publish-failed` and retries "
+                    "forever, which reads identically to a token that is merely scoped "
+                    "too narrowly.\n"
+                    "  Replace it with the one command that is allowed to ask:\n"
+                    "      python3 %s run\n"
+                    "  …or by hand, signed in as %s: edit %s/env, change only that one "
+                    "line, and leave the daemons alone — every pass re-reads the file."
+                    % (name, self.stage_home, detail, _self_path(), self.account,
+                       self.stage_home))
+        self._github = api
         return api
 
 
@@ -2056,10 +2285,29 @@ def step_credentials(ctx, apply_it):
     seen, mode, owner = parse_env_probe(probe.out if probe.ok else "")
 
     missing = [n for n in names if seen.get(n, 0) < 20]
-    # A value this RUN replaced, because the tracker refused the stored one.
-    # The probe cannot see it: the old key is the right length, in the right
-    # file, at the right mode, and rejected. Trusting the probe here would keep
-    # the bad value and make the next run ask for a replacement all over again.
+
+    # THE STORED CODE-HOST TOKEN IS PROVED HERE, AND NOWHERE ELSE.
+    #
+    # The probe above can only say that a name is present and long enough. Both
+    # credentials look identical to it, and one of them EXPIRES — so the file
+    # can be complete, mode 600 and correctly owned while the review loop cannot
+    # publish a single comment. The code host is the only party that knows, so
+    # it is asked, on `verify` as well as `run`: a drift check that cannot see a
+    # dead credential is a drift check that goes green on the one morning it
+    # matters. The tracker key needs no line here — the tracker step above ran
+    # first and proved it by using it.
+    #
+    # Only when the file HAS a token. An absent one is already reported below,
+    # and probing a value that is not there would turn "you have not installed
+    # this yet" into a second, noisier row saying the same thing.
+    if probe.ok and conf["GITHUB_TOKEN_ENV"] not in missing:
+        ctx.github()
+
+    # A value this RUN replaced, because the tracker refused the stored key or
+    # the code host refused the stored token. The probe cannot see either: the
+    # dead value is the right length, in the right file, at the right mode, and
+    # rejected. Trusting the probe here would keep the bad value and make the
+    # next run ask for a replacement all over again.
     replaced = [n for n in names if n in ctx.replaced]
     if probe.ok and not missing and not replaced and mode == "600" and owner == ctx.account:
         return True, "env file present, mode 600, owned by %s, both names set (%s)" % (
@@ -2099,7 +2347,6 @@ def step_credentials(ctx, apply_it):
     say("  A value this run has ALREADY resolved is reused, not asked for again — so a")
     say("  key the tracker step needed a moment ago is not typed a second time.")
     say("")
-    lines = []
     for name in names:
         val, source = ctx.secret(name, "  paste the value for %s (hidden): " % name)
         if val is None:
@@ -2109,7 +2356,13 @@ def step_credentials(ctx, apply_it):
             raise Unknown("%s could not be resolved: %s" % (name, source),
                           "run this again from a terminal, where it can ask:\n"
                           "    python3 %s run" % _self_path())
-        lines.append("%s=%s" % (name, val))
+    # PROVED BEFORE IT IS WRITTEN. A token the code host will not take is worth
+    # exactly nothing here, and storing one buys a `publish-failed` loop that
+    # looks like a scope problem. This re-reads what the loop above already
+    # resolved — nothing is asked for twice — and may replace it, so the body
+    # is built from what it settled on rather than from what was first typed.
+    ctx.github()
+    lines = ["%s=%s" % (n, ctx.secret(n, "")[0]) for n in names]
     body = "\n".join(lines) + "\n"
     res = r.as_role(ctx.account,
                     "umask 077; mkdir -p %s/state && chmod 700 %s %s/state && "
@@ -3506,9 +3759,11 @@ def _agent_credential_notice():
     markers = agent_env_markers_present()
     if not markers:
         return
-    say("                AGENT ENVIRONMENT (%s): no stored credential is read, so the"
+    say("                AGENT ENVIRONMENT (%s): no stored credential is read, so"
         % ", ".join(markers))
-    say("                tracker row will report UNMEASURED. A person's shell reads it.")
+    say("                BOTH the tracker row and the credentials row report UNMEASURED —")
+    say("                neither the key nor the code-host token can be asked about.")
+    say("                A person's shell reads both.")
 
 
 def cmd_run(ctx, dry_run):
@@ -3661,7 +3916,9 @@ def cmd_verify(ctx):
     # ever asked for here, because the tracker key is read, never prompted.
     say("Stage E verify — read-only drift check. Nothing is changed, and no credential is")
     say("ever asked for; your login password may be, once, to re-measure as root.")
-    say("The tracker key is read from %s/env as %s." % (ctx.stage_home, ctx.account))
+    say("The tracker key and the code-host token are read from %s/env as %s, and each is"
+        % (ctx.stage_home, ctx.account))
+    say("asked whether it still works — a credential that expired is drift like any other.")
     _agent_credential_notice()
     ctx.may_prompt = False
     code, rows = run_steps(ctx, apply_it=False, keep_going=True)
@@ -3840,6 +4097,36 @@ class FakeLaunchd(FakeRunner):
         return FakeRunner._exec(self, argv, stdin, timeout)
 
 
+class FakeGitHub(object):
+    """The code host, stubbed. One knob, because the probe asks one question
+    and the answer is one of three verdicts."""
+
+    def __init__(self, verdict=GH_LIVE, detail=""):
+        self.verdict = verdict
+        self.detail = detail or {
+            GH_LIVE: "HTTP 200 from %s" % GH_LIVENESS_PATH,
+            GH_REJECTED: "the code host refused the token (HTTP 401)",
+            GH_UNMEASURED: "the code host was unreachable (offline)",
+        }[verdict]
+        self.asked = 0
+
+    def liveness(self):
+        self.asked += 1
+        return self.verdict, self.detail
+
+
+def _no_real_transport(token):
+    """What the default code-host factory is replaced by for the whole battery.
+
+    Reached only if a case forgot its stub — and a case that forgot would
+    otherwise make one authenticated request to the real code host from an
+    OFFLINE battery, on somebody's CI runner, with a fixture value for a
+    token. Failing loudly is the cheap half of keeping "every transport is
+    stubbed" a fact rather than a habit."""
+    raise SetupError("--selftest tried to build a REAL code-host transport; every "
+                     "transport in this battery is stubbed")
+
+
 class FakeLinear(object):
     def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
                  no_field=(), reject_key=False):
@@ -3990,11 +4277,17 @@ def selftest():
     saved_env = dict(os.environ)
     for marker in AGENT_ENV_MARKERS:
         os.environ.pop(marker, None)
+    # …and its own transports. The default code-host factory is a named seam
+    # exactly so this line can exist: with it in place, a case that forgets to
+    # stub the code host fails loudly instead of reaching the network.
+    saved_factory = globals()["_github_transport"]
+    globals()["_github_transport"] = _no_real_transport
     try:
         return _selftest_body()
     finally:
         os.environ.clear()
         os.environ.update(saved_env)
+        globals()["_github_transport"] = saved_factory
 
 
 def _selftest_body():
@@ -5345,9 +5638,13 @@ def _selftest_body():
     ctxL._stored_secret = lambda name: (None, "the old spelling never looked")
     askedL = _counted(ctxL)
     _quiet(lambda: run_steps(ctxL, apply_it=True, keep_going=True))
-    expect("no-reprompt-mutant", askedL == [conf["LINEAR_KEY_ENV"]],
-           "an installer that never reads the stored key asked for %s — the zero-prompt "
-           "check cannot see the defect it exists to catch" % askedL)
+    # BOTH credentials now, not just the key: the credentials step asks the code
+    # host whether the stored token still works, so a context that cannot read
+    # what it stored has to prompt for that one too.
+    expect("no-reprompt-mutant",
+           sorted(askedL) == sorted([conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"]]),
+           "an installer that never reads the stored credentials asked for %s — the "
+           "zero-prompt check cannot see the defect it exists to catch" % askedL)
 
     # -- 16b. ONE secret, ONE request, however many steps want it -----------
     # The tracker step needs the tracker key; the credentials step needs it
@@ -5594,6 +5891,163 @@ def _selftest_body():
            "the same fixture WITHOUT a replacement already rewrites the file, so the "
            "check above cannot see a step that ignores `ctx.replaced`")
 
+    # ------------------------------------------------------------------ #
+    # 17e. A DEAD CODE-HOST TOKEN IS DRIFT, NOT A CLEAN MACHINE.
+    #
+    # The asymmetry this closes: the tracker key was the only credential with a
+    # rejection path, and the one WITHOUT one is the one that expires. Both sit
+    # in the same file and look identical to the env probe — a name and a
+    # length — so a machine whose token died measured as fully installed while
+    # the review poller recorded `publish-failed` on every pass, forever. That
+    # is also exactly what a too-narrow scope looks like, so the only signal
+    # anybody saw pointed at the wrong fix.
+    # ------------------------------------------------------------------ #
+    # -- 17e-i. `run`: rejected, asking allowed -> one replacement, written --
+    cases += 1
+    ctxG1, fakeG1, _apiG1 = _healthy_ctx(conf)
+    fakeG1.answers = list(fakeG1.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    builtG1 = []
+    deadG1, liveG1 = FakeGitHub(GH_REJECTED), FakeGitHub(GH_LIVE)
+    ctxG1.github_factory = lambda t: (builtG1.append(t),
+                                      deadG1 if len(builtG1) == 1 else liveG1)[1]
+    askedG1 = _counted(ctxG1)
+    (okG1, _dG1, _xG1), printedG1 = _quiet(
+        lambda: step_credentials(ctxG1, apply_it=True))
+    expect("dead-token-is-drift", askedG1 == [conf["GITHUB_TOKEN_ENV"]],
+           "a rejected stored token asked for %s — it must ask once, for the one "
+           "credential that was refused" % askedG1)
+    expect("dead-token-is-drift", conf["GITHUB_TOKEN_ENV"] in ctxG1.replaced,
+           "the replacement was not marked, so the probe's `complete` verdict would win "
+           "and the dead token would stay in the file")
+    wroteG1 = [w for w in fakeG1.writes if "env file" in w["why"]]
+    expect("dead-token-is-drift", okG1 is False and len(wroteG1) == 1
+           and wroteG1[0]["stdin"] == "<hidden>",
+           "the replacement did not reach the file once, hidden (%r, %d write(s))"
+           % (okG1, len(wroteG1)))
+    expect("dead-token-is-drift", "REJECTED BY THE CODE HOST" in printedG1,
+           "the owner was not told the stored token was refused: %r" % printedG1[:200])
+    expect("dead-token-is-drift", "403" in printedG1 and "comment" in printedG1,
+           "the rejection did not separate a DEAD token from one merely scoped too "
+           "narrowly, which is the confusion it exists to end")
+    expect("dead-token-is-drift", STORED_TOKEN not in printedG1,
+           "the rejection printed the credential")
+
+    # -- 17e-ii. `verify`: rejected, asking not allowed -> FAILED, not quiet --
+    # FAILED and not UNKNOWN, deliberately: the code host was asked and
+    # answered. Reporting a thing you measured as a thing you could not is the
+    # same §13 defect in the other direction.
+    cases += 1
+    ctxG2, fakeG2, _apiG2 = _healthy_ctx(conf)
+    ctxG2.github_factory = lambda t: FakeGitHub(GH_REJECTED)
+    askedG2 = _counted(ctxG2)
+    ctxG2.runner.dry_run = True
+    codeG2, printedG2 = _quiet(lambda: cmd_verify(ctxG2))
+    rowG2 = ctxG2.state.data["steps"].get("credentials", {}).get("outcome")
+    expect("dead-token-is-drift", rowG2 == FAILED,
+           "a machine whose token the code host refuses verified its credentials step as "
+           "%s" % rowG2)
+    expect("dead-token-is-drift", codeG2 == EX_FAILED,
+           "verify exited %s over a dead credential" % codeG2)
+    expect("dead-token-is-drift", askedG2 == [] and not fakeG2.writes,
+           "verify asked for %s or wrote %s" % (askedG2, fakeG2.writes))
+    expect("dead-token-is-drift", "publish-failed" in printedG2,
+           "the row never named the symptom the owner would actually see, so nobody "
+           "connects this red to the reviews that stopped landing")
+    expect("dead-token-is-drift", "/env" in printedG2 and "python3" in printedG2,
+           "the row named neither the file that holds the token nor the command that "
+           "replaces it")
+    expect("dead-token-is-drift", STORED_TOKEN not in printedG2,
+           "verify printed a credential")
+
+    # -- 17e-iii. offline is neither a pass nor a rejection -----------------
+    cases += 1
+    ctxG3, _fG3, _apiG3 = _healthy_ctx(conf)
+    ctxG3.github_factory = lambda t: FakeGitHub(GH_UNMEASURED)
+    _counted(ctxG3)
+    ctxG3.runner.dry_run = True
+    codeG3, printedG3 = _quiet(lambda: cmd_verify(ctxG3))
+    rowG3 = ctxG3.state.data["steps"].get("credentials", {}).get("outcome")
+    expect("offline-is-not-a-verdict", rowG3 == UNKNOWN and codeG3 == EX_UNKNOWN,
+           "a code host that could not be reached was reported as %s / exit %s"
+           % (rowG3, codeG3))
+    expect("offline-is-not-a-verdict", "COULD NOT MEASURE" in printedG3,
+           "the unmeasurable row did not say so in those words")
+    expect("offline-is-not-a-verdict", "REJECTED" not in printedG3,
+           "an unreachable code host was reported as a refused token, which would send "
+           "someone to replace a credential that is fine")
+
+    # -- 17e-iv. the transport's own map from an HTTP answer to a verdict ---
+    # The three verdicts live in one place and this is it, so this is where a
+    # 403 is proved NOT to read as a dead token.
+    cases += 1
+    import urllib.error as _uerr
+
+    class _Closeable(object):
+        def close(self):
+            pass
+
+    class _Answers(object):
+        """One scripted answer, and the request that asked for it."""
+
+        def __init__(self, exc=None):
+            self.exc, self.seen = exc, []
+
+        def open(self, req, timeout=None):
+            self.seen.append(req)
+            if self.exc is not None:
+                raise self.exc
+            return _Closeable()
+
+    def _verdict(answer):
+        tx = GitHubTransport("ghp_" + "T" * 36)
+        tx._opener = answer
+        return tx.liveness()
+
+    def _http(code):
+        return _uerr.HTTPError(GITHUB_API + GH_LIVENESS_PATH, code, "no", {}, None)
+
+    okA = _Answers()
+    expect("liveness-map", _verdict(okA)[0] == GH_LIVE,
+           "a 200 from the code host was not read as a live token")
+    expect("liveness-map", _verdict(_Answers(_http(401)))[0] == GH_REJECTED,
+           "a 401 was not read as a refused token")
+    v403, d403 = _verdict(_Answers(_http(403)))
+    expect("liveness-map", v403 == GH_UNMEASURED,
+           "a 403 at %s was read as %s. It is the SCOPE answer, not the credential one, "
+           "and minting a new token fixes nothing" % (GH_LIVENESS_PATH, v403))
+    expect("liveness-map", "Pull requests: write" in d403 and "comments endpoint" in d403,
+           "the 403 detail did not name the permission the poller actually needs: %r"
+           % d403[:160])
+    expect("liveness-map", _verdict(_Answers(_http(500)))[0] == GH_UNMEASURED,
+           "a 500 was read as a verdict about the token")
+    vOff, dOff = _verdict(_Answers(_uerr.URLError("nodename nor servname provided")))
+    expect("liveness-map", vOff == GH_UNMEASURED and "unreachable" in dOff,
+           "an unreachable code host answered %s / %r" % (vOff, dOff))
+    # …and the request itself: GET, one fixed path, no credential in the URL.
+    req0 = okA.seen[0]
+    expect("liveness-map", req0.get_method() == "GET",
+           "the liveness probe used %s — this transport has no mutating path at all"
+           % req0.get_method())
+    expect("liveness-map", req0.get_full_url() == GITHUB_API + GH_LIVENESS_PATH,
+           "the probe asked %r, not the one endpoint that needs no permission"
+           % req0.get_full_url())
+    expect("liveness-map", "T" * 36 not in req0.get_full_url(),
+           "the token was spliced into the URL")
+
+    # mutant: the credentials step with no liveness probe at all — the exact
+    # pre-fix spelling, against the same dead token. It must go clean, or 17e
+    # cannot see the defect it exists to catch.
+    cases += 1
+    ctxG5, fakeG5, _apiG5 = _healthy_ctx(conf)
+    ctxG5.github_factory = lambda t: FakeGitHub(GH_REJECTED)
+    ctxG5.github = lambda: None                     # nobody asks the code host
+    _counted(ctxG5)
+    okG5, _dG5, _xG5 = _quiet(lambda: step_credentials(ctxG5, apply_it=True))[0]
+    expect("dead-token-mutant", okG5 is True and not fakeG5.writes,
+           "without the probe the same dead token did NOT measure as already-done "
+           "(%r, %d write(s)) — something else is catching it and the checks above "
+           "prove less than they claim" % (okG5, len(fakeG5.writes)))
+
     # -- 17. `status` names what is next and exits on the worst row ---------
     cases += 1
     ctx10, _f10 = _settled_ctx(conf)
@@ -5649,8 +6103,12 @@ def _selftest_body():
                    "§13's UNKNOWN, never a pass" % (label, codeZ))
             unknownZ = [s for s, rec in ctxZ.state.data["steps"].items()
                         if rec["outcome"] == UNKNOWN]
-            expect("agent-cannot-read-the-key", unknownZ == ["tracker"],
-                   "`%s` reported %s as unmeasured, not just the tracker" % (label, unknownZ))
+            expect("agent-cannot-read-the-key",
+                   sorted(unknownZ) == ["credentials", "tracker"],
+                   "`%s` reported %s as unmeasured. Under a model NEITHER stored value is "
+                   "read, so neither the tracker nor the code-host token's liveness can "
+                   "be measured — and both rows must say so rather than one of them "
+                   "passing quietly" % (label, unknownZ))
             expect("agent-cannot-read-the-key", STORED_KEY not in printedZ,
                    "`%s` printed a credential" % label)
         # …and the gate is BEFORE the read, not after it: nothing even ran.
@@ -6047,6 +6505,9 @@ def _settled_ctx(conf):
                          "model_label_id": "l1", "owner_user_id": "u-owner"}
     fake = FakeRunner()
     ctx = Ctx(conf, fake, state, tty=False)
+    # A LIVE code-host token, by default, on every fixture: the interesting
+    # cases are the ones that say otherwise, and each of those sets its own.
+    ctx.github_factory = lambda token: FakeGitHub()
     ctx.role_home = "/Users/<role-account>"
     ctx.dispatcher = {
         "workspace_ids": ["ws-1"],
