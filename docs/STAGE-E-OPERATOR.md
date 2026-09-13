@@ -195,6 +195,16 @@ gate; only the first does now.
    lane. That is Stage E handing the work to a person, and it is the only ticket move it
    makes.
 
+   **After that hand-off the pull request is yours, and the driver stops re-prompting it.**
+   Say a later push turns a required check red, or a fresh review comes back at the
+   threshold. The driver leaves **one comment on the coding ticket** saying what changed.
+   It re-prompts nobody, spends no bounce, moves nothing and adds no label. One comment per
+   head per kind: push a new commit and you hear about it once more, for that commit. To
+   hand the work back to the coding session, reply in its agent-session thread yourself —
+   that reply is what resumes it. The exception is a ticket that ran **out of budget**:
+   raise `budgets.maxBounces` on the default branch and the next trigger buys another
+   round, the way it always did.
+
 What neither script ever does: merge, enable auto-merge, approve, edit a PR, apply any
 label but `agent:needs-human`, or launch a Claude session. The one move of a **coding**
 ticket either makes is the bounce driver's, into the **needs-approval** lane
@@ -985,6 +995,16 @@ nor `--all`: it is the daemon's whole pass.
   Once per PR — a second pass says "already concluded" and writes nothing. No comment, no
   label. A pending or unreadable CI result, or a review that DECLINED, is never a
   conclusion: the driver waits.
+- **After a conclusion the PR is a person's, and the driver stops re-prompting it.** A
+  later push that turns a required check red, or a fresh review at the threshold, gets
+  **one comment on the coding ticket** naming what changed. No re-prompt, no bounce spent,
+  no second move, no label — the ticket stays in the needs-approval lane. One comment per
+  head per kind, recorded as a `notice` ledger row, so a red check does not comment every
+  five minutes and a new commit is still heard about once. To hand the work back to the
+  session, reply in its agent-session thread yourself; that reply is what resumes it. A
+  moved head does not reopen the loop — the driver cannot tell your push from a session's,
+  and after a hand-off yours is the likely one. **Exhaustion is the exception**: raise
+  `budgets.maxBounces` on the default branch and the next trigger buys another round.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
