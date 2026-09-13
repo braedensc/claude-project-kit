@@ -36,7 +36,7 @@ three daemons for one reader's convenience would be the larger change:
 |---|---|---|---|
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 | bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle` |
-| finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
+| finding poller | `<finding_state_dir>/heartbeat.json` | `at` | `ok: true` |
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
 cross-checks every schema string and filename against the three writers, so a renamed field

@@ -45,8 +45,7 @@ WHAT IT WATCHES, AND WHY THE THREE SHAPES ARE NOT UNIFIED HERE
   The three daemons were written at different times and their heartbeats do not agree on
   field names: the review poller ends with `result`/`ended_at`, the bounce driver writes
   `result`/`at`/`finished_at` and also writes a `running` beat at the START of a pass, and
-  the finding poller — since its heartbeat /2 — writes the review poller's shape
-  (`result`/`ended_at`/`started_at`). Rewriting them to one shape would
+  the finding poller writes a boolean `ok` with `at`. Rewriting them to one shape would
   touch three daemons for this one reader's convenience, so the shapes stay where they are
   and the differences live in the WATCHERS table below — one row per job, declaring the
   schema string, the timestamp fields in priority order, and what counts as a good result.
@@ -176,9 +175,7 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 # `ts_fields`    timestamp fields in PRIORITY order — the first present and parseable wins.
 #                The bounce driver's `finished_at` is preferred over its `at` because `at`
 #                is rewritten by the mid-pass `running` beat.
-# `bool_field`   for a heartbeat that reports a boolean instead of a result string. No
-#                watched job does since the finding poller's /2; kept, and selftested,
-#                so a future boolean-shaped writer is one row, not a code change.
+# `bool_field`   the finding poller reports a boolean instead of a result string.
 # `good`         results that mean the last pass was fine.
 # `running`      results that mean a pass was IN FLIGHT when the file was written. Fresh,
 #                that is healthy; stale, it means a pass started and never finished, which
@@ -213,13 +210,10 @@ WATCHERS = {
         "writer": "scripts/pipeline_finding_poller.py",
         "dir_key": "finding_state_dir",
         "filename": "heartbeat.json",
-        # /2 (the finding poller's own bump): the review poller's shape. A /1 file — a
-        # boolean `ok` with `at` — is a different schema string and so reads as
-        # UNREADABLE, never as healthy, until that machine runs the new poller.
-        "schema": "pipeline-finding-poller-heartbeat/2",
-        "ts_fields": ("ended_at", "started_at"),
-        "result_field": "result",
-        "bool_field": None,
+        "schema": "pipeline-finding-poller-heartbeat/1",
+        "ts_fields": ("at",),
+        "result_field": None,
+        "bool_field": "ok",
         "good": ("ok",),
         "running": (),
     },
@@ -336,9 +330,8 @@ def parse_iso(value):
 def result_of(doc, spec):
     """The last pass's result as one lower-case word, or None if the file does not say.
 
-    A boolean-shaped heartbeat (`bool_field`) becomes `ok`/`error` here so one vocabulary
-    reaches the verdict table; the translation lives in this one function rather than at
-    each use.
+    The finding poller's boolean becomes `ok`/`error` here so one vocabulary reaches the
+    verdict table; the translation lives in this one function rather than at each use.
     """
     if spec.get("bool_field"):
         raw = doc.get(spec["bool_field"])
@@ -1032,22 +1025,12 @@ def selftest():
     ok("bounce driver: finished_at is preferred over the running beat's at",
        verdict("bounce-driver", beat("bounce-driver", result="ok", at=old,
                                      finished_at=fresh)) == "ok")
-    ok("finding poller: result ok ⇒ ok",
-       verdict("finding-poller", beat("finding-poller", result="ok", ended_at=fresh)) == "ok")
-    for bad in ("error", "usage"):
-        ok("finding poller: result %s ⇒ failing" % bad,
-           verdict("finding-poller", beat("finding-poller", result=bad, ended_at=fresh)) == "failing")
-    ok("finding poller: ended_at is preferred over started_at",
-       verdict("finding-poller", beat("finding-poller", result="ok", started_at=old,
-                                      ended_at=fresh)) == "ok")
-    ok("finding poller: a /1 boolean heartbeat is UNREADABLE, never assumed healthy",
-       judge_one("finding-poller", WATCHERS["finding-poller"],
-                 {"path": "/x/heartbeat.json", "exists": True, "error": None,
-                  "doc": {"schema": "pipeline-finding-poller-heartbeat/1", "ok": True, "at": fresh}},
-                 NOW, 600, False)["verdict"] == "unreadable")
-    ok("a boolean-shaped heartbeat is still translated to one result vocabulary",
-       (result_of({"ok": False}, {"bool_field": "ok"}),
-        result_of({"ok": True}, {"bool_field": "ok"})) == ("error", "ok"))
+    ok("finding poller: ok:true ⇒ ok",
+       verdict("finding-poller", beat("finding-poller", ok=True, at=fresh)) == "ok")
+    ok("finding poller: ok:false ⇒ failing",
+       verdict("finding-poller", beat("finding-poller", ok=False, at=fresh)) == "failing")
+    ok("the boolean is translated to one result vocabulary",
+       result_of({"ok": False}, WATCHERS["finding-poller"]) == "error")
 
     # ── 3. The monitor's own inability to judge is never a clean bill of health ───────
     ok("a missing file ⇒ missing",
