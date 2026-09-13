@@ -395,10 +395,13 @@ Stop hook between them:
    spent budget never renders as a clean one (`docs/PIPELINE-CONTRACT.md` §13). A PR
    observed with nothing red clears the ledger, so a later failure gets its own three.
    Red **only** on a human-pending check neither spends the budget nor clears it.
-   `HUMAN_PENDING_CHECKS` is the single list of those **for this hook** — say that
-   precisely: the Stage E bounce driver judges the same redness without consulting it,
-   so a PR red only on a label-pending check can still trigger a bounce. A real gap,
-   recorded rather than asserted away.
+   `HUMAN_PENDING_CHECKS` is the single list of those **for this hook**. The Stage E
+   bounce driver judges the same redness and now honours the same rule through its own
+   `human_pending_checks` config key, which the Stage E installer writes and its operator
+   guide documents. Say the relationship precisely: **two lists, one rule.** The hook runs
+   in a session's process and the driver in the daemon's, with no import path between
+   them, so a check named in one and not the other is a real divergence — and the only
+   thing keeping them in step is that both batteries name the check.
 3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
 4. **CI + branch protection** — the unbypassable gate. All changes land via PR with

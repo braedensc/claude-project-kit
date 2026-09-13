@@ -445,7 +445,15 @@ CONF_DEFAULTS = {
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
     "DIFF_CAP_CHARS": "120000",
+    # Required checks that wait on a PERSON, not on the session. Written into the
+    # bounce driver's config as `human_pending_checks`; see HUMAN_PENDING_DEFAULT.
+    "HUMAN_PENDING_CHECKS": "Hooks change guard",
 }
+# The kit's own grader-path guard, by name — the one check a session can never turn
+# green, because it is red exactly until a person applies the label it demands. It is
+# the DEFAULT rather than a hard-coded value so a deployment whose guard is named
+# differently can say so; an empty HUMAN_PENDING_CHECKS turns the exemption off.
+HUMAN_PENDING_DEFAULT = CONF_DEFAULTS["HUMAN_PENDING_CHECKS"]
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 
 # Values left invalid on purpose so an unedited conf cannot be run by accident.
@@ -1173,8 +1181,11 @@ CARDS = {
                "Put the exact context names into the driver's config, under",
                "`required_checks`, keyed by OWNER/NAME. An entry REPLACES the set the",
                "driver would read from the code host; it never subtracts from it.",
-               "Leave out any context a session cannot reach on its own — a check that",
-               "stays red until a person acts would spend a whole bounce budget."],
+               "List EVERY required context, including any that stays red until a person",
+               "acts: name those in HUMAN_PENDING_CHECKS instead, which the driver sets",
+               "aside at judgment time and reports as waiting on a person. Dropping one",
+               "here would hide a required check; dropping ALL of them would leave an",
+               "empty set, which is the one answer this card exists to refuse."],
         "good": "every repository in REVIEW_REPOS has a required_checks row",
         "attest": None,
     },
@@ -2186,6 +2197,7 @@ def step_configs(ctx, apply_it):
     checks, unreadable = _required_checks(ctx)
     if unreadable:
         raise Blocked("CK-6", "could not read required contexts for: " + ", ".join(unreadable))
+    notes = _human_pending_notes(conf, checks)
 
     poller = {
         "reviews_team_key": conf["REVIEWS_TEAM_KEY"],
@@ -2213,6 +2225,13 @@ def step_configs(ctx, apply_it):
         "model_label_id": ids["model_label_id"],
         "dispatcher_repo_names": _dispatcher_repo_names(ctx),
         "required_checks": checks,
+        # WRITTEN BESIDE `required_checks`, NEVER SUBTRACTED FROM IT. `required_checks`
+        # stays the verbatim answer the code host gave, which is what keeps "an empty
+        # required set is never invented" true: subtracting here would turn a repository
+        # whose only required context waits on a person into an empty row, which is the
+        # one shape CK-6 exists to refuse. The driver does the setting-aside at judgment
+        # time instead, and says which checks it set aside.
+        "human_pending_checks": split_list(conf["HUMAN_PENDING_CHECKS"]),
     }
     # KIT-96 finding poller config. It scans the WORK teams (not the reviews team)
     # for pipeline-finding/1 comments, trusts only the dispatcher's agent user, and
@@ -2244,9 +2263,9 @@ def step_configs(ctx, apply_it):
 
     stale = [f for f, want in wanted.items() if current.get(f) != want]
     if not stale:
-        return True, "all %d config files match what this conf produces" % len(wanted), []
+        return True, "all %d config files match what this conf produces" % len(wanted), notes
     if not apply_it:
-        return False, "would rewrite: " + ", ".join(sorted(stale)), []
+        return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
     # A `finding/…` file lands in a subdir cat cannot create; make it first (its
     # own state dir doubles as its config dir), mode 700 like the rest.
@@ -2276,7 +2295,7 @@ def step_configs(ctx, apply_it):
     # nothing: `--example-config` never opens `--config` at all, so a check
     # built on it would pass a file the poller would reject.
     return False, ("wrote %s — acceptance is proven by the `dry-run` step, not here"
-                   % ", ".join(sorted(stale))), []
+                   % ", ".join(sorted(stale))), notes
 
 
 def _repo_slug(url):
@@ -2354,6 +2373,36 @@ def _dispatcher_repo_names(ctx):
                  "ticket for it has nowhere to route. The primary re-prompt is "
                  "unaffected." % repo)
     return out
+
+
+def _human_pending_notes(conf, checks):
+    """What HUMAN_PENDING_CHECKS actually bought, said out loud — a list of notes.
+
+    The key names checks that are REQUIRED and still not the session's: the grader-path
+    guard is red exactly until a person applies the label it demands, so a bounce spent
+    on it is the whole budget spent on nothing. A name that matches no required context
+    anywhere buys nothing, and a value that does not take is the invisible-effective-value
+    defect this kit is shaped against — so it is REPORTED, per repository, rather than
+    left to be discovered by a bounce months later.
+
+    It is a note and never a refusal, deliberately: the default names the kit's own guard,
+    and a repository that does not run it (a project that renamed the job, or one reviewed
+    alongside the kit) is a perfectly ordinary deployment. Blocking those on a default
+    would be a gate nobody asked for."""
+    named = split_list(conf.get("HUMAN_PENDING_CHECKS", ""))
+    required_anywhere = {c for names in checks.values() for c in names}
+    if not named:
+        return ["HUMAN_PENDING_CHECKS is empty: every required check is judged, and a check "
+                "that stays red until a person acts will spend a bounce. That is a choice, "
+                "not a default — the default is %r." % HUMAN_PENDING_DEFAULT]
+    notes = ["human_pending_checks = %s — required, but never a bounce trigger; the driver "
+             "names them as waiting on a person" % ", ".join(named)]
+    inert = [n for n in named if n not in required_anywhere]
+    if inert:
+        notes.append("…of which %s match no required context on any reviewed repository, so "
+                     "they change nothing. What IS required: %s. Check the spelling, or drop "
+                     "the entry." % (", ".join(inert), ", ".join(sorted(required_anywhere)) or "nothing"))
+    return notes
 
 
 def _required_checks(ctx):
@@ -4418,6 +4467,69 @@ def _selftest_body():
     expect("no-empty-checks", not checks and unreadable,
            "a repository neither endpoint answered for was given a set anyway: %s" % checks)
 
+    # -- 12b. HUMAN_PENDING_CHECKS is written BESIDE the required set, never --
+    #         subtracted from it. `required_checks` stays the verbatim answer the
+    #         code host gave — subtracting would turn a repository whose only
+    #         required context waits on a person into an empty row, which is
+    #         exactly the answer CK-6 exists to refuse (case 12 above). The driver
+    #         sets them aside at judgment time instead.
+    cases += 1
+    confHP, _e = validate_conf(parse_conf(GOOD_CONF)[0])
+    ctxHP, fakeHP = _settled_ctx(confHP)
+    fakeHP.answers = [
+        ("cat $HOME/.stage-e/config.json", 0, "{}"),      # only the driver's config is stale
+        ("required_status_checks", 0,
+         '["Kit checks", "Provenance scan", "Hooks change guard"]\n'),
+        ("cat > ", 0, ""),
+    ] + list(fakeHP.answers)
+    _okHP, _dHP, notesHP = step_configs(ctxHP, apply_it=True)
+    writtenHP = [json.loads(w["stdin"]) for w in fakeHP.writes
+                 if "cat >" in _fmt(w["argv"]) and "config.json" in _fmt(w["argv"])]
+    expect("human-pending-written", len(writtenHP) == 1,
+           "the driver's config was not written exactly once: %s" % len(writtenHP))
+    if writtenHP:
+        expect("human-pending-written",
+               writtenHP[0].get("human_pending_checks") == ["Hooks change guard"],
+               "the driver was not told which checks wait on a person: %s"
+               % writtenHP[0].get("human_pending_checks"))
+        expect("human-pending-written",
+               writtenHP[0].get("required_checks") == {
+                   "example-org/kit": ["Hooks change guard", "Kit checks", "Provenance scan"]},
+               "the required set was not written VERBATIM — a subtracted set hides a "
+               "required check and can go empty: %s" % writtenHP[0].get("required_checks"))
+    expect("human-pending-written",
+           any("Hooks change guard" in n and "never a bounce trigger" in n for n in notesHP),
+           "what the key bought was not reported to the operator: %s" % notesHP)
+
+    # …and a name that matches no required context anywhere buys NOTHING, so it is
+    # said — a value that does not take is the defect class, not a detail. It stays a
+    # NOTE and never a refusal: the default names the kit's own guard, and a reviewed
+    # repository that does not run it is an ordinary deployment.
+    cases += 1
+    checks_real = {"example-org/kit": ["Kit checks", "Provenance scan"]}
+    inert = _human_pending_notes(dict(confHP, HUMAN_PENDING_CHECKS="Hooks chnge guard"),
+                                 checks_real)
+    expect("human-pending-inert",
+           any("match no required context" in n and "Hooks chnge guard" in n
+               and "Kit checks" in n for n in inert),
+           "a typo that buys nothing was not reported, nor were the real names: %s" % inert)
+    expect("human-pending-inert",
+           not any("match no required context" in n for n in
+                   _human_pending_notes(dict(confHP, HUMAN_PENDING_CHECKS="Kit checks"),
+                                        checks_real)),
+           "a name that IS required was reported as inert")
+    # An empty value is the exemption turned OFF. It is honoured as written and said
+    # out loud, because it is a choice with a cost: a label-pending check will then
+    # spend a bounce.
+    cases += 1
+    offHP = _human_pending_notes(dict(confHP, HUMAN_PENDING_CHECKS=""), checks_real)
+    expect("human-pending-off",
+           any("every required check is judged" in n and HUMAN_PENDING_DEFAULT in n
+               for n in offHP),
+           "an empty HUMAN_PENDING_CHECKS did not say what it costs: %s" % offHP)
+    expect("human-pending-off", split_list("") == [],
+           "an empty value must write an EMPTY list, not the default")
+
     # -- 13. every card and sign-off is reachable and complete ---------------
     cases += 1
     for cid, card in CARDS.items():
@@ -6072,6 +6184,7 @@ def _settled_ctx(conf):
         "reviews_team_id": "t1", "dispatcher_app_user_id": "u-agent", "model_label_id": "l1",
         "dispatcher_repo_names": {"example-org/kit": "kit"},
         "required_checks": {"example-org/kit": ["Kit checks", "Provenance scan"]},
+        "human_pending_checks": ["Hooks change guard"],
     }
     finding = {
         "teams": ["KIT"], "owner_user_id": "u-owner", "agent_user_id": "u-agent",
