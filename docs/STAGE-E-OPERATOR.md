@@ -76,6 +76,15 @@ back over the old one. Revoke a key, let one expire, or point the installer at a
 workspace and you will type that one secret a second time. `verify` and `run --dry-run`
 never ask; they report the rejection and name `run` as the command that can fix it.
 
+**Both credentials are asked about, not just counted.** The tracker key proves itself by
+being used. The code-host token is proved by one read-only request per pass, because it is
+the value that *expires* — a fine-grained token lasts at most a year — and a dead one leaves
+the file looking perfect: right name, right length, mode `600`. A dead token that nothing
+checks is silent here and loud nowhere: the review poller records `publish-failed` on every
+pass, forever. So `run` asks you to replace it, `verify` and `run --dry-run` report it as a
+failed step naming the file and the fix, and a code host that could not be reached at all is
+reported as **could not measure**, which is not a pass. Step 3b has the table.
+
 **Your login password is asked for once, at the start, and not again.** `run` and `verify`
 both read this machine as the role account (`sudo -u …`) and as root, dozens of times per
 pass, and macOS forgets a sudo timestamp after a few minutes. So both acquire administrator
@@ -567,6 +576,40 @@ is how a token could approve. No code path here submits one — the poller's own
 asserts there is no approve, merge or label path — and merging additionally needs *Contents:
 write*, which stays read. But the guarantee thins from *impossible* to *not implemented*, and
 those are different guarantees.
+
+#### The token expires. Plan for it.
+
+A fine-grained token lasts **at most a year**, and you chose the date when you minted it.
+Write it down somewhere you will see it. Nothing in Stage E renews one, and nothing warns you
+in advance.
+
+What does happen is that `run` and `verify` **ask the code host whether the stored token
+still works**, once per pass, at an endpoint that needs no permission, names no repository
+and costs no rate-limit budget — so the answer is about the token itself and not about its
+scope. That distinction is the point, because a dead token and a too-narrow one produce the
+same line in the poller's state:
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Every review records `publish-failed` and retries each pass, and the PR comment never appears | Either the token is dead or its scope is too narrow. From here the two look identical | Run `verify`. The credentials row tells you which |
+| `verify` says **REJECTED BY THE CODE HOST (HTTP 401)** at the credentials step, exit 1 | The stored token is revoked or expired. The file is fine; what is in it is no longer accepted | Replace the token — `run`, or by hand, below |
+| The poller reports `HTTP 403: Resource not accessible by personal access token` at the comments endpoint, and `verify` is clean | The token is alive and lacks *Pull requests: write* | Widen that permission on the token you have. Minting a new one changes nothing |
+| `verify` says **COULD NOT MEASURE** at the credentials step, exit 4 | The code host could not be asked — offline, a proxy, or an account-level 403 such as single sign-on | Nothing yet. Ask again from a machine that can reach it. It is not a pass and not a failure |
+
+**Replacing it by hand** is the shortest path when you already have the new value. As the
+**role account**, not as you:
+
+```sh
+$EDITOR ~/.stage-e/env          # change the GH_TOKEN line, nothing else
+ls -l ~/.stage-e/env            # still mode 600? an editor that rewrites the file can widen it
+```
+
+That is the whole procedure. **Do not restart the daemons.** Each pass re-reads the env file
+when it starts, so the next scheduled pass picks up the new value on its own; a restart buys
+nothing and stops whatever was mid-flight. The alternative is `python3
+scripts/pipeline_stage_e_setup.py run`, which asks for a replacement at a hidden prompt and
+writes the file for you — take that one if you would rather not edit a credential file by
+hand.
 
 The scripts read the values from the environment variables their config **names**.
 
