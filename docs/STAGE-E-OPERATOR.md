@@ -73,7 +73,7 @@ checks your work and carries on. It never asks you to type `y`.
 | `status` | **replays the ledger** — what past runs recorded, what blocks it, and the one command that clears it. It probes nothing on this machine |
 | `verify` | read-only drift check — **re-measures** every step against the live machine, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
 | `card CK-3` | print any checkpoint card in full, at any time |
-| `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
+| `attest A-AUTOMATIONS --initials YOUR-INITIALS` | record something no computer can check. `YOUR-INITIALS` is a placeholder and is refused as typed — sign with your own 2–4 letters |
 
 **`status` and `verify` answer different questions, and only one of them looks.** `status`
 prints the recorded outcome of each step from the installer's own state file; it is fast,
@@ -672,7 +672,9 @@ prints this and lists every key it accepts:
   *restrict* review to certain repositories, or as a fallback where the GitHub integration
   is not installed — those repos are then also scanned the old way, by branch name.
 - `team_keys` are your pipeline teams, used to route a branch back to its ticket. Empty
-  means any team.
+  means any team **here**, but the installer no longer lets you leave it empty: the same
+  `MANAGED_TEAM_KEYS` value feeds the finding poller, which scans exactly these teams and
+  refuses an empty list. Name at least one.
 - `threshold` is `low`, `medium`, `high` or `critical`, and it decides which findings the
   comment calls out. The **bounce** threshold comes from `delivery.json`, not from here.
 - Optional and omitted above: `reviews_team_id`, `cyrus_agent_user_id`, `model_label_id`
@@ -1142,9 +1144,11 @@ nor `--all`: it is the daemon's whole pass.
 - **Conclusion**: a usable review of the current head, below the severity threshold, with
   the required checks green ⇒ one `concluded` ledger row (basis `clean` or
   `below-threshold`) and one move of the coding ticket to `linear.stateIds.needsApproval`.
-  Once per PR — a second pass says "already concluded" and writes nothing. No comment, no
-  label. A pending or unreadable CI result, or a review that DECLINED, is never a
-  conclusion: the driver waits.
+  Once per PR — a second pass says "already concluded" and writes nothing. No label, and
+  no comment on the **pull request**; the telemetry publisher does post one comment on the
+  **ticket**, which is the §4 row and the only comment a conclusion makes. A pending or
+  unreadable CI result, or a review that DECLINED, is never a conclusion: the driver
+  waits.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.

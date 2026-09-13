@@ -1760,8 +1760,13 @@ def linear_reply_in_thread(issue_id, parent_comment_id, body, cfg):
     dispatcher receives as a `prompted` activity (its `sourceCommentId` is this comment)
     and answers by resuming the recorded session. The SDK exposes no public
     prompt-activity mutation (only an `[Internal]` input type), so the thread reply is
-    the one route. LIVE-TEST: confirm on a real ticket that this reply resumes the
-    session before relying on it unattended."""
+    the one route.
+
+    PROVEN LIVE 2026-09-08: a real bounce on a real ticket resumed the recorded session
+    from this reply, and the fix it produced was re-reviewed. The note that used to stand
+    here asked the next reader to confirm that before relying on it — which, once the
+    route was proven, only bought a re-test of a settled question or a quiet distrust of
+    the driver's primary path."""
     mutation = """
 mutation($input: CommentCreateInput!) {
   commentCreate(input: $input) { success comment { id } }
@@ -2327,9 +2332,15 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run):
 
 def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     """Stage E reviewed this PR and nothing needs fixing: record it once, hand the ticket
-    to a person. The lane move is the entire signal — no comment, no label, no approval,
-    no merge. `agent:needs-human` stays exactly what it was (a spent budget), so the two
-    ways Stage E ends stay distinguishable on the board."""
+    to a person. The lane move is the whole of the BOARD signal — no label, no approval,
+    no merge, and `agent:needs-human` stays exactly what it was (a spent budget), so the
+    two ways Stage E ends stay distinguishable on the board.
+
+    ONE COMMENT IS POSTED, and it is telemetry's. `record_conclusion` writes no comment at
+    all; `emit_telemetry` below hands the artifact to the §4 publisher, whose only Linear
+    mutation is a `commentCreate` on the pinned ticket. This docstring said "no comment"
+    for two releases while a comment landed on every conclusion — which is the reading a
+    person does when a comment appears and they go looking for the code that posts it."""
     basis = verdict.get("basis") or "clean"
     _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run)
     if dry_run:
