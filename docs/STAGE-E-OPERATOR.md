@@ -189,7 +189,8 @@ gate; only the first does now.
    pushed — filing a new review ticket under its own title, posting a second PR comment, and
    deleting the request. That new outcome is what lets the driver bounce again, so a
    `maxBounces` above 1 is real. No push, no re-review, no cost.
-7b. **If nothing is ever pushed, the driver stops waiting and calls you.** A bounce that
+
+   **If nothing is ever pushed, the driver stops waiting and calls you.** A bounce that
    was delivered, on a head that has not moved, more than `blocked_after_seconds` later
    (default six hours) gets **one top-level comment on the coding ticket** and the
    `agent:needs-human` label. Once per bounce. **No bounce is spent** and the ticket is
@@ -209,7 +210,7 @@ gate; only the first does now.
 What neither script ever does: merge, enable auto-merge, approve, edit a PR, apply any
 label but `agent:needs-human`, or launch a Claude session. That label goes on in exactly
 two cases, both the bounce driver's: the budget is spent, or a delivered bounce was never
-answered with a push (step 7b). The one move of a **coding**
+answered with a push (step 7). The one move of a **coding**
 ticket either makes is the bounce driver's, into the **needs-approval** lane
 (`linear.stateIds.needsApproval`), once, when review concludes — clean, below the
 threshold, or out of budget. **A stopped session is not one of those:** it gets the
@@ -1070,7 +1071,7 @@ second, the daemons last.
 What the live run established, in order, over 2026-09-08 to 2026-09-12: a review comment on
 an opened pull request; a bounce delivered into the ticket thread when findings met the
 threshold; then **no** re-review and no spend at all for the ten hours the re-prompted
-session pushed nothing — correct on cost, and the reason step 7b exists, since nothing
+session pushed nothing — correct on cost, and the reason step 7 now calls a person, since nothing
 called a person for those ten hours either; a re-review with its own ticket, its own title
 and its own second PR comment once the head finally moved; and a conclusion that moved the
 coding ticket into the needs-approval lane — including one conclusion held, correctly, for three days until that
