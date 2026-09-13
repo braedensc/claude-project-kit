@@ -174,6 +174,8 @@ npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-an
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:notifier        # human-action notifier: marks table, the three §13
                              #   states, label-only tracker mutation (KIT-115)
+npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
+                             #   per incident, the sleep blind spot, §13 exit codes
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
@@ -193,7 +195,8 @@ broken: the validator exits 0 emitting nothing at all.
 and each asserts its contract rows against synthetic fixtures.
 
 **Stage E** — automated review and a bounded fix re-prompt of dispatcher-opened PRs — is
-the same shape: three scripts (publisher, review poller, bounce driver) whose three
+the same shape: three scripts (publisher, review poller, bounce driver), plus the optional
+heartbeat monitor that reads the daemons' heartbeats (`docs/HEARTBEAT-MONITOR.md`), whose
 selftests above are the whole of what runs in this repo. Nothing is scheduled here; the
 deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
 `docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`.
