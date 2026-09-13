@@ -51,7 +51,7 @@ checks your work and carries on. It never asks you to type `y`.
 | `status` | where the install got to, what blocks it, and the one command that clears it |
 | `verify` | read-only drift check — measures every step, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
 | `card CK-3` | print any checkpoint card in full, at any time |
-| `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
+| `attest A-AUTOMATIONS --initials YOUR-INITIALS` | record something no computer can check. `YOUR-INITIALS` is a placeholder and is refused as typed — sign with your own 2–4 letters |
 
 **Seven cards exist and three are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
@@ -577,12 +577,15 @@ The scripts read the values from the environment variables their config **names*
 its own process; the bounce driver does not, so every comment the driver posts fails with
 *no GitHub token*.
 
-### 3c. Two config files, not one
+### 3c. Three config files, not one
 
-The poller **refuses** a config key it does not know, so a typo cannot silently fall back
+The pollers **refuse** a config key they do not know, so a typo cannot silently fall back
 to a default. The bounce driver **ignores** unknown keys, so one file can feed it. Those
 two rules do not compose: a single file carrying the driver's own keys is not a valid
-poller config. Give each its own file.
+poller config. Give each its own file — `~/.stage-e/poller.json` for the review poller,
+`~/.stage-e/config.json` for the bounce driver, and `~/.stage-e/finding/poller.json` for
+the finding poller, which lives in its own directory so its heartbeat cannot collide with
+the review poller's.
 
 `~/.stage-e/poller.json` — `python3 scripts/pipeline_review_poller.py --example-config`
 prints this and lists every key it accepts:
@@ -608,7 +611,9 @@ prints this and lists every key it accepts:
   *restrict* review to certain repositories, or as a fallback where the GitHub integration
   is not installed — those repos are then also scanned the old way, by branch name.
 - `team_keys` are your pipeline teams, used to route a branch back to its ticket. Empty
-  means any team.
+  means any team **here**, but the installer no longer lets you leave it empty: the same
+  `MANAGED_TEAM_KEYS` value feeds the finding poller, which scans exactly these teams and
+  refuses an empty list. Name at least one.
 - `threshold` is `low`, `medium`, `high` or `critical`, and it decides which findings the
   comment calls out. The **bounce** threshold comes from `delivery.json`, not from here.
 - Optional and omitted above: `reviews_team_id`, `cyrus_agent_user_id`, `model_label_id`
@@ -685,7 +690,7 @@ used the day a session cannot be resumed and a fallback fix ticket has to be min
 one moment the system is already in trouble. Grep your own config for the placeholder text
 before you load the daemons. The poller has no such hole: it refuses a key it does not know.
 
-### 3d. Two system LaunchDaemons
+### 3d. Three system LaunchDaemons
 
 One-shot jobs. Each pass is scan → act → exit; the interval belongs to launchd, not to the
 script. **No `KeepAlive`** — it would restart a one-shot process in a tight loop.
@@ -712,24 +717,36 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 </dict></plist>
 ```
 
-The second plist is the same file with four changes: the label
-`com.example.stage-e-bounce`, the log path `bounce.log`, a `StartInterval` offset from the
-poller's (say 360, so the two rarely start together), and this command:
+The other two plists are the same file with four changes each — the label, the log path, a
+`StartInterval` offset from the poller's so the three rarely start together, and the
+command. The **bounce driver** is `com.example.stage-e-bounce`, `bounce.log`, 360:
 
 ```text
 set -a; . "$HOME/.stage-e/env"; set +a; exec python3 <scripts dir>/pipeline_bounce_local.py run
+```
+
+The **finding poller** — which turns a session's side-findings into backlog tickets — is
+`com.example.stage-e-finding`, `finding/poller.log`, 300, and it both reads its config and
+writes its log and heartbeat inside its own `finding/` directory, so none of its files
+collide with the review poller's:
+
+```text
+set -a; . "$HOME/.stage-e/env"; set +a; exec python3 <scripts dir>/pipeline_finding_poller.py scan --config "$HOME/.stage-e/finding/poller.json"
 ```
 
 `<scripts dir>` is the `scripts/` directory of a plain clone of the kit-derived repository
 — a clone, never a dispatcher worktree. The poller passes `--repo OWNER/REPO` on every
 GitHub call, so neither script cares what directory it is started in.
 
-**That clone does not update itself, and nothing will tell you it is old.** Both daemons
-exec out of it, so a fix merged to the default branch is inert on the machine until someone
-pulls. Neither the heartbeats nor the logs mention the code's version. Pull it with both
-jobs unloaded, never under a running pass, re-run the dry run afterwards, and compare its
-`git rev-parse --short HEAD` against your own clone whenever behaviour surprises you. A
-stale daemon clone looks exactly like a bug.
+**All three daemons exec out of that clone**, so a fix merged to the default branch is
+inert on the machine until it moves. **The installer moves it for you**: every `run`
+compares its HEAD against origin's and fast-forwards when it is behind, with the jobs
+unloaded for the move. Nothing else does — neither the heartbeats nor the logs mention the
+code's version, and a machine nobody has run the installer on since a merge is running the
+old code. If you pull by hand, do it with the jobs unloaded, never under a running pass,
+and re-run the dry run afterwards. Compare its `git rev-parse --short HEAD` against your
+own clone whenever behaviour surprises you: a stale daemon clone looks exactly like a
+bug.
 
 **Set `HOME` explicitly.** A system daemon inherits no login environment, and both the env
 file and the config paths above are written relative to it.
@@ -982,9 +999,11 @@ nor `--all`: it is the daemon's whole pass.
 - **Conclusion**: a usable review of the current head, below the severity threshold, with
   the required checks green ⇒ one `concluded` ledger row (basis `clean` or
   `below-threshold`) and one move of the coding ticket to `linear.stateIds.needsApproval`.
-  Once per PR — a second pass says "already concluded" and writes nothing. No comment, no
-  label. A pending or unreadable CI result, or a review that DECLINED, is never a
-  conclusion: the driver waits.
+  Once per PR — a second pass says "already concluded" and writes nothing. No label, and
+  no comment on the **pull request**; the telemetry publisher does post one comment on the
+  **ticket**, which is the §4 row and the only comment a conclusion makes. A pending or
+  unreadable CI result, or a review that DECLINED, is never a conclusion: the driver
+  waits.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
