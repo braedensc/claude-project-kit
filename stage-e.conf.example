@@ -4,7 +4,7 @@
 # HOW TO USE THIS FILE
 #
 #   cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-#   $EDITOR stage-e.conf                             # eleven values, none of them secret
+#   $EDITOR stage-e.conf                             # the values below, none of them secret
 #   python3 scripts/pipeline_stage_e_setup.py run    # the only command you type
 #
 # `run` validates this file before it touches anything, and reports EVERY bad
@@ -175,6 +175,10 @@ MANAGED_TEAM_KEYS=KIT,TOD
 # invent an empty set: it raises checkpoint card CK-6 with the exact command,
 # and blocks.
 #
+# That map is written VERBATIM — every required context, including any that
+# waits on a person.  Which of them a session can actually fix is a separate
+# question, answered by HUMAN_PENDING_CHECKS below.
+#
 # RULE: OWNER/NAME entries, comma-separated, each readable by your `gh` login.
 # LEFT INVALID ON PURPOSE — `example-org/repo-name` is refused by name.
 REVIEW_REPOS=example-org/repo-name
@@ -189,6 +193,33 @@ REVIEW_REPOS=example-org/repo-name
 # no KeepAlive: KeepAlive would restart a one-shot process in a tight loop.
 POLL_INTERVAL_SECONDS=300
 BOUNCE_INTERVAL_SECONDS=360
+
+# Required checks that are red at a PERSON, not at the code.
+#
+# A check can be required and still be nothing a session can fix.  The kit's own
+# grader-path guard is the example: it fails every pull request that touches a
+# guarded path until someone applies the `hooks-change` label, and no push the
+# session makes will turn it green.  The bounce driver sets these aside before it
+# judges CI, so such a pull request is never treated as terminally red — a bounce
+# spent re-prompting a session to apply a label it cannot apply is the whole
+# budget spent on nothing.
+#
+# They are never hidden.  Every name here that is not passing is reported in the
+# driver's verdict line, in `decide --json`, and inside the re-prompt itself as
+# explicitly not the session's to touch.  The required set is still written out
+# in full: this key decides what a bounce may be spent on, and subtracts nothing.
+#
+# The installer tells you what this bought.  A name that matches no required
+# context on any reviewed repository buys nothing, and the run says so and lists
+# what IS required — a typo here is silent otherwise.
+#
+# Leave it EMPTY to judge every required check.  That is a choice with a price:
+# a label-pending check will then spend a bounce.
+#
+# RULE: check NAMES exactly as the code host shows them, comma-separated.  A
+# check whose own name contains a comma cannot be written here — name it in the
+# driver's `human_pending_checks` config directly.
+HUMAN_PENDING_CHECKS=Hooks change guard
 
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from

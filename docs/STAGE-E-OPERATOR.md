@@ -31,7 +31,7 @@ can perform. **What you type is one command, repeated.**
 
 ```sh
 cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-$EDITOR stage-e.conf                                  # ten values, none of them secret
+$EDITOR stage-e.conf                                  # the values it lists, none of them secret
 python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
 ```
 
@@ -632,7 +632,8 @@ prints this and lists every key it accepts:
   "repo_roots": { "OWNER/REPO": "<a plain clone, for reading delivery.json>" },
   "in_flight_hours": 6,
   "run_timeout_seconds": 900,
-  "required_checks": { "OWNER/REPO": ["Kit checks"] }
+  "required_checks": { "OWNER/REPO": ["Kit checks", "Hooks change guard"] },
+  "human_pending_checks": ["Hooks change guard"]
 }
 ```
 
@@ -644,10 +645,23 @@ prints this and lists every key it accepts:
   `git show origin/<default>:delivery.json`; without it the driver uses the contents API.
 - **`required_checks` is the one you will actually need, and it does not subtract.** An
   entry for a repository **replaces** the whole required set the driver would otherwise
-  read from the forge. So write out every context a session actually controls, and leave
-  out the ones it cannot — on a kit-derived repo, the grader-floor guard waits for a
-  person's label. Leave the key out entirely and a whole bounce budget is spent on a check
-  the session cannot fix.
+  read from the forge. Write out **every** required context, including any the session
+  cannot fix. Which ones those are is the next key's job, not this one's.
+- **`human_pending_checks` names the checks that are red at a *person*.** On a kit-derived
+  repo the grader-path guard fails every PR touching a guarded path until someone applies
+  the `hooks-change` label, and no push the session makes will turn it green. The driver
+  sets these aside before judging CI, so such a PR is never terminally red and never buys
+  a bounce. They are not hidden: each one that is not passing is named in the verdict line
+  and in `decide --json` as *waiting on a person*, and the re-prompt tells the session
+  explicitly to leave it alone.
+  - Leave the key **out** and you get the default, `["Hooks change guard"]` — forgetting
+    it cannot cost you a budget. Set it to `[]` to judge every required check; that is a
+    choice with a price, and a label-pending check will then spend a bounce.
+  - A plain list applies to every repository. A map keyed by `OWNER/REPO` applies per
+    repository, and a repository the map does not name keeps the default.
+  - It never shrinks `required_checks`. Hand-editing the required set to drop such a check
+    is the wrong fix twice over: it hides a required check, and dropping the last one
+    leaves an empty set, which the driver must never read as *requires nothing*.
 - **On most repositories that entry is mandatory, not merely useful.** The driver unions
   the branch rulesets with classic branch protection. Rulesets read with plain repository
   access; classic protection needs *Administration: read*, which the token above
@@ -662,6 +676,11 @@ prints this and lists every key it accepts:
   read), and takes the contexts out of every `required_status_checks` rule it finds. It
   raises `CK-6` only when neither shape answers, and it never writes an empty set — an
   empty set means *requires nothing*, which is the one answer that must never be guessed.
+  It writes `human_pending_checks` at the same time, from `HUMAN_PENDING_CHECKS` in
+  `stage-e.conf`, and reports what that bought — including any name that matches no
+  required context on any reviewed repository, which buys nothing and is usually a typo.
+  Because the installer rewrites both files from the conf, **a hand edit to either key is
+  undone by the next run**: change `stage-e.conf` instead.
 - `in_flight_hours` is a per-head cooldown, default 6. After a bounce is sent, the driver
   waits that long before bouncing the same PR head again, so a session that has not yet
   pushed is not re-prompted.
@@ -943,8 +962,19 @@ nor `--all`: it is the daemon's whole pass.
   the session's to fix. When the required set cannot be established, CI is *unknown*.
   Unknown never triggers a bounce — and it is never a quiet skip either: the verdict reads
   *CANNOT EVALUATE*, the driver says so on the PR once per reason, and the pass exits 2.
+- **Required is not the same as the session's.** A check named in `human_pending_checks`
+  is red at a *person* — the grader-path guard stays red until someone applies the
+  `hooks-change` label — so it is set aside before CI is judged and can never buy a
+  bounce. It is still said out loud: the verdict line and `decide --json`
+  (`waiting_on_a_person`) name every such check that is not passing, and the re-prompt
+  tells the session to leave it alone. A PR red **only** on one of these is not red here:
+  with a clean review it *concludes* and goes to the needs-approval lane, which is
+  correct, because the only thing left to do is yours. A genuinely red required check
+  beside one still bounces as usual.
 - **Confirm the override took.** `decide --pr <n> --repo OWNER/REPO --json` prints
-  `checks_source`, one of three values. `config` means your override is what the driver is
+  `checks_source`, one of three values. The same output carries `waiting_on_a_person`,
+  which is how you confirm `human_pending_checks` took: a check you expected there and do
+  not see is misspelled, and the installer's own run said so at write time. `config` means your override is what the driver is
   judging against. `api` means the forge answered and your override did **not** apply — it
   is missing or misspelled for that repository. `unknown` means nobody answered: no
   override, and the forge refused. `checks_note` names the remedy, and on `unknown` the

@@ -128,9 +128,19 @@ WHICH CHECKS COUNT, AND WHOSE TICKET THIS IS
   "Required checks are terminally red" means the checks the BASE branch requires — the
   classic branch-protection contexts and the rulesets' required status checks, unioned,
   or the config's `required_checks` override — not every check run on the head. A red
-  optional check is not the session's to fix (on a kit-derived repo the grader-floor
-  guard stays red until a person applies a label; telling a session to fix that would
-  spend the whole budget on nothing).
+  optional check is not the session's to fix.
+
+  REQUIRED IS NOT THE SAME AS THE SESSION'S. A check can be required and still be red at
+  a PERSON: on a kit-derived repository the grader-path guard is a required context and
+  stays red until the owner applies the label it demands, so no push a session can make
+  turns it green. `human_pending_checks` names those, they are set aside before the
+  status is judged, and they can never trigger a bounce — telling a session to fix a
+  label spends the whole budget on nothing. They are never hidden, either: every such
+  check that is not passing is named in the verdict line as "waiting on a person", in
+  the `decide --json` output, and inside the re-prompt's fence as explicitly not the
+  session's to touch. The default is the kit's own such check by name, and the same list
+  lives (separately, with no import path between them) in the Stop hook that keeps an
+  interactive session from calling a red PR done.
 
   That set is read in THREE distinguishable states, never two (§13). `required_checks`
   returns the set AND its source: 'config' (an override named it), 'api' (GitHub
@@ -251,6 +261,18 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
                                                    protection — a repo listed here is
                                                    answered from config and can never
                                                    reach the 'unknown' state
+   "human_pending_checks": ["Hooks change guard"],  which of those required checks wait
+                                                   on a PERSON, not on the session (a
+                                                   plain list, or a map keyed by
+                                                   OWNER/REPO). Never a bounce trigger,
+                                                   always named in the verdict. ABSENT ⇒
+                                                   the built-in default, so forgetting it
+                                                   cannot cost a budget; `[]` turns the
+                                                   exemption off and is honoured as
+                                                   written. It does NOT shrink
+                                                   `required_checks`, which stays the
+                                                   faithful record of what the base
+                                                   branch demands
    "poll_seconds": 300, "diff_cap_chars": 120000}  poller keys, same file
 
   Credentials are named by ENV VAR NAME only, and the loader refuses a value that does
@@ -353,6 +375,21 @@ BOUNCE_MARKER = "stage-e-bounce/1"
 LINEAR_API = "https://api.linear.app/graphql"
 GITHUB_API = "https://api.github.com"
 DEFAULT_IN_FLIGHT_HOURS = 6
+# REQUIRED, AND STILL NOT THE SESSION'S. A required check whose ONLY failure mode is an
+# absent HUMAN action is red at a person, not at the code: no push a session can make
+# turns it green. Treating one as a trigger spends a whole bounce budget re-prompting a
+# session to fix something it is structurally unable to fix — and on a kit-derived repo
+# that is the ordinary case, because the grader-path guard stays red until the owner
+# applies the label it demands.
+#
+# The default is the kit's own such check, by name. The Stop hook that keeps an
+# interactive session from calling a red PR done already carries the same one-name list
+# for the same reason; this is the SECOND list, deliberately — the hook runs in a
+# session's process and this runs in the daemon's, with no import path between them, so
+# the two are kept in step by the operator doc and by both batteries naming the check.
+# Keep it TINY, and only for checks whose sole failure mode is an absent human action:
+# anything that can also fail for a second reason belongs in the judged set.
+DEFAULT_HUMAN_PENDING_CHECKS = ("Hooks change guard",)
 
 CONFIG_DEFAULTS = {
     "state_dir": DEFAULT_STATE_DIR,
@@ -370,6 +407,7 @@ CONFIG_DEFAULTS = {
     "in_flight_hours": DEFAULT_IN_FLIGHT_HOURS,
     "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
     "telemetry_model": "unknown",
+    "human_pending_checks": list(DEFAULT_HUMAN_PENDING_CHECKS),
 }
 # The poller's spellings for the two values both components need, accepted here so ONE
 # config file serves both without either side having to be renamed (§ CONFIG above).
@@ -532,7 +570,51 @@ def validate_config(cfg):
     secs = cfg.get("run_timeout_seconds")
     if not isinstance(secs, (int, float)) or isinstance(secs, bool) or secs <= 0:
         cfg["run_timeout_seconds"] = DEFAULT_RUN_TIMEOUT_SECONDS
+    # A malformed `human_pending_checks` is REFUSED, never quietly replaced by the
+    # default: the two spellings differ in exactly the behaviour the key exists to buy,
+    # and a value that does not take is the invisible-effective-value defect this kit is
+    # shaped against. An ABSENT key is a different thing, and is the default (below).
+    hp = cfg.get("human_pending_checks")
+    bad = None
+    if isinstance(hp, dict):
+        bad = [k for k, v in hp.items()
+               if not isinstance(v, list) or not all(isinstance(x, str) for x in v)]
+        bad = ("the entries for %s are not lists of check names" % ", ".join(sorted(bad))) if bad else None
+    elif not isinstance(hp, list) or not all(isinstance(x, str) for x in hp):
+        bad = "it must be a list of check names, or a map of OWNER/REPO to such a list"
+    if bad:
+        raise BounceError("config 'human_pending_checks' is malformed: %s. It names the "
+                          "required checks that wait on a PERSON (default %s); an empty "
+                          "list turns the exemption off, and removing the key restores the "
+                          "default." % (bad, list(DEFAULT_HUMAN_PENDING_CHECKS)))
     return cfg
+
+
+def human_pending_checks(cfg, owner_repo):
+    """The required checks that wait on a PERSON rather than on the session, for this
+    repository — as a set of names.
+
+    Shaped like `required_checks`' override: a plain list applies to every repository, a
+    map keyed by OWNER/REPO applies per repository. THREE states, kept apart:
+
+      absent   — the key was never written (an older config, a hand-written one, or a
+                 repository missing from the map) ⇒ DEFAULT_HUMAN_PENDING_CHECKS. The
+                 exemption is a floor, so forgetting it cannot cost a bounce budget.
+      a list   — that list, verbatim, INCLUDING the empty one: `[]` is an operator saying
+                 "judge every required check here", and it is honoured as written.
+      anything else — never reached; `validate_config` refuses it loudly first.
+
+    It never adds a check to the required set and never subtracts one from what the base
+    branch actually requires: `required_checks` stays the faithful record of that, and
+    this decides only which of those names a bounce may be spent on."""
+    raw = cfg.get("human_pending_checks")
+    if isinstance(raw, dict):
+        if owner_repo not in raw:
+            return set(DEFAULT_HUMAN_PENDING_CHECKS)
+        raw = raw.get(owner_repo)
+    if isinstance(raw, list):
+        return {str(x) for x in raw}
+    return set(DEFAULT_HUMAN_PENDING_CHECKS)
 
 
 def state_dir_problems(state_dir):
@@ -637,7 +719,7 @@ def secret_hits(text):
     return hits
 
 
-def render_findings_block(outcome, checks_status, failing_checks, head_sha):
+def render_findings_block(outcome, checks_status, failing_checks, head_sha, waiting_checks=()):
     """The fenced DATA block: what triggered the bounce, said as facts, never as orders."""
     lines = []
     if checks_status == "red":
@@ -645,6 +727,16 @@ def render_findings_block(outcome, checks_status, failing_checks, head_sha):
                      % ((head_sha or "?")[:12], ", ".join(failing_checks) or "(names unavailable)"))
         lines.append("Read each failing check's log and fix the cause it names. Never weaken, "
                      "skip or delete a test assertion to make a check pass.")
+    if waiting_checks:
+        # Said even when the trigger was the review, and said as the reason NOT to act: a
+        # session that sees one of these red in `gh pr checks` and is not told whose it is
+        # will spend its turn trying to turn it green, which no push of its can do.
+        if lines:
+            lines.append("")
+        lines.append("Also not green on this head, and NOT yours to fix: %s. That check waits "
+                     "on a person (it is red until someone with write access acts on it), so "
+                     "leave it alone — it is not part of this bounce."
+                     % ", ".join(waiting_checks))
     if outcome and outcome.get("usable") and outcome.get("meets_threshold"):
         if lines:
             lines.append("")
@@ -829,10 +921,24 @@ def render_decline_pr_comment(pr_number, reason):
     ])
 
 
-def checks_summary(runs, required, unknown_detail=""):
-    """('red'|'green'|'pending'|'none'|'unknown', [failing names], note). Only the base
-    branch's REQUIRED contexts are judged — a red optional check is not the session's to
-    fix.
+def checks_summary(runs, required, unknown_detail="", human_pending=()):
+    """('red'|'green'|'pending'|'none'|'unknown', [failing names], note, [waiting names]).
+    Only the base branch's REQUIRED contexts are judged — a red optional check is not the
+    session's to fix.
+
+    `human_pending` names the required checks that are red AT A PERSON: the grader-path
+    guard that stays red until the owner applies a label is required, so it reaches this
+    function, and no push a session can make turns it green. Those names are set aside
+    BEFORE the status is computed and returned separately, so they can never be a bounce
+    trigger and are still said out loud — a bounce spent re-prompting a session to fix a
+    label is the whole budget spent on nothing. The exemption NEVER hides a check: every
+    name it holds comes back in the fourth element whenever that check is not passing,
+    and the note says it is waiting on a person.
+
+    It also never shrinks the required set behind the caller's back. `required` is the
+    faithful record of what the base branch demands, and a base that requires ONLY
+    human-pending checks reads as 'none' (CI cannot be terminally red here) with a note
+    naming them — not as a silently empty requirement.
 
     THREE states, never two. `required` None ⇒ 'unknown': the set could not be
     established, so CI cannot be evaluated at all — that is a could-not, and it is
@@ -846,22 +952,48 @@ def checks_summary(runs, required, unknown_detail=""):
     legacy commit status rather than a check run stays pending here, conservatively."""
     if required is None:
         return "unknown", [], (unknown_detail
-                               or "required set unavailable — CI is not a trigger until it is")
+                               or "required set unavailable — CI is not a trigger until it is"), []
     if not required:
-        return "none", [], "the base branch requires no status checks"
+        return "none", [], "the base branch requires no status checks", []
+
+    exempt = {str(x) for x in (human_pending or ())}
     by_name = {str(run.get("name") or ""): run for run in (runs or [])}
+
+    def passing(name):
+        run = by_name.get(name)
+        return bool(run) and run.get("status") == "completed" \
+            and run.get("conclusion") in ("success", "neutral", "skipped")
+
+    # The exempt names are reported when they are NOT passing — red, still running, or
+    # never reported at all. All three are "a person has not acted yet" from here, and
+    # none of them is a thing a push can change.
+    waiting = [name for name in required if name in exempt and not passing(name)]
+    judged = [name for name in required if name not in exempt]
+
+    note = ""
+    if waiting:
+        note = ("waiting on a person, not on a fix: %s — not a bounce trigger"
+                % ", ".join(waiting))
+    if not judged:
+        # The base DOES require checks; every one of them waits on a person. Said as
+        # such, never as the bare "requires no status checks" above, which would be a
+        # false statement about this branch.
+        note = ("every check %s requires waits on a person, not on a fix: %s — CI cannot "
+                "be terminally red here" % ("the base branch", ", ".join(required)))
+        return "none", [], note, waiting
+
     pending, failing = False, []
-    for name in required:
+    for name in judged:
         run = by_name.get(name)
         if run is None or run.get("status") != "completed":
             pending = True
         elif run.get("conclusion") not in ("success", "neutral", "skipped"):
             failing.append(name)
     if failing:
-        return "red", failing, ""
+        return "red", failing, note, waiting
     if pending:
-        return "pending", [], ""
-    return "green", [], ""
+        return "pending", [], note, waiting
+    return "green", [], note, waiting
 
 
 def outcome_is_fresh(outcome, head_sha, last_spent):
@@ -1903,8 +2035,9 @@ def _gather_after_pr(sit, cfg, state_dir):
         str(meta.get("baseRefName") or default), owner_repo, cfg)
     runs = check_runs(sit["head_sha"], owner_repo, cfg) if (sit["head_sha"] and required) else []
     sit["required_checks"], sit["checks_source"] = required, checks_source
-    sit["checks_status"], sit["failing_checks"], sit["checks_note"] = checks_summary(
-        runs, required, checks_detail)
+    (sit["checks_status"], sit["failing_checks"],
+     sit["checks_note"], sit["waiting_checks"]) = checks_summary(
+        runs, required, checks_detail, human_pending_checks(cfg, owner_repo))
 
     sit.update(ledger_view(ledger_path(state_dir), owner_repo, pr_number))
 
@@ -1951,8 +2084,11 @@ def decision_for(sit, cfg):
         fresh, fresh_reason, cannot_note)
     # The note rides along on an ordinary skip as before — and ALSO on a bounce that a
     # review triggered while CI stayed unreadable, so "we bounced, but half the evidence
-    # was never available" is said rather than implied.
-    if sit.get("checks_note") and (not trigger_ok or unknown_checks):
+    # was never available" is said rather than implied. A check waiting on a PERSON is
+    # said on every path for the same reason: a PR that looks red to anyone reading the
+    # checks list, and is nonetheless a skip or a conclusion here, must say why in the
+    # one line the verdict prints.
+    if sit.get("checks_note") and (not trigger_ok or unknown_checks or sit.get("waiting_checks")):
         trigger_reason += " [%s]" % sit["checks_note"]
 
     in_flight = None
@@ -2023,7 +2159,8 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
                       "dispatcher's agent session from another app's on the ticket, and cannot "
                       "delegate a fallback fix ticket; nothing was sent and no bounce was spent", sit)
     block = render_findings_block(sit.get("outcome"), sit.get("checks_status"),
-                                  sit.get("failing_checks") or [], sit.get("head_sha"))
+                                  sit.get("failing_checks") or [], sit.get("head_sha"),
+                                  sit.get("waiting_checks") or [])
     body = render_reprompt(bounce_no=verdict["bounce_no"], max_bounces=sit["max_bounces"],
                            threshold=sit["threshold"], branch=sit["branch"], pr_number=sit["pr"],
                            pr_url=sit["pr_url"], findings_block=block, owner_repo=sit["repo"])
@@ -2321,6 +2458,7 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
                               "threshold": sit.get("threshold"), "threshold_source": sit.get("threshold_source"),
                               "checks": sit.get("checks_status"), "checks_source": sit.get("checks_source"),
                               "checks_note": sit.get("checks_note") or None,
+                              "waiting_on_a_person": sit.get("waiting_checks") or [],
                               "ticket_state": sit.get("ticket_state_name"), **verdict}, sort_keys=True))
         else:
             print(describe(sit, verdict))
@@ -2856,6 +2994,90 @@ def selftest():
     check("a fresh above-threshold review still triggers while CI is unknown",
           compute_trigger("unknown", [], {"usable": True, "meets_threshold": True, "max_severity": "high"},
                           True, "", "n/a")[0::2], (True, "review"))
+
+    # 9a-ii. REQUIRED, AND STILL NOT THE SESSION'S. `runs_mixed` is exactly the live
+    #        shape: a kit-derived PR whose code checks pass and whose grader-path guard
+    #        is red because nobody has applied the label yet. Every assertion below is
+    #        about the difference between "red" and "red at a person".
+    hp = ("Hooks change guard",)
+    both = ["Kit checks", "Hooks change guard"]
+    status, failing, note, waiting = checks_summary(runs_mixed, both, "", hp)
+    check("a required check that waits on a PERSON is not red", (status, failing), ("green", []))
+    check("…it is reported instead, by name", waiting, ["Hooks change guard"])
+    check("…and the note says whose it is",
+          "waiting on a person, not on a fix: Hooks change guard" in note, True)
+    check("…so nothing triggers a bounce", compute_trigger(status, failing, None, False, "")[0], False)
+    check("…and the re-prompt would tell a session to leave it alone",
+          "NOT yours to fix: Hooks change guard"
+          in render_findings_block(None, status, failing, "abc", waiting), True)
+    check("the exemption never hides a GENUINE red one",
+          checks_summary([{"name": "Kit checks", "status": "completed", "conclusion": "failure"},
+                          {"name": "Hooks change guard", "status": "completed", "conclusion": "failure"}],
+                         both, "", hp)[:2], ("red", ["Kit checks"]))
+    check("…and names the person-pending one alongside it, still not as a trigger",
+          checks_summary([{"name": "Kit checks", "status": "completed", "conclusion": "failure"},
+                          {"name": "Hooks change guard", "status": "completed", "conclusion": "failure"}],
+                         both, "", hp)[3], ["Hooks change guard"])
+    check("an exempt check that PASSED is nobody's business and is not reported",
+          checks_summary([{"name": "Kit checks", "status": "completed", "conclusion": "success"},
+                          {"name": "Hooks change guard", "status": "completed", "conclusion": "success"}],
+                         both, "", hp)[0::3], ("green", []))
+    check("an exempt check that has not reported at all still waits on a person, not on CI",
+          checks_summary([{"name": "Kit checks", "status": "completed", "conclusion": "success"}],
+                         both, "", hp)[0::3], ("green", ["Hooks change guard"]))
+    # A base branch whose ONLY required check waits on a person: 'none' (CI cannot be
+    # terminally red here) — but never with the bare "requires no status checks" note,
+    # which would be a false statement about a branch that requires one.
+    only_hp = checks_summary(runs_mixed, ["Hooks change guard"], "", hp)
+    check("a base requiring only person-pending checks is 'none'", only_hp[0], "none")
+    check("…and says so truthfully, naming them",
+          "every check the base branch requires waits on a person" in only_hp[2]
+          and "Hooks change guard" in only_hp[2], True)
+    check("…and is never described as requiring nothing",
+          "requires no status checks" in only_hp[2], False)
+    # …and that PR can still CONCLUDE: it is done from the pipeline's side and the only
+    # thing left is the person. That is the whole point of not calling it red.
+    check("a clean review concludes on a PR that is only waiting for a person",
+          conclusion_basis(only_hp[0], {"usable": True, "meets_threshold": False}, True, False), "clean")
+
+    # 9a-iii. THE MUTATION PROOF. `unexempted` is the PRE-FIX logic — the same call with
+    #         no human-pending list, which is exactly what the driver did before this key
+    #         existed. Both run against the SAME runs and the SAME required set, and the
+    #         assertion is on the DIFFERENCE: deleting the exemption makes the two agree
+    #         and turns THIS check red. The defect it reproduces is a spent bounce.
+    unexempted = checks_summary(runs_mixed, both, "", ())
+    check("the pre-fix logic really did call this red (the defect, reproduced)",
+          unexempted[0], "red")
+    check("…and would have triggered a bounce on it",
+          compute_trigger(unexempted[0], unexempted[1], None, False, "")[0], True)
+    check("the shipped logic disagrees — removing human_pending_checks turns this red",
+          (status, unexempted[0]), ("green", "red"))
+
+    # 9a-iv. The key itself: absent is the DEFAULT (forgetting it cannot cost a budget),
+    #        an explicit empty list is honoured as written, and a malformed one is
+    #        refused rather than silently replaced.
+    check("an absent key is the built-in default", human_pending_checks({}, "o/r"),
+          set(DEFAULT_HUMAN_PENDING_CHECKS))
+    check("the shipped default is the kit's own grader-path guard",
+          DEFAULT_HUMAN_PENDING_CHECKS, ("Hooks change guard",))
+    check("an explicit empty list turns the exemption OFF",
+          human_pending_checks({"human_pending_checks": []}, "o/r"), set())
+    check("a plain list applies to every repository",
+          human_pending_checks({"human_pending_checks": ["A"]}, "o/r"), {"A"})
+    check("a map applies per repository",
+          human_pending_checks({"human_pending_checks": {"o/r": ["A"]}}, "o/r"), {"A"})
+    check("…and a repository the map does not name keeps the default",
+          human_pending_checks({"human_pending_checks": {"x/y": []}}, "o/r"),
+          set(DEFAULT_HUMAN_PENDING_CHECKS))
+    check("the default config carries the key, so an installed driver never guesses",
+          CONFIG_DEFAULTS["human_pending_checks"], list(DEFAULT_HUMAN_PENDING_CHECKS))
+    for bad in ("Hooks change guard", [1], {"o/r": "Hooks change guard"}):
+        try:
+            validate_config(dict(CONFIG_DEFAULTS, human_pending_checks=bad))
+            failures.append("human_pending_checks %r was accepted" % (bad,))
+        except BounceError as exc:
+            check("a malformed human_pending_checks %r is refused loudly" % (bad,),
+                  "human_pending_checks" in str(exc) and "malformed" in str(exc), True)
 
     # 9b-i. required_checks: the SET and the SOURCE, and the four states kept apart.
     #       The 403 case is the live one — both managed repositories keep their required
@@ -3776,6 +3998,48 @@ def selftest():
             check("CI unknown does not disable the review half of the trigger",
                   (rc, kinds()), (EXIT_OK, ["reply", "telemetry"]))
         world["required"], world["checks_source"], world["checks_detail"] = ["Kit checks"], "api", ""
+
+        # 10o-iii. REQUIRED, RED, AND WAITING ON A PERSON. The live kit-derived shape: the
+        #      code checks pass and the grader-path guard is red because nobody has applied
+        #      the label it demands. No push the session can make turns that green, so a
+        #      bounce spent here is the budget spent on nothing. Nothing is sent, nothing
+        #      is spent, and the verdict SAYS whose it is rather than reporting a quiet
+        #      green — a PR that reads red to anyone looking at the checks list must say
+        #      why the driver walked past it.
+        world["required"] = ["Kit checks", "Hooks change guard"]
+        world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "success"},
+                         {"name": "Hooks change guard", "status": "completed", "conclusion": "failure"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("person-pending required check: exit 0, nothing sent, nothing spent",
+                  (rc, calls, os.path.exists(ledger_path(tmp))), (EXIT_OK, [], False))
+            check("person-pending required check: the verdict says it is waiting on a person",
+                  ("waiting on a person, not on a fix: Hooks change guard" in buf.getvalue(),
+                   "skip" in buf.getvalue()), (True, True))
+        with tempfile.TemporaryDirectory() as tmp:
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                run_one(41, "o/r", cfg, tmp, "decide", False, as_json=True)
+            doc = json.loads(buf.getvalue().strip())
+            check("…and --json carries the names an operator would look for",
+                  (doc["checks"], doc["waiting_on_a_person"], doc["action"]),
+                  ("green", ["Hooks change guard"], "skip"))
+        # THE MUTATION PROOF, end to end: the SAME PR against a config whose exemption is
+        # empty — which is precisely what this driver did before the key existed — spends a
+        # bounce. Delete the exemption and this check goes red.
+        unexempt_cfg = validate_config(dict(cfg, human_pending_checks=[]))
+        with tempfile.TemporaryDirectory() as tmp:
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_one(41, "o/r", unexempt_cfg, tmp, "bounce", False)
+            check("without the exemption the same PR really does spend a bounce (the defect)",
+                  (kinds(), ledger_view(ledger_path(tmp), "o/r", 41)["prior"]),
+                  (["reply", "telemetry"], 1))
+        world["required"] = ["Kit checks"]
         world["runs"] = [{"name": "Kit checks", "status": "completed", "conclusion": "failure"}]
 
         # 10p. A head branch outside the pipeline alphabet (`=` here) ⇒ decline: exit 2, zero
@@ -4087,7 +4351,11 @@ def selftest():
           "is exhaust, only REQUIRED checks count and the required SET has three states — "
           "config / api / unknown, with rulesets [] + a classic 403 UNKNOWN and never "
           "'none' (exit 2, CANNOT EVALUATE, one PR comment naming the repo and the "
-          "remedy, review half of the trigger unaffected), branch-named "
+          "remedy, review half of the trigger unaffected), a required check that waits on "
+          "a PERSON is never a trigger and is always named as waiting — in the verdict, in "
+          "--json and inside the re-prompt's fence — while a genuine red one beside it "
+          "still bounces (absent key ⇒ the default, `[]` honoured, malformed refused), "
+          "branch-named "
           "ticket must own the PR in Linear's record, non-pipeline branch declined, BROKEN "
           "budget said once on the PR, comments paginated, terminal ticket skipped with reason, "
           "absent delivery.json ⇒ OFF and named, missing thread ⇒ fallback fix ticket with "
