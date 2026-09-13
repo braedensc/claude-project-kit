@@ -5,22 +5,28 @@ session that opened it to fix what the review found, a bounded number of times. 
 dispatcher does no reviewing of its own; this is the layer that does.
 
 **Mechanism** ships in this kit as tested `scripts/`. **Activation** — a Linear team, one
-dispatcher config entry, two system daemons — is yours, at your own terminal. **No session
-installs, starts or edits a service.** This file is generic on purpose: no hostnames,
-account names, ids or paths from a real deployment. Keep the filled-in copy in your
-private runbook.
+dispatcher config entry per reviewed repository, three system daemons — is yours, at your
+own terminal. **No session installs, starts or edits a service.** This file is generic on
+purpose: no hostnames, account names, ids or paths from a real deployment. Keep the
+filled-in copy in your private runbook.
 
-Design: `docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md` (Update
-2026-09-06). What every session is told: `docs/SESSION-BRIEF.md`.
+Design: `docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md` (Updates
+2026-09-06, 2026-09-08, 2026-09-12). What every session is told: `docs/SESSION-BRIEF.md`.
 
-Two scripts do the work, and they are separate programs with separate commands:
+Three scripts do the work, and they are separate programs with separate commands:
 
 | Script | Command it runs on a schedule | Selftest |
 |---|---|---|
 | `scripts/pipeline_review_poller.py` | `--config F run` | `npm run test:review-poller` |
 | `scripts/pipeline_bounce_local.py` | `run --config F` | `npm run test:bounce` |
+| `scripts/pipeline_finding_poller.py` | `scan --config F` | `npm run test:finding-poller` |
 
-They share a state directory and nothing else. Neither imports the other.
+The first two are Stage E proper: review, then bounce. The third is the **finding poller**
+(`docs/FINDING-POLLER.md`) — a session's `pipeline-finding/1` comment becomes a backlog
+ticket, which is a different job that happens to want the same role account, the same
+credential file and the same installer. It has its **own** state directory, so its
+heartbeat cannot be mistaken for the review poller's. Review and bounce share a state
+directory and nothing else; no script imports another.
 
 ---
 
@@ -38,7 +44,23 @@ python3 scripts/pipeline_stage_e_setup.py run         # the only command that ch
 **Run the first pass when no coding session is in flight.** Writing the review entries
 restarts the dispatcher, and a restart kills every session mid-work. It restarts only when
 the entries actually change, so later re-runs are usually free — and `run --dry-run` tells
-you in advance, printing `WOULD stop the dispatcher` if this pass would.
+you in advance, in the **`dispatcher-entry`** row:
+
+| The row you see | What it means |
+|---|---|
+| `dispatcher-entry WOULD-CHANGE — would write <ids> and remove <ids>` | the entries are about to change, so **a restart is coming** |
+| `dispatcher-entry WOULD-CHANGE — <ids> differ(s) from what this conf produces` | same: a rewrite, and a restart with it |
+| `dispatcher-entry WOULD-CHANGE — the review entries match; their load has not been proven yet` | **no restart**; the run only wants to re-read the log for the load banner |
+
+A dry run never reaches the apply path, so it never prints the Runner's own `WOULD stop the
+dispatcher` line. Read the row, not that phrase.
+
+**A real pass also moves the code the daemons run.** It fast-forwards the role account's
+clone of the kit, and unloads all three daemons first so nothing execs out of a tree that
+is moving. Reloading them is the `enable` step, several checkpoints downstream: if the run
+stops at a card before it, **all three loops are off**, and the notice printed on the way
+out is the only thing that says so. A dry run does none of this — it reports that the clone
+is behind and returns.
 
 It stops at the first step only a person can do, prints a numbered checkpoint card saying
 exactly what to do, and exits 10. Do that one thing and run the same command again: it
@@ -48,10 +70,18 @@ checks your work and carries on. It never asks you to type `y`.
 |---|---|
 | `run` | do everything possible, in order, idempotently; stop at the first card |
 | `run --dry-run` | the same pass with apply **off**: names what would change, changes nothing — not a file, not a daemon, not one tracker object |
-| `status` | where the install got to, what blocks it, and the one command that clears it |
-| `verify` | read-only drift check — measures every step, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
+| `status` | **replays the ledger** — what past runs recorded, what blocks it, and the one command that clears it. It probes nothing on this machine |
+| `verify` | read-only drift check — **re-measures** every step against the live machine, changes nothing, asks for no credential (your login password, once, as below), and on a healthy machine exits 0 |
 | `card CK-3` | print any checkpoint card in full, at any time |
 | `attest A-AUTOMATIONS --initials xx` | record something no computer can check |
+
+**`status` and `verify` answer different questions, and only one of them looks.** `status`
+prints the recorded outcome of each step from the installer's own state file; it is fast,
+needs no password, and is exactly as true as the last run that wrote it. Anything that
+changed *since* — a daemon booted out by hand, an edited dispatcher config, a clone someone
+pulled — is invisible to it, so a machine that has drifted still reads clean. `verify` is
+the one that measures, and it is the one to run after every merge to the default branch and
+whenever `status` looks better than the machine feels.
 
 **Seven cards exist and three are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
@@ -75,6 +105,23 @@ there and its contents are not accepted — and `run` asks you for a replacement
 back over the old one. Revoke a key, let one expire, or point the installer at another
 workspace and you will type that one secret a second time. `verify` and `run --dry-run`
 never ask; they report the rejection and name `run` as the command that can fix it.
+
+**That path is the tracker key's alone. A dead GitHub token you replace by hand.** The
+installer probes the env file for *names and lengths*, and asks the tracker whether its key
+is accepted — there is no equivalent probe for the forge, so a revoked or expired GitHub
+token is the right length in the right file and reads as healthy at every step. The symptom
+appears elsewhere and does not stop: a settled verdict that cannot be posted is recorded
+`publish-failed` and retried every pass, forever, while `status` stays green. Fine-grained
+tokens expire, so this is a *when*, not an *if*. Write the replacement into the role
+account's own env file yourself, keeping the file's mode and owner, and re-run the
+installer afterwards so the next pass picks it up:
+
+```sh
+sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && umask 077 && $EDITOR ~/.stage-e/env'
+```
+
+Record the minting and expiry dates of both credentials somewhere you will read them — the
+env file itself holds no clock, and nothing in Stage E will remind you.
 
 **Your login password is asked for once, at the start, and not again.** `run` and `verify`
 both read this machine as the role account (`sudo -u …`) and as root, dozens of times per
@@ -195,8 +242,8 @@ gate; only the first does now.
    lane. That is Stage E handing the work to a person, and it is the only ticket move it
    makes.
 
-What neither script ever does: merge, enable auto-merge, approve, edit a PR, apply any
-label but `agent:needs-human`, or launch a Claude session. The one move of a **coding**
+What neither of those two ever does: merge, enable auto-merge, approve, edit a PR, apply
+any label but `agent:needs-human`, or launch a Claude session. The one move of a **coding**
 ticket either makes is the bounce driver's, into the **needs-approval** lane
 (`linear.stateIds.needsApproval`), once, when review concludes — clean, below the
 threshold, or out of budget. That is the only state it can write, and a project that has
@@ -216,9 +263,10 @@ poller would.
 | Component | Runs as | Trust position |
 |---|---|---|
 | Poller + bounce driver | **The dispatcher's own role account**, system LaunchDaemon | Holds an owner-scoped Linear key and a GitHub token, in their own env file under that account's home. Plain Python, one pass per interval. Not a session. |
+| Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | No shell, no edits, no fetch. Reads its ticket body. Linear MCP tools present (accepted risk, below). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces as thread comments. |
-| State | `<role-account home>/.stage-e/state` | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
+| State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
 ### Why the role account and not yours
 
@@ -245,7 +293,7 @@ working tree, and warns when one sits outside the account's home.
 
 ## Step 1 — Linear: a Reviews team with automations off
 
-**The installer does all four of these** (`step_tracker`). They are here as the reference
+**The installer does all five of these** (`step_tracker`). They are here as the reference
 for what it did, and for a workspace whose API declines one of them.
 
 1. Create a team named **Reviews**. Any key works; you route on it (`REV` below).
@@ -257,7 +305,13 @@ for what it did, and for a workspace whose API declines one of them.
    without looking: a workspace whose API will not answer raises `CK-3` instead.
 3. Make sure a cheap-model label exists in the workspace. The dispatcher picks the model
    from a ticket label (`haiku`, `sonnet`, `opus`, `fable`).
-4. Do **not** make Reviews a sub-team of anything, and never parent a review ticket. A
+4. Make sure **`provenance:agent`** exists, at **workspace** scope. It is the finding
+   poller's mark: every ticket that poller files carries it, and it refuses to file a
+   finding it cannot mark, so an absent label is a whole daemon that can do nothing. The
+   installer creates it and reads it back, exactly as it does the model label. A
+   team-scoped label of the same name does not count — the tracker reads labels by name,
+   and a label scoped to one team is invisible to every other team's tickets.
+5. Do **not** make Reviews a sub-team of anything, and never parent a review ticket. A
    sub-issue is based on its parent's branch. `Team.parent` is read, and a nested Reviews
    team stops the run by name.
 
@@ -468,7 +522,7 @@ The whole body stays under `diff_cap_chars`. Above it, the poller declines with 
 
 ---
 
-## Step 3 — The poller and the bounce driver, as the role account
+## Step 3 — The pollers and the bounce driver, as the role account
 
 Everything in this step is done **as the dispatcher's role account**, not as you. Switch
 to it however your machine does that, and stay there until Step 4.
@@ -476,11 +530,14 @@ to it however your machine does that, and stay there until Step 4.
 ### 3a. The home and the state directory
 
 ```bash
-mkdir -p ~/.stage-e/state
-chmod 700 ~/.stage-e ~/.stage-e/state
+mkdir -p ~/.stage-e/state ~/.stage-e/finding
+chmod 700 ~/.stage-e ~/.stage-e/state ~/.stage-e/finding
 ```
 
-Everything the two scripts remember lives under `~/.stage-e/state`:
+Everything review and bounce remember lives under `~/.stage-e/state`. The finding poller
+keeps its own config, state and log under `~/.stage-e/finding` instead — including a
+`heartbeat.json` of its own, which is the whole reason for the second directory: two
+heartbeat files with the same name in the same place cannot be told apart.
 
 | Path | Written by | What it is |
 |---|---|---|
@@ -577,12 +634,13 @@ The scripts read the values from the environment variables their config **names*
 its own process; the bounce driver does not, so every comment the driver posts fails with
 *no GitHub token*.
 
-### 3c. Two config files, not one
+### 3c. Three config files, not one
 
-The poller **refuses** a config key it does not know, so a typo cannot silently fall back
-to a default. The bounce driver **ignores** unknown keys, so one file can feed it. Those
-two rules do not compose: a single file carrying the driver's own keys is not a valid
-poller config. Give each its own file.
+The review poller **refuses** a config key it does not know, so a typo cannot silently fall
+back to a default. The bounce driver **ignores** unknown keys, so one file can feed it.
+Those two rules do not compose: a single file carrying the driver's own keys is not a valid
+poller config. The finding poller refuses unknown keys too, and takes a different set of
+them again. Give each its own file — the installer writes all three.
 
 `~/.stage-e/poller.json` — `python3 scripts/pipeline_review_poller.py --example-config`
 prints this and lists every key it accepts:
@@ -656,12 +714,20 @@ prints this and lists every key it accepts:
   reports *CANNOT EVALUATE*, comments on the PR and exits 2 — until you add the entry or
   grant the token *Administration: read*. A repository with an entry can never reach
   unknown.
-- **The installer writes that entry for you**, with YOUR `gh` login rather than the
-  daemon's token: it reads classic protection first, falls back to the branch's effective
-  ruleset rules (`repos/OWNER/NAME/rules/branches/BRANCH`, which needs no administration
-  read), and takes the contexts out of every `required_status_checks` rule it finds. It
-  raises `CK-6` only when neither shape answers, and it never writes an empty set — an
-  empty set means *requires nothing*, which is the one answer that must never be guessed.
+- **The installer writes that entry for you — verbatim, subtracting nothing.** It uses
+  YOUR `gh` login rather than the daemon's token: it reads classic protection first, falls
+  back to the branch's effective ruleset rules
+  (`repos/OWNER/NAME/rules/branches/BRANCH`, which needs no administration read), and takes
+  the contexts out of every `required_status_checks` rule it finds. It raises `CK-6` only
+  when neither shape answers, and it never writes an empty set — an empty set means
+  *requires nothing*, which is the one answer that must never be guessed.
+- **So the entry it writes is what the branch requires, not what a session can fix**, and
+  the two are not the same set. A context gated on a human's label — the kit's own
+  hooks-change acknowledgement is the example — goes in like any other, and a session
+  bounced toward it can never turn it green. The installer has no way to tell those apart;
+  you do. After the install, read the entry it wrote and **delete by hand any context no
+  session controls**. Until you do, that is a bounce budget spent on a check that was
+  always going to stay red.
 - `in_flight_hours` is a per-head cooldown, default 6. After a bounce is sent, the driver
   waits that long before bouncing the same PR head again, so a session that has not yet
   pushed is not re-prompted.
@@ -673,7 +739,33 @@ prints this and lists every key it accepts:
   moved nothing. Provision the lane as type **`unstarted`** — see the contract §1 note;
   `started` and `completed` both break the dispatcher in ways that produce no error.
 
-Both files hold **names of environment variables**, never a value. The loaders refuse a
+`~/.stage-e/finding/poller.json` — the finding poller's own, in its own directory
+(`python3 scripts/pipeline_finding_poller.py --example-config` prints the shape):
+
+```json
+{
+  "teams": ["ENG"],
+  "owner_user_id": "<your Linear user id — the ticket's subscriber>",
+  "agent_user_id": "<the dispatcher's Linear agent user id — the only trusted author>",
+  "provenance_agent_label": "provenance:agent",
+  "backlog_state_name": "Backlog",
+  "linear_key_env": "STAGE_E_LINEAR_API_KEY",
+  "state_dir": "~/.stage-e/finding",
+  "lookback_hours": 72,
+  "max_per_source": 3,
+  "max_per_run": 20
+}
+```
+
+- `teams` are the **work** teams whose tickets carry the findings, not the Reviews team.
+  The installer fills it from `MANAGED_TEAM_KEYS`, which has **no default** — leave that
+  conf key empty and the config is written with an empty team list, which the poller
+  refuses.
+- The label and the backlog state are named here because the poller resolves both per team
+  and **refuses to file a finding it cannot mark** (`docs/FINDING-POLLER.md`).
+- It reads the tracker key and no GitHub token at all; it never touches a pull request.
+
+All three files hold **names of environment variables**, never a value. The loaders refuse a
 value that does not look like a variable name.
 
 **Nothing validates the driver's ids.** Its `validate_config` checks the two credential
@@ -685,10 +777,20 @@ used the day a session cannot be resumed and a fallback fix ticket has to be min
 one moment the system is already in trouble. Grep your own config for the placeholder text
 before you load the daemons. The poller has no such hole: it refuses a key it does not know.
 
-### 3d. Two system LaunchDaemons
+### 3d. Three system LaunchDaemons
 
 One-shot jobs. Each pass is scan → act → exit; the interval belongs to launchd, not to the
 script. **No `KeepAlive`** — it would restart a one-shot process in a tight loop.
+
+| Label | Script | Interval from | Log |
+|---|---|---|---|
+| `com.example.stage-e-poller` | `pipeline_review_poller.py … run` | `POLL_INTERVAL_SECONDS` (300) | `~/.stage-e/poller.log` |
+| `com.example.stage-e-bounce` | `pipeline_bounce_local.py run` | `BOUNCE_INTERVAL_SECONDS` (360) | `~/.stage-e/bounce.log` |
+| `com.example.stage-e-finding` | `pipeline_finding_poller.py scan …` | `FINDING_INTERVAL_SECONDS` (300) | `~/.stage-e/finding/poller.log` |
+
+`FINDING_INTERVAL_SECONDS` **is not in `stage-e.conf.example`**; it defaults to 300, and you
+only need the line if you want a different interval. Offsetting the three from each other
+keeps them from starting together.
 
 ```xml
 <!-- /Library/LaunchDaemons/com.example.stage-e-poller.plist   root:wheel, mode 644 -->
@@ -698,12 +800,15 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
   <key>Label</key><string>com.example.stage-e-poller</string>
   <key>UserName</key><string>&lt;the dispatcher's role account&gt;</string>
   <key>EnvironmentVariables</key>
-  <dict><key>HOME</key><string>&lt;role-account home&gt;</string></dict>
+  <dict>
+    <key>HOME</key><string>&lt;role-account home&gt;</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>set -a; . "$HOME/.stage-e/env"; set +a; exec python3 &lt;scripts dir&gt;/pipeline_review_poller.py --config "$HOME/.stage-e/poller.json" run</string>
+    <string>set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 &lt;scripts dir&gt;/pipeline_review_poller.py --config "$HOME/.stage-e/poller.json" run</string>
   </array>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
@@ -712,22 +817,38 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 </dict></plist>
 ```
 
+**Type the interpreter's full path, `/usr/bin/python3`, and never a bare `python3`.** All
+three jobs are pinned to Apple's own interpreter, deliberately: a package-manager Python
+earlier on the path cannot verify the tracker's TLS certificate and every call fails with
+`CERTIFICATE_VERIFY_FAILED … unable to get local issuer certificate`. The same applies to
+anything you run by hand as the role account — copy the `ProgramArguments` line out of the
+plist rather than retyping it. Nothing here installs Python; the system one (3.9 is enough)
+is what these scripts are written against.
+
 The second plist is the same file with four changes: the label
 `com.example.stage-e-bounce`, the log path `bounce.log`, a `StartInterval` offset from the
-poller's (say 360, so the two rarely start together), and this command:
+poller's (say 360), and this command:
 
 ```text
-set -a; . "$HOME/.stage-e/env"; set +a; exec python3 <scripts dir>/pipeline_bounce_local.py run
+set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 <scripts dir>/pipeline_bounce_local.py run
+```
+
+The third is the finding poller — label `com.example.stage-e-finding`, log
+`~/.stage-e/finding/poller.log`, and:
+
+```text
+set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 <scripts dir>/pipeline_finding_poller.py scan --config "$HOME/.stage-e/finding/poller.json"
 ```
 
 `<scripts dir>` is the `scripts/` directory of a plain clone of the kit-derived repository
-— a clone, never a dispatcher worktree. The poller passes `--repo OWNER/REPO` on every
-GitHub call, so neither script cares what directory it is started in.
+— a clone, never a dispatcher worktree. The pollers pass `--repo OWNER/REPO` on every
+GitHub call, so no script cares what directory it is started in.
 
-**That clone does not update itself, and nothing will tell you it is old.** Both daemons
-exec out of it, so a fix merged to the default branch is inert on the machine until someone
-pulls. Neither the heartbeats nor the logs mention the code's version. Pull it with both
-jobs unloaded, never under a running pass, re-run the dry run afterwards, and compare its
+**That clone is the deployment, and nothing in a heartbeat or a log names its version.** All
+three daemons exec out of it, so a fix merged to the default branch is inert on the machine
+until the clone moves. `run` moves it for you — it unloads the three jobs, fast-forwards,
+and reloads at its `enable` step — and that is the only thing that does. Pull it by hand
+only with the jobs unloaded, never under a running pass, and compare its
 `git rev-parse --short HEAD` against your own clone whenever behaviour surprises you. A
 stale daemon clone looks exactly like a bug.
 
@@ -759,31 +880,36 @@ Input/output error` and leaves you with nothing loaded. Poll
   (`run_timeout_seconds`, or `--timeout`); the poller exits 4 when it is cut off, the
   driver exits 2 and calls the pass partial.
 
-**Monitor the heartbeats, not the log.** `state/heartbeat.json` and
-`state/bounce-heartbeat.json` carry a timestamp and a result on every terminal path,
-including a failed one. A stale heartbeat means *not running*; a fresh one with a non-`ok`
-result means *ran and could not do it*. Both files live under the **role account's** home,
+**Monitor the heartbeats, not the log — there are three.**
+`state/heartbeat.json`, `state/bounce-heartbeat.json` and `finding/heartbeat.json` carry a
+timestamp and a result on every terminal path, including a failed one. A stale heartbeat
+means *not running*; a fresh one with a non-`ok` result means *ran and could not do it*.
+**Count them**: two fresh heartbeats out of three is one whole daemon that is not running,
+and nothing else on the machine will say so. They live under the **role account's** home,
 not yours, so reading them takes `sudo -u`:
 
 ```sh
-sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json'
+sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
 ```
 
 The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours —
 and the `cd /` suppresses the `shell-init: … getcwd … Permission denied` lines that
 otherwise appear, harmlessly, because that account cannot traverse your home.
 
-Two cases leave no poller heartbeat at all: a
-config that cannot be read (it exits 2 before it learns where the state directory is), and
-somebody stopping the process on purpose.
+Two cases leave no heartbeat at all: a config that cannot be read (the job exits before it
+learns where its state directory is), and somebody stopping the process on purpose.
 
-### 3e. Dry run first — before either job is loaded
+### 3e. Dry run first — before any job is loaded
 
 ```bash
 set -a; . ~/.stage-e/env; set +a
-python3 <scripts dir>/pipeline_review_poller.py --config ~/.stage-e/poller.json scan --dry-run
-python3 <scripts dir>/pipeline_bounce_local.py decide --all --json
+/usr/bin/python3 <scripts dir>/pipeline_review_poller.py --config ~/.stage-e/poller.json scan --dry-run
+/usr/bin/python3 <scripts dir>/pipeline_bounce_local.py decide --all --json
+/usr/bin/python3 <scripts dir>/pipeline_finding_poller.py scan --config ~/.stage-e/finding/poller.json --dry-run
 ```
+
+(`/usr/bin/python3`, not `python3` — see 3d. A bare `python3` here is the
+`CERTIFICATE_VERIFY_FAILED` you will otherwise spend an hour on.)
 
 A poller dry run says how many open PRs it saw, how many discovery calls dispatcher-worked,
 and how many are new to review — that last count is exactly how many tickets a live `scan`
@@ -808,6 +934,11 @@ property of your backlog, not of Stage E.
 
 `decide --all` prints one line per PR that has a review outcome on file and says what it
 would do. With no outcomes yet it says so in words, and exits 0.
+
+The finding poller's dry run reads the same tickets a live pass would, reports what it would
+file, and writes nothing. **It has no decline state — 0 is its only success**, and the
+installer treats any other exit as a failed pass. An empty team list is the usual first
+cause: the config was written from a conf whose `MANAGED_TEAM_KEYS` was left blank.
 
 The publisher has its own dry run, if you want to see a comment rendered from a block you
 saved by hand. Give it the criteria the reviewer was given: `--acceptance` once per

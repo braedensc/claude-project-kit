@@ -132,6 +132,68 @@ redesigns Stage E for what actually runs.
 >   an entry with `git -C <path> remote get-url origin`. A path basename is not evidence
 >   of identity, and that class of guess is what this update removes.
 
+> **Update (2026-09-12) — what shipped after this ADR was last amended.** Nothing had
+> touched this file since PR #85, and the deployment below it had moved on in five ways. No
+> decision is reversed here; where the text that follows disagrees with this block, this
+> block is the later fact.
+>
+> - **Three system LaunchDaemons, not two** (#94). The finding poller
+>   (`scripts/pipeline_finding_poller.py`, `docs/FINDING-POLLER.md`) turns a session's
+>   `pipeline-finding/1` comment into a backlog ticket marked `provenance:agent`. It is a
+>   different job from review and bounce — it reads no pull request — but it wants the same
+>   role account, the same mode-600 credential file and the same clone, so the same
+>   installer places it: a third config, a third plist, a third heartbeat. Read every
+>   "the two system LaunchDaemons" below as three. Its filing path is proven by selftest
+>   and dry run only; no deployment has yet filed a real one.
+> - **The basis tier the ADR left "decided by a spike (KIT-92)" shipped, and it is tier 3.**
+>   The spike's answer is recorded in `scripts/pipeline_review_basis.py`: no tool in the
+>   tracker surface these sessions hold exposes an as-of-timestamp read, and the public
+>   schema's issue-history connection was assessed to record field-level transitions —
+>   including a boolean saying the description changed — rather than its prior text, which
+>   is not the same thing. That assessment was never confirmed against a live credential
+>   and says so. So tier 1 is not implementable from what is verifiable, the resolver ships
+>   with no history fetcher, tier 2's writer is unbuilt, and **`live` is the default
+>   basis**.
+> - **On that tier the criteria-edit flag reports unknown** (#82). Only a tier that saw the
+>   criteria as of delegation can compare them, so `criteria_changed_after_delegation` is
+>   `None` there — **and None is not False**. Its predecessor compared the record's
+>   modification time, which a state move or a label bumps, so it was true on nearly every
+>   reviewed pull request and manufactured scope findings that spent real bounces.
+>   Decision 2 stands as written; what changed is that the mid-work criteria-edit gap it
+>   leaves open is honestly *unmeasured* on the shipped tier rather than flagged.
+> - **Review concludes by moving the coding ticket** (#88). "The original ticket is never
+>   moved by E" is no longer true. When nothing is left to bounce — clean, below the
+>   threshold, or out of budget — the driver writes one `concluded` ledger row and moves the
+>   coding ticket into the **needs-approval** lane, once. That is the single state write
+>   Stage E makes on anybody's coding ticket, and a project that has not provisioned the
+>   lane still gets the ledger row and the words, and no move. So the poller-and-driver
+>   vocabulary listed under decision 6 gains two verbs: move a coding ticket to one
+>   configured state, and retire a re-review request.
+> - **A bounce is followed by a re-review** (#87, #93). Each delivered bounce leaves a
+>   request naming the head it bounced, and the poller re-reviews that pull request on its
+>   next pass **if the head has moved** — so a `maxBounces` above 1 means something, and a
+>   conclusion after a bounce is reachable at all. A session that pushes nothing buys no
+>   review and costs nothing. The request is written atomically, deleted only once the new
+>   review ticket exists, and retired by a conclusion, so a flaky check going green cannot
+>   open a second review on a pull request a person already owns.
+> - **The deployment is no longer unexercised** (#99). The Verified section's closing claim
+>   — design verified against source, deployment **not yet exercised** — held until
+>   2026-09-08. Since then the whole loop has run against live pull requests on a
+>   production deployment: an owner-key delegation admitted by the dispatcher, a pull
+>   request discovered through the tracker, a sandboxed reviewer returning its block, a
+>   review comment published on the pull request, a bounce delivered into the coding
+>   ticket's session thread and that session resumed by it, no re-review and no spend for
+>   the hours the session pushed nothing, a re-review with its own ticket and its own
+>   second comment once the head moved, and a conclusion that moved the coding ticket into
+>   the needs-approval lane — including one held, correctly, until the lane existed.
+> - **What that run did not establish**, and is therefore still design rather than fact: a
+>   re-prompted session pushing its own fix (the one head move was a person's), a second or
+>   third bounce, exhaustion and its label, a bounce triggered by a red required check, the
+>   fallback fix ticket, the tool fence measured by probing a reviewer rather than read off
+>   the config, and live test 7 — whether one session's identity can re-prompt another,
+>   which is the open measurement of accepted risk 3. The finding poller's filing path is
+>   on that list too.
+
 ## Decision
 
 **Stage E is a poller running as the dispatcher's own role account that speaks to the
