@@ -493,6 +493,8 @@ Everything the two scripts remember lives under `~/.stage-e/state`:
 | `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
 | `bounces/` | bounce driver | its telemetry artifacts |
+| `monitor-state.json` | heartbeat monitor (optional, unscheduled) | the last verdict-set it announced, so an incident is said once |
+| `monitor-heartbeat.json` | heartbeat monitor (optional, unscheduled) | its own last run and result |
 
 Never point `state_dir` at a repo checkout or a worktree. The bounce driver refuses one
 inside a git working tree: the ledger is the budget authority and a worktree is writable by
@@ -764,6 +766,15 @@ Input/output error` and leaves you with nothing loaded. Poll
 including a failed one. A stale heartbeat means *not running*; a fresh one with a non-`ok`
 result means *ran and could not do it*. Both files live under the **role account's** home,
 not yours, so reading them takes `sudo -u`:
+
+> **Something can read them for you.** `scripts/pipeline_heartbeat_monitor.py` is a fourth
+> one-shot job, run by the same role account on a longer interval, that judges all three
+> heartbeats and posts **one** comment on a ticket when the verdict changes — once per
+> incident, not once per pass, and one more when it clears. It is off unless a ticket is
+> configured, and a problem it cannot report is exit 3 rather than a clean pass. It does not
+> replace the command below: it runs on the same Mac as the daemons, so it cannot report the
+> machine asleep or off, or its own death. **The installer does not schedule it yet.**
+> `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the run steps.
 
 ```sh
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json'
