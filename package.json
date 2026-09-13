@@ -39,6 +39,7 @@
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
     "test:bounce": "python3 scripts/pipeline_bounce_local.py --selftest",
     "test:notifier": "python3 scripts/pipeline_notify_local.py --selftest",
+    "test:heartbeat-monitor": "python3 scripts/pipeline_heartbeat_monitor.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },
