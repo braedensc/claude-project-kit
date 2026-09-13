@@ -45,10 +45,13 @@ WHAT IT WATCHES, AND WHY THE THREE SHAPES ARE NOT UNIFIED HERE
   The three daemons were written at different times and their heartbeats do not agree on
   field names: the review poller ends with `result`/`ended_at`, the bounce driver writes
   `result`/`at`/`finished_at` and also writes a `running` beat at the START of a pass, and
-  the finding poller writes a boolean `ok` with `at`. Rewriting them to one shape would
-  touch three daemons for this one reader's convenience, so the shapes stay where they are
-  and the differences live in the WATCHERS table below — one row per job, declaring the
-  schema string, the timestamp fields in priority order, and what counts as a good result.
+  the finding poller — since its heartbeat/2 — writes the review poller's shape (it wrote
+  a boolean `ok` with `at` before). Rewriting them to one shape would touch three daemons
+  for this one reader's convenience, so the shapes stay where they are and the differences
+  live in the WATCHERS table below — one row per job, declaring the schema string, the
+  timestamp fields in priority order, and what counts as a good result. The selftest
+  cross-checks every row against the writer it names, including one real heartbeat the
+  finding poller's own writer produces, so the two cannot drift apart unnoticed again.
 
   A shape this table does not recognize is `unreadable`, which is a verdict about THIS
   MONITOR ("I could not judge") and never about the daemon ("it is down"). Those two are
@@ -175,7 +178,9 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 # `ts_fields`    timestamp fields in PRIORITY order — the first present and parseable wins.
 #                The bounce driver's `finished_at` is preferred over its `at` because `at`
 #                is rewritten by the mid-pass `running` beat.
-# `bool_field`   the finding poller reports a boolean instead of a result string.
+# `bool_field`   a writer that reports a boolean instead of a result string. No current
+#                writer does (the finding poller did until its heartbeat/2); kept so a
+#                future one needs a table row, not a code change.
 # `good`         results that mean the last pass was fine.
 # `running`      results that mean a pass was IN FLIGHT when the file was written. Fresh,
 #                that is healthy; stale, it means a pass started and never finished, which
@@ -210,10 +215,15 @@ WATCHERS = {
         "writer": "scripts/pipeline_finding_poller.py",
         "dir_key": "finding_state_dir",
         "filename": "heartbeat.json",
-        "schema": "pipeline-finding-poller-heartbeat/1",
-        "ts_fields": ("at",),
-        "result_field": None,
-        "bool_field": "ok",
+        # /2 (kit #104): the finding poller adopted the review poller's shape — `command`,
+        # `result`, `exit_code`, `started_at`/`ended_at` — so one rule reads both. Its /1
+        # shape (a boolean `ok` with `at`) is what a role clone older than #104 still
+        # writes; that reads as `unreadable` here, which is the honest verdict for a
+        # daemon this monitor cannot judge, never a silent pass.
+        "schema": "pipeline-finding-poller-heartbeat/2",
+        "ts_fields": ("ended_at", "started_at", "at"),
+        "result_field": "result",
+        "bool_field": None,
         "good": ("ok",),
         "running": (),
     },
@@ -1025,12 +1035,19 @@ def selftest():
     ok("bounce driver: finished_at is preferred over the running beat's at",
        verdict("bounce-driver", beat("bounce-driver", result="ok", at=old,
                                      finished_at=fresh)) == "ok")
-    ok("finding poller: ok:true ⇒ ok",
-       verdict("finding-poller", beat("finding-poller", ok=True, at=fresh)) == "ok")
-    ok("finding poller: ok:false ⇒ failing",
-       verdict("finding-poller", beat("finding-poller", ok=False, at=fresh)) == "failing")
-    ok("the boolean is translated to one result vocabulary",
-       result_of({"ok": False}, WATCHERS["finding-poller"]) == "error")
+    ok("finding poller: result ok ⇒ ok",
+       verdict("finding-poller", beat("finding-poller", result="ok", ended_at=fresh)) == "ok")
+    ok("finding poller: result error ⇒ failing",
+       verdict("finding-poller", beat("finding-poller", result="error", ended_at=fresh)) == "failing")
+    ok("finding poller: the pre-#104 boolean shape (/1) ⇒ unreadable, never ok",
+       verdict("finding-poller", {"path": "/x/heartbeat.json", "exists": True, "error": None,
+                                  "doc": {"schema": "pipeline-finding-poller-heartbeat/1",
+                                          "ok": True, "at": fresh}}) == "unreadable")
+    ok("a boolean writer would be translated to one result vocabulary",
+       result_of({"ok": False}, {"bool_field": "ok"}) == "error"
+       and result_of({"ok": True}, {"bool_field": "ok"}) == "ok")
+    ok("no current writer is read through the boolean path",
+       all(not spec.get("bool_field") for spec in WATCHERS.values()))
 
     # ── 3. The monitor's own inability to judge is never a clean bill of health ───────
     ok("a missing file ⇒ missing",
@@ -1442,6 +1459,25 @@ def selftest():
         ok("the two pollers' files are told apart by DIRECTORY, not by name",
            WATCHERS["finding-poller"]["filename"] == WATCHERS["review-poller"]["filename"]
            and WATCHERS["finding-poller"]["dir_key"] != WATCHERS["review-poller"]["dir_key"])
+        # The shape, not only the string: a heartbeat the finding poller's OWN writer
+        # produces must be judged by this table. #104 and #110 merged separately and the
+        # string matched a shape this monitor could not read; this is the case that
+        # would have caught it.
+        with tempfile.TemporaryDirectory() as real_dir:
+            started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            pfp.write_heartbeat(real_dir, pfp.EXIT_OK, started, time.monotonic(), False)
+            raw = read_beat(pfp.heartbeat_path(real_dir))
+            live = judge_one("finding-poller", WATCHERS["finding-poller"], raw,
+                             int(time.time()), 600, False)
+            ok("a real heartbeat from the finding poller's writer judges as ok",
+               live["verdict"] == "ok" and live["result"] == "ok")
+            pfp.write_heartbeat(real_dir, pfp.EXIT_ERROR, started, time.monotonic(), False,
+                                error="synthetic")
+            raw = read_beat(pfp.heartbeat_path(real_dir))
+            live = judge_one("finding-poller", WATCHERS["finding-poller"], raw,
+                             int(time.time()), 600, False)
+            ok("a real failing heartbeat from that writer judges as failing, not ok",
+               live["verdict"] == "failing")
     except ImportError:
         ok("the finding poller is importable for the cross-check", False)
 
