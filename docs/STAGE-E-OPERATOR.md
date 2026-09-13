@@ -289,6 +289,23 @@ points at a clone of **that** repository (a separate clone from the coding entry
 tidier), bases on its default branch, admits only you as a delegator, and removes every
 tool that could act.
 
+**Copy the config before you edit it — and not to the directory it sits in.** That file
+holds the dispatcher's own tracker OAuth access and refresh tokens, so every copy of it is
+another live credential on disk. The sandbox denies sessions the **role account's home**
+and nothing else; the dispatcher's own tree is not denied, so a `config.json.bak` beside
+the original is a copy any session can read, and one that nothing ever deletes. Put it
+where the credentials already live, as that account:
+
+```bash
+sudo -u <role account> -H /bin/sh -c 'cd / && umask 077 && mkdir -p "$HOME/.stage-e/backups" && chmod 700 "$HOME/.stage-e" "$HOME/.stage-e/backups" && f="$HOME/.stage-e/backups/config.json.$(date -u +%Y%m%dT%H%M%SZ)" && cp <config path> "$f" && chmod 600 "$f" && echo "$f"'
+```
+
+The installer does exactly this before every write, and prints the path it wrote. Its
+prune then keeps the newest `CONFIG_BACKUPS_KEPT` (five by default) of everything in that
+directory named `<config name>.<something>` — **the copies you make with the command above
+included**, since they are the same thing under the same name. Name a copy you want kept
+something else, and it is never touched.
+
 **Why one each, and not one shared entry.** A review session's worktree is cut from one
 entry's clone. With a single shared entry, a reviewer judging a pull request from one
 repository sits in a clone of another. It still has Read, Grep and Glob, so it opens a
@@ -403,6 +420,17 @@ would not come back. EIO is a domain error raised before any config is read, so 
 is usually the wrong suspect anyway. The banner prints the restore command. The call is
 yours.
 
+The backup it names is the one under the role account's home, printed as a full absolute
+path. Use that path verbatim, and run the restore as that account, because it is the only
+account that can read the file:
+
+```bash
+sudo -u <role account> cp <the absolute path the banner printed> <config path>
+```
+
+A `~` or a `$HOME` of your own is the wrong path here: your shell expands it to **your**
+home, not the role account's, and the copy is not there.
+
 Do the same by hand: never `bootout` and `bootstrap` on consecutive lines. Wait for
 `sudo launchctl print system/<label>` to fail before you bootstrap.
 
@@ -466,6 +494,30 @@ ticket, in the tracker (live test 3). In order:
 The whole body stays under `diff_cap_chars`. Above it, the poller declines with the reason
 *diff too large to deliver* and posts that on the PR.
 
+### Turning the review entries off again
+
+Reviews stop when the entries are gone from the dispatcher's config, so this is Step 2
+backwards. Back the config up first, to the same place and by the same command as above —
+turning something off is still an edit to a file full of tokens.
+
+1. Drop the repository from `REVIEW_REPOS` and run the installer again. It removes the
+   entry it wrote, in the same single rewrite, and restarts the dispatcher only because
+   the file changed. To stop reviewing everything, delete the entries by hand instead: an
+   empty `REVIEW_REPOS` is a conf the validator refuses, deliberately.
+2. Unload the daemons (Step 3d) if you want the poller and the bounce driver stopped too.
+   Leaving them loaded with no review entries means review tickets that start no session.
+3. **Delete the backups you no longer need.** They are copies of the dispatcher's tracker
+   tokens. The installer's prune only runs when the installer runs, and only over files
+   named after the config — so once you have stopped running it, nothing is tidying that
+   directory at all. Look, then remove:
+
+```bash
+sudo -u <role account> -H /bin/sh -c 'cd / && ls -l "$HOME/.stage-e/backups"'
+```
+
+Rotating the dispatcher's own tracker credential is what actually retires an old copy. A
+backup taken before that rotation is no longer a live secret; one taken after it is.
+
 ---
 
 ## Step 3 — The poller and the bounce driver, as the role account
@@ -479,6 +531,11 @@ to it however your machine does that, and stay there until Step 4.
 mkdir -p ~/.stage-e/state
 chmod 700 ~/.stage-e ~/.stage-e/state
 ```
+
+That home holds three kinds of thing, and the sandbox's deny-read of it is what keeps all
+three from the sessions: the env file of credentials (3b), this state directory, and
+`~/.stage-e/backups` — the copies of the dispatcher's config taken in Step 2, which hold
+its tracker tokens. Everything under here is mode 700 or 600, owned by the role account.
 
 Everything the two scripts remember lives under `~/.stage-e/state`:
 
