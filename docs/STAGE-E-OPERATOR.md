@@ -106,22 +106,29 @@ back over the old one. Revoke a key, let one expire, or point the installer at a
 workspace and you will type that one secret a second time. `verify` and `run --dry-run`
 never ask; they report the rejection and name `run` as the command that can fix it.
 
-**That path is the tracker key's alone. A dead GitHub token you replace by hand.** The
-installer probes the env file for *names and lengths*, and asks the tracker whether its key
-is accepted — there is no equivalent probe for the forge, so a revoked or expired GitHub
-token is the right length in the right file and reads as healthy at every step. The symptom
-appears elsewhere and does not stop: a settled verdict that cannot be posted is recorded
-`publish-failed` and retried every pass, forever, while `status` stays green. Fine-grained
-tokens expire, so this is a *when*, not an *if*. Write the replacement into the role
-account's own env file yourself, keeping the file's mode and owner, and re-run the
-installer afterwards so the next pass picks it up:
+**Both credentials are asked about, not just counted.** The installer probes the env file
+for *names and lengths*, which cannot tell a live credential from a dead one. So the tracker
+key proves itself by being used, and the GitHub token is proved by one read-only request per
+pass — it is the value that *expires*, and a dead one is the right length in the right file.
+Unchecked, it reads as healthy at every step while the review poller records
+`publish-failed` on every pass, forever. Now `run` asks you for a replacement, `verify` and
+`run --dry-run` report a **failed** credentials step naming the file and the fix, and a code
+host that could not be reached at all is reported as **could not measure**, which is not a
+pass. Step 3b has the table that tells a dead token from a too-narrow one.
+
+Fine-grained tokens expire, so replacing one is a *when*, not an *if*. When you already hold
+the new value, the by-hand path is shortest: write it into the role account's own env file,
+keeping the file's mode and owner.
 
 ```sh
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && umask 077 && $EDITOR ~/.stage-e/env'
 ```
 
+**No restart.** Every daemon pass sources that file when it starts, so the next scheduled
+pass uses the new value. Run `verify` afterwards to see the credentials row come back clean.
+
 Record the minting and expiry dates of both credentials somewhere you will read them — the
-env file itself holds no clock, and nothing in Stage E will remind you.
+env file itself holds no clock, and the probe only notices a token *after* it has died.
 
 **Your login password is asked for once, at the start, and not again.** `run` and `verify`
 both read this machine as the role account (`sudo -u …`) and as root, dozens of times per
@@ -630,6 +637,40 @@ is how a token could approve. No code path here submits one — the poller's own
 asserts there is no approve, merge or label path — and merging additionally needs *Contents:
 write*, which stays read. But the guarantee thins from *impossible* to *not implemented*, and
 those are different guarantees.
+
+#### The token expires. Plan for it.
+
+A fine-grained token lasts **at most a year**, and you chose the date when you minted it.
+Write it down somewhere you will see it. Nothing in Stage E renews one, and nothing warns you
+in advance.
+
+What does happen is that `run` and `verify` **ask the code host whether the stored token
+still works**, once per pass, at an endpoint that needs no permission, names no repository
+and costs no rate-limit budget — so the answer is about the token itself and not about its
+scope. That distinction is the point, because a dead token and a too-narrow one produce the
+same line in the poller's state:
+
+| What you see | What it means | What to do |
+|---|---|---|
+| Every review records `publish-failed` and retries each pass, and the PR comment never appears | Either the token is dead or its scope is too narrow. From here the two look identical | Run `verify`. The credentials row tells you which |
+| `verify` says **REJECTED BY THE CODE HOST (HTTP 401)** at the credentials step, exit 1 | The stored token is revoked or expired. The file is fine; what is in it is no longer accepted | Replace the token — `run`, or by hand, below |
+| The poller reports `HTTP 403: Resource not accessible by personal access token` at the comments endpoint, and `verify` is clean | The token is alive and lacks *Pull requests: write* | Widen that permission on the token you have. Minting a new one changes nothing |
+| `verify` says **COULD NOT MEASURE** at the credentials step, exit 4 | The code host could not be asked — offline, a proxy, or an account-level 403 such as single sign-on | Nothing yet. Ask again from a machine that can reach it. It is not a pass and not a failure |
+
+**Replacing it by hand** is the shortest path when you already have the new value. As the
+**role account**, not as you:
+
+```sh
+$EDITOR ~/.stage-e/env          # change the GH_TOKEN line, nothing else
+ls -l ~/.stage-e/env            # still mode 600? an editor that rewrites the file can widen it
+```
+
+That is the whole procedure. **Do not restart the daemons.** Each pass re-reads the env file
+when it starts, so the next scheduled pass picks up the new value on its own; a restart buys
+nothing and stops whatever was mid-flight. The alternative is `python3
+scripts/pipeline_stage_e_setup.py run`, which asks for a replacement at a hidden prompt and
+writes the file for you — take that one if you would rather not edit a credential file by
+hand.
 
 The scripts read the values from the environment variables their config **names**.
 
