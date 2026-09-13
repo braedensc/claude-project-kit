@@ -219,6 +219,25 @@ jobs:
       - name: Human-action notifier selftest (marks, §13 states, label-only mutation)
         run: python3 scripts/pipeline_notify_local.py --selftest
 
+      # The heartbeat monitor: the one job that READS the other three's heartbeats, which
+      # until now nothing did. Offline, every file local and the tracker stubbed: asserts
+      # each daemon's real heartbeat SHAPE is judged (the schema strings and filenames are
+      # cross-checked against the three writers, so a renamed field turns this red rather
+      # than silently reading as healthy), that a heartbeat this monitor cannot parse is
+      # `unreadable` — a statement about the monitor, never a clean bill of health — that a
+      # stale beat after the monitor missed its OWN schedule is NOT paged on (a sleeping
+      # laptop would otherwise guarantee three false pages on every wake) while a missing,
+      # failing or unjudgeable beat still is, that five identical bad passes post exactly
+      # ONE comment and a recovery posts exactly one more, that a cooldown carries a
+      # suppressed change instead of dropping it and never delays a recovery, that a problem
+      # with no configured ticket is exit 3 rather than a clean green (§13), that an
+      # undelivered page is not recorded as sent yet still advances the run clock (so a
+      # tracker outage cannot silently disable staleness judgment), and that the file builds
+      # exactly one tracker mutation — commentCreate — with no label, state, ticket or
+      # pull-request write anywhere in it.
+      - name: Heartbeat monitor selftest (one comment per incident, §13 exit codes)
+        run: python3 scripts/pipeline_heartbeat_monitor.py --selftest
+
       # Stage E's installer — the one command an operator runs. Offline, every
       # transport stubbed: the conf validator reports EVERY bad value in one pass
       # (a first-error-wins mutant turns it red), a settled machine is written to

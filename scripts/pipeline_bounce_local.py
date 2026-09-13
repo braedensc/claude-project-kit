@@ -192,20 +192,33 @@ STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either w
       difference between "never reviewed" and "reviewed, record unreadable" is the whole
       trigger. `head_sha` lets a review of an older head never trigger a second bounce;
       without it, an outcome older than the last bounce is treated as stale.
-  <state_dir>/bounce-ledger.jsonl                     written ONLY by this file
+  <state_dir>/bounce-ledger.jsonl                     written ONLY by this file. Its
+      `outcome` says what the row records: "spent"/"delivered"/"send-failed" (a bounce),
+      "exhausted", "concluded", and "refresh" — a stale-head re-review request, counted
+      separately from the bounce budget because it spends a reviewer session, never a
+      bounce
   <state_dir>/bounce-heartbeat.json                   the one-shot `run` pass's last start,
       last finish and result — how an operator tells "ran, nothing to do" from "did not
       run" without reading a launchd log
-  <state_dir>/rereview/<OWNER>__<REPO>/pr-<n>.json    written after each DELIVERED bounce
-      and READ by the poller — the half of the loop that makes a budget above 1 real:
-      {"rereview_schema": "pipeline-rereview-request/1", "pr", "repo", "requested_at",
-       "after_bounce_no", "head_before"}
-      `head_before` is the head this bounce was delivered against. The poller re-reviews
-      the PR on its next pass IF the current head differs — the re-prompted session
-      actually pushed — and DELETES the file once the new review ticket exists. One bounce
-      writes one request and one request buys one review, so review cost can never exceed
-      the bounces spent plus the review the PR was opened with. A request written before
-      that loop existed carries no `rereview_schema`; the poller reads those too
+  <state_dir>/rereview/<OWNER>__<REPO>/pr-<n>.json    the ONLY thing that makes a PR
+      reviewable a second time, written here and READ by the poller. Two kinds:
+      {"rereview_schema": "pipeline-rereview-request/1", "kind", "pr", "repo",
+       "requested_at", "head_before", and the kind's own sequence key}
+        kind "after-bounce" (+ "after_bounce_no") — written after each DELIVERED bounce;
+          the half of the loop that makes a budget above 1 real.
+        kind "stale-head"   (+ "refresh_no")      — the REFRESH: written when the driver
+          holds because the outcome on file judges a head the PR has moved off and NO
+          request is outstanding. Without it that hold is permanent — only a bounce ever
+          asked for a re-review, so a PR whose head moved before its first bounce could
+          never be bounced OR concluded, and said nothing about it. Capped at
+          REFRESH_ALLOWANCE per PR and counted on the ledger below; past the cap the PR
+          is handed to a person instead (verdict CANNOT EVALUATE, exit 2, said on the PR).
+      `head_before` is the head already judged — the bounce's head, or the stale outcome's.
+      The poller re-reviews the PR on its next pass IF the current head differs, and
+      DELETES the file once the new review ticket exists. One request buys exactly one
+      review, so reviewer sessions per PR can never exceed 1 (the opening review) +
+      maxBounces + REFRESH_ALLOWANCE. A request written before this loop existed carries
+      no `rereview_schema` and no `kind`; the poller reads those as "after-bounce"
   <state_dir>/declines/<OWNER>__<REPO>/pr-<n>.json    which could-not reasons were already
       said on the PR, so a five-minute poller says each once, not 288 times a day
   <state_dir>/bounces/…                               §4 telemetry artifacts, handed to
@@ -325,10 +338,27 @@ CREDENTIAL_HOME_NOTE = ("it belongs in the driver's own env file (%s, mode 600) 
 HEARTBEAT_SCHEMA = "pipeline-bounce-heartbeat/1"
 DEFAULT_RUN_TIMEOUT_SECONDS = 900
 LEDGER_SCHEMA = "pipeline-bounce-ledger/1"
-# The re-review request left for the poller after each delivered bounce. It is the only
-# thing that ever makes a PR reviewable a second time, so its shape is a cross-script
-# contract: scripts/pipeline_review_poller.py reads exactly these keys.
+# The re-review request left for the poller. It is the only thing that ever makes a PR
+# reviewable a second time, so its shape is a cross-script contract:
+# scripts/pipeline_review_poller.py reads exactly these keys.
 REREVIEW_SCHEMA = "pipeline-rereview-request/1"
+# Two kinds of request, because there are two reasons a second look is owed, and the
+# poller has to title them apart (it dedups on the exact title, archived tickets
+# included, so two re-reviews sharing one title republish the first one's verdict).
+#   after-bounce — one per DELIVERED bounce, carrying `after_bounce_no`. The loop #87
+#                  built: a bounce says "fix this", the push that follows is re-reviewed.
+#   stale-head   — the REFRESH below, carrying `refresh_no` and no bounce number at all.
+REREVIEW_KIND_BOUNCE = "after-bounce"
+REREVIEW_KIND_STALE = "stale-head"
+# How many stale-head refreshes one pull request may ever buy. A refresh is a reviewer
+# session nobody asked for, so it is capped per PR and counted on the ledger — the same
+# append-only record the bounce budget is counted from — rather than trusted to a flag
+# a crash could lose. One is enough for the shape this exists for (a session that pushes
+# again while its opening review is in flight); past it the PR is handed to a person
+# rather than re-reviewed again, because a head that keeps moving is a person's problem.
+# Worst case per PR: 1 opening review + `maxBounces` after-bounce re-reviews +
+# REFRESH_ALLOWANCE refreshes.
+REFRESH_ALLOWANCE = 1
 # The poller's outcome record (`pipeline_review_poller.OUTCOME_SCHEMA`) — the one shape
 # this driver reads; any other value is refused, never read as best-effort.
 OUTCOME_SCHEMA = "pipeline-review-outcome/1"
@@ -438,7 +468,8 @@ def rereview_request_path(state_dir, owner_repo, pr_number):
     return os.path.join(state_dir, "rereview", repo_slug(owner_repo), "pr-%d.json" % pr_number)
 
 
-def write_rereview_request(state_dir, owner_repo, pr_number, bounce_no, head_before):
+def write_rereview_request(state_dir, owner_repo, pr_number, bounce_no, head_before,
+                           kind=REREVIEW_KIND_BOUNCE, refresh_no=None):
     """Ask the poller for a second look at this PR once its head moves off `head_before`.
 
     Written write-then-rename, because a reader now exists and a half-written file is no
@@ -446,18 +477,42 @@ def write_rereview_request(state_dir, owner_repo, pr_number, bounce_no, head_bef
     lost re-review would otherwise strand every later bounce silently), so a crash during
     a plain in-place write would leave a truncated document that reddens every poller pass
     until a person deletes it. os.replace is atomic, so a reader sees the whole file or no
-    file at all."""
+    file at all.
+
+    The two kinds carry DIFFERENT sequence keys and neither carries the other's. An
+    after-bounce request has `after_bounce_no` and no `refresh_no`; a stale-head refresh
+    has `refresh_no` and no `after_bounce_no`. That is deliberate on both sides: the key
+    is what the poller titles the new review ticket by, and a refresh borrowing a bounce
+    number would collide with that bounce's own re-review ticket and republish its
+    verdict. It also means a poller too old to know about refreshes refuses one LOUDLY
+    (it requires `after_bounce_no`) instead of filing it under a colliding title."""
     path = rereview_request_path(state_dir, owner_repo, pr_number)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    doc = {"rereview_schema": REREVIEW_SCHEMA, "kind": kind, "pr": pr_number,
+           "repo": owner_repo, "requested_at": _now_iso(), "head_before": head_before}
+    if kind == REREVIEW_KIND_STALE:
+        doc["refresh_no"] = refresh_no
+    else:
+        doc["after_bounce_no"] = bounce_no
     tmp = "%s.tmp-%d" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"rereview_schema": REREVIEW_SCHEMA, "pr": pr_number, "repo": owner_repo,
-                   "requested_at": _now_iso(), "after_bounce_no": bounce_no,
-                   "head_before": head_before}, fh)
+        json.dump(doc, fh)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
     return path
+
+
+def rereview_request_outstanding(state_dir, owner_repo, pr_number):
+    """Is a re-review already queued for this PR? Existence, nothing more.
+
+    The driver never parses the request — the poller owns that, and refuses a malformed
+    one loudly on its own pass. What this file needs to know is only whether a second
+    look is already coming, because that is the difference between "ask for one" and
+    "wait for the one already asked for". Treating an unreadable file as "no request" here
+    would have the driver write a second one over it, replacing a problem a person has to
+    see with a fresh file that hides it."""
+    return os.path.exists(rereview_request_path(state_dir, owner_repo, pr_number))
 
 
 def retire_rereview_request(state_dir, owner_repo, pr_number):
@@ -864,6 +919,20 @@ def checks_summary(runs, required, unknown_detail=""):
     return "green", [], ""
 
 
+def outcome_head_is_stale(outcome, head_sha):
+    """True when the recorded review judged a head this PR has since moved off.
+
+    The ONE spelling of the head comparison, because two things now turn on it and they
+    must never disagree: `outcome_is_fresh` REFUSES such an outcome (it cannot buy a
+    bounce or a conclusion), and the refresh path is what stops that refusal being a dead
+    end. An outcome with no head recorded is not stale — nothing is known about which
+    head it judged, and the clock guard is what covers that case."""
+    if not outcome:
+        return False
+    reviewed = str(outcome.get("head_sha") or "")
+    return bool(reviewed and head_sha and reviewed != head_sha)
+
+
 def outcome_is_fresh(outcome, head_sha, last_spent):
     """A review outcome is a trigger only when it is BOTH about the current head AND newer
     than the last bounce. Two guards, and each catches what the other cannot:
@@ -884,10 +953,10 @@ def outcome_is_fresh(outcome, head_sha, last_spent):
     """
     if not outcome:
         return False, "no review outcome is recorded for this PR"
-    reviewed = str(outcome.get("head_sha") or "")
-    if reviewed and head_sha and reviewed != head_sha:
+    if outcome_head_is_stale(outcome, head_sha):
         return False, ("the review outcome is for an older head (%s); not a trigger for %s "
-                       "until re-reviewed" % (reviewed[:12], head_sha[:12]))
+                       "until re-reviewed"
+                       % (str(outcome.get("head_sha"))[:12], head_sha[:12]))
     if last_spent and str(last_spent.get("at") or "") >= str(outcome.get("at") or ""):
         return False, "the review outcome predates the last bounce; not a trigger until re-reviewed"
     return True, ""
@@ -970,7 +1039,8 @@ def conclusion_pending(row, lane_configured):
 
 def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger_ok,
            trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced,
-           cannot_evaluate="", conclusion=None, settled_conclusion=None):
+           cannot_evaluate="", conclusion=None, settled_conclusion=None,
+           stale_head=False, rereview_queued=False, refreshes_spent=0):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
     fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
     then the budget: bounce `prior + 1` while budget remains, exhaust when
@@ -995,7 +1065,20 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     person. It is ranked BELOW `cannot_evaluate` (we must be able to see CI before we can
     say it is clean) and it never outranks a live trigger, a fork, a closed or draft PR
     or a terminal ticket. `settled_conclusion` is the already-written ledger row: with
-    one, the conclusion becomes the named no-op instead of repeating."""
+    one, the conclusion becomes the named no-op instead of repeating.
+
+    `stale_head` is the fourth thing that can sit where the quiet `skip` used to, and the
+    reason it must: a review of a head the PR has moved off can buy neither a bounce nor a
+    conclusion, and before this branch existed NOTHING could replace it — only a delivered
+    bounce ever asked for a re-review, so a PR whose head moved before its first bounce
+    parked forever at exit 0 with nothing red. It is ranked last of the four, under a
+    live trigger and under every hold above: a stale review is the least urgent thing
+    that can be true of a PR, and a red required check bounces without consulting it.
+    Three outcomes, kept apart because two of them look identical from outside (§13):
+    a re-review already queued is WAITING (quiet, correct — one request buys one review),
+    an allowance left is `refresh` (ask for one, once, counted), and an allowance spent is
+    `unknown` — Stage E cannot evaluate this PR at any price it is allowed to pay, and
+    says so on the PR rather than exiting 0 on it forever."""
     def hold(action, reason, bounce_no=None):
         return {"action": action, "reason": reason, "bounce_no": bounce_no}
 
@@ -1022,6 +1105,21 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
         if conclusion:
             return {"action": "conclude", "bounce_no": None, "basis": conclusion,
                     "reason": "Stage E concluded (%s) — %s" % (conclusion, trigger_reason)}
+        if stale_head:
+            if rereview_queued:
+                return hold("skip", "%s — a re-review is already queued for this PR; waiting "
+                                    "for the poller to deliver it" % trigger_reason)
+            if refreshes_spent < REFRESH_ALLOWANCE:
+                return {"action": "refresh", "bounce_no": None,
+                        "refresh_no": refreshes_spent + 1,
+                        "reason": "%s — asking for one re-review of the current head "
+                                  "(refresh %d of %d for this PR)"
+                                  % (trigger_reason, refreshes_spent + 1, REFRESH_ALLOWANCE)}
+            return hold("unknown",
+                        "every review Stage E has for this PR judged a head it has since "
+                        "moved off, and its re-review allowance (%d per PR) is spent: it can "
+                        "neither bounce nor conclude here, so a person is needed — %s"
+                        % (REFRESH_ALLOWANCE, trigger_reason))
         return hold("skip", trigger_reason)
     if in_flight:
         return hold("skip", "bounce %d was already sent for head %s (%s); waiting for a push"
@@ -1152,7 +1250,7 @@ def read_ledger(path):
 
 
 def ledger_view(path, owner_repo, pr_number):
-    """{'prior', 'last_spent', 'exhausted', 'concluded'} for one PR. Only
+    """{'prior', 'last_spent', 'exhausted', 'concluded', 'refreshes'} for one PR. Only
     `outcome == "spent"` rows count toward the budget — those are appended BEFORE a send,
     so a failed send still spent its bounce (over-count, never under-count). A missing
     ledger reads as zero; an unreadable or corrupt one raises (read_ledger) rather than
@@ -1160,8 +1258,15 @@ def ledger_view(path, owner_repo, pr_number):
 
     `concluded` is the LAST such row, not a count: a conclusion whose lane move failed
     appends another on the retry, exactly as a partly-announced exhaustion does, and the
-    newest row is the current state of it."""
-    prior, last_spent, exhausted, concluded = 0, None, None, None
+    newest row is the current state of it.
+
+    `refreshes` counts the stale-head re-reviews this PR has bought (`outcome ==
+    "refresh"`). They are a SEPARATE count from `prior` on purpose: a refresh spends a
+    reviewer session, never a bounce, and folding the two would let a refresh eat the
+    budget a person set for findings. It is counted here rather than kept in a flag for
+    the same reason the bounce budget is — this file is the only durable record either
+    survives a crash in."""
+    prior, last_spent, exhausted, concluded, refreshes = 0, None, None, None, 0
     for row in read_ledger(path):
         if row.get("repo") != owner_repo or row.get("pr") != pr_number:
             continue
@@ -1172,8 +1277,10 @@ def ledger_view(path, owner_repo, pr_number):
             exhausted = row
         elif row.get("outcome") == "concluded":
             concluded = row
+        elif row.get("outcome") == "refresh":
+            refreshes += 1
     return {"prior": prior, "last_spent": last_spent, "exhausted": exhausted,
-            "concluded": concluded}
+            "concluded": concluded, "refreshes": refreshes}
 
 
 def append_row(path, **fields):
@@ -1912,6 +2019,9 @@ def _gather_after_pr(sit, cfg, state_dir):
         runs, required, checks_detail)
 
     sit.update(ledger_view(ledger_path(state_dir), owner_repo, pr_number))
+    # Whether a second look is already coming. Read here, with the rest of the facts, so
+    # the verdict stays a pure function of the situation.
+    sit["rereview_queued"] = rereview_request_outstanding(state_dir, owner_repo, pr_number)
 
     issue = linear_issue(sit["ticket_id"], cfg)
     sit["issue"] = issue
@@ -1988,7 +2098,10 @@ def decision_for(sit, cfg):
                      max_bounces=sit.get("max_bounces", 0), in_flight=in_flight,
                      head_sha=sit.get("head_sha"), exhausted_announced=announced,
                      cannot_evaluate=cannot_evaluate, conclusion=basis,
-                     settled_conclusion=settled)
+                     settled_conclusion=settled,
+                     stale_head=outcome_head_is_stale(sit.get("outcome"), sit.get("head_sha")),
+                     rereview_queued=bool(sit.get("rereview_queued")),
+                     refreshes_spent=sit.get("refreshes", 0))
     verdict["trigger"] = kind if trigger_ok else None
     verdict["trigger_reason"] = trigger_reason
     verdict["cannot_evaluate"] = cannot_evaluate or None
@@ -2006,6 +2119,8 @@ def describe(sit, verdict):
         head = "EXHAUST"
     elif action == "conclude":
         head = "CONCLUDE (%s)" % (verdict.get("basis") or "clean")
+    elif action == "refresh":
+        head = "REFRESH %d of %d" % (verdict.get("refresh_no") or 1, REFRESH_ALLOWANCE)
     elif action == "unknown":
         head = "CANNOT EVALUATE"     # never the same word as `skip`: that was the defect
     else:
@@ -2110,6 +2225,53 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
         "max_bounces": sit["max_bounces"], "reason": verdict["reason"]}, cfg)
     print("%s — delivered via %s (%s); telemetry: %s"
           % (describe(sit, verdict), via, ref, emit_status))
+    return EXIT_OK
+
+
+def perform_refresh(sit, verdict, cfg, state_dir, dry_run):
+    """Ask the poller for ONE re-review of the current head, because the review on file
+    judged a head this PR has moved off.
+
+    This is the un-sticking move, and the whole of it is a ledger row and a request file.
+    It sends nothing, comments nothing, labels nothing, moves nothing and spends no
+    bounce: the poller does the reviewing, on its own pass, under its own fork and draft
+    guards, and the outcome it writes is what lets the NEXT pass here bounce or conclude
+    normally.
+
+    Ledger row FIRST, then the request — the same ordering as a bounce, and for the same
+    reason. The row is what caps the spend, so a crash between the two must cost the
+    allowance rather than leave a request nothing counted. The cost of that ordering is
+    one PR that gets no refresh; the cost of the other is a refresh loop nothing bounds.
+
+    `head_before` is the head the STALE OUTCOME judged, not the current head: the poller's
+    rule is "re-review once the head differs from `head_before`", and it already does —
+    that difference is the reason this request exists — so the re-review is due on the
+    poller's very next pass rather than waiting for another push that may never come."""
+    reviewed_head = str((sit.get("outcome") or {}).get("head_sha") or "")
+    refresh_no = verdict.get("refresh_no") or 1
+    if dry_run:
+        print("[dry-run] %s" % describe(sit, verdict))
+        print("[dry-run] would ask the poller to re-review %s#%d: the outcome on file judges "
+              "%s and the PR is at %s — nothing written, no bounce spent"
+              % (sit["repo"], sit["pr"], reviewed_head[:12] or "?",
+                 (sit.get("head_sha") or "?")[:12]))
+        return EXIT_OK
+    append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"],
+               ticket_id=sit.get("ticket_id"), outcome="refresh", refresh_no=refresh_no,
+               head_sha=sit.get("head_sha"), reviewed_head=reviewed_head)
+    try:
+        path = write_rereview_request(state_dir, sit["repo"], sit["pr"], None, reviewed_head,
+                                      kind=REREVIEW_KIND_STALE, refresh_no=refresh_no)
+    except OSError as exc:
+        # The allowance is spent and nothing asked for it. Say so now; the next pass sees a
+        # spent allowance against a still-stale outcome and hands the PR to a person (§13).
+        sys.stderr.write("FAIL: %s#%d: refresh %d of %d was counted on the ledger but the "
+                         "re-review request could not be written (%s); the next pass will "
+                         "say on the PR that a person is needed\n"
+                         % (sit["repo"], sit["pr"], refresh_no, REFRESH_ALLOWANCE, exc))
+        return EXIT_USAGE
+    print("%s — requested (%s); the poller re-reviews this PR on its next pass"
+          % (describe(sit, verdict), path))
     return EXIT_OK
 
 
@@ -2369,6 +2531,8 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         return act(perform_exhaust)
     if verdict["action"] == "conclude":
         return act(perform_conclude)
+    if verdict["action"] == "refresh":
+        return act(perform_refresh)
     print(describe(sit, verdict))
     return EXIT_OK
 
@@ -2589,6 +2753,18 @@ def selftest():
     check("…but a genuine RE-review of that head, postdating the bounce, is",
           outcome_is_fresh(dict(above, head_sha="bbb", at="2026-01-04T00:00:00Z"), "bbb",
                            {"at": "2026-01-03T00:00:00Z"})[0], True)
+    # The HEAD guard's one comparison, which the refusal and the refresh both read. An
+    # outcome with no head recorded is NOT stale by head — nothing is known about which
+    # head it judged, and it is the clock guard that covers that case. Reading it as stale
+    # would buy a refresh for every PR reviewed before the poller recorded heads at all.
+    check("stale by head is exactly 'a head is recorded and it is not this one'",
+          [outcome_head_is_stale(o, h) for o, h in (
+              (dict(above, head_sha="aaa"), "bbb"),     # judged another head → stale
+              (dict(above, head_sha="bbb"), "bbb"),     # judged this one     → not
+              (above, "bbb"),                           # no head recorded    → not
+              (dict(above, head_sha="aaa"), ""),        # no current head     → not
+              (None, "bbb"))],                          # no outcome          → not
+          [True, False, False, False, False])
 
     # 4a2. A conclusion RETIRES any outstanding re-review request. Reachable without any
     #      push at all: a bounce leaves a request naming the head it bounced, a flaky
@@ -2607,6 +2783,28 @@ def selftest():
               (write_rereview_request(tmp, "o/r", 42, 1, "bbbb") and
                retire_rereview_request(tmp, "o/r", 41) == "" and
                os.path.exists(rereview_request_path(tmp, "o/r", 42))), True)
+        check("a conclusion retires a stale-head refresh too, not only a bounce's request",
+              (write_rereview_request(tmp, "o/r", 43, None, "cccc", kind=REREVIEW_KIND_STALE,
+                                      refresh_no=1) and
+               retire_rereview_request(tmp, "o/r", 43).startswith("retired"),
+               os.path.exists(rereview_request_path(tmp, "o/r", 43))), (True, False))
+        # The two kinds carry DIFFERENT sequence keys and never the other's. Sharing one
+        # would put a refresh under a bounce's re-review title, where the poller's dedup
+        # search finds that bounce's closed ticket and republishes its verdict.
+        check("an after-bounce request carries a bounce number and no refresh number",
+              sorted(json.load(open(write_rereview_request(tmp, "o/r", 44, 2, "dddd"),
+                                    encoding="utf-8"))),
+              ["after_bounce_no", "head_before", "kind", "pr", "repo", "requested_at",
+               "rereview_schema"])
+        check("a stale-head refresh carries a refresh number and no bounce number",
+              sorted(json.load(open(write_rereview_request(tmp, "o/r", 45, None, "eeee",
+                                                           kind=REREVIEW_KIND_STALE, refresh_no=1),
+                                    encoding="utf-8"))),
+              ["head_before", "kind", "pr", "refresh_no", "repo", "requested_at",
+               "rereview_schema"])
+        check("an outstanding request is seen by existence alone — the poller parses it",
+              (rereview_request_outstanding(tmp, "o/r", 45),
+               rereview_request_outstanding(tmp, "o/r", 46)), (True, False))
 
     # …and the write is ATOMIC, asserted over the source the way this file asserts its
     # other invariants: no behavioural check can see the difference until a process dies
@@ -2694,6 +2892,42 @@ def selftest():
     check("a conclusion settled with the lane OFF says the ticket was NOT moved",
           "was NOT moved" in decide(prior=0, **dict(cleared, conclusion="clean",
                                                     settled_conclusion={"basis": "clean", "moved": False}))["reason"], True)
+
+    # 5c. THE STRANDED PR, and the three answers to it. A review of a head the PR has moved
+    #     off can buy neither a bounce nor a conclusion, and before this branch existed
+    #     nothing could replace it: only a delivered bounce ever asked for a re-review, so a
+    #     PR whose head moved before its first bounce parked at the quiet `skip` — never
+    #     bounced, never concluded, exit 0, nothing red — for the rest of its life.
+    stale = dict(base, trigger_ok=False,
+                 trigger_reason="the review outcome is for an older head (aaaa1111)",
+                 stale_head=True)
+    d = decide(prior=0, **stale)
+    check("a stale-by-head review asks for ONE re-review instead of parking",
+          (d["action"], d["refresh_no"]), ("refresh", 1))
+    check("…and a re-review already queued is WAITED for, never asked for twice",
+          decide(prior=0, **dict(stale, rereview_queued=True))["action"], "skip")
+    check("…the wait says so, so it is not read as 'nothing to do'",
+          "already queued" in decide(prior=0, **dict(stale, rereview_queued=True))["reason"], True)
+    check("…and the allowance is per PR: spent means spent",
+          decide(prior=0, **dict(stale, refreshes_spent=REFRESH_ALLOWANCE))["action"], "unknown")
+    check("…which is a could-not that names a person, not a quiet skip (§13)",
+          "a person is needed" in decide(prior=0, **dict(stale, refreshes_spent=REFRESH_ALLOWANCE))["reason"], True)
+    # Its rank: last of the four things that can sit where the quiet skip used to, and
+    # under every hold that means "not ours to judge". A refresh buys a reviewer session,
+    # so every cheaper answer wins first.
+    check("a LIVE trigger always outranks a refresh — red CI bounces without a review",
+          decide(prior=0, **dict(base, stale_head=True))["action"], "bounce")
+    check("CANNOT EVALUATE outranks a refresh",
+          decide(prior=0, **dict(stale, cannot_evaluate="CI unreadable"))["action"], "unknown")
+    check("a settled conclusion outranks a refresh — Stage E is done with this PR",
+          decide(prior=0, **dict(stale, settled_conclusion={"basis": "clean", "moved": True}))["action"], "noop")
+    for label, over in (("fork", {"is_fork": True}), ("closed PR", {"pr_open": False}),
+                        ("draft", {"is_draft": True}), ("terminal ticket", {"ticket_terminal": True})):
+        check("a %s is never refreshed — it is not ours to review at all" % label,
+              decide(prior=0, **dict(stale, **over))["action"], "skip")
+    check("an exhausted budget does not stop a refresh: a fresh review is what tells "
+          "'hand it over' from 'bounce again'",
+          decide(prior=9, **stale)["action"], "refresh")
 
     # 6. parse_delivery: OK / BROKEN shapes (absence is decided before parsing).
     ok_cfg = json.dumps({"version": 1, "budgets": {"maxBounces": 2, "reviewSeverityThreshold": "medium"},
@@ -3408,6 +3642,13 @@ def selftest():
             check("stale outcome: reason says it predates the last bounce", "predates the last bounce" in buf.getvalue(), True)
             world["pr"] = open_pr
         #      …and with a head recorded, a review of an OLDER head is stale by that head.
+        #      That refusal used to be a DEAD END, and the common one: the poller opens its
+        #      review at PR-open while the session is still pushing under /ship's CI watch,
+        #      so the only outcome on file judged a head the PR has already left. Nothing
+        #      could replace it — only a delivered bounce ever asked for a re-review — so the
+        #      PR was never bounced, never concluded, exit 0, nothing red. The driver now
+        #      asks for ONE re-review of the current head, capped per PR and counted on the
+        #      ledger, and says so on the PR when the cap is gone.
         with tempfile.TemporaryDirectory() as tmp:
             write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), dict(poller_record, head_sha="aaaa1111"))
             world["pr"] = dict(open_pr, headRefOid="dddd4444")
@@ -3415,8 +3656,65 @@ def selftest():
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("outcome for an older head: exit 0, nothing sent", (rc, calls), (EXIT_OK, []))
-            check("outcome for an older head: reason says older head", "older head" in buf.getvalue(), True)
+            rr = rereview_request_path(tmp, "o/r", 41)
+            check("outcome for an older head: exit 0, nothing sent to Linear",
+                  (rc, kinds(), linear_writes()), (EXIT_OK, [], []))
+            check("outcome for an older head: the verdict is REFRESH and says why",
+                  ("REFRESH 1 of %d" % REFRESH_ALLOWANCE in buf.getvalue(),
+                   "older head" in buf.getvalue()), (True, True))
+            doc = json.load(open(rr, encoding="utf-8"))
+            check("the refresh asks the poller for the CURRENT head — head_before is the "
+                  "head already judged, so it is due on the next pass without a new push",
+                  (doc["kind"], doc["head_before"], doc["refresh_no"], "after_bounce_no" in doc),
+                  (REREVIEW_KIND_STALE, "aaaa1111", 1, False))
+            rows = read_ledger(ledger_path(tmp))
+            check("the refresh is counted on the ledger, and spends no bounce",
+                  ([(r["outcome"], r.get("refresh_no")) for r in rows],
+                   ledger_view(ledger_path(tmp), "o/r", 41)["prior"]),
+                  ([("refresh", 1)], 0))
+            # A second pass while the request is still on disk must not write another. One
+            # request buys one review; two would buy two reviewers for one moved head.
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("a queued re-review is waited for, not asked for twice",
+                  (rc, calls, len(read_ledger(ledger_path(tmp)))), (EXIT_OK, [], 1))
+            check("…and the pass says it is waiting", "already queued" in buf.getvalue(), True)
+            # The poller spends the request and the session pushes AGAIN before its review
+            # lands, so the new outcome is stale too. The allowance is gone: this is a
+            # could-not, never a quiet exit 0 (§13).
+            os.remove(rr)
+            calls.clear()
+            buf, e2 = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(e2):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("allowance spent and still stale: exit 2, one PR comment, nothing to Linear",
+                  (rc, kinds(), linear_writes()), (EXIT_USAGE, ["prComment"], []))
+            check("…the comment says the allowance is spent and a person is needed",
+                  ("allowance" in body_of("prComment") and "a person is needed" in body_of("prComment")),
+                  True)
+            check("…the verdict is CANNOT EVALUATE, never 'skip'",
+                  ("CANNOT EVALUATE" in (buf.getvalue() + e2.getvalue()),
+                   "skip" in buf.getvalue()), (True, False))
+            check("…and no second refresh was counted, so the cap holds",
+                  ledger_view(ledger_path(tmp), "o/r", 41)["refreshes"], 1)
+            check("…and nothing was written for the poller either", os.path.exists(rr), False)
+            world["pr"] = open_pr
+        #      A dry run reports the refresh and writes neither the row nor the request.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), dict(poller_record, head_sha="aaaa1111"))
+            world["pr"] = dict(open_pr, headRefOid="dddd4444")
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", True)
+            check("--dry-run refresh: exit 0, reported, nothing written anywhere",
+                  (rc, calls, os.path.exists(ledger_path(tmp)),
+                   os.path.exists(rereview_request_path(tmp, "o/r", 41))),
+                  (EXIT_OK, [], False, False))
+            check("--dry-run refresh: it says what it would ask for",
+                  "would ask the poller to re-review" in buf.getvalue(), True)
             world["pr"] = open_pr
         #      A record this driver cannot understand is a could-not: exit 2, said on the PR
         #      (path-free), nothing to Linear, no ledger — never "nothing to do".
@@ -4118,7 +4416,11 @@ def selftest():
           "does and the branch fallback says why; C3: the ledger is the budget and the "
           "re-prompt carries its visible record, which can refuse but never grant a bounce; "
           "every delivered bounce leaves a re-review request naming the head it bounced, which "
-          "is what lets the poller re-review and a budget above 1 mean anything")
+          "is what lets the poller re-review and a budget above 1 mean anything; and a review "
+          "of a head the PR has moved off is no longer a dead end — one capped, "
+          "ledger-counted refresh asks for a re-review of the current head, a queued one is "
+          "waited for rather than asked for twice, and a spent allowance hands the PR to a "
+          "person on the PR instead of parking it at exit 0")
     return 0
 
 

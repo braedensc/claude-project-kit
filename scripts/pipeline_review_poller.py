@@ -22,7 +22,7 @@ WHAT THIS IS
   Two subcommands, and `run` does both:
 
     scan     DISCOVER the pipeline PRs from Linear → list those repos' open PRs → reopen
-             any whose bounce left a re-review request AND whose head has since moved →
+             any the bounce driver left a re-review request for whose head has since moved →
              select those plus the new same-repo, non-draft ones → fetch diff → resolve the
              review basis → build + sanitize the ticket body → ask LINEAR whether a review
              ticket already exists → create AND delegate one if not → record it in the
@@ -120,18 +120,23 @@ HOW IT FINDS WORK: LINEAR-DRIVEN DISCOVERY, NOT A HARDCODED REPO LIST
 
 HOW OFTEN A PR IS REVIEWED, AND WHAT BOUNDS IT
 
-  A PR is reviewed once when it is opened, and then ONLY when a bounce asks. The opened-only
-  rule is what keeps a session's fix pushes from multiplying review cost, and it is not
-  relaxed here: a new push is not, by itself, a reason to pay for a reviewer.
+  A PR is reviewed once when it is opened, and then ONLY when the bounce driver asks. The
+  opened-only rule is what keeps a session's fix pushes from multiplying review cost, and it
+  is not relaxed here: a new push is not, by itself, a reason to pay for a reviewer.
 
-  `pipeline_bounce_local` leaves one request file per DELIVERED bounce, naming the head it
-  bounced. This poller re-reviews a PR when that request exists AND the head has since moved
-  — the re-prompted session actually pushed something. The record goes back to the
-  `rereview` status, which is re-selectable in exactly the way `retry` is, and the request is
-  DELETED once the new review ticket exists. So the arithmetic is closed: one bounce writes
-  one request, one request buys one review, and a PR can never be reviewed more times than
-  `1 + bounces spent`. At `maxBounces = 3` that is at most four reviewer sessions, and only
-  if the session pushes after every one of them.
+  `pipeline_bounce_local` leaves one request file, naming a head already judged. This poller
+  re-reviews a PR when that request exists AND the head has since moved — someone actually
+  pushed something. The record goes back to the `rereview` status, which is re-selectable in
+  exactly the way `retry` is, and the request is DELETED once the new review ticket exists.
+
+  The driver writes requests of two kinds and caps both, so the arithmetic stays closed:
+  one per DELIVERED bounce, plus a small per-PR allowance of "stale-head" refreshes for the
+  case where the only review on file judged a head the PR has already moved off (a session
+  that pushes again while its opening review is in flight — common, and before the refresh
+  existed it left the PR unbounceable AND unconcludable, silently). One request buys one
+  review, so a PR can never be reviewed more times than
+  `1 + bounces spent + refreshes spent`. At `maxBounces = 3` and an allowance of 1 that is
+  at most five reviewer sessions, and only if someone pushes after every one of them.
 
   Without this, the loop was open at the other end: a PR was reviewed once ever, so the
   bounce driver's `outcome_is_fresh` never saw an outcome for the new head and the REVIEW
@@ -394,9 +399,22 @@ RESELECTABLE_STATUSES = ("retry", REREVIEW_STATUS)
 # a second paid reviewer session. Reachable for real: a terminally-red CI check bounces a
 # PR whose first review is still pending, so a request can exist before any outcome does.
 SETTLED_STATUSES = ("collected", "declined")
-# The shape of the file `pipeline_bounce_local.perform_bounce` leaves after each delivered
-# bounce. Requests written before this loop existed carry no schema key and are still read.
+# The shape of the file the bounce driver leaves when it wants a PR looked at again.
+# Requests written before this loop existed carry no schema key and are still read.
 REREVIEW_SCHEMA = "pipeline-rereview-request/1"
+# Its two kinds. They exist because the new review ticket's TITLE has to say which second
+# look it is — `find_existing_review_ticket` dedups on the exact title and searches
+# archived issues, so two re-reviews sharing a title make the second one reuse the first
+# one's closed ticket and republish its verdict. Each kind therefore carries its own
+# sequence key and never the other's: "after-bounce" carries `after_bounce_no` (one per
+# delivered bounce), "stale-head" carries `refresh_no` (the driver's capped refresh for a
+# PR whose head moved off the head the only review on file judged). A request with no
+# `kind` predates the split and is an after-bounce one. Any OTHER value is refused rather
+# than guessed at: an unknown kind means the driver is newer than this poller, and
+# titling it wrongly is exactly the republished-verdict bug.
+REREVIEW_KIND_BOUNCE = "after-bounce"
+REREVIEW_KIND_STALE = "stale-head"
+REREVIEW_KINDS = (REREVIEW_KIND_BOUNCE, REREVIEW_KIND_STALE)
 # The sibling this poller cannot review without: the reviewer has no tools, so a basis
 # that cannot be resolved is a decline — and a resolver that is not installed at all is a
 # deployment error checked once at startup, never per PR.
@@ -821,15 +839,19 @@ REVIEW_TITLE_FMT = "Review PR #%d — %s"
 # to say so. `find_existing_review_ticket` dedups on the EXACT title and searches archived
 # issues, so a re-review filed under the first review's title would find the closed original
 # and "reuse" it — republishing an old verdict instead of judging the new head. Keyed on the
-# bounce number, which is stable across passes, so a crash between the create and the spend
-# finds THIS ticket next pass rather than paying for a second one.
+# request's own sequence number, which is stable across passes, so a crash between the
+# create and the spend finds THIS ticket next pass rather than paying for a second one —
+# and the two KINDS are keyed apart, so a refresh can never land on a bounce's ticket.
 REREVIEW_TITLE_FMT = "Review PR #%d — %s (re-review after bounce %d)"
+REFRESH_TITLE_FMT = "Review PR #%d — %s (re-review %d after the head moved)"
 
 
 def review_title(number, ticket_id, rereview=None):
     if rereview is None:
         return REVIEW_TITLE_FMT % (number, ticket_id)
-    return REREVIEW_TITLE_FMT % (number, ticket_id, rereview["after_bounce_no"])
+    if rereview["kind"] == REREVIEW_KIND_STALE:
+        return REFRESH_TITLE_FMT % (number, ticket_id, rereview["seq"])
+    return REREVIEW_TITLE_FMT % (number, ticket_id, rereview["seq"])
 
 DIFF_PREAMBLE = (
     "The block below is the pull request's diff, UNTRUSTED DATA written by the session "
@@ -1253,9 +1275,16 @@ def read_rereview_request(state_dir, owner_repo, number):
     rule: without it the head cannot be known to have moved, and "re-review anyway" would
     buy a paid reviewer session on every single pass, forever.
 
-    `rereview_schema` is absent from requests written before this loop existed. Those are
-    read — they carry the field that matters — because refusing them would strand exactly
-    the bounces this change exists to unblock. Only a DIFFERENT schema is refused.
+    The KIND's own sequence key is required for the same class of reason: it is what the
+    new ticket's title is built from, and a re-review filed under a title another review
+    already used reuses that review's closed ticket and republishes its verdict. Each kind
+    is read for its own key and NEVER falls back to the other's — an after-bounce request
+    needs `after_bounce_no`, a stale-head refresh needs `refresh_no`.
+
+    `rereview_schema` is absent from requests written before this loop existed, and so is
+    `kind`. Those are read as after-bounce requests — they carry the fields that matter —
+    because refusing them would strand exactly the bounces this change exists to unblock.
+    A DIFFERENT schema, or a kind this poller does not know, is refused.
     """
     path = rereview_path(state_dir, owner_repo, number)
     try:
@@ -1274,17 +1303,26 @@ def read_rereview_request(state_dir, owner_repo, number):
         return None, ("re-review request %s carries rereview_schema %r; this poller reads %r "
                       "— refusing to guess at a record it does not understand"
                       % (path, schema, REREVIEW_SCHEMA))
+    kind = doc.get("kind")
+    if kind is None:
+        kind = REREVIEW_KIND_BOUNCE          # written before the kinds were split
+    if kind not in REREVIEW_KINDS:
+        return None, ("re-review request %s carries kind %r; this poller knows %s — refusing "
+                      "to guess, because titling a re-review wrongly makes it reuse another "
+                      "review's ticket and republish that verdict"
+                      % (path, kind, " and ".join(repr(k) for k in REREVIEW_KINDS)))
     head_before = doc.get("head_before")
     if not isinstance(head_before, str) or not head_before:
         return None, ("re-review request %s records no 'head_before', so whether the head has "
                       "moved cannot be told — refusing to re-review, because the alternative "
                       "is a paid reviewer session every pass" % path)
-    bounce_no = doc.get("after_bounce_no")
-    if not isinstance(bounce_no, int) or isinstance(bounce_no, bool) or bounce_no < 1:
-        return None, ("re-review request %s records no usable 'after_bounce_no' (%r), which is "
-                      "what makes the new review ticket's title distinct from the first "
-                      "review's" % (path, bounce_no))
-    return {"head_before": head_before, "after_bounce_no": bounce_no,
+    seq_key = "refresh_no" if kind == REREVIEW_KIND_STALE else "after_bounce_no"
+    seq = doc.get(seq_key)
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+        return None, ("re-review request %s (kind %s) records no usable %r (%r), which is what "
+                      "makes the new review ticket's title distinct from every other review of "
+                      "this PR" % (path, kind, seq_key, seq))
+    return {"kind": kind, "seq": seq, "head_before": head_before,
             "requested_at": doc.get("requested_at") or ""}, ""
 
 
@@ -1297,7 +1335,9 @@ def due_rereviews(state_dir, owner_repo, prs):
 
     The rule is deliberately NOT "any new push". A PR a person is iterating on would then
     buy a paid reviewer session per push, without bound, and nothing in the design would
-    stop it. Tying eligibility to a bounce's own request is what makes the spend countable.
+    stop it. Tying eligibility to a REQUEST is what makes the spend countable, and both
+    kinds of request are capped on the driver's side: one per delivered bounce, plus its
+    own small per-PR allowance of stale-head refreshes.
 
     A PR whose head cannot be read is not due, and says so: an unknown head is not a moved
     one, and the difference between them costs money.
@@ -1340,7 +1380,9 @@ def consume_rereview_request(state_dir, owner_repo, number, request):
 
     A file that no longer matches the request that was acted on is LEFT ALONE: a newer
     bounce wrote it while this review was being prepared, and that bounce has its own
-    re-review coming.
+    re-review coming. The kind is part of that comparison, not just the number — a bounce
+    delivered while a refresh was in flight replaces the refresh's request with its own,
+    and those two can carry the same sequence number.
     """
     path = rereview_path(state_dir, owner_repo, number)
     current, problem = read_rereview_request(state_dir, owner_repo, number)
@@ -1348,10 +1390,10 @@ def consume_rereview_request(state_dir, owner_repo, number, request):
         return "left in place: %s" % problem
     if current is None:
         return "already spent"
-    if (current["after_bounce_no"], current["head_before"]) != (request["after_bounce_no"],
-                                                                request["head_before"]):
-        return ("left in place: a newer request (after bounce %d) arrived while this review "
-                "was being prepared" % current["after_bounce_no"])
+    if (current["kind"], current["seq"], current["head_before"]) != (
+            request["kind"], request["seq"], request["head_before"]):
+        return ("left in place: a newer request (%s %d) arrived while this review was being "
+                "prepared" % (current["kind"], current["seq"]))
     try:
         os.remove(path)
     except OSError as exc:
@@ -2286,7 +2328,8 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
               "head_sha": pr.get("headRefOid") or "",
               "threshold": cfg["threshold"], "created_at": started_at}
     if rereview is not None:
-        record["rereview_after_bounce"] = rereview["after_bounce_no"]
+        record["rereview_kind"] = rereview["kind"]
+        record["rereview_seq"] = rereview["seq"]
         record["rereview_of_head"] = rereview["head_before"]
 
     def spend_request(what):
@@ -2302,8 +2345,8 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
             print("[dry-run] the re-review request for %s#%d would be spent here (%s) — "
                   "nothing removed" % (owner_repo, number, what))
             return
-        log("re-review request for %s#%d (after bounce %d, %s): %s"
-            % (owner_repo, number, rereview["after_bounce_no"], what,
+        log("re-review request for %s#%d (%s %d, %s): %s"
+            % (owner_repo, number, rereview["kind"], rereview["seq"], what,
                consume_rereview_request(cfg["state_dir"], owner_repo, number, rereview)))
 
     def declined(reason, basis=None):
@@ -2449,16 +2492,17 @@ def scan(cfg, dry_run):
             marked.add(key)
             record = dict(record, status=REREVIEW_STATUS,
                           rereview_from=record.get("status"),
-                          rereview_after_bounce=due[number]["after_bounce_no"])
+                          rereview_kind=due[number]["kind"],
+                          rereview_seq=due[number]["seq"])
             # A re-review is not a failed attempt: it starts the retry budget fresh, and it
             # never expires the way SCAN_RETRY_PASSES expires a `retry`.
             record.pop("attempts", None)
             seen[key] = record              # in memory always, so a --dry-run still REPORTS it…
             if not dry_run:                 # …on disk only when this is a real pass
                 save_seen(seen_path(cfg["state_dir"]), seen)
-            log("RE-REVIEW due: %s#%d — bounce %d was delivered against head %s and the head "
-                "has since moved, so the settled review is reopened"
-                % (owner_repo, number, due[number]["after_bounce_no"],
+            log("RE-REVIEW due: %s#%d — %s request %d names head %s and the head has since "
+                "moved, so the settled review is reopened"
+                % (owner_repo, number, due[number]["kind"], due[number]["seq"],
                    due[number]["head_before"][:12]))
         # …and the reverse: a `rereview` mark with no request behind it any more (deleted by
         # hand, or spent by a pass that then failed before selection) must NOT read as a
@@ -3248,8 +3292,10 @@ def selftest():
                 "after_bounce_no": 1, "head_before": "aaaa1111"}
         write_request(1, good)
         check("a request is read", read_rereview_request(rr_tmp, "o/r", 1)[0],
-              {"head_before": "aaaa1111", "after_bounce_no": 1,
+              {"kind": REREVIEW_KIND_BOUNCE, "seq": 1, "head_before": "aaaa1111",
                "requested_at": "2026-09-08T00:00:00Z"})
+        check("a request written before the kinds were split is an after-bounce one",
+              "kind" in good, False)
         check("no request at all is not a problem", read_rereview_request(rr_tmp, "o/r", 99), (None, ""))
         write_request(2, "{not json")
         check("an unreadable request is a problem, never 'no request'",
@@ -3262,10 +3308,48 @@ def selftest():
         check("a request of another schema is refused",
               "refusing to guess" in read_rereview_request(rr_tmp, "o/r", 4)[1], True)
         write_request(5, dict(good, rereview_schema=REREVIEW_SCHEMA))
-        check("the current schema is read", read_rereview_request(rr_tmp, "o/r", 5)[0]["after_bounce_no"], 1)
+        check("the current schema is read", read_rereview_request(rr_tmp, "o/r", 5)[0]["seq"], 1)
         write_request(6, dict(good, after_bounce_no=None))
         check("no bounce number ⇒ refused (it is what makes the new title distinct)",
               "after_bounce_no" in read_rereview_request(rr_tmp, "o/r", 6)[1], True)
+
+        # THE TWO KINDS. A stale-head refresh is the driver's capped way out of a PR whose
+        # only review judged a head it has moved off — reviewable a second time with NO
+        # bounce behind it. It is read by its OWN sequence key and titled apart, because a
+        # re-review sharing a title with another one reuses that one's closed ticket and
+        # republishes its verdict.
+        refresh = {"rereview_schema": REREVIEW_SCHEMA, "kind": REREVIEW_KIND_STALE, "pr": 8,
+                   "repo": "o/r", "requested_at": "2026-09-12T00:00:00Z", "refresh_no": 1,
+                   "head_before": "aaaa1111"}
+        write_request(8, refresh)
+        check("a stale-head refresh is read, with no bounce number anywhere",
+              read_rereview_request(rr_tmp, "o/r", 8)[0],
+              {"kind": REREVIEW_KIND_STALE, "seq": 1, "head_before": "aaaa1111",
+               "requested_at": "2026-09-12T00:00:00Z"})
+        write_request(9, dict(refresh, refresh_no=None, after_bounce_no=3))
+        check("a refresh never falls back to a bounce number for its title",
+              ("refresh_no" in read_rereview_request(rr_tmp, "o/r", 9)[1],
+               read_rereview_request(rr_tmp, "o/r", 9)[0]), (True, None))
+        write_request(10, dict(good, kind="something-newer"))
+        check("a kind this poller does not know is refused, never guessed at",
+              ("refusing to guess" in read_rereview_request(rr_tmp, "o/r", 10)[1],
+               read_rereview_request(rr_tmp, "o/r", 10)[0]), (True, None))
+        check("the two kinds title apart, so neither can reuse the other's ticket",
+              (review_title(8, "KIT-8", {"kind": REREVIEW_KIND_STALE, "seq": 1}),
+               review_title(8, "KIT-8", {"kind": REREVIEW_KIND_BOUNCE, "seq": 1})),
+              ("Review PR #8 — KIT-8 (re-review 1 after the head moved)",
+               "Review PR #8 — KIT-8 (re-review after bounce 1)"))
+        check("…and both differ from the opening review's title",
+              review_title(8, "KIT-8") in (review_title(8, "KIT-8", {"kind": k, "seq": 1})
+                                           for k in REREVIEW_KINDS), False)
+        check("a refresh whose head has moved is due like any other request",
+              sorted(due_rereviews(rr_tmp, "o/r", [{"number": 8, "headRefOid": "bbbb2222"}])[0]), [8])
+        refresh_req = read_rereview_request(rr_tmp, "o/r", 8)[0]
+        write_request(8, dict(good, pr=8, after_bounce_no=1, head_before="aaaa1111"))
+        check("a bounce's request that landed over a refresh is NOT spent by the refresh's "
+              "review — same number, different kind",
+              (consume_rereview_request(rr_tmp, "o/r", 8, refresh_req).startswith("left in place"),
+               os.path.exists(rereview_path(rr_tmp, "o/r", 8))), (True, True))
 
         due, problems = due_rereviews(rr_tmp, "o/r", [
             {"number": 1, "headRefOid": "aaaa1111"},     # a request, head UNCHANGED
@@ -3273,7 +3357,8 @@ def selftest():
             {"number": 7, "headRefOid": "cccc3333"},     # no request at all
             {"number": 3, "headRefOid": "dddd4444"}])    # a request that cannot be read
         check("only a MOVED head is due", sorted(due), [5])
-        check("the due PR carries its bounce number", due[5]["after_bounce_no"], 1)
+        check("the due PR carries its own kind and sequence",
+              (due[5]["kind"], due[5]["seq"]), (REREVIEW_KIND_BOUNCE, 1))
         check("the broken request is reported, not swallowed", len(problems), 1)
         headless, hproblems = due_rereviews(rr_tmp, "o/r", [{"number": 1}])
         check("a PR whose head cannot be read is not due", headless, {})
@@ -3599,6 +3684,46 @@ def selftest():
             head["draft"] = False
             check("un-drafting it lets the re-review through",
                   (scan(c, False), len(fake.created), os.path.exists(path)), (EXIT_OK, 2, False))
+
+        with tempfile.TemporaryDirectory() as tmp:   # (j) a STALE-HEAD refresh, end to end
+            # The other kind of request, and the one with no bounce behind it: the session
+            # pushed again while its opening review was in flight, so the only outcome on
+            # file judges a head the PR has left. The bounce driver cannot bounce OR
+            # conclude on it, and before the refresh existed nothing could replace it — the
+            # PR parked at exit 0 with nothing red. Everything downstream of the request is
+            # the ordinary re-review path; what must differ is the TITLE, because a refresh
+            # filed under a bounce's title reuses that bounce's closed ticket.
+            c = settled_at(tmp)
+            path = os.path.join(tmp, "rereview", pbl.repo_slug("o/r"), "pr-7.json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump({"rereview_schema": pbl.REREVIEW_SCHEMA, "kind": pbl.REREVIEW_KIND_STALE,
+                           "pr": 7, "repo": "o/r", "requested_at": "2026-09-12T00:00:00Z",
+                           "refresh_no": 1, "head_before": "aaaa1111"}, fh)
+            check("the driver's refresh lands where this poller looks",
+                  path, rereview_path(tmp, "o/r", 7))
+            check("a refresh whose head has not moved buys nothing, exactly like a bounce's",
+                  (scan(c, False), len(fake.created), os.path.exists(path)), (EXIT_OK, 1, True))
+            head["sha"] = "bbbb2222"
+            check("head moved ⇒ the refresh buys ONE re-review and is spent",
+                  (scan(c, False), len(fake.created), os.path.exists(path)), (EXIT_OK, 2, False))
+            check("…under a title no bounce's re-review can collide with",
+                  fake.created[1]["title"], "Review PR #7 — KIT-7 (re-review 1 after the head moved)")
+            check("…delegated like any other review ticket, and still not parented",
+                  (fake.created[1].get("delegateId"), "parentId" in fake.created[1]),
+                  ("agent-1", False))
+            check("…and a further pass finds nothing: one request, one review",
+                  (scan(c, False), len(fake.created)), (EXIT_OK, 2))
+            # THE POINT, read back through the bounce driver's own reader: what the refresh
+            # buys is an outcome the driver can finally act on.
+            fake.respond("rev-uuid-2", "```json\n%s\n```" % json.dumps(one_high))
+            check("the re-review settles with its own comment", (collect(c, False), len(posted)), (EXIT_OK, 2))
+            refreshed = pbl.read_outcome(tmp, "o/r", 7)
+            check("the refreshed outcome judges the head the PR is actually at",
+                  refreshed["head_sha"], "bbbb2222")
+            check("…so the driver's head guard passes, where before nothing could clear it",
+                  (pbl.outcome_head_is_stale(refreshed, "bbbb2222"),
+                   pbl.outcome_is_fresh(refreshed, "bbbb2222", None)[0]), (False, True))
 
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
 
@@ -4622,7 +4747,10 @@ def selftest():
           "only when its head has MOVED, buys exactly one new ticket under its own title, is spent "
           "only after that ticket exists and never twice, and leaves a fresh outcome at the new head "
           "so the bounce driver's next bounce can fire; an unreadable request is loud, a dry run "
-          "spends nothing), sanitizer strips routing tags + fence tokens, ticket text fenced + one line per "
+          "spends nothing) and the driver's STALE-HEAD refresh, which drives the same loop with "
+          "no bounce behind it under a title of its own (each kind read by its own sequence key, "
+          "an unknown kind refused rather than guessed at, and neither kind spending the other's "
+          "request), sanitizer strips routing tags + fence tokens, ticket text fenced + one line per "
           "item, PR named not linked, fences paired, body capped, create+delegate in one call (never "
           "parented), read-back validated whole, tamper/malformed/timeout/error → loud decline with "
           "fixed reasons, transient scan failures retried then declined, publish-failed / "
