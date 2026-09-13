@@ -175,7 +175,8 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 # `ts_fields`    timestamp fields in PRIORITY order — the first present and parseable wins.
 #                The bounce driver's `finished_at` is preferred over its `at` because `at`
 #                is rewritten by the mid-pass `running` beat.
-# `bool_field`   the finding poller reports a boolean instead of a result string.
+# `bool_field`   a heartbeat that reports a boolean instead of a result string. No
+#                watcher uses it today: the finding poller did until its /2 heartbeat.
 # `good`         results that mean the last pass was fine.
 # `running`      results that mean a pass was IN FLIGHT when the file was written. Fresh,
 #                that is healthy; stale, it means a pass started and never finished, which
@@ -210,10 +211,13 @@ WATCHERS = {
         "writer": "scripts/pipeline_finding_poller.py",
         "dir_key": "finding_state_dir",
         "filename": "heartbeat.json",
-        "schema": "pipeline-finding-poller-heartbeat/1",
-        "ts_fields": ("at",),
-        "result_field": None,
-        "bool_field": "ok",
+        # /2 since the finding poller adopted the review poller's shape (result string,
+        # started_at/ended_at). Read as /1 — `at` and a boolean `ok` — every healthy v2
+        # file was a schema mismatch, which is `unreadable`, which PAGES.
+        "schema": "pipeline-finding-poller-heartbeat/2",
+        "ts_fields": ("ended_at", "started_at"),
+        "result_field": "result",
+        "bool_field": None,
         "good": ("ok",),
         "running": (),
     },
@@ -1025,12 +1029,17 @@ def selftest():
     ok("bounce driver: finished_at is preferred over the running beat's at",
        verdict("bounce-driver", beat("bounce-driver", result="ok", at=old,
                                      finished_at=fresh)) == "ok")
-    ok("finding poller: ok:true ⇒ ok",
-       verdict("finding-poller", beat("finding-poller", ok=True, at=fresh)) == "ok")
-    ok("finding poller: ok:false ⇒ failing",
-       verdict("finding-poller", beat("finding-poller", ok=False, at=fresh)) == "failing")
-    ok("the boolean is translated to one result vocabulary",
-       result_of({"ok": False}, WATCHERS["finding-poller"]) == "error")
+    ok("finding poller: result ok ⇒ ok",
+       verdict("finding-poller", beat("finding-poller", result="ok", ended_at=fresh)) == "ok")
+    ok("finding poller: result error ⇒ failing",
+       verdict("finding-poller", beat("finding-poller", result="error",
+                                      ended_at=fresh)) == "failing")
+    ok("finding poller: a v1 file (`at` + boolean `ok`) is UNREADABLE, never healthy",
+       verdict("finding-poller", {"path": "/x/heartbeat.json", "exists": True, "error": None,
+                                  "doc": {"schema": "pipeline-finding-poller-heartbeat/1",
+                                          "ok": True, "at": fresh}}) == "unreadable")
+    ok("a boolean heartbeat is still translated to one result vocabulary",
+       result_of({"ok": False}, dict(WATCHERS["finding-poller"], bool_field="ok")) == "error")
 
     # ── 3. The monitor's own inability to judge is never a clean bill of health ───────
     ok("a missing file ⇒ missing",
@@ -1442,6 +1451,19 @@ def selftest():
         ok("the two pollers' files are told apart by DIRECTORY, not by name",
            WATCHERS["finding-poller"]["filename"] == WATCHERS["review-poller"]["filename"]
            and WATCHERS["finding-poller"]["dir_key"] != WATCHERS["review-poller"]["dir_key"])
+        # THE SCHEMA STRING IS NOT THE SHAPE. The check above caught the /1 → /2 rename,
+        # but a bumped string with stale field names would pass it and still page on every
+        # healthy file. So the poller's OWN writer produces a heartbeat and this monitor's
+        # OWN reader and judge read it — the drift is caught where it would bite.
+        import tempfile
+        import time as _time
+        with tempfile.TemporaryDirectory() as fd:
+            for code, want in ((0, "ok"), (1, "failing")):
+                pfp.write_heartbeat(fd, code, pfp._now_iso(), _time.monotonic(), False)
+                real = judge_one("finding-poller", WATCHERS["finding-poller"],
+                                 read_beat(pfp.heartbeat_path(fd)), time.time(), 600, False)
+                ok("a heartbeat the finding poller REALLY writes (exit %d) is judged %s"
+                   % (code, want), real["verdict"] == want, real.get("detail"))
     except ImportError:
         ok("the finding poller is importable for the cross-check", False)
 

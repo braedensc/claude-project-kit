@@ -4,7 +4,7 @@
 # HOW TO USE THIS FILE
 #
 #   cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-#   $EDITOR stage-e.conf                             # eleven values, none of them secret
+#   $EDITOR stage-e.conf             # ten values to fill in, none of them secret
 #   python3 scripts/pipeline_stage_e_setup.py run    # the only command you type
 #
 # `run` validates this file before it touches anything, and reports EVERY bad
@@ -47,7 +47,7 @@
 # 1.  THE MACHINE — who Stage E runs as, and where the dispatcher already lives
 # ===========================================================================
 
-# The non-admin macOS account the dispatcher runs as, and that Stage E's two
+# The non-admin macOS account the dispatcher runs as, and that Stage E's three
 # daemons will run as too.  NOT your login account: a user LaunchAgent only
 # runs while you are logged in, so a poller under your account stops the moment
 # you log out while the dispatcher keeps opening pull requests — reviews would
@@ -63,28 +63,33 @@ ROLE_ACCOUNT=_exdispatch
 # restarts it (unload-then-load) after writing the reviews entry, and reads its
 # startup banner back.  It is also the source of the Stage E daemon labels: the
 # reverse-DNS prefix is reused, so `com.example.dispatcher` yields
-# `com.example.stage-e-poller` and `com.example.stage-e-bounce`.
+# `com.example.stage-e-poller`, `com.example.stage-e-bounce` and
+# `com.example.stage-e-finding`.
 #
 # RULE: reverse-DNS, at least two dot-separated segments, and a service that
 # `launchctl print system/<label>` can find.
 DISPATCHER_SERVICE=com.example.dispatcher
 
 # The dispatcher's config file — the one holding its `repositories` array.  The
-# installer backs it up, inserts or updates ONE entry in it (`id: reviews`),
-# and validates that the result still parses.  It writes nothing else there.
+# installer backs it up, inserts or updates ONE ENTRY PER REVIEWED REPOSITORY in
+# it (`reviews-<name>`, one clone each), removes the single `reviews` entry an
+# older installer wrote, and validates that the result still parses.  It writes
+# nothing else there.  A review runs in the entry its tag names, so a shared
+# entry would put a reviewer in the wrong repository's clone.
 #
 # RULE: an absolute path to a readable JSON file owned by ROLE_ACCOUNT.  The
 # installer reads `workspaceBaseDir`, `linearWorkspaceId`, `repositoryPath` and
 # every entry `name` out of it, so you type none of those.
 DISPATCHER_CONFIG=/opt/example-dispatch/config.json
 
-# The clone URL the two daemons exec out of.  The installer clones it under the
-# role account at `~/.stage-e/kit`, SEPARATE from whatever clone the dispatcher
-# cuts worktrees from, so a fetch never moves code under a running pass.  It
-# touches that clone again only when one of the scripts the daemons exec has
-# gone missing from it — then, with both jobs unloaded, it fast-forwards
-# (`fetch` + `pull --ff-only`).  A run that finds every script present leaves
-# the clone alone, so later runs do NOT update it for you.
+# The clone URL the three daemons exec out of.  The installer clones it under
+# the role account at `~/.stage-e/kit`, SEPARATE from whatever clone the
+# dispatcher cuts worktrees from, so a fetch never moves code under a running
+# pass.  EVERY run compares that clone's HEAD against origin's and fast-forwards
+# it when it is behind (`fetch` + `pull --ff-only`), with the daemons unloaded
+# for the move.  It once decided by listing FILENAMES instead, which never
+# change when their contents do — so a merged fix stayed inert on the machine
+# while every command on the box reported it current.
 #
 # RULE: an https git URL.  Not a path, not ssh — the role account has no keys.
 KIT_REPO_URL=https://github.com/example-org/claude-project-kit
@@ -147,11 +152,18 @@ MODEL_LABEL=haiku
 OWNER_LINEAR_EMAIL=you@example.com
 
 # The team keys whose tickets Stage E treats as pipeline work, comma-separated.
-# Reviews are discovered through Linear (what the agent worked on), so this is
-# a routing hint for branch→ticket matching, not a repository list.
+# Reviews are discovered through Linear (what the agent worked on), so for the
+# review poller and the bounce driver this is a routing hint for branch→ticket
+# matching, not a repository list.
 #
-# RULE: comma-separated team keys, same alphabet as REVIEWS_TEAM_KEY.  Leave it
-# empty to accept any team.
+# REQUIRED, AND EMPTY IS NOT "ANY TEAM".  The finding poller scans exactly these
+# teams for the side-findings a session reports, and it refuses an empty list —
+# a scan of no teams is a component that cannot say what it did.  Left empty,
+# every other check passes and the run dies at that component's dry run, at exit
+# 1, with no checkpoint card.  The validator now names this key instead.
+#
+# RULE: comma-separated team keys, same alphabet as REVIEWS_TEAM_KEY, at least
+# one.
 MANAGED_TEAM_KEYS=KIT,TOD
 
 
@@ -184,11 +196,14 @@ REVIEW_REPOS=example-org/repo-name
 # 4.  OPTIONAL — every one of these has a working default
 # ===========================================================================
 
-# How often each one-shot pass runs, in seconds.  They are offset so the two
-# jobs rarely start together.  Both jobs are one-shot (scan → act → exit) with
-# no KeepAlive: KeepAlive would restart a one-shot process in a tight loop.
+# How often each one-shot pass runs, in seconds — one per daemon: the review
+# poller, the bounce driver, and the finding poller that turns a session's
+# side-findings into backlog tickets.  They are offset so the three jobs rarely
+# start together.  All three are one-shot (scan → act → exit) with no KeepAlive:
+# KeepAlive would restart a one-shot process in a tight loop.
 POLL_INTERVAL_SECONDS=300
 BOUNCE_INTERVAL_SECONDS=360
+FINDING_INTERVAL_SECONDS=300
 
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from
