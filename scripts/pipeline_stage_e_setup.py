@@ -9,9 +9,11 @@ exactly what to do, and exits 10. You do that one thing and run the SAME command
 again: it checks your work and carries on. It never asks you to type `y`.
 
 WHAT IT BUILDS.  The review-and-bounce layer beside an already-running
-dispatcher: a Reviews team in the tracker, an env file and two config files
-under the dispatcher's role account, one extra repository entry in the
-dispatcher's own config, and two system LaunchDaemons running one-shot passes.
+dispatcher: a Reviews team in the tracker, an env file and three config files
+under the dispatcher's role account (the review poller's, the bounce driver's
+and the finding poller's), one repository entry per reviewed repository in the
+dispatcher's own config, and three system LaunchDaemons running one-shot
+passes — review poller, bounce driver, finding poller.
 
 SUBCOMMANDS
 
@@ -23,8 +25,10 @@ SUBCOMMANDS
     verify                 read-only drift check: re-measures every step against
                            the live machine and changes nothing
     card <CK-id>           print any checkpoint card in full, at any time
-    attest <A-id> --initials xx [--note ...]
-                           record something no computer can check
+    attest <A-id> --initials YOUR-INITIALS [--note ...]
+                           record something no computer can check.  YOUR-INITIALS
+                           is a placeholder and is REFUSED as typed: 2-4 letters,
+                           your own, or nothing is recorded
     --selftest             offline battery; every transport stubbed
 
 EXIT CODES — contract §13.  "Nothing to do" and "could not do it" never share
@@ -289,7 +293,7 @@ def review_entry_name(repo):
     return REVIEW_ENTRY_PREFIX + str(repo or "").split("/")[-1]
 
 
-# The scripts the two daemons exec. Their absence from the role account's clone
+# The scripts the three daemons exec. Their absence from the role account's clone
 # means the pull requests carrying them are not merged yet (card CK-1).
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_review_local.py", "pipeline_review_basis.py",
@@ -531,6 +535,20 @@ def validate_conf(values):
             if conf.get(key) and other.upper() == conf[key].upper():
                 errors.append("REVIEWS_TEAM_KEY %s also appears in MANAGED_TEAM_KEYS — a "
                               "review team must not be a work team" % conf[key])
+    # EMPTY IS NOT "ANY TEAM" ANY MORE. Since the finding poller joined the
+    # install (#94) this value feeds its `teams`, and that component REFUSES an
+    # empty list — it scans work teams for finding comments, and a scan of no
+    # teams is a component that cannot say what it did. Left empty, every check
+    # above passes, the conf is accepted, and the run dies at the finding
+    # poller's dry run with a failure and NO CARD: exit 1 on a line about a
+    # config key, twenty minutes in. Said here instead, by name, before anything
+    # is touched.
+    if not split_list(conf.get("MANAGED_TEAM_KEYS", "")):
+        errors.append("MANAGED_TEAM_KEYS is required and is empty — name the team keys whose "
+                      "tickets are pipeline work, comma-separated (e.g. MANAGED_TEAM_KEYS="
+                      "KIT,TOD). It is not a hint any more: the finding poller scans exactly "
+                      "these teams and refuses an empty list, so an empty value here fails "
+                      "the dry run instead of accepting every team")
     for k in split_list(conf.get("MANAGED_TEAM_KEYS", "")):
         if not _TEAM_KEY_RE.match(k.upper()):
             errors.append("MANAGED_TEAM_KEYS entry %r is not a team key" % k)
@@ -598,8 +616,10 @@ def load_conf(path):
 
 
 def daemon_labels(conf):
-    """`com.example.dispatcher` -> the two Stage E labels beside it. One value
-    typed, three derived: a prefix typed twice is a prefix that disagrees."""
+    """`com.example.dispatcher` -> the review and bounce labels beside it. The
+    finding poller's is `finding_label`, and `all_daemon_labels` is all THREE.
+    One value typed, three derived: a prefix typed twice is a prefix that
+    disagrees."""
     prefix = conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0]
     return prefix + ".stage-e-poller", prefix + ".stage-e-bounce"
 
@@ -837,7 +857,8 @@ def _privilege_reason(command, dry_run, account):
         return ("`run --dry-run` measures this machine as the %s role account and as "
                 "root. It changes nothing." % account)
     return ("`run` reads and writes files as the %s role account, edits the dispatcher's "
-            "config, and installs and loads two system LaunchDaemons." % account)
+            "config, and installs and loads three system LaunchDaemons — the review "
+            "poller, the bounce driver and the finding poller." % account)
 
 
 def acquire_privilege(ctx, command, dry_run):
@@ -1064,6 +1085,19 @@ class State(object):
                                           "at": now_iso()}
 
 
+# The placeholder every card and the usage text print where your initials go,
+# plus every spelling this file has ever printed there. A placeholder a person
+# can SIGN is not a placeholder: `xx` was printed here for one release, signed
+# literally on a live machine, and recorded a sign-off nobody made — which
+# disarmed CK-5, the only gate between an operator and one paid session per open
+# pull request. Printed and refused by the same constants, so the two can never
+# drift apart; `--selftest` asserts that nothing a card prints here would be
+# accepted as a signature.
+INITIALS_PLACEHOLDER = "YOUR-INITIALS"
+INITIALS_PLACEHOLDERS = frozenset((INITIALS_PLACEHOLDER.lower(), "yourinitials",
+                                   "xx", "xxx", "xxxx"))
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint cards.  A card is a step a computer cannot do.  Each one says WHY
 # it is a person's, because a card nobody believes is a card nobody does.
@@ -1121,7 +1155,8 @@ CARDS = {
                "  - pull request merged",
                "Then sign it off — this run could not read them for you:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-AUTOMATIONS "
-               "--initials xx"],
+               "--initials " + INITIALS_PLACEHOLDER,
+               "(YOUR initials, 2-4 letters — the placeholder above is refused as typed.)"],
         "good": "the review ticket stays put when its pull request opens and when it merges",
         "attest": "A-AUTOMATIONS",
     },
@@ -1152,7 +1187,9 @@ CARDS = {
                "When the number is what you meant, sign it off and re-run — the installer",
                "then loads the daemons and confirms their heartbeats:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-DRY-RUN "
-               "--initials xx --note \"count read: N\""],
+               "--initials " + INITIALS_PLACEHOLDER + " --note \"count read: N\"",
+               "(YOUR initials, 2-4 letters, and N the count you just read. Both the",
+               "placeholder and an empty note are refused: this is the cost gate.)"],
         "good": "the count you attested is the count you meant",
         "attest": "A-DRY-RUN",
     },
@@ -1201,7 +1238,8 @@ CARDS = {
                "NOT RUNNING; a fresh one with a non-ok result means RAN AND COULD NOT.",
                "Then sign it off:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-FIRST-TICKET "
-               "--initials xx"],
+               "--initials " + INITIALS_PLACEHOLDER,
+               "(YOUR initials, 2-4 letters — the placeholder above is refused as typed.)"],
         "good": "one pull request carries one review comment, and nothing merged itself",
         "attest": "A-FIRST-TICKET",
     },
@@ -1215,6 +1253,11 @@ ATTESTATIONS = {
     "A-ENTRY-LOADED": ("the dispatcher really loaded the review entries — the behavioural "
                        "proof, when its startup banner says nothing"),
 }
+
+# Sign-offs that are worth nothing without a note. A-DRY-RUN records that you
+# read a COUNT — the number of pull requests the first real pass will open a paid
+# session for — so a sign-off carrying no number records a click, not a reading.
+ATTESTATIONS_NEEDING_NOTE = frozenset(("A-DRY-RUN",))
 
 NEVER = [
     "Never merge a pull request, and never approve one. An approval says somebody else",
@@ -1654,7 +1697,7 @@ def _clone_differs_from_origin(ctx):
     was MISSING — and the six names never change when their contents do. So on
     any machine that had completed one install the update path was dead code. A
     fix merged upstream stayed inert while `run` printed "clone at <sha>, all 6
-    scripts present" and `verify` printed no drift and exited 0. Both daemons
+    scripts present" and `verify` printed no drift and exited 0. All three daemons
     went on exec'ing the old code with every command on the box agreeing they
     were current.
     """
@@ -1756,7 +1799,7 @@ def step_code(ctx, apply_it):
 
 def step_tracker(ctx, apply_it):
     """The Reviews team, its states, the model label, the agent's membership,
-    and every id the two daemons need — resolved BY NAME, recorded by id."""
+    and every id the three daemons need — resolved BY NAME, recorded by id."""
     conf, st = ctx.conf, ctx.state
     ids = dict(st.data.get("ids") or {})
     key = conf["REVIEWS_TEAM_KEY"]
@@ -2174,9 +2217,10 @@ def _refuse_bad_credential_home(ctx):
 
 
 def step_configs(ctx, apply_it):
-    """The poller's config and the bounce driver's — two files, not one. The
-    poller REFUSES an unknown key so a typo cannot take a default; the driver
-    IGNORES one so a shared file still works. Those two rules do not compose."""
+    """THREE files, not one: the review poller's, the bounce driver's, and the
+    finding poller's (under its own `finding/` subdirectory). The pollers REFUSE
+    an unknown key so a typo cannot take a default; the driver IGNORES one so a
+    shared file still works. Those two rules do not compose."""
     r, conf, st = ctx.runner, ctx.conf, ctx.state
     ids = st.data.get("ids") or {}
     for need in ("reviews_team_id", "agent_user_id", "model_label_id", "owner_user_id"):
@@ -2695,12 +2739,13 @@ def step_dispatcher_entry(ctx, apply_it):
         "    python3 %s run\n"
         "If its log still says nothing either way, look at what the running process\n"
         "actually loaded, then record what you saw:\n"
-        "    python3 %s attest A-ENTRY-LOADED --initials xx --note \"...\"\n"
+        "    python3 %s attest A-ENTRY-LOADED --initials %s --note \"...\"\n"
+        "(YOUR initials, 2-4 letters — the placeholder is refused as typed.)\n"
         "Watching one review ticket produce a session with no Bash (CK-7) is the same\n"
         "proof, behaviourally — but it is downstream of this step, so it is the slower\n"
         "way out, not the only one."
         % (conf["DISPATCHER_SERVICE"], _dispatcher_plist(conf["DISPATCHER_SERVICE"]),
-           _self_path(), _self_path()))
+           _self_path(), _self_path(), INITIALS_PLACEHOLDER))
 
 
 def _dispatcher_plist(label):
@@ -3213,7 +3258,7 @@ def _say_declines(text):
 
 
 def step_dry_run(ctx, apply_it):
-    """Both components' own dry runs, shape-checked. This is what CK-5 reads."""
+    """All three components' own dry runs, shape-checked. This is what CK-5 reads."""
     r = ctx.runner
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
     poller = r.as_role(ctx.account,
@@ -3239,7 +3284,7 @@ def step_dry_run(ctx, apply_it):
     for line in (finding.out + finding.err).strip().splitlines()[-14:]:
         say("    " + line)
     say("")
-    # BOTH COMPONENTS ARE JUDGED BEFORE EITHER IS REPORTED. Raising on the
+    # EVERY COMPONENT IS JUDGED BEFORE ANY IS REPORTED. Raising on the
     # poller first is exactly how a bounce driver that had never once parsed
     # its own arguments stayed hidden behind the poller's legitimate decline:
     # one half of the system was totally broken and nothing said so, because
@@ -3294,7 +3339,7 @@ def step_enable(ctx, apply_it):
     labels = all_daemon_labels(conf)
     missing = []
     for label in labels:
-        # LOADED, not "running". Both jobs are one-shot — scan, act, exit — so
+        # LOADED, not "running". All three jobs are one-shot — scan, act, exit — so
         # for all but a few seconds of each interval a healthy job is a loaded
         # job that is not running. Reading `state = running` as health here
         # would report every healthy install as broken.
@@ -3362,9 +3407,9 @@ def step_enable(ctx, apply_it):
         time.sleep(5)
     raise Unknown("the daemons were loaded and only %d of 3 heartbeats appeared within 90s "
                   "(%s)" % (len(have_beats), ", ".join(have_beats) or "none"),
-                  "read the two logs under the role account's ~/.stage-e/; a stale "
-                  "timestamp means NOT RUNNING, a fresh one with a non-ok result means "
-                  "RAN AND COULD NOT")
+                  "read the logs under the role account's ~/.stage-e/, one per daemon: a "
+                  "stale timestamp means NOT RUNNING, a fresh one with a non-ok result "
+                  "means RAN AND COULD NOT")
 
 
 def step_handover(ctx, apply_it):
@@ -3739,14 +3784,39 @@ def cmd_status(ctx):
 
 def cmd_attest(state, aid, initials, note):
     """HUMAN ONLY. A session supplying its own sign-off is the agent producing
-    the human's signal, and no amount of good intent makes the record true."""
+    the human's signal, and no amount of good intent makes the record true.
+
+    A PLACEHOLDER IS NOT A SIGNATURE. This file used to print `--initials xx` in
+    its own usage text and on three cards, and `xx` passed the letters check. So
+    on a live machine the dry-run sign-off was recorded as `xx` with an empty
+    note: CK-5, the only thing standing between an operator and one paid session
+    per open pull request, answered by nobody. Every spelling this file has ever
+    printed is now refused BY NAME, and the sign-off that gates a bill
+    (A-DRY-RUN) additionally needs a note — a number nobody wrote down is a
+    number nobody read."""
     refuse_if_agent("attest")
     if aid not in ATTESTATIONS:
         raise SetupError("no such sign-off: %s (have %s)" % (aid, ", ".join(sorted(ATTESTATIONS))))
     initials = (initials or "").strip()
+    if not initials:
+        raise SetupError("--initials is required: 2-4 letters, your own. It is your word "
+                         "with a date on it, not a measurement, and an unsigned record is "
+                         "worse than no record")
+    if initials.lower() in INITIALS_PLACEHOLDERS:
+        raise SetupError("--initials %r is the placeholder this file prints, not a person. "
+                         "Sign with YOUR OWN 2-4 letters: what this records is that a named "
+                         "human looked, and %r names nobody." % (initials, initials))
     if not re.match(r"^[A-Za-z]{2,4}$", initials):
-        raise SetupError("--initials wants 2-4 letters; it is your word with a date on it, "
-                         "not a measurement")
+        raise SetupError("--initials wants 2-4 LETTERS and nothing else (got %r); it is your "
+                         "word with a date on it, not a measurement" % initials)
+    note = (note or "").strip()
+    if aid in ATTESTATIONS_NEEDING_NOTE and not note:
+        raise SetupError("%s needs a --note saying what you read: %s\n"
+                         "  e.g. --note \"count read: 7\"\n"
+                         "  This sign-off is the only thing between you and one paid session "
+                         "per eligible pull request, and a sign-off with no number in it "
+                         "records that somebody clicked, not that somebody read."
+                         % (aid, ATTESTATIONS[aid]))
     state.attest(aid, initials.lower(), note or "")
     state.save()
     say("recorded: %s  %s  %s  %s" % (aid, initials.lower(), now_iso(), note or ""))
@@ -4027,7 +4097,8 @@ def _selftest_body():
     wanted_fragments = ["duplicate key", "not KEY=value", "unknown key NOT_A_KEY",
                         "DISPATCHER_SERVICE", "DISPATCHER_CONFIG", "KIT_REPO_URL",
                         "REVIEWS_TEAM_KEY", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
-                        "SEVERITY_THRESHOLD", "GITHUB_TOKEN_ENV", "DIFF_CAP_CHARS"]
+                        "SEVERITY_THRESHOLD", "GITHUB_TOKEN_ENV", "DIFF_CAP_CHARS",
+                        "MANAGED_TEAM_KEYS"]
     for frag in wanted_fragments:
         expect("conf-all-at-once", any(frag in e for e in allerr),
                "no error mentioned %r; got %d errors" % (frag, len(allerr)))
@@ -4056,6 +4127,60 @@ def _selftest_body():
     expect("labels-derived", daemon_labels(conf) == ("com.example.stage-e-poller",
                                                      "com.example.stage-e-bounce"),
            "derived labels: %s" % (daemon_labels(conf),))
+
+    # -- 3b. AN EMPTY MANAGED_TEAM_KEYS IS REFUSED, BY NAME, AT THE CONF -----
+    # It used to be optional ("empty means any team"). Since the finding poller
+    # joined the install it feeds that component's `teams`, which refuses an
+    # empty list — so an empty value here validated clean and then killed the
+    # dry run twenty minutes later, at exit 1, with no card and a message about
+    # a different file's config key. Both spellings of empty are the same
+    # mistake and both are caught here.
+    for label, text in (("set-but-empty", GOOD_CONF.replace("MANAGED_TEAM_KEYS=KIT",
+                                                            "MANAGED_TEAM_KEYS=")),
+                        ("absent", GOOD_CONF.replace("MANAGED_TEAM_KEYS=KIT\n", ""))):
+        cases += 1
+        _c, errs_mt = validate_conf(parse_conf(text)[0])
+        expect("conf-managed-team-keys",
+               any("MANAGED_TEAM_KEYS" in e for e in errs_mt),
+               "%s: an empty MANAGED_TEAM_KEYS validated clean — the finding poller's "
+               "dry run would be the first thing to say so: %s" % (label, errs_mt))
+        expect("conf-managed-team-keys",
+               any("MANAGED_TEAM_KEYS" in e and "finding poller" in e for e in errs_mt),
+               "%s: the error does not say WHY the key is now required" % label)
+
+    # -- 3c. THE COMMITTED EXAMPLE NAMES EVERY KEY THIS FILE KNOWS ----------- #
+    # `FINDING_INTERVAL_SECONDS` was added to CONF_DEFAULTS and never to the
+    # example, so the one file an operator edits did not mention a daemon's
+    # whole schedule — invisible, because a defaulted key never errors. The
+    # example is pinned to CONF_KEYS in both directions here: a key added to
+    # this file and not to the example turns it red, and so does a key in the
+    # example this file would reject as unknown.
+    cases += 1
+    _example_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 os.pardir, "stage-e.conf.example")
+    try:
+        with open(_example_path, encoding="utf-8") as _fh:
+            _example_text = _fh.read()
+    except OSError as _exc:
+        _example_text = None
+        expect("conf-example-complete", False,
+               "the committed stage-e.conf.example could not be read: %s" % _exc)
+    if _example_text is not None:
+        _ex_values, _ex_errors = parse_conf(_example_text, "stage-e.conf.example")
+        expect("conf-example-complete", not _ex_errors,
+               "the committed example does not parse cleanly: %s" % _ex_errors)
+        expect("conf-example-complete", set(_ex_values) == CONF_KEYS,
+               "example ⇄ CONF_KEYS drift — missing from the example: %s; unknown to this "
+               "file: %s" % (sorted(CONF_KEYS - set(_ex_values)),
+                             sorted(set(_ex_values) - CONF_KEYS)))
+        # …and it is a conf NOBODY EDITED: the only complaints are the two
+        # placeholders that exist to stop it being run as shipped.
+        _ex_conf, _ex_more = validate_conf(_ex_values)
+        expect("conf-example-complete",
+               len(_ex_more) == len(CONF_UNEDITED)
+               and all("has not been edited" in e for e in _ex_more),
+               "the example is wrong in some way other than its two deliberate "
+               "placeholders: %s" % _ex_more)
 
     # -- 4. the agent-environment refusal -----------------------------------
     cases += 1
@@ -4431,6 +4556,79 @@ def _selftest_body():
            "a sign-off exists that no card asks for: %s"
            % (set(ATTESTATIONS) - referenced - {"A-ENTRY-LOADED"}))
 
+    # -- 13b. A PLACEHOLDER IS NOT A SIGNATURE ------------------------------ #
+    # `--initials xx` was printed by this file's own usage text and cards, and
+    # `xx` passed the 2-4-letters check — so it was signed literally on a live
+    # machine: A-DRY-RUN recorded to `xx` with an empty note, which is CK-5, the
+    # cost gate, answered by nobody. Four refusals, and one acceptance so the
+    # command is not merely broken.
+    #
+    # The agent markers are scrubbed around these calls ONLY: `cmd_attest`
+    # refuses first and refuses correctly (case 4 owns that), and this case is
+    # about what it does for the person it is written for.
+    saved_env = dict(os.environ)
+    try:
+        for marker in AGENT_ENV_MARKERS:
+            os.environ.pop(marker, None)
+        for label, aid, initials, note, want in (
+                ("placeholder", "A-FIRST-TICKET", "xx", "", "names nobody"),
+                ("placeholder-printed", "A-FIRST-TICKET", INITIALS_PLACEHOLDER, "",
+                 "names nobody"),
+                ("empty", "A-FIRST-TICKET", "   ", "", "--initials is required"),
+                ("not-letters", "A-FIRST-TICKET", "b7", "", "2-4 LETTERS"),
+                ("dry-run-no-note", "A-DRY-RUN", "bc", "   ", "needs a --note")):
+            cases += 1
+            # A FRESH LEDGER PER CASE. One shared directory makes the
+            # "and recorded it anyway" half read a PREVIOUS case's record, so a
+            # regression in one case reports as a failure in the next.
+            st_a = State(tempfile.mkdtemp(prefix="stage-e-attest."))
+            try:
+                _quiet(lambda: cmd_attest(st_a, aid, initials, note))
+                expect("attest-refusals", False,
+                       "%s: `--initials %r` was RECORDED as a sign-off" % (label, initials))
+            except SetupError as exc:
+                expect("attest-refusals", want in str(exc),
+                       "%s: refused, but the message does not say why (%s)" % (label, exc))
+                expect("attest-refusals", not st_a.attested(aid),
+                       "%s: refused and recorded it anyway" % label)
+
+        # …and a real sign-off still lands, note and all.
+        cases += 1
+        st_ok = State(tempfile.mkdtemp(prefix="stage-e-attest-ok."))
+        rc_at, printed_at = _quiet(
+            lambda: cmd_attest(st_ok, "A-DRY-RUN", "BC", "count read: 7"))
+        expect("attest-accepts", rc_at == EX_OK and st_ok.attested("A-DRY-RUN"),
+               "a real sign-off was refused (exit %s): %s" % (rc_at, printed_at))
+        expect("attest-accepts",
+               (st_ok.data["attestations"]["A-DRY-RUN"]["initials"] == "bc"
+                and st_ok.data["attestations"]["A-DRY-RUN"]["note"] == "count read: 7"),
+               "the record is not what was signed: %s" % st_ok.data["attestations"])
+
+        # THE PIN: nothing this file PRINTS where initials go may be accepted as
+        # initials. A card that starts printing a signable example again turns
+        # this red, which is the whole defect said once.
+        printed_placeholders = set()
+        for card in CARDS.values():
+            for line in card["do"]:
+                if "--initials " in line:
+                    printed_placeholders.add(line.split("--initials ", 1)[1].split()[0])
+        expect("attest-placeholder-pinned", printed_placeholders,
+               "no card prints an `--initials` example any more; this pin is measuring "
+               "nothing")
+        for token in sorted(printed_placeholders):
+            cases += 1
+            st_p = State(tempfile.mkdtemp(prefix="stage-e-attest-pin."))
+            try:
+                _quiet(lambda t=token: cmd_attest(st_p, "A-FIRST-TICKET", t, "x"))
+                expect("attest-placeholder-pinned", False,
+                       "a card prints `--initials %s`, and that is ACCEPTED as a "
+                       "signature" % token)
+            except SetupError:
+                pass
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+
     # -- 14. the reviewer entries have exactly the shape that was settled ----
     cases += 1
     ctx7, _f7 = _settled_ctx(conf)
@@ -4552,6 +4750,27 @@ def _selftest_body():
     expect("name-parity", REVIEW_BRIEF_FINGERPRINT
            and REVIEWER_BRIEF.startswith(REVIEW_BRIEF_FINGERPRINT),
            "the ownership fingerprint is not the brief's own first sentence")
+
+    # THE FENCE AND THE BRIEF MUST AGREE ABOUT WHAT WAS TAKEN AWAY. This file
+    # writes `disallowedTools`; the poller writes the sentence the reviewer
+    # reads. They drifted once in the expensive direction — the ticket said the
+    # reviewer had no tools to fetch anything while Read, Grep and Glob were in
+    # its hand — so each name the poller PROMISES is asserted absent from the
+    # fence here, and each tool the fence removes is asserted not to be one of
+    # them. Fencing Read would now turn this red instead of turning the
+    # reviewer's ticket into a lie.
+    cases += 1
+    for kept in _poller_names.REVIEW_TOOLS_KEPT:
+        expect("brief-fence-parity", kept not in DISALLOWED_TOOLS,
+               "the review ticket promises the reviewer still has %s, and this file "
+               "fences it" % kept)
+    expect("brief-fence-parity",
+           "Read, Grep and Glob" in _poller_names.REVIEW_ONLY_PREAMBLE,
+           "the brief no longer names the read tools it keeps")
+    for gone in ("Bash", "Edit", "Write"):
+        expect("brief-fence-parity", gone in DISALLOWED_TOOLS,
+               "the review ticket tells the reviewer it has no %s, and this file does "
+               "not fence it" % gone)
 
     # -- 14e. two repositories that differ only by owner are REFUSED --------- #
     # They would want one entry name, and the poller derives the tag from the
@@ -6301,7 +6520,9 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true",
                    help="measure every step and change nothing: name what `run` would "
                         "do, on this machine and in the tracker, and do none of it")
-    p.add_argument("--initials", default="", help="attest: 2-4 letters, your word")
+    p.add_argument("--initials", default="",
+                   help="attest: 2-4 letters, YOUR OWN — the placeholder %s is refused"
+                        % INITIALS_PLACEHOLDER)
     p.add_argument("--note", default="", help="attest: what you are recording")
     p.add_argument("--selftest", action="store_true")
     return p

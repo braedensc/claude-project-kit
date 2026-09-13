@@ -620,7 +620,7 @@ fallback.**
 - **Amended 2026-09-13: the label has a second occasion, and the invariant is unchanged.**
   A session that stops after a bounce reaches exhaustion never, so the budget could not be
   what called a person. A bounce that was *delivered*, whose head has not moved, more than
-  `blocked_after_seconds` later now gets one top-level comment on the coding ticket and the
+  `blocked_after_seconds` later now gets one top-level notice on the coding ticket and the
   same label — once per bounce, spending no budget and moving no ticket. The condition is
   the ledger, the head and the clock; deliberately not the session's reply, which is a
   string the counted party writes. Still one label, still dispatcher-side, still never a

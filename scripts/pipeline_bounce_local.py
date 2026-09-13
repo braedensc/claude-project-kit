@@ -75,8 +75,9 @@ WHAT HAPPENS WHEN A BOUNCED SESSION STOPS (the no-push signal)
   cosmetic keeps it out of this decision. It can be absent when the session is dead,
   forged when it is not, and deleted afterwards.
 
-  On that condition, once per bounce: ONE TOP-LEVEL comment on the coding ticket and
-  `agent:needs-human`. Top level, never the session thread — the dispatcher resumes a
+  On that condition, once per bounce: ONE TOP-LEVEL notice on the coding ticket and
+  `agent:needs-human` — plus, as for every action here, the §4 telemetry row, which
+  the publisher posts as a comment on the same ticket. Top level, never the session thread — the dispatcher resumes a
   session on any new comment in its own thread, so saying "you have stopped" there would
   re-run the session that stopped, off-budget. NO bounce is spent, nothing concludes and
   the ticket is not moved: this says a person is needed, not that the review is over. The
@@ -949,9 +950,9 @@ def render_blocked_ticket_comment(pr_number, pr_url, bounce_no, max_bounces, spe
         "session or by anyone else — can raise this signal or suppress it.",
         "",
         "**No bounce was spent.** The budget still stands at %d of %d, so the loop can "
-        "carry on the moment a push lands. The driver applies `%s` alongside this comment "
-        "and does nothing else: it does not move this ticket, does not conclude the "
-        "review, does not sign the work off and does not merge."
+        "carry on the moment a push lands. The driver applies `%s` alongside this comment. "
+        "It does not move this ticket, does not conclude the review, does not sign the "
+        "work off and does not merge."
         % (spent, max_bounces, NEEDS_HUMAN_KEY),
         "",
         "A person needs to look. The usual causes are a session that refused the work, "
@@ -1958,8 +1959,13 @@ def linear_reply_in_thread(issue_id, parent_comment_id, body, cfg):
     dispatcher receives as a `prompted` activity (its `sourceCommentId` is this comment)
     and answers by resuming the recorded session. The SDK exposes no public
     prompt-activity mutation (only an `[Internal]` input type), so the thread reply is
-    the one route. LIVE-TEST: confirm on a real ticket that this reply resumes the
-    session before relying on it unattended."""
+    the one route.
+
+    PROVEN LIVE 2026-09-08: a real bounce on a real ticket resumed the recorded session
+    from this reply, and the fix it produced was re-reviewed. The note that used to stand
+    here asked the next reader to confirm that before relying on it — which, once the
+    route was proven, only bought a re-test of a settled question or a quiet distrust of
+    the driver's primary path."""
     mutation = """
 mutation($input: CommentCreateInput!) {
   commentCreate(input: $input) { success comment { id } }
@@ -2536,9 +2542,15 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run):
 
 def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     """Stage E reviewed this PR and nothing needs fixing: record it once, hand the ticket
-    to a person. The lane move is the entire signal — no comment, no label, no approval,
-    no merge. `agent:needs-human` stays exactly what it was (a spent budget), so the two
-    ways Stage E ends stay distinguishable on the board."""
+    to a person. The lane move is the whole of the BOARD signal — no label, no approval,
+    no merge, and `agent:needs-human` stays exactly what it was (a spent budget), so the
+    two ways Stage E ends stay distinguishable on the board.
+
+    ONE COMMENT IS POSTED, and it is telemetry's. `record_conclusion` writes no comment at
+    all; `emit_telemetry` below hands the artifact to the §4 publisher, whose only Linear
+    mutation is a `commentCreate` on the pinned ticket. This docstring said "no comment"
+    for two releases while a comment landed on every conclusion — which is the reading a
+    person does when a comment appears and they go looking for the code that posts it."""
     basis = verdict.get("basis") or "clean"
     _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run)
     if dry_run:
@@ -2655,6 +2667,12 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
     conclusion and no lane move (the review has not finished; the needs-approval lane
     means "accept this work", which is the opposite of what is being said), and no
     re-review request.
+
+    TWO COMMENTS land on the ticket, not one: the notice below, and the §4 telemetry row
+    `emit_telemetry` hands to the publisher, whose only Linear mutation is a comment on
+    that ticket. The same is true of a conclusion and an exhaustion; saying "one comment"
+    here would send the person who sees the second one looking for code that is not
+    there.
 
     Recorded as a `blocked` row whose `announced` map says which of the two steps landed,
     exactly like a partial exhaustion: a step that failed is a problem, exit 2, and the

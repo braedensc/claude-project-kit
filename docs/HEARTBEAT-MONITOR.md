@@ -36,11 +36,13 @@ three daemons for one reader's convenience would be the larger change:
 |---|---|---|---|
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 | bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle` |
-| finding poller | `<finding_state_dir>/heartbeat.json` | `at` | `ok: true` |
+| finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
-cross-checks every schema string and filename against the three writers, so a renamed field
-turns CI red instead of quietly reading as healthy.
+cross-checks every schema string and filename against the three writers, and judges a
+heartbeat the finding poller's own writer produced, so a renamed field turns CI red instead
+of quietly reading as healthy — or, the way it actually failed once, paging on every healthy
+file.
 
 ## The verdicts
 
