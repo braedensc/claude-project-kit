@@ -63,17 +63,30 @@ configured agent user, so an outside commenter cannot inject one.
 
 ## Enabling it (operator)
 
-The poller is a kit script; the operator runs it as the role account under a system
-LaunchDaemon, exactly like the review poller. It needs:
+**Nothing here is installed by hand any more.** Since PR #94 the poller is one of the three
+daemons `scripts/pipeline_stage_e_setup.py` installs, so `run` is the whole procedure:
+`docs/STAGE-E-OPERATOR.md`. That one pass creates the `provenance:agent` label at workspace
+scope, writes `~/.stage-e/finding/poller.json` from the conf's `MANAGED_TEAM_KEYS` and the
+ids it resolved, installs the third LaunchDaemon on `FINDING_INTERVAL_SECONDS`, and waits on
+a third heartbeat before it calls the install loaded.
 
-1. A `provenance:agent` label in the workspace (workspace-scoped), in each team it files into.
-2. A config file (`pipeline_finding_poller.py --example-config` prints the shape) naming the
-   teams, the owner's user id, the agent user id, and the **name** of the env var holding the
-   Linear key — never the key value.
-3. The Linear key in the role account's own env file (`<home>/.stage-e/env`, mode 600), never
-   in the dispatcher's env file.
-4. A LaunchDaemon running `pipeline_finding_poller.py scan --config <path>` on an interval,
-   `RunAtLoad`, no `KeepAlive` — one pass then exit.
+What the installer does **not** decide is the part that was never a config value: which
+teams are yours. `MANAGED_TEAM_KEYS` has no default, and the poller refuses an empty team
+list — so a conf left blank there produces a daemon that fails every pass. That is the first
+thing to check if the finding heartbeat is the one that is missing.
 
-Prove it with `--dry-run` (reads and reports, writes nothing) before enabling. The machine-
-specific runbook lives outside this repo with the other operator runbooks.
+Three things to know that the installer cannot do for you:
+
+- **The key.** The Linear key lives in the role account's own env file
+  (`<home>/.stage-e/env`, mode 600), shared with the review poller, and never in the
+  dispatcher's env file — which is copied unscrubbed into every session it starts.
+- **The dry run.** `pipeline_finding_poller.py scan --config <path> --dry-run` reads and
+  reports and writes nothing. It has no decline state: **0 is its only success.**
+- **The positive path is still unproven in production.** Every claim above about *filing* —
+  the backlog state, the `provenance:agent` mark, the caps, the receipt — is held up by the
+  selftest (`npm run test:finding-poller`) and by dry runs. No deployment has yet turned a
+  real `pipeline-finding/1` comment into a real ticket, so the first one is worth watching
+  end to end rather than assuming. A pass that files nothing is the *expected* output when
+  no session has left a finding, which is exactly why it proves nothing.
+
+The machine-specific runbook lives outside this repo with the other operator runbooks.
