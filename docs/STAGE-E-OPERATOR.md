@@ -199,8 +199,8 @@ gate; only the first does now.
    carries the issue id, which the kit's branch rule guarantees. The repository comes out
    of the PR URL. A second signal covers a missing attachment: a PR URL in the coding
    session's own final response. **There is no repository list to keep in step.**
-2. It selects same-repo, non-draft, not-yet-reviewed PRs — plus, per step 7, any whose
-   bounce asked for a second look and whose head has since moved. Forks are skipped, and an
+2. It selects same-repo, non-draft, not-yet-reviewed PRs — plus, per step 7, any the driver
+   asked for a second look at whose head has since moved. Forks are skipped, and an
    unknown fork flag is skipped too. It fetches the diff and resolves the **review basis**
    — the ticket's acceptance criteria and out-of-scope as of delegation
    (`scripts/pipeline_review_basis.py`). No basis ⇒ it declines, loudly, with a PR comment
@@ -231,11 +231,15 @@ gate; only the first does now.
    The dispatcher resumes that session — same worktree, same branch — with the findings as
    its prompt. Budget spent ⇒ one comment on the PR, one on the ticket, optionally the
    `agent:needs-human` label, stop.
-7. **Each delivered bounce leaves a re-review request** naming the head it bounced. On its
-   next pass the poller re-reviews that PR **if the head has moved** — the session actually
-   pushed — filing a new review ticket under its own title, posting a second PR comment, and
-   deleting the request. That new outcome is what lets the driver bounce again, so a
-   `maxBounces` above 1 is real. No push, no re-review, no cost.
+7. **The driver asks for a second look by leaving a request file**, naming a head that has
+   already been reviewed. On its next pass the poller re-reviews that PR **if the head has
+   moved** — someone actually pushed — filing a new review ticket under its own title,
+   posting a second PR comment, and deleting the request. No push, no re-review, no cost.
+   It asks for two reasons. Every **delivered bounce** leaves one, which is what lets the
+   driver bounce again, so a `maxBounces` above 1 is real. And a PR whose only review
+   judged a head it has **already moved off** gets one **refresh**, once ever, because
+   that review can buy neither a bounce nor a conclusion and nothing else would ever
+   replace it.
 8. **When there is nothing left to bounce** — the review came back clean or below the
    threshold and the required checks are green, or the budget ran out — the driver writes
    one `concluded` row to its ledger and moves the coding ticket to the **needs-approval**
@@ -1105,10 +1109,24 @@ nor `--all`: it is the daemon's whole pass.
   orphaned). Or the PR is now a draft, a fork, or lost its discovery hint — that one is an
   **error**, not a quiet skip: the pass exits non-zero and names the PR, because the bounce
   driver is waiting behind it.
+- **The refresh: when the only review on file is already out of date.** A review that
+  judged a head the PR has moved off is not a trigger and not a conclusion either, and the
+  driver will not act on one. That is right — it never saw the code that is there now — but
+  on its own it is a dead end, and a common one: the poller opens its review the moment the
+  PR opens, while the session is still pushing under `/ship`'s CI watch. So the driver asks
+  for **one** re-review of the current head, **once per PR, ever**, recorded as a `refresh`
+  row on the ledger. The verdict reads *REFRESH 1 of 1*; nothing is sent to Linear and no
+  bounce is spent. While that request is on disk the driver says it is **waiting** and asks
+  for nothing more. If the head moves again and the allowance is gone, the verdict is
+  *CANNOT EVALUATE*: the driver says on the PR that a person is needed, and the pass exits
+  2 — never a silent exit 0 on a PR nothing will ever finish.
+- **What all of that costs, per PR.** One review when the PR opens, one per delivered
+  bounce, and one refresh. At `maxBounces: 3` that is at most **five** reviewer sessions,
+  and only if someone pushes after every single one.
 - **A conclusion ends the re-review loop too.** Handing the PR to a person retires any
-  outstanding re-review request. That matters without anyone pushing: a bounce leaves a
-  request naming the head it bounced, and a flaky required check re-running green at that
-  same head concludes. A request surviving that would open a second review ticket and post
+  outstanding re-review request, of either kind. That matters without anyone pushing: a
+  bounce leaves a request naming the head it bounced, and a flaky required check
+  re-running green at that same head concludes. A request surviving that would open a second review ticket and post
   another review comment on a pull request somebody already owns.
 - **Conclusion**: a usable review of the current head, below the severity threshold, with
   the required checks green ⇒ one `concluded` ledger row (basis `clean` or
