@@ -55,6 +55,34 @@ WHAT HAPPENS WHEN NOTHING NEEDS BOUNCING (the conclusion)
   started state, and a `completed` one would make the dispatcher delete the worktree and
   turn every later bounce into a silent no-op.
 
+WHAT HAPPENS WHEN A BOUNCED SESSION STOPS (the no-push signal)
+
+  A bounce is delivered and the session does nothing: it answers in the thread that it
+  cannot push, or it dies, or it was never resumed at all. Before this signal existed
+  that was the quietest state in the pipeline. No budget is spent — the review that
+  triggered the bounce now predates it, so the trigger is gone until a re-review, and a
+  re-review only happens after a push — the findings still stand, nothing concludes, and
+  the ticket reads like any other in progress. The only thing that ever called a person
+  was an EXHAUSTED budget, which a session that stops at bounce 1 of 3 never reaches. A
+  production PR sat ten hours that way.
+
+  The signal is three facts a session cannot write: a `delivered` ledger row exists for
+  the last bounce (it was actually told), the PR's head is still the commit that bounce
+  was delivered against (GitHub's answer, not anyone's claim), and more than
+  `blocked_after_seconds` have passed (the daemon's clock). Deliberately NOT the session's
+  reply: the obvious signal — "I am stuck" in the thread — is a string the counted party
+  authors, and the same doctrine that makes the ledger the budget and the branch name
+  cosmetic keeps it out of this decision. It can be absent when the session is dead,
+  forged when it is not, and deleted afterwards.
+
+  On that condition, once per bounce: ONE TOP-LEVEL comment on the coding ticket and
+  `agent:needs-human`. Top level, never the session thread — the dispatcher resumes a
+  session on any new comment in its own thread, so saying "you have stopped" there would
+  re-run the session that stopped, off-budget. NO bounce is spent, nothing concludes and
+  the ticket is not moved: this says a person is needed, not that the review is over. The
+  ledger row (`outcome: "blocked"`) is what makes it once — a later bounce that is itself
+  ignored signals again, and a partly-announced row is completed rather than repeated.
+
 WHERE THIS RUNS, AND WHERE ITS CREDENTIALS LIVE (owner decision 2026-09-06, "C1")
 
   As the DISPATCHER'S OWN ROLE ACCOUNT — the same account the dispatcher runs as — not
@@ -171,9 +199,10 @@ WHAT THIS FILE NEVER DOES
 
   It never merges, never enables auto-merge, never approves, never moves the ORIGINAL
   ticket (Done deletes the worktree the fix has to land in), and applies exactly ONE
-  label: `agent:needs-human`, on the original ticket, on exhaustion, as the dispatcher-
-  side component contract §6 names for it — additively (`addedLabelIds`), so the ticket's
-  other labels survive. The fix ticket it may mint carries the configured cheap-model
+  label: `agent:needs-human`, on the original ticket, in the two cases contract §6 names
+  for the dispatcher-side component — a spent budget, and a delivered bounce whose head
+  has not moved past `blocked_after_seconds` — additively (`addedLabelIds`), so the
+  ticket's other labels survive. The fix ticket it may mint carries the configured cheap-model
   label on CREATE, which is choosing a model for a ticket this file owns, not writing to
   anyone else's. The fix ticket is never parented (a sub-issue would base on its parent's
   branch). --selftest asserts each of these against the source and against a recorded
@@ -252,6 +281,15 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
                                                    broken)
    "in_flight_hours": 6,                           a sent bounce blocks a repeat on the
                                                    same head for this long
+   "blocked_after_seconds": 21600,                 how long a DELIVERED bounce may sit on
+                                                   an unmoved head before the driver says
+                                                   so on the ticket and applies
+                                                   `agent:needs-human` — once per bounce,
+                                                   spending no budget. A cooldown and a
+                                                   deadline are different questions, so
+                                                   this is not `in_flight_hours`; a
+                                                   non-positive or non-numeric value
+                                                   resets to the default
    "run_timeout_seconds": 900,                     the one-shot `run` pass's own deadline
    "required_checks": {"OWNER/REPO": ["Kit checks"]},   override of the base branch's
                                                    required contexts (a plain list
@@ -383,6 +421,11 @@ BOUNCE_MARKER = "stage-e-bounce/1"
 LINEAR_API = "https://api.linear.app/graphql"
 GITHUB_API = "https://api.github.com"
 DEFAULT_IN_FLIGHT_HOURS = 6
+# How long a DELIVERED bounce may sit on an unmoved head before the driver stops waiting
+# and pages a person (six hours). It is deliberately not the same knob as
+# `in_flight_hours`, which only says how long to wait before re-prompting the same head:
+# one is a cooldown, the other is the point at which waiting has become silence.
+DEFAULT_BLOCKED_AFTER_SECONDS = 21600
 
 CONFIG_DEFAULTS = {
     "state_dir": DEFAULT_STATE_DIR,
@@ -398,6 +441,7 @@ CONFIG_DEFAULTS = {
     "needs_human_label_id": "",
     "needs_approval_state_id": "",
     "in_flight_hours": DEFAULT_IN_FLIGHT_HOURS,
+    "blocked_after_seconds": DEFAULT_BLOCKED_AFTER_SECONDS,
     "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
     "telemetry_model": "unknown",
 }
@@ -455,6 +499,20 @@ def _parse_iso(s):
         return datetime.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def _duration(seconds):
+    """A wait, in words a person reads at a glance ('7h 20m'). Never a bare second count:
+    the one place this is printed is a message telling somebody how long nothing has
+    happened, and '26400' does not say that."""
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return "an unknown time"
+    if total < 60:
+        return "%ds" % max(total, 0)
+    hours, minutes = divmod(total // 60, 60)
+    return "%dh %02dm" % (hours, minutes) if hours else "%dm" % minutes
 
 
 def repo_slug(owner_repo):
@@ -587,6 +645,9 @@ def validate_config(cfg):
     secs = cfg.get("run_timeout_seconds")
     if not isinstance(secs, (int, float)) or isinstance(secs, bool) or secs <= 0:
         cfg["run_timeout_seconds"] = DEFAULT_RUN_TIMEOUT_SECONDS
+    blocked = cfg.get("blocked_after_seconds")
+    if not isinstance(blocked, (int, float)) or isinstance(blocked, bool) or blocked <= 0:
+        cfg["blocked_after_seconds"] = DEFAULT_BLOCKED_AFTER_SECONDS
     return cfg
 
 
@@ -865,6 +926,40 @@ def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reas
     ])
 
 
+def render_blocked_ticket_comment(pr_number, pr_url, bounce_no, max_bounces, spent,
+                                  head_sha, delivered_at, waited_seconds):
+    """The one comment a stopped session produces — TOP LEVEL on the coding ticket, never
+    in the session thread. A thread comment is a prompt: the dispatcher resumes a session
+    on any new comment in its own thread, so saying "you have stopped" there would re-run
+    the session that stopped, silently spending real money outside the budget the ledger
+    counts. Top level is read by a person and nothing else.
+
+    Carries no text from the review, the session or the ticket — every value below is the
+    driver's own fact — so there is nothing here to sanitize and nothing a session could
+    have written into it."""
+    return "\n".join([
+        "**Stage E — no push since the last bounce.** Bounce %d of %d for PR #%d (%s) was "
+        "delivered at %s. The pull request's head is still `%s` %s later, so nothing has "
+        "been pushed to the branch since the session was asked to fix it."
+        % (bounce_no, max_bounces, pr_number, pr_url or "no URL recorded", delivered_at or "an unknown time",
+           (head_sha or "?")[:12], _duration(waited_seconds)),
+        "",
+        "This is measured, not read: the driver compares the head GitHub reports against "
+        "the head it bounced, and its own clock. Nothing written on this ticket — by the "
+        "session or by anyone else — can raise this signal or suppress it.",
+        "",
+        "**No bounce was spent.** The budget still stands at %d of %d, so the loop can "
+        "carry on the moment a push lands. The driver applies `%s` alongside this comment "
+        "and does nothing else: it does not move this ticket, does not conclude the "
+        "review, does not sign the work off and does not merge."
+        % (spent, max_bounces, NEEDS_HUMAN_KEY),
+        "",
+        "A person needs to look. The usual causes are a session that refused the work, "
+        "one that cannot push (a blocked command, a credential, a protected branch), and "
+        "one that is simply gone.",
+    ])
+
+
 def render_decline_pr_comment(pr_number, reason):
     """The could-not comment (§13): distinct from the exhaustion notice and from a
     review, and never a verdict on the code — it says the DRIVER could not act."""
@@ -1037,10 +1132,70 @@ def conclusion_pending(row, lane_configured):
     return bool(lane_configured)
 
 
+def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
+                   blocked_after_seconds):
+    """The one thing that was missing when a re-prompted session stops: a MEASURED signal
+    that it has, once per bounce. Returns {'bounce_no', 'at', 'waited_seconds', 'head_sha'}
+    or None.
+
+    THE DEFECT THIS CLOSES. A bounce is delivered; the session answers in the thread that
+    it cannot push and stops. Nothing then happens at all: no budget is spent (the review
+    outcome now predates the bounce, so the trigger is gone until a re-review, and a
+    re-review needs a push), the findings stand, nothing concludes, and the ticket looks
+    like any other in progress. Only an EXHAUSTED budget ever called a person, and a
+    session that stops after bounce 1 of 3 never exhausts one. The PR sat ten hours.
+
+    WHY IT DOES NOT READ THE REPLY. The obvious signal — the session saying "I am stuck" —
+    is a string the counted party writes, and this driver's whole doctrine is that nothing
+    a session can author may drive supervision (the ledger, not the thread, is the budget;
+    the branch name is cosmetic). A reply could be absent when the session is dead, forged
+    when it is not, and deleted afterwards. So the condition is three facts a session
+    cannot write:
+
+      DELIVERED    a `delivered` ledger row exists for the last bounce — the session was
+                   actually told. A bounce whose send failed is excluded: it is already
+                   loud on the PR, and a session nobody prompted is not one that stopped.
+      NOT MOVED    the PR's head is the same commit the bounce was delivered against. This
+                   is GitHub's answer about a branch, not anyone's claim about it.
+      OVERDUE      more than `blocked_after_seconds` have passed since that row was
+                   written. The clock is the daemon's.
+
+    Idempotent by ledger row, not by comment: a fully-announced `blocked` row for THIS
+    bounce number is the stop. A later bounce that is itself ignored signals again — once
+    per bounce, which is what makes the budget still mean something. A partly-announced
+    row (the comment landed, the label did not) is not a stop, so the next pass completes
+    it, exactly as a partial exhaustion is completed.
+
+    Never fires for an unreadable timestamp: a clock that cannot be read has not told us
+    the deadline passed, and inventing one would page a person from a hand-edited ledger."""
+    if not last_spent or not head_sha:
+        return None
+    bounce_no = last_spent.get("bounce_no")
+    if not isinstance(bounce_no, int) or isinstance(bounce_no, bool):
+        return None
+    if bounce_no not in (delivered_bounces or set()):
+        return None
+    if str(last_spent.get("head_sha") or "") != str(head_sha):
+        return None
+    sent_at = _parse_iso(last_spent.get("at"))
+    if sent_at is None:
+        return None
+    waited = (now - sent_at).total_seconds()
+    if waited <= float(blocked_after_seconds):
+        return None
+    prior = blocked_row or {}
+    if prior.get("bounce_no") == bounce_no:
+        announced = prior.get("announced") or {}
+        if announced and all(bool(v) for v in announced.values()):
+            return None
+    return {"bounce_no": bounce_no, "at": last_spent.get("at"), "waited_seconds": int(waited),
+            "head_sha": str(head_sha)}
+
+
 def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger_ok,
            trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced,
            cannot_evaluate="", conclusion=None, settled_conclusion=None,
-           stale_head=False, rereview_queued=False, refreshes_spent=0):
+           stale_head=False, rereview_queued=False, refreshes_spent=0, blocked=None):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
     fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
     then the budget: bounce `prior + 1` while budget remains, exhaust when
@@ -1071,16 +1226,36 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     reason it must: a review of a head the PR has moved off can buy neither a bounce nor a
     conclusion, and before this branch existed NOTHING could replace it — only a delivered
     bounce ever asked for a re-review, so a PR whose head moved before its first bounce
-    parked forever at exit 0 with nothing red. It is ranked last of the four, under a
-    live trigger and under every hold above: a stale review is the least urgent thing
-    that can be true of a PR, and a red required check bounces without consulting it.
-    Three outcomes, kept apart because two of them look identical from outside (§13):
-    a re-review already queued is WAITING (quiet, correct — one request buys one review),
-    an allowance left is `refresh` (ask for one, once, counted), and an allowance spent is
-    `unknown` — Stage E cannot evaluate this PR at any price it is allowed to pay, and
-    says so on the PR rather than exiting 0 on it forever."""
+    parked forever at exit 0 with nothing red. It is ranked under a live trigger and under
+    every hold above: a stale review is the least urgent thing that can be true of a PR,
+    and a red required check bounces without consulting it. Three outcomes, kept apart
+    because two of them look identical from outside (§13): a re-review already queued is
+    WAITING (quiet, correct — one request buys one review), an allowance left is `refresh`
+    (ask for one, once, counted), and an allowance spent is `unknown` — Stage E cannot
+    evaluate this PR at any price it is allowed to pay, and says so on the PR rather than
+    exiting 0 on it forever.
+
+    `blocked` (from `blocked_signal`) is the fifth, and it is ranked LAST on purpose: it
+    replaces only a hold that would otherwise do nothing at all about this PR. Every other
+    action already breaks the silence it exists to break — a bounce re-prompts the
+    session, an exhaustion pages a person with the same label, a conclusion hands the work
+    over, a refresh buys a re-review that will actually run, a CANNOT EVALUATE says so on
+    the PR — and firing alongside one of those would page a person about a pipeline that
+    is visibly moving. It replaces exactly three silences: the no-trigger skip (the live
+    shape: the review that triggered the bounce now predates it, and only a push buys a
+    re-review), the stale-head WAITING hold (after a CI-triggered bounce on an unmoved
+    head the queued request is that bounce's own, and the poller serves it only once the
+    head moves — so without a push it waits forever), and the in-flight skip (reachable
+    whenever `in_flight_hours` is set longer than `blocked_after_seconds`)."""
     def hold(action, reason, bounce_no=None):
         return {"action": action, "reason": reason, "bounce_no": bounce_no}
+
+    def stopped(quiet_reason):
+        return {"action": "blocked", "bounce_no": blocked["bounce_no"], "blocked": blocked,
+                "reason": "no push since bounce %d was delivered %s ago on head %s (%s)"
+                          % (blocked["bounce_no"],
+                             _duration(blocked.get("waited_seconds")),
+                             (head_sha or "?")[:12], quiet_reason)}
 
     if not pr_open:
         return hold("skip", "the PR is not open — nothing to bounce")
@@ -1107,8 +1282,11 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
                     "reason": "Stage E concluded (%s) — %s" % (conclusion, trigger_reason)}
         if stale_head:
             if rereview_queued:
-                return hold("skip", "%s — a re-review is already queued for this PR; waiting "
-                                    "for the poller to deliver it" % trigger_reason)
+                waiting = ("%s — a re-review is already queued for this PR; waiting "
+                           "for the poller to deliver it" % trigger_reason)
+                if blocked:
+                    return stopped(waiting)
+                return hold("skip", waiting)
             if refreshes_spent < REFRESH_ALLOWANCE:
                 return {"action": "refresh", "bounce_no": None,
                         "refresh_no": refreshes_spent + 1,
@@ -1120,8 +1298,13 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
                         "moved off, and its re-review allowance (%d per PR) is spent: it can "
                         "neither bounce nor conclude here, so a person is needed — %s"
                         % (REFRESH_ALLOWANCE, trigger_reason))
+        if blocked:
+            return stopped(trigger_reason)
         return hold("skip", trigger_reason)
     if in_flight:
+        if blocked:
+            return stopped("a bounce is still inside the in-flight window, and the wait has "
+                           "outlasted blocked_after_seconds")
         return hold("skip", "bounce %d was already sent for head %s (%s); waiting for a push"
                             % (in_flight.get("bounce_no") or 0, (head_sha or "?")[:12],
                                in_flight.get("at") or "?"))
@@ -1250,37 +1433,52 @@ def read_ledger(path):
 
 
 def ledger_view(path, owner_repo, pr_number):
-    """{'prior', 'last_spent', 'exhausted', 'concluded', 'refreshes'} for one PR. Only
-    `outcome == "spent"` rows count toward the budget — those are appended BEFORE a send,
-    so a failed send still spent its bounce (over-count, never under-count). A missing
-    ledger reads as zero; an unreadable or corrupt one raises (read_ledger) rather than
-    resetting the budget.
+    """{'prior', 'last_spent', 'exhausted', 'concluded', 'refreshes', 'delivered_bounces',
+    'blocked'} for one PR. Only `outcome == "spent"` rows count toward the budget — those
+    are appended BEFORE a send, so a failed send still spent its bounce (over-count, never
+    under-count). A missing ledger reads as zero; an unreadable or corrupt one raises
+    (read_ledger) rather than resetting the budget.
 
-    `concluded` is the LAST such row, not a count: a conclusion whose lane move failed
-    appends another on the retry, exactly as a partly-announced exhaustion does, and the
-    newest row is the current state of it.
+    `concluded` and `blocked` are the LAST such row, not a count: a conclusion whose lane
+    move failed appends another on the retry, exactly as a partly-announced exhaustion
+    does, and the newest row is the current state of it.
 
     `refreshes` counts the stale-head re-reviews this PR has bought (`outcome ==
     "refresh"`). They are a SEPARATE count from `prior` on purpose: a refresh spends a
     reviewer session, never a bounce, and folding the two would let a refresh eat the
     budget a person set for findings. It is counted here rather than kept in a flag for
     the same reason the bounce budget is — this file is the only durable record either
-    survives a crash in."""
-    prior, last_spent, exhausted, concluded, refreshes = 0, None, None, None, 0
+    survives a crash in.
+
+    `delivered_bounces` is the set of bounce numbers that actually ARRIVED — a `spent` row
+    says a bounce was counted, a `delivered` row says the session was told. The two differ
+    for exactly the case that must never be read as a silent session: a bounce whose send
+    failed, which is already loud on the PR (`send-failed`) and whose session was never
+    prompted at all."""
+    prior, last_spent, exhausted, concluded, refreshes, blocked = 0, None, None, None, 0, None
+    delivered = set()
     for row in read_ledger(path):
         if row.get("repo") != owner_repo or row.get("pr") != pr_number:
             continue
-        if row.get("outcome") == "spent":
+        outcome = row.get("outcome")
+        if outcome == "spent":
             prior += 1
             last_spent = row
-        elif row.get("outcome") == "exhausted":
+        elif outcome == "delivered":
+            n = row.get("bounce_no")
+            if isinstance(n, int) and not isinstance(n, bool):
+                delivered.add(n)
+        elif outcome == "exhausted":
             exhausted = row
-        elif row.get("outcome") == "concluded":
+        elif outcome == "concluded":
             concluded = row
-        elif row.get("outcome") == "refresh":
+        elif outcome == "refresh":
             refreshes += 1
+        elif outcome == "blocked":
+            blocked = row
     return {"prior": prior, "last_spent": last_spent, "exhausted": exhausted,
-            "concluded": concluded, "refreshes": refreshes}
+            "concluded": concluded, "refreshes": refreshes,
+            "delivered_bounces": delivered, "blocked": blocked}
 
 
 def append_row(path, **fields):
@@ -2084,6 +2282,15 @@ def decision_for(sit, cfg):
     lane_on = bool(sit.get("needs_approval_state_id"))
     settled = None if conclusion_pending(prior_conclusion, lane_on) else prior_conclusion
 
+    # The stopped session. Read from the ledger, the head GitHub reports and the clock —
+    # never from anything on the ticket, which is the only half a session can write.
+    blocked = blocked_signal(last_spent=sit.get("last_spent"),
+                             delivered_bounces=sit.get("delivered_bounces") or set(),
+                             blocked_row=sit.get("blocked"), head_sha=sit.get("head_sha"),
+                             now=datetime.now(timezone.utc),
+                             blocked_after_seconds=cfg.get("blocked_after_seconds")
+                             or DEFAULT_BLOCKED_AFTER_SECONDS)
+
     meta = sit.get("pr_meta") or {}
     verdict = decide(pr_open=bool(meta.get("open")), is_draft=bool(meta.get("isDraft")),
                      is_fork=bool(meta.get("isCrossRepository")),
@@ -2096,7 +2303,7 @@ def decision_for(sit, cfg):
                      settled_conclusion=settled,
                      stale_head=outcome_head_is_stale(sit.get("outcome"), sit.get("head_sha")),
                      rereview_queued=bool(sit.get("rereview_queued")),
-                     refreshes_spent=sit.get("refreshes", 0))
+                     refreshes_spent=sit.get("refreshes", 0), blocked=blocked)
     verdict["trigger"] = kind if trigger_ok else None
     verdict["trigger_reason"] = trigger_reason
     verdict["cannot_evaluate"] = cannot_evaluate or None
@@ -2116,6 +2323,8 @@ def describe(sit, verdict):
         head = "CONCLUDE (%s)" % (verdict.get("basis") or "clean")
     elif action == "refresh":
         head = "REFRESH %d of %d" % (verdict.get("refresh_no") or 1, REFRESH_ALLOWANCE)
+    elif action == "blocked":
+        head = "BLOCKED (no push since bounce %d)" % (verdict.get("bounce_no") or 0)
     elif action == "unknown":
         head = "CANNOT EVALUATE"     # never the same word as `skip`: that was the defect
     else:
@@ -2435,6 +2644,90 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
+def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
+    """A delivered bounce the session never answered with a push: ONE top-level comment on
+    the coding ticket and the ONE label, each done once per bounce, and nothing else.
+
+    What it deliberately does NOT do, because each would make the signal cost something it
+    should not: no ledger `spent` row (the budget is untouched — a session that stopped
+    has not used a round trip, and the loop must be able to carry on the moment somebody
+    pushes), no thread reply (that would resume the very session that stopped), no
+    conclusion and no lane move (the review has not finished; the needs-approval lane
+    means "accept this work", which is the opposite of what is being said), and no
+    re-review request.
+
+    Recorded as a `blocked` row whose `announced` map says which of the two steps landed,
+    exactly like a partial exhaustion: a step that failed is a problem, exit 2, and the
+    next pass completes it rather than repeating what already landed."""
+    signal = verdict.get("blocked") or {}
+    bounce_no = signal.get("bounce_no") or verdict.get("bounce_no") or 0
+    issue = sit.get("issue") or {}
+    prev = sit.get("blocked") or {}
+    prev_announced = (prev.get("announced") or {}) if prev.get("bounce_no") == bounce_no else {}
+    announced = {"ticket_comment": bool(prev_announced.get("ticket_comment")),
+                 "label": bool(prev_announced.get("label"))}
+    body = render_blocked_ticket_comment(
+        sit["pr"], sit.get("pr_url") or "", bounce_no, sit.get("max_bounces", 0),
+        sit.get("prior", 0), signal.get("head_sha") or sit.get("head_sha"),
+        signal.get("at"), signal.get("waited_seconds"))
+    hits = secret_hits(body)
+    if hits:    # the same gate everywhere, even on a body built only from this file's own facts
+        sys.stderr.write("WITHHELD: %s (%s) — the no-push notice was not posted\n"
+                         % (SECRET_DECLINE_REASON, ", ".join(hits)))
+        raise Decline("%s (%s); the no-push notice was not posted to the ticket"
+                      % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
+
+    if dry_run:
+        print("[dry-run] %s" % describe(sit, verdict))
+        print("=== [dry-run] ticket comment (TOP LEVEL, never the session thread) ===\n%s" % body)
+        print("[dry-run] would apply %s (label id %r) to %s — no bounce spent, nothing written"
+              % (NEEDS_HUMAN_KEY, sit.get("needs_human_label_id") or "", sit.get("ticket_id")))
+        return EXIT_OK
+
+    problems = []
+    if not announced["ticket_comment"]:
+        if issue.get("id"):
+            try:
+                linear_comment(issue["id"], body, cfg)
+                announced["ticket_comment"] = True
+            except BounceError as exc:
+                problems.append("ticket comment: %s" % exc)
+        else:
+            problems.append("ticket comment: no original ticket resolved for this PR")
+    if not announced["label"]:
+        label_id = sit.get("needs_human_label_id") or ""
+        if not issue.get("id"):
+            problems.append("label: no original ticket resolved for this PR")
+        elif not label_id:
+            problems.append("label: no id for %s (set linear.labels.ids in the committed "
+                            "delivery.json or needs_human_label_id in the config)" % NEEDS_HUMAN_KEY)
+        else:
+            try:
+                linear_add_label(issue["id"], label_id, cfg)
+                announced["label"] = True
+            except BounceError as exc:
+                problems.append("label: %s" % exc)
+
+    append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
+               bounce_no=bounce_no, head_sha=signal.get("head_sha") or sit.get("head_sha"),
+               waited_seconds=signal.get("waited_seconds"), outcome="blocked",
+               announced=announced, problems=problems)
+    emit_status = emit_telemetry(state_dir, {
+        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+        "outcome": "blocked", "error_class": "bounce_no_push",
+        "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
+        "reason": verdict["reason"]}, cfg)
+    if problems:
+        sys.stderr.write("FAIL: the no-push signal for %s#%d only partly landed (%s); the next "
+                         "run completes the missing step(s). telemetry: %s\n"
+                         % (sit["repo"], sit["pr"], "; ".join(problems), emit_status))
+        return EXIT_USAGE
+    print("%s — said on the ticket, %s applied, no bounce spent (%d of %d still); telemetry: %s"
+          % (describe(sit, verdict), NEEDS_HUMAN_KEY, sit.get("prior", 0),
+             sit.get("max_bounces", 0), emit_status))
+    return EXIT_OK
+
+
 def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False):
     """mode ∈ decide | bounce | exhaust. Returns an exit code; prints one line per PR.
     `decide` is the read-only mode: it never posts, not even a could-not comment. In the
@@ -2522,6 +2815,8 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         return act(perform_conclude)
     if verdict["action"] == "refresh":
         return act(perform_refresh)
+    if verdict["action"] == "blocked":
+        return act(perform_blocked)
     print(describe(sit, verdict))
     return EXIT_OK
 
@@ -2831,6 +3126,62 @@ def selftest():
     check("…and settles when the lane is not configured (off, never broken)",
           conclusion_pending({"moved": False}, False), False)
 
+    # 4c. THE NO-PUSH SIGNAL. Three facts a session cannot write — a `delivered` row, the
+    #     head GitHub reports, and the clock — because the obvious signal (the session
+    #     saying "I am stuck") is a string the counted party authors. Everything below is
+    #     the pure predicate; 10p drives the whole driver through it.
+    t0 = datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)
+    spent1 = {"bounce_no": 1, "head_sha": "aaaa1111", "at": "2026-01-02T00:00:00Z"}
+
+    def sig(hours, **over):
+        kw = dict(last_spent=spent1, delivered_bounces={1}, blocked_row=None,
+                  head_sha="aaaa1111", now=t0 + timedelta(hours=hours),
+                  blocked_after_seconds=DEFAULT_BLOCKED_AFTER_SECONDS)
+        kw.update(over)
+        return blocked_signal(**kw)
+
+    check("the default deadline is six hours", DEFAULT_BLOCKED_AFTER_SECONDS, 21600)
+    check("a delivered bounce on an unmoved head past the deadline fires, naming its bounce",
+          (sig(10) or {}).get("bounce_no"), 1)
+    check("…and says how long the wait has been", (sig(10) or {}).get("waited_seconds"), 36000)
+    check("before the deadline it does not fire", sig(5), None)
+    check("AT the deadline it does not fire either (strictly past, so a boundary "
+          "cannot fire twice)", sig(6), None)
+    check("a head that MOVED never fires — the session pushed", sig(10, head_sha="bbbb2222"), None)
+    check("a bounce that was never DELIVERED never fires (its send-failed is already loud)",
+          sig(10, delivered_bounces=set()), None)
+    check("no bounce at all never fires", sig(10, last_spent=None), None)
+    check("an unreadable head never fires", sig(10, head_sha=""), None)
+    check("a ledger timestamp that cannot be parsed never fires — a clock nobody can read "
+          "has not said the deadline passed", sig(10, last_spent=dict(spent1, at="last tuesday")), None)
+    check("a raised blocked_after_seconds holds the signal back", sig(10, blocked_after_seconds=86400), None)
+    check("a fully announced row for THIS bounce is the stop",
+          sig(10, blocked_row={"bounce_no": 1, "announced": {"ticket_comment": True, "label": True}}), None)
+    check("a PARTLY announced row is not a stop — the next pass completes it",
+          (sig(10, blocked_row={"bounce_no": 1, "announced": {"ticket_comment": True, "label": False}})
+           or {}).get("bounce_no"), 1)
+    check("an announced row for an EARLIER bounce does not silence a later one "
+          "(once per bounce, not once per PR)",
+          (sig(10, last_spent=dict(spent1, bounce_no=2), delivered_bounces={1, 2},
+               blocked_row={"bounce_no": 1, "announced": {"ticket_comment": True, "label": True}})
+           or {}).get("bounce_no"), 2)
+    #     The comment itself: top level, its own facts only, and — load-bearing — NO visible
+    #     bounce record. A record line here would be read back by the next pass's
+    #     cross-check as a bounce the ledger never counted, and the driver would refuse.
+    blocked_body = render_blocked_ticket_comment(41, "https://example.invalid/pr/41", 1, 3, 1,
+                                                 "aaaa1111", "2026-01-02T00:00:00Z", 36000)
+    check("the no-push comment carries no bounce record line", bounce_markers([blocked_body], "o/r", 41), [])
+    for must in ("no push since the last bounce", "Bounce 1 of 3", "`aaaa1111`", "10h 00m",
+                 "measured, not read", "No bounce was spent", NEEDS_HUMAN_KEY,
+                 "does not move this ticket", "A person needs to look"):
+        check("the no-push comment says %r" % must, must in blocked_body, True)
+    for never in ("approve", "LGTM", "merge this"):
+        if never in blocked_body:
+            failures.append("the no-push comment contains %r" % never)
+    check("a wait is said in hours and minutes, never a bare second count",
+          (_duration(36000), _duration(900), _duration(30), _duration(None)),
+          ("10h 00m", "15m", "30s", "an unknown time"))
+
     # 5. The counter, exactly at N-1 / N / N+1 (bounce numbers) against maxBounces = N = 3.
     base = dict(pr_open=True, is_draft=False, is_fork=False, ticket_terminal=False, ticket_state="In Progress",
                 trigger_ok=True, trigger_reason="red", max_bounces=3, in_flight=None, head_sha="h",
@@ -2917,6 +3268,52 @@ def selftest():
     check("an exhausted budget does not stop a refresh: a fresh review is what tells "
           "'hand it over' from 'bounce again'",
           decide(prior=9, **stale)["action"], "refresh")
+
+    # 5d. Where the no-push signal sits in that order: LAST of the things that can replace
+    #     a quiet skip. It fires only where the driver would otherwise do nothing at all —
+    #     every other action already breaks the silence, and paging a person about a
+    #     pipeline that is visibly moving is the noise that gets a signal ignored.
+    stop = {"bounce_no": 1, "at": "2026-01-02T00:00:00Z", "waited_seconds": 36000, "head_sha": "h"}
+    d = decide(prior=1, **dict(cleared, blocked=stop))
+    check("a cleared trigger with a stopped session SIGNALS instead of skipping",
+          (d["action"], d["bounce_no"]), ("blocked", 1))
+    check("…and the reason says what was measured", "no push since bounce 1" in d["reason"], True)
+    check("a LIVE trigger outranks it — a bounce is not silence",
+          decide(prior=1, **dict(base, blocked=stop))["action"], "bounce")
+    check("an EXHAUSTION outranks it — it pages a person with the same label",
+          decide(prior=3, **dict(base, blocked=stop))["action"], "exhaust")
+    check("an ANNOUNCED exhaustion outranks it — the label is already on the ticket",
+          decide(prior=3, **dict(base, exhausted_announced=True, blocked=stop))["action"], "noop")
+    check("a CONCLUSION outranks it — the work is a person's already",
+          decide(prior=1, **dict(cleared, conclusion="clean", blocked=stop))["action"], "conclude")
+    check("a settled conclusion outranks it",
+          decide(prior=1, **dict(cleared, conclusion="clean", blocked=stop,
+                                 settled_conclusion={"basis": "clean", "moved": True}))["action"], "noop")
+    check("CANNOT EVALUATE outranks it — that is already said on the PR",
+          decide(prior=1, **dict(cleared, cannot_evaluate="CI unreadable", blocked=stop))["action"], "unknown")
+    for label, over in (("fork", {"is_fork": True}), ("closed PR", {"pr_open": False}),
+                        ("draft", {"is_draft": True}), ("terminal ticket", {"ticket_terminal": True})):
+        check("a %s never signals — not ours to judge" % label,
+              decide(prior=1, **dict(cleared, blocked=stop, **over))["action"], "skip")
+    #     …and the OTHER silence: a live trigger held inside the in-flight window, which is
+    #     reachable whenever in_flight_hours outlasts blocked_after_seconds.
+    held = dict(base, in_flight={"bounce_no": 1, "at": "2026-01-02T00:00:00Z"})
+    check("an in-flight hold with no signal is the skip it always was",
+          decide(prior=1, **held)["action"], "skip")
+    check("an in-flight hold that has outlasted the deadline signals",
+          decide(prior=1, **dict(held, blocked=stop))["action"], "blocked")
+    #     …and against the STRANDED-PR answers (5c). The WAITING hold is a silence like any
+    #     other — after a CI-triggered bounce on an unmoved head the queued request is that
+    #     bounce's own, and the poller serves it only once the head moves — so the signal
+    #     replaces it. A refresh buys a re-review that WILL run, and a spent allowance is
+    #     already said on the PR, so both of those outrank it.
+    check("a stale-head WAITING hold that has outlasted the deadline signals",
+          decide(prior=1, **dict(stale, rereview_queued=True, blocked=stop))["action"], "blocked")
+    check("a stale-head REFRESH outranks it — a re-review that will actually run is not silence",
+          decide(prior=1, **dict(stale, blocked=stop))["action"], "refresh")
+    check("a spent refresh allowance outranks it — CANNOT EVALUATE is already said on the PR",
+          decide(prior=1, **dict(stale, refreshes_spent=REFRESH_ALLOWANCE, blocked=stop))["action"],
+          "unknown")
 
     # 6. parse_delivery: OK / BROKEN shapes (absence is decided before parsing).
     ok_cfg = json.dumps({"version": 1, "budgets": {"maxBounces": 2, "reviewSeverityThreshold": "medium"},
@@ -4252,6 +4649,214 @@ def selftest():
         sent = [c[3] for c in calls if c[0] == "reply"]
         check("the re-prompt that was sent carries its own record line",
               bounce_markers(sent, "o/r", 41), [2])
+
+        # 10p. THE STOPPED SESSION, end to end — the shape a production PR actually sat in
+        #      for ten hours. Bounce 1 of 2 was delivered on findings; the session replied
+        #      that it could not push and stopped. From that moment nothing at all was due:
+        #      the review that triggered the bounce now predates it, so the trigger is gone
+        #      until a re-review, and a re-review needs a push. Budget unspent, findings
+        #      standing, no conclusion, no label, no comment — and the only thing that ever
+        #      called a person was a SPENT budget, which this PR will never reach.
+        world["issue"] = live_issue
+        world.update(delivery=delivery_lane, pr=open_pr, required=["Kit checks"], runs=green)
+
+        def hours_ago(h):
+            return (datetime.now(timezone.utc) - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        at_threshold = dict(poller_record, head_sha="aaaa1111", at=hours_ago(11))
+
+        def stalled(tmp, bounce_at, delivered=True, bounce_no=1):
+            """A PR whose bounce landed at `bounce_at` and whose head never moved since."""
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), at_threshold)
+            append_row(ledger_path(tmp), repo="o/r", pr=41, ticket_id="ENG-41", bounce_no=bounce_no,
+                       head_sha="aaaa1111", trigger="review", outcome="spent", at=bounce_at)
+            if delivered:
+                append_row(ledger_path(tmp), repo="o/r", pr=41, bounce_no=bounce_no,
+                           outcome="delivered", via="reprompt", ref="cmt-1", at=bounce_at)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stalled(tmp, hours_ago(10))
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("a stopped session: exit 0, one TICKET comment, the label, telemetry",
+                  (rc, kinds()), (EXIT_OK, ["ticketComment", "label", "telemetry"]))
+            check("…and the comment is TOP LEVEL on the coding ticket, never the session "
+                  "thread — a thread comment would resume the session that stopped",
+                  ([c[1] for c in calls if c[0] == "ticketComment"], "reply" in kinds()),
+                  (["iss-uuid"], False))
+            check("…the label is agent:needs-human's id on the ORIGINAL ticket",
+                  [c[1:] for c in calls if c[0] == "label"], [("iss-uuid", "lbl-nh")])
+            check("…the comment says what was measured and that no budget went with it",
+                  ("no push since the last bounce" in body_of("ticketComment")
+                   and "measured, not read" in body_of("ticketComment")
+                   and "No bounce was spent" in body_of("ticketComment")), True)
+            check("…the verdict is BLOCKED, never the word skip",
+                  ("BLOCKED" in buf.getvalue(), "skip" in buf.getvalue()), (True, False))
+            check("NO BOUNCE WAS SPENT: the budget still reads 1 of 2",
+                  ledger_view(ledger_path(tmp), "o/r", 41)["prior"], 1)
+            check("…nothing concluded and the ticket was NOT moved, though the lane is "
+                  "configured — this says a person is needed, not that review is over",
+                  ([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"],
+                   [c for c in calls if c[0] == "state"]), ([], []))
+            rows = [r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "blocked"]
+            check("…one blocked row, carrying the bounce, the head and the wait",
+                  [(r["bounce_no"], r["head_sha"], r["announced"]) for r in rows],
+                  [(1, "aaaa1111", {"ticket_comment": True, "label": True})])
+            check("…and the telemetry row is a §4 `blocked` outcome with an error class",
+                  [(a["outcome"], a["error_class"]) for k, a in
+                   [(c[0], c[1]) for c in calls if c[0] == "telemetry"]],
+                  [("blocked", "bounce_no_push")])
+
+            # FIRES ONCE, NOT TWICE. The next pass has the same three facts and must be
+            # silent: the ledger row is the stop, not a comment anyone could delete.
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("the second pass says nothing again", (rc, calls), (EXIT_OK, []))
+            check("…and appends no second blocked row",
+                  len([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "blocked"]), 1)
+
+        # 10p-i. THE HEAD MOVED ⇒ never a signal. The session pushed; that is the whole
+        #        thing the driver is waiting for, and it is GitHub's answer, not a claim.
+        with tempfile.TemporaryDirectory() as tmp:
+            stalled(tmp, hours_ago(10))
+            world["pr"] = dict(open_pr, headRefOid="bbbb2222")
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("head moved: nothing said, nothing labelled", (rc, calls), (EXIT_OK, []))
+            check("head moved: no blocked row",
+                  [r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "blocked"], [])
+        world["pr"] = open_pr
+
+        # 10p-ii. BEFORE THE DEADLINE ⇒ never a signal, by either route: a bounce delivered
+        #         minutes ago, and a wait the operator has configured as still acceptable.
+        for label, bounce_at, run_cfg in (("a bounce delivered five minutes ago", hours_ago(0.08), cfg),
+                                          ("a deadline the operator raised to 24h", hours_ago(10),
+                                           dict(cfg, blocked_after_seconds=86400))):
+            with tempfile.TemporaryDirectory() as tmp:
+                stalled(tmp, bounce_at)
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = run_one(41, "o/r", run_cfg, tmp, "bounce", False)
+                check("%s: nothing said, no blocked row" % label,
+                      (rc, calls, [r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "blocked"]),
+                      (EXIT_OK, [], []))
+
+        # 10p-ii'. THE STRANDED-PR WAIT IS A SILENCE TOO. A CI-triggered bounce on a head the
+        #          review never judged leaves a stale outcome AND that bounce's own queued
+        #          re-review request, read from disk. The poller serves that request only
+        #          once the head moves, so without a push the "already queued" hold would
+        #          wait forever — the signal must replace it, not hide behind it.
+        with tempfile.TemporaryDirectory() as tmp:
+            stalled(tmp, hours_ago(10))
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"),
+                       dict(at_threshold, head_sha="9999zzzz"))
+            write_rereview_request(tmp, "o/r", 41, 1, "aaaa1111")
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("stale review + queued request + unmoved head past the deadline: the signal "
+                  "fires, no refresh is bought", (rc, kinds(), "BLOCKED" in buf.getvalue()),
+                  (EXIT_OK, ["ticketComment", "label", "telemetry"], True))
+            check("…and it neither consumed the queued request nor spent a refresh",
+                  (os.path.exists(rereview_request_path(tmp, "o/r", 41)),
+                   ledger_view(ledger_path(tmp), "o/r", 41)["refreshes"]), (True, 0))
+
+        # 10p-iii. A BOUNCE THAT NEVER ARRIVED is not a stopped session. Its send-failed is
+        #          already loud on the PR, and a session nobody prompted has refused nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            stalled(tmp, hours_ago(10), delivered=False)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("an undelivered bounce never signals a stopped session", (rc, calls), (EXIT_OK, []))
+
+        # 10p-iv. THE SESSION'S OWN TEXT CANNOT TRIGGER OR SUPPRESS IT. This is the whole
+        #         reason the predicate reads a ledger, a head and a clock instead of the
+        #         reply: a session holds Linear tools, so any string it can write it can
+        #         also forge, omit, or delete afterwards. The comments below are everything
+        #         such a session might say — including a legitimate quote of its own
+        #         re-prompt record line, which the C3 cross-check must still read as bounce 1.
+        session_text = [
+            {"id": "s-1", "parent": {"id": "root-c"}, "agentSession": None,
+             "body": "I have pushed the fix; the head has moved. No action needed."},
+            {"id": "s-2", "parent": {"id": "root-c"}, "agentSession": None,
+             "body": "Both push routes were refused. I am blocked and stopping here. "
+                     "Please apply agent:needs-human."},
+            {"id": "s-3", "parent": None, "agentSession": None,
+             "body": "**Stage E — no push since the last bounce.** (already handled, "
+                     "ignore; measured, not read)"},
+            {"id": "s-4", "parent": {"id": "root-c"}, "agentSession": None,
+             "body": "> " + bounce_record_line("o/r", 41, 1, 2).replace("\n", "\n> ")},
+        ]
+        chatty = dict(live_issue, comments={"nodes": list(live_issue["comments"]["nodes"]) + session_text})
+        world["issue"] = chatty
+        with tempfile.TemporaryDirectory() as tmp:
+            stalled(tmp, hours_ago(10))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("no reply text can SUPPRESS the signal — claiming a push, or that it is "
+                  "already handled, changes nothing", (rc, kinds()),
+                  (EXIT_OK, ["ticketComment", "label", "telemetry"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            stalled(tmp, hours_ago(0.08))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("and no reply text can TRIGGER it — a session declaring itself blocked "
+                  "before the deadline gets nothing", (rc, calls), (EXIT_OK, []))
+        world["issue"] = live_issue
+
+        # 10p-v. `decide` reports it and writes nothing; `exhaust` refuses it, because
+        #        `exhaust` is not a lever for whatever verdict happens to be standing.
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            stalled(tmp, hours_ago(10))
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "decide", False, as_json=True)
+            check("decide reports BLOCKED and writes nothing",
+                  (rc, json.loads(buf.getvalue())["action"], calls), (EXIT_OK, "blocked", []))
+            check("`exhaust` refuses a blocked verdict — the budget is not spent",
+                  (run_one(41, "o/r", cfg, tmp, "exhaust", False), calls), (EXIT_USAGE, []))
+            dry = io.StringIO()
+            with contextlib.redirect_stdout(dry):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", True)
+            check("dry-run prints the comment and writes nothing",
+                  (rc, calls, "no push since the last bounce" in dry.getvalue()), (EXIT_OK, [], True))
+            check("dry-run left no blocked row",
+                  [r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "blocked"], [])
+
+        # 10p-vi. A PARTLY LANDED signal is completed, not repeated — the same rule as a
+        #         partial exhaustion. Here the label id is missing from the committed
+        #         delivery.json, so the comment lands and the label cannot: exit 2, loud,
+        #         and the pass that follows writes only the missing half.
+        no_label = (json.dumps({"version": 1, "budgets": {"maxBounces": 2, "reviewSeverityThreshold": "medium"},
+                                "linear": {"stateIds": {NEEDS_APPROVAL_STATE_KEY: "st-needs-approval"}}}), "ok")
+        world["delivery"] = no_label
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            stalled(tmp, hours_ago(10))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("a missing label id makes the signal PARTIAL: exit 2, the comment still said",
+                  (rc, kinds()), (EXIT_USAGE, ["ticketComment", "telemetry"]))
+            row = ledger_view(ledger_path(tmp), "o/r", 41)["blocked"]
+            check("…and the row records which half landed",
+                  row["announced"], {"ticket_comment": True, "label": False})
+            world["delivery"] = delivery_lane
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("the next pass completes the label and does NOT comment again",
+                  (rc, kinds()), (EXIT_OK, ["label", "telemetry"]))
+        check("a partial signal is loud on stderr", "only partly landed" in err.getvalue(), True)
+        world["delivery"] = delivery_ok
     finally:
         globals().update(saved)
 
@@ -4362,6 +4967,20 @@ def selftest():
     check("the label mutation is additive", "added" + "LabelIds" in src, True)
     check("labelIds on create appears once (the model label for a ticket this file mints)",
           src.count('payload["label' + 'Ids"]'), 1)
+    #     …and the no-push signal's four abstentions, asserted over its own source rather
+    #     than only behaviourally: each is a thing that would quietly turn a free
+    #     notification into something that costs money, resumes a session, or ends a
+    #     review. A behavioural check sees them only on the paths it happens to drive.
+    _pb = inspect.getsource(perform_blocked)
+    check("the no-push signal never replies in the session thread (that would resume the "
+          "session that stopped)", "linear_reply_in_thread" in _pb, False)
+    check("…never spends a bounce", 'outcome="spent"' in _pb, False)
+    check("…never concludes and never moves the ticket",
+          ("record_conclusion" in _pb, "linear_set_state" in _pb), (False, False))
+    check("…and never asks for a re-review", "write_rereview_request" in _pb, False)
+    check("it posts exactly one TOP-LEVEL ticket comment and applies exactly one label",
+          (_pb.count("linear_comment("), _pb.count("linear_add_label(")), (1, 1))
+
     check("no credential-shaped literal in the source",
           re.search(r"(lin_api_|lin_oauth_|ghp_|gho_|github_pat_|sk-ant-)[A-Za-z0-9_\-]{20,}", src) is None, True)
     check("the only GitHub write goes through the reviewer core's publisher", src.count("prl.post_" + "comment("), 1)
@@ -4390,7 +5009,14 @@ def selftest():
           "budget said once on the PR, comments paginated, terminal ticket skipped with reason, "
           "absent delivery.json ⇒ OFF and named, missing thread ⇒ fallback fix ticket with "
           "[repo=name#branch] + push + rename instruction, sanitizer strips routing tags and "
-          "fence tags everywhere, the only label written is agent:needs-human on exhaustion, "
+          "fence tags everywhere, the only label written is agent:needs-human — on a spent "
+          "budget and on a stopped session, nowhere else; a DELIVERED bounce whose head has "
+          "not moved past blocked_after_seconds says so ONCE PER BOUNCE on the coding ticket "
+          "(top level, never the session thread) and applies that label, spending no bounce, "
+          "concluding nothing and moving nothing — measured from the ledger, the head and the "
+          "clock, so no reply text can raise it or suppress it, and it never fires before the "
+          "deadline, on a moved head, on an undelivered bounce, or where the driver is already "
+          "bouncing, exhausting, concluding or saying it cannot evaluate; "
           "no merge/approve/auto-merge/launch path; a clean or below-threshold review on "
           "green CI CONCLUDES — one ledger row carrying the basis and one move of the "
           "original ticket into the needs-approval lane, exactly once, with exhaustion "
