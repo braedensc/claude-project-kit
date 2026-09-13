@@ -355,3 +355,13 @@ lane write the rest:
 
 New producer marks are added to this table in the same PR that ships them, so a mark the
 notifier cannot page on never exists silently.
+
+> **Implementation note, 2026-09-13.** The shipped notifier applies **`agent:needs-human`**
+> on the `agent:needs-human` mark, not the `agent:blocked` this table's last data column
+> says. §6 routes the two labels differently — blocked means a question is waiting, needs-human
+> means the work is terminal until a person acts — so answering a needs-human mark with a
+> blocked label would file it where someone looks for a question to answer. The four planning
+> rows match the table exactly, and §6's invariant is untouched either way: the session
+> requests the label, this job applies it. Recorded here rather than changed in the decision,
+> which stays the owner's to confirm. The reasoning lives beside `MARKS` in
+> `scripts/pipeline_notify_local.py`.

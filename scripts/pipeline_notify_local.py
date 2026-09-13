@@ -86,6 +86,13 @@ LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
     normalizes leading whitespace this still matches (the regex tolerates it).
   * Whether `chat.postMessage` needs `channels:read` in addition to `chat:write` for a
     private channel the bot was invited to. Coded for `chat:write` only.
+  * Whether `comments(first:N, orderBy:createdAt)` returns the NEWEST comments. Linear
+    pages descending by the ordering field, so newest-first is what the query now asks for
+    explicitly rather than inheriting the connection's default. Coded so a wrong assumption
+    is VISIBLE: a ticket whose window comes back full is reported as saturated in the pass
+    summary and the heartbeat, because an escalation pushed outside the window would
+    otherwise produce no send, no decline and no non-zero exit — a missed page that reads
+    exactly like a quiet week.
   * The exact label id for `agent:blocked` in the live workspace. Resolved by key from config,
     never by display text (§6).
 
@@ -139,12 +146,28 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 # `label` is the lifecycle label this job applies, or None.
 #
 # Decision 4 names agent:blocked for the two planning marks that mean "the run needs the
-# owner". For a SESSION-authored mark the job applies the label the session's own mark
-# REQUESTS — agent:blocked or agent:needs-human — because §6 routes those two differently
-# and the session asked for a specific one. The ADR's table gives "yes" for the bounce
-# driver's needs-human row; that row is left as None here because the bounce driver has
-# ALREADY applied needs-human by the time the mark exists, and re-applying it would be a
-# second writer for one signal. Flagged in the PR for the owner rather than assumed.
+# owner" (planning-needs-input, planning-no-output), and no label for the other two
+# (epic-awaiting-approval is an approval, planning-rejected is already a loud comment).
+# Those four rows are the ADR's table, read straight across.
+#
+# THE agent:needs-human ROW DEPARTS FROM THE CRITERION'S LITERAL WORDING, deliberately.
+# The acceptance criterion and the ADR table both say to apply *agent:blocked* there. This
+# dict applies **agent:needs-human** instead — the label the mark itself names — and the
+# selftest pins that. Why: §6 routes the two labels differently. blocked means a question
+# is waiting and an answer unblocks it; needs-human means the work is terminal until a
+# person acts. Answering a needs-human mark with a blocked label would file it in the
+# queue where someone looks for a question to answer, and lose the only distinction the
+# mark carries. §6's invariant holds either way — the session still never applies its own
+# supervision label; this job applies the one the session asked for.
+#
+# Recorded because the comment that stood here said this row was None, reasoning that the
+# bounce driver has already applied needs-human so a second write would be a second
+# writer. The code never matched that, and the reasoning does not hold anyway: a stopped
+# working session writes this mark too (`.claude/skills/work/SKILL.md`'s escalation table,
+# the riskPaths row), with no bounce driver in the picture, and the write
+# is additive and skipped outright when the ticket already carries the label. A reader who
+# trusted the old comment would have concluded this job cannot label a terminal session at
+# all (Stage E review of PR #98, LOW).
 ESC_AWAITING_APPROVAL = "epic-awaiting-approval"
 ESC_NEEDS_INPUT = "planning-needs-input"
 ESC_REJECTED = "planning-rejected"
@@ -454,6 +477,8 @@ def write_heartbeat(cfg, result, now):
         "would_send": result.get("sent", 0) if dry else 0,
         "declined": result.get("declined", 0),
         "labelled": 0 if dry else result.get("labelled", 0),
+        "settled": 0 if dry else result.get("settled", 0),
+        "would_settle": result.get("settled", 0) if dry else 0,
         "summary": result.get("summary", ""),
     }
     try:
@@ -498,16 +523,37 @@ def secret_hits(text):
     Empty means clean.
     """
     hits = list(_local_secret_hits(text))
-    try:
-        import pipeline_review_local as prl
-        fn = getattr(prl, "secret_hits", None)
-        if callable(fn):
-            for label in fn(text):
-                if label not in hits:
-                    hits.append(label)
-    except Exception:                                             # noqa: BLE001
-        pass
+    for label in _shared_secret_hits(text):
+        if label not in hits:
+            hits.append(label)
     return hits
+
+
+def _shared_secret_hits(text):
+    """The publisher's scanner — the ONE shared scrub — with no failure swallowed.
+
+    This used to sit inside a bare `except Exception: pass`, and that made the acceptance
+    criterion ("the same secret scrub pipeline_review_local.py uses runs on every outbound
+    body") silently false the moment that function was renamed, moved, or made to raise:
+    no error, no decline, no red check, and a shape only the publisher knows — an AWS key
+    id, a JWT, a credential embedded in a URL — relayed to a third party. That is the §13
+    silent no-op inside a security check, which is the one place it costs the most (Stage E
+    review of PR #98, MEDIUM).
+
+    So a failure is raised instead. Both files live in the directory HERE puts on sys.path,
+    so an import error here means something is genuinely broken, and the caller turns it
+    into a DECLINE: the body is withheld, the pass goes non-zero, and the problem is named.
+    Failing that way round is the safe one — nothing unscrubbed is posted. The selftest
+    asserts the import is live, and that both failure shapes decline rather than send.
+    """
+    import pipeline_review_local as prl
+
+    fn = getattr(prl, "secret_hits", None)
+    if not callable(fn):
+        raise NotifierError(
+            "pipeline_review_local.secret_hits is missing or not callable — the shared "
+            "secret scrub cannot run, so nothing is posted this pass", code=EXIT_ERROR)
+    return fn(text)
 
 
 def redact(text, secrets):
@@ -617,20 +663,54 @@ def is_authorised(mark, author_id, cfg):
     return bool(author_id) and author_id in allowed
 
 
-def select_events(tickets, sent_keys, cfg):
-    """Pure: turn tracker reads into the events that should be sent this pass.
+SATURATED_SKIP = "comment window saturated"
+
+
+def select_events(tickets, sent_keys, cfg, labelled_keys=None):
+    """Pure: turn tracker reads into the events this pass should act on.
 
     `tickets` is a list of {"id","uuid","title","comments":[{"id","body","author_id"}]}.
     Returns (events, skipped, capped) where every skipped entry NAMES its reason, so a pass
     can say what it asked and what the answer was rather than going quiet.
+
+    TWO KINDS OF EVENT come back, told apart by `settle`:
+
+      * a PAGEABLE event — a mark nobody has been paged for yet. One message, plus the
+        lifecycle label its mark carries.
+      * a SETTLE event (`settle: True`) — already paged on an earlier pass, but the label
+        write did not land. The label ALONE, and never a second message.
+
+    The settle events have to be produced HERE, and cannot be derived from what this
+    returns: an already-sent key is filtered out during selection, so nothing downstream
+    can still see one. The first slice did try to derive them outside, intersecting "not
+    already sent" with "already sent" — so the owed list was ALWAYS empty, the retry path
+    was dead code, and a failed agent:blocked write was permanent and invisible. That is
+    the exact failure the two-halves seen-set exists to prevent (Stage E review of PR #98,
+    HIGH).
+
+    `labelled_keys` is the seen-set's second half. None means "treat every sent key as
+    settled" and yields no settle events — the right answer for the callers that only want
+    to know what a fresh read would page on.
     """
-    events, skipped = [], []
+    events, settle, skipped = [], [], []
     emitted = set()
     cap = cfg.get("max_events_per_pass") or 25
     capped = 0
+    labelled_keys = set(sent_keys) if labelled_keys is None else set(labelled_keys)
 
     for ticket in tickets:
         tid = ticket.get("id")
+        if ticket.get("comment_window_full"):
+            # The window is asked for newest-first, so a FULL one means older comments went
+            # unexamined — and if the order is ever not what was asked for, the NEWEST mark
+            # is the one missed instead. Either way the miss produces no send, no decline
+            # and no non-zero exit, so it is named here and reported by the pass rather than
+            # left to read as a quiet week.
+            skipped.append((tid, None,
+                            "%s — all %d requested comment(s) came back, so older comments "
+                            "on this ticket were not examined; raise lookback_comments"
+                            % (SATURATED_SKIP, cfg.get("lookback_comments") or 0)))
+
         for comment in ticket.get("comments") or []:
             cid = comment.get("id")
             body = comment.get("body") or ""
@@ -660,28 +740,40 @@ def select_events(tickets, sent_keys, cfg):
                 continue
 
             key = event_id(cid)
-            if key in sent_keys:
-                skipped.append((tid, cid, "already sent"))
-                continue
             if key in emitted:
                 skipped.append((tid, cid, "duplicate within this pass"))
                 continue
-            if len(events) >= cap:
+
+            # Paged already? Then the only thing that can still be owed is the label.
+            owed = (key in sent_keys and key not in labelled_keys
+                    and bool(label_for(mark)))
+            if key in sent_keys and not owed:
+                skipped.append((tid, cid, "already sent"))
+                continue
+            if not owed and len(events) >= cap:
                 capped += 1
                 continue
 
             emitted.add(key)
-            events.append({
+            event = {
                 "key": key,
                 "mark": mark,
+                "settle": bool(owed),
                 "ticket_id": tid,
                 "ticket_uuid": ticket.get("uuid"),
                 "ticket_title": ticket.get("title") or "",
                 "url": ticket_url(cfg, tid or ""),
                 "label": label_for(mark),
                 "existing_labels": ticket.get("label_ids") or [],
-            })
-    return events, skipped, capped
+            }
+            (settle if owed else events).append(event)
+
+    # Owed labels go FIRST: a debt from an earlier pass is discharged before new work, so a
+    # pass that runs out of wall clock leaves the smaller debt behind. They are also NOT
+    # counted against max_events_per_pass — that cap is a flood guard on NOTIFICATIONS, and
+    # a settle event pages nobody, so charging it there would let a busy pass push the retry
+    # out for ever: the same dead-code outcome by a second route.
+    return settle + events, skipped, capped
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -740,11 +832,21 @@ class TrackerClient:
 
     def recent_tickets(self, team_key, limit):
         """Tickets, with the UUID a mutation needs, the labels a union needs, and the
-        comment author the mark gate needs."""
+        comment author the mark gate needs.
+
+        The comment window is ordered EXPLICITLY. Inheriting the connection's default order
+        risks getting a busy ticket's OLDEST comments, in which case a fresh escalation sits
+        outside the window and is never examined — a missed page with no skip entry, no
+        decline and no non-zero exit. Linear pages descending by the ordering field, so
+        `orderBy:createdAt` asks for the newest, which is where a new mark is. Because that
+        is a live-test assumption and not a guarantee, a ticket whose window came back FULL
+        is flagged, and the pass reports the truncation instead of going quiet about it.
+        """
         query = ("query($t:String!,$n:Int!,$c:Int!){issues(filter:{team:{key:{eq:$t}}},"
                  "first:$n,orderBy:updatedAt){nodes{id identifier title "
                  "labels{nodes{id}} "
-                 "comments(first:$c){nodes{id body user{id} botActor{id}}}}}}")
+                 "comments(first:$c,orderBy:createdAt){nodes{id body user{id} "
+                 "botActor{id}}}}}}")
         doc = self._gql(query, {"t": team_key, "n": 50, "c": int(limit)})
         nodes = (((doc.get("data") or {}).get("issues") or {}).get("nodes")) or []
         out = []
@@ -762,6 +864,7 @@ class TrackerClient:
                 "label_ids": [x.get("id") for x in
                               ((n.get("labels") or {}).get("nodes")) or []],
                 "comments": comments,
+                "comment_window_full": len(comments) >= int(limit),
             })
         return out
 
@@ -791,6 +894,21 @@ class TrackerClient:
 # The pass
 # ══════════════════════════════════════════════════════════════════════════════════════
 
+def apply_label(cfg, tracker, event):
+    """Put the event's lifecycle label on its ticket. ONE writer, two callers.
+
+    A no-op when the ticket already carries the label, which is what makes a retry safe and
+    lets a label a person applied by hand settle the debt too. Raises on failure — the
+    caller counts a decline and leaves the key out of the labelled half, so the next pass
+    settles it without paging again.
+    """
+    label_id = (cfg["label_ids"] or {}).get(event["label"])
+    if label_id and label_id in (event.get("existing_labels") or []):
+        return "already there"
+    tracker.add_label(event["ticket_uuid"], label_id)
+    return "applied"
+
+
 def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=()):
     """One scan-decide-send pass. Returns a result dict; never raises for one bad event.
 
@@ -800,6 +918,11 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=()):
     the second, so the NEXT pass retries the label alone — it neither re-pages the owner nor
     silently abandons the supervision hold. Recording one combined "done" would have made a
     failed label permanent and invisible, which is how this was first written and wrong.
+
+    The retry itself arrives as a SETTLE event out of select_events(), which is the only
+    place it can be built — see there. This function must not try to spot owed labels in
+    the list it gets back: that was the second way to write the same bug, and it shipped
+    once. A settle event takes the label path and skips the message path entirely.
     """
     state = load_seen(cfg)
     sent_keys, labelled_keys = set(state["sent"]), set(state["labelled"])
@@ -822,16 +945,51 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=()):
         return {"exit": EXIT_ERROR, "examined": 0, "sent": 0, "declined": 0,
                 "labelled": 0, "dry": bool(dry_run), "summary": summary}
 
-    events, skipped, capped = select_events(tickets, sent_keys, cfg)
-    sent = declined = labelled = 0
+    events, skipped, capped = select_events(tickets, sent_keys, cfg, labelled_keys)
+    sent = declined = labelled = settled = 0
     problems = []
 
-    # Labels owed from an earlier pass whose ping landed but whose write did not.
-    pending = [e for e in events if e["label"] and e["key"] in sent_keys
-               and e["key"] not in labelled_keys]
+    # Labels owed from an earlier pass whose ping landed but whose write did not. They
+    # arrive as settle events, and selection is the only thing that can produce one: an
+    # already-paged key never survives it, so a list derived from `events` here would be
+    # empty for ever. It was, and the retry never ran (Stage E review of PR #98, HIGH).
+    owed = [e for e in events if e.get("settle")]
+
+    # A read that may be INCOMPLETE is not "nothing to do". Put it where both the summary
+    # on stdout and the heartbeat carry it.
+    saturated = [s for s in skipped if s[1] is None and SATURATED_SKIP in (s[2] or "")]
+    if saturated:
+        problems.append(
+            "%d ticket(s) returned a FULL comment window (%s) — an older escalation mark "
+            "could sit outside it and would never be paged; raise lookback_comments"
+            % (len(saturated), ", ".join(str(s[0]) for s in saturated)))
 
     for event in events:
         try:
+            if event.get("settle"):
+                # The owed label ALONE. The owner was paged for this event on an earlier
+                # pass, so a second message is the duplicate the seen-set exists to stop.
+                if dry_run:
+                    out.write("WOULD LABEL %s  %s  (owed from an earlier pass)\n"
+                              % (event["ticket_id"], event["label"]))
+                    settled += 1
+                    continue
+                try:
+                    apply_label(cfg, tracker, event)
+                except Deadline:
+                    raise
+                except Exception as exc:                          # noqa: BLE001
+                    declined += 1
+                    problems.append(
+                        "%s: the owed %s label STILL did not apply (%s) — will retry"
+                        % (event["ticket_id"], event["label"],
+                           redact(str(exc), secrets)))
+                    continue
+                labelled += 1
+                settled += 1
+                labelled_keys.add(event["key"])
+                continue
+
             text = build_message(event["mark"], event["ticket_id"],
                                  event["ticket_title"], event["url"])
             leaked = secret_hits(text)
@@ -863,26 +1021,22 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=()):
             sent_keys.add(event["key"])
 
             if event["label"]:
-                label_id = (cfg["label_ids"] or {}).get(event["label"])
-                if label_id and label_id in (event.get("existing_labels") or []):
+                try:
+                    apply_label(cfg, tracker, event)
                     labelled += 1
                     labelled_keys.add(event["key"])
-                else:
-                    try:
-                        tracker.add_label(event["ticket_uuid"], label_id)
-                        labelled += 1
-                        labelled_keys.add(event["key"])
-                    except Deadline:
-                        raise
-                    except Exception as exc:                      # noqa: BLE001
-                        # A label that did not land is "could not do it": it is counted,
-                        # it makes the pass non-zero, and it is retried next pass because
-                        # the key never enters labelled_keys.
-                        declined += 1
-                        problems.append(
-                            "%s: paged, but the %s label did NOT apply (%s) — will retry"
-                            % (event["ticket_id"], event["label"],
-                               redact(str(exc), secrets)))
+                except Deadline:
+                    raise
+                except Exception as exc:                          # noqa: BLE001
+                    # A label that did not land is "could not do it": it is counted, it
+                    # makes the pass non-zero, and the key stays out of labelled_keys so
+                    # the next pass settles it as a label-only event.
+                    declined += 1
+                    problems.append(
+                        "%s: paged, but the %s label did NOT apply (%s) — the next pass "
+                        "will retry the label alone, without paging again"
+                        % (event["ticket_id"], event["label"],
+                           redact(str(exc), secrets)))
             else:
                 labelled_keys.add(event["key"])
         except Deadline:
@@ -901,23 +1055,27 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=()):
                         % (capped, cfg.get("max_events_per_pass") or 25))
 
     verb = "would send" if dry_run else "sent"
+    settle_verb = "would settle" if dry_run else "settled"
     if not events:
         summary = ("nothing to do: examined %d ticket(s) across %s and found no unsent "
-                   "escalation mark (%d skipped: already sent, unauthorised, or "
-                   "informational) — this is 'nothing to do', not a failure"
+                   "escalation mark and no label owed from an earlier pass (%d skipped: "
+                   "already sent, unauthorised, or informational) — this is 'nothing to "
+                   "do', not a failure"
                    % (len(tickets), ", ".join(cfg["team_keys"]), len(skipped)))
         code = EXIT_OK
     else:
-        summary = "%s %d, labelled %d, declined %d (examined %d ticket(s), %d owed label)" % (
-            verb, sent, labelled, declined, len(tickets), len(pending))
+        summary = ("%s %d, labelled %d, declined %d (examined %d ticket(s); %d label(s) "
+                   "owed from an earlier pass, %d %s)"
+                   % (verb, sent, labelled, declined, len(tickets), len(owed), settled,
+                      settle_verb))
         code = EXIT_DECLINED if declined else EXIT_OK
     if problems:
         summary += " | " + "; ".join(problems)
 
     out.write(summary + "\n")
     return {"exit": code, "examined": len(tickets), "sent": sent,
-            "declined": declined, "labelled": labelled, "dry": bool(dry_run),
-            "summary": summary}
+            "declined": declined, "labelled": labelled, "settled": settled,
+            "dry": bool(dry_run), "summary": summary}
 
 
 def _now_iso():
@@ -1155,7 +1313,7 @@ def selftest():
                         refusing, False, out=buf)
         ok("a refused send → exit 3 (declined)", res4["exit"] == EXIT_DECLINED)
 
-        # ── §7b. A failed LABEL write is loud, and retried without re-paging ──────
+        # ── §7b. A failed LABEL write is loud, and SETTLED later without re-paging ─
         t_lbl = [tkt("KIT-9", ESC_NEEDS_INPUT, "c9")]
         chat_l, tracker_l = _FakeChat(), _FakeTracker(t_lbl, label_fails=True)
         res5 = run_once(cfg, tracker_l, chat_l, False, out=buf)
@@ -1167,9 +1325,58 @@ def selftest():
            event_id("c9") in state["sent"])
         ok("the label is NOT remembered, so the next pass settles it",
            event_id("c9") not in state["labelled"])
+        # The owed event must come OUT OF SELECTION. Deriving it from select_events'
+        # output is what made the retry dead code, and only a check at this level can
+        # tell the two apart: the pass-level assertions below pass either way until the
+        # label is actually demanded.
+        owed_ev, _, _ = select_events(t_lbl, {event_id("c9")}, cfg, set())
+        ok("selection emits a label-only settle event for an owed label",
+           len(owed_ev) == 1 and owed_ev[0]["settle"] is True
+           and owed_ev[0]["label"] == "agent:blocked", repr(owed_ev))
+        ok("a key in both halves emits nothing at all",
+           select_events(t_lbl, {event_id("c9")}, cfg, {event_id("c9")})[0] == [])
+        ok("an owed key defaults to settled when the second half is not passed",
+           select_events(t_lbl, {event_id("c9")}, cfg)[0] == [])
         chat_r, tracker_r = _FakeChat(), _FakeTracker(t_lbl)
         res6 = run_once(cfg, tracker_r, chat_r, False, out=buf)
         ok("the retry pass re-pages nobody", chat_r.posts == [])
+        ok("the retry pass APPLIES the owed label, keyed on the UUID",
+           tracker_r.labels == [("u-KIT-9", "L1")], repr(tracker_r.labels))
+        ok("the retry pass reports what it settled, and is clean",
+           res6["exit"] == EXIT_OK and res6["settled"] == 1
+           and "1 settled" in res6["summary"], res6["summary"])
+        state_r = load_seen(cfg)
+        ok("the settled key enters the labelled half of the seen-set",
+           event_id("c9") in state_r["labelled"])
+        ok("the settled key is still recorded as paged exactly once",
+           event_id("c9") in state_r["sent"])
+        chat_t, tracker_t = _FakeChat(), _FakeTracker(t_lbl)
+        res6b = run_once(cfg, tracker_t, chat_t, False, out=buf)
+        ok("a settled event is neither re-paged nor re-labelled afterwards",
+           chat_t.posts == [] and tracker_t.labels == []
+           and "nothing to do" in res6b["summary"], res6b["summary"])
+        # A label a person applied by hand settles the debt without a second write.
+        st = load_seen(cfg)
+        save_seen(cfg, st["sent"] | {event_id("c10")}, st["labelled"])
+        t_have = [tkt("KIT-10", ESC_NEEDS_INPUT, "c10", labels=["L1"])]
+        chat_h, tracker_h = _FakeChat(), _FakeTracker(t_have)
+        run_once(cfg, tracker_h, chat_h, False, out=buf)
+        ok("an owed label the ticket already carries settles with no second write",
+           tracker_h.labels == [] and chat_h.posts == []
+           and event_id("c10") in load_seen(cfg)["labelled"])
+        # A dry run says what it would settle and settles nothing.
+        save_seen(cfg, load_seen(cfg)["sent"] | {event_id("c9")},
+                  load_seen(cfg)["labelled"] - {event_id("c9")})
+        chat_d, tracker_d = _FakeChat(), _FakeTracker(t_lbl)
+        buf_dry = io.StringIO()
+        res6c = run_once(cfg, tracker_d, chat_d, dry_run=True, out=buf_dry)
+        ok("a dry run neither pages nor labels an owed event",
+           chat_d.posts == [] and tracker_d.labels == []
+           and "WOULD LABEL" in buf_dry.getvalue())
+        ok("a dry run says it WOULD settle, never that it did",
+           "1 would settle" in res6c["summary"], res6c["summary"])
+        chat_z, tracker_z = _FakeChat(), _FakeTracker(t_lbl)
+        run_once(cfg, tracker_z, chat_z, False, out=buf)
 
         # ── §7c. An unauthorised author cannot forge a planning mark ─────────────
         forgery = [tkt("KIT-3", ESC_NO_OUTPUT, "c3", author="a-session")]
@@ -1201,6 +1408,56 @@ def selftest():
         ok("a credential shape in a title is never posted", chat_k.posts == [])
         ok("withholding is a decline, not a silent skip",
            res8["exit"] == EXIT_DECLINED and "withheld" in res8["summary"])
+
+        # ── §7f. The SHARED scrub really runs, and its failure declines ──────────
+        import pipeline_review_local as _prl
+        ok("the shared secret scrub is importable and callable",
+           callable(getattr(_prl, "secret_hits", None)))
+        # An AWS key id: a shape the publisher knows and this file's own six do not. If the
+        # union stopped consulting the publisher, this is the assertion that goes red.
+        aws = "AKIA" + "ABCDEFGHIJKLMNOP"
+        ok("a shape only the publisher knows is caught, so the shared scrub ran",
+           _local_secret_hits(aws) == [] and secret_hits(aws) != [], repr(secret_hits(aws)))
+        shared_leak = [tkt("KIT-11", ESC_BLOCKED, "c11", title="rotate " + aws, author="s")]
+        chat_a = _FakeChat()
+        res_a = run_once(cfg, _FakeTracker(shared_leak), chat_a, False, out=buf)
+        ok("a title only the shared scrub can flag is withheld, not posted",
+           chat_a.posts == [] and res_a["exit"] == EXIT_DECLINED)
+        _saved_scrub = _prl.secret_hits
+        try:
+            # The two ways the shared scrub can go away. Neither may end in a send: it was
+            # wrapped in except/pass once, and then the criterion was quietly false.
+            _prl.secret_hits = None
+            raised = False
+            try:
+                secret_hits("clean text")
+            except NotifierError:
+                raised = True
+            ok("a shared scrub that vanished is a NAMED failure, not a silent pass", raised)
+
+            def _boom(_text):
+                raise RuntimeError("the shared scrub exploded")
+
+            _prl.secret_hits = _boom
+            bang = [tkt("KIT-12", ESC_BLOCKED, "c12", author="s")]
+            chat_b = _FakeChat()
+            res_b = run_once(cfg, _FakeTracker(bang), chat_b, False, out=buf)
+            ok("a shared scrub that raises declines rather than post unscrubbed text",
+               chat_b.posts == [] and res_b["exit"] == EXIT_DECLINED, res_b["summary"])
+        finally:
+            _prl.secret_hits = _saved_scrub
+
+        # ── §7g. A saturated comment window is REPORTED, never silent ────────────
+        full = [{"id": "KIT-13", "uuid": "u-KIT-13", "title": "t", "label_ids": [],
+                 "comment_window_full": True, "comments": []}]
+        chat_w = _FakeChat()
+        res_w = run_once(cfg, _FakeTracker(full), chat_w, False, out=buf)
+        ok("a full comment window is named in the pass summary",
+           "FULL comment window" in res_w["summary"] and "KIT-13" in res_w["summary"],
+           res_w["summary"])
+        _, sat_skipped, _ = select_events(full, set(), cfg)
+        ok("the saturation is a named skip entry, not a bare count",
+           any(SATURATED_SKIP in (s[2] or "") for s in sat_skipped), repr(sat_skipped))
 
         # ── §8. Dedupe, and the seen-set's refusal to guess ──────────────────────
         ok("the first sent event is remembered", event_id("c1") in load_seen(cfg)["sent"])
@@ -1280,6 +1537,10 @@ def selftest():
     ok("the only tracker mutation is one label write",
        body_only.count("mutation(") == 1)
     ok("no ticket state is ever written", "stateId" not in body_only)
+    # The comment window's ORDER is asked for, never inherited: the newest comments are
+    # where a fresh escalation is. Asserted against body_only so this line's own literal
+    # cannot satisfy the check.
+    ok("the comment window is explicitly ordered", "orderBy:createdAt" in body_only)
 
     # exit-code vocabulary agrees with the sibling job the installer cross-checks
     try:
