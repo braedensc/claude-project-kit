@@ -36,11 +36,18 @@ three daemons for one reader's convenience would be the larger change:
 |---|---|---|---|
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 | bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle` |
-| finding poller | `<finding_state_dir>/heartbeat.json` | `at` | `ok: true` |
+| finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
-cross-checks every schema string and filename against the three writers, so a renamed field
-turns CI red instead of quietly reading as healthy.
+cross-checks every schema string and filename against the three writers, and judges one
+real heartbeat written by the finding poller's own writer, so a renamed field or a changed
+shape turns CI red instead of quietly reading as healthy.
+
+The finding poller's heartbeat changed shape once (schema `/1`, a boolean `ok` with `at`,
+became `/2`, the review poller's layout). A `/1` file left on disk by a finding poller older
+than that change reads as `unreadable` here, which is the honest verdict for a shape this
+monitor cannot judge. It clears itself on that poller's next pass once its clone has moved,
+because every daemon runs from the same clone.
 
 ## The verdicts
 
