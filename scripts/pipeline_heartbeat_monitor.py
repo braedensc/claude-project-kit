@@ -175,7 +175,6 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 # `ts_fields`    timestamp fields in PRIORITY order — the first present and parseable wins.
 #                The bounce driver's `finished_at` is preferred over its `at` because `at`
 #                is rewritten by the mid-pass `running` beat.
-# `bool_field`   the finding poller reports a boolean instead of a result string.
 # `good`         results that mean the last pass was fine.
 # `running`      results that mean a pass was IN FLIGHT when the file was written. Fresh,
 #                that is healthy; stale, it means a pass started and never finished, which
@@ -189,7 +188,6 @@ WATCHERS = {
         "schema": "pipeline-review-poller-heartbeat/1",
         "ts_fields": ("ended_at", "started_at", "at"),
         "result_field": "result",
-        "bool_field": None,
         "good": ("ok",),
         "running": (),
     },
@@ -201,7 +199,6 @@ WATCHERS = {
         "schema": "pipeline-bounce-heartbeat/1",
         "ts_fields": ("finished_at", "at", "started_at"),
         "result_field": "result",
-        "bool_field": None,
         "good": ("ok", "idle"),
         "running": ("running",),
     },
@@ -210,10 +207,12 @@ WATCHERS = {
         "writer": "scripts/pipeline_finding_poller.py",
         "dir_key": "finding_state_dir",
         "filename": "heartbeat.json",
-        "schema": "pipeline-finding-poller-heartbeat/1",
-        "ts_fields": ("at",),
-        "result_field": None,
-        "bool_field": "ok",
+        # /2 adopted the review poller's shape (command, result, exit_code, started_at,
+        # ended_at), so this entry reads it the same way. /1's `at` + boolean `ok` is
+        # refused by the schema check below, never half-read.
+        "schema": "pipeline-finding-poller-heartbeat/2",
+        "ts_fields": ("ended_at", "started_at"),
+        "result_field": "result",
         "good": ("ok",),
         "running": (),
     },
@@ -329,15 +328,8 @@ def parse_iso(value):
 
 def result_of(doc, spec):
     """The last pass's result as one lower-case word, or None if the file does not say.
-
-    The finding poller's boolean becomes `ok`/`error` here so one vocabulary reaches the
-    verdict table; the translation lives in this one function rather than at each use.
-    """
-    if spec.get("bool_field"):
-        raw = doc.get(spec["bool_field"])
-        if isinstance(raw, bool):
-            return "ok" if raw else "error"
-        return None
+    Every watched job now writes a result string, so one vocabulary reaches the verdict
+    table without translation."""
     raw = doc.get(spec.get("result_field") or "result")
     if isinstance(raw, str) and raw.strip():
         return raw.strip().lower()
@@ -1025,12 +1017,18 @@ def selftest():
     ok("bounce driver: finished_at is preferred over the running beat's at",
        verdict("bounce-driver", beat("bounce-driver", result="ok", at=old,
                                      finished_at=fresh)) == "ok")
-    ok("finding poller: ok:true ⇒ ok",
-       verdict("finding-poller", beat("finding-poller", ok=True, at=fresh)) == "ok")
-    ok("finding poller: ok:false ⇒ failing",
-       verdict("finding-poller", beat("finding-poller", ok=False, at=fresh)) == "failing")
-    ok("the boolean is translated to one result vocabulary",
-       result_of({"ok": False}, WATCHERS["finding-poller"]) == "error")
+    ok("finding poller: fresh + ok ⇒ ok",
+       verdict("finding-poller", beat("finding-poller", result="ok", ended_at=fresh)) == "ok")
+    ok("finding poller: fresh + error ⇒ failing (ran, could not do it)",
+       verdict("finding-poller", beat("finding-poller", result="error", ended_at=fresh)) == "failing")
+    ok("finding poller: a config failure (usage) is failing, not ok",
+       verdict("finding-poller", beat("finding-poller", result="usage", ended_at=fresh)) == "failing")
+    ok("finding poller: old ⇒ stale",
+       verdict("finding-poller", beat("finding-poller", result="ok", ended_at=old)) == "stale")
+    # The shape this entry used to read. A /1 file is refused by schema, and a /2 schema
+    # carrying only /1's fields has no timestamp this entry reads: unjudged, never healthy.
+    ok("finding poller: the retired /1 shape (at + boolean ok) is unreadable, never ok",
+       verdict("finding-poller", beat("finding-poller", ok=True, at=fresh)) == "unreadable")
 
     # ── 3. The monitor's own inability to judge is never a clean bill of health ───────
     ok("a missing file ⇒ missing",
@@ -1444,6 +1442,39 @@ def selftest():
            and WATCHERS["finding-poller"]["dir_key"] != WATCHERS["review-poller"]["dir_key"])
     except ImportError:
         ok("the finding poller is importable for the cross-check", False)
+
+    # ── The ROUND TRIP. Matching schema strings is not the same as reading the file: the
+    #    finding poller once moved to /2 AND changed every field, and a string-only check
+    #    would have gone green on a rename while every real beat read as unreadable and
+    #    paged. So each poller's OWN writer writes a real file, this monitor's own reader
+    #    reads it back, and the verdict must follow the exit code the writer was given.
+    #    The bounce driver is not round-tripped: its writer takes free-form fields, so a
+    #    test would only be reading back fields this test chose.
+    round_trips = []
+    try:
+        import pipeline_finding_poller as pfp_rt
+        round_trips.append(("finding-poller", lambda d, code: pfp_rt.write_heartbeat(
+            d, code, _iso(time.time() - 5), time.monotonic(), False, filed=1),
+            pfp_rt.EXIT_OK, pfp_rt.EXIT_ERROR))
+    except ImportError:
+        pass
+    try:
+        import pipeline_review_poller as prp_rt
+        round_trips.append(("review-poller", lambda d, code: prp_rt.write_heartbeat(
+            d, "scan", code, _iso(time.time() - 5), time.monotonic(), False),
+            prp_rt.EXIT_OK, prp_rt.EXIT_ERROR))
+    except ImportError:
+        pass
+    ok("both pollers are importable for the round trip", len(round_trips) == 2,
+       [j for j, *_ in round_trips])
+    for job, write, good_code, bad_code in round_trips:
+        for code, want in ((good_code, "ok"), (bad_code, "failing")):
+            with tempfile.TemporaryDirectory() as d:
+                write(d, code)
+                raw = read_beat(os.path.join(d, WATCHERS[job]["filename"]))
+                got = judge_one(job, WATCHERS[job], raw, time.time(), 600, False)
+                ok("%s: a real heartbeat written with exit %s reads as %s" % (job, code, want),
+                   got["verdict"] == want, got.get("detail"))
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))

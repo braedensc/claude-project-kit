@@ -29,18 +29,21 @@ dead-man's switch that quietly stops pinging is worse than none at all.
 
 ## What it watches
 
-One row per job, because the three heartbeats do not agree on field names and rewriting
-three daemons for one reader's convenience would be the larger change:
+One row per job, because the heartbeats do not all agree on field names. The two pollers
+now share one shape; the bounce driver keeps its own:
 
 | Job | File | Freshness from | Good result |
 |---|---|---|---|
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 | bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle` |
-| finding poller | `<finding_state_dir>/heartbeat.json` | `at` | `ok: true` |
+| finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
-cross-checks every schema string and filename against the three writers, so a renamed field
-turns CI red instead of quietly reading as healthy.
+cross-checks every schema string and filename against the three writers. A matching schema
+string is not proof the fields match, so for both pollers it also has each poller's own
+writer write a real heartbeat and reads it back: a renamed field turns CI red instead of
+reading as unreadable in production. The bounce driver's writer takes free-form fields, so
+it gets the string and filename checks only.
 
 ## The verdicts
 
