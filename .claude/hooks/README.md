@@ -217,6 +217,18 @@ cost one spurious nag; with it, the same stale entry would spend an attempt and 
 exhaust a branch's budget on a PR that was never red. `_latest_per_name()` keeps the newest
 run per name — `startedAt` when present, array order otherwise.
 
+**…and it returns two entry shapes, so status contexts are normalized first.** A GitHub
+Actions check is a `CheckRun` (`name` + `conclusion`). A legacy commit status — Vercel,
+Netlify, any commit-status integration — is a `StatusContext`, with `context` + `state` and
+**no** `name` or `conclusion`. Read raw, the "settled" test above never passed on a green PR
+carrying one, so the budget **never cleared** (red → green → red came back as attempt 2, and
+an exhausted branch stayed exhausted); and a red status was silently ignored. `_normalize()`
+maps `SUCCESS`→`SUCCESS`, `FAILURE`/`ERROR`→`FAILURE` and `PENDING`/`EXPECTED`→still
+running, before anything else reads the rollup. Consequence: **a failing status context now
+nags** like any other fixable red check. This kit's own CI has no status context, which is
+why the battery missed it until a downstream project hit it (2026-09-13); `check_status_context`
+now pins it.
+
 > **Known gap, stated rather than asserted away: the ledger is agent-writable.**
 > `.claude/.stop-pr-nag/` lives inside the worktree and is **not** in the self-protected
 > set, so a session can write it. That was already true of the per-sha dedup markers; what

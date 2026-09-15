@@ -428,6 +428,54 @@ def check_budget_is_shared(root, hook_path, env, view_file):
     return ran, failures
 
 
+def check_status_context(root, hook_path, env, view_file):
+    """A legacy `StatusContext` (any commit-status integration: Vercel, Netlify, …) has
+    `context` + `state` and no `name` or `conclusion`. Read raw, a green PR looked
+    unsettled forever — the budget never cleared — and a red status was invisible. This
+    kit's own CI has none, so no other case here can see it; shape copied from a
+    downstream project's PR, 2026-09-13. Returns (assertions, failures)."""
+    failures, ran = 0, 4
+    red = ('{"statusCheckRollup":['
+           '{"__typename":"CheckRun","name":"Kit checks","conclusion":"FAILURE"}]}')
+    green = ('{"statusCheckRollup":['
+             '{"__typename":"CheckRun","name":"Kit checks","conclusion":"SUCCESS"},'
+             '{"__typename":"StatusContext","context":"Vercel","state":"SUCCESS"}]}')
+    status_pending = ('{"statusCheckRollup":['
+                      '{"__typename":"CheckRun","name":"Kit checks","conclusion":"SUCCESS"},'
+                      '{"__typename":"StatusContext","context":"Vercel","state":"PENDING"}]}')
+    status_red = ('{"statusCheckRollup":['
+                  '{"__typename":"CheckRun","name":"Kit checks","conclusion":"SUCCESS"},'
+                  '{"__typename":"StatusContext","context":"Vercel","state":"FAILURE"}]}')
+
+    def turn(view):
+        with open(view_file, "w") as f:
+            f.write(view)
+        advance(root)
+        return run_stop_hook_json({}, hook_path, env=env)
+
+    turn(red)                                          # attempt 1
+    # (a) and (b) guard against over-correcting: a PENDING status is still in flight,
+    # and clearing on it would reset the ledger exactly as queued CI once did.
+    out = turn(status_pending)
+    failures += _say("stop: a PENDING status context is in flight — quiet, no clear",
+                     out == {}, "" if out == {} else f" (got: {out})")
+    out = turn(red)
+    ok = "attempt 2 of 3" in out.get("reason", "")
+    failures += _say("stop: …so the next red is attempt 2 (pending status did not clear)",
+                     ok, "" if ok else f" (got: {out})")
+    turn(green)
+    out = turn(red)
+    ok = "attempt 1 of 3" in out.get("reason", "")
+    failures += _say("stop: a green PR carrying a SUCCESS status context clears the budget",
+                     ok, "" if ok else f" (got: {out})")
+    turn(green)
+    out = turn(status_red)
+    ok = out.get("decision") == "block" and "Vercel" in out.get("reason", "")
+    failures += _say("stop: a FAILURE status context is red, not silently green",
+                     ok, "" if ok else f" (got: {out})")
+    return ran, failures
+
+
 def _git_env():
     return {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
 
@@ -786,6 +834,10 @@ def main():
             '[{"number":7,"state":"OPEN"}]',
             '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
     stop_shared_root, stop_shared, stop_shared_env, stop_shared_view = \
+        make_stop_flip_sandbox(
+            '[{"number":7,"state":"OPEN"}]',
+            '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
+    stop_status_root, stop_status, stop_status_env, stop_status_view = \
         make_stop_flip_sandbox(
             '[{"number":7,"state":"OPEN"}]',
             '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
@@ -1714,6 +1766,8 @@ def main():
             stop_prem_root, stop_prem, stop_prem_env, stop_prem_view),
         check_budget_is_shared(
             stop_shared_root, stop_shared, stop_shared_env, stop_shared_view),
+        check_status_context(
+            stop_status_root, stop_status, stop_status_env, stop_status_view),
     ):
         seq_ran += ran
         failures += failed
@@ -1785,7 +1839,7 @@ def main():
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,
               stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
               stop_dirtyred_root, stop_msgred_root, stop_budget_root, stop_clear_root,
-              stop_prem_root, stop_shared_root,
+              stop_prem_root, stop_shared_root, stop_status_root,
               *pl_cleanup):
         shutil.rmtree(r, ignore_errors=True)
 
