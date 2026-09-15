@@ -44,6 +44,12 @@ heartbeat the finding poller's own writer produced, so a renamed field turns CI 
 of quietly reading as healthy — or, the way it actually failed once, paging on every healthy
 file.
 
+**Not watched: the conflict waker's heartbeat.** That job runs as a *person*, as a
+LaunchAgent, and its file sits under that person's home, where this role account cannot
+read it. It also goes stale at every logout, so a staleness page would be nightly noise.
+Its installer's `verify` reads it instead, and the conflict monitor pages on the pull
+request whenever a waiting request goes unclaimed (`STAGE-E-OPERATOR.md`, Step 6).
+
 ## The verdicts
 
 | Verdict | Meaning | Pages? |

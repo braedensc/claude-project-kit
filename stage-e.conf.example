@@ -237,6 +237,23 @@ FINDING_INTERVAL_SECONDS=300
 # driver's `human_pending_checks` config directly.
 HUMAN_PENDING_CHECKS=Hooks change guard
 
+# The local half of the conflict loop — YOUR conflict waker.
+#
+# Everything above runs as the role account and serves the dispatcher.  When a
+# dispatcher's pull request goes CONFLICTING, the bounce driver sends it back to
+# that session's own thread, inside its sandbox.  Your LOCALLY spawned sessions
+# have no such thread: when their pull requests go CONFLICTING, the conflict
+# waker starts a capped fix session in the worktree they worked in.  It runs as
+# YOU, as a LaunchAgent (your `claude` and `gh` logins live in your keychain),
+# and only while you are logged in.  The installer's `conflict-waker` step sets
+# it up from this file; `pipeline_conflict_waker_setup.py` does the same on a
+# machine with no dispatcher.
+#
+# RULE: a path to a conflict-waker.conf (beside this file, or absolute) — copy
+# conflict-waker.conf.example — or `off`, which leaves the waker off BY NAME:
+# a local session's conflicted pull request then pages you instead.
+CONFLICT_WAKER_CONF=conflict-waker.conf
+
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from
 # each repository's own `delivery.json` on its committed default branch.  Keep

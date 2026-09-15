@@ -24,6 +24,10 @@ stage-e.conf
 # stage-e.conf. stage-a.conf.example is the committed one.
 stage-a.conf
 
+# The conflict waker installer's filled-in settings — local checkout paths.
+# conflict-waker.conf.example is the committed one.
+conflict-waker.conf
+
 # Dependencies
 node_modules/
 

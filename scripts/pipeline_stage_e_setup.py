@@ -15,6 +15,13 @@ and the finding poller's), one repository entry per reviewed repository in the
 dispatcher's own config, and three system LaunchDaemons running one-shot
 passes — review poller, bounce driver, finding poller.
 
+And one thing that is NOT the role account's: the `conflict-waker` step installs
+the local half of the conflict loop for the PERSON running this command — a user
+LaunchAgent that wakes that person's locally spawned sessions when their pull
+requests go CONFLICTING (scripts/pipeline_conflict_waker_setup.py, conf
+CONFLICT_WAKER_CONF, `off` by name). A dispatcher's own conflicted pull requests are
+the bounce driver's, answered in the session's thread, never the waker's.
+
 SUBCOMMANDS
 
     run                    do everything possible; stop at the first card
@@ -305,11 +312,13 @@ def review_entry_name(repo):
 
 
 # The scripts the three daemons exec. Their absence from the role account's clone
-# means the pull requests carrying them are not merged yet (card CK-1).
+# means the pull requests carrying them are not merged yet (card CK-1). The bounce
+# driver imports the conflict loop's marker grammar (pr_conflict.py), which imports
+# the agent-environment markers (pipeline_dispatch_local.py).
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_review_local.py", "pipeline_review_basis.py",
                     "pipeline_telemetry_local.py", "pipeline_finding_poller.py",
-                    "gh_fallback.py")
+                    "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py")
 
 # The workflow states a Reviews team needs beyond the stock set. `Ready`
 # authorises nothing here — review tickets are delegated on creation — but the
@@ -464,6 +473,12 @@ CONF_DEFAULTS = {
     # Required checks that wait on a PERSON, not on the session. Written into the
     # bounce driver's config as `human_pending_checks`; see HUMAN_PENDING_DEFAULT.
     "HUMAN_PENDING_CHECKS": "Hooks change guard",
+    # The local half of the conflict loop — YOUR LaunchAgent, not the role account's — is
+    # installed by the `conflict-waker` step from this file (a path beside stage-e.conf,
+    # or absolute). `off` turns the step off BY NAME: locally spawned sessions' conflicts
+    # then page you instead of waking a fix. Dispatcher PRs go through the bounce driver
+    # either way.
+    "CONFLICT_WAKER_CONF": "conflict-waker.conf",
 }
 # The kit's own grader-path guard, by name — the one check a session can never turn
 # green, because it is red exactly until a person applies the label it demands. It is
@@ -1373,6 +1388,23 @@ CARDS = {
                "(YOUR initials, 2-4 letters — the placeholder above is refused as typed.)"],
         "good": "one pull request carries one review comment, and nothing merged itself",
         "attest": "A-FIRST-TICKET",
+    },
+    "CK-8": {
+        "title": "Read your conflict waker's dry run before it is turned on",
+        "why": ("The conflict waker is the local half of the conflict loop: YOUR LaunchAgent, "
+                "waking YOUR locally spawned sessions when their pull requests go CONFLICTING. "
+                "Once loaded, each pass starts a paid session per unclaimed fix request, up to "
+                "its session cap. The count, and whether the fix session gets the tools it "
+                "needs, are yours to judge. Its sign-off lives in the waker's own ledger."),
+        "do": ["Read the conflict waker's dry run printed above (`would wake [...]`), and its",
+               "card, which says what to check in CLAUDE_ARGS:",
+               "    python3 scripts/pipeline_conflict_waker_setup.py card CK-W1",
+               "Then sign the count off there and re-run this installer:",
+               "    python3 scripts/pipeline_conflict_waker_setup.py attest A-WAKE-DRY-RUN "
+               "--initials " + INITIALS_PLACEHOLDER + " --note \"count read: N\"",
+               "Not wanted on this machine? Set CONFLICT_WAKER_CONF=off in stage-e.conf instead."],
+        "good": "the waker's dry-run count is the count you meant",
+        "attest": None,
     },
 }
 
@@ -3798,6 +3830,54 @@ def step_enable(ctx, apply_it):
                   "means RAN AND COULD NOT")
 
 
+def step_conflict_waker(ctx, apply_it):
+    """The local half of the conflict loop, installed for the PERSON running this command.
+
+    Everything above serves the dispatcher, as its role account. This does not: the waker
+    wakes locally spawned sessions, in your worktrees, with your `claude` and `gh` logins, so
+    it is a user LaunchAgent for you (scripts/pipeline_conflict_waker_setup.py says why, and
+    runs the same steps on a machine with no dispatcher). The dispatcher's own PRs are never
+    its business — their conflicts go back through the bounce driver installed above, in the
+    session's own thread and sandbox.
+
+    The waker's steps run through THIS run's runner, so a dry run and `verify` stay
+    write-free here too. Its rows come back as data and are translated into this file's own
+    outcomes: its card becomes CK-8, and its sign-off stays in its own ledger."""
+    value = (ctx.conf.get("CONFLICT_WAKER_CONF") or "").strip()
+    if value.lower() == "off":
+        return True, ("OFF by conf (CONFLICT_WAKER_CONF=off): a local session's conflicted PR pages "
+                      "you instead of waking a fix; dispatcher PRs still go through the bounce "
+                      "driver"), []
+    base = os.path.dirname(os.path.abspath(ctx.conf.get("__source__") or "stage-e.conf"))
+    path = value if os.path.isabs(value) else os.path.join(base, value)
+    import pipeline_conflict_waker_setup as waker
+    try:
+        wconf, errors = waker.load_conf(path)
+    except waker.SetupError as exc:
+        raise SetupError("%s\n  …or set CONFLICT_WAKER_CONF=off in stage-e.conf to leave the local "
+                         "half of the conflict loop off on this machine, by name." % exc)
+    if errors:
+        raise SetupError("%s has %d problem(s):\n%s" % (path, len(errors),
+                                                        "\n".join("  - " + e for e in errors)))
+    wctx = waker.Ctx(wconf, ctx.runner, waker.State(waker.DEFAULT_STATE_HOME))
+    rows = waker.measure(wctx, apply_it, keep_going=not apply_it)
+    trail = "; ".join("%s %s" % (sid, outcome) for sid, outcome, _d, _e in rows)
+    for sid, outcome, detail, extra in rows:
+        if outcome == FAILED:
+            raise SetupError("the conflict waker's `%s` step failed: %s" % (sid, detail))
+    for sid, outcome, detail, extra in rows:
+        if outcome == UNKNOWN:
+            raise Unknown("the conflict waker's `%s` step could not measure itself: %s" % (sid, detail),
+                          getattr(extra, "remedy", "") or
+                          "python3 scripts/pipeline_conflict_waker_setup.py verify")
+    for sid, outcome, detail, extra in rows:
+        if outcome == BLOCKED:
+            raise Blocked("CK-8", "conflict waker: %s" % detail)
+    if all(outcome == ALREADY_DONE for _s, outcome, _d, _e in rows):
+        return True, "conflict waker: " + rows[-1][2], []
+    return False, "conflict waker: " + trail, []
+
+
 def step_handover(ctx, apply_it):
     if not ctx.state.attested("A-FIRST-TICKET"):
         raise Blocked("CK-7", "no real ticket has been watched end to end yet")
@@ -3815,6 +3895,8 @@ STEPS = (
     ("daemons", "the plists, rendered, linted and installed", step_daemons),
     ("dry-run", "the dry runs, read before anything is on", step_dry_run),
     ("enable", "load the daemons and see their heartbeats", step_enable),
+    ("conflict-waker", "your own conflict waker — the local half of the conflict loop",
+     step_conflict_waker),
     ("handover", "one real ticket, watched end to end", step_handover),
 )
 
@@ -3960,6 +4042,8 @@ def cmd_run(ctx, dry_run):
     say("  role account  %s" % ctx.account)
     say("  dispatcher    %s" % ctx.conf["DISPATCHER_SERVICE"])
     say("  daemons       %s" % ", ".join(all_daemon_labels(ctx.conf)))
+    say("  your waker    %s" % ("OFF by conf" if str(ctx.conf.get("CONFLICT_WAKER_CONF")).lower() == "off"
+                                else "a LaunchAgent for you, from %s" % ctx.conf.get("CONFLICT_WAKER_CONF")))
     say("  credentials   read as %s from %s/env%s"
         % (ctx.account, ctx.stage_home,
            "; this run asks for nothing" if dry_run else "; asked for only if absent"))
@@ -4442,6 +4526,7 @@ MODEL_LABEL=haiku
 OWNER_LINEAR_EMAIL=owner@example.com
 REVIEW_REPOS=example-org/kit
 MANAGED_TEAM_KEYS=KIT
+CONFLICT_WAKER_CONF=off
 """
 
 
@@ -7048,6 +7133,73 @@ def _selftest_body():
     expect("sudo-stays-fresh", '"-n"' not in inspect.getsource(_sudo_validate),
            "the one deliberate acquisition passes -n too, so it can never ask for the "
            "password it exists to ask for — and every probe after it would prompt instead")
+
+    # -- THE CONFLICT WAKER STEP: the local half of the conflict loop, for the person --
+    cases += 1
+    import pipeline_conflict_waker_setup as waker_mod
+    conf_w, _e = validate_conf(parse_conf(GOOD_CONF)[0])
+    ctx_w, _fake_w = _settled_ctx(conf_w)
+    ok_w, detail_w, _x = step_conflict_waker(ctx_w, False)
+    expect("waker-off-by-name", ok_w and "OFF by conf" in detail_w,
+           "CONFLICT_WAKER_CONF=off must be ALREADY-DONE and say OFF by name: %r" % detail_w)
+    with tempfile.TemporaryDirectory() as tmp_w:
+        conf_w2 = dict(conf_w, CONFLICT_WAKER_CONF="conflict-waker.conf",
+                       __source__=os.path.join(tmp_w, "stage-e.conf"))
+        ctx_w.conf = conf_w2
+        try:
+            step_conflict_waker(ctx_w, False)
+            expect("waker-missing-conf", False, "an absent conflict-waker.conf must not pass")
+        except SetupError as exc:
+            expect("waker-missing-conf", "CONFLICT_WAKER_CONF=off" in str(exc)
+                   and "conflict-waker.conf.example" in str(exc), str(exc))
+        with open(os.path.join(tmp_w, "conflict-waker.conf"), "w") as fh:
+            fh.write("REPO_DIRS=relative/path\n")
+        try:
+            step_conflict_waker(ctx_w, False)
+            expect("waker-bad-conf", False, "a bad conflict-waker.conf must not pass")
+        except SetupError as exc:
+            expect("waker-bad-conf", "absolute path" in str(exc), str(exc))
+        with open(os.path.join(tmp_w, "conflict-waker.conf"), "w") as fh:
+            fh.write("REPO_DIRS=/Users/you/src/app\n")
+        seen_w = []
+        saved_measure = waker_mod.measure
+        try:
+            for rows_w, want in (
+                    ([("preflight", ALREADY_DONE, "ok", None), ("enable", ALREADY_DONE, "loaded", None)], "done"),
+                    ([("preflight", ALREADY_DONE, "ok", None), ("dry-run", BLOCKED, "would wake [7]", "CK-W1")], "CK-8"),
+                    ([("preflight", ALREADY_DONE, "ok", None), ("enable", UNKNOWN, "NOT RUNNING", None)], "unknown"),
+                    ([("preflight", FAILED, "root", None)], "failed"),
+                    ([("preflight", ALREADY_DONE, "ok", None), ("code", WOULD_CHANGE, "would clone", None)], "drift")):
+                waker_mod.measure = (lambda rows: lambda wctx, apply_it, keep_going=False: (
+                    seen_w.append((wctx.runner, apply_it)) or rows))(rows_w)
+                try:
+                    ok_w, detail_w, _x = step_conflict_waker(ctx_w, False)
+                    got = "done" if ok_w else "drift"
+                except Blocked as exc:
+                    got = exc.card_id
+                except Unknown:
+                    got = "unknown"
+                except SetupError:
+                    got = "failed"
+                expect("waker-translated", got == want, "rows %s became %s, not %s" % (rows_w, got, want))
+        finally:
+            waker_mod.measure = saved_measure
+        expect("waker-same-runner", all(r is ctx_w.runner and a is False for r, a in seen_w),
+               "the waker must measure through THIS run's runner with apply as given: %s" % seen_w)
+    expect("waker-card", "CK-8" in CARDS and "A-WAKE-DRY-RUN" in " ".join(CARDS["CK-8"]["do"]),
+           "the waker's sign-off must be reachable from this installer's own card")
+    # The role account's clone must carry everything the bounce driver imports — the conflict
+    # loop's grammar included — or the driver dies at import on the first pass after an update.
+    here = os.path.dirname(os.path.abspath(__file__))
+    need = set()
+    for name in ("pipeline_bounce_local.py", "pr_conflict.py"):
+        with open(os.path.join(here, name), encoding="utf-8") as fh:
+            for mod in re.findall(r"^(?:import|from) (\w+)", fh.read(), re.M):
+                if os.path.exists(os.path.join(here, mod + ".py")):
+                    need.add(mod + ".py")
+    expect("required-scripts-cover-imports", need <= set(REQUIRED_SCRIPTS),
+           "the bounce driver's local imports are not all in REQUIRED_SCRIPTS: %s"
+           % sorted(need - set(REQUIRED_SCRIPTS)))
 
     say("")
     if failures:

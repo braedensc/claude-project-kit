@@ -195,7 +195,12 @@ request nobody acknowledges within 15 minutes becomes a page, so a missing waker
 back to the old behaviour, never to silence. The same audit found the `conflict` label
 stuck on four merged PRs: it was removed only from PRs still open, so a PR merged
 between ticks kept it forever. A dedupe key needs a clearing path for every way its
-subject can end. **For every gate, ask when it samples.** A gate that samples at an
+subject can end. The same day's follow-up found the waker itself activated by a
+hand-typed `while true` loop. No installer, supervisor or heartbeat knew about it, so a
+closed terminal looked exactly like nothing to do. A mechanism is not deployed until it
+installs, runs supervised and can say it is not running. It also had to learn whose
+session it may wake: a fix started outside the sandbox must never touch a sandboxed
+session's branch. **For every gate, ask when it samples.** A gate that samples at an
 event covers that event, not the interval after it.
 
 **A hook that compares to *local* `main` false-nags — use `origin/main`.** In PR flow

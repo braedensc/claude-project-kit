@@ -297,10 +297,20 @@ jobs:
       # result on a still-CONFLICTING PR each escalate exactly once; markers count only
       # from the author allowed to write them and only on a comment's first line, so a
       # session cannot forge one; closed/draft PRs lose a stale label; an unsettled PR
-      # fails the run (§13); `wake` refuses an agent environment, acks before the
-      # session starts, declines a dirty worktree; and nothing merges, approves or pushes.
+      # fails the run (§13); `wake` refuses an agent environment, root and a dispatcher's
+      # role account, takes only a worktree this user's own Claude Code worked in, acks
+      # every session of a capped pass before the first starts, declines a dirty
+      # worktree, writes a heartbeat on every real pass and exits 1 when it cannot tell;
+      # and nothing merges, approves or pushes.
       - name: Conflict loop selftest (request, bounded escalation, stale labels, no merge)
         run: python3 scripts/pr_conflict.py --selftest
+
+      # The waker as a supervised job (scripts/pipeline_conflict_waker_setup.py): a user
+      # LaunchAgent, never a role-account daemon; every conf error at once, an unboundable
+      # queue refused; the dry run passes the job's own argv and blocks on a sign-off; a
+      # loaded job with a stale heartbeat is NOT RUNNING, never "installed"; no sudo path.
+      - name: Conflict waker installer selftest (LaunchAgent, heartbeat, agent-refused)
+        run: python3 scripts/pipeline_conflict_waker_setup.py --selftest
 
       # The union check (pr-union-check.yml): a check and the fixture it rejects, each green
       # alone, are red together and bisected to the PR that joined last; a textual conflict
