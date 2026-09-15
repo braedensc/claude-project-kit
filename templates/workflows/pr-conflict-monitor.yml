@@ -16,7 +16,12 @@ name: PR conflict monitor
 # `mergeable` state. CONFLICTING → add a `conflict` label + post ONE comment with
 # the canonical rebase recipe, cc/assign the owner. Back to MERGEABLE → remove
 # the label, so a NEW conflict later re-alerts. The label IS the dedupe key —
-# one comment per conflict episode, no nag loop.
+# one comment per conflict episode, no nag loop. Closed PRs and drafts still
+# carrying the label are swept each run, so a PR merged mid-conflict doesn't keep it.
+#
+# The kit's own active copy (.github/workflows/pr-conflict-monitor.yml) replaces the
+# @claude handoff with a local waker (scripts/pr_conflict.py) — for projects that
+# run their sessions locally rather than through claude.yml.
 #
 # TIER 1 (default, active): the comment tells the human the fix and the exact
 # @claude reply that hands it off. TIER 2 (full-auto, commented out below): the
@@ -85,9 +90,13 @@ jobs:
 
             const newlyConflicted = []
             for (const pr of result.repository.pullRequests.nodes) {
-              if (pr.isDraft) continue // drafts aren't mergeable anyway; don't nag WIP
               const labels = pr.labels.nodes.map((l) => l.name)
               const hasLabel = labels.includes(LABEL)
+              if (pr.isDraft) {
+                // Drafts aren't monitored (don't nag WIP) — so a label left on one would lie.
+                if (hasLabel) await github.rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name: LABEL })
+                continue
+              }
 
               if (pr.mergeable === 'CONFLICTING' && !hasLabel) {
                 // New conflict episode: label (the dedupe key) + ONE comment.
@@ -140,6 +149,27 @@ jobs:
                 core.info(`#${pr.number}: mergeability still computing — skipping this tick`)
               }
             }
+
+            // Stale-label sweep. The removal branch above only sees OPEN PRs, so a PR
+            // labeled while conflicted and merged or closed before the next tick kept
+            // `conflict` forever. Clear it from every closed PR still carrying it.
+            const closed = await github.graphql(`
+              query($owner: String!, $repo: String!, $label: String!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequests(states: [CLOSED, MERGED], labels: [$label], first: 100) {
+                    nodes { number }
+                  }
+                }
+              }`, { owner, repo, label: LABEL })
+            for (const pr of closed.repository.pullRequests.nodes) {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name: LABEL })
+                core.info(`#${pr.number}: closed with the label still on — removed`)
+              } catch (e) {
+                if (e.status !== 404) throw e // 404 = already gone; anything else is real
+              }
+            }
+
             // Consumed by the (commented-out) Tier 2 step; harmless while Tier 2 is off.
             core.setOutput('newly_conflicted', JSON.stringify(newlyConflicted))
 

@@ -109,6 +109,12 @@ open the PR, then watch CI to green (`gh pr checks <n> --watch`) before calling 
 done. A DIRTY PR is *not* green — GitHub skips the required CI, so side checks alone can
 look passing; rebase, resolve, force-push.
 
+The Stop hook samples **at turn-end only**. After your turn, two watchers run where no
+session is: `pr-conflict-monitor.yml` requests a fix when `main` moves under your PR — a
+local waker (`scripts/pr_conflict.py wake`, run by a person) may resume you, or start a
+session in your worktree, to merge `origin/main`, resolve, push and watch CI — and
+`pr-union-check.yml` comments if your PR is green alone but red with the other open PRs.
+
 Two non-enforcing complements: `.claude/settings.json` also carries native
 `permissions.deny` rules that hard-block reads of secret files independently of the
 Python hook (deny wins even under `bypassPermissions`); and
@@ -180,6 +186,9 @@ npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idemp
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
                              #   (no Linear MCP), agent-refused, conf-all-errors, human gates
+npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
+                             #   markers, stale-label sweep, waker refused in an agent env
+npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -204,8 +213,8 @@ deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
-auto-merge, grader-path, safe-outputs, telemetry, dashboard and weekly-review selftests,
-and secretlint on every PR. `main` is protected: **three** contexts are required —
+auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
+and weekly-review selftests, and secretlint on every PR. `main` is protected: **three** contexts are required —
 **Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
 
 **A component that can do nothing must say which nothing it did.** *Nothing to do* and

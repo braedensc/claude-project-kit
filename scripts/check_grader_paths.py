@@ -123,6 +123,12 @@ FLOOR = (
     # in a Bash command, and `python3 scripts/gh_fallback.py …` contains no such string.
     # So the file itself is the boundary, and it belongs behind a human's label.
     "scripts/gh_fallback.py",
+    # pr_conflict.py is neither a grader nor on the dispatch path, but it is the other
+    # half of a workflow: pr-conflict-monitor.yml runs it with a write token, and its
+    # `wake` half starts model sessions from a prompt it builds. An edit to it could
+    # drop "never merge" from that prompt or widen the one label it writes, and no
+    # hook would see it — so a person's label, like the workflow that runs it.
+    "scripts/pr_conflict.py",
     "templates/workflows/pipeline-*.yml",
     "templates/hooks/**",
     "delivery.json",

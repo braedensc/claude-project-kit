@@ -40,6 +40,8 @@
     "test:bounce": "python3 scripts/pipeline_bounce_local.py --selftest",
     "test:notifier": "python3 scripts/pipeline_notify_local.py --selftest",
     "test:heartbeat-monitor": "python3 scripts/pipeline_heartbeat_monitor.py --selftest",
+    "test:conflict": "python3 scripts/pr_conflict.py --selftest",
+    "test:union": "python3 scripts/check_pr_union.py --selftest",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },
