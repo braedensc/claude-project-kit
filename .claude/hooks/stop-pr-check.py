@@ -284,6 +284,40 @@ except Exception:
 raw_checks = info.get("statusCheckRollup", [])
 
 
+# GitHub's legacy commit-status API reports as a `StatusContext`, which has no `name`
+# and no `conclusion` — it carries `context` and `state` instead. Any commit-status
+# integration (Vercel, Netlify, …) produces one, and read raw it broke two things,
+# observed on a downstream project's PR on 2026-09-13: the `settled` test below
+# requires every entry to have a conclusion, so a genuinely green PR NEVER cleared the
+# budget (red, green, red came back as attempt 2, and an exhausted branch stayed
+# exhausted after going green); and a red status was silently not failing. This kit's
+# own CI has no StatusContext, which is why its battery never saw it. Map each one onto
+# the CheckRun shape once, up front, so every reader below sees a single vocabulary.
+_STATUS_STATE_TO_CONCLUSION = {
+    "SUCCESS": "SUCCESS",
+    "FAILURE": "FAILURE",
+    "ERROR": "FAILURE",
+    "PENDING": None,   # still running
+    "EXPECTED": None,  # required, not yet reported
+}
+
+
+def _normalize(entries):
+    out = []
+    for c in entries or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("__typename") == "StatusContext" or ("context" in c and "name" not in c):
+            out.append({
+                "name": c.get("context"),
+                "conclusion": _STATUS_STATE_TO_CONCLUSION.get(c.get("state")),
+                "startedAt": c.get("startedAt") or c.get("createdAt"),
+            })
+        else:
+            out.append(c)
+    return out
+
+
 def _latest_per_name(entries):
     """statusCheckRollup returns one entry per RUN, not per check name, so a check
     that was red and has since been re-run green appears TWICE — old conclusion and
@@ -305,7 +339,7 @@ def _latest_per_name(entries):
     return [v[1] for v in latest.values()]
 
 
-checks = _latest_per_name(raw_checks)
+checks = _latest_per_name(_normalize(raw_checks))
 
 # ── classify: is this PR not-green, and for which reason? ────────────────────
 # DIRTY = merge conflicts with the base branch. GitHub can't build the merge ref, so the
