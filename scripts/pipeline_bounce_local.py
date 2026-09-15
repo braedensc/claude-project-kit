@@ -1383,12 +1383,17 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
         if cannot_evaluate:
             return hold("unknown", cannot_evaluate)
         if settled_conclusion:
-            return hold("noop", "Stage E already concluded this PR (%s); %s"
+            # The trigger reason rides along so what the pass SAW is still said — above all
+            # a required check waiting on a person, which `checks_summary` sets aside and
+            # promises to name in the verdict line. A settled PR is exactly where that
+            # check lingers: it waits on the person who now holds the ticket.
+            return hold("noop", "Stage E already concluded this PR (%s); %s — %s"
                                 % (settled_conclusion.get("basis") or "concluded",
                                    "the ticket is in the needs-approval lane and a person has it"
                                    if settled_conclusion.get("moved") else
                                    "the ticket was NOT moved — no linear.stateIds.%s is "
-                                   "configured for this repository" % NEEDS_APPROVAL_STATE_KEY))
+                                   "configured for this repository" % NEEDS_APPROVAL_STATE_KEY,
+                                   trigger_reason))
         if conclusion:
             return {"action": "conclude", "bounce_no": None, "basis": conclusion,
                     "reason": "Stage E concluded (%s) — %s" % (conclusion, trigger_reason)}
@@ -4600,6 +4605,29 @@ def selftest():
                    "already concluded" in buf.getvalue(), "REFRESH" in buf.getvalue()),
                   (EXIT_OK, [], False, 0, True, False))
             world["pr"] = open_pr
+
+        #       A CHECK WAITING ON A PERSON IS NOT NEWS EITHER. The grader-path guard is a
+        #       required context that stays red until the owner applies a label, and it is
+        #       set aside before CI is judged (`human_pending_checks`). On a concluded PR it
+        #       must not become a notice any more than a bounce: the person it waits on is
+        #       the person who already holds the ticket.
+        with tempfile.TemporaryDirectory() as tmp:
+            hand_over(tmp)
+            world["required"] = ["Kit checks", "Hooks change guard"]
+            world["runs"] = green + [{"name": "Hooks change guard", "status": "completed",
+                                      "conclusion": "failure"}]
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("a concluded PR whose only red check waits on a person: nothing written",
+                  (rc, calls, [r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "notice"]),
+                  (EXIT_OK, [], []))
+            check("…the settled no-op, and the waiting check is still named",
+                  ("already concluded" in buf.getvalue(), "Hooks change guard" in buf.getvalue()),
+                  (True, True))
+            world["required"] = ["Kit checks"]
+            world["runs"] = green
 
         #       `decide` stays read-only on a notice, `exhaust` refuses it (it is not a
         #       lever), and a dry run writes nothing while saying what it would have said.
