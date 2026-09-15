@@ -57,7 +57,8 @@ other specific project by name. MIT licensed.
 | `.claude/skills/` | `/ship` (commit → push → PR → watch CI → stop), `/fix-ci`, `/work` (ticket → PR, pipeline projects only) and `/new-adr` custom slash-commands |
 | `.husky/` + `.secretlintrc.json` | Layer-2 pre-commit: branch block, forbidden paths, worktree-aware secretlint |
 | `.github/workflows/ci.yml` | The kit's own CI (battery, JSON/YAML validation, forbidden paths, secretlint, placeholder integrity) |
-| `.github/workflows/pr-conflict-monitor.yml` | The kit's own standing conflict watch — flags an open PR the moment it goes `CONFLICTING`, because a conflicted PR skips the required CI and can still look green |
+| `.github/workflows/pr-conflict-monitor.yml` + `scripts/pr_conflict.py` | The kit's own standing conflict watch — when an open PR goes `CONFLICTING` (a conflicted PR skips the required CI and can still look green), requests a fix from a local waker that wakes a session in the branch's worktree, and pages the owner only when that stalls |
+| `.github/workflows/pr-union-check.yml` + `scripts/check_pr_union.py` | Green alone, red together — runs the battery on the union of all open PRs and names the PR that broke it. Report-only |
 | `.github/pull_request_template.md` | The concise-PR format (≤ ~150 visible words, depth in `<details>`) |
 | `templates/workflows/` | **Inert** app-project workflows — CI, deploy-on-green, backup-cron, keepalive, `@claude` Action — activated by `git mv` at bootstrap ([templates/README.md](templates/README.md)) |
 | `.devcontainer/` | Minimal Claude-Code devcontainer + hardening/firewall notes for sandboxed autonomous runs |

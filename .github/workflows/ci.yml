@@ -291,6 +291,24 @@ jobs:
       - name: Plan-tree executor selftest (forced fields, DoR gate, §8/§13 verdicts)
         run: python3 scripts/pipeline_plan_executor.py --selftest
 
+      # The conflict loop (pr-conflict-monitor.yml + the local waker). Offline, GitHub and
+      # the model stubbed, git real: a new conflict requests a fix and pages nobody; the
+      # budget (3 per PR) and forks page instead; a missed ack, a missed result, and a
+      # result on a still-CONFLICTING PR each escalate exactly once; markers count only
+      # from the author allowed to write them and only on a comment's first line, so a
+      # session cannot forge one; closed/draft PRs lose a stale label; an unsettled PR
+      # fails the run (§13); `wake` refuses an agent environment, acks before the
+      # session starts, declines a dirty worktree; and nothing merges, approves or pushes.
+      - name: Conflict loop selftest (request, bounded escalation, stale labels, no merge)
+        run: python3 scripts/pr_conflict.py --selftest
+
+      # The union check (pr-union-check.yml): a check and the fixture it rejects, each green
+      # alone, are red together and bisected to the PR that joined last; a textual conflict
+      # inside the union is skipped by name; the cap skips loudly; could-not is its own
+      # verdict; the battery sees no token and no runner step file; no ref in the checkout moves.
+      - name: Union check selftest (green alone, red together, bisected, report-only)
+        run: python3 scripts/check_pr_union.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 

@@ -90,7 +90,9 @@ that rejects absolute home paths; a sibling PR added a test fixture containing o
 Each was green alone (the check without the fixture; the fixture without the check),
 and `main` went red the moment the second merged — with no PR to blame, because git
 reports no conflict: they touched different files. It is a *semantic* conflict, not a
-textual one, so `git merge` will never warn you.
+textual one, so `git merge` will never warn you. It recurred in 2026-09: two review-lane
+PRs, each green alone, and where their rules met, a concluded PR stopped naming the
+label-gated check that was blocking it.
 
 Cheap check before merging a batch — merge them together somewhere disposable and run
 CI's checks against *that* tree:
@@ -105,7 +107,10 @@ merge — real friction at any volume, and often removed for that reason. GitHub
 **merge queue** buys the same guarantee without the churn (it tests the batch as one
 tree) at the cost of a `merge_group` trigger in CI. Otherwise: keep CI's `push: [main]`
 run — it turns this from silent to *loud within a minute* — and reach for the union
-check when landing several PRs at once.
+check when landing several PRs at once. The kit now runs that union check itself:
+`.github/workflows/pr-union-check.yml` builds the union on every push to `main` and
+hourly, bisects a red one to the PR whose arrival broke it, and comments there. It only
+reports; it never merges.
 
 **`workflow_run` uses the workflow file on the DEFAULT branch.** Edits to a
 `workflow_run`-triggered workflow take effect only after merging to main; you cannot
@@ -166,6 +171,32 @@ the dedupe key: one comment per episode, cleared when the PR is mergeable again 
 later conflict re-alerts. Event-driven costs one wrinkle — GitHub computes
 `mergeable` lazily, so a run right after a push reads `UNKNOWN` and must re-query a
 *bounded* number of times before giving up.
+
+**Detection is not resolution: an idle local session has no wake path (2026-09-15).**
+Thirteen parallel sessions each opened a PR, drove it green and ended their turn. Five
+merged, `main` moved, and the other eight went `CONFLICTING`. The monitor above fired
+correctly on all eight — label, recipe, owner assigned — and all eight still waited for
+a person to wake each session by hand. Two facts made that certain:
+
+- **The Stop hook and its fix budget sample at turn-end only.** They judge the PR at
+  the instant a session stops, hold no timer, and never run for that branch again
+  unless the session does. "Green at turn-end" is a fact about one instant, not a state.
+- **Nothing could re-invoke an idle local session.** The only wake path in the design
+  was a tracker comment an out-of-repo dispatcher turns into a resume, which exists only
+  for dispatcher-owned sessions. The template's `@claude` handoff needs `claude.yml`,
+  which the kit does not run — and a comment written with `GITHUB_TOKEN` triggers no
+  workflow anyway.
+
+A watcher that can only page makes a person the loop. The fix splits the loop by what
+each side holds. GitHub keeps the clock and the budget: the monitor posts a fix request,
+three per PR. The machine that holds the worktrees does the work: a waker
+(`scripts/pr_conflict.py wake`) starts a session there, under the repo's own hooks. A
+request nobody acknowledges within 15 minutes becomes a page, so a missing waker falls
+back to the old behaviour, never to silence. The same audit found the `conflict` label
+stuck on four merged PRs: it was removed only from PRs still open, so a PR merged
+between ticks kept it forever. A dedupe key needs a clearing path for every way its
+subject can end. **For every gate, ask when it samples.** A gate that samples at an
+event covers that event, not the interval after it.
 
 **A hook that compares to *local* `main` false-nags — use `origin/main`.** In PR flow
 you branch off `origin/main` and rarely update local `main`, so it lags (often several

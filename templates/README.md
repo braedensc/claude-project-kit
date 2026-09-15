@@ -7,8 +7,9 @@ place in your new project.
 
 **One exception:** the kit runs its own adapted, *active* copy of
 `pr-conflict-monitor.yml` at `.github/workflows/` — parallel PRs off one `main`
-make the conflict hazard real in this repo too. The template below stays inert
-and unchanged; app projects still activate it the normal way.
+make the conflict hazard real in this repo too. The template below stays inert and
+keeps its `@claude` handoff, which the kit's copy replaces with a local waker
+(`scripts/pr_conflict.py`); app projects still activate it the normal way.
 
 | Template | Activates to | What it is |
 |---|---|---|

@@ -184,8 +184,11 @@ are handled explicitly. The parallel build collided three times on ADR numbering
 twice on doc-tail merges before these rules existed:
 
 1. **Surface contracts in every kickoff prompt.** Each session gets an explicit "you
-   own these paths; read-only everywhere else" list. Code never collided under this
-   rule — only shared docs did.
+   own these paths; read-only everywhere else" list. That rule stops *textual*
+   collisions — the conflicts git reported were in shared docs — but not *semantic*
+   ones. Disjoint paths still collided: a new check met a sibling's test fixture it
+   rejects, and two review-lane rules each assumed the other did not exist
+   (docs/LESSONS.md). Owning paths is not owning behaviour; item 6 covers the rest.
 2. **Structurally eliminate shared counters.** ADRs are one-file-per-decision with
    date+slug names (docs/adr/README.md) — no number to claim, no common tail to
    conflict. Prefer this shape for any append-only log.
@@ -195,8 +198,9 @@ twice on doc-tail merges before these rules existed:
    (doc-tail conflicts).
 4. **Before claiming anything ordered**, check `origin/main` **and every open PR's
    diff** (`gh pr diff <n>`) — parallel sessions claim resources before they merge.
-5. **The later-opened PR rebases.** Merge small and fast; the collision window is
-   exactly the open-PR window.
+5. **The later-opened PR updates.** Merge small and fast; the collision window is
+   exactly the open-PR window. Update by merging `origin/main` into the branch rather
+   than rebasing, so nothing is force-pushed under a worktree that may still hold it.
 6. **Seam-check after every parallel wave.** Two changes that are each correct can
    combine into something worse than the bug either one fixed. Real case (2026-08-25):
    one stream made the bounce workflow write a pin — right; another made an expired pin
@@ -207,7 +211,11 @@ twice on doc-tail merges before these rules existed:
    tests each PR against `main`, never against its siblings (the semantic-conflict entry
    in docs/LESSONS.md is the same shape one layer down). The practice that does catch
    it: after each wave, list the handoffs the wave touched, and for each one **quote the
-   exact string from both sides** and confirm they match.
+   exact string from both sides** and confirm they match. The mechanical half now runs
+   on its own: `.github/workflows/pr-union-check.yml` merges every open PR into one
+   throwaway tree, runs the battery there, and names the PR whose arrival turned it red.
+   The quoting stays manual — a union can be green and still hold two handoffs that
+   disagree.
 7. **A brief is not authority — a correct refusal is the system working.** Across this
    build, sessions refused their instructions four times, each with reasoning and a
    citation: a rule a later contract had superseded; a premise about hardcoded text that
@@ -217,6 +225,25 @@ twice on doc-tail merges before these rules existed:
    code is read, and the session is the one reading the code. Running many sessions at
    once, the failure mode to fear is the opposite: every one of them dutifully
    implementing a stale brief, in parallel, at speed.
+8. **An idle session cannot see `main` move.** Its Stop hook sampled merge state at
+   turn-end, once. When a sibling merges and its PR goes `CONFLICTING`, the conflict
+   monitor requests a fix, and a **waker** on the machine that holds the worktree
+   starts a session there to merge `main`, resolve, push and watch CI. Run the waker
+   yourself — it starts paid sessions, so it refuses to run inside one:
+
+   ```bash
+   python3 scripts/pr_conflict.py wake --dry-run   # what it would pick up
+   while true; do python3 scripts/pr_conflict.py wake; sleep 300; done
+   ```
+
+   A scheduler works too; give it a `PATH` with `gh` and `claude`. Each session is
+   capped (`--max-budget-usd`, default 5; `--timeout-min`, default 40) and resumes the
+   session linked to the PR where Claude Code has one (`--resume-mode`). A headless
+   session can only use the tools its settings allow — pass `--claude-arg` to match how
+   you run sessions, or it will end `failed` and the monitor pages you. Three automated
+   attempts per PR; after that, or when nothing picks a request up within 15 minutes,
+   the monitor pages the owner. No waker, or a sleeping machine, gets you the old page —
+   never silence.
 
 ---
 
@@ -377,7 +404,8 @@ Stop hook between them:
    PR has **failing CI**, or its open PR is **`DIRTY`** (merge conflicts — GitHub
    then never runs the required CI, so side checks like CodeQL/Vercel can make a
    conflicted PR look green). Dedups per (branch, reason, commit) so it can't loop;
-   fails open like the PreToolUse guards.
+   fails open like the PreToolUse guards. It samples **at turn-end only**: a PR that
+   goes `DIRTY` after its session ends is the conflict monitor's (below).
 
    A hook cannot make the model run anything — it can block, and it can inject text —
    so the two not-green messages **name `/fix-ci`**, the loop the kit already ships,
@@ -418,6 +446,22 @@ Stop hook between them:
    them; a PR authored in another clone or the web UI never meets one. The job runs
    the gate script from the PR's **base** sha for the same reason it reads config
    from base — a head that can rewrite the gate grades its own homework.
+
+Plus two **standing watchers**, because every layer above samples a moment and a PR
+can break after that moment, when nobody is in a session:
+
+- **`.github/workflows/pr-conflict-monitor.yml`** — on every push to `main`, and every
+  20 minutes, labels a newly `CONFLICTING` PR `conflict` and requests a fix from the
+  local waker (`scripts/pr_conflict.py`; parallel-session protocol item 8). A request
+  nobody acknowledges within 15 minutes, a fix that does not land, a fourth conflict on
+  the same PR, or a fork pages the owner instead. It clears the label when the PR is
+  mergeable again, closed, or a draft. It never merges, approves or pushes, and a PR
+  whose mergeability never settles fails the run rather than reading as clean.
+- **`.github/workflows/pr-union-check.yml`** — on every push to `main`, and hourly, runs
+  the battery on the union of all open same-repo PRs (`scripts/check_pr_union.py`) and
+  comments once on the PR whose addition turned the union red. Green alone, red
+  together is the one class no per-PR check can see. Report-only; past 8 open PRs it
+  skips and names what it skipped.
 
 Plus two non-enforcing complements: native `permissions.deny` rules in `settings.json`
 hard-block secret-file reads independently of the Python hook (docs/SECURITY.md), and

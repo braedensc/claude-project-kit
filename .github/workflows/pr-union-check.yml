@@ -1,0 +1,185 @@
+name: PR union check
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Green alone, red together. GitHub tests each PR as main + that PR, never as
+# main + the other open PRs, so a break that exists only in the COMBINATION is
+# invisible to every PR's CI until the second one merges and main goes red. It
+# happened here: two Stage E PRs each passed alone, and where their rules met, a
+# concluded PR stopped naming the label-gated check blocking it. docs/LESSONS.md
+# (semantic conflicts) and docs/COLLABORATION.md (seam-check) prescribed the
+# union check by hand; scripts/check_pr_union.py mechanizes it.
+#
+# REPORTING ONLY. It merges the open non-draft same-repo PRs into a detached
+# throwaway worktree off main, runs every `test:*`/`lint:*` script plus the
+# provenance and placeholder checks there, and on red bisects to name the PR
+# whose addition broke the union. It never merges a PR, never pushes, never
+# labels. Past MAX_PRS open PRs it skips the run and names every PR it skipped.
+#
+# Two jobs, on purpose. `union` RUNS PR CODE, so it holds a read-only token and
+# drops even that from .git before the battery starts. `report` holds the write
+# token and runs no PR code: it only reads the verdict and comments once per
+# distinct red union on the PR the bisection named.
+#
+# Cost: a battery run (~1 min) per distinct union. An unchanged union — same
+# main, same PR heads — is not re-run: its verdict is cached by key, and a cache
+# hit says so and repeats the earlier verdict instead of going silent.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '41 * * * *' # hourly backstop: catches pushes to open PRs, not only merges
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: pr-union-check
+  cancel-in-progress: false
+
+env:
+  MAX_PRS: '8'
+
+jobs:
+  union:
+    name: Battery on the union of open PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      result: ${{ steps.check.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List open PRs and fetch their heads
+        id: prepare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/check_pr_union.py prepare --out "$RUNNER_TEMP/plan.json" --max-prs "$MAX_PRS"
+
+      # From here on PR code runs. Remove the checkout's credential and PROVE it
+      # is gone, rather than trusting the unset to have worked.
+      - name: Drop the git credential before any PR code runs
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          if git config --local --get-all http.https://github.com/.extraheader >/dev/null; then
+            echo "::error::credential still present in .git/config — refusing to run PR code"
+            exit 1
+          fi
+
+      - name: Look up this exact union's earlier verdict
+        id: cache
+        if: steps.prepare.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .pr-union-verdict
+          key: pr-union-${{ steps.prepare.outputs.key }}
+
+      - name: Build the union and run the battery
+        id: check
+        if: steps.prepare.outputs.run == 'true' && steps.cache.outputs.cache-hit != 'true'
+        # The two steps below evaluate this step's outcome and fail the job on it
+        # (contract §13) — this only keeps the outputs alive for `report`.
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet pyyaml
+          mkdir -p .pr-union-verdict
+          python3 scripts/check_pr_union.py check --plan "$RUNNER_TEMP/plan.json" \
+            --out .pr-union-verdict/result.json \
+            --also "python3 scripts/check_provenance.py" \
+            --also "python3 scripts/check_placeholders.py"
+
+      - name: Remember this union's verdict
+        if: steps.check.outcome != 'skipped' && steps.check.outputs.verdict != 'could-not' && steps.check.outputs.verdict != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .pr-union-verdict
+          key: pr-union-${{ steps.prepare.outputs.key }}
+
+      - name: Verdict
+        id: verdict
+        env:
+          RAN: ${{ steps.prepare.outputs.run }}
+          HIT: ${{ steps.cache.outputs.cache-hit }}
+          OUTCOME: ${{ steps.check.outcome }}
+          VERDICT: ${{ steps.check.outputs.verdict }}
+        run: |
+          if [ "$RAN" != "true" ]; then
+            echo "verdict=not-run" >> "$GITHUB_OUTPUT"
+            echo "No union built this run — the prepare step's summary says why."
+            exit 0
+          fi
+          if [ "$HIT" = "true" ]; then
+            VERDICT=$(python3 -c 'import json; print(json.load(open(".pr-union-verdict/result.json"))["verdict"])')
+            echo "::notice::this exact union (key ${{ steps.prepare.outputs.key }}) was already checked — earlier verdict: $VERDICT; not re-running, not re-reporting"
+            echo "### PR union check — unchanged union, earlier verdict **$VERDICT** (not re-run)" >> "$GITHUB_STEP_SUMMARY"
+            echo "verdict=cached-$VERDICT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "verdict=${VERDICT:-could-not}" >> "$GITHUB_OUTPUT"
+          echo "step outcome: $OUTCOME, verdict: '${VERDICT}'"
+
+      # A separate step, so the verdict output above is always set before the job
+      # fails — `report` reads it.
+      - name: Fail the job unless the union is green or honestly not checkable
+        env:
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          case "$VERDICT" in
+            green|nothing-to-combine|skipped-cap|not-run|cached-*) echo "verdict: $VERDICT" ;;
+            red) echo "::error::the open PRs are green alone and red together — see the summary"; exit 1 ;;
+            *) echo "::error::could not check the union (verdict: '$VERDICT') — this is NOT green"; exit 1 ;;
+          esac
+
+  report:
+    name: Report a red union on the PR that broke it
+    needs: union
+    if: always() && needs.union.outputs.verdict == 'red'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          RESULT: ${{ needs.union.outputs.result }}
+        with:
+          script: |
+            const r = JSON.parse(process.env.RESULT)
+            const a = r.attribution
+            if (!a || a.kind === 'main') {
+              core.notice('red, but attributed to main itself — the push-to-main CI run owns that; no PR comment')
+              return
+            }
+            const { owner, repo } = context.repo
+            const tag = `<!-- pr-union:red key=${r.key} -->`
+            const existing = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: a.culprit, per_page: 100 })
+            if (existing.some((c) => c.user.type === 'Bot' && (c.body || '').startsWith(tag))) {
+              core.info(`#${a.culprit}: this union was already reported`)
+              return
+            }
+            // Command output ran from PR code: no fence break-out, no @-pings.
+            const clean = (s) => (s || '').replace(/`{3,}/g, "'''").replace(/@/g, '@\u200b')
+            const why = a.kind === 'alone'
+              ? `This PR is **red against current \`main\` by itself** — its green CI ran on an older \`main\`.`
+              : `Each PR was green alone, but the union goes **red once this PR joins** a union already holding ${a.partners.map((n) => '#' + n).join(', ')}.`
+            const body = [
+              tag,
+              `**Union check: green alone, red together.** ${why}`,
+              '',
+              `Merging as-is would turn \`main\` red with no PR to blame (a semantic conflict — git reports nothing). Failing on the union of main@${r.base_sha.slice(0, 8)} + ${r.merged.map((p) => '#' + p.number).join(', ')}:`,
+              '',
+              ...r.failures.map((f) => `<details><summary><code>${clean(f.command).replace(/</g, '&lt;')}</code></summary>\n\n\`\`\`\n${clean(f.tail)}\n\`\`\`\n</details>`),
+              '',
+              'Reported by `pr-union-check.yml`; it never merges. Find where the two changes meet and quote the exact string from both sides.',
+            ].join('\n')
+            await github.rest.issues.createComment({ owner, repo, issue_number: a.culprit, body })
+            core.info(`#${a.culprit}: reported red union ${r.key}`)
