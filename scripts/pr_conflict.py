@@ -2,8 +2,11 @@
 """Conflict self-resolution — one loop, two halves, one marker grammar.
 
     pr_conflict.py monitor [--dry-run]              # GitHub Actions (pr-conflict-monitor.yml)
-    pr_conflict.py wake [--repo-dir DIR] [options]  # a PERSON's machine, on a schedule
+    pr_conflict.py wake [--repo-dir DIR]... [opts]  # a PERSON's machine, as a LaunchAgent
     pr_conflict.py --selftest
+
+  `wake` is installed and supervised by scripts/pipeline_conflict_waker_setup.py — one
+  LaunchAgent per person, a heartbeat, a signed-off dry run. Nobody types a loop.
 
 THE GAP THIS CLOSES
 
@@ -45,6 +48,41 @@ WHY THE FIX RUNS LOCALLY, NOT IN ACTIONS
   that holds the branch's worktree and is awake. When it does not, the monitor's
   deadline turns that into a page — the same page as before, never silence.
 
+WHOSE PULL REQUEST THE WAKER MAY TAKE — AND WHOSE IT MAY NEVER TAKE
+
+  A fix session starts OUTSIDE any sandbox, as the person running the waker, and
+  reads a branch it did not write. That is fine for a branch the same person's own
+  local session wrote, and wrong for one a dispatcher's SANDBOXED session wrote:
+  the fix would run with the owner's reach over text a sandboxed agent authored.
+  A dispatcher's PR has its own wake path that keeps the sandbox — the Stage E
+  bounce driver re-prompts the original session in its tracker thread
+  (scripts/pipeline_bounce_local.py, the `conflict` action), and it answers the
+  same `request` marker. So the waker takes a request only when ALL of these hold,
+  and each is a fact a dispatcher's session cannot write:
+
+    * the worktree holding the branch belongs to THIS uid, and
+    * THIS user's own Claude Code has worked in it — a transcript under
+      `<claude config dir>/projects/<the worktree path, non-alphanumerics as '-'>`,
+      owned by this uid. A dispatcher's sessions run as its role account and keep
+      their transcripts under THAT home, which this uid cannot write; and
+    * the waker is not itself running as a dispatcher's role account (it refuses
+      where `~/.stage-e/env` exists — that account's PRs are the bounce driver's)
+      or as root.
+
+  A request none of that matches is left alone, and the monitor's ack deadline
+  turns it into a page. If Claude Code ever moves its transcripts, every request
+  reads "no local session" and pages — loud, never a fix in the wrong place.
+
+WHAT A PASS IS BOUNDED BY
+
+  Per session: `--max-budget-usd` and `--timeout-min`. Per pass: `--max-sessions`,
+  and the product of the two must fit inside the monitor's result deadline (so a
+  queued session is never still working when the monitor pages about it). Every
+  session this pass will run is ACKNOWLEDGED BEFORE THE FIRST STARTS, so a queue
+  cannot miss the ack deadline. Per PR, lifetime: the monitor's three requests.
+  A request over the pass cap is not acknowledged and is said by number: the
+  monitor pages it. No loop anywhere — launchd starts the next pass.
+
 MARKERS (the whole producer/consumer contract)
 
   The FIRST LINE of a comment, exactly:
@@ -72,10 +110,20 @@ WHAT NEITHER HALF EVER DOES (asserted in --selftest)
 EXIT CODES (contract §13)
 
   0  the pass completed — it printed what it asked and what the answer was
-  1  could not tell: mergeability never settled, a listing was truncated, or a
-     GitHub call failed. Never the same token as "no conflicts".
+  1  could not tell: mergeability never settled, a listing was truncated, a
+     GitHub call failed, or a fix session ended with GitHub unable to say whether
+     the conflict is gone. Never the same token as "no conflicts".
   2  usage error
-  3  REFUSED — `wake` (not --dry-run) in an agent environment
+  3  REFUSED — `wake` (not --dry-run) in an agent environment, as root, or as a
+     dispatcher's role account
+
+THE WAKER'S HEARTBEAT (contract §13)
+
+  Every real `wake` pass writes `<state dir>/heartbeat.json`
+  (`pr-conflict-waker-heartbeat/1`): a `running` beat first, then `started_at`,
+  `finished_at`, `result` (ok | idle | problems | error) and what it did. A stale
+  file is NOT RUNNING; a fresh one saying `idle` is ran-and-had-nothing-to-do.
+  A dry run and a refusal write none, so neither can impersonate a pass.
 """
 import argparse
 import datetime as dt
@@ -107,6 +155,21 @@ MARKER_RE = re.compile(
     r"((?: [a-z]+=[a-z-]+)*) -->$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
 TAIL_CHARS = 1500
+
+WAKER_HEARTBEAT_SCHEMA = "pr-conflict-waker-heartbeat/1"
+DEFAULT_WAKER_HOME = "~/.pr-conflict-waker"
+DEFAULT_STATE_DIR = DEFAULT_WAKER_HOME + "/state"
+DEFAULT_MAX_SESSIONS = 2
+DEFAULT_BUDGET_USD = 5.0
+DEFAULT_TIMEOUT_MIN = 40
+# A queued session must finish inside the monitor's result deadline, with room for
+# the settle re-reads and the result comment after it.
+QUEUE_MARGIN_MIN = 10
+# The Stage E role account's env file (pipeline_bounce_local.DEFAULT_ENV_FILE — the
+# selftest pins the two together). Where it exists, this is a dispatcher's account,
+# its PRs are the bounce driver's to wake, and a waker here would run fixes outside
+# the sandbox its sessions live in.
+DISPATCHER_ENV_FILE = "~/.stage-e/env"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402  (one tuple, owned there)
@@ -324,9 +387,10 @@ def request_body(pr, episode, attempt):
     return "\n".join([
         marker("request", episode), _headline(pr), "",
         f"**A fix has been requested** (automated attempt {attempt} of {MAX_FIX_REQUESTS} on this PR). "
-        "A conflict waker (`scripts/pr_conflict.py wake`) running on a machine that holds this "
-        "branch's worktree acknowledges it here, then wakes a Claude Code session in that worktree "
-        "to merge `main`, resolve, push and watch CI. It never merges or approves.",
+        "It is acknowledged here by whichever owns this branch's session: the conflict waker on the "
+        "machine where a local session worked in its worktree, or — for a dispatcher's PR — the "
+        "bounce driver, which sends it back to that session's own thread. Either way the session "
+        "merges `main`, resolves, pushes and watches CI. Nothing merges or approves.",
         "",
         f"If nothing acknowledges this within {ACK_DEADLINE_MIN} min, or the attempt ends with the "
         "PR still conflicted, this monitor pages the owner here. To fix it by hand meanwhile:", "",
@@ -470,6 +534,54 @@ def agent_env_markers_present(env):
     return [m for m in AGENT_ENV_MARKERS if m in env]  # presence, not truthiness
 
 
+def refuse_waker(env, dry_run, uid, dispatcher_env):
+    """Raise Refusal when this process must not start sessions. Checked before anything
+    is read or written. A dry run starts nothing, so it is never refused."""
+    if dry_run:
+        return
+    found = agent_env_markers_present(env)
+    if found:
+        raise Refusal(
+            f"REFUSED: `wake` starts model sessions, and this is an agent environment ({', '.join(found)} set).\n"
+            "  A session that launches its own sessions spends money nobody approved. A PERSON installs\n"
+            "  this (scripts/pipeline_conflict_waker_setup.py run). Read-only meanwhile: wake --dry-run")
+    if uid == 0:
+        raise Refusal(
+            "REFUSED: `wake` as root. A fix session runs as whoever runs the waker, and root owns no\n"
+            "  local session's worktree. Install it for the person whose sessions it wakes.")
+    if dispatcher_env and os.path.exists(dispatcher_env):
+        raise Refusal(
+            f"REFUSED: `wake` as a dispatcher's role account ({dispatcher_env} exists).\n"
+            "  That account's sessions are sandboxed and a waker is not: a fix started here would run\n"
+            "  outside the sandbox, over a branch a sandboxed session wrote. A dispatcher's conflicts\n"
+            "  go back through its tracker thread — the Stage E bounce driver's `conflict` action.")
+
+
+def claude_project_dir(claude_dir, path):
+    """Where Claude Code keeps the transcripts of sessions whose working directory was
+    `path`: every non-alphanumeric character of the path becomes '-'."""
+    return os.path.join(claude_dir, "projects", re.sub(r"[^A-Za-z0-9]", "-", path))
+
+
+def local_session_evidence(worktree, claude_dir, uid):
+    """True when THIS uid owns the worktree AND its own Claude Code has worked there —
+    the positive proof that a branch belongs to a local session rather than a
+    dispatcher's. A sandboxed session runs as another account and cannot write here."""
+    try:
+        if os.stat(worktree).st_uid != uid:
+            return False
+    except OSError:
+        return False
+    for path in dict.fromkeys((worktree, os.path.realpath(worktree))):
+        d = claude_project_dir(claude_dir, path)
+        try:
+            if os.stat(d).st_uid == uid and any(n.endswith(".jsonl") for n in os.listdir(d)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def worktrees_by_branch(repo_dir, runner):
     r = runner(["git", "-C", repo_dir, "worktree", "list", "--porcelain"])
     if r.returncode != 0:
@@ -495,48 +607,73 @@ def _lock(lock_dir, repo, number):
     return fh
 
 
+def queue_problem(max_sessions, timeout_min, budget_usd):
+    """A usage error in the bounds themselves, or None."""
+    if max_sessions < 1 or timeout_min < 1 or budget_usd <= 0:
+        return "--max-sessions and --timeout-min must be at least 1, and --max-budget-usd above 0"
+    if max_sessions * timeout_min > RESULT_DEADLINE_MIN - QUEUE_MARGIN_MIN:
+        return (f"--max-sessions {max_sessions} x --timeout-min {timeout_min} = "
+                f"{max_sessions * timeout_min} min, past the monitor's {RESULT_DEADLINE_MIN}-min result "
+                f"deadline less {QUEUE_MARGIN_MIN} min of margin: the last queued session would still be "
+                "working when the monitor pages about it")
+    return None
+
+
+def new_tally():
+    return {"pending": 0, "woken": [], "declined": [], "elsewhere": [], "not_local": [],
+            "busy": [], "deferred": [], "outcomes": {}, "problems": []}
+
+
 def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=False,
-         claude_bin="claude", resume_mode="from-pr", claude_args=(), budget_usd=5.0,
-         timeout_min=40, lock_dir=None):
+         claude_bin="claude", resume_mode="from-pr", claude_args=(), budget_usd=DEFAULT_BUDGET_USD,
+         timeout_min=DEFAULT_TIMEOUT_MIN, lock_dir=None, sessions_left=DEFAULT_MAX_SESSIONS,
+         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE):
+    """One repository's share of a pass. Returns its tally; raises CouldNotTell when the
+    repository cannot be read at all, and Refusal before anything is read."""
     env = os.environ if env is None else env
-    found = agent_env_markers_present(env)
-    if found and not dry_run:
-        raise Refusal(
-            f"REFUSED: `wake` starts model sessions, and this is an agent environment ({', '.join(found)} set).\n"
-            "  A session that launches its own sessions spends money nobody approved. A PERSON runs\n"
-            "  this, from a terminal or a scheduler. Read-only meanwhile: wake --dry-run")
+    uid = os.getuid() if uid is None else uid
+    refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
     lock_dir = lock_dir or os.path.join(tempfile.gettempdir(), "pr-conflict-waker")
+    claude_dir = claude_dir or env.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     trees = worktrees_by_branch(repo_dir, runner)
-    tally = {"pending": 0, "woken": [], "declined": [], "elsewhere": [], "busy": []}
+    tally = new_tally()
     candidates = [p for p in gh.open_prs()
                   if LABEL in p["labels"] and not p["isDraft"] and not p["isCrossRepository"]]
-    for pr in candidates:
-        n, branch = pr["number"], pr["headRefName"]
-        state = episode_state(gh.comments(n))
-        latest = state["latest"]
-        if not latest or latest["kind"] != "request" or state["escalated"]:
-            print(f"#{n}: no open fix request")
-            continue
-        if state["ack"] or state["result"]:
-            print(f"#{n}: request already claimed")
-            continue
-        if pr["mergeable"] == "MERGEABLE":
-            print(f"#{n}: already mergeable — the monitor clears the label on its next run")
-            continue
-        tally["pending"] += 1
-        wt = trees.get(branch)
-        if not wt:
-            tally["elsewhere"].append(n)
-            print(f"#{n}: no worktree on this machine holds `{branch}` — left for a machine that does")
-            continue
-        lock = _lock(lock_dir, f"{gh.owner}/{gh.name}", n)
-        if lock is None:
-            tally["busy"].append(n)
-            print(f"#{n}: another waker pass is working it")
-            continue
-        try:
+    claimed = []  # (number, branch, worktree, episode, lock)
+    try:
+        for pr in candidates:
+            n, branch = pr["number"], pr["headRefName"]
+            state = episode_state(gh.comments(n))
+            latest = state["latest"]
+            if not latest or latest["kind"] != "request" or state["escalated"]:
+                print(f"#{n}: no open fix request")
+                continue
+            if state["ack"] or state["result"]:
+                print(f"#{n}: request already claimed")
+                continue
+            if pr["mergeable"] == "MERGEABLE":
+                print(f"#{n}: already mergeable — the monitor clears the label on its next run")
+                continue
+            tally["pending"] += 1
+            wt = trees.get(branch)
+            if not wt:
+                tally["elsewhere"].append(n)
+                print(f"#{n}: no worktree on this machine holds `{branch}` — left for a machine that does")
+                continue
+            if not local_session_evidence(wt, claude_dir, uid):
+                tally["not_local"].append(n)
+                print(f"#{n}: `{branch}` is checked out here, but no Claude Code session of this user has "
+                      "worked in that worktree — not a local session's PR. A dispatcher's PR is re-prompted "
+                      "in its tracker thread by the bounce driver; anything else is paged by the monitor")
+                continue
+            lock = _lock(lock_dir, f"{gh.owner}/{gh.name}", n)
+            if lock is None:
+                tally["busy"].append(n)
+                print(f"#{n}: another waker pass is working it")
+                continue
             state = episode_state(gh.comments(n))  # re-read under the lock: a finished pass may have claimed it
             if state["ack"] or state["result"]:
+                lock.close()
                 print(f"#{n}: claimed by another pass while waiting for the lock")
                 continue
             episode = state["episode"]
@@ -549,6 +686,7 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
             elif dirty.stdout.strip():
                 reason = "the worktree has uncommitted changes — a session may be mid-work there"
             if reason:
+                lock.close()
                 tally["declined"].append(n)
                 print(f"#{n}: declined — {reason}")
                 if not dry_run:
@@ -556,14 +694,36 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                                              f"The conflict waker declined to start a fix: {reason}. "
                                              "A person needs to look."]))
                 continue
-            if dry_run:
+            if len(claimed) >= sessions_left:
+                lock.close()
+                tally["deferred"].append(n)
+                print(f"#{n}: over this pass's session cap — NOT acknowledged, so the monitor pages the "
+                      f"owner unless a later pass claims it within {ACK_DEADLINE_MIN} min of the request")
+                continue
+            claimed.append((n, branch, wt, episode, lock))
+
+        if dry_run:
+            for n, branch, *_rest in claimed:
                 tally["woken"].append(n)
                 print(f"#{n}: would wake a session in the worktree for `{branch}`")
-                continue
-            gh.comment(n, "\n".join([
-                marker("ack", episode),
-                f"Conflict waker: starting a fix session in this branch's worktree "
-                f"(spend cap ${budget_usd:g}, timeout {timeout_min} min). It never merges or approves."]))
+            return tally
+
+        # Acknowledge EVERY session this pass will run before the first one starts: a queued
+        # request must not miss the ack deadline while an earlier session is still working.
+        runnable = []
+        for item in claimed:
+            n, episode = item[0], item[3]
+            try:
+                gh.comment(n, "\n".join([
+                    marker("ack", episode),
+                    f"Conflict waker: a fix session starts in this branch's worktree on this pass "
+                    f"(spend cap ${budget_usd:g}, timeout {timeout_min} min). It never merges or approves."]))
+                runnable.append(item)
+            except CouldNotTell as e:
+                tally["problems"].append(f"#{n}: the ack could not be posted, so no session was started: {e}")
+                print(f"#{n}: COULD NOT acknowledge — no session started: {e}")
+
+        for n, branch, wt, episode, _held in runnable:
             cmd = [claude_bin, "-p", FIX_PROMPT.format(number=n, branch=branch),
                    "--max-budget-usd", f"{budget_usd:g}"]
             cmd += {"from-pr": ["--from-pr", str(n)], "continue": ["--continue"], "fresh": []}[resume_mode]
@@ -577,26 +737,100 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 output = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
             except OSError as e:
                 rc, output = 127, f"could not start {claude_bin}: {e}"
-            merge_state = settle(lambda: [{"number": n, "isDraft": False, "mergeable": gh.mergeable(n)}],
-                                 sleep, attempts=6, delay=10)[0]["mergeable"]
+            tally["woken"].append(n)
+            ran = "timed out" if timed_out else f"exited {rc}"
+            try:
+                merge_state = settle(lambda: [{"number": n, "isDraft": False, "mergeable": gh.mergeable(n)}],
+                                     sleep, attempts=6, delay=10)[0]["mergeable"]
+            except CouldNotTell as e:
+                merge_state = "UNREADABLE"
+                tally["problems"].append(f"#{n}: mergeability could not be read after the session: {e}")
             outcome = {"MERGEABLE": "resolved", "CONFLICTING": "unresolved"}.get(merge_state, "unknown")
             if outcome != "resolved" and (timed_out or rc):
                 outcome = "failed"
-            ran = "timed out" if timed_out else f"exited {rc}"
-            gh.comment(n, "\n".join([
-                marker("result", episode, outcome=outcome),
-                f"Conflict waker: the fix session {ran}; GitHub now reports mergeable = {merge_state}.",
-                "", "<details><summary>Last lines of the session's output</summary>", "",
-                "```", neutralize(output) or "(no output)", "```", "</details>"]))
-            tally["woken"].append(n)
+            tally["outcomes"][n] = outcome
+            try:
+                gh.comment(n, "\n".join([
+                    marker("result", episode, outcome=outcome),
+                    f"Conflict waker: the fix session {ran}; GitHub now reports mergeable = {merge_state}.",
+                    "", "<details><summary>Last lines of the session's output</summary>", "",
+                    "```", neutralize(output) or "(no output)", "```", "</details>"]))
+            except CouldNotTell as e:
+                tally["problems"].append(f"#{n}: the result could not be posted: {e}")
             print(f"#{n}: fix session {ran} — outcome {outcome}")
-        finally:
-            lock.close()
-    print(f"asked: open `{LABEL}` PRs with an unclaimed fix request; pending {tally['pending']} · "
-          f"{'would wake' if dry_run else 'woke'} {tally['woken'] or 'none'} · declined "
-          f"{tally['declined'] or 'none'} · not on this machine {tally['elsewhere'] or 'none'} · "
-          f"busy {tally['busy'] or 'none'}")
-    return 0
+    finally:
+        for item in claimed:
+            item[4].close()
+    return tally
+
+
+def summarize(tally, dry_run):
+    return (f"asked: open `{LABEL}` PRs with an unclaimed fix request; pending {tally['pending']} · "
+            f"{'would wake' if dry_run else 'woke'} {tally['woken'] or 'none'} · declined "
+            f"{tally['declined'] or 'none'} · not a local session's {tally['not_local'] or 'none'} · "
+            f"not on this machine {tally['elsewhere'] or 'none'} · busy {tally['busy'] or 'none'} · "
+            f"over the session cap {tally['deferred'] or 'none'}")
+
+
+def write_heartbeat(state_dir, **fields):
+    """Atomic and best effort: a heartbeat that cannot be written is said on stderr and
+    never changes the pass's own exit code."""
+    doc = {"schema": WAKER_HEARTBEAT_SCHEMA, "at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    doc.update(fields)
+    path = os.path.join(state_dir, "heartbeat.json")
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        with open(path + ".tmp", "w") as fh:
+            json.dump(doc, fh, indent=2, sort_keys=True)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        print(f"NOTE: could not write the heartbeat {path}: {e}", file=sys.stderr)
+    return doc
+
+
+def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=DEFAULT_MAX_SESSIONS,
+              env=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, **wake_kw):
+    """The whole pass the LaunchAgent runs: every repository, one shared session cap, one
+    heartbeat. Exit 0, or 1 when it could not tell; a Refusal propagates before anything
+    is read or written, heartbeat included."""
+    env = os.environ if env is None else env
+    uid = os.getuid() if uid is None else uid
+    refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
+    state_dir = os.path.expanduser(state_dir)
+    wake_kw.setdefault("lock_dir", os.path.join(state_dir, "locks"))
+    started = dt.datetime.now(dt.timezone.utc).isoformat()
+    beat = (lambda **f: None) if dry_run else (lambda **f: write_heartbeat(state_dir, **f))
+    beat(started_at=started, result="running", repos=list(repo_dirs))
+    total = new_tally()
+    for repo_dir in repo_dirs:
+        try:
+            tally = wake(gh_for(repo_dir), repo_dir, now, dry_run=dry_run, env=env, uid=uid,
+                         dispatcher_env=dispatcher_env,
+                         sessions_left=max_sessions - len(total["woken"]), **wake_kw)
+        except CouldNotTell as e:
+            total["problems"].append(f"{repo_dir}: {e}")
+            print(f"COULD NOT TELL for {repo_dir}: {e}", file=sys.stderr)
+            continue
+        total["pending"] += tally["pending"]
+        total["outcomes"].update({f"{repo_dir}#{n}": o for n, o in tally["outcomes"].items()})
+        for key in ("woken", "declined", "elsewhere", "not_local", "busy", "deferred", "problems"):
+            total[key] += tally[key]
+    print(summarize(total, dry_run))
+    for problem in total["problems"]:
+        print(f"PROBLEM: {problem}", file=sys.stderr)
+    unknown = sorted(k for k, o in total["outcomes"].items() if o == "unknown")
+    if unknown:
+        print(f"COULD NOT TELL whether the fix landed for {unknown}: GitHub never settled mergeability",
+              file=sys.stderr)
+    bad = [o for o in total["outcomes"].values() if o in ("failed", "unknown")]
+    result = ("problems" if (total["problems"] or bad) else
+              "ok" if (total["woken"] or total["declined"]) else "idle")
+    beat(started_at=started, finished_at=dt.datetime.now(dt.timezone.utc).isoformat(), result=result,
+         repos=list(repo_dirs), pending=total["pending"], woken=total["woken"],
+         declined=total["declined"], not_local=total["not_local"], elsewhere=total["elsewhere"],
+         busy=total["busy"], deferred=total["deferred"], outcomes=total["outcomes"],
+         problems=total["problems"][:20])
+    return 1 if (total["problems"] or unknown) else 0
 
 
 # ── selftest ─────────────────────────────────────────────────────────────────
@@ -788,6 +1022,20 @@ def selftest():
         g("worktree", "add", "-q", "-b", "feat/pr-8", os.path.join(tmp, "wt-8"))
         with open(os.path.join(tmp, "wt-8", "dirty.txt"), "w") as fh:
             fh.write("uncommitted\n")
+        g("worktree", "add", "-q", "-b", "feat/pr-5", os.path.join(tmp, "wt-5"))
+        claude_dir = os.path.join(tmp, "claude-config")
+
+        def local_session(path):
+            """What this user's own Claude Code leaves behind in a worktree it worked in."""
+            d = claude_project_dir(claude_dir, os.path.realpath(path))
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "session.jsonl"), "w").close()
+
+        # wt-7 and wt-8 are local sessions' worktrees; wt-5 holds a branch no local session
+        # ever worked in — the shape of a dispatcher's PR someone checked out by hand.
+        local_session(wt)
+        local_session(os.path.join(tmp, "wt-8"))
+        no_dispatcher = os.path.join(tmp, "not-a-role-account", "env")
 
         calls = []
 
@@ -805,7 +1053,11 @@ def selftest():
                         6: [_bot(marker("request", 1), 9), _human(marker("ack", 1), 8)]}
             return FakeGh(prs, comments, **kw)
 
-        common = dict(runner=runner, sleep=quiet, lock_dir=os.path.join(tmp, "locks"))
+        common = dict(runner=runner, sleep=quiet, lock_dir=os.path.join(tmp, "locks"),
+                      claude_dir=claude_dir, dispatcher_env=no_dispatcher)
+
+        def firsts_for(gh, n):
+            return [w[2].split("\n", 1)[0] for w in gh.writes if w[0] == "comment" and w[1] == n]
 
         # 15. an agent environment is refused before anything is read or written.
         gh = fresh_gh()
@@ -824,11 +1076,12 @@ def selftest():
         #     cap and --from-pr, result from GitHub's re-read; #8 declined (dirty); #9 elsewhere;
         #     #6 already claimed.
         gh = fresh_gh()
-        rc = wake(gh, repo, NOW, env={}, **common)
+        tally = wake(gh, repo, NOW, env={}, **common)
         seq = [(w[0], w[1], (w[2].split("\n", 1)[0] if w[0] == "comment" else "")) for w in gh.writes]
-        expect(rc == 0, f"wake rc={rc}")
-        expect(seq[:3] == [("comment", 7, marker("ack", 1)), ("read_mergeable", 7, ""),
-                           ("comment", 7, marker("result", 1, outcome="resolved"))],
+        on7 = [s for s in seq if s[1] == 7]
+        expect(tally["woken"] == [7] and not tally["problems"], f"wake tally={tally}")
+        expect(on7 == [("comment", 7, marker("ack", 1)), ("read_mergeable", 7, ""),
+                       ("comment", 7, marker("result", 1, outcome="resolved"))],
                f"ack must precede the session and the result must follow a re-read: {seq}")
         expect(("comment", 8, marker("result", 1, outcome="declined")) in seq, f"dirty worktree must decline: {seq}")
         expect(not any(len(w) > 1 and w[1] in (6, 9) for w in gh.writes), f"#6 claimed and #9 elsewhere must be untouched: {seq}")
@@ -850,12 +1103,110 @@ def selftest():
         bad = lambda cmd, cwd=None, input=None, timeout=None: (  # noqa: E731
             subprocess.CompletedProcess(cmd, 1, "", "boom") if cmd[0] == "claude" else run(cmd, cwd=cwd))
         wake(gh, repo, NOW, env={}, **{**common, "runner": bad})
-        firsts = [w[2].split("\n", 1)[0] for w in gh.writes if w[0] == "comment" and w[1] == 7]
-        expect(firsts[-1] == marker("result", 1, outcome="failed"), f"a failed session must say failed: {firsts}")
+        expect(firsts_for(gh, 7)[-1] == marker("result", 1, outcome="failed"),
+               f"a failed session must say failed: {firsts_for(gh, 7)}")
 
         # 20. the prompt forbids merge/approve/labels and never asks for a force-push.
         expect("Never merge" in FIX_PROMPT and "never approve" in FIX_PROMPT
                and "--force-with-lease" not in FIX_PROMPT, "the fix prompt must stay merge-free")
+
+        # 22. WHOSE PR: a branch checked out here that no local Claude Code session of this user
+        #     ever worked in is not the waker's — no ack, no session, no declined result. That is
+        #     the shape of a dispatcher's PR someone checked out by hand, and its fix belongs in
+        #     the session's own sandbox, through the bounce driver.
+        calls.clear()
+        gh = FakeGh([_pr(5, labels=[LABEL])], {5: [_bot(marker("request", 1), 2)]})
+        tally = wake(gh, repo, NOW, env={}, **common)
+        expect(tally["not_local"] == [5] and gh.writes == [] and calls == [],
+               f"a worktree with no local session must be left untouched: {tally} {gh.writes} {calls}")
+        expect(not local_session_evidence(wt, claude_dir, os.getuid() + 1),
+               "a worktree owned by another uid is never local evidence, whatever the transcripts say")
+
+        # 23. the waker refuses to run as root or as a dispatcher's role account — before any read.
+        role_home = os.path.join(tmp, "role")
+        os.makedirs(os.path.join(role_home, ".stage-e"))
+        role_env = os.path.join(role_home, ".stage-e", "env")
+        open(role_env, "w").close()
+        for label, kw in (("root", {"uid": 0}), ("a role account", {"dispatcher_env": role_env})):
+            gh = fresh_gh()
+            try:
+                wake(gh, repo, NOW, env={}, **{**common, **kw})
+                expect(False, f"wake as {label} must refuse")
+            except Refusal:
+                expect(gh.writes == [] and calls == [], f"a refusal as {label} must write and start nothing")
+        gh = fresh_gh()
+        wake(gh, repo, NOW, env={}, dry_run=True, **{**common, "dispatcher_env": role_env})
+        expect(gh.writes == [], "a dry run as a role account reads and writes nothing")
+        import pipeline_bounce_local as _bounce
+        expect(DISPATCHER_ENV_FILE == _bounce.DEFAULT_ENV_FILE,
+               f"the role-account marker must be the bounce driver's env file: {DISPATCHER_ENV_FILE}")
+
+        # 24. the per-pass cap: two claimable requests and room for one — ONE acked and woken, the
+        #     other NOT acked (so the monitor pages it) and named. With room for both, BOTH acks
+        #     precede the first session, so a queue never misses the ack deadline.
+        g("worktree", "add", "-q", "-b", "feat/pr-4", os.path.join(tmp, "wt-4"))
+        local_session(os.path.join(tmp, "wt-4"))
+
+        def two():
+            return FakeGh([_pr(7, labels=[LABEL]), _pr(4, labels=[LABEL])],
+                          {7: [_bot(marker("request", 1), 2)], 4: [_bot(marker("request", 1), 2)]})
+        calls.clear()
+        gh = two()
+        tally = wake(gh, repo, NOW, env={}, sessions_left=1, **common)
+        expect(tally["woken"] == [7] and tally["deferred"] == [4] and firsts_for(gh, 4) == []
+               and len(calls) == 1, f"over the cap: not acked, not woken, named: {tally} {gh.writes}")
+        calls.clear()
+        gh = two()
+        wake(gh, repo, NOW, env={}, sessions_left=2, **common)
+        order = [(w[0], w[1]) for w in gh.writes]
+        expect(order[:2] == [("comment", 7), ("comment", 4)] and len(calls) == 2,
+               f"every ack must precede the first session: {order}")
+        expect(queue_problem(2, 40, 5) is None and queue_problem(3, 40, 5) is not None
+               and queue_problem(0, 40, 5) is not None,
+               "the cap times the timeout must fit inside the monitor's result deadline")
+        expect(main(["wake", "--max-sessions", "4", "--timeout-min", "40", "--dry-run"]) == 2,
+               "an unboundable queue is a usage error before anything runs")
+
+        # 25. the heartbeat: a real pass writes `running`, then its result; a dry run writes none; a
+        #     repository that cannot be read makes the pass exit 1 and the heartbeat say problems.
+        state_dir = os.path.join(tmp, "waker-state")
+        beat_path = os.path.join(state_dir, "heartbeat.json")
+        pass_kw = {k: v for k, v in common.items() if k != "lock_dir"}
+        calls.clear()
+        rc = wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=state_dir, dry_run=True, env={}, **pass_kw)
+        expect(rc == 0 and not os.path.exists(beat_path), "a dry run must leave no heartbeat")
+        rc = wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=state_dir, env={}, **pass_kw)
+        with open(beat_path) as fh:
+            beat = json.load(fh)
+        expect(rc == 0 and beat["schema"] == WAKER_HEARTBEAT_SCHEMA and beat["result"] == "idle"
+               and beat.get("finished_at"), f"nothing to do must say idle, with a finish time: {beat}")
+
+        def unreadable(d):
+            raise CouldNotTell("simulated: gh could not resolve the repository")
+        rc = wake_pass([repo], unreadable, NOW, state_dir=state_dir, env={}, **pass_kw)
+        with open(beat_path) as fh:
+            beat = json.load(fh)
+        expect(rc == 1 and beat["result"] == "problems" and beat["problems"],
+               f"could-not-tell must exit 1 and say problems: rc={rc} {beat}")
+        rc = wake_pass([repo], lambda d: two(), NOW, state_dir=state_dir, env={}, max_sessions=1, **pass_kw)
+        with open(beat_path) as fh:
+            beat = json.load(fh)
+        expect(rc == 0 and beat["result"] == "ok" and beat["woken"] == [7] and beat["deferred"] == [4],
+               f"a pass that woke one and capped one must say both: {beat}")
+        try:
+            os.unlink(beat_path)
+            wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=state_dir, env={"CLAUDECODE": "1"}, **pass_kw)
+            expect(False, "wake_pass in an agent environment must refuse")
+        except Refusal:
+            expect(not os.path.exists(beat_path), "a refused pass must leave no heartbeat")
+
+        # 26. a session whose PR GitHub never settles is `unknown` — and the pass exits 1.
+        gh_u = two()
+        gh_u.prs = gh_u.prs[:1]
+        gh_u.mergeable_after = "UNKNOWN"
+        rc = wake_pass([repo], lambda d: gh_u, NOW, state_dir=state_dir, env={}, **pass_kw)
+        expect(rc == 1 and firsts_for(gh_u, 7)[-1] == marker("result", 1, outcome="unknown"),
+               f"a fix nobody can confirm must say unknown and exit 1: rc={rc} {firsts_for(gh_u, 7)}")
 
     # 21. the real transport: label writes carry only `conflict`; nothing merges or approves.
     seen = []
@@ -878,7 +1229,7 @@ def selftest():
         for f in failures:
             print("  -", f)
         return 1
-    print("pr_conflict selftest: OK (21 cases)")
+    print("pr_conflict selftest: OK (26 cases)")
     return 0
 
 
@@ -890,10 +1241,14 @@ def main(argv=None):
     m.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     m.add_argument("--dry-run", action="store_true")
     w = sub.add_parser("wake")
-    w.add_argument("--repo-dir", default=".")
+    w.add_argument("--repo-dir", action="append", default=[],
+                   help="a checkout whose worktrees this waker serves; repeat for several (default .)")
+    w.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="where the heartbeat and locks live")
     w.add_argument("--dry-run", action="store_true")
-    w.add_argument("--max-budget-usd", type=float, default=5.0)
-    w.add_argument("--timeout-min", type=int, default=40)
+    w.add_argument("--max-budget-usd", type=float, default=DEFAULT_BUDGET_USD)
+    w.add_argument("--timeout-min", type=int, default=DEFAULT_TIMEOUT_MIN)
+    w.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS,
+                   help="fix sessions per pass, across every --repo-dir")
     w.add_argument("--resume-mode", choices=["from-pr", "continue", "fresh"], default="from-pr")
     w.add_argument("--claude-bin", default="claude")
     w.add_argument("--claude-arg", action="append", default=[],
@@ -917,14 +1272,24 @@ def main(argv=None):
             return monitor(Gh(args.repo), dt.datetime.now(dt.timezone.utc),
                            dry_run=args.dry_run, summary=summary)
         if args.cmd == "wake":
-            repo_dir = os.path.abspath(args.repo_dir)
-            r = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], cwd=repo_dir)
-            if r.returncode != 0 or "/" not in r.stdout:
-                raise CouldNotTell(f"could not resolve the GitHub repo for {repo_dir}: {r.stderr.strip()[-300:]}")
-            return wake(Gh(r.stdout.strip(), cwd=repo_dir), repo_dir, dt.datetime.now(dt.timezone.utc),
-                        dry_run=args.dry_run, claude_bin=args.claude_bin, resume_mode=args.resume_mode,
-                        claude_args=args.claude_arg, budget_usd=args.max_budget_usd,
-                        timeout_min=args.timeout_min)
+            problem = queue_problem(args.max_sessions, args.timeout_min, args.max_budget_usd)
+            if problem:
+                print(f"wake: {problem}", file=sys.stderr)
+                return 2
+
+            def gh_for(repo_dir):
+                r = run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], cwd=repo_dir)
+                if r.returncode != 0 or "/" not in r.stdout:
+                    raise CouldNotTell(f"could not resolve the GitHub repo for {repo_dir}: "
+                                       f"{(r.stderr or '').strip()[-300:]}")
+                return Gh(r.stdout.strip(), cwd=repo_dir)
+
+            return wake_pass([os.path.abspath(d) for d in (args.repo_dir or ["."])], gh_for,
+                             dt.datetime.now(dt.timezone.utc), state_dir=args.state_dir,
+                             dry_run=args.dry_run, max_sessions=args.max_sessions,
+                             claude_bin=args.claude_bin, resume_mode=args.resume_mode,
+                             claude_args=args.claude_arg, budget_usd=args.max_budget_usd,
+                             timeout_min=args.timeout_min)
     except CouldNotTell as e:
         print(f"COULD NOT TELL: {e}", file=sys.stderr)
         return 1

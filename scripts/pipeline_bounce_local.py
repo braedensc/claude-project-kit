@@ -116,6 +116,28 @@ WHAT HAPPENS WHEN A BOUNCED SESSION STOPS (the no-push signal)
   ledger row (`outcome: "blocked"`) is what makes it once — a later bounce that is itself
   ignored signals again, and a partly-announced row is completed rather than repeated.
 
+WHAT HAPPENS WHEN A PULL REQUEST GOES CONFLICTING (the dispatched lane)
+
+  `main` moves after a sibling merges, and a dispatcher's pull request goes CONFLICTING
+  with its session idle. The conflict monitor (scripts/pr_conflict.py, in Actions) posts
+  a fix `request` on the PR and keeps the clock and the three-per-PR budget. A LOCAL
+  waker must not take that request: it would start a fresh session outside the sandbox,
+  over a branch a sandboxed session wrote. This driver answers it instead, the way it
+  answers everything — a reply in the original session's own thread, so the dispatcher
+  resumes that session in its own worktree and sandbox.
+
+  The trigger is GitHub's `mergeable == CONFLICTING` AND an open, unclaimed request from
+  the Actions bot (read with the monitor's own marker rules). Ledger row first
+  (`conflict`), then the thread reply, then `conflict-delivered`, then the monitor's own
+  `ack` marker on the PR so it holds its page. A later push that leaves the PR
+  CONFLICTING is reported once as `result outcome=unresolved`, and the monitor escalates.
+  It spends NO bounce, writes no re-review request and no label, is capped on the ledger
+  at the monitor's budget, and never uses the fallback fix ticket (a second session on a
+  branch the first may hold). No thread, or no request, sends nothing and the monitor
+  pages. On a CONCLUDED pull request a conflict is a notice, like any other change. The
+  ack counts on GitHub only when the token this driver posts with belongs to a writer; if
+  it does not, the monitor pages while the session works — loud, never silent.
+
 WHERE THIS RUNS, AND WHERE ITS CREDENTIALS LIVE (owner decision 2026-09-06, "C1")
 
   As the DISPATCHER'S OWN ROLE ACCOUNT — the same account the dispatcher runs as — not
@@ -268,8 +290,10 @@ STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either w
       `outcome` says what the row records: "spent"/"delivered"/"send-failed" (a bounce),
       "exhausted", "concluded", "refresh" — a stale-head re-review request, counted
       separately from the bounce budget because it spends a reviewer session, never a
-      bounce — and "notice", one post-conclusion ticket comment keyed by head and kind,
-      which spends neither
+      bounce — "notice", one post-conclusion ticket comment keyed by head and kind,
+      which spends neither — and "conflict"/"conflict-delivered"/"conflict-send-failed"/
+      "conflict-result", the conflict lane's rows, counted against the conflict
+      monitor's budget and never against maxBounces
   <state_dir>/bounce-heartbeat.json                   the one-shot `run` pass's last start,
       last finish and result — how an operator tells "ran, nothing to do" from "did not
       run" without reading a launchd log
@@ -413,6 +437,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gh_fallback  # noqa: E402  (resolve_repo; pr-comment is the ONE GitHub write, via prl)
 import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment, SEVERITY_RANK)
+# The conflict loop's marker grammar has ONE owner. Only its pure readers and writers are
+# used here (episode_state, marker, BRANCH_RE, MAX_FIX_REQUESTS); --selftest asserts this
+# file never reaches for the waker half, which is the one that starts sessions.
+import pr_conflict as prc  # noqa: E402
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -482,6 +510,10 @@ BOUNCE_MARKER = "stage-e-bounce/1"
 # treats a visible number above the ledger's count as a lost budget authority and refuses
 # to spend anything until a person restores it.
 NOTICE_MARKER = "stage-e-post-conclusion/1"
+# The VISIBLE record of a CONFLICT FIX sent back to the session (the `conflict` action). Its
+# own marker, never the bounce one: a conflict fix spends the conflict monitor's request
+# budget, not `budgets.maxBounces`, and must never read back as a bounce.
+CONFLICT_MARKER = "stage-e-conflict/1"
 # The one conclusion basis that is NOT Stage E finishing — it is Stage E running out of
 # road. A finished conclusion (`clean`, `below-threshold`) is final, so every later
 # trigger is said and never re-prompted; this one keeps its budget-governed path, because
@@ -836,7 +868,8 @@ _FENCE_RE = re.compile(r"<(/?)untrusted-", re.IGNORECASE)
 # or a ticket would be the driver forging its own signal in its own output. The `/` that
 # makes each marker a marker becomes `_`, which leaves the text readable and the marker
 # inert; the real ones are appended OUTSIDE every sanitized span and so survive.
-_OWN_MARKER_RE = re.compile("|".join(re.escape(m) for m in (BOUNCE_MARKER, NOTICE_MARKER)),
+_OWN_MARKER_RE = re.compile("|".join(re.escape(m) for m in (BOUNCE_MARKER, NOTICE_MARKER,
+                                                             CONFLICT_MARKER)),
                             re.IGNORECASE)
 
 
@@ -1012,6 +1045,67 @@ def render_reprompt(*, bounce_no, max_bounces, threshold, branch, pr_number, pr_
     ])
 
 
+def render_conflict_reprompt(*, conflict_no, episode, branch, base, pr_number, pr_url, owner_repo):
+    """The fixed conflict-fix re-prompt, sent as a THREAD reply so the dispatcher resumes the
+    session that owns the branch — in its own worktree and its own sandbox. Nothing in it is
+    copied from a reviewer or a ticket: the branch and base are GitHub's, both checked
+    against the conflict loop's branch pattern before this is called, and the PR URL is
+    GitHub's own. The instructions match the local waker's, so the two lanes fix a conflict
+    the same way."""
+    return "\n".join([
+        "**Stage E conflict fix %d of %d** — an automated re-prompt from the bounce driver for "
+        "PR #%d (%s). Nobody is watching this thread live: reply here, never to a person, and "
+        "never try to ask an interactive user anything." % (conflict_no, prc.MAX_FIX_REQUESTS,
+                                                            pr_number, pr_url),
+        "",
+        "`%s` moved after this pull request went green, and GitHub now reports it CONFLICTING, "
+        "so its required checks are not running. Resolve it in this worktree, on branch %s:"
+        % (base, branch),
+        "",
+        "1. Confirm `git status` is clean and you are on %s." % branch,
+        "2. `git fetch origin %s && git merge origin/%s` — merge, never rebase: a rebase ends in a "
+        "force-push." % (base, base),
+        "3. Resolve each conflict by reading BOTH sides and keeping both intents. Where they "
+        "genuinely contradict, push nothing: say in this thread what contradicts, and stop.",
+        "4. Run the project's local checks, commit the merge with `git commit -F`, and `git push` "
+        "to the SAME branch %s (never --force). Do not open a new PR; do not edit the PR "
+        "title/body." % branch,
+        "5. Watch CI: `gh pr checks %d --watch`." % pr_number,
+        "",
+        "Never merge or approve, and never add or remove a label.",
+        "",
+        "_%s %s#%d episode=%d k=%d — conflict fix %d of %d, sent by the Stage E bounce driver in "
+        "answer to the conflict monitor's request. The driver's ledger and the monitor's request "
+        "count are the budget; this line is their visible record._"
+        % (CONFLICT_MARKER, owner_repo, pr_number, episode, conflict_no, conflict_no,
+           prc.MAX_FIX_REQUESTS),
+    ])
+
+
+def render_conflict_ack(episode, conflict_no):
+    """The PR comment that claims the conflict monitor's request. Its FIRST LINE is the
+    monitor's own `ack` marker, so the monitor holds off its page — which counts only when
+    the token this driver posts with belongs to a writer on the repository. When it does
+    not, the monitor pages at its ack deadline while the session works: loud, not silent."""
+    return "\n".join([
+        prc.marker("ack", episode),
+        "Stage E bounce driver: this conflict was sent back to the session that opened the PR, "
+        "in its tracker thread (conflict fix %d of %d). The fix runs in that session's own "
+        "worktree and sandbox. Nothing here merges or approves." % (conflict_no, prc.MAX_FIX_REQUESTS),
+    ])
+
+
+def render_conflict_result(episode, head_before, head_now):
+    """`result outcome=unresolved`: the session pushed after the fix was delivered and GitHub
+    still reports CONFLICTING. The monitor escalates on a result like this on its next tick."""
+    return "\n".join([
+        prc.marker("result", episode, outcome="unresolved"),
+        "Stage E bounce driver: the session pushed after the conflict fix was delivered "
+        "(head %s → %s) and GitHub still reports this PR CONFLICTING. A person needs to look."
+        % ((head_before or "?")[:12], (head_now or "?")[:12]),
+    ])
+
+
 def render_fix_ticket(*, repo_name, branch, pr_number, pr_url, ticket_id, bounce_no,
                       max_bounces, threshold, findings_block, owner_repo):
     """(title, description) for the FALLBACK fix ticket. Line one is the dispatcher's
@@ -1101,7 +1195,9 @@ def render_post_conclusion_notice(*, owner_repo, pr_number, pr_url, basis, kind,
     markers, so nothing quoted in here can forge one. The record line is appended outside
     that and is the only marker the body carries."""
     changed = {"ci": "a required check went red",
-               "review": "a new review landed at or above the severity threshold"}.get(
+               "review": "a new review landed at or above the severity threshold",
+               "conflict": "the base branch moved and the pull request now has merge conflicts "
+                           "(the conflict monitor pages you on the PR as well)"}.get(
                    kind, "something changed")
     return "\n".join([
         "**Stage E — a change after this pull request was handed over.** PR #%d (%s)."
@@ -1446,11 +1542,71 @@ def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
             "head_sha": str(head_sha)}
 
 
+def conflict_view(mergeable, episode, rows, head_sha):
+    """Where a CONFLICTING pull request stands for this driver, or None when it is not
+    conflicting. A pure function of three things a session cannot write: GitHub's
+    `mergeable`, the conflict monitor's markers (read with the monitor's own author rules,
+    `pr_conflict.episode_state`), and this driver's ledger rows for the PR.
+
+    THE MONITOR KEEPS THE CLOCK AND THE BUDGET; THIS DRIVER ONLY ANSWERS IT. A conflict is
+    sent back to the session only in answer to an open, unclaimed fix `request`, so the
+    monitor's three-per-PR lifetime budget bounds it — and the ledger caps it again at the
+    same number, so a forged or reset request can never buy a fourth. States:
+
+      request   an open request nobody has claimed, budget left — send the fix (action
+                `conflict`)
+      ours      this driver already sent the fix for this episode; `head_moved` says whether
+                the session has pushed since (a push that left it CONFLICTING is `unresolved`)
+      claimed   another waker acknowledged it — not this driver's
+      said      this driver already reported the result for this episode
+      none      no open request: the monitor is not deployed here, has not ticked yet, or has
+                handed the episode to a person
+      spent     the ledger already holds the full count of conflict fixes for this PR
+
+    Only `request`, `ours` and `claimed` change the verdict. The other three are said in the
+    verdict line and the PR otherwise takes its ordinary path — except that a CONFLICTING PR
+    never concludes, because its required checks cannot run."""
+    if mergeable != "CONFLICTING":
+        return None
+    episode = episode or {}
+    latest = episode.get("latest")
+    n = episode.get("episode") or 0
+    sent = [r for r in (rows or []) if r.get("outcome") == "conflict"]
+    mine = [r for r in sent if r.get("episode") == n]
+    view = {"episode": n, "spent": len(sent), "head_moved": False}
+    if latest is None:
+        return dict(view, state="none", reason="GitHub reports this PR CONFLICTING and the conflict "
+                                               "monitor has posted no fix request for it (not deployed "
+                                               "on this repository, or it has not ticked yet)")
+    if latest.get("kind") == "page" or episode.get("escalated"):
+        return dict(view, state="none", reason="GitHub reports this PR CONFLICTING and the conflict "
+                                               "monitor has handed episode %d to a person" % n)
+    if mine:
+        if any(r.get("outcome") == "conflict-result" and r.get("episode") == n for r in (rows or [])):
+            return dict(view, state="said", reason="the conflict fix for episode %d ended unresolved "
+                                                   "and the monitor has it" % n)
+        before = str(mine[-1].get("head_sha") or "")
+        return dict(view, state="ours", head_before=before,
+                    head_moved=bool(before and head_sha and before != head_sha),
+                    reason="the conflict fix for episode %d was sent to the session at %s"
+                           % (n, mine[-1].get("at") or "?"))
+    if episode.get("ack") or episode.get("result"):
+        return dict(view, state="claimed", reason="episode %d's fix request was claimed by another "
+                                                  "waker" % n)
+    if len(sent) >= prc.MAX_FIX_REQUESTS:
+        return dict(view, state="spent", reason="GitHub reports this PR CONFLICTING and this driver has "
+                                                "already sent %d conflict fixes for it — no more are "
+                                                "sent; the monitor pages" % len(sent))
+    return dict(view, state="request", conflict_no=len(sent) + 1,
+                reason="GitHub reports this PR CONFLICTING and the conflict monitor asked for a fix "
+                       "(episode %d)" % n)
+
+
 def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger_ok,
            trigger_reason, prior, max_bounces, in_flight, head_sha, exhausted_announced,
            cannot_evaluate="", conclusion=None, settled_conclusion=None,
            notice_sent=False, stale_head=False, rereview_queued=False,
-           refreshes_spent=0, blocked=None):
+           refreshes_spent=0, blocked=None, conflict=None):
     """The verdict. Holds that never bounce regardless of budget come first (closed PR,
     fork, draft, terminal ticket, no trigger, a bounce already in flight for this head);
     then the budget: bounce `prior + 1` while budget remains, exhaust when
@@ -1518,7 +1674,15 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     sides of the trigger, so that PR is never refreshed, never re-prompted and never
     paged as a stopped session: with nothing wrong it is the settled no-op, and with a
     live trigger it is a notice. A hand-off is not undone by a push the driver cannot
-    attribute, and the person a stall would page already holds the ticket."""
+    attribute, and the person a stall would page already holds the ticket.
+
+    `conflict` (from `conflict_view`) is the sixth, and it sits directly under the settled
+    conclusion. A CONFLICTING pull request's required checks cannot run, so nothing a review
+    or CI says about it can be acted on until the conflict is gone: an open fix request is
+    answered first (`conflict`), a fix already sent waits for the session's push, and a push
+    that left it conflicting is reported to the monitor (`conflict-result`). On a CONCLUDED
+    pull request the conflict is a `notice` like any other change, never a re-prompt — the
+    caller turns it into that trigger before this is reached."""
     def hold(action, reason, bounce_no=None):
         return {"action": action, "reason": reason, "bounce_no": bounce_no}
 
@@ -1555,6 +1719,24 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
                 "reason": "Stage E already concluded this PR (%s) and the ticket is a "
                           "person's — saying what changed on the ticket instead of "
                           "re-prompting the session: %s" % (basis, trigger_reason)}
+    state = (conflict or {}).get("state")
+    if state == "request":
+        return {"action": "conflict", "bounce_no": None, "episode": conflict["episode"],
+                "conflict_no": conflict["conflict_no"],
+                "reason": "%s — sending conflict fix %d of %d to the session's thread"
+                          % (conflict["reason"], conflict["conflict_no"], prc.MAX_FIX_REQUESTS)}
+    if state == "ours":
+        if conflict["head_moved"]:
+            return {"action": "conflict-result", "bounce_no": None, "episode": conflict["episode"],
+                    "head_before": conflict.get("head_before"),
+                    "reason": "%s; the session has pushed since (%s → %s) and GitHub still reports "
+                              "CONFLICTING — reporting it unresolved to the monitor"
+                              % (conflict["reason"], (conflict.get("head_before") or "?")[:12],
+                                 (head_sha or "?")[:12])}
+        return hold("skip", "%s; waiting for its push (the monitor pages if no result lands "
+                            "within its deadline)" % conflict["reason"])
+    if state == "claimed":
+        return hold("skip", "%s — not this driver's to send" % conflict["reason"])
     if not trigger_ok:
         if cannot_evaluate:
             return hold("unknown", cannot_evaluate)
@@ -1753,6 +1935,10 @@ def ledger_view(path, owner_repo, pr_number):
     prior, last_spent, exhausted, concluded, notices, refreshes, blocked = (
         0, None, None, None, [], 0, None)
     delivered = set()
+    # Conflict-fix rows (`conflict`, `conflict-delivered`, `conflict-send-failed`,
+    # `conflict-result`) are their own list and never touch `prior`: a conflict fix spends
+    # the conflict monitor's request budget, not budgets.maxBounces.
+    conflicts = []
     for row in read_ledger(path):
         if row.get("repo") != owner_repo or row.get("pr") != pr_number:
             continue
@@ -1774,9 +1960,11 @@ def ledger_view(path, owner_repo, pr_number):
             refreshes += 1
         elif outcome == "blocked":
             blocked = row
+        elif str(outcome or "").startswith("conflict"):
+            conflicts.append(row)
     return {"prior": prior, "last_spent": last_spent, "exhausted": exhausted,
             "concluded": concluded, "notices": notices, "refreshes": refreshes,
-            "delivered_bounces": delivered, "blocked": blocked}
+            "delivered_bounces": delivered, "blocked": blocked, "conflicts": conflicts}
 
 
 def append_row(path, **fields):
@@ -1915,9 +2103,12 @@ def _rest_get(path, cfg):
 
 
 def pr_view(pr_number, owner_repo, cfg):
-    """{number, open, isDraft, headRefName, headRefOid, baseRefName, isCrossRepository, url}."""
+    """{number, open, isDraft, headRefName, headRefOid, baseRefName, isCrossRepository, url,
+    mergeable}. `mergeable` is GitHub's MERGEABLE | CONFLICTING | UNKNOWN; UNKNOWN (still
+    computing, or not answered) is never read as either of the other two."""
     ok, out, _ = _gh(["pr", "view", str(pr_number), "--repo", owner_repo, "--json",
-                      "number,state,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,url"])
+                      "number,state,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,url,"
+                      "mergeable,mergeStateStatus"])
     if ok:
         try:
             data = json.loads(out)
@@ -1938,7 +2129,29 @@ def pr_view(pr_number, owner_repo, cfg):
         "baseRefName": (data.get("base") or {}).get("ref") or "",
         "isCrossRepository": head_repo is not None and head_repo != owner_repo,
         "url": data.get("html_url") or "",
+        # REST says `mergeable: false` with `mergeable_state: "dirty"` for a conflict, and
+        # `mergeable: null` while it is still computing.
+        "mergeable": ("CONFLICTING" if data.get("mergeable_state") == "dirty" else
+                      "MERGEABLE" if data.get("mergeable") is True else "UNKNOWN"),
     }
+
+
+def pr_issue_comments(pr_number, owner_repo, cfg):
+    """Every comment on the PR's conversation, in the REST shape the conflict monitor's
+    marker reader takes (body, user, author_association, created_at). A listing that does
+    not end inside the page cap is BounceError — a truncated listing could hide an ack or
+    an escalation, and "could not read them all" is not "there were none"."""
+    out = []
+    for page in range(1, MAX_COMMENT_PAGES + 1):
+        batch = _api_json("/repos/%s/issues/%d/comments?per_page=100&page=%d"
+                          % (owner_repo, pr_number, page), cfg) or []
+        if not isinstance(batch, list):
+            raise BounceError("the PR comment listing for %s#%d was not a list" % (owner_repo, pr_number))
+        out += batch
+        if len(batch) < 100:
+            return out
+    raise BounceError("%s#%d has more than %d PR comments; the conflict markers cannot all be read"
+                      % (owner_repo, pr_number, MAX_COMMENT_PAGES * 100))
 
 
 def _api_json(path, cfg):
@@ -2539,6 +2752,13 @@ def _gather_after_pr(sit, cfg, state_dir):
     disagreement = visible_over_ledger(sit["visible_bounces"], sit.get("prior", 0))
     if disagreement:
         raise Decline(disagreement, sit)
+
+    # MERGE STATE, and — only when GitHub says CONFLICTING — the conflict monitor's markers.
+    # Read last: a conflict is answered in the session's own thread, so it needs everything
+    # above (the ticket, its thread, the ledger) to have been established first.
+    sit["mergeable"] = str(meta.get("mergeable") or "UNKNOWN")
+    if sit["mergeable"] == "CONFLICTING":
+        sit["conflict_episode"] = prc.episode_state(pr_issue_comments(pr_number, owner_repo, cfg))
     return sit
 
 
@@ -2588,6 +2808,21 @@ def decision_for(sit, cfg):
     prior_conclusion = sit.get("concluded")
     lane_on = bool(sit.get("needs_approval_state_id"))
     settled = None if conclusion_pending(prior_conclusion, lane_on) else prior_conclusion
+
+    # A CONFLICTING pull request. Its required checks cannot run, so it never concludes. On a
+    # pull request Stage E already handed to a person the conflict is news — a notice of kind
+    # `conflict`, never a re-prompt. Otherwise `decide` answers the monitor's request, and
+    # a state that changes nothing is still said in the verdict line.
+    conflict = conflict_view(sit.get("mergeable"), sit.get("conflict_episode"),
+                             sit.get("conflicts"), sit.get("head_sha"))
+    if conflict is not None:
+        basis = None
+        if settled and (settled.get("basis") or "") != EXHAUSTED_BASIS:
+            trigger_ok, kind = True, "conflict"
+            trigger_reason = conflict["reason"]
+            conflict = None
+        elif conflict["state"] not in ("request", "ours", "claimed"):
+            trigger_reason += " [%s]" % conflict["reason"]
     # Whether this head has already been told about THIS kind of change since the
     # hand-off. Read for every verdict, used only where a settled conclusion meets a live
     # trigger; `kind` is None without one, which no notice row can match.
@@ -2614,7 +2849,7 @@ def decision_for(sit, cfg):
                      settled_conclusion=settled, notice_sent=notice_sent,
                      stale_head=outcome_head_is_stale(sit.get("outcome"), sit.get("head_sha")),
                      rereview_queued=bool(sit.get("rereview_queued")),
-                     refreshes_spent=sit.get("refreshes", 0), blocked=blocked)
+                     refreshes_spent=sit.get("refreshes", 0), blocked=blocked, conflict=conflict)
     verdict["trigger"] = kind if trigger_ok else None
     verdict["trigger_reason"] = trigger_reason
     verdict["cannot_evaluate"] = cannot_evaluate or None
@@ -2638,6 +2873,11 @@ def describe(sit, verdict):
         head = "REFRESH %d of %d" % (verdict.get("refresh_no") or 1, REFRESH_ALLOWANCE)
     elif action == "blocked":
         head = "BLOCKED (no push since bounce %d)" % (verdict.get("bounce_no") or 0)
+    elif action == "conflict":
+        head = "CONFLICT FIX %d of %d (episode %d)" % (verdict.get("conflict_no") or 0,
+                                                       prc.MAX_FIX_REQUESTS, verdict.get("episode") or 0)
+    elif action == "conflict-result":
+        head = "CONFLICT UNRESOLVED (episode %d)" % (verdict.get("episode") or 0)
     elif action == "unknown":
         head = "CANNOT EVALUATE"     # never the same word as `skip`: that was the defect
     else:
@@ -3115,6 +3355,111 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
+def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
+    """Send a CONFLICTING pull request back to the session that opened it, in its own
+    tracker thread — the one conflict path that keeps the fix inside that session's sandbox.
+    A local waker must never take a dispatcher's pull request (scripts/pr_conflict.py,
+    WHOSE PULL REQUEST), so this is the whole of the dispatched lane.
+
+    Three refusals come BEFORE the ledger row, and none is a spend: no dispatcher app user,
+    no agent-session thread (the bounce's fallback fix ticket is deliberately NOT used — it
+    would start a SECOND session on a branch the first may still hold), and a branch or base
+    outside the conflict loop's branch pattern. Each is a Decline — one PR comment, exit 2 —
+    and the monitor pages at its ack deadline, because nothing claimed the request.
+
+    Then the order is a bounce's: ledger row FIRST (the cap counts attempts, so a crash
+    over-counts), the thread reply, a `conflict-delivered` row, and only then the `ack`
+    marker on the PR. A reply that fails is recorded and NOT acknowledged, so the monitor
+    pages. An ack that fails after a delivered reply is exit 2 and said: the monitor will
+    page while the session works — loud, never silent.
+
+    No telemetry artifact: §4 records a session's outcome, and this is a prompt. Its record
+    is the ledger rows, the thread reply's visible line and the ack."""
+    app_user = cfg.get("dispatcher_app_user_id") or ""
+    if not app_user:
+        raise Decline("config 'dispatcher_app_user_id' is unset — the driver cannot tell the "
+                      "dispatcher's agent session from another app's, so no conflict fix was sent; "
+                      "the conflict monitor pages the owner", sit)
+    issue = sit.get("issue") or {}
+    thread_id, _session = pick_agent_thread(issue, app_user)
+    if not (thread_id and issue.get("id")):
+        raise Decline("GitHub reports this PR CONFLICTING and the original ticket has no agent-session "
+                      "thread: a conflict fix only ever goes to the session that owns the branch, inside "
+                      "its sandbox, so nothing was sent and the conflict monitor pages the owner", sit)
+    meta = sit.get("pr_meta") or {}
+    base = str(meta.get("baseRefName") or sit.get("default_branch") or "")
+    if not (prc.BRANCH_RE.match(sit["branch"]) and prc.BRANCH_RE.match(base)):
+        raise Decline("the branch or base name has characters the driver will not put in a prompt; "
+                      "no conflict fix was sent and the conflict monitor pages the owner", sit)
+    episode, conflict_no = verdict["episode"], verdict["conflict_no"]
+    body = render_conflict_reprompt(conflict_no=conflict_no, episode=episode, branch=sit["branch"],
+                                    base=base, pr_number=sit["pr"], pr_url=sit.get("pr_url") or "",
+                                    owner_repo=sit["repo"])
+    ack = render_conflict_ack(episode, conflict_no)
+    hits = secret_hits("\n".join((body, ack)))
+    if hits:
+        raise Decline("%s (%s); no conflict fix was sent" % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
+    if dry_run:
+        print("[dry-run] %s" % describe(sit, verdict))
+        print("=== [dry-run] thread reply on comment %s ===\n%s" % (thread_id, body))
+        print("=== [dry-run] PR comment ===\n%s\n=== [dry-run] end — nothing written ===" % ack)
+        return EXIT_OK
+
+    lpath = ledger_path(state_dir)
+    append_row(lpath, repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
+               outcome="conflict", episode=episode, conflict_no=conflict_no,
+               head_sha=sit.get("head_sha"))
+    try:
+        ref = linear_reply_in_thread(issue["id"], thread_id, body, cfg)
+    except BounceError as exc:
+        append_row(lpath, repo=sit["repo"], pr=sit["pr"], outcome="conflict-send-failed",
+                   episode=episode, conflict_no=conflict_no, error=str(exc))
+        sys.stderr.write("FAIL: %s#%d: conflict fix %d was counted but could not be delivered: %s\n"
+                         % (sit["repo"], sit["pr"], conflict_no, exc))
+        announce_could_not(sit, "Stage E conflict fix %d of %d was counted but could not be delivered "
+                                "to the session's thread (%s); nothing claimed the fix request, so the "
+                                "conflict monitor pages the owner"
+                           % (conflict_no, prc.MAX_FIX_REQUESTS, exc.public or exc), state_dir, False)
+        return EXIT_USAGE
+    append_row(lpath, repo=sit["repo"], pr=sit["pr"], outcome="conflict-delivered",
+               episode=episode, conflict_no=conflict_no, ref=ref)
+    try:
+        post_pr_comment(sit["pr"], ack, sit["repo"], False)
+    except Exception as exc:    # delivery failed (IOError) or the publisher's own scrub refused
+        sys.stderr.write("FAIL: %s#%d: conflict fix %d was DELIVERED to the session but the ack could "
+                         "not be posted (%s: %s); the conflict monitor will page while the session "
+                         "works\n" % (sit["repo"], sit["pr"], conflict_no, exc.__class__.__name__, exc))
+        return EXIT_USAGE
+    print("%s — delivered in the session's thread (%s) and acknowledged on the PR"
+          % (describe(sit, verdict), ref))
+    return EXIT_OK
+
+
+def perform_conflict_result(sit, verdict, cfg, state_dir, dry_run):
+    """Tell the conflict monitor that the fix this driver sent did not land: the session
+    pushed, and GitHub still says CONFLICTING. One `result outcome=unresolved` on the PR,
+    once per episode. Sent BEFORE it is recorded — a repeat is harmless, a lost result would
+    leave the monitor waiting out its whole deadline. It re-prompts nobody."""
+    episode = verdict["episode"]
+    body = render_conflict_result(episode, verdict.get("head_before"), sit.get("head_sha"))
+    if dry_run:
+        print("[dry-run] %s" % describe(sit, verdict))
+        print("=== [dry-run] PR comment ===\n%s" % body)
+        return EXIT_OK
+    try:
+        post_pr_comment(sit["pr"], body, sit["repo"], False)
+    except Exception as exc:
+        sys.stderr.write("FAIL: %s#%d: the unresolved conflict result could not be posted (%s: %s); "
+                         "the next pass says it again\n"
+                         % (sit["repo"], sit["pr"], exc.__class__.__name__, exc))
+        return EXIT_USAGE
+    append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
+               outcome="conflict-result", episode=episode, result="unresolved",
+               head_sha=sit.get("head_sha"))
+    print("%s — said on the PR; the monitor escalates it" % describe(sit, verdict))
+    return EXIT_OK
+
+
 def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False):
     """mode ∈ decide | bounce | exhaust. Returns an exit code; prints one line per PR.
     `decide` is the read-only mode: it never posts, not even a could-not comment. In the
@@ -3207,6 +3552,10 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
         return act(perform_refresh)
     if verdict["action"] == "blocked":
         return act(perform_blocked)
+    if verdict["action"] == "conflict":
+        return act(perform_conflict)
+    if verdict["action"] == "conflict-result":
+        return act(perform_conflict_result)
     print(describe(sit, verdict))
     return EXIT_OK
 
@@ -4327,7 +4676,7 @@ def selftest():
     stubbed = ("repo_default_branch", "committed_delivery_json", "pr_view", "check_runs", "required_checks",
                "linear_issue", "linear_ticket_for_pr_url", "linear_reply_in_thread",
                "linear_create_fix_ticket", "linear_comment", "linear_add_label", "linear_set_state",
-               "post_pr_comment", "emit_telemetry")
+               "post_pr_comment", "emit_telemetry", "pr_issue_comments")
     saved = {name: globals()[name] for name in stubbed}
 
     def install():
@@ -4369,6 +4718,11 @@ def selftest():
         globals()["linear_add_label"] = lambda issue_id, label_id, cfg: calls.append(("label", issue_id, label_id)) or True
         globals()["post_pr_comment"] = lambda pr, body, repo, dry: calls.append(("prComment", pr, body))
         globals()["emit_telemetry"] = lambda sd, art, cfg: calls.append(("telemetry", art)) or "emitted"
+
+        def pr_comments(pr, repo, cfg):
+            world["comment_reads"] = world.get("comment_reads", 0) + 1
+            return [dict(c) for c in (world.get("pr_comments") or [])]
+        globals()["pr_issue_comments"] = pr_comments
 
     cfg = validate_config(dict(CONFIG_DEFAULTS, team_keys=["ENG"], reviews_team_id="team", dispatcher_app_user_id="app",
                                model_label_id="lbl-model", dispatcher_repo_names={"o/r": "kit"}))
@@ -5634,6 +5988,126 @@ def selftest():
                   (rc, kinds()), (EXIT_OK, ["label", "telemetry"]))
         check("a partial signal is loud on stderr", "only partly landed" in err.getvalue(), True)
         world["delivery"] = delivery_ok
+
+        # 10q. CONFLICTS — the dispatched lane of the conflict loop. A dispatcher's pull request
+        #      that goes CONFLICTING is sent back to the session that opened it, in its own
+        #      thread (its own sandbox), ONLY in answer to the conflict monitor's request, and
+        #      claimed on the PR with the monitor's own `ack` marker. It spends no bounce.
+        def gh_comment(body, assoc="OWNER", bot=False, at="2026-01-01T00:00:00Z"):
+            return {"body": body, "created_at": at, "author_association": "NONE" if bot else assoc,
+                    "user": {"login": prc.BOT_LOGIN, "type": "Bot"} if bot else {"login": "someone", "type": "User"}}
+        request1 = gh_comment(prc.marker("request", 1), bot=True)
+        conflicted = dict(open_pr, headRefOid="dddd4444", mergeable="CONFLICTING")
+        world.update(pr=conflicted, runs=[], required=["Kit checks"], issue=live_issue,
+                     pr_comments=[request1], delivery=delivery_ok)
+
+        def pass_(tmp, mode="bounce"):
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", cfg, tmp, mode, False)
+            return rc, buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            rc, out = pass_(tmp)
+            check("a conflict with an open request is sent to the thread, THEN acknowledged on the PR",
+                  (rc, kinds()), (EXIT_OK, ["reply", "prComment"]))
+            ack_body = ([c[2] for c in calls if c[0] == "prComment"] or [""])[0]
+            reply_call = ([c for c in calls if c[0] == "reply"] or [("reply", "", "", "")])[0]
+            check("the conflict fix goes to the session's ROOT comment", (reply_call[1], reply_call[2]),
+                  ("iss-uuid", "root-c"))
+            reply_body = reply_call[3]
+            for must in ("conflict fix 1 of %d" % prc.MAX_FIX_REQUESTS, "git merge origin/main",
+                         "never rebase", "SAME branch feat/eng-41-x", "never --force",
+                         "Never merge or approve", CONFLICT_MARKER):
+                check("the conflict fix says %r" % must, must in reply_body, True)
+            check("the conflict fix is never a bounce on the visible record",
+                  bounce_markers([reply_body], "o/r", 41), [])
+            check("the ack's FIRST LINE is the monitor's own ack marker, for this episode",
+                  prc.parse_marker(gh_comment(ack_body)), {"kind": "ack", "episode": 1, "attrs": {},
+                                                           "at": prc._ts("2026-01-01T00:00:00Z")})
+            rows = read_ledger(ledger_path(tmp))
+            check("ledger: the conflict row BEFORE the send, then delivered",
+                  [r["outcome"] for r in rows], ["conflict", "conflict-delivered"])
+            view = ledger_view(ledger_path(tmp), "o/r", 41)
+            check("a conflict fix spends no bounce and asks for no re-review",
+                  (view["prior"], rereview_request_outstanding(tmp, "o/r", 41)), (0, False))
+            check("no telemetry for a prompt", "telemetry" in kinds(), False)
+
+            world["pr_comments"] = [request1, gh_comment(ack_body)]
+            rc, out = pass_(tmp)
+            check("the same episode on an unmoved head waits: nothing sent twice", (rc, calls), (EXIT_OK, []))
+            world["pr_comments"] = [request1, gh_comment(ack_body, assoc="NONE")]
+            rc, out = pass_(tmp)
+            check("…even when its own ack did not count on GitHub — the ledger says it was sent",
+                  (rc, calls), (EXIT_OK, []))
+
+            world["pr"] = dict(conflicted, headRefOid="eeee5555")
+            rc, out = pass_(tmp)
+            first = [c[2] for c in calls if c[0] == "prComment"]
+            check("a push that left it CONFLICTING is reported unresolved to the monitor, once",
+                  (rc, kinds(), first[0].split("\n", 1)[0] if first else ""),
+                  (EXIT_OK, ["prComment"], prc.marker("result", 1, outcome="unresolved")))
+            rc, out = pass_(tmp)
+            check("…and never said twice for the episode", (rc, calls), (EXIT_OK, []))
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            world.update(pr=conflicted, pr_comments=[request1, gh_comment(prc.marker("ack", 1))])
+            rc, out = pass_(tmp)
+            check("a request another waker claimed is not this driver's", (rc, calls), (EXIT_OK, []))
+            world["pr_comments"] = []
+            rc, out = pass_(tmp)
+            check("CONFLICTING with no fix request sends nothing and says why",
+                  (rc, calls, "posted no fix request" in out), (EXIT_OK, [], True))
+            world["pr_comments"] = [gh_comment(prc.marker("request", 9), assoc="OWNER")]
+            rc, out = pass_(tmp)
+            check("a request a writer forged (not the Actions bot) is no request", (rc, calls), (EXIT_OK, []))
+            for n in (1, 2, 3):
+                append_row(ledger_path(tmp), repo="o/r", pr=41, outcome="conflict", episode=n,
+                           conflict_no=n, head_sha="old")
+            world["pr_comments"] = [gh_comment(prc.marker("request", 4), bot=True)]
+            rc, out = pass_(tmp)
+            check("the ledger caps conflict fixes at the monitor's budget, whatever GitHub shows",
+                  (rc, calls, "no more are sent" in out), (EXIT_OK, [], True))
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            world.update(pr=conflicted, pr_comments=[request1],
+                         issue=dict(live_issue, comments={"nodes": []}))
+            rc, out = pass_(tmp)
+            check("no agent-session thread: declined BEFORE any spend — no fix ticket, no ack, "
+                  "one could-not on the PR", (rc, kinds(), os.path.exists(ledger_path(tmp))),
+                  (EXIT_USAGE, ["prComment"], False))
+            check("…and the could-not is not an ack",
+                  body_of("prComment").startswith("<!-- pr-conflict:"), False)
+            world["issue"] = live_issue
+            world["reply_fails"] = True
+            rc, out = pass_(tmp)
+            check("a failed thread reply is counted, told on the PR, and NOT acknowledged",
+                  (rc, [r["outcome"] for r in read_ledger(ledger_path(tmp))],
+                   any(c[2].startswith("<!-- pr-conflict:ack") for c in calls if c[0] == "prComment")),
+                  (EXIT_USAGE, ["conflict", "conflict-send-failed"], False))
+            world["reply_fails"] = False
+            rc, out = pass_(tmp, mode="exhaust")
+            check("`exhaust` refuses a conflict verdict", (rc, calls), (EXIT_USAGE, []))
+
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            world.update(pr=conflicted, pr_comments=[request1], delivery=delivery_lane)
+            append_row(ledger_path(tmp), repo="o/r", pr=41, ticket_id="ENG-41", outcome="concluded",
+                       basis="clean", head_sha="dddd4444", moved=True, lane="moved", note="", problems=[])
+            rc, out = pass_(tmp)
+            check("on a CONCLUDED pull request a conflict is a notice on the ticket, never a re-prompt",
+                  (rc, kinds()), (EXIT_OK, ["ticketComment"]))
+            check("…of kind conflict", "merge conflicts" in body_of("ticketComment"), True)
+            world["delivery"] = delivery_ok
+
+        world.update(pr=dict(open_pr, mergeable="MERGEABLE"), pr_comments=[request1], comment_reads=0)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            pass_(tmp)
+            check("a mergeable PR never reads the PR's comments for conflict markers",
+                  world["comment_reads"], 0)
+        check("a CONFLICTING PR never concludes, and UNKNOWN is not a conflict",
+              (conflict_view("UNKNOWN", {}, [], "h"), conflict_view("MERGEABLE", {}, [], "h")), (None, None))
+        world["pr"] = open_pr
     finally:
         globals().update(saved)
 
@@ -5778,13 +6252,25 @@ def selftest():
     check("no subprocess launches an agent (gh, git and the telemetry publisher only)",
           re.search(r"subprocess\.run\(\[\"(?!gh\"|git\")", src) is None
           and re.search(r"subprocess\.run\(argv", src) is not None, True)
+    # The conflict marker grammar is imported from pr_conflict.py, and that module also holds
+    # the local waker — the half that starts sessions OUTSIDE any sandbox. This driver's lane
+    # is the session's own thread, so it may read and write markers and must never wake.
+    check("the driver never reaches for the conflict waker (it answers in the session's thread)",
+          [name for name in ("wake", "wake_pass", "run", "FIX_PROMPT", "refuse_waker", "Gh")
+           if ("prc." + name + "(") in src or ("prc." + name + ")") in src
+           or ("prc." + name + ",") in src or ("prc." + name + "\n") in src], [])
 
     if failures:
         print("FAIL pipeline_bounce_local selftest:")
         for f in failures:
             print("  -", f)
         return 1
-    print("ok — pipeline_bounce_local: N-1/N/N+1 ⇒ bounce/bounce/exhaust, a raised budget "
+    print("ok — pipeline_bounce_local: a CONFLICTING dispatcher PR is sent back to its session's "
+          "own thread only in answer to the conflict monitor's request (ledger row first, then "
+          "the reply, then the monitor's ack marker), spends no bounce, is capped at the "
+          "monitor's budget, never falls back to a fix ticket, reports a push that left it "
+          "conflicted as unresolved once, and is a notice on a concluded PR; "
+          "N-1/N/N+1 ⇒ bounce/bounce/exhaust, a raised budget "
           "re-bounces after an announced exhaustion, ledger row before the send (a failed send "
           "is still spent and told to the PR), unreadable/corrupt ledger refused (never zero) "
           "and said on the PR, the poller's outcome record (its path, ticket_id, outcome_schema) "

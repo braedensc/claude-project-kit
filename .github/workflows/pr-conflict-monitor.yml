@@ -16,12 +16,14 @@ name: PR conflict monitor
 # to wake its idle session by hand. Detection without resolution.
 #
 # So a conflict now STARTS A FIX. The logic lives in scripts/pr_conflict.py
-# (monitor half here, waker half on a person's machine; one marker grammar, one
-# selftest in CI). Per new conflict episode:
+# (monitor half here; one marker grammar, one selftest in CI). Per new episode:
 #   • budget left (3 automated attempts per PR, lifetime) → label + a `request`
-#     comment. A waker running where the branch's worktree lives acknowledges it
-#     and wakes a Claude Code session there to merge main, resolve, push and
-#     watch CI — under the repo's hooks, never merging, never approving.
+#     comment, answered by whoever owns the branch's session: a LOCAL session's
+#     PR by the conflict waker — a supervised LaunchAgent on the machine that
+#     holds the worktree (scripts/pipeline_conflict_waker_setup.py), which wakes
+#     a capped session there under the repo's hooks; a DISPATCHER's PR by the
+#     Stage E bounce driver, in the session's own thread and sandbox. Neither
+#     merges or approves, and neither can take the other's PR.
 #   • no ack in 15 min, no result in 2 h, or a result while GitHub still says
 #     CONFLICTING → ESCALATE once: @mention + assign the owner. Budget spent, or
 #     a fork → page straight away, never request.

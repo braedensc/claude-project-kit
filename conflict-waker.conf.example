@@ -1,0 +1,61 @@
+# conflict-waker.conf.example — every value the conflict waker installer reads.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp conflict-waker.conf.example conflict-waker.conf
+#   $EDITOR conflict-waker.conf      # one value you must set: REPO_DIRS
+#   python3 scripts/pipeline_conflict_waker_setup.py run
+#
+# On a machine running Stage E, put it beside stage-e.conf and the Stage E
+# installer's `conflict-waker` step runs the same steps for you.
+#
+# WHAT IT INSTALLS.  A LaunchAgent for YOU, the person whose local Claude Code
+# sessions it wakes.  When one of their pull requests goes CONFLICTING, the
+# conflict monitor posts a fix request; each pass of the waker claims requests
+# for branches whose worktree one of YOUR sessions worked in, and starts a
+# capped fix session there.  A dispatcher's pull requests are never its
+# business — the bounce driver sends those back to the session's own thread.
+#
+# FORMAT.  `KEY=value`, one per line; `#` starts a comment only at the start of
+# a line.  Parsed, never sourced.  A duplicate key is an error.  No value here
+# ever holds a credential — the waker uses your own `claude` and `gh` logins.
+# ---------------------------------------------------------------------------
+
+# The checkouts whose worktrees your sessions run in — the directory you start
+# parallel sessions from, whose `git worktree list` holds their worktrees.
+# RULE: absolute paths, comma-separated, each a checkout ROOT with a GitHub
+# origin.  The value below is refused as typed, so an unedited file cannot run.
+REPO_DIRS=/Users/you/src/your-project
+
+# The LaunchAgent's label.  RULE: reverse-DNS.
+LABEL=local.pr-conflict-waker
+
+# Where the waker's own code is cloned from.  Empty means the origin of the
+# first REPO_DIRS entry, which must carry scripts/pr_conflict.py on its default
+# branch.  The job never execs code from a checkout your sessions work in.
+CODE_REPO_URL=
+
+# Seconds between passes.  launchd starts each one; there is no loop.
+INTERVAL_SECONDS=300
+
+# The bounds.  Per fix session: a spend cap in US dollars and a timeout in
+# minutes.  Per pass: a session cap.  MAX_SESSIONS_PER_PASS x TIMEOUT_MIN must
+# fit inside the conflict monitor's two-hour result deadline, less ten minutes,
+# or the installer refuses the conf — a queued session must never still be
+# working when the monitor pages about it.  Per pull request, lifetime, the
+# monitor allows three requests; that bound is not configurable here.
+MAX_BUDGET_USD=5
+TIMEOUT_MIN=40
+MAX_SESSIONS_PER_PASS=2
+
+# How the fix session starts: `from-pr` resumes the session linked to the pull
+# request where Claude Code has one; `continue` resumes the worktree's latest;
+# `fresh` starts a new one.
+RESUME_MODE=from-pr
+
+# Extra arguments for `claude`, space-separated.  A headless session gets only
+# the tools your settings and these allow; one that cannot run git and gh ends
+# `failed` and the monitor pages you.  Match how you run your own sessions, for
+# example:  --permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*)
+CLAUDE_ARGS=

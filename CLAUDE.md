@@ -110,9 +110,11 @@ done. A DIRTY PR is *not* green — GitHub skips the required CI, so side checks
 look passing; rebase, resolve, force-push.
 
 The Stop hook samples **at turn-end only**. After your turn, two watchers run where no
-session is: `pr-conflict-monitor.yml` requests a fix when `main` moves under your PR — a
-local waker (`scripts/pr_conflict.py wake`, run by a person) may resume you, or start a
-session in your worktree, to merge `origin/main`, resolve, push and watch CI — and
+session is: `pr-conflict-monitor.yml` requests a fix when `main` moves under your PR — the
+conflict waker (a LaunchAgent a person installs with `scripts/pipeline_conflict_waker_setup.py`)
+may resume you, or start a session in your worktree; a dispatcher's session is instead
+re-prompted in its own thread by the bounce driver — to merge `origin/main`, resolve, push
+and watch CI — and
 `pr-union-check.yml` comments if your PR is green alone but red with the other open PRs.
 
 Two non-enforcing complements: `.claude/settings.json` also carries native
@@ -187,7 +189,10 @@ npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idemp
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
                              #   (no Linear MCP), agent-refused, conf-all-errors, human gates
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
-                             #   markers, stale-label sweep, waker refused in an agent env
+                             #   markers, stale-label sweep, waker refused in an agent env,
+                             #   local-session-only worktrees, capped pass, heartbeat
+npm run test:conflict-waker-setup  # the waker's installer: a user LaunchAgent, signed-off
+                             #   dry run, stale heartbeat = NOT RUNNING, no sudo path
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md

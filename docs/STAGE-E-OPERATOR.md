@@ -26,7 +26,19 @@ The first two are Stage E proper: review, then bounce. The third is the **findin
 ticket, which is a different job that happens to want the same role account, the same
 credential file and the same installer. It has its **own** state directory, so its
 heartbeat cannot be mistaken for the review poller's. Review and bounce share a state
-directory and nothing else; no script imports another.
+directory and nothing else. The bounce driver imports one thing: the conflict loop's
+marker grammar, from `scripts/pr_conflict.py`.
+
+One more job belongs on the same machine, and it is **not** the role account's:
+
+| Script | Command it runs on a schedule | Selftest |
+|---|---|---|
+| `scripts/pr_conflict.py` | `wake --repo-dir D …` (as **you**, a LaunchAgent) | `npm run test:conflict` |
+
+That is the **conflict waker**. When one of your *locally spawned* sessions' pull requests
+goes `CONFLICTING`, it starts a capped fix session in that worktree. Step 6 explains it.
+Its installer is `scripts/pipeline_conflict_waker_setup.py`, and the Stage E installer runs
+it for you as the `conflict-waker` step.
 
 ---
 
@@ -83,12 +95,13 @@ pulled — is invisible to it, so a machine that has drifted still reads clean. 
 the one that measures, and it is the one to run after every merge to the default branch and
 whenever `status` looks better than the machine feels.
 
-**Seven cards exist and three are usual:** merge the pull requests that carry Stage E
+**Eight cards exist and four are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
 installer checks and prints, and has no code path to either); read the dry-run count before
 anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
-only you know whether that number is the one you meant); and watch one real ticket become a
-reviewed pull request (`CK-7`). The other four appear only when the automated path could
+only you know whether that number is the one you meant); read your conflict waker's dry-run
+count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); and watch one
+real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
 (`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
@@ -291,6 +304,14 @@ and said, and nothing else changes. (The poller also closes its **own** review t
 one per review, so one more per re-review — which is what frees the reviewer's worktree.
 Those are Reviews-team tickets, never anybody's coding ticket.)
 
+9. **When `main` moves and a pull request goes `CONFLICTING`**, the conflict monitor posts a
+   fix request on it (`.github/workflows/pr-conflict-monitor.yml`). For a dispatcher's
+   pull request, the bounce driver answers. It replies in the session's own thread with a
+   fixed "merge main, resolve, push" prompt, and claims the request on the PR. The session
+   fixes it in its own worktree and sandbox. **No bounce is spent.** For a local session's
+   pull request, your conflict waker answers instead (Step 6). Nothing answers → the
+   monitor pages you after 15 minutes.
+
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
 poller would.
@@ -304,7 +325,8 @@ poller would.
 | Poller + bounce driver | **The dispatcher's own role account**, system LaunchDaemon | Holds an owner-scoped Linear key and a GitHub token, in their own env file under that account's home. Plain Python, one pass per interval. Not a session. |
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | No shell, no edits, no fetch. Reads its ticket body. Linear MCP tools present (accepted risk, below). |
-| Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces as thread comments. |
+| Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
+| Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
 ### Why the role account and not yours
@@ -1349,6 +1371,114 @@ nor `--all`: it is the daemon's whole pass.
 
 ---
 
+## Step 6 — Conflicts: two lanes, one monitor
+
+A pull request that goes `CONFLICTING` after its session stopped skips its required checks.
+It can sit there looking green. The conflict monitor sees it and posts a **fix request** on
+the pull request. It allows three per pull request, ever. Then something must answer.
+
+**Who answers depends on who owns the session. Never both.**
+
+| The pull request was opened by | Answered by | Where the fix runs |
+|---|---|---|
+| A dispatcher's session | the **bounce driver** (already installed, above) | that session, resumed in its own thread, worktree and sandbox |
+| One of your own local sessions | your **conflict waker** | a new capped session in that worktree, as you, under the repo's hooks |
+
+Why the split matters: a waker starts its session **outside** any sandbox. Pointed at a
+branch a sandboxed session wrote, it would run that session's work with your reach. So:
+
+- The waker takes a request only for a worktree **your own Claude Code has worked in**.
+  A dispatcher's sessions keep their transcripts under the role account's home, which
+  you do not write. Checking a dispatcher branch out by hand does not change that.
+- The waker refuses to run as root, or as any account that holds `~/.stage-e/env`.
+- The bounce driver answers only in the session's own thread. With no thread, it sends
+  nothing, and the monitor pages you. It never opens a fix ticket for a conflict.
+
+### 6a. The bounce driver's lane — nothing to install
+
+It is on as soon as the bounce driver is. Each pass reads GitHub's merge state. A
+`CONFLICTING` pull request with an open, unclaimed request gets:
+
+1. a `conflict` row in the ledger, first;
+2. one reply in the session's thread: merge `main`, resolve, push to the same branch,
+   watch CI, never merge or approve;
+3. the monitor's own `ack` marker on the pull request, so the monitor holds its page.
+
+If the session pushes and it is still conflicted, the driver posts `outcome=unresolved`
+once. The monitor then pages you. Nothing here spends a bounce.
+
+**One requirement:** the token in `~/.stage-e/env` must belong to a **writer** on the
+repository. The monitor only counts an `ack` from a writer.
+
+- Good: the fix lands; the monitor clears the `conflict` label on its next run.
+- Not: the ack is ignored because the token is not a writer. You get paged while the
+  session is still working. Loud, never silent — fix the token's owner.
+
+A pull request Stage E already **concluded** is yours. A conflict there is one comment on
+the coding ticket, never a re-prompt.
+
+### 6b. Your conflict waker — one more conf file
+
+Put this beside `stage-e.conf`:
+
+```sh
+cp conflict-waker.conf.example conflict-waker.conf
+$EDITOR conflict-waker.conf      # REPO_DIRS: the checkouts you start sessions from
+```
+
+Then run the installer as usual. Its `conflict-waker` step does the rest, as **you**:
+
+1. clones the waker's code to `~/.pr-conflict-waker/code`, level with origin;
+2. writes `~/Library/LaunchAgents/<LABEL>.plist` (no `sudo`, no role account);
+3. runs the waker's own dry run with the job's exact arguments;
+4. stops at **CK-8**: read the `would wake [...]` count and sign it off;
+5. loads the job and waits for its first heartbeat.
+
+Don't want it on this machine? Set `CONFLICT_WAKER_CONF=off`. The step then says **OFF**
+by name. Your local sessions' conflicts page you instead.
+
+On a machine with no dispatcher, run the same steps directly:
+
+```sh
+python3 scripts/pipeline_conflict_waker_setup.py run
+```
+
+**Why a LaunchAgent for you, not a daemon for the role account.** It wakes *your* sessions,
+with *your* `claude` and `gh` logins. On macOS those live in your login keychain, and a
+system daemon cannot open it. So it runs only while you are logged in. When you are logged
+out, your local sessions are not running either, and the monitor pages you.
+
+**What bounds it.** Each session: `MAX_BUDGET_USD` and `TIMEOUT_MIN`. Each pass:
+`MAX_SESSIONS_PER_PASS`. The installer refuses a conf where sessions × timeout would outlast
+the monitor's two-hour result deadline. Every session in a pass is acknowledged before the
+first starts. A request over the cap is left unclaimed and named; the monitor pages it.
+
+**Give the fix session its tools.** A headless session gets only what your settings and
+`CLAUDE_ARGS` allow. Without git and gh it ends `failed`, and the monitor pages you.
+
+**Is it running?** Read the heartbeat, not the log:
+
+```sh
+python3 scripts/pipeline_conflict_waker_setup.py status   # last heartbeat, fresh or STALE
+python3 scripts/pipeline_conflict_waker_setup.py verify   # re-measures; stale = NOT RUNNING
+```
+
+| Heartbeat | Meaning |
+|---|---|
+| fresh, `idle` | ran, nothing to claim |
+| fresh, `ok` | ran, woke or declined something |
+| fresh, `problems` | ran and could not do all of it — a repository it could not read, or a session that ended `failed` or `unknown`. Read `~/.pr-conflict-waker/waker.log` |
+| stale | **not running** (or you were logged out). `verify` exits 4 |
+
+The heartbeat monitor above does not read this file. It runs as the role account, and a
+LaunchAgent's heartbeat goes stale every time you log out. Where it matters — a conflict
+waiting — the conflict monitor already pages you on the pull request.
+
+**The waker's code moves only when `run` moves it**, like the role account's clone. Run
+`verify` after a merge that touches `scripts/pr_conflict.py`.
+
+---
+
 ## Accepted risks — owner decisions of 2026-09-06, monitored not closed
 
 | Risk | Why it is accepted, and what to watch |
@@ -1384,9 +1514,9 @@ posts its result as a `response` activity needs the poller changed nowhere.
 run end to end against live pull requests on a production deployment.
 
 **Activation: OFF in a fresh copy.** Merging this changes nothing on your machine: no team
-exists, no entry is loaded, no daemon is bootstrapped, and no key is anywhere. Turning it on
-is the five steps above, on your own machine, in your own time — dry run first, live tests
-second, the daemons last.
+exists, no entry is loaded, no daemon is bootstrapped, no LaunchAgent is written, and no key
+is anywhere. Turning it on is the six steps above, on your own machine, in your own time —
+dry run first, live tests second, the daemons last.
 
 What the live run established, in order, over 2026-09-08 to 2026-09-12: a review comment on
 an opened pull request; a bounce delivered into the ticket thread when findings met the
@@ -1396,6 +1526,10 @@ called a person for those ten hours either; a re-review with its own ticket, its
 and its own second PR comment once the head finally moved; and a conclusion that moved the
 coding ticket into the needs-approval lane — including one conclusion held, correctly, for three days until that
 lane was provisioned, then completed on the next pass without anyone touching it.
+
+**Step 6 has not run live.** Both conflict lanes are tested only in the batteries. The first
+real conflict on a dispatcher's pull request is its live test: watch for the thread reply,
+the `ack` on the pull request, and the label clearing after the push.
 
 Two of those had never run outside the test battery: a PR had only ever been reviewed once,
 so the review half of the bounce trigger could not fire again, and the conclusion path could

@@ -227,23 +227,27 @@ twice on doc-tail merges before these rules existed:
    implementing a stale brief, in parallel, at speed.
 8. **An idle session cannot see `main` move.** Its Stop hook sampled merge state at
    turn-end, once. When a sibling merges and its PR goes `CONFLICTING`, the conflict
-   monitor requests a fix, and a **waker** on the machine that holds the worktree
-   starts a session there to merge `main`, resolve, push and watch CI. Run the waker
-   yourself — it starts paid sessions, so it refuses to run inside one:
+   monitor requests a fix, and a **conflict waker** on the machine that holds the
+   worktree starts a session there to merge `main`, resolve, push and watch CI.
+   Install the waker once, as yourself. It starts paid sessions, so the install
+   refuses to run inside one:
 
    ```bash
-   python3 scripts/pr_conflict.py wake --dry-run   # what it would pick up
-   while true; do python3 scripts/pr_conflict.py wake; sleep 300; done
+   cp conflict-waker.conf.example conflict-waker.conf   # set REPO_DIRS
+   python3 scripts/pipeline_conflict_waker_setup.py run
    ```
 
-   A scheduler works too; give it a `PATH` with `gh` and `claude`. Each session is
-   capped (`--max-budget-usd`, default 5; `--timeout-min`, default 40) and resumes the
-   session linked to the PR where Claude Code has one (`--resume-mode`). A headless
-   session can only use the tools its settings allow — pass `--claude-arg` to match how
-   you run sessions, or it will end `failed` and the monitor pages you. Three automated
-   attempts per PR; after that, or when nothing picks a request up within 15 minutes,
-   the monitor pages the owner. No waker, or a sleeping machine, gets you the old page —
-   never silence.
+   That is a LaunchAgent, not a loop in a terminal. It writes a heartbeat every pass,
+   and `verify` reports a stale one as **not running**. It stops at one card: read the
+   dry-run count and sign it off. It takes only a worktree **your own Claude Code
+   worked in**. A dispatcher's PR never qualifies; the bounce driver re-prompts that
+   session in its own thread. Each session is capped (`MAX_BUDGET_USD`, `TIMEOUT_MIN`),
+   and so is each pass (`MAX_SESSIONS_PER_PASS`). A headless session only gets the
+   tools its settings allow, so set `CLAUDE_ARGS` to match yours. If you don't, it ends
+   `failed` and the monitor pages you. Three automated attempts per PR. After that, or
+   when nothing claims a request within 15 minutes, the monitor pages the owner.
+   Logged out, asleep, or never installed, you get the old page, never silence. On a
+   Stage E machine, its installer's `conflict-waker` step does this for you.
 
 ---
 
@@ -451,8 +455,10 @@ Plus two **standing watchers**, because every layer above samples a moment and a
 can break after that moment, when nobody is in a session:
 
 - **`.github/workflows/pr-conflict-monitor.yml`** — on every push to `main`, and every
-  20 minutes, labels a newly `CONFLICTING` PR `conflict` and requests a fix from the
-  local waker (`scripts/pr_conflict.py`; parallel-session protocol item 8). A request
+  20 minutes, labels a newly `CONFLICTING` PR `conflict` and requests a fix. A local
+  session's PR is answered by the conflict waker (a supervised LaunchAgent,
+  `scripts/pipeline_conflict_waker_setup.py`; parallel-session protocol item 8). A
+  dispatcher's PR is answered by the bounce driver, in the session's own thread. A request
   nobody acknowledges within 15 minutes, a fix that does not land, a fourth conflict on
   the same PR, or a fork pages the owner instead. It clears the label when the PR is
   mergeable again, closed, or a draft. It never merges, approves or pushes, and a PR

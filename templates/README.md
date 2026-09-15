@@ -7,9 +7,11 @@ place in your new project.
 
 **One exception:** the kit runs its own adapted, *active* copy of
 `pr-conflict-monitor.yml` at `.github/workflows/` — parallel PRs off one `main`
-make the conflict hazard real in this repo too. The template below stays inert and
-keeps its `@claude` handoff, which the kit's copy replaces with a local waker
-(`scripts/pr_conflict.py`); app projects still activate it the normal way.
+make the conflict hazard real in this repo too. The template below stays inert and runs
+the same `scripts/pr_conflict.py monitor`; app projects activate it the normal way. Its
+requests are answered by the conflict waker for local sessions
+(`scripts/pipeline_conflict_waker_setup.py` installs it) and by the Stage E bounce driver
+for a dispatcher's sessions.
 
 | Template | Activates to | What it is |
 |---|---|---|
@@ -18,7 +20,7 @@ keeps its `@claude` handoff, which the kit's copy replaces with a local waker
 | `workflows/pipeline-failure-alert.yml` | `.github/workflows/pipeline-failure-alert.yml` | `workflow_run` failure on main → one deduped issue, owner @mention+assign (email + phone push); post-merge failures are otherwise silent |
 | `workflows/backup-cron.yml` | `.github/workflows/backup-cron.yml` | Daily encrypted `pg_dump` → artifact, with the IPv6/pooler/role gotchas inline |
 | `workflows/keepalive.yml` | `.github/workflows/keepalive.yml` | Free-tier anti-pause ping (401-is-healthy pattern) |
-| `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | Flags PRs whose merge state goes DIRTY — conflicted PRs skip required CI and can look green |
+| `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | A PR that goes CONFLICTING (it skips required CI and can look green) gets a bounded fix request, answered by the conflict waker or the bounce driver; unanswered, it pages the owner |
 | `workflows/frontend-uptime.yml` | `.github/workflows/frontend-uptime.yml` | Synthetic probe of the user-facing app (status + app-shell marker, blip-tolerant) for surfaces deployed outside the pipeline |
 | `workflows/migration-drift.yml` | `.github/workflows/migration-drift.yml` | Daily read-only declared-vs-applied compare against prod → issue; catches drift however it arises |
 | `workflows/cron-health.yml` | `.github/workflows/cron-health.yml` | Monitors the downstream EFFECT of in-platform scheduled jobs — schedulers self-report success even when the work fails |
