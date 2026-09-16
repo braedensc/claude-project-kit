@@ -560,7 +560,13 @@ CONFIG_DEFAULTS = {
     "in_flight_hours": DEFAULT_IN_FLIGHT_HOURS,
     "blocked_after_seconds": DEFAULT_BLOCKED_AFTER_SECONDS,
     "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
-    "telemetry_model": "unknown",
+    # A CONFIGURED model id, used only when the dispatcher's session log names none.
+    # Empty by default: an absent value becomes `unknown` WITH its reason (§4), never a
+    # bare `unknown` that says nothing (KIT-130).
+    "telemetry_model": "",
+    # The dispatcher's session-log directory, where the model a re-prompted session
+    # ran with is recorded. The installer writes it beside the dispatcher's config.
+    "session_log_root": "",
     "human_pending_checks": list(DEFAULT_HUMAN_PENDING_CHECKS),
 }
 # The poller's spellings for the two values both components need, accepted here so ONE
@@ -2598,11 +2604,17 @@ def announce_could_not(sit, reason, state_dir, dry_run):
     return True
 
 
-def emit_telemetry(state_dir, artifact, cfg):
+def emit_telemetry(state_dir, artifact, cfg, session_issue="", no_session=""):
     """Hand a §4 bounce artifact to scripts/pipeline_telemetry_local.py when that
     publisher exists. Returns a one-line status; 'not emitted' is REPORTED, never
     swallowed — telemetry is reporting, so its failure never blocks the bounce, but a
-    silent skip would be the §13 defect."""
+    silent skip would be the §13 defect.
+
+    KIT-130: say which session the row is about. `session_issue` names the issue whose
+    session this bounce re-prompts (or the fix ticket it minted): the publisher reads
+    that session's model from the dispatcher's log and says the cost is not incurred
+    yet — this row is written before the session runs. `no_session` is the reason for
+    a row no model session belongs to at all (a conclusion, an exhaustion, a stall)."""
     slug_dir = os.path.join(state_dir, "bounces", repo_slug(artifact["repo"]))
     os.makedirs(slug_dir, exist_ok=True)
     path = os.path.join(slug_dir, "pr-%d-bounce-%s-%s.json"
@@ -2615,10 +2627,15 @@ def emit_telemetry(state_dir, artifact, cfg):
     team_key = str(artifact.get("ticket_id") or "").split("-")[0] or "UNKNOWN"
     now = _now_iso()
     argv = [sys.executable, script, "--from-bounce", path, "--team-key", team_key,
-            "--model", str(cfg.get("telemetry_model") or "unknown"), "--auth-mode", "api-key",
+            "--model", str(cfg.get("telemetry_model") or ""), "--auth-mode", "api-key",
             "--run-id", "r_bounce_%s_%d_%s" % (repo_slug(artifact["repo"]), artifact["pr"],
                                                 artifact.get("bounce_no") or 0),
             "--started-at", now, "--ended-at", now, "--api-key-env", cfg["linear_api_key_env"]]
+    if no_session:
+        argv += ["--no-session", no_session]
+    else:
+        argv += ["--session-logs", str(cfg.get("session_log_root") or ""),
+                 "--session-issue", str(session_issue or ""), "--session-role", "resumed"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -2967,7 +2984,8 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
                 "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
                 "outcome": "error", "error_class": "bounce_undeliverable",
                 "bounce_no": verdict["bounce_no"], "max_bounces": sit["max_bounces"],
-                "reason": verdict["reason"]}, cfg)
+                "reason": verdict["reason"]}, cfg,
+                no_session="the bounce could not be delivered, so no session was re-prompted")
             sys.stderr.write("telemetry: %s\n" % emit_status)
             return EXIT_USAGE
 
@@ -2980,7 +2998,10 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     emit_status = emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "completed", "bounce_no": verdict["bounce_no"],
-        "max_bounces": sit["max_bounces"], "reason": verdict["reason"]}, cfg)
+        "max_bounces": sit["max_bounces"], "reason": verdict["reason"]}, cfg,
+        # The thread reply resumes the coding ticket's own session; the fallback starts
+        # a fresh one in the fix ticket it just minted.
+        session_issue=sit.get("ticket_id") if via == "reprompt" else (ref or ""))
     print("%s — delivered via %s (%s); telemetry: %s"
           % (describe(sit, verdict), via, ref, emit_status))
     return EXIT_OK
@@ -3108,7 +3129,8 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     emit_status = emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "completed", "bounce_no": 0, "max_bounces": sit.get("max_bounces", 0),
-        "reason": verdict["reason"]}, cfg)
+        "reason": verdict["reason"]}, cfg,
+        no_session="this row records a conclusion; no model session runs for it")
     if problems:
         sys.stderr.write("FAIL: %s#%d concluded (%s) but the needs-approval move did not land "
                          "(%s); the conclusion is on the ledger and the next run retries the "
@@ -3254,7 +3276,8 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     emit_status = emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "budget", "error_class": "bounce_budget_exhausted",
-        "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg)
+        "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
+        no_session="this row records a spent bounce budget; no model session runs for it")
     if problems:
         sys.stderr.write("FAIL: exhaustion for %s#%d only partly announced (%s); the next run "
                          "completes the missing step(s). telemetry: %s\n"
@@ -3343,7 +3366,9 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "blocked", "error_class": "bounce_no_push",
         "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
-        "reason": verdict["reason"]}, cfg)
+        "reason": verdict["reason"]}, cfg,
+        no_session="this row records a session that stopped pushing; no model session "
+                   "runs for it")
     if problems:
         sys.stderr.write("FAIL: the no-push signal for %s#%d only partly landed (%s); the next "
                          "run completes the missing step(s). telemetry: %s\n"
@@ -4717,7 +4742,9 @@ def selftest():
         globals()["linear_comment"] = lambda issue_id, body, cfg: calls.append(("ticketComment", issue_id, body)) or "c"
         globals()["linear_add_label"] = lambda issue_id, label_id, cfg: calls.append(("label", issue_id, label_id)) or True
         globals()["post_pr_comment"] = lambda pr, body, repo, dry: calls.append(("prComment", pr, body))
-        globals()["emit_telemetry"] = lambda sd, art, cfg: calls.append(("telemetry", art)) or "emitted"
+        globals()["emit_telemetry"] = (lambda sd, art, cfg, **kw:
+                                       calls.append(("telemetry", dict(art, _session=kw)))
+                                       or "emitted")
 
         def pr_comments(pr, repo, cfg):
             world["comment_reads"] = world.get("comment_reads", 0) + 1
@@ -4789,6 +4816,8 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("bounce 1 exits 0", rc, EXIT_OK)
             check("bounce 1 went to the thread, then telemetry", kinds(), ["reply", "telemetry"])
+            check("KIT-130: a thread bounce's telemetry reads the model of the session it resumes",
+                  [c for c in calls if c[0] == "telemetry"][-1][1]["_session"], {"session_issue": "ENG-41"})
             reply_call = calls[0]
             check("reply targets the session's ROOT comment", (reply_call[1], reply_call[2]), ("iss-uuid", "root-c"))
             check("reply carries the instruction block", "Bounce 1 of 2." in reply_call[3]
@@ -4853,6 +4882,8 @@ def selftest():
             check("exhaustion exits 0", rc, EXIT_OK)
             check("exhaustion: PR comment, ticket comment, label, telemetry",
                   kinds(), ["prComment", "ticketComment", "label", "telemetry"])
+            check("KIT-130: an exhaustion row says no model session runs for it",
+                  "spent bounce budget" in [c for c in calls if c[0] == "telemetry"][-1][1]["_session"].get("no_session", ""), True)
             label_call = [c for c in calls if c[0] == "label"][0]
             check("the ONLY label written is agent:needs-human's id, on the ORIGINAL ticket",
                   (label_call[1], label_call[2]), ("iss-uuid", "lbl-nh"))
@@ -4898,6 +4929,11 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("fallback exits 0", rc, EXIT_OK)
             check("fallback minted a fix ticket (no thread reply)", kinds(), ["issueCreate", "telemetry"])
+            fallback_session = [c for c in calls if c[0] == "telemetry"][-1][1]["_session"]
+            check("KIT-130: a fallback's telemetry names the FIX ticket's session, not the original's",
+                  (bool(fallback_session.get("session_issue")),
+                   fallback_session.get("session_issue") != "ENG-41",
+                   fallback_session.get("no_session")), (True, True, None))
             _, title, description, _cfg = calls[0]
             check("fix ticket carries the repo#branch tag", "[repo=kit#feat/eng-41-x]" in description, True)
             check("fix ticket carries the push instruction", "git push origin HEAD:feat/eng-41-x" in description, True)
@@ -5099,6 +5135,8 @@ def selftest():
                     rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
                 check("%s review CONCLUDES: exit 0, the lane move, then telemetry" % label,
                       (rc, kinds()), (EXIT_OK, ["state", "telemetry"]))
+                check("KIT-130: %s conclusion row says no model session runs for it" % label,
+                      "conclusion" in [c for c in calls if c[0] == "telemetry"][-1][1]["_session"].get("no_session", ""), True)
                 check("%s review: the hand-off RETIRES the outstanding re-review request" % label,
                       os.path.exists(left_over), False)
                 check("%s review: …and says so, so the operator can see it happen" % label,
@@ -5813,6 +5851,8 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("a stopped session: exit 0, one TICKET comment, the label, telemetry",
                   (rc, kinds()), (EXIT_OK, ["ticketComment", "label", "telemetry"]))
+            check("KIT-130: a stopped-session row says no model session runs for it",
+                  "stopped pushing" in [c for c in calls if c[0] == "telemetry"][-1][1]["_session"].get("no_session", ""), True)
             check("…and the comment is TOP LEVEL on the coding ticket, never the session "
                   "thread — a thread comment would resume the session that stopped",
                   ([c[1] for c in calls if c[0] == "ticketComment"], "reply" in kinds()),

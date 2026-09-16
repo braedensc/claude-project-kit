@@ -74,7 +74,11 @@
           "enum": ["epic", "dev", "review", "bounce", "triage", "diagnosis", "retro"],
           "description": "What kind of work this run did. Must sit inside the pinned session_mode's allowed set (§4) — checked by the collector, not here."
         },
-        "model": {"type": "string", "pattern": "\\S", "description": "Exact model ID as used."},
+        "model": {"type": "string", "pattern": "\\S", "description": "Exact model ID as used. The literal unknown when no source named one — and then model_note says why."},
+        "model_note": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL. Why model is not the exact ID read from the run's own record: nothing reported one, or it was read from somewhere else. Null when it was read from the run itself. The gate refuses model unknown without a note (§4)."
+        },
         "auth_mode": {"enum": ["subscription", "api-key"]},
         "started_at": {"$ref": "#/$defs/timestamp"},
         "ended_at": {
@@ -91,6 +95,10 @@
           "minimum": 0,
           "multipleOf": 0.0001,
           "description": "Best-effort self-report, up to 4 decimal places. Dashboards only — spend is metered by the dispatcher, and a session that under-reports must not be able to buy itself more budget (§1)."
+        },
+        "cost_note": {
+          "type": ["string", "null"],
+          "description": "OPTIONAL. Why cost_usd and the token counters are not measured from the run's own record: the source reports no cost, or none is incurred yet. Null when they were measured, so a measured 0 still means free."
         },
         "turns": {"$ref": "#/$defs/counter"},
         "outcome": {

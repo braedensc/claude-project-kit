@@ -814,7 +814,8 @@ prints this and lists every key it accepts:
   "github_token_env": "GH_TOKEN",
   "linear_key_env": "STAGE_E_LINEAR_API_KEY",
   "collect_timeout_seconds": 3600,
-  "run_timeout_seconds": 900
+  "run_timeout_seconds": 900,
+  "session_log_root": "<the dispatcher's home>/logs"
 }
 ```
 
@@ -827,9 +828,14 @@ prints this and lists every key it accepts:
   refuses an empty list. Name at least one.
 - `threshold` is `low`, `medium`, `high` or `critical`, and it decides which findings the
   comment calls out. The **bounce** threshold comes from `delivery.json`, not from here.
+- `session_log_root` is where the dispatcher writes each session's message log, one
+  directory per issue. The installer writes it as the sibling `logs/` of
+  `DISPATCHER_CONFIG`. Telemetry reads the reviewer session's model and cost there — see
+  *Where the telemetry numbers come from* below.
 - Optional and omitted above: `reviews_team_id`, `cyrus_agent_user_id`, `model_label_id`
-  (id overrides for the three names), `reviewer_model` (what telemetry records),
-  `basis_snapshot_dir` (a tier-2 snapshot directory for the basis resolver).
+  (id overrides for the three names), `reviewer_model` (a model id telemetry records only
+  when the session log names none, and says so), `basis_snapshot_dir` (a tier-2 snapshot
+  directory for the basis resolver).
 
 `~/.stage-e/config.json` — the bounce driver's default path, so its commands need no
 `--config` at all:
@@ -850,9 +856,31 @@ prints this and lists every key it accepts:
   "blocked_after_seconds": 21600,
   "run_timeout_seconds": 900,
   "required_checks": { "OWNER/REPO": ["Kit checks", "Hooks change guard"] },
-  "human_pending_checks": ["Hooks change guard"]
+  "human_pending_checks": ["Hooks change guard"],
+  "session_log_root": "<the dispatcher's home>/logs"
 }
 ```
+
+#### Where the telemetry numbers come from
+
+Stage E starts no model session itself, so neither daemon holds a model name or a cost.
+The dispatcher does: it writes each session's message stream to
+`<session_log_root>/<issue id>/session-*.jsonl`, with the model in the `init` message and
+`total_cost_usd`, tokens and turns in the `result` message. The daemons run as the
+dispatcher's own account, so they read it.
+
+| Row | Model | Cost |
+|---|---|---|
+| A review | the reviewer session's, from the review ticket's log | measured from the same log |
+| A delivered bounce | the resumed session's last run — `model_note` says so | not incurred yet — `cost_note` says so |
+| A fallback fix ticket's bounce | that ticket's log, when one exists yet | not incurred yet |
+| A conclusion, an exhaustion, a stopped-session call, a decline before any review ticket | `unknown`, with the reason in `model_note` | `0`, with the reason in `cost_note` |
+
+A `model` of `unknown` always carries `model_note`, and a cost that was not measured always
+carries `cost_note` (contract §4). The dashboard counts both per stage, so a total spend
+that includes unmeasured rows says it is a floor. The log's layout is read from the
+dispatcher's published source; if it moves, the rows say *no session log* rather than
+guessing.
 
 - `linear_api_key_env` is the driver's spelling; it also accepts the poller's
   `linear_key_env`, and `dispatcher_app_user_id` also accepts `cyrus_agent_user_id`.

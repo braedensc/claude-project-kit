@@ -586,12 +586,14 @@ A session reports itself by posting **one fenced JSON block** as a ticket commen
 | `ticket_id` | string \| null | e.g. `ENG-123`. Null for runs with no ticket. |
 | `team_key` | string | e.g. `ENG`. |
 | `stage` | enum `epic\|dev\|review\|bounce\|triage\|diagnosis\|retro` | What kind of work this run did. |
-| `model` | string | Exact model ID as used. |
+| `model` | string | Exact model ID as used. The literal `unknown` when no source named one — and then `model_note` says why. |
+| `model_note` | string \| null (optional) | Why `model` is not the exact ID read from the run's own record: nothing reported one, or it was read from somewhere else (a resumed session's earlier run, a config value). Null when it was read from the run itself. A silent `unknown` says nothing, so the gate refuses `unknown` without this. |
 | `auth_mode` | enum `subscription\|api-key` | |
 | `started_at` / `ended_at` | ISO-8601 UTC | `ended_at` null only for an in-flight row; a posted block should be terminal. |
 | `tokens_in` / `tokens_out` | integer | |
 | `tokens_cache_read` / `tokens_cache_write` | integer | `0` when caching was not used — never null. |
 | `cost_usd` | number | Best-effort self-report. Dashboards only. |
+| `cost_note` | string \| null (optional) | Why `cost_usd` (and the token counters) are not measured from the run's own record: the source reports no cost, or none is incurred yet when the row is written. Null when they were measured, so a measured `0` still means free. A dashboard reads a non-null note as "spend is a floor", never as zero. |
 | `turns` | integer | |
 | `outcome` | enum `completed\|blocked\|timeout\|capacity\|error\|budget` | `capacity` = provider capacity (see `dispatch.pauseOnCapacity`); `budget` = a cap in `budgets` stopped it; `blocked` = needs a human decision. |
 | `error_class` | string \| null | Short stable slug (e.g. `rate_limit`, `hook_block`, `ci_red`). Null unless `outcome` ∈ {`blocked`, `error`, `timeout`, `capacity`, `budget`}. |

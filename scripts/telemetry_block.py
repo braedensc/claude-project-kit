@@ -132,7 +132,86 @@ def semantic_errors(doc):
         if row.get("event") == "merged" and row.get("actor") == "agent":
             out.append("ticket_events[%d]: `merged` with actor `agent` — §4 forbids it, "
                        "and no session merges its own PR" % index)
+    # §4: a `model` that names no model must say why. A schema cannot express "this
+    # string requires that one", and a silent `unknown` is the row that made Stage E's
+    # spend and model mix unreadable for its first eight days (KIT-130).
+    for index, row in enumerate(doc.get("runs") or []):
+        if not isinstance(row, dict):
+            continue
+        if model_is_unknown(row.get("model")) and not str(row.get("model_note") or "").strip():
+            out.append("runs[%d]: model %r names no model and carries no model_note — §4 "
+                       "asks for the reason, because a silent unknown says nothing"
+                       % (index, row.get("model")))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Model and cost provenance — §4's `model_note` and `cost_note`
+# --------------------------------------------------------------------------- #
+UNKNOWN_MODEL = "unknown"
+
+
+def model_is_unknown(model):
+    """True when `model` names no model: empty, the literal `unknown`, or a
+    `label:<id>` stand-in. A label selects a model FAMILY through a dispatcher's
+    mapping; it is not the exact ID §4 asks for, and reading it as one is how
+    every Stage E review row came to carry a UUID where a model belongs."""
+    text = str(model or "").strip()
+    return not text or text.lower() == UNKNOWN_MODEL or text.lower().startswith("label:")
+
+
+def resolve_model(model, model_note=None):
+    """(model, model_note) for a run row. A named model passes through with whatever
+    note the caller gave (a caller that read it from somewhere other than the run
+    itself says so). A model that names nothing becomes the literal `unknown`, and
+    always with a reason — the caller's, or a fixed one naming what was missing."""
+    note = str(model_note).strip() if model_note else None
+    if not model_is_unknown(model):
+        return str(model).strip(), note
+    text = str(model or "").strip()
+    if note:
+        return UNKNOWN_MODEL, note
+    if text.lower().startswith("label:"):
+        return UNKNOWN_MODEL, ("only a model label (%s) reached this emitter; a label "
+                               "selects a model family, it does not name the model that "
+                               "ran" % (text[len("label:"):] or "no id"))
+    return UNKNOWN_MODEL, "no model was reported to this emitter"
+
+
+def execution_has_cost(execution):
+    """True when an execution record carries a `total_cost_usd` anywhere — the one
+    field that makes `cost_usd` a measurement rather than a default zero."""
+    found = [False]
+
+    def visit(node):
+        if found[0]:
+            return
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+        elif isinstance(node, dict):
+            value = node.get("total_cost_usd")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                found[0] = True
+                return
+            for item in node.values():
+                visit(item)
+
+    visit(execution)
+    return found[0]
+
+
+def resolve_cost_note(execution, cost_note=None):
+    """The `cost_note` for a run row: the caller's reason when it gave one, else a
+    fixed reason when the execution record could not have measured the cost, else
+    None — which is the only value that lets a `cost_usd` of 0 mean "free"."""
+    if cost_note and str(cost_note).strip():
+        return str(cost_note).strip()
+    if execution is None:
+        return "no execution record reached this emitter, so cost and tokens are unreported"
+    if not execution_has_cost(execution):
+        return "the execution record carries no total_cost_usd, so cost is unreported"
+    return None
 
 
 def scan(body, schema=None):
@@ -291,9 +370,15 @@ def project_findings(findings, pr_number, at, schema=None):
 
 
 def review_block(artifact, team_key, model, auth_mode, run_id, started_at, ended_at,
-                 dispatch_id=None, execution=None, reviewer_outcome=None, schema=None):
-    """The block the review pass posts: what it cost, that it ran, what it found."""
+                 dispatch_id=None, execution=None, reviewer_outcome=None, schema=None,
+                 model_note=None, cost_note=None):
+    """The block the review pass posts: what it cost, that it ran, what it found.
+
+    `model_note` and `cost_note` are §4's reasons. Pass them when the caller knows
+    why a value is not measured; otherwise the row derives one from what arrived."""
     usable = bool(artifact.get("usable"))
+    model, model_note = resolve_model(model, model_note)
+    cost_note = resolve_cost_note(execution, cost_note)
     pr_number = artifact.get("pr") if isinstance(artifact.get("pr"), int) else None
     if reviewer_outcome == "cancelled":
         outcome, error_class = "timeout", "review_cancelled"
@@ -315,6 +400,7 @@ def review_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
         "team_key": team_key,
         "stage": "review",
         "model": model,
+        "model_note": model_note,
         "auth_mode": auth_mode,
         "started_at": started_at,
         "ended_at": ended_at,
@@ -323,6 +409,7 @@ def review_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
         "tokens_cache_read": usage["tokens_cache_read"],
         "tokens_cache_write": usage["tokens_cache_write"],
         "cost_usd": usage["cost_usd"],
+        "cost_note": cost_note,
         "turns": usage["turns"],
         "outcome": outcome,
         "error_class": error_class,
@@ -361,7 +448,8 @@ _NEEDS_ERROR_CLASS = ("blocked", "error", "timeout", "capacity", "budget")
 
 
 def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended_at,
-                 dispatch_id=None, execution=None, schema=None):
+                 dispatch_id=None, execution=None, schema=None, model_note=None,
+                 cost_note=None):
     """The block a bounce (fix) session posts: what it cost, that it ran, the outcome.
 
     `artifact` is daemon-authored (KIT-93's own facts about the run it started), not
@@ -372,7 +460,13 @@ def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
     `lines_removed`. Unlike a review, a bounce WRITES code — the fix session's own
     commits — so files/lines are real numbers when the caller has them; zero is the
     honest default when it does not.
+
+    `model_note` and `cost_note` are §4's reasons, as for `review_block`. A bounce row
+    is usually written BEFORE the re-prompted session runs, so its caller passes a
+    cost note saying the cost is not incurred yet — never a zero that reads as free.
     """
+    model, model_note = resolve_model(model, model_note)
+    cost_note = resolve_cost_note(execution, cost_note)
     outcome = artifact.get("outcome")
     if outcome not in BOUNCE_OUTCOMES:
         outcome = "error"
@@ -403,6 +497,7 @@ def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
         "team_key": team_key,
         "stage": "bounce",
         "model": model,
+        "model_note": model_note,
         "auth_mode": auth_mode,
         "started_at": started_at,
         "ended_at": ended_at,
@@ -411,6 +506,7 @@ def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
         "tokens_cache_read": usage["tokens_cache_read"],
         "tokens_cache_write": usage["tokens_cache_write"],
         "cost_usd": usage["cost_usd"],
+        "cost_note": cost_note,
         "turns": usage["turns"],
         "outcome": outcome,
         "error_class": error_class,
@@ -785,6 +881,83 @@ def selftest():
               result.returncode == 0 and os.path.exists(out_path),
               result.stdout[-300:] + result.stderr[-300:])
 
+    # ── §4 model and cost provenance (KIT-130) ─────────────────────────────
+    # A resolved model with a measured cost: no notes at all, and a real cost.
+    run = block["runs"][0]
+    check("a resolved model carries no model_note",
+          run["model"] == "claude-sonnet-5" and run["model_note"] is None, json.dumps(run))
+    check("a measured cost carries no cost_note, and the cost is real",
+          run["cost_note"] is None and run["cost_usd"] == 0.8321, json.dumps(run))
+
+    # An explicitly unresolvable model: `unknown`, WITH the reason, and it conforms.
+    for label, given, needle in (
+            ("an empty model", "", "no model was reported"),
+            ("the literal unknown", "unknown", "no model was reported"),
+            ("a label stand-in", "label:c6dfa4e9", "label (c6dfa4e9)"),
+            ("a bare label prefix", "label:", "label (no id)")):
+        rblock = review_block(GOOD_ARTIFACT, "ENG", given, "api-key", "r_review_u",
+                              "2026-08-24T15:50:00Z", "2026-08-24T16:00:00Z",
+                              execution=EXECUTION_LOG)
+        urun = rblock["runs"][0]
+        check("%s becomes model unknown" % label, urun["model"] == UNKNOWN_MODEL, urun["model"])
+        check("%s carries its reason" % label, needle in (urun["model_note"] or ""),
+              str(urun["model_note"]))
+        check("%s still conforms and passes the gate" % label,
+              validate_block(rblock) == [] and not scan(fence(rblock))["errors"],
+              "; ".join(validate_block(rblock) + scan(fence(rblock))["errors"]))
+    given_note = review_block(GOOD_ARTIFACT, "ENG", "", "api-key", "r_review_n",
+                              "2026-08-24T15:50:00Z", "2026-08-24T16:00:00Z",
+                              model_note="the dispatcher wrote no session log")["runs"][0]
+    check("a caller's own model reason wins over the fixed one",
+          given_note["model_note"] == "the dispatcher wrote no session log")
+    check("a named model read from elsewhere keeps the caller's caveat",
+          review_block(GOOD_ARTIFACT, "ENG", "claude-opus-5", "api-key", "r", "2026-08-24T15:50:00Z",
+                       "2026-08-24T16:00:00Z", model_note="read from the resumed session"
+                       )["runs"][0]["model_note"] == "read from the resumed session")
+
+    # Cost that is not measured says so, in each of the three ways it can fail to be.
+    check("no execution record ⇒ a cost_note, never a silent zero",
+          "no execution record" in (block_bad["runs"][0]["cost_note"] or ""),
+          str(block_bad["runs"][0]["cost_note"]))
+    costless = [{"type": "system", "subtype": "init"}, {"type": "result", "num_turns": 3}]
+    check("an execution record with no total_cost_usd ⇒ a cost_note",
+          "no total_cost_usd" in (review_block(GOOD_ARTIFACT, "ENG", "m", "api-key", "r",
+                                               "2026-08-24T15:50:00Z", "2026-08-24T16:00:00Z",
+                                               execution=costless)["runs"][0]["cost_note"] or ""))
+    pending = bounce_block(GOOD_BOUNCE, "ENG", "claude-opus-5", "api-key", "r_b",
+                           "2026-08-24T16:00:00Z", "2026-08-24T16:00:00Z",
+                           cost_note="the re-prompted session has not run yet")["runs"][0]
+    check("a bounce written before its session runs says the cost is not incurred",
+          pending["cost_note"] == "the re-prompted session has not run yet"
+          and pending["cost_usd"] == 0.0, json.dumps(pending))
+    check("a free run that WAS measured keeps cost 0 with no note",
+          review_block(GOOD_ARTIFACT, "ENG", "m", "api-key", "r", "2026-08-24T15:50:00Z",
+                       "2026-08-24T16:00:00Z",
+                       execution=[{"type": "result", "total_cost_usd": 0}]
+                       )["runs"][0]["cost_note"] is None)
+
+    # The gate refuses the silent shape a hand-written block could still post.
+    silent = copy.deepcopy(good)
+    silent["runs"][0]["model"] = "unknown"
+    check("a silent unknown is shape-valid (the schema cannot tie two fields)",
+          validate_block(silent) == [], "; ".join(validate_block(silent)))
+    check("...and the gate refuses it", scan(fence(silent))["errors"])
+    labelled = copy.deepcopy(good)
+    labelled["runs"][0]["model"] = "label:c6dfa4e9"
+    check("a label posing as a model is refused too", scan(fence(labelled))["errors"])
+    explained = copy.deepcopy(silent)
+    explained["runs"][0]["model_note"] = "the dispatcher reports no model for this session"
+    check("an explained unknown passes", not scan(fence(explained))["errors"],
+          "; ".join(scan(fence(explained))["errors"]))
+
+    # …and the notes reach the collector's row rather than dying at the boundary.
+    nsink = scrape.DrySink("pipeline")
+    nswept = scrape.sweep([scrape.comment(fence(explained), cid="c-notes", ticket="ENG-123")], nsink)
+    nrow = dict(zip(scrape.RUN_COLUMNS, nsink.rows["runs"][0])) if nsink.rows["runs"] else {}
+    check("end-to-end: the model_note lands in the store",
+          nrow.get("model_note") == "the dispatcher reports no model for this session",
+          json.dumps(nswept["stats"]))
+
     # ── usage_from is forgiving by design ──────────────────────────────────
     for label, payload in (("None", None), ("an empty dict", {}),
                            ("a stray string", "not a log"), ("a list of noise", [1, 2, 3])):
@@ -871,6 +1044,10 @@ def main():
     ap.add_argument("--started-at", default="")
     ap.add_argument("--ended-at", default="")
     ap.add_argument("--usage", help="a Claude Code execution log, for cost and turns")
+    ap.add_argument("--model-note", default="",
+                    help="§4 model_note: why --model is not the exact model read from the run")
+    ap.add_argument("--cost-note", default="",
+                    help="§4 cost_note: why cost is not measured from the run's own record")
     ap.add_argument("--reviewer-outcome", default="")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
@@ -912,7 +1089,9 @@ def main():
         block = review_block(artifact, args.team_key, args.model, args.auth_mode,
                              args.run_id, args.started_at, args.ended_at,
                              dispatch_id=args.dispatch_id or None, execution=execution,
-                             reviewer_outcome=args.reviewer_outcome or None)
+                             reviewer_outcome=args.reviewer_outcome or None,
+                             model_note=args.model_note or None,
+                             cost_note=args.cost_note or None)
         problems = validate_block(block)
         if problems:
             # Fail here rather than let the validator reject the batch downstream:
@@ -963,7 +1142,9 @@ def main():
                 print("::notice::execution log unreadable (%s) — reporting zero cost." % exc)
         block = bounce_block(artifact, args.team_key, args.model, args.auth_mode,
                              args.run_id, args.started_at, args.ended_at,
-                             dispatch_id=args.dispatch_id or None, execution=execution)
+                             dispatch_id=args.dispatch_id or None, execution=execution,
+                             model_note=args.model_note or None,
+                             cost_note=args.cost_note or None)
         problems = validate_block(block)
         if problems:
             for line in problems:

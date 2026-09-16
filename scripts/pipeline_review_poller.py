@@ -484,7 +484,8 @@ CONFIG_KEYS = {
     "team_keys": "optional: managed team keys for branch→ticket routing ([] = any team)",
     "collect_timeout_seconds": "optional: how long a review ticket may stay unanswered",
     "run_timeout_seconds": "optional: wall clock for ONE run before it is cut off (exit 4)",
-    "reviewer_model": "optional: model id to record in telemetry (default: label:<label id>)",
+    "reviewer_model": "optional: model id telemetry records ONLY when the session log names none",
+    "session_log_root": "optional: the dispatcher's session-log dir; telemetry reads the model and cost there",
     "basis_snapshot_dir": "optional: tier-2 snapshot dir handed to the basis resolver",
 }
 # Each pair is (name key, id override key): one of the two must be given. Names are the
@@ -584,6 +585,7 @@ def load_config(path):
         "collect_timeout_seconds": int(raw.get("collect_timeout_seconds")
                                        or DEFAULT_COLLECT_TIMEOUT_SECONDS),
         "reviewer_model": raw.get("reviewer_model") or "",
+        "session_log_root": raw.get("session_log_root") or "",
         "basis_snapshot_dir": raw.get("basis_snapshot_dir") or "",
     }
     if cfg["threshold"] not in prl.SEVERITY_RANK:
@@ -2049,12 +2051,21 @@ def emit_telemetry(cfg, artifact, dry_run, started_at):
     tele_dir = tempfile.mkdtemp(prefix="stage-e-dry-") if dry_run else os.path.join(cfg["state_dir"], "telemetry")
     path = os.path.join(tele_dir, "%s__pr-%d.json" % (artifact["repo"].replace("/", "__"), artifact["pr"]))
     _atomic_write_json(path, artifact)
+    # KIT-130: the model and the cost are the reviewer SESSION's, and only the dispatcher
+    # recorded them — in its session log for the review ticket. A decline that stopped
+    # before any review ticket existed had no session at all, and says exactly that.
+    review_ticket = str(artifact.get("review_ticket") or "")
     ns = argparse.Namespace(
         from_review=path, from_bounce=None, out=None,
         team_key=(artifact.get("ticket_id") or "UNKNOWN").split("-", 1)[0],
-        model=cfg.get("reviewer_model") or ("label:%s" % (cfg.get("model_label_id") or "none")),
+        model=cfg.get("reviewer_model") or "",
         auth_mode="api-key", run_id="r_review_%d_%d" % (artifact["pr"], int(time.time())),
         dispatch_id="", started_at=started_at, ended_at=_now_iso(), usage=None,
+        session_logs=cfg.get("session_log_root") or "", session_issue=review_ticket,
+        session_role="run",
+        no_session="" if review_ticket else ("the review declined before a review ticket "
+                                             "existed, so no reviewer session ran"),
+        model_note="", cost_note="",
         reviewer_outcome=artifact.get("reviewer_outcome") or "",
         api_key_env=cfg["linear_key_env"], dry_run=dry_run)
     try:
@@ -4646,10 +4657,29 @@ def selftest():
                     return 0
             globals()["_optional_module"] = lambda name: _Mod if name == "pipeline_telemetry_local" else None
             art = outcome_artifact("o/r", {"number": 5}, "KIT-5", "REV-1", prl.classify(good, "high"))
-            check("telemetry present → emitted", emit_telemetry(dict(cfg, state_dir=tmp), art, True, _now_iso()), True)
+            check("telemetry present → emitted",
+                  emit_telemetry(dict(cfg, state_dir=tmp, session_log_root="/logs/root"), art,
+                                 True, _now_iso()), True)
             check("telemetry present → driven once", len(_Mod.calls), 1)
             check("telemetry credential by env NAME", _Mod.calls[0].api_key_env if _Mod.calls else None, "LINEAR_KEY_TEST_91")
             check("telemetry team key from the ticket", _Mod.calls[0].team_key if _Mod.calls else None, "KIT")
+            # KIT-130: the row is the REVIEWER session's, read from the dispatcher's log for
+            # the review ticket — never a model label posing as a model.
+            ns0 = _Mod.calls[0] if _Mod.calls else argparse.Namespace()
+            check("telemetry reads the review ticket's session log",
+                  (getattr(ns0, "session_logs", None), getattr(ns0, "session_issue", None),
+                   getattr(ns0, "session_role", None), getattr(ns0, "no_session", None)),
+                  ("/logs/root", "REV-1", "run", ""))
+            check("telemetry never passes a label as the model",
+                  str(getattr(ns0, "model", "")).startswith("label:"), False)
+            _Mod.calls.clear()
+            declined = outcome_artifact("o/r", {"number": 6}, "KIT-6", None,
+                                        decline_verdict(dict(cfg, threshold="high"), "no basis"))
+            emit_telemetry(dict(cfg, state_dir=tmp, session_log_root="/logs/root"), declined, True,
+                           _now_iso())
+            check("a decline with no review ticket says no reviewer session ran",
+                  "no reviewer session ran" in (getattr(_Mod.calls[0], "no_session", "")
+                                                if _Mod.calls else ""), True)
         globals()["_optional_module"] = real_import
         # basis_resolver_missing: "" when the sibling imports, a FAIL line naming it when not
         globals()["basis_resolver_missing"] = saved["basis_resolver_missing"]

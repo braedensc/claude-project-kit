@@ -32,7 +32,9 @@ python3 scripts/telemetry_dashboard.py --config delivery.json --days ${0:-7} --j
 
 That prints a `pipeline-dashboard/1` object: `metrics`, `cycle_time`,
 `findings_by_category`, `no_pr_runs`, `most_expensive_tickets`, `run_outcomes`,
-`totals`. **This is your only source for every number you cite.**
+`usage_coverage`, `totals`. **This is your only source for every number you cite.**
+When `usage_coverage` counts runs with an unknown model or an unmeasured cost, say so
+beside the spend figure: that spend is a floor, and the reasons it lists are why.
 
 > **Why not the rendered page.** The HTML dashboard is generated from this exact
 > object by the same script, in one `summarize()` call. If you read the page — or
