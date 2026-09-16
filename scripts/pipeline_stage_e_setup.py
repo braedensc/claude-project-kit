@@ -346,11 +346,13 @@ def review_entry_name(repo):
 # The scripts the three daemons exec. Their absence from the role account's clone
 # means the pull requests carrying them are not merged yet (card CK-1). The bounce
 # driver imports the conflict loop's marker grammar (pr_conflict.py), which imports
-# the agent-environment markers (pipeline_dispatch_local.py).
+# the agent-environment markers (pipeline_dispatch_local.py), and hosts the criteria
+# snapshot pass (pipeline_criteria_snapshot.py) that the basis resolver reads.
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_review_local.py", "pipeline_review_basis.py",
                     "pipeline_telemetry_local.py", "pipeline_finding_poller.py",
-                    "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py")
+                    "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
+                    "pipeline_criteria_snapshot.py")
 
 # The workflow states a Reviews team needs beyond the stock set. `Ready`
 # authorises nothing here — review tickets are delegated on creation — but the
