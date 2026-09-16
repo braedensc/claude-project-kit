@@ -98,7 +98,7 @@
         },
         "cost_note": {
           "type": ["string", "null"],
-          "description": "OPTIONAL. Why cost_usd and the token counters are not measured from the run's own record: the source reports no cost, or none is incurred yet. Null when they were measured, so a measured 0 still means free."
+          "description": "OPTIONAL. Why cost_usd and the token counters are not measured from the run's own record: the source reports no cost, a session cannot read its own total, or the run has not happened yet. Null when they were measured, and for a row no model session belongs to (an exact 0, its reason in model_note). A 0 with no tokens and no note still reads as unmeasured unless model_note explains the absent session (§4)."
         },
         "turns": {"$ref": "#/$defs/counter"},
         "outcome": {

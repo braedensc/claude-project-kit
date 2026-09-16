@@ -596,6 +596,7 @@ jobs:
             --out "$RUNNER_TEMP/safe-outputs/requests.json" \
             --team-key "$(jq -r '.linear.teamKey' delivery.json)" \
             --model "$MODEL" \
+            --model-note "the configured model (the PIPELINE_REVIEW_MODEL repository variable, or this workflow's default), not read from the run" \
             --auth-mode "${AUTH_MODE:-api-key}" \
             --run-id "r_review_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}" \
             --dispatch-id "$DISPATCH_ID" \

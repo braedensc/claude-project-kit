@@ -935,27 +935,6 @@ prints this and lists every key it accepts:
 }
 ```
 
-#### Where the telemetry numbers come from
-
-Stage E starts no model session itself, so neither daemon holds a model name or a cost.
-The dispatcher does: it writes each session's message stream to
-`<session_log_root>/<issue id>/session-*.jsonl`, with the model in the `init` message and
-`total_cost_usd`, tokens and turns in the `result` message. The daemons run as the
-dispatcher's own account, so they read it.
-
-| Row | Model | Cost |
-|---|---|---|
-| A review | the reviewer session's, from the review ticket's log | measured from the same log |
-| A delivered bounce | the resumed session's last run — `model_note` says so | not incurred yet — `cost_note` says so |
-| A fallback fix ticket's bounce | that ticket's log, when one exists yet | not incurred yet |
-| A conclusion, an exhaustion, a stopped-session call, a decline before any review ticket | `unknown`, with the reason in `model_note` | `0`, with the reason in `cost_note` |
-
-A `model` of `unknown` always carries `model_note`, and a cost that was not measured always
-carries `cost_note` (contract §4). The dashboard counts both per stage, so a total spend
-that includes unmeasured rows says it is a floor. The log's layout is read from the
-dispatcher's published source; if it moves, the rows say *no session log* rather than
-guessing.
-
 - `linear_api_key_env` is the driver's spelling; it also accepts the poller's
   `linear_key_env`, and `dispatcher_app_user_id` also accepts `cyrus_agent_user_id`.
 - `dispatcher_repo_names` maps a repository to the dispatcher entry name used in the
@@ -1032,6 +1011,8 @@ guessing.
 - `basis_snapshot_dir` is optional in both files. Both default to
   `<state_dir>/basis-snapshots`, so with one `state_dir` the writer and the reader meet
   without it. Set it in both or in neither.
+- `session_log_root` is the same directory as the poller's key. The driver reads the
+  re-prompted session's model there — see *Where the telemetry numbers come from* below.
 
 `~/.stage-e/finding/poller.json` — the finding poller's own, in its own directory
 (`python3 scripts/pipeline_finding_poller.py --example-config` prints the shape):
@@ -1070,6 +1051,36 @@ carrying a fill-in placeholder loads clean and runs green for weeks; the string 
 used the day a session cannot be resumed and a fallback fix ticket has to be minted — the
 one moment the system is already in trouble. Grep your own config for the placeholder text
 before you load the daemons. The poller has no such hole: it refuses a key it does not know.
+
+#### Where the telemetry numbers come from
+
+Stage E starts no model session itself, so neither daemon holds a model name or a cost.
+The dispatcher does: it writes each session's message stream to
+`<session_log_root>/<issue id>/session-*.jsonl`, with the model in the `init` message and
+`total_cost_usd`, tokens and turns in the `result` message. The daemons run as the
+dispatcher's own account, so they read it.
+
+| Row | Model | Cost |
+|---|---|---|
+| A review | the reviewer session's, from the review ticket's log | measured from the same log |
+| A delivered bounce | the resumed session's last run — `model_note` says so | not recorded — `cost_note` says so |
+| A fallback fix ticket's bounce | that ticket's log, when one exists yet | not recorded — `cost_note` says so |
+| A conclusion, an exhaustion, a stopped-session call, a decline before any review ticket | `unknown`, with the reason in `model_note` | an exact `0`: no model ran, so no `cost_note` |
+
+**Stage E never records a bounce's fix run.** The bounce row is written before the
+re-prompted session runs, and no later row records that run. Its cost stays only in the
+dispatcher's session log (no ticket yet).
+
+A `model` of `unknown` always carries `model_note`, and a cost that was not measured always
+carries `cost_note` (contract §4). The dashboard counts both per stage. Every cost figure
+that includes an unmeasured run says it is a floor: spend, cost per merged PR, and each
+ticket's cost.
+
+A missing or unlistable `session_log_root` is a configuration fault. Every row then says
+so and names the path. One issue with no log says only that. The installer writes the
+path but does not check that it exists or that the daemons can list it (no ticket yet).
+The log's layout is read from the dispatcher's published source; if it moves, the rows
+say *no session log* rather than guessing.
 
 ### 3d. Three system LaunchDaemons
 

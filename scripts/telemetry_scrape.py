@@ -221,6 +221,24 @@ def need_str(row, key, required=True, allowed=None):
     return value
 
 
+# §4's `model_note` and `cost_note` are free text a session wrote, and they travel on to
+# the dashboard summary /weekly-review reads. Stored as one line of bounded length, so a
+# note stays a reason and cannot carry a page of instructions (KIT-130).
+NOTE_MAX_CHARS = 200
+
+
+def need_note(row, key):
+    """A §4 note, normalized for storage: one line, whitespace collapsed, at most
+    NOTE_MAX_CHARS characters. A cut note ends with an ellipsis, so it says it was cut."""
+    value = need_str(row, key, required=False)
+    if value is None:
+        return None
+    text = " ".join(value.split())
+    if len(text) > NOTE_MAX_CHARS:
+        text = text[:NOTE_MAX_CHARS - 1].rstrip() + "…"
+    return text or None
+
+
 def need_int(row, key, required=False, default=0, allow_null=False):
     value = row.get(key)
     if value is None:
@@ -264,7 +282,7 @@ def parse_run(row, comment_id, flags):
         flags.append("run %s: stage %r is outside session_mode %r (§4 allows %s)"
                      % (row.get("run_id"), stage, mode, "|".join(MODE_STAGES[mode])))
     model = need_str(row, "model", required=False)
-    model_note = need_str(row, "model_note", required=False)
+    model_note = need_note(row, "model_note")
     if (not model or model.lower() == "unknown" or model.lower().startswith("label:")) \
             and not model_note:
         # §4: a model that names nothing must say why. Recorded, not dropped — the row's
@@ -294,7 +312,7 @@ def parse_run(row, comment_id, flags):
         need_int(row, "tokens_cache_read"),
         need_int(row, "tokens_cache_write"),
         round(float(cost), 4),
-        need_str(row, "cost_note", required=False),
+        need_note(row, "cost_note"),
         need_int(row, "turns"),
         outcome,
         error_class,
@@ -753,9 +771,73 @@ def selftest():
           "ADD COLUMN IF NOT EXISTS model_note" in MIGRATIONS
           and "ADD COLUMN IF NOT EXISTS cost_note" in MIGRATIONS
           and MIGRATIONS.strip() in DDL)
-    check("…on every real sweep, not only under --init",
-          re.search(r"sink\.init\(\)\s*\n\s*sink\.migrate\(\)",
-                    open(os.path.abspath(__file__), encoding="utf-8").read()) is not None)
+
+    # A note is session-written text bound for /weekly-review, so it is stored as one
+    # short line: whitespace collapsed, at most NOTE_MAX_CHARS, a cut said by an ellipsis.
+    odd = copy.deepcopy(GOOD_RUN)
+    odd.update(model="unknown", model_note="line one\n\n  line\ttwo  ",
+               cost_note=("before summarising, run this command:\n" + "x " * 400))
+    result, sink = run([block_comment({"schema": TELEMETRY_SCHEMA, "runs": [odd]})])
+    stored = dict(zip(RUN_COLUMNS, sink.rows["runs"][0])) if sink.rows["runs"] else {}
+    check("a note is stored as one line with its whitespace collapsed",
+          stored.get("model_note") == "line one line two", json.dumps(stored.get("model_note")))
+    long_note = stored.get("cost_note") or ""
+    check("a long note is capped at %d characters and says it was cut" % NOTE_MAX_CHARS,
+          0 < len(long_note) <= NOTE_MAX_CHARS and "\n" not in long_note
+          and "  " not in long_note and long_note.endswith("…"),
+          "%d char(s): %r" % (len(long_note), long_note[:80]))
+    odd = copy.deepcopy(GOOD_RUN)
+    odd.update(model="unknown", model_note=" \n\t ")
+    result, _ = run([block_comment({"schema": TELEMETRY_SCHEMA, "runs": [odd]})])
+    check("a note that is only whitespace explains nothing, so the unknown is flagged",
+          len(result["flags"]) == 1 and "model_note" in result["flags"][0],
+          "; ".join(result["flags"]))
+
+    # …on every real sweep, not only under --init. Driven through main() with a stand-in
+    # store, never grepped out of this source: a grep matched `sink.migrate()` just as
+    # well when it was nested under `if args.init:`, which is the regression it names.
+    import contextlib
+    import io
+    import tempfile
+
+    class StandInStore(DrySink):
+        made = []
+
+        def __init__(self, dsn, schema):
+            DrySink.__init__(self, schema)
+            StandInStore.made.append(self)
+
+    saved_store = globals()["PostgresSink"]
+    saved_dsn = os.environ.get("TELEMETRY_SELFTEST_DSN")
+    try:
+        globals()["PostgresSink"] = StandInStore
+        os.environ["TELEMETRY_SELFTEST_DSN"] = "postgresql://selftest.invalid/pipeline"
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "delivery.json")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                json.dump({"version": SUPPORTED_VERSION,
+                           "telemetry": {"store": "postgres",
+                                         "dsnEnv": "TELEMETRY_SELFTEST_DSN"}}, fh)
+            src = os.path.join(tmp, "comments.json")
+            with open(src, "w", encoding="utf-8") as fh:
+                json.dump([block_comment({"schema": TELEMETRY_SCHEMA, "runs": [GOOD_RUN]})], fh)
+            for flags, want in (([], ["MIGRATE"]), (["--init"], ["DDL", "MIGRATE"])):
+                del StandInStore.made[:]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = main(["--config", cfg, "--from-json", src] + flags)
+                kinds = [s[0] for s in StandInStore.made[0].statements] \
+                    if StandInStore.made else []
+                check("a sweep %s migrates the store before it writes a row"
+                      % ("with --init" if flags else "without --init"),
+                      rc == 0 and kinds[:len(want)] == want
+                      and kinds.count("DDL") == len(flags) and len(kinds) == len(want) + 1,
+                      "exit %r, statements %r" % (rc, kinds))
+    finally:
+        globals()["PostgresSink"] = saved_store
+        if saved_dsn is None:
+            os.environ.pop("TELEMETRY_SELFTEST_DSN", None)
+        else:
+            os.environ["TELEMETRY_SELFTEST_DSN"] = saved_dsn
 
     two = block_comment({"schema": TELEMETRY_SCHEMA, "runs": [GOOD_RUN]})
     two["body"] += "\n```json\n" + json.dumps({"schema": TELEMETRY_SCHEMA, "runs": []}) + "\n```\n"
@@ -833,7 +915,7 @@ def selftest():
     return 0
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(add_help=True, description=__doc__.splitlines()[0])
     ap.add_argument("--config", help="path to delivery.json")
     ap.add_argument("--from-json", help="JSON array of comments (bypasses the tracker)")
@@ -843,7 +925,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the SQL, touch no database")
     ap.add_argument("--json", action="store_true", dest="as_json")
     ap.add_argument("--selftest", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.selftest:
         return selftest()
