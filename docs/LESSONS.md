@@ -265,6 +265,15 @@ assign the owner on create AND on every comment, so the notification reason beco
 mention/assign = email + GitHub Mobile phone push, zero new secrets. One manual step:
 install GitHub Mobile and enable push.
 
+**"The owner" is not a person on an organization's repo.** That chassis @mentioned and
+assigned `context.repo.owner` — on an org-owned repository an org, which a mention does
+not notify and an assignment cannot name. The issue opened, looked delivered, and paged
+nobody: detection without delivery again, one level down. The alert templates now page the
+`ALERT_PAGE_TO` repository variable, else the owner *only when the owner is a person*, name
+the recipient in the issue, and **fail the run** when nobody can be notified
+(`scripts/check_alert_pages.py` runs every copy). The general form: a notification's
+recipient must be resolved to a person or the notifier must go red — never assumed.
+
 **Skip-green preflights become a silent half-deploy hole once secrets exist — and they
 blind the alerting layer.** Skip-green (a fork is never red) is right pre-configuration,
 and stays right for low-stakes crons (backup/keepalive). For the deploy it is

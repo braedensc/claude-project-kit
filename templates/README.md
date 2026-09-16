@@ -17,7 +17,7 @@ for a dispatcher's sessions.
 |---|---|---|
 | `workflows/ci.yml` | `.github/workflows/ci.yml` (replacing the kit's own) | App CI: secret-scan + forbidden paths, lint, typecheck, test, non-required e2e smoke |
 | `workflows/deploy-on-green.yml` | `.github/workflows/deploy-on-green.yml` | Deploy-on-green: `workflow_run` gate → migrate → deploy, tree-derived targets + all-function smoke, with every production lesson inline |
-| `workflows/pipeline-failure-alert.yml` | `.github/workflows/pipeline-failure-alert.yml` | `workflow_run` failure on main → one deduped issue, owner @mention+assign (email + phone push); post-merge failures are otherwise silent |
+| `workflows/pipeline-failure-alert.yml` | `.github/workflows/pipeline-failure-alert.yml` | `workflow_run` failure on main → one deduped issue, @mention+assign a person (email + phone push; see *Who an alert pages* below); post-merge failures are otherwise silent |
 | `workflows/backup-cron.yml` | `.github/workflows/backup-cron.yml` | Daily encrypted `pg_dump` → artifact, with the IPv6/pooler/role gotchas inline |
 | `workflows/keepalive.yml` | `.github/workflows/keepalive.yml` | Free-tier anti-pause ping (401-is-healthy pattern) |
 | `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | A PR that goes CONFLICTING (it skips required CI and can look green) gets a bounded fix request, answered by the conflict waker or the bounce driver; unanswered, it pages the owner |
@@ -77,3 +77,21 @@ low-stakes and visible elsewhere); for **deploy-on-green it is lifecycle-bound**
 after your first successful deploy, flip its preflights to the fail-loud
 variants commented inline — post-seed, a skipped deploy is a silent half-deploy
 on a green run, and a green run is invisible to `pipeline-failure-alert.yml`.
+
+**Who an alert pages.** `pipeline-failure-alert`, `cron-health`, `frontend-uptime` and
+`migration-drift` @mention and assign whoever the **`ALERT_PAGE_TO`** repository variable
+names (logins or `org/team`, comma-separated; a team is mentioned, never assigned). With
+no variable they page the repository owner — but only when the owner is a person. An
+@mention of an *organization* notifies nobody and an organization cannot be assigned, so
+on an org-owned repository an unset variable does not fail quietly: the issue is still
+filed, says **Nobody was paged**, and the run goes red. Every issue names who was paged
+and why. Set it once for all four (Settings → Secrets and variables → Actions →
+Variables; it is not a secret):
+
+```bash
+gh variable set ALERT_PAGE_TO --body "your-login"
+```
+
+The rule is one block copied into each template, so a template stays a single file after
+activation. `scripts/check_alert_pages.py` runs every copy under node against a mock
+GitHub and fails when the copies drift.

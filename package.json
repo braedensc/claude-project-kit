@@ -43,6 +43,7 @@
     "test:conflict": "python3 scripts/pr_conflict.py --selftest",
     "test:conflict-waker-setup": "python3 scripts/pipeline_conflict_waker_setup.py --selftest",
     "test:union": "python3 scripts/check_pr_union.py --selftest",
+    "test:alert-pages": "python3 scripts/check_alert_pages.py",
     "lint:secrets": "git ls-files -z | xargs -0 secretlint --secretlintrc .secretlintrc.json",
     "prepare": "husky"
   },

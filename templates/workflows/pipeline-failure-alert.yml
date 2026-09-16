@@ -6,12 +6,20 @@ name: Pipeline failure alert
 # green is SEPARATE from the post-merge prod deploy, and the deploy failed in
 # the Actions tab for hours with nothing surfacing it. This reacts to a watched
 # workflow finishing with `failure` on main and opens (or comments on) ONE
-# deduplicated GitHub issue, @mentioning and assigning the repo owner so the
-# alert actually reaches a human.
+# deduplicated GitHub issue, @mentioning and assigning a person so the alert
+# actually reaches a human.
 #
-# STACK-NEUTRAL: pure actions/github-script + context.repo.owner — zero new
-# secrets, zero placeholders, and decoupled via workflow_run (no edits to the
-# watched workflows needed). Two operational requirements:
+# WHO is paged: the ALERT_PAGE_TO repository variable (logins or org/team,
+# comma-separated) when set; else the repository owner when that is a person.
+# An @mention of an ORGANIZATION notifies nobody and an org cannot be assigned,
+# so on an org-owned repo with no variable set the issue says "Nobody was paged"
+# and this run FAILS — set the variable (Settings → Secrets and variables →
+# Actions → Variables). It is not a secret. Every alert template reads the same
+# variable.
+#
+# STACK-NEUTRAL: pure actions/github-script — zero new secrets, zero
+# placeholders, and decoupled via workflow_run (no edits to the watched
+# workflows needed). Two operational requirements:
 #   • workflow_run reads THIS FILE on the DEFAULT branch — it only fires once
 #     merged to main; you cannot exercise it from a feature branch
 #     (docs/LESSONS.md).
@@ -53,15 +61,63 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/github-script@v7
+        env:
+          ALERT_PAGE_TO: ${{ vars.ALERT_PAGE_TO }}
         with:
           script: |
             const run = context.payload.workflow_run
             const owner = context.repo.owner
             const repo = context.repo.repo
+            // ── WHO THIS ALERT PAGES ── identical in every alert template (scripts/check_alert_pages.py
+            // runs each copy). An @mention of an ORGANIZATION notifies nobody and an organization
+            // cannot be assigned, so the repository owner is never paged blindly. In order: the
+            // ALERT_PAGE_TO repository variable (logins or org/team, comma- or space-separated);
+            // else the owner, when the owner is a person. When neither applies the issue is still
+            // filed, says "Nobody was paged", and the run FAILS: a page that reaches nobody must
+            // not look delivered.
+            async function alertRecipients() {
+              const { owner, repo } = context.repo
+              const names = (process.env.ALERT_PAGE_TO || '').split(/[\s,]+/).filter(Boolean).map((n) => n.replace(/^@/, ''))
+              // A login, or an org/team slug. Nothing else is ever embedded after an `@`.
+              const mentionable = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$/
+              const rejected = names.filter((n) => !mentionable.test(n))
+              const logins = [...new Set(names.filter((n) => mentionable.test(n)))]
+              if (logins.length) return { logins, whose: 'ALERT_PAGE_TO', rejected }
+              let ownerType
+              try {
+                ownerType = (await github.rest.repos.get({ owner, repo })).data.owner.type
+              } catch (e) {
+                core.warning(`could not read who owns ${owner}/${repo}: ${e.message}`)
+                return { logins: [], whose: 'this run could not read who owns the repository. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+              }
+              if (ownerType === 'User') return { logins: [owner], whose: 'the repository owner', rejected }
+              return { logins: [], whose: 'the repository owner is an organization, which an @mention does not notify. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+            }
+            function pageLine({ logins, whose }, what) {
+              if (!logins.length) return `**Nobody was paged:** ${whose}.`
+              return `cc ${logins.map((l) => '@' + l).join(', ')} (${whose}) — ${what}`
+            }
+            // Assign whoever the page names (the "assign" reason keeps them subscribed to later
+            // comments), then fail the run if the page named nobody or the variable was malformed.
+            async function page(issue_number, { logins, whose, rejected }) {
+              const { owner, repo } = context.repo
+              const people = logins.filter((l) => !l.includes('/')) // a team is mentioned, never assigned
+              if (people.length) {
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: people })
+                } catch (e) { // e.g. not a collaborator: the @mention is the page, this is extra
+                  core.warning(`#${issue_number}: could not assign ${people.join(', ')}: ${e.message}`)
+                }
+              }
+              if (rejected.length) core.setFailed(`ALERT_PAGE_TO names ${JSON.stringify(rejected)}, which is not a GitHub login or org/team`)
+              if (!logins.length) core.setFailed(`#${issue_number}: this alert paged NOBODY — ${whose}.`)
+            }
+            // ── end WHO THIS ALERT PAGES ──
             // The stable title IS the dedupe key — change it and you fork a second
             // issue instead of commenting on the existing one. One issue per watched
             // workflow (run.name), regardless of how many runs fail.
             const title = `🚨 ${run.name} is failing on main`
+            const recipients = await alertRecipients()
             const body = [
               `**${run.name}** run [#${run.run_number}](${run.html_url}) finished with \`failure\` on \`${run.head_branch}\` (commit \`${run.head_sha.slice(0, 7)}\`).`,
               '',
@@ -69,23 +125,24 @@ jobs:
               '',
               `Investigate the failing job: \`gh run view ${run.id} --log-failed\``,
               '',
-              // @mention the repo owner so the notification reason is "mention"
+              // @mention a person so the notification reason is "mention"
               // (delivered + emailed even under a "Participating and @mentions"
               // watch, and pushed by GitHub Mobile) rather than "subscribed" —
               // which a solo owner can silently miss. Repeated on EVERY comment so
               // a still-failing pipeline keeps nudging instead of going quiet after
               // the first (missed) issue.
-              `cc @${owner} — this pipeline is broken on main until resolved.`,
+              pageLine(recipients, 'this pipeline is broken on main until resolved.'),
             ].join('\n')
             const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
             const existing = open.data.find((i) => i.title === title && !i.pull_request)
+            let number
             if (existing) {
               await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
-              core.info(`Commented on #${existing.number}`)
+              number = existing.number
+              core.info(`Commented on #${number}`)
             } else {
-              // assignees:[owner] adds the "assign" notification reason and keeps
-              // the owner subscribed, so later comments on this same issue also
-              // reach them.
-              const created = await github.rest.issues.create({ owner, repo, title, body, assignees: [owner] })
-              core.info(`Opened #${created.data.number}`)
+              const created = await github.rest.issues.create({ owner, repo, title, body })
+              number = created.data.number
+              core.info(`Opened #${number}`)
             }
+            await page(number, recipients)

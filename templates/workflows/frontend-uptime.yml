@@ -10,9 +10,15 @@ name: Frontend uptime check
 # deploys via its own host (Vercel/Netlify/Pages) entirely OUTSIDE the deploy
 # pipeline, so a green backend deploy says NOTHING about the app users see. This
 # curls the prod site every ~15 min and, if it is unreachable or not serving the
-# app shell, opens/updates a GitHub issue (assigning + @mentioning the owner,
+# app shell, opens/updates a GitHub issue (assigning + @mentioning a person,
 # same chassis as the other monitors). Catches: hard-down, provider error page,
 # DNS/domain break, deleted project, host outage.
+#
+# WHO is paged: the ALERT_PAGE_TO repository variable (logins or org/team,
+# comma-separated) when set; else the repository owner when that is a person.
+# On an org-owned repo with no variable set, an outage still files the issue,
+# which says "Nobody was paged", and the run FAILS — an @mention of an
+# organization notifies nobody (see pipeline-failure-alert.yml).
 #
 # What it does NOT catch: a STALE-but-serving build (a failed frontend BUILD
 # keeps the last good deploy live, still HTTP 200). For that, enable your host's
@@ -20,10 +26,11 @@ name: Frontend uptime check
 # Notifications). Schema skew (frontend ahead of a failed migration) belongs to
 # the deploy pipeline's own alerting (deploy-failure-alert.yml).
 #
-# Config (repo → Settings → Secrets and variables → Actions → Variables — both
+# Config (repo → Settings → Secrets and variables → Actions → Variables — all
 # are public values, so they are repo VARIABLES, not secrets):
 #   gh variable set FRONTEND_URL --body "https://your-app.example.com"
 #   gh variable set APP_SHELL_MARKER --body "<title>YourApp</title>"
+#   gh variable set ALERT_PAGE_TO --body "your-login"   # required on an org-owned repo
 # APP_SHELL_MARKER is a string only the REAL app shell serves (its <title> is
 # the classic choice) — it catches provider error/placeholder pages that still
 # return HTTP 200. Until FRONTEND_URL is set the job runs green but SKIPS, so an
@@ -102,28 +109,79 @@ jobs:
         env:
           FRONTEND_URL: ${{ vars.FRONTEND_URL }}
           LAST_CODE: ${{ steps.check.outputs.last_code }}
+          ALERT_PAGE_TO: ${{ vars.ALERT_PAGE_TO }}
         with:
           script: |
             const owner = context.repo.owner
             const repo = context.repo.repo
+            // ── WHO THIS ALERT PAGES ── identical in every alert template (scripts/check_alert_pages.py
+            // runs each copy). An @mention of an ORGANIZATION notifies nobody and an organization
+            // cannot be assigned, so the repository owner is never paged blindly. In order: the
+            // ALERT_PAGE_TO repository variable (logins or org/team, comma- or space-separated);
+            // else the owner, when the owner is a person. When neither applies the issue is still
+            // filed, says "Nobody was paged", and the run FAILS: a page that reaches nobody must
+            // not look delivered.
+            async function alertRecipients() {
+              const { owner, repo } = context.repo
+              const names = (process.env.ALERT_PAGE_TO || '').split(/[\s,]+/).filter(Boolean).map((n) => n.replace(/^@/, ''))
+              // A login, or an org/team slug. Nothing else is ever embedded after an `@`.
+              const mentionable = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$/
+              const rejected = names.filter((n) => !mentionable.test(n))
+              const logins = [...new Set(names.filter((n) => mentionable.test(n)))]
+              if (logins.length) return { logins, whose: 'ALERT_PAGE_TO', rejected }
+              let ownerType
+              try {
+                ownerType = (await github.rest.repos.get({ owner, repo })).data.owner.type
+              } catch (e) {
+                core.warning(`could not read who owns ${owner}/${repo}: ${e.message}`)
+                return { logins: [], whose: 'this run could not read who owns the repository. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+              }
+              if (ownerType === 'User') return { logins: [owner], whose: 'the repository owner', rejected }
+              return { logins: [], whose: 'the repository owner is an organization, which an @mention does not notify. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+            }
+            function pageLine({ logins, whose }, what) {
+              if (!logins.length) return `**Nobody was paged:** ${whose}.`
+              return `cc ${logins.map((l) => '@' + l).join(', ')} (${whose}) — ${what}`
+            }
+            // Assign whoever the page names (the "assign" reason keeps them subscribed to later
+            // comments), then fail the run if the page named nobody or the variable was malformed.
+            async function page(issue_number, { logins, whose, rejected }) {
+              const { owner, repo } = context.repo
+              const people = logins.filter((l) => !l.includes('/')) // a team is mentioned, never assigned
+              if (people.length) {
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: people })
+                } catch (e) { // e.g. not a collaborator: the @mention is the page, this is extra
+                  core.warning(`#${issue_number}: could not assign ${people.join(', ')}: ${e.message}`)
+                }
+              }
+              if (rejected.length) core.setFailed(`ALERT_PAGE_TO names ${JSON.stringify(rejected)}, which is not a GitHub login or org/team`)
+              if (!logins.length) core.setFailed(`#${issue_number}: this alert paged NOBODY — ${whose}.`)
+            }
+            // ── end WHO THIS ALERT PAGES ──
             // The stable title IS the dedupe key — change it and you fork the issue.
             const title = '🚨 Production frontend is unreachable'
+            const recipients = await alertRecipients()
             const body = [
               `The synthetic uptime check could not load ${process.env.FRONTEND_URL} (last HTTP \`${process.env.LAST_CODE || 'no response'}\`; app-shell marker missing).`,
               '',
               'The frontend is served by its own host, OUTSIDE the deploy pipeline, so this is likely the only automated detector for it. Check the host dashboard (latest deployment + build logs) and load the site directly.',
               '',
-              // @mention + assign so this reaches the owner even under a "Participating
-              // and @mentions" watch (see deploy-failure-alert.yml). Repeated on every
+              // @mention + assign so this reaches a person even under a "Participating
+              // and @mentions" watch (see pipeline-failure-alert.yml). Repeated on every
               // comment so a sustained outage keeps nudging.
-              `cc @${owner} — the app is down for users.`,
+              pageLine(recipients, 'the app is down for users.'),
             ].join('\n')
             const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
             const existing = open.data.find((i) => i.title === title && !i.pull_request)
+            let number
             if (existing) {
               await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
-              core.info(`Updated #${existing.number}`)
+              number = existing.number
+              core.info(`Updated #${number}`)
             } else {
-              const created = await github.rest.issues.create({ owner, repo, title, body, assignees: [owner] })
-              core.info(`Opened #${created.data.number}`)
+              const created = await github.rest.issues.create({ owner, repo, title, body })
+              number = created.data.number
+              core.info(`Opened #${number}`)
             }
+            await page(number, recipients)

@@ -194,6 +194,8 @@ npm run test:conflict        # conflict loop: fix request, bounded escalation, u
 npm run test:conflict-waker-setup  # the waker's installer: a user LaunchAgent, signed-off
                              #   dry run, stale heartbeat = NOT RUNNING, no sudo path
 npm run test:union           # union check: green alone + red together, bisected, report-only
+npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
+                             #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
 npm install             # installs husky + secretlint, wires the pre-commit hook
@@ -216,7 +218,7 @@ deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
 `docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
-validation, the reusable-workflow call-contract check, the forbidden-paths gate,
+validation, the reusable-workflow call-contract check, the alert-page check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
 and weekly-review selftests, and secretlint on every PR. `main` is protected: **three** contexts are required —
