@@ -15,6 +15,11 @@ and the finding poller's), one repository entry per reviewed repository in the
 dispatcher's own config, and three system LaunchDaemons running one-shot
 passes — review poller, bounce driver, finding poller.
 
+A fourth system LaunchDaemon reads those three's heartbeats: the heartbeat
+monitor (scripts/pipeline_heartbeat_monitor.py, KIT-127). It comments on ONE
+ticket when their health changes, so the `heartbeat-monitor` step stops on a card
+until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name.
+
 And one thing that is NOT the role account's: the `conflict-waker` step installs
 the local half of the conflict loop for the PERSON running this command — a user
 LaunchAgent that wakes that person's locally spawned sessions when their pull
@@ -507,6 +512,11 @@ CONF_DEFAULTS = {
     # then page you instead of waking a fix. Dispatcher PRs go through the bounce driver
     # either way.
     "CONFLICT_WAKER_CONF": "conflict-waker.conf",
+    # The heartbeat monitor (KIT-127): the ticket its one comment per incident lands on.
+    # Empty stops the `heartbeat-monitor` step on card CK-9 until a person names one;
+    # `off` leaves the three heartbeats unread, BY NAME.
+    "HEARTBEAT_MONITOR_TICKET": "",
+    "MONITOR_INTERVAL_SECONDS": "1800",
 }
 # The kit's own grader-path guard, by name — the one check a session can never turn
 # green, because it is red exactly until a person applies the label it demands. It is
@@ -525,6 +535,7 @@ _ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 _RDNS_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([0-9]+)$")
 # A value with a credential shape must never reach this file. Prefix match plus
 # a long high-entropy blob; the message names the KEY only.
 _CRED_PREFIXES = ("lin_api_", "lin_oauth_", "github_pat_", "ghp_", "gho_", "ghs_",
@@ -651,11 +662,15 @@ def validate_conf(values):
                       "comment transport reads those two and nothing else, and the bounce "
                       "driver does not mirror a renamed variable — every comment it posts "
                       "would fail weeks later, at exhaustion time")
+    monitor_value = (conf.get("HEARTBEAT_MONITOR_TICKET") or "").strip()
+    if monitor_value and monitor_value.lower() != "off" and not _TICKET_ID_RE.match(monitor_value):
+        errors.append("HEARTBEAT_MONITOR_TICKET must be a ticket id like KIT-123, or `off` "
+                      "(got %r)" % monitor_value)
     if conf.get("SEVERITY_THRESHOLD") not in ("low", "medium", "high", "critical"):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
     for key in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS",
-                "FINDING_INTERVAL_SECONDS", "DIFF_CAP_CHARS",
+                "FINDING_INTERVAL_SECONDS", "MONITOR_INTERVAL_SECONDS", "DIFF_CAP_CHARS",
                 # A retention of ZERO would delete the copy it just took, which
                 # is the one thing the whole step refuses to proceed without.
                 "CONFIG_BACKUPS_KEPT"):
@@ -701,6 +716,19 @@ def all_daemon_labels(conf):
     """Every Stage E daemon label, review + bounce + finding — for the loops that
     install, load and check all of them uniformly."""
     return daemon_labels(conf) + (finding_label(conf),)
+
+
+def monitor_label(conf):
+    """The heartbeat monitor's launchd label, beside the other three. NOT in
+    `all_daemon_labels`: its own step installs, loads and checks it, because it is
+    off by name on some machines and it must never block the three it watches."""
+    return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-monitor"
+
+
+def monitor_ticket(conf):
+    """The ticket the monitor comments on, `off`, or "" while nobody has named one."""
+    value = (conf.get("HEARTBEAT_MONITOR_TICKET") or "").strip()
+    return "off" if value.lower() == "off" else value
 
 
 # --------------------------------------------------------------------------- #
@@ -1039,6 +1067,10 @@ def _refusal_hint(query, msgs):
 # halfway through a build-out — and it is what lets a REJECTED stored key be
 # told apart from an ABSENT one, which are different facts with the same silence.
 Q_VIEWER = "query Viewer { viewer { id } }"
+# The heartbeat monitor's ticket, proved to exist before a job is loaded to comment on it.
+Q_ISSUE_BY_NUMBER = ("query FindIssueByNumber($team: String!, $number: Float!) "
+                     "{ issues(filter: { team: { key: { eq: $team } }, "
+                     "number: { eq: $number } }, first: 1) { nodes { id identifier } } }")
 
 
 def mutation_ok(data, field):
@@ -1432,6 +1464,24 @@ CARDS = {
                "--initials " + INITIALS_PLACEHOLDER + " --note \"count read: N\"",
                "Not wanted on this machine? Set CONFLICT_WAKER_CONF=off in stage-e.conf instead."],
         "good": "the waker's dry-run count is the count you meant",
+        "attest": None,
+    },
+    "CK-9": {
+        "title": "Name the ticket the heartbeat monitor comments on",
+        "why": ("The three daemons each write a heartbeat, and nothing reads them unless the "
+                "heartbeat monitor runs. It is deterministic code on the role account: no "
+                "model and no session. Its only tracker write is one comment, on one ticket, "
+                "when the daemons' health changes, and one more when it recovers. Which "
+                "ticket that is, and whether you want those comments at all, is yours to "
+                "decide. Without it, a daemon that stops is silent."),
+        "do": ["Pick an open ticket you read, on a work team. Name it in stage-e.conf:",
+               "    HEARTBEAT_MONITOR_TICKET=KIT-123",
+               "Then run the installer again. It checks that the ticket exists, runs the",
+               "monitor's own check, and loads it:",
+               "    python3 scripts/pipeline_stage_e_setup.py run",
+               "Not wanted on this machine? Set HEARTBEAT_MONITOR_TICKET=off instead. Then",
+               "nothing reads the heartbeats but you."],
+        "good": "the heartbeat-monitor row says loaded, commenting on your ticket",
         "attest": None,
     },
 }
@@ -2052,6 +2102,11 @@ def step_code(ctx, apply_it):
                                                           head.out.strip() or "?"), []
 
     stop_labels = all_daemon_labels(conf)
+    # The heartbeat monitor execs from the same clone. It is stopped whenever it is
+    # loaded, even under `off` (its own step removes it then), and only then: a job this
+    # machine never loaded is not one to report as switched off.
+    if r.as_root(["launchctl", "print", "system/" + monitor_label(conf)]).ok:
+        stop_labels = stop_labels + (monitor_label(conf),)
     for label in stop_labels:
         # Unload before touching the code every job execs out of — the finding
         # poller runs from the same clone as review and bounce. `bootout` on a
@@ -3605,6 +3660,9 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 # launchd's own default PATH carries no package-manager prefix, so a daemon
 # would silently take a different transport from the one a terminal measures.
 DAEMON_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Every daemon's command starts here: its credentials from the role account's own env
+# file, and Apple's interpreter by full path (Step 3d says why).
+DAEMON_EXEC = 'set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 '
 
 
 def _plists(ctx):
@@ -3614,7 +3672,7 @@ def _plists(ctx):
     conf = ctx.conf
     poller_label, bounce_label = daemon_labels(conf)
     home = ctx.role_home
-    common = 'set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 '
+    common = DAEMON_EXEC
     return {
         poller_label: PLIST.format(
             label=poller_label, account=ctx.account, home=home, path=DAEMON_PATH,
@@ -3658,26 +3716,31 @@ def step_daemons(ctx, apply_it):
         return False, "would install: " + ", ".join(sorted(stale)), []
 
     for label in sorted(stale):
-        fd, tmp = tempfile.mkstemp(prefix="stage-e-", suffix=".plist")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(want[label])
-            lint = r.read(["plutil", "-lint", tmp])
-            if not lint.ok:
-                raise SetupError("the plist this installer rendered for %s does not parse: "
-                                 "%s" % (label, (lint.out or lint.err).strip()[:200]))
-            res = r.as_root(["install", "-o", "root", "-g", "wheel", "-m", "644",
-                             tmp, _dispatcher_plist(label)],
-                            why="install %s (root:wheel 644, as launchd requires)" % label)
-            if not res.ok and not res.skipped:
-                raise SetupError("could not install %s: %s"
-                                 % (label, (res.err or "").strip()[:200]))
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        _install_plist(r, label, want[label])
     return False, "installed " + ", ".join(sorted(stale)) + " (not loaded yet — CK-5)", []
+
+
+def _install_plist(r, label, body):
+    """Lint one rendered plist, then install it root:wheel 644. Loads nothing."""
+    fd, tmp = tempfile.mkstemp(prefix="stage-e-", suffix=".plist")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        lint = r.read(["plutil", "-lint", tmp])
+        if not lint.ok:
+            raise SetupError("the plist this installer rendered for %s does not parse: "
+                             "%s" % (label, (lint.out or lint.err).strip()[:200]))
+        res = r.as_root(["install", "-o", "root", "-g", "wheel", "-m", "644",
+                         tmp, _dispatcher_plist(label)],
+                        why="install %s (root:wheel 644, as launchd requires)" % label)
+        if not res.ok and not res.skipped:
+            raise SetupError("could not install %s: %s"
+                             % (label, (res.err or "").strip()[:200]))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # Exit 3 is DECLINED in BOTH Stage E components (`EXIT_DECLINED` in each). It is
@@ -3818,7 +3881,7 @@ def step_enable(ctx, apply_it):
     have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
 
     if not missing and len(have_beats) == 3:
-        ctx.unloaded = []
+        ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
         return True, "all three daemons loaded and all heartbeats present", []
     if not apply_it:
         return False, "would load %s; heartbeats present: %s" % (
@@ -3854,7 +3917,8 @@ def step_enable(ctx, apply_it):
                         why="load %s" % label)
         if not res.ok and not res.skipped:
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
-    ctx.unloaded = []
+    # Only these three: a heartbeat monitor `code` stopped is the next step's to load.
+    ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
     if ctx.runner.dry_run:
         return False, "would load the daemons and wait for their heartbeats", []
 
@@ -3930,6 +3994,246 @@ def step_conflict_waker(ctx, apply_it):
     return False, "conflict waker: " + trail, []
 
 
+# --------------------------------------------------------------------------- #
+# The heartbeat monitor — the job that reads the other three's heartbeats (KIT-127)
+# --------------------------------------------------------------------------- #
+MONITOR_SCRIPT = "pipeline_heartbeat_monitor.py"
+MONITOR_CONFIG = "monitor.json"
+MONITOR_LOG = "monitor.log"
+MONITOR_HEARTBEAT = "state/monitor-heartbeat.json"
+# scripts/pipeline_heartbeat_monitor.py's own names, held here for the reason
+# COMPONENT_EXIT_DECLINED is: this file runs while the clone carrying that script is the
+# thing being installed. The battery imports the monitor and asserts they still agree.
+MONITOR_HEARTBEAT_SCHEMA = "pipeline-heartbeat-monitor-heartbeat/1"
+MONITOR_JOBS = (("review-poller", "POLL_INTERVAL_SECONDS"),
+                ("bounce-driver", "BOUNCE_INTERVAL_SECONDS"),
+                ("finding-poller", "FINDING_INTERVAL_SECONDS"))
+MONITOR_STALE_MULTIPLIER = 2
+MONITOR_RUN_TIMEOUT_SECONDS = 120
+# `declined` is a pass that judged and held its comment for the cooldown — a choice the
+# config made. `error`, `usage` and `timeout` are a monitor that could not do its job.
+MONITOR_GOOD_RESULTS = ("ok", "declined")
+MONITOR_HEARTBEAT_POLLS = 18
+MONITOR_HEARTBEAT_POLL_SECONDS = 5
+
+
+def monitor_config(conf):
+    """The monitor's config, from the same conf values the three daemons are scheduled
+    by — so its idea of "stale" is always the interval launchd really uses."""
+    return {
+        "state_dir": "~/.stage-e/state",
+        "finding_state_dir": "~/.stage-e/finding",
+        "watch": [job for job, _key in MONITOR_JOBS],
+        "intervals": {job: int(conf[key]) for job, key in MONITOR_JOBS},
+        "run_interval_seconds": int(conf["MONITOR_INTERVAL_SECONDS"]),
+        "stale_multiplier": MONITOR_STALE_MULTIPLIER,
+        "run_timeout_seconds": MONITOR_RUN_TIMEOUT_SECONDS,
+        "notify_ticket_id": monitor_ticket(conf),
+        "linear_key_env": conf["LINEAR_KEY_ENV"],
+    }
+
+
+def _monitor_plist(ctx):
+    return PLIST.format(
+        label=monitor_label(ctx.conf), account=ctx.account, home=ctx.role_home,
+        path=DAEMON_PATH,
+        command=(DAEMON_EXEC + '"$HOME/.stage-e/kit/scripts/%s" run --config '
+                               '"$HOME/.stage-e/%s"' % (MONITOR_SCRIPT, MONITOR_CONFIG)),
+        interval=int(ctx.conf["MONITOR_INTERVAL_SECONDS"]),
+        log=ctx.role_home + "/.stage-e/" + MONITOR_LOG)
+
+
+def monitor_stale_after(conf):
+    """Older than this, a loaded monitor is NOT RUNNING: two of its intervals, plus the
+    longest one pass may take, plus two minutes."""
+    return (MONITOR_STALE_MULTIPLIER * int(conf["MONITOR_INTERVAL_SECONDS"])
+            + MONITOR_RUN_TIMEOUT_SECONDS + 120)
+
+
+def _read_monitor_heartbeat(ctx):
+    """(doc, why_not), read as the role account out of its own state directory."""
+    got = ctx.runner.as_role(ctx.account, "cat %s/%s 2>/dev/null"
+                             % (ctx.stage_home, MONITOR_HEARTBEAT))
+    if not got.ok or not got.out.strip():
+        return None, "no heartbeat at ~/.stage-e/%s" % MONITOR_HEARTBEAT
+    try:
+        doc = json.loads(got.out)
+    except ValueError:
+        return None, "its heartbeat is not JSON"
+    if not isinstance(doc, dict) or doc.get("schema") != MONITOR_HEARTBEAT_SCHEMA:
+        return None, "its heartbeat carries an unknown schema"
+    return doc, None
+
+
+def _heartbeat_epoch(doc):
+    try:
+        return datetime.fromisoformat(str(doc.get("at") or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _monitor_off(ctx, apply_it):
+    """`off` by name. A monitor an earlier run installed is unloaded AND its plist
+    removed: a plist left in /Library/LaunchDaemons loads again at the next boot, and
+    would go on commenting under a conf that says it is off."""
+    r, label = ctx.runner, monitor_label(ctx.conf)
+    plist = _dispatcher_plist(label)
+    loaded = r.as_root(["launchctl", "print", "system/" + label]).ok
+    installed = r.read(["test", "-f", plist]).ok
+    if not loaded and not installed:
+        return True, ("OFF by conf (HEARTBEAT_MONITOR_TICKET=off): nothing reads the three "
+                      "heartbeats, so a daemon that stops is silent until someone reads them "
+                      "by hand"), []
+    if not apply_it:
+        return False, ("OFF by conf, and %s is still %s — would unload it and remove its plist"
+                       % (label, "loaded" if loaded else "installed")), []
+    if loaded:
+        out = r.as_root(["launchctl", "bootout", "system/" + label],
+                        why="unload %s: HEARTBEAT_MONITOR_TICKET=off" % label)
+        if not out.skipped:
+            _wait_until_gone(r, label, _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+    res = r.as_root(["rm", "-f", plist],
+                    why="remove %s, so the next boot does not load it again" % plist)
+    if not res.ok and not res.skipped:
+        raise SetupError("could not remove %s: %s" % (plist, (res.err or "").strip()[:200]))
+    ctx.unloaded = [l for l in ctx.unloaded if l != label]
+    return False, "OFF by conf: unloaded %s and removed its plist" % label, []
+
+
+def step_heartbeat_monitor(ctx, apply_it):
+    """The fourth role-account job: it reads the three heartbeats and comments on ONE
+    ticket when their health changes (scripts/pipeline_heartbeat_monitor.py,
+    docs/HEARTBEAT-MONITOR.md). Deterministic code — no model and no session.
+
+    Which ticket, or none, is a person's call, so an unnamed ticket is card CK-9 and
+    `off` is said by name on every run. Before it is loaded the ticket is proved to
+    exist and the monitor's own `check` runs; a loaded monitor whose heartbeat is stale
+    is NOT RUNNING, never installed."""
+    r, conf = ctx.runner, ctx.conf
+    ticket = monitor_ticket(conf)
+    if ticket == "off":
+        return _monitor_off(ctx, apply_it)
+    if not ticket:
+        raise Blocked("CK-9", "no ticket is named for the heartbeat monitor to comment on")
+    if not ctx.role_home:
+        return False, "the role account's home is not known yet", []
+    label = monitor_label(conf)
+    plist = _dispatcher_plist(label)
+
+    present = r.as_role(ctx.account, "ls %s/kit/scripts/%s 2>/dev/null"
+                        % (ctx.stage_home, MONITOR_SCRIPT))
+    if not present.ok or MONITOR_SCRIPT not in present.out:
+        raise Blocked("CK-1", "the role account's clone carries no scripts/%s" % MONITOR_SCRIPT)
+
+    # A comment to a ticket that does not exist is a page to nobody, and the monitor
+    # would find that out only at the first incident.
+    team, number = _TICKET_ID_RE.match(ticket).groups()
+    found = (((ctx.linear().post(Q_ISSUE_BY_NUMBER, {"team": team, "number": int(number)})
+               or {}).get("issues") or {}).get("nodes")) or []
+    if not found:
+        raise SetupError("HEARTBEAT_MONITOR_TICKET=%s names no ticket the stored tracker key can "
+                         "read, so every comment the monitor owes would fail. Name one that "
+                         "exists, or set it to off." % ticket)
+
+    want_conf, want_plist = monitor_config(conf), _monitor_plist(ctx)
+    got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
+    try:
+        have_conf = json.loads(got.out) if got.ok and got.out.strip() else None
+    except ValueError:
+        have_conf = None
+    conf_stale = have_conf != want_conf
+    have_plist = r.as_root(["cat", plist])
+    plist_stale = not have_plist.ok or have_plist.out != want_plist
+    loaded = r.as_root(["launchctl", "print", "system/" + label]).ok
+    doc, why_not = _read_monitor_heartbeat(ctx)
+    stamp = _heartbeat_epoch(doc) if doc else None
+    age = None if stamp is None else time.time() - stamp
+    real = bool(doc) and not doc.get("dry_run")
+
+    if not conf_stale and not plist_stale and loaded and real and age is not None:
+        if age > monitor_stale_after(conf):
+            raise Unknown("the heartbeat monitor is loaded and NOT RUNNING: its last heartbeat is "
+                          "%d s old, past the %d s two passes may take"
+                          % (int(age), monitor_stale_after(conf)),
+                          "read %s/.stage-e/%s; `sudo launchctl print system/%s` names the "
+                          "last exit" % (ctx.role_home, MONITOR_LOG, label))
+        if doc.get("result") not in MONITOR_GOOD_RESULTS:
+            raise SetupError("the heartbeat monitor runs and could not do its job: its last pass "
+                             "ended `%s` — %s" % (doc.get("result"),
+                                                  str(doc.get("detail") or "")[:300]))
+        return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`"
+                      % (ticket, int(age), doc.get("result"))), []
+
+    if not apply_it:
+        todo = (["write ~/.stage-e/%s" % MONITOR_CONFIG] if conf_stale else []) \
+            + (["install %s" % plist] if plist_stale else []) \
+            + ["%s it and wait for a heartbeat (%s)"
+               % ("reload" if loaded else "load",
+                  why_not or ("the last one was a dry run" if not real else "stale"))]
+        return False, "would " + ", then ".join(todo), []
+
+    if conf_stale:
+        body = json.dumps(want_conf, indent=2, sort_keys=True) + "\n"
+        res = r.as_role(ctx.account, "umask 077; cat > %s/%s" % (ctx.stage_home, MONITOR_CONFIG),
+                        stdin=body, why="write %s/%s" % (ctx.stage_home, MONITOR_CONFIG))
+        if not res.ok and not res.skipped:
+            raise SetupError("could not write %s: %s" % (MONITOR_CONFIG, (res.err or "")[:200]))
+
+    # ITS OWN DRY RUN, BEFORE IT IS LOADED. `check` loads the config the way the daemon
+    # will, judges the three heartbeats, prints the table and writes nothing. A config it
+    # refuses is exit 2, and a job loaded on it would fail every pass in a log nobody reads.
+    check = r.as_role(ctx.account,
+                      'set -a; . %s/env; set +a; /usr/bin/python3 %s/kit/scripts/%s check '
+                      '--config %s/%s' % (ctx.stage_home, ctx.stage_home, MONITOR_SCRIPT,
+                                          ctx.stage_home, MONITOR_CONFIG),
+                      timeout=MONITOR_RUN_TIMEOUT_SECONDS + 60)
+    say("")
+    say("  -- the heartbeat monitor's check --")
+    for line in (check.out + check.err).strip().splitlines()[-14:]:
+        say("    " + line)
+    if check.rc not in (0, COMPONENT_EXIT_DECLINED):
+        raise SetupError("the heartbeat monitor's check failed (exit %d), so it was not loaded: %s"
+                         % (check.rc, (check.err or check.out).strip()[-400:]))
+    if check.rc == COMPONENT_EXIT_DECLINED:
+        say("  It found a problem on its first look. That is its job: the first real pass")
+        say("  comments on %s." % ticket)
+
+    if plist_stale:
+        _install_plist(r, label, want_plist)
+    say("")
+    say("  LOADING the heartbeat monitor. RunAtLoad starts a real pass within seconds, and")
+    say("  a problem it finds becomes a comment on %s." % ticket)
+    say("")
+    loaded_at = time.time()
+    if loaded:
+        out = r.as_root(["launchctl", "bootout", "system/" + label],
+                        why="unload %s before loading the current plist" % label)
+        if not out.skipped:
+            _wait_until_gone(r, label, _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+    res = r.as_root(["launchctl", "bootstrap", "system", plist], why="load %s" % label)
+    if res.skipped:
+        return False, "would load %s and wait for its heartbeat" % label, []
+    if not res.ok:
+        raise SetupError("could not load %s: %s" % (label, (res.err or "").strip()[:200]))
+    ctx.unloaded = [l for l in ctx.unloaded if l != label]
+    for n in range(MONITOR_HEARTBEAT_POLLS):
+        doc, _why = _read_monitor_heartbeat(ctx)
+        stamp = _heartbeat_epoch(doc) if doc else None
+        # Second precision on its side, so a beat stamped in the same second counts.
+        if stamp is not None and stamp >= loaded_at - 2 and not doc.get("dry_run"):
+            if doc.get("result") not in MONITOR_GOOD_RESULTS:
+                raise SetupError("the heartbeat monitor loaded and its first pass ended `%s` — %s"
+                                 % (doc.get("result"), str(doc.get("detail") or "")[:300]))
+            return False, ("loaded; its first pass wrote a heartbeat (`%s`) and comments on %s"
+                           % (doc.get("result"), ticket)), []
+        if n < MONITOR_HEARTBEAT_POLLS - 1:
+            _pause(MONITOR_HEARTBEAT_POLL_SECONDS)
+    raise Unknown("the heartbeat monitor was loaded and wrote no heartbeat within %d s"
+                  % (MONITOR_HEARTBEAT_POLLS * MONITOR_HEARTBEAT_POLL_SECONDS),
+                  "read %s/.stage-e/%s — a pass that cannot start writes nothing there"
+                  % (ctx.role_home, MONITOR_LOG))
+
+
 def step_handover(ctx, apply_it):
     if not ctx.state.attested("A-FIRST-TICKET"):
         raise Blocked("CK-7", "no real ticket has been watched end to end yet")
@@ -3947,6 +4251,8 @@ STEPS = (
     ("daemons", "the plists, rendered, linted and installed", step_daemons),
     ("dry-run", "the dry runs, read before anything is on", step_dry_run),
     ("enable", "load the daemons and see their heartbeats", step_enable),
+    ("heartbeat-monitor", "the job that reads those heartbeats, and the ticket it comments on",
+     step_heartbeat_monitor),
     ("conflict-waker", "your own conflict waker — the local half of the conflict loop",
      step_conflict_waker),
     ("handover", "one real ticket, watched end to end", step_handover),
@@ -4096,6 +4402,9 @@ def cmd_run(ctx, dry_run):
     say("  daemons       %s" % ", ".join(all_daemon_labels(ctx.conf)))
     say("  your waker    %s" % ("OFF by conf" if str(ctx.conf.get("CONFLICT_WAKER_CONF")).lower() == "off"
                                 else "a LaunchAgent for you, from %s" % ctx.conf.get("CONFLICT_WAKER_CONF")))
+    say("  monitor       %s" % {"off": "OFF by conf", "": "no ticket named yet (CK-9)"}.get(
+        monitor_ticket(ctx.conf), "%s, commenting on %s" % (monitor_label(ctx.conf),
+                                                           monitor_ticket(ctx.conf))))
     say("  credentials   read as %s from %s/env%s"
         % (ctx.account, ctx.stage_home,
            "; this run asks for nothing" if dry_run else "; asked for only if absent"))
@@ -4579,6 +4888,7 @@ OWNER_LINEAR_EMAIL=owner@example.com
 REVIEW_REPOS=example-org/kit
 MANAGED_TEAM_KEYS=KIT
 CONFLICT_WAKER_CONF=off
+HEARTBEAT_MONITOR_TICKET=off
 """
 
 
@@ -7306,6 +7616,249 @@ def _selftest_body():
     expect("required-scripts-cover-imports", need <= set(REQUIRED_SCRIPTS),
            "the bounce driver's local imports are not all in REQUIRED_SCRIPTS: %s"
            % sorted(need - set(REQUIRED_SCRIPTS)))
+
+    # -- THE HEARTBEAT MONITOR STEP (KIT-127): the job that reads the three heartbeats --
+    # Named ticket, `off` by name, or a card — never a silent absence. Proved to exist and
+    # checked before it is loaded; a loaded monitor with a stale heartbeat is NOT RUNNING.
+    cases += 1
+
+    def _monitor_conf(value):
+        return validate_conf(parse_conf(GOOD_CONF.replace(
+            "HEARTBEAT_MONITOR_TICKET=off", "HEARTBEAT_MONITOR_TICKET=" + value))[0])
+
+    _cm, _errs = _monitor_conf("KIT-7")
+    expect("monitor-conf", not _errs and monitor_ticket(_cm) == "KIT-7", "KIT-7 refused: %s" % _errs)
+    expect("monitor-conf", monitor_ticket(_monitor_conf("OFF")[0]) == "off" and not _monitor_conf("OFF")[1],
+           "`OFF` must read as off, by name")
+    expect("monitor-conf", monitor_ticket(_monitor_conf("")[0]) == "" and not _monitor_conf("")[1],
+           "an empty ticket is a card at its step, not a conf error that stops every step")
+    expect("monitor-conf", any("HEARTBEAT_MONITOR_TICKET" in e for e in _monitor_conf("kit-7")[1]),
+           "a lower-case id is not a ticket id and must be refused by key")
+    expect("monitor-conf", any("MONITOR_INTERVAL_SECONDS" in e for e in validate_conf(
+        dict(parse_conf(GOOD_CONF)[0], MONITOR_INTERVAL_SECONDS="0"))[1]),
+           "a zero monitor interval must be refused")
+    mlabel = monitor_label(_cm)
+    expect("monitor-label", mlabel == "com.example.stage-e-monitor"
+           and mlabel not in all_daemon_labels(_cm), "label %r" % mlabel)
+
+    # The monitor's own loader accepts what this file writes, and the names this file
+    # holds for it still agree with the script.
+    import pipeline_heartbeat_monitor as hbm
+    _mdir = tempfile.mkdtemp(prefix="stage-e-selftest-monitor.")
+    _mpath = os.path.join(_mdir, MONITOR_CONFIG)
+    with open(_mpath, "w", encoding="utf-8") as fh:
+        json.dump(monitor_config(_cm), fh)
+    try:
+        _mcfg = hbm.load_config(_mpath)
+        expect("monitor-config-accepted",
+               set(_mcfg["watch"]) == set(hbm.WATCHERS) and _mcfg["notify_ticket_id"] == "KIT-7"
+               and _mcfg["intervals"] == {"review-poller": 300, "bounce-driver": 360,
+                                          "finding-poller": 300}
+               and _mcfg["run_interval_seconds"] == 1800,
+               "the monitor read back %s" % _mcfg)
+        expect("monitor-names-agree",
+               os.path.basename(hbm.heartbeat_path(_mcfg)) == os.path.basename(MONITOR_HEARTBEAT)
+               and _mcfg["monitor_state_dir"] == _mcfg["state_dir"]
+               and MONITOR_HEARTBEAT.startswith("state/"), "heartbeat path drifted")
+    except hbm.MonitorError as exc:
+        failures.append("monitor-config-accepted: the monitor refused this file's config: %s" % exc)
+    expect("monitor-names-agree",
+           MONITOR_HEARTBEAT_SCHEMA == hbm.HEARTBEAT_SCHEMA
+           and set(MONITOR_GOOD_RESULTS) <= set(hbm.RESULT_BY_CODE.values())
+           and COMPONENT_EXIT_DECLINED == hbm.EXIT_DECLINED
+           and MONITOR_RUN_TIMEOUT_SECONDS >= 1,
+           "a name or code this file holds for the monitor no longer matches the script")
+
+    def _monitor_ctx(value="KIT-7", issues=("KIT-7",), config=True, plist=True, loaded=True,
+                     beat_age=30, result="ok", dry=False, runner=None):
+        conf_x = _monitor_conf(value)[0]
+        ctx_x, fake_x = _settled_ctx(conf_x)
+        if runner is not None:
+            runner.answers = list(fake_x.answers)
+            ctx_x.runner, fake_x = runner, runner
+
+        class _Issues(object):
+            asked = []
+
+            def post(self, query, variables=None):
+                self.asked.append(variables)
+                ident = "%s-%s" % (variables["team"], variables["number"])
+                return {"issues": {"nodes": [{"id": "i1", "identifier": ident}]
+                                   if ident in issues else []}}
+        ctx_x._linear = _Issues()
+        beat = None
+        if beat_age is not None:
+            beat = json.dumps({"schema": MONITOR_HEARTBEAT_SCHEMA, "result": result,
+                               "dry_run": dry, "detail": "simulated",
+                               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                   time.gmtime(time.time() - beat_age))})
+        answers = [("ls $HOME/.stage-e/kit/scripts/" + MONITOR_SCRIPT, 0,
+                    "$HOME/.stage-e/kit/scripts/%s\n" % MONITOR_SCRIPT)]
+        if config:
+            answers.append(("cat $HOME/.stage-e/" + MONITOR_CONFIG, 0,
+                            json.dumps(monitor_config(conf_x))))
+        if plist:
+            answers.append(("cat " + _dispatcher_plist(mlabel), 0, _monitor_plist(ctx_x)))
+        if loaded and not isinstance(fake_x, FakeLaunchd):
+            answers.append(("launchctl print system/" + mlabel, 0, "\tstate = not running\n"))
+        if beat is not None:
+            answers.append((MONITOR_HEARTBEAT, 0, beat))
+        fake_x.answers = answers + list(fake_x.answers)
+        return ctx_x, fake_x
+
+    _saved_pause_m = globals()["_pause"]
+    globals()["_pause"] = lambda _s: None
+    try:
+        # A settled, fresh, healthy monitor holds, and writes nothing.
+        ctxM, fakeM = _monitor_ctx()
+        okM, detailM, _x = step_heartbeat_monitor(ctxM, apply_it=True)
+        expect("monitor-settled", okM is True and "commenting on KIT-7" in detailM and not fakeM.writes,
+               "a settled monitor read %r and wrote %s" % (detailM, fakeM.writes))
+
+        # Unnamed: card CK-9, before anything is read.
+        ctxU, fakeU = _monitor_ctx(value="")
+        try:
+            step_heartbeat_monitor(ctxU, apply_it=True)
+            failures.append("monitor-unnamed: no ticket and no card")
+        except Blocked as exc:
+            expect("monitor-unnamed", exc.card_id == "CK-9" and not fakeU.writes and not fakeU.reads,
+                   "blocked on %s after %d reads" % (exc.card_id, len(fakeU.reads)))
+        expect("monitor-card", "CK-9" in CARDS and "HEARTBEAT_MONITOR_TICKET=off"
+               in " ".join(CARDS["CK-9"]["do"]), "CK-9 must say how to turn it off by name")
+
+        # Off, and nothing installed: said by name, nothing written.
+        ctxO, fakeO = _monitor_ctx(value="off", loaded=False)
+        fakeO.answers = [a for a in fakeO.answers if "launchctl print system/" + mlabel not in a[0]]
+        okO, detailO, _x = step_heartbeat_monitor(ctxO, apply_it=True)
+        expect("monitor-off", okO is True and "OFF by conf" in detailO and not fakeO.writes,
+               "off read %r and wrote %s" % (detailO, fakeO.writes))
+
+        # Off, but an earlier run loaded one: a dry run says so; a run unloads AND removes it.
+        ctxOL, fakeOL = _monitor_ctx(value="off", runner=FakeLaunchd())
+        fakeOL.answers = [("test -f " + _dispatcher_plist(mlabel), 0, ""), ("rm -f", 0, "")] + fakeOL.answers
+        okOL, detailOL, _x = step_heartbeat_monitor(ctxOL, apply_it=False)
+        expect("monitor-off-loaded", okOL is False and "would unload" in detailOL and not fakeOL.writes,
+               "a dry run over a loaded, now-off monitor read %r" % detailOL)
+        ctxOL.unloaded = [mlabel]
+        _quiet(lambda: step_heartbeat_monitor(ctxOL, apply_it=True))
+        whys = [w["why"] for w in fakeOL.writes]
+        expect("monitor-off-loaded", any(w.startswith("unload " + mlabel) for w in whys)
+               and any(w["argv"] == ["sudo", "rm", "-f", _dispatcher_plist(mlabel)]
+                       for w in fakeOL.writes)
+               and ctxOL.unloaded == [],
+               "off must unload and remove the plist a reboot would load again: %s" % whys)
+
+        # A loaded monitor whose heartbeat is old is NOT RUNNING — never installed.
+        ctxS, _fS = _monitor_ctx(beat_age=10 ** 6)
+        try:
+            step_heartbeat_monitor(ctxS, apply_it=False)
+            failures.append("monitor-stale: a stale heartbeat read as installed")
+        except Unknown as exc:
+            expect("monitor-stale", "NOT RUNNING" in str(exc), str(exc))
+
+        # …and one that runs but cannot page is a failure, not a pass.
+        ctxE, _fE = _monitor_ctx(result="error")
+        try:
+            step_heartbeat_monitor(ctxE, apply_it=False)
+            failures.append("monitor-failing: a monitor whose last pass ended `error` passed")
+        except SetupError as exc:
+            expect("monitor-failing", "`error`" in str(exc), str(exc))
+
+        # A ticket the key cannot read is refused before anything is written.
+        ctxT, fakeT = _monitor_ctx(issues=())
+        try:
+            step_heartbeat_monitor(ctxT, apply_it=True)
+            failures.append("monitor-ticket: a ticket that does not exist was accepted")
+        except SetupError as exc:
+            expect("monitor-ticket", "KIT-7" in str(exc) and not fakeT.writes, str(exc))
+
+        # A fresh machine: the dry run names all three changes and writes nothing.
+        ctxF, fakeF = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=None)
+        okF, detailF, _x = step_heartbeat_monitor(ctxF, apply_it=False)
+        expect("monitor-dry-run", okF is False and "write ~/.stage-e/" + MONITOR_CONFIG in detailF
+               and "install " + _dispatcher_plist(mlabel) in detailF and "load it" in detailF
+               and not fakeF.writes, "dry run read %r, wrote %s" % (detailF, fakeF.writes))
+
+        # …and a run writes the config, checks, installs, loads, and waits for a NEW heartbeat.
+        ctxA, fakeA = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=-5)
+        fakeA.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                         (MONITOR_SCRIPT + " check --config", 3, "missing: finding-poller\n"),
+                         ("plutil -lint", 0, ""), ("install -o root", 0, ""),
+                         ("launchctl bootstrap system", 0, "")] + fakeA.answers
+        ctxA.unloaded = [mlabel]
+        (okA, detailA, _x), printedA = _quiet(lambda: step_heartbeat_monitor(ctxA, apply_it=True))
+        whysA = [w["why"] for w in fakeA.writes]
+        bodyA = [w["stdin"] for w in fakeA.writes if "write " in w["why"]]
+        expect("monitor-install", okA is False and "loaded" in detailA and ctxA.unloaded == []
+               and any(w.startswith("install " + mlabel) for w in whysA)
+               and any(w == "load " + mlabel for w in whysA)
+               and bodyA and json.loads(bodyA[0]) == monitor_config(ctxA.conf)
+               and "found a problem on its first look" in printedA,
+               "install read %r, wrote %s" % (detailA, whysA))
+        expect("monitor-install-order", [i for i, w in enumerate(whysA) if w.startswith("write ")][0]
+               < [i for i, w in enumerate(whysA) if w.startswith("install ")][0]
+               < [i for i, w in enumerate(whysA) if w.startswith("load ")][0],
+               "config, then plist, then load: %s" % whysA)
+        expect("monitor-plist", 'run --config "$HOME/.stage-e/%s"' % MONITOR_CONFIG in _monitor_plist(ctxA)
+               and "<integer>1800</integer>" in _monitor_plist(ctxA)
+               and _monitor_plist(ctxA).count(DAEMON_EXEC) == 1,
+               "the monitor's plist does not run the monitor on its interval")
+
+        # A config the monitor refuses is never loaded.
+        ctxC, fakeC = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=None)
+        fakeC.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                         (MONITOR_SCRIPT + " check --config", 2, "this config cannot be used\n")] + fakeC.answers
+        try:
+            _quiet(lambda: step_heartbeat_monitor(ctxC, apply_it=True))
+            failures.append("monitor-check-refused: a refused config was loaded anyway")
+        except SetupError as exc:
+            expect("monitor-check-refused", "exit 2" in str(exc)
+                   and not any(w["why"].startswith("load ") for w in fakeC.writes), str(exc))
+
+        # Loaded, and no heartbeat newer than the load: UNKNOWN, after a bounded wait.
+        ctxW, fakeW = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=3600)
+        fakeW.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                         (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
+                         ("install -o root", 0, ""), ("launchctl bootstrap system", 0, "")] + fakeW.answers
+        try:
+            _quiet(lambda: step_heartbeat_monitor(ctxW, apply_it=True))
+            failures.append("monitor-no-beat: an old heartbeat counted as the new job's first pass")
+        except Unknown as exc:
+            expect("monitor-no-beat", "wrote no heartbeat" in str(exc), str(exc))
+
+        # `code` stops a LOADED monitor before the clone moves, and names it; `enable` does
+        # not clear it from that list, because it loads only the three.
+        ctxK, fakeK = _monitor_ctx(runner=FakeLaunchd())
+        fakeK.answers = [("ls $HOME/.stage-e/kit/scripts", 0, "\n"), ("rev-parse --short HEAD", 1, ""),
+                         ("git clone --quiet", 0, "")]
+        try:
+            step_code(ctxK, apply_it=True)
+        except Blocked:
+            pass
+        expect("monitor-code-stops", ctxK.unloaded == list(all_daemon_labels(ctxK.conf)) + [mlabel],
+               "code recorded %s" % ctxK.unloaded)
+        ctxN, fakeN = _settled_ctx(_cm)
+        fakeN.answers = [("launchctl print system/", 0, "\tstate = not running\n"),
+                         ("heartbeat.json", 0, "state/heartbeat.json ok\nstate/bounce-heartbeat.json ok\n"
+                                               "finding/heartbeat.json ok\n")] + fakeN.answers
+        ctxN.unloaded = list(all_daemon_labels(_cm)) + [mlabel]
+        step_enable(ctxN, apply_it=True)
+        expect("monitor-enable-leaves-it", ctxN.unloaded == [mlabel], "enable left %s" % ctxN.unloaded)
+        # …on the path that really loads the three, too.
+        ctxL, fakeL = _settled_ctx(_cm)
+        fakeL.answers = [("launchctl bootstrap system", 0, ""),
+                         ("heartbeat.json", 0, "state/heartbeat.json ok\nstate/bounce-heartbeat.json ok\n"
+                                               "finding/heartbeat.json ok\n")] + fakeL.answers
+        ctxL.unloaded = list(all_daemon_labels(_cm)) + [mlabel]
+        _quiet(lambda: step_enable(ctxL, apply_it=True))
+        expect("monitor-enable-leaves-it", ctxL.unloaded == [mlabel],
+               "loading the three left %s" % ctxL.unloaded)
+    finally:
+        globals()["_pause"] = _saved_pause_m
+    order = [s for s, _t, _f in STEPS]
+    expect("monitor-step-order", order.index("heartbeat-monitor") == order.index("enable") + 1
+           and order.index("heartbeat-monitor") < order.index("handover"),
+           "the monitor step must follow `enable`: %s" % order)
 
     say("")
     if failures:

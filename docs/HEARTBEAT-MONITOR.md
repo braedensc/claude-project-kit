@@ -18,7 +18,7 @@ design, not defects in the script:
 | Blind spot | Why it is blind |
 |---|---|
 | The Mac asleep, off, or logged out | No process runs, so nothing is judged and nothing is posted. The silence looks exactly like health |
-| Its own death | A monitor that is not running pages nobody. It writes its own heartbeat so a fourth file is *visible*, but nothing reads that one either |
+| Its own death | A monitor that is not running pages nobody. It writes its own heartbeat, and the installer's `verify` reads it — but only when a person runs `verify` |
 | A tracker outage | The page is undeliverable precisely when the tracker is what broke. Reported as exit 3 and retried; never recorded as delivered |
 | Wrong rather than dead | A heartbeat proves a pass ran and what it decided. A daemon doing the wrong thing every interval looks healthy here |
 
@@ -124,7 +124,37 @@ nothing, and launches no session. It writes **no** `pipeline-escalation` mark, b
 makes the human-action notifier apply a lifecycle label and a label is not this job's to
 write. `--selftest` asserts all of that against the file's own source.
 
-## Running it
+## Installing it
+
+**The Stage E installer installs it (KIT-127).** Its `heartbeat-monitor` step runs after the
+three daemons are loaded. Name the ticket in `stage-e.conf`, or turn it off by name:
+
+```sh
+HEARTBEAT_MONITOR_TICKET=KIT-123      # or: HEARTBEAT_MONITOR_TICKET=off
+MONITOR_INTERVAL_SECONDS=1800         # optional; this is the default
+```
+
+Left empty, `run` stops at card `CK-9`. With a ticket named, the step does five things:
+
+1. It checks that the stored tracker key can read the ticket. A comment to a missing ticket
+   reaches nobody.
+2. It writes `~/.stage-e/monitor.json` under the role account. The intervals come from the
+   same conf values launchd schedules the three daemons by.
+3. It runs the monitor's own `check`. A config the monitor refuses (exit 2) is never loaded.
+   Exit 3 means it found a problem on its first look, which is its job.
+4. It installs `<prefix>.stage-e-monitor` as a fourth system LaunchDaemon, logging to
+   `~/.stage-e/monitor.log`.
+5. It loads the job and waits for a heartbeat newer than the load.
+
+`verify` re-measures all of it. A loaded monitor whose heartbeat is older than two of its
+intervals, plus two minutes and one pass, is **NOT RUNNING** (exit 4). One whose last pass
+ended `error`, `usage` or `timeout` is a failure. `off` unloads a monitor an earlier run
+installed and removes its plist, so the next boot does not load it again.
+
+The `code` step unloads a loaded monitor with the other three before it moves the clone they
+all run from.
+
+## Running it by hand
 
 ```sh
 python3 scripts/pipeline_heartbeat_monitor.py --example-config > ~/.stage-e/monitor.json
@@ -137,10 +167,6 @@ python3 scripts/pipeline_heartbeat_monitor.py run   --config ~/.stage-e/monitor.
 rehearsal that moved it would make the next real pass mis-judge. `run --dry-run` is the same
 plus the heartbeat, marked `dry_run` so it cannot impersonate a real pass.
 
-**The installer does not yet manage this job.** Scheduling it — a fourth LaunchDaemon at a
-longer `StartInterval`, its config written beside the other three, its heartbeat added to the
-verify step — is a follow-up. Until then it is a script an operator schedules by hand, on the
-same pattern as the daemons in `STAGE-E-OPERATOR.md`, reading its credential from the same
-`~/.stage-e/env` file (`linear_key_env` names the variable; the value never enters the
-config). Nothing is scheduled in this repository, and the `--selftest` above is all that runs
-in CI.
+It reads its credential from the same `~/.stage-e/env` file as the daemons
+(`linear_key_env` names the variable; the value never enters the config). Nothing is
+scheduled in this repository, and the `--selftest` above is all that runs in CI.

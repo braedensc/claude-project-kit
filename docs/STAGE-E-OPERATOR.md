@@ -49,7 +49,7 @@ can perform. **What you type is one command, repeated.**
 
 ```sh
 cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-$EDITOR stage-e.conf                                  # ten values to fill in, none of them secret
+$EDITOR stage-e.conf                                  # eleven values to fill in, none of them secret
 python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
 ```
 
@@ -69,7 +69,7 @@ dispatcher` line. Read the row, not that phrase.
 
 **A real pass also moves the code the daemons run.** It fast-forwards the role account's
 clone of the kit, and unloads all three daemons first so nothing execs out of a tree that
-is moving. Reloading them is the `enable` step, several checkpoints downstream: if the run
+is moving — and the heartbeat monitor too, when it is loaded. Reloading them is the `enable` step, several checkpoints downstream: if the run
 stops at a card before it, **all three loops are off**, and the notice printed on the way
 out is the only thing that says so. A dry run does none of this — it reports that the clone
 is behind and returns.
@@ -95,13 +95,14 @@ pulled — is invisible to it, so a machine that has drifted still reads clean. 
 the one that measures, and it is the one to run after every merge to the default branch and
 whenever `status` looks better than the machine feels.
 
-**Eight cards exist and four are usual:** merge the pull requests that carry Stage E
+**Nine cards exist and five are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
 installer checks and prints, and has no code path to either); read the dry-run count before
 anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
 only you know whether that number is the one you meant); read your conflict waker's dry-run
-count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); and watch one
-real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
+count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); name the ticket
+the heartbeat monitor comments on (`CK-9` — it does not appear once `HEARTBEAT_MONITOR_TICKET`
+names one or says `off`); and watch one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
 (`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
@@ -326,6 +327,7 @@ poller would.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | No shell, no edits, no fetch. Reads its ticket body. Linear MCP tools present (accepted risk, below). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
+| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats and one tracker key. Posts one comment per incident on one ticket, and nothing else. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
@@ -717,8 +719,8 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
 | `bounces/` | bounce driver | its telemetry artifacts |
-| `monitor-state.json` | heartbeat monitor (optional, unscheduled) | the last verdict-set it announced, so an incident is said once |
-| `monitor-heartbeat.json` | heartbeat monitor (optional, unscheduled) | its own last run and result |
+| `monitor-state.json` | heartbeat monitor (installed unless `HEARTBEAT_MONITOR_TICKET=off`) | the last verdict-set it announced, so an incident is said once |
+| `monitor-heartbeat.json` | heartbeat monitor (installed unless `HEARTBEAT_MONITOR_TICKET=off`) | its own last run and result; `verify` reads it |
 
 Never point `state_dir` at a repo checkout or a worktree. The bounce driver refuses one
 inside a git working tree: the ledger is the budget authority and a worktree is writable by
@@ -1048,6 +1050,10 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 | `com.example.stage-e-poller` | `pipeline_review_poller.py … run` | `POLL_INTERVAL_SECONDS` (300) | `~/.stage-e/poller.log` |
 | `com.example.stage-e-bounce` | `pipeline_bounce_local.py run` | `BOUNCE_INTERVAL_SECONDS` (360) | `~/.stage-e/bounce.log` |
 | `com.example.stage-e-finding` | `pipeline_finding_poller.py scan …` | `FINDING_INTERVAL_SECONDS` (300) | `~/.stage-e/finding/poller.log` |
+| `com.example.stage-e-monitor` | `pipeline_heartbeat_monitor.py run --config …/monitor.json` | `MONITOR_INTERVAL_SECONDS` (1800) | `~/.stage-e/monitor.log` |
+
+The fourth row is the heartbeat monitor. It has its own installer step, after the other three
+are loaded, and is off only by name (`HEARTBEAT_MONITOR_TICKET=off`).
 
 `FINDING_INTERVAL_SECONDS` **is not in `stage-e.conf.example`**; it defaults to 300, and you
 only need the line if you want a different interval. Offsetting the three from each other
@@ -1155,8 +1161,9 @@ not yours, so reading them takes `sudo -u`:
 > incident, not once per pass, and one more when it clears. It is off unless a ticket is
 > configured, and a problem it cannot report is exit 3 rather than a clean pass. It does not
 > replace the command below: it runs on the same Mac as the daemons, so it cannot report the
-> machine asleep or off, or its own death. **The installer does not schedule it yet.**
-> `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the run steps.
+> machine asleep or off, or its own death. **The installer installs it** at its
+> `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
+> `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the install steps.
 
 ```sh
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'

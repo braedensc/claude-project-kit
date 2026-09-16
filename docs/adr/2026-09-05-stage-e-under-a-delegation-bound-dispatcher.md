@@ -145,7 +145,9 @@ redesigns Stage E for what actually runs.
 >   role account, the same mode-600 credential file and the same clone, so the same
 >   installer places it: a third config, a third plist, a third heartbeat. Read every
 >   "the two system LaunchDaemons" below as three. Its filing path is proven by selftest
->   and dry run only; no deployment has yet filed a real one.
+>   and dry run only; no deployment has yet filed a real one. *(A fourth since 2026-09-16:
+>   the installer installs the heartbeat monitor that reads the three heartbeats, unless
+>   `HEARTBEAT_MONITOR_TICKET=off` — KIT-127.)*
 > - **The basis tier the ADR left "decided by a spike (KIT-92)" shipped, and it is tier 3.**
 >   The spike's answer is recorded in `scripts/pipeline_review_basis.py`: no tool in the
 >   tracker surface these sessions hold exposes an as-of-timestamp read, and the public

@@ -4,7 +4,7 @@
 # HOW TO USE THIS FILE
 #
 #   cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-#   $EDITOR stage-e.conf             # ten values to fill in, none of them secret
+#   $EDITOR stage-e.conf             # eleven values to fill in, none of them secret
 #   python3 scripts/pipeline_stage_e_setup.py run    # the only command you type
 #
 # `run` validates this file before it touches anything, and reports EVERY bad
@@ -253,6 +253,31 @@ HUMAN_PENDING_CHECKS=Hooks change guard
 # conflict-waker.conf.example — or `off`, which leaves the waker off BY NAME:
 # a local session's conflicted pull request then pages you instead.
 CONFLICT_WAKER_CONF=conflict-waker.conf
+
+# The heartbeat monitor — the job that reads the three daemons' heartbeats.
+#
+# Each daemon writes a heartbeat after every pass, so that "it stopped" and "it
+# had nothing to do" stop looking alike.  Nothing reads them unless this job
+# runs.  It is a fourth system LaunchDaemon under the same role account, running
+# `pipeline_heartbeat_monitor.py`: deterministic code, no model, no session.  When
+# the three daemons' health changes it posts ONE comment on the ticket named
+# here, and one more when it recovers.  It cannot see the Mac asleep or off, or
+# its own death — docs/HEARTBEAT-MONITOR.md lists what it cannot catch.
+#
+# Left EMPTY, the installer stops at card CK-9 and asks you to name a ticket.
+# Before loading the job it checks the ticket exists and runs the monitor's own
+# `check`.
+#
+# RULE: a ticket id like KIT-123 that the tracker key can read, or `off`, which
+# leaves the heartbeats unread BY NAME and removes a monitor an earlier run
+# installed.
+HEARTBEAT_MONITOR_TICKET=
+
+# How often the heartbeat monitor runs, in seconds.  A daemon that stops is
+# reported within about this long plus two of that daemon's own intervals.
+#
+# RULE: a positive integer.
+MONITOR_INTERVAL_SECONDS=1800
 
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from
