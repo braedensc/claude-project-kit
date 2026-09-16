@@ -30,11 +30,40 @@ THE ONE WRITE THIS FILE CAN EVER MAKE
   asserted in --selftest by grepping this file's own source for any other Linear mutation
   name, the same idiom `pipeline_review_local.py` uses for its GitHub write guard.
 
+WHERE THE MODEL AND THE COST COME FROM (KIT-130)
+
+  Stage E starts no model session itself: the dispatcher runs the reviewer, and it
+  resumes the coding session a bounce re-prompts. So neither daemon ever held a model
+  name or a cost, and every row it posted said `label:<uuid>` or `unknown` and cost 0.
+  The dispatcher does record both — each session's SDK message stream goes to
+  `<dispatcher home>/logs/<issue identifier>/session-*.jsonl`, one `sdk-message` per
+  line, carrying the SDK's own `system/init` message (the model) and `result` message
+  (`total_cost_usd`, `usage`, `num_turns`). Stage E's daemons run as the dispatcher's
+  role account, so that directory is readable to them; `--session-logs` names it.
+
+  Two roles, because a row is not always the run it names:
+    run      the row IS that session's run (a review): model and cost both come from
+             its log, and a missing piece is said in §4's `model_note`/`cost_note`.
+    resumed  the row is written BEFORE the session runs (a bounce): the model is read
+             from that session's last run and says so; the cost is never taken from
+             the log — it would be the earlier run's — and the note says it is not
+             incurred yet.
+  `--no-session REASON` is for a row no model session belongs to at all (a conclusion,
+  an exhaustion): the model is `unknown` and both notes carry the reason.
+
+  The log layout is read from the dispatcher's published source (v0.2.69,
+  `ClaudeRunner.setupLogging`), not from a log on any machine; the parser therefore
+  tolerates unknown lines, and anything it cannot find becomes a stated reason rather
+  than a guess.
+
 Usage:
     pipeline_telemetry_local.py --from-review FINDINGS.json | --from-bounce ARTIFACT.json
                                 --team-key KIT --model ID --auth-mode api-key
                                 --run-id r_... --started-at ISO --ended-at ISO
                                 [--dispatch-id ID] [--usage EXECUTION.json]
+                                [--session-logs DIR --session-issue ID
+                                 [--session-role run|resumed]] [--no-session REASON]
+                                [--model-note TEXT] [--cost-note TEXT]
                                 [--reviewer-outcome success] [--out REQUESTS.json]
                                 [--api-key-env LINEAR_API_KEY] [--dry-run]
     pipeline_telemetry_local.py --selftest
@@ -44,6 +73,7 @@ Exit: 0 = built (and posted, unless --dry-run)
       2 = usage/IO/API error (bad arguments, no credential, Linear unreachable)
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -126,6 +156,153 @@ def post_ticket_comment(ticket_id, body, api_key):
 
 
 # --------------------------------------------------------------------------- #
+# The dispatcher's session log — where a real model and a real cost live
+# --------------------------------------------------------------------------- #
+SESSION_LOG_GLOB = "session-*.jsonl"
+SESSION_ROLES = ("run", "resumed")
+# A tracker identifier, never a path: it is joined onto the log root, so anything that
+# could climb out of it is refused before the join.
+ISSUE_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
+NOT_INCURRED = ("the re-prompted session has not run when this row is written; its cost "
+                "lands in the dispatcher's own session log")
+
+
+def _log_messages(path):
+    """Every SDK message in one session log, oldest first. A line that is not JSON, or
+    not a message, is stepped over: the file's shape belongs to the dispatcher."""
+    out = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(doc, dict) and doc.get("type") == "sdk-message":
+                doc = doc.get("message")
+            if isinstance(doc, dict):
+                out.append(doc)
+    return out
+
+
+def _billed_most(result):
+    """The model a result message billed most, from its `modelUsage` map — or None."""
+    usage = (result or {}).get("modelUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    def weight(item):
+        stats = item[1] if isinstance(item[1], dict) else {}
+        cost = stats.get("costUSD")
+        return (cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else 0,
+                item[0])
+
+    return max(usage.items(), key=weight)[0]
+
+
+def session_usage(log_root, issue_identifier, role="run"):
+    """What the dispatcher's session log says about one issue's session.
+
+    Returns {"model", "model_note", "execution", "cost_note"}. `model` is None when the
+    log names none; `execution` is the `result` message to cost from, or None. Every
+    None carries its reason in the matching note — the §13 rule, applied to telemetry:
+    "could not read it" and "there was nothing to read" are said differently, and never
+    as silence."""
+    if role not in SESSION_ROLES:
+        raise ValueError("session role must be one of %s" % "|".join(SESSION_ROLES))
+    resumed = role == "resumed"
+
+    def nothing(why):
+        return {"model": None, "model_note": why, "execution": None,
+                "cost_note": NOT_INCURRED if resumed else why}
+
+    if not log_root:
+        return nothing("no dispatcher session-log directory is configured (session_log_root), "
+                       "so the session's own record was not read")
+    if not ISSUE_IDENTIFIER_RE.match(issue_identifier or ""):
+        return nothing("no dispatcher session is named for this row")
+    folder = os.path.join(os.path.expanduser(log_root), issue_identifier)
+    try:
+        files = sorted(glob.glob(os.path.join(folder, SESSION_LOG_GLOB)),
+                       key=lambda p: (os.path.getmtime(p), p))
+    except OSError as exc:
+        return nothing("the dispatcher's session log for %s could not be listed (%s)"
+                       % (issue_identifier, exc.__class__.__name__))
+    if not files:
+        return nothing("the dispatcher wrote no session log for %s, or this account cannot "
+                       "read it" % issue_identifier)
+
+    model, result = None, None
+    # Newest first, stopping at the first log that says anything: a runner writes a
+    # metadata-only `pending` file before its session id exists, then the real one.
+    for path in reversed(files):
+        try:
+            messages = _log_messages(path)
+        except OSError as exc:
+            return nothing("the dispatcher's session log for %s could not be read (%s)"
+                           % (issue_identifier, exc.__class__.__name__))
+        for msg in messages:
+            if msg.get("type") == "system" and msg.get("subtype") == "init" \
+                    and isinstance(msg.get("model"), str) and msg["model"].strip():
+                model = msg["model"].strip()
+            elif msg.get("type") == "result":
+                result = msg
+        if model or result:
+            break
+
+    model_note = None
+    if not model:
+        model = _billed_most(result)
+        model_note = (("the session log for %s has no init message; this is the model its "
+                       "result billed most" % issue_identifier) if model else
+                      "the dispatcher's session log for %s names no model" % issue_identifier)
+    if resumed and model:
+        model_note = ("read from the last run of the session this row re-prompts (%s); the "
+                      "resumed run may differ if its model label changed" % issue_identifier)
+
+    if resumed:
+        return {"model": model, "model_note": model_note, "execution": None,
+                "cost_note": NOT_INCURRED}
+    if result is None:
+        return {"model": model, "model_note": model_note, "execution": None,
+                "cost_note": "the session for %s has no result in its log yet, so its cost is "
+                             "unreported" % issue_identifier}
+    if not tb.execution_has_cost(result):
+        return {"model": model, "model_note": model_note, "execution": result,
+                "cost_note": "the session log's result for %s carries no total_cost_usd"
+                             % issue_identifier}
+    return {"model": model, "model_note": model_note, "execution": result, "cost_note": None}
+
+
+def resolve_usage(args, execution):
+    """(model, model_note, execution, cost_note) for this row, from the most direct
+    source available: an explicit `--no-session`, then the dispatcher's session log,
+    then what the caller passed. A caller's `--model` is a CONFIGURED value, so when it
+    is used in place of the log it says so."""
+    model = getattr(args, "model", "") or ""
+    model_note = getattr(args, "model_note", "") or None
+    cost_note = getattr(args, "cost_note", "") or None
+    no_session = getattr(args, "no_session", "") or ""
+    if no_session:
+        return tb.UNKNOWN_MODEL, model_note or no_session, None, cost_note or no_session
+    logs, issue = getattr(args, "session_logs", "") or "", getattr(args, "session_issue", "") or ""
+    if not (logs or issue) or execution is not None:
+        return model, model_note, execution, cost_note
+    found = session_usage(logs, issue, getattr(args, "session_role", "") or "run")
+    if found["model"]:
+        chosen_model, chosen_note = found["model"], model_note or found["model_note"]
+    elif not tb.model_is_unknown(model):
+        chosen_model = model
+        chosen_note = model_note or ("taken from configuration, not read from the session: %s"
+                                     % found["model_note"])
+    else:
+        chosen_model, chosen_note = tb.UNKNOWN_MODEL, model_note or found["model_note"]
+    return chosen_model, chosen_note, found["execution"], cost_note or found["cost_note"]
+
+
+# --------------------------------------------------------------------------- #
 # Pure-ish logic — file reads only, no network, so --selftest covers it offline
 # --------------------------------------------------------------------------- #
 def _read_usage(path):
@@ -151,11 +328,12 @@ def build_batch(args):
     if args.from_review:
         with open(args.from_review, encoding="utf-8") as fh:
             artifact = json.load(fh)
-        execution = _read_usage(args.usage)
-        block = tb.review_block(artifact, args.team_key, args.model, args.auth_mode,
+        model, model_note, execution, cost_note = resolve_usage(args, _read_usage(args.usage))
+        block = tb.review_block(artifact, args.team_key, model, args.auth_mode,
                                 args.run_id, args.started_at, args.ended_at,
                                 dispatch_id=args.dispatch_id or None, execution=execution,
-                                reviewer_outcome=args.reviewer_outcome or None)
+                                reviewer_outcome=args.reviewer_outcome or None,
+                                model_note=model_note, cost_note=cost_note)
         problems = tb.validate_block(block)
         if problems:
             raise ValueError("review telemetry block is malformed: " + "; ".join(problems))
@@ -164,10 +342,11 @@ def build_batch(args):
     elif args.from_bounce:
         with open(args.from_bounce, encoding="utf-8") as fh:
             artifact = json.load(fh)
-        execution = _read_usage(args.usage)
-        block = tb.bounce_block(artifact, args.team_key, args.model, args.auth_mode,
+        model, model_note, execution, cost_note = resolve_usage(args, _read_usage(args.usage))
+        block = tb.bounce_block(artifact, args.team_key, model, args.auth_mode,
                                 args.run_id, args.started_at, args.ended_at,
-                                dispatch_id=args.dispatch_id or None, execution=execution)
+                                dispatch_id=args.dispatch_id or None, execution=execution,
+                                model_note=model_note, cost_note=cost_note)
         problems = tb.validate_block(block)
         if problems:
             raise ValueError("bounce telemetry block is malformed: " + "; ".join(problems))
@@ -340,6 +519,103 @@ def selftest():
                                 **common)
         check("no credential and no --dry-run is a usage error", run(ns), EXIT_USAGE)
 
+    # 5b. KIT-130 — the model and the cost come from the dispatcher's session log.
+    #     The fixture mirrors what the dispatcher writes (ClaudeRunner.setupLogging):
+    #     a metadata line, then one `sdk-message` per SDK message, and an older
+    #     metadata-only `pending` file from before the session id was known.
+    with tempfile.TemporaryDirectory() as root:
+        def write_log(issue, name, lines, mtime):
+            folder = os.path.join(root, issue)
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                for line in lines:
+                    fh.write((line if isinstance(line, str) else json.dumps(line)) + "\n")
+            os.utime(path, (mtime, mtime))
+
+        meta = {"type": "session-metadata", "sessionId": "s1", "workspaceName": "REV-3"}
+        init = {"type": "sdk-message", "message": {"type": "system", "subtype": "init",
+                                                   "model": "claude-opus-5"}}
+        result = {"type": "sdk-message", "message": {
+            "type": "result", "subtype": "success", "num_turns": 7, "total_cost_usd": 0.9132,
+            "usage": {"input_tokens": 4100, "output_tokens": 950,
+                      "cache_read_input_tokens": 30000, "cache_creation_input_tokens": 2000}}}
+        write_log("REV-3", "session-pending-2026-09-16T10-00-00.jsonl", [meta], 1000)
+        write_log("REV-3", "session-s1-2026-09-16T10-00-01.jsonl",
+                  [meta, "not json at all", init, result], 2000)
+
+        got = session_usage(root, "REV-3")
+        check("run: the model is read from the init message", got["model"], "claude-opus-5")
+        check("run: a model read from the run itself carries no note", got["model_note"], None)
+        check("run: the cost is measured, so no cost note", got["cost_note"], None)
+        check("run: the execution is the result message",
+              tb.usage_from(got["execution"])["cost_usd"], 0.9132)
+
+        resumed = session_usage(root, "REV-3", role="resumed")
+        check("resumed: the model comes from the last run, and says so",
+              (resumed["model"], "last run" in (resumed["model_note"] or "")),
+              ("claude-opus-5", True))
+        check("resumed: the earlier run's cost is never taken", resumed["execution"], None)
+        check("resumed: the cost note says it is not incurred", resumed["cost_note"], NOT_INCURRED)
+
+        write_log("TOD-9", "session-s2-2026-09-16T11-00-00.jsonl", [meta, init], 3000)
+        running = session_usage(root, "TOD-9")
+        check("a session with no result yet names its model and says cost is unreported",
+              (running["model"], "no result" in (running["cost_note"] or "")),
+              ("claude-opus-5", True))
+
+        billed = {"type": "sdk-message", "message": {
+            "type": "result", "total_cost_usd": 0.5,
+            "modelUsage": {"claude-haiku-4-5": {"costUSD": 0.01},
+                           "claude-opus-5": {"costUSD": 0.49}}}}
+        write_log("TOD-10", "session-s3-2026-09-16T12-00-00.jsonl", [meta, billed], 4000)
+        fallback = session_usage(root, "TOD-10")
+        check("no init message: the model its result billed most, with the reason",
+              (fallback["model"], "billed most" in (fallback["model_note"] or "")),
+              ("claude-opus-5", True))
+
+        for label, logs, issue, needle in (
+                ("no root configured", "", "REV-3", "session_log_root"),
+                ("no log for the issue", root, "REV-404", "wrote no session log"),
+                ("an identifier that is a path", root, "../REV-3", "no dispatcher session")):
+            none = session_usage(logs, issue)
+            check("%s: model is None with a reason" % label,
+                  (none["model"], needle in (none["model_note"] or "")), (None, True))
+            check("%s: cost has a reason too" % label, bool(none["cost_note"]), True)
+
+        base = dict(common, from_bounce=None, out=None, usage=None, model="",
+                    session_logs=root, session_issue="REV-3", session_role="run",
+                    no_session="", model_note="", cost_note="")
+        with open(os.path.join(root, "review.json"), "w", encoding="utf-8") as fh:
+            json.dump(GOOD_REVIEW, fh)
+        ns = argparse.Namespace(**dict(base, from_review=os.path.join(root, "review.json")))
+        _, body, _, _ = build_batch(ns)
+        row = tb.scan(body)["blocks"][0]["runs"][0]
+        check("end to end: a review row names the model that ran",
+              (row["model"], row["model_note"]), ("claude-opus-5", None))
+        check("end to end: a review row carries the real cost",
+              (row["cost_usd"], row["cost_note"], row["turns"]), (0.9132, None, 7))
+        check("end to end: the posted body passes the gate", tb.gate([body], True)["ok"], True)
+
+        ns = argparse.Namespace(**dict(base, from_review=os.path.join(root, "review.json"),
+                                       session_issue="REV-404", model="claude-sonnet-5"))
+        row = tb.scan(build_batch(ns)[1])["blocks"][0]["runs"][0]
+        check("a configured model stands in for a missing log, and says so",
+              (row["model"], "taken from configuration" in (row["model_note"] or "")),
+              ("claude-sonnet-5", True))
+
+        ns = argparse.Namespace(**dict(base, from_review=None,
+                                       from_bounce=os.path.join(root, "bounce.json"),
+                                       session_issue="", no_session="a conclusion starts no "
+                                                                     "model session"))
+        with open(os.path.join(root, "bounce.json"), "w", encoding="utf-8") as fh:
+            json.dump(GOOD_BOUNCE, fh)
+        row = tb.scan(build_batch(ns)[1])["blocks"][0]["runs"][0]
+        check("--no-session: model unknown, and both notes carry the reason",
+              (row["model"], row["model_note"], row["cost_note"]),
+              ("unknown", "a conclusion starts no model session",
+               "a conclusion starts no model session"))
+
     # 6. The write guard: this file's only Linear mutation is commentCreate. Each
     #    banned name below appears exactly once in this file — right here, in this
     #    check list. A count above one means a real second mutation slipped into the
@@ -375,6 +651,16 @@ def main(argv=None):
     p.add_argument("--started-at", help="ISO-8601 UTC")
     p.add_argument("--ended-at", help="ISO-8601 UTC")
     p.add_argument("--usage", help="a Claude Code execution log, for cost and turns")
+    p.add_argument("--session-logs", default="",
+                   help="the dispatcher's session-log directory (<home>/logs)")
+    p.add_argument("--session-issue", default="",
+                   help="the issue identifier whose session log to read, e.g. REV-3")
+    p.add_argument("--session-role", default="run", choices=list(SESSION_ROLES),
+                   help="run: this row is that session's run; resumed: it precedes the run")
+    p.add_argument("--no-session", default="",
+                   help="REASON no model session belongs to this row (model becomes unknown)")
+    p.add_argument("--model-note", default="", help="§4 model_note, overriding a derived one")
+    p.add_argument("--cost-note", default="", help="§4 cost_note, overriding a derived one")
     p.add_argument("--reviewer-outcome", default="", help="review runs only")
     p.add_argument("--out", help="also write the built §8 batch here")
     p.add_argument("--api-key-env", default="LINEAR_API_KEY",

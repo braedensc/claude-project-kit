@@ -2519,6 +2519,18 @@ def _refuse_bad_credential_home(ctx):
         raise SetupError(problem)
 
 
+def dispatcher_session_logs(conf):
+    """<the dispatcher's home>/logs — where the dispatcher writes each session's SDK
+    message stream, one directory per issue identifier. Stage E's telemetry reads the
+    model a session ran with, and what it cost, from there (KIT-130); the daemons run
+    as the dispatcher's own role account, so the directory is theirs to read.
+
+    Derived, never typed: the dispatcher keeps its config at the root of its home, so
+    the log directory is that file's sibling. A value in the conf could drift from the
+    dispatcher it describes; this one moves with DISPATCHER_CONFIG."""
+    return os.path.join(os.path.dirname(conf["DISPATCHER_CONFIG"]), "logs")
+
+
 def step_configs(ctx, apply_it):
     """THREE files, not one: the review poller's, the bounce driver's, and the
     finding poller's (under its own `finding/` subdirectory). The pollers REFUSE
@@ -2549,6 +2561,7 @@ def step_configs(ctx, apply_it):
         "threshold": conf["SEVERITY_THRESHOLD"],
         "github_token_env": conf["GITHUB_TOKEN_ENV"],
         "linear_key_env": conf["LINEAR_KEY_ENV"],
+        "session_log_root": dispatcher_session_logs(conf),
     }
     bounce = {
         "state_dir": "~/.stage-e/state",
@@ -2568,6 +2581,8 @@ def step_configs(ctx, apply_it):
         # one shape CK-6 exists to refuse. The driver does the setting-aside at judgment
         # time instead, and says which checks it set aside.
         "human_pending_checks": split_list(conf["HUMAN_PENDING_CHECKS"]),
+        # KIT-130: where the model a re-prompted session ran with is recorded.
+        "session_log_root": dispatcher_session_logs(conf),
     }
     # KIT-96 finding poller config. It scans the WORK teams (not the reviews team)
     # for pipeline-finding/1 comments, trusts only the dispatcher's agent user, and
@@ -5093,6 +5108,11 @@ def _selftest_body():
                writtenHP[0].get("human_pending_checks") == ["Hooks change guard"],
                "the driver was not told which checks wait on a person: %s"
                % writtenHP[0].get("human_pending_checks"))
+        expect("session-log-root-written",
+               writtenHP[0].get("session_log_root") == "/opt/example-dispatch/logs",
+               "the driver was not told where the dispatcher's session logs are, so every "
+               "bounce row's model stays unknown (KIT-130): %s"
+               % writtenHP[0].get("session_log_root"))
         expect("human-pending-written",
                writtenHP[0].get("required_checks") == {
                    "example-org/kit": ["Hooks change guard", "Kit checks", "Provenance scan"]},
@@ -7295,6 +7315,7 @@ def _settled_ctx(conf):
         "repos": ["example-org/kit"], "team_keys": ["KIT"],
         "state_dir": "~/.stage-e/state", "diff_cap_chars": 120000, "threshold": "medium",
         "github_token_env": "GH_TOKEN", "linear_key_env": "STAGE_E_LINEAR_API_KEY",
+        "session_log_root": "/opt/example-dispatch/logs",
     }
     bounce = {
         "state_dir": "~/.stage-e/state", "repos": ["example-org/kit"], "team_keys": ["KIT"],
@@ -7303,6 +7324,7 @@ def _settled_ctx(conf):
         "dispatcher_repo_names": {"example-org/kit": "kit"},
         "required_checks": {"example-org/kit": ["Kit checks", "Provenance scan"]},
         "human_pending_checks": ["Hooks change guard"],
+        "session_log_root": "/opt/example-dispatch/logs",
     }
     finding = {
         "teams": ["KIT"], "owner_user_id": "u-owner", "agent_user_id": "u-agent",
