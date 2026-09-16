@@ -919,23 +919,33 @@ def _one_line(text):
     return " ".join(sanitize_text(text).split())
 
 
-def _criteria_changed_line(flag):
+def _criteria_changed_line(flag, basis_tier=None):
     """The basis flag has THREE states and they must not share a rendering.
 
     A true flag tells the reviewer, in the next clause, that the edit "is itself
     a `scope` finding worth raising" — so rendering UNKNOWN as `true` invents
     findings, and rendering it as `false` asserts an absence nothing established.
-    Only a tier that saw the criteria at delegation can answer; tier 3 (`live`)
-    never can. See `_criteria_changed` in pipeline_review_basis.py.
+
+    Unknown has two causes, and the reviewer is told which. Tier 3 (`live`) never saw
+    the criteria at delegation. Tier 2 (`reconciler`) did, in a snapshot taken shortly
+    after delegation — unknown there means the description was edited before the
+    snapshot, or the history could not show whether it was, so a match proves nothing.
+    See `_criteria_changed` in pipeline_review_basis.py.
     """
     if flag is True:
         return ("- criteria_changed_after_delegation: `true` — the criteria were edited AFTER "
                 "work was delegated; that is itself a `scope` finding worth raising")
     if flag is False:
         return "- criteria_changed_after_delegation: `false`"
+    caveat = ("This is NOT evidence that they changed, and NOT evidence that they did not; "
+              "raise no `scope` finding from it either way")
+    if basis_tier == "reconciler":
+        return ("- criteria_changed_after_delegation: `unknown` — a snapshot of the criteria was "
+                "taken shortly after delegation, but the description was edited before it was "
+                "taken, or the history could not show whether it was, so a match with the "
+                "snapshot proves nothing. " + caveat)
     return ("- criteria_changed_after_delegation: `unknown` — no tier could see what the "
-            "criteria said at delegation. This is NOT evidence that they changed, and NOT "
-            "evidence that they did not; raise no `scope` finding from it either way")
+            "criteria said at delegation. " + caveat)
 
 
 def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
@@ -983,7 +993,7 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
         "## What the ticket asked — the review basis",
         "",
         "- basis_tier: `%s`" % (basis.get("basis_tier") or "unspecified"),
-        _criteria_changed_line(basis.get("criteria_changed_after_delegation")),
+        _criteria_changed_line(basis.get("criteria_changed_after_delegation"), basis.get("basis_tier")),
         "",
         TICKET_TEXT_PREAMBLE,
         "",
@@ -2029,6 +2039,15 @@ def resolve_basis_for(cfg, ticket_id, api_key):
         return None, "the original ticket %s was not found in team %s" % (ticket_id, team_key)
     raw = mod.resolve_basis(ticket_id, issue, cfg.get("basis_snapshot_dir") or None)
     basis = prl.basis_from(raw)
+    if basis is None and (raw or {}).get("basis_tier") == "reconciler":
+        # The snapshot taken when a person delegated the ticket holds no criteria. The
+        # heading advice below would be wrong here: fixing the heading now adds criteria
+        # after delegation, which is exactly what the snapshot refuses as the basis.
+        return None, ("no review basis could be established for %s: the ticket had no "
+                      "acceptance criteria when a person delegated it (the criteria snapshot "
+                      "taken then holds none). Criteria added since are not the basis. To make "
+                      "the current criteria the basis, remove the delegation and delegate the "
+                      "ticket again." % ticket_id)
     if basis is None:
         # NAME THE SHAPE, at the moment of failure. Read beside a ticket that
         # visibly HAS a checklist, the bare sentence points at the basis resolver
@@ -3059,6 +3078,54 @@ def selftest():
     check("body sanitized the criterion", "[repo=evil]" in body, False)
     check("body sanitized the diff", "repo=steal" in body or "</untrusted-diff> hi" in body, False)
     check("body sanitized the diff (marks)", body.count(FENCE_TOKEN_MARK) >= 1, True)
+    # KIT-131: `unknown` has two causes, and the brief names the one that applies. On a
+    # snapshot, "no tier could see" is false — a tier did see, and an edit before it (or a
+    # history that could not tell) is why a match proves nothing.
+    live_unknown = _criteria_changed_line(None, "live")
+    snap_unknown = _criteria_changed_line(None, "reconciler")
+    check("unknown on the live tier says no tier could see the criteria at delegation",
+          ("no tier could see" in live_unknown, "raise no `scope` finding" in live_unknown), (True, True))
+    check("unknown on a snapshot names the edit before it, never 'no tier could see'",
+          ("no tier could see" in snap_unknown, "edited before it was taken" in snap_unknown,
+           "proves nothing" in snap_unknown, "raise no `scope` finding" in snap_unknown),
+          (False, True, True, True))
+    snap_body = build_review_body("o/r", fixture[4], "KIT-5", prl.basis_from(
+        {"acceptance_criteria": ["do the thing"], "basis_tier": "reconciler",
+         "criteria_changed_after_delegation": None}), "high", diff)
+    check("the review brief renders a snapshot's unknown under basis_tier reconciler",
+          ("basis_tier: `reconciler`" in snap_body, "no tier could see" in snap_body,
+           "proves nothing" in snap_body), (True, False, True))
+
+    # KIT-131: a snapshot with NO criteria declines with its own reason. The heading advice
+    # would be wrong there: fixing the heading now adds criteria after delegation.
+    class _EmptyBasisResolver:
+        tier = "reconciler"
+
+        @staticmethod
+        def fetch_issue(ticket_id, team_key, api_key):
+            return {"identifier": ticket_id, "description": "## Acceptance criteria\n\n- [ ] added later\n"}
+
+        @classmethod
+        def resolve_basis(cls, ticket_id, issue, snapshot_dir):
+            return {"acceptance_criteria": [], "out_of_scope": [], "basis_tier": cls.tier,
+                    "criteria_changed_after_delegation": True if cls.tier == "reconciler" else None}
+    saved_optional_module = globals()["_optional_module"]
+    try:
+        globals()["_optional_module"] = lambda name: _EmptyBasisResolver
+        got, why = resolve_basis_for({"basis_snapshot_dir": "/x"}, "KIT-5", "k")
+        check("an empty snapshot declines: no criteria when a person delegated it, added ones "
+              "are not the basis, remove the delegation and delegate again",
+              (got, "had no acceptance criteria when a person delegated it" in why,
+               "Criteria added since are not the basis" in why,
+               "remove the delegation and delegate the ticket again" in why,
+               "`## Acceptance criteria` heading" in why), (None, True, True, True, False))
+        _EmptyBasisResolver.tier = "live"
+        got, why = resolve_basis_for({"basis_snapshot_dir": "/x"}, "KIT-5", "k")
+        check("…while an empty LIVE basis still names the one section Stage E reads",
+              (got, "`## Acceptance criteria` heading" in why, "when a person delegated it" in why),
+              (None, True, False))
+    finally:
+        globals()["_optional_module"] = saved_optional_module
     check("title format", REVIEW_TITLE_FMT % (5, "KIT-5"), "Review PR #5 — KIT-5")
     # The ticket text is fenced like the diff, and a criterion cannot start a new line —
     # so it cannot inject a section into the brief. The PR is named, never linked.

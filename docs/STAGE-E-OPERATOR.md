@@ -226,7 +226,8 @@ gate; only the first does now.
    — the ticket's acceptance criteria and out-of-scope as of delegation
    (`scripts/pipeline_review_basis.py`). It reads them from the snapshot step 10 took, and
    from the live ticket when there is none; the review ticket names which. No basis ⇒ it
-   declines, loudly, with a PR comment that says *NOT reviewed*.
+   declines, loudly, with a PR comment that says *NOT reviewed*. A snapshot with no
+   criteria is no basis too: criteria added after delegation never stand in for it.
 3. It **sanitizes** every string it copies — strips the dispatcher's routing and model tags
    (`[repo=`, `repo=`, `repos=`, `[model=`, `[agent=`) and neutralizes the fence tags. It
    writes **one** routing tag of its own, on the ticket's first line, outside every fence:
@@ -316,25 +317,51 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
 10. **Every bounce driver pass starts by snapshotting acceptance criteria**
     (`scripts/pipeline_criteria_snapshot.py`, KIT-131). A session can edit its own ticket,
     so a review that reads the live criteria can be judged against text the session wrote.
-    The pass lists the tracker's agent sessions. For each open ticket a **person**
-    delegated, it saves the criteria once, to `state/basis-snapshots/<TICKET>.json`. A
-    session started by automation or an agent never takes or replaces one. The snapshot
-    records how long after delegation it was taken, and whether the ticket's history shows
-    a description edit in that gap: yes, no, or unknown.
+    The pass lists the tracker's agent sessions. For each open ticket where a **person**
+    started a dispatcher session, it saves the criteria once, to
+    `state/basis-snapshots/<TICKET>.json`. A session started by automation or an agent
+    never takes or replaces one. With `dispatcher_app_user_id` set, neither does another
+    agent app's session. The snapshot records how long after delegation it was taken, and
+    whether the ticket's history shows a description edit since delegation: yes, no, or
+    unknown. A history entry that began before delegation and was updated after it reads
+    unknown.
+
+    **Replacing a snapshot takes a delegation.** A newer session is not enough: an
+    @mention of the dispatcher also opens a session with you as its creator. The pass
+    replaces a snapshot only when the ticket's history shows a person delegating it to the
+    dispatcher after the snapshot's delegation. Removing the delegation and delegating the
+    ticket again writes that entry. Any other newer session is **held**: the pass names
+    it, and the snapshot stands. Without `dispatcher_app_user_id`, every replacement is
+    held. So is one whose history runs past the one page the pass reads, even after a real
+    delegation (no ticket yet).
 
     **On later passes it compares.** Live criteria that differ from the snapshot get **one
-    top-level comment on the coding ticket** per distinct version. It says what was added
-    and removed, and that the review judges against the criteria as delegated. Revert the
-    edit and it stops differing; nothing more is said. To make new criteria the basis,
-    delegate the ticket again: a newer person-delegated session replaces the snapshot and
-    keeps the old one beside it. The comment is never a thread reply, so no session is
-    prompted.
+    top-level comment on the coding ticket** per distinct version. It gives counts only:
+    criteria added, criteria removed, whether the out-of-scope list changed, and when the
+    snapshot was taken. It quotes no ticket text. It is posted under your key, so a mention
+    quoted from the ticket would be a mention by you. It says the review judges against the
+    criteria as delegated. Revert the edit and it stops differing; nothing more is said. To
+    make new criteria the basis, remove the delegation and delegate the ticket again. The
+    next pass replaces the snapshot and keeps the old one beside it. The comment is never a
+    thread reply, so no session is prompted.
+
+    **A ticket delegated with no criteria.** Its snapshot holds none. Criteria added later
+    are not the basis, so the review declines and says why, and so does the comment. Write
+    the criteria, then remove the delegation and delegate the ticket again.
 
     **What the reviewer is told.** On a snapshot, `criteria_changed_after_delegation` is
-    `true` when live differs, `false` when it matches and the gap showed no edit, and
-    `unknown` otherwise. A pass that could not list the sessions says *COULD NOT LOOK* and
-    counts as a problem in the driver's heartbeat — never as *nothing changed*. The bounces
-    after it still run.
+    `true` when live differs, `false` when it matches and the history showed no edit, and
+    `unknown` otherwise. The reviewer is told why it is unknown: an edit before the
+    snapshot, or a history that could not show one. A pass that could not list the
+    sessions says *COULD NOT LOOK* and counts as a problem in the driver's heartbeat —
+    never as *nothing changed*. The bounces after it still run.
+
+    **What one pass covers.** It reads up to 25 tickets and stops at its share of the
+    run's time. Tickets owed a snapshot go first. Re-checks follow, most recently active
+    first. An owed ticket the pass did not reach is a problem in the heartbeat. A re-check
+    it did not reach is named as *capped*, and is not a problem. The session listing stops
+    after 150 sessions and says *TRUNCATED* when more remain. A dry run says *would take*
+    and *would replace*, and its heartbeat says `dry_run`.
 
 **A human-authored PR is not auto-reviewed.** No agent session, no discovery, no review.
 To review one anyway, delegate a review ticket by hand in the Reviews team, the way the
@@ -738,8 +765,8 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
-| `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit inside it (step 10). Immutable for its session |
-| `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a newer delegation replaced it |
+| `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit since delegation (step 10). Immutable for its session. Still read by the poller when `criteria_snapshots` is `false` |
+| `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a person delegating the ticket again replaced it |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
 | `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
@@ -1027,8 +1054,13 @@ guessing.
   moved nothing. Provision the lane as type **`unstarted`** — see the contract §1 note;
   `started` and `completed` both break the dispatcher in ways that produce no error.
 - `criteria_snapshots` is optional and defaults to `true`: each `run` starts with the
-  snapshot pass (step 10). `false` turns it off, and every `run` then prints
-  *criteria snapshots: OFF*. Reviews fall back to the live ticket.
+  snapshot pass (step 10). `false` stops new snapshots, replacements and change notices,
+  and every `run` then prints *criteria snapshots: OFF*. **It does not stop the poller
+  reading the snapshots already stored** (no ticket yet). Reviews of those tickets still
+  use them. To stop that, move `<state_dir>/basis-snapshots` aside; the OFF line names the
+  directory.
+- `dispatcher_app_user_id` also decides whose sessions the snapshot pass counts. Without
+  it, first snapshots are still taken, but no snapshot is ever replaced (step 10).
 - `basis_snapshot_dir` is optional in both files. Both default to
   `<state_dir>/basis-snapshots`, so with one `state_dir` the writer and the reader meet
   without it. Set it in both or in neither.
@@ -1628,7 +1660,7 @@ or cron: `docs/COLLABORATION.md`, parallel-session item 8.
 | **The poller shares a uid with the sessions it reviews** | It runs as the dispatcher's role account so that a reboot brings it back without a login. The delegation key is therefore kept from sessions by the sandbox's deny-read of that home, and by nothing else — not a permission boundary. **Revisit the moment either is true:** a non-Claude runner label appears (a runner outside that sandbox), or the session Linear token is tightened to read-only (which makes a separate role account cheap). Then move the poller to its own account. |
 | The Linear MCP tools stay in every **coding** session | Sessions may read Linear and comment across tickets. The brief says not to; the brief is not a boundary. Live test 7 measures it. **Closed for the reviewer on 2026-09-16 (KIT-132):** the review entries fence every dispatcher-injected MCP server, and that closure is an installer change plus a restart — see *Changing the fence*. A coding session still needs the tracker to report its work. |
 | The re-prompt access check tests the *delegator*, not the commenter | Anyone who can comment in the thread can resume a session the owner delegated. Accepted for a single-owner workspace. Watch for comments not yours. |
-| The mid-work criteria-edit gap (ADR decision 2) is narrowed, not closed | The snapshot is taken on the first driver pass after a person delegates, not at delegation (step 10). An edit inside that gap is recorded as an edit, and the flag then reads `unknown` rather than `false`. Watch `lag_seconds` in the snapshots. |
+| The mid-work criteria-edit gap (ADR decision 2) is narrowed, not closed (no ticket yet) | The snapshot is taken on the first driver pass after a person delegates, not at delegation (step 10). An edit inside that gap is recorded as an edit, and the flag then reads `unknown` rather than `false`. Watch `lag_seconds` in the snapshots. |
 
 The one thing that is **not** a risk to accept: the credentials in the dispatcher's own env
 file, or under its state root. See the three rules in *What runs where*.
@@ -1670,9 +1702,13 @@ coding ticket into the needs-approval lane — including one conclusion held, co
 lane was provisioned, then completed on the next pass without anyone touching it.
 
 **The criteria snapshot pass (step 10) has not run live.** It is tested in the batteries
-only. After the installer's `run` moves the role account's clone, the next driver pass
-prints a `criteria snapshots:` line. Delegate a throwaway ticket and look for
-`state/basis-snapshots/<TICKET>.json`; edit its criteria and look for the one comment.
+only (no ticket yet). After the installer's `run` moves the role account's clone, the next
+driver pass prints a `criteria snapshots:` line. Delegate a throwaway ticket and look for
+`state/basis-snapshots/<TICKET>.json`. Edit its criteria and look for the one comment.
+@mention the dispatcher on it and look for *held*. Remove the delegation, delegate it
+again, and look for *replaced*. The history fields that last check reads (`toDelegate`,
+`actor`) come from the tracker's published schema and are not yet observed live (no
+ticket yet).
 
 **Step 6 has not run live.** Both conflict lanes are tested only in the batteries. The first
 real conflict on a dispatcher's pull request is its live test: watch for the thread reply,
