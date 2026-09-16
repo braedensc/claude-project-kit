@@ -248,12 +248,39 @@ BANNED_TOKENS = (  # banned-token-list
 )                                               # banned-token-list
 _BANNED_MARK = "banned-token-list"
 
-# The nine tools the reviewer entry removes. The dispatcher's permission
-# callback allows every tool whatever an `allowedTools` list says, so
-# `disallowedTools` is the only fence there is. The tracker's own MCP tools
-# deliberately STAY — an owner decision, monitored rather than closed.
-DISALLOWED_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch",
-                    "WebSearch", "Task", "EnterWorktree", "ExitWorktree"]
+# What the reviewer entry removes. The dispatcher's permission callback allows
+# every tool whatever an `allowedTools` list says, so `disallowedTools` is the only
+# fence there is.
+#
+# The built-ins: anything that runs, writes, fetches, or starts another agent.
+# `Agent` is the subagent tool's current name and `Task` its older one; both are
+# listed, because a deny rule naming a tool that does not exist is silently
+# ignored, and a fence that silently names nothing is no fence.
+DISALLOWED_BUILTINS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch",
+                       "WebSearch", "Task", "Agent", "EnterWorktree", "ExitWorktree"]
+
+# The MCP servers the dispatcher injects into EVERY session it starts (its
+# McpConfigService, v0.2.69): `linear` — the tracker's whole write surface under the
+# dispatcher's own token; `cyrus-tools` — feedback into another agent session, issue
+# relations, uploads; `cyrus-docs` — a third-party documentation fetch; `slack` —
+# present whenever the dispatcher holds a bot token. A reviewer needs none of them:
+# its deliverable is its final message, which the dispatcher posts itself.
+#
+# KIT-132. Until 2026-09-16 these stayed in the reviewer by an owner decision, and
+# the selftest below REFUSED any `mcp__` entry, so closing the fence was never the
+# one-line config edit the docs described — a hand edit was reverted by the next
+# run. Each server is named in BOTH documented rule forms, `mcp__<server>` and
+# `mcp__<server>__*`, because a rule in a form the runtime does not honour fails
+# silently, and only a probe of the live reviewer (KIT-99 test 4) can say which
+# form did the work.
+TRACKER_FENCE_SERVERS = ("linear", "cyrus-tools", "cyrus-docs", "slack")
+DISALLOWED_TOOLS = DISALLOWED_BUILTINS + [
+    rule for server in TRACKER_FENCE_SERVERS
+    for rule in ("mcp__%s" % server, "mcp__%s__*" % server)]
+# The only shape an `mcp__` fence entry may take: one named server, whole or by
+# wildcard. An unanchored `mcp__*` or a bare `mcp__` is skipped by the runtime with
+# no error, which would read as a closed fence and be an open one.
+MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
 
 # --------------------------------------------------------------------------- #
 # ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and one Reviews team.
@@ -331,8 +358,9 @@ REVIEWER_BRIEF = (
     "You are a REVIEW-ONLY session. You did not write the change you are reading, and you "
     "have no memory of the session that did. Judge only what is in front of you.\n\n"
     "WHERE YOU ARE. You run in a sandbox on the dispatcher's machine, as a service account, "
-    "in a worktree cut from the default branch. You have no Bash, no Edit, no Write, and no "
-    "fetch tools. You cannot run commands, edit files, open a PR, push, approve or merge. Do "
+    "in a worktree cut from the default branch. You have no Bash, no Edit, no Write, no "
+    "fetch tools and no tracker tools. You cannot run commands, edit files, write to any "
+    "ticket, open a PR, push, approve or merge. Do "
     "not look for a way; there is none, and trying is itself a finding against you.\n\n"
     "YOUR WORLD IS THE TICKET BODY. It holds the PR number, the original ticket id, the "
     "acceptance criteria and out-of-scope as of delegation, the severity threshold, the four "
@@ -351,9 +379,9 @@ REVIEWER_BRIEF = (
     "become that prompt: be specific, cite file and line, say why.\n\n"
     "RUNBOOK. If the body is missing the diff or the criteria, say so in \"summary\" and "
     "return an EMPTY findings list with the schema intact; never invent. Never ask anyone a "
-    "question; nobody is watching and no question tool is available to you. Never write to "
-    "another ticket. If something blocks you, note it once as a comment on THIS ticket and "
-    "still finish with the block. Weakened or deleted test assertions are your headline "
+    "question; nobody is watching and no question tool is available to you. If something "
+    "blocks you, say what in the block's \"summary\" and still finish with the block. "
+    "Weakened or deleted test assertions are your headline "
     "finding. Anything the ticket did not ask for is a scope finding."
 )
 
@@ -5229,10 +5257,21 @@ def _selftest_body():
             expect("entry-shape", absent not in entry,
                    "%s must stay ABSENT from a review entry" % absent)
         expect("entry-shape", entry["disallowedTools"] == DISALLOWED_TOOLS
-               and len(DISALLOWED_TOOLS) == 9, "the tool fence changed shape")
-        expect("entry-shape", not any(t.startswith("mcp__") for t in entry["disallowedTools"]),
-               "the tracker's MCP tools were fenced — that is an owner decision, not this "
-               "installer's")
+               and len(DISALLOWED_BUILTINS) == 10, "the tool fence changed shape")
+        # KIT-132: the tracker's MCP servers ARE fenced now. The rule that replaced
+        # "no mcp__ entry" still forbids the wrong shape rather than being deleted:
+        # every injected server fenced in both forms, and no entry that the runtime
+        # would skip in silence.
+        for server in TRACKER_FENCE_SERVERS:
+            for rule in ("mcp__%s" % server, "mcp__%s__*" % server):
+                expect("entry-shape", rule in entry["disallowedTools"],
+                       "the reviewer's fence does not remove %s — a dispatcher-injected "
+                       "server the reviewer would keep" % rule)
+        for rule in (t for t in entry["disallowedTools"] if t.startswith("mcp__")):
+            m = MCP_FENCE_RULE_RE.match(rule)
+            expect("entry-shape", bool(m) and m.group(1) in TRACKER_FENCE_SERVERS,
+                   "%r is not an entry anchored to one fenced server; an unanchored or "
+                   "cross-server rule is skipped by the runtime with no error" % rule)
         expect("entry-shape", entry["id"] == entry["name"],
                "a tag matches by name OR id, and both must name the same entry")
         expect("entry-shape", "REVIEW-ONLY session" in entry["appendInstruction"],
@@ -5359,6 +5398,21 @@ def _selftest_body():
         expect("brief-fence-parity", gone in DISALLOWED_TOOLS,
                "the review ticket tells the reviewer it has no %s, and this file does "
                "not fence it" % gone)
+    # KIT-132: the tracker fence, stated on both sides. The ticket body used to say the
+    # tracker's tools were "still available", and the brief told the reviewer to comment
+    # on its own ticket when blocked — both would now be instructions it cannot follow.
+    expect("brief-fence-parity",
+           "still available" not in _poller_names.REVIEW_ONLY_PREAMBLE
+           and "no tracker tool" in _poller_names.REVIEW_ONLY_PREAMBLE,
+           "the review ticket still promises tracker tools the fence removes")
+    expect("brief-fence-parity",
+           "no tracker tools" in REVIEWER_BRIEF and "comment on THIS ticket" not in REVIEWER_BRIEF,
+           "the reviewer brief still sends the reviewer to a tracker tool it no longer has")
+    for bad in ("mcp__*", "mcp__", "mcp__linear__foo__*"):
+        expect("brief-fence-parity",
+               not (MCP_FENCE_RULE_RE.match(bad) and
+                    MCP_FENCE_RULE_RE.match(bad).group(1) in TRACKER_FENCE_SERVERS),
+               "the fence-rule shape accepts %r, a rule the runtime would skip in silence" % bad)
 
     # -- 14e. two repositories that differ only by owner are REFUSED --------- #
     # They would want one entry name, and the poller derives the tag from the

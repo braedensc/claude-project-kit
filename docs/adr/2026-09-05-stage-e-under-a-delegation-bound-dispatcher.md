@@ -79,6 +79,7 @@ redesigns Stage E for what actually runs.
 >      (which makes a separate role account cheap). Either one, and the poller moves to a
 >      role account of its own.
 >   2. The Linear MCP tools stay available to every session, the reviewer included.
+>      *(Closed for the reviewer 2026-09-16 — KIT-132, see that update.)*
 >   3. The re-prompt access check tests the *delegator*, not the commenter
 >      (`EdgeWorker.ts:5281-5290, 6726-6745`) — so one session's identity can re-prompt
 >      another session, which live test 7 in the operator doc measures deliberately.
@@ -194,6 +195,36 @@ redesigns Stage E for what actually runs.
 >   which is the open measurement of accepted risk 3. The finding poller's filing path is
 >   on that list too.
 
+> **Update (2026-09-16) — the reviewer loses the tracker (KIT-132).** Accepted risk 2 said
+> the Linear MCP tools stay available to every session, "the reviewer included", and named
+> a single `mcp__linear` entry in `disallowedTools` as the closure if it were ever needed.
+> Both halves were wrong about what closing it takes, and the risk is now closed for the
+> reviewer.
+>
+> - **It was never a config edit.** The installer writes the review entries from a
+>   constant and rewrites them on every run, and its selftest refused any `mcp__` entry. A
+>   hand edit lasted until the next `run`. The closure is an installer change, a kit pull
+>   request carrying `hooks-change`, and a dispatcher restart.
+> - **`linear` is one of four servers.** The dispatcher's `McpConfigService` (v0.2.69)
+>   injects `linear` (the tracker, under the dispatcher's own token), `cyrus-tools`
+>   (feedback into another agent session, issue relations, uploads) and `cyrus-docs` (a
+>   third-party fetch) into every session, and `slack` whenever it holds a bot token. The
+>   reviewer's deliverable is its final message, which the dispatcher posts itself, so it
+>   needs none of them. All four are fenced, each as `mcp__<server>` and
+>   `mcp__<server>__*`: a rule in a form the runtime does not honour fails silently.
+> - **The fence also names `Agent`**, the subagent tool's current name, beside the older
+>   `Task` this ADR listed.
+> - **The selftest still forbids a wrong shape rather than dropping the check.** Every
+>   injected server must be fenced, and every `mcp__` entry must be anchored to one of them.
+>   An unanchored `mcp__*` is skipped by the runtime and would read as a closed fence.
+> - **The brief and the ticket body say so.** The reviewer is told it holds no tracker tool
+>   and, when blocked, to say why in its block's summary rather than comment on its ticket.
+> - **Still open.** An MCP server a repository's own `.mcp.json` adds is not fenced; its
+>   name is unknowable to the installer (no ticket yet). The fence is configured, not yet
+>   measured: live test 4 probes a reviewer after the restart. Coding sessions keep the
+>   tracker tools, which they need to report their work, so accepted risk 2 and live test 7
+>   still stand for them.
+
 ## Decision
 
 **Stage E is a poller running as the dispatcher's own role account that speaks to the
@@ -216,8 +247,9 @@ sandbox.** Six decisions:
    **`disallowedTools`** list, which is the *only* tool fence the dispatcher honours. The
    reviewer has no `Bash`, no `Edit`/`Write`, no fetch; its worktree is a checkout of the
    **default branch**, never the PR head; the diff, the criteria and the schema arrive in
-   the ticket body. Same host and Claude credential family are accepted. The Linear MCP
-   tools remain available to it — an accepted, monitored risk.
+   the ticket body. Same host and Claude credential family are accepted. The dispatcher's
+   injected MCP servers, the tracker among them, are fenced off it too *(since 2026-09-16,
+   KIT-132; before that they stayed, as an accepted risk)*.
 4. **Verdict** — a **PR comment** (and a Linear telemetry comment), **never an approval**;
    a review that *could not run* is a visibly different, loud outcome from one that ran and
    found nothing.
@@ -496,7 +528,8 @@ it can fetch nothing.**
   the reviewer has no tool that could fetch it.
 - **A tool fence the dispatcher actually enforces.** The Reviews entry's
   **`disallowedTools`** removes `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebFetch`,
-  `WebSearch`, `Task`, `EnterWorktree` and `ExitWorktree`; the dispatcher passes that list
+  `WebSearch`, `Task`, `EnterWorktree` and `ExitWorktree` — and, since 2026-09-16, `Agent`
+  and the dispatcher's four injected MCP servers (KIT-132); the dispatcher passes that list
   through to the runner (`RunnerConfigBuilder.ts:439`, `ClaudeRunner.ts:563, 701`). Two
   facts corrected here, and in the 2026-08-26 ADR's "Building it" step 3 which relied on
   an allowlist: **`allowedTools` restricts nothing** — the permission callback allows
@@ -531,6 +564,7 @@ it can fetch nothing.**
   across sessions. The reviewer's brief tells it not to; the brief is not a boundary.
   Accepted "for now" and monitored: the review ticket's activity log is what to watch, and
   a single `mcp__linear` entry in `disallowedTools` is the closure if it is ever needed.
+  *(Superseded 2026-09-16, KIT-132: closed, and not by one entry. See that update.)*
 - **A separate trust domain.** Same host as the dispatcher and the coding sessions;
   isolation is account + sandbox + per-ticket worktree + tool fence, not a separate
   machine.
