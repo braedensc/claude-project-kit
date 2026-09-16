@@ -110,7 +110,19 @@ human-only steps at the end.
 >    must stay in CI. Move the other `templates/workflows/*.yml` (deploy-on-green,
 >    pipeline-failure-alert, backup-cron, keepalive, …) the same way; adapt their
 >    fenced stack sections; DELETE any that don't apply (no DB → no backup-cron;
->    nothing pauses → no keepalive). Fill `{{KEEPALIVE_TABLE}}` or remove it with
+>    nothing pauses → no keepalive). **Decide the parallel-session pair with me, not
+>    by the glob:** `pr-conflict-monitor.yml` (a PR that goes `CONFLICTING` gets a fix
+>    request, then a page) and `pr-union-check.yml` (green alone, red together) — keep
+>    both unless I will only ever run one session at a time. Adapt the union check's
+>    fenced battery step to my stack; if my default branch is not `main`, change both
+>    files' `push:` trigger. They run `scripts/pr_conflict.py` and
+>    `scripts/check_pr_union.py`; the first, and the waker's installer, import other
+>    `scripts/` files (`pipeline_*` ones among them), so keep `scripts/` whole even
+>    with no delivery pipeline. Keep
+>    `conflict-waker.conf.example` at the root and
+>    `scripts/pipeline_conflict_waker_setup.py`: the waker is what turns a conflict
+>    request into a fix on my machine instead of a page (docs/COLLABORATION.md,
+>    parallel-session item 8). Fill `{{KEEPALIVE_TABLE}}` or remove it with
 >    its file; `templates/scripts/check-migrations.mjs` moves to `scripts/` if you
 >    have an ordered-migrations dir (adjust its fenced knobs), else delete it. Also adapt `templates/scripts/dev-worktree-login.sh`
 >    to my backend and `git mv` it to `scripts/` (or delete it if no local
@@ -182,6 +194,13 @@ human-only steps at the end.
 > isolated; docs/SECURITY.md); GitHub → Settings → Security: enable secret scanning +
 > push protection + Dependabot; and branch protection AFTER the app CI's first green
 > run on main — merge THEN require (docs/LESSONS.md), contexts = the new CI job names.
+> If I kept the conflict monitor: set the `PR_CONFLICT_PAGE_TO` Actions variable when
+> the repo is org-owned or its PRs are opened by a bot (an org @mention notifies
+> nobody), and install the conflict waker myself — it starts paid sessions, so it
+> refuses to run inside one. On macOS: `cp conflict-waker.conf.example
+> conflict-waker.conf`, set `REPO_DIRS` and `CLAUDE_ARGS` (git, gh and my local gate's
+> runners), then `python3 scripts/pipeline_conflict_waker_setup.py run`. On Linux:
+> schedule `scripts/pr_conflict.py wake` per docs/COLLABORATION.md item 8.
 >
 > (end of prompt)
 

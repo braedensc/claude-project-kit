@@ -5,13 +5,15 @@ workflows would fail (or worse, run) against the bare kit, and the kit's own CI
 must stay green. They become real when BOOTSTRAP-PROMPT.md moves them into
 place in your new project.
 
-**One exception:** the kit runs its own adapted, *active* copy of
-`pr-conflict-monitor.yml` at `.github/workflows/` — parallel PRs off one `main`
-make the conflict hazard real in this repo too. The template below stays inert and runs
-the same `scripts/pr_conflict.py monitor`; app projects activate it the normal way. Its
-requests are answered by the conflict waker for local sessions
-(`scripts/pipeline_conflict_waker_setup.py` installs it) and by the Stage E bounce driver
-for a dispatcher's sessions.
+**Two exceptions:** the kit runs its own adapted, *active* copies of
+`pr-conflict-monitor.yml` and `pr-union-check.yml` at `.github/workflows/` — parallel PRs
+off one `main` make both hazards real in this repo too. The templates below stay inert and
+run the same scripts (`scripts/pr_conflict.py monitor`, `scripts/check_pr_union.py`); app
+projects activate them the normal way. The monitor's requests are answered by the conflict
+waker for local sessions (`scripts/pipeline_conflict_waker_setup.py` installs it on macOS;
+`docs/COLLABORATION.md` item 8 covers Linux) and by the Stage E bounce driver for a
+dispatcher's sessions. Both scripts, and what `pr_conflict.py` imports, live in `scripts/`,
+so `git rm -r templates/` never takes them.
 
 | Template | Activates to | What it is |
 |---|---|---|
@@ -20,7 +22,8 @@ for a dispatcher's sessions.
 | `workflows/pipeline-failure-alert.yml` | `.github/workflows/pipeline-failure-alert.yml` | `workflow_run` failure on main → one deduped issue, owner @mention+assign (email + phone push); post-merge failures are otherwise silent |
 | `workflows/backup-cron.yml` | `.github/workflows/backup-cron.yml` | Daily encrypted `pg_dump` → artifact, with the IPv6/pooler/role gotchas inline |
 | `workflows/keepalive.yml` | `.github/workflows/keepalive.yml` | Free-tier anti-pause ping (401-is-healthy pattern) |
-| `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | A PR that goes CONFLICTING (it skips required CI and can look green) gets a bounded fix request, answered by the conflict waker or the bounce driver; unanswered, it pages the owner |
+| `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | A PR that goes CONFLICTING (it skips required CI and can look green) gets a bounded fix request, answered by the conflict waker or the bounce driver; unanswered, it pages the PR's author (or the `PR_CONFLICT_PAGE_TO` variable). Names each PR's real base branch |
+| `workflows/pr-union-check.yml` | `.github/workflows/pr-union-check.yml` | Green alone, red together: runs the battery on the union of the open PRs and comments on the PR whose arrival turned it red. Report-only. Adapt its fenced battery step to your stack |
 | `workflows/frontend-uptime.yml` | `.github/workflows/frontend-uptime.yml` | Synthetic probe of the user-facing app (status + app-shell marker, blip-tolerant) for surfaces deployed outside the pipeline |
 | `workflows/migration-drift.yml` | `.github/workflows/migration-drift.yml` | Daily read-only declared-vs-applied compare against prod → issue; catches drift however it arises |
 | `workflows/cron-health.yml` | `.github/workflows/cron-health.yml` | Monitors the downstream EFFECT of in-platform scheduled jobs — schedulers self-report success even when the work fails |

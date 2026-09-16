@@ -242,12 +242,41 @@ twice on doc-tail merges before these rules existed:
    dry-run count and sign it off. It takes only a worktree **your own Claude Code
    worked in**. A dispatcher's PR never qualifies; the bounce driver re-prompts that
    session in its own thread. Each session is capped (`MAX_BUDGET_USD`, `TIMEOUT_MIN`),
-   and so is each pass (`MAX_SESSIONS_PER_PASS`). A headless session only gets the
-   tools its settings allow, so set `CLAUDE_ARGS` to match yours. If you don't, it ends
-   `failed` and the monitor pages you. Three automated attempts per PR. After that, or
-   when nothing claims a request within 15 minutes, the monitor pages the owner.
-   Logged out, asleep, or never installed, you get the old page, never silence. On a
-   Stage E machine, its installer's `conflict-waker` step does this for you.
+   and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR.
+   After that, or when nothing claims a request within 15 minutes, the monitor pages
+   a person. Logged out, asleep, or never installed, you get the old page, never
+   silence. On a Stage E machine, its installer's `conflict-waker` step does this for
+   you. Before you rely on it:
+
+   - **`REPO_DIRS` names every project.** A checkout left out is never claimed. Parallel
+     sessions in two projects means both roots, comma-separated.
+   - **`CLAUDE_ARGS` covers the whole prompt.** A headless session gets only the tools it
+     is given. The prompt uses git, gh, and the local checks your `CLAUDE.md` names, so
+     allow each runner. Missing git or gh ends `failed` and pages you; missing the gate's
+     runners pushes an untested merge. `conflict-waker.conf.example` has the kit's line.
+   - **`CLAUDE_CONFIG_DIR` is read at install.** The job keeps the value your shell had
+     then (else `~/.claude`). Change it later and re-run `run`, or the waker finds no
+     transcripts and every conflict pages you. Preflight refuses a directory with none.
+   - **After a merge, run `verify`.** It reads `behind` only when a script the job runs
+     changed: `scripts/pr_conflict.py` or a `scripts/` module it imports. Then `run`
+     moves the clone. Nothing schedules this.
+   - **`waker.log` grows forever.** `~/.pr-conflict-waker/waker.log` takes both output
+     streams every 300 s, with no rotation and no size cap. Truncate it yourself when it
+     grows. Judge health by the heartbeat, not the log.
+   - **Who gets paged.** The `PR_CONFLICT_PAGE_TO` Actions variable when set; else the
+     PR's author, when a person; else a person who owns the repository. A plain @mention
+     of an organization notifies nobody, so on an org repository whose PRs a bot opens,
+     set the variable. Otherwise the page says *Nobody was paged* and the monitor's run
+     fails.
+   - **The installer is macOS-only.** It builds a LaunchAgent, and on any other platform
+     its preflight says so and stops. The waker itself is portable:
+     `python3 scripts/pr_conflict.py wake` is one pass that exits. On Linux, do by hand
+     what the installer would: run it from a clone no session works in, kept level;
+     read `wake --dry-run`'s `would wake` count first, with the flags you will schedule
+     (`wake --help`); schedule it every few minutes from a systemd user timer or cron,
+     with `claude` and `gh` on its `PATH` and logged in; and read
+     `~/.pr-conflict-waker/state/heartbeat.json` — a stale `finished_at` means it is
+     not running.
 
 ---
 
@@ -442,7 +471,9 @@ Stop hook between them:
    touches a grader path — `.claude/hooks/**`, `.claude/settings*.json`,
    `.github/workflows/**`, `scripts/check_*.py`, the dispatch path those graders
    import (`scripts/pipeline_*.py`, `scripts/jsonschema_mini.py`),
-   `templates/workflows/pipeline-*.yml`, `templates/hooks/**`, and (when configured) `delivery.json`
+   `templates/workflows/pipeline-*.yml`, `templates/hooks/**`, the conflict loop's
+   `scripts/pr_conflict.py` and its staged workflow
+   `templates/workflows/pr-conflict-monitor.yml`, and (when configured) `delivery.json`
    plus its `autonomy.riskPaths`, read from the PR's **base** sha — must carry the
    `hooks-change` label — and, since that label is the *acknowledgement*, the job
    also checks **who applied it**: a machine identity can never supply it, and a
@@ -460,8 +491,10 @@ can break after that moment, when nobody is in a session:
   `scripts/pipeline_conflict_waker_setup.py`; parallel-session protocol item 8). A
   dispatcher's PR is answered by the bounce driver, in the session's own thread. A request
   nobody acknowledges within 15 minutes, a fix that does not land, a fourth conflict on
-  the same PR, or a fork pages the owner instead. It clears the label when the PR is
-  mergeable again, closed, or a draft. It never merges, approves or pushes, and a PR
+  the same PR, or a fork pages a person instead: `PR_CONFLICT_PAGE_TO`, else the PR's
+  author, else a person who owns the repository — and a page that reaches nobody fails
+  the run. Every command it posts names the PR's own base branch. It clears the label
+  when the PR is mergeable again, closed, or a draft. It never merges, approves or pushes, and a PR
   whose mergeability never settles fails the run rather than reading as clean.
 - **`.github/workflows/pr-union-check.yml`** — on every push to `main`, and hourly, runs
   the battery on the union of all open same-repo PRs (`scripts/check_pr_union.py`) and
