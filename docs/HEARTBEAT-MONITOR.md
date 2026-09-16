@@ -102,9 +102,16 @@ runs it just before every load of the monitor. The daemons were just reloaded, s
 heartbeats are old for that reason. Without it, the first pass would page about daemons that
 are running.
 
-A pass that left a heartbeat `unknown-after-gap` does not close an open incident. It posts no
-recovery comment, because a stale daemon it could not judge has not been seen to recover.
-The next pass decides.
+A pass that left any heartbeat `unknown-after-gap` has only part of the picture:
+
+- It posts only for a `missing`, `failing` or `unreadable` heartbeat that the last comment
+  did not already name. Those do not depend on the clock, so they do not wait. The comment
+  then names, in its first line, the jobs it did not judge.
+- Otherwise it posts nothing, and records nothing about posting. No change is carried.
+- It never posts a recovery. A stale daemon it could not judge has not been seen to recover.
+
+The next pass that judges staleness decides. So a rearm during an open incident adds no
+comment, and the judged pass after it posts only if the verdicts differ from the last comment.
 
 ## One comment per incident, never one per pass
 
@@ -114,8 +121,9 @@ problem is a new fingerprint and is announced.
 
 - **Per ticket:** the state also records the ticket the last comment went to. Change
   `notify_ticket_id` during an open incident, and the new ticket is told about it on the
-  next pass. A new ticket gets no recovery comment for an incident it never saw. A state
-  file written before the ticket was recorded re-announces an open incident once.
+  next pass that judges staleness. A new ticket gets no recovery comment for an incident it
+  never saw. A state file written before the ticket was recorded re-announces an open
+  incident once.
 - **Flap bound:** `min_seconds_between_comments`. A change suppressed by it is **carried,
   counted and said later** — the next allowed comment names how many changes it swallowed.
   A recovery is exempt, because a delayed recovery leaves a false impression standing.
@@ -185,6 +193,8 @@ With a ticket named, the step does six things:
    `~/.stage-e/monitor.log`.
 5. It runs the monitor's `rearm`, so the first pass does not judge the reloaded daemons'
    old heartbeats as stale. A failed `rearm` is a failed step, and the job is not loaded.
+   On a reload, the old job is unloaded first. If launchd still holds it after the wait,
+   the step fails before `rearm` and names the `sudo launchctl bootout` command.
 6. It loads the job and waits for a heartbeat newer than the load.
 
 `verify` re-measures all of it. A loaded monitor whose heartbeat is older than two of its

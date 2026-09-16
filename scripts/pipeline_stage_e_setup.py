@@ -4243,7 +4243,25 @@ def step_heartbeat_monitor(ctx, apply_it):
         out = r.as_root(["launchctl", "bootout", "system/" + label],
                         why="unload %s before loading the current plist" % label)
         if not out.skipped:
-            _wait_until_gone(r, label, _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+            # READ, NEVER DISCARDED, as in `_monitor_off`. Bootstrapping into a job launchd
+            # still holds returns EIO, and a pass of the old job could stamp the run clock
+            # again after the rearm below. A job launchd still holds is not unloaded, so it
+            # leaves `ctx.unloaded` (where `code` may have put it): the exit notice would
+            # otherwise advise loading it.
+            said = (out.err or out.out).strip()
+            if not out.ok:
+                say("  launchctl bootout exited %d: %s"
+                    % (out.rc, (said.splitlines() or ["no output"])[0][:160]))
+            gone, waited = _wait_until_gone(r, label,
+                                            _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+            if not gone:
+                ctx.unloaded = [l for l in ctx.unloaded if l != label]
+                raise SetupError(
+                    "the heartbeat monitor was told to stop for a reload and launchd still "
+                    "holds %s %ds later.\nIt was NOT rearmed or loaded again: bootstrapping "
+                    "into a job launchd still holds returns EIO.\nStop it by hand, then run "
+                    "the installer again:\n    sudo launchctl bootout system/%s"
+                    % (label, waited, label))
             if label not in ctx.unloaded:
                 ctx.unloaded.append(label)
     # REARMED IMMEDIATELY BEFORE IT IS LOADED. The three daemons were loaded moments ago,
@@ -5138,6 +5156,17 @@ def _selftest_body():
                and all("has not been edited" in e for e in _ex_more),
                "the example is wrong in some way other than its two deliberate "
                "placeholders: %s" % _ex_more)
+        # A default that names a file is not a working default until the file exists, and
+        # the optional section must not promise otherwise (the conflict-waker step fails
+        # without it: waker-missing-conf).
+        _ex_optional = _example_text.partition("# 4.  OPTIONAL")[2]
+        expect("conf-example-complete",
+               CONF_DEFAULTS["CONFLICT_WAKER_CONF"] not in ("", "off")
+               and "every one of these has a working default" not in _ex_optional
+               and "except CONFLICT_WAKER_CONF" in _ex_optional
+               and "must exist" in _ex_optional.partition("CONFLICT_WAKER_CONF=")[0],
+               "section 4 of stage-e.conf.example must say the CONFLICT_WAKER_CONF default "
+               "names a file that must exist")
 
     # -- 4. the agent-environment refusal -----------------------------------
     cases += 1
@@ -8038,6 +8067,29 @@ def _selftest_body():
                -1 < _out_at < _gone_at < _rearm_at
                and _next.endswith(_dispatcher_plist(mlabel)) and "launchctl bootstrap system" in _next,
                "a reload must bootout, wait, rearm, then load: %s" % seqRL)
+
+        # …and when launchd will not let go of the old job, the reload stops there. It names
+        # the job and the command, and neither rearms nor loads: bootstrapping into a job
+        # launchd still holds is EIO, and the old job could stamp the clock again.
+        for _rc_out in (0, 5):
+            ctxRS, fakeRS = _monitor_ctx(config=False, beat_age=-5,
+                                         runner=FakeLaunchd(stuck=True, bootout_rc=_rc_out))
+            ctxRS.unloaded = [mlabel]            # as `code` records it before its own bootout
+            fakeRS.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                              (MONITOR_SCRIPT + " check --config", 0, ""),
+                              (_rearm_cmd, 0, "")] + fakeRS.answers
+            try:
+                _quiet(lambda: step_heartbeat_monitor(ctxRS, apply_it=True))
+                failures.append("monitor-reload-stuck: a reload went on while launchd still held "
+                                "the old job (bootout rc %d)" % _rc_out)
+            except SetupError as exc:
+                expect("monitor-reload-stuck", mlabel in str(exc)
+                       and "sudo launchctl bootout system/" + mlabel in str(exc)
+                       and fakeRS.present and fakeRS.attempts == 0
+                       and not any(w["why"].startswith("rearm ") for w in fakeRS.writes)
+                       and mlabel not in ctxRS.unloaded,
+                       "rc %d: %s; writes %s; unloaded %s"
+                       % (_rc_out, exc, [w["why"] for w in fakeRS.writes], ctxRS.unloaded))
 
         # `code` stops a LOADED monitor before the clone moves, and names it; `enable` does
         # not clear it from that list, because it loads only the three.

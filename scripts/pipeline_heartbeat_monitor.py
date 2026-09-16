@@ -77,8 +77,13 @@ WHAT "STALE" MEANS, AND THE ONE FALSE PAGE IT WOULD OTHERWISE GUARANTEE
   `rearm` does the same on purpose. It removes the last-run timestamp and nothing else, so
   the next pass is handled like a wake. The installer runs it just before it loads this
   job: the daemons were stopped for the reload, their heartbeats are old for that reason,
-  and a pass that judged them would page about daemons that are running. A pass that could
-  not judge staleness also never closes an open incident — its recovery is not known yet.
+  and a pass that judged them would page about daemons that are running.
+
+  A pass that could not judge staleness has only part of the picture, so it says little. It
+  posts only for a missing, failing or unreadable heartbeat the last comment did not already
+  name, and then it names the jobs it did not judge. Otherwise it posts nothing and records
+  nothing about posting. It never closes an open incident: its recovery is not known yet.
+  The next pass that judges staleness decides.
 
 ONE COMMENT PER INCIDENT — NEVER ONE PER PASS
 
@@ -255,6 +260,9 @@ PROBLEM_VERDICTS = ("missing", "unreadable", "failing", "stale", "wedged")
 # Verdicts that do not page. `unknown-after-gap` is the sleep blind spot: not a problem,
 # not a clean bill of health either, and it is always NAMED in the report.
 QUIET_VERDICTS = ("ok", "running", "unknown-after-gap")
+# Problems that do not depend on the clock. A pass that cannot judge staleness still judges
+# these, so they are the only thing such a pass may speak for.
+CLOCK_FREE_PROBLEMS = ("missing", "unreadable", "failing")
 
 VERDICT_SENTENCE = {
     "ok": "ran and reported a good result",
@@ -264,7 +272,7 @@ VERDICT_SENTENCE = {
     "failing": "ran and reported a bad result",
     "stale": "has not written since",
     "wedged": "started a pass and never finished it",
-    "unknown-after-gap": "staleness not judged (the machine was not running)",
+    "unknown-after-gap": "staleness not judged (this monitor had no recent run to measure from)",
 }
 
 CONFIG_KEYS = {
@@ -429,8 +437,8 @@ def judge_one(job, spec, raw, now, limit, blind):
         if blind:
             out["verdict"] = "unknown-after-gap"
             out["detail"] = ("last beat %s (%s ago), older than the %ds limit — but this "
-                             "monitor missed its own schedule, so the machine was not "
-                             "running and staleness cannot be judged this pass"
+                             "monitor has no recent run of its own to measure from, so "
+                             "staleness cannot be judged this pass"
                              % (out["beat_at"], human_age(out["age_seconds"]), limit))
             return out
         out["verdict"] = "wedged" if running else "stale"
@@ -465,11 +473,16 @@ def human_age(seconds):
     return "%dd" % (seconds // 86400)
 
 
+def _pair(verdict):
+    """One job's part of a fingerprint: `job=verdict`."""
+    return "%s=%s" % (verdict["job"], verdict["verdict"])
+
+
 def fingerprint(verdicts):
     """The identity of a verdict-SET, stable under ordering. Ages and details are
     deliberately excluded: an incident whose only change is that it got older is the same
     incident, and including the age would page every pass."""
-    return "|".join("%s=%s" % (v["job"], v["verdict"]) for v in sorted(verdicts, key=lambda v: v["job"]))
+    return "|".join(_pair(v) for v in sorted(verdicts, key=lambda v: v["job"]))
 
 
 def build_report(verdicts, unwatched, blind, gap_seconds):
@@ -497,12 +510,32 @@ def decide_post(report, state, now, cooldown, target=None):
     cooldown: nothing has been said on that ticket to flood it. A state written before the
     ticket was recorded names none. While a problem is open that reads as not yet posted (a
     duplicate, never a miss); otherwise as the same ticket, so a recovery still goes out.
+
+    A pass that left any verdict `unknown-after-gap` (a wake, a first pass, a rearm) has
+    only part of the picture. It posts only for a missing, failing or unreadable heartbeat
+    whose `job=verdict` the last posted fingerprint does not hold. Otherwise it posts
+    nothing and returns the carried count unchanged, so nothing about posting is recorded.
+    It never posts a recovery. The next pass that judges staleness decides.
     """
     current = report["fingerprint"]
     last = state.get("last_posted_fingerprint")
     last_was_problem = bool(state.get("last_posted_problem"))
     carried = int(state.get("suppressed_changes") or 0)
     recorded = state.get("last_posted_target")
+
+    unjudged = [v["job"] for v in report["verdicts"] if v["verdict"] == "unknown-after-gap"]
+    if unjudged:
+        # Posting part of the picture drops the unjudged jobs from the header, so a stale
+        # daemon reads as recovered, and the next judged pass posts the whole picture again.
+        # A clock-free problem nobody was told about does not wait for that pass.
+        said = set((last or "").split("|"))
+        if not any(v["verdict"] in CLOCK_FREE_PROBLEMS and _pair(v) not in said
+                   for v in report["verdicts"]):
+            why = ("this pass could not judge staleness for %s, and it found no missing, "
+                   "failing or unreadable heartbeat the last comment did not already name. It "
+                   "posts nothing and records nothing about posting; the next pass that judges "
+                   "staleness decides" % ", ".join(sorted(unjudged)))
+            return False, why, carried
 
     if target and last is not None and recorded != target:
         if report["problem"] and recorded:
@@ -522,11 +555,6 @@ def decide_post(report, state, now, cooldown, target=None):
         if last is None or not last_was_problem:
             return False, "everything watched is healthy and no incident is open — there "\
                           "is nothing to announce", carried
-        if any(v["verdict"] == "unknown-after-gap" for v in report["verdicts"]):
-            # Not a problem, and not a recovery either: a stale daemon whose staleness this
-            # pass could not judge has not been seen to recover.
-            return False, "the open incident is NOT closed by a pass that could not judge "\
-                          "staleness; the next pass decides", carried
         # A recovery closes an incident and is never delayed by the cooldown.
         return True, "recovery: the open incident has cleared", carried
     last_at = parse_iso(state.get("last_posted_at"))
@@ -547,8 +575,15 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
                      "fresh heartbeat with a good result.")
     else:
         names = ", ".join(v["label"] for v in report["problems"])
-        lines.append("**Stage E daemon health: %d of %d watched job(s) need a look** — %s."
-                     % (len(report["problems"]), len(report["verdicts"]), names))
+        head = ("**Stage E daemon health: %d of %d watched job(s) need a look** — %s."
+                % (len(report["problems"]), len(report["verdicts"]), names))
+        unjudged = [v["label"] for v in report["verdicts"] if v["verdict"] == "unknown-after-gap"]
+        if unjudged:
+            # Named in the first line, so a job this pass could not judge never reads as one
+            # that recovered.
+            head += " Staleness not judged this pass, so not known to be healthy: %s." \
+                % ", ".join(unjudged)
+        lines.append(head)
     lines.append("")
     lines.append("| Job | Verdict | What that means |")
     lines.append("| --- | --- | --- |")
@@ -558,10 +593,14 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     if report["unwatched"]:
         lines.append("Not watched on this machine, so not judged: %s."
                      % ", ".join(report["unwatched"]))
-    if report["blind"]:
+    if report["blind"] and report["gap_seconds"] is None:
+        lines.append("Staleness was not judged this pass: this monitor has no last run on "
+                     "record to measure from (its first pass, a state file it could not read, "
+                     "or a rearm when the installer loaded it).")
+    elif report["blind"]:
         lines.append("Staleness was not judged this pass: this monitor missed its own "
                      "schedule by %s, so the machine was asleep or off."
-                     % human_age(report["gap_seconds"] or 0))
+                     % human_age(report["gap_seconds"]))
     if carried:
         lines.append("%d earlier change(s) were held back by the comment cooldown and are "
                      "included in the state above." % carried)
@@ -1232,6 +1271,42 @@ def selftest():
        decide_post(report_of([("review-poller", "ok"), ("bounce-driver", "ok")], blind=True),
                    open_incident, NOW, 900)[0] is True)
 
+    # An incident that mixes a stale job with a missing one. A pass that cannot judge the
+    # stale job has only part of the picture: posting it drops that job from the header, and
+    # the next judged pass posts the whole picture again.
+    mixed = report_of([("review-poller", "stale"), ("finding-poller", "missing")])
+    mixed_said = {"last_posted_at": _iso(NOW - 7200),
+                  "last_posted_fingerprint": mixed["fingerprint"],
+                  "last_posted_problem": True, "last_posted_target": "KIT-7",
+                  "suppressed_changes": 0}
+    mixed_unjudged = report_of([("review-poller", "unknown-after-gap"),
+                                ("finding-poller", "missing")], blind=True)
+    should, why, carried = decide_post(mixed_unjudged, mixed_said, NOW, 900, "KIT-7")
+    ok("an unjudged pass during a mixed incident posts nothing it already said",
+       should is False, why)
+    ok("…and records nothing about posting: no change is carried", carried == 0, (carried, why))
+    should, why, carried = decide_post(mixed_unjudged,
+                                       dict(mixed_said, last_posted_at=_iso(NOW - 60)),
+                                       NOW, 900, "KIT-7")
+    ok("…not even inside the cooldown, where a real change would be carried",
+       should is False and carried == 0 and "CARRIED" not in why, (carried, why))
+    ok("…and the judged pass after it posts nothing new: its verdicts match what was posted",
+       decide_post(mixed, mixed_said, NOW + 1800, 900, "KIT-7")[0] is False)
+    ok("an unjudged pass still pages a clock-independent problem the last comment did not name",
+       decide_post(report_of([("review-poller", "unknown-after-gap"),
+                              ("finding-poller", "failing")], blind=True),
+                   mixed_said, NOW, 900, "KIT-7")[0] is True)
+    ok("…and one on a job the last comment did not name at all",
+       decide_post(report_of([("review-poller", "unknown-after-gap"), ("finding-poller", "missing"),
+                              ("bounce-driver", "unreadable")], blind=True),
+                   mixed_said, NOW, 900, "KIT-7")[0] is True)
+    ok("an unjudged first pass with a missing job pages it (nothing was said before)",
+       decide_post(mixed_unjudged, {}, NOW, 900, "KIT-7")[0] is True)
+    ok("a changed ticket is not told part of the picture by an unjudged pass",
+       decide_post(mixed_unjudged, mixed_said, NOW, 900, "KIT-9")[0] is False)
+    ok("…the judged pass after it tells that ticket the whole picture",
+       decide_post(mixed, mixed_said, NOW + 1800, 900, "KIT-9")[0] is True)
+
     # The ticket the last comment went to is part of "already reported".
     on7 = dict(open_incident, last_posted_at=_iso(NOW - 60), last_posted_target="KIT-7")
     ok("an open incident is not said twice on the same ticket",
@@ -1281,6 +1356,24 @@ def selftest():
     note_body = build_comment(broken, "state file was unreadable", 0, False, {"review-poller": 300})
     ok("a lost state file is disclosed in the comment it may duplicate",
        "state file was unreadable" in note_body)
+    part_body = build_comment(report_of([("review-poller", "unknown-after-gap"),
+                                         ("finding-poller", "failing")], blind=True, gap=None),
+                              None, 0, False, {"review-poller": 300, "finding-poller": 300})
+    ok("a comment from an unjudged pass names the job it did not judge in its first line, so "
+       "that job never reads as recovered",
+       "not judged this pass" in part_body.splitlines()[0]
+       and "review-poller" in part_body.splitlines()[0], part_body.splitlines()[0])
+    ok("…and with no last run on record it does not claim the machine was asleep",
+       "missed its own schedule" not in part_body and "no last run on record" in part_body,
+       part_body)
+    ok("…while a real gap is still named as one",
+       "missed its own schedule by 2h" in build_comment(
+           report_of([("review-poller", "unknown-after-gap")], blind=True, gap=7200),
+           None, 0, False, {"review-poller": 300}))
+    ok("an unjudged verdict's detail does not guess why this monitor has no recent run",
+       "was not running" not in judge_one("review-poller", WATCHERS["review-poller"],
+                                          beat("review-poller", result="ok", ended_at=old),
+                                          NOW, 600, True)["detail"])
 
     # ── 9. Every pass prints what it asked and what the answer was (§13) ─────────────
     quiet = render_report(healthy, {"review-poller": 300, "bounce-driver": 300})
@@ -1557,6 +1650,48 @@ def selftest():
            json.load(open(spath, encoding="utf-8")).get("last_posted_target") == "KIT-001")
         cmd_run(Args(), poster=fake_poster)
         ok("…and says it once there, not every pass", len(sent) == sent_before + 2)
+
+        # (m) a rearm during an incident that mixes a stale job with a missing one. The pass
+        # after the rearm cannot judge the stale job, so it says nothing and records nothing
+        # about posting; the judged pass after it finds what was already said.
+        write(dict(good, watch=["review-poller", "finding-poller"],
+                   intervals={"review-poller": 300, "finding-poller": 300},
+                   notify_ticket_id="KIT-7", min_seconds_between_comments=900))
+        cfg_m = load_config(path)
+        if os.path.exists(beat_path(cfg_m, "finding-poller")):
+            os.remove(beat_path(cfg_m, "finding-poller"))
+        t0 = float(parse_iso(_iso()))
+        _atomic_write_json(hb, {"schema": WATCHERS["review-poller"]["schema"],
+                                "result": "ok", "ended_at": _iso(t0 - 10000)})
+        _atomic_write_json(spath, {"schema": STATE_SCHEMA, "last_run_at": _iso(t0 - 1800)})
+        posting = ("last_posted_at", "last_posted_fingerprint", "last_posted_problem",
+                   "last_posted_target", "suppressed_changes")
+        sent_before = len(sent)
+        _real_now = globals()["_now"]
+        try:
+            globals()["_now"] = lambda: t0
+            run_pass(cfg_m, poster=fake_poster)
+            ok("(m) the judged pass announces both jobs",
+               len(sent) == sent_before + 1 and sent[-1][0] == "KIT-7"
+               and "2 of 2" in sent[-1][1], sent[sent_before:])
+            said = json.load(open(spath, encoding="utf-8"))
+            globals()["_now"] = lambda: t0 + 7200
+            ok("(m) the installer's rearm two hours later succeeds", cmd_rearm(Args()) == EXIT_OK)
+            code, _rep, happened = run_pass(cfg_m, poster=fake_poster)
+            ok("(m) the pass after the rearm, which cannot judge the stale job, posts nothing",
+               len(sent) == sent_before + 1 and code == EXIT_OK,
+               (code, happened, [b[:80] for _t, b in sent[sent_before + 1:]]))
+            now_state = json.load(open(spath, encoding="utf-8"))
+            ok("…and records nothing about posting, only its own run",
+               all(now_state.get(k) == said.get(k) for k in posting)
+               and now_state.get("last_run_at") == _iso(t0 + 7200), now_state)
+            globals()["_now"] = lambda: t0 + 9000
+            run_pass(cfg_m, poster=fake_poster)
+            ok("…and the judged pass after it posts nothing new: its verdicts match what was "
+               "posted", len(sent) == sent_before + 1,
+               [b[:80] for _t, b in sent[sent_before + 1:]])
+        finally:
+            globals()["_now"] = _real_now
         del os.environ["STAGE_E_LINEAR_API_KEY"]
 
     # ── 12. The credential rule ──────────────────────────────────────────────────────

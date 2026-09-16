@@ -225,8 +225,13 @@ REVIEW_REPOS=example-org/repo-name
 
 
 # ===========================================================================
-# 4.  OPTIONAL — every one of these has a working default
+# 4.  OPTIONAL — each has a default, and one default needs a file
 # ===========================================================================
+#
+# Every default below works as shipped, except CONFLICT_WAKER_CONF's.  That
+# default names conflict-waker.conf, beside this file, and that file must
+# exist (no ticket yet).  Copy it from conflict-waker.conf.example, or set the
+# key to `off`.
 
 # How often each one-shot pass runs, in seconds — one per daemon: the review
 # poller, the bounce driver, and the finding poller that turns a session's
@@ -279,6 +284,9 @@ HUMAN_PENDING_CHECKS=Hooks change guard
 # RULE: a path to a conflict-waker.conf (beside this file, or absolute) — copy
 # conflict-waker.conf.example — or `off`, which leaves the waker off BY NAME:
 # a local session's conflicted pull request then pages you instead.
+#
+# The default is not a working default.  The file it names must exist, or the
+# `conflict-waker` step fails and says so (no ticket yet).
 CONFLICT_WAKER_CONF=conflict-waker.conf
 
 # How often the heartbeat monitor runs, in seconds (its ticket is in section 2).
