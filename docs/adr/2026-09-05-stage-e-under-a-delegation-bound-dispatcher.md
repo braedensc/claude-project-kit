@@ -217,16 +217,32 @@ redesigns Stage E for what actually runs.
 >   `mcp__<server>__*`: a rule in a form the runtime does not honour fails silently.
 > - **The fence also names `Agent`**, the subagent tool's current name, beside the older
 >   `Task` this ADR listed.
+> - **Review follow-up, same day: the built-ins were not complete either.** `Monitor` runs a
+>   shell command that a `Bash` rule does not stop, `RemoteTrigger` starts a cloud agent, and
+>   the MCP resource tools read a fenced server's resources past its server rule. The fence
+>   now removes 31 built-ins: every tool the dispatcher lists, or the SDK it uses defines,
+>   that runs, writes, fetches, schedules, messages, publishes or starts other work. What
+>   the reviewer keeps is a named read-only set, and the live probe is an allowlist check
+>   against it. A deny list cannot name a tool added later (no ticket yet).
+> - **Platform MCP configs are fenced too.** An entry with no `allowedTools`, which every
+>   review entry is, also gets every server in the files the dispatcher config's
+>   `linearMcpConfigs` names. The installer reads those names as the role account and
+>   fences each one in both forms. A file it cannot read stops the run.
+> - **The end-to-end sign-off names the fence it watched.** `CK-7` records a fingerprint of
+>   the entries' `disallowedTools`, and a different fence blocks on `CK-7` again. A machine
+>   signed before this stops there once.
 > - **The selftest still forbids a wrong shape rather than dropping the check.** Every
 >   injected server must be fenced, and every `mcp__` entry must be anchored to one of them.
 >   An unanchored `mcp__*` is skipped by the runtime and would read as a closed fence.
-> - **The brief and the ticket body say so.** The reviewer is told it holds no tracker tool
->   and, when blocked, to say why in its block's summary rather than comment on its ticket.
+> - **The brief, the ticket body and `docs/SESSION-BRIEF.md` say so.** The reviewer is told
+>   it holds no tracker tool and, when blocked, to say why in its block's summary rather than
+>   comment on its ticket. The ticket body also says the dispatcher posts every message and
+>   tool call to the ticket's activity, so a quoted secret would land there.
 > - **Still open.** An MCP server a repository's own `.mcp.json` adds is not fenced; its
 >   name is unknowable to the installer (no ticket yet). The fence is configured, not yet
->   measured: live test 4 probes a reviewer after the restart. Coding sessions keep the
->   tracker tools, which they need to report their work, so accepted risk 2 and live test 7
->   still stand for them.
+>   measured: live test 5 in `docs/STAGE-E-OPERATOR.md` probes a reviewer's tool list after
+>   the restart. Coding sessions keep the tracker tools, which they need to report their
+>   work, so accepted risk 2 and live test 7 still stand for them.
 
 ## Decision
 
@@ -572,8 +588,10 @@ it can fetch nothing.**
   the reviewer has no tool that could fetch it.
 - **A tool fence the dispatcher actually enforces.** The Reviews entry's
   **`disallowedTools`** removes `Bash`, `Edit`, `Write`, `NotebookEdit`, `WebFetch`,
-  `WebSearch`, `Task`, `EnterWorktree` and `ExitWorktree` — and, since 2026-09-16, `Agent`
-  and the dispatcher's four injected MCP servers (KIT-132); the dispatcher passes that list
+  `WebSearch`, `Task`, `EnterWorktree` and `ExitWorktree` — and, since 2026-09-16, every
+  other tool that runs, writes, fetches, schedules, messages or starts work, `Agent` and the
+  MCP resource tools among them, plus the dispatcher's four injected MCP servers and every
+  server its platform MCP configs add (KIT-132); the dispatcher passes that list
   through to the runner (`RunnerConfigBuilder.ts:439`, `ClaudeRunner.ts:563, 701`). Two
   facts corrected here, and in the 2026-08-26 ADR's "Building it" step 3 which relied on
   an allowlist: **`allowedTools` restricts nothing** — the permission callback allows

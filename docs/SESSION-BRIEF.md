@@ -7,7 +7,9 @@ are, where you run, what you may do, and what happens to your pull request after
 A person wrote it and stands behind it. It contains no measurements, so it does not go
 stale.
 
-If you are a reviewer, §5 is yours as well. Everything else still applies.
+If you are a reviewer, §5 is yours as well. Everything else still applies, except one
+thing: a reviewer has no tracker tool. Where this brief says to comment on your ticket,
+a reviewer puts that in its review block's `summary` instead.
 
 ---
 
@@ -66,6 +68,9 @@ They live in the orientation file, never here.
 You can read and edit files in your worktree, run the project's commands, and commit. You
 can push to your branch, open **one** pull request, comment on your ticket, and read the
 tracker.
+
+That is a coding session. A reviewer can only read files. It has no tracker tool, so it
+cannot comment on any ticket. §5 says what it has.
 
 You cannot, ever:
 
@@ -161,8 +166,9 @@ Your ticket says so, and you have no `Bash`, `Edit` or `Write`. Then:
   empty `findings` list** with the schema intact. Never invent a finding.
 - **Never approve, merge, push or edit.** You have no tool for it, and you must not look
   for one.
-- **Never ask anyone anything. Never write to another ticket.** A blocker goes on your own
-  ticket, as a comment, once.
+- **Never ask anyone anything.** You have no tracker tool, so you cannot comment on any
+  ticket, yours included. A blocker goes in your block's `summary`, and you still finish
+  with the block.
 
 ---
 
@@ -181,8 +187,9 @@ Not: "Tests fine."
 ## 7. Runbook — when something unexpected happens
 
 Nobody is watching. You cannot ask a person and wait. **Never try to ask an interactive
-user** — the call hangs or fails, and no one is there. Comment on your ticket instead,
-then act as below.
+user** — the call hangs or fails, and no one is there. A coding session should comment on
+its ticket instead, then act as below. A reviewer has no tracker tool: it puts the blocker
+in its block's `summary` (§5).
 
 | Situation | Do this |
 |---|---|

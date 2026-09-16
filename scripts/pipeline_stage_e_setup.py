@@ -190,6 +190,7 @@ your sessions cannot read it.
 import argparse
 import atexit
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -197,6 +198,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from datetime import datetime, timezone
@@ -257,12 +259,45 @@ _BANNED_MARK = "banned-token-list"
 # every tool whatever an `allowedTools` list says, so `disallowedTools` is the only
 # fence there is.
 #
-# The built-ins: anything that runs, writes, fetches, or starts another agent.
-# `Agent` is the subagent tool's current name and `Task` its older one; both are
-# listed, because a deny rule naming a tool that does not exist is silently
-# ignored, and a fence that silently names nothing is no fence.
-DISALLOWED_BUILTINS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch",
-                       "WebSearch", "Task", "Agent", "EnterWorktree", "ExitWorktree"]
+# The reviewer needs to READ, and nothing else. So the built-ins that go are every
+# tool that runs, writes, fetches, schedules, messages, publishes or starts other
+# work. The names come from the dispatcher's own list of available tools
+# (cyrus-claude-runner `config.js`, v0.2.69) and from the tool schemas of the SDK it
+# depends on (v0.3.245), which add `REPL`, `Artifact`, `SendUserMessage`,
+# `AskUserQuestion` (the dispatcher turns it into a question on the tracker), the
+# plan-mode pair and the MCP resource tools. `Agent` is the subagent tool's current
+# name and `Task` its older one; both are listed, because a deny rule naming a tool
+# that does not exist is silently ignored, and a fence that silently names nothing
+# is no fence.
+#
+# The three MCP resource tools read any connected server by a `server` argument.
+# Their names do not start with `mcp__`, so a server rule below never reaches them.
+#
+# `Monitor` runs a shell command, and a `Bash` rule does not stop it: a deny rule
+# matches the tool's own name.
+DISALLOWED_BUILTINS = [
+    "Bash", "Monitor", "REPL",                                    # runs
+    "Edit", "Write", "NotebookEdit",                              # writes
+    "WebFetch", "WebSearch",                                      # fetches
+    "Task", "Agent", "Workflow", "RemoteTrigger", "Skill",        # starts other work
+    "TaskStop", "EnterWorktree", "ExitWorktree",
+    "CronCreate", "CronDelete", "ScheduleWakeup",                 # schedules
+    "SendMessage", "SendUserMessage", "PushNotification",         # messages, publishes
+    "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
+    "EnterPlanMode", "ExitPlanMode",                              # switches its mode
+    "ListMcpResourcesTool", "ReadMcpResourceTool",                # reads MCP resources
+    "ReadMcpResourceDirTool",
+]
+
+# What the reviewer KEEPS: tools that only read, or only track the session's own
+# work. None of them is in the list above, and the selftest asserts it. The live
+# probe (card CK-7, and live test 5 in docs/STAGE-E-OPERATOR.md) passes only when the
+# reviewer's tool list holds no name outside this set: an allowlist check, because
+# a deny list cannot name a tool the dispatcher or its SDK adds later. Such a tool
+# reaches the reviewer until someone adds it above (no ticket yet).
+REVIEWER_READ_ONLY_TOOLS = (
+    "Read", "Grep", "Glob", "LSP", "ToolSearch", "TaskOutput", "CronList",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite", "ReportFindings")
 
 # The MCP servers the dispatcher injects into EVERY session it starts (its
 # McpConfigService, v0.2.69): `linear` — the tracker's whole write surface under the
@@ -276,16 +311,32 @@ DISALLOWED_BUILTINS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch",
 # one-line config edit the docs described — a hand edit was reverted by the next
 # run. Each server is named in BOTH documented rule forms, `mcp__<server>` and
 # `mcp__<server>__*`, because a rule in a form the runtime does not honour fails
-# silently, and only a probe of the live reviewer (KIT-99 test 4) can say which
-# form did the work.
+# silently, and only a probe of the live reviewer (live test 5 in
+# docs/STAGE-E-OPERATOR.md) can say which form did the work.
+#
+# These four are the servers every machine has. A machine can add more: an entry
+# with no `allowedTools`, which every review entry is, also gets every server in the
+# files the dispatcher config's `linearMcpConfigs` names. `review_fence` reads those
+# names on the machine and fences them the same way.
 TRACKER_FENCE_SERVERS = ("linear", "cyrus-tools", "cyrus-docs", "slack")
+
+
+def _server_rules(server):
+    return ["mcp__%s" % server, "mcp__%s__*" % server]
+
+
 DISALLOWED_TOOLS = DISALLOWED_BUILTINS + [
-    rule for server in TRACKER_FENCE_SERVERS
-    for rule in ("mcp__%s" % server, "mcp__%s__*" % server)]
+    rule for server in TRACKER_FENCE_SERVERS for rule in _server_rules(server)]
 # The only shape an `mcp__` fence entry may take: one named server, whole or by
 # wildcard. An unanchored `mcp__*` or a bare `mcp__` is skipped by the runtime with
 # no error, which would read as a closed fence and be an open one.
 MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
+# A server name this file will turn into a rule: letters, digits and `-`, joined by
+# single underscores. The runtime splits a tool name on `__`, so a server called
+# `a__b` would make `mcp__a__b` name the tool `b` on server `a`. A name with any
+# other character is renamed by the runtime before it is matched, so a rule spelled
+# from the config's own key would name nothing.
+MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 
 # --------------------------------------------------------------------------- #
 # ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and one Reviews team.
@@ -1285,9 +1336,11 @@ class State(object):
     def attested(self, aid):
         return aid in self.data["attestations"]
 
-    def attest(self, aid, initials, note=""):
-        self.data["attestations"][aid] = {"initials": initials, "note": note,
-                                          "at": now_iso()}
+    def attest(self, aid, initials, note="", **bound):
+        """`bound` is what the sign-off was made against — `fence_sha256` for CK-7."""
+        record = {"initials": initials, "note": note, "at": now_iso()}
+        record.update(bound)
+        self.data["attestations"][aid] = record
 
 
 # The placeholder every card and the usage text print where your initials go,
@@ -1429,7 +1482,9 @@ CARDS = {
                 "mechanical can watch a ticket turn into a session, a session into a pull "
                 "request, and a pull request into a review comment — and that end-to-end "
                 "pass is the only thing that proves the tool fence took, because a "
-                "configuration read back is only the file you wrote."),
+                "configuration read back is only the file you wrote. So the sign-off "
+                "records which fence you watched, and this card comes back whenever the "
+                "review entries carry a different one."),
         "do": ["Delegate one real ticket in the normal way and leave the loop alone for a",
                "full cycle. Watch for, in order:",
                "  1. a worktree for the coding ticket, and a pull request",
@@ -1444,11 +1499,21 @@ CARDS = {
                "  5. the review ticket closed, and only its own worktree gone",
                "Read the heartbeat files rather than the logs: a stale timestamp means",
                "NOT RUNNING; a fresh one with a non-ok result means RAN AND COULD NOT.",
+               "Then probe the fence. Create a ticket by hand in the Reviews team, with",
+               "[repo=reviews-<repo name>] as its first line, and delegate it to the",
+               "agent. Ask the reviewer to list every tool it has, by exact name.",
+               "Nothing posts on a pull request: the poller collects only its own tickets.",
+               "  6. the list holds NO name outside this read-only set:",
+               ] + ["       " + line for line in textwrap.wrap(
+                   ", ".join(REVIEWER_READ_ONLY_TOOLS), 62)] + [
+               "     No mcp__ name at all. Any other name is a tool the fence misses:",
+               "     do not sign; it needs a kit pull request first.",
                "Then sign it off:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-FIRST-TICKET "
                "--initials " + INITIALS_PLACEHOLDER,
                "(YOUR initials, 2-4 letters — the placeholder above is refused as typed.)"],
-        "good": "one pull request carries one review comment, and nothing merged itself",
+        "good": ("one pull request carries one review comment, nothing merged itself, and "
+                 "the reviewer holds only read-only tools"),
         "attest": "A-FIRST-TICKET",
     },
     "CK-8": {
@@ -1492,7 +1557,8 @@ ATTESTATIONS = {
     "A-AUTOMATIONS": ("the Reviews team's git automations are off — the fallback for a "
                       "workspace whose API would not name them (CK-3)"),
     "A-DRY-RUN": "the dry-run count is the number you meant (CK-5)",
-    "A-FIRST-TICKET": "one real ticket ran end to end and was reviewed (CK-7)",
+    "A-FIRST-TICKET": ("one real ticket ran end to end and was reviewed, and a reviewer's "
+                       "tools were probed under the fence the entries carry (CK-7)"),
     "A-ENTRY-LOADED": ("the dispatcher really loaded the review entries — the behavioural "
                        "proof, when its startup banner says nothing"),
 }
@@ -2020,12 +2086,40 @@ def step_preflight(ctx, apply_it):
 
 def _read_dispatcher_facts_py(path):
     """One field-picking program, run as the role account. It prints FACTS, never
-    the file: the config holds tracker tokens and this must never move them."""
+    the file: the config holds tracker tokens and this must never move them.
+
+    `linear_mcp_configs` is one row per file the config's `linearMcpConfigs` names:
+    the server NAMES that file adds, or why they could not be read. Names only — an
+    MCP config carries its servers' tokens in headers and env. A `~/` path is expanded
+    in the role account's home, as the dispatcher running as that account does. A
+    relative path is an error row: the dispatcher resolves it against its own working
+    directory, which nothing here can see."""
     return (
-        "import json,sys\n"
+        "import json,os,sys\n"
         "c=json.load(open(%r))\n"
         "rs=c.get('repositories') or []\n"
+        "def mcp(ps):\n"
+        "  if ps is None: return []\n"
+        "  if not isinstance(ps,list):\n"
+        "    return [{'path':'linearMcpConfigs','error':'is not a list of paths'}]\n"
+        "  out=[]\n"
+        "  for p in ps:\n"
+        "    if not isinstance(p,str):\n"
+        "      out.append({'path':repr(p)[:80],'error':'is not a path'}); continue\n"
+        "    q=os.path.expanduser(p) if p.startswith('~/') else p\n"
+        "    if not os.path.isabs(q):\n"
+        "      out.append({'path':p,'error':'is a relative path'}); continue\n"
+        "    try:\n"
+        "      d=json.load(open(q))\n"
+        "    except (OSError,ValueError) as e:\n"
+        "      out.append({'path':p,'error':type(e).__name__+': '+str(e)[:160]}); continue\n"
+        "    s=d.get('mcpServers') if isinstance(d,dict) else None\n"
+        "    if not isinstance(d,dict) or not isinstance(s,(dict,type(None))):\n"
+        "      out.append({'path':p,'error':'holds no mcpServers object'}); continue\n"
+        "    out.append({'path':p,'servers':sorted(s or {})})\n"
+        "  return out\n"
         "print(json.dumps({\n"
+        "  'linear_mcp_configs': mcp(c.get('linearMcpConfigs')),\n"
         "  'workspace_ids': sorted({r.get('linearWorkspaceId') for r in rs if "
         "r.get('linearWorkspaceId')}),\n"
         "  'workspace_base_dirs': sorted({r.get('workspaceBaseDir') for r in rs if "
@@ -2988,6 +3082,39 @@ def _tag_ambiguity(entries, wanted, dead=()):
     return problems
 
 
+def review_fence(ctx):
+    """The reviewer's `disallowedTools` ON THIS MACHINE: `DISALLOWED_TOOLS`, plus both
+    rule forms for every server the dispatcher's `linearMcpConfigs` files add.
+
+    A review entry has no `allowedTools`, and for such an entry the dispatcher loads
+    every server in those files into the session. They sit in the config this
+    installer already reads, so their names are knowable, and a fence that skipped
+    them would read closed over servers it never named. A file whose names could not
+    be read is therefore a refusal, never a smaller fence."""
+    rows = (getattr(ctx, "dispatcher", None) or {}).get("linear_mcp_configs") or []
+    problems, extra = [], []
+    for row in rows:
+        path = row.get("path") or "?"
+        if row.get("error") or not isinstance(row.get("servers"), list):
+            problems.append("%s: %s" % (path, row.get("error") or "no server list"))
+            continue
+        for server in row["servers"]:
+            if not (isinstance(server, str) and MCP_SERVER_NAME_RE.match(server)):
+                problems.append("%s: the server %r is not a name a rule can fence"
+                                % (path, str(server)[:60]))
+            elif server not in TRACKER_FENCE_SERVERS and server not in extra:
+                extra.append(server)
+    if problems:
+        raise SetupError(
+            "refusing to write review entries: the dispatcher config's linearMcpConfigs "
+            "adds MCP servers to every review session, and these could not be fenced:\n%s\n"
+            "Fix or remove each file named, then re-run. An entry written without them "
+            "would claim a closed fence over servers nothing named."
+            % "\n".join("  - " + p for p in problems))
+    return list(DISALLOWED_TOOLS) + [
+        rule for server in sorted(extra) for rule in _server_rules(server)]
+
+
 def reviews_entries(ctx):
     """The repository entries this installer writes — ONE PER REVIEWED REPOSITORY, so a
     review is read in a clone of the repository the diff came from.
@@ -3021,6 +3148,7 @@ def reviews_entries(ctx):
             "correct checkout to read — which is the whole defect this entry exists to "
             "fix. Give the dispatcher an entry whose clone's `origin` is that repository, "
             "or drop it from REVIEW_REPOS." % ", ".join(missing))
+    fence = review_fence(ctx)
 
     out = []
     for at, repo in enumerate(repos):
@@ -3038,7 +3166,7 @@ def reviews_entries(ctx):
             "linearWorkspaceId": spaces[0],
             "routingLabels": [REVIEW_ENTRY_NEVER_LABEL],
             "isActive": True,
-            "disallowedTools": list(DISALLOWED_TOOLS),
+            "disallowedTools": list(fence),
             "userAccessControl": {"allowedUsers": [ids.get("owner_user_id", "")]},
             "appendInstruction": REVIEWER_BRIEF,
         }
@@ -3181,6 +3309,16 @@ def step_dispatcher_entry(ctx, apply_it):
     differs = [w["id"] for w in want if not _entry_matches(have_by_id.get(w["id"]), w)]
     same = not differs and not stale
 
+    # THE FENCE THE ENTRIES CARRY, recorded whenever this step sees it on the machine:
+    # the entries match (the compare covers `disallowedTools`), or this pass wrote them.
+    # A measured mismatch drops the note, so the CK-7 sign-off is never matched against
+    # a fence the entries no longer carry.
+    notes = ctx.state.data.setdefault("notes", {})
+    if same:
+        notes[FENCE_NOTE] = _fence_note(want[0]["disallowedTools"])
+    elif not apply_it:
+        notes.pop(FENCE_NOTE, None)
+
     # The banner proof is recorded SEPARATELY from "the entries match". They are
     # different facts, and folding them into one ledger row is what made a
     # re-run bounce a live dispatcher to re-learn something it already knew.
@@ -3213,11 +3351,14 @@ def step_dispatcher_entry(ctx, apply_it):
                             _reconcile_entries_py(conf["DISPATCHER_CONFIG"])),
                         stdin=body,
                         why="reconcile the review entries in the dispatcher config")
-        if not res.skipped:
+        if res.skipped:
+            notes.pop(FENCE_NOTE, None)
+        else:
             if not res.ok:
                 raise SetupError("could not write the dispatcher config: %s"
                                  % (res.err or res.out).strip()[:300])
             say("  " + res.out.strip())
+            notes[FENCE_NOTE] = _fence_note(want[0]["disallowedTools"])
 
         # RESTART ONLY WHEN THE FILE ACTUALLY CHANGED. A restart kills every
         # in-flight coding session, and the owner is told to re-run this same
@@ -3227,8 +3368,13 @@ def step_dispatcher_entry(ctx, apply_it):
         # bootout THEN bootstrap. `kickstart -k` restarts the process without
         # re-reading the plist, and confusing the two once left a front-door
         # proxy on a stale config for four days.
-        _restart_dispatcher(ctx, backup_path)
+        #
+        # `since` is how many bytes the log held once the old process was gone.
+        # The proof below reads only what came after it, so a banner the old
+        # process printed can never prove what the new one loaded.
+        since = _restart_dispatcher(ctx, backup_path)
     else:
+        since = None
         say("  the review entries already match this conf, so the dispatcher was NOT "
             "restarted;")
         say("  only their load is still unproven, and re-reading a log proves that without "
@@ -3237,7 +3383,7 @@ def step_dispatcher_entry(ctx, apply_it):
     if ctx.runner.dry_run:
         return False, "would write the entries and restart the dispatcher", []
 
-    proven, how = _banner_proves_entry(ctx, names)
+    proven, how = _banner_proves_entry(ctx, names, since=since)
     if proven:
         ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = {"names": names,
                                                                     "how": how}
@@ -3358,7 +3504,15 @@ def _wait_until_gone(r, label, limit):
 
 
 def _restart_dispatcher(ctx, backup):
-    """Stop the dispatcher, wait for it to REALLY be gone, start it again.
+    """Stop the dispatcher, wait for it to REALLY be gone, start it again. Returns
+    the log's size in bytes at the moment the old process was gone and the new one
+    not yet started (`LOG_SIZE_UNREAD` if it could not be read), or None on a dry
+    run, which restarts nothing.
+
+    THE SIZE IS TAKEN AFTER THE OLD JOB LEFT THE DOMAIN, NOT BEFORE THE STOP. The
+    dispatcher watches its config, so the old process logs the entries it hot-loaded
+    moments after the rewrite, and those lines name them. Everything past this
+    offset was written by the new process, and nothing else.
 
     Raises SetupError on every path that ends with the service not running —
     but never before recording what a person has to do about it on `ctx`, so
@@ -3380,9 +3534,9 @@ def _restart_dispatcher(ctx, backup):
     plist = _dispatcher_plist(label)
 
     out = r.as_root(["launchctl", "bootout", "system/" + label],
-                    why="stop the dispatcher (config is read only at process start)")
+                    why="stop the dispatcher so it starts again and prints a fresh banner")
     if out.skipped:
-        return                      # a dry run stops nothing, so it starts nothing
+        return None                 # a dry run stops nothing, so it starts nothing
     # THE RESULT IS READ, NEVER DISCARDED. `bootout` exits non-zero both when
     # there was nothing to unload and when the unload failed — opposite facts —
     # so it is reported here and the wait below is what decides, because only
@@ -3409,6 +3563,7 @@ def _restart_dispatcher(ctx, backup):
     if waited:
         say("  the dispatcher took about %ds to leave the domain; bootstrapping into a "
             "job that is still terminating is what returns EIO." % waited)
+    since = _dispatcher_log_size(ctx)
 
     said, attempt = "", 0
     for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
@@ -3425,14 +3580,14 @@ def _restart_dispatcher(ctx, backup):
         boot = r.as_root(["launchctl", "bootstrap", "system", plist],
                          why="start the dispatcher again so it re-reads its config")
         if boot.skipped:
-            return
+            return None
         # "launchctl accepted it" is not "the dispatcher is back". The domain
         # is asked, for the same reason the wait above asks it.
         if boot.ok and _service_in_domain(r, label):
             if attempt > 1:
                 say("  the dispatcher came back on attempt %d of %d."
                     % (attempt, BOOTSTRAP_ATTEMPTS))
-            return
+            return since
         said = (boot.err or boot.out).strip()
         if boot.ok:
             said = ("launchctl accepted the bootstrap and the service is still not in "
@@ -3495,6 +3650,26 @@ def _reconcile_entries_py(path):
 
 
 ENTRY_PROOF_NOTE = "dispatcher-entry-banner"
+
+# THE FENCE A SIGN-OFF WATCHED. CK-7 is the only proof that a live reviewer ran under
+# the fence, and a sign-off with nothing tying it to a fence went on proving every
+# later one: a sign-off made under the nine-tool fence settled `handover` after the
+# entries were rewritten, though no reviewer had run under the new fence. So the
+# `dispatcher-entry` step records the fingerprint of the `disallowedTools` the entries
+# carry, `attest A-FIRST-TICKET` copies it into the sign-off, and `step_handover`
+# blocks on CK-7 when the two differ. A sign-off older than this has no fingerprint,
+# so a machine upgraded to this code stops at CK-7 once, on purpose.
+FENCE_NOTE = "dispatcher-entry-fence"
+ATTESTATIONS_BOUND_TO_FENCE = frozenset(("A-FIRST-TICKET",))
+
+
+def fence_fingerprint(tools):
+    """sha256 of the sorted rule list: the same fence in any order is one fence."""
+    return hashlib.sha256(json.dumps(sorted(tools)).encode("utf-8")).hexdigest()
+
+
+def _fence_note(tools):
+    return {"sha256": fence_fingerprint(tools), "rules": len(tools)}
 
 # THE BANNER IS A REGION, NOT A LINE, and reading it as a line is what made
 # this step unclearable. A dispatcher prints what it loaded as a header with
@@ -3568,23 +3743,64 @@ def _proof_covers(note, names):
     return set(note.get("names") or []) >= set(names)
 
 
-def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,)):
+def _dispatcher_log_path(ctx):
+    """The dispatcher's StandardOutPath, read out of its plist, or None."""
+    got = ctx.runner.read(["/usr/libexec/PlistBuddy", "-c", "Print :StandardOutPath",
+                           _dispatcher_plist(ctx.conf["DISPATCHER_SERVICE"])])
+    if not got.ok or not got.out.strip():
+        return None
+    return got.out.strip().splitlines()[0]
+
+
+# `_restart_dispatcher` could not read the log's size, so no line in the log can be
+# told apart from one the old process wrote.
+LOG_SIZE_UNREAD = "unread"
+
+
+def _dispatcher_log_size(ctx):
+    """The dispatcher log's size in bytes, or LOG_SIZE_UNREAD. A log that does not
+    exist yet is 0 bytes: nothing in it predates the restart. `wc -c` rather than
+    `stat`, whose flags differ between the BSD and GNU spellings."""
+    path = _dispatcher_log_path(ctx)
+    if not path:
+        return LOG_SIZE_UNREAD
+    quoted = shlex.quote(path)
+    got = ctx.runner.as_root(["/bin/sh", "-c", "if [ -e %s ]; then wc -c < %s; else echo 0; fi"
+                              % (quoted, quoted)])
+    try:
+        return int((got.out or "").strip()) if got.ok else LOG_SIZE_UNREAD
+    except ValueError:
+        return LOG_SIZE_UNREAD
+
+
+def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,), since=None):
     """(proven, how). Reads the dispatcher's own log for proof that it loaded
     EVERY named review entry. ABSENCE IS NEVER READ AS SUCCESS, and a partial
     answer is an absence: one entry missing from the banner is one repository
     whose reviews would fall back to another entry's clone.
 
-    The WHOLE log is searched, not the tail: this is called on a re-run that
-    deliberately did NOT restart the dispatcher, so the banner it is looking for
-    may be thousands of lines back. A tail would then report "nothing named it"
-    about a log that names it, and the only way to make the tail true again
-    would be to bounce a live service to re-print a line it already printed."""
-    r, conf = ctx.runner, ctx.conf
-    logpath = r.read(["/usr/libexec/PlistBuddy", "-c", "Print :StandardOutPath",
-                      _dispatcher_plist(conf["DISPATCHER_SERVICE"])])
-    if not logpath.ok or not logpath.out.strip():
+    `since` is None when this pass did NOT restart the dispatcher. Then the WHOLE
+    log is searched, not the tail: the banner it is looking for may be thousands of
+    lines back. A tail would then report "nothing named it" about a log that names
+    it, and the only way to make the tail true again would be to bounce a live
+    service to re-print a line it already printed.
+
+    After a restart, `since` is the byte offset `_restart_dispatcher` measured, and
+    only the log past it is read. The entries keep their names when their contents
+    change, so the old process's banner names them too; read whole, it proved a load
+    the new process may never have made — one still starting, or one launchd keeps
+    restarting."""
+    r = ctx.runner
+    path = _dispatcher_log_path(ctx)
+    if not path:
         return False, "its plist names no StandardOutPath"
-    path = logpath.out.strip().splitlines()[0]
+    if since == LOG_SIZE_UNREAD:
+        return False, ("the size of %s could not be read before the restart, so no "
+                       "banner in it can be told from one the old process printed" % path)
+    # What the greps read: the whole log, or only what the new process wrote.
+    source = ("tail -c +%d %s 2>/dev/null | " % (since + 1, shlex.quote(path))
+              if since is not None else "")
+    target = "" if since is not None else " " + shlex.quote(path)
     wanted = list(entries)
     found = {}
     for _ in range(BANNER_TRIES):
@@ -3593,9 +3809,9 @@ def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,)):
         # containing the id and threw the header away before anything could read
         # it. -i so a capitalised banner still counts.
         region = r.as_root(["/bin/sh", "-c",
-                            "grep -i -A %d -e %s %s 2>/dev/null | tail -%d"
-                            % (BANNER_AFTER, shlex.quote(BANNER_HEADER),
-                               shlex.quote(path), BANNER_TAIL)])
+                            "%sgrep -i -A %d -e %s%s 2>/dev/null | tail -%d"
+                            % (source, BANNER_AFTER, shlex.quote(BANNER_HEADER),
+                               target, BANNER_TAIL)])
         for entry in wanted:
             if entry in found:
                 continue
@@ -3614,8 +3830,8 @@ def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,)):
             if entry in found:
                 continue
             same = r.as_root(["/bin/sh", "-c",
-                              "grep -i -e %s %s 2>/dev/null | tail -60"
-                              % (shlex.quote(entry), shlex.quote(path))])
+                              "%sgrep -i -e %s%s 2>/dev/null | tail -60"
+                              % (source, shlex.quote(entry), target)])
             # The grep is a substring PREFILTER; what counts is the whole name.
             # A bare `entry in line` here had the same hole as the old `\b`:
             # "loaded repository reviews-kit-docs with 9 disallowed tools" names
@@ -3632,7 +3848,8 @@ def _banner_proves_entry(ctx, entries=(LEGACY_REVIEW_ENTRY_ID,)):
         _pause(1)
     missing = [e for e in wanted if e not in found]
     if missing:
-        return False, "no banner in %s named %s" % (path, ", ".join(missing))
+        return False, "no banner in %s%s named %s" % (
+            path, " since the restart" if since is not None else "", ", ".join(missing))
     return True, "; ".join(found[e] for e in wanted)
 
 
@@ -4237,9 +4454,24 @@ def step_heartbeat_monitor(ctx, apply_it):
 
 
 def step_handover(ctx, apply_it):
-    if not ctx.state.attested("A-FIRST-TICKET"):
+    """The end-to-end sign-off, and the fence it watched. See FENCE_NOTE."""
+    signed = (ctx.state.data.get("attestations") or {}).get("A-FIRST-TICKET")
+    if not signed:
         raise Blocked("CK-7", "no real ticket has been watched end to end yet")
-    return True, "one real ticket was watched through to a reviewed pull request", []
+    watched = signed.get("fence_sha256") if isinstance(signed, dict) else None
+    current = ((ctx.state.data.get("notes") or {}).get(FENCE_NOTE) or {}).get("sha256")
+    if not watched:
+        raise Blocked("CK-7", "the end-to-end sign-off names no fence, so it proves none "
+                              "— probe a live reviewer's tools and sign again")
+    if not current:
+        raise Blocked("CK-7", "this pass did not see which fence the review entries carry, "
+                              "so the sign-off cannot be matched to it")
+    if watched != current:
+        raise Blocked("CK-7", "the fence changed since the end-to-end sign-off (signed "
+                              "under %s…, the entries now carry %s…) — probe a live "
+                              "reviewer's tools and sign again" % (watched[:12], current[:12]))
+    return True, ("one real ticket was watched through to a reviewed pull request, under "
+                  "the fence the entries carry (%s…)" % current[:12]), []
 
 
 STEPS = (
@@ -4659,10 +4891,25 @@ def cmd_attest(state, aid, initials, note):
                          "per eligible pull request, and a sign-off with no number in it "
                          "records that somebody clicked, not that somebody read."
                          % (aid, ATTESTATIONS[aid]))
-    state.attest(aid, initials.lower(), note or "")
+    bound = {}
+    if aid in ATTESTATIONS_BOUND_TO_FENCE:
+        # A SIGN-OFF OF A LIVE REVIEWER NAMES THE FENCE IT RAN UNDER. With none
+        # recorded yet there is nothing to bind it to, and an unbound sign-off would
+        # block at CK-7 on the very next pass anyway.
+        fence = ((state.data.get("notes") or {}).get(FENCE_NOTE) or {}).get("sha256")
+        if not fence:
+            raise SetupError(
+                "%s records that a live reviewer ran under the review entries' fence, and "
+                "no fence is recorded yet.\n  Run the installer until the dispatcher-entry "
+                "step holds, probe a reviewer's tools (card CK-7), then sign." % aid)
+        bound["fence_sha256"] = fence
+    state.attest(aid, initials.lower(), note or "", **bound)
     state.save()
     say("recorded: %s  %s  %s  %s" % (aid, initials.lower(), now_iso(), note or ""))
     say("  (%s)" % ATTESTATIONS[aid])
+    if bound:
+        say("  under the fence %s… — change the fence and this sign-off stops counting"
+            % bound["fence_sha256"][:12])
     return EX_OK
 
 
@@ -4750,6 +4997,30 @@ class FakeLaunchd(FakeRunner):
             self.present = self.present or self.resurrect
             return Result(rc, "", self.bootstrap_err)
         return FakeRunner._exec(self, argv, stdin, timeout)
+
+
+class FakeLaunchdWithLog(FakeLaunchd):
+    """A FakeLaunchd whose dispatcher log is a REAL file, read by this file's own shell
+    fragments: `wc -c` for the offset, `tail -c` and `grep` for the banner. A bootstrap
+    that starts the service appends `new_output`, which is what the new process
+    prints. An offset nobody has executed is a guess about a shell."""
+
+    def __init__(self, log_path, new_output="", **kw):
+        FakeLaunchd.__init__(self, **kw)
+        self.log_path, self.new_output = log_path, new_output
+
+    def _exec(self, argv, stdin, timeout):
+        line = _fmt(argv)
+        if "Print :StandardOutPath" in line:
+            return Result(0, self.log_path + "\n", "")
+        if list(argv[:3]) == ["sudo", "/bin/sh", "-c"] and self.log_path in argv[3]:
+            ran = subprocess.run(["/bin/sh", "-c", argv[3]], capture_output=True, text=True)
+            return Result(ran.returncode, ran.stdout, ran.stderr)
+        res = FakeLaunchd._exec(self, argv, stdin, timeout)
+        if "launchctl bootstrap system" in line and res.ok and self.present:
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(self.new_output)
+        return res
 
 
 class FakeGitHub(object):
@@ -5552,6 +5823,27 @@ def _selftest_body():
                 and st_ok.data["attestations"]["A-DRY-RUN"]["note"] == "count read: 7"),
                "the record is not what was signed: %s" % st_ok.data["attestations"])
 
+        # THE END-TO-END SIGN-OFF CARRIES THE FENCE IT WATCHED, copied from the note
+        # the entry step wrote — and with no note there is no fence to sign under.
+        cases += 1
+        st_f = State(tempfile.mkdtemp(prefix="stage-e-attest-fence."))
+        st_f.data["notes"][FENCE_NOTE] = _fence_note(DISALLOWED_TOOLS)
+        _quiet(lambda: cmd_attest(st_f, "A-FIRST-TICKET", "BC", ""))
+        expect("attest-binds-fence",
+               (st_f.data["attestations"].get("A-FIRST-TICKET") or {}).get("fence_sha256")
+               == fence_fingerprint(DISALLOWED_TOOLS),
+               "the sign-off does not name the fence it watched: %s"
+               % st_f.data["attestations"])
+        st_nf = State(tempfile.mkdtemp(prefix="stage-e-attest-nofence."))
+        try:
+            _quiet(lambda: cmd_attest(st_nf, "A-FIRST-TICKET", "BC", ""))
+            expect("attest-binds-fence", False,
+                   "a sign-off was recorded with no fence to tie it to")
+        except SetupError as exc:
+            expect("attest-binds-fence", "no fence is recorded" in str(exc)
+                   and not st_nf.attested("A-FIRST-TICKET"),
+                   "refused without saying why, or recorded anyway: %s" % exc)
+
         # THE PIN: nothing this file PRINTS where initials go may be accepted as
         # initials. A card that starts printing a signable example again turns
         # this red, which is the whole defect said once.
@@ -5588,17 +5880,13 @@ def _selftest_body():
                        "promptTemplatePath", "allowedTools", "model"):
             expect("entry-shape", absent not in entry,
                    "%s must stay ABSENT from a review entry" % absent)
-        expect("entry-shape", entry["disallowedTools"] == DISALLOWED_TOOLS
-               and len(DISALLOWED_BUILTINS) == 10, "the tool fence changed shape")
+        # The entry carries THIS MACHINE's fence, which is the base fence when the
+        # dispatcher config names no platform MCP config (14-fence-platform below).
+        expect("entry-shape", entry["disallowedTools"] == review_fence(ctx7)
+               == DISALLOWED_TOOLS, "the entry does not carry the machine's fence")
         # KIT-132: the tracker's MCP servers ARE fenced now. The rule that replaced
         # "no mcp__ entry" still forbids the wrong shape rather than being deleted:
-        # every injected server fenced in both forms, and no entry that the runtime
-        # would skip in silence.
-        for server in TRACKER_FENCE_SERVERS:
-            for rule in ("mcp__%s" % server, "mcp__%s__*" % server):
-                expect("entry-shape", rule in entry["disallowedTools"],
-                       "the reviewer's fence does not remove %s — a dispatcher-injected "
-                       "server the reviewer would keep" % rule)
+        # no entry that the runtime would skip in silence.
         for rule in (t for t in entry["disallowedTools"] if t.startswith("mcp__")):
             m = MCP_FENCE_RULE_RE.match(rule)
             expect("entry-shape", bool(m) and m.group(1) in TRACKER_FENCE_SERVERS,
@@ -5610,6 +5898,167 @@ def _selftest_body():
                "the reviewer brief is not in appendInstruction")
     expect("entry-shape", entries7[0]["teamKeys"] == ["REV"],
            "the fallback team key is not on the first entry")
+
+    # -- 14-fence-servers. THE SERVERS ARE PINNED BY NAME, NOT BY THE CONSTANT -- #
+    # The check this replaces looped over TRACKER_FENCE_SERVERS, the tuple that also
+    # BUILDS the fence, so dropping `linear` from it — or emptying it — stayed green
+    # while the brief still promised "no tracker tool". Literals only, here.
+    cases += 1
+    expect("fence-servers-pinned",
+           TRACKER_FENCE_SERVERS == ("linear", "cyrus-tools", "cyrus-docs", "slack"),
+           "the fenced servers changed: %r" % (TRACKER_FENCE_SERVERS,))
+    for rule in ("mcp__linear", "mcp__linear__*", "mcp__cyrus-tools", "mcp__cyrus-tools__*",
+                 "mcp__cyrus-docs", "mcp__cyrus-docs__*", "mcp__slack", "mcp__slack__*"):
+        expect("fence-servers-pinned", rule in entries7[0]["disallowedTools"],
+               "the written entry does not remove %s — a dispatcher-injected server the "
+               "reviewer would keep" % rule)
+    expect("fence-servers-pinned",
+           len(DISALLOWED_TOOLS) == 39 and len(entries7[0]["disallowedTools"]) == 39,
+           "the fence has %d rules and the entry %d, not 31 built-ins and 8 server rules"
+           % (len(DISALLOWED_TOOLS), len(entries7[0]["disallowedTools"])))
+
+    # -- 14-fence-builtins. EVERY TOOL THAT RUNS, WRITES, FETCHES, SCHEDULES, --- #
+    # MESSAGES OR STARTS WORK IS GONE, and every tool the dispatcher lists is on one
+    # side of the line or the other. The fence once named ten built-ins and called
+    # itself complete while `Monitor` ran shell commands (a `Bash` rule matches only a
+    # tool NAMED Bash) and `RemoteTrigger` started cloud agents.
+    cases += 1
+    for name in ("Bash", "Monitor", "REPL", "Edit", "Write", "NotebookEdit", "WebFetch",
+                 "WebSearch", "Task", "Agent", "Workflow", "RemoteTrigger", "Skill",
+                 "TaskStop", "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
+                 "ScheduleWakeup", "SendMessage", "SendUserMessage", "PushNotification",
+                 "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
+                 "EnterPlanMode", "ExitPlanMode", "ListMcpResourcesTool",
+                 "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
+        expect("fence-builtins-pinned", name in entries7[0]["disallowedTools"],
+               "the written entry leaves the reviewer %s" % name)
+    expect("fence-builtins-pinned", len(DISALLOWED_BUILTINS) == 31
+           and len(set(DISALLOWED_BUILTINS)) == 31,
+           "the built-in fence has %d names, not 31" % len(DISALLOWED_BUILTINS))
+    # The dispatcher's own list of available tools, v0.2.69, copied here as a literal.
+    # A name on neither side of the line is a tool nobody decided about.
+    dispatcher_tools_0_2_69 = (
+        "Read", "Edit", "Write", "Bash", "Task", "WebFetch", "WebSearch", "TaskCreate",
+        "TaskUpdate", "TaskGet", "TaskList", "NotebookEdit", "Skill", "SendMessage",
+        "PushNotification", "ShareOnboardingGuide", "EnterWorktree", "ExitWorktree",
+        "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "Monitor", "LSP",
+        "RemoteTrigger", "TaskOutput", "TaskStop", "ToolSearch", "DesignSync", "Workflow",
+        "ReportFindings")
+    unclassified = [t for t in dispatcher_tools_0_2_69
+                    if t not in DISALLOWED_BUILTINS and t not in REVIEWER_READ_ONLY_TOOLS]
+    expect("fence-builtins-pinned", not unclassified,
+           "the dispatcher offers %s, and neither the fence nor the read-only set names it"
+           % unclassified)
+    overlap = sorted(set(DISALLOWED_BUILTINS) & set(REVIEWER_READ_ONLY_TOOLS))
+    expect("fence-builtins-pinned", not overlap,
+           "%s is both fenced and promised as read-only" % overlap)
+    for kept in ("Read", "Grep", "Glob"):
+        expect("fence-builtins-pinned", kept in REVIEWER_READ_ONLY_TOOLS,
+               "the probe's read-only set no longer admits %s, which the reviewer needs"
+               % kept)
+    # …and the probe a person runs names the same set, from the same constant.
+    ck7 = " ".join(CARDS["CK-7"]["do"])
+    expect("fence-builtins-pinned", all(t in ck7 for t in REVIEWER_READ_ONLY_TOOLS)
+           and "every tool it has, by exact name" in ck7,
+           "card CK-7 does not ask for the reviewer's tool list against the read-only set")
+    # …and the operator doc's copy of the entry carries the same fence, in order.
+    op_doc = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "docs",
+                          "STAGE-E-OPERATOR.md")
+    try:
+        with open(op_doc, encoding="utf-8") as fh:
+            op_text = fh.read()
+        block = [b for b in op_text.split("```json\n")[1:] if '"disallowedTools"' in b]
+        doc_entry = json.loads(block[0].split("```", 1)[0]) if block else {}
+    except (OSError, ValueError) as exc:
+        op_text, doc_entry = "", {"error": str(exc)}
+    expect("fence-doc-parity", doc_entry.get("disallowedTools") == DISALLOWED_TOOLS,
+           "docs/STAGE-E-OPERATOR.md's entry lists a different fence: %r"
+           % (doc_entry.get("disallowedTools") or doc_entry,))
+    expect("fence-doc-parity", all(t in op_text for t in REVIEWER_READ_ONLY_TOOLS),
+           "docs/STAGE-E-OPERATOR.md does not name every tool the probe admits")
+
+    # -- 14-fence-platform. THE SERVERS A MACHINE ADDS ARE FENCED TOO --------- #
+    # An entry with no `allowedTools` gets every server in the files the dispatcher
+    # config's `linearMcpConfigs` names. Their names are in a file this installer
+    # already reads, so a fence that left them out would be closed only on paper.
+    cases += 1
+    ctxP, _fP = _settled_ctx(conf)
+    ctxP.dispatcher["linear_mcp_configs"] = [
+        {"path": "/opt/example-dispatch/github-mcp.json", "servers": ["github", "linear"]},
+        {"path": "~/.example/extra-mcp.json", "servers": ["search_index"]}]
+    fenceP = reviews_entries(ctxP)[0]["disallowedTools"]
+    for rule in ("mcp__github", "mcp__github__*", "mcp__search_index",
+                 "mcp__search_index__*"):
+        expect("platform-mcp-fenced", rule in fenceP,
+               "a server the machine's platform MCP config adds is not fenced: %s" % rule)
+    expect("platform-mcp-fenced", len(fenceP) == 43 and fenceP.count("mcp__linear") == 1,
+           "the platform servers were not added once each on top of the base fence: %r"
+           % fenceP[len(DISALLOWED_TOOLS):])
+    for rule in (t for t in fenceP if t.startswith("mcp__")):
+        m = MCP_FENCE_RULE_RE.match(rule)
+        expect("platform-mcp-fenced", bool(m) and m.group(1) in (
+            TRACKER_FENCE_SERVERS + ("github", "search_index")),
+            "%r is not anchored to one fenced server" % rule)
+    # A FILE WHOSE NAMES COULD NOT BE READ IS A REFUSAL, never a smaller fence. So is
+    # a name no rule can spell: `a__b` splits into a server and a tool, and `x.y` is
+    # renamed by the runtime before it is matched.
+    for label, row, needle in (
+            ("unreadable", {"path": "/opt/example-dispatch/gone.json",
+                            "error": "FileNotFoundError: no such file"}, "gone.json"),
+            ("double-underscore", {"path": "/x/a.json", "servers": ["a__b"]}, "'a__b'"),
+            ("renamed", {"path": "/x/b.json", "servers": ["x.y"]}, "'x.y'")):
+        cases += 1
+        ctxQ, _fQ = _settled_ctx(conf)
+        ctxQ.dispatcher["linear_mcp_configs"] = [row]
+        try:
+            reviews_entries(ctxQ)
+            failures.append("platform-mcp-refused: %s — entries were written over a "
+                            "server nothing fenced" % label)
+        except SetupError as exc:
+            expect("platform-mcp-refused", needle in str(exc),
+                   "%s: the refusal does not name %s: %s" % (label, needle, exc))
+
+    # THE READER IS RUN, not merely read: it is a program this file generates, run as
+    # another account, and it must print names and never a server's token.
+    cases += 1
+    mcp_dir = tempfile.mkdtemp(prefix="stage-e-mcp.")
+    mcp_home = os.path.join(mcp_dir, "home")
+    os.makedirs(os.path.join(mcp_home, ".cfg"))
+    canary = "CANARY" + "-not-a-real-token-7731"
+    with open(os.path.join(mcp_dir, "github.json"), "w") as fh:
+        json.dump({"mcpServers": {"github": {"headers": {"Authorization": canary}},
+                                  "docs_search": {}}}, fh)
+    with open(os.path.join(mcp_home, ".cfg", "extra.json"), "w") as fh:
+        json.dump({"mcpServers": {"home-server": {"env": {"TOKEN": canary}}}}, fh)
+    with open(os.path.join(mcp_dir, "broken.json"), "w") as fh:
+        fh.write("{not json")
+    mcp_cfg = os.path.join(mcp_dir, "config.json")
+    with open(mcp_cfg, "w") as fh:
+        json.dump({"repositories": [], "linearMcpConfigs": [
+            os.path.join(mcp_dir, "github.json"), "~/.cfg/extra.json",
+            os.path.join(mcp_dir, "missing.json"), os.path.join(mcp_dir, "broken.json"),
+            "relative.json"]}, fh)
+    ran = subprocess.run([sys.executable, "-c", _read_dispatcher_facts_py(mcp_cfg)],
+                         capture_output=True, text=True, cwd=mcp_dir,
+                         env=dict(os.environ, HOME=mcp_home))
+    try:
+        rows = json.loads(ran.stdout).get("linear_mcp_configs")
+    except ValueError:
+        rows = None
+    expect("platform-mcp-reader", ran.returncode == 0 and isinstance(rows, list)
+           and len(rows) == 5, "the reader did not print one row per listed file: rc=%d %r %s"
+           % (ran.returncode, rows, ran.stderr[-300:]))
+    rows = rows or [{}] * 5
+    expect("platform-mcp-reader", rows[0].get("servers") == ["docs_search", "github"]
+           and rows[1].get("servers") == ["home-server"],
+           "the server names were not read, or `~/` was not the role account's home: %r"
+           % rows[:2])
+    expect("platform-mcp-reader", all(rows[i].get("error") for i in (2, 3, 4))
+           and "relative" in (rows[4].get("error") or ""),
+           "a missing, broken or relative file did not come back as an error row: %r"
+           % rows[2:])
+    expect("platform-mcp-reader", canary not in ran.stdout + ran.stderr,
+           "the reader printed a server's credential")
 
     # -- 14b. N REPOSITORIES, N ENTRIES, EACH IN ITS OWN CLONE --------------- #
     # THE DEFECT, stated as a case: every review session was cut from ONE clone
@@ -5745,6 +6194,49 @@ def _selftest_body():
                not (MCP_FENCE_RULE_RE.match(bad) and
                     MCP_FENCE_RULE_RE.match(bad).group(1) in TRACKER_FENCE_SERVERS),
                "the fence-rule shape accepts %r, a rule the runtime would skip in silence" % bad)
+
+    # WHAT REACHES THE TICKET. The dispatcher posts every message the reviewer writes,
+    # and every tool call with its parameters, to the review ticket's activity while the
+    # session runs. A preamble promising that only the final message reaches a ticket
+    # taught the reviewer a privacy it does not have.
+    cases += 1
+    expect("preamble-activity-honest",
+           "except your final message" not in _poller_names.REVIEW_ONLY_PREAMBLE
+           and "every message you write" in _poller_names.REVIEW_ONLY_PREAMBLE
+           and "secret" in _poller_names.REVIEW_ONLY_PREAMBLE,
+           "the review ticket still tells the reviewer its words stay off the ticket "
+           "until its final message")
+
+    # THE COMMITTED BRIEF AGREES. docs/SESSION-BRIEF.md is what every dispatched
+    # session reads first, a reviewer included, and it told a blocked reviewer to
+    # comment on its own ticket — with a tool the fence removes.
+    cases += 1
+    brief_doc = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "docs",
+                             "SESSION-BRIEF.md")
+    try:
+        with open(brief_doc, encoding="utf-8") as fh:
+            brief_text = fh.read()
+    except OSError:
+        brief_text = ""
+
+    def _section(text, number):
+        head = "\n## %d." % number
+        return text.split(head, 1)[1].split("\n## ", 1)[0] if head in text else ""
+
+    brief5 = _section(brief_text, 5)
+    expect("session-brief-reviewer", brief5,
+           "no §5 in docs/SESSION-BRIEF.md, so this check measures nothing")
+    expect("session-brief-reviewer",
+           "no tracker tool" in brief5 and "summary" in brief5
+           and "as a comment" not in brief5 and "own ticket" not in brief5,
+           "§5 of docs/SESSION-BRIEF.md still sends a blocked reviewer to comment on its "
+           "ticket")
+    for number in (3, 7):
+        section = _section(brief_text, number)
+        expect("session-brief-reviewer",
+               "comment on" in section.lower() and "reviewer" in section,
+               "§%d of docs/SESSION-BRIEF.md tells a session to comment on its ticket and "
+               "never says a reviewer cannot" % number)
 
     # -- 14e. two repositories that differ only by owner are REFUSED --------- #
     # They would want one entry name, and the poller derives the tag from the
@@ -6513,6 +7005,45 @@ def _selftest_body():
                provenB8 is False and "reviews-app" in howB8 and "reviews-kit" not in howB8,
                "a banner naming one of two entries was read as proving both, or the "
                "refusal did not name the missing one: %r" % howB8)
+
+        # -- 15i-c. AFTER A RESTART, ONLY WHAT THE NEW PROCESS WROTE COUNTS - #
+        # A fence change rewrites the entries' contents and keeps their names, so
+        # the banner the OLD process printed names every one of them. Read whole,
+        # the log proved a load the new process never made — one still starting, or
+        # one launchd keeps restarting — and the note was never looked at again. The
+        # old process also logs its hot reload of the rewritten entries; that line
+        # names them too, and is older than the offset.
+        log_dir = tempfile.mkdtemp(prefix="stage-e-log.")
+        log_path = os.path.join(log_dir, "dispatcher.log")
+        banner_kit = ("\U0001f4e6 Managing 2 repositories:\n"
+                      "   • kit (/Users/<role-account>/kit)\n"
+                      "   • reviews-kit (/Users/<role-account>/kit)\n")
+        for label, new_output, proves in (
+                ("banner-after-restart-only", "[INFO] starting\n", False),
+                ("banner-after-restart-proves", "[INFO] starting\n" + banner_kit, True)):
+            cases += 1
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.write("[INFO] the previous process\n" + banner_kit
+                         + "\U0001f504 Updating repository: reviews-kit (reviews-kit)\n")
+            ctxL, fakeL = _restart_ctx(conf)
+            ctxL.runner = FakeLaunchdWithLog(log_path, new_output, answers=list(fakeL.answers))
+            excL = _quiet(lambda: _entry_raises(ctxL))[0]
+            proofL = ctxL.state.data["notes"].get(ENTRY_PROOF_NOTE)
+            if proves:
+                expect(label, excL is None and _proof_covers(proofL, ["reviews-kit"]),
+                       "the new process's own banner did not prove the entry: %r %r"
+                       % (excL, proofL))
+            else:
+                expect(label, isinstance(excL, Unknown) and "since the restart" in excL.what
+                       and not proofL,
+                       "a banner printed BEFORE the restart proved the entries: %r %r"
+                       % (excL, proofL))
+        # …and a size that could not be read proves nothing at all.
+        cases += 1
+        ctxLU, _fLU = _banner_ctx(conf, region=BANNER_SAMPLE)
+        provenLU, howLU = _banner_proves_entry(ctxLU, since=LOG_SIZE_UNREAD)
+        expect("banner-after-restart-only", provenLU is False and "could not be read" in howLU,
+               "an unmeasured offset still let the whole log prove the entry: %r" % howLU)
     finally:
         globals()["_pause"] = _saved_pause
 
@@ -6821,6 +7352,75 @@ def _selftest_body():
     reached = set(ctx9.state.data["steps"])
     expect("verify-keeps-going", {s for s, _t, _f in STEPS} <= reached,
            "verify stopped early: measured %d of %d steps" % (len(reached), len(STEPS)))
+
+    # -- 17-fence. THE END-TO-END SIGN-OFF NAMES THE FENCE IT WATCHED -------- #
+    # A-FIRST-TICKET used to be stored with nothing tying it to a fence, so once the
+    # review entries were rewritten, `run` and `verify` went on reporting as proven a
+    # fence no live reviewer had run under. Three sign-offs: under the fence the
+    # entries carry, under an older one, and from before sign-offs named a fence.
+    old_fence = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task",
+                 "EnterWorktree", "ExitWorktree"]
+    cases += 1
+    ctxF1, _fF1, _aF1 = _healthy_ctx(conf)
+    okF1, detailF1, _x = step_handover(ctxF1, apply_it=False)
+    expect("fence-signoff-match", okF1 is True and "under the fence" in detailF1,
+           "a sign-off under the fence the entries carry did not settle handover: %s"
+           % detailF1)
+    for label, change, needle in (
+            ("fence-signoff-mismatch",
+             lambda rec: rec.update(fence_sha256=fence_fingerprint(old_fence)),
+             "fence changed since"),
+            ("fence-signoff-legacy", lambda rec: rec.pop("fence_sha256"), "names no fence")):
+        cases += 1
+        ctxF, _fF, _aF = _healthy_ctx(conf)
+        change(ctxF.state.data["attestations"]["A-FIRST-TICKET"])
+        try:
+            step_handover(ctxF, apply_it=False)
+            failures.append("%s: handover settled on a sign-off that watched no reviewer "
+                            "under this fence" % label)
+        except Blocked as exc:
+            expect(label, exc.card_id == "CK-7" and needle in exc.extra,
+                   "blocked on %s, saying %r" % (exc.card_id, exc.extra))
+    # …and a WHOLE `verify` of a machine upgraded to this code: every step holds except
+    # handover, which waits on CK-7 once, on purpose.
+    cases += 1
+    ctxF4, fakeF4, _aF4 = _healthy_ctx(conf)
+    _counted(ctxF4)
+    ctxF4.state.data["attestations"]["A-FIRST-TICKET"].pop("fence_sha256")
+    ctxF4.runner.dry_run = True
+    codeF4, _pF4 = _quiet(lambda: cmd_verify(ctxF4))
+    rowsF4 = {s: r["outcome"] for s, r in ctxF4.state.data["steps"].items()
+              if r["outcome"] not in (DONE, ALREADY_DONE, SKIPPED)}
+    expect("fence-signoff-legacy", codeF4 == EX_BLOCKED and rowsF4 == {"handover": BLOCKED},
+           "an upgraded machine did not stop at CK-7 and only there (exit %s): %s"
+           % (codeF4, rowsF4))
+    # THE NOTE THE SIGN-OFF IS MATCHED AGAINST is written by the entry step: when the
+    # entries match, when it writes them, and dropped when a read-only pass sees them
+    # differ.
+    cases += 1
+    ctxFN, _fFN = _settled_ctx(conf)
+    _install_review_entries(ctxFN)
+    ctxFN.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = _proof_note(ctxFN)
+    step_dispatcher_entry(ctxFN, apply_it=False)
+    expect("fence-note-recorded",
+           (ctxFN.state.data["notes"].get(FENCE_NOTE) or {}).get("sha256")
+           == fence_fingerprint(review_fence(ctxFN)),
+           "matching entries did not record the fence they carry: %r"
+           % ctxFN.state.data["notes"].get(FENCE_NOTE))
+    ctxFN.dispatcher["entries"][-1]["disallowedTools"] = list(old_fence)
+    step_dispatcher_entry(ctxFN, apply_it=False)
+    expect("fence-note-recorded", FENCE_NOTE not in ctxFN.state.data["notes"],
+           "entries carrying another fence left the old note standing")
+    ctxFNW, _fFNW = _restart_ctx(conf)
+    globals()["_pause"] = lambda _s: None
+    try:
+        _quiet(lambda: _entry_once(ctxFNW))
+    finally:
+        globals()["_pause"] = _saved_pause
+    expect("fence-note-recorded",
+           (ctxFNW.state.data["notes"].get(FENCE_NOTE) or {}).get("sha256")
+           == fence_fingerprint(review_fence(ctxFNW)),
+           "entries this pass wrote did not record the fence they carry")
 
     # mutant: the pre-fix spelling — a `verify` that may not prompt and never
     # looks in the env file, so the tracker is unmeasurable on EVERY machine,
@@ -8128,7 +8728,11 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
     if stored_env:
         _with_stored_env(ctx, fake, conf)
     ctx.state.attest("A-DRY-RUN", "xx", "count read: 0")
-    ctx.state.attest("A-FIRST-TICKET", "xx")
+    # …signed under the fence the entries carry, which the entry step records again
+    # on every pass.
+    fence = review_fence(ctx)
+    ctx.state.data["notes"][FENCE_NOTE] = _fence_note(fence)
+    ctx.state.attest("A-FIRST-TICKET", "xx", fence_sha256=fence_fingerprint(fence))
     return ctx, fake, api
 
 

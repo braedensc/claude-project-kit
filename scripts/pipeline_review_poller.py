@@ -264,8 +264,8 @@ THE SEEN-SET IS A STATE MACHINE, AND DELIVERY IS PART OF EVERY OUTCOME
 
 NOTHING LEAVES THIS HOST WITH A SECRET IN IT
 
-  The reviewer keeps the Linear MCP (an owner decision, recorded in the ADR), so its
-  `summary` and `detail` strings can echo whatever it read. Before ANY body reaches
+  The reviewer holds no tracker tool since KIT-132, but it keeps Read, Grep and Glob, so
+  its `summary` and `detail` strings can echo whatever it read. Before ANY body reaches
   `post_comment` — reviewed, declined, dry-run — `publish()` scans it for credential
   shapes (`secret_hits`: GitHub / Anthropic / Linear / AWS tokens, private-key blocks,
   JWTs, URL-embedded passwords, long blobs next to key/token/secret words). A hit posts a
@@ -875,15 +875,20 @@ OUTPUT_SHAPE = (
 # WHAT THE REVIEWER ACTUALLY HAS, said in the reviewer's own ticket.
 #
 # This sentence used to read "you have no tools to fetch anything: this description is
-# your entire input", and it was FALSE. The installer's fence removes Bash, Edit, Write,
-# NotebookEdit, WebFetch, WebSearch, Task and the worktree tools — it does NOT remove
+# your entire input", and it was FALSE. The installer's fence removes every tool that
+# runs, writes, fetches, schedules, messages or starts other work, and every MCP server
+# the dispatcher injects or its platform MCP configs add (KIT-132). It does NOT remove
 # Read, Grep or Glob (deliberately: the session sits in a clone of the repository the
-# diff came from, and that is good context), and the tracker's own MCP tools stay too, an
-# owner decision that is monitored rather than closed. A brief a reviewer can see is
-# wrong about its own powers is a brief it can reason its way out of, so this says what
-# is true and then draws the line where the line actually is: the diff below is the only
-# view of THIS CHANGE, because the worktree is cut from the default branch and does not
-# contain it.
+# diff came from, and that is good context). A brief a reviewer can see is wrong about
+# its own powers is a brief it can reason its way out of, so this says what is true and
+# then draws the line where the line actually is: the diff below is the only view of
+# THIS CHANGE, because the worktree is cut from the default branch and does not contain
+# it.
+#
+# NO TRACKER TOOL IS NOT NO TRACKER. The dispatcher posts every message the session
+# writes, and every tool call with its parameters, to the review ticket's activity as it
+# runs. A line that promised "nothing you write reaches any ticket except your final
+# message" taught the reviewer a privacy it does not have, so this one says the opposite.
 #
 # Kept a module constant so the installer's selftest can pin it against
 # `DISALLOWED_TOOLS` — the two files must not disagree about what was taken away.
@@ -891,8 +896,10 @@ REVIEW_ONLY_PREAMBLE = (
     "You are a review-only session. You cannot run commands, edit or write files, push, "
     "open a pull request, approve or merge, and you cannot fetch a URL or search the web: "
     "there is no Bash, Edit, Write or web tool in your hand, and looking for a way round "
-    "that is itself a finding against you. There is no tracker tool either: nothing you "
-    "write reaches any ticket except your final message. You CAN read this repository — "
+    "that is itself a finding against you. There is no tracker tool either. The "
+    "dispatcher still posts every message you write and every tool call you make to this "
+    "ticket's activity as you go, so never quote a secret-looking value from a file you "
+    "read. You CAN read this repository — "
     "Read, Grep and Glob work in a worktree cut from its DEFAULT BRANCH, so a file you open "
     "shows the code WITHOUT this change. "
     "Do not use them to go looking for a different brief: the diff below is the only view of "
