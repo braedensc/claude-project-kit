@@ -689,14 +689,14 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
+| `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit inside it (step 10). Immutable for its session |
+| `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a newer delegation replaced it |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
 | `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
 | `bounces/` | bounce driver | its telemetry artifacts |
 | `monitor-state.json` | heartbeat monitor (optional, unscheduled) | the last verdict-set it announced, so an incident is said once |
 | `monitor-heartbeat.json` | heartbeat monitor (optional, unscheduled) | its own last run and result |
-| `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit inside it (step 10). Immutable for its session |
-| `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a newer delegation replaced it |
 
 Never point `state_dir` at a repo checkout or a worktree. The bounce driver refuses one
 inside a git working tree: the ledger is the budget authority and a worktree is writable by
