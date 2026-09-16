@@ -10,6 +10,15 @@
 # On a machine running Stage E, put it beside stage-e.conf and the Stage E
 # installer's `conflict-waker` step runs the same steps for you.
 #
+# macOS only: the installer builds a LaunchAgent.  On Linux, skip this file
+# and schedule `python3 scripts/pr_conflict.py wake` yourself (systemd timer
+# or cron) — docs/COLLABORATION.md, parallel-session item 8.
+#
+# CLAUDE_CONFIG_DIR is not a key here: the job keeps the value your shell has
+# when you run the installer (or ~/.claude when unset).  Set it BEFORE running
+# the installer, and re-run `run` if it changes — otherwise the waker finds no
+# transcripts, reads every conflict as "not a local session", and pages you.
+#
 # WHAT IT INSTALLS.  A LaunchAgent for YOU, the person whose local Claude Code
 # sessions it wakes.  When one of their pull requests goes CONFLICTING, the
 # conflict monitor posts a fix request; each pass of the waker claims requests
@@ -24,6 +33,8 @@
 
 # The checkouts whose worktrees your sessions run in — the directory you start
 # parallel sessions from, whose `git worktree list` holds their worktrees.
+# List EVERY project you run parallel sessions in: a checkout missing here is
+# never claimed, so its conflicts page you instead of being fixed.
 # RULE: absolute paths, comma-separated, each a checkout ROOT with a GitHub
 # origin.  The value below is refused as typed, so an unedited file cannot run.
 REPO_DIRS=/Users/you/src/your-project
@@ -55,7 +66,14 @@ MAX_SESSIONS_PER_PASS=2
 RESUME_MODE=from-pr
 
 # Extra arguments for `claude`, space-separated.  A headless session gets only
-# the tools your settings and these allow; one that cannot run git and gh ends
-# `failed` and the monitor pages you.  Match how you run your own sessions, for
-# example:  --permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*)
+# the tools your settings and these allow, and it cannot ask for more.  The fix
+# prompt needs three kinds: git (merge, commit, push), gh (watch CI), and every
+# runner your local gate uses — the prompt tells it to run the checks your
+# CLAUDE.md names before pushing.  Without git or gh it ends `failed` and the
+# monitor pages you; without the gate's runners it pushes an untested merge or
+# ends `failed`.  In this kit the gate is `npm run test:hooks` and
+# `python3 scripts/check_placeholders.py`, so its line is:
+#   --permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(python3:*)
+# Swap the last two for your own gate's runners.  Each one you allow is a whole
+# interpreter the session may run (under the repo's hooks), so allow only those.
 CLAUDE_ARGS=

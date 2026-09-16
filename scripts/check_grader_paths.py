@@ -129,6 +129,12 @@ FLOOR = (
     # drop "never merge" from that prompt or widen the one label it writes, and no
     # hook would see it — so a person's label, like the workflow that runs it.
     "scripts/pr_conflict.py",
+    # …and its staged twin, by the same capability test. It was excused as a stack template
+    # before the conflict loop existed; it now becomes a workflow that holds a write token
+    # and posts the request marker a waker turns into a paid session start on a person's
+    # machine. At bootstrap it IS `.github/workflows/**`, so the bytes chosen here are the
+    # bytes that run there.
+    "templates/workflows/pr-conflict-monitor.yml",
     "templates/workflows/pipeline-*.yml",
     "templates/hooks/**",
     "delivery.json",
@@ -152,7 +158,9 @@ UNGATED = {
     "templates/workflows/frontend-uptime.yml": "stack template; no supervision role",
     "templates/workflows/keepalive.yml": "stack template; no supervision role",
     "templates/workflows/migration-drift.yml": "stack template; no supervision role",
-    "templates/workflows/pr-conflict-monitor.yml": "stack template; no supervision role",
+    "templates/workflows/pr-union-check.yml":
+        "reporting only: comments on the PR a red union names; never a required check, and "
+        "never starts a session, merges, approves or labels",
 }
 # The directories UNGATED must account for, exhaustively.
 # `templates/hooks` joins the ledger because it was invisible to it: the
@@ -416,6 +424,11 @@ def _selftest():
     expect("floor leaves telemetry alone", gated("scripts/telemetry_scrape.py"), False)
     expect("floor leaves stack templates alone",
            gated("templates/workflows/deploy-on-green.yml"), False)
+    # The conflict monitor's staged twin starts sessions by proxy; the union check only reports.
+    expect("floor gates the conflict-monitor template",
+           gated("templates/workflows/pr-conflict-monitor.yml"), True)
+    expect("floor leaves the report-only union template alone",
+           gated("templates/workflows/pr-union-check.yml"), False)
     expect("floor leaves docs alone", gated("docs/SECURITY.md"), False)
     expect("floor leaves src alone", gated("src/app.ts"), False)
 

@@ -10,6 +10,12 @@ installer runs these same steps as its own `conflict-waker` step, so a fresh Sta
 install brings the waker up with the others; this file is also usable on its own, on a
 machine with no dispatcher at all.
 
+MACOS ONLY — AND WHAT IS NOT.  Everything this file installs is launchd's, so on any other
+platform its preflight names the platform and stops before it runs anything. The waker
+itself is portable: `scripts/pr_conflict.py wake` is one pass of plain Python that shells
+`gh` and `claude` and exits, so a systemd timer or cron runs it on Linux. What this file
+would otherwise do for you is listed in docs/COLLABORATION.md, parallel-session item 8.
+
 WHAT IT BUILDS.  For the PERSON running it, never for anyone else:
 
     ~/.pr-conflict-waker/code         a clone, level with origin, that the job execs
@@ -96,7 +102,11 @@ say = se.say
 
 HOME_DIR = prc.DEFAULT_WAKER_HOME                     # ~/.pr-conflict-waker
 DEFAULT_STATE_HOME = HOME_DIR + "/setup"
-REQUIRED_SCRIPTS = ("pr_conflict.py", "pipeline_dispatch_local.py")
+# What the job EXECS: pr_conflict.py and every scripts/ module it imports at load,
+# transitively. The clone is `behind` only when one of these differs from origin — a merge
+# that touches none of them leaves the job's code current. The selftest derives the closure
+# from the sources and fails when this tuple drifts from it.
+REQUIRED_SCRIPTS = ("pr_conflict.py", "pipeline_dispatch_local.py", "pipeline_labels.py", "jsonschema_mini.py")
 DAEMON_PATH = se.DAEMON_PATH
 HEARTBEAT_WAIT_SECONDS = 90
 
@@ -122,6 +132,21 @@ class Refusal(Exception):
 
 class SetupError(Exception):
     """A read or a write failed for a reason worth naming."""
+
+
+class Unsupported(SetupError):
+    """This platform has no launchd. Nothing after preflight is measured."""
+
+
+def platform_problem(platform):
+    """None on macOS; otherwise what this installer cannot do here, and what runs instead."""
+    if platform == "darwin":
+        return None
+    return ("this installer builds a macOS LaunchAgent, and this machine's platform is %r — it has no "
+            "launchd, so nothing here can be installed on it. The waker itself is portable: run "
+            "`python3 scripts/pr_conflict.py wake` (its flags: `wake --help`) from a systemd user timer "
+            "or cron, every few minutes. docs/COLLABORATION.md, parallel-session item 8, lists what this "
+            "installer would have done for you" % platform)
 
 
 class Blocked(Exception):
@@ -255,12 +280,14 @@ CARDS = {
                 "worked in — up to MAX_SESSIONS_PER_PASS per pass, each capped at MAX_BUDGET_USD. "
                 "Nothing can decide for you whether that number is what you meant, or whether the "
                 "fix session will be allowed the tools it needs: a headless session gets only the "
-                "tools your settings and CLAUDE_ARGS allow, and one that cannot run git ends "
-                "`failed` and pages you."),
+                "tools your settings and CLAUDE_ARGS allow. One that cannot run git ends `failed` "
+                "and pages you; one that cannot run your local checks pushes a merge nobody tested, "
+                "or ends `failed`."),
         "do": ["Read the dry run the installer just printed: `would wake [...]` is the count.",
-               "Check CLAUDE_ARGS gives a fix session what yours use (for example a",
-               "--permission-mode and --allowedTools covering git and gh). Change it and re-run",
-               "if not. Then sign the count off and re-run — the installer loads the job:",
+               "Check CLAUDE_ARGS gives a fix session what its prompt asks for: git and gh, AND",
+               "every runner your local gate uses (CLAUDE.md names it; conflict-waker.conf.example",
+               "has a worked line). Change it and re-run if not. Then sign the count off and",
+               "re-run — the installer loads the job:",
                "    python3 scripts/pipeline_conflict_waker_setup.py attest A-WAKE-DRY-RUN "
                "--initials " + se.INITIALS_PLACEHOLDER + " --note \"count read: N\"",
                "(YOUR initials, 2-4 letters, and N the count. Both the placeholder and an empty",
@@ -319,6 +346,7 @@ class Ctx(object):
         self.home = home or os.path.expanduser("~")
         self.uid = os.getuid() if uid is None else uid
         self.env = os.environ if env is None else env
+        self.platform = sys.platform
         self.claude_bin = None
         self.gh_bin = None
         self.python_bin = None
@@ -352,6 +380,12 @@ class Ctx(object):
         return "gui/%d" % self.uid
 
     @property
+    def claude_dir(self):
+        """Where the job will look for your sessions' transcripts: the CLAUDE_CONFIG_DIR this
+        shell has NOW (the plist keeps it), else ~/.claude."""
+        return self.env.get("CLAUDE_CONFIG_DIR") or os.path.join(self.home, ".claude")
+
+    @property
     def repo_dirs(self):
         return split_list(self.conf["REPO_DIRS"])
 
@@ -369,6 +403,9 @@ def _first_line(res):
 # Steps. Each returns (ok, detail) or raises Blocked / Unknown / SetupError / Refusal.
 # --------------------------------------------------------------------------- #
 def step_preflight(ctx, apply_it):
+    unsupported = platform_problem(ctx.platform)
+    if unsupported:
+        raise Unsupported(unsupported)
     r, problems = ctx.runner, []
     if ctx.uid == 0:
         problems.append("this is root. The waker runs as the person whose local sessions it wakes; "
@@ -406,6 +443,15 @@ def step_preflight(ctx, apply_it):
         problems.append("`%s --version` failed — the waker would start a binary that does not run" % claude)
     else:
         ctx.claude_bin = claude
+    # The waker proves a worktree is YOUR local session's by finding its transcripts here. A
+    # config directory set only in some other shell reads as "no local session" on every
+    # request, and every conflict pages you instead of being fixed.
+    if not r.read(["test", "-d", os.path.join(ctx.claude_dir, "projects")]).ok:
+        problems.append("%s has no projects/ directory, where Claude Code keeps session transcripts. The "
+                        "waker takes a request only for a worktree whose transcripts it finds there, so "
+                        "every conflict would page you. If your Claude Code uses another config directory, "
+                        "export CLAUDE_CONFIG_DIR in this shell and re-run: the job keeps the value this "
+                        "shell has now" % ctx.claude_dir)
     gh = _first_line(r.read(["/bin/sh", "-c", "command -v gh"]))
     if not gh.startswith("/"):
         problems.append("`gh` is not on your PATH; the waker reads and comments on PRs through it")
@@ -432,12 +478,22 @@ def step_preflight(ctx, apply_it):
     if problems:
         raise SetupError("preflight found %d problem(s) — all of them, in one pass:\n%s"
                          % (len(problems), "\n".join("  - " + p for p in problems)))
-    return True, "python3 %s, claude %s, gh %s, %d checkout(s), code from %s" % (
-        ctx.python_bin, ctx.claude_bin, ctx.gh_bin, len(ctx.repo_dirs), ctx.code_url)
+    return True, "python3 %s, claude %s, gh %s, %d checkout(s), code from %s, transcripts from %s%s" % (
+        ctx.python_bin, ctx.claude_bin, ctx.gh_bin, len(ctx.repo_dirs), ctx.code_url, ctx.claude_dir,
+        " (CLAUDE_CONFIG_DIR as this shell has it — change it later and re-run `run`)"
+        if ctx.env.get("CLAUDE_CONFIG_DIR") else "")
 
 
 def _clone_status(ctx):
-    """(state, detail): 'absent' | 'level' | 'behind' | 'dirty' | 'foreign' | 'unknown'."""
+    """(state, detail): 'absent' | 'level' | 'behind' | 'missing' | 'dirty' | 'foreign' | 'unknown'.
+
+    LEVEL MEANS THE JOB'S CODE IS CURRENT, not that the clone's HEAD is. The job execs
+    REQUIRED_SCRIPTS and nothing else, so a merge that touches none of them leaves the clone
+    level. Comparing whole HEADs read `behind` after every merge to origin, whatever it
+    touched — noise that teaches a person to stop reading `verify`.
+
+    The comparison fetches origin's HEAD into the clone's FETCH_HEAD. That moves no branch and
+    no file the job execs; it is what lets `verify` see origin's tree at all."""
     r, code = ctx.runner, ctx.code_dir
     head = _first_line(r.read(["git", "-C", code, "rev-parse", "HEAD"]))
     if not head:
@@ -450,16 +506,25 @@ def _clone_status(ctx):
         return "unknown", "`git status` failed in %s" % code
     if status.out.strip():
         return "dirty", "the clone at %s has local changes" % code
-    listing = r.read(["ls", os.path.join(code, "scripts")])
-    missing = [s for s in REQUIRED_SCRIPTS if s not in set(listing.out.split())]
-    remote = (r.read(["git", "-C", code, "ls-remote", "origin", "HEAD"]).out or "").split()
+    if not r.read(["git", "-C", code, "fetch", "--quiet", "--no-tags", "origin", "HEAD"], timeout=120).ok:
+        return "unknown", "could not fetch origin HEAD (no network, or no such remote)"
+    remote = _first_line(r.read(["git", "-C", code, "rev-parse", "FETCH_HEAD"]))
     if not remote:
-        return "unknown", "origin would not name its HEAD (no network, or no such remote)"
-    if head != remote[0]:
-        return "behind", "the clone is at %s and origin HEAD is %s" % (head[:12], remote[0][:12])
+        return "unknown", "origin HEAD was fetched but cannot be named"
+    paths = ["scripts/" + name for name in REQUIRED_SCRIPTS]
+    missing = [p for p in paths if not r.read(["git", "-C", code, "cat-file", "-e", "FETCH_HEAD:" + p]).ok]
     if missing:
         return "missing", "origin HEAD carries no %s — the change that ships it is not merged" % ", ".join(missing)
-    return "level", "clone at %s is level with origin HEAD (%s)" % (code, head[:12])
+    if head == remote:
+        return "level", "clone at %s is level with origin HEAD (%s)" % (code, head[:12])
+    changed = r.read(["git", "-C", code, "diff", "--name-only", head, remote, "--"] + paths)
+    if not changed.ok:
+        return "unknown", "could not compare the job's scripts between %s and origin HEAD %s" % (head[:12], remote[:12])
+    if changed.out.strip():
+        return "behind", "origin HEAD (%s) changed %s since the clone's %s" % (
+            remote[:12], ", ".join(changed.out.split()), head[:12])
+    return "level", ("the scripts the job runs are identical at origin HEAD (%s); the clone's other files are "
+                     "older (%s), and the job never reads them" % (remote[:12], head[:12]))
 
 
 def step_code(ctx, apply_it):
@@ -690,7 +755,7 @@ def measure(ctx, apply_it, keep_going=False):
         else:
             rows.append((sid, ALREADY_DONE if ok else (DONE if apply_it else WOULD_CHANGE), detail, None))
             continue
-        if not keep_going:
+        if not keep_going or isinstance(rows[-1][3], Unsupported):
             break
     return rows
 
@@ -832,6 +897,7 @@ def _fake_ctx(conf_text=GOOD_CONF, answers=(), dry_run=False, attested=True, uid
         state.attest("A-WAKE-DRY-RUN", "ab", "count read: 1")
     runner = se.FakeRunner(list(answers), dry_run=dry_run)
     ctx = Ctx(conf, runner, state, home=HOME, uid=uid, env={})
+    ctx.platform = "darwin"
     ctx.sleep = lambda s: None
     return ctx, runner
 
@@ -851,6 +917,7 @@ def _settled_answers(ctx, heartbeat_age=30, loaded=True):
         ("bin/python3 -c", 0, ctx.python_bin + "\n"),
         ("command -v claude", 0, ctx.claude_bin + "\n"),
         ("claude --version", 0, "2.0.0\n"),
+        ("test -d /Users/you/.claude/projects", 0, ""),
         ("command -v gh", 0, ctx.gh_bin + "\n"),
         ("gh auth status", 0, "Logged in\n"),
         ("src/app rev-parse --show-toplevel", 0, "/Users/you/src/app\n"),
@@ -860,8 +927,9 @@ def _settled_answers(ctx, heartbeat_age=30, loaded=True):
         ("code rev-parse HEAD", 0, HEAD + "\n"),
         ("code remote get-url origin", 0, CODE_URL + "\n"),
         ("code status --porcelain", 0, ""),
-        ("ls /Users/", 0, "pr_conflict.py\npipeline_dispatch_local.py\n"),
-        ("code ls-remote origin HEAD", 0, HEAD + "\tHEAD\n"),
+        ("code fetch --quiet --no-tags origin HEAD", 0, ""),
+        ("code rev-parse FETCH_HEAD", 0, HEAD + "\n"),
+        ("code cat-file -e FETCH_HEAD:scripts/", 0, ""),
         ("cat /Users/you/Library/LaunchAgents/local.pr-conflict-waker.plist", 0, render_plist(ctx)),
         ("pr_conflict.py wake", 0, "asked: …; pending 1 · would wake [7] · declined none\n"),
         ("heartbeat.json", 0, json.dumps(beat)),
@@ -1040,6 +1108,72 @@ def _selftest_body():
         except SetupError:
             pass
 
+    # 12. not macOS: preflight names the platform and points at the portable waker, and NOTHING
+    #     else is read or run — not launchctl, not the clone — even when asked to keep going.
+    expect("platform-darwin", platform_problem("darwin") is None, "macOS must be supported")
+    c, f = _fake_ctx()
+    f.answers = _settled_answers(c)
+    c.platform = "linux"
+    rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    expect("platform-linux", len(rows) == 1 and rows[0][:2] == ("preflight", FAILED)
+           and "'linux'" in rows[0][2] and "pr_conflict.py wake" in rows[0][2] and "systemd" in rows[0][2]
+           and "gui/" not in rows[0][2] and not f.reads,
+           "a non-macOS machine must be told so before anything runs: %s reads=%s" % (rows, f.reads))
+
+    # 13. CLAUDE_CONFIG_DIR: preflight looks where the JOB will look — the value this shell has —
+    #     refuses a directory with no transcripts, and the plist carries the value it proved.
+    c, f = _fake_ctx()
+    c.env = {"CLAUDE_CONFIG_DIR": "/Users/you/alt-claude"}
+    f.answers = _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    expect("claude-dir-missing", rows[0][1] == FAILED and "/Users/you/alt-claude has no projects/" in rows[0][2]
+           and "CLAUDE_CONFIG_DIR" in rows[0][2], str(rows))
+    c, f = _fake_ctx()
+    c.env = {"CLAUDE_CONFIG_DIR": "/Users/you/alt-claude"}
+    f.answers = [("test -d /Users/you/alt-claude/projects", 0, "")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    env_w = plistlib.loads(render_plist(c).encode())["EnvironmentVariables"]
+    expect("claude-dir-captured", rows[0][1] == ALREADY_DONE and "transcripts from /Users/you/alt-claude" in rows[0][2]
+           and env_w.get("CLAUDE_CONFIG_DIR") == "/Users/you/alt-claude", "%s %s" % (rows[0], env_w))
+
+    # 14. the clone is `behind` only when a script the job runs changed: a merge elsewhere leaves
+    #     it level (said), a changed pr_conflict.py is named, and a missing import is FAILED.
+    other = "def5678000000000000000000000000000000000"
+    for diff_out, want, needle in (("", ALREADY_DONE, "identical"),
+                                   ("scripts/pr_conflict.py\n", WOULD_CHANGE, "changed scripts/pr_conflict.py")):
+        c, f = _fake_ctx()
+        f.answers = [("code rev-parse FETCH_HEAD", 0, other + "\n"),
+                     ("code diff --name-only %s %s --" % (HEAD, other), 0, diff_out)] + _settled_answers(c)
+        rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+        code_row = [r for r in rows if r[0] == "code"]
+        expect("clone-%s" % ("unrelated-merge" if not diff_out else "job-script-merge"),
+               code_row and code_row[0][1] == want and needle in code_row[0][2], str(code_row))
+    c, f = _fake_ctx()
+    f.answers = [("FETCH_HEAD:scripts/pipeline_labels.py", 1, "")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=True, keep_going=True))
+    code_row = [r for r in rows if r[0] == "code"]
+    expect("clone-missing-import", code_row and code_row[0][1] == FAILED
+           and "scripts/pipeline_labels.py" in code_row[0][2] and not f.writes, str(code_row))
+
+    # 15. REQUIRED_SCRIPTS is exactly what the job execs: pr_conflict.py's module-level local
+    #     imports, transitively. A new import that is not listed would make `behind` blind to it.
+    import ast
+    here = os.path.dirname(os.path.abspath(__file__))
+    closure, todo = set(), ["pr_conflict.py"]
+    while todo:
+        name = todo.pop()
+        if name in closure:
+            continue
+        closure.add(name)
+        with open(os.path.join(here, name), encoding="utf-8") as fh:
+            body = ast.parse(fh.read()).body
+        for node in body:
+            mods = ([a.name for a in node.names] if isinstance(node, ast.Import) else
+                    [node.module] if isinstance(node, ast.ImportFrom) and node.module else [])
+            todo += [m.split(".")[0] + ".py" for m in mods if os.path.exists(os.path.join(here, m.split(".")[0] + ".py"))]
+    expect("required-scripts-are-the-closure", closure == set(REQUIRED_SCRIPTS),
+           "the job execs %s but REQUIRED_SCRIPTS is %s" % (sorted(closure), sorted(REQUIRED_SCRIPTS)))
+
     # 11. the source: no merge/approve/label path, no sudo, no role-account daemon.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     for token in ("pr " + "merge", "--app" + "rove", "--add-" + "label", "enable-auto-" + "merge",
@@ -1059,7 +1193,9 @@ def _selftest_body():
         "stale heartbeat is NOT RUNNING (UNKNOWN); loading targets the GUI domain and waits for a "
         "heartbeat; a dry run writes nothing; root and a role account are refused in one pass; a "
         "dirty or foreign clone is never discarded; placeholder sign-offs refused; no merge, "
-        "approve, label or sudo path")
+        "approve, label or sudo path; a non-macOS machine is told so before anything runs; "
+        "CLAUDE_CONFIG_DIR is proved where the job will look; the clone is behind only when a "
+        "script the job execs changed, and that set is the import closure")
     return 0
 
 
@@ -1090,6 +1226,10 @@ def main(argv=None):
         if args.command == "card":
             print_card(args.target or "")
             return EX_OK
+        unsupported = platform_problem(sys.platform) if args.command in ("run", "verify") else None
+        if unsupported:  # said before a conf is asked for: no conf makes it installable here
+            say("UNSUPPORTED PLATFORM: " + unsupported)
+            return EX_USAGE
         state = State(args.state)
         if args.command == "attest":
             return cmd_attest(state, args.target or "", args.initials, args.note)

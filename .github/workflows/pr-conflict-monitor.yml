@@ -25,8 +25,14 @@ name: PR conflict monitor
 #     Stage E bounce driver, in the session's own thread and sandbox. Neither
 #     merges or approves, and neither can take the other's PR.
 #   • no ack in 15 min, no result in 2 h, or a result while GitHub still says
-#     CONFLICTING → ESCALATE once: @mention + assign the owner. Budget spent, or
+#     CONFLICTING → ESCALATE once: @mention + assign a person. Budget spent, or
 #     a fork → page straight away, never request.
+#   • WHO is paged: the PR_CONFLICT_PAGE_TO repository variable (logins or
+#     org/team, comma-separated) when set; else the PR's author when that is a
+#     person; else a person who owns the repository. An @mention of an
+#     ORGANIZATION notifies nobody, so on an org repo a bot's PR with no variable
+#     set says "Nobody was paged" on the PR and fails this run — set the variable
+#     (Settings → Secrets and variables → Actions → Variables). It is not a secret.
 #
 # Why not the template's `@claude` handoff: it needs claude.yml, which this repo
 # does not run, a model credential in Actions, and a PAT — GITHUB_TOKEN-authored
@@ -89,4 +95,5 @@ jobs:
       - name: Request fixes, escalate stalled ones, clear stale labels
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_CONFLICT_PAGE_TO: ${{ vars.PR_CONFLICT_PAGE_TO }}
         run: python3 scripts/pr_conflict.py monitor

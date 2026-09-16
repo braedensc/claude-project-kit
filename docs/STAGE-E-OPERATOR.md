@@ -1414,6 +1414,15 @@ repository. The monitor only counts an `ack` from a writer.
 - Not: the ack is ignored because the token is not a writer. You get paged while the
   session is still working. Loud, never silent — fix the token's owner.
 
+**Who a page reaches.** The monitor @mentions the PR's author when that is a person.
+If your dispatcher's PRs are opened by an account nobody reads, pages go there. Set the
+`PR_CONFLICT_PAGE_TO` Actions variable to your login (Settings → Secrets and variables →
+Actions → Variables). It is not a secret.
+
+- Good: `PR_CONFLICT_PAGE_TO=your-login`; the page says `cc @your-login (PR_CONFLICT_PAGE_TO)`.
+- Not: an org repository and a bot author with no variable. The page says *Nobody was
+  paged*, and the monitor's run fails so you see it.
+
 A pull request Stage E already **concluded** is yours. A conflict there is one comment on
 the coding ticket, never a re-prompt.
 
@@ -1423,8 +1432,14 @@ Put this beside `stage-e.conf`:
 
 ```sh
 cp conflict-waker.conf.example conflict-waker.conf
-$EDITOR conflict-waker.conf      # REPO_DIRS: the checkouts you start sessions from
+$EDITOR conflict-waker.conf      # REPO_DIRS: EVERY checkout you start sessions from
 ```
+
+A checkout left out of `REPO_DIRS` is never claimed. Two projects means both roots.
+
+**Set `CLAUDE_CONFIG_DIR` first, if you use one.** The job keeps the value your shell has
+when you run the installer. Change it later and re-run `run`. If you don't, the waker finds
+no transcripts, and every conflict pages you instead of being fixed.
 
 Then run the installer as usual. Its `conflict-waker` step does the rest, as **you**:
 
@@ -1454,7 +1469,11 @@ the monitor's two-hour result deadline. Every session in a pass is acknowledged 
 first starts. A request over the cap is left unclaimed and named; the monitor pages it.
 
 **Give the fix session its tools.** A headless session gets only what your settings and
-`CLAUDE_ARGS` allow. Without git and gh it ends `failed`, and the monitor pages you.
+`CLAUDE_ARGS` allow. Its prompt uses git, gh, and your local checks. Allow all three.
+
+- Good, for this kit: `--permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(python3:*)`.
+- Not: git and gh only. The session merges, cannot run a check, and pushes untested or
+  ends `failed`.
 
 **Is it running?** Read the heartbeat, not the log:
 
@@ -1467,15 +1486,24 @@ python3 scripts/pipeline_conflict_waker_setup.py verify   # re-measures; stale =
 |---|---|
 | fresh, `idle` | ran, nothing to claim |
 | fresh, `ok` | ran, woke or declined something |
-| fresh, `problems` | ran and could not do all of it — a repository it could not read, or a session that ended `failed` or `unknown`. Read `~/.pr-conflict-waker/waker.log` |
+| fresh, `problems` | ran and could not do all of it — a repository it could not read, or a session that ended `failed` or `unknown`. Read the end of `~/.pr-conflict-waker/waker.log` |
 | stale | **not running** (or you were logged out). `verify` exits 4 |
 
 The heartbeat monitor above does not read this file. It runs as the role account, and a
 LaunchAgent's heartbeat goes stale every time you log out. Where it matters — a conflict
 waiting — the conflict monitor already pages you on the pull request.
 
-**The waker's code moves only when `run` moves it**, like the role account's clone. Run
-`verify` after a merge that touches `scripts/pr_conflict.py`.
+**`waker.log` is never trimmed.** Every pass appends to it, every 300 seconds, with no
+rotation and no size cap. Truncate it yourself when it grows.
+
+**The waker's code moves only when `run` moves it**, like the role account's clone. After a
+merge, run `verify`. It reads `behind` only when a script the job runs changed:
+`scripts/pr_conflict.py`, or a `scripts/` module it imports. Then run `run`. A merge that
+touched none of them leaves the clone level, and `verify` says so. Nothing schedules this.
+
+**macOS only.** The installer builds a LaunchAgent. On Linux its preflight names the
+platform and stops. `scripts/pr_conflict.py wake` still runs there, from a systemd timer
+or cron: `docs/COLLABORATION.md`, parallel-session item 8.
 
 ---
 

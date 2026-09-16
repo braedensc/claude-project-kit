@@ -23,8 +23,14 @@ name: PR conflict monitor
 #         session's own tracker thread, inside its sandbox.
 #     Both merge main, resolve, push and watch CI. Neither merges or approves.
 #   • no ack in 15 min, no result in 2 h, or a result while GitHub still says
-#     CONFLICTING → ESCALATE once: @mention + assign the owner. Budget spent, or
+#     CONFLICTING → ESCALATE once: @mention + assign a person. Budget spent, or
 #     a fork → page straight away, never request.
+#   • WHO is paged: the PR_CONFLICT_PAGE_TO repository variable (logins or
+#     org/team, comma-separated) when set; else the PR's author when that is a
+#     person; else a person who owns the repository. An @mention of an
+#     ORGANIZATION notifies nobody, so on an org repo a bot's PR with no variable
+#     set says "Nobody was paged" on the PR and fails this run — set the variable
+#     (Settings → Secrets and variables → Actions → Variables). It is not a secret.
 #
 # With neither answerer installed, every request becomes that page 15 minutes
 # later — the old behaviour, never silence. A project that runs claude.yml can
@@ -37,9 +43,12 @@ name: PR conflict monitor
 # closed PRs and drafts still carrying it are swept each run. A PR whose
 # mergeability never settles fails the run (contract §13).
 #
-# Requires scripts/pr_conflict.py and scripts/pipeline_dispatch_local.py at the
-# default branch (both ship with the kit). Zero new secrets. Scheduled runs only
-# fire from the default branch; use workflow_dispatch to test.
+# Requires scripts/pr_conflict.py and what it imports — scripts/pipeline_dispatch_local.py,
+# scripts/pipeline_labels.py, scripts/jsonschema_mini.py — at the default branch (all
+# ship with the kit). The script asks GitHub for each PR's base and the repository's
+# default branch, so the comments name yours; only the `push:` trigger below names
+# `main` — change it if yours is not. Zero new secrets. Scheduled runs only fire
+# from the default branch; use workflow_dispatch to test.
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -75,4 +84,5 @@ jobs:
       - name: Request fixes, escalate stalled ones, clear stale labels
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_CONFLICT_PAGE_TO: ${{ vars.PR_CONFLICT_PAGE_TO }}
         run: python3 scripts/pr_conflict.py monitor

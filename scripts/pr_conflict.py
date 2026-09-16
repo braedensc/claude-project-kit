@@ -6,7 +6,10 @@
     pr_conflict.py --selftest
 
   `wake` is installed and supervised by scripts/pipeline_conflict_waker_setup.py — one
-  LaunchAgent per person, a heartbeat, a signed-off dry run. Nobody types a loop.
+  LaunchAgent per person, a heartbeat, a signed-off dry run. Nobody types a loop. That
+  installer is macOS-only; `wake` is not. It is one pass of plain Python that shells `gh`
+  and `claude` and exits, so a systemd timer or cron runs it anywhere
+  (docs/COLLABORATION.md, parallel-session protocol item 8).
 
 THE GAP THIS CLOSES
 
@@ -34,12 +37,12 @@ WHY THE FIX RUNS LOCALLY, NOT IN ACTIONS
       → label + `request` marker   ──►    sees an unclaimed request for a branch
                                           one of ITS worktrees holds
                                           → `ack` marker, then `claude -p` in that
-                                            worktree: merge main, resolve, push,
-                                            watch CI — never merge, never approve
+                                            worktree: merge the PR's base, resolve,
+                                            push, watch CI — never merge or approve
                                           → re-reads mergeable → `result` marker
     next tick:
       MERGEABLE        → drop label (episode over)
-      no ack in 15 min → ESCALATE (page the owner)
+      no ack in 15 min → ESCALATE (page a person — WHO A PAGE REACHES)
       no result in 2 h → ESCALATE
       result, still CONFLICTING → ESCALATE
       budget spent (3 requests on this PR) or a fork → page, never request
@@ -83,6 +86,24 @@ WHAT A PASS IS BOUNDED BY
   A request over the pass cap is not acknowledged and is said by number: the
   monitor pages it. No loop anywhere — launchd starts the next pass.
 
+THE BASE BRANCH IS GITHUB'S, NEVER ASSUMED
+
+  Every recipe, headline and fix prompt names the PR's own `baseRefName` — the branch
+  GitHub computed `mergeable` against — and falls back to the repository's default
+  branch, read once per run and cached on `Gh`. A stacked PR, or a repository whose
+  default is `trunk`, gets a command that runs. The bounce driver picks its base the
+  same way, so the two lanes hand a session the same command.
+
+WHO A PAGE REACHES
+
+  An @mention of an ORGANIZATION notifies nobody, so the page never names the
+  repository owner blindly. It names, in order: the logins in `--page-to` (the
+  PR_CONFLICT_PAGE_TO repository variable in the workflow); else the PR's author, when
+  that is a person; else the repository owner, when that is a person. The comment says
+  which. When none applies — a bot's PR on an organization's repository, with no
+  --page-to — the comment says nobody was paged and the run exits 1, because a page
+  that reaches nobody must not look delivered.
+
 MARKERS (the whole producer/consumer contract)
 
   The FIRST LINE of a comment, exactly:
@@ -112,7 +133,8 @@ EXIT CODES (contract §13)
   0  the pass completed — it printed what it asked and what the answer was
   1  could not tell: mergeability never settled, a listing was truncated, a
      GitHub call failed, or a fix session ended with GitHub unable to say whether
-     the conflict is gone. Never the same token as "no conflicts".
+     the conflict is gone. Never the same token as "no conflicts". Also: a page
+     was posted that notifies nobody (WHO A PAGE REACHES).
   2  usage error
   3  REFUSED — `wake` (not --dry-run) in an agent environment, as root, or as a
      dispatcher's role account
@@ -154,6 +176,11 @@ MARKER_RE = re.compile(
     r"^<!-- pr-conflict:(request|page|escalated|ack|result) episode=(\d+)"
     r"((?: [a-z]+=[a-z-]+)*) -->$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
+# A user login, or an org/team slug (mentionable, not assignable). Nothing else is
+# embedded after an `@`, so a value here cannot carry markup into a comment.
+PAGE_TO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$")
+PERSON_TYPES = {"User", "EnterpriseUserAccount"}  # GraphQL __typename of an actor a mention notifies
+LABEL_DESCRIPTION_MAX = 100  # GitHub's limit; past it the create is a 422, read as "exists"
 TAIL_CHARS = 1500
 
 WAKER_HEARTBEAT_SCHEMA = "pr-conflict-waker-heartbeat/1"
@@ -282,6 +309,26 @@ class Gh:
     def __init__(self, repo, runner=run, cwd=None):
         self.owner, self.name = repo.split("/", 1)
         self.runner, self.cwd = runner, cwd
+        self._meta = None
+
+    def _repo_meta(self):
+        """The repository's own record, read at most once per Gh: its default branch and
+        whether its owner is a person. Neither is ever assumed."""
+        if self._meta is None:
+            data = self._api("GET", f"repos/{self.owner}/{self.name}") or {}
+            branch = data.get("default_branch") or ""
+            if not BRANCH_RE.match(branch):
+                raise CouldNotTell(f"GitHub named no usable default branch for {self.owner}/{self.name}: {branch!r}")
+            self._meta = {"default_branch": branch, "owner_type": (data.get("owner") or {}).get("type") or ""}
+        return self._meta
+
+    @property
+    def default_branch(self):
+        return self._repo_meta()["default_branch"]
+
+    @property
+    def owner_type(self):
+        return self._repo_meta()["owner_type"]
 
     def _api(self, method, path, body=None, ok_statuses=()):
         cmd = ["gh", "api", "-X", method, path]
@@ -304,13 +351,16 @@ class Gh:
         query = """query($owner:String!,$name:String!,$states:[PullRequestState!],$labels:[String!],$cursor:String){
           repository(owner:$owner,name:$name){pullRequests(states:$states,labels:$labels,first:100,after:$cursor){
             pageInfo{hasNextPage endCursor}
-            nodes{number isDraft mergeable headRefName isCrossRepository labels(first:100){nodes{name}}}}}}"""
+            nodes{number isDraft mergeable headRefName baseRefName isCrossRepository author{login __typename}
+                  labels(first:100){nodes{name}}}}}}"""
         out, cursor = [], None
         for _ in range(MAX_PR_PAGES):
             page = self._graphql(query, {"owner": self.owner, "name": self.name, "states": states,
                                          "labels": labels, "cursor": cursor})
             prs = page["repository"]["pullRequests"]
-            out += [{**p, "labels": [label["name"] for label in p["labels"]["nodes"]]}
+            out += [{**p, "labels": [label["name"] for label in p["labels"]["nodes"]],
+                     "author": (p.get("author") or {}).get("login"),
+                     "authorType": (p.get("author") or {}).get("__typename")}
                     for p in prs["nodes"]]
             if not prs["pageInfo"]["hasNextPage"]:
                 return out
@@ -334,9 +384,9 @@ class Gh:
         raise CouldNotTell(f"#{number} has more than {MAX_COMMENT_PAGES * 100} comments")
 
     def ensure_label(self):
+        description = f"Merge conflicts with {self.default_branch} (auto-managed by pr-conflict-monitor)"
         self._api("POST", f"repos/{self.owner}/{self.name}/labels",
-                  {"name": LABEL, "color": "d93f0b",
-                   "description": "Merge conflicts with main (auto-managed by pr-conflict-monitor)"},
+                  {"name": LABEL, "color": "d93f0b", "description": description[:LABEL_DESCRIPTION_MAX]},
                   ok_statuses=(422,))
 
     # No label parameter on purpose: `conflict` is the only label either half writes.
@@ -351,12 +401,15 @@ class Gh:
     def comment(self, number, body):
         self._api("POST", f"repos/{self.owner}/{self.name}/issues/{number}/comments", {"body": body})
 
-    def assign_owner(self, number):
+    def assign(self, number, logins):
+        people = [login for login in logins if "/" not in login]  # a team is mentioned, never assigned
+        if not people:
+            return
         try:
             self._api("POST", f"repos/{self.owner}/{self.name}/issues/{number}/assignees",
-                      {"assignees": [self.owner]})
-        except CouldNotTell as e:  # an org owner cannot be assigned; the @mention still lands
-            print(f"  #{number}: could not assign @{self.owner}: {e}")
+                      {"assignees": people})
+        except CouldNotTell as e:  # e.g. not a collaborator; the @mention is the page, this is extra
+            print(f"  #{number}: could not assign {', '.join('@' + p for p in people)}: {e}")
 
     def mergeable(self, number):
         query = """query($owner:String!,$name:String!,$number:Int!){
@@ -367,9 +420,43 @@ class Gh:
 
 # ── comment bodies ───────────────────────────────────────────────────────────
 
-def _recipe(pr):
+def base_of(pr, gh):
+    """The branch this PR conflicts with: GitHub's `baseRefName`, else the default branch."""
+    return pr.get("baseRefName") or gh.default_branch
+
+
+def page_recipients(pr, gh, page_to=()):
+    """(logins, whose) — who a page @mentions, and the words that say why them. An empty
+    list means nobody a mention would notify: the caller says so and fails the run."""
+    if page_to:
+        return list(page_to), "PR_CONFLICT_PAGE_TO"
+    if pr.get("author") and pr.get("authorType") in PERSON_TYPES:
+        return [pr["author"]], "the PR's author"
+    author = "a bot" if pr.get("author") else "unknown"
+    if gh.owner_type == "User":
+        return [gh.owner], f"the repository owner — the PR's author is {author}"
+    return [], (f"the PR's author is {author} and the repository owner is an organization, which an "
+                "@mention does not notify. Set the PR_CONFLICT_PAGE_TO repository variable to the "
+                "logins that should be paged")
+
+
+def parse_page_to(value):
+    """(logins, rejected) from a comma- or space-separated value; a leading `@` is dropped."""
+    names = [v.lstrip("@") for v in re.split(r"[\s,]+", value or "") if v.strip()]
+    return list(dict.fromkeys(names)), [n for n in names if not PAGE_TO_RE.match(n)]
+
+
+def _page_line(page):
+    logins, whose = page
+    if not logins:
+        return f"**Nobody was paged:** {whose}. This PR cannot merge and its required checks are not running."
+    return (f"cc {', '.join('@' + login for login in logins)} ({whose}) — this PR cannot merge and its "
+            "required checks are not running.")
+
+
+def _recipe(pr, base):
     return "\n".join([
-        "```", "git fetch origin main && git merge origin/main",
+        "```", f"git fetch origin {base} && git merge origin/{base}",
         "# resolve, run the local checks, git commit, then:",
         "git push", f"gh pr checks {pr['number']} --watch", "```",
         "",
@@ -377,47 +464,47 @@ def _recipe(pr):
     ])
 
 
-def _headline(pr):
-    return (f"`{pr['headRefName']}` has **merge conflicts** with `main` (mergeable = CONFLICTING). "
+def _headline(pr, base):
+    return (f"`{pr['headRefName']}` has **merge conflicts** with `{base}` (mergeable = CONFLICTING). "
             "While conflicted, GitHub cannot build the merge ref, so the **required checks never run** "
             "— a side check can still report green. Do not read that as a passing PR.")
 
 
-def request_body(pr, episode, attempt):
+def request_body(pr, episode, attempt, base):
     return "\n".join([
-        marker("request", episode), _headline(pr), "",
+        marker("request", episode), _headline(pr, base), "",
         f"**A fix has been requested** (automated attempt {attempt} of {MAX_FIX_REQUESTS} on this PR). "
         "It is acknowledged here by whichever owns this branch's session: the conflict waker on the "
         "machine where a local session worked in its worktree, or — for a dispatcher's PR — the "
         "bounce driver, which sends it back to that session's own thread. Either way the session "
-        "merges `main`, resolves, pushes and watches CI. Nothing merges or approves.",
+        f"merges `{base}`, resolves, pushes and watches CI. Nothing merges or approves.",
         "",
         f"If nothing acknowledges this within {ACK_DEADLINE_MIN} min, or the attempt ends with the "
-        "PR still conflicted, this monitor pages the owner here. To fix it by hand meanwhile:", "",
-        _recipe(pr), "",
+        "PR still conflicted, this monitor pages a person here. To fix it by hand meanwhile:", "",
+        _recipe(pr, base), "",
         "The label clears itself once the PR is mergeable again, so a later conflict starts a new episode.",
     ])
 
 
-def page_body(pr, episode, reason, owner):
+def page_body(pr, episode, reason, base, page):
     why = {
         "budget": (f"this PR has already had {MAX_FIX_REQUESTS} automated fix attempts — a PR that "
                    "keeps conflicting needs a person, not another guess"),
         "fork": "it comes from a fork, and the waker only acts on branches in this repository",
     }[reason]
     return "\n".join([
-        marker("page", episode, reason=reason), _headline(pr), "",
-        f"**No automated fix requested:** {why}.", "", _recipe(pr), "",
-        f"cc @{owner} — this PR cannot merge and its required checks are not running.",
+        marker("page", episode, reason=reason), _headline(pr, base), "",
+        f"**No automated fix requested:** {why}.", "", _recipe(pr, base), "",
+        _page_line(page),
     ])
 
 
-def escalation_body(pr, episode, reason, owner):
+def escalation_body(pr, episode, reason, base, page):
     return "\n".join([
         marker("escalated", episode),
         f"**The automated conflict fix did not land — this needs a person.** {reason[0].upper()}{reason[1:]}.",
-        "", _recipe(pr), "",
-        f"cc @{owner} — this PR cannot merge and its required checks are not running.",
+        "", _recipe(pr, base), "",
+        _page_line(page),
     ])
 
 
@@ -436,19 +523,28 @@ def settle(fetch, sleep, attempts=SETTLE_ATTEMPTS, delay=SETTLE_DELAY_S):
     return prs
 
 
-def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print):
+def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=()):
     act = (lambda *a, **k: None) if dry_run else None
     add_label = act or gh.add_label
     remove_label = act or gh.remove_label
     comment = act or gh.comment
-    assign = act or gh.assign_owner
+    assign = act or gh.assign
     if dry_run:
         print("DRY RUN — every line below says what WOULD be written; nothing is.")
     else:
         gh.ensure_label()
 
     tally = {"open": 0, "conflicted": 0, "requested": [], "paged": [], "escalated": [],
-             "cleared": [], "unsettled": []}
+             "cleared": [], "unsettled": [], "unpaged": []}
+
+    def page(n, recipients):
+        """Assign whoever the page names; a page that names nobody fails the run, said."""
+        if recipients[0]:
+            assign(n, recipients[0])
+        else:
+            tally["unpaged"].append(n)
+            print(f"::warning::#{n}: the page reaches NOBODY — {recipients[1]}")
+
     prs = settle(gh.open_prs, sleep)
     tally["open"] = len(prs)
     for pr in prs:
@@ -476,19 +572,21 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print):
             add_label(n)  # the dedupe key first: a mid-step failure re-alerts, never double-posts
             if pr["isCrossRepository"] or state["requests"] >= MAX_FIX_REQUESTS:
                 reason = "fork" if pr["isCrossRepository"] else "budget"
-                comment(n, page_body(pr, episode, reason, gh.owner))
-                assign(n)
+                recipients = page_recipients(pr, gh, page_to)
+                comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients))
+                page(n, recipients)
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
             else:
-                comment(n, request_body(pr, episode, state["requests"] + 1))
+                comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh)))
                 tally["requested"].append(n)
                 print(f"#{n}: CONFLICTING — fix requested, episode {episode}")
             continue
         verdict, why = decide_ongoing(state, now)
         if verdict == "escalate":
-            comment(n, escalation_body(pr, state["episode"], why, gh.owner))
-            assign(n)
+            recipients = page_recipients(pr, gh, page_to)
+            comment(n, escalation_body(pr, state["episode"], why, base_of(pr, gh), recipients))
+            page(n, recipients)
             tally["escalated"].append(n)
         print(f"#{n}: still CONFLICTING — {verdict}: {why}")
 
@@ -507,18 +605,21 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print):
     if tally["unsettled"]:
         lines.append(f"- **COULD NOT TELL** for {tally['unsettled']}: GitHub never finished computing "
                      "mergeability. This run is not a clean result for those PRs.")
+    if tally["unpaged"]:
+        lines.append(f"- **PAGED NOBODY** for {tally['unpaged']}: the page was posted, but no person it "
+                     "@mentions would be notified. Set the PR_CONFLICT_PAGE_TO repository variable.")
     summary("\n".join(lines))
-    return 1 if tally["unsettled"] else 0
+    return 1 if (tally["unsettled"] or tally["unpaged"]) else 0
 
 
 # ── wake (a person's machine) ────────────────────────────────────────────────
 
 FIX_PROMPT = """\
-PR #{number} (branch `{branch}`) now has merge conflicts with main: main moved after this PR \
+PR #{number} (branch `{branch}`) now has merge conflicts with `{base}`: `{base}` moved after this PR \
 went green, so its required checks are not running. You are in this branch's worktree. Resolve it:
 
 1. Confirm `git status` is clean and you are on `{branch}`.
-2. `git fetch origin main && git merge origin/main` — merge, do not rebase. A rebase ends in a \
+2. `git fetch origin {base} && git merge origin/{base}` — merge, do not rebase. A rebase ends in a \
 force-push under a branch a session may still hold, and stops mid-way on a detached HEAD.
 3. Resolve each conflict by reading BOTH sides and keeping both intents. Where they genuinely \
 contradict, do not pick one: stop and say what contradicts.
@@ -639,7 +740,7 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
     tally = new_tally()
     candidates = [p for p in gh.open_prs()
                   if LABEL in p["labels"] and not p["isDraft"] and not p["isCrossRepository"]]
-    claimed = []  # (number, branch, worktree, episode, lock)
+    claimed = []  # (number, branch, worktree, episode, lock, base)
     try:
         for pr in candidates:
             n, branch = pr["number"], pr["headRefName"]
@@ -677,10 +778,11 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 print(f"#{n}: claimed by another pass while waiting for the lock")
                 continue
             episode = state["episode"]
+            base = base_of(pr, gh)
             dirty = runner(["git", "-C", wt, "status", "--porcelain"])
             reason = None
-            if not BRANCH_RE.match(branch):
-                reason = "the branch name has characters the waker will not put in a prompt"
+            if not (BRANCH_RE.match(branch) and BRANCH_RE.match(base)):
+                reason = "the branch or base name has characters the waker will not put in a prompt"
             elif dirty.returncode != 0:
                 reason = "`git status` failed in the worktree"
             elif dirty.stdout.strip():
@@ -697,10 +799,10 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
             if len(claimed) >= sessions_left:
                 lock.close()
                 tally["deferred"].append(n)
-                print(f"#{n}: over this pass's session cap — NOT acknowledged, so the monitor pages the "
+                print(f"#{n}: over this pass's session cap — NOT acknowledged, so the monitor pages a person "
                       f"owner unless a later pass claims it within {ACK_DEADLINE_MIN} min of the request")
                 continue
-            claimed.append((n, branch, wt, episode, lock))
+            claimed.append((n, branch, wt, episode, lock, base))
 
         if dry_run:
             for n, branch, *_rest in claimed:
@@ -723,8 +825,8 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 tally["problems"].append(f"#{n}: the ack could not be posted, so no session was started: {e}")
                 print(f"#{n}: COULD NOT acknowledge — no session started: {e}")
 
-        for n, branch, wt, episode, _held in runnable:
-            cmd = [claude_bin, "-p", FIX_PROMPT.format(number=n, branch=branch),
+        for n, branch, wt, episode, _held, base in runnable:
+            cmd = [claude_bin, "-p", FIX_PROMPT.format(number=n, branch=branch, base=base),
                    "--max-budget-usd", f"{budget_usd:g}"]
             cmd += {"from-pr": ["--from-pr", str(n)], "continue": ["--continue"], "fresh": []}[resume_mode]
             cmd += list(claude_args)
@@ -855,12 +957,14 @@ def _human(body, minutes_ago, assoc="OWNER"):
 class FakeGh:
     owner, name = "acme", "widgets"
 
-    def __init__(self, prs=(), comments=None, closed=(), mergeable_after="MERGEABLE"):
+    def __init__(self, prs=(), comments=None, closed=(), mergeable_after="MERGEABLE",
+                 default_branch="main", owner_type="Organization"):
         self.prs = [dict(p) for p in prs]
         self._comments = comments or {}
         self.closed = list(closed)
         self.writes = []
         self.mergeable_after = mergeable_after
+        self.default_branch, self.owner_type = default_branch, owner_type
 
     def open_prs(self):
         return [dict(p) for p in self.prs]
@@ -887,17 +991,19 @@ class FakeGh:
         author = _bot if kind and kind.group(1) in BOT_KINDS else _human
         self._comments.setdefault(n, []).append(author(body, 0))
 
-    def assign_owner(self, n):
-        self.writes.append(("assign", n))
+    def assign(self, n, logins):
+        self.writes.append(("assign", n, tuple(logins)))
 
     def mergeable(self, n):
         self.writes.append(("read_mergeable", n))
         return self.mergeable_after
 
 
-def _pr(n, mergeable="CONFLICTING", labels=(), draft=False, fork=False, branch=None):
+def _pr(n, mergeable="CONFLICTING", labels=(), draft=False, fork=False, branch=None, base="main",
+        author="dev", author_type="User"):
     return {"number": n, "mergeable": mergeable, "labels": list(labels), "isDraft": draft,
-            "isCrossRepository": fork, "headRefName": branch or f"feat/pr-{n}"}
+            "isCrossRepository": fork, "headRefName": branch or f"feat/pr-{n}", "baseRefName": base,
+            "author": author, "authorType": author_type}
 
 
 def selftest():
@@ -922,16 +1028,16 @@ def selftest():
     rc, _ = run_monitor(gh)
     expect(rc == 0 and kinds(gh, 1) == ["add_label", "comment"], f"new conflict: {gh.writes}")
     body = [w for w in gh.writes if w[0] == "comment"][0][2]
-    expect(body.startswith(marker("request", 1)) and "@acme" not in body,
-           "a request must carry the marker on line 1 and must not page the owner")
+    expect(body.startswith(marker("request", 1)) and "cc @" not in body,
+           "a request must carry the marker on line 1 and must not page anyone")
 
-    # 2. budget spent → page (assign + @mention), never a fourth request.
+    # 2. budget spent → page (assign + @mention the PR's author, said by role), never a fourth request.
     prior = [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]
     gh = FakeGh([_pr(2)], {2: prior})
     run_monitor(gh)
     body = [w for w in gh.writes if w[0] == "comment"][0][2]
-    expect(body.startswith(marker("page", 4, reason="budget")) and "@acme" in body
-           and ("assign", 2) in gh.writes, f"budget spent must page: {gh.writes}")
+    expect(body.startswith(marker("page", 4, reason="budget")) and "cc @dev (the PR's author)" in body
+           and ("assign", 2, ("dev",)) in gh.writes, f"budget spent must page the author: {gh.writes}")
 
     # 3. a fork is paged, never requested.
     gh = FakeGh([_pr(3, fork=True)])
@@ -1009,6 +1115,78 @@ def selftest():
     safe = neutralize(hostile)
     expect(len(safe) <= TAIL_CHARS + 20 and "<!--" not in safe and "```" not in safe
            and "@owner" not in safe, "session output must be neutralized before embedding")
+
+    # 28. the base branch is GitHub's: a trunk-based repo gets a recipe that runs; a stacked PR
+    #     names its own base; a PR carrying none falls back to the repository's default.
+    def first_comment(gh):
+        return [w[2] for w in gh.writes if w[0] == "comment"][0]
+    for pr, want in ((_pr(28, base="trunk"), "trunk"), (_pr(28, base="feat/parent"), "feat/parent"),
+                     (_pr(28, base=None), "trunk")):
+        gh = FakeGh([pr], default_branch="trunk")
+        run_monitor(gh)
+        body = first_comment(gh)
+        expect(f"git fetch origin {want} && git merge origin/{want}" in body and f"with `{want}`" in body
+               and f"merges `{want}`" in body and "origin/main" not in body and "`main`" not in body,
+               f"base {pr['baseRefName']!r} must be named as {want!r}: {body[:400]}")
+
+    # 29. WHO A PAGE REACHES. An organization's @mention notifies nobody, so: the PR's author;
+    #     else a person who owns the repo; else say NOBODY was paged and fail the run. A
+    #     configured --page-to wins, and every page says which rule chose its recipient.
+    budget = [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]
+    gh = FakeGh([_pr(29, author="deploy-app", author_type="Bot")], {29: list(budget)}, owner_type="Organization")
+    rc, text = run_monitor(gh)
+    body = first_comment(gh)
+    expect(rc == 1 and "**Nobody was paged:**" in body and "PR_CONFLICT_PAGE_TO" in body and "cc @" not in body
+           and "PAGED NOBODY" in text and not any(w[0] == "assign" for w in gh.writes),
+           f"a bot's PR on an org repo must say nobody was paged and fail the run: rc={rc} {body} {text}")
+    gh = FakeGh([_pr(29, author="deploy-app", author_type="Bot")], {29: list(budget)}, owner_type="User")
+    rc, _ = run_monitor(gh)
+    expect(rc == 0 and "cc @acme (the repository owner — the PR's author is a bot)" in first_comment(gh)
+           and ("assign", 29, ("acme",)) in gh.writes, f"a user-owned repo pages its owner: {gh.writes}")
+    gh = FakeGh([_pr(29, author="deploy-app", author_type="Bot")], {29: list(budget)})
+    rc, _ = run_monitor(gh, page_to=["alice", "acme/on-call"])
+    expect(rc == 0 and "cc @alice, @acme/on-call (PR_CONFLICT_PAGE_TO)" in first_comment(gh)
+           and ("assign", 29, ("alice", "acme/on-call")) in gh.writes, f"--page-to must win: {gh.writes}")
+    stalled = FakeGh([_pr(30, labels=[LABEL], author=None, author_type=None)],
+                     {30: [_bot(marker("request", 1), ACK_DEADLINE_MIN + 5)]})
+    rc, text = run_monitor(stalled)
+    expect(rc == 1 and "**Nobody was paged:**" in first_comment(stalled) and "PAGED NOBODY" in text,
+           f"an escalation that reaches nobody must fail the run too: rc={rc} {text}")
+    expect(parse_page_to("@alice, bob acme/on-call") == (["alice", "bob", "acme/on-call"], [])
+           and parse_page_to("alice;rm")[1] == ["alice;rm"] and parse_page_to("") == ([], []),
+           "PR_CONFLICT_PAGE_TO parses logins and team slugs and rejects anything else")
+    expect(main(["monitor", "--repo", "acme/widgets", "--page-to", "x<y", "--dry-run"]) == 2,
+           "a --page-to that is not a login is a usage error before anything is read")
+
+    # 30. the real transport reads the repository ONCE, names its default branch in the label,
+    #     and assigns people, never a team.
+    seen30 = []
+
+    def rec30(cmd, cwd=None, input=None, timeout=None):
+        seen30.append((cmd, input))
+        out = ('{"default_branch": "trunk", "owner": {"type": "Organization"}}'
+               if cmd[3:5] == ["GET", "repos/acme/widgets"] else "{}")
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+    real = Gh("acme/widgets", runner=rec30)
+    real.ensure_label()
+    real.ensure_label()
+    reads = [c for c, _i in seen30 if c[3:5] == ["GET", "repos/acme/widgets"]]
+    labels = [json.loads(i) for c, i in seen30 if c[4] == "repos/acme/widgets/labels"]
+    expect(len(reads) == 1 and real.owner_type == "Organization"
+           and all("trunk" in d["description"] and "main" not in d["description"]
+                   and len(d["description"]) <= LABEL_DESCRIPTION_MAX for d in labels),
+           f"one repository read, and the label names the real default branch: {seen30}")
+    seen30.clear()
+    real.assign(4, ["alice", "acme/on-call"])
+    real.assign(5, ["acme/on-call"])
+    expect([json.loads(i) for _c, i in seen30] == [{"assignees": ["alice"]}],
+           f"assign must carry people only, and skip a call with none: {seen30}")
+    empty = Gh("acme/widgets", runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "{}", ""))
+    try:
+        empty.default_branch
+        expect(False, "a repository record with no default branch must not be guessed")
+    except CouldNotTell:
+        pass
 
     # ── wake ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -1088,6 +1266,8 @@ def selftest():
         expect(len(calls) == 1 and os.path.realpath(calls[0][1]) == os.path.realpath(wt)
                and "--from-pr" in calls[0][0] and "--max-budget-usd" in calls[0][0],
                f"one session, in #7's worktree, resumed by PR, with a spend cap: {calls}")
+        expect("git fetch origin main && git merge origin/main" in calls[0][0][2],
+               "the fix prompt must name the PR's own base")
         posted = [w[2] for w in gh.writes if w[0] == "comment" and w[1] == 7][-1]
         expect(posted.count("<!--") == 1 and parse_marker(_human(posted, 0))["attrs"]["outcome"] == "resolved",
                "a marker inside session output must not survive into the result comment")
@@ -1208,6 +1388,21 @@ def selftest():
         expect(rc == 1 and firsts_for(gh_u, 7)[-1] == marker("result", 1, outcome="unknown"),
                f"a fix nobody can confirm must say unknown and exit 1: rc={rc} {firsts_for(gh_u, 7)}")
 
+        # 27. the fix session is handed the PR's OWN base, never `main` by assumption: a `develop`
+        #     base gets a command that runs; a base the prompt must not carry is declined, said.
+        calls.clear()
+        gh = FakeGh([_pr(7, labels=[LABEL], base="develop")], {7: [_bot(marker("request", 1), 2)]},
+                    default_branch="trunk")
+        wake(gh, repo, NOW, env={}, **common)
+        prompt = calls[0][0][2] if calls else ""
+        expect("git fetch origin develop && git merge origin/develop" in prompt and "origin/main" not in prompt
+               and "origin/trunk" not in prompt, f"the prompt must merge the PR's base: {prompt[:300]}")
+        calls.clear()
+        gh = FakeGh([_pr(7, labels=[LABEL], base="rel ease`x")], {7: [_bot(marker("request", 1), 2)]})
+        wake(gh, repo, NOW, env={}, **common)
+        expect(calls == [] and firsts_for(gh, 7) == [marker("result", 1, outcome="declined")],
+               f"a base the prompt must not carry is declined, never embedded: {gh.writes} {calls}")
+
     # 21. the real transport: label writes carry only `conflict`; nothing merges or approves.
     seen = []
 
@@ -1229,7 +1424,7 @@ def selftest():
         for f in failures:
             print("  -", f)
         return 1
-    print("pr_conflict selftest: OK (26 cases)")
+    print("pr_conflict selftest: OK (30 cases)")
     return 0
 
 
@@ -1240,6 +1435,9 @@ def main(argv=None):
     m = sub.add_parser("monitor")
     m.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     m.add_argument("--dry-run", action="store_true")
+    m.add_argument("--page-to", default=os.environ.get("PR_CONFLICT_PAGE_TO", ""),
+                   help="logins (or org/team) a page @mentions, comma- or space-separated; default "
+                        "PR_CONFLICT_PAGE_TO, else the PR's author, else a person who owns the repo")
     w = sub.add_parser("wake")
     w.add_argument("--repo-dir", action="append", default=[],
                    help="a checkout whose worktrees this waker serves; repeat for several (default .)")
@@ -1261,6 +1459,11 @@ def main(argv=None):
             if not args.repo or "/" not in args.repo:
                 print("monitor needs --repo owner/name (or GITHUB_REPOSITORY)", file=sys.stderr)
                 return 2
+            page_to, bad = parse_page_to(args.page_to)
+            if bad:
+                print(f"monitor: --page-to / PR_CONFLICT_PAGE_TO names {bad}, which is not a GitHub "
+                      "login or org/team", file=sys.stderr)
+                return 2
             summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
 
             def summary(text):
@@ -1270,7 +1473,7 @@ def main(argv=None):
                         fh.write(text + "\n")
 
             return monitor(Gh(args.repo), dt.datetime.now(dt.timezone.utc),
-                           dry_run=args.dry_run, summary=summary)
+                           dry_run=args.dry_run, summary=summary, page_to=page_to)
         if args.cmd == "wake":
             problem = queue_problem(args.max_sessions, args.timeout_min, args.max_budget_usd)
             if problem:
