@@ -695,11 +695,19 @@ def measure(ctx, apply_it, keep_going=False):
     return rows
 
 
+def record_rows(state, rows):
+    """Write measured rows into the ledger `status` replays, and save it. Every caller of
+    `measure` must come through here — the Stage E installer included — or `status` reads a
+    working install as never run. The ledger lives in the person's own home; recording it
+    is not a change to the machine, so a dry run and `verify` record too."""
+    for sid, outcome, detail, extra in rows:
+        state.record(sid, outcome, detail if outcome != BLOCKED else extra)
+    state.save()
+
+
 def run_steps(ctx, apply_it, keep_going=False, resume="run"):
     rows = measure(ctx, apply_it, keep_going)
-    for sid, outcome, detail, _extra in rows:
-        ctx.state.record(sid, outcome, detail if outcome != BLOCKED else _extra)
-    ctx.state.save()
+    record_rows(ctx.state, rows)
     say("")
     say("-- steps --")
     for sid, outcome, detail, _extra in rows:

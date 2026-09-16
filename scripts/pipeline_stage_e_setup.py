@@ -1517,6 +1517,9 @@ class Ctx(object):
         self.replaced = set()
         self.role_home = None
         self.dispatcher = {}     # facts read out of the dispatcher's own config
+        # The conflict waker's ledger. None is its own default under your home, the one its
+        # `status` reads; the selftest points this at a temp dir so it never writes yours.
+        self.waker_state_home = None
         # repositoryPath -> the OWNER/NAME its `origin` remote names, asked of
         # git once per path per run. Which repository a clone IS decides which
         # entry a review runs in, so it is read, never inferred from the path.
@@ -3841,8 +3844,10 @@ def step_conflict_waker(ctx, apply_it):
     session's own thread and sandbox.
 
     The waker's steps run through THIS run's runner, so a dry run and `verify` stay
-    write-free here too. Its rows come back as data and are translated into this file's own
-    outcomes: its card becomes CK-8, and its sign-off stays in its own ledger."""
+    write-free here too. Its rows come back as data, are recorded in the waker's own ledger
+    (so its `status` tells the truth about an install made from here), and are translated
+    into this file's own outcomes: its card becomes CK-8, and its sign-off stays in that
+    ledger."""
     value = (ctx.conf.get("CONFLICT_WAKER_CONF") or "").strip()
     if value.lower() == "off":
         return True, ("OFF by conf (CONFLICT_WAKER_CONF=off): a local session's conflicted PR pages "
@@ -3859,8 +3864,12 @@ def step_conflict_waker(ctx, apply_it):
     if errors:
         raise SetupError("%s has %d problem(s):\n%s" % (path, len(errors),
                                                         "\n".join("  - " + e for e in errors)))
-    wctx = waker.Ctx(wconf, ctx.runner, waker.State(waker.DEFAULT_STATE_HOME))
+    wctx = waker.Ctx(wconf, ctx.runner, waker.State(ctx.waker_state_home or waker.DEFAULT_STATE_HOME))
     rows = waker.measure(wctx, apply_it, keep_going=not apply_it)
+    # Recorded BEFORE any row is translated into a raise below: a blocked or failed step is
+    # exactly what `status` must be able to show. Measured live: without this, a loaded waker
+    # with a fresh heartbeat read "not run" on every step.
+    waker.record_rows(wctx.state, rows)
     trail = "; ".join("%s %s" % (sid, outcome) for sid, outcome, _d, _e in rows)
     for sid, outcome, detail, extra in rows:
         if outcome == FAILED:
@@ -7164,14 +7173,15 @@ def _selftest_body():
         seen_w = []
         saved_measure = waker_mod.measure
         try:
-            for rows_w, want in (
+            for n_w, (rows_w, want) in enumerate((
                     ([("preflight", ALREADY_DONE, "ok", None), ("enable", ALREADY_DONE, "loaded", None)], "done"),
                     ([("preflight", ALREADY_DONE, "ok", None), ("dry-run", BLOCKED, "would wake [7]", "CK-W1")], "CK-8"),
                     ([("preflight", ALREADY_DONE, "ok", None), ("enable", UNKNOWN, "NOT RUNNING", None)], "unknown"),
                     ([("preflight", FAILED, "root", None)], "failed"),
-                    ([("preflight", ALREADY_DONE, "ok", None), ("code", WOULD_CHANGE, "would clone", None)], "drift")):
+                    ([("preflight", ALREADY_DONE, "ok", None), ("code", WOULD_CHANGE, "would clone", None)], "drift"))):
                 waker_mod.measure = (lambda rows: lambda wctx, apply_it, keep_going=False: (
                     seen_w.append((wctx.runner, apply_it)) or rows))(rows_w)
+                ctx_w.waker_state_home = os.path.join(tmp_w, "ledger-%d" % n_w)
                 try:
                     ok_w, detail_w, _x = step_conflict_waker(ctx_w, False)
                     got = "done" if ok_w else "drift"
@@ -7182,6 +7192,28 @@ def _selftest_body():
                 except SetupError:
                     got = "failed"
                 expect("waker-translated", got == want, "rows %s became %s, not %s" % (rows_w, got, want))
+                # THE LEDGER `status` REPLAYS, read back off disk — whichever way the rows
+                # translated. Without this, an install made from here read "not run" on
+                # every step of a loaded waker with a fresh heartbeat.
+                steps_w = waker_mod.State(ctx_w.waker_state_home).data["steps"]
+                expect("waker-ledger-recorded",
+                       sorted(steps_w) == sorted(s for s, _o, _d, _e in rows_w)
+                       and all(steps_w[s]["outcome"] == o for s, o, _d, _e in rows_w)
+                       and all(steps_w[s]["detail"] == e for s, o, _d, e in rows_w if o == BLOCKED),
+                       "rows %s left the waker's ledger holding %s — `status` would misreport them"
+                       % (rows_w, steps_w))
+            # …and a real run, with no override, records where the waker's own `status` reads.
+            saved_default = waker_mod.DEFAULT_STATE_HOME
+            waker_mod.DEFAULT_STATE_HOME = os.path.join(tmp_w, "default-ledger")
+            ctx_w.waker_state_home = None
+            try:
+                step_conflict_waker(ctx_w, False)
+            finally:
+                waker_mod.DEFAULT_STATE_HOME = saved_default
+            expect("waker-ledger-default",
+                   set(waker_mod.State(os.path.join(tmp_w, "default-ledger")).data["steps"])
+                   == {s for s, _o, _d, _e in rows_w},
+                   "with no override the embedded waker must record in its own default ledger")
         finally:
             waker_mod.measure = saved_measure
         expect("waker-same-runner", all(r is ctx_w.runner and a is False for r, a in seen_w),
@@ -7241,6 +7273,7 @@ def _settled_ctx(conf):
                          "model_label_id": "l1", "owner_user_id": "u-owner"}
     fake = FakeRunner()
     ctx = Ctx(conf, fake, state, tty=False)
+    ctx.waker_state_home = tempfile.mkdtemp(prefix="stage-e-selftest-waker.")
     # A LIVE code-host token, by default, on every fixture: the interesting
     # cases are the ones that say otherwise, and each of those sets its own.
     ctx.github_factory = lambda token: FakeGitHub()
