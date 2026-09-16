@@ -25,10 +25,11 @@ WHAT IT CANNOT CATCH, STATED FIRST BECAUSE IT IS THE POINT
      is judged and nothing is posted. The silence is indistinguishable from health — which
      is exactly the conflation §13 is about, and this file cannot close it from inside.
   2. **Its own death.** A monitor that is not running pages nobody, for the same reason a
-     poller that is not running files nothing. It writes its own heartbeat (below) so the
-     installer's verify step and an operator's one command can SEE a fourth file — but that
-     heartbeat has no consumer either. This job moves the unread-heartbeat problem one step;
-     it does not delete it.
+     poller that is not running files nothing. It writes its own heartbeat (below), and the
+     Stage E installer's `verify` and `run` read it: its `schema`, `at`, `result` and
+     `dry_run` fields. Nothing SCHEDULED reads it, so its death is seen only when a person
+     runs the installer. This job moves the unread-heartbeat problem one step; it does not
+     delete it.
   3. **A tracker outage.** The page is undeliverable exactly when the tracker is what is
      broken. An undelivered page is reported as exit 3 and retried next pass; it is never
      recorded as delivered.
@@ -37,8 +38,9 @@ WHAT IT CANNOT CATCH, STATED FIRST BECAUSE IT IS THE POINT
 
   Closing 1 and 2 needs something OFF this box — an external service that alerts when a
   ping stops arriving, which is the inverse of this design (it fails loud rather than
-  silent). That is deliberately a separate piece of work and deliberately not attempted
-  here: a half-built dead-man's switch that silently stops pinging is worse than none.
+  silent). That is deliberately a separate piece of work (KIT-45) and deliberately not
+  attempted here: a half-built dead-man's switch that silently stops pinging is worse than
+  none.
 
 WHAT IT WATCHES, AND WHY THE THREE SHAPES ARE NOT UNIFIED HERE
 
@@ -57,9 +59,12 @@ WHAT IT WATCHES, AND WHY THE THREE SHAPES ARE NOT UNIFIED HERE
 WHAT "STALE" MEANS, AND THE ONE FALSE PAGE IT WOULD OTHERWISE GUARANTEE
 
   Stale = the newest timestamp in the file is older than `stale_multiplier` (default 2)
-  times that job's OWN scheduled interval, which the config must state — "stale" has no
-  meaning without the interval, so a watched job with no interval is a config error rather
-  than a guess.
+  times that job's interval in the config. That interval is the LONGEST A HEALTHY JOB CAN
+  GO BETWEEN TWO HEARTBEATS: its scheduler interval, plus one pass's wall clock when a pass
+  can outlast it. The review poller writes only when a pass ends, so a long pass inside its
+  own deadline leaves an old file; an interval without the pass in it pages on that pass.
+  "Stale" has no meaning without the interval, so a watched job with no interval is a
+  config error rather than a guess.
 
   A sleeping laptop would otherwise make this useless. launchd runs the missed interval on
   wake, so for one interval after a wake EVERY heartbeat is legitimately old and a naive
@@ -69,12 +74,22 @@ WHAT "STALE" MEANS, AND THE ONE FALSE PAGE IT WOULD OTHERWISE GUARANTEE
   `missing`, `failing` and `unreadable` are still judged — none of them depends on the
   clock. The next pass, one interval later, judges staleness normally.
 
+  `rearm` does the same on purpose. It removes the last-run timestamp and nothing else, so
+  the next pass is handled like a wake. The installer runs it just before it loads this
+  job: the daemons were stopped for the reload, their heartbeats are old for that reason,
+  and a pass that judged them would page about daemons that are running. A pass that could
+  not judge staleness also never closes an open incident — its recovery is not known yet.
+
 ONE COMMENT PER INCIDENT — NEVER ONE PER PASS
 
   The state file holds the fingerprint of the last verdict-set that was POSTED. A pass
   whose fingerprint matches it posts nothing: an incident is announced once, not every
   interval. A return to health posts one recovery comment and closes the incident. A
   changed problem (a second daemon joins the first) is a new fingerprint and is announced.
+
+  The state also records the ticket the last comment went to. A ticket that is not that one
+  has not seen the open incident, so a changed `notify_ticket_id` announces it again there.
+  It gets no recovery comment for an incident it never saw.
 
   `min_seconds_between_comments` bounds a flapping daemon. A change suppressed by that
   cooldown is CARRIED, never dropped: it is counted, and the next allowed pass posts the
@@ -107,6 +122,7 @@ WHAT IT NEVER DOES (asserted in --selftest against this file's own source)
 Usage:
   pipeline_heartbeat_monitor.py run   --config FILE [--dry-run] [--timeout N]
   pipeline_heartbeat_monitor.py check --config FILE          # judge + print, post nothing
+  pipeline_heartbeat_monitor.py rearm --config FILE          # next pass skips staleness
   pipeline_heartbeat_monitor.py --example-config
   pipeline_heartbeat_monitor.py --selftest
 
@@ -125,6 +141,10 @@ Exit:
   A heartbeat is left on every path above. The two that leave none are a --config that
   cannot be read (exit 2, before the state directory is known) and somebody stopping the
   process on purpose.
+
+  `check` and `rearm` write no heartbeat. `rearm` exits 0 when the next pass will not judge
+  staleness (the stamp was removed, or there was none to remove), 1 when the state file
+  could not be rewritten, and 2 on a config error.
 """
 
 import argparse
@@ -177,7 +197,12 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 #                is rewritten by the mid-pass `running` beat.
 # `bool_field`   a heartbeat that reports a boolean instead of a result string. No
 #                watcher uses it today: the finding poller did until its /2 heartbeat.
-# `good`         results that mean the last pass was fine.
+# `good`         results that mean the last pass was fine. That is the daemon's own reading
+#                of its exit, not "nothing was declined": the review poller's `declined`
+#                (exit 3) is a pass that settled a NOT-reviewed verdict and said so on the
+#                pull request — the poller doing its job, which the notifier does not page
+#                on either. The bounce driver's `problems` and `deadline` and the finding
+#                poller's `error` are a pass that could not do something, and stay out.
 # `running`      results that mean a pass was IN FLIGHT when the file was written. Fresh,
 #                that is healthy; stale, it means a pass started and never finished, which
 #                is a different sentence from "the daemon is not running" and gets one.
@@ -191,7 +216,7 @@ WATCHERS = {
         "ts_fields": ("ended_at", "started_at", "at"),
         "result_field": "result",
         "bool_field": None,
-        "good": ("ok",),
+        "good": ("ok", "declined"),
         "running": (),
     },
     "bounce-driver": {
@@ -250,8 +275,10 @@ CONFIG_KEYS = {
     "watch": "which jobs this machine actually runs: any of %s. Required — an "
              "un-deployed job's absent heartbeat must not page forever"
              % ", ".join(sorted(WATCHERS)),
-    "intervals": "map of watched job -> its scheduler interval in seconds. Required for "
-                 "every watched job: 'stale' is meaningless without it",
+    "intervals": "map of watched job -> the longest a healthy job can go between two "
+                 "heartbeats, in seconds: its scheduler interval, plus one pass's wall "
+                 "clock when a pass can outlast it. Required for every watched job: "
+                 "'stale' is meaningless without it",
     "run_interval_seconds": "THIS job's own interval, in seconds. Required: it is how a "
                             "missed pass (a sleeping machine) is told from a stale daemon",
     "stale_multiplier": "how many intervals old a heartbeat may be before it is stale "
@@ -269,7 +296,9 @@ EXAMPLE_CONFIG = {
     "state_dir": DEFAULT_STATE_DIR,
     "finding_state_dir": DEFAULT_FINDING_DIR,
     "watch": ["review-poller", "bounce-driver", "finding-poller"],
-    "intervals": {"review-poller": 300, "bounce-driver": 300, "finding-poller": 900},
+    # Each is a 300 s schedule plus that daemon's pass wall clock (900 s for the review
+    # poller and the bounce driver), or a 900 s schedule plus the finding poller's 300 s.
+    "intervals": {"review-poller": 1200, "bounce-driver": 1200, "finding-poller": 1200},
     "run_interval_seconds": 1800,
     "stale_multiplier": DEFAULT_STALE_MULTIPLIER,
     "notify_ticket_id": "KIT-000",
@@ -457,17 +486,35 @@ def build_report(verdicts, unwatched, blind, gap_seconds):
     }
 
 
-def decide_post(report, state, now, cooldown):
+def decide_post(report, state, now, cooldown, target=None):
     """(post?, why, carried) — the whole "one comment per incident" rule, as pure logic.
 
     `carried` is how many changes the cooldown has swallowed INCLUDING this one; it reaches
     the comment that finally goes out, so a suppressed change is late, never lost.
+
+    `target` is the ticket this pass would comment on. A different ticket from the one the
+    state recorded has not seen the open incident, so a problem is announced there, with no
+    cooldown: nothing has been said on that ticket to flood it. A state written before the
+    ticket was recorded names none. While a problem is open that reads as not yet posted (a
+    duplicate, never a miss); otherwise as the same ticket, so a recovery still goes out.
     """
     current = report["fingerprint"]
     last = state.get("last_posted_fingerprint")
     last_was_problem = bool(state.get("last_posted_problem"))
     carried = int(state.get("suppressed_changes") or 0)
+    recorded = state.get("last_posted_target")
 
+    if target and last is not None and recorded != target:
+        if report["problem"] and recorded:
+            return True, ("%s has not seen the open verdict — it was said on %s — so it is "
+                          "announced there" % (target, recorded)), carried
+        if report["problem"]:
+            return True, ("the state does not record which ticket the last comment went to, "
+                          "so the open verdict is said on %s (a duplicate at worst)" % target), \
+                carried
+        if recorded:
+            return False, ("no incident is open, and %s never saw the last one — there is "
+                           "nothing to announce there" % target), carried
     if current == last:
         return False, "this exact verdict was already reported; an incident is announced "\
                       "once, not every pass", carried
@@ -475,6 +522,11 @@ def decide_post(report, state, now, cooldown):
         if last is None or not last_was_problem:
             return False, "everything watched is healthy and no incident is open — there "\
                           "is nothing to announce", carried
+        if any(v["verdict"] == "unknown-after-gap" for v in report["verdicts"]):
+            # Not a problem, and not a recovery either: a stale daemon whose staleness this
+            # pass could not judge has not been seen to recover.
+            return False, "the open incident is NOT closed by a pass that could not judge "\
+                          "staleness; the next pass decides", carried
         # A recovery closes an incident and is never delayed by the cooldown.
         return True, "recovery: the open incident has cleared", carried
     last_at = parse_iso(state.get("last_posted_at"))
@@ -516,9 +568,9 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     if state_note:
         lines.append(state_note)
     lines.append("")
-    lines.append("Intervals in force: %s. Read the heartbeat files themselves and the "
-                 "daemon logs as the role account (operator doc, *Monitor the heartbeats, "
-                 "not the log*)."
+    lines.append("Longest healthy gap between two heartbeats, per job: %s. Read the "
+                 "heartbeat files themselves and the daemon logs as the role account "
+                 "(operator doc, *Monitor the heartbeats, not the log*)."
                  % ", ".join("%s %ds" % (k, v) for k, v in sorted(watched_intervals.items())))
     lines.append("")
     lines.append("_Posted by the Stage E heartbeat monitor, which runs on the same machine "
@@ -540,7 +592,7 @@ def render_report(report, intervals, notify_target=None):
         out.append("  %-15s %-18s %s" % (v["job"], v["verdict"], v["detail"]))
     for job in report["unwatched"]:
         out.append("  %-15s %-18s not in 'watch' on this machine" % (job, "not-judged"))
-    out.append("  asked: %d heartbeat file(s) against intervals %s"
+    out.append("  asked: %d heartbeat file(s) against longest healthy gaps %s"
                % (len(report["verdicts"]),
                   ", ".join("%s=%ds" % (k, v) for k, v in sorted(intervals.items()))))
     out.append("  answer: %s" % ("%d problem(s)" % len(report["problems"])
@@ -604,8 +656,9 @@ def load_config(path):
     for job in watch:
         value = intervals_raw.get(job)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            problems.append("'intervals[%s]' must be that job's scheduler interval in "
-                            "seconds — 'stale' has no meaning without it" % job)
+            problems.append("'intervals[%s]' must be the longest that job can go between two "
+                            "heartbeats when healthy, in seconds — 'stale' has no meaning "
+                            "without it" % job)
         else:
             intervals[job] = value
     for job in sorted(set(intervals_raw) - set(watch)):
@@ -759,9 +812,10 @@ def write_heartbeat(cfg, **fields):
     """This job's own heartbeat, on every terminal path. Best effort by design: a heartbeat
     that cannot be written is said on stderr and never changes the pass's exit code.
 
-    It closes no loop by itself — nothing reads it either. It exists so the installer's
-    verify step and an operator's one command see four files where there were three, and so
-    that this job's own death is at least VISIBLE to someone already looking.
+    It closes no loop by itself — nothing SCHEDULED reads it. The Stage E installer's
+    `verify` and `run` do, when a person runs them: they judge `schema`, `at`, `result` and
+    `dry_run` (scripts/pipeline_stage_e_setup.py, whose selftest builds its fixture with
+    this function). So this job's own death is at least VISIBLE to someone already looking.
     """
     doc = {"schema": HEARTBEAT_SCHEMA, "at": _iso()}
     doc.update(fields)
@@ -854,7 +908,8 @@ def run_pass(cfg, post=True, dry_run=False, poster=None):
     report = judge(cfg, state, now)
     print(render_report(report, cfg["intervals"], cfg["notify_ticket_id"] or None))
 
-    should, why, carried = decide_post(report, state, now, cfg["min_seconds_between_comments"])
+    should, why, carried = decide_post(report, state, now, cfg["min_seconds_between_comments"],
+                                       cfg["notify_ticket_id"] or None)
     recovery = should and not report["problem"]
     code, happened = EXIT_OK, why
 
@@ -907,6 +962,7 @@ def run_pass(cfg, post=True, dry_run=False, poster=None):
             new_state["last_posted_at"] = _iso(now)
             new_state["last_posted_fingerprint"] = report["fingerprint"]
             new_state["last_posted_problem"] = report["problem"]
+            new_state["last_posted_target"] = cfg["notify_ticket_id"]
             new_state["suppressed_changes"] = 0
         else:
             new_state["suppressed_changes"] = carried
@@ -973,6 +1029,44 @@ def cmd_check(args):
     return code
 
 
+def cmd_rearm(args):
+    """Remove `last_run_at` from the state file, and nothing else.
+
+    The next pass then has no last run to measure its own gap from, so it does not judge
+    staleness — the same as a pass after a wake. The installer runs this just before it
+    loads the job, because the daemons were stopped for the reload and their old heartbeats
+    say so. Every other field is kept, so an open incident stays open. It posts nothing and
+    writes no heartbeat. A state file it cannot read is left as it is: the next pass treats
+    that file as empty, which does not judge staleness either, and names the file in its
+    log."""
+    cfg = load_config(args.config)
+    path = state_path(cfg)
+    if not os.path.exists(path):
+        log("rearm: no state file at %s, so the next pass has no last run to measure from "
+            "and does not judge staleness. Nothing was written." % path)
+        return EXIT_OK
+    state, note = load_state(path)
+    if note:
+        log("rearm: %s cannot be read as a %s document and was left as it is. The next pass "
+            "treats it as empty, so it does not judge staleness. Nothing was written."
+            % (path, STATE_SCHEMA))
+        return EXIT_OK
+    if "last_run_at" not in state:
+        log("rearm: %s holds no last_run_at, so the next pass does not judge staleness. "
+            "Nothing was written." % path)
+        return EXIT_OK
+    was = state.pop("last_run_at")
+    try:
+        save_state(path, state)
+    except OSError as exc:
+        log("FAIL: rearm could not rewrite %s (%s). The next pass still measures from %s and "
+            "judges staleness." % (path, exc, was))
+        return EXIT_ERROR
+    log("rearm: removed last_run_at (%s) from %s and kept every other field. The next pass "
+        "does not judge staleness; the one after it does." % (was, path))
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------- #
 # Selftest — offline; every file, clock and tracker call is local or stubbed
 # --------------------------------------------------------------------------- #
@@ -1013,6 +1107,12 @@ def selftest():
        verdict("review-poller", beat("review-poller", result="error", ended_at=fresh)) == "failing")
     ok("review poller: fresh + timeout ⇒ failing, not ok",
        verdict("review-poller", beat("review-poller", result="timeout", ended_at=fresh)) == "failing")
+    ok("review poller: fresh + usage ⇒ failing, not ok",
+       verdict("review-poller", beat("review-poller", result="usage", ended_at=fresh)) == "failing")
+    ok("review poller: fresh + declined ⇒ ok (a NOT-reviewed verdict is the poller doing its job)",
+       verdict("review-poller", beat("review-poller", result="declined", ended_at=fresh)) == "ok")
+    ok("bounce driver: problems ⇒ failing (a PR it could not act on)",
+       verdict("bounce-driver", beat("bounce-driver", result="problems", at=fresh)) == "failing")
     ok("review poller: old ⇒ stale",
        verdict("review-poller", beat("review-poller", result="ok", ended_at=old)) == "stale")
     ok("review poller: ended_at wins over an older started_at",
@@ -1119,6 +1219,35 @@ def selftest():
                  "last_posted_problem": False, "suppressed_changes": 0}
     ok("steady health after a recovery posts nothing",
        decide_post(healthy, recovered, NOW + 20000, 900)[0] is False)
+
+    # A pass that could not judge staleness (a wake, or a rearm) is not a recovery.
+    open_incident = {"last_posted_at": _iso(NOW - 5000),
+                     "last_posted_fingerprint": broken["fingerprint"],
+                     "last_posted_problem": True, "suppressed_changes": 0}
+    unjudged = report_of([("review-poller", "unknown-after-gap"), ("bounce-driver", "ok")],
+                         blind=True)
+    ok("a pass that could not judge staleness does NOT close an open incident",
+       decide_post(unjudged, open_incident, NOW, 900)[0] is False)
+    ok("…but a blind pass whose every beat is fresh and good does",
+       decide_post(report_of([("review-poller", "ok"), ("bounce-driver", "ok")], blind=True),
+                   open_incident, NOW, 900)[0] is True)
+
+    # The ticket the last comment went to is part of "already reported".
+    on7 = dict(open_incident, last_posted_at=_iso(NOW - 60), last_posted_target="KIT-7")
+    ok("an open incident is not said twice on the same ticket",
+       decide_post(broken, on7, NOW, 900, "KIT-7")[0] is False)
+    ok("a NEW ticket has not seen the open incident: it is announced there, cooldown or not",
+       decide_post(broken, on7, NOW, 900, "KIT-9")[0] is True)
+    ok("a new ticket gets no recovery for an incident it never saw",
+       decide_post(healthy, on7, NOW, 900, "KIT-9")[0] is False)
+    ok("…and no comment at all when nothing is open",
+       decide_post(healthy, dict(on7, last_posted_fingerprint=healthy["fingerprint"],
+                                 last_posted_problem=False), NOW, 900, "KIT-9")[0] is False)
+    ok("the recovery still goes to the ticket that saw the incident",
+       decide_post(healthy, on7, NOW, 900, "KIT-7")[0] is True)
+    ok("a state that never recorded its ticket re-announces an open problem (a duplicate, "
+       "never a miss)", decide_post(broken, open_incident, NOW, 900, "KIT-7")[0] is True)
+    ok("…and still posts the recovery", decide_post(healthy, open_incident, NOW, 900, "KIT-7")[0] is True)
 
     # ── 7. The cooldown bounds a flap, carries it, and never delays good news ────────
     hot = {"last_posted_at": _iso(NOW - 60), "last_posted_fingerprint": broken["fingerprint"],
@@ -1351,6 +1480,83 @@ def selftest():
         woke = json.load(open(heartbeat_path(load_config(path)), encoding="utf-8"))
         ok("…and the heartbeat records the unjudged verdict by name",
            woke["verdicts"]["review-poller"] == "unknown-after-gap", woke)
+
+        # (k) rearm: the next pass is handled like a wake, and nothing else changes
+        spath = state_path(load_config(path))
+        kept = {"schema": STATE_SCHEMA, "last_posted_fingerprint": "review-poller=ok",
+                "last_posted_problem": False, "last_posted_target": "KIT-000",
+                "last_posted_at": _iso(_now() - 5000), "suppressed_changes": 0}
+        _atomic_write_json(spath, dict(kept, last_run_at=_iso(_now() - 60)))
+        _atomic_write_json(hb, {"schema": WATCHERS["review-poller"]["schema"],
+                                "result": "ok", "ended_at": _iso(_now() - 86400)})
+        own_before = open(heartbeat_path(load_config(path)), encoding="utf-8").read()
+        sent_before = len(sent)
+        rc = cmd_rearm(Args())
+        ok("rearm removes last_run_at and keeps every other field",
+           rc == EXIT_OK and json.load(open(spath, encoding="utf-8")) == kept,
+           open(spath, encoding="utf-8").read())
+        ok("rearm posts nothing and writes no heartbeat",
+           len(sent) == sent_before
+           and open(heartbeat_path(load_config(path)), encoding="utf-8").read() == own_before)
+        code = cmd_run(Args(), poster=fake_poster)
+        ok("a pass after rearm does not page on the daemons' old heartbeats",
+           len(sent) == sent_before and code == EXIT_OK, (code, sent[sent_before:]))
+        rearmed = json.load(open(heartbeat_path(load_config(path)), encoding="utf-8"))
+        ok("…and names the verdict it did not judge",
+           rearmed["verdicts"]["review-poller"] == "unknown-after-gap", rearmed)
+        os.remove(hb)
+        cmd_rearm(Args())
+        cmd_run(Args(), poster=fake_poster)
+        ok("after rearm a MISSING heartbeat still pages",
+           len(sent) == sent_before + 1 and sent[-1][0] == "KIT-000", sent[sent_before:])
+        _atomic_write_json(hb, {"schema": WATCHERS["review-poller"]["schema"],
+                                "result": "error", "ended_at": _iso()})
+        cmd_rearm(Args())
+        cmd_run(Args(), poster=fake_poster)
+        ok("after rearm a FAILING heartbeat still pages", len(sent) == sent_before + 2,
+           sent[sent_before:])
+        with open(hb, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        cmd_rearm(Args())
+        cmd_run(Args(), poster=fake_poster)
+        ok("after rearm an UNREADABLE heartbeat still pages", len(sent) == sent_before + 3,
+           sent[sent_before:])
+        _atomic_write_json(spath, dict(kept, last_run_at=_iso(_now() - 60)))
+
+        def _readonly(_p, _s):
+            raise OSError("read-only file system")
+        _real_save = globals()["save_state"]
+        globals()["save_state"] = _readonly
+        try:
+            ok("a rearm that cannot rewrite the state file is exit 1, never a quiet 0",
+               cmd_rearm(Args()) == EXIT_ERROR)
+        finally:
+            globals()["save_state"] = _real_save
+        os.remove(spath)
+        ok("rearm with no state file writes none",
+           cmd_rearm(Args()) == EXIT_OK and not os.path.exists(spath))
+        with open(spath, "w", encoding="utf-8") as fh:
+            fh.write("{ corrupt")
+        ok("rearm leaves an unreadable state file as it is",
+           cmd_rearm(Args()) == EXIT_OK
+           and open(spath, encoding="utf-8").read() == "{ corrupt")
+
+        # (l) a changed ticket during an open incident: the new ticket hears about it
+        _atomic_write_json(hb, {"schema": WATCHERS["review-poller"]["schema"],
+                                "result": "error", "ended_at": _iso()})
+        os.remove(spath)
+        sent_before = len(sent)
+        cmd_run(Args(), poster=fake_poster)
+        ok("the incident is announced on the ticket configured then",
+           len(sent) == sent_before + 1 and sent[-1][0] == "KIT-000", sent[sent_before:])
+        write(dict(live, notify_ticket_id="KIT-001"))
+        cmd_run(Args(), poster=fake_poster)
+        ok("a changed ticket is told about the incident that is still open",
+           len(sent) == sent_before + 2 and sent[-1][0] == "KIT-001", sent[sent_before:])
+        ok("…and the state records where it went",
+           json.load(open(spath, encoding="utf-8")).get("last_posted_target") == "KIT-001")
+        cmd_run(Args(), poster=fake_poster)
+        ok("…and says it once there, not every pass", len(sent) == sent_before + 2)
         del os.environ["STAGE_E_LINEAR_API_KEY"]
 
     # ── 12. The credential rule ──────────────────────────────────────────────────────
@@ -1432,6 +1638,17 @@ def selftest():
            WATCHERS["review-poller"]["schema"] == prp.HEARTBEAT_SCHEMA)
         ok("the watched filename matches where the review poller writes it",
            os.path.basename(prp.heartbeat_path("/d")) == WATCHERS["review-poller"]["filename"])
+        import tempfile
+        import time as _time
+        with tempfile.TemporaryDirectory() as rd:
+            for code, want in ((prp.EXIT_OK, "ok"), (prp.EXIT_DECLINED, "ok"),
+                               (prp.EXIT_ERROR, "failing"), (prp.EXIT_USAGE, "failing"),
+                               (prp.EXIT_TIMEOUT, "failing")):
+                prp.write_heartbeat(rd, "scan", code, prp._now_iso(), _time.monotonic(), False)
+                real = judge_one("review-poller", WATCHERS["review-poller"],
+                                 read_beat(prp.heartbeat_path(rd)), time.time(), 600, False)
+                ok("a heartbeat the review poller REALLY writes (exit %d) is judged %s"
+                   % (code, want), real["verdict"] == want, real.get("detail"))
     except ImportError:
         ok("the review poller is importable for the cross-check", False)
     try:
@@ -1481,7 +1698,7 @@ def selftest():
 # --------------------------------------------------------------------------- #
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", nargs="?", choices=["run", "check"])
+    ap.add_argument("command", nargs="?", choices=["run", "check", "rearm"])
     ap.add_argument("--config")
     ap.add_argument("--dry-run", action="store_true",
                     help="judge and report; write no state and post nothing")
@@ -1496,12 +1713,12 @@ def main(argv=None):
     if args.example_config:
         print(json.dumps(EXAMPLE_CONFIG, indent=2))
         return 0
-    if args.command in ("run", "check"):
+    if args.command in ("run", "check", "rearm"):
         if not args.config:
             sys.stderr.write("%s needs --config\n" % args.command)
             return EXIT_USAGE
         try:
-            return cmd_run(args) if args.command == "run" else cmd_check(args)
+            return {"run": cmd_run, "check": cmd_check, "rearm": cmd_rearm}[args.command](args)
         except MonitorError as exc:
             log("FAIL: %s" % exc)
             return exc.code
