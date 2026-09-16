@@ -191,7 +191,11 @@ human-only steps at the end.
 > **Phase 6 — hand me the human-only list** (you cannot do these; give exact
 > commands/click-paths): create the cloud services; set secrets in ALL THREE stores as
 > applicable (local `.env.local`, GitHub Actions secrets/variables, host env — they're
-> isolated; docs/SECURITY.md); GitHub → Settings → Security: enable secret scanning +
+> isolated; docs/SECURITY.md); if I kept any alert workflow (pipeline-failure-alert,
+> cron-health, frontend-uptime, migration-drift), set the `ALERT_PAGE_TO` Actions
+> variable to the logins it should page — required when the repo is org-owned, since an
+> org @mention notifies nobody and those runs fail until it is set (`gh variable set
+> ALERT_PAGE_TO --body "<login>"`); GitHub → Settings → Security: enable secret scanning +
 > push protection + Dependabot; and branch protection AFTER the app CI's first green
 > run on main — merge THEN require (docs/LESSONS.md), contexts = the new CI job names.
 > If I kept the conflict monitor: set the `PR_CONFLICT_PAGE_TO` Actions variable when

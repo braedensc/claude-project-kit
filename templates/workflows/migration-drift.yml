@@ -24,6 +24,12 @@ name: Migration drift check
 # gotchas). Until it is set the job runs green but SKIPS — correct here, since
 # this is a monitor, not a deploy: an unconfigured fork is never red.
 #
+# WHO is paged: the ALERT_PAGE_TO repository variable (logins or org/team,
+# comma-separated; not a secret) when set; else the repository owner when that
+# is a person. On an org-owned repo with no variable set, drift still files the
+# issue, which says "Nobody was paged", and the run FAILS — an @mention of an
+# organization notifies nobody (see pipeline-failure-alert.yml).
+#
 # NOTE: scheduled workflows only run from the DEFAULT branch (main). Trigger
 # manually (workflow_dispatch) to test.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -99,12 +105,59 @@ jobs:
         uses: actions/github-script@v7
         env:
           PENDING: ${{ steps.drift.outputs.pending }}
+          ALERT_PAGE_TO: ${{ vars.ALERT_PAGE_TO }}
         with:
           script: |
             const owner = context.repo.owner
             const repo = context.repo.repo
+            // ── WHO THIS ALERT PAGES ── identical in every alert template (scripts/check_alert_pages.py
+            // runs each copy). An @mention of an ORGANIZATION notifies nobody and an organization
+            // cannot be assigned, so the repository owner is never paged blindly. In order: the
+            // ALERT_PAGE_TO repository variable (logins or org/team, comma- or space-separated);
+            // else the owner, when the owner is a person. When neither applies the issue is still
+            // filed, says "Nobody was paged", and the run FAILS: a page that reaches nobody must
+            // not look delivered.
+            async function alertRecipients() {
+              const { owner, repo } = context.repo
+              const names = (process.env.ALERT_PAGE_TO || '').split(/[\s,]+/).filter(Boolean).map((n) => n.replace(/^@/, ''))
+              // A login, or an org/team slug. Nothing else is ever embedded after an `@`.
+              const mentionable = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$/
+              const rejected = names.filter((n) => !mentionable.test(n))
+              const logins = [...new Set(names.filter((n) => mentionable.test(n)))]
+              if (logins.length) return { logins, whose: 'ALERT_PAGE_TO', rejected }
+              let ownerType
+              try {
+                ownerType = (await github.rest.repos.get({ owner, repo })).data.owner.type
+              } catch (e) {
+                core.warning(`could not read who owns ${owner}/${repo}: ${e.message}`)
+                return { logins: [], whose: 'this run could not read who owns the repository. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+              }
+              if (ownerType === 'User') return { logins: [owner], whose: 'the repository owner', rejected }
+              return { logins: [], whose: 'the repository owner is an organization, which an @mention does not notify. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+            }
+            function pageLine({ logins, whose }, what) {
+              if (!logins.length) return `**Nobody was paged:** ${whose}.`
+              return `cc ${logins.map((l) => '@' + l).join(', ')} (${whose}) — ${what}`
+            }
+            // Assign whoever the page names (the "assign" reason keeps them subscribed to later
+            // comments), then fail the run if the page named nobody or the variable was malformed.
+            async function page(issue_number, { logins, whose, rejected }) {
+              const { owner, repo } = context.repo
+              const people = logins.filter((l) => !l.includes('/')) // a team is mentioned, never assigned
+              if (people.length) {
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: people })
+                } catch (e) { // e.g. not a collaborator: the @mention is the page, this is extra
+                  core.warning(`#${issue_number}: could not assign ${people.join(', ')}: ${e.message}`)
+                }
+              }
+              if (rejected.length) core.setFailed(`ALERT_PAGE_TO names ${JSON.stringify(rejected)}, which is not a GitHub login or org/team`)
+              if (!logins.length) core.setFailed(`#${issue_number}: this alert paged NOBODY — ${whose}.`)
+            }
+            // ── end WHO THIS ALERT PAGES ──
             // The stable title IS the dedupe key — change it and you fork the issue.
             const title = '⚠️ Prod database is behind (unapplied migrations)'
+            const recipients = await alertRecipients()
             const pending = (process.env.PENDING || '').trim().split('\n').filter(Boolean)
             const body = [
               `The daily drift check found ${pending.length} migration(s) in the repo that are **not applied to prod**:`,
@@ -113,16 +166,20 @@ jobs:
               '',
               'Prod is behind — usually a deploy that failed or was skipped. Check the latest **Deploy (prod)** run and its `migrate` job, then re-run it from `main` (Actions → Deploy (prod) → Run workflow) once the cause is fixed.',
               '',
-              // @mention + assign the owner so this reaches them even under a
-              // "Participating and @mentions" watch (see deploy-failure-alert.yml).
-              `cc @${owner} — prod database is behind the repo.`,
+              // @mention + assign a person so this reaches them even under a
+              // "Participating and @mentions" watch (see pipeline-failure-alert.yml).
+              pageLine(recipients, 'prod database is behind the repo.'),
             ].join('\n')
             const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
             const existing = open.data.find((i) => i.title === title && !i.pull_request)
+            let number
             if (existing) {
               await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
-              core.info(`Updated #${existing.number}`)
+              number = existing.number
+              core.info(`Updated #${number}`)
             } else {
-              const created = await github.rest.issues.create({ owner, repo, title, body, assignees: [owner] })
-              core.info(`Opened #${created.data.number}`)
+              const created = await github.rest.issues.create({ owner, repo, title, body })
+              number = created.data.number
+              core.info(`Opened #${number}`)
             }
+            await page(number, recipients)

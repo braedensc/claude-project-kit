@@ -357,6 +357,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The alert templates (pipeline-failure-alert, cron-health, frontend-uptime,
+      # migration-drift) share one recipient rule: ALERT_PAGE_TO, else a person who owns
+      # the repo, else the issue says "Nobody was paged" and the run fails — an @mention of
+      # an org notifies nobody. The rule is JavaScript inside YAML that nothing else ever
+      # executes before production, so this runs every copy under node against a mock
+      # GitHub, and fails on a copy that drifted or a workflow that pages the owner blindly.
+      # After setup-node (it needs node) and the parse step (it needs pyyaml).
+      - name: Alert pages reach a person, or fail their run
+        run: python3 scripts/check_alert_pages.py
+
       - name: secretlint (scan all tracked files)
         run: git ls-files -z | xargs -0 npx secretlint --secretlintrc .secretlintrc.json
 
