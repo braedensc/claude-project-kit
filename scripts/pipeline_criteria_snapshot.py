@@ -571,6 +571,9 @@ def selftest():
 
     check("no snapshot yet ⇒ one is owed", needs_snapshot(None, session("s-human")), True)
     check("the same session's snapshot is never re-taken", needs_snapshot(snap, session("s-human")), False)
+    check("…even when its recorded delegation time reads older than the session's (the id "
+          "decides, not the clock)",
+          needs_snapshot(dict(snap, delegated_at="2026-09-01T00:00:00Z"), session("s-human")), False)
     check("a NEWER person-delegated session replaces it — the reconciliation path",
           needs_snapshot(snap, session("s-new", created="2026-09-17T09:00:00Z")), True)
     check("an older session never replaces it",
