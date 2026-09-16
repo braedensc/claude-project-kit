@@ -1076,9 +1076,11 @@ carries `cost_note` (contract §4). The dashboard counts both per stage. Every c
 that includes an unmeasured run says it is a floor: spend, cost per merged PR, and each
 ticket's cost.
 
-A missing or unlistable `session_log_root` is a configuration fault. Every row then says
-so and names the path. One issue with no log says only that. The installer writes the
-path but does not check that it exists or that the daemons can list it (no ticket yet).
+A `session_log_root` that is missing, or that the daemons cannot enter, is a configuration
+fault. Every row then says so and names the path. The daemons never list the root itself,
+so a root at mode `0711` works. They list only the issue's own folder. A folder they
+cannot list says so. One issue with no log says only that. The installer writes the path
+but does not check that it exists or that the daemons can enter it (no ticket yet).
 The log's layout is read from the dispatcher's published source; if it moves, the rows
 say *no session log* rather than guessing.
 

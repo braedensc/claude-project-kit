@@ -229,15 +229,15 @@ def session_usage(log_root, issue_identifier, role="run"):
                        "so the session's own record was not read")
     if not ISSUE_IDENTIFIER_RE.match(issue_identifier or ""):
         return nothing("no dispatcher session is named for this row")
-    # Listed with os.listdir, never glob: glob swallows every OSError and returns [], so
-    # a missing root, an unreadable folder and a folder with no log would all read as
-    # "no log". The first is a configuration fault on every row, and is said as one.
+    # The root is entered, never listed: a root the account can search but not read (mode
+    # 0711) still reaches <root>/<issue>, so it needs only the search bit. The issue's
+    # folder is listed with os.listdir, never glob: glob swallows every OSError and returns
+    # [], so an unreadable folder and a folder with no log would read the same. A root
+    # that is missing or cannot be entered is a configuration fault on every row.
     root = os.path.expanduser(log_root)
-    try:
-        os.listdir(root)
-    except OSError as exc:
-        return nothing("session_log_root %s is missing or cannot be listed (%s): a "
-                       "configuration fault, not a missing log" % (root, exc.__class__.__name__))
+    if not (os.path.isdir(root) and os.access(root, os.X_OK)):
+        return nothing("session_log_root %s is missing, not a directory, or cannot be "
+                       "entered: a configuration fault, not a missing log" % root)
     folder = os.path.join(root, issue_identifier)
     try:
         names = os.listdir(folder)
@@ -610,7 +610,7 @@ def selftest():
                   (none["model"], needle in (none["model_note"] or "")), (None, True))
             check("%s: cost has a reason too" % label, bool(none["cost_note"]), True)
 
-        # A root that is missing or cannot be listed, an issue folder that cannot
+        # A root that is missing or cannot be entered, an issue folder that cannot
         # be listed, and an issue with no log are three different facts. glob said all
         # three as "no log"; the first is a configuration fault on every row.
         missing_root = os.path.join(root, "no-such-dispatcher-home", "logs")
@@ -636,12 +636,36 @@ def selftest():
             finally:
                 os.chmod(locked_root, 0o700)
                 os.chmod(os.path.join(root, "REV-5"), 0o700)
-            check("a root this account cannot list is a configuration fault that names the path",
+            check("a root this account cannot enter is a configuration fault that names the path",
                   ("configuration fault" in said["unlistable root"],
                    locked_root in said["unlistable root"]), (True, True))
             check("an issue folder this account cannot list says so, and is not a missing log",
                   ("REV-5 cannot be listed" in said["unlistable folder"],
                    "configuration" in said["unlistable folder"]), (True, False))
+            # A root the account can enter but not list (mode 0311, or the common 0711)
+            # still reaches <root>/<issue>. Only the issue's own folder is listed, so the
+            # row keeps its model and cost, and a missing folder there is still "no log".
+            search_only = os.path.join(root, "search-only-home")
+            os.makedirs(os.path.join(search_only, "REV-3"))
+            with open(os.path.join(search_only, "REV-3", "session-s1-2026-09-16T10-30-00.jsonl"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(line) + "\n" for line in (meta, init, result)))
+            os.chmod(search_only, 0o311)
+            try:
+                entered = session_usage(search_only, "REV-3")
+                entered_none = session_usage(search_only, "REV-404")["model_note"] or ""
+            finally:
+                os.chmod(search_only, 0o700)
+            check("a root this account can enter but not list (0311) still reads the issue's log",
+                  (entered["model"], (entered["execution"] or {}).get("total_cost_usd"),
+                   entered["cost_note"], "configuration" in (entered["model_note"] or "")),
+                  ("claude-opus-5", 0.9132, None, False))
+            check("under a 0311 root, an issue with no folder is no log, not a configuration fault",
+                  ("wrote no session log for REV-404" in entered_none,
+                   "configuration" in entered_none), (True, False))
+        else:
+            print("  skip: the permission cases (a 000 root, a 000 issue folder, a 0311 root) "
+                  "run as root here, where file modes do not bite")
         check("the root, the folder and the missing log are said differently",
               len(set(said.values())) == len(said) and all(said.values()), True)
 
