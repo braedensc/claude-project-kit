@@ -85,8 +85,10 @@ no variable they page the repository owner — but only when the owner is a pers
 @mention of an *organization* notifies nobody and an organization cannot be assigned, so
 on an org-owned repository an unset variable does not fail quietly: the issue is still
 filed, says **Nobody was paged**, and the run goes red. Every issue names who was paged
-and why. Set it once for all four (Settings → Secrets and variables → Actions →
-Variables; it is not a secret):
+and why. `pipeline-dispatch`'s capacity-pause notice follows the same rule from its own
+last job, `notify-capacity`, so a notice that paged nobody reddens the run without
+touching the tickets or the carried state. Set the variable once for all of them
+(Settings → Secrets and variables → Actions → Variables; it is not a secret):
 
 ```bash
 gh variable set ALERT_PAGE_TO --body "your-login"
