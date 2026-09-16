@@ -161,8 +161,17 @@ jobs:
       # issue), the edit-after-delegation flag computed from the live ticket regardless
       # of which tier answered, an honestly empty basis is not a crash, and the script
       # never constructs a Linear write mutation — read-only, like the reviewer it feeds.
+      # Tier 2 reads only the snapshot writer's document, and a snapshot that was edited
+      # before it was taken (or cannot say) never answers "unchanged".
       - name: Stage E basis resolver selftest (tier ordering, read-only against Linear)
         run: python3 scripts/pipeline_review_basis.py --selftest
+      # Tier 2's writer (KIT-131), run by the bounce driver: a snapshot only for a session
+      # a PERSON delegated, immutable for its session, its lag and any edit inside that lag
+      # recorded (unknown is not "no"), an unreadable snapshot never re-taken as the live
+      # ticket, one change notice per distinct live version, and commentCreate as its only
+      # Linear mutation.
+      - name: Stage E criteria snapshot selftest (person-delegated only, one notice, one mutation)
+        run: python3 scripts/pipeline_criteria_snapshot.py --selftest
       # Stage E's poller (option 4): creates + delegates one review ticket per new pipeline
       # PR, reads the reviewer's answer back and publishes it. Offline: asserts the
       # sanitizer strips dispatcher routing tags and fence tokens, the ticket is never

@@ -586,6 +586,10 @@ def load_config(path):
         "reviewer_model": raw.get("reviewer_model") or "",
         "basis_snapshot_dir": raw.get("basis_snapshot_dir") or "",
     }
+    # KIT-131: the bounce driver's snapshot pass writes under the SAME state_dir by
+    # default, so one shared config file needs no key for the two to meet.
+    if not cfg["basis_snapshot_dir"]:
+        cfg["basis_snapshot_dir"] = os.path.join(cfg["state_dir"], "basis-snapshots")
     if cfg["threshold"] not in prl.SEVERITY_RANK:
         raise PollerError("config 'threshold' must be one of %s" % sorted(prl.SEVERITY_RANK))
     for key in ("github_token_env", "linear_key_env"):
@@ -3238,6 +3242,9 @@ def selftest():
         check("config defaults cap", cfg["diff_cap_chars"], DEFAULT_DIFF_CAP_CHARS)
         check("config defaults the run timeout", cfg["run_timeout_seconds"], DEFAULT_RUN_TIMEOUT_SECONDS)
         check("config leaves the ids unresolved", (cfg["reviews_team_id"], cfg["cyrus_agent_user_id"]), ("", ""))
+        check("the tier-2 snapshot dir defaults to where the driver's snapshot pass writes",
+              cfg["basis_snapshot_dir"], os.path.join(os.path.realpath(os.path.join(tmp, "state")),
+                                                      "basis-snapshots"))
         # `repos` is optional now: a config with none is Linear-driven, not invalid.
         no_repos = dict(base)
         no_repos.pop("repos")

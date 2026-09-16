@@ -180,6 +180,8 @@ npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
 npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
+npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
+                             #   person's delegation, lag recorded, one change notice
 npm run test:notifier        # human-action notifier: marks table, the three §13
                              #   states, label-only tracker mutation (KIT-115)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment

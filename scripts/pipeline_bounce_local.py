@@ -562,6 +562,11 @@ CONFIG_DEFAULTS = {
     "run_timeout_seconds": DEFAULT_RUN_TIMEOUT_SECONDS,
     "telemetry_model": "unknown",
     "human_pending_checks": list(DEFAULT_HUMAN_PENDING_CHECKS),
+    # KIT-131: the criteria snapshot pass that runs at the start of every `run`. The
+    # store defaults to <state_dir>/basis-snapshots, which is where the poller's basis
+    # resolver reads tier 2 from. `false` turns the pass off, and the pass says OFF.
+    "basis_snapshot_dir": "",
+    "criteria_snapshots": True,
 }
 # The poller's spellings for the two values both components need, accepted here so ONE
 # config file serves both without either side having to be renamed (§ CONFIG above).
@@ -3615,6 +3620,52 @@ def run_targets(state_dir, cfg):
     return sorted(found)
 
 
+# The share of a pass's wall clock the criteria snapshot pass may use, so it can never
+# starve the bounces that follow it.
+SNAPSHOT_TIME_SHARE = 0.4
+SNAPSHOT_TIME_CAP_SECONDS = 300
+
+
+def criteria_snapshots(cfg, state_dir, dry_run, deadline):
+    """Run scripts/pipeline_criteria_snapshot.py's pass (KIT-131) and say what it did.
+
+    Returns {"ok", "line", "problems", "counts"} and NEVER raises: the snapshot pass is a
+    neighbour of the bounces, not their gate. But "could not look" is never folded into
+    "nothing changed" — a missing module, a missing key, or a tracker that would not list
+    sessions comes back not-ok, and the caller counts it as a problem on the heartbeat."""
+    if cfg.get("criteria_snapshots") is False:
+        return {"ok": True, "line": "criteria snapshots: OFF (config criteria_snapshots: false)",
+                "problems": [], "counts": None}
+    try:
+        import pipeline_criteria_snapshot as pcs
+    except ImportError as exc:
+        why = "scripts/pipeline_criteria_snapshot.py could not be imported (%s)" % exc
+        return {"ok": False, "line": "criteria snapshots: NOT RUN — %s" % why,
+                "problems": ["criteria snapshots: %s" % why], "counts": None}
+    try:
+        key = _linear_key(cfg)
+    except BounceError as exc:
+        return {"ok": False, "line": "criteria snapshots: NOT RUN — %s" % (exc.public or exc),
+                "problems": ["criteria snapshots: no tracker key"], "counts": None}
+    cfg_for = dict(cfg, basis_snapshot_dir=cfg.get("basis_snapshot_dir")
+                   or os.path.join(state_dir, pcs.SNAPSHOT_SUBDIR))
+    try:
+        result = pcs.snapshot_pass(cfg_for, state_dir, pcs.linear_transport(key),
+                                   dry_run=dry_run, deadline=deadline)
+    except pcs.SnapshotError as exc:
+        return {"ok": False,
+                "line": "criteria snapshots: COULD NOT LOOK — %s (this is not 'nothing changed')" % exc,
+                "problems": ["criteria snapshots: could not list sessions: %s" % exc], "counts": None}
+    except Exception as exc:  # a response of an unexpected shape: said, and the bounces still run
+        why = "the pass stopped on %s" % exc.__class__.__name__
+        return {"ok": False,
+                "line": "criteria snapshots: COULD NOT LOOK — %s (this is not 'nothing changed')" % why,
+                "problems": ["criteria snapshots: %s" % why], "counts": None}
+    counts = {k: (len(v) if isinstance(v, list) else v) for k, v in result.items() if k != "detail"}
+    return {"ok": not result["problems"], "line": pcs.summarize(result),
+            "problems": ["criteria snapshots: %s" % p for p in result["problems"]], "counts": counts}
+
+
 def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     """One scan-decide-act pass. Returns an exit code and leaves a heartbeat on EVERY
     path, success or not.
@@ -3628,22 +3679,34 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     """
     started_at, deadline = _now_iso(), time.monotonic() + float(timeout_seconds)
     write_heartbeat(state_dir, started_at=started_at, result="running")
+    # KIT-131, first and bounded: the delegation-time criteria snapshots the review's basis
+    # resolver reads. Its problems are this pass's problems; its absence never stops a bounce.
+    snap = criteria_snapshots(cfg, state_dir, dry_run, time.monotonic()
+                              + min(float(timeout_seconds) * SNAPSHOT_TIME_SHARE,
+                                    SNAPSHOT_TIME_CAP_SECONDS))
+    print(snap["line"])
+    for problem in snap["problems"]:
+        sys.stderr.write("PROBLEM: %s\n" % problem)
     try:
         targets = run_targets(state_dir, cfg)
     except BounceError as exc:
         sys.stderr.write("FAIL: could not build this pass's target list: %s\n" % exc)
         write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
-                        result="error", detail=str(exc.public or exc))
+                        result="error", detail=str(exc.public or exc),
+                        snapshots=snap["counts"], problems=snap["problems"][:20])
         return EXIT_USAGE
     if not targets:
         print("nothing to do: no review outcome and no bounce ledger row for any PR under %s "
               "— the poller has recorded nothing yet (this is 'nothing to do', not a failure)"
               % state_dir)
         write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
-                        result="idle", considered=0)
-        return EXIT_OK
+                        result="problems" if snap["problems"] else "idle", considered=0,
+                        snapshots=snap["counts"], problems=snap["problems"][:20])
+        return EXIT_USAGE if snap["problems"] else EXIT_OK
 
-    worst, done, problems, timed_out = EXIT_OK, 0, [], False
+    worst, done, problems, timed_out = EXIT_OK, 0, list(snap["problems"]), False
+    if problems:
+        worst = EXIT_USAGE
     for owner_repo, pr_number in targets:
         if time.monotonic() >= deadline:
             timed_out = True
@@ -3668,7 +3731,7 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
                     result=("deadline" if timed_out else ("problems" if worst else "ok")),
                     considered=len(targets), examined=done, remaining=remaining,
                     timeout_seconds=timeout_seconds, dry_run=bool(dry_run),
-                    problems=problems[:20], exit_code=worst)
+                    problems=problems[:20], exit_code=worst, snapshots=snap["counts"])
     print("pass complete: %d of %d PR(s) examined%s; heartbeat at %s"
           % (done, len(targets), " (deadline reached)" if timed_out else "", heartbeat_path(state_dir)))
     return worst
@@ -6117,6 +6180,10 @@ def selftest():
     #      one PR's crash from the pass, and reports a deadline as a PARTIAL pass, not a
     #      clean one.
     saved_run_one = globals()["run_one"]
+    saved_snapshots = globals()["criteria_snapshots"]
+    # The snapshot pass has its own cases below (10p); these are the bounce pass's.
+    globals()["criteria_snapshots"] = lambda *a, **k: {
+        "ok": True, "line": "criteria snapshots: (stubbed)", "problems": [], "counts": {}}
     try:
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(quiet):
             base_cfg = validate_config(dict(CONFIG_DEFAULTS))
@@ -6168,8 +6235,78 @@ def selftest():
             beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
             check("a clean pass exits 0 and records what it examined",
                   (rc, beat["result"], beat["examined"], beat["dry_run"]), (EXIT_OK, "ok", 2, True))
+
+        # 10p. KIT-131: the criteria snapshot pass runs first in every `run`. Its problems
+        #      are the pass's problems — a heartbeat that says `idle` while the snapshots
+        #      could not even look would be the §13 conflation — and it never stops the
+        #      bounces after it.
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(quiet):
+            base_cfg = validate_config(dict(CONFIG_DEFAULTS))
+            globals()["criteria_snapshots"] = lambda *a, **k: {
+                "ok": False, "line": "criteria snapshots: COULD NOT LOOK — simulated",
+                "problems": ["criteria snapshots: could not list sessions: simulated"],
+                "counts": None}
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("a snapshot pass that could not look is NOT an idle heartbeat",
+                  (rc, beat["result"], beat["problems"]),
+                  (EXIT_USAGE, "problems", ["criteria snapshots: could not list sessions: simulated"]))
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), poller_record)
+            examined = []
+            globals()["run_one"] = lambda pr, *a, **k: examined.append(pr) or EXIT_OK
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            check("…and never stops the bounces that follow it", (rc, examined), (EXIT_USAGE, [41]))
+
+        globals()["criteria_snapshots"] = saved_snapshots
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(quiet):
+            off = criteria_snapshots(dict(CONFIG_DEFAULTS, criteria_snapshots=False), tmp, False, None)
+            check("criteria_snapshots: false is OFF, said by name, not a problem",
+                  (off["ok"], "OFF" in off["line"], off["problems"]), (True, True, []))
+            keyless = dict(CONFIG_DEFAULTS, linear_api_key_env="STAGE_E_TEST_KEY_ABSENT_131")
+            os.environ.pop("STAGE_E_TEST_KEY_ABSENT_131", None)
+            nokey = criteria_snapshots(keyless, tmp, False, None)
+            check("no tracker key: NOT RUN, a problem, and no exception",
+                  (nokey["ok"], "NOT RUN" in nokey["line"], len(nokey["problems"])), (False, True, 1))
+            import pipeline_criteria_snapshot as pcs_mod
+            saved_pass, saved_transport = pcs_mod.snapshot_pass, pcs_mod.linear_transport
+            os.environ["STAGE_E_TEST_KEY_131"] = "x"
+            try:
+                keyed = dict(CONFIG_DEFAULTS, linear_api_key_env="STAGE_E_TEST_KEY_131")
+                pcs_mod.linear_transport = lambda key: None
+
+                def cannot(*a, **k):
+                    raise pcs_mod.SnapshotError("tracker unreachable (URLError)")
+                pcs_mod.snapshot_pass = cannot
+                bad = criteria_snapshots(keyed, tmp, False, None)
+                check("could not list sessions: COULD NOT LOOK, never 'nothing changed'",
+                      (bad["ok"], "COULD NOT LOOK" in bad["line"], len(bad["problems"])), (False, True, 1))
+
+                def malformed(*a, **k):
+                    return [][0]  # an answer of a shape the pass did not expect
+                pcs_mod.snapshot_pass = malformed
+                odd = criteria_snapshots(keyed, tmp, False, None)
+                check("an unexpected failure inside the pass is COULD NOT LOOK, and never raises",
+                      (odd["ok"], "IndexError" in odd["line"], len(odd["problems"])), (False, True, 1))
+                seen = {}
+
+                def fine(cfg_, sd, call, dry_run=False, deadline=None):
+                    seen["dir"] = cfg_.get("basis_snapshot_dir")
+                    return {"taken": ["KIT-7"], "replaced": [], "notices": [], "unchanged": 0,
+                            "reads": 1, "capped": [], "problems": [], "detail": []}
+                pcs_mod.snapshot_pass = fine
+                good = criteria_snapshots(keyed, tmp, False, None)
+                check("a clean pass is ok, counted, and uses <state_dir>/basis-snapshots — where "
+                      "the poller's resolver reads tier 2",
+                      (good["ok"], good["counts"]["taken"], seen["dir"]),
+                      (True, 1, os.path.join(tmp, "basis-snapshots")))
+            finally:
+                pcs_mod.snapshot_pass, pcs_mod.linear_transport = saved_pass, saved_transport
+                os.environ.pop("STAGE_E_TEST_KEY_131", None)
     finally:
         globals()["run_one"] = saved_run_one
+        globals()["criteria_snapshots"] = saved_snapshots
 
     # 11. Source-level guards. Each banned token appears exactly once — here. A count
     #     above one means a real merge/approve/auto-merge/label/launch path slipped in.
@@ -6313,7 +6450,8 @@ def selftest():
           "(poller key spellings aliased, unknown keys ignored), a state dir inside a git "
           "worktree is refused and one outside the account's home warns, the one-shot `run` "
           "pass leaves a heartbeat on every path, isolates one PR's crash and reports a "
-          "deadline as PARTIAL; C2: Linear's attachment names the ticket before the branch "
+          "deadline as PARTIAL, and starts with the criteria snapshot pass (KIT-131), whose "
+          "could-not is a problem on the heartbeat, never idle, and never stops a bounce; C2: Linear's attachment names the ticket before the branch "
           "does and the branch fallback says why; C3: the ledger is the budget and the "
           "re-prompt carries its visible record, which can refuse but never grant a bounce; "
           "every delivered bounce leaves a re-review request naming the head it bounced, which "

@@ -17,7 +17,7 @@ THE PROBLEM THIS FILE DOES NOT PRETEND TO SOLVE
   | Tier | Source | Forgeable by the coding session? |
   |---|---|---|
   | 1 `history`     | Linear's server-side description history, as of delegation time | No, if it existed — see the spike note below |
-  | 2 `reconciler`  | An independent daemon's delegation-time snapshot, outside every worktree | No, once such a daemon exists (none ships yet) |
+  | 2 `reconciler`  | A snapshot taken when a person delegated, outside every worktree (scripts/pipeline_criteria_snapshot.py) | No — but it is taken minutes after delegation, and says whether the ticket was edited in between |
   | 3 `live`        | The live ticket, with post-delegation edits FLAGGED | Yes — the weakest tier, used honestly, never silently |
 
 THE KIT-92 SPIKE — RECORDED HERE, NOT JUST IN THE ADR
@@ -44,9 +44,9 @@ THE KIT-92 SPIKE — RECORDED HERE, NOT JUST IN THE ADR
   flag) is the shipped default.** `resolve_tier1()` below is a real, tested interface —
   not a placeholder comment — so that the day someone confirms a working history query
   (see the candidate query in the phase doc handed to Braeden), wiring it in is a change
-  to ONE function's body, not to any caller. Tier 2 is deliberately unbuilt: this file is
-  only the CONSUMER half (`resolve_tier2` reads a snapshot if one exists); the reconciler
-  daemon that would WRITE one is filed as future work, per the ADR.
+  to ONE function's body, not to any caller. Tier 2 was the consumer half only until
+  2026-09-16; scripts/pipeline_criteria_snapshot.py (KIT-131) now writes the snapshots
+  `resolve_tier2` reads, from the bounce driver's pass.
 
 WHY resolve_tier1's SIGNATURE IS THE FORGERY-RESISTANCE ARGUMENT
 
@@ -78,7 +78,7 @@ WHAT IT IS AND IS NOT
 
   It is not: the reviewer that consumes the basis (KIT-90, already merged), the poller
   that would wire this in (KIT-91 — one added `--basis-file` flag once this lands), or
-  the reconciler daemon tier 2 is a consumer interface for (unbuilt, future work).
+  the snapshot writer tier 2 reads (scripts/pipeline_criteria_snapshot.py).
 
 Usage:
     pipeline_review_basis.py TICKET-ID --team-key KIT [--out FILE]
@@ -109,7 +109,11 @@ EXIT_USAGE = 2
 
 LINEAR_API = "https://api.linear.app/graphql"
 TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([0-9]+)$")
-DEFAULT_SNAPSHOT_DIR = "~/.claude/pipeline/stage-e/basis-snapshots"
+DEFAULT_SNAPSHOT_DIR = "~/.stage-e/state/basis-snapshots"
+# The writer's document kind (scripts/pipeline_criteria_snapshot.py SCHEMA). Held here
+# rather than imported, so the resolver installs and runs without the writer; the
+# selftest checks the two agree.
+SNAPSHOT_SCHEMA = "pipeline-criteria-snapshot/1"
 
 ISSUE_QUERY = """
 query($team: String!, $number: Float!) {
@@ -198,11 +202,15 @@ def resolve_tier1(ticket_id, delegated_at, history_fetcher):
 
 
 def resolve_tier2(ticket_id, snapshot_dir):
-    """A reconciler's delegation-time snapshot, if one has ever been written.
+    """The delegation-time snapshot at `<snapshot_dir>/<ticket_id>.json`, if one exists.
 
-    No reconciler ships in this round (ADR: filed as future work once the tier-1 spike
-    answer was known). This is the CONSUMER half only — a future daemon starts writing
-    `<snapshot_dir>/<ticket_id>.json` and tier 2 begins working with no change here.
+    scripts/pipeline_criteria_snapshot.py writes it (KIT-131). Only a document of that
+    kind is a snapshot; anything else at the path is None, and the search continues to
+    the live tier, which says it cannot see the criteria at delegation. The writer's own
+    pass reports an unreadable snapshot as a problem in the driver's heartbeat.
+
+    The answer carries what the snapshot knows about its own lag: `delegated_at` and
+    `edited_before_snapshot` (True, False, or None when the history could not tell).
     """
     if not snapshot_dir:
         return None
@@ -212,13 +220,16 @@ def resolve_tier2(ticket_id, snapshot_dir):
             doc = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(doc, dict):
+    if not isinstance(doc, dict) or doc.get("schema") != SNAPSHOT_SCHEMA:
         return None
     ac = [s for s in (doc.get("acceptance_criteria") or []) if str(s).strip()]
     if not ac:
         return None
+    edited = doc.get("edited_before_snapshot")
     return {"acceptance_criteria": ac,
-            "out_of_scope": [s for s in (doc.get("out_of_scope") or []) if str(s).strip()]}
+            "out_of_scope": [s for s in (doc.get("out_of_scope") or []) if str(s).strip()],
+            "delegated_at": doc.get("delegated_at") or None,
+            "edited_before_snapshot": edited if edited in (True, False) else None}
 
 
 def resolve_tier3(issue):
@@ -239,6 +250,13 @@ def _criteria_changed(tier, data, issue):
     and holds no record of what it said before, so it cannot answer either way
     and must say so.
 
+    Tier 2 compares acceptance criteria AND out-of-scope, the pair its writer hashes
+    and notices on. It was taken minutes after delegation, not at it. A difference
+    from live is still an edit after delegation: True. A match is False only when the
+    snapshot recorded that the description was NOT edited in that window. Edited, or
+    unknown, and a match proves nothing — an edit made before the snapshot is inside
+    it — so the answer is None.
+
     THE DEFECT THIS REPLACES. This was `issue.updatedAt > issue.startedAt`. That
     is the RECORD's modification time — bumped by a state move, a label, an
     assignee, or the pull-request attachment the poller discovers the work by —
@@ -252,9 +270,15 @@ def _criteria_changed(tier, data, issue):
     """
     if tier not in ("history", "reconciler"):
         return None
+    live_fields = resolve_tier3(issue)
     at_delegation = [str(s) for s in (data.get("acceptance_criteria") or [])]
-    live = [str(s) for s in (resolve_tier3(issue).get("acceptance_criteria") or [])]
-    return at_delegation != live
+    live = [str(s) for s in (live_fields.get("acceptance_criteria") or [])]
+    if tier == "history":
+        return at_delegation != live
+    if at_delegation != live or ([str(s) for s in (data.get("out_of_scope") or [])]
+                                 != [str(s) for s in (live_fields.get("out_of_scope") or [])]):
+        return True
+    return False if data.get("edited_before_snapshot") is False else None
 
 
 def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
@@ -298,7 +322,8 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
         "basis_tier": tier,
         "criteria_changed_after_delegation": changed,
         "ticket_id": ticket_id,
-        "delegated_at": delegated_at_str,
+        "delegated_at": (data.get("delegated_at") if tier == "reconciler" else None)
+                        or delegated_at_str,
     }
 
 
@@ -402,16 +427,29 @@ def selftest():
 
     # 3. Tier 2: consumes a snapshot file if present, ignores an absent/malformed one.
     import tempfile
+
+    def snap(directory, ident, ac, oos=(), edited=False):
+        with open(os.path.join(directory, "%s.json" % ident), "w", encoding="utf-8") as fh:
+            json.dump({"schema": SNAPSHOT_SCHEMA, "ticket_id": ident, "acceptance_criteria": list(ac),
+                       "out_of_scope": list(oos), "delegated_at": "2026-09-05T09:58:00Z",
+                       "edited_before_snapshot": edited}, fh)
+
     with tempfile.TemporaryDirectory() as tmp:
-        good = os.path.join(tmp, "KIT-2.json")
-        with open(good, "w", encoding="utf-8") as fh:
-            json.dump({"acceptance_criteria": ["reconciled criterion"], "out_of_scope": []}, fh)
+        snap(tmp, "KIT-2", ["reconciled criterion"])
         t2 = resolve_tier2("KIT-2", tmp)
         check("tier2 reads a real snapshot", t2["acceptance_criteria"], ["reconciled criterion"])
+        check("tier2 carries the snapshot's own lag record",
+              (t2["delegated_at"], t2["edited_before_snapshot"]), ("2026-09-05T09:58:00Z", False))
         check("tier2 is None for a ticket with no snapshot", resolve_tier2("KIT-3", tmp), None)
+        with open(os.path.join(tmp, "KIT-11.json"), "w", encoding="utf-8") as fh:
+            json.dump({"acceptance_criteria": ["no schema: not the writer's document"]}, fh)
+        check("tier2 refuses a file that is not a criteria snapshot", resolve_tier2("KIT-11", tmp), None)
+        snap(tmp, "KIT-12", ["x"], edited="yes")
+        check("tier2 reads a non-boolean edited flag as unknown, never as False",
+              resolve_tier2("KIT-12", tmp)["edited_before_snapshot"], None)
         empty = os.path.join(tmp, "KIT-4.json")
         with open(empty, "w", encoding="utf-8") as fh:
-            json.dump({"acceptance_criteria": []}, fh)
+            json.dump({"schema": SNAPSHOT_SCHEMA, "acceptance_criteria": []}, fh)
         check("tier2 with an empty ac list is None (search continues)", resolve_tier2("KIT-4", tmp), None)
         with open(os.path.join(tmp, "KIT-5.json"), "w", encoding="utf-8") as fh:
             fh.write("not json")
@@ -467,12 +505,65 @@ def selftest():
           basis_same["criteria_changed_after_delegation"], False)
 
     with tempfile.TemporaryDirectory() as tmp:
-        with open(os.path.join(tmp, "KIT-9.json"), "w", encoding="utf-8") as fh:
-            json.dump({"acceptance_criteria": ["from the reconciler"]}, fh)
+        snap(tmp, "KIT-9", ["from the reconciler"])
         basis_t2 = resolve_basis("KIT-9", {"description": ""}, snapshot_dir=tmp,
                                  history_fetcher=_history_unavailable)
         check("basis uses tier 2 when 1 is unavailable and 2 has a snapshot",
               basis_t2["basis_tier"], "reconciler")
+        check("tier 2's delegated_at is the snapshot's (the session's own), not startedAt",
+              basis_t2["delegated_at"], "2026-09-05T09:58:00Z")
+
+        # KIT-131: the four answers tier 2 can give. The live ticket is issue_with_ac:
+        # ["do the thing"], out of scope ["not this"].
+        snap(tmp, "KIT-8", ["do the thing"], ["not this"], edited=False)
+        check("tier 2, unedited before the snapshot, matching live -> NOT changed",
+              resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              False)
+        snap(tmp, "KIT-8", ["do the thing"], ["not this"], edited=True)
+        check("tier 2, edited before the snapshot, matching live -> UNKNOWN (the edit is inside it)",
+              resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              None)
+        snap(tmp, "KIT-8", ["do the thing"], ["not this"], edited=None)
+        check("tier 2, history could not tell, matching live -> UNKNOWN, never False",
+              resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              None)
+        snap(tmp, "KIT-8", ["do the thing", "and one the session later deleted"], ["not this"], edited=True)
+        check("tier 2, live differs from the snapshot -> changed, however late the snapshot was",
+              resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              True)
+        # Edited, then reverted: the live ticket went "do the thing" -> "do more" -> "do the
+        # thing". The resolver reads only what live says now, so a revert is no divergence.
+        reverted = dict(issue_with_ac, description="## Acceptance criteria\n\n- [ ] do more\n\n"
+                                                   "## Out of scope\n\n- not this\n")
+        snap(tmp, "KIT-8", ["do the thing"], ["not this"], edited=False)
+        check("tier 2, live edited away from the snapshot -> changed",
+              resolve_basis("KIT-8", reverted, snapshot_dir=tmp)["criteria_changed_after_delegation"], True)
+        check("tier 2, the same edit reverted to the snapshot's text -> NOT changed",
+              resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              False)
+        check("…and the basis is still the snapshot's criteria, never the edit's",
+              resolve_basis("KIT-8", reverted, snapshot_dir=tmp)["acceptance_criteria"], ["do the thing"])
+        snap(tmp, "KIT-8", ["do the thing"], [], edited=False)
+        check("tier 2 counts an out-of-scope edit — a widened fence is a scope change too",
+              resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              True)
+        snap(tmp, "KIT-8", ["do the thing"], ["not this"], edited=False)
+        check("tier 2 reads no clock: a bumped updatedAt changes nothing",
+              resolve_basis("KIT-8", issue_edited_after, snapshot_dir=tmp)["criteria_changed_after_delegation"],
+              False)
+        try:
+            import pipeline_criteria_snapshot as writer
+            check("the resolver and the writer agree on the snapshot's kind",
+                  (writer.SCHEMA, writer.SNAPSHOT_SUBDIR), (SNAPSHOT_SCHEMA, "basis-snapshots"))
+            with tempfile.TemporaryDirectory() as wtmp:
+                session = {"id": "s1", "createdAt": "2026-09-05T10:00:00Z", "creator": {"id": "u1"}}
+                doc = writer.build_snapshot("KIT-8", session, issue_with_ac, "2026-09-05T10:02:00Z",
+                                            history_nodes=[], history_more=False)
+                writer.write_snapshot(wtmp, doc)
+                check("a snapshot the writer wrote is one the resolver reads",
+                      resolve_basis("KIT-8", issue_with_ac, snapshot_dir=wtmp)["basis_tier"], "reconciler")
+        except ImportError:
+            failures.append("scripts/pipeline_criteria_snapshot.py is not beside the resolver")
 
     basis_empty = resolve_basis("KIT-10", {"description": "no headings here"},
                                history_fetcher=_history_unavailable)
@@ -551,7 +642,8 @@ def selftest():
     print("ok — pipeline_review_basis: tier ordering (history > reconciler > live), "
           "tier 1 immune to post-delegation edits by construction, edit-flag computed "
           "from the live ticket regardless of tier, empty basis is honest not a crash, "
-          "read-only against Linear")
+          "read-only against Linear; tier 2 reads only the writer's document, and a match "
+          "with a snapshot that was edited before it was taken, or cannot say, is unknown")
     return 0
 
 
@@ -565,7 +657,8 @@ def main(argv=None):
     p.add_argument("--ticket-file", help="an offline issue JSON (identifier, description, "
                                         "startedAt, createdAt, updatedAt) instead of Linear")
     p.add_argument("--snapshot-dir", default=DEFAULT_SNAPSHOT_DIR,
-                   help="tier-2 reconciler snapshot store (default %s)" % DEFAULT_SNAPSHOT_DIR)
+                   help="tier-2 criteria snapshot store, written by "
+                        "pipeline_criteria_snapshot.py (default %s)" % DEFAULT_SNAPSHOT_DIR)
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
 

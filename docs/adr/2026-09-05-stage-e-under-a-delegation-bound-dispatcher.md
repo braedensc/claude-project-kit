@@ -153,7 +153,7 @@ redesigns Stage E for what actually runs.
 >   is not the same thing. That assessment was never confirmed against a live credential
 >   and says so. So tier 1 is not implementable from what is verifiable, the resolver ships
 >   with no history fetcher, tier 2's writer is unbuilt, and **`live` is the default
->   basis**.
+>   basis**. *(Tier 2's writer was built 2026-09-16 — KIT-131, see decision 2.)*
 > - **On that tier the criteria-edit flag reports unknown** (#82). Only a tier that saw the
 >   criteria as of delegation can compare them, so `criteria_changed_after_delegation` is
 >   `None` there — **and None is not False**. Its predecessor compared the record's
@@ -161,6 +161,7 @@ redesigns Stage E for what actually runs.
 >   reviewed pull request and manufactured scope findings that spent real bounces.
 >   Decision 2 stands as written; what changed is that the mid-work criteria-edit gap it
 >   leaves open is honestly *unmeasured* on the shipped tier rather than flagged.
+>   *(Measured on tier 2 since 2026-09-16 — KIT-131.)*
 > - **Review concludes by moving the coding ticket** (#88). "The original ticket is never
 >   moved by E" is no longer true. When nothing is left to bounce — clean, below the
 >   threshold, or out of budget — the driver writes one `concluded` ledger row and moves the
@@ -470,6 +471,47 @@ and KIT-18: it runs inside the worktree, from branch contents a prior session co
 with daemon privileges, and cannot refuse to start a session. A snapshot it wrote would be
 a snapshot a session could plant.
 
+> **Update (2026-09-16) — tier 2 is built (KIT-131).** The spike ruled out tier 1, so review
+> ran on tier 3 alone and the criteria-edit flag was always unknown. Tier 2's writer is
+> `scripts/pipeline_criteria_snapshot.py`. Both rejections above still hold. History says
+> *that* a description changed, not what it said. `cyrus-setup.sh` runs from branch
+> contents a session controls.
+>
+> - **No second daemon.** The bounce driver runs a snapshot pass at the start of every
+>   `run`. It already runs as the role account, holds the owner-scoped tracker key, and
+>   leaves notices on coding tickets. The duplicated polling costs one session listing
+>   per pass.
+> - **Keyed by delegation, not by a branch.** The pass reads the tracker's agent sessions.
+>   It takes a snapshot only for a session whose `creator` is a person. The tracker leaves
+>   `creator` empty for a session started by automation or an agent, so a session cannot
+>   open a second one to re-take its snapshot. The branch hint named above plays no part.
+> - **Outside every worktree.** The store is `<state_dir>/basis-snapshots`, mode 600 in a
+>   mode-700 directory, which the session sandbox cannot read. A snapshot is immutable for
+>   its session. A newer person-delegated session replaces it, and the old one is kept.
+> - **Late, and it says how late.** A snapshot is taken on the first pass after delegation,
+>   not at it. It records the session's creation time, its own time, and whether the
+>   ticket's history shows a description edit in between: yes, no, or unknown. The weakness
+>   named above — an edit before the first poll — is now recorded, not closed.
+> - **The flag on tier 2.** `criteria_changed_after_delegation` is true when the live
+>   acceptance criteria or out-of-scope list differ from the snapshot. It is false only when
+>   they match and the window showed no edit. A match after an edit, or after an unreadable
+>   window, is unknown, because the edit may be inside the snapshot.
+> - **A divergence is said on the ticket, once.** While the ticket is open, a pass that
+>   finds the live criteria differ posts one top-level comment per distinct version. It
+>   names what was added and removed, says the review judges against the criteria as
+>   delegated, and says a person re-delegating makes the new ones the basis. That comment
+>   is the pass's only tracker write. It is never a thread reply, which would prompt the
+>   session.
+> - **A pass that could not look is a problem**, in the driver's output and heartbeat,
+>   never "nothing changed". An unreadable snapshot is refused, never re-taken from the live
+>   ticket, which would launder an edit into the basis.
+> - **Still open.** The empty-`creator` rule is read from the tracker's published schema,
+>   not yet observed on a live session (no ticket yet). The pass has not run against a live
+>   tracker; it runs once the pull request merges and the installer's `run` moves the role
+>   account's clone (no ticket yet). A snapshot is keyed by ticket, so a pull request whose
+>   ticket was re-delegated after the last pass is judged against the earlier delegation
+>   (no ticket yet).
+
 ### 3. Independence
 
 **Decision (amended 2026-09-06): independence is enforced by the operating system and by
@@ -695,6 +737,8 @@ in the kit or in Phase 2?": **both, by role.**
 
 - The **dispatch-time snapshot** as a hard, unforgeable, pin-carried fact. Replaced by a
   best-available basis with a loud decline, and an explicit edit-flag. Weaker; honest.
+  *(Since 2026-09-16, KIT-131: tier 2 takes the snapshot on the first pass after a person
+  delegates, with its lag recorded. Closer to the pin, and still not it.)*
 - **Structural non-approval** via a scoped token. Replaced by a dispatcher-enforced tool
   fence (`disallowedTools`) plus the sandbox. Weaker; a config edit can widen it where a
   token scope cannot.
