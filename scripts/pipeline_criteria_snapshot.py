@@ -26,24 +26,41 @@ WHAT A SNAPSHOT IS, AND WHY A SESSION CANNOT FORGE ONE
     session never does.
   - A FIRST snapshot takes the newest such session. REPLACING one takes more: the issue's
     history must show a person delegating the ticket to the dispatcher after the snapshot
-    was delegated — an entry whose `toDelegate` is the dispatcher's app user and whose
-    `actor` is set and is not that app user. Removing the delegation and delegating the
-    ticket again writes that entry. An @mention or a new comment thread opens a session
-    with a person as its creator and writes no such entry, so its session is HELD: named
-    in the pass's output, and the snapshot stands. So is every replacement when the app
-    user is not configured, and every one where the history has more pages than were read
-    and the page read shows no delegation.
+    was TAKEN — an entry whose `toDelegate` is the dispatcher's app user and whose `actor`
+    is set and is not that app user. Removing the delegation and delegating the ticket
+    again writes that entry. The comparison is with `taken_at`, because the tracker can
+    stamp the original delegation's entry milliseconds after its session. The entry must
+    also be more than DELEGATION_TOLERANCE_SECONDS after the snapshot's `delegated_at`, so
+    a driver clock behind the tracker's never makes that entry read as new. An @mention or a
+    new comment thread opens a session with a person as its creator and writes no such
+    entry, so its session is HELD: named in the pass's output, and the snapshot stands. So
+    is every replacement when the app user is not configured, and every one where the
+    history has more pages than were read and the page read shows no delegation.
+  - A hold judged from the history is RECORDED in the snapshot (`held_sessions`: the
+    session, when, and why). On later passes that session is a divergence re-check, not
+    owed, so held tickets never fill the read cap. A different, newer session is judged
+    afresh. Not recorded: a dry run's hold, a hold for want of an app user (the history
+    was not read), and a hold on a session less than DELEGATION_TOLERANCE_SECONDS old,
+    whose delegation entry may not be written yet. Each delegation is assumed to open a
+    new session; one that reused a session already recorded as held would stay held (no
+    ticket yet).
   - It is written under the role account's state directory, outside every worktree, which
     the session sandbox denies reads of — let alone writes.
-  - It is immutable for its session. A replacement keeps the old one beside it.
-  - It records how late it was. `delegated_at` is the session's own `createdAt` (Linear's
-    clock); for a replacement it is the delegation entry's. `taken_at` is stamped just
-    after this ticket's read. Linear's issue history says whether the description changed
-    since `delegated_at` (`updatedDescription`, `descriptionUpdatedBy`). The window has no
-    top: every entry in the response predates the description read with it. An entry
-    counts over its span, `createdAt` to `updatedAt`, because one entry can take in a
-    later edit. The snapshot records the answer — true, false, or None when the history
-    could not be read, did not reach back far enough, or holds an entry that opened
+  - Its criteria are immutable for its session; it gains records only, of notices said and
+    sessions held. A replacement keeps the old one beside it.
+  - It records how late it was. `delegated_at` is Linear's clock. For a first snapshot it
+    is the newest person delegation to the dispatcher in the history at or before the
+    session's `createdAt` plus DELEGATION_TOLERANCE_SECONDS. So a driver down across a
+    delegation, a session edit and an @mention still dates the window from the delegation.
+    With no app user, or no such entry, it is the session's `createdAt`, and an edit
+    between a delegation and a later @mention is outside the window (no ticket yet). For a
+    replacement it is the delegation entry's. `taken_at` is stamped just after this
+    ticket's read (the driver's clock). Linear's issue history says whether the description
+    changed since `delegated_at` (`updatedDescription`, `descriptionUpdatedBy`). The
+    window has no top: every entry in the response predates the description read with it.
+    An entry counts over its span, `createdAt` to `updatedAt`, because one entry can take
+    in a later edit. The snapshot records the answer — true, false, or None when the history
+    could not be read, has more pages than were read, or holds an entry that opened
     before the window and was updated inside it. None is not false.
 
   The one parser is check_ticket_dor.pin_fields — the same one the resolver's live tier
@@ -66,11 +83,12 @@ WHAT A DIVERGENCE DOES
 ORDER AND LIMITS
 
   A pass reads at most DEFAULT_MAX_READS tickets and stops at the driver's deadline.
-  Tickets owed a snapshot, a first one or a replacement, go first, oldest session first.
-  Divergence re-checks follow, the most recently updated session first. An owed ticket
-  the pass could not reach is a problem. A re-check it could not reach is named as capped
-  and is not. The session listing reads SESSION_MAX_PAGES pages; when more remain, the
-  pass says the listing was truncated. A dry run says "would take" and "would replace".
+  Tickets owed a first snapshot go first, then newer sessions not yet judged as
+  replacements, each oldest session first. Divergence re-checks follow, held tickets among
+  them, the most recently updated session first. An owed ticket the pass could not reach
+  is a problem. A re-check it could not reach is named as capped and is not. The session
+  listing reads SESSION_MAX_PAGES pages; when more remain, the pass says the listing was
+  truncated. A dry run says "would take" and "would replace".
   The order the tracker pages sessions and history in is not verified here (no ticket
   yet).
 
@@ -104,7 +122,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -123,6 +141,11 @@ SESSION_PAGE_SIZE = 50
 SESSION_MAX_PAGES = 3
 DEFAULT_MAX_READS = 25
 HISTORY_PAGE = 50
+# How far a delegation's history entry may trail the session it opens, how old a session must
+# be before a hold on it is recorded, and how long after a snapshot's delegation a new one
+# must come. The tracker can stamp the entry a few milliseconds after the session's
+# createdAt; a minute is room for that and for clock skew.
+DELEGATION_TOLERANCE_SECONDS = 60
 NO_APP_USER = "dispatcher_app_user_id is not configured, so no delegation can be checked"
 
 SESSIONS_QUERY = """
@@ -288,23 +311,12 @@ def edits_since(history, start, has_more):
     return False, []
 
 
-def delegation_after(history, app_user_id, since, has_more):
-    """(the delegation entry's createdAt, "") when the issue's history shows a PERSON
-    delegating the ticket to the dispatcher after `since`; else (None, why not).
-
-    The entry's `toDelegate` is the dispatcher's app user, its `actor` is set and is not
-    that app user, and it was created after `since`. Removing the delegation and
-    delegating the ticket again writes one. An @mention writes none. The newest such entry
-    is returned: it is the delegation the replacement snapshot stands for. Fail closed:
-    no app user, an unreadable `since`, no history, or more pages than were read with no
-    such entry in the page read all answer None."""
-    if not app_user_id:
-        return None, NO_APP_USER
-    since_dt = _parse_iso(since)
-    if since_dt is None or not isinstance(history, list):
-        return None, "the issue history could not be read"
-    newest = None
-    for node in history:
+def _person_delegations(history, app_user_id):
+    """[(datetime, createdAt as written)] for each entry that is a PERSON delegating the
+    ticket to the dispatcher: `toDelegate` is its app user, and `actor` is set and is not
+    that app user. An entry whose time cannot be read is left out."""
+    found = []
+    for node in history if isinstance(history, list) else []:
         node = node if isinstance(node, dict) else {}
         if str((node.get("toDelegate") or {}).get("id") or "") != app_user_id:
             continue
@@ -312,31 +324,90 @@ def delegation_after(history, app_user_id, since, has_more):
         if not actor or actor == app_user_id:
             continue
         at = _parse_iso(node.get("createdAt"))
-        if at is None or at <= since_dt:
-            continue
-        if newest is None or at > newest[0]:
-            newest = (at, str(node.get("createdAt")))
-    if newest:
-        return newest[1], ""
+        if at is not None:
+            found.append((at, str(node.get("createdAt"))))
+    return found
+
+
+def delegation_after(history, app_user_id, taken_at, has_more, delegated_at=None):
+    """(the delegation entry's createdAt, "") when the issue's history shows a PERSON
+    delegating the ticket to the dispatcher after the snapshot was TAKEN; else (None, why).
+
+    Compared to `taken_at`, not to `delegated_at`. The tracker can stamp a delegation's
+    history entry a few milliseconds after the session it opens, so the delegation a
+    snapshot stands for can read as later than its `delegated_at`. A delegation that makes
+    new criteria the basis happens after the snapshot read the old ones, so after
+    `taken_at`. Removing the delegation and delegating the ticket again writes one. An
+    @mention writes none. The newest such entry is returned: it is the delegation the
+    replacement stands for. Fail closed: no app user, an unreadable `taken_at`, no history,
+    or more pages than were read with no such entry in the page read all answer None.
+
+    `taken_at` is the driver's clock and the entry is the tracker's. So the entry must also
+    be more than DELEGATION_TOLERANCE_SECONDS after the snapshot's `delegated_at`, which is
+    the tracker's clock. A driver clock behind the tracker's then never lets the snapshot's
+    own delegation entry count as a new one. The cost: a re-delegation within that minute
+    is held, and delegating the ticket again once more replaces the snapshot (no ticket
+    yet). A driver clock ahead of the tracker's by more than the time between a snapshot
+    and a re-delegation holds that re-delegation too (no ticket yet)."""
+    if not app_user_id:
+        return None, NO_APP_USER
+    since_dt = _parse_iso(taken_at)
+    if since_dt is None:
+        return None, "the snapshot's taken_at could not be read"
+    if not isinstance(history, list):
+        return None, "the issue history could not be read"
+    delegated_dt = _parse_iso(delegated_at)
+    if delegated_dt is not None:
+        since_dt = max(since_dt, delegated_dt + timedelta(seconds=DELEGATION_TOLERANCE_SECONDS))
+    after = [d for d in _person_delegations(history, app_user_id) if d[0] > since_dt]
+    if after:
+        return max(after)[1], ""
     if has_more:
         return None, ("the history has more pages than were read, and the page read shows "
                       "no person delegating the ticket again")
-    return None, ("the history shows no person delegating the ticket again since %s (an "
-                  "@mention or a new thread is not a delegation)" % since)
+    return None, ("the history shows no person delegating the ticket again since the snapshot "
+                  "was taken at %s (an @mention or a new thread is not a delegation)" % taken_at)
+
+
+def delegation_at_or_before(history, app_user_id, created_at):
+    """The createdAt of the newest PERSON delegation to the dispatcher at or before the
+    session's `created_at` plus DELEGATION_TOLERANCE_SECONDS, or None.
+
+    A FIRST snapshot's window starts there. The newest person-created session is not always
+    the delegation's own: when the driver was down across a delegation, a session edit and
+    an @mention, the newest is the mention, and a window from it would hide the edit. The
+    entry can trail its session by milliseconds, hence the tolerance. None with no app user,
+    no history, or no such entry in the page read."""
+    created = _parse_iso(created_at)
+    if not app_user_id or created is None:
+        return None
+    limit = created + timedelta(seconds=DELEGATION_TOLERANCE_SECONDS)
+    before = [d for d in _person_delegations(history, app_user_id) if d[0] <= limit]
+    return max(before)[1] if before else None
 
 
 def needs_snapshot(existing, session):
     """Whether this ticket is owed a snapshot.
 
     No snapshot ⇒ yes, a first one. The same session's ⇒ never: a snapshot is immutable
-    for its session. A NEWER person-created session ⇒ a replacement, which the pass writes
-    only when `delegation_after` finds a person delegating the ticket again — a newer
-    session alone may be an @mention. An OLDER one (paging order, or a stale read) ⇒ no."""
+    for its session. A NEWER person-created session ⇒ a replacement candidate, which the
+    pass writes only when `delegation_after` finds a person delegating the ticket again — a
+    newer session alone may be an @mention — and skips when `held_before` says it was
+    already judged held. An OLDER one (paging order, or a stale read) ⇒ no."""
     if not existing:
         return True
     if existing.get("session_id") == session.get("id"):
         return False
     return str(session.get("createdAt") or "") > str(existing.get("delegated_at") or "")
+
+
+def held_before(existing, session):
+    """Whether this session was already judged HELD against this snapshot, on an earlier
+    pass. Its history was read then and showed no person delegating the ticket again, so it
+    is a divergence re-check now, not owed. A different session is judged afresh."""
+    sid = session.get("id")
+    return bool(sid) and any(isinstance(h, dict) and h.get("session_id") == sid
+                             for h in (existing or {}).get("held_sessions") or [])
 
 
 def build_snapshot(identifier, session, issue, taken_at, history_nodes=None, history_more=False,
@@ -502,8 +573,9 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
 
     `clock` returns the time as an ISO string. It is read after each ticket's read, so a
     snapshot's `taken_at` is stamped after the description it holds was read. The order is
-    in the module docstring: owed snapshots before re-checks, so the read cap and the
-    deadline cut a re-check before they cut a snapshot."""
+    in the module docstring: first snapshots, then replacement candidates, then re-checks,
+    so the read cap and the deadline cut a re-check before they cut a snapshot, and a held
+    ticket, recorded as held, never cuts a first snapshot."""
     directory = snapshot_dir_for(cfg, state_dir)
     team_keys = (cfg or {}).get("team_keys") or []
     app_user = app_user_of(cfg)
@@ -545,13 +617,18 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
             continue
         if existing is None:
             owed.append(("first", ident, session, None))
-        elif needs_snapshot(existing, session) and app_user:
+        elif not needs_snapshot(existing, session) or held_before(existing, session):
+            rechecks.append(("recheck", ident, session, existing))
+        elif app_user:
             owed.append(("replace", ident, session, existing))
         else:
-            if needs_snapshot(existing, session):
-                _hold(result, ident, existing, session, NO_APP_USER)
+            # Known without a read, and not recorded: once the app user is configured, the
+            # history decides.
+            _hold(result, ident, existing, session, NO_APP_USER)
             rechecks.append(("recheck", ident, session, existing))
-    owed.sort(key=lambda t: (str(t[2].get("createdAt") or ""), t[1]))
+    # First snapshots before replacement candidates, each oldest session first. A ticket
+    # with no snapshot has no basis at all; a replacement candidate already has one.
+    owed.sort(key=lambda t: (t[0] != "first", str(t[2].get("createdAt") or ""), t[1]))
     rechecks.sort(key=lambda t: (str(t[2].get("updatedAt") or ""), t[1]), reverse=True)
 
     for kind, ident, session, existing in owed + rechecks:
@@ -559,10 +636,12 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
                else "the read cap of %d" % max_reads if result["reads"] >= max_reads else "")
         if cut:
             result["capped"].append(ident)
-            if kind != "recheck":
-                result["problems"].append("%s: owed a %s snapshot and not taken this pass (%s); "
-                                          "the next pass takes owed snapshots first"
-                                          % (ident, "first" if kind == "first" else "replacement", cut))
+            if kind == "first":
+                result["problems"].append("%s: owed a first snapshot and not taken this pass (%s); "
+                                          "the next pass reads first snapshots first" % (ident, cut))
+            elif kind == "replace":
+                result["problems"].append("%s: a newer person-created session was not checked for "
+                                          "a delegation this pass (%s)" % (ident, cut))
             continue
         result["reads"] += 1
         try:
@@ -581,12 +660,30 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
         hist_more = bool((hist.get("pageInfo") or {}).get("hasNextPage"))
 
         delegated_at = None
-        if kind == "replace":
-            delegated_at, why = delegation_after(hist_nodes, app_user, existing.get("delegated_at"),
-                                                 hist_more)
+        if kind == "first":
+            delegated_at = delegation_at_or_before(hist_nodes, app_user, session.get("createdAt"))
+        elif kind == "replace":
+            delegated_at, why = delegation_after(hist_nodes, app_user, existing.get("taken_at"),
+                                                 hist_more, delegated_at=existing.get("delegated_at"))
             if not delegated_at:
                 _hold(result, ident, existing, session, why)
                 kind = "recheck"
+                if not dry_run and _hold_settled(hist_nodes, existing, session, taken_at):
+                    prior_holds = existing.get("held_sessions")
+                    existing["held_sessions"] = (prior_holds or []) + [
+                        {"session_id": session.get("id"), "at": taken_at, "reason": why}]
+                    try:
+                        write_snapshot(directory, existing)
+                    except OSError as exc:
+                        # Unrecorded, so not carried into a later write this pass either
+                        # (a change notice's): the message below stays true.
+                        if prior_holds is None:
+                            existing.pop("held_sessions", None)
+                        else:
+                            existing["held_sessions"] = prior_holds
+                        result["problems"].append("%s: the hold could not be recorded (%s); the "
+                                                  "next pass checks the session again"
+                                                  % (ident, exc.__class__.__name__))
 
         if kind != "recheck":
             doc = build_snapshot(ident, session, issue, taken_at, history_nodes=hist_nodes,
@@ -637,6 +734,17 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
         result["notices"].append(ident)
         result["detail"].append("%s: said the criteria changed since delegation" % ident)
     return result
+
+
+def _hold_settled(history, existing, session, taken_at):
+    """Whether a hold is final enough to record: the history was read, the snapshot's
+    `taken_at` is readable, and the session is at least DELEGATION_TOLERANCE_SECONDS older
+    than this read. A delegation entry can trail its session, so a younger session is held
+    this pass and judged again on the next."""
+    created, read = _parse_iso(session.get("createdAt")), _parse_iso(taken_at)
+    return (isinstance(history, list) and _parse_iso(existing.get("taken_at")) is not None
+            and created is not None and read is not None
+            and (read - created).total_seconds() >= DELEGATION_TOLERANCE_SECONDS)
 
 
 def _hold(result, ident, existing, session, why):
@@ -756,6 +864,34 @@ def selftest():
           delegation_after([], app, start, True)[0], None)
     check("no app user configured holds every replacement, and says why",
           delegation_after([delegated("2026-09-16T11:00:00Z")], "", start, False), (None, NO_APP_USER))
+    check("an unreadable taken_at holds, and says so",
+          delegation_after([delegated("2026-09-16T11:00:00Z")], app, "garbage", False),
+          (None, "the snapshot's taken_at could not be read"))
+    check("a driver clock behind the tracker's: the snapshot's own delegation entry, later than "
+          "taken_at, is not a new delegation",
+          delegation_after([delegated("2026-09-16T10:00:00.050Z")], app, "2026-09-16T09:56:00Z", False,
+                           delegated_at="2026-09-16T10:00:00.000Z")[0], None)
+    check("…while one more than a minute after the snapshot's delegation still replaces it",
+          delegation_after([delegated("2026-09-16T10:01:00.100Z")], app, "2026-09-16T09:56:00Z", False,
+                           delegated_at="2026-09-16T10:00:00.050Z")[0], "2026-09-16T10:01:00.100Z")
+
+    # ── A first snapshot's window starts at the delegation, not at a later session ──
+    check("a delegation entry stamped 50 ms after its session starts the window",
+          delegation_at_or_before([delegated("2026-09-16T10:00:00.050Z")], app, "2026-09-16T10:00:00.000Z"),
+          "2026-09-16T10:00:00.050Z")
+    check("…the newest person delegation at or before the session wins",
+          delegation_at_or_before([delegated("2026-09-16T09:00:00Z"), delegated("2026-09-16T10:00:00Z")],
+                                  app, "2026-09-16T10:30:00Z"), "2026-09-16T10:00:00Z")
+    check("an entry exactly at the tolerance counts; one past it does not",
+          (delegation_at_or_before([delegated("2026-09-16T10:01:00Z")], app, start),
+           delegation_at_or_before([delegated("2026-09-16T10:01:00.001Z")], app, start)),
+          ("2026-09-16T10:01:00Z", None))
+    check("a delegation by the dispatcher itself, or to another app, never starts the window",
+          (delegation_at_or_before([delegated(start, actor=app)], app, start),
+           delegation_at_or_before([delegated(start, to="app-other")], app, start)), (None, None))
+    check("no app user, or no history, starts no window from history",
+          (delegation_at_or_before([delegated(start)], "", start), delegation_at_or_before(None, app, start)),
+          (None, None))
 
     # ── The snapshot ────────────────────────────────────────────────────────
     snap = build_snapshot("KIT-7", session("s-human"), {"description": desc},
@@ -944,6 +1080,13 @@ def selftest():
               (r["held"], r["replaced"], read_snapshot(snapshot_dir_for(cfg, state), "KIT-7")["session_id"],
                any(NO_APP_USER in d for d in r["detail"]), r["problems"]),
               (["KIT-7"], [], "s-human", True, []))
+        check("…and that hold is NOT recorded: no history was read",
+              read_snapshot(snapshot_dir_for(cfg, state), "KIT-7").get("held_sessions"), None)
+        r = snapshot_pass(dict(cfg, dispatcher_app_user_id=app), state, fake,
+                          clock=at("2026-09-16T11:10:00Z"))
+        check("…so once the app user is configured, the history decides and the delegation replaces it",
+              (r["replaced"], read_snapshot(snapshot_dir_for(cfg, state), "KIT-7")["session_id"]),
+              (["KIT-7"], "s-again"))
 
     with tempfile.TemporaryDirectory() as state:
         # The window has no top, and taken_at is stamped after this ticket's read.
@@ -1019,6 +1162,228 @@ def selftest():
         check("…and so is one the deadline cuts",
               ([p.split(":")[0] for p in r["problems"]], r["reads"]), (["KIT-8"], 0))
 
+    def held_ids(store, ident):
+        return [h.get("session_id") for h in read_snapshot(store, ident).get("held_sessions") or []]
+
+    def one_delegation(when="2026-09-16T10:00:00Z", more=False):
+        return {"nodes": [delegated(when)], "pageInfo": {"hasNextPage": more}}
+
+    with tempfile.TemporaryDirectory() as state:
+        # A held session is recorded, so it is a re-check on later passes and never starves
+        # a newly delegated ticket. 26 snapshotted tickets each gain a later @mention.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        store = snapshot_dir_for(cfg, state)
+        firsts = [session("s-%d" % i, ident="KIT-%d" % i, issue_id="iss-%d" % i) for i in range(10, 36)]
+        issues = {"iss-%d" % i: {"id": "iss-%d" % i, "description": desc, "history": one_delegation()}
+                  for i in range(9, 36)}
+        fake = Fake(firsts, issues)
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:30:00Z"), max_reads=100)
+        check("setup: 26 open tickets are snapshotted from their delegations", len(r["taken"]), 26)
+        mentions = [session("s-m%d" % i, ident="KIT-%d" % i, issue_id="iss-%d" % i,
+                            created="2026-09-16T11:%02d:00Z" % (i - 10)) for i in range(10, 36)]
+        new9 = session("s-9", ident="KIT-9", issue_id="iss-9", created="2026-09-16T11:30:00Z")
+        fake.sessions = firsts + mentions + [new9]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:40:00Z"))
+        check("26 tickets with a later @mention and a newly delegated KIT-9: KIT-9 is taken on the "
+              "FIRST pass — first snapshots are read before replacement candidates",
+              (r["taken"], len(r["held"]), r["capped"], [p.split(":")[0] for p in r["problems"]]),
+              (["KIT-9"], 24, ["KIT-34", "KIT-35"], ["KIT-34", "KIT-35"]))
+        check("…and a held session is recorded in the snapshot, which otherwise stands",
+              (held_ids(store, "KIT-10"),
+               read_snapshot(store, "KIT-10")["session_id"]), (["s-m10"], "s-10"))
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:50:00Z"))
+        check("on the next pass the held tickets are re-checks and are not problems; only the two "
+              "the cap cut are judged",
+              (sorted(r["held"]), r["problems"], r["taken"], r["replaced"], r["reads"]),
+              (["KIT-34", "KIT-35"], [], [], [], DEFAULT_MAX_READS))
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T12:00:00Z"))
+        check("…and on the pass after, nothing is held again and nothing is a problem",
+              (r["held"], r["problems"]), ([], []))
+        fake.sessions = firsts + mentions + [new9, session("s-m10b", ident="KIT-10", issue_id="iss-10",
+                                                           created="2026-09-16T12:05:00Z")]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T12:10:00Z"))
+        check("a different, newer session on a held ticket is judged afresh, and recorded too",
+              (r["held"], held_ids(store, "KIT-10")),
+              (["KIT-10"], ["s-m10", "s-m10b"]))
+
+    with tempfile.TemporaryDirectory() as state:
+        # A dry run judges a hold and says so, but writes no record of it.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        store = snapshot_dir_for(cfg, state)
+        issue = {"id": "iss-7", "description": desc, "history": one_delegation()}
+        fake = Fake([session("s-human")], {"iss-7": issue})
+        snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:04:00Z"))
+        with open(os.path.join(store, "KIT-7.json"), "rb") as fh:
+            before_bytes = fh.read()
+        fake.sessions = [session("s-human"), session("s-mention", created="2026-09-16T11:00:00Z")]
+        r = snapshot_pass(cfg, state, fake, dry_run=True, clock=at("2026-09-16T11:05:00Z"))
+        with open(os.path.join(store, "KIT-7.json"), "rb") as fh:
+            after_bytes = fh.read()
+        check("a dry run holds the session and writes no hold record",
+              (r["held"], after_bytes == before_bytes), (["KIT-7"], True))
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:06:00Z"))
+        check("…so the next real pass judges it afresh, and records it",
+              (r["held"], held_ids(store, "KIT-7")),
+              (["KIT-7"], ["s-mention"]))
+        fake.sessions = [session("s-human"), session("s-young", created="2026-09-16T12:00:00Z")]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T12:00:30Z"))
+        check("a session younger than the tolerance is held WITHOUT a record: its delegation entry "
+              "may not be written yet",
+              (r["held"], held_ids(store, "KIT-7")),
+              (["KIT-7"], ["s-mention"]))
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T12:05:00Z"))
+        check("…and the next pass judges it again, and records it",
+              (r["held"], held_ids(store, "KIT-7")),
+              (["KIT-7"], ["s-mention", "s-young"]))
+        fake.sessions = [session("s-human"), session("s-late", created="2026-09-16T13:00:00Z")]
+        saved_write = globals()["write_snapshot"]
+
+        def unwritable(*_a, **_k):
+            raise PermissionError("simulated read-only store")
+        globals()["write_snapshot"] = unwritable
+        try:
+            r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T13:05:00Z"))
+        finally:
+            globals()["write_snapshot"] = saved_write
+        check("a hold that cannot be recorded is a PROBLEM, and the session is checked again next pass",
+              (r["held"], [p.split(":")[0] for p in r["problems"]],
+               any("hold could not be recorded" in p for p in r["problems"]),
+               held_ids(store, "KIT-7")),
+              (["KIT-7"], ["KIT-7"], True, ["s-mention", "s-young"]))
+
+        issue["description"] = edited
+        fake.sessions = [session("s-human"), session("s-flaky", created="2026-09-16T14:00:00Z")]
+        writes = [0]
+
+        def fails_once(*a, **k):
+            writes[0] += 1
+            if writes[0] == 1:
+                raise PermissionError("simulated transient failure")
+            return saved_write(*a, **k)
+        globals()["write_snapshot"] = fails_once
+        try:
+            r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T14:05:00Z"))
+        finally:
+            globals()["write_snapshot"] = saved_write
+        check("a hold whose record failed is not carried into the change notice's write in the "
+              "same pass, so the next pass does check the session again",
+              (r["held"], r["notices"], any("hold could not be recorded" in p for p in r["problems"]),
+               writes[0], held_ids(store, "KIT-7")),
+              (["KIT-7"], ["KIT-7"], True, 2, ["s-mention", "s-young"]))
+
+    with tempfile.TemporaryDirectory() as state:
+        # The driver was down, and the history runs past the page read with no delegation in
+        # it: the edit flag is unknown, never false.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        issue = {"id": "iss-7", "description": desc,
+                 "history": {"nodes": [{"createdAt": "2026-09-16T10:31:00Z", "title": "x"}],
+                             "pageInfo": {"hasNextPage": True}}}
+        fake = Fake([session("s-mention", created="2026-09-16T10:30:00Z")], {"iss-7": issue})
+        snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:40:00Z"))
+        stored = read_snapshot(snapshot_dir_for(cfg, state), "KIT-7")
+        check("more history pages and no delegation in the page read: the window starts at the "
+              "session and the edit flag is None, never False",
+              (stored["delegated_at"], stored["edited_before_snapshot"]), ("2026-09-16T10:30:00Z", None))
+
+    with tempfile.TemporaryDirectory() as state:
+        # The tracker may stamp a delegation's history entry a few ms AFTER the session it
+        # opens. That entry predates the snapshot, so a later @mention must not replace it.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        store = snapshot_dir_for(cfg, state)
+        issue = {"id": "iss-7", "description": desc,
+                 "history": one_delegation("2026-09-16T10:00:00.050Z")}
+        fake = Fake([session("s-1", created="2026-09-16T10:00:00.000Z")], {"iss-7": issue})
+        snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:04:00Z"))
+        issue["description"] = edited
+        fake.sessions = [session("s-1", created="2026-09-16T10:00:00.000Z"),
+                         session("s-mention", created="2026-09-16T11:00:00.000Z")]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:05:00Z"))
+        check("the original delegation entry stamped 50 ms after its session, and an @mention an "
+              "hour later: HELD, the snapshot stands",
+              (r["held"], r["replaced"], read_snapshot(store, "KIT-7")["acceptance_criteria"]),
+              (["KIT-7"], [], ["do the thing", "test it"]))
+
+    with tempfile.TemporaryDirectory() as state:
+        # …and so for a snapshot dated by its session, not its delegation entry: one taken
+        # before the app user was configured. The replacement rule compares to taken_at.
+        issue = {"id": "iss-7", "description": desc,
+                 "history": one_delegation("2026-09-16T10:00:00.050Z")}
+        fake = Fake([session("s-1", created="2026-09-16T10:00:00.000Z")], {"iss-7": issue})
+        snapshot_pass({"team_keys": ["KIT"]}, state, fake, clock=at("2026-09-16T10:04:00Z"))
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        issue["description"] = edited
+        fake.sessions = [session("s-1", created="2026-09-16T10:00:00.000Z"),
+                         session("s-mention", created="2026-09-16T11:00:00.000Z")]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:05:00Z"))
+        check("a snapshot dated by its session, then an @mention: the trailing delegation entry "
+              "is before taken_at, so HELD",
+              (r["held"], r["replaced"],
+               read_snapshot(snapshot_dir_for(cfg, state), "KIT-7")["acceptance_criteria"]),
+              (["KIT-7"], [], ["do the thing", "test it"]))
+
+    with tempfile.TemporaryDirectory() as state:
+        # A delegation entry after the snapshot's own delegation but before its read: the
+        # snapshot read the criteria after it, so it is not a new delegation.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        issue = {"id": "iss-7", "description": desc,
+                 "history": {"nodes": [delegated("2026-09-16T10:00:00Z"), delegated("2026-09-16T10:02:00Z")],
+                             "pageInfo": {"hasNextPage": False}}}
+        fake = Fake([session("s-1", created="2026-09-16T10:00:00Z")], {"iss-7": issue})
+        snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:04:00Z"))
+        issue["description"] = edited
+        fake.sessions = [session("s-1", created="2026-09-16T10:00:00Z"),
+                         session("s-mention", created="2026-09-16T11:00:00Z")]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:05:00Z"))
+        check("a delegation entry between the snapshot's delegation and its taken_at, then an "
+              "@mention: the entry is before taken_at, so HELD",
+              (r["held"], r["replaced"],
+               read_snapshot(snapshot_dir_for(cfg, state), "KIT-7")["acceptance_criteria"]),
+              (["KIT-7"], [], ["do the thing", "test it"]))
+
+    with tempfile.TemporaryDirectory() as state:
+        # The driver's clock runs five minutes behind the tracker's, so taken_at reads earlier
+        # than the snapshot's own delegation entry.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        store = snapshot_dir_for(cfg, state)
+        issue = {"id": "iss-7", "description": desc,
+                 "history": one_delegation("2026-09-16T10:00:00.050Z")}
+        fake = Fake([session("s-1", created="2026-09-16T10:00:00.000Z")], {"iss-7": issue})
+        snapshot_pass(cfg, state, fake, clock=at("2026-09-16T09:56:00Z"))
+        issue["description"] = edited
+        fake.sessions = [session("s-1", created="2026-09-16T10:00:00.000Z"),
+                         session("s-mention", created="2026-09-16T11:00:00.000Z")]
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:01:00Z"))
+        check("a driver clock five minutes behind the tracker's, then an @mention: the snapshot's "
+              "own delegation entry is not a new one, so HELD",
+              (r["held"], r["replaced"], read_snapshot(store, "KIT-7")["acceptance_criteria"]),
+              (["KIT-7"], [], ["do the thing", "test it"]))
+        issue["history"] = {"nodes": [delegated("2026-09-16T11:30:00Z"), delegated("2026-09-16T10:00:00.050Z")],
+                            "pageInfo": {"hasNextPage": False}}
+        fake.sessions.append(session("s-again", created="2026-09-16T11:30:00.020Z"))
+        r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T11:31:00Z"))
+        check("…and a person delegating the ticket again still replaces it",
+              (r["replaced"], read_snapshot(store, "KIT-7")["session_id"]), (["KIT-7"], "s-again"))
+
+    with tempfile.TemporaryDirectory() as state:
+        # The driver was down across a delegation (10:00), a session edit (10:05) and an
+        # @mention (10:30). The first snapshot's window starts at the delegation.
+        cfg = {"team_keys": ["KIT"], "dispatcher_app_user_id": app}
+        store = snapshot_dir_for(cfg, state)
+        down = {"nodes": [{"createdAt": "2026-09-16T10:05:00Z", "updatedDescription": True,
+                           "descriptionUpdatedBy": [{"id": "u-agent"}]},
+                          delegated("2026-09-16T10:00:00Z")],
+                "pageInfo": {"hasNextPage": False}}
+        issue = {"id": "iss-7", "description": edited, "history": down}
+        fake = Fake([session("s-deleg", created="2026-09-16T10:00:00Z"),
+                     session("s-mention", created="2026-09-16T10:30:00Z")], {"iss-7": issue})
+        snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:40:00Z"))
+        stored = read_snapshot(store, "KIT-7")
+        check("delegation 10:00, session edit 10:05, @mention 10:30, first pass 10:40: the window "
+              "starts at the delegation, so edited_before_snapshot is True",
+              (stored["session_id"], stored["delegated_at"], stored["edited_before_snapshot"],
+               stored["edited_before_snapshot_by"]),
+              ("s-mention", "2026-09-16T10:00:00Z", True, ["u-agent"]))
+
     # ── The write guard ────────────────────────────────────────────────────
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     code = src.split("def selftest", 1)[0]
@@ -1035,9 +1400,11 @@ def selftest():
         return 1
     print("ok — pipeline_criteria_snapshot: %d cases — only a person's session of the dispatcher "
           "takes a snapshot, it is immutable for its session and replaced only when the history "
-          "shows a person delegating again (an @mention is held), the window from delegation has "
-          "no top and counts an entry over its span, owed snapshots are read before re-checks and "
-          "an owed one cut is a problem, the owner-key notice carries counts and no ticket text, a "
+          "shows a person delegating again after it was taken (an @mention is held, and the hold "
+          "recorded so it is a re-check after), a first snapshot's window starts at the "
+          "delegation, the window has no top and counts an entry over its span, first snapshots "
+          "are read before replacement candidates and those before re-checks, an owed one cut is "
+          "a problem, the owner-key notice carries counts and no ticket text, a "
           "divergence is said once top-level (edited-then-reverted says nothing more), a truncated "
           "listing and a dry run say so, an unreadable snapshot is a problem never re-taken, one "
           "mutation only" % cases[0])

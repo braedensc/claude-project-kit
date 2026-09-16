@@ -324,16 +324,29 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
     agent app's session. The snapshot records how long after delegation it was taken, and
     whether the ticket's history shows a description edit since delegation: yes, no, or
     unknown. A history entry that began before delegation and was updated after it reads
-    unknown.
+    unknown. With `dispatcher_app_user_id` set, delegation means the person's delegation in
+    the history, not the newest session. So if the driver was down across a delegation, a
+    session edit and an @mention, the edit still counts. Without it, the window starts at
+    the newest session, and that edit is not seen (no ticket yet).
 
     **Replacing a snapshot takes a delegation.** A newer session is not enough: an
     @mention of the dispatcher also opens a session with you as its creator. The pass
     replaces a snapshot only when the ticket's history shows a person delegating it to the
-    dispatcher after the snapshot's delegation. Removing the delegation and delegating the
-    ticket again writes that entry. Any other newer session is **held**: the pass names
-    it, and the snapshot stands. Without `dispatcher_app_user_id`, every replacement is
-    held. So is one whose history runs past the one page the pass reads, even after a real
-    delegation (no ticket yet).
+    dispatcher after the snapshot was taken, and more than a minute after the delegation
+    the snapshot stands for. Removing the delegation and delegating the ticket again writes
+    that entry. Any other newer session is **held**: the pass names it, and the snapshot
+    stands. Without `dispatcher_app_user_id`, every replacement is held. So is one whose
+    history runs past the one page the pass reads, even after a real delegation (no ticket
+    yet).
+
+    **A hold is recorded.** The snapshot keeps the held session in `held_sessions`. Later
+    passes only compare that ticket's criteria; they do not check the session again. A
+    newer session is checked afresh. Three holds are not recorded and are checked again
+    next pass: a dry run's, one for want of `dispatcher_app_user_id`, and one on a session
+    under a minute old, whose delegation entry may not be written yet. The pass compares
+    the driver's clock with the tracker's. A driver clock ahead of the tracker's can hold a
+    real re-delegation (no ticket yet). So can a re-delegation within a minute of the one
+    the snapshot stands for; delegate the ticket again once more (no ticket yet).
 
     **On later passes it compares.** Live criteria that differ from the snapshot get **one
     top-level comment on the coding ticket** per distinct version. It gives counts only:
@@ -346,8 +359,11 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
     thread reply, so no session is prompted.
 
     **A ticket delegated with no criteria.** Its snapshot holds none. Criteria added later
-    are not the basis, so the review declines and says why, and so does the comment. Write
-    the criteria, then remove the delegation and delegate the ticket again.
+    are not the basis, so the review declines and says why, and so does the comment. The
+    decline also names the one shape Stage E reads: a top-level `## Acceptance criteria`
+    heading with `- [ ]` items. Criteria under any other heading read as none, and so would
+    the next snapshot. Fix the shape or write the criteria, then remove the delegation and
+    delegate the ticket again.
 
     **What the reviewer is told.** On a snapshot, `criteria_changed_after_delegation` is
     `true` when live differs, `false` when it matches and the history showed no edit, and
@@ -357,7 +373,8 @@ Those are Reviews-team tickets, never anybody's coding ticket.)
     never as *nothing changed*. The bounces after it still run.
 
     **What one pass covers.** It reads up to 25 tickets and stops at its share of the
-    run's time. Tickets owed a snapshot go first. Re-checks follow, most recently active
+    run's time. Tickets with no snapshot go first. Newer sessions not yet checked for a
+    delegation come next. Re-checks follow, held tickets among them, most recently active
     first. An owed ticket the pass did not reach is a problem in the heartbeat. A re-check
     it did not reach is named as *capped*, and is not a problem. The session listing stops
     after 150 sessions and says *TRUNCATED* when more remain. A dry run says *would take*
@@ -765,7 +782,7 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
-| `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit since delegation (step 10). Immutable for its session. Still read by the poller when `criteria_snapshots` is `false` |
+| `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit since delegation (step 10). Its criteria never change; it also records the notices said and the sessions held. Still read by the poller when `criteria_snapshots` is `false` |
 | `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a person delegating the ticket again replaced it |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
 | `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
@@ -1060,7 +1077,8 @@ guessing.
   use them. To stop that, move `<state_dir>/basis-snapshots` aside; the OFF line names the
   directory.
 - `dispatcher_app_user_id` also decides whose sessions the snapshot pass counts. Without
-  it, first snapshots are still taken, but no snapshot is ever replaced (step 10).
+  it, first snapshots are still taken, but their edit window starts at the newest
+  session, and no snapshot is ever replaced (step 10).
 - `basis_snapshot_dir` is optional in both files. Both default to
   `<state_dir>/basis-snapshots`, so with one `state_dir` the writer and the reader meet
   without it. Set it in both or in neither.
@@ -1705,10 +1723,11 @@ lane was provisioned, then completed on the next pass without anyone touching it
 only (no ticket yet). After the installer's `run` moves the role account's clone, the next
 driver pass prints a `criteria snapshots:` line. Delegate a throwaway ticket and look for
 `state/basis-snapshots/<TICKET>.json`. Edit its criteria and look for the one comment.
-@mention the dispatcher on it and look for *held*. Remove the delegation, delegate it
-again, and look for *replaced*. The history fields that last check reads (`toDelegate`,
-`actor`) come from the tracker's published schema and are not yet observed live (no
-ticket yet).
+@mention the dispatcher on it and look for *held*. A few passes later, the snapshot's
+`held_sessions` names that session, and the pass no longer says *held*. Remove the
+delegation, delegate it again, and look for *replaced*. The history fields those checks
+read (`toDelegate`, `actor`) come from the tracker's published schema and are not yet
+observed live (no ticket yet).
 
 **Step 6 has not run live.** Both conflict lanes are tested only in the batteries. The first
 real conflict on a dispatcher's pull request is its live test: watch for the thread reply,

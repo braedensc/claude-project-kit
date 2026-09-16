@@ -524,25 +524,38 @@ a snapshot a session could plant.
 > - **Replaced only by a delegation.** A newer session is not enough. An @mention of the
 >   dispatcher also opens one with a person as its creator. A replacement needs an entry in
 >   the ticket's history that delegates it to the dispatcher (`toDelegate`), made by an
->   actor who is not the dispatcher, after the snapshot's delegation. Removing the
->   delegation and delegating the ticket again writes one. Any other newer session is held:
->   the pass says so, and the snapshot stands. A replacement is also held when no app user
->   is configured. It is held too when the history runs past the page the pass reads, even
+>   actor who is not the dispatcher, after the snapshot was taken. Not after the snapshot's
+>   delegation: the tracker can stamp that delegation's own entry milliseconds after its
+>   session. The entry must also come more than a minute after the snapshot's delegation.
+>   `taken_at` is the driver's clock, so a driver clock behind the tracker's could
+>   otherwise make the snapshot's own entry read as new. Removing the delegation and
+>   delegating the ticket again writes one. Any other newer session is held: the pass says
+>   so, and the snapshot stands. A replacement is also held when no app user is
+>   configured. It is held too when the history runs past the page the pass reads, even
 >   after a real delegation (no ticket yet). The first build let any newer person-created
 >   session replace a snapshot. Review found the hole in that. The change notice quoted
->   criteria under the owner's key, so a session could plant a mention, have the owner post
->   it, and replace its own snapshot.
+>   criteria under the owner's key, so a session could plant a mention, have the owner
+>   post it, and replace its own snapshot.
+> - **A hold is recorded.** The snapshot keeps each session held after a history read.
+>   Later passes re-check that ticket's criteria and never judge the session again, so
+>   held tickets cannot fill the read cap and starve a new delegation. A newer session is
+>   judged afresh. A dry run records nothing. Neither does a hold for want of an app user,
+>   or one on a session under a minute old, whose delegation entry may not be written yet.
 > - **Outside every worktree.** The store is `<state_dir>/basis-snapshots`, mode 600 in a
->   mode-700 directory, which the session sandbox cannot read. A snapshot is immutable for
->   its session. A replacement keeps the old one beside it.
+>   mode-700 directory, which the session sandbox cannot read. A snapshot's criteria are
+>   immutable for its session; it gains records only, of notices and holds. A replacement
+>   keeps the old one beside it.
 > - **Late, and it says how late.** A snapshot is taken on the first pass after delegation,
 >   not at it. It records the delegation time, its own time, and whether the ticket's
->   history shows a description edit since delegation: yes, no, or unknown. Its own time is
->   stamped after the ticket is read, and the window has no end, since every history entry
->   read predates the description read with it. A history entry counts over its whole span,
->   so one that began before delegation and was updated after it is unknown. The weakness
->   named above — an edit before the first poll — is now recorded, not closed (no ticket
->   yet).
+>   history shows a description edit since delegation: yes, no, or unknown. With an app
+>   user configured, a first snapshot's delegation time is the newest person delegation in
+>   the history at or before its session, allowing a minute for the entry to trail. The
+>   newest session can be a later @mention, and a window from it would hide a session's
+>   edit made in between. Its own time is stamped after the ticket is read, and the window
+>   has no end, since every history entry read predates the description read with it. A
+>   history entry counts over its whole span, so one that began before delegation and was
+>   updated after it is unknown. The weakness named above — an edit before the first poll —
+>   is now recorded, not closed (no ticket yet).
 > - **The flag on tier 2.** `criteria_changed_after_delegation` is true when the live
 >   acceptance criteria or out-of-scope list differ from the snapshot. It is false only when
 >   they match and the window showed no edit. A match after an edit, or after an unreadable
@@ -559,17 +572,23 @@ a snapshot a session could plant.
 >   never a thread reply, which would prompt the session.
 > - **A pass that could not look is a problem**, in the driver's output and heartbeat,
 >   never "nothing changed". An unreadable snapshot is refused, never re-taken from the live
->   ticket, which would launder an edit into the basis. Owed snapshots are read before
->   divergence re-checks, and an owed one the pass could not reach is a problem too. A
->   truncated session listing and a dry run each say so.
+>   ticket, which would launder an edit into the basis. First snapshots are read first, then
+>   newer sessions not yet judged, then divergence re-checks. An owed one the pass could not
+>   reach is a problem too. A truncated session listing and a dry run each say so.
 > - **Still open.** The empty-`creator` rule and the delegation entry's fields are read
 >   from the tracker's published schema, not yet observed on a live ticket (no ticket yet).
->   The pass has not run against a live tracker; it runs once the pull request merges and
->   the installer's `run` moves the role account's clone (no ticket yet). A snapshot is
->   keyed by ticket, so a pull request whose ticket was re-delegated after the last pass is
->   judged against the earlier delegation (no ticket yet). `criteria_snapshots: false`
->   stops the writer, not the reader: the poller reads the snapshots already stored until
->   the store is moved aside, and the driver's OFF line says so (no ticket yet).
+>   The pass has not run against a live tracker (no ticket yet). A snapshot is keyed by
+>   ticket, so a pull request whose ticket was re-delegated after the last pass is judged
+>   against the earlier delegation (no ticket yet). `criteria_snapshots: false` stops the
+>   writer, not the reader: the poller reads the snapshots already stored until the store
+>   is moved aside, and the driver's OFF line says so (no ticket yet). The replacement rule
+>   compares the driver's clock with the tracker's, so a driver clock ahead of the
+>   tracker's can hold a real re-delegation (no ticket yet). A re-delegation within a
+>   minute of the snapshot's own delegation is held too; delegating the ticket again once
+>   more replaces the snapshot (no ticket yet). Each delegation is assumed to open a new
+>   session. A delegation that reused a session already recorded as held would stay held
+>   (no ticket yet). Without an app user, a first snapshot's window starts at its session,
+>   so an edit before a later @mention is not seen (no ticket yet).
 
 ### 3. Independence
 

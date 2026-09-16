@@ -42,11 +42,11 @@ THE KIT-92 SPIKE — RECORDED HERE, NOT JUST IN THE ADR
 
   **Conclusion: tier 1 is not implementable from what is verifiable here. Tier 3 (live +
   flag) is the shipped default.** `resolve_tier1()` below is a real, tested interface —
-  not a placeholder comment — so that the day someone confirms a working history query
-  (see the candidate query in the phase doc handed to Braeden), wiring it in is a change
-  to ONE function's body, not to any caller. Tier 2 was the consumer half only until
-  2026-09-16; scripts/pipeline_criteria_snapshot.py (KIT-131) now writes the snapshots
-  `resolve_tier2` reads, from the bounce driver's pass.
+  not a placeholder comment — so that the day someone confirms a working history query,
+  wiring it in is a change to ONE function's body, not to any caller. No history query
+  for tier 1 has been run against a live tracker (no ticket yet). Tier 2 was the consumer
+  half only until 2026-09-16; scripts/pipeline_criteria_snapshot.py (KIT-131) now writes
+  the snapshots `resolve_tier2` reads, from the bounce driver's pass.
 
 WHY resolve_tier1's SIGNATURE IS THE FORGERY-RESISTANCE ARGUMENT
 

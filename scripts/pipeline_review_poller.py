@@ -2020,6 +2020,14 @@ def basis_resolver_missing():
             "— nothing was listed, declined or marked seen; install it and rerun" % BASIS_RESOLVER_MODULE)
 
 
+# The one description shape the basis resolver reads (check_ticket_dor.pin_fields). Both
+# empty-basis declines name it, so an owner whose criteria sit under another heading is
+# pointed at the heading, not at the resolver.
+CRITERIA_SHAPE = ("Stage E reads exactly one section: a top-level `## Acceptance criteria` "
+                  "heading with `- [ ]` checkbox items. A `###` heading, a renamed heading such "
+                  "as `## Deliverable`, a trailing colon, bold, or plain bullets all read as none.")
+
+
 def resolve_basis_for(cfg, ticket_id, api_key):
     """(basis or None, TERMINAL reason). Uses scripts/pipeline_review_basis.py; the
     reviewer has no tools, so an unresolvable basis is a decline, not a lenient review.
@@ -2040,25 +2048,24 @@ def resolve_basis_for(cfg, ticket_id, api_key):
     raw = mod.resolve_basis(ticket_id, issue, cfg.get("basis_snapshot_dir") or None)
     basis = prl.basis_from(raw)
     if basis is None and (raw or {}).get("basis_tier") == "reconciler":
-        # The snapshot taken when a person delegated the ticket holds no criteria. The
-        # heading advice below would be wrong here: fixing the heading now adds criteria
-        # after delegation, which is exactly what the snapshot refuses as the basis.
+        # The snapshot taken when a person delegated the ticket holds no criteria. Two
+        # owners reach this: one who wrote none, and one whose criteria sit under a heading
+        # Stage E does not read. Re-delegating alone helps neither — the second one's new
+        # snapshot is empty again — so the shape comes first, then the re-delegation.
         return None, ("no review basis could be established for %s: the ticket had no "
                       "acceptance criteria when a person delegated it (the criteria snapshot "
-                      "taken then holds none). Criteria added since are not the basis. To make "
-                      "the current criteria the basis, remove the delegation and delegate the "
-                      "ticket again." % ticket_id)
+                      "taken then holds none). Criteria added since are not the basis. %s If "
+                      "the ticket has criteria, check that shape first. Then, to make the "
+                      "current criteria the basis, remove the delegation and delegate the "
+                      "ticket again." % (ticket_id, CRITERIA_SHAPE))
     if basis is None:
         # NAME THE SHAPE, at the moment of failure. Read beside a ticket that
         # visibly HAS a checklist, the bare sentence points at the basis resolver
         # rather than at the heading — the wrong diagnosis, and the one the first
         # live install actually made.
         return None, ("no review basis could be established for %s (no acceptance criteria "
-                      "reachable by any tier; tier tried: %s). Stage E reads exactly one "
-                      "section: a top-level `## Acceptance criteria` heading with `- [ ]` "
-                      "checkbox items. A `###` heading, a renamed heading such as "
-                      "`## Deliverable`, a trailing colon, bold, or plain bullets all read as "
-                      "none." % (ticket_id, (raw or {}).get("basis_tier")))
+                      "reachable by any tier; tier tried: %s). %s"
+                      % (ticket_id, (raw or {}).get("basis_tier"), CRITERIA_SHAPE))
     return basis, ""
 
 
@@ -3096,8 +3103,8 @@ def selftest():
           ("basis_tier: `reconciler`" in snap_body, "no tier could see" in snap_body,
            "proves nothing" in snap_body), (True, False, True))
 
-    # KIT-131: a snapshot with NO criteria declines with its own reason. The heading advice
-    # would be wrong there: fixing the heading now adds criteria after delegation.
+    # KIT-131: a snapshot with NO criteria declines with its own reason. It still names the
+    # heading shape: criteria under the wrong heading make the next snapshot empty too.
     class _EmptyBasisResolver:
         tier = "reconciler"
 
@@ -3117,8 +3124,13 @@ def selftest():
               "are not the basis, remove the delegation and delegate again",
               (got, "had no acceptance criteria when a person delegated it" in why,
                "Criteria added since are not the basis" in why,
-               "remove the delegation and delegate the ticket again" in why,
-               "`## Acceptance criteria` heading" in why), (None, True, True, True, False))
+               "remove the delegation and delegate the ticket again" in why), (None, True, True, True))
+        check("…and it names the one heading shape Stage E reads, before the re-delegation, so "
+              "criteria under the wrong heading are pointed at",
+              ("top-level `## Acceptance criteria` heading with `- [ ]` checkbox items" in why,
+               "`###` heading" in why,
+               0 <= why.find("`## Acceptance criteria` heading") < why.find("remove the delegation")),
+              (True, True, True))
         _EmptyBasisResolver.tier = "live"
         got, why = resolve_basis_for({"basis_snapshot_dir": "/x"}, "KIT-5", "k")
         check("…while an empty LIVE basis still names the one section Stage E reads",
