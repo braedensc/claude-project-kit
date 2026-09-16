@@ -12,7 +12,7 @@ name: Pipeline dispatch
 # checkout. This is also the preflight-skip-green pattern the kit's other
 # scheduled templates use, so a fresh fork is never red.
 #
-# ── The five jobs, and why they are separate ─────────────────────────────────
+# ── The six jobs, and why they are separate ──────────────────────────────────
 #   claim         holds LINEAR_API_KEY. Serialized. Reads config from the
 #                 DEFAULT BRANCH, gates on capacity/budget/WIP, ENQUEUES ready
 #                 tickets, atomically claims them, writes the pins. The only
@@ -28,6 +28,8 @@ name: Pipeline dispatch
 #                 state: re-queue, blocked, needs-human, or blocked:capacity.
 #                 IT NEVER LEAVES A TICKET IN `working` — see the job comment.
 #   carry-forward folds this run's flags into the state the next run reads.
+#   notify-capacity  files ONE capacity-pause notice per run and pages a person
+#                 (ALERT_PAGE_TO, else a person who owns the repo) — or fails.
 #
 # ── THE QUEUE IS A ROUND TRIP, NOT A ONE-WAY DOOR ────────────────────────────
 # Two halves that only work as a pair, both owned by the dispatcher because
@@ -62,6 +64,10 @@ name: Pipeline dispatch
 #   Var     PIPELINE_MODEL              optional; default claude-sonnet-5
 #   Var     PIPELINE_DISPATCH_ENABLED   optional kill switch; set to "false" to
 #                                       stop dispatching without editing config
+#   Var     ALERT_PAGE_TO               who the capacity notice pages (logins or
+#                                       org/team, comma-separated). REQUIRED on an
+#                                       org-owned repo: an org @mention notifies
+#                                       nobody, so notify-capacity fails without it
 # Until the secrets exist the workflow runs green and skips.
 #
 # ── WHY THE DEFAULT `GITHUB_TOKEN` CANNOT PUSH HERE ──────────────────────────
@@ -1297,7 +1303,6 @@ jobs:
     permissions:
       contents: read
       actions: read    # read the finished session job's log
-      issues: write    # the once-per-window capacity notification
     strategy:
       fail-fast: false
       matrix:
@@ -1619,36 +1624,9 @@ jobs:
           print("::notice::%s -> %s: %s" % (ticket, final, body.splitlines()[0]))
           PY
 
-      # Notify ONCE per capacity window, not once per failed ticket — a paused
-      # queue with three tickets in flight is one event. The stable title is the
-      # dedupe key (same pattern as pipeline-failure-alert.yml).
-      - name: Notify once about a capacity pause
-        if: steps.classify.outputs.capacity == 'true'
-        uses: actions/github-script@v7
-        env:
-          RESETS_AT: ${{ steps.classify.outputs.resets_at }}
-        with:
-          script: |
-            const { owner, repo } = context.repo
-            const title = '⏸️ Agentic pipeline paused — provider capacity'
-            const body = [
-              `The dispatcher hit a provider usage limit and paused the queue until \`${process.env.RESETS_AT || 'the next reset'}\`.`,
-              '',
-              'This is capacity, not a broken ticket: affected tickets carry `blocked:capacity`, their attempt was not consumed, and the queue resumes by itself at the reset.',
-              '',
-              `[Run](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId})`,
-              '',
-              `cc @${owner}`,
-            ].join('\n')
-            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
-            const existing = open.data.find((i) => i.title === title && !i.pull_request)
-            if (existing) {
-              core.info(`Capacity pause already reported in #${existing.number} — not filing a second issue.`)
-            } else {
-              const created = await github.rest.issues.create({ owner, repo, title, body, assignees: [owner] })
-              core.info(`Opened #${created.data.number}`)
-            }
-
+      # The capacity NOTICE is not sent from here: this job runs once per ticket,
+      # and a paused queue with three tickets in flight is one event. The
+      # `notify-capacity` job sends it once, from the folded state.
       - name: Record this ticket's flag for the carry-forward job
         if: always()
         env:
@@ -1682,6 +1660,9 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: read
+    outputs:
+      paused: ${{ steps.fold.outputs.paused }}
+      resets_at: ${{ steps.fold.outputs.resets_at }}
     steps:
       # No `continue-on-error`, and gated on `claim` instead (contract §13).
       # `claim` writes a default state.json before it reads anything, so when
@@ -1715,6 +1696,7 @@ jobs:
           path: ${{ runner.temp }}/merge
 
       - name: Fold capacity pauses and refunds into the state
+        id: fold
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -1755,6 +1737,8 @@ jobs:
                   "noted_at": stamp,
               }
               print("::notice::Queue paused until %s" % state["capacity"]["paused_until"])
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("paused=true\nresets_at=%s\n" % (resets or ""))
           json.dump(state, open(sp, "w"), indent=2)
           PY
 
@@ -1767,3 +1751,116 @@ jobs:
           path: ${{ runner.temp }}/merge/state.json
           retention-days: 90
           if-no-files-found: warn
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 6. NOTIFY — one capacity notice per run, sent after the state is safe.
+  # ════════════════════════════════════════════════════════════════════════════
+  # Once per run, not once per ticket: a paused queue with three tickets in
+  # flight is one event. It is also once per capacity WINDOW, because `claim`
+  # dispatches nothing while a pause is in force — so a run that folds a new
+  # pause is the first run of a new window, and a second notice on the same
+  # open issue is news, not noise.
+  #
+  # WHO is paged: the WHO THIS ALERT PAGES block, identical to the alert
+  # templates' (ALERT_PAGE_TO, else a person who owns the repo). When it can
+  # page nobody — an org-owned repo with no variable — this job FAILS, and so
+  # the run goes red. That is deliberate (contract §13): the notice is filed
+  # either way, but a notice that reached nobody must not look delivered.
+  #
+  # Its own job, last, with nothing depending on it, so that failure costs
+  # nothing else: `lifecycle` has already labelled the tickets, `carry-forward`
+  # has already published the pause, and the queue still resumes by itself at
+  # the reset. "Re-run failed jobs" re-runs ONLY this job — set ALERT_PAGE_TO,
+  # re-run, and the page goes out. Failing inside `lifecycle` instead, that
+  # button would re-run a ticket transition and `carry-forward` with it,
+  # publishing this run's state over whatever newer runs had written since.
+  notify-capacity:
+    name: Notify about a capacity pause
+    needs: [carry-forward]
+    # `always()`, because one failed `lifecycle` leg must not silence another
+    # leg's pause; carry-forward's own success, because an unpublished pause is
+    # not in force and the notice would say that it was.
+    if: always() && needs.carry-forward.result == 'success' && needs.carry-forward.outputs.paused == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write    # the capacity notice issue
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          RESETS_AT: ${{ needs.carry-forward.outputs.resets_at }}
+          ALERT_PAGE_TO: ${{ vars.ALERT_PAGE_TO }}
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            // ── WHO THIS ALERT PAGES ── identical in every alert template (scripts/check_alert_pages.py
+            // runs each copy). An @mention of an ORGANIZATION notifies nobody and an organization
+            // cannot be assigned, so the repository owner is never paged blindly. In order: the
+            // ALERT_PAGE_TO repository variable (logins or org/team, comma- or space-separated);
+            // else the owner, when the owner is a person. When neither applies the issue is still
+            // filed, says "Nobody was paged", and the run FAILS: a page that reaches nobody must
+            // not look delivered.
+            async function alertRecipients() {
+              const { owner, repo } = context.repo
+              const names = (process.env.ALERT_PAGE_TO || '').split(/[\s,]+/).filter(Boolean).map((n) => n.replace(/^@/, ''))
+              // A login, or an org/team slug. Nothing else is ever embedded after an `@`.
+              const mentionable = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$/
+              const rejected = names.filter((n) => !mentionable.test(n))
+              const logins = [...new Set(names.filter((n) => mentionable.test(n)))]
+              if (logins.length) return { logins, whose: 'ALERT_PAGE_TO', rejected }
+              let ownerType
+              try {
+                ownerType = (await github.rest.repos.get({ owner, repo })).data.owner.type
+              } catch (e) {
+                core.warning(`could not read who owns ${owner}/${repo}: ${e.message}`)
+                return { logins: [], whose: 'this run could not read who owns the repository. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+              }
+              if (ownerType === 'User') return { logins: [owner], whose: 'the repository owner', rejected }
+              return { logins: [], whose: 'the repository owner is an organization, which an @mention does not notify. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+            }
+            function pageLine({ logins, whose }, what) {
+              if (!logins.length) return `**Nobody was paged:** ${whose}.`
+              return `cc ${logins.map((l) => '@' + l).join(', ')} (${whose}) — ${what}`
+            }
+            // Assign whoever the page names (the "assign" reason keeps them subscribed to later
+            // comments), then fail the run if the page named nobody or the variable was malformed.
+            async function page(issue_number, { logins, whose, rejected }) {
+              const { owner, repo } = context.repo
+              const people = logins.filter((l) => !l.includes('/')) // a team is mentioned, never assigned
+              if (people.length) {
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: people })
+                } catch (e) { // e.g. not a collaborator: the @mention is the page, this is extra
+                  core.warning(`#${issue_number}: could not assign ${people.join(', ')}: ${e.message}`)
+                }
+              }
+              if (rejected.length) core.setFailed(`ALERT_PAGE_TO names ${JSON.stringify(rejected)}, which is not a GitHub login or org/team`)
+              if (!logins.length) core.setFailed(`#${issue_number}: this alert paged NOBODY — ${whose}.`)
+            }
+            // ── end WHO THIS ALERT PAGES ──
+            // The stable title IS the dedupe key — change it and you fork the issue.
+            const title = '⏸️ Agentic pipeline paused — provider capacity'
+            const recipients = await alertRecipients()
+            const body = [
+              `The dispatcher hit a provider usage limit and paused the queue until \`${process.env.RESETS_AT || 'the next reset'}\`.`,
+              '',
+              'This is capacity, not a broken ticket: affected tickets carry `blocked:capacity`, their attempt was not consumed, and the queue resumes by itself at the reset.',
+              '',
+              `[Run](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId})`,
+              '',
+              pageLine(recipients, 'nothing to do unless the pauses keep coming.'),
+            ].join('\n')
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
+            const existing = open.data.find((i) => i.title === title && !i.pull_request)
+            let number
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
+              number = existing.number
+              core.info(`Commented on #${number}`)
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title, body })
+              number = created.data.number
+              core.info(`Opened #${number}`)
+            }
+            await page(number, recipients)

@@ -2,7 +2,8 @@
 """Alert pages reach a person — or the run says that they did not.
 
 WHY THIS EXISTS. The alert templates (pipeline-failure-alert, cron-health,
-frontend-uptime, migration-drift) used to @mention and assign `context.repo.owner`.
+frontend-uptime, migration-drift) and the dispatcher's capacity-pause notice
+(pipeline-dispatch) used to @mention and assign `context.repo.owner`.
 On an organization-owned repository that is an org: an @mention of an org notifies
 nobody and an org cannot be assigned, so the issue was filed, looked delivered, and
 reached no one. That is contract §13's worst shape — *could not do it* wearing the
@@ -11,8 +12,8 @@ ALERT_PAGE_TO repository variable, else the owner when the owner is a person), s
 who in the issue, and FAILS its run when nobody can be notified.
 
 The rule lives in a block copied into every alert template (a template must stay a
-single self-contained file after bootstrap). Four copies drift unless something
-reads all four, and a JavaScript string inside YAML is otherwise never executed
+single self-contained file after bootstrap). Five copies drift unless something
+reads all five, and a JavaScript string inside YAML is otherwise never executed
 before production. So this check does both.
 
 WHAT IS CHECKED, over every *.yml in templates/workflows/ and .github/workflows/:
@@ -54,11 +55,7 @@ ENV_LINE = "${{ vars.ALERT_PAGE_TO }}"
 BLIND = re.compile(r"@\$\{(?:context\.repo\.)?owner\}|assignees:\s*\[\s*(?:context\.repo\.)?owner\s*\]")
 # Keyed by basename: bootstrap moves a template from templates/workflows/ to
 # .github/workflows/ without changing what it does.
-KNOWN_BLIND = {
-    "pipeline-dispatch.yml":
-        "capacity-pause notice: the queue resumes by itself at the reset, and failing the "
-        "dispatch job over a missed page is a dispatcher change of its own — open follow-up",
-}
+KNOWN_BLIND = {}
 
 OWNER = "octo-owner"
 ENV = {

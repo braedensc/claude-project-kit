@@ -358,7 +358,8 @@ jobs:
         run: npm ci
 
       # The alert templates (pipeline-failure-alert, cron-health, frontend-uptime,
-      # migration-drift) share one recipient rule: ALERT_PAGE_TO, else a person who owns
+      # migration-drift) and pipeline-dispatch's capacity notice share one recipient
+      # rule: ALERT_PAGE_TO, else a person who owns
       # the repo, else the issue says "Nobody was paged" and the run fails — an @mention of
       # an org notifies nobody. The rule is JavaScript inside YAML that nothing else ever
       # executes before production, so this runs every copy under node against a mock
