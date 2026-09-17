@@ -407,31 +407,32 @@ These came out of reading the dispatcher's source for this build.
 - Whether the tool server's upload reads a file outside a session on a live dispatcher, and
   whether any user-level rule can take that server away from the chat lane (KIT-162).
 - That the anchored deny rules block a `Read` in a chat session. This rests on Claude Code's
-  permissions page, not on a live test (no ticket yet).
+  permissions page, not on a live test (KIT-174).
 - That the port rule refuses a second device. Card `CK-C4` measures it (KIT-117).
-- That the anchor survives a reboot: whether the system's own boot-time load of
-  `/etc/pf.conf` can run after the LaunchDaemon and drop it. Card `CK-C4` after a reboot
-  measures it (no ticket yet).
+- That the anchor survives a reboot. The race is real: the operating system's own
+  packet-filter job, `/System/Library/LaunchDaemons/com.apple.pfctl.plist`, runs
+  `pfctl -f /etc/pf.conf` at load with nothing ordering it against this LaunchDaemon (read on
+  macOS 26.6.2, 2026-09-17). Card `CK-C4` after a reboot measures it (KIT-174).
 - That a macOS update keeps `anchor "com.apple/*"` in `/etc/pf.conf`. Step 5 has you check
-  the line; re-check it after an update (no ticket yet).
+  the line; re-check it after an update (KIT-174).
 - What `pfctl -a <anchor> -s rules` prints for an anchor that was never loaded. `verify`
   reads an empty list, or an error naming the anchor, as not loaded; any other error as
-  unmeasured (no ticket yet).
+  unmeasured (KIT-174).
 - Whether the dispatcher gets `CYRUS_API_KEY`, `CYRUS_TEAM_ID` or `CYRUS_SERVER_PORT` from
   somewhere other than its env file, such as its service definition. `verify` reads the env
-  file only (no ticket yet).
+  file only (KIT-174).
 - Whether a front door's forwarded address passes the tracker or GitHub address check when
-  those are on. The code that enforces them was not read (no ticket yet).
+  those are on. The code that enforces them was not read (KIT-174).
 - Whether the config watcher sees an edit from an editor that replaces the file instead of
-  changing it. Only a `change` event reloads (`ConfigManager.js:59`) (no ticket yet).
+  changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174).
 - Whether Slack creates an app from a manifest whose request URL does not answer yet
-  (no ticket yet).
+  (KIT-174).
 - Whether the Slack tool server's tools the lane uses need scopes the chat app lacks. None
-  were added (no ticket yet).
+  were added (KIT-174).
 - That `verify` reads the env file exactly as the dispatcher's loader does. It matches
-  `NAME=value` lines, with an optional `export` (no ticket yet).
+  `NAME=value` lines, with an optional `export` (KIT-174).
 - That a live planning session holds the Slack server before its fence goes in. This rests
-  on the source, not a live test (no ticket yet).
+  on the source, not a live test (KIT-174).
 - That seeding an idea from the chat creates exactly one backlog ticket and starts nothing
   (KIT-117).
 
