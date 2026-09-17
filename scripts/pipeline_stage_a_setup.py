@@ -271,6 +271,8 @@ CONF_KEYS = {
     "OWNER_USER_ID": "the Linear user id notified on every filed plan",
     "LINEAR_KEY_ENV": "the env-var NAME holding the executor's Linear key",
     "KIT_REPO_URL": "the https URL the role account clones the kit from",
+    "PLANNED_REPO": "owner/repo whose ideas this Planning team plans — its committed "
+                    "delivery.json is the executor's only config",
 }
 
 
@@ -299,6 +301,9 @@ def validate_conf(conf):
     if role and role == os.environ.get("USER"):
         errors.append("ROLE_ACCOUNT is your own login (%s) — the executor must run "
                       "as a separate account so a session cannot read its key" % role)
+    planned = conf.get("PLANNED_REPO", "")
+    if planned and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", planned):
+        errors.append("PLANNED_REPO must be owner/repo (got %r)" % planned)
     url = conf.get("KIT_REPO_URL", "")
     if url and not url.startswith("https://"):
         errors.append("KIT_REPO_URL must be https:// (got %r)" % url)
@@ -505,6 +510,23 @@ INITIALS_PLACEHOLDERS = frozenset((INITIALS_PLACEHOLDER.lower(), "yourinitials",
 # printed beside it — a card nobody believes is a card nobody does.
 # --------------------------------------------------------------------------- #
 CARDS = {
+    "CA-DELIVERY": {
+        "title": "Turn the plan kind on in the planned repository's delivery config",
+        "measured": True,
+        "why": ("The executor reads only the planned repository's committed "
+                "delivery.json, and rejects every tree until that file carries "
+                "`linear.findingTicket` and the two provenance label ids. That block is "
+                "the switch that lets a machine's proposal become tickets, so it lives "
+                "in a file a person reviews and merges — never in a file this installer "
+                "writes."),
+        "do": ["The block to add was printed above, with this workspace's label ids.",
+               "Add it to the `linear` section of the planned repository's",
+               "delivery.json on a branch, open a pull request, and merge it yourself.",
+               "Then run the config validator in that repository:",
+               "    python3 scripts/check_delivery_config.py",
+               "Nothing to sign: this step reads the merged file on the next run."],
+        "good": "the next run reads the default branch and marks this step ALREADY-DONE",
+    },
     "CA-ENTRY": {
         "title": "Apply the Planning entry to the dispatcher's config",
         "why": ("The dispatcher's config is a session's supervision. A program that "
@@ -809,7 +831,6 @@ class Host(object):
 # Each returns (ok, detail, notes); `ok` true means ALREADY satisfied.
 # --------------------------------------------------------------------------- #
 ROLE_ENV_FILE = ".stage-a/env"
-ROLE_CONFIG_FILE = ".stage-a/config.json"
 
 # The ticket that must close before the executor has anything to run. Named in
 # one place so the step, the card and the selftest cannot disagree about it.
@@ -906,38 +927,136 @@ def step_credentials(ctx, apply_it):
     return False, "wrote %s to %s's env file (mode 600)" % (name, account), []
 
 
-def step_config(ctx, apply_it):
-    """The installer's half of the executor's config. WHICH file the executor
-    reads is the config seam (KIT-136) — until that closes, this file is written
-    for the record and the executor does not read it, and the note says so."""
-    ids = ctx.state.data.get("ids") or {}
-    cfg = {
-        "schema": "stage-a-executor-config/0",
-        "planning_team_key": ctx.conf["PLANNING_TEAM_KEY"],
-        "planning_team_id": ids.get("planning_team_id"),
-        "owner_user_id": ctx.conf["OWNER_USER_ID"],
-        "notify": "subscribe",
-        "linear_key_env": ctx.conf["LINEAR_KEY_ENV"],
-        "label_ids": ids.get("labels") or {},
+# --------------------------------------------------------------------------- #
+# The planned repository's delivery config — the executor's ONLY config.
+#
+# THE SEAM THIS CLOSES (KIT-136). This installer used to write
+# ~/.stage-a/config.json under the role account and the executor never read it:
+# the executor reads the planned repository's committed delivery.json, and turns
+# the plan kind off unless that file carries `linear.findingTicket`. So a gate
+# switched on with a green installer would reject every tree, on a file nobody
+# had been told to change.
+#
+# WHY THE COMMITTED FILE AND NOT A MACHINE-LOCAL ONE. `linear.findingTicket` is
+# the switch that lets an agent's proposal become tickets. A switch like that
+# belongs in a file a person reviews and merges, read from the default branch
+# (contract §1, §2), not in an unreviewed file under a role account. So this
+# step MEASURES the committed file and, when it is not ready, prints the exact
+# block for you to add in a pull request of your own.
+# --------------------------------------------------------------------------- #
+PLAN_KIND_LABELS = ("provenance:agent", "provenance:epic")
+
+
+class GitHubReader(object):
+    """Reads ONE file from a repository's default branch through the operator's
+    own `gh` login. Read-only by construction: two fixed GET paths."""
+
+    def _gh(self, args):
+        import subprocess
+        try:
+            proc = subprocess.run(["gh", "api"] + args, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, "gh could not run (%s)" % str(exc)[:120]
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace")
+            if "404" in err or "Not Found" in err:
+                return 404, err[:160]
+            return None, "gh api failed: %s" % err.strip()[:160]
+        return 0, proc.stdout.decode("utf-8", "replace")
+
+    def delivery_config(self, repo):
+        """(doc, branch, None) / (None, branch, "absent") / (None, None, reason)."""
+        import base64
+        code, out = self._gh(["repos/%s" % repo, "--jq", ".default_branch"])
+        if code != 0:
+            return None, None, (out if code is None else "the repository %s was not found" % repo)
+        branch = out.strip()
+        code, out = self._gh(["repos/%s/contents/delivery.json?ref=%s" % (repo, branch),
+                              "--jq", ".content"])
+        if code == 404:
+            return None, branch, "absent"
+        if code != 0:
+            return None, branch, out
+        try:
+            return json.loads(base64.b64decode(out.strip()).decode("utf-8")), branch, None
+        except (ValueError, TypeError) as exc:
+            return None, branch, "delivery.json on %s is not JSON (%s)" % (branch, exc)
+
+
+def delivery_gaps(doc, owner_user_id):
+    """Every reason the committed config would make the executor refuse or
+    error on a valid tree — in ONE pass, mirroring the executor's own checks."""
+    gaps = []
+    if doc.get("version") != 1:
+        gaps.append("`version` is %r, not 1 — the executor refuses to guess" % doc.get("version"))
+    linear = doc.get("linear") or {}
+    if not linear.get("teamKey"):
+        gaps.append("`linear.teamKey` is missing — the tree has no work team to land in")
+    finding = linear.get("findingTicket")
+    if not isinstance(finding, dict):
+        gaps.append("`linear.findingTicket` is missing — the plan kind is OFF, so every "
+                    "tree is rejected")
+        finding = {}
+    landing = finding.get("landing")
+    if finding and not (linear.get("stateIds") or {}).get(landing or ""):
+        gaps.append("`linear.findingTicket.landing` is %r, which does not resolve in "
+                    "`linear.stateIds`" % landing)
+    if finding and landing not in (None, "raw"):
+        gaps.append("`linear.findingTicket.landing` is %r — a plan must land in the "
+                    "intake (raw) state, where nothing starts it" % landing)
+    if finding and not finding.get("ownerUserId"):
+        gaps.append("`linear.findingTicket.ownerUserId` is unset — a plan nobody is "
+                    "notified about dies in the backlog")
+    elif finding and owner_user_id and finding.get("ownerUserId") != owner_user_id:
+        gaps.append("`linear.findingTicket.ownerUserId` names a different person than "
+                    "OWNER_USER_ID in your conf")
+    ids = (linear.get("labels") or {}).get("ids") or {}
+    for name in PLAN_KIND_LABELS:
+        if not ids.get(name):
+            gaps.append("`linear.labels.ids[%r]` is missing or empty — the executor "
+                        "cannot mark what it files" % name)
+    return gaps
+
+
+def delivery_patch(ctx):
+    """The exact JSON a person adds to `linear` in the planned repository."""
+    labels = (ctx.state.data.get("ids") or {}).get("labels") or {}
+    return {
+        "findingTicket": {"landing": "raw", "notify": "subscribe",
+                          "ownerUserId": ctx.conf["OWNER_USER_ID"]},
+        "labels": {"ids": dict((n, labels.get(n) or "<run the tracker step first>")
+                               for n in PLAN_KIND_LABELS)},
     }
-    body = json.dumps(cfg, indent=2, sort_keys=True) + "\n"
-    notes = ["the executor does not read this file yet: it reads only its project's "
-             "delivery config (KIT-136). Written so the values are recorded in one "
-             "place, not because anything consumes them."]
-    account = ctx.conf["ROLE_ACCOUNT"]
-    present = ctx.host.file_present(account, ROLE_CONFIG_FILE)
-    if present is None:
-        raise Unknown("could not look for the executor's config file",
-                      "run this from a terminal as yourself")
-    if present and ctx.state.data["notes"].get("config_body") == body:
-        return True, "executor config present and unchanged", notes
-    if not apply_it:
-        return False, ("would %s the executor's config (%d keys)"
-                       % ("rewrite" if present else "write", len(cfg))), notes
-    ctx.runner.do("write the executor's config", lambda: ctx.host.write_role_file(
-        account, ROLE_CONFIG_FILE, body))
-    ctx.state.data["notes"]["config_body"] = body
-    return False, "wrote the executor's config (%d keys)" % len(cfg), notes
+
+
+def step_delivery_config(ctx, apply_it):
+    """Measure the planned repository's committed delivery config. Never write
+    it: it is reviewed and merged by a person."""
+    repo = ctx.conf["PLANNED_REPO"]
+    if ctx.github is None:
+        raise Unknown("no GitHub reader in this pass, so %s's delivery config could "
+                      "not be measured" % repo, "run this where `gh` is logged in")
+    doc, branch, why = ctx.github.delivery_config(repo)
+    if doc is None and why == "absent":
+        ctx.state.data["notes"]["delivery_gaps"] = ["delivery.json is absent on %s" % branch]
+        raise Blocked("CA-DELIVERY")
+    if doc is None:
+        raise Unknown("could not read %s's delivery config: %s" % (repo, why),
+                      "check `gh auth status`, then run the same command again")
+    gaps = delivery_gaps(doc, ctx.conf.get("OWNER_USER_ID"))
+    if gaps:
+        ctx.state.data["notes"]["delivery_gaps"] = gaps
+        ctx.say("")
+        ctx.say("----- %s's delivery.json on %s is not ready for plans -----" % (repo, branch))
+        for gap in gaps:
+            ctx.say("  - " + gap)
+        ctx.say("")
+        ctx.say("Merge these keys into its `linear` block (keep everything else):")
+        ctx.say(json.dumps(delivery_patch(ctx), indent=2))
+        raise Blocked("CA-DELIVERY")
+    ctx.state.data["notes"].pop("delivery_gaps", None)
+    return True, "%s's delivery.json on %s turns the plan kind on" % (repo, branch), []
 
 
 def step_executor_job(ctx, apply_it):
@@ -1005,7 +1124,8 @@ STEPS = (
     ("preflight", "your conf, and the role account", step_preflight),
     ("tracker", "the Planning team and the labels", step_tracker),
     ("credentials", "the role account's own env file, mode 600", step_credentials),
-    ("config", "the executor's config file", step_config),
+    ("delivery-config", "the planned repository's committed delivery config",
+     step_delivery_config),
     ("executor-job", "a reader that runs the executor — checked before the entry",
      step_executor_job),
     ("dispatcher-entry", "the Planning entry, composed and handed to you",
@@ -1021,8 +1141,9 @@ STEPS = (
 # Context
 # --------------------------------------------------------------------------- #
 class Ctx(object):
-    def __init__(self, conf, runner, tracker, host, state, out=None):
+    def __init__(self, conf, runner, tracker, host, state, out=None, github=None):
         self.conf = conf
+        self.github = github
         self.runner = runner
         self.tracker = tracker
         self.host = host
@@ -1071,6 +1192,10 @@ def print_card(ctx, cid):
     ctx.say("")
     ctx.say(" GOOD: %s" % card["good"])
     ctx.say("")
+    if card.get("measured"):
+        ctx.say(" Then run the same command again — this step measures it:")
+        ctx.say("     python3 %s run" % _self_path())
+        return
     ctx.say(" Then record that you did it, and run the same command again:")
     ctx.say("     python3 %s attest %s --initials %s --note '...'"
             % (_self_path(), cid, INITIALS_PLACEHOLDER))
@@ -1404,6 +1529,25 @@ class FakeHost(object):
 
 ALL_LABELS = dict((name, "lbl-%d" % i) for i, name in enumerate(REQUIRED_LABELS))
 
+READY_DELIVERY = {
+    "version": 1,
+    "linear": {"teamKey": "PROD",
+               "stateIds": {"raw": "s-raw", "ready": "s-ready"},
+               "labels": {"ids": {"provenance:agent": "lbl-0", "provenance:epic": "lbl-1"}},
+               "findingTicket": {"landing": "raw", "notify": "subscribe",
+                                 "ownerUserId": "owner-1"}},
+}
+
+
+class FakeGitHub(object):
+    def __init__(self, doc=READY_DELIVERY, why=None):
+        self.doc, self.why = doc, why
+
+    def delivery_config(self, repo):
+        if self.why:
+            return None, ("main" if self.why == "absent" else None), self.why
+        return json.loads(json.dumps(self.doc)), "main", None
+
 GOOD_CONF = {
     "ROLE_ACCOUNT": "_planclaw",
     "PLANNING_TEAM_KEY": "PLAN",
@@ -1411,13 +1555,15 @@ GOOD_CONF = {
     "OWNER_USER_ID": "owner-1",
     "LINEAR_KEY_ENV": "STAGE_A_LINEAR_API_KEY",
     "KIT_REPO_URL": "https://github.com/x/kit.git",
+    "PLANNED_REPO": "example-org/product",
 }
 
 
-def _ctx(state_root, conf=None, tracker=None, host=None, secret="k" * 40):
+def _ctx(state_root, conf=None, tracker=None, host=None, secret="k" * 40, github=None):
     ctx = Ctx(dict(GOOD_CONF if conf is None else conf), Runner(apply_it=False),
               FakeLinear() if tracker is None else tracker,
-              FakeHost() if host is None else host, State(state_root))
+              FakeHost() if host is None else host, State(state_root),
+              github=FakeGitHub() if github is None else github)
     ctx.prompt_secret = lambda name: secret
     return ctx
 
@@ -1586,7 +1732,7 @@ def selftest():
         rows = dict((sid, ctx.state.outcome(sid)) for sid, _t, _f in STEPS)
         check("dry-run-tracker-would-change", rows["tracker"], WOULD_CHANGE)
         check("dry-run-credentials-would-change", rows["credentials"], WOULD_CHANGE)
-        for sid in ("tracker", "credentials", "config"):
+        for sid in ("tracker", "credentials", "delivery-config"):
             detail = (ctx.state.data["steps"].get(sid) or {}).get("detail") or ""
             check("dry-run-reason:%s" % sid, len(detail) > 10, True)
         check("dry-run-created-nothing", ctx.tracker.created, [])
@@ -1622,13 +1768,14 @@ def selftest():
         # 8. IDEMPOTENT. A second apply over the same machine changes nothing it
         #    already did and records ALREADY-DONE.
         again = Ctx(ctx.conf, Runner(apply_it=False), ctx.tracker, ctx.host,
-                    State(ctx.state.root))
+                    State(ctx.state.root), github=FakeGitHub())
         again.prompt_secret = lambda name: "SHOULD-NOT-BE-ASKED"
         again._out = []
         cmd_run(again, dry_run=False)
         check("second-run-credentials-already-done",
               again.state.outcome("credentials"), ALREADY_DONE)
-        check("second-run-config-already-done", again.state.outcome("config"), ALREADY_DONE)
+        check("second-run-delivery-already-done",
+              again.state.outcome("delivery-config"), ALREADY_DONE)
         check("second-run-created-nothing-new", ctx.tracker.created, [])
 
         # 9. VERIFY re-measures every step, never stops early, never mutates, and
@@ -1715,7 +1862,63 @@ def selftest():
             os.environ.update(saved)
 
         # 14. Every card names a real sign-off, and every sign-off has a card.
-        check("cards-match-attestations", sorted(CARDS), sorted(ATTESTATIONS))
+        check("signed-cards-match-attestations",
+              sorted(c for c in CARDS if not CARDS[c].get("measured")), sorted(ATTESTATIONS))
+        check("measured-cards-are-not-signable",
+              [c for c in CARDS if CARDS[c].get("measured") and c in ATTESTATIONS], [])
+
+        # 16. THE CONFIG SEAM (KIT-136). The executor reads ONLY the planned
+        #     repository's committed delivery.json. The installer measures that file
+        #     and never writes it; an unready file BLOCKS with the exact block to add.
+        dctx = _ctx(os.path.join(tmp, "delivery-ready"),
+                    tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS))
+        dctx._out = []
+        cmd_verify(dctx)
+        check("delivery-ready-already-done", dctx.state.outcome("delivery-config"), ALREADY_DONE)
+        off = json.loads(json.dumps(READY_DELIVERY))
+        del off["linear"]["findingTicket"]
+        del off["linear"]["labels"]["ids"]["provenance:agent"]
+        octx = _ctx(os.path.join(tmp, "delivery-off"),
+                    tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS),
+                    github=FakeGitHub(doc=off))
+        octx._out = []
+        ocode = cmd_run(octx, dry_run=True)
+        check("delivery-off-blocks", octx.state.outcome("delivery-config"), BLOCKED)
+        check("delivery-off-exit", ocode, EX_BLOCKED)
+        printed = "\n".join(octx._out)
+        check("delivery-off-prints-finding-block", '"findingTicket"' in printed, True)
+        check("delivery-off-prints-resolved-label-id",
+              '"provenance:agent": "%s"' % ALL_LABELS["provenance:agent"] in printed, True)
+        check("delivery-off-names-both-gaps",
+              "findingTicket` is missing" in printed and "provenance:agent" in printed, True)
+        check("delivery-off-stops-before-entry",
+              octx.state.outcome("dispatcher-entry"), None)
+        actx2 = _ctx(os.path.join(tmp, "delivery-absent"),
+                     tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS),
+                     github=FakeGitHub(why="absent"))
+        actx2._out = []
+        cmd_verify(actx2)
+        check("delivery-absent-blocks", actx2.state.outcome("delivery-config"), BLOCKED)
+        uctx2 = _ctx(os.path.join(tmp, "delivery-unread"),
+                     tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS),
+                     github=FakeGitHub(why="gh api failed: HTTP 401"))
+        uctx2._out = []
+        cmd_verify(uctx2)
+        check("delivery-unreadable-unknown", uctx2.state.outcome("delivery-config"), UNKNOWN)
+        # the gap check mirrors every executor refusal, in one pass
+        bad = json.loads(json.dumps(READY_DELIVERY))
+        bad["linear"]["findingTicket"]["landing"] = "ready"
+        bad["linear"]["findingTicket"]["ownerUserId"] = "someone-else"
+        gaps = delivery_gaps(bad, "owner-1")
+        check("delivery-gap-landing-not-raw", any("intake" in g for g in gaps), True)
+        check("delivery-gap-owner-mismatch", any("different person" in g for g in gaps), True)
+        check("delivery-gaps-all-at-once", len(gaps) >= 2, True)
+        check("delivery-ready-no-gaps", delivery_gaps(READY_DELIVERY, "owner-1"), [])
+        check("installer-never-writes-delivery", "delivery.json\"" in "".join(
+            ln for ln in src.splitlines() if "write_role_file" in ln), False)
+        check("conf-flags-bad-planned-repo",
+              any("PLANNED_REPO" in e for e in validate_conf(dict(GOOD_CONF, PLANNED_REPO="nope"))),
+              True)
         check("probe-card-checks-subagent",
               "subagent" in " ".join(CARDS["CA-PROBE"]["do"]), True)
         check("placeholder-unsignable", INITIALS_PLACEHOLDER.lower() in INITIALS_PLACEHOLDERS, True)
@@ -1776,7 +1979,8 @@ def _live_ctx(conf, state_home):
     if not markers:
         key = os.environ.get(conf.get("LINEAR_KEY_ENV", "")) or ""
         tracker = LinearTransport(key) if len(key) >= 20 else None
-    ctx = Ctx(conf, Runner(apply_it=False), tracker, Host(), State(state_home))
+    ctx = Ctx(conf, Runner(apply_it=False), tracker, Host(), State(state_home),
+              github=GitHubReader())
     if markers:
         ctx.say("AGENT ENVIRONMENT (%s): no tracker key is read in this pass, so the "
                 "tracker row reports UNKNOWN." % ", ".join(markers))
