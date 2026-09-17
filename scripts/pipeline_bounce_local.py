@@ -570,7 +570,10 @@ CONFIG_DEFAULTS = {
     "human_pending_checks": list(DEFAULT_HUMAN_PENDING_CHECKS),
     # KIT-131: the criteria snapshot pass that runs at the start of every `run`. The
     # store defaults to <state_dir>/basis-snapshots, which is where the poller's basis
-    # resolver reads tier 2 from. `false` turns the pass off, and the pass says OFF.
+    # resolver reads tier 2 from. `false` turns the pass off, and the pass says OFF. The
+    # poller still reads the snapshots already stored; the OFF line names that directory.
+    # The pass also reads `dispatcher_app_user_id` above: only that app user's sessions
+    # count, and without it no snapshot is ever replaced.
     "basis_snapshot_dir": "",
     "criteria_snapshots": True,
 }
@@ -3660,7 +3663,15 @@ def criteria_snapshots(cfg, state_dir, dry_run, deadline):
     "nothing changed" — a missing module, a missing key, or a tracker that would not list
     sessions comes back not-ok, and the caller counts it as a problem on the heartbeat."""
     if cfg.get("criteria_snapshots") is False:
-        return {"ok": True, "line": "criteria snapshots: OFF (config criteria_snapshots: false)",
+        # OFF stops the writer, not the reader: the poller has no such switch and keeps
+        # reading every snapshot already in the store. Said on every run, with the one act
+        # that stops it, so "off" is never read as "reviews use the live ticket".
+        store = os.path.expanduser(cfg.get("basis_snapshot_dir") or os.path.join(state_dir, "basis-snapshots"))
+        return {"ok": True,
+                "line": "criteria snapshots: OFF (config criteria_snapshots: false) — no snapshot "
+                        "is taken or replaced and no change notice is posted, but the review "
+                        "poller still reads the snapshots already in %s; move that directory "
+                        "aside to stop it" % store,
                 "problems": [], "counts": None}
     try:
         import pipeline_criteria_snapshot as pcs
@@ -3718,7 +3729,7 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     except BounceError as exc:
         sys.stderr.write("FAIL: could not build this pass's target list: %s\n" % exc)
         write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
-                        result="error", detail=str(exc.public or exc),
+                        result="error", detail=str(exc.public or exc), dry_run=bool(dry_run),
                         snapshots=snap["counts"], problems=snap["problems"][:20])
         return EXIT_USAGE
     if not targets:
@@ -3727,7 +3738,7 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
               % state_dir)
         write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
                         result="problems" if snap["problems"] else "idle", considered=0,
-                        snapshots=snap["counts"], problems=snap["problems"][:20])
+                        dry_run=bool(dry_run), snapshots=snap["counts"], problems=snap["problems"][:20])
         return EXIT_USAGE if snap["problems"] else EXIT_OK
 
     worst, done, problems, timed_out = EXIT_OK, 0, list(snap["problems"]), False
@@ -6236,6 +6247,26 @@ def selftest():
             check("…and leaves a heartbeat saying it ran and found nothing",
                   (beat["schema"], beat["result"], beat["considered"]), (HEARTBEAT_SCHEMA, "idle", 0))
             check("the heartbeat records when the pass finished", bool(beat.get("finished_at")), True)
+            # A dry run's heartbeat says so on EVERY path, so snapshot counts from a rehearsal
+            # are never read as snapshots that exist.
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_pass(base_cfg, tmp, True, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("a dry run's idle heartbeat says it was a dry run",
+                  (beat["result"], beat.get("dry_run")), ("idle", True))
+            saved_targets = globals()["run_targets"]
+
+            def unreadable_targets(sd, c):
+                raise BounceError("simulated: the ledger could not be read")
+            globals()["run_targets"] = unreadable_targets
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = run_pass(base_cfg, tmp, True, 60)
+            finally:
+                globals()["run_targets"] = saved_targets
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("…and so does its error heartbeat",
+                  (rc, beat["result"], beat.get("dry_run")), (EXIT_USAGE, "error", True))
 
             # Targets: the poller's outcome records, plus any PR this driver already spent
             # a bounce on — a round trip must stay in view until its budget resolves.
@@ -6305,6 +6336,10 @@ def selftest():
             off = criteria_snapshots(dict(CONFIG_DEFAULTS, criteria_snapshots=False), tmp, False, None)
             check("criteria_snapshots: false is OFF, said by name, not a problem",
                   (off["ok"], "OFF" in off["line"], off["problems"]), (True, True, []))
+            check("…and OFF says the poller still reads the snapshots already stored, and names "
+                  "the directory to move aside to stop it",
+                  ("poller still reads the snapshots already in %s" % os.path.join(tmp, "basis-snapshots")
+                   in off["line"], "move that directory aside" in off["line"]), (True, True))
             keyless = dict(CONFIG_DEFAULTS, linear_api_key_env="STAGE_E_TEST_KEY_ABSENT_131")
             os.environ.pop("STAGE_E_TEST_KEY_ABSENT_131", None)
             nokey = criteria_snapshots(keyless, tmp, False, None)
@@ -6334,14 +6369,18 @@ def selftest():
 
                 def fine(cfg_, sd, call, dry_run=False, deadline=None):
                     seen["dir"] = cfg_.get("basis_snapshot_dir")
+                    seen["app_user"] = pcs_mod.app_user_of(cfg_)
                     return {"taken": ["KIT-7"], "replaced": [], "notices": [], "unchanged": 0,
                             "reads": 1, "capped": [], "problems": [], "detail": []}
                 pcs_mod.snapshot_pass = fine
-                good = criteria_snapshots(keyed, tmp, False, None)
+                good = criteria_snapshots(dict(keyed, dispatcher_app_user_id="app-1"), tmp, False, None)
                 check("a clean pass is ok, counted, and uses <state_dir>/basis-snapshots — where "
                       "the poller's resolver reads tier 2",
                       (good["ok"], good["counts"]["taken"], seen["dir"]),
                       (True, 1, os.path.join(tmp, "basis-snapshots")))
+                check("…and the pass is handed the dispatcher's app user, which decides whose "
+                      "sessions count and whether a replacement can be checked",
+                      seen["app_user"], "app-1")
             finally:
                 pcs_mod.snapshot_pass, pcs_mod.linear_transport = saved_pass, saved_transport
                 os.environ.pop("STAGE_E_TEST_KEY_131", None)

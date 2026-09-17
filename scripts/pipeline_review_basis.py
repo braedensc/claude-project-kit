@@ -42,11 +42,11 @@ THE KIT-92 SPIKE — RECORDED HERE, NOT JUST IN THE ADR
 
   **Conclusion: tier 1 is not implementable from what is verifiable here. Tier 3 (live +
   flag) is the shipped default.** `resolve_tier1()` below is a real, tested interface —
-  not a placeholder comment — so that the day someone confirms a working history query
-  (see the candidate query in the phase doc handed to Braeden), wiring it in is a change
-  to ONE function's body, not to any caller. Tier 2 was the consumer half only until
-  2026-09-16; scripts/pipeline_criteria_snapshot.py (KIT-131) now writes the snapshots
-  `resolve_tier2` reads, from the bounce driver's pass.
+  not a placeholder comment — so that the day someone confirms a working history query,
+  wiring it in is a change to ONE function's body, not to any caller. No history query
+  for tier 1 has been run against a live tracker (no ticket yet). Tier 2 was the consumer
+  half only until 2026-09-16; scripts/pipeline_criteria_snapshot.py (KIT-131) now writes
+  the snapshots `resolve_tier2` reads, from the bounce driver's pass.
 
 WHY resolve_tier1's SIGNATURE IS THE FORGERY-RESISTANCE ARGUMENT
 
@@ -209,6 +209,11 @@ def resolve_tier2(ticket_id, snapshot_dir):
     the live tier, which says it cannot see the criteria at delegation. The writer's own
     pass reports an unreadable snapshot as a problem in the driver's heartbeat.
 
+    None means NO snapshot. A snapshot whose acceptance-criteria list is EMPTY is not
+    None: it is an answer — the ticket had no criteria when a person delegated it — and
+    it is returned with that empty list. Reading it as "no snapshot" would make criteria
+    added after delegation, possibly by the session, the basis.
+
     The answer carries what the snapshot knows about its own lag: `delegated_at` and
     `edited_before_snapshot` (True, False, or None when the history could not tell).
     """
@@ -222,9 +227,9 @@ def resolve_tier2(ticket_id, snapshot_dir):
         return None
     if not isinstance(doc, dict) or doc.get("schema") != SNAPSHOT_SCHEMA:
         return None
-    ac = [s for s in (doc.get("acceptance_criteria") or []) if str(s).strip()]
-    if not ac:
+    if not isinstance(doc.get("acceptance_criteria"), list):
         return None
+    ac = [s for s in doc["acceptance_criteria"] if str(s).strip()]
     edited = doc.get("edited_before_snapshot")
     return {"acceptance_criteria": ac,
             "out_of_scope": [s for s in (doc.get("out_of_scope") or []) if str(s).strip()],
@@ -255,7 +260,9 @@ def _criteria_changed(tier, data, issue):
     from live is still an edit after delegation: True. A match is False only when the
     snapshot recorded that the description was NOT edited in that window. Edited, or
     unknown, and a match proves nothing — an edit made before the snapshot is inside
-    it — so the answer is None.
+    it — so the answer is None. A snapshot with no criteria follows the same rule:
+    True once live has criteria, False while live has none too and the window showed
+    no edit.
 
     THE DEFECT THIS REPLACES. This was `issue.updatedAt > issue.startedAt`. That
     is the RECORD's modification time — bumped by a state move, a label, an
@@ -286,13 +293,16 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
     already reads: acceptance_criteria[], out_of_scope[], basis_tier,
     criteria_changed_after_delegation.
 
-    Tiers are tried in trust order (1 -> 2 -> 3) and the first with a NON-EMPTY
-    acceptance-criteria list wins — an empty tier-1/2 answer is not "found nothing
-    useful", it is "this mechanism could not answer", so the search continues. If
-    every tier comes back empty, the returned basis is honestly empty and
-    `basis_tier` names the last tier tried (`live`) — the reviewer declines on an
-    empty list regardless of which tier produced it, so naming the tier here is for
-    the human reading the eventual PR comment, not for any downstream branching.
+    Tiers are tried in trust order (1 -> 2 -> 3). Tier 1 wins only with a NON-EMPTY
+    acceptance-criteria list — an empty tier-1 answer is "this mechanism could not
+    answer", so the search continues. Tier 2 wins whenever a snapshot exists, even an
+    empty one: a snapshot with no criteria says the ticket had none when a person
+    delegated it, so the basis is that empty list — basis_tier `reconciler`, and the
+    reviewer declines. Criteria added since never become the basis by falling through
+    to the live tier; `criteria_changed_after_delegation` is True when live now has
+    criteria. If every tier comes back empty, the basis is honestly empty and
+    `basis_tier` names the tier that answered — `reconciler` for an empty snapshot,
+    `live` otherwise. The poller words its decline by that tier.
 
     `criteria_changed_after_delegation` is TRUE, FALSE or NONE, and None is not
     False: only a tier that can see what the criteria said AT DELEGATION can
@@ -309,7 +319,7 @@ def resolve_basis(ticket_id, issue, snapshot_dir=None, history_fetcher=None):
         tier, data = "history", t1
     if data is None:
         t2 = resolve_tier2(ticket_id, snapshot_dir)
-        if t2 and t2.get("acceptance_criteria"):
+        if t2 is not None:
             tier, data = "reconciler", t2
     if data is None:
         tier, data = "live", resolve_tier3(issue)
@@ -364,7 +374,13 @@ def run(args):
             return EXIT_USAGE
 
     basis = resolve_basis(args.ticket_id, issue, args.snapshot_dir)
-    if not basis["acceptance_criteria"]:
+    if not basis["acceptance_criteria"] and basis["basis_tier"] == "reconciler":
+        sys.stderr.write(
+            "NOTE: %s had no acceptance criteria when a person delegated it (the criteria "
+            "snapshot holds none). Criteria added since are not the basis; the reviewer will "
+            "decline. Remove the delegation and delegate the ticket again to make the current "
+            "criteria the basis.\n" % args.ticket_id)
+    elif not basis["acceptance_criteria"]:
         sys.stderr.write(
             "NOTE: %s carries no acceptance criteria reachable by any tier (tier tried: "
             "%s). The basis is honestly empty; the reviewer will decline on it, which is "
@@ -450,7 +466,11 @@ def selftest():
         empty = os.path.join(tmp, "KIT-4.json")
         with open(empty, "w", encoding="utf-8") as fh:
             json.dump({"schema": SNAPSHOT_SCHEMA, "acceptance_criteria": []}, fh)
-        check("tier2 with an empty ac list is None (search continues)", resolve_tier2("KIT-4", tmp), None)
+        check("tier2 with an empty ac list is an ANSWER — no criteria at delegation — never "
+              "None", (resolve_tier2("KIT-4", tmp) or {}).get("acceptance_criteria"), [])
+        with open(os.path.join(tmp, "KIT-13.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": SNAPSHOT_SCHEMA}, fh)
+        check("tier2 with no ac list at all is not a snapshot: None", resolve_tier2("KIT-13", tmp), None)
         with open(os.path.join(tmp, "KIT-5.json"), "w", encoding="utf-8") as fh:
             fh.write("not json")
         check("tier2 malformed JSON is None, not a crash", resolve_tier2("KIT-5", tmp), None)
@@ -551,6 +571,18 @@ def selftest():
         check("tier 2 reads no clock: a bumped updatedAt changes nothing",
               resolve_basis("KIT-8", issue_edited_after, snapshot_dir=tmp)["criteria_changed_after_delegation"],
               False)
+        # A ticket delegated with NO criteria, and criteria added since (by anyone, the
+        # session included). The snapshot is the answer; the added criteria are not the basis.
+        snap(tmp, "KIT-8", [], [], edited=False)
+        added_later = resolve_basis("KIT-8", issue_with_ac, snapshot_dir=tmp)
+        check("an EMPTY snapshot is the basis: tier reconciler, no criteria, and changed=True "
+              "because live now has some",
+              (added_later["basis_tier"], added_later["acceptance_criteria"],
+               added_later["criteria_changed_after_delegation"]), ("reconciler", [], True))
+        still_empty = resolve_basis("KIT-8", {"description": "still no criteria"}, snapshot_dir=tmp)
+        check("an empty snapshot and a live ticket still without criteria: reconciler, NOT changed",
+              (still_empty["basis_tier"], still_empty["acceptance_criteria"],
+               still_empty["criteria_changed_after_delegation"]), ("reconciler", [], False))
         try:
             import pipeline_criteria_snapshot as writer
             check("the resolver and the writer agree on the snapshot's kind",
@@ -643,7 +675,8 @@ def selftest():
           "tier 1 immune to post-delegation edits by construction, edit-flag computed "
           "from the live ticket regardless of tier, empty basis is honest not a crash, "
           "read-only against Linear; tier 2 reads only the writer's document, and a match "
-          "with a snapshot that was edited before it was taken, or cannot say, is unknown")
+          "with a snapshot that was edited before it was taken, or cannot say, is unknown; a "
+          "snapshot with no criteria is the basis, never a fall-through to criteria added since")
     return 0
 
 
