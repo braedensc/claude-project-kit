@@ -53,8 +53,18 @@ THE FENCE — the one security choice, and how it is enforced
   with no error, so this file refuses to write one.
 
   WHAT THE PLANNER KEEPS, and why each is needed: Read/Grep/Glob to decompose
-  against real code, Write to emit its proposal file, and Task/Agent because the
-  planning procedure's rubric panel is five independent passes in fresh contexts.
+  against real code, and Task/Agent because the planning procedure's rubric panel
+  is five independent passes in fresh contexts.
+
+  IT DOES NOT KEEP `Write`. An earlier version of this fence kept it, for the
+  proposal file. The dispatcher's OS sandbox confines only the shell commands a
+  session runs, not the in-process Write tool, and the dispatcher hot-reloads its
+  own config file and loads a `.mcp.json` from the session's working directory. A
+  planner steered by the idea's text could therefore rewrite its own entry's deny
+  list, or add a tool server, and hold the tracker on its next resume. So the
+  planner writes nothing: its proposal travels in its FINAL MESSAGE, which the
+  dispatcher posts to the idea ticket, and the reader reads it back from there —
+  the route the reviewer already uses (KIT-150).
   Everything else that runs, edits, fetches, schedules, messages, publishes or
   starts other work is named in the fence — including the three MCP resource
   tools, whose names do not start with `mcp__`, so a server rule never reaches
@@ -159,13 +169,12 @@ MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
 # allowlist check, because a deny list cannot name a tool the dispatcher or its
 # SDK adds later. Such a tool reaches the planner until someone adds it below.
 #
-# `Write` is here because the proposal file IS the planner's only output. `Task`
-# and `Agent` are here because the planning procedure's rubric panel is five
-# passes in fresh contexts, and collapsing them into one context is a quality
-# change, not a security one — see the docstring's "not proven" note on whether
-# a subagent inherits this fence.
+# `Task` and `Agent` are here because the planning procedure's rubric panel is
+# five passes in fresh contexts, and collapsing them into one context is a quality
+# change, not a security one — see the docstring's "not proven" note on whether a
+# subagent inherits this fence. `Write` is NOT here: see the docstring.
 PLANNER_KEEP_TOOLS = (
-    "Read", "Grep", "Glob", "Write", "Task", "Agent", "LSP", "ToolSearch",
+    "Read", "Grep", "Glob", "Task", "Agent", "LSP", "ToolSearch",
     "TaskOutput", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite",
     "CronList", "ReportFindings")
 
@@ -180,7 +189,7 @@ PLANNER_KEEP_TOOLS = (
 # one could message, and anything it lists can reach a ticket.
 DISALLOWED_BUILTINS = [
     "Bash", "Monitor", "REPL",                                    # runs
-    "Edit", "NotebookEdit",                                       # writes elsewhere
+    "Edit", "Write", "NotebookEdit",                              # writes any file
     "WebFetch", "WebSearch",                                      # fetches
     "Workflow", "RemoteTrigger", "Skill", "TaskStop",             # starts other work
     "EnterWorktree", "ExitWorktree",
@@ -209,9 +218,9 @@ PLANNING_BRIEF = (
     "tool: you cannot create, move, comment on, or label any ticket, and trying is "
     "itself a finding against you. Read the real codebase (Read/Grep/Glob), run the "
     "PRD, decomposition and rubric passes from the plan-epic procedure, then EMIT "
-    "the whole tree as ONE pipeline-safe-outputs/1 request file (a ticket-create "
-    "carrying `epic` and `children` with `depends_on`), written with the Write tool "
-    "to the run's safe-outputs path. Do not open a pull request. Do not ask "
+    "the whole tree as ONE pipeline-safe-outputs/1 document (a ticket-create "
+    "carrying `epic` and `children` with `depends_on`) in a fenced json block in "
+    "your FINAL MESSAGE. You can write no file. Do not open a pull request. Do not ask "
     "questions. A credential-holding executor validates your proposal, runs the "
     "Definition-of-Ready gate on every child, and files the tree for a person to "
     "approve — your proposal approves nothing and starts nothing."
@@ -396,14 +405,14 @@ def entry_problems(entry):
             problems.append("%r is not a rule anchored to one fenced server; an "
                             "unanchored or per-tool rule is skipped by the runtime with "
                             "no error" % rule)
-    for runs in ("Bash", "Monitor", "Edit", "WebFetch", "ListMcpResourcesTool",
-                 "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
+    for runs in ("Bash", "Monitor", "Edit", "Write", "NotebookEdit", "WebFetch",
+                 "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
         if runs not in seen:
             problems.append("the fence leaves the planner %s" % runs)
-    for kept in ("Write", "Read", "Grep", "Glob"):
+    for kept in ("Read", "Grep", "Glob"):
         if kept in seen:
-            problems.append("the fence removes %s, which the planner needs to read code "
-                            "and emit its proposal" % kept)
+            problems.append("the fence removes %s, which the planner needs to read code"
+                            % kept)
     if not (entry.get("appendInstruction") or "").startswith(PLANNING_BRIEF_FINGERPRINT):
         problems.append("the entry carries no planning brief")
     if entry.get("routingLabels") != [PLANNING_ENTRY_NEVER_LABEL]:
@@ -585,28 +594,33 @@ CARDS = {
         "good": "both lists hold no `mcp__` name and nothing outside the keep-set",
     },
     "CA-EXECUTOR": {
-        "title": "Load the executor's job and watch one pass",
-        "why": ("Nothing files a plan until the executor runs. Loading a scheduled "
-                "job needs the role account's own launch context, and this installer "
-                "installs the job without loading it so that the moment the gate can "
-                "first write to the board is a moment a person chose."),
-        "do": ["Load the job as the role account, then watch one pass go by and",
-               "confirm it wrote a heartbeat.",
+        "title": "Load the executor's reader and watch one pass",
+        "why": ("Nothing files a plan until something runs the executor. That reader "
+                "does not exist yet (KIT-150); this installer stops before this step "
+                "until it does. When it exists, the installer installs it without "
+                "loading it, so the moment the gate can first write to the board is a "
+                "moment a person chose."),
+        "do": ["Load the reader's job as the executor's account, then watch one pass",
+               "go by and find the record it leaves — KIT-150 names what that record",
+               "is. The executor itself writes no heartbeat.",
                "A job that is installed and never loaded looks identical to one that",
                "is loaded and failing — which is why this is a sign-off and not a",
                "probe."],
-        "good": "one pass of the executor ran and left a heartbeat",
+        "good": "one pass of the reader ran and left its record",
     },
     "CA-HANDOVER": {
         "title": "Run the planner by hand once, before anything is automatic",
         "why": ("The planning procedure has never been run on this machine at all. "
                 "Turning on an unattended planner whose output nobody has ever seen "
-                "puts the first look at its quality after the tickets are filed."),
-        "do": ["In a project that has a delivery config, run the planning skill by",
-               "hand on one real idea.",
+                "puts the first look at its quality after the tickets are filed. This "
+                "run is the INTERACTIVE path: it writes to the board itself, so it "
+                "proves nothing about the fence, the reader or the executor. It shows "
+                "what a plan looks like."),
+        "do": ["In the planned repository, start a plain session and run the planning",
+               "skill by hand on one real idea.",
                "Confirm three things: the tree files, every child passes the",
                "readiness gate, and the epic lands in the backlog awaiting you."],
-        "good": "one epic and its children in the backlog, none of them ready",
+        "good": "one epic and its children in the backlog, none of them released",
     },
 }
 
@@ -1665,7 +1679,7 @@ def selftest():
     check("fence-no-allowed-tools", "allowedTools" in good, False)
     # Every tool that runs, writes elsewhere, fetches, schedules, messages or
     # reads an MCP resource by argument is named.
-    for name in ("Bash", "Monitor", "REPL", "Edit", "NotebookEdit", "WebFetch",
+    for name in ("Bash", "Monitor", "REPL", "Edit", "Write", "NotebookEdit", "WebFetch",
                  "WebSearch", "Workflow", "RemoteTrigger", "Skill", "TaskStop",
                  "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
                  "ScheduleWakeup", "SendMessage", "SendUserMessage", "PushNotification",
@@ -1673,13 +1687,21 @@ def selftest():
                  "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
                  "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
         check("fence-removes-builtin:%s" % name, name in good["disallowedTools"], True)
-    check("fence-builtin-count", len(DISALLOWED_BUILTINS) == 29
-          and len(set(DISALLOWED_BUILTINS)) == 29, True)
-    check("fence-rule-count", len(good["disallowedTools"]), 29 + 8)
+    check("fence-builtin-count", len(DISALLOWED_BUILTINS) == 30
+          and len(set(DISALLOWED_BUILTINS)) == 30, True)
+    check("fence-rule-count", len(good["disallowedTools"]), 30 + 8)
     # …and what it KEEPS is kept: nothing the planner needs is in the fence, and
     # nothing is on both sides of the line.
-    for kept in ("Read", "Grep", "Glob", "Write", "Task", "Agent"):
+    for kept in ("Read", "Grep", "Glob", "Task", "Agent"):
         check("fence-keeps:%s" % kept, kept in good["disallowedTools"], False)
+    # WRITE IS FENCED. The OS sandbox confines only shell commands, and the
+    # dispatcher hot-reloads its config and loads a worktree `.mcp.json`: a planner
+    # that could Write could rewrite its own fence.
+    check("fence-removes-write", "Write" in good["disallowedTools"], True)
+    check("fence-keep-set-has-no-writer",
+          [t for t in ("Write", "Edit", "NotebookEdit", "Bash") if t in PLANNER_KEEP_TOOLS], [])
+    check("brief-says-no-file",
+          "FINAL MESSAGE" in PLANNING_BRIEF and "Write tool" not in PLANNING_BRIEF, True)
     check("fence-keep-set-disjoint",
           sorted(set(DISALLOWED_BUILTINS) & set(PLANNER_KEEP_TOOLS)), [])
     # The dispatcher's own list of available tools, v0.2.69, as a literal. A name
@@ -1700,7 +1722,7 @@ def selftest():
     # mutants — each one is a way the fence could be quietly reopened.
     m = dict(good); m["linearMcpAttached"] = False
     check("fence-mutant-reintroduces-unread-key", bool(entry_problems(m)), True)
-    m = dict(good); m["allowedTools"] = ["Read", "Write"]
+    m = dict(good); m["allowedTools"] = ["Read", "Grep"]
     check("fence-mutant-adds-allowed-tools", bool(entry_problems(m)), True)
     m = dict(good)
     m["disallowedTools"] = [t for t in good["disallowedTools"] if t != "mcp__linear__*"]
@@ -1709,8 +1731,10 @@ def selftest():
     m["disallowedTools"] = [t for t in good["disallowedTools"]
                             if not t.startswith("mcp__cyrus-tools")]
     check("fence-mutant-drops-a-server", bool(entry_problems(m)), True)
-    m = dict(good); m["disallowedTools"] = good["disallowedTools"] + ["Write"]
-    check("fence-mutant-removes-write", bool(entry_problems(m)), True)
+    m = dict(good); m["disallowedTools"] = [t for t in good["disallowedTools"] if t != "Write"]
+    check("fence-mutant-gives-back-write", bool(entry_problems(m)), True)
+    m = dict(good); m["disallowedTools"] = good["disallowedTools"] + ["Read"]
+    check("fence-mutant-removes-read", bool(entry_problems(m)), True)
     m = dict(good)
     m["disallowedTools"] = [t for t in good["disallowedTools"] if t != "Bash"]
     check("fence-mutant-leaves-bash", bool(entry_problems(m)), True)
