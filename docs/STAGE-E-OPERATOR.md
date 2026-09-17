@@ -540,10 +540,22 @@ restart kills every in-flight coding session and you are told to re-run the same
 clear the cards downstream of here. Whether the entries match and whether their load has
 been proven are recorded separately, so a re-run re-reads the log without re-starting
 anything. A recorded proof names the entries it proved, so adding a repository does not
-inherit it. After a restart, the installer reads only what the new process wrote: it notes
-the log's size once the old process has left the domain, and searches past that point. A
-re-run that restarts nothing searches the whole log. If the log names one of them nowhere,
-the run reports `UNKNOWN` and prints the
+inherit it.
+
+After a restart, the installer reads only what the new process wrote. It notes the log's
+size once the old process has left the domain, and searches past that point. It keeps that
+size in its ledger until a banner past it proves the entries. So a re-run after a restart
+that printed no banner still reads only past that point, even though it restarts nothing.
+If the log is now shorter than that point, it was rotated or truncated, and the whole log
+is read. A re-run with no restart waiting on its proof searches the whole log.
+
+A pass that rewrites the entries drops any earlier banner proof. If its restart stops
+before it reads the size, there is no point to read past. The next run then saves the
+log's size as it is at that moment and reports `UNKNOWN`. Restart the dispatcher and run
+again: only what the log gains past that size counts. A rewrite keeps an `A-ENTRY-LOADED`
+sign-off, so a sign-off made for the old entries settles the new ones (no ticket yet).
+
+If the log names one of them nowhere, the run reports `UNKNOWN` and prints the
 restart-and-re-read commands; signing off `A-ENTRY-LOADED` is the other way out, and
 watching `CK-7` is a third — slower, because it is downstream of this step.
 
@@ -684,6 +696,22 @@ change by one that started after it.
 
 A machine upgraded to an installer that ties the sign-off to its fence stops at `CK-7`
 once, for the same reason: no reviewer there has been probed under the current fence.
+
+The `handover` row matches the sign-off only against the fence the `dispatcher-entry` step
+read on the same pass. When that step fails before it reads the entries, `handover` reads
+`UNKNOWN`. Clear `dispatcher-entry` first.
+
+**A prompt type's list replaces the fence.** The dispatcher picks a session's
+`disallowedTools` in this order: the entry's `labelPrompts.<type>`, then the global
+`promptDefaults.<type>`, then the entry's own list. A ticket's labels pick the type. The
+label `orchestrator` picks the orchestrator type on every entry, with or without
+`labelPrompts`. On an entry with no `labelPrompts`, it is the only label that picks a type.
+So a review ticket with such a label runs under that type's list, not the reviewer fence.
+The poller adds only `MODEL_LABEL` to a review ticket, but anyone with write access to the
+tracker can add a label. The installer does not refuse this, because `promptDefaults` is
+there for coding sessions. After the steps table it prints a note from the
+`dispatcher-entry` step that names each type with a list. Nothing stops a label from
+reaching a review ticket (no ticket yet).
 
 ### The reviewer brief — the value of `appendInstruction`
 
