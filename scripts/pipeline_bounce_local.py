@@ -1496,8 +1496,57 @@ def notice_pending(notices, head_sha, kind):
     return (str(head_sha or ""), str(kind or "")) not in seen
 
 
+# A LABEL THAT CANNOT BE APPLIED BECAUSE NOBODY CONFIGURED ITS ID (KIT-152). Not a
+# transient failure, so not something to retry every pass: `announced["label"]` records
+# this instead of False, the announcement counts as complete while no id is configured,
+# and the gap is said ONCE. Before, the label step could never land, so every pass re-ran
+# the announcement, appended a ledger row, posted another telemetry comment on the coding
+# ticket and exited 2 — paging the owner on every monitor pass, forever.
+LABEL_NOT_CONFIGURED = "no-id"
+
+
+def announcement_complete(announced, label_configured):
+    """Whether every step of an exhaustion or no-push announcement has landed. A label
+    recorded as LABEL_NOT_CONFIGURED counts only while there is still no id: configure one
+    and the next pass applies it, and nothing else."""
+    if not announced:
+        return False
+    for step, value in announced.items():
+        if value is True:
+            continue
+        if step == "label" and value == LABEL_NOT_CONFIGURED and not label_configured:
+            continue
+        return False
+    return True
+
+
+def seed_label(prev_value):
+    """What a previous row said about the label, kept as one of True / False / no-id."""
+    return LABEL_NOT_CONFIGURED if prev_value == LABEL_NOT_CONFIGURED else bool(prev_value)
+
+
+def apply_needs_human(issue, label_id, current, cfg):
+    """(new label state, problem or None). The one place both announcements apply the label."""
+    if current is True:
+        return True, None
+    if not issue.get("id"):
+        return current, "label: no original ticket resolved for this PR"
+    if not label_id:
+        if current == LABEL_NOT_CONFIGURED:
+            return current, None                     # said once already; holding, not retrying
+        return LABEL_NOT_CONFIGURED, (
+            "label: no id for %s, so it was not applied (set linear.labels.ids in the committed "
+            "delivery.json or needs_human_label_id in the config). Said once: later passes hold "
+            "instead of retrying, and apply it on the first pass that finds an id" % NEEDS_HUMAN_KEY)
+    try:
+        linear_add_label(issue["id"], label_id, cfg)
+        return True, None
+    except BounceError as exc:
+        return False, "label: %s" % exc
+
+
 def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
-                   blocked_after_seconds):
+                   blocked_after_seconds, label_configured=True):
     """The one thing that was missing when a re-prompted session stops: a MEASURED signal
     that it has, once per bounce. Returns {'bounce_no', 'at', 'waited_seconds', 'head_sha'}
     or None.
@@ -1549,8 +1598,7 @@ def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
         return None
     prior = blocked_row or {}
     if prior.get("bounce_no") == bounce_no:
-        announced = prior.get("announced") or {}
-        if announced and all(bool(v) for v in announced.values()):
+        if announcement_complete(prior.get("announced") or {}, label_configured):
             return None
     return {"bounce_no": bounce_no, "at": last_spent.get("at"), "waited_seconds": int(waited),
             "head_sha": str(head_sha)}
@@ -2825,7 +2873,8 @@ def decision_for(sit, cfg):
             in_flight = last
 
     ex = sit.get("exhausted") or {}
-    announced = bool(ex.get("announced")) and all(bool(v) for v in ex["announced"].values())
+    announced = announcement_complete(ex.get("announced") or {},
+                                      bool(sit.get("needs_human_label_id")))
 
     # The conclusion, and whether one is already on the ledger. `lane_on` is read from
     # the situation, never from the verdict: a project with no needs-approval lane still
@@ -2861,7 +2910,8 @@ def decision_for(sit, cfg):
                              blocked_row=sit.get("blocked"), head_sha=sit.get("head_sha"),
                              now=datetime.now(timezone.utc),
                              blocked_after_seconds=cfg.get("blocked_after_seconds")
-                             or DEFAULT_BLOCKED_AFTER_SECONDS)
+                             or DEFAULT_BLOCKED_AFTER_SECONDS,
+                             label_configured=bool(sit.get("needs_human_label_id")))
 
     meta = sit.get("pr_meta") or {}
     verdict = decide(pr_open=bool(meta.get("open")), is_draft=bool(meta.get("isDraft")),
@@ -3222,10 +3272,11 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     spent, max_bounces = sit.get("prior", 0), sit.get("max_bounces", 0)
     reason = verdict.get("trigger_reason") or verdict.get("reason") or "budget exhausted"
     issue = sit.get("issue") or {}
-    prev = ((sit.get("exhausted") or {}).get("announced")) or {}
+    prev_row = sit.get("exhausted") or {}
+    prev = prev_row.get("announced") or {}
     announced = {"pr_comment": bool(prev.get("pr_comment")),
                  "ticket_comment": bool(prev.get("ticket_comment")),
-                 "label": bool(prev.get("label")),
+                 "label": seed_label(prev.get("label")),
                  "concluded": bool(prev.get("concluded"))}
     pr_body = render_exhaustion_pr_comment(sit.get("ticket_id"), sit["pr"], spent, max_bounces, reason)
     ticket_body = render_exhaustion_ticket_comment(sit["pr"], sit.get("pr_url") or "", spent, max_bounces, reason)
@@ -3260,19 +3311,10 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
                 problems.append("ticket comment: %s" % exc)
         else:
             problems.append("ticket comment: no original ticket resolved for this PR")
-    if not announced["label"]:
-        label_id = sit.get("needs_human_label_id") or ""
-        if not issue.get("id"):
-            problems.append("label: no original ticket resolved for this PR")
-        elif not label_id:
-            problems.append("label: no id for %s (set linear.labels.ids in the committed "
-                            "delivery.json or needs_human_label_id in the config)" % NEEDS_HUMAN_KEY)
-        else:
-            try:
-                linear_add_label(issue["id"], label_id, cfg)
-                announced["label"] = True
-            except BounceError as exc:
-                problems.append("label: %s" % exc)
+    announced["label"], label_problem = apply_needs_human(
+        issue, sit.get("needs_human_label_id") or "", announced["label"], cfg)
+    if label_problem:
+        problems.append(label_problem)
 
     if not announced["concluded"]:
         settled, conclusion_problems = record_conclusion(sit, cfg, state_dir, EXHAUSTED_BASIS, False)
@@ -3282,11 +3324,17 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                bounce_no=verdict.get("bounce_no"), outcome="exhausted", announced=announced,
                problems=problems)
-    emit_status = emit_telemetry(state_dir, {
-        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-        "outcome": "budget", "error_class": "bounce_budget_exhausted",
-        "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
-        no_session="this row records a spent bounce budget; no model session runs for it")
+    if prev_row:
+        # ONE ROW PER EXHAUSTION, not one per pass that completes it (KIT-152). Each row is
+        # a comment on the coding ticket; a pass that only finishes a missing step is the
+        # same exhaustion. A first emission that failed is not retried here (no ticket yet).
+        emit_status = "not re-emitted: this exhaustion's row was sent on an earlier pass"
+    else:
+        emit_status = emit_telemetry(state_dir, {
+            "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+            "outcome": "budget", "error_class": "bounce_budget_exhausted",
+            "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
+            no_session="this row records a spent bounce budget; no model session runs for it")
     if problems:
         sys.stderr.write("FAIL: exhaustion for %s#%d only partly announced (%s); the next run "
                          "completes the missing step(s). telemetry: %s\n"
@@ -3324,7 +3372,7 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
     prev = sit.get("blocked") or {}
     prev_announced = (prev.get("announced") or {}) if prev.get("bounce_no") == bounce_no else {}
     announced = {"ticket_comment": bool(prev_announced.get("ticket_comment")),
-                 "label": bool(prev_announced.get("label"))}
+                 "label": seed_label(prev_announced.get("label"))}
     body = render_blocked_ticket_comment(
         sit["pr"], sit.get("pr_url") or "", bounce_no, sit.get("max_bounces", 0),
         sit.get("prior", 0), signal.get("head_sha") or sit.get("head_sha"),
@@ -3353,25 +3401,17 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
                 problems.append("ticket comment: %s" % exc)
         else:
             problems.append("ticket comment: no original ticket resolved for this PR")
-    if not announced["label"]:
-        label_id = sit.get("needs_human_label_id") or ""
-        if not issue.get("id"):
-            problems.append("label: no original ticket resolved for this PR")
-        elif not label_id:
-            problems.append("label: no id for %s (set linear.labels.ids in the committed "
-                            "delivery.json or needs_human_label_id in the config)" % NEEDS_HUMAN_KEY)
-        else:
-            try:
-                linear_add_label(issue["id"], label_id, cfg)
-                announced["label"] = True
-            except BounceError as exc:
-                problems.append("label: %s" % exc)
+    announced["label"], label_problem = apply_needs_human(
+        issue, sit.get("needs_human_label_id") or "", announced["label"], cfg)
+    if label_problem:
+        problems.append(label_problem)
 
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                bounce_no=bounce_no, head_sha=signal.get("head_sha") or sit.get("head_sha"),
                waited_seconds=signal.get("waited_seconds"), outcome="blocked",
                announced=announced, problems=problems)
-    emit_status = emit_telemetry(state_dir, {
+    emit_status = "not re-emitted: this no-push signal's row was sent on an earlier pass" \
+        if prev_announced else emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "blocked", "error_class": "bounce_no_push",
         "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
@@ -6093,15 +6133,63 @@ def selftest():
             check("a missing label id makes the signal PARTIAL: exit 2, the comment still said",
                   (rc, kinds()), (EXIT_USAGE, ["ticketComment", "telemetry"]))
             row = ledger_view(ledger_path(tmp), "o/r", 41)["blocked"]
-            check("…and the row records which half landed",
-                  row["announced"], {"ticket_comment": True, "label": False})
+            check("KIT-152 …and the row records the label as not configured, not as failed",
+                  row["announced"], {"ticket_comment": True, "label": globals().get("LABEL_NOT_CONFIGURED", "no-id")})
             world["delivery"] = delivery_lane
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("the next pass completes the label and does NOT comment again",
-                  (rc, kinds()), (EXIT_OK, ["label", "telemetry"]))
+            check("KIT-152 the pass that finds an id applies the label, and neither comments "
+                  "nor posts a second telemetry row", (rc, kinds()), (EXIT_OK, ["label"]))
         check("a partial signal is loud on stderr", "only partly landed" in err.getvalue(), True)
+
+        # KIT-152: THE LOOP ITSELF. With no label id, every pass used to re-run the signal:
+        # a new row, another telemetry comment on the ticket, exit 2, a page. Said once,
+        # then held; applied on the first pass that finds an id.
+        world["delivery"] = no_label
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            stalled(tmp, hours_ago(10))
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_one(41, "o/r", cfg, tmp, "bounce", False)
+            rows_after_first = len(read_ledger(ledger_path(tmp)))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("KIT-152 a second pass with still no id is QUIET: exit 0, nothing sent, no new row",
+                  (rc, kinds(), len(read_ledger(ledger_path(tmp)))), (EXIT_OK, [], rows_after_first))
+        world["delivery"] = delivery_ok
+
+        # …and the same for a spent budget, driven straight through the announcement.
+        _complete = globals().get("announcement_complete")
+        check("KIT-152 the completeness rule exists", callable(_complete), True)
+        if callable(_complete):
+            check("KIT-152 not-configured counts as announced only while no id is configured",
+                  (_complete({"a": True, "label": globals().get("LABEL_NOT_CONFIGURED", "no-id")}, False),
+                   _complete({"a": True, "label": globals().get("LABEL_NOT_CONFIGURED", "no-id")}, True),
+                   _complete({"a": True, "label": False}, False), _complete({}, False)),
+                  (True, False, False, False))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            sit_x = {"repo": "o/r", "pr": 41, "ticket_id": "ENG-41", "issue": {"id": "iss-uuid"},
+                     "prior": 2, "max_bounces": 2, "pr_url": "https://github.com/o/r/pull/41",
+                     "head_sha": "aaaa1111", "needs_human_label_id": "", "needs_approval_state_id": ""}
+            verdict_x = {"action": "exhaust", "trigger_reason": "review at threshold", "bounce_no": 2,
+                         "reason": "bounce budget exhausted (2 of 2 spent)"}
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc1 = perform_exhaust(dict(sit_x), verdict_x, cfg, tmp, False)
+            first = ledger_view(ledger_path(tmp), "o/r", 41)["exhausted"]
+            check("KIT-152 exhaustion with no label id: loud once, two comments and ONE telemetry row",
+                  (rc1, kinds(), (first["announced"] or {}).get("label")),
+                  (EXIT_USAGE, ["prComment", "ticketComment", "telemetry"], globals().get("LABEL_NOT_CONFIGURED", "no-id")))
+            if callable(_complete):
+                check("KIT-152 …and the verdict now reads it as announced, so later passes hold",
+                      _complete(first["announced"], False), True)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc2 = perform_exhaust(dict(sit_x, exhausted=first, needs_human_label_id="lbl-nh"),
+                                      verdict_x, cfg, tmp, False)
+            check("KIT-152 an id configured later: the label and nothing else, no second telemetry row",
+                  (rc2, kinds()), (EXIT_OK, ["label"]))
         world["delivery"] = delivery_ok
 
         # 10q. CONFLICTS — the dispatched lane of the conflict loop. A dispatcher's pull request
@@ -6446,8 +6534,11 @@ def selftest():
     check("…never concludes and never moves the ticket",
           ("record_conclusion" in _pb, "linear_set_state" in _pb), (False, False))
     check("…and never asks for a re-review", "write_rereview_request" in _pb, False)
-    check("it posts exactly one TOP-LEVEL ticket comment and applies exactly one label",
-          (_pb.count("linear_comment("), _pb.count("linear_add_label(")), (1, 1))
+    _label_step = inspect.getsource(globals()["apply_needs_human"]) if "apply_needs_human" in globals() else ""
+    check("it posts exactly one TOP-LEVEL ticket comment and applies exactly one label "
+          "(KIT-152: through the one shared label step)",
+          (_pb.count("linear_comment("), _pb.count("apply_needs_human("),
+           _label_step.count("linear_add_label(")), (1, 1, 1))
 
     # 11c. THE NOTICE PATH IS A COMMENT AND NOTHING ELSE. The defect this closes was a
     #      re-prompt reaching a PR a person already held, so the checks are about what the

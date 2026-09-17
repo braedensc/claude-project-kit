@@ -1632,14 +1632,20 @@ nor `--all`: it is the daemon's whole pass.
   budget spent, no ticket move, no conclusion. The telemetry publisher posts its §4 row
   on the same ticket, as it does for every driver action, so expect two comments. `decide` reports it as **BLOCKED**; the
   ledger row (`outcome: "blocked"`) is what makes it once, and a later bounce that is also
-  ignored signals again. Where one half lands and the other does not — a missing label id
-  is the usual cause — the pass exits 2 and the next one writes only the missing half.
+  ignored signals again. Where one half lands and the other does not — the tracker refused
+  the label, say — the pass exits 2 and the next one writes only the missing half. A label
+  with no id configured is not retried; see below.
 - **Exhaustion**: one comment on the PR, one on the original ticket, both saying the budget
   is spent and a person is needed. The driver may add `agent:needs-human` — the one label
   Stage E ever writes, added to the ticket's existing labels, never replacing them.
   Nothing else labels. Exhaustion also concludes (basis `exhausted`) and moves the ticket
   to the same lane, so the label is what tells "we ran out of road" from "nothing needed
   fixing" when you look at the board.
+- **A label with no id configured** is said once, not retried. Exhaustion and the no-push
+  signal both need `agent:needs-human`'s id, from `linear.labels.ids` in the committed
+  `delivery.json` or `needs_human_label_id` in the driver's config. Without one, the pass
+  posts its comments and one telemetry row, exits 2 once naming the missing id, and later
+  passes hold. Add the id and the next pass applies the label, and nothing else (KIT-152).
 - **Fallback**: only when the original ticket has no agent session or the re-prompt cannot
   be delivered, a fix ticket in the Reviews team pinned to the PR branch by the description
   tag, delegated the same way, instructed to push to that branch and open no PR.
