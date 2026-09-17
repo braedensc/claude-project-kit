@@ -995,17 +995,24 @@ class SudoSession(object):
             self._stop.set()
 
 
-def _privilege_reason(command, dry_run, account):
-    """The one line printed immediately before the password prompt."""
+def _privilege_reason(command, dry_run, account, conf):
+    """The one line printed immediately before the password prompt. The daemon
+    count follows the conf: the `heartbeat-monitor` step installs a fourth unless
+    HEARTBEAT_MONITOR_TICKET is `off`."""
     if command == "verify":
         return ("`verify` re-measures this machine as the %s role account and as root. "
                 "It changes nothing." % account)
     if dry_run:
         return ("`run --dry-run` measures this machine as the %s role account and as "
                 "root. It changes nothing." % account)
+    if monitor_ticket(conf) == "off":
+        daemons = ("three system LaunchDaemons — the review poller, the bounce driver "
+                   "and the finding poller.")
+    else:
+        daemons = ("four system LaunchDaemons — the review poller, the bounce driver, "
+                   "the finding poller and the heartbeat monitor.")
     return ("`run` reads and writes files as the %s role account, edits the dispatcher's "
-            "config, and installs and loads three system LaunchDaemons — the review "
-            "poller, the bounce driver and the finding poller." % account)
+            "config, and installs and loads %s" % (account, daemons))
 
 
 def acquire_privilege(ctx, command, dry_run):
@@ -1030,7 +1037,7 @@ def acquire_privilege(ctx, command, dry_run):
     if agent_env_markers_present():
         return False
     resume = command + (" --dry-run" if dry_run else "")
-    ctx.sudo.acquire(_privilege_reason(command, dry_run, ctx.account), resume)
+    ctx.sudo.acquire(_privilege_reason(command, dry_run, ctx.account, ctx.conf), resume)
     return True
 
 
@@ -8546,7 +8553,7 @@ def _selftest_body():
     lineRV = ""
     try:
         _quiet(lambda: ctxRV.sudo.acquire(
-            _privilege_reason("run", True, ctxRV.account), "run"))   # the reversion
+            _privilege_reason("run", True, ctxRV.account, ctxRV.conf), "run"))   # the reversion
         failures.append("sudo-refused-spelling-mutant: a refused sudo did not stop")
     except NoPrivilege as exc:
         lineRV = str(exc).strip().splitlines()[-1].strip()
@@ -8732,6 +8739,30 @@ def _selftest_body():
     expect("sudo-stays-fresh", '"-n"' not in inspect.getsource(_sudo_validate),
            "the one deliberate acquisition passes -n too, so it can never ask for the "
            "password it exists to ask for — and every probe after it would prompt instead")
+
+    # -- 19f. the reason names every daemon `run` installs --------------------
+    # The `heartbeat-monitor` step (KIT-127) installs a fourth system LaunchDaemon
+    # unless the conf turns it off by name. The banner said "three" either way.
+    # Read off the printed line, so this pins what the person sees.
+    cases += 1
+    for ticketBN, tailBN in (
+            ("KIT-7", "installs and loads four system LaunchDaemons — the review poller, "
+                      "the bounce driver, the finding poller and the heartbeat monitor."),
+            ("", "installs and loads four system LaunchDaemons — the review poller, "
+                 "the bounce driver, the finding poller and the heartbeat monitor."),
+            ("off", "installs and loads three system LaunchDaemons — the review poller, "
+                    "the bounce driver and the finding poller.")):
+        confBN, errsBN = validate_conf(parse_conf(GOOD_CONF.replace(
+            "HEARTBEAT_MONITOR_TICKET=off", "HEARTBEAT_MONITOR_TICKET=" + ticketBN))[0])
+        ctxBN, _fBN = _settled_ctx(confBN)
+        ctxBN.sudo = SudoSession(validate=lambda: 0, refresh=lambda: 0, interval=3600)
+        _x, printedBN = _quiet(lambda c=ctxBN: acquire_privilege(c, "run", False))
+        ctxBN.sudo.release()
+        whyBN = [l for l in printedBN.splitlines() if l.startswith("WHY IT IS NEEDED:")]
+        expect("sudo-reason-daemons", not errsBN and len(whyBN) == 1
+               and whyBN[0].endswith(tailBN),
+               "HEARTBEAT_MONITOR_TICKET=%s: the banner read %r, not one line ending %r"
+               % (ticketBN or "(empty)", whyBN, tailBN))
 
     # -- THE CONFLICT WAKER STEP: the local half of the conflict loop, for the person --
     cases += 1
