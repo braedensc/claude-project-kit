@@ -49,7 +49,7 @@ can perform. **What you type is one command, repeated.**
 
 ```sh
 cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-$EDITOR stage-e.conf                                  # eleven values to fill in, none of them secret
+$EDITOR stage-e.conf                                  # twelve values to fill in, none of them secret
 python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
 ```
 
@@ -69,10 +69,12 @@ dispatcher` line. Read the row, not that phrase.
 
 **A real pass also moves the code the daemons run.** It fast-forwards the role account's
 clone of the kit, and unloads all three daemons first so nothing execs out of a tree that
-is moving — and the heartbeat monitor too, when it is loaded. Reloading them is the `enable` step, several checkpoints downstream: if the run
-stops at a card before it, **all three loops are off**, and the notice printed on the way
-out is the only thing that says so. A dry run does none of this — it reports that the clone
-is behind and returns.
+is moving — and the heartbeat monitor too, when it is loaded. The `enable` step reloads the
+three daemons, several checkpoints downstream. The `heartbeat-monitor` step right after it
+reloads the monitor. If the run stops at a card before `enable`, **all three loops are off**.
+If it stops at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
+the way out names which jobs are off, and it is the only thing that says so. A dry run does
+none of this — it reports that the clone is behind and returns.
 
 It stops at the first step only a person can do, prints a numbered checkpoint card saying
 exactly what to do, and exits 10. Do that one thing and run the same command again: it
@@ -735,9 +737,13 @@ turning something off is still an edit to a file full of tokens.
    entry it wrote, in the same single rewrite, and restarts the dispatcher only because
    the file changed. To stop reviewing everything, delete the entries by hand instead: an
    empty `REVIEW_REPOS` is a conf the validator refuses, deliberately.
-2. Unload the three daemons (Step 3d) if you want the pollers and the bounce driver stopped
-   too. Leaving them loaded with no review entries means review tickets that start no
-   session.
+2. If you want the pollers and the bounce driver stopped too, stop **the heartbeat monitor**
+   with them. A monitor left loaded judges the stopped daemons as stale and comments about a
+   shutdown you made on purpose. Either unload all four jobs (Step 3d), or set
+   `HEARTBEAT_MONITOR_TICKET=off` before the installer run in step 1 — that run unloads the
+   monitor and removes its plist — and then unload the three daemons. A later installer run
+   loads the three daemons again at its `enable` step. Leaving the daemons loaded with no
+   review entries means review tickets that start no session.
 3. **Delete the backups you no longer need.** They are copies of the dispatcher's tracker
    tokens. The installer's prune only runs when the installer runs, and only over files
    named after the config — so once you have stopped running it, nothing is tidying that
@@ -788,7 +794,7 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `rereview/<OWNER>__<REPO>/pr-<n>.json` | bounce driver, deleted by the poller | one per delivered bounce, naming the head it bounced. The poller re-reviews that PR when the head has **moved**, then deletes the file |
 | `declines/<OWNER>__<REPO>/pr-<n>.json` | bounce driver | which could-not reasons were already said on the PR, so each is said once |
 | `bounces/` | bounce driver | its telemetry artifacts |
-| `monitor-state.json` | heartbeat monitor (installed unless `HEARTBEAT_MONITOR_TICKET=off`) | the last verdict-set it announced, so an incident is said once |
+| `monitor-state.json` | heartbeat monitor (installed unless `HEARTBEAT_MONITOR_TICKET=off`) | the last verdict-set it announced and the ticket it went to, so an incident is said once per ticket; `rearm` clears only its last-run time |
 | `monitor-heartbeat.json` | heartbeat monitor (installed unless `HEARTBEAT_MONITOR_TICKET=off`) | its own last run and result; `verify` reads it |
 
 Never point `state_dir` at a repo checkout or a worktree. The bounce driver refuses one
@@ -1207,11 +1213,12 @@ GitHub call, so no script cares what directory it is started in.
 
 **That clone is the deployment, and nothing in a heartbeat or a log names its version.** All
 three daemons exec out of it, so a fix merged to the default branch is inert on the machine
-until the clone moves. `run` moves it for you — it unloads the three jobs, fast-forwards,
-and reloads at its `enable` step — and that is the only thing that does. Pull it by hand
-only with the jobs unloaded, never under a running pass, and compare its
-`git rev-parse --short HEAD` against your own clone whenever behaviour surprises you. A
-stale daemon clone looks exactly like a bug.
+until the clone moves. `run` moves it for you — it unloads the three jobs and the heartbeat
+monitor, fast-forwards, reloads the three at its `enable` step and the monitor at its
+`heartbeat-monitor` step — and that is the only thing that does. The monitor runs from the
+same clone. Pull it by hand only with all four jobs unloaded, never under a running pass,
+and compare its `git rev-parse --short HEAD` against your own clone whenever behaviour
+surprises you. A stale daemon clone looks exactly like a bug.
 
 **Set `HOME` explicitly.** A system daemon inherits no login environment, and both the env
 file and the config paths above are written relative to it.
@@ -1252,11 +1259,12 @@ not yours, so reading them takes `sudo -u`:
 > **Something can read them for you.** `scripts/pipeline_heartbeat_monitor.py` is a fourth
 > one-shot job, run by the same role account on a longer interval, that judges all three
 > heartbeats and posts **one** comment on a ticket when the verdict changes — once per
-> incident, not once per pass, and one more when it clears. It is off unless a ticket is
-> configured, and a problem it cannot report is exit 3 rather than a clean pass. It does not
-> replace the command below: it runs on the same Mac as the daemons, so it cannot report the
-> machine asleep or off, or its own death. **The installer installs it** at its
-> `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
+> incident, not once per pass, and one more when it clears. Under the installer it is off
+> only by name (`HEARTBEAT_MONITOR_TICKET=off`); left empty, `run` stops at card `CK-9`. Run
+> by hand with no ticket configured, a problem it cannot report is exit 3 rather than a clean
+> pass. It does not replace the command below: it runs on the same Mac as the daemons, so it
+> cannot report the machine asleep or off, or its own death (KIT-45). **The installer
+> installs it** at its `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
 > `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the install steps.
 
 ```sh

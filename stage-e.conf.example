@@ -4,7 +4,7 @@
 # HOW TO USE THIS FILE
 #
 #   cp stage-e.conf.example stage-e.conf && chmod 600 stage-e.conf
-#   $EDITOR stage-e.conf             # eleven values to fill in, none of them secret
+#   $EDITOR stage-e.conf             # twelve values to fill in, none of them secret
 #   python3 scripts/pipeline_stage_e_setup.py run    # the only command you type
 #
 # `run` validates this file before it touches anything, and reports EVERY bad
@@ -167,6 +167,33 @@ OWNER_LINEAR_EMAIL=you@example.com
 # one.
 MANAGED_TEAM_KEYS=KIT,TOD
 
+# The ticket the heartbeat monitor comments on.  A decision, not a default: a
+# ticket id, or `off`.
+#
+# Each daemon writes a heartbeat after every pass, so that "it stopped" and "it
+# had nothing to do" stop looking alike.  Nothing reads them unless this job
+# runs.  It is a fourth system LaunchDaemon under the same role account, running
+# `pipeline_heartbeat_monitor.py`: deterministic code, no model, no session.  When
+# the three daemons' health changes it posts ONE comment on the ticket named
+# here, and one more when it recovers.  It cannot see the Mac asleep or off, or
+# its own death (KIT-45) — docs/HEARTBEAT-MONITOR.md lists what it cannot catch.
+#
+# WHICH TICKET.  Pick one you read that no session is ever delegated, and that
+# stays open.  A closed ticket can auto-archive, and the monitor's lookup then no
+# longer finds it.  Sessions hold workspace-wide tracker write, so a session can
+# move or archive any ticket it can reach, this one included.  Every comment the
+# monitor owes then fails, and only the installer's `verify` shows it (no ticket
+# yet; docs/STAGE-E-OPERATOR.md, Accepted risks).
+#
+# Left EMPTY, the installer stops at card CK-9 and asks you to name a ticket.
+# Before loading the job it checks the ticket exists and runs the monitor's own
+# `check`.
+#
+# RULE: a ticket id like KIT-123 that the tracker key can read, or `off`, which
+# leaves the heartbeats unread BY NAME and removes a monitor an earlier run
+# installed.
+HEARTBEAT_MONITOR_TICKET=
+
 
 # ===========================================================================
 # 3.  THE REPOSITORIES under review
@@ -198,8 +225,13 @@ REVIEW_REPOS=example-org/repo-name
 
 
 # ===========================================================================
-# 4.  OPTIONAL — every one of these has a working default
+# 4.  OPTIONAL — each has a default, and one default needs a file
 # ===========================================================================
+#
+# Every default below works as shipped, except CONFLICT_WAKER_CONF's.  That
+# default names conflict-waker.conf, beside this file, and that file must
+# exist (no ticket yet).  Copy it from conflict-waker.conf.example, or set the
+# key to `off`.
 
 # How often each one-shot pass runs, in seconds — one per daemon: the review
 # poller, the bounce driver, and the finding poller that turns a session's
@@ -252,29 +284,15 @@ HUMAN_PENDING_CHECKS=Hooks change guard
 # RULE: a path to a conflict-waker.conf (beside this file, or absolute) — copy
 # conflict-waker.conf.example — or `off`, which leaves the waker off BY NAME:
 # a local session's conflicted pull request then pages you instead.
+#
+# The default is not a working default.  The file it names must exist, or the
+# `conflict-waker` step fails and says so (no ticket yet).
 CONFLICT_WAKER_CONF=conflict-waker.conf
 
-# The heartbeat monitor — the job that reads the three daemons' heartbeats.
-#
-# Each daemon writes a heartbeat after every pass, so that "it stopped" and "it
-# had nothing to do" stop looking alike.  Nothing reads them unless this job
-# runs.  It is a fourth system LaunchDaemon under the same role account, running
-# `pipeline_heartbeat_monitor.py`: deterministic code, no model, no session.  When
-# the three daemons' health changes it posts ONE comment on the ticket named
-# here, and one more when it recovers.  It cannot see the Mac asleep or off, or
-# its own death — docs/HEARTBEAT-MONITOR.md lists what it cannot catch.
-#
-# Left EMPTY, the installer stops at card CK-9 and asks you to name a ticket.
-# Before loading the job it checks the ticket exists and runs the monitor's own
-# `check`.
-#
-# RULE: a ticket id like KIT-123 that the tracker key can read, or `off`, which
-# leaves the heartbeats unread BY NAME and removes a monitor an earlier run
-# installed.
-HEARTBEAT_MONITOR_TICKET=
-
-# How often the heartbeat monitor runs, in seconds.  A daemon that stops is
-# reported within about this long plus two of that daemon's own intervals.
+# How often the heartbeat monitor runs, in seconds (its ticket is in section 2).
+# A daemon that stops is reported within about this long plus twice that
+# daemon's gap: its own interval above plus 900 s, the longest one pass may run.
+# At the defaults that is about 70 minutes.
 #
 # RULE: a positive integer.
 MONITOR_INTERVAL_SECONDS=1800

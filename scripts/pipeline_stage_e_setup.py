@@ -1475,8 +1475,14 @@ CARDS = {
                 "model and no session. Its only tracker write is one comment, on one ticket, "
                 "when the daemons' health changes, and one more when it recovers. Which "
                 "ticket that is, and whether you want those comments at all, is yours to "
-                "decide. Without it, a daemon that stops is silent."),
-        "do": ["Pick an open ticket you read, on a work team. Name it in stage-e.conf:",
+                "decide. Without it, a daemon that stops is silent. Sessions hold "
+                "workspace-wide tracker write, so a session can move or archive any ticket "
+                "it can reach, this one included. Every comment the monitor owes then fails, "
+                "and only `verify` shows it (no ticket yet; docs/STAGE-E-OPERATOR.md, "
+                "Accepted risks)."),
+        "do": ["Pick a ticket you read that no session is ever delegated, and that stays",
+               "open: a closed ticket can auto-archive, and the monitor's lookup then no",
+               "longer finds it. Name it in stage-e.conf:",
                "    HEARTBEAT_MONITOR_TICKET=KIT-123",
                "Then run the installer again. It checks that the ticket exists, runs the",
                "monitor's own check, and loads it:",
@@ -2118,10 +2124,10 @@ def step_code(ctx, apply_it):
         r.as_root(["launchctl", "bootout", "system/" + label],
                   why="unload %s before the clone moves under it" % label)
     if not r.dry_run:
-        # Loading them again is the `enable` step, which is several checkpoints
-        # downstream. If this run stops before it, the review, bounce and finding
-        # loops are OFF and the only thing that says so is the notice cmd_run
-        # prints off this list.
+        # Loading the three again is the `enable` step, several checkpoints
+        # downstream, and loading the monitor is the `heartbeat-monitor` step after
+        # it. If this run stops before them, those jobs are OFF and the only thing
+        # that says so is the notice cmd_run prints off this list.
         ctx.unloaded = list(stop_labels)
 
     if head.ok and head.out.strip():
@@ -4012,6 +4018,10 @@ MONITOR_JOBS = (("review-poller", "POLL_INTERVAL_SECONDS"),
                 ("finding-poller", "FINDING_INTERVAL_SECONDS"))
 MONITOR_STALE_MULTIPLIER = 2
 MONITOR_RUN_TIMEOUT_SECONDS = 120
+# The longest one daemon pass may run: the review poller's and the bounce driver's default
+# run_timeout_seconds, which the configs this file writes leave alone (the finding
+# poller's is shorter). The battery imports those daemons and asserts it still agrees.
+MONITOR_DAEMON_PASS_SECONDS = 900
 # `declined` is a pass that judged and held its comment for the cooldown — a choice the
 # config made. `error`, `usage` and `timeout` are a monitor that could not do its job.
 MONITOR_GOOD_RESULTS = ("ok", "declined")
@@ -4021,12 +4031,18 @@ MONITOR_HEARTBEAT_POLL_SECONDS = 5
 
 def monitor_config(conf):
     """The monitor's config, from the same conf values the three daemons are scheduled
-    by — so its idea of "stale" is always the interval launchd really uses."""
+    by — so its idea of "stale" follows the interval launchd really uses.
+
+    Each job's interval is launchd's PLUS one pass's wall clock: the longest a healthy job
+    can go between two heartbeats. The review poller writes only when a pass ends, and the
+    bounce driver's `running` beat stands until its pass ends, so launchd's interval alone
+    reads a long pass inside its own deadline as `stale` or `wedged`."""
     return {
         "state_dir": "~/.stage-e/state",
         "finding_state_dir": "~/.stage-e/finding",
         "watch": [job for job, _key in MONITOR_JOBS],
-        "intervals": {job: int(conf[key]) for job, key in MONITOR_JOBS},
+        "intervals": {job: int(conf[key]) + MONITOR_DAEMON_PASS_SECONDS
+                      for job, key in MONITOR_JOBS},
         "run_interval_seconds": int(conf["MONITOR_INTERVAL_SECONDS"]),
         "stale_multiplier": MONITOR_STALE_MULTIPLIER,
         "run_timeout_seconds": MONITOR_RUN_TIMEOUT_SECONDS,
@@ -4093,7 +4109,21 @@ def _monitor_off(ctx, apply_it):
         out = r.as_root(["launchctl", "bootout", "system/" + label],
                         why="unload %s: HEARTBEAT_MONITOR_TICKET=off" % label)
         if not out.skipped:
-            _wait_until_gone(r, label, _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+            # READ, NEVER DISCARDED, for `_restart_dispatcher`'s reason. A plist removed
+            # while launchd still holds the job leaves it commenting until the next boot,
+            # under a conf that says off, with nothing on disk left to show it is there.
+            said = (out.err or out.out).strip()
+            if not out.ok:
+                say("  launchctl bootout exited %d: %s"
+                    % (out.rc, (said.splitlines() or ["no output"])[0][:160]))
+            gone, waited = _wait_until_gone(r, label,
+                                            _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+            if not gone:
+                raise SetupError(
+                    "the heartbeat monitor was told to stop and launchd still holds %s %ds "
+                    "later.\nIts plist was NOT removed, so the next run still finds it and "
+                    "tries again.\nStop it by hand, then run the installer again:\n"
+                    "    sudo launchctl bootout system/%s" % (label, waited, label))
     res = r.as_root(["rm", "-f", plist],
                     why="remove %s, so the next boot does not load it again" % plist)
     if not res.ok and not res.skipped:
@@ -4169,6 +4199,7 @@ def step_heartbeat_monitor(ctx, apply_it):
     if not apply_it:
         todo = (["write ~/.stage-e/%s" % MONITOR_CONFIG] if conf_stale else []) \
             + (["install %s" % plist] if plist_stale else []) \
+            + ["rearm its run clock"] \
             + ["%s it and wait for a heartbeat (%s)"
                % ("reload" if loaded else "load",
                   why_not or ("the last one was a dry run" if not real else "stale"))]
@@ -4197,8 +4228,9 @@ def step_heartbeat_monitor(ctx, apply_it):
         raise SetupError("the heartbeat monitor's check failed (exit %d), so it was not loaded: %s"
                          % (check.rc, (check.err or check.out).strip()[-400:]))
     if check.rc == COMPONENT_EXIT_DECLINED:
-        say("  It found a problem on its first look. That is its job: the first real pass")
-        say("  comments on %s." % ticket)
+        say("  It found a problem on its first look. That is its job. Loaded, it comments on")
+        say("  %s once per incident. Its first pass does not judge staleness (its run clock" % ticket)
+        say("  is rearmed below, because the daemons were just loaded); the pass after it does.")
 
     if plist_stale:
         _install_plist(r, label, want_plist)
@@ -4211,7 +4243,42 @@ def step_heartbeat_monitor(ctx, apply_it):
         out = r.as_root(["launchctl", "bootout", "system/" + label],
                         why="unload %s before loading the current plist" % label)
         if not out.skipped:
-            _wait_until_gone(r, label, _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+            # READ, NEVER DISCARDED, as in `_monitor_off`. Bootstrapping into a job launchd
+            # still holds returns EIO, and a pass of the old job could stamp the run clock
+            # again after the rearm below. A job launchd still holds is not unloaded, so it
+            # leaves `ctx.unloaded` (where `code` may have put it): the exit notice would
+            # otherwise advise loading it.
+            said = (out.err or out.out).strip()
+            if not out.ok:
+                say("  launchctl bootout exited %d: %s"
+                    % (out.rc, (said.splitlines() or ["no output"])[0][:160]))
+            gone, waited = _wait_until_gone(r, label,
+                                            _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+            if not gone:
+                ctx.unloaded = [l for l in ctx.unloaded if l != label]
+                raise SetupError(
+                    "the heartbeat monitor was told to stop for a reload and launchd still "
+                    "holds %s %ds later.\nIt was NOT rearmed or loaded again: bootstrapping "
+                    "into a job launchd still holds returns EIO.\nStop it by hand, then run "
+                    "the installer again:\n    sudo launchctl bootout system/%s"
+                    % (label, waited, label))
+            if label not in ctx.unloaded:
+                ctx.unloaded.append(label)
+    # REARMED IMMEDIATELY BEFORE IT IS LOADED. The three daemons were loaded moments ago,
+    # often after `code` stopped them, so their heartbeats are old for that reason and
+    # their first passes may not have ended yet. A monitor whose own last run was recent
+    # would judge those files stale and comment about daemons that are running. `rearm`
+    # removes only its last-run stamp, so its first pass is handled like a wake from sleep
+    # and the pass after it judges staleness. Run AFTER the bootout, so no pass of the old
+    # job can stamp the clock again in between.
+    rearm = r.as_role(ctx.account, "/usr/bin/python3 %s/kit/scripts/%s rearm --config %s/%s"
+                      % (ctx.stage_home, MONITOR_SCRIPT, ctx.stage_home, MONITOR_CONFIG),
+                      why="rearm %s's run clock, so its first pass does not judge the daemons' "
+                          "reloaded heartbeats as stale" % label)
+    if not rearm.ok and not rearm.skipped:
+        raise SetupError("the heartbeat monitor's rearm failed (exit %d), so it was not loaded: "
+                         "its first pass would judge the daemons' old heartbeats as stale. %s"
+                         % (rearm.rc, (rearm.err or rearm.out).strip()[-400:]))
     res = r.as_root(["launchctl", "bootstrap", "system", plist], why="load %s" % label)
     if res.skipped:
         return False, "would load %s and wait for its heartbeat" % label, []
@@ -4226,8 +4293,8 @@ def step_heartbeat_monitor(ctx, apply_it):
             if doc.get("result") not in MONITOR_GOOD_RESULTS:
                 raise SetupError("the heartbeat monitor loaded and its first pass ended `%s` — %s"
                                  % (doc.get("result"), str(doc.get("detail") or "")[:300]))
-            return False, ("loaded; its first pass wrote a heartbeat (`%s`) and comments on %s"
-                           % (doc.get("result"), ticket)), []
+            return False, ("loaded; its first pass wrote a heartbeat (`%s`), and it comments "
+                           "on %s once per incident" % (doc.get("result"), ticket)), []
         if n < MONITOR_HEARTBEAT_POLLS - 1:
             _pause(MONITOR_HEARTBEAT_POLL_SECONDS)
     raise Unknown("the heartbeat monitor was loaded and wrote no heartbeat within %d s"
@@ -4462,20 +4529,48 @@ def cmd_run(ctx, dry_run):
 def _unloaded_notice(ctx):
     """Say it out loud when a run ends with the loops switched off.
 
-    `code` stops every daemon before it moves the clone under them, and only
-    the far-downstream `enable` step starts them again. A run that blocks in
-    between leaves review, bounce and finding OFF, and silence there looks
-    exactly like a healthy install."""
+    `code` stops every daemon before it moves the clone under them. The
+    far-downstream `enable` step starts the three again, and the
+    `heartbeat-monitor` step after it starts the monitor. A run that blocks in
+    between leaves those jobs OFF, and silence there looks exactly like a
+    healthy install. Each is named for what it is: a run that stops at the
+    monitor's step has review, bounce and finding running, and saying they are
+    off would send a person to look at loops that are fine."""
     if not ctx.unloaded:
         return
-    say("")
-    say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
-    say("under them, and did not get as far as the step that loads them again — so review,")
-    say("bounce and finding are OFF until it does:")
-    for label in ctx.unloaded:
-        say("    %s" % label)
+    mlabel = monitor_label(ctx.conf)
+    core = [l for l in ctx.unloaded if l != mlabel]
+    advice = list(core)
+    if core:
+        say("")
+        say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
+        say("under them, and did not get as far as the step that loads them again — so review,")
+        say("bounce and finding are OFF until it does:")
+        for label in core:
+            say("    %s" % label)
+    rearm = None
+    if mlabel in ctx.unloaded:
+        say("")
+        if monitor_ticket(ctx.conf) == "off":
+            say("The heartbeat monitor was stopped too. HEARTBEAT_MONITOR_TICKET=off, so leave it")
+            say("unloaded. The `heartbeat-monitor` step removes its plist; until that step runs,")
+            say("the next boot loads it again.")
+        else:
+            say("THE HEARTBEAT MONITOR IS UNLOADED. This run stopped it with the daemons and did")
+            say("not get as far as its own step, so nothing reads their heartbeats until it does:")
+            say("    %s" % mlabel)
+            advice.append(mlabel)
+            # Rearmed first, as its step does, so its first pass does not page on the
+            # heartbeats this stop made old.
+            rearm = ("sudo -u %s -H /bin/sh -c 'cd / && /usr/bin/python3 %s/kit/scripts/%s "
+                     "rearm --config %s/%s'" % (ctx.account, ctx.stage_home, MONITOR_SCRIPT,
+                                                ctx.stage_home, MONITOR_CONFIG))
+    if not advice:
+        return
     say("Clear the row above and run the same command again, or load them yourself:")
-    for label in ctx.unloaded:
+    for label in advice:
+        if label == mlabel and rearm:
+            say("    %s" % rearm)
         say("    sudo launchctl bootstrap system %s" % _dispatcher_plist(label))
 
 
@@ -5061,6 +5156,17 @@ def _selftest_body():
                and all("has not been edited" in e for e in _ex_more),
                "the example is wrong in some way other than its two deliberate "
                "placeholders: %s" % _ex_more)
+        # A default that names a file is not a working default until the file exists, and
+        # the optional section must not promise otherwise (the conflict-waker step fails
+        # without it: waker-missing-conf).
+        _ex_optional = _example_text.partition("# 4.  OPTIONAL")[2]
+        expect("conf-example-complete",
+               CONF_DEFAULTS["CONFLICT_WAKER_CONF"] not in ("", "off")
+               and "every one of these has a working default" not in _ex_optional
+               and "except CONFLICT_WAKER_CONF" in _ex_optional
+               and "must exist" in _ex_optional.partition("CONFLICT_WAKER_CONF=")[0],
+               "section 4 of stage-e.conf.example must say the CONFLICT_WAKER_CONF default "
+               "names a file that must exist")
 
     # -- 4. the agent-environment refusal -----------------------------------
     cases += 1
@@ -7654,8 +7760,8 @@ def _selftest_body():
         _mcfg = hbm.load_config(_mpath)
         expect("monitor-config-accepted",
                set(_mcfg["watch"]) == set(hbm.WATCHERS) and _mcfg["notify_ticket_id"] == "KIT-7"
-               and _mcfg["intervals"] == {"review-poller": 300, "bounce-driver": 360,
-                                          "finding-poller": 300}
+               and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
+                                          "finding-poller": 300 + 900}
                and _mcfg["run_interval_seconds"] == 1800,
                "the monitor read back %s" % _mcfg)
         expect("monitor-names-agree",
@@ -7670,6 +7776,73 @@ def _selftest_body():
            and COMPONENT_EXIT_DECLINED == hbm.EXIT_DECLINED
            and MONITOR_RUN_TIMEOUT_SECONDS >= 1,
            "a name or code this file holds for the monitor no longer matches the script")
+
+    # A PASS INSIDE ITS OWN DEADLINE IS NOT STALE. The pass clock this file adds is each
+    # daemon's own default, and with the config it writes, a review poller whose last pass
+    # ended one interval plus one long pass ago, and a bounce driver whose `running` beat is
+    # one long pass old, both read as healthy.
+    import pipeline_review_poller as _prp_m
+    import pipeline_bounce_local as _pbl_m
+    import pipeline_finding_poller as _pfp_m
+    expect("monitor-pass-clock",
+           MONITOR_DAEMON_PASS_SECONDS == _prp_m.DEFAULT_RUN_TIMEOUT_SECONDS
+           == _pbl_m.DEFAULT_RUN_TIMEOUT_SECONDS
+           and MONITOR_DAEMON_PASS_SECONDS >= _pfp_m.DEFAULT_RUN_TIMEOUT_SECONDS,
+           "MONITOR_DAEMON_PASS_SECONDS=%d no longer covers the daemons' own pass wall clocks"
+           % MONITOR_DAEMON_PASS_SECONDS)
+    _wcfg, _tnow = monitor_config(_cm), time.time()
+
+    def _judged(job, **fields):
+        doc = dict(fields, schema=hbm.WATCHERS[job]["schema"])
+        return hbm.judge_one(job, hbm.WATCHERS[job],
+                             {"exists": True, "path": "/x", "error": None, "doc": doc}, _tnow,
+                             hbm.stale_after(_wcfg["intervals"][job], _wcfg["stale_multiplier"]),
+                             False)["verdict"]
+    _long = MONITOR_DAEMON_PASS_SECONDS - 50
+    expect("monitor-pass-clock",
+           _judged("review-poller", result="ok",
+                   ended_at=hbm._iso(_tnow - int(_cm["POLL_INTERVAL_SECONDS"]) - _long)) == "ok"
+           and _judged("bounce-driver", result="running", at=hbm._iso(_tnow - _long)) == "running",
+           "a long pass inside the daemon's own deadline read as stale or wedged")
+
+    # THE FIELDS THE STEP JUDGES COME FROM THE MONITOR'S OWN PASS. A real `run` (and a
+    # `--dry-run`) over one fresh, good heartbeat leaves the file `verify` reads, so a
+    # renamed `at`, `result` or `dry_run` fails here rather than on a live machine.
+    import contextlib
+    import io
+    _sdir = tempfile.mkdtemp(prefix="state.", dir=_mdir)
+    _hand = os.path.join(_mdir, "hand.json")
+    with open(_hand, "w", encoding="utf-8") as fh:
+        json.dump({"state_dir": _sdir, "watch": ["review-poller"],
+                   "intervals": {"review-poller": 1200}, "run_interval_seconds": 1800}, fh)
+    with open(os.path.join(_sdir, "heartbeat.json"), "w", encoding="utf-8") as fh:
+        json.dump({"schema": hbm.WATCHERS["review-poller"]["schema"], "result": "ok",
+                   "ended_at": hbm._iso()}, fh)
+    for _dry in (False, True):
+        with contextlib.redirect_stderr(io.StringIO()):
+            _rc, _p = _quiet(lambda: hbm.main(["run", "--config", _hand]
+                                              + (["--dry-run"] if _dry else [])))
+        with open(os.path.join(_sdir, os.path.basename(MONITOR_HEARTBEAT)), encoding="utf-8") as fh:
+            _doc = json.load(fh)
+        _stamp = _heartbeat_epoch(_doc)
+        expect("monitor-heartbeat-shape",
+               _rc == 0 and _doc.get("schema") == MONITOR_HEARTBEAT_SCHEMA and _stamp is not None
+               and abs(time.time() - _stamp) < 120 and _doc.get("result") in MONITOR_GOOD_RESULTS
+               and _doc.get("dry_run") is _dry,
+               "the monitor's own %s pass left %s" % ("dry" if _dry else "real", _doc))
+
+    def _monitor_beat(age, result, dry):
+        """The fixture heartbeat, written by the monitor's OWN writer at `age` seconds old."""
+        bdir = tempfile.mkdtemp(prefix="beat.", dir=_mdir)
+        saved_now = hbm._now
+        hbm._now = lambda: time.time() - age
+        try:
+            hbm.write_heartbeat({"monitor_state_dir": bdir}, result=result, dry_run=dry,
+                                detail="simulated")
+        finally:
+            hbm._now = saved_now
+        with open(hbm.heartbeat_path({"monitor_state_dir": bdir}), encoding="utf-8") as fh:
+            return fh.read()
 
     def _monitor_ctx(value="KIT-7", issues=("KIT-7",), config=True, plist=True, loaded=True,
                      beat_age=30, result="ok", dry=False, runner=None):
@@ -7690,10 +7863,7 @@ def _selftest_body():
         ctx_x._linear = _Issues()
         beat = None
         if beat_age is not None:
-            beat = json.dumps({"schema": MONITOR_HEARTBEAT_SCHEMA, "result": result,
-                               "dry_run": dry, "detail": "simulated",
-                               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                   time.gmtime(time.time() - beat_age))})
+            beat = _monitor_beat(beat_age, result, dry)
         answers = [("ls $HOME/.stage-e/kit/scripts/" + MONITOR_SCRIPT, 0,
                     "$HOME/.stage-e/kit/scripts/%s\n" % MONITOR_SCRIPT)]
         if config:
@@ -7727,6 +7897,10 @@ def _selftest_body():
                    "blocked on %s after %d reads" % (exc.card_id, len(fakeU.reads)))
         expect("monitor-card", "CK-9" in CARDS and "HEARTBEAT_MONITOR_TICKET=off"
                in " ".join(CARDS["CK-9"]["do"]), "CK-9 must say how to turn it off by name")
+        expect("monitor-card", "no session is ever delegated" in " ".join(CARDS["CK-9"]["do"])
+               and "stays open" in " ".join(CARDS["CK-9"]["do"])
+               and "Accepted risks" in CARDS["CK-9"]["why"],
+               "CK-9 must steer to a never-delegated, open ticket and name the session risk")
 
         # Off, and nothing installed: said by name, nothing written.
         ctxO, fakeO = _monitor_ctx(value="off", loaded=False)
@@ -7749,6 +7923,24 @@ def _selftest_body():
                        for w in fakeOL.writes)
                and ctxOL.unloaded == [],
                "off must unload and remove the plist a reboot would load again: %s" % whys)
+
+        # …and when launchd will not let go, it says so and KEEPS the plist, so the job
+        # can still be found. Removing it would leave a loaded job nothing on disk names.
+        for _rc_out in (0, 5):
+            ctxOS, fakeOS = _monitor_ctx(value="off", runner=FakeLaunchd(stuck=True,
+                                                                        bootout_rc=_rc_out))
+            fakeOS.answers = [("test -f " + _dispatcher_plist(mlabel), 0, ""),
+                              ("rm -f", 0, "")] + fakeOS.answers
+            try:
+                _quiet(lambda: step_heartbeat_monitor(ctxOS, apply_it=True))
+                failures.append("monitor-off-stuck: a job launchd still holds was reported "
+                                "unloaded (bootout rc %d)" % _rc_out)
+            except SetupError as exc:
+                expect("monitor-off-stuck", mlabel in str(exc)
+                       and "sudo launchctl bootout system/" + mlabel in str(exc)
+                       and fakeOS.present
+                       and not any(w["argv"][:2] == ["sudo", "rm"] for w in fakeOS.writes),
+                       "rc %d: %s; writes %s" % (_rc_out, exc, [w["why"] for w in fakeOS.writes]))
 
         # A loaded monitor whose heartbeat is old is NOT RUNNING — never installed.
         ctxS, _fS = _monitor_ctx(beat_age=10 ** 6)
@@ -7779,15 +7971,23 @@ def _selftest_body():
         okF, detailF, _x = step_heartbeat_monitor(ctxF, apply_it=False)
         expect("monitor-dry-run", okF is False and "write ~/.stage-e/" + MONITOR_CONFIG in detailF
                and "install " + _dispatcher_plist(mlabel) in detailF and "load it" in detailF
+               and "rearm" in detailF
                and not fakeF.writes, "dry run read %r, wrote %s" % (detailF, fakeF.writes))
 
-        # …and a run writes the config, checks, installs, loads, and waits for a NEW heartbeat.
+        # …and a run writes the config, checks, installs, REARMS, loads, and waits for a NEW
+        # heartbeat.
+        _rearm_cmd = MONITOR_SCRIPT + " rearm --config $HOME/.stage-e/" + MONITOR_CONFIG
         ctxA, fakeA = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=-5)
         fakeA.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
                          (MONITOR_SCRIPT + " check --config", 3, "missing: finding-poller\n"),
                          ("plutil -lint", 0, ""), ("install -o root", 0, ""),
+                         (_rearm_cmd, 0, ""),
                          ("launchctl bootstrap system", 0, "")] + fakeA.answers
         ctxA.unloaded = [mlabel]
+        # Every command, read or write, in the order it ran.
+        seqA, _execA = [], fakeA._exec
+        fakeA._exec = lambda argv, stdin, timeout: (seqA.append(_fmt(argv)),
+                                                    _execA(argv, stdin, timeout))[1]
         (okA, detailA, _x), printedA = _quiet(lambda: step_heartbeat_monitor(ctxA, apply_it=True))
         whysA = [w["why"] for w in fakeA.writes]
         bodyA = [w["stdin"] for w in fakeA.writes if "write " in w["why"]]
@@ -7797,10 +7997,15 @@ def _selftest_body():
                and bodyA and json.loads(bodyA[0]) == monitor_config(ctxA.conf)
                and "found a problem on its first look" in printedA,
                "install read %r, wrote %s" % (detailA, whysA))
-        expect("monitor-install-order", [i for i, w in enumerate(whysA) if w.startswith("write ")][0]
-               < [i for i, w in enumerate(whysA) if w.startswith("install ")][0]
-               < [i for i, w in enumerate(whysA) if w.startswith("load ")][0],
-               "config, then plist, then load: %s" % whysA)
+
+        def _at(needle):
+            return ([i for i, line in enumerate(seqA) if needle in line] or [-1])[0]
+        expect("monitor-install-order",
+               -1 < _at("cat > $HOME/.stage-e/" + MONITOR_CONFIG) < _at(" check --config")
+               < _at("install -o root") < _at(_rearm_cmd) < _at("launchctl bootstrap system")
+               and _at(_rearm_cmd) + 1 == _at("launchctl bootstrap system")
+               and any(w.startswith("rearm " + mlabel) for w in whysA),
+               "config, check, plist, then rearm immediately before load: %s" % seqA)
         expect("monitor-plist", 'run --config "$HOME/.stage-e/%s"' % MONITOR_CONFIG in _monitor_plist(ctxA)
                and "<integer>1800</integer>" in _monitor_plist(ctxA)
                and _monitor_plist(ctxA).count(DAEMON_EXEC) == 1,
@@ -7821,12 +8026,70 @@ def _selftest_body():
         ctxW, fakeW = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=3600)
         fakeW.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
                          (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
-                         ("install -o root", 0, ""), ("launchctl bootstrap system", 0, "")] + fakeW.answers
+                         ("install -o root", 0, ""), (_rearm_cmd, 0, ""),
+                         ("launchctl bootstrap system", 0, "")] + fakeW.answers
         try:
             _quiet(lambda: step_heartbeat_monitor(ctxW, apply_it=True))
             failures.append("monitor-no-beat: an old heartbeat counted as the new job's first pass")
         except Unknown as exc:
             expect("monitor-no-beat", "wrote no heartbeat" in str(exc), str(exc))
+
+        # A monitor that could not be rearmed is never loaded: its first pass would page on
+        # heartbeats the reload made old.
+        ctxR, fakeR = _monitor_ctx(config=False, plist=False, loaded=False, beat_age=-5)
+        fakeR.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                         (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
+                         ("install -o root", 0, ""),
+                         (_rearm_cmd, 1, "FAIL: rearm could not rewrite")] + fakeR.answers
+        try:
+            _quiet(lambda: step_heartbeat_monitor(ctxR, apply_it=True))
+            failures.append("monitor-rearm-refused: a monitor that was not rearmed was loaded")
+        except SetupError as exc:
+            expect("monitor-rearm-refused", "rearm failed" in str(exc)
+                   and not any(w["why"].startswith("load ") for w in fakeR.writes), str(exc))
+
+        # A LOADED monitor being reloaded is rearmed after launchd lets go of the old job,
+        # so no pass of that job can stamp the clock again before the new one starts.
+        ctxRL, fakeRL = _monitor_ctx(config=False, beat_age=-5, runner=FakeLaunchd())
+        fakeRL.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                          (MONITOR_SCRIPT + " check --config", 0, ""),
+                          (_rearm_cmd, 0, "")] + fakeRL.answers
+        seqRL, _execRL = [], fakeRL._exec
+        fakeRL._exec = lambda argv, stdin, timeout: (seqRL.append(_fmt(argv)),
+                                                     _execRL(argv, stdin, timeout))[1]
+        _quiet(lambda: step_heartbeat_monitor(ctxRL, apply_it=True))
+        _gone_at = max([i for i, line in enumerate(seqRL)
+                        if "launchctl print system/" + mlabel in line] or [-1])
+        _rearm_at = ([i for i, line in enumerate(seqRL) if _rearm_cmd in line] or [-1])[0]
+        _out_at = ([i for i, line in enumerate(seqRL) if "launchctl bootout" in line] or [-1])[0]
+        _next = seqRL[_rearm_at + 1] if -1 < _rearm_at < len(seqRL) - 1 else ""
+        expect("monitor-install-order",
+               -1 < _out_at < _gone_at < _rearm_at
+               and _next.endswith(_dispatcher_plist(mlabel)) and "launchctl bootstrap system" in _next,
+               "a reload must bootout, wait, rearm, then load: %s" % seqRL)
+
+        # …and when launchd will not let go of the old job, the reload stops there. It names
+        # the job and the command, and neither rearms nor loads: bootstrapping into a job
+        # launchd still holds is EIO, and the old job could stamp the clock again.
+        for _rc_out in (0, 5):
+            ctxRS, fakeRS = _monitor_ctx(config=False, beat_age=-5,
+                                         runner=FakeLaunchd(stuck=True, bootout_rc=_rc_out))
+            ctxRS.unloaded = [mlabel]            # as `code` records it before its own bootout
+            fakeRS.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                              (MONITOR_SCRIPT + " check --config", 0, ""),
+                              (_rearm_cmd, 0, "")] + fakeRS.answers
+            try:
+                _quiet(lambda: step_heartbeat_monitor(ctxRS, apply_it=True))
+                failures.append("monitor-reload-stuck: a reload went on while launchd still held "
+                                "the old job (bootout rc %d)" % _rc_out)
+            except SetupError as exc:
+                expect("monitor-reload-stuck", mlabel in str(exc)
+                       and "sudo launchctl bootout system/" + mlabel in str(exc)
+                       and fakeRS.present and fakeRS.attempts == 0
+                       and not any(w["why"].startswith("rearm ") for w in fakeRS.writes)
+                       and mlabel not in ctxRS.unloaded,
+                       "rc %d: %s; writes %s; unloaded %s"
+                       % (_rc_out, exc, [w["why"] for w in fakeRS.writes], ctxRS.unloaded))
 
         # `code` stops a LOADED monitor before the clone moves, and names it; `enable` does
         # not clear it from that list, because it loads only the three.
@@ -7855,6 +8118,37 @@ def _selftest_body():
         _quiet(lambda: step_enable(ctxL, apply_it=True))
         expect("monitor-enable-leaves-it", ctxL.unloaded == [mlabel],
                "loading the three left %s" % ctxL.unloaded)
+
+        # …and the exit notice then says the MONITOR is off, not review, bounce and finding.
+        _x, outNM = _quiet(lambda: _unloaded_notice(ctxL))
+        expect("unloaded-notice", "THE STAGE E DAEMONS ARE UNLOADED" not in outNM
+               and "THE HEARTBEAT MONITOR IS UNLOADED" in outNM
+               and "sudo launchctl bootstrap system " + _dispatcher_plist(mlabel) in outNM
+               and " rearm --config " in outNM
+               and outNM.index(" rearm --config ") < outNM.index("bootstrap system "
+                                                                   + _dispatcher_plist(mlabel))
+               and not any(_dispatcher_plist(l) in outNM for l in all_daemon_labels(_cm)),
+               "only the monitor is unloaded and the notice read:\n%s" % outNM)
+        # Everything stopped: the three are named as off, and the monitor on its own line.
+        ctxL.unloaded = list(all_daemon_labels(_cm)) + [mlabel]
+        _x, outAll = _quiet(lambda: _unloaded_notice(ctxL))
+        expect("unloaded-notice", "THE STAGE E DAEMONS ARE UNLOADED" in outAll
+               and "THE HEARTBEAT MONITOR IS UNLOADED" in outAll
+               and all("bootstrap system " + _dispatcher_plist(l) in outAll
+                       for l in all_daemon_labels(_cm) + (mlabel,)), outAll)
+        # Under `off`, the monitor is never in the advice to load it again.
+        ctxOff, _fOff = _settled_ctx(_monitor_conf("off")[0])
+        ctxOff.unloaded = list(all_daemon_labels(ctxOff.conf)) + [mlabel]
+        _x, outOff = _quiet(lambda: _unloaded_notice(ctxOff))
+        expect("unloaded-notice", "THE STAGE E DAEMONS ARE UNLOADED" in outOff
+               and "bootstrap system " + _dispatcher_plist(mlabel) not in outOff
+               and "HEARTBEAT_MONITOR_TICKET=off" in outOff
+               and all("bootstrap system " + _dispatcher_plist(l) in outOff
+                       for l in all_daemon_labels(ctxOff.conf)), outOff)
+        ctxOff.unloaded = [mlabel]
+        _x, outOffM = _quiet(lambda: _unloaded_notice(ctxOff))
+        expect("unloaded-notice", "THE STAGE E DAEMONS ARE UNLOADED" not in outOffM
+               and "bootstrap system" not in outOffM, outOffM)
     finally:
         globals()["_pause"] = _saved_pause_m
     order = [s for s, _t, _f in STEPS]
