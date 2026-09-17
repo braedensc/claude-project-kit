@@ -434,6 +434,20 @@ verified per request against Slack's signing secret. Without the secret the disp
 back to a bearer check that no client can currently satisfy. That accident is not relied on.
 The notifier still needs no inbound path.
 
+Signature verification is switched on by the same setting that makes the dispatcher's web
+server listen on **every network interface** instead of this machine only; the two cannot be
+separated. Every route then answers the local network directly, past the front door. So the
+owner applies a packet-filter rule, persisted across reboots, that refuses the dispatcher's port
+on every interface except loopback, and verifies it from a second device. The front door still
+connects locally. The application firewall is not used: it does not close a port a signed app
+already holds.
+
+**The dispatcher's API key stays unset.** Setting one would close the tool server's open auth
+check, but any value also marks the dispatcher as paired with its vendor's hosted service, which
+registers a failure-report tool that posts session recaps and quotes to that service from outside
+the sandbox, with no opt-out. Accepted instead: a process already on this machine can call the
+tool server, given a live session's id.
+
 ### 3. Heartbeat-monitor incidents page through the notifier
 
 The monitor posts under the owner's own key, and the tracker does not notify a user of their own
