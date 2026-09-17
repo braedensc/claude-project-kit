@@ -161,6 +161,10 @@ import time
 
 LABEL = "conflict"
 MAX_FIX_REQUESTS = 3          # automated attempts per PR, lifetime; the 4th conflict pages
+# …unless a repository says otherwise. `monitor --max-fix-requests N` overrides it, and 0
+# means NOTHING HERE ANSWERS: page a person at detection rather than ask for a fix nobody
+# can do (KIT-175). The budget is the whole difference between the two first-conflict
+# paths, so it is the only knob that needs to exist for that.
 ACK_DEADLINE_MIN = 15
 RESULT_DEADLINE_MIN = 120     # a pass may queue several sessions of up to --timeout-min each
 SETTLE_ATTEMPTS = 5           # bounded re-query while GitHub computes `mergeable` lazily
@@ -470,10 +474,11 @@ def _headline(pr, base):
             "— a side check can still report green. Do not read that as a passing PR.")
 
 
-def request_body(pr, episode, attempt, base):
+def request_body(pr, episode, attempt, base, budget=None):
+    budget = MAX_FIX_REQUESTS if budget is None else budget
     return "\n".join([
         marker("request", episode), _headline(pr, base), "",
-        f"**A fix has been requested** (automated attempt {attempt} of {MAX_FIX_REQUESTS} on this PR). "
+        f"**A fix has been requested** (automated attempt {attempt} of {budget} on this PR). "
         "It is acknowledged here by whichever owns this branch's session: the conflict waker on the "
         "machine where a local session worked in its worktree, or — for a dispatcher's PR — the "
         "bounce driver, which sends it back to that session's own thread. Either way the session "
@@ -486,10 +491,15 @@ def request_body(pr, episode, attempt, base):
     ])
 
 
-def page_body(pr, episode, reason, base, page):
+def page_body(pr, episode, reason, base, page, budget=None):
+    budget = MAX_FIX_REQUESTS if budget is None else budget
     why = {
-        "budget": (f"this PR has already had {MAX_FIX_REQUESTS} automated fix attempts — a PR that "
-                   "keeps conflicting needs a person, not another guess"),
+        "budget": (f"this PR has already had {budget} automated fix attempts — a PR that "
+                   "keeps conflicting needs a person, not another guess")
+        if budget else
+        # The 0 case reads as its own sentence: "0 attempts" would say nothing true.
+        ("nothing in this repository answers an automated fix request — it is configured "
+         "to page a person at the first conflict instead"),
         "fork": "it comes from a fork, and the waker only acts on branches in this repository",
     }[reason]
     return "\n".join([
@@ -523,7 +533,9 @@ def settle(fetch, sleep, attempts=SETTLE_ATTEMPTS, delay=SETTLE_DELAY_S):
     return prs
 
 
-def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=()):
+def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
+            max_fix_requests=None):
+    budget = MAX_FIX_REQUESTS if max_fix_requests is None else int(max_fix_requests)
     act = (lambda *a, **k: None) if dry_run else None
     add_label = act or gh.add_label
     remove_label = act or gh.remove_label
@@ -570,15 +582,15 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=())
         if not labeled:
             episode = state["opened"] + 1
             add_label(n)  # the dedupe key first: a mid-step failure re-alerts, never double-posts
-            if pr["isCrossRepository"] or state["requests"] >= MAX_FIX_REQUESTS:
+            if pr["isCrossRepository"] or state["requests"] >= budget:
                 reason = "fork" if pr["isCrossRepository"] else "budget"
                 recipients = page_recipients(pr, gh, page_to)
-                comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients))
+                comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget))
                 page(n, recipients)
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
             else:
-                comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh)))
+                comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh), budget))
                 tally["requested"].append(n)
                 print(f"#{n}: CONFLICTING — fix requested, episode {episode}")
             continue
@@ -1039,6 +1051,29 @@ def selftest():
     expect(body.startswith(marker("page", 4, reason="budget")) and "cc @dev (the PR's author)" in body
            and ("assign", 2, ("dev",)) in gh.writes, f"budget spent must page the author: {gh.writes}")
 
+    # 2b. A REPOSITORY WHERE NOTHING ANSWERS pages at the first conflict (KIT-175). Asking
+    #     for a fix where no waker and no dispatcher exists posts a comment addressed to
+    #     nobody and delays the person who can actually fix it by a whole tick.
+    gh = FakeGh([_pr(21)])
+    rc0, _ = run_monitor(gh, max_fix_requests=0)
+    body0 = [w for w in gh.writes if w[0] == "comment"][0][2]
+    expect(rc0 == 0 and body0.startswith(marker("page", 1, reason="budget")),
+           f"--max-fix-requests 0 must page at detection: {gh.writes}")
+    expect("A fix has been requested" not in body0 and "cc @dev (the PR's author)" in body0
+           and ("assign", 21, ("dev",)) in gh.writes,
+           "…and it must page a person, not ask an answerer that does not exist")
+    expect("nothing in this repository answers" in body0 and "0 automated fix attempts" not in body0,
+           f"…and it must say WHY in its own words, not as a count of zero: {body0[:200]}")
+    # …while the default is untouched, and a raised budget asks more times before paging.
+    gh = FakeGh([_pr(22)], {22: [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]})
+    run_monitor(gh, max_fix_requests=5)
+    body5 = [w for w in gh.writes if w[0] == "comment"][0][2]
+    expect(body5.startswith(marker("request", 4)) and "attempt 4 of 5" in body5,
+           f"a raised budget must keep asking, and say the budget it is counting: {body5[:200]}")
+    expect(main(["monitor", "--repo", "acme/widgets", "--max-fix-requests", "-1",
+                 "--dry-run"]) == 2,
+           "a negative budget must be a usage error, never a silent default")
+
     # 3. a fork is paged, never requested.
     gh = FakeGh([_pr(3, fork=True)])
     run_monitor(gh)
@@ -1435,6 +1470,11 @@ def main(argv=None):
     m = sub.add_parser("monitor")
     m.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     m.add_argument("--dry-run", action="store_true")
+    m.add_argument("--max-fix-requests", type=int,
+                   default=os.environ.get("PR_CONFLICT_MAX_FIX_REQUESTS") or MAX_FIX_REQUESTS,
+                   help="automated fix attempts per PR before a person is paged (default %d). "
+                        "0 means nothing in this repository answers one: page at the first "
+                        "conflict instead of asking" % MAX_FIX_REQUESTS)
     m.add_argument("--page-to", default=os.environ.get("PR_CONFLICT_PAGE_TO", ""),
                    help="logins (or org/team) a page @mentions, comma- or space-separated; default "
                         "PR_CONFLICT_PAGE_TO, else the PR's author, else a person who owns the repo")
@@ -1459,6 +1499,10 @@ def main(argv=None):
             if not args.repo or "/" not in args.repo:
                 print("monitor needs --repo owner/name (or GITHUB_REPOSITORY)", file=sys.stderr)
                 return 2
+            if args.max_fix_requests < 0:
+                print("monitor: --max-fix-requests cannot be negative (0 means page at the "
+                      "first conflict)", file=sys.stderr)
+                return 2
             page_to, bad = parse_page_to(args.page_to)
             if bad:
                 print(f"monitor: --page-to / PR_CONFLICT_PAGE_TO names {bad}, which is not a GitHub "
@@ -1473,7 +1517,8 @@ def main(argv=None):
                         fh.write(text + "\n")
 
             return monitor(Gh(args.repo), dt.datetime.now(dt.timezone.utc),
-                           dry_run=args.dry_run, summary=summary, page_to=page_to)
+                           dry_run=args.dry_run, summary=summary, page_to=page_to,
+                           max_fix_requests=args.max_fix_requests)
         if args.cmd == "wake":
             problem = queue_problem(args.max_sessions, args.timeout_min, args.max_budget_usd)
             if problem:
