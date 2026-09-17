@@ -492,7 +492,9 @@ holds the pen at filing time* changes.
 The honest list — where the build session should expect the real risk, because it needs Stage
 E's *built* behaviour or an open decision to resolve. **Item 1 is the load-bearing one.**
 
-1. **Per-tool tracker fencing — the linchpin. RESOLVED (2026-09-08): fallback (b).** Whether
+1. **Per-tool tracker fencing — the linchpin. RESOLVED (2026-09-08): fallback (b);
+   its IMPLEMENTATION was corrected 2026-09-17 — see the Update at the end of this
+   file, which supersedes this item's account of how the fence is enforced.** Whether
    the dispatcher's `disallowedTools` can remove *individual* Linear tools (`save_issue` but
    keep `save_comment` and the read tools) was the open question. The build session read the
    **built** Stage E installer (`scripts/pipeline_stage_e_setup.py`) for the answer the running
@@ -603,3 +605,49 @@ forward-references until activation and the end-to-end proof (a later session's)
   and the executor logic would be inert here and proven by `--selftest` in CI, as every other
   pipeline script is. The gating dependencies (Stage E, KIT-102, KIT-96 enabled, KIT-104, and
   build-fixes A/B) are open, and this ADR does not pre-empt any of them.
+
+---
+
+## Update 2026-09-17 — fallback (b) was implemented as a key nothing reads
+
+**What this corrects.** Item 1 above records the fence as *resolved to fallback (b)* and
+describes the planning session as holding "no Linear MCP at all". The installer implemented
+that sentence literally: the composed Planning entry carried `linearMcpAttached: False`, and
+both this ADR and the installer treated that field as the structural control.
+
+**The dispatcher never reads it.** Version 0.2.69 has zero references to the key across all
+of its packages, while its MCP config service injects `linear`, `cyrus-tools` and `cyrus-docs`
+into every tracker-triggered session. The entry's `disallowedTools` named six individual
+`mcp__linear__*` tools, so a planning session would have held the tracker's whole write
+surface apart from those six. Nothing was exposed: Stage A has never run on any machine.
+
+**What is true now.** The fence is the shape
+[KIT-132](https://linear.app/braedenclaw/issue/KIT-132) gave the reviewer. Every server the
+dispatcher injects is named in `disallowedTools` in both documented rule forms,
+`mcp__<server>` and `mcp__<server>__*`; `MCP_FENCE_RULE_RE` refuses any other shape, because
+a rule the runtime does not honour is skipped in silence and reads as a closed fence. The
+unread key is gone, and so is `allowedTools`, which narrows nothing and changes which servers
+are injected. Twenty-nine built-in tools go with them — everything that runs, edits, fetches,
+schedules, messages, publishes or reads an MCP resource by argument.
+
+**Fallback (b) is still the decision.** What changed is only the mechanism that delivers it:
+a named deny list instead of a field nobody consumes. The security argument above is
+unaffected, because it always rested on the session holding no tracker tool — that claim is
+now made in the one list the dispatcher actually reads.
+
+**What the planner keeps, and the one thing that is not proven.** It keeps Read, Grep and
+Glob to decompose against real code, Write to emit its proposal, and Task/Agent because the
+planning procedure's rubric panel is five passes in fresh contexts. Whether a subagent
+started by `Task` inherits its parent's `disallowedTools` is **unverified**, and if it does
+not, one Task call reopens the fence. No selftest can answer it; the activation checklist
+carries a live probe for a person to run before the gate goes on
+([KIT-140](https://linear.app/braedenclaw/issue/KIT-140)).
+
+**Two consequences of holding no tracker tool that this ADR still overstates.** The
+decomposition section says the executor "can run dedupe instead" of the planner's Linear
+search pass; the executor does not, and no ticket asked it to
+([KIT-141](https://linear.app/braedenclaw/issue/KIT-141)). And the installer's own live path
+does not work at all — its ledger is never written, `verify` raises, and every tracker call
+fails ([KIT-135](https://linear.app/braedenclaw/issue/KIT-135)), with the installer and the
+executor reading different config files ([KIT-136](https://linear.app/braedenclaw/issue/KIT-136)).
+Activation is blocked on those three before any operator step can succeed.
