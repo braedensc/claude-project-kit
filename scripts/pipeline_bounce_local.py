@@ -3985,7 +3985,7 @@ def selftest():
     check("an at-threshold review never concludes", conclusion_basis("green", above, True, False), None)
     #   KIT-138: a partial review never concludes, and is routed to a person only where
     #   nothing else already speaks for the PR.
-    _prn = globals().get("partial_review_note") or (lambda *a: "")
+    _prn = partial_review_note
     part = {"usable": True, "meets_threshold": False, "findings": [], "max_severity": None,
             "coverage": "partial", "withheld_files": ["src/big.py"]}
     check("KIT-138 a clean PARTIAL review never concludes",

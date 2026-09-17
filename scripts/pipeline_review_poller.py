@@ -477,7 +477,7 @@ CONFIG_KEYS = {
     "model_label_id": "optional override: the model label's UUID ('' = attach no label)",
     "repos": "optional: OWNER/NAME list — RESTRICTS discovery, and branch-scans these as a fallback",
     "state_dir": "role-account directory for the seen-set, outcomes, heartbeat and telemetry",
-    "diff_cap_chars": "max chars of the whole review-ticket description; over it → decline",
+    "diff_cap_chars": "max chars of the whole review-ticket description; over it → whole files are withheld, largest first, until it fits; one file alone over it → decline",
     "threshold": "severity at or above which findings start a fix pass (low|medium|high|critical)",
     "github_token_env": "NAME of the env var holding the GitHub token (never the value)",
     "linear_key_env": "NAME of the env var holding the delegation-capable Linear API key",
@@ -1122,16 +1122,35 @@ def fit_to_cap(owner_repo, pr, ticket_id, basis, threshold, diff, cap):
     files = split_diff_by_file(diff)
     if len(files) < 2:
         return None
-    kept, withheld = list(files), []
-    while len(kept) > 1:
-        largest = max(kept, key=lambda f: len(f[1]))
-        kept.remove(largest)
-        withheld.append(largest[0])
-        body = build_review_body(owner_repo, pr, ticket_id, basis, threshold,
-                                 "".join(text for _path, text in kept), withheld=withheld)
-        if len(body) <= cap:
-            return body, withheld, len(kept), len(files)
-    return None
+    # LINEAR, NOT QUADRATIC (review of #143). Building a body sanitizes and scans the whole
+    # diff, so rebuilding once per dropped file cost O(files × diff). Instead: size the
+    # body WITHOUT a diff for a given withheld list (cheap), add the raw size of the files
+    # kept, and drop the largest until that estimate fits. Then build ONCE and verify, and
+    # drop one more only if sanitizing grew the text past the estimate.
+    order = sorted(range(len(files)), key=lambda i: len(files[i][1]), reverse=True)
+    dropped = set()
+
+    def estimate():
+        withheld = [files[i][0] for i in order if i in dropped]
+        fixed = len(build_review_body(owner_repo, pr, ticket_id, basis, threshold, "",
+                                      withheld=withheld))
+        return fixed + sum(len(files[i][1]) for i in range(len(files)) if i not in dropped)
+
+    for i in order:
+        if len(dropped) >= len(files) - 1 or estimate() <= cap:
+            break
+        dropped.add(i)
+    while True:
+        kept = [files[i] for i in range(len(files)) if i not in dropped]
+        withheld = [files[i][0] for i in order if i in dropped]
+        if withheld:
+            body = build_review_body(owner_repo, pr, ticket_id, basis, threshold,
+                                     "".join(text for _path, text in kept), withheld=withheld)
+            if len(body) <= cap:
+                return body, withheld, len(kept), len(files)
+        if len(kept) <= 1:
+            return None
+        dropped.add(next(i for i in order if i not in dropped))
 
 
 def body_sha256(body):
@@ -4045,31 +4064,47 @@ def selftest():
 
         # KIT-138: OVER THE CAP, WHOLE FILES ARE WITHHELD — largest first — and the review
         # that runs is marked partial all the way to the bounce driver, which never concludes it.
-        _split, _fit = globals().get("split_diff_by_file"), globals().get("fit_to_cap")
-        check("KIT-138 the diff splitter and the fitter exist", (callable(_split), callable(_fit)), (True, True))
+        _split, _fit = split_diff_by_file, fit_to_cap
         small = "diff --git a/src/small.py b/src/small.py\n+++ b/src/small.py\n+x = 1\n"
         big1 = "diff --git a/src/big_one.py b/src/big_one.py\n+++ b/src/big_one.py\n" + "+y = 2\n" * 3000
         big2 = "diff --git a/src/big_two.py b/src/big_two.py\n+++ b/src/big_two.py\n" + "+z = 3\n" * 2000
         three = small + big1 + big2
         pr5 = [p for p in fixture if p["number"] == 5][0]
         cap138 = len(build_review_body("o/r", pr5, "KIT-5", basis, cfg["threshold"], small,
-                                       **({"withheld": ["src/big_one.py", "src/big_two.py"]}
-                                          if callable(_fit) else {}))) + 200
-        if callable(_split):
-            parts = _split("preamble\n" + three)
-            check("KIT-138 the diff splits into whole files, in order, losing nothing",
-                  ([p for p, _t in parts], "".join(t for _p, t in parts)),
-                  (["src/small.py", "src/big_one.py", "src/big_two.py"], "preamble\n" + three))
-        if callable(_fit):
-            fitted = _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], three, cap138)
-            check("KIT-138 over the cap, the largest files are withheld until the body fits",
-                  (fitted[1], fitted[2], fitted[3], len(fitted[0]) <= cap138) if fitted else None,
-                  (["src/big_one.py", "src/big_two.py"], 1, 3, True))
-            check("KIT-138 …the reviewer is told, and sees none of what was withheld",
-                  ("PART OF THIS CHANGE WAS WITHHELD" in fitted[0], "+x = 1" in fitted[0],
-                   "+y = 2" in fitted[0]) if fitted else None, (True, True, False))
-            check("KIT-138 one file too large on its own is still today's decline",
-                  _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], big1, 500), None)
+                                       withheld=["src/big_one.py", "src/big_two.py"])) + 200
+        parts = _split("preamble\n" + three)
+        check("KIT-138 the diff splits into whole files, in order, losing nothing",
+              ([p for p, _t in parts], "".join(t for _p, t in parts)),
+              (["src/small.py", "src/big_one.py", "src/big_two.py"], "preamble\n" + three))
+        fitted = _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], three, cap138)
+        check("KIT-138 over the cap, the largest files are withheld until the body fits",
+              (fitted[1], fitted[2], fitted[3], len(fitted[0]) <= cap138) if fitted else None,
+              (["src/big_one.py", "src/big_two.py"], 1, 3, True))
+        check("KIT-138 …the reviewer is told, and sees none of what was withheld",
+              ("PART OF THIS CHANGE WAS WITHHELD" in fitted[0], "+x = 1" in fitted[0],
+               "+y = 2" in fitted[0]) if fitted else None, (True, True, False))
+        check("KIT-138 one file too large on its own is still today's decline",
+              _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], big1, 500), None)
+        # Linear, not quadratic (review of #143): forty files, one that fits — the full body,
+        # which sanitizes and scans the whole diff, is built a bounded number of times.
+        many = small + "".join("diff --git a/src/f%02d.py b/src/f%02d.py\n+++ b/src/f%02d.py\n%s"
+                               % (k, k, k, "+w = %d\n" % k * 400) for k in range(40))
+        real_build, full_builds = build_review_body, []
+
+        def counting_build(*a, **k):
+            if a[5]:
+                full_builds.append(len(a[5]))
+            return real_build(*a, **k)
+        globals()["build_review_body"] = counting_build
+        try:
+            cap40 = len(real_build("o/r", pr5, "KIT-5", basis, cfg["threshold"], small,
+                                   withheld=["src/f%02d.py" % k for k in range(40)])) + 200
+            full_builds.clear()
+            fitted40 = _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], many, cap40)
+        finally:
+            globals()["build_review_body"] = real_build
+        check("KIT-138 forty files: the whole body is built at most twice, not once per file",
+              (fitted40 is not None and fitted40[2] == 1, len(full_builds) <= 2), (True, True))
 
         with tempfile.TemporaryDirectory() as tmp:
             fake.__init__()
@@ -4096,7 +4131,7 @@ def selftest():
                       (out138.get("coverage"), out138.get("usable")), ("partial", True))
                 check("KIT-138 a clean partial review never concludes the PR",
                       pbl.conclusion_basis("green", out138, True, False), None)
-                note = getattr(pbl, "partial_review_note", lambda *a: "")(out138, True, False, "")
+                note = pbl.partial_review_note(out138, True, False, "")
                 check("KIT-138 …it is routed to a person instead, naming what was withheld",
                       ("a person must review" in note, "src/big_one.py" in note), (True, True))
             finally:
