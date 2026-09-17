@@ -549,28 +549,33 @@ CARDS = {
         "good": "both lists hold no `mcp__` name and nothing outside the keep-set",
     },
     "CA-EXECUTOR": {
-        "title": "Load the executor's job and watch one pass",
-        "why": ("Nothing files a plan until the executor runs. Loading a scheduled "
-                "job needs the role account's own launch context, and this installer "
-                "installs the job without loading it so that the moment the gate can "
-                "first write to the board is a moment a person chose."),
-        "do": ["Load the job as the role account, then watch one pass go by and",
-               "confirm it wrote a heartbeat.",
+        "title": "Load the executor's reader and watch one pass",
+        "why": ("Nothing files a plan until something runs the executor. That reader "
+                "does not exist yet (KIT-150); this installer stops before this step "
+                "until it does. When it exists, the installer installs it without "
+                "loading it, so the moment the gate can first write to the board is a "
+                "moment a person chose."),
+        "do": ["Load the reader's job as the executor's account, then watch one pass",
+               "go by and find the record it leaves — KIT-150 names what that record",
+               "is. The executor itself writes no heartbeat.",
                "A job that is installed and never loaded looks identical to one that",
                "is loaded and failing — which is why this is a sign-off and not a",
                "probe."],
-        "good": "one pass of the executor ran and left a heartbeat",
+        "good": "one pass of the reader ran and left its record",
     },
     "CA-HANDOVER": {
         "title": "Run the planner by hand once, before anything is automatic",
         "why": ("The planning procedure has never been run on this machine at all. "
                 "Turning on an unattended planner whose output nobody has ever seen "
-                "puts the first look at its quality after the tickets are filed."),
-        "do": ["In a project that has a delivery config, run the planning skill by",
-               "hand on one real idea.",
+                "puts the first look at its quality after the tickets are filed. This "
+                "run is the INTERACTIVE path: it writes to the board itself, so it "
+                "proves nothing about the fence, the reader or the executor. It shows "
+                "what a plan looks like."),
+        "do": ["In the planned repository, start a plain session and run the planning",
+               "skill by hand on one real idea.",
                "Confirm three things: the tree files, every child passes the",
                "readiness gate, and the epic lands in the backlog awaiting you."],
-        "good": "one epic and its children in the backlog, none of them ready",
+        "good": "one epic and its children in the backlog, none of them released",
     },
 }
 
