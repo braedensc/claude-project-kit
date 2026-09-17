@@ -293,8 +293,10 @@ Exit: 0 = ran; every "nothing to do" is printed as what was asked and what the a
           close or a telemetry row did not land (`publish-failed` / `close-pending` /
           `telemetry-pending`), an unexpected error
           escaped one PR's work (the others continued), a close was given up on (a person
-          must close that review ticket), or the seen-set is unreadable (nothing ran —
-          refusing is the only way not to re-review every open PR)
+          must close that review ticket), a TELEMETRY ROW WAS GIVEN UP ON (that review is
+          delivered and is missing from the dashboard for good — nothing retries it), or
+          the seen-set is unreadable (nothing ran — refusing is the only way not to
+          re-review every open PR)
       2 = usage/config/import error — nothing was touched. Includes the basis resolver
           (scripts/pipeline_review_basis.py) not being installed, and a workspace name
           (team key, agent display name, model label) that resolves to nothing: both are
@@ -405,7 +407,12 @@ RESELECTABLE_STATUSES = ("retry", REREVIEW_STATUS)
 # throw away the `review_ticket_id` it points at, orphaning a delegated ticket and buying
 # a second paid reviewer session. Reachable for real: a terminally-red CI check bounces a
 # PR whose first review is still pending, so a request can exist before any outcome does.
-SETTLED_STATUSES = ("collected", "declined")
+# `telemetry-pending` is SETTLED for this purpose (review of #142). Its comment is on the
+# pull request, its outcome file is written and its review ticket is closed; the only thing
+# still owed is a §4 row, which is reporting. Telemetry that could hold up a re-review the
+# bounce driver has already paid for would be telemetry buying something, which §4 forbids
+# in the one direction it has always mattered. What that costs is said out loud below.
+SETTLED_STATUSES = ("collected", "declined", "telemetry-pending")
 # The shape of the file the bounce driver leaves when it wants a PR looked at again.
 # Requests written before this loop existed carry no schema key and are still read.
 REREVIEW_SCHEMA = "pipeline-rereview-request/1"
@@ -2592,6 +2599,14 @@ def scan(cfg, dry_run):
                     "waiting for it to settle so its review ticket is not orphaned"
                     % (owner_repo, number, record.get("status")))
                 continue
+            if record.get("status") == "telemetry-pending":
+                # Said, never silent: re-marking rebuilds the record, so the row this pass
+                # still owed will never be written. The review itself delivered fine.
+                log("TELEMETRY LOST: %s#%d is due for a re-review, so its record is being "
+                    "re-opened before its §4 row could be retried. That review is delivered "
+                    "and its row will never be written — the dashboard will not show this "
+                    "run. Reporting never delays delivery (§4)" % (owner_repo, number))
+                result.errors += 1
             marked.add(key)
             record = dict(record, status=REREVIEW_STATUS,
                           rereview_from=record.get("status"),
@@ -2806,7 +2821,8 @@ def collect(cfg, dry_run):
             result.errors += 1
             persist(cfg, seen, key, record, dry_run)
     print("collect: %d published, %d declined, %d still pending, %d error(s) (read failed, "
-          "comment or close not delivered, or an unexpected error — retried next pass)"
+          "comment or close not delivered, or an unexpected error — retried next pass; a "
+          "close or a telemetry row GIVEN UP on is not retried, and says so on its own line)"
           % (result.published, result.declined, result.waiting, result.errors))
     return result.exit_code()
 
@@ -3825,6 +3841,24 @@ def selftest():
             check("collect settles it", collect(c, False), EXIT_OK)
             check("the deferred re-review then happens", (scan(c, False), len(fake.created)), (EXIT_OK, 2))
             check("…and only then is the request spent", os.path.exists(path), False)
+            # …but a record waiting only on its TELEMETRY ROW is not mid-flight (review of
+            # #142). Its comment is on the PR, its outcome is written, its ticket is closed.
+            # Holding a paid-for re-review on a reporting failure would be §4's telemetry
+            # costing a session something, which it may never do.
+            held = load_seen(seen_path(tmp))
+            held[pr_key("o/r", 7)]["status"] = "telemetry-pending"
+            save_seen(seen_path(tmp), held)
+            path2 = request_after_bounce(tmp, 2, "bbbb2222")
+            head["sha"] = "cccc3333"
+            mark142 = len(sys.stderr.getvalue())
+            check("a record waiting only on telemetry does NOT hold up a due re-review, "
+                  "and the pass still goes red for the row it lost",
+                  (scan(c, False), len(fake.created), os.path.exists(path2)),
+                  (EXIT_ERROR, 3, False))
+            said142 = sys.stderr.getvalue()[mark142:]
+            check("…and the row it will never write is SAID, not dropped in silence",
+                  ("TELEMETRY LOST" in said142, "will never be written" in said142),
+                  (True, True))
 
         with tempfile.TemporaryDirectory() as tmp:   # (i) due, but selection drops it
             # Marked `rereview` and then filtered out (draft here; a missing discovery hint
@@ -4857,6 +4891,10 @@ def selftest():
             rec = _settled_record(7)
             seen139 = {pr_key("o/r", 7): rec}
             _Flaky.calls, _Flaky.fail_next = [], 1
+            mark139 = len(sys.stderr.getvalue())
+
+            def said139(_at=None):
+                return sys.stderr.getvalue()[mark139:]
             r1 = PassResult()
             settle(c139, pr_key("o/r", 7), rec, seen139, "k", False, r1)
             check("KIT-139 a failed emit leaves the record telemetry-pending, counted as an error",
@@ -4865,11 +4903,34 @@ def selftest():
             r2 = PassResult()
             if rec.get("status") in COLLECT_STATUSES:            # only what collect resumes
                 settle(c139, pr_key("o/r", 7), rec, seen139, "k", False, r2)
+            check("KIT-139 …and the operator is TOLD it will be retried, with the run id",
+                  ("telemetry-pending, retried next pass under the same run id" in said139(),
+                   "r_review_o__r_7_REV-9" in said139()), (True, True))
             check("KIT-139 the next pass re-emits it and settles",
                   (rec.get("status"), bool(rec.get("telemetry_emitted")), r2.errors),
                   ("collected", True, 0))
             check("KIT-139 …under the SAME run id both times",
                   (len(_Flaky.calls), len(set(_Flaky.calls))), (2, 1))
+            # …AND THE CLOCK MOVES BETWEEN THEM (review of #142). The row above passes with
+            # the old clock-based id restored, because both retries land inside the same
+            # wall-clock second — so it cannot fail for the bug it names. This one can:
+            # the id is a pure function of the artifact, and nothing else.
+            art139 = {"repo": "o/r", "pr": 7, "review_ticket": "REV-9"}
+            saved_clock = time.time
+            try:
+                time.time = lambda: saved_clock() + 86400
+                later = review_run_id(dict(art139))
+            finally:
+                time.time = saved_clock
+            check("KIT-139 the run id is the review's, not the clock's",
+                  (review_run_id(dict(art139)) == later,
+                   review_run_id(dict(art139)) == review_run_id(dict(art139))), (True, True))
+            check("KIT-139 …and it names the repository, so two repos' PR #7 cannot collide",
+                  review_run_id(dict(art139)) == review_run_id(dict(art139, repo="other/r")),
+                  False)
+            check("KIT-139 …while a decline with no ticket is named by the head it declined",
+                  review_run_id({"repo": "o/r", "pr": 7, "head_sha": "abcdef1234567890"})
+                  == review_run_id({"repo": "o/r", "pr": 7, "head_sha": "999999999999"}), False)
             rid = _Flaky.calls[0] if _Flaky.calls else ""
             check("KIT-139 the run id names the repository, the PR and the review",
                   ("o__r" in rid, "_7_" in rid, rid.endswith("REV-9")), (True, True, True))
@@ -4899,6 +4960,15 @@ def selftest():
                   (3, True, "collected", [1, 1, 1]))
             check("KIT-139 …and a settled record is not collected again",
                   rec3.get("status") in COLLECT_STATUSES, False)
+            # THE GIVE-UP LINE IS THE ONLY EVIDENCE (review of #142). After it the record
+            # settles as `collected`, the PR comment is already posted, and the run's one
+            # error is indistinguishable from any transient one — so if this sentence goes,
+            # a review missing from the dashboard forever is missing in silence too.
+            gave_up_said = sys.stderr.getvalue()[mark139:]
+            check("KIT-139 the give-up says the run is permanently missing, and from where",
+                  ("giving up" in gave_up_said,
+                   "MISSING from the dashboard" in gave_up_said,
+                   "every sum that should include it" in gave_up_said), (True, True, True))
 
             # An absent telemetry module is nothing to do: said once, settled at once, and
             # never retried or counted as an error (review of #142).
