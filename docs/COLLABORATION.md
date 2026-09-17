@@ -89,6 +89,35 @@ This protocol is now **deterministic, not just written**: the PreToolUse hook bl
 `git commit`/`git push` outright on any branch whose PR is already MERGED (fails open
 if `gh`/network is unavailable — it never blocks on what it can't verify).
 
+### Retarget a stacked PR before its base merges, or it lands nowhere
+
+**A stacked PR whose base is squash-merged merges into a dead branch, and `main` never
+gets the change.** Nothing goes red. The PR shows MERGED, its CI was green, and the badge
+is telling the truth about the wrong target.
+
+It happened here. One PR was stacked on another; the base was squash-merged, which
+deleted the base branch and rewrote its commits into one new commit. GitHub had not
+retargeted the stacked PR, so fifteen seconds later it merged into that dead branch. The
+fix never reached `main` and had to be re-landed from a fresh branch.
+
+**Opening a stacked PR — tell the human the order.** Merge the base, wait for the stacked
+PR to show base `main`, then merge it. If GitHub has not retargeted it, do that first:
+
+```bash
+gh pr edit <n> --base main
+```
+
+**After anyone reports merging a stack**, confirm the retarget actually happened and the
+change actually landed. The badge is not the evidence; `origin/main` is:
+
+```bash
+gh pr view <n> --json baseRefName,mergedAt
+git fetch origin && git log origin/main --oneline -5
+```
+
+Re-land from a **new** branch off `origin/main` — the merged-PR guard above blocks
+committing on the old one, which is the guard doing its job.
+
 ---
 
 ## PR & commit format (concise, non-negotiable)

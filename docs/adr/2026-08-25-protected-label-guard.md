@@ -52,8 +52,8 @@ and acknowledging are the same act at different points in the pipeline.
   tradeoff below, which is the sharpest thing in this ADR.
 - *Fail whenever the labeller equals the PR author* (the obvious reading). **Rejected
   as actively wrong here**: Claude Code locally drives `gh` with the human's own
-  credential, so on PR #39 the label was applied by `braedensc`, who also authored the
-  PR. That rule would have failed #39, would fail this very PR, and would brick every
+  credential, so on PR #39 the label was applied by the repository owner's own account,
+  which also authored the PR. That rule would have failed #39, would fail this very PR, and would brick every
   PR in this repo — while detecting nothing, because the two are the same account.
 
 **The accepted tradeoff, stated plainly.** The identity check has teeth exactly when
