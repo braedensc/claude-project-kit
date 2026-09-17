@@ -661,6 +661,15 @@ FIXTURES = [
      _with(VALID_REVIEW_FINDINGS, "usable", True), False, "additionalProperties"),
     ("review-findings", "no-findings-key",
      _without(VALID_REVIEW_FINDINGS, "findings"), False, "required"),
+    # KIT-137: a reviewer that could not see the change says so in a field a machine
+    # can read. It is legal beside an empty list, and a number is not a reason.
+    ("review-findings", "blocked-with-an-empty-list",
+     _with(_with(VALID_REVIEW_FINDINGS, "findings", []), "blocked", "no diff in the description"),
+     True, None),
+    ("review-findings", "blocked-null-is-legal",
+     _with(VALID_REVIEW_FINDINGS, "blocked", None), True, None),
+    ("review-findings", "blocked-is-not-a-number",
+     _with(VALID_REVIEW_FINDINGS, "blocked", 5), False, "type"),
 ]
 
 

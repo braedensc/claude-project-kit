@@ -434,17 +434,21 @@ REVIEWER_BRIEF = (
     "YOUR DELIVERABLE IS ONE FENCED JSON BLOCK IN YOUR FINAL MESSAGE with "
     "\"schema\": \"pipeline-review/1\", a \"summary\", and a \"findings\" array of objects "
     "{severity, category, file, line, summary, detail}, severity one of "
-    "low|medium|high|critical. A malformed block means your whole review is discarded as "
+    "low|medium|high|critical, and an optional \"blocked\" field. A malformed block means "
+    "your whole review is discarded as "
     "unusable, never partly used. If you write more than one such block, the LAST one is "
     "taken as your verdict. Put nothing else inside the fence.\n\n"
     "WHAT HAPPENS NEXT. A poller reads your final message from this ticket, validates the "
     "block whole, and posts one comment on the PR. Findings at or above the threshold may be "
     "sent back to the coding session as a fix request, a bounded number of times. Your words "
     "become that prompt: be specific, cite file and line, say why.\n\n"
-    "RUNBOOK. If the body is missing the diff or the criteria, say so in \"summary\" and "
-    "return an EMPTY findings list with the schema intact; never invent. Never ask anyone a "
+    "RUNBOOK. If you cannot judge the change at all (the body is missing the diff or the "
+    "criteria, or stops mid-way), set \"blocked\" to one line saying what was missing and "
+    "return an EMPTY findings list with the schema intact; never invent. An empty findings "
+    "list WITHOUT \"blocked\" is published as a clean review of a change you never saw. "
+    "Leave \"blocked\" out of every review you could do. Never ask anyone a "
     "question; nobody is watching and no question tool is available to you. If something "
-    "blocks you, say what in the block's \"summary\" and still finish with the block. "
+    "blocks you, set \"blocked\" to say what, and still finish with the block. "
     "Weakened or deleted test assertions are your headline "
     "finding. Anything the ticket did not ask for is a scope finding."
 )
@@ -6539,11 +6543,17 @@ def _selftest_body():
     brief5 = _section(brief_text, 5)
     expect("session-brief-reviewer", brief5,
            "no §5 in docs/SESSION-BRIEF.md, so this check measures nothing")
+    # KIT-137: the blocker goes in the block's machine-readable `blocked` field. A
+    # `summary` is prose nothing downstream parses, so a brief that still sends the
+    # blocker there is a brief that publishes "could not review" as a clean review.
     expect("session-brief-reviewer",
-           "no tracker tool" in brief5 and "summary" in brief5
+           "no tracker tool" in brief5 and "`blocked`" in brief5
            and "as a comment" not in brief5 and "own ticket" not in brief5,
            "§5 of docs/SESSION-BRIEF.md still sends a blocked reviewer to comment on its "
-           "ticket")
+           "ticket, or to a `summary` nothing reads instead of the `blocked` field")
+    expect("session-brief-reviewer",
+           "`blocked`" in REVIEWER_BRIEF.replace('"blocked"', "`blocked`"),
+           "the installer's reviewer brief no longer tells a blocked reviewer to set `blocked`")
     for number in (3, 7):
         section = _section(brief_text, number)
         expect("session-brief-reviewer",

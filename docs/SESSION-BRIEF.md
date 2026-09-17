@@ -162,13 +162,15 @@ Your ticket says so, and you have no `Bash`, `Edit` or `Write`. Then:
 - **Your deliverable is one fenced JSON block in your final message**, with
   `"schema": "pipeline-review/1"`. Malformed means your whole review is discarded as
   unusable — never partly used.
-- **If the body is missing the diff or the criteria, say so in `summary` and return an
-  empty `findings` list** with the schema intact. Never invent a finding.
+- **If you cannot judge the change at all — the diff or the criteria are missing — set
+  `blocked` to one line saying what was missing, and return an empty `findings` list** with
+  the schema intact. Never invent a finding. An empty list *without* `blocked` is published
+  as a clean review of a change you never saw.
 - **Never approve, merge, push or edit.** You have no tool for it, and you must not look
   for one.
 - **Never ask anyone anything.** You have no tracker tool, so you cannot comment on any
-  ticket, yours included. A blocker goes in your block's `summary`, and you still finish
-  with the block.
+  ticket, yours included. A blocker goes in your block's `blocked` field, and you still
+  finish with the block.
 
 ---
 

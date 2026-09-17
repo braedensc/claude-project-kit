@@ -244,6 +244,36 @@ redesigns Stage E for what actually runs.
 >   the restart. Coding sessions keep the tracker tools, which they need to report their
 >   work, so accepted risk 2 and live test 7 still stand for them.
 
+> **Update (2026-09-17) — a review that could not see the change is a decline, not a pass
+> (KIT-137).** Decision 4 says a review that could not run is visibly different from one
+> that ran clean. One path broke that from the start.
+>
+> - **The gap.** A reviewer handed a description with no diff, or no criteria, was told to
+>   say so in `summary` and return an empty findings list. That document conforms, so the
+>   publisher read it as usable and clean. It posted the ordinary review comment, and the
+>   bounce driver concluded the pull request and moved its ticket to Needs Approval.
+>   `summary` is prose, and nothing downstream reads prose.
+> - **The fix is one optional field.** `pipeline-review/1` gains `blocked`: one line saying
+>   what the reviewer could not see. Set, the publisher declines exactly as it does for a
+>   malformed document — the same *NOT reviewed* comment, the same `usable: false` — so the
+>   bounce driver's existing refusal to conclude an unusable review covers it with no change
+>   of its own. The PR comment says *could not review*, not *malformed*, so nobody goes
+>   hunting a schema bug. Absent, `null`, `false` and the usual negative words mean not
+>   blocked, because a false decline is its own kind of noise.
+> - **Every copy of the brief moved together.** The ticket body, the local rubric, the
+>   installer's `appendInstruction`, this repository's session brief and the operator doc
+>   all tell a blocked reviewer to set `blocked`. The installer's copy reaches the reviewer
+>   only after its owner re-runs the installer, which restarts the dispatcher. The first
+>   sentence of that brief is unchanged, because the installer uses it to recognise the
+>   entries it owns.
+> - **Order of rollout is safe.** The schema accepts `blocked` before any reviewer is told
+>   to write it. A reviewer that writes it against an older publisher is declined as
+>   malformed: noisy, never clean.
+> - **Still open.** The field is reviewer-authored, so it is reporting and never authority.
+>   A reviewer that is blocked and says nothing is unchanged by it (no ticket yet). A
+>   declined review is announced once, on the PR, and then held in silence by the bounce
+>   driver (KIT-142).
+
 ## Decision
 
 **Stage E is a poller running as the dispatcher's own role account that speaks to the

@@ -162,9 +162,14 @@ apply. The document is validated WHOLE against a schema: one finding with a seve
 outside low|medium|high|critical, a missing `detail`, or an extra field, and the ENTIRE
 review is discarded as unusable and everything you found is lost with it. Never approve,
 merge, push, comment on the pull request or edit anything — you have no tools to, and the
-fenced block is your whole deliverable. If this ticket is missing its diff or its
-criteria, say so in `summary` and return an EMPTY findings list with the schema intact;
-never invent either.
+fenced block is your whole deliverable.
+
+IF YOU CANNOT JUDGE THE CHANGE AT ALL — no diff, no criteria, a description that stops
+mid-way — add `"blocked"` to the block with one line saying what was missing, and return
+an EMPTY findings list with the schema intact. Never invent either. `blocked` is the only
+thing that makes your inability machine-readable: an empty findings list on its own reads
+as "this change is clean", and would be published as a clean review of a change you never
+saw. Omit `blocked` entirely on any review you were able to do.
 """
 
 
@@ -268,17 +273,50 @@ def ingest_findings(response_body):
     return None
 
 
+# Spellings of "not blocked" that a model reaches for when it fills in an optional field
+# it should have omitted. Treating these as a decline would throw away good reviews, and a
+# false decline is its own kind of lie, so the tolerant reading wins here — the field is
+# only trusted when it says something.
+_NOT_BLOCKED = frozenset(("", "no", "none", "null", "false", "n/a", "na", "not blocked",
+                          "nothing", "not applicable"))
+
+
+def blocked_reason(doc):
+    """The reviewer's own statement that it could not judge the change, or None.
+
+    `blocked` is OPTIONAL and reviewer-authored, so this reads it the way the field is
+    actually filled in rather than the way a schema hopes: absent, null, false and the
+    usual negative words all mean not blocked; `true` means blocked with no reason given;
+    anything else is the reason itself.
+    """
+    raw = (doc or {}).get("blocked")
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return "the reviewer set `blocked` but gave no reason"
+    text = " ".join(str(raw).split())
+    if text.lower().strip(".!") in _NOT_BLOCKED:
+        return None
+    return text[:500]
+
+
 def classify(doc, threshold):
     """Turn a findings document (or None) into a verdict the publisher renders.
 
     Fail-closed on shape, fail-open on outcome: a malformed or missing document is
     `usable=False` (the PR is reported unreviewed), never a quietly-clean review.
+
+    A conforming document can still be a non-review. A reviewer given a description with
+    no diff in it finds nothing because there was nothing to find, and an empty findings
+    list read as a clean bill is the one failure a review must never have (KIT-137). So a
+    document whose `blocked` field says the reviewer could not judge the change is
+    `usable=False` too — the same decline as a malformed one, for the opposite reason.
     """
     if threshold not in SEVERITY_RANK:
         threshold = DEFAULT_THRESHOLD
     result = {"usable": False, "summary": "", "findings": [],
               "max_severity": None, "meets_threshold": False,
-              "threshold": threshold, "reason": ""}
+              "threshold": threshold, "reason": "", "blocked": None}
     if doc is None:
         result["reason"] = (f"the reviewer's output carried no {FINDINGS_SCHEMA} findings "
                             "document")
@@ -287,6 +325,17 @@ def classify(doc, threshold):
     if problems:
         # The WHOLE document or none of it — never the findings that happened to parse.
         result["reason"] = "malformed findings document: " + "; ".join(problems[:5])
+        return result
+    blocked = blocked_reason(doc)
+    if blocked:
+        # Conforming, and still not a review. Anything it did find goes unacted-on, so
+        # the count is said out loud rather than dropped in silence.
+        also = len(doc["findings"])
+        result["blocked"] = blocked
+        result["reason"] = ("the reviewer reported it could not review this change: %s%s"
+                            % (blocked,
+                               "" if not also else
+                               " (it also listed %d finding(s), which are not acted on)" % also))
         return result
     findings = doc["findings"]
     result.update(usable=True, summary=doc["summary"], findings=findings)
@@ -674,6 +723,28 @@ def selftest():
     check("clean-usable", clean_v["usable"], True)
     check("clean-maxsev", clean_v["max_severity"], None)
     check("clean-exit", exit_code_for(clean_v), EXIT_REVIEWED)
+
+    # KIT-137: a CONFORMING document can still be a non-review. A reviewer handed no diff
+    # finds nothing because there was nothing to find; read as clean, that is a lie.
+    blocked = dict(clean, summary="no diff in the description", blocked="the description carried no diff")
+    blocked_v = classify(blocked, "high")
+    check("KIT-137 blocked-not-usable", blocked_v["usable"], False)
+    check("KIT-137 blocked-exit-is-not-reviewed", exit_code_for(blocked_v), EXIT_NOT_REVIEWED)
+    check("KIT-137 blocked-reason-names-it", "could not review" in blocked_v["reason"], True)
+    check("KIT-137 blocked-reason-carries-words", "carried no diff" in blocked_v["reason"], True)
+    check("KIT-137 blocked-renders-as-NOT-reviewed",
+          "was NOT reviewed" in render_comment(blocked_v, "KIT-137", None), True)
+    check("KIT-137 blocked=true-is-blocked", classify(dict(clean, blocked=True), "high")["usable"], False)
+    found_too = {"schema": "pipeline-review/1", "summary": "s", "blocked": "criteria missing",
+                 "findings": [{"severity": "low", "category": "scope", "summary": "x", "detail": "y"}]}
+    ft = classify(found_too, "high")
+    check("KIT-137 blocked-with-findings-still-declines", ft["usable"], False)
+    check("KIT-137 blocked-with-findings-says-they-are-not-acted-on", "1 finding(s)" in ft["reason"], True)
+    for spelling in (None, False, "", "no", "None", "false", "N/A", "not blocked."):
+        check("KIT-137 not-blocked spelling %r stays a clean review" % (spelling,),
+              classify(dict(clean, blocked=spelling), "high")["usable"], True)
+    check("KIT-137 blocked of the wrong type is malformed, not clean",
+          classify(dict(clean, blocked=5), "high")["usable"], False)
 
     findings = {"schema": "pipeline-review/1", "summary": "found things", "findings": [
         {"severity": "medium", "category": "scope", "summary": "drive-by", "detail": "why"},
