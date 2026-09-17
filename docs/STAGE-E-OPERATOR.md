@@ -892,7 +892,12 @@ the sessions it counts.
 
 **Each `seen-prs.json` record carries a `status`.** Most are self-explanatory —
 `pending` (waiting on the reviewer), `delivering`, `publish-failed`, `close-pending`,
-`collected`, `declined`. Two mean *not finished, select it again next pass*, and they are
+`telemetry-pending`, `collected`, `declined`.
+
+`telemetry-pending` means the review is published and only its telemetry row did not land.
+The next pass re-sends it under the same run id, so the dashboard counts it once. After
+three passes the record settles with `telemetry_failed: true`, and the log says the run is
+missing from the dashboard (KIT-139). Two mean *not finished, select it again next pass*, and they are
 two because they mean different things:
 
 | Status | What it means | Gives up? |
