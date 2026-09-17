@@ -636,8 +636,13 @@ unaffected, because it always rested on the session holding no tracker tool — 
 now made in the one list the dispatcher actually reads.
 
 **What the planner keeps, and the one thing that is not proven.** It keeps Read, Grep and
-Glob to decompose against real code, Write to emit its proposal, and Task/Agent because the
-planning procedure's rubric panel is five passes in fresh contexts. Whether a subagent
+Glob to decompose against real code, and Task/Agent because the planning procedure's rubric
+panel is five passes in fresh contexts. It does **not** keep `Write`, which fallback (b) above
+relied on for its artifact: the dispatcher's OS sandbox confines only shell commands, and the
+dispatcher hot-reloads its own config file and loads a working-directory `.mcp.json`, so a
+planner that could write a file could rewrite its own fence. Its proposal therefore travels in
+its final message, which the dispatcher posts to the idea ticket, and is read back from there —
+the route the reviewer already uses (KIT-150). Whether a subagent
 started by `Task` inherits its parent's `disallowedTools` is **unverified**, and if it does
 not, one Task call reopens the fence. No selftest can answer it; the activation checklist
 carries a live probe for a person to run before the gate goes on
