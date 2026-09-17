@@ -1138,7 +1138,10 @@ prints this and lists every key it accepts:
   "how soon may I re-prompt", the other is "when has waiting become silence" — so the two
   are separate keys and neither implies the other.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
-  `delivery.json`.
+  `delivery.json`. Unset in **both** ⇒ exhaustion and the no-push signal still post their
+  comments and still hand the pull request to a person, say once that the id is missing,
+  and then hold. The label goes on nothing until an id exists, and the line the driver
+  prints says so rather than claiming it applied one (KIT-152).
 - `needs_approval_state_id` is optional the same way; without it the driver reads
   `linear.stateIds.needsApproval` from `delivery.json`. Unset in **both** ⇒ the lane is
   off: the driver still writes its `concluded` ledger row and says on stdout that it
@@ -1645,7 +1648,10 @@ nor `--all`: it is the daemon's whole pass.
   signal both need `agent:needs-human`'s id, from `linear.labels.ids` in the committed
   `delivery.json` or `needs_human_label_id` in the driver's config. Without one, the pass
   posts its comments and one telemetry row, exits 2 once naming the missing id, and later
-  passes hold. Add the id and the next pass applies the label, and nothing else (KIT-152).
+  passes hold. Add the id and the next pass that still looks at the pull request applies the
+  label, and nothing else. If the pull request has gone quiet since — its checks green, its
+  review below threshold — no pass looks again, and the label is yours to add by hand
+  (KIT-152).
 - **Fallback**: only when the original ticket has no agent session or the re-prompt cannot
   be delivered, a fix ticket in the Reviews team pinned to the PR branch by the description
   tag, delegated the same way, instructed to push to that branch and open no PR.

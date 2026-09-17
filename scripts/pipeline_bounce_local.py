@@ -3262,6 +3262,18 @@ def perform_notice(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
+def _label_said(state):
+    """What the success line may claim about the label (review of #140). A pass that held
+    a not-configured label used to print "agent:needs-human applied" and exit 0, so the log
+    and the heartbeat both said a write had happened that never did."""
+    if state is True:
+        return "%s applied" % NEEDS_HUMAN_KEY
+    if state == LABEL_NOT_CONFIGURED:
+        return ("%s NOT applied — no id is configured for it; it goes on the first pass that "
+                "finds one" % NEEDS_HUMAN_KEY)
+    return "%s not applied" % NEEDS_HUMAN_KEY
+
+
 def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     """The two budget-spent comments, the ONE label and the conclusion, each done once:
     a previous partial announcement is completed, not repeated. Recorded as an 'exhausted'
@@ -3276,6 +3288,12 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     reason = verdict.get("trigger_reason") or verdict.get("reason") or "budget exhausted"
     issue = sit.get("issue") or {}
     prev_row = sit.get("exhausted") or {}
+    # ONLY THIS exhaustion's row seeds it (review of #140). A person who raises
+    # budgets.maxBounces buys more bounces, and spending those exhausts the budget AGAIN at a
+    # higher bounce number. Seeding from the older row would read that second exhaustion as
+    # already announced and say nothing at all about it.
+    if prev_row.get("bounce_no") != verdict.get("bounce_no"):
+        prev_row = {}
     prev = prev_row.get("announced") or {}
     announced = {"pr_comment": bool(prev.get("pr_comment")),
                  "ticket_comment": bool(prev.get("ticket_comment")),
@@ -3324,28 +3342,28 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
         announced["concluded"] = settled
         problems += conclusion_problems
 
-    append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
-               bounce_no=verdict.get("bounce_no"), outcome="exhausted", announced=announced,
-               problems=problems)
-    if prev_row:
-        # ONE ROW PER EXHAUSTION, not one per pass that completes it (KIT-152). Each row is
-        # a comment on the coding ticket; a pass that only finishes a missing step is the
-        # same exhaustion. A first emission that failed is not retried here (no ticket yet).
-        emit_status = ("not re-emitted: an earlier pass already attempted this exhaustion's row "
-                       "(a failed first attempt is not retried here, KIT-165)")
+    if str(prev_row.get("telemetry") or "") == "emitted":
+        # ONE ROW PER EXHAUSTION, not one per pass that completes it (KIT-152) — but a first
+        # attempt that FAILED is retried, exactly like a failed comment (review of #140), so
+        # the row below records which of the two happened. The emission sits after every send
+        # and before the row, so the sends still come first and the ledger still holds one row.
+        emit_status = "not re-emitted: an earlier pass already sent this exhaustion's row"
     else:
         emit_status = emit_telemetry(state_dir, {
             "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
             "outcome": "budget", "error_class": "bounce_budget_exhausted",
             "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
             no_session="this row records a spent bounce budget; no model session runs for it")
+    append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
+               bounce_no=verdict.get("bounce_no"), outcome="exhausted", announced=announced,
+               problems=problems, telemetry=emit_status)
     if problems:
         sys.stderr.write("FAIL: exhaustion for %s#%d only partly announced (%s); the next run "
                          "completes the missing step(s). telemetry: %s\n"
                          % (sit["repo"], sit["pr"], "; ".join(problems), emit_status))
         return EXIT_USAGE
-    print("%s — announced on the PR and the ticket, %s applied; telemetry: %s"
-          % (describe(sit, verdict), NEEDS_HUMAN_KEY, emit_status))
+    print("%s — announced on the PR and the ticket, %s; telemetry: %s"
+          % (describe(sit, verdict), _label_said(announced["label"]), emit_status))
     return EXIT_OK
 
 
@@ -3410,26 +3428,29 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
     if label_problem:
         problems.append(label_problem)
 
+    if str((prev if prev.get("bounce_no") == bounce_no else {}).get("telemetry") or "") == "emitted":
+        # One row per signal, not per pass — but an attempt that FAILED is retried, exactly
+        # like a failed comment, and the row records which happened (review of #140).
+        emit_status = "not re-emitted: an earlier pass already sent this no-push signal's row"
+    else:
+        emit_status = emit_telemetry(state_dir, {
+            "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+            "outcome": "blocked", "error_class": "bounce_no_push",
+            "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
+            "reason": verdict["reason"]}, cfg,
+            no_session="this row records a session that stopped pushing; no model session "
+                       "runs for it")
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                bounce_no=bounce_no, head_sha=signal.get("head_sha") or sit.get("head_sha"),
                waited_seconds=signal.get("waited_seconds"), outcome="blocked",
-               announced=announced, problems=problems)
-    emit_status = ("not re-emitted: an earlier pass already attempted this no-push signal's "
-                   "row (a failed first attempt is not retried here, KIT-165)") \
-        if prev_announced else emit_telemetry(state_dir, {
-        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-        "outcome": "blocked", "error_class": "bounce_no_push",
-        "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
-        "reason": verdict["reason"]}, cfg,
-        no_session="this row records a session that stopped pushing; no model session "
-                   "runs for it")
+               announced=announced, problems=problems, telemetry=emit_status)
     if problems:
         sys.stderr.write("FAIL: the no-push signal for %s#%d only partly landed (%s); the next "
                          "run completes the missing step(s). telemetry: %s\n"
                          % (sit["repo"], sit["pr"], "; ".join(problems), emit_status))
         return EXIT_USAGE
-    print("%s — said on the ticket, %s applied, no bounce spent (%d of %d still); telemetry: %s"
-          % (describe(sit, verdict), NEEDS_HUMAN_KEY, sit.get("prior", 0),
+    print("%s — said on the ticket, %s, no bounce spent (%d of %d still); telemetry: %s"
+          % (describe(sit, verdict), _label_said(announced["label"]), sit.get("prior", 0),
              sit.get("max_bounces", 0), emit_status))
     return EXIT_OK
 
@@ -6196,6 +6217,52 @@ def selftest():
             check("KIT-152 an id configured later: the label and nothing else, no second telemetry row",
                   (rc2, kinds()), (EXIT_OK, ["label"]))
 
+            # …and the line it prints never claims a label it did not apply (review of #140).
+            calls.clear()
+            out_ne = io.StringIO()
+            with contextlib.redirect_stdout(out_ne):
+                perform_exhaust(dict(sit_x, exhausted=first), verdict_x, cfg, tmp, False)
+            said_ne = out_ne.getvalue()
+            check("KIT-152 a pass that held a not-configured label does not claim it applied",
+                  ("NOT applied" in said_ne, "%s applied" % NEEDS_HUMAN_KEY in said_ne), (True, False))
+
+            # A first telemetry attempt that FAILED is retried; one that landed is not.
+            saved_emit_t = globals()["emit_telemetry"]
+            globals()["emit_telemetry"] = lambda *a, **k: "not emitted: publisher exit 1"
+            with tempfile.TemporaryDirectory() as tmp_t, contextlib.redirect_stdout(io.StringIO()):
+                sit_t = dict(sit_x, needs_human_label_id="lbl-nh")
+                perform_exhaust(dict(sit_t), verdict_x, cfg, tmp_t, False)
+                row_t = ledger_view(ledger_path(tmp_t), "o/r", 41)["exhausted"]
+                globals()["emit_telemetry"] = saved_emit_t
+                calls.clear()
+                perform_exhaust(dict(sit_t, exhausted=row_t), verdict_x, cfg, tmp_t, False)
+                row_t2 = ledger_view(ledger_path(tmp_t), "o/r", 41)["exhausted"]
+            globals()["emit_telemetry"] = saved_emit_t
+            check("KIT-152 a telemetry row that FAILED first is retried, and the ledger says so",
+                  (str(row_t.get("telemetry")).startswith("not emitted"),
+                   [c[0] for c in calls], row_t2.get("telemetry")),
+                  (True, ["telemetry"], "emitted"))
+
+            # A SECOND exhaustion, after a person raised the budget, is its own announcement.
+            with tempfile.TemporaryDirectory() as tmp_2, contextlib.redirect_stdout(io.StringIO()):
+                sit_2 = dict(sit_x, needs_human_label_id="lbl-nh")
+                perform_exhaust(dict(sit_2), verdict_x, cfg, tmp_2, False)
+                first_2 = ledger_view(ledger_path(tmp_2), "o/r", 41)["exhausted"]
+                calls.clear()
+                perform_exhaust(dict(sit_2, exhausted=first_2, prior=4, max_bounces=4),
+                                dict(verdict_x, bounce_no=4), cfg, tmp_2, False)
+            check("KIT-152 a second exhaustion after a raised budget says everything again",
+                  [c[0] for c in calls], ["prComment", "ticketComment", "label", "telemetry"])
+
+            # …and the verdict wiring itself: an exhausted row whose label is not configured
+            # holds, and stops holding the moment an id exists (review of #140).
+            ex_row = {"outcome": "exhausted", "bounce_no": 3,
+                      "announced": {"pr_comment": True, "ticket_comment": True,
+                                    "label": LABEL_NOT_CONFIGURED, "concluded": True}}
+            check("KIT-152 the verdict holds a no-id exhaustion, and re-opens it when an id appears",
+                  (announcement_complete(ex_row["announced"], False),
+                   announcement_complete(ex_row["announced"], True)), (True, False))
+
         # …and a label the TRACKER REFUSES is different from one nobody configured: it is
         # retried, loudly, and never recorded as not-configured (review of #140).
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
@@ -6570,9 +6637,10 @@ def selftest():
     check("…and never asks for a re-review", "write_rereview_request" in _pb, False)
     _label_step = inspect.getsource(globals()["apply_needs_human"]) if "apply_needs_human" in globals() else ""
     check("it posts exactly one TOP-LEVEL ticket comment and applies exactly one label "
-          "(KIT-152: through the one shared label step)",
+          "(KIT-152: through the one shared label step, and never directly)",
           (_pb.count("linear_comment("), _pb.count("apply_needs_human("),
-           _label_step.count("linear_add_label(")), (1, 1, 1))
+           _pb.count("linear_add_label("), _label_step.count("linear_add_label(")),
+          (1, 1, 0, 1))
 
     # 11c. THE NOTICE PATH IS A COMMENT AND NOTHING ELSE. The defect this closes was a
     #      re-prompt reaching a PR a person already held, so the checks are about what the
