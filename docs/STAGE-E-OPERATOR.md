@@ -877,6 +877,7 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
+| `PAUSED` | **you** | the durable pause: while it exists the bounce driver does nothing and says so. Its first line is the reason. Nothing removes it but you — an installer `run` and a reboot both leave it |
 | `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit since delegation (step 10). Its criteria never change; it also records the notices said and the sessions held. Still read by the poller when `criteria_snapshots` is `false` |
 | `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a person delegating the ticket again replaced it |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
@@ -1340,7 +1341,10 @@ Input/output error` and leaves you with nothing loaded. Poll
 **Monitor the heartbeats, not the log — there are three.**
 `state/heartbeat.json`, `state/bounce-heartbeat.json` and `finding/heartbeat.json` carry a
 timestamp and a result on every terminal path, including a failed one. A stale heartbeat
-means *not running*; a fresh one with a non-`ok` result means *ran and could not do it*.
+means *not running*. A fresh one with a result outside that job's good list means *ran and
+could not do it* — the good lists differ per job, and `docs/HEARTBEAT-MONITOR.md` has them:
+the review poller's `declined`, and the bounce driver's `idle`, `declined` and `paused`,
+are healthy.
 **Count them**: two fresh heartbeats out of three is one whole daemon that is not running,
 and nothing else on the machine will say so. They live under the **role account's** home,
 not yours, so reading them takes `sudo -u`:
@@ -1589,9 +1593,10 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
   is missing or misspelled for that repository. `unknown` means nobody answered: no
   override, and the forge refused. `checks_note` names the remedy, and on `unknown` the
   command exits 2. This is the only check on a block the whole CI half depends on, so run
-  it against a real PR once. If you get no JSON — only a `FAIL: …` line — the driver refused
-  the PR before it read any checks, which is not a `required_checks` failure; pick another
-  PR.
+  it against a real PR once. If you get no JSON — only a `DECLINED: …` or `FAIL: …` line —
+  the driver refused the PR before it read any checks, which is not a `required_checks`
+  failure; pick another PR. `DECLINED` means it was never this driver's pull request
+  (exit 3); `FAIL` means it could not act (exit 2).
 - **Whose ticket it is.** The driver takes the poller's outcome record first, Linear's own
   PR attachment second, and the branch name only third — and then only if Linear ties that
   ticket to this PR. Otherwise it declines. A branch name is a hint a session chose.

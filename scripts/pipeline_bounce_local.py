@@ -2766,6 +2766,13 @@ def _gather_after_pr(sit, cfg, state_dir):
                              "Linear's record.\n"
                              % (owner_repo, pr_number, sit["branch"], why))
     if not sit["ticket_id"]:
+        if not (cfg.get("team_keys") or []):
+            # NOT an eligibility refusal (review of #137). With no team keys configured, EVERY
+            # pull request lands here, and a decline reads as healthy — so a misconfiguration
+            # would look exactly like a quiet machine. A configuration fault is exit 2.
+            raise Decline("no team keys are configured (`team_keys` is empty), so no branch can "
+                          "name a ticket this driver manages — every PR would decline. Set it in "
+                          "the driver's config", sit)
         raise NotEligible("no pipeline ticket identified for branch %r (its team key is not one this "
                       "driver manages) — a bounce needs a ticket to re-prompt" % sit["branch"], sit)
 
@@ -5788,6 +5795,7 @@ def selftest():
         world["pr"] = dict(open_pr, headRefName="feat/eng-41-x=y")
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
+            mark = len(err.getvalue())
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("KIT-112 bad branch: DECLINED (3), nothing to Linear, no ledger",
                   (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (globals().get("EXIT_DECLINED", 3), [], False))
@@ -5796,6 +5804,36 @@ def selftest():
             calls.clear()
             check("KIT-112 bad branch under decide: DECLINED (3), nothing posted",
                   (run_one(41, "o/r", cfg, tmp, "decide", False), calls), (globals().get("EXIT_DECLINED", 3), []))
+            # …and the log says DECLINED, not FAIL: the two words are the §13 distinction,
+            # and nothing asserted them before (review of #137). Read only THIS block's
+            # stderr — `err` accumulates across the whole battery.
+            said = err.getvalue()[mark:]
+            check("KIT-112 an eligibility decline logs DECLINED, never FAIL",
+                  ("DECLINED: o/r#41" in said, "FAIL: o/r#41" in said), (True, False))
+        world["pr"] = open_pr
+
+        # 10p-ii. The THIRD eligibility refusal — a real branch shape whose team key this
+        #         driver does not manage — was claimed and never tested (review of #137).
+        world["pr"] = dict(open_pr, headRefName="feat/xyz-41-other-team")
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            rc = run_one(41, "o/r", dict(cfg, team_keys=["ENG"]), tmp, "bounce", False)
+            check("KIT-112 an unmanaged team key is a DECLINE (3), one PR comment, no ledger",
+                  (rc, kinds(), os.path.exists(ledger_path(tmp))),
+                  (globals().get("EXIT_DECLINED", 3), ["prComment"], False))
+            check("KIT-112 …and it names why", "team key is not one this driver manages" in calls[0][2], True)
+            # A review asked whether an empty `team_keys` makes EVERY pull request a healthy
+            # decline. It does not: the shape check and resolve_ticket admit exactly the same
+            # branches when no key is set, so "no pipeline ticket identified" is unreachable
+            # there, and an unshaped branch is refused one step earlier for a reason that is
+            # true whatever the configuration. Pinned so the claim is not re-raised.
+            check("KIT-112 with no team keys, a shaped branch still names a ticket and an "
+                  "unshaped one is refused for its shape",
+                  (bool(PIPELINE_BRANCH_RE.fullmatch("feat/eng-41-x")),
+                   prl.resolve_ticket("feat/eng-41-x", []),
+                   bool(PIPELINE_BRANCH_RE.fullmatch("chore/no-ticket-in-this-branch")),
+                   prl.resolve_ticket("chore/no-ticket-in-this-branch", [])),
+                  (True, "ENG-41", False, None))
         world["pr"] = open_pr
 
         # 10q. A corrupt ledger makes the DRIVER refuse: exit 2, nothing sent — never a reset budget.
@@ -6493,6 +6531,25 @@ def selftest():
         globals()["run_one"] = saved_run_one
         globals()["criteria_snapshots"] = saved_snapshots
 
+    # KIT-112: `decide --all` ranks its codes like a pass does. run_pass was fixed and
+    # main()'s own loop was not, so one declined PR (3) hid a failed one (2) — and the
+    # installer's dry-run gate accepts 3 (review of #137).
+    cases_main = {41: EXIT_USAGE, 42: globals().get("EXIT_DECLINED", 3)}
+    saved_run_one_main, saved_targets_main = globals()["run_one"], globals()["list_outcomes"]
+    globals()["run_one"] = lambda pr, repo, c, sd, mode, dry, as_json=False: cases_main[pr]
+    globals()["list_outcomes"] = lambda sd, c: [("o/r", 41), ("o/r", 42)]
+    try:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+            conf_main = os.path.join(tmp, "config.json")
+            with open(conf_main, "w", encoding="utf-8") as fh:
+                json.dump({"state_dir": tmp, "repos": ["o/r"], "team_keys": ["ENG"]}, fh)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_main = main(["decide", "--all", "--config", conf_main, "--dry-run"])
+        check("KIT-112 `decide --all` reports the FAILURE, not the decline that outranks it",
+              rc_main, EXIT_USAGE)
+    finally:
+        globals()["run_one"], globals()["list_outcomes"] = saved_run_one_main, saved_targets_main
+
     # KIT-112: one sentence, one code, in both Stage E loops — and every result word this
     # driver writes that is not a problem is one the heartbeat monitor reads as healthy,
     # or a paused driver pages its owner.
@@ -6737,7 +6794,7 @@ def main(argv=None):
     worst = EXIT_OK
     for owner_repo, pr_number in targets:
         rc = run_one(pr_number, owner_repo, cfg, state_dir, args.mode, args.dry_run, as_json=args.json)
-        worst = max(worst, rc)
+        worst = _worse(worst, rc)     # KIT-112: a decline (3) must never hide a failure (2)
     return worst
 
 
