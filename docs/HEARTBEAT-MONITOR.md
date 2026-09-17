@@ -40,9 +40,12 @@ three daemons for one reader's convenience would be the larger change:
 
 The review poller's `declined` (exit 3) is a good result. That pass settled a NOT-reviewed
 verdict and said so on the pull request: no acceptance criteria, a review that timed out, a
-diff over the cap. That is the poller doing its job, and the notifier does not page on it
-either. The bounce driver's `problems` and `deadline` stay bad: each is a pull request it
-could not act on, or a pass cut short. The finding poller has no exit 3.
+reviewer that reported it could not see the change, or a change with no single file small
+enough to deliver. (A large change is no longer one of these — since KIT-138 it gets a
+*partial* review, and only a lone file over the cap still declines.) That is the poller
+doing its job, and the notifier does not page on it either. The bounce driver's `problems`
+and `deadline` stay bad: each is a pull request it could not act on, or a pass cut short.
+The finding poller has no exit 3.
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
 cross-checks every schema string and filename against the three writers, and judges

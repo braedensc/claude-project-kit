@@ -5,7 +5,8 @@ session that opened it to fix what the review found, a bounded number of times. 
 dispatcher does no reviewing of its own; this is the layer that does.
 
 **Mechanism** ships in this kit as tested `scripts/`. **Activation** — a Linear team, one
-dispatcher config entry per reviewed repository, four system daemons — is yours, at your
+dispatcher config entry per reviewed repository, three system daemons and a fourth unless
+you switch it off — is yours, at your
 own terminal. **No session installs, starts or edits a service.** This file is generic on
 purpose: no hostnames, account names, ids or paths from a real deployment. Keep the
 filled-in copy in your private runbook.
@@ -47,11 +48,13 @@ it for you as the `conflict-waker` step.
 Stage E is a layer on a dispatcher. It builds none of the dispatcher, and it cannot be
 installed before one runs. Build the dispatcher with its own setup guide, then come back.
 
-The installer's `preflight` step checks four things, and reports every failure in one pass:
+The installer's `preflight` step checks five things, and reports every failure in one pass:
 
 - **The role account resolves.** It is the dispatcher's service account. Stage E creates no
   account.
 - **That account has `/usr/bin/python3`.** Every daemon runs with it.
+- **Your own `gh` is logged in.** The installer reads each repository's required checks
+  with your login; the daemons' token deliberately cannot.
 - **The dispatcher's service is loaded and running.** Stage E starts no dispatcher.
 - **The dispatcher's config reads as JSON, as that account.** Stage E adds its review
   entries to that file.
@@ -60,16 +63,16 @@ Good: `preflight ALREADY-DONE — role home …, dispatcher running, N existing 
 Not: `preflight FAILED — preflight found 2 problem(s)`. Fix every line it names, then run
 again.
 
-Four more things no check can do for you. Have them before the first `run`:
+Three more things no check can do for you. Have them before the first `run`:
 
-1. **Your own `gh` is logged in** with administration read on each reviewed repository. The
-   installer reads required checks with your login, not the daemons' token.
-2. **Two credentials, minted by you**: a Linear API key and a GitHub fine-grained token.
+1. **Two credentials, minted by you**: a Linear API key and a GitHub fine-grained token.
    The installer stores them; it never mints one. Write down both expiry dates when you
    mint them, because nothing warns you before they lapse.
-3. **The board lanes** on each work team (*In AI Review*, *Needs Approval*, the PR-opened
-   automation). No installer adds them; the private runbook has the steps.
-4. **One coding session already run by the dispatcher.** Before its first session a
+2. **The board lanes** on each work team — the review lane the PR-opened automation moves
+   a ticket into (*In Review* in this kit's own contract), and *Needs Approval*, which the
+   bounce driver moves a ticket into when review concludes. No installer adds either lane
+   or the automation; the private runbook has the steps.
+3. **One coding session already run by the dispatcher.** Before its first session a
    dispatcher has no session-log directory, so every telemetry row says it could not read
    one until a session has run.
 
@@ -1265,7 +1268,7 @@ but does not check that it exists or that the daemons can enter it (no ticket ye
 The log's layout is read from the dispatcher's published source; if it moves, the rows
 say *no session log* rather than guessing.
 
-### 3d. Three system LaunchDaemons
+### 3d. The system LaunchDaemons — three, and a fourth unless it is off
 
 One-shot jobs. Each pass is scan → act → exit; the interval belongs to launchd, not to the
 script. **No `KeepAlive`** — it would restart a one-shot process in a tight loop.
@@ -1277,8 +1280,13 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 | `com.example.stage-e-finding` | `pipeline_finding_poller.py scan …` | `FINDING_INTERVAL_SECONDS` (300) | `~/.stage-e/finding/poller.log` |
 | `com.example.stage-e-monitor` | `pipeline_heartbeat_monitor.py run --config …/monitor.json` | `MONITOR_INTERVAL_SECONDS` (1800) | `~/.stage-e/monitor.log` |
 
-The fourth row is the heartbeat monitor. It has its own installer step, after the other three
-are loaded, and is off only by name (`HEARTBEAT_MONITOR_TICKET=off`).
+The fourth row is the heartbeat monitor. It has its own installer step, after the other
+three are loaded, and it is the only one the conf can switch off by name
+(`HEARTBEAT_MONITOR_TICKET=off`). With it off the installer loads three and removes a
+monitor an earlier run installed, and the privilege banner says three. **So: three daemons
+always, four when the monitor is on.** Elsewhere in this file "the three daemons" means
+review, bounce and finding — the trio that does the work — whether or not a fourth is
+watching them.
 
 `FINDING_INTERVAL_SECONDS` **is not in `stage-e.conf.example`**; it defaults to 300, and you
 only need the line if you want a different interval. Offsetting the three from each other
@@ -1805,7 +1813,7 @@ LaunchAgent's heartbeat goes stale every time you log out. Where it matters — 
 waiting — the conflict monitor already pages you on the pull request.
 
 **`waker.log` is never trimmed.** Every pass appends to it, every 300 seconds, with no
-rotation and no size cap. Truncate it yourself when it grows. The four Stage E daemons'
+rotation and no size cap. Truncate it yourself when it grows. Every Stage E daemon's
 logs grow the same way (KIT-159).
 
 **The waker's code moves only when `run` moves it**, like the role account's clone. After a

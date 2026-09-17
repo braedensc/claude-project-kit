@@ -371,7 +371,9 @@ fence tags; it writes exactly one routing tag of its own, in its trusted header
 (amended 2026-09-08) — and then creates **and** delegates, in one `issueCreate{…, delegateId}`
 carrying an owner-scoped Linear key, a review ticket in a dedicated Reviews team: title
 `Review PR #<n> — <TICKET-ID>`, description = the review brief with the diff inlined under
-a size cap (above the cap ⇒ decline, reason *diff too large to deliver*), **never
+a size cap (above the cap ⇒ whole files are withheld, largest first, and the review is
+marked `coverage: partial` — *amended 2026-09-17, KIT-138*; a change where no single file
+fits alone is still declined, reason *diff too large to deliver*), **never
 parented** (a sub-issue would be based on its parent's branch), never linked to the PR by
 branch, title or body. The dispatcher sees a delegation by the owner and starts a session
 in the Reviews entry, exactly as it starts any other. The poller then reads that ticket's
@@ -826,8 +828,9 @@ original ticket, never merge.
 >   left the largest changes with no review at all. Splitting into several paid reviews was
 >   rejected on cost; a page was rejected because the notifier deliberately does not page on
 >   a review verdict.
-> - **A failed telemetry row is retried under a stable run id (KIT-139).** The row's id is
->   now the review's, as §4 already required.
+> - **A failed review-telemetry row is retried under a stable run id (KIT-139).** The row's
+>   id is now the review's, as §4 already required. The *review poller's* row only — the
+>   bounce driver's ids are still time-based and its first failure is still lost (KIT-165).
 > - **The bounce driver has a declined exit code and a durable pause (KIT-112).** Exit 3 is
 >   the review poller's code for the same sentence. A `PAUSED` file in the state directory
 >   survives an installer run and a reboot, which unloading the job never did.
@@ -836,14 +839,25 @@ original ticket, never merge.
 >   (KIT-149).** `verify` reads *behind* only when a file the jobs run moved; the hand
 >   sign-off of the entries' load binds to the entries; the session-log root is checked.
 >
-> **The conflict loop reaches the product repository.** Its monitor is ported there
-> (TOD-125), so a dispatcher's conflicted pull request there now gets a fix request the
-> bounce driver answers. On the kit itself bounce stays off by design, so a kit dispatcher
-> PR's conflict is paged, not fixed.
+> **The conflict loop is ported to the product repository, on an open pull request**
+> (TOD-125). When it merges, a dispatcher's conflicted pull request there gets a fix
+> request the bounce driver answers; until then that repository is where it was. On the
+> kit itself bounce stays off by design, so a kit dispatcher PR's conflict is paged, not
+> fixed.
 >
-> **Still open, each with a home.** A declined review is held in silence after its one PR
-> comment (KIT-142). No job's log is trimmed (KIT-159). `auth_mode` is a literal on every
-> row (KIT-160). None of the paths the live tests cover has run yet (KIT-99).
+> **Still open, each with a home — and this list is not the whole of it.** A declined
+> review is held in silence after its one PR comment (KIT-142). No job's log is trimmed
+> (KIT-159). `auth_mode` is a literal on every row (KIT-160). The *bounce driver's*
+> telemetry ids can still collide, and its failed first row is not retried (KIT-165) — the
+> retry above is the review poller's row only. The review sanitizer still rewrites
+> config-shaped text inside a diff (KIT-168).
+>
+> **None of the six changes above has run on a deployment.** They are proven by selftest,
+> by a fail-first run of each new check, and by the seven branches passing as a union — not
+> by a live pull request. What the 2026-09-12 block lists as unestablished is unchanged, and
+> everything this round touched joins it (KIT-99). The loop itself is not unexercised: that
+> block records it running end to end on 2026-09-08, and this sentence narrows the claim to
+> this round's code.
 
 ## Where Stage E lives
 
