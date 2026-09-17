@@ -74,7 +74,16 @@ three daemons, several checkpoints downstream. The `heartbeat-monitor` step righ
 reloads the monitor. If the run stops at a card before `enable`, **all three loops are off**.
 If it stops at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
 the way out names which jobs are off, and it is the only thing that says so. A dry run does
-none of this — it reports that the clone is behind and returns.
+none of this — it reports that `run` would fast-forward and restart the jobs, and returns.
+
+**`verify` reads `behind` only when a file the jobs run changed.** Those files are every
+script the four jobs load, their imports included, and `schemas/`, which a review and a
+telemetry row are judged against. A merge that touched none of them — a doc, an ADR,
+another project's script — leaves `verify` at `ALREADY-DONE`, naming both commits. `run`
+still fast-forwards whenever the commits differ, so the clone never drifts.
+Good: `code ALREADY-DONE — every file the jobs run is identical at origin HEAD`.
+Not: `code WOULD-CHANGE — … changed there: scripts/…`. Run `run` when no session is in
+flight.
 
 It stops at the first step only a person can do, prints a numbered checkpoint card saying
 exactly what to do, and exits 10. Do that one thing and run the same command again: it
@@ -599,8 +608,13 @@ is read. A re-run with no restart waiting on its proof searches the whole log.
 A pass that rewrites the entries drops any earlier banner proof. If its restart stops
 before it reads the size, there is no point to read past. The next run then saves the
 log's size as it is at that moment and reports `UNKNOWN`. Restart the dispatcher and run
-again: only what the log gains past that size counts. A rewrite keeps an `A-ENTRY-LOADED`
-sign-off, so a sign-off made for the old entries settles the new ones (no ticket yet).
+again: only what the log gains past that size counts.
+
+**A hand sign-off counts only for the entries it was made against.** `A-ENTRY-LOADED`
+records a fingerprint of every review entry, fence included. Rewrite the entries and the
+sign-off stops counting; the step says so and names the date it was made. A sign-off from
+before this binding names no entries, so it counts for none. Run `verify` first, so the
+installer has measured the entries, then sign.
 
 If the log names one of them nowhere, the run reports `UNKNOWN` and prints the
 restart-and-re-read commands; signing off `A-ENTRY-LOADED` is the other way out, and
@@ -1224,8 +1238,17 @@ ticket's cost.
 A `session_log_root` that is missing, or that the daemons cannot enter, is a configuration
 fault. Every row then says so and names the path. The daemons never list the root itself,
 so a root at mode `0711` works. They list only the issue's own folder. A folder they
-cannot list says so. One issue with no log says only that. The installer writes the path
-but does not check that it exists or that the daemons can enter it (no ticket yet).
+cannot list says so. One issue with no log says only that.
+
+The installer checks the root as the role account, on every `run` and `verify`:
+
+- **There and enterable** — nothing is said.
+- **There, and the role account cannot enter it** — the `configs` step fails. It does not
+  fix itself. Give the role account the search bit.
+- **Not there** — a note on the `configs` row, not a failure. A dispatcher that has run no
+  session has no log directory yet. On one that has, `DISPATCHER_CONFIG` names the wrong
+  home.
+- **Could not look** — `UNKNOWN`, never read as fine.
 The log's layout is read from the dispatcher's published source; if it moves, the rows
 say *no session log* rather than guessing.
 
