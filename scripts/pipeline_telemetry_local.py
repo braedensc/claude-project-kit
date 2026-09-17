@@ -46,10 +46,11 @@ WHERE THE MODEL AND THE COST COME FROM (KIT-130)
              its log, and a missing piece is said in §4's `model_note`/`cost_note`.
     resumed  the row is written BEFORE the session runs (a bounce): the model is read
              from that session's last run and says so; the cost is never taken from
-             the log — it would be the earlier run's — and the note says it is not
-             incurred yet.
+             the log — it would be the earlier run's — and the note says Stage E does
+             not record it.
   `--no-session REASON` is for a row no model session belongs to at all (a conclusion,
-  an exhaustion): the model is `unknown` and both notes carry the reason.
+  an exhaustion): the model is `unknown` with the reason in `model_note`, and the cost
+  is an exact 0 with no `cost_note`, because nothing ran.
 
   The log layout is read from the dispatcher's published source (v0.2.69,
   `ClaudeRunner.setupLogging`), not from a log on any machine; the parser therefore
@@ -73,7 +74,7 @@ Exit: 0 = built (and posted, unless --dry-run)
       2 = usage/IO/API error (bad arguments, no credential, Linear unreachable)
 """
 import argparse
-import glob
+import fnmatch
 import json
 import os
 import re
@@ -163,13 +164,18 @@ SESSION_ROLES = ("run", "resumed")
 # A tracker identifier, never a path: it is joined onto the log root, so anything that
 # could climb out of it is refused before the join.
 ISSUE_IDENTIFIER_RE = re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$")
-NOT_INCURRED = ("the re-prompted session has not run when this row is written; its cost "
-                "lands in the dispatcher's own session log")
+# A bounce row is written before the re-prompted run, and no later row records that run:
+# its cost stays only in the dispatcher's session log (no ticket yet).
+NOT_INCURRED = ("the re-prompted session has not run when this row is written, and Stage E "
+                "never records its cost: it stays only in the dispatcher's session log "
+                "(no ticket yet)")
 
 
 def _log_messages(path):
     """Every SDK message in one session log, oldest first. A line that is not JSON, or
-    not a message, is stepped over: the file's shape belongs to the dispatcher."""
+    not a message, is stepped over: the file's shape belongs to the dispatcher. So is a
+    line nested too deeply to decode, which raises RecursionError, not ValueError: the
+    session being reported on writes this log, and must not be able to crash the row."""
     out = []
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -178,7 +184,7 @@ def _log_messages(path):
                 continue
             try:
                 doc = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(doc, dict) and doc.get("type") == "sdk-message":
                 doc = doc.get("message")
@@ -223,16 +229,32 @@ def session_usage(log_root, issue_identifier, role="run"):
                        "so the session's own record was not read")
     if not ISSUE_IDENTIFIER_RE.match(issue_identifier or ""):
         return nothing("no dispatcher session is named for this row")
-    folder = os.path.join(os.path.expanduser(log_root), issue_identifier)
+    # The root is entered, never listed: a root the account can search but not read (mode
+    # 0711) still reaches <root>/<issue>, so it needs only the search bit. The issue's
+    # folder is listed with os.listdir, never glob: glob swallows every OSError and returns
+    # [], so an unreadable folder and a folder with no log would read the same. A root
+    # that is missing or cannot be entered is a configuration fault on every row.
+    root = os.path.expanduser(log_root)
+    if not (os.path.isdir(root) and os.access(root, os.X_OK)):
+        return nothing("session_log_root %s is missing, not a directory, or cannot be "
+                       "entered: a configuration fault, not a missing log" % root)
+    folder = os.path.join(root, issue_identifier)
     try:
-        files = sorted(glob.glob(os.path.join(folder, SESSION_LOG_GLOB)),
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        names = []
+    except OSError as exc:
+        return nothing("the dispatcher's session log folder for %s cannot be listed (%s)"
+                       % (issue_identifier, exc.__class__.__name__))
+    try:
+        files = sorted((os.path.join(folder, n) for n in names
+                        if fnmatch.fnmatch(n, SESSION_LOG_GLOB)),
                        key=lambda p: (os.path.getmtime(p), p))
     except OSError as exc:
-        return nothing("the dispatcher's session log for %s could not be listed (%s)"
+        return nothing("the dispatcher's session log folder for %s cannot be listed (%s)"
                        % (issue_identifier, exc.__class__.__name__))
     if not files:
-        return nothing("the dispatcher wrote no session log for %s, or this account cannot "
-                       "read it" % issue_identifier)
+        return nothing("the dispatcher wrote no session log for %s" % issue_identifier)
 
     model, result = None, None
     # Newest first, stopping at the first log that says anything: a runner writes a
@@ -280,13 +302,16 @@ def resolve_usage(args, execution):
     """(model, model_note, execution, cost_note) for this row, from the most direct
     source available: an explicit `--no-session`, then the dispatcher's session log,
     then what the caller passed. A caller's `--model` is a CONFIGURED value, so when it
-    is used in place of the log it says so."""
+    is used in place of the log it says so.
+
+    A `--no-session` row puts its reason in `model_note` only. No model ran, so its
+    cost of 0 is exact, and a `cost_note` would count it as unmeasured spend (§4)."""
     model = getattr(args, "model", "") or ""
     model_note = getattr(args, "model_note", "") or None
     cost_note = getattr(args, "cost_note", "") or None
     no_session = getattr(args, "no_session", "") or ""
     if no_session:
-        return tb.UNKNOWN_MODEL, model_note or no_session, None, cost_note or no_session
+        return tb.UNKNOWN_MODEL, model_note or no_session, None, cost_note
     logs, issue = getattr(args, "session_logs", "") or "", getattr(args, "session_issue", "") or ""
     if not (logs or issue) or execution is not None:
         return model, model_note, execution, cost_note
@@ -333,7 +358,8 @@ def build_batch(args):
                                 args.run_id, args.started_at, args.ended_at,
                                 dispatch_id=args.dispatch_id or None, execution=execution,
                                 reviewer_outcome=args.reviewer_outcome or None,
-                                model_note=model_note, cost_note=cost_note)
+                                model_note=model_note, cost_note=cost_note,
+                                no_session=bool(getattr(args, "no_session", "")))
         problems = tb.validate_block(block)
         if problems:
             raise ValueError("review telemetry block is malformed: " + "; ".join(problems))
@@ -346,7 +372,8 @@ def build_batch(args):
         block = tb.bounce_block(artifact, args.team_key, model, args.auth_mode,
                                 args.run_id, args.started_at, args.ended_at,
                                 dispatch_id=args.dispatch_id or None, execution=execution,
-                                model_note=model_note, cost_note=cost_note)
+                                model_note=model_note, cost_note=cost_note,
+                                no_session=bool(getattr(args, "no_session", "")))
         problems = tb.validate_block(block)
         if problems:
             raise ValueError("bounce telemetry block is malformed: " + "; ".join(problems))
@@ -583,6 +610,86 @@ def selftest():
                   (none["model"], needle in (none["model_note"] or "")), (None, True))
             check("%s: cost has a reason too" % label, bool(none["cost_note"]), True)
 
+        # A root that is missing or cannot be entered, an issue folder that cannot
+        # be listed, and an issue with no log are three different facts. glob said all
+        # three as "no log"; the first is a configuration fault on every row.
+        missing_root = os.path.join(root, "no-such-dispatcher-home", "logs")
+        said = {"no log": session_usage(root, "REV-404")["model_note"] or "",
+                "missing root": session_usage(missing_root, "REV-3")["model_note"] or ""}
+        check("a missing root is a configuration fault that names the path",
+              ("configuration fault" in said["missing root"], missing_root in said["missing root"],
+               "session_log_root" in said["missing root"]), (True, True, True))
+        check("an issue with no log says only that",
+              ("wrote no session log for REV-404" in said["no log"],
+               "configuration" in said["no log"], "cannot" in said["no log"]),
+              (True, False, False))
+        can_deny = hasattr(os, "geteuid") and os.geteuid() != 0
+        if can_deny:
+            locked_root = os.path.join(root, "locked-home")
+            os.makedirs(os.path.join(locked_root, "REV-3"))
+            write_log("REV-5", "session-s5-2026-09-16T13-00-00.jsonl", [meta, init, result], 5000)
+            os.chmod(locked_root, 0)
+            os.chmod(os.path.join(root, "REV-5"), 0)
+            try:
+                said["unlistable root"] = session_usage(locked_root, "REV-3")["model_note"] or ""
+                said["unlistable folder"] = session_usage(root, "REV-5")["model_note"] or ""
+            finally:
+                os.chmod(locked_root, 0o700)
+                os.chmod(os.path.join(root, "REV-5"), 0o700)
+            check("a root this account cannot enter is a configuration fault that names the path",
+                  ("configuration fault" in said["unlistable root"],
+                   locked_root in said["unlistable root"]), (True, True))
+            check("an issue folder this account cannot list says so, and is not a missing log",
+                  ("REV-5 cannot be listed" in said["unlistable folder"],
+                   "configuration" in said["unlistable folder"]), (True, False))
+            # A root the account can enter but not list (mode 0311, or the common 0711)
+            # still reaches <root>/<issue>. Only the issue's own folder is listed, so the
+            # row keeps its model and cost, and a missing folder there is still "no log".
+            search_only = os.path.join(root, "search-only-home")
+            os.makedirs(os.path.join(search_only, "REV-3"))
+            with open(os.path.join(search_only, "REV-3", "session-s1-2026-09-16T10-30-00.jsonl"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(line) + "\n" for line in (meta, init, result)))
+            os.chmod(search_only, 0o311)
+            try:
+                entered = session_usage(search_only, "REV-3")
+                entered_none = session_usage(search_only, "REV-404")["model_note"] or ""
+            finally:
+                os.chmod(search_only, 0o700)
+            check("a root this account can enter but not list (0311) still reads the issue's log",
+                  (entered["model"], (entered["execution"] or {}).get("total_cost_usd"),
+                   entered["cost_note"], "configuration" in (entered["model_note"] or "")),
+                  ("claude-opus-5", 0.9132, None, False))
+            check("under a 0311 root, an issue with no folder is no log, not a configuration fault",
+                  ("wrote no session log for REV-404" in entered_none,
+                   "configuration" in entered_none), (True, False))
+        else:
+            print("  skip: the permission cases (a 000 root, a 000 issue folder, a 0311 root) "
+                  "run as root here, where file modes do not bite")
+        check("the root, the folder and the missing log are said differently",
+              len(set(said.values())) == len(said) and all(said.values()), True)
+
+        # A line nested past the decoder's recursion limit raises RecursionError, not
+        # ValueError. The session reported on writes this log, so the line is stepped over
+        # like any other it cannot parse, and the row still reads the lines around it.
+        # The depth is the first that raises on the interpreter running this test (about
+        # 1000 on 3.9, more on later versions); the deepest is used if none does.
+        for depth in (2000, 20000, 200000):
+            try:
+                json.loads("[" * depth + "]" * depth)
+            except RecursionError:
+                break
+        deep = "[" * depth + "]" * depth
+        write_log("REV-7", "session-s7-2026-09-16T14-00-00.jsonl",
+                  [meta, init, '{"type": "sdk-message", "message": %s}' % deep, result], 6000)
+        try:
+            nested = session_usage(root, "REV-7")
+            check("a deeply nested log line is stepped over, and the row still reads",
+                  (nested["model"], nested["cost_note"]), ("claude-opus-5", None))
+        except RecursionError:
+            failures.append("a deeply nested log line (depth %d) crashed session_usage with "
+                            "RecursionError" % depth)
+
         base = dict(common, from_bounce=None, out=None, usage=None, model="",
                     session_logs=root, session_issue="REV-3", session_role="run",
                     no_session="", model_note="", cost_note="")
@@ -611,10 +718,12 @@ def selftest():
         with open(os.path.join(root, "bounce.json"), "w", encoding="utf-8") as fh:
             json.dump(GOOD_BOUNCE, fh)
         row = tb.scan(build_batch(ns)[1])["blocks"][0]["runs"][0]
-        check("--no-session: model unknown, and both notes carry the reason",
-              (row["model"], row["model_note"], row["cost_note"]),
-              ("unknown", "a conclusion starts no model session",
-               "a conclusion starts no model session"))
+        check("--no-session: model unknown with the reason, and an exact zero with no cost_note",
+              (row["model"], row["model_note"], row["cost_note"], row["cost_usd"]),
+              ("unknown", "a conclusion starts no model session", None, 0.0))
+        check("the not-incurred note says Stage E never records the fix run's cost, in one "
+              "stored line", ("never records" in NOT_INCURRED, "(no ticket yet)" in NOT_INCURRED,
+                              len(NOT_INCURRED) <= 200), (True, True, True))
 
     # 6. The write guard: this file's only Linear mutation is commentCreate. Each
     #    banned name below appears exactly once in this file — right here, in this

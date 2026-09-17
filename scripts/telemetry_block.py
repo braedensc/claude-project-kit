@@ -201,12 +201,18 @@ def execution_has_cost(execution):
     return found[0]
 
 
-def resolve_cost_note(execution, cost_note=None):
+def resolve_cost_note(execution, cost_note=None, no_session=False):
     """The `cost_note` for a run row: the caller's reason when it gave one, else a
     fixed reason when the execution record could not have measured the cost, else
-    None — which is the only value that lets a `cost_usd` of 0 mean "free"."""
+    None — which is the only value that lets a `cost_usd` of 0 mean "free".
+
+    `no_session` marks a row no model session belongs to (a conclusion, say). Nothing
+    ran, so its zero is exact rather than unmeasured, and it carries no note; the
+    reason there was no session belongs in `model_note` (§4)."""
     if cost_note and str(cost_note).strip():
         return str(cost_note).strip()
+    if no_session:
+        return None
     if execution is None:
         return "no execution record reached this emitter, so cost and tokens are unreported"
     if not execution_has_cost(execution):
@@ -371,14 +377,15 @@ def project_findings(findings, pr_number, at, schema=None):
 
 def review_block(artifact, team_key, model, auth_mode, run_id, started_at, ended_at,
                  dispatch_id=None, execution=None, reviewer_outcome=None, schema=None,
-                 model_note=None, cost_note=None):
+                 model_note=None, cost_note=None, no_session=False):
     """The block the review pass posts: what it cost, that it ran, what it found.
 
     `model_note` and `cost_note` are §4's reasons. Pass them when the caller knows
-    why a value is not measured; otherwise the row derives one from what arrived."""
+    why a value is not measured; otherwise the row derives one from what arrived.
+    `no_session` is for a row no reviewer session belongs to: see resolve_cost_note."""
     usable = bool(artifact.get("usable"))
     model, model_note = resolve_model(model, model_note)
-    cost_note = resolve_cost_note(execution, cost_note)
+    cost_note = resolve_cost_note(execution, cost_note, no_session)
     pr_number = artifact.get("pr") if isinstance(artifact.get("pr"), int) else None
     if reviewer_outcome == "cancelled":
         outcome, error_class = "timeout", "review_cancelled"
@@ -449,7 +456,7 @@ _NEEDS_ERROR_CLASS = ("blocked", "error", "timeout", "capacity", "budget")
 
 def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended_at,
                  dispatch_id=None, execution=None, schema=None, model_note=None,
-                 cost_note=None):
+                 cost_note=None, no_session=False):
     """The block a bounce (fix) session posts: what it cost, that it ran, the outcome.
 
     `artifact` is daemon-authored (KIT-93's own facts about the run it started), not
@@ -463,10 +470,12 @@ def bounce_block(artifact, team_key, model, auth_mode, run_id, started_at, ended
 
     `model_note` and `cost_note` are §4's reasons, as for `review_block`. A bounce row
     is usually written BEFORE the re-prompted session runs, so its caller passes a
-    cost note saying the cost is not incurred yet — never a zero that reads as free.
+    cost note saying the cost is not recorded — never a zero that reads as free. A row
+    no session belongs to (a conclusion, an exhaustion) passes `no_session`: its zero
+    is exact, and the reason sits in `model_note`.
     """
     model, model_note = resolve_model(model, model_note)
-    cost_note = resolve_cost_note(execution, cost_note)
+    cost_note = resolve_cost_note(execution, cost_note, no_session)
     outcome = artifact.get("outcome")
     if outcome not in BOUNCE_OUTCOMES:
         outcome = "error"
@@ -935,6 +944,16 @@ def selftest():
                        "2026-08-24T16:00:00Z",
                        execution=[{"type": "result", "total_cost_usd": 0}]
                        )["runs"][0]["cost_note"] is None)
+    concluded = bounce_block(GOOD_BOUNCE, "ENG", "", "api-key", "r_c",
+                             "2026-08-24T16:00:00Z", "2026-08-24T16:00:00Z",
+                             model_note="a conclusion starts no model session",
+                             no_session=True)["runs"][0]
+    check("a row no model session belongs to is an exact zero: no cost_note, the reason "
+          "in model_note",
+          concluded["cost_note"] is None and concluded["cost_usd"] == 0.0
+          and concluded["model"] == UNKNOWN_MODEL
+          and concluded["model_note"] == "a conclusion starts no model session",
+          json.dumps(concluded))
 
     # The gate refuses the silent shape a hand-written block could still post.
     silent = copy.deepcopy(good)
@@ -1013,6 +1032,53 @@ def selftest():
         check("--from-review still writes a conforming batch",
               result.returncode == 0 and os.path.exists(out_path),
               result.stdout[-300:] + result.stderr[-300:])
+
+    # The kit's own review workflow passes a CONFIGURED model (a repository
+    # variable or its default), never one read from the run, so its row must say so.
+    # The build step's own command is extracted and run, not grepped for a flag name.
+    import shlex
+    workflow = os.path.join(REPO_ROOT, "templates", "workflows", "pipeline-review.yml")
+    try:
+        with open(workflow, encoding="utf-8") as handle:
+            step = re.search(r"python3 scripts/telemetry_block\.py \\\n((?:[^\n]*\\\n)*[^\n]*)\n",
+                             handle.read())
+    except OSError:
+        step = None
+    check("the review workflow's batch-building command is found", step is not None, workflow)
+    if step is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "findings"))
+            with open(os.path.join(tmp, "findings", "findings.json"), "w",
+                      encoding="utf-8") as handle:
+                json.dump(GOOD_ARTIFACT, handle)
+            env = {"RUNNER_TEMP": tmp, "MODEL": "claude-sonnet-5", "AUTH_MODE": "",
+                   "DISPATCH_ID": "", "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1",
+                   "STARTED_AT": "", "ENDED_AT": "", "now": "2026-08-24T15:04:00Z",
+                   "REVIEWER_RESULT": "success", "usage": ""}
+
+            def expand(text):
+                text = re.sub(r"\$\{(\w+):-([^}]*)\}",
+                              lambda m: env.get(m.group(1)) or expand(m.group(2)), text)
+                return re.sub(r"\$\{?(\w+)\}?", lambda m: env.get(m.group(1), ""), text)
+
+            command = re.sub(r"\$\(jq -r '\.linear\.teamKey' delivery\.json\)", "ENG",
+                             step.group(1).replace("\\\n", " "))
+            argv = shlex.split(expand(command))
+            result = subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
+                                    capture_output=True, text=True, timeout=120)
+            row = {}
+            try:
+                with open(os.path.join(tmp, "safe-outputs", "requests.json"),
+                          encoding="utf-8") as handle:
+                    row = scan(comment_bodies(json.load(handle))[0])["blocks"][0]["runs"][0]
+            except (OSError, ValueError, IndexError, KeyError):
+                pass
+            check("the review workflow's row names the configured model and says it was not "
+                  "read from the run",
+                  row.get("model") == "claude-sonnet-5"
+                  and "not read from the run" in (row.get("model_note") or ""),
+                  "exit %d, row %s %s" % (result.returncode, json.dumps(row)[:300],
+                                          result.stdout[-200:] + result.stderr[-200:]))
 
     if failures:
         print("FAIL: %d of %d telemetry-block case(s) failed:" % (len(failures), cases[0]))

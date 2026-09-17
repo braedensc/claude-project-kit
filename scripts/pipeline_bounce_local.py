@@ -2617,9 +2617,10 @@ def emit_telemetry(state_dir, artifact, cfg, session_issue="", no_session=""):
 
     KIT-130: say which session the row is about. `session_issue` names the issue whose
     session this bounce re-prompts (or the fix ticket it minted): the publisher reads
-    that session's model from the dispatcher's log and says the cost is not incurred
-    yet — this row is written before the session runs. `no_session` is the reason for
-    a row no model session belongs to at all (a conclusion, an exhaustion, a stall)."""
+    that session's model from the dispatcher's log and says Stage E does not record the
+    cost — this row is written before the session runs, and no later row records that
+    run (no ticket yet). `no_session` is the reason for a row no model session belongs
+    to at all (a conclusion, an exhaustion, a stall): its cost is an exact 0."""
     slug_dir = os.path.join(state_dir, "bounces", repo_slug(artifact["repo"]))
     os.makedirs(slug_dir, exist_ok=True)
     path = os.path.join(slug_dir, "pr-%d-bounce-%s-%s.json"

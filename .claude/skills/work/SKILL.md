@@ -447,6 +447,7 @@ gh pr view --json number,createdAt
     "tokens_in": 0, "tokens_out": 0,
     "tokens_cache_read": 0, "tokens_cache_write": 0,
     "cost_usd": 0.0,
+    "cost_note": "a session cannot read its own total cost, so cost and tokens are not measured",
     "turns": 0,
     "outcome": "completed",
     "error_class": null,
@@ -476,6 +477,9 @@ that part of the loop — the same division that makes `agent:*` labels dispatch
 - `outcome` ∈ `completed|blocked|timeout|capacity|error|budget`; `error_class` is null
   unless the outcome is one of `blocked|error|timeout|capacity|budget`.
 - Timestamps are ISO-8601 UTC with `Z`; counters are non-negative integers, never null.
+- Keep `cost_note` exactly as written. A session cannot read its own total cost, so the
+  zeros above are not a measurement. The note says so in the row, and a dashboard then
+  calls its spend a floor rather than a total (§4).
 - **The block is validated, not merely counted.** The safe-outputs validator checks it
   against `schemas/telemetry-block.schema.json` — §4's machine rendering — so an unknown
   key, a missing field or a malformed timestamp rejects the whole batch. Emit the fields
