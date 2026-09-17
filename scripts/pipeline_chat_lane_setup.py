@@ -69,9 +69,12 @@ THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
       transport gets the list only when LINEAR_DIRECT_WEBHOOKS=true (EdgeWorker.js:475-489),
       the GitHub one only in signature mode (EdgeWorker.js:561-580); Slack gets none
       (EdgeWorker.js:743-750). Fastify trusts X-Forwarded-For
-      (SharedApplicationServer.js:37-40). The code that enforces those lists lives in
-      packages not read here, so whether a front door's forwarded address passes is
-      unmeasured.
+      (SharedApplicationServer.js:37-40), and the tracker transport refuses a webhook whose
+      address misses the list with a 403, loopback included (linear-event-transport
+      LinearEventTransport.js:89-96). A front door that does not trust its local tunnel
+      client forwards 127.0.0.1, so on a signature-verifying dispatcher every tracker
+      webhook would be refused. Piece 3 therefore sets WEBHOOK_IP_VALIDATION=false, the
+      only value that keeps the checks off (EdgeWorker.js:244-246) — today's behaviour.
    d. GitHub and GitLab webhooks switch to signature checks when their secrets are set
       (EdgeWorker.js:561-574, 625-631); with no secret, nothing changes.
    e. The tracker sign-in flow uses a local authorize page instead of the hosted proxy
@@ -270,6 +273,19 @@ def entry_kind(entry):
 # --------------------------------------------------------------------------- #
 ENV_NAMES = ("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "CYRUS_HOST_EXTERNAL")
 
+# REQUIRED, owner decision of 2026-09-17 (KIT-117). CYRUS_HOST_EXTERNAL=true turns webhook
+# source-address checks on unless this is exactly `false` (EdgeWorker.js:241-252). On a
+# dispatcher that verifies tracker signatures (LINEAR_DIRECT_WEBHOOKS=true) the tracker
+# webhook then accepts only the tracker's nine published addresses (EdgeWorker.js:475-489;
+# core WebhookIpValidator.js:9-19) and answers anything else with 403, loopback included
+# (linear-event-transport LinearEventTransport.js:89-96). The address comes from
+# X-Forwarded-For, which the server trusts (SharedApplicationServer.js:37-40), and a front
+# door that does not trust its local tunnel client replaces that header with 127.0.0.1
+# (Caddy's reverse_proxy reference: "by default, the proxy will ignore their values from
+# incoming requests"). Every tracker webhook refused: no ticket starts a session. `false`
+# keeps today's behaviour, a webhook protected by its signature alone.
+IP_VALIDATION_NAME = "WEBHOOK_IP_VALIDATION"
+
 # NEVER SET — owner decision of 2026-09-17 (KIT-117). Any CYRUS_API_KEY makes the dispatcher
 # act as paired with the vendor's hosted service: it registers `log_failure_mode`
 # (EdgeWorker.js:4016-4027, 4142-4147; mcp-tools cyrus-tools/index.js:636-642), which POSTs
@@ -372,6 +388,13 @@ def pf_install_commands(port):
                "sudo /sbin/pfctl -s info | grep Status",
                "curl -s -m 5 http://127.0.0.1:%s/status" % port])
 
+
+# The first thing to prove after the restart: tracker dispatch still works.
+TICKET_CHECK_STEP = (
+    "Delegate one throwaway tracker ticket to the dispatcher. Good: a session starts on it "
+    "within five minutes. Not that: no session. Roll back now: remove CYRUS_HOST_EXTERNAL "
+    "from the dispatcher's env file and restart it, then read the dispatcher's log for "
+    "\"Rejected Linear webhook from unauthorized IP\" (LinearEventTransport.js:93).")
 
 PF_COPY_START = "----- copy from the next line -----"
 PF_COPY_END = "----- to the line above -----"
@@ -714,7 +737,7 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
     say("")
 
     # -- Piece 3 -------------------------------------------------------------
-    say("PIECE 3 — THE DISPATCHER'S ENV FILE: THREE NAMES")
+    say("PIECE 3 — THE DISPATCHER'S ENV FILE: FOUR NAMES")
     para("Where: %s. The dispatcher loads it at start and re-applies it when it changes "
          "(Application.js:52-78). Names only: type the two secret values in yourself."
          % conf["DISPATCHER_ENV_FILE"])
@@ -722,6 +745,21 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
     say("    SLACK_BOT_TOKEN        the CHAT app's bot token (Slack: OAuth & Permissions)")
     say("    SLACK_SIGNING_SECRET   the CHAT app's signing secret (Slack: Basic Information)")
     say("    CYRUS_HOST_EXTERNAL=true")
+    say("    %s=false" % IP_VALIDATION_NAME)
+    say("")
+    say("  %s=false IS NOT OPTIONAL. WITHOUT IT, TICKETS STOP STARTING SESSIONS." % IP_VALIDATION_NAME)
+    para("CYRUS_HOST_EXTERNAL=true turns on webhook source-address checks unless this name "
+         "is exactly false (EdgeWorker.js:241-252). A dispatcher that verifies tracker "
+         "signatures (LINEAR_DIRECT_WEBHOOKS=true) then takes tracker webhooks only from the "
+         "tracker's nine published addresses (EdgeWorker.js:475-489; WebhookIpValidator.js:"
+         "9-19), and answers every other address with 403, loopback included "
+         "(LinearEventTransport.js:89-96). It reads the address from X-Forwarded-For "
+         "(SharedApplicationServer.js:37-40). A front door that does not trust its local "
+         "tunnel client puts 127.0.0.1 there, so every tracker webhook is refused, no ticket "
+         "starts a session, and nothing else looks wrong.")
+    para("What false keeps: today's behaviour exactly. The tracker webhook stays protected by "
+         "its signature alone, as it is now. The Slack webhook gets no address list either "
+         "way (EdgeWorker.js:743-750).")
     say("")
     say("  SLACK_BOT_TOKEN MUST BE THE CHAT APP'S TOKEN, NEVER THE NOTIFIER'S.")
     para("The dispatcher's environment reaches every session it starts: a session's "
@@ -761,11 +799,12 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
         "while CYRUS_API_KEY is unset (McpConfigService.js:166-170), /status and every "
         "webhook. Read at start only. CLOSED BY PIECE 4 once it is loaded and card CK-C4 "
         "passes; open until then.",
-        "3. Webhook source-address checks turn on (EdgeWorker.js:241-252) unless "
-        "WEBHOOK_IP_VALIDATION=false, and the dispatcher fetches GitHub's address list from "
-        "api.github.com at start (EdgeWorker.js:411-416). The tracker webhook is checked "
-        "only with LINEAR_DIRECT_WEBHOOKS=true (EdgeWorker.js:475-489); the Slack webhook gets no "
-        "address list at all (EdgeWorker.js:743-750). Read at start only.",
+        "3. Webhook source-address checks turn on (EdgeWorker.js:241-252), and the "
+        "dispatcher fetches GitHub's address list from api.github.com at start "
+        "(EdgeWorker.js:411-416). The tracker webhook is checked only with "
+        "LINEAR_DIRECT_WEBHOOKS=true (EdgeWorker.js:475-489); the Slack webhook gets no "
+        "address list at all (EdgeWorker.js:743-750). Read at start only. KEPT OFF by "
+        "WEBHOOK_IP_VALIDATION=false, above.",
         "4. GitHub and GitLab webhooks switch to signature checks if their secrets are set "
         "(EdgeWorker.js:561-574, 625-631). No secret, no change.",
         "5. A tracker sign-in uses a local authorize page instead of the hosted proxy when "
@@ -888,17 +927,18 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
         "rules and \"Status: Enabled\" — the next restart makes the dispatcher listen on "
         "every interface.",
         "5. Card CK-C1: create the chat app from piece 6 and install it.",
-        "6. Piece 3, then restart the dispatcher when no session is in flight. "
-        "slackAllowedTools reloads live (ConfigManager.js:51-62, 181), but the listening "
-        "address and address checks are read at start only, and a removed env name stays "
-        "set until a restart (Application.js:54). Restart on purpose, now, not at the next "
-        "reboot.",
-        "7. Card CK-C4, from a second device: the port refuses the network.",
-        "8. Piece 7 and card CK-C2: the front door.",
-        "9. In the Slack app, retry the request URL under Event Subscriptions. Make a "
+        "6. Piece 3, all four names together, then restart the dispatcher when no session "
+        "is in flight. slackAllowedTools reloads live (ConfigManager.js:51-62, 181), but the "
+        "listening address and address checks are read at start only, and a removed env "
+        "name stays set until a restart (Application.js:54). Restart on purpose, now, not at "
+        "the next reboot.",
+        "7. %s" % TICKET_CHECK_STEP,
+        "8. Card CK-C4, from a second device: the port refuses the network.",
+        "9. Piece 7 and card CK-C2: the front door.",
+        "10. In the Slack app, retry the request URL under Event Subscriptions. Make a "
         "private channel and invite the bot.",
-        "10. python3 %s verify" % _self_path(),
-        "11. Card CK-C3: the live check, in the channel.",
+        "11. python3 %s verify" % _self_path(),
+        "12. Card CK-C3: the live check, in the channel.",
     )
     for step in steps:
         para(step, "  ")
@@ -1137,7 +1177,7 @@ def env(path):
             text = fh.read()
     except Exception as exc:
         return {"error": why(exc)}
-    seen, external, port = {}, None, None
+    seen, external, port, ip_off = {}, None, None, None
     for line in text.splitlines():
         m = LINE.match(line)
         if not m:
@@ -1146,6 +1186,8 @@ def env(path):
         seen[m.group(1)] = bool(value)
         if m.group(1) == "CYRUS_HOST_EXTERNAL":
             external = value.strip().lower() == "true"
+        if m.group(1) == "WEBHOOK_IP_VALIDATION":
+            ip_off = value.strip().lower() == "false"
         if m.group(1) == "CYRUS_SERVER_PORT":
             digits = re.match(r"^\s*(\d+)", value)
             port = int(digits.group(1)) if digits else 0
@@ -1155,6 +1197,7 @@ def env(path):
     return {"names": sorted(k for k, v in seen.items() if v),
             "empty": sorted(k for k, v in seen.items() if not v),
             "hostExternalTrue": external,
+            "ipValidationOff": ip_off,
             "serverPortMatches": live_port == int(sys.argv[3])}
 
 def user_settings():
@@ -1341,6 +1384,34 @@ def check_env(conf, env_facts):
                 "all three names are set (values not read into this process)")
 
 
+def check_ip_validation_off(env_facts):
+    """WEBHOOK_IP_VALIDATION=false, by name and value (the value is not a secret)."""
+    err = env_facts.get("error")
+    if err == "missing":
+        return _row("ip-validation-off", BLOCKED,
+                    "no dispatcher env file, so %s=false is not set" % IP_VALIDATION_NAME)
+    if err:
+        return _row("ip-validation-off", UNKNOWN, "the env file is %s" % err)
+    off = env_facts.get("ipValidationOff")
+    if off is True:
+        return _row("ip-validation-off", ALREADY_DONE,
+                    "%s=false: tracker webhooks keep today's signature-only check"
+                    % IP_VALIDATION_NAME)
+    state = "not set" if off is None else "set, but not to false"
+    consequence = ("with CYRUS_HOST_EXTERNAL=true a signature-verifying dispatcher takes "
+                   "tracker webhooks only from the tracker's own addresses, and a front "
+                   "door that forwards them as 127.0.0.1 gets every one refused with 403 "
+                   "(LinearEventTransport.js:89-96): no ticket starts a session")
+    if env_facts.get("hostExternalTrue") is True:
+        return _row("ip-validation-off", FAILED,
+                    "%s is %s while CYRUS_HOST_EXTERNAL=true: %s. Set %s=false and restart "
+                    "the dispatcher" % (IP_VALIDATION_NAME, state, consequence,
+                                        IP_VALIDATION_NAME))
+    return _row("ip-validation-off", BLOCKED,
+                "%s is %s. Add %s=false with the other names, before the restart: %s"
+                % (IP_VALIDATION_NAME, state, IP_VALIDATION_NAME, consequence))
+
+
 def check_notifier_absent(conf, env_facts):
     name = conf["NOTIFIER_TOKEN_ENV"]
     err = env_facts.get("error")
@@ -1466,7 +1537,7 @@ def check_user_settings(conf, us, env_facts):
                 "%s carries every composed deny rule" % path)
 
 
-CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env",
+CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env", "ip-validation-off",
           "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings")
 
 
@@ -1489,6 +1560,7 @@ def evaluate(facts, conf, pf=None):
             rows.append(check_fence(cfg, env_facts))
             rows.append(check_chat_mcp(cfg))
         rows.append(check_env(conf, env_facts))
+        rows.append(check_ip_validation_off(env_facts))
         rows.append(check_notifier_absent(conf, env_facts))
         rows.append(check_hosted_keys_absent(env_facts))
         rows.append(check_user_settings(conf, us, env_facts))
@@ -1811,10 +1883,22 @@ def _selftest_body():
         expect("compose-port-block-says:" + needle, needle in flat4, needle)
     order_at = out.find("THE ORDER")
     load_step = out.find("Piece 4: install and load the port block", order_at)
-    restart_step = out.find("Piece 3, then restart", order_at)
+    restart_step = out.find("Piece 3, all four names together", order_at)
     c4_step = out.find("Card CK-C4", order_at)
     expect("order-port-block-before-restart", order_at < load_step < restart_step < c4_step,
            (load_step, restart_step, c4_step))
+    p3_text = " ".join(out[p3:p4].split())
+    expect("compose-piece3-ip-validation", "WEBHOOK_IP_VALIDATION=false IS NOT OPTIONAL" in
+           p3_text and "LinearEventTransport.js:89-96" in p3_text and "signature alone" in
+           p3_text and "\n    WEBHOOK_IP_VALIDATION=false\n" in out[p3:p4], p3_text[:200])
+    restart_at = out.find("Piece 3, all four names together", order_at)
+    ticket_at = out.find(" ".join(TICKET_CHECK_STEP.split()[:6]), order_at)
+    door_at = out.find("Piece 7 and card CK-C2", order_at)
+    expect("order-ticket-check-after-restart-before-slack",
+           0 < restart_at < ticket_at < door_at, (restart_at, ticket_at, door_at))
+    expect("ticket-check-content", all(t in TICKET_CHECK_STEP for t in (
+        "five minutes", "remove CYRUS_HOST_EXTERNAL",
+        "Rejected Linear webhook from unauthorized IP")))
     expect("compose-do-not-hosted", "DO NOT SET CYRUS_API_KEY, CYRUS_TEAM_ID OR CYRUS_APP_URL"
            in flat and "app.atcyrus.com/api/failure-modes" in flat
            and "McpConfigService.js:166-181" in flat, "piece 3 lacks the hosted-service DO NOT")
@@ -1995,7 +2079,8 @@ def _selftest_body():
             return ("# dispatcher env\n"
                     "SLACK_BOT_TOKEN=%s\n"
                     "export SLACK_SIGNING_SECRET=\"%s\"\n"
-                    "CYRUS_HOST_EXTERNAL=true\n" % (SENTINELS[0], SENTINELS[1]))
+                    "CYRUS_HOST_EXTERNAL=true\n"
+                    "WEBHOOK_IP_VALIDATION=false\n" % (SENTINELS[0], SENTINELS[1]))
 
         def settings_with(deny):
             return json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
@@ -2155,6 +2240,24 @@ def _selftest_body():
         outputs.append(ran.stdout)
         expect("verify-notifier-token-present", rc_v == EX_BLOCKED
                and re.search(r"notifier-token-absent\s+BLOCKED-ON-HUMAN", printed), printed)
+
+        # WEBHOOK_IP_VALIDATION: missing and `true` are failures under CYRUS_HOST_EXTERNAL,
+        # `false` passes, and before activation a missing one is outstanding, not broken
+        base_env = good_env().replace("WEBHOOK_IP_VALIDATION=false\n", "")
+        for label, env_text, want_row, want_rc in (
+                ("missing", base_env, FAILED, EX_FAILED),
+                ("true", base_env + "WEBHOOK_IP_VALIDATION=true\n", FAILED, EX_FAILED),
+                ("false", base_env + "WEBHOOK_IP_VALIDATION=false\n", ALREADY_DONE, EX_OK),
+                ("quoted-FALSE", base_env + "WEBHOOK_IP_VALIDATION=\"FALSE\"\n", ALREADY_DONE,
+                 EX_OK),
+                ("missing-before-activation", base_env.replace(
+                    "CYRUS_HOST_EXTERNAL=true\n", ""), BLOCKED, EX_BLOCKED)):
+            ran_ip = probe(good_config(), env_text, good_settings)
+            rc_v, printed, _f, _s = verify_with(ran_ip)
+            got = re.search(r"ip-validation-off\s+(\S+)", printed)
+            expect("verify-ip-validation-" + label, rc_v == want_rc and got
+                   and got.group(1) == want_row
+                   and (want_row == ALREADY_DONE or "403" in printed), printed)
 
         # CYRUS_API_KEY and CYRUS_TEAM_ID: each alone turns the check red, by name only
         for name, sentinel in (("CYRUS_API_KEY", SENTINELS[4]), ("CYRUS_TEAM_ID", SENTINELS[5])):

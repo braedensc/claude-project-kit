@@ -208,17 +208,34 @@ token and never refreshes it (`SlackEventTransport.js:53-55`). No Socket Mode: t
 is inbound HTTP only (`SlackEventTransport.js:84-89`). The Slack tool server the dispatcher
 starts (`McpConfigService.js:91-98`) may want more scopes for some tools. None is added.
 
-If Slack says the request URL did not verify, carry on. Step 10 retries it.
+If Slack says the request URL did not verify, carry on. Step 11 retries it.
 
 Good: an app with exactly those four bot scopes and no user scopes.
 
-### Step 7 — Three names in the dispatcher's env file, then restart (piece 3)
+### Step 7 — Four names in the dispatcher's env file, then restart (piece 3)
 
 | Name | Value |
 |---|---|
 | `SLACK_BOT_TOKEN` | the **chat** app's bot token, typed by you |
 | `SLACK_SIGNING_SECRET` | the chat app's signing secret, typed by you |
 | `CYRUS_HOST_EXTERNAL` | `true` |
+| `WEBHOOK_IP_VALIDATION` | `false` |
+
+Add all four together, before the restart.
+
+**`WEBHOOK_IP_VALIDATION=false` is not optional. Without it, tickets stop starting sessions.**
+`CYRUS_HOST_EXTERNAL=true` turns on webhook source-address checks unless this name is exactly
+`false` (`EdgeWorker.js:241-252`). A dispatcher that verifies tracker signatures
+(`LINEAR_DIRECT_WEBHOOKS=true`) then takes tracker webhooks only from the tracker's nine
+published addresses (`EdgeWorker.js:475-489`; `WebhookIpValidator.js:9-19`). Every other
+address gets a 403, loopback included (`LinearEventTransport.js:89-96`). The dispatcher reads
+the address from `X-Forwarded-For` (`SharedApplicationServer.js:37-40`). A front door that
+does not trust its local tunnel client puts `127.0.0.1` there. So every tracker webhook is
+refused, no ticket starts a session, and nothing else looks wrong.
+
+What `false` keeps is today's behaviour, exactly. The tracker webhook stays protected by its
+signature alone, as it is now. The Slack webhook gets no address list either way
+(`EdgeWorker.js:743-750`).
 
 **`SLACK_BOT_TOKEN` must be the chat app's token, never the notifier's.** A session's
 environment is a copy of the dispatcher's (`session-env.js:45-65`), so every coding session
@@ -243,7 +260,19 @@ Then **restart the dispatcher** when no session is in flight. A restart stops ev
 session (`docs/STAGE-E-OPERATOR.md`). Some of this reloads live, but not all of it (see
 *When a change takes effect*).
 
-### Step 8 — Prove the port is closed, from a second device (card CK-C4)
+### Step 8 — Confirm tickets still start sessions
+
+Do this first after the restart, before anything on the Slack side.
+
+Delegate one throwaway tracker ticket to the dispatcher.
+
+Good: a session starts on it within five minutes.
+
+Not that: no session. Roll back now. Remove `CYRUS_HOST_EXTERNAL` from the dispatcher's env
+file and restart the dispatcher. Then read the dispatcher's log for
+`Rejected Linear webhook from unauthorized IP` (`LinearEventTransport.js:93`).
+
+### Step 9 — Prove the port is closed, from a second device (card CK-C4)
 
 ```sh
 python3 scripts/pipeline_chat_lane_setup.py card CK-C4
@@ -262,7 +291,7 @@ restart the dispatcher, and fix Step 5 before anything else.
 
 After the next reboot, run the card again: the rule is loaded at boot.
 
-### Step 9 — Open the front door for one path (card CK-C2, piece 7)
+### Step 10 — Open the front door for one path (card CK-C2, piece 7)
 
 The reverse proxy's path allowlist gains `/slack-webhook`, and nothing else.
 
@@ -273,14 +302,14 @@ python3 scripts/pipeline_chat_lane_setup.py card CK-C2
 Good: the door answers `401` on `/slack-webhook` with no signature, and still refuses
 `/status`.
 
-### Step 10 — Point Slack at it
+### Step 11 — Point Slack at it
 
 In the chat app's Event Subscriptions page, retry the request URL. Make a private channel.
 Invite the bot.
 
 Good: Slack shows the URL as verified.
 
-### Step 11 — Verify
+### Step 12 — Verify
 
 ```sh
 python3 scripts/pipeline_chat_lane_setup.py verify
@@ -291,7 +320,8 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `grant` | `slackAllowedTools` is the list in Step 3, and the first entry adds no `mcp__` tools |
 | `coding-fence` | every non-review entry's effective list carries both Slack rules, and no prompt type replaces it without them |
 | `chat-mcp-configs` | `slackMcpConfigs` is empty or unset. Otherwise it names each extra server |
-| `dispatcher-env` | all three names are set, checked by name. No value is read into the command |
+| `dispatcher-env` | the Slack names and `CYRUS_HOST_EXTERNAL=true` are set, checked by name. No secret value is read into the command |
+| `ip-validation-off` | `WEBHOOK_IP_VALIDATION=false` is set, checked by name and value (the value is not a secret). Missing or `true` while `CYRUS_HOST_EXTERNAL=true` is a **failure**: tracker webhooks are being refused |
 | `notifier-token-absent` | the notifier's token name is **not** in the dispatcher's env file |
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
@@ -302,7 +332,7 @@ Good: `No drift: every check measures as applied.` and exit 0.
 `verify` cannot see the network from outside. `port-block` says the rule is loaded; card
 `CK-C4` is the proof that it works.
 
-### Step 12 — The live check (card CK-C3)
+### Step 13 — The live check (card CK-C3)
 
 ```sh
 python3 scripts/pipeline_chat_lane_setup.py card CK-C3
@@ -325,14 +355,14 @@ It is set to turn on Slack's signature check. It does five things.
 |---|---|---|
 | Slack requests are checked against `SLACK_SIGNING_SECRET` | `EdgeWorker.js:730-752`; `SlackEventTransport.js:65-80` | per request, so live |
 | **The dispatcher's web server listens on every network interface, not only this machine** | `WorkerService.js:149, 191`; `EdgeWorker.js:254-257` | at start |
-| Webhook source-address checks turn on, and the dispatcher fetches GitHub's address list at start. Set `WEBHOOK_IP_VALIDATION=false` to keep them off | `EdgeWorker.js:241-252, 411-416` | at start |
+| Webhook source-address checks turn on, and the dispatcher fetches GitHub's address list at start. **Step 7's `WEBHOOK_IP_VALIDATION=false` keeps them off** | `EdgeWorker.js:241-252, 411-416` | at start |
 | GitHub and GitLab webhooks use signature checks, if their secrets are set | `EdgeWorker.js:561-574, 625-631` | at start |
 | A tracker sign-in uses a local page instead of the hosted proxy, when `LINEAR_CLIENT_ID` is set. The self-auth command's listener binds every interface | `SharedApplicationServer.js:209-218`; `SelfAuthCommand.js:153-156` | when you sign in |
 
 The second row matters most. With the server on every interface, a device on your network
 reaches every route without the front door. That includes the dispatcher's tool server,
 whose auth check lets everything through while `CYRUS_API_KEY` is unset
-(`McpConfigService.js:166-170`). Step 5's rule closes that; Step 8 proves it.
+(`McpConfigService.js:166-170`). Step 5's rule closes that; Step 9 proves it.
 
 The tracker webhook gets an address check only with `LINEAR_DIRECT_WEBHOOKS=true`
 (`EdgeWorker.js:475-489`). The Slack webhook never gets one (`EdgeWorker.js:743-750`).
@@ -386,8 +416,10 @@ deployment accepts the same list.
 
 These came out of reading the dispatcher's source for this build.
 
-- **The address checks and the GitHub fetch** turn on with `CYRUS_HOST_EXTERNAL=true`, at
-  start.
+- **The address checks would refuse every tracker webhook** behind a front door that
+  forwards `127.0.0.1`: they turn on with `CYRUS_HOST_EXTERNAL=true` and allow loopback no
+  exemption (`LinearEventTransport.js:89-96`). Step 7 keeps them off; Step 8 proves tickets
+  still start sessions.
 - **The repository's deny rules are relative**, so copied verbatim they guard only the
   chat session's empty folder. `compose` anchors them. Step 4 explains.
 - **The first repository entry's `mcp__` tools join the chat grant.** `verify` checks it.
@@ -421,8 +453,8 @@ These came out of reading the dispatcher's source for this build.
 - Whether the dispatcher gets `CYRUS_API_KEY`, `CYRUS_TEAM_ID` or `CYRUS_SERVER_PORT` from
   somewhere other than its env file, such as its service definition. `verify` reads the env
   file only (KIT-174).
-- Whether a front door's forwarded address passes the tracker or GitHub address check when
-  those are on. The code that enforces them was not read (KIT-174).
+- Whether a front door that trusts its tunnel client would pass the real address, so
+  validation could be turned on later (KIT-174).
 - Whether the config watcher sees an edit from an editor that replaces the file instead of
   changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174).
 - Whether Slack creates an app from a manifest whose request URL does not answer yet
@@ -442,7 +474,7 @@ These came out of reading the dispatcher's source for this build.
 
 1. **Uninstall the chat app in Slack.** That revokes its token, and it is the step that
    really ends the lane: a copied token works until then.
-2. Remove the three names from the dispatcher's env file, then restart. A reload does not
+2. Remove the four names from the dispatcher's env file, then restart. A reload does not
    unset a name (`Application.js:54`). The dispatcher then listens on this machine only.
 3. Remove `/slack-webhook` from the front door.
 4. Leave `slackAllowedTools`, the entry fences and the port block in place. Removing the
