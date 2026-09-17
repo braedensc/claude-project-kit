@@ -277,8 +277,17 @@ def ingest_findings(response_body):
 # it should have omitted. Treating these as a decline would throw away good reviews, and a
 # false decline is its own kind of lie, so the tolerant reading wins here — the field is
 # only trusted when it says something.
-_NOT_BLOCKED = frozenset(("", "no", "none", "null", "false", "n/a", "na", "not blocked",
-                          "nothing", "not applicable"))
+# The spellings a model reaches for when it means "nothing stopped me". Matched after
+# lower-casing, collapsing whitespace and stripping the punctuation and articles around
+# it, because "No blockers." and "none - the diff was complete" mean what "no" means, and
+# reading either as a blocker throws away a review that was done (review of #134).
+_NOT_BLOCKED = frozenset(("", "no", "none", "null", "false", "nil", "n/a", "na", "n a",
+                          "not blocked", "nothing", "not applicable", "no blockers",
+                          "no blocker", "none applicable", "nothing to report",
+                          "nothing blocking", "no issues", "no problems", "not needed",
+                          "empty", "false alarm", "unblocked"))
+# …and the tail a reviewer adds after any of those: "none — the diff was complete".
+_NOT_BLOCKED_TAIL_RE = re.compile(r"^(?P<head>[a-z/ ]{1,16}?)\s*[-—:;,(]")
 
 
 def blocked_reason(doc):
@@ -295,9 +304,24 @@ def blocked_reason(doc):
     if raw is True:
         return "the reviewer set `blocked` but gave no reason"
     text = " ".join(str(raw).split())
-    if text.lower().strip(".!") in _NOT_BLOCKED:
+    if _reads_as_not_blocked(text):
         return None
     return text[:500]
+
+
+def _reads_as_not_blocked(text):
+    """True when this `blocked` value is a reviewer saying nothing stopped it.
+
+    Tolerant ON PURPOSE, in one direction only. A false decline discards a review that
+    was done and leaves the PR reading as unreviewed until a person looks; a missed
+    negative spelling costs nothing, because the field was meant to be left out. So this
+    reads the head of the value and stops at the first punctuation: `none — the diff was
+    complete` is `none`. Anything longer than a stock phrase is treated as a reason."""
+    core = str(text or "").strip().lower().strip(".!?*`\"' ")
+    if core in _NOT_BLOCKED:
+        return True
+    m = _NOT_BLOCKED_TAIL_RE.match(core)
+    return bool(m) and m.group("head").strip() in _NOT_BLOCKED
 
 
 def classify(doc, threshold):
@@ -332,6 +356,9 @@ def classify(doc, threshold):
         # the count is said out loud rather than dropped in silence.
         also = len(doc["findings"])
         result["blocked"] = blocked
+        # Machine-readable, because the caller reports this on the PR and a caller that
+        # had to parse the sentence below would parse it wrong (review of #134).
+        result["unacted_findings"] = also
         result["reason"] = ("the reviewer reported it could not review this change: %s%s"
                             % (blocked,
                                "" if not also else
@@ -767,6 +794,17 @@ def selftest():
     check("declined-heading", "was NOT reviewed" in declined, True)
     check("declined-distinct", reviewed != declined, True)
     check("declined-not-clean", "unreviewed, not as clean" in declined, True)
+    # THE REVIEWER-FACING HALF OF KIT-137, pinned (review of #134). Only the publisher's
+    # reading of `blocked` was tested; the rubric that tells a reviewer to SET it could be
+    # reverted to "say so in `summary`" with every battery green, and the field would go
+    # back to being one nothing fills.
+    check("rubric-tells-a-blocked-reviewer-what-to-set",
+          ('add `"blocked"` to the block' in REVIEW_RUBRIC,
+           "Omit `blocked` entirely on any review you were able to do" in REVIEW_RUBRIC),
+          (True, True))
+    check("rubric-says-why-an-empty-list-alone-is-wrong",
+          'reads\nas "this change is clean"' in REVIEW_RUBRIC
+          or 'reads as "this change is clean"' in REVIEW_RUBRIC.replace("\n", " "), True)
     for text in (reviewed, declined, REVIEW_RUBRIC):
         for word in ("approve ", "Approved", "LGTM", "merge this"):
             if word in text:

@@ -9,7 +9,8 @@ stale.
 
 If you are a reviewer, §5 is yours as well. Everything else still applies, except one
 thing: a reviewer has no tracker tool. Where this brief says to comment on your ticket,
-a reviewer puts that in its review block's `summary` instead.
+a reviewer puts it in its review block instead — a **blocker** in `blocked`, anything
+else in `summary`. Only `blocked` is read by a machine (§5).
 
 ---
 
@@ -166,6 +167,9 @@ Your ticket says so, and you have no `Bash`, `Edit` or `Write`. Then:
   `blocked` to one line saying what was missing, and return an empty `findings` list** with
   the schema intact. Never invent a finding. An empty list *without* `blocked` is published
   as a clean review of a change you never saw.
+- **A diff you were given only part of is not a blocker.** Where the ticket says files were
+  withheld, review the ones you can see and say in `summary` that this was partial. Setting
+  `blocked` there throws away every finding you made.
 - **Never approve, merge, push or edit.** You have no tool for it, and you must not look
   for one.
 - **Never ask anyone anything.** You have no tracker tool, so you cannot comment on any
@@ -191,7 +195,7 @@ Not: "Tests fine."
 Nobody is watching. You cannot ask a person and wait. **Never try to ask an interactive
 user** — the call hangs or fails, and no one is there. A coding session should comment on
 its ticket instead, then act as below. A reviewer has no tracker tool: it puts the blocker
-in its block's `summary` (§5).
+in its block's `blocked` field (§5). `summary` is prose for a person and stops nothing.
 
 | Situation | Do this |
 |---|---|
