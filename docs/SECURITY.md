@@ -157,7 +157,7 @@ So which layer actually carries which guarantee:
 | No destructive local op | `rm -rf` matcher | the blast radius being a disposable worktree; git history for anything committed |
 | Nothing lands on `main` | push guard | **branch protection** (server-side, GitHub) |
 | Claude never merges | `gh pr merge` matcher | **branch protection + the platform merge gate**, in repository settings, outside the repo tree |
-| An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** — ⚠️ **not currently switched on here; see below** |
+| An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** — ⚠️ **a team's layer, deliberately off on a single-maintainer repository; see below** |
 | A guard change is acknowledged by a person | protected-label matcher | **`scripts/check_grader_paths.py`**, which checks *who* applied the label, server-side |
 
 Every row's right-hand column is unreachable from a session. That is the design the
@@ -167,20 +167,31 @@ never-merge, self-approval and protected-label guards were each already document
 What the measurement adds is the same honesty for the other three, and numbers behind
 all six.
 
-**One row's durable layer is not actually enabled, measured 2026-09-04.** The approval row
-names a branch-protection rule; the API says otherwise. On this repository `GET
-/branches/main/protection` omits `required_pull_request_reviews` entirely (its sub-endpoint
-still reports `1`, which is the inconsistency), and five consecutive pull requests — #57
-through #61 — were authored by one person, merged by that same person, and reviewed by
-nobody, under `enforce_admins: true`. A required review would have blocked all five. So
-that row is carried today by the hook matcher alone, which the table above rates advisory.
+**One row's durable layer needs a second maintainer to mean anything, and a solo
+repository has one. Measured 2026-09-04 and again 2026-09-17, unchanged.** The approval
+row names a branch-protection rule. On this repository `GET /branches/main/protection`
+omits `required_pull_request_reviews` entirely, while its own sub-endpoint still reports
+`required_approving_review_count: 1` — the two disagree, and the parent is the one that
+governs. Under `enforce_admins: true`, no review is required to merge. Five consecutive
+pull requests early on were authored, merged and reviewed by the same single person.
 
-This is not an outage: a person still merges every pull request by hand, and the merge
-guard blocks the agent in every spelling. It is a gap between what this file promises an
-adopter and what a fresh clone inherits. Whether a solo repository should require a review
-at all — a rule nobody can satisfy would be switched off within a day — is the open
-question in KIT-87, and this row should be rewritten once that is decided rather than
-quietly fixed.
+**That is a deliberate state, not an outage and not an oversight.** A required-review rule
+on a repository with one maintainer is a rule nobody can satisfy, and a rule nobody can
+satisfy gets switched off within a day — which leaves a repository worse off than one that
+never claimed the protection at all. So on a single-maintainer repository this row's
+durable layer is **off on purpose**, and what carries it instead is narrower and worth
+stating plainly:
+
+- the hook matcher, which this table rates **advisory** — it stops the obvious spellings
+  and is not a boundary;
+- **a person merging every pull request by hand**, which is the actual control;
+- the automated review lane, where one is configured, whose verdict a person reads before
+  merging.
+
+**Switch the rule on the moment a second person can approve.** That is the trigger, and it
+is one setting: require a review, and do not count one from the pull request's own author.
+Until then this row promises an adopter a team's layer, and an adopter running solo
+inherits the three controls above instead. KIT-87 holds the decision and the measurement.
 
 **Not measured (out of scope, KIT-36 step 1):** the Bash arm of *self-protection*
 (`_SELF_MUTATE_RE`) is built from the same regex scaffold and should be assumed to share
