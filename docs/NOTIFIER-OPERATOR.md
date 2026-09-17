@@ -278,20 +278,22 @@ shows up, and only when you run it.
   separate app keeps that token from posting as the notifier. Nothing stops a session with a
   shell from copying that token into a pull request body or a ticket comment: no fence
   closes that. (KIT-157)
-- **The token file is kept from sessions by the sandbox, not by a permission.** Sessions run
-  as the role account. Its home is closed to them by the dispatcher sandbox's deny-read, and
-  by nothing else. Stage E accepted this for the tracker key; the Slack token inherits it
-  (`docs/STAGE-E-OPERATOR.md`, Accepted risks). (no ticket yet)
+- **A session can read the token file through the dispatcher's own tools.** Sessions run as
+  the role account. A dispatcher may give sessions tools that run outside the session
+  sandbox, in the dispatcher's own process. Where it does, any file that account can read —
+  this env file included — is readable by a session through a tool server the dispatcher
+  provides, whatever the sandbox denies. Moving the file does not help: every daemon runs as
+  the same account. (KIT-162)
 - **The Stage E installer rewrites the env file whole** when it stores or replaces a
   credential. That drops the notifier's token line. Every notifier pass then exits 2, and only
   `verify` here shows it. Re-run this installer after any Stage E credential change.
-  (no ticket yet)
+  (KIT-171)
 - **Whether `chat:write` alone posts to a private channel** the bot was invited to. The
-  notifier is built for that one scope. The throwaway test settles it. (no ticket yet)
+  notifier is built for that one scope. The throwaway test settles it. (KIT-173)
 - **Whether the tracker's editor keeps `<!--` intact** on a comment's first line. The API
-  path above sidesteps it. (no ticket yet)
+  path above sidesteps it. (KIT-173)
 - **Whether the comment window is really newest-first.** The notifier asks for it, and names
   any ticket whose window came back full, so a wrong answer is visible, not silent.
-  (no ticket yet)
+  (KIT-173)
 - **The four planning marks have not paged live.** The throwaway test cannot exercise them.
-  (no ticket yet)
+  (KIT-173)
