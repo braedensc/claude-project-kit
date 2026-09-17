@@ -1089,9 +1089,14 @@ def step_dispatcher_entry(ctx, apply_it):
         raise SetupError("composed a broken Planning entry — refusing to print it:\n"
                          + "\n".join("  - " + p for p in problems))
     if not ctx.state.attested("CA-ENTRY"):
-        ctx.say("")
-        ctx.say("----- the Planning entry, for you to apply -----")
-        ctx.say(json.dumps(entry, indent=2))
+        if getattr(ctx, "failed_before", False):
+            ctx.say("")
+            ctx.say("(the Planning entry is withheld: an earlier step failed, and applying")
+            ctx.say(" the entry before it is fixed would start sessions nothing can finish)")
+        else:
+            ctx.say("")
+            ctx.say("----- the Planning entry, for you to apply -----")
+            ctx.say(json.dumps(entry, indent=2))
         raise Blocked("CA-ENTRY")
     return True, "Planning entry applied (signed %s)" % _signed_at(ctx, "CA-ENTRY"), []
 
@@ -1212,6 +1217,10 @@ def run_steps(ctx, apply_it, keep_going=False):
     made. `verify` KEEPS GOING, because its whole job is to tell you everything
     outstanding in one read, and it changes nothing."""
     rows, deferred, notes = [], [], []
+    # A step that hands something to a person must know whether an earlier step
+    # in THIS pass already failed: `verify` keeps going past a failure, and the
+    # entry must never be printed "for you to apply" over a missing reader.
+    ctx.failed_before = False
     for sid, _title, fn in STEPS:
         try:
             ok, detail, step_notes = fn(ctx, apply_it)
@@ -1236,6 +1245,7 @@ def run_steps(ctx, apply_it, keep_going=False):
             deferred.append(("unknown", exc, sid))
             continue
         except (SetupError, Refusal) as exc:
+            ctx.failed_before = True
             rows.append((sid, FAILED, str(exc).splitlines()[0]))
             ctx.state.record(sid, FAILED, str(exc)[:400])
             if not keep_going:
@@ -1793,6 +1803,10 @@ def selftest():
         check("verify-kept-going-past-failure",
               vctx.state.outcome("handover"), BLOCKED)
         check("verify-no-mutation", vctx.runner.writes, [])
+        check("verify-withholds-entry-after-failure",
+              any('"disallowedTools"' in line for line in vctx._out), False)
+        check("verify-says-entry-withheld",
+              any("entry is withheld" in line for line in vctx._out), True)
         check("verify-created-nothing", vctx.tracker.created, [])
 
         # 10. COULD NOT LOOK IS NOT NOTHING TO DO (§13). A session cannot use sudo
