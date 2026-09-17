@@ -1577,7 +1577,10 @@ def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
     bounce number is the stop. A later bounce that is itself ignored signals again — once
     per bounce, which is what makes the budget still mean something. A partly-announced
     row (the comment landed, the label did not) is not a stop, so the next pass completes
-    it, exactly as a partial exhaustion is completed.
+    it, exactly as a partial exhaustion is completed — with one exception (KIT-152). A
+    label recorded as LABEL_NOT_CONFIGURED counts as landed while `label_configured` is
+    False: no id exists to apply, so retrying every pass would only repeat the problem.
+    Configure an id and the row is incomplete again, so the next pass applies the label.
 
     Never fires for an unreadable timestamp: a clock that cannot be read has not told us
     the deadline passed, and inventing one would page a person from a hand-edited ledger."""
@@ -3328,7 +3331,8 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
         # ONE ROW PER EXHAUSTION, not one per pass that completes it (KIT-152). Each row is
         # a comment on the coding ticket; a pass that only finishes a missing step is the
         # same exhaustion. A first emission that failed is not retried here (no ticket yet).
-        emit_status = "not re-emitted: this exhaustion's row was sent on an earlier pass"
+        emit_status = ("not re-emitted: an earlier pass already attempted this exhaustion's row "
+                       "(a failed first attempt is not retried here, KIT-165)")
     else:
         emit_status = emit_telemetry(state_dir, {
             "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
@@ -3410,7 +3414,8 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
                bounce_no=bounce_no, head_sha=signal.get("head_sha") or sit.get("head_sha"),
                waited_seconds=signal.get("waited_seconds"), outcome="blocked",
                announced=announced, problems=problems)
-    emit_status = "not re-emitted: this no-push signal's row was sent on an earlier pass" \
+    emit_status = ("not re-emitted: an earlier pass already attempted this no-push signal's "
+                   "row (a failed first attempt is not retried here, KIT-165)") \
         if prev_announced else emit_telemetry(state_dir, {
         "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
         "outcome": "blocked", "error_class": "bounce_no_push",
@@ -6190,6 +6195,35 @@ def selftest():
                                       verdict_x, cfg, tmp, False)
             check("KIT-152 an id configured later: the label and nothing else, no second telemetry row",
                   (rc2, kinds()), (EXIT_OK, ["label"]))
+
+        # …and a label the TRACKER REFUSES is different from one nobody configured: it is
+        # retried, loudly, and never recorded as not-configured (review of #140).
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            saved_add_label = globals()["linear_add_label"]
+
+            def refusing_label(issue_id, label_id, cfg_):
+                calls.append(("label", issue_id, label_id))
+                raise BounceError("simulated: the tracker refused the label")
+            globals()["linear_add_label"] = refusing_label
+            try:
+                sit_r = dict(sit_x, needs_human_label_id="lbl-nh")
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_r = perform_exhaust(dict(sit_r), verdict_x, cfg, tmp, False)
+                row_r = ledger_view(ledger_path(tmp), "o/r", 41)["exhausted"]
+                check("KIT-152 a label the tracker REFUSES is retried: loud, recorded as not landed",
+                      (rc_r, (row_r["announced"] or {}).get("label"),
+                       any("simulated: the tracker refused" in p for p in (row_r.get("problems") or []))),
+                      (EXIT_USAGE, False, True))
+                check("KIT-152 …so the verdict still reads it as unannounced, and the next pass retries",
+                      announcement_complete(row_r["announced"], True), False)
+            finally:
+                globals()["linear_add_label"] = saved_add_label
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_r2 = perform_exhaust(dict(sit_r, exhausted=row_r), verdict_x, cfg, tmp, False)
+            check("KIT-152 …and the next pass applies it, and nothing else",
+                  (rc_r2, kinds()), (EXIT_OK, ["label"]))
         world["delivery"] = delivery_ok
 
         # 10q. CONFLICTS — the dispatched lane of the conflict loop. A dispatcher's pull request
