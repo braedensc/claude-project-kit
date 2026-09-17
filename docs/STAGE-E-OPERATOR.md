@@ -74,7 +74,10 @@ three daemons, several checkpoints downstream. The `heartbeat-monitor` step righ
 reloads the monitor. If the run stops at a card before `enable`, **all three loops are off**.
 If it stops at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
 the way out names which jobs are off, and it is the only thing that says so. A dry run does
-none of this — it reports that `run` would fast-forward and restart the jobs, and returns.
+none of this. It reports one of three things and returns: that no file the jobs run has
+moved, so `run` would only fast-forward and restart them; or the names of the files that
+did move; or, when it could not fetch or could not compare, that it does not know — which
+stops the pass with a remedy rather than guessing.
 
 **`verify` reads `behind` only when a file the jobs run changed.** Those files are every
 script the four jobs load, their imports included, and `schemas/`, which a review and a

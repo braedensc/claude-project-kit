@@ -2118,6 +2118,24 @@ def step_preflight(ctx, apply_it):
                         % (conf["DISPATCHER_CONFIG"], ctx.account,
                            (cfg.err or cfg.out).strip()[:160]))
 
+    # A REFUSAL THE RUN WOULD REACH ANYWAY, MOVED IN FRONT OF THE DAMAGE (review of #136).
+    # `dispatcher-entry` (step 6) refuses a hand sign-off that names no entries — it
+    # predates the binding and proves nothing. `code` (step 2) has by then already booted
+    # the daemons out to fast-forward the clone, so an upgrade on such a machine stops with
+    # review and bounce OFF and the operator holding a re-sign they cannot do until they
+    # re-run. Preflight cannot know the entries yet, so it cannot judge a FINGERPRINT — but
+    # a sign-off carrying no fingerprint at all needs nothing but the state file.
+    signed_pre = (ctx.state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
+    signed_pre = signed_pre if isinstance(signed_pre, dict) else {}
+    if signed_pre and not signed_pre.get("entries_sha256"):
+        problems.append(
+            "the hand sign-off of the review entries' load (%s) names no entries, so it "
+            "proves none of them — it predates the binding.\n      This run would refuse it "
+            "at `dispatcher-entry`, four steps after it takes the daemons down, so it is "
+            "refused here instead.\n      Re-sign it after this run reaches that step:\n"
+            "      $ %s attest A-ENTRY-LOADED"
+            % (signed_pre.get("at", "undated"), os.path.basename(sys.argv[0] or "setup")))
+
     if problems:
         # EVERY problem, in one pass. A preflight that stops at the first one
         # makes you run it five times to learn five facts it already knew.
@@ -2878,7 +2896,18 @@ def dispatcher_session_logs(conf):
 # directory it can enter, 9 none there (or a directory above it closed to this
 # account, which is the same fact from where the daemons stand), 8 there and not
 # enterable. Anything else is "could not look", which is none of the three.
-SESSION_LOG_ROOT_PROBE_SH = 'd=%s; [ -d "$d" ] || exit 9; [ -x "$d" ] || exit 8; exit 0'
+# NOT-THERE AND CANNOT-SEE ARE DIFFERENT ANSWERS (contract 13, review of #136). A plain
+# `[ -d "$d" ]` fails identically for a root that does not exist and for one hidden behind
+# a parent the role account cannot search — and the second does not fix itself, while the
+# first is the ordinary state of a dispatcher that has run no session yet. So when the root
+# is not a directory, walk up until a directory answers: an unsearchable one is exit 7.
+SESSION_LOG_ROOT_PROBE_SH = (
+    'd=%s; if [ -d "$d" ]; then [ -x "$d" ] || exit 8; exit 0; fi; '
+    'p=$(dirname "$d"); '
+    'while [ "$p" != "/" ] && [ "$p" != "." ]; do '
+    'if [ -d "$p" ]; then [ -x "$p" ] || exit 7; exit 9; fi; '
+    'if [ -e "$p" ]; then exit 7; fi; '
+    'p=$(dirname "$p"); done; exit 9')
 
 
 def session_log_root_verdict(rc, root):
@@ -2892,10 +2921,17 @@ def session_log_root_verdict(rc, root):
         return "ok", "the role account can enter the session-log root %s" % root
     if rc == 9:
         return "absent", (
-            "the session-log root %s does not exist, or a directory above it is closed to the "
-            "role account. Telemetry reads each session's model and cost from there, so until "
-            "it exists every row says it could not. On a dispatcher that has run no session yet "
-            "that is expected; on one that has, DISPATCHER_CONFIG names the wrong home" % root)
+            "the session-log root %s does not exist. Telemetry reads each session's model and "
+            "cost from there, so until it exists every row says it could not. On a dispatcher "
+            "that has run no session yet that is expected; on one that has, DISPATCHER_CONFIG "
+            "names the wrong home" % root)
+    if rc == 7:
+        return "closed", (
+            "the session-log root %s cannot be reached: a directory ABOVE it is closed to the "
+            "role account, or a file sits in its path. This is not the same as a root that does "
+            "not exist yet, and it does not fix itself — every telemetry row would carry the "
+            "fault. Give the role account the search bit on each directory in that path (0711 "
+            "is enough), then run this again" % root)
     if rc == 8:
         return "closed", (
             "the session-log root %s exists, and the role account cannot enter it. Telemetry "
@@ -4418,7 +4454,7 @@ def _say_declines(text):
 
 def step_dry_run(ctx, apply_it):
     """All three components' own dry runs, shape-checked. This is what CK-5 reads."""
-    r = ctx.runner
+    r, notes = ctx.runner, []
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
     poller = r.as_role(ctx.account,
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_review_poller.py "
@@ -4461,7 +4497,21 @@ def step_dry_run(ctx, apply_it):
     if poller.rc not in ok_codes:
         problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
-    if bounce.rc not in ok_codes:
+    # A FOURTH STATE, for the same reason as the third. The driver exits 2 when it CANNOT
+    # EVALUATE a pull request — and one long-lived cause of that is a pull request waiting
+    # on a person (a partial review over the size cap can never conclude). Reading that as
+    # an installer failure would make Stage E un-upgradeable while any such PR is open,
+    # which is a property of the backlog again, not of the install. So: a pass whose only
+    # non-OK verdicts are CANNOT EVALUATE, with no failure of its own, is reported and
+    # passed; anything with a FAIL line in it is still a failure (review of #136).
+    bounce_said = bounce.out + bounce.err
+    cannot = [ln for ln in bounce_said.splitlines() if "CANNOT EVALUATE" in ln]
+    bounce_failed = [ln for ln in bounce_said.splitlines() if ln.strip().startswith("FAIL:")]
+    if bounce.rc not in ok_codes and cannot and not bounce_failed:
+        notes.append("the bounce driver could not evaluate %d pull request(s) — each is "
+                     "waiting on a person, not on this install. It ran and said so; that is "
+                     "the driver working, so this run goes on." % len(cannot))
+    elif bounce.rc not in ok_codes:
         problems.append("the bounce driver's dry run failed (exit %d): %s"
                         % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
     # The finding poller has no DECLINE state — 0 is the only success; anything
@@ -4488,7 +4538,7 @@ def step_dry_run(ctx, apply_it):
         raise Blocked("CK-5", "the counts above have not been signed off")
     return True, ("all three dry runs ran and the count is signed off; "
                   + ("the poller declined at least one pull request"
-                     if declined else "the poller did not decline")), []
+                     if declined else "the poller did not decline")), notes
 
 
 def step_enable(ctx, apply_it):
@@ -6060,6 +6110,32 @@ def _selftest_body():
     expect("idempotent", ok2 is True, "configs did not read as already-done")
     expect("idempotent", not fake2.writes, "configs were rewritten when they already matched")
 
+    # -- A REFUSAL IN FRONT OF THE DAMAGE (review of #136) ------------------------------
+    # An upgrade resting on a pre-binding sign-off used to stop at step 6, with the daemons
+    # already down since step 2. Preflight now refuses it while everything is still running.
+    cases += 1
+    ctxP, _fakeP = _settled_ctx(conf)
+    okP, _saidP, _nP = _quiet(lambda: step_preflight(ctxP, apply_it=False))[0]
+    expect("KIT-149 preflight-legacy-signoff", okP is True,
+           "preflight refused a machine with no hand sign-off at all")
+    ctxL, _fakeL = _settled_ctx(conf)
+    ctxL.state.data["attestations"] = {"A-ENTRY-LOADED": {"at": "2026-09-01T00:00:00Z",
+                                                          "by": "a person"}}
+    try:
+        _quiet(lambda: step_preflight(ctxL, apply_it=False))
+        saidL, refused = "", False
+    except SetupError as exc:
+        saidL, refused = str(exc), True
+    expect("KIT-149 preflight-legacy-signoff",
+           refused and "predates the binding" in saidL and "takes the daemons down" in saidL,
+           "a pre-binding sign-off was not refused before the daemons go down: %r" % saidL[:200])
+    ctxB, _fakeB = _settled_ctx(conf)
+    ctxB.state.data["attestations"] = {"A-ENTRY-LOADED": {"at": "2026-09-17T00:00:00Z",
+                                                          "entries_sha256": "deadbeef"}}
+    okB, _saidB, _nB = _quiet(lambda: step_preflight(ctxB, apply_it=False))[0]
+    expect("KIT-149 preflight-legacy-signoff", okB is True,
+           "preflight refused a BOUND sign-off, which only dispatcher-entry may judge")
+
     # -- KIT-149 (3). THE SESSION-LOG ROOT IS LOOKED AT, NOT ONLY WRITTEN ---------------
     # The probe, EXECUTED: an enterable directory, a missing one, and one that exists but
     # has no search bit. Then the step: closed fails, absent is a note, could-not-look is
@@ -6085,6 +6161,29 @@ def _selftest_body():
                     os.chmod(shut, 0o700)
                 expect("KIT-149 log-root-probe-runs", got == 8,
                        "a root with no search bit exited %s" % got)
+                # …and the case the plain `[ -d ]` could not tell from "absent": the root
+                # itself is missing, and a directory ABOVE it is closed (review of #136).
+                deep = os.path.join(shut, "logs")
+                os.chmod(shut, 0o600)
+                try:
+                    got = Runner().read(["/bin/sh", "-c", probe_sh % shlex.quote(deep)]).rc
+                finally:
+                    os.chmod(shut, 0o700)
+                expect("KIT-149 log-root-probe-runs", got == 7,
+                       "a root hidden behind a closed parent exited %s — it must not read "
+                       "as the tolerant 'absent'" % got)
+                # A file where a directory belongs is the same kind of could-not.
+                filed = os.path.join(tmpL, "afile")
+                open(filed, "w").close()
+                got = Runner().read(["/bin/sh", "-c",
+                                     probe_sh % shlex.quote(os.path.join(filed, "logs"))]).rc
+                expect("KIT-149 log-root-probe-runs", got == 7,
+                       "a file in the root's path exited %s" % got)
+                # …while a genuinely missing tree under a readable parent is still absent.
+                got = Runner().read(["/bin/sh", "-c", probe_sh
+                                     % shlex.quote(os.path.join(tmpL, "no", "such", "logs"))]).rc
+                expect("KIT-149 log-root-probe-runs", got == 9,
+                       "a missing tree under a readable parent exited %s" % got)
 
     def _configs_with_log_root(rc):
         ctxR, fakeR = _settled_ctx(conf)
@@ -6104,6 +6203,12 @@ def _selftest_body():
     how, said = _configs_with_log_root(9)
     expect("KIT-149 log-root-absent-is-said", how == "returned" and "does not exist" in said,
            "a missing log root was not said: %s %r" % (how, said[:160]))
+    # A closed PARENT is a could-not, not the tolerant absent note (review of #136): the
+    # install must stop, because nothing about it improves on its own.
+    how, said = _configs_with_log_root(7)
+    expect("KIT-149 log-root-closed-above-fails",
+           how == "failed" and "ABOVE it is closed" in said,
+           "a log root hidden behind a closed parent read as %s %r" % (how, said[:160]))
     how, said = _configs_with_log_root(1)
     expect("KIT-149 log-root-unlooked-is-unknown", how == "unknown",
            "a probe that could not run read as %s %r" % (how, said[:160]))
@@ -7880,6 +7985,29 @@ def _selftest_body():
         except SetupError as exc:
             expect("declined-is-not-failed", "exit %d" % rc in str(exc),
                    "the poller's %s exit was not named: %s" % (what, exc))
+
+    # A PULL REQUEST WAITING ON A PERSON IS NOT A FAILED INSTALL (review of #136). The
+    # driver exits 2 for CANNOT EVALUATE, and a partial review is a permanent cause of it,
+    # so this used to make Stage E un-upgradeable while such a PR was open.
+    cases += 1
+    cannot_out = ("example-org/kit#75 [KIT-1]: CANNOT EVALUATE — the review saw only part "
+                  "of this change: 2 file(s) were withheld\n")
+    ctxD5, _fD5 = _dry_run_ctx(conf, bounce=(2, cannot_out))
+    rowD5, _pD5 = _quiet(lambda: _dry_run_row(ctxD5))
+    okD5 = isinstance(rowD5, tuple) and rowD5[0] is True
+    expect("cannot-evaluate-is-not-failed", okD5,
+           "a pull request the driver could not evaluate stopped the install: %s"
+           % (rowD5[1] if isinstance(rowD5, tuple) else rowD5))
+    expect("cannot-evaluate-is-not-failed",
+           okD5 and any("waiting on a person" in str(n) for n in (rowD5[2] or [])),
+           "…and it passed in SILENCE, which is the other half of the defect: %r"
+           % (rowD5[2] if isinstance(rowD5, tuple) else None))
+    # …while a driver that genuinely failed still stops the install, even beside one.
+    ctxD6, _fD6 = _dry_run_ctx(conf, bounce=(2, cannot_out + "FAIL: could not read the ledger\n"))
+    rowD6, _pD6 = _quiet(lambda: _dry_run_row(ctxD6))
+    expect("cannot-evaluate-is-not-failed", isinstance(rowD6, SetupError),
+           "a real driver failure was excused by a CANNOT EVALUATE line beside it: %r"
+           % (rowD6 if not isinstance(rowD6, SetupError) else ""))
 
     # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
     # It never was. `decide` with neither --pr nor --all is a usage error, and
