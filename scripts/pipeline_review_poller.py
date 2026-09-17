@@ -955,7 +955,39 @@ def _criteria_changed_line(flag, basis_tier=None):
             "criteria said at delegation. " + caveat)
 
 
-def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff, withheld=None):
+WITHHELD_MARK = "<!-- stage-e-partial/1 -->"
+_WITHHELD_MARK_RE = re.compile(r"<!-- stage-e-partial/1 --> shown=(\d+) withheld=(\d+)")
+
+
+def partial_from_body(body):
+    """The coverage a review-ticket body itself records, or None for a whole-change body.
+
+    THE BODY THE REVIEWER READ IS THE ONE THAT COUNTS (review of #143). When a pass reuses
+    an existing review ticket, the diff it just fitted may be a different size from the one
+    that ticket holds — a force-push between passes is enough — so a freshly computed
+    `partial` could say "whole change" about a body that withheld half of it, and the
+    outcome would carry no `coverage` for the bounce driver to refuse."""
+    m = _WITHHELD_MARK_RE.search(body or "")
+    if not m:
+        return None
+    shown, withheld_count = int(m.group(1)), int(m.group(2))
+    paths, taking = [], False
+    for line in (body or "").splitlines():
+        if line.startswith("## PART OF THIS CHANGE WAS WITHHELD"):
+            taking = True
+            continue
+        if taking:
+            if line.startswith("## "):
+                break
+            stripped = line.strip()
+            if stripped and not stripped.startswith(("`", "<!--", "The whole change")):
+                paths.append(stripped)
+    return {"withheld": paths[:withheld_count] or ["(named in the ticket body)"],
+            "shown": shown, "total": shown + withheld_count}
+
+
+def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff, withheld=None,
+                      shown_count=None):
     """The review ticket's description — the reviewer's ENTIRE world.
 
     Every copied string passes through `sanitize_text`; ticket text is additionally
@@ -1060,6 +1092,12 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff, withhel
         lines += [
             "## PART OF THIS CHANGE WAS WITHHELD — this is a partial review",
             "",
+            # Read back by `partial_from_body` when a later pass reuses this ticket, so the
+            # coverage always comes from the body the REVIEWER read (review of #143).
+            "%s shown=%d withheld=%d" % (WITHHELD_MARK,
+                                         len(split_diff_by_file(diff)) if shown_count is None
+                                         else shown_count, len(safe_paths)),
+            "",
             "The whole change is larger than one review ticket can carry, so the %d file(s) "
             "below were left out of the diff, largest first. You cannot see them. Judge only "
             "the files in the diff below. Never describe the change as a whole as clean, and "
@@ -1088,24 +1126,85 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff, withhel
     return body
 
 
-_DIFF_FILE_RE = re.compile(r"^diff --git a/(.*?) b/(.*)$")
+# EVERY SPELLING GIT USES for a file header, because a header this misses is a file that
+# disappears into its neighbour's chunk and is never named as withheld (review of #143):
+# the ordinary `a/x b/x`; a path git decided to quote, which it C-escapes; and a path that
+# itself contains " b/". The chunk's own `+++ b/...` line settles the rest.
+_NEW_PATH_RE = re.compile(r"^\+\+\+ (?P<operand>\S.*?)\s*$")
+UNNAMED_DIFF_PATH = "(unnamed - this file's header could not be parsed)"
+
+
+def _unquote_diff_path(text):
+    """(side, path) for `a/x`, `b/x` or a quoted `"a/x"`, or None when it is neither."""
+    text = text.strip()
+    if len(text) > 1 and text[0] == '"' and text[-1] == '"':
+        inner = text[1:-1]
+        try:
+            inner = inner.encode("latin-1", "backslashreplace").decode("unicode_escape")
+            inner = inner.encode("latin-1", "ignore").decode("utf-8", "replace")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
+        text = inner
+    if text.startswith("a/") or text.startswith("b/"):
+        return text[0], text[2:]
+    return None
+
+
+def _header_path(line):
+    """The `b/` path from a `diff --git` header, or None when the line is not one.
+
+    Git writes both sides symmetrically for everything but a move, so the ambiguity in
+    `a/my b/file.py b/my b/file.py` is resolved by preferring the split that makes the two
+    sides equal. A header this cannot read at all is still a BOUNDARY, named
+    UNNAMED_DIFF_PATH rather than folded into the file before it: a file the reviewer never
+    saw must be counted and named, even when its name could not be read (contract 13)."""
+    if not line.startswith("diff --git "):
+        return None
+    rest = line[len("diff --git "):].strip()
+    cuts = [i for i, ch in enumerate(rest) if ch == " "]
+    for cut in reversed(cuts):
+        left, right = _unquote_diff_path(rest[:cut]), _unquote_diff_path(rest[cut + 1:])
+        if left and right and left[0] == "a" and right[0] == "b" and left[1] == right[1]:
+            return right[1]
+    for cut in reversed(cuts):
+        right = _unquote_diff_path(rest[cut + 1:])
+        if right and right[0] == "b":
+            return right[1]
+    return UNNAMED_DIFF_PATH
 
 
 def split_diff_by_file(diff):
-    """[(path, text)] — the unified diff cut at each `diff --git` header, in order, each
+    """[(path, text)] - the unified diff cut at each `diff --git` header, in order, each
     chunk whole. Anything before the first header rides with the first file. The path is
-    the `b/` side, so a rename is named by where it now lives."""
+    the `b/` side, so a file that moved is named by where it now lives, and the chunk's own
+    `+++ b/...` line is preferred when it has one, because git never leaves that ambiguous."""
     chunks, path, buf = [], None, []
+
+    def flush():
+        if not buf:
+            return
+        named = path
+        for line in buf[:12]:
+            m = _NEW_PATH_RE.match(line.rstrip("\n"))
+            if not m or m.group("operand") in ("/dev/null", '"/dev/null"'):
+                continue
+            # The operand is passed WHOLE, quotes included: git C-escapes a quoted path, and
+            # stripping the quotes first would leave the escapes in the name it shows.
+            side = _unquote_diff_path(m.group("operand"))
+            if side and side[0] == "b" and side[1]:
+                named = side[1]
+                break
+        chunks.append((named or UNNAMED_DIFF_PATH, "".join(buf)))
+
     for line in diff.splitlines(keepends=True):
-        m = _DIFF_FILE_RE.match(line.rstrip("\n"))
-        if m and path is not None:                  # a new file: flush the previous one
-            chunks.append((path, "".join(buf)))
+        header = _header_path(line.rstrip("\n"))
+        if header is not None and path is not None:      # a new file: flush the previous one
+            flush()
             buf = []
-        if m:
-            path = m.group(2)
+        if header is not None:
+            path = header
         buf.append(line)
-    if buf:
-        chunks.append((path or "(unnamed)", "".join(buf)))
+    flush()
     return chunks
 
 
@@ -1133,7 +1232,8 @@ def fit_to_cap(owner_repo, pr, ticket_id, basis, threshold, diff, cap):
     def estimate():
         withheld = [files[i][0] for i in order if i in dropped]
         fixed = len(build_review_body(owner_repo, pr, ticket_id, basis, threshold, "",
-                                      withheld=withheld))
+                                      withheld=withheld,
+                                      shown_count=len(files) - len(withheld)))
         return fixed + sum(len(files[i][1]) for i in range(len(files)) if i not in dropped)
 
     for i in order:
@@ -1145,7 +1245,8 @@ def fit_to_cap(owner_repo, pr, ticket_id, basis, threshold, diff, cap):
         withheld = [files[i][0] for i in order if i in dropped]
         if withheld:
             body = build_review_body(owner_repo, pr, ticket_id, basis, threshold,
-                                     "".join(text for _path, text in kept), withheld=withheld)
+                                     "".join(text for _path, text in kept), withheld=withheld,
+                                     shown_count=len(kept))
             if len(body) <= cap:
                 return body, withheld, len(kept), len(files)
         if len(kept) <= 1:
@@ -2446,7 +2547,10 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
         # second paid reviewer session for a PR that already has one.
         return "retry", "the Reviews team could not be searched for an existing review ticket", exc, basis
     if existing is not None:
-        return "created", existing, basis, (existing.get("description") or ""), True, partial
+        # The REUSED ticket's own body decides the coverage, never this pass's fit: the
+        # reviewer answers the body Linear holds (review of #143).
+        stored_body = existing.get("description") or ""
+        return "created", existing, basis, stored_body, True, partial_from_body(stored_body)
     try:
         issue = create_review_ticket(cfg, title, body, linear_key, dry_run)
     except PollerError as exc:
@@ -4085,6 +4189,29 @@ def selftest():
                "+y = 2" in fitted[0]) if fitted else None, (True, True, False))
         check("KIT-138 one file too large on its own is still today's decline",
               _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], big1, 500), None)
+        # EVERY HEADER SPELLING GIT WRITES (review of #143). A header the splitter
+        # misses is not a formatting nit: that file joins its neighbour's chunk, so it is
+        # neither shown to the reviewer nor named as withheld — it just disappears.
+        shapes = (
+            'diff --git a/src/a.py b/src/a.py\n+++ b/src/a.py\n+x\n'
+            'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n+++ "b/caf\\303\\251.py"\n+y\n'
+            'diff --git a/my b/file.py b/my b/file.py\n+++ b/my b/file.py\n+z\n'
+            'diff --git a/old.py b/new.py\nsimilarity index 90%\n'
+            'diff --git something-unreadable\n+nothing\n')
+        check("KIT-138 quoted, spaced, moved and unreadable headers are all file boundaries",
+              [pth for pth, _t in _split(shapes)],
+              ["src/a.py", "café.py", "my b/file.py", "new.py", UNNAMED_DIFF_PATH])
+        check("KIT-138 …and splitting them loses not one byte",
+              "".join(t for _pth, t in _split(shapes)), shapes)
+        check("KIT-138 two files, neither fitting alone, is a decline — not an empty review",
+              _fit("o/r", pr5, "KIT-5", basis, cfg["threshold"], big1 + big2, 500), None)
+        check("KIT-138 the ticket body records its own coverage, for a later pass to read",
+              partial_from_body(fitted[0]) if fitted else None,
+              {"withheld": ["src/big_one.py", "src/big_two.py"], "shown": 1, "total": 3})
+        check("KIT-138 …and a whole-change body records none",
+              partial_from_body(build_review_body("o/r", pr5, "KIT-5", basis,
+                                                  cfg["threshold"], small)), None)
+
         # Linear, not quadratic (review of #143): forty files, one that fits — the full body,
         # which sanitizes and scans the whole diff, is built a bounded number of times.
         many = small + "".join("diff --git a/src/f%02d.py b/src/f%02d.py\n+++ b/src/f%02d.py\n%s"
@@ -4136,6 +4263,37 @@ def selftest():
                       ("a person must review" in note, "src/big_one.py" in note), (True, True))
             finally:
                 globals()["fetch_pr_diff"] = saved_diff138
+
+        # THE BODY THE REVIEWER READ IS THE ONE THAT COUNTS (review of #143). A force-push
+        # between passes changes the diff this pass fits, but not the ticket Linear holds —
+        # so the coverage must come from the stored body, or a partial review would come
+        # back carrying no coverage at all and conclude the PR clean.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake.__init__()
+            posted.clear()
+            saved_reuse = globals()["fetch_pr_diff"]
+            try:
+                c = dict(cfg, state_dir=tmp, diff_cap_chars=cap138)
+                save_seen(seen_path(tmp), dict(seen0))
+                globals()["fetch_pr_diff"] = lambda owner_repo, n: three
+                scan(c, False)                       # the ticket Linear now holds is PARTIAL
+                os.remove(seen_path(tmp))            # the cache is lost; the PR is re-selected
+                save_seen(seen_path(tmp), dict(seen0))
+                globals()["fetch_pr_diff"] = lambda owner_repo, n: small   # …and now it fits
+                scan(c, False)
+                rec143 = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
+                check("KIT-138 a reused ticket's coverage comes from the body the reviewer read",
+                      (rec143.get("reused"), (rec143.get("partial") or {}).get("withheld")),
+                      (True, ["src/big_one.py", "src/big_two.py"]))
+                fake.respond(rec143["review_ticket_id"],
+                             "```json\n%s\n```" % json.dumps(clean138))
+                collect(c, False)
+                out143 = json.load(open(outcome_path(tmp, "o/r", 5)))
+                check("KIT-138 …so a clean answer to it still never concludes the PR",
+                      (out143.get("coverage"),
+                       pbl.conclusion_basis("green", out143, True, False)), ("partial", None))
+            finally:
+                globals()["fetch_pr_diff"] = saved_reuse
 
         with tempfile.TemporaryDirectory() as tmp:   # basis unavailable (TERMINAL) → decline at scan, at once
             fake.__init__()

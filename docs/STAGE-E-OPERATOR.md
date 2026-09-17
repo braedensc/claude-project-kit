@@ -821,6 +821,22 @@ files* and names them. The outcome carries `coverage: partial`, so the bounce dr
 bounce on what the review found but never concludes the PR. With nothing to bounce, it says
 once on the PR that a person must review the withheld files (KIT-138).
 
+**Said once means said once.** The PR gets that sentence on one pass only. Every pass after
+it is an ordinary quiet skip, because a partial review never stops being partial, and a
+driver that reported it as a problem every five minutes would hold its heartbeat at
+`problems` for good — which pages you once and then hides every later failure behind the
+same fingerprint. The PR is a person's from the first sentence on.
+
+Three other places repeat the coverage, so *partial* never reads as *clean*:
+
+- The telemetry row on the original ticket opens with **PARTIAL REVIEW — N file(s) were
+  never read** and names them, above the reviewer's own summary.
+- A reused review ticket takes its coverage from the body Linear holds, not from what this
+  pass would have fitted. A force-push between passes changes the diff, never the ticket
+  the reviewer actually answered.
+- Auto-merge refuses it. A partial review cannot qualify a PR for the merge tier however
+  few findings it carries (§11).
+
 Good: `PARTIAL o/r#N: … 2 of 3 file(s) withheld` in the poller log, and a ticket that
 opens.
 Not: *diff too large to deliver … and no single file fits alone*. One file is over the cap

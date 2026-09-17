@@ -1249,7 +1249,7 @@ auto-merge" enabled. **Without required checks, auto-merge merges the instant it
 enabled** and the gates below become the only gates, which is exactly what they are not
 designed to be. `docs/AUTONOMY.md` carries the copy-paste setup.
 
-Eight conditions, all required:
+Nine conditions, all required:
 
 | Condition | Read from (never from) |
 |---|---|
@@ -1257,6 +1257,7 @@ Eight conditions, all required:
 | The ticket still passes the approve tier, **recomputed** | a live re-run (a stored "was approved" flag) |
 | **Zero bounces** | Actions run history (`pipeline:bounce-N` PR labels — the fix session's token can edit PR labels) |
 | Review findings usable, none at or above `reviewSeverityThreshold` | the review artifact (a PR comment — the author can edit it) |
+| The review covered the **whole** change — `coverage` is not `partial` | the review artifact's own coverage (the findings list's length: a partial review is clean about the files it saw) |
 | Every check run terminal and green | the check-runs API ("CI passed" asserted in a commit message) |
 | `mergeStateStatus` is not `DIRTY` / `UNSTABLE` / `UNKNOWN` | the PR API |
 | The diff touches no `riskPaths` | `git diff base...head` (the PR body's description of its own size) |
