@@ -105,15 +105,34 @@ environment variable replaces `defaultDisallowedTools` at start (`WorkerService.
 
 ### Step 3 — Trim the chat grant (piece 1)
 
-Merge this one key into the top level of the dispatcher's config:
+Merge this one key into the top level of the dispatcher's config. `compose` prints it
+filled in; the shape is:
 
 ```json
-"slackAllowedTools": ["Read", "Bash(git -C * pull)", "WebFetch", "WebSearch", "SendMessage", "ToolSearch", "mcp__slack", "mcp__linear"]
+"slackAllowedTools": ["Read", "WebFetch", "WebSearch", "SendMessage", "ToolSearch", "mcp__slack", "mcp__linear", "Bash(git -C /ABSOLUTE/PATH/TO/REPOSITORY pull)", "Bash(git -C /ABSOLUTE/PATH/TO/REPOSITORY pull --ff-only)"]
 ```
 
 Setting it replaces the built-in chat list (`ToolPermissionResolver.js:68-71`). That list
 also holds `Monitor`, `Task`, `ScheduleWakeup`, `Skill` and the task tools
 (`allowed-tools-defaults.js:91-119`). `Monitor` runs a shell command.
+
+**The pull rules are per repository, with the path written out.** Repeat both rules for
+every repository the dispatcher serves, using that repository's own `repositoryPath`:
+
+```json
+"Bash(git -C /srv/first-repo pull)", "Bash(git -C /srv/first-repo pull --ff-only)",
+"Bash(git -C /srv/second-repo pull)", "Bash(git -C /srv/second-repo pull --ff-only)"
+```
+
+Don't: write `Bash(git -C * pull)`. A Bash rule matches the whole command text, and only
+the words before the first `*` limit it — here, `git -C `. So that rule also matches
+`git -C <dir> -c core.fsmonitor='<any command>' status pull`, and git's `-c` runs the
+program it names. On this lane the grant is the only fence, so the rule would be a shell.
+A literal path leaves nothing that can stand before `pull`.
+
+**The cost, plainly: a new repository needs new rules, or its pull stops working.** Nothing
+announces it — the tool call is simply refused. `verify` reads the live repository paths and
+names any repository with no pull rule.
 
 Don't: replace the whole file. The dispatcher rewrites it itself to store refreshed tracker
 tokens (`EdgeWorker.js:5154-5211`), and a stale copy loses them.
@@ -127,9 +146,11 @@ hard-coded empty (`RunnerConfigBuilder.js:78`).
 | `mcp__cyrus-tools` | The dispatcher's own tool server, running in the dispatcher's process, outside any sandbox. It can send a message into **any** running session by id, with no check on the caller (`cyrus-tools/index.js:181`; `EdgeWorker.js:4138-4170`). It can read **any** file the role account can read and upload it to the tracker, public if asked (`cyrus-tools/index.js:72-107`). |
 | `mcp__cyrus-docs` | A documentation search run by a third party (`McpConfigService.js:82-85`). That service sees what the session searches for. |
 
-One more path adds tools. Any `mcp__` name in the **first** repository entry's
+One more path adds tools. Any `mcp__` name in the first **active** repository entry's
 `allowedTools` joins the chat grant (`RunnerConfigBuilder.js:63-66`;
-`ChatRepositoryProvider.js:18-20`). Keep that entry free of them.
+`ChatRepositoryProvider.js:18-20`). First active, not first in the file: the dispatcher
+skips entries with `isActive` false (`EdgeWorker.js:274-290`), so retiring one promotes the
+next. Keep every entry free of them; `verify` checks the live order.
 
 ### Step 4 — Deny secret-file reads in the role account's user settings (piece 5)
 
@@ -278,13 +299,19 @@ file and restart the dispatcher. Then read the dispatcher's log for
 python3 scripts/pipeline_chat_lane_setup.py card CK-C4
 ```
 
-On this machine, `curl -s -m 5 http://127.0.0.1:<port>/status` answers. On a **second
-device** on the same network, the same request to this machine's network address is refused
-or times out.
+The card has three steps: the dispatcher answers on `127.0.0.1` here; a **control** from a
+second device against a port nothing listens on; then the dispatcher's port from that same
+device. All three use `curl -sS`, which prints curl's own error, and report `exit=$?`.
 
-The second device is the proof. A request from this machine to its own network address
-never crosses the network, so it shows nothing either way. And before Step 7's restart, the
-dispatcher listens on this machine only, so every test passes for the wrong reason.
+**Only a refusal counts.** The rule is `block return`, which answers at once with a reset,
+so `exit=7` is what a working rule produces. A timeout (`exit=28`) is not proof of anything:
+it is what an unreachable device looks like — client isolation, a guest network, a VPN, or
+the address of an interface the device cannot reach. That is why the control runs first: it
+shows what a refusal looks like from there before the real check.
+
+The second device is the proof. A request from this machine to its own network address never
+crosses the network. And before Step 7's restart, the dispatcher listens on this machine
+only, so every test passes for the wrong reason.
 
 Not that: a JSON status on the second device. Remove `CYRUS_HOST_EXTERNAL` from the env file,
 restart the dispatcher, and fix Step 5 before anything else.
@@ -299,8 +326,10 @@ The reverse proxy's path allowlist gains `/slack-webhook`, and nothing else.
 python3 scripts/pipeline_chat_lane_setup.py card CK-C2
 ```
 
-Good: the door answers `401` on `/slack-webhook` with no signature, and still refuses
-`/status`.
+Good: the door answers `401` on `/slack-webhook` with no signature — the dispatcher asking
+for one — and anything **but** `401` on the dispatcher's config-update route, which must
+never be reachable. A status or version path is not the test: a front door may forward one
+on purpose for monitoring.
 
 ### Step 11 — Point Slack at it
 
@@ -317,8 +346,8 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 
 | Check | Passes when |
 |---|---|
-| `grant` | `slackAllowedTools` is the list in Step 3, and the first entry adds no `mcp__` tools |
-| `coding-fence` | every non-review entry's effective list carries both Slack rules, and no prompt type replaces it without them |
+| `grant` | `slackAllowedTools` is the list in Step 3, with a pull rule pair for every repository path the dispatcher serves, no rule that a wildcard or a shell could widen, and no `mcp__` tools added by the first active entry |
+| `coding-fence` | every non-review entry's effective list carries both Slack rules, no prompt type replaces it without them, and no review entry is missing them either |
 | `chat-mcp-configs` | `slackMcpConfigs` is empty or unset. Otherwise it names each extra server |
 | `dispatcher-env` | the Slack names and `CYRUS_HOST_EXTERNAL=true` are set, checked by name. No secret value is read into the command |
 | `ip-validation-off` | `WEBHOOK_IP_VALIDATION=false` is set, checked by name and value (the value is not a secret). Missing or `true` while `CYRUS_HOST_EXTERNAL=true` is a **failure**: tracker webhooks are being refused |
@@ -381,6 +410,7 @@ read.
 | Remove `slackAllowedTools` | At restart only: a reload keeps the old value (`ConfigManager.js:181`). |
 | Add or change a name in the env file | Live (`Application.js:52-78`), except the listening address and address checks, which are read at start. |
 | Remove a name from the env file | At restart only: a reload sets names and never unsets one (`Application.js:54`). |
+| **Delete** `promptDefaults`, `slackMcpConfigs` or any other config key | At restart only, and worse: the merge keeps the old value (`ConfigManager.js:176-183`), so the reloaded config equals the old one and nothing is re-applied at all — while the log still prints the reload line. Set the key to an empty value instead, or restart. `verify` reads the file, so both rows go green either way. |
 | The port block | Now, when the LaunchDaemon is bootstrapped, and again at every boot. |
 
 Look for `Config file changed, reloading...` in the dispatcher's log after an edit
@@ -455,6 +485,13 @@ These came out of reading the dispatcher's source for this build.
   file only (KIT-174).
 - Whether a front door that trusts its tunnel client would pass the real address, so
   validation could be turned on later (KIT-174).
+- How `pfctl -s rules` spells an anchor line. `verify` reads the loaded main ruleset to see
+  whether anything still evaluates the anchor; when the file has the line and the loaded
+  ruleset does not show it, it says "could not measure" rather than claiming drift
+  (KIT-174).
+- That the per-repository pull rules match what a chat session actually types. A rule is an
+  exact string, so `git -C <path> pull origin main` is refused by design; only the two
+  composed forms are allowed (KIT-174).
 - Whether the config watcher sees an edit from an editor that replaces the file instead of
   changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174).
 - Whether Slack creates an app from a manifest whose request URL does not answer yet

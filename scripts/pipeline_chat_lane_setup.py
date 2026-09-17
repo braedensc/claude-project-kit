@@ -110,6 +110,7 @@ THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
 """
 import argparse
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -127,6 +128,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # The Stage E installer's exit codes, outcomes, role-account runner, administrator-access
 # session, card helpers and its test of "a review entry this installer wrote". Imported so
 # the two installers cannot disagree on any of them.
+from pipeline_stage_e_setup import _self_path as _stage_e_self_path  # noqa: E402
 from pipeline_stage_e_setup import (  # noqa: E402
     ALREADY_DONE, BLOCKED, FAILED, UNKNOWN,
     EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED,
@@ -153,12 +155,58 @@ ROOT = os.path.dirname(HERE)
 # onAskUserQuestion (claude-runner ClaudeRunner.js:196-199), the issue builder does
 # (RunnerConfigBuilder.js:229-232), and the chat builder does not.
 # --------------------------------------------------------------------------- #
-OWNER_GRANT = ["Read", "Bash(git -C * pull)", "WebFetch", "WebSearch", "SendMessage",
-                  "ToolSearch", "mcp__slack", "mcp__linear"]
+OWNER_GRANT_BASE = ["Read", "WebFetch", "WebSearch", "SendMessage", "ToolSearch",
+                    "mcp__slack", "mcp__linear"]
+
+# THE PULL RULE IS PER REPOSITORY, AND THAT IS THE WHOLE POINT (owner decision, 2026-09-17,
+# after the review of PR #147). The first list carried `Bash(git -C * pull)`. A Bash rule
+# matches the whole command text with `*` standing in for any text, so that rule also
+# matches `git -C <dir> -c core.fsmonitor='<any command>' status pull`: everything before
+# the first `*` is `git -C `, an option rather than a subcommand, so every option and every
+# subcommand in between is free — and `-c` makes git run a program the caller names. A
+# verifier ran it: git executed the named program. Claude Code's own permissions page uses
+# `Bash(git * main)` as the worked example ("That includes `-c`, which makes git run a
+# program you name"), and its errors page uses this exact `git -C *` shape, saying the rule
+# is kept and matches as written. On the chat lane the grant is the only fence, so that was
+# unprompted command execution as the role account, with no sandbox.
+#
+# So: no wildcard. One pair of literal rules per repository the dispatcher serves, with the
+# path fixed, so nothing can stand before `pull`. A new repository needs a new pair, or the
+# chat lane's pull of it simply stops working — said out loud in compose and in the doc,
+# because a silent stop is the cost of this shape.
+PULL_RULE_FORMS = ("Bash(git -C %s pull)", "Bash(git -C %s pull --ff-only)")
+# What compose prints in place of a path it cannot know: it reads nothing live.
+PLACEHOLDER_REPO_PATH = "/ABSOLUTE/PATH/TO/REPOSITORY"
+
+
+def pull_rules(repo_path):
+    # `replace`, not `%`: a form that lost its placeholder would raise, and a crash hides
+    # the finding the checker exists to report. This way the rule is built, and
+    # `grant_problems` refuses it by name.
+    return [form.replace("%s", repo_path) for form in PULL_RULE_FORMS]
+
+
+def owner_grant(repo_paths=(PLACEHOLDER_REPO_PATH,)):
+    """The approved grant for a machine serving these repository paths."""
+    out = list(OWNER_GRANT_BASE)
+    for path in repo_paths:
+        for rule in pull_rules(path):
+            if rule not in out:
+                out.append(rule)
+    return out
+
 
 # Tools that must never appear in the grant. A mutant grant holding any is red.
 NEVER_IN_GRANT = ("Monitor", "Task", "Agent", "ScheduleWakeup", "Skill", "Write", "Edit",
                   "NotebookEdit", "CronCreate", "RemoteTrigger", "Workflow")
+
+# Programs that are a shell by another name: a rule naming one grants whatever it is handed.
+SHELL_PROGRAMS = ("sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "env", "eval",
+                  "exec", "xargs", "nohup", "script", "sudo", "doas", "ssh", "perl",
+                  "python", "python2", "python3", "ruby", "node", "osascript", "open",
+                  "awk", "find")
+# Shell punctuation inside a rule: a second command hides behind any of them.
+SHELL_OPERATORS = ("&&", "||", ";", "|", "`", "$(", ">", "<", "&")
 
 # What the dispatcher appends whatever the list says: `mcp__<name>` for every server it
 # built for the session (ToolPermissionResolver.js:72-77), with the chat lane's
@@ -180,6 +228,47 @@ APPENDED_SERVERS = (
 )
 
 
+def bash_rule_problems(tool):
+    """Every way one `Bash(...)` rule grants more than its words suggest.
+
+    The rules this composes carry no wildcard at all, so they pass trivially. The point is
+    that a hand-edited or future one cannot quietly reintroduce the shape the owner removed.
+    """
+    if tool == "Bash":
+        return ["an unscoped Bash (%s) is in the grant" % tool]
+    m = re.match(r"^Bash\((.*)\)$", tool, re.S)
+    if not m:
+        return []
+    inner = m.group(1).strip()
+    problems = []
+    if not inner or inner == "*":
+        return ["an unscoped Bash (%s) is in the grant" % tool]
+    for op in SHELL_OPERATORS:
+        if op in inner:
+            problems.append("%s carries the shell punctuation %r: a second command can hide "
+                            "behind it" % (tool, op))
+            break
+    tokens = inner.split()
+    program = os.path.basename(tokens[0]) if tokens else ""
+    if program in SHELL_PROGRAMS or any(os.path.basename(t) in SHELL_PROGRAMS
+                                        for t in tokens[1:]):
+        problems.append("%s names a shell, or a program that runs one: it grants whatever "
+                        "it is handed" % tool)
+    wild = [i for i, t in enumerate(tokens) if "*" in t]
+    if wild:
+        before = tokens[1:wild[0]]            # the fixed words after the program name
+        if not [t for t in before if not t.startswith("-")]:
+            problems.append("%s puts its wildcard where the subcommand goes: everything "
+                            "before the first * is what limits the rule, so every "
+                            "subcommand and every option before it matches — including "
+                            "the options that make a program run another program" % tool)
+        elif before and before[-1].startswith("-"):
+            problems.append("%s ends its fixed words with an option, so the wildcard "
+                            "stands in for that option's value and for whatever follows"
+                            % tool)
+    return problems
+
+
 def grant_problems(grant):
     """Every way a grant breaks the owner's decision. Empty means acceptable."""
     problems = []
@@ -188,8 +277,7 @@ def grant_problems(grant):
     for tool in grant:
         if tool in NEVER_IN_GRANT:
             problems.append("%s is in the grant" % tool)
-        if tool == "Bash" or re.match(r"^Bash\(\s*\*?\s*\)$", tool):
-            problems.append("an unscoped Bash (%s) is in the grant" % tool)
+        problems.extend(bash_rule_problems(tool))
     if len(set(grant)) != len(grant):
         problems.append("the grant names a tool twice")
     return problems
@@ -373,6 +461,11 @@ def pf_install_commands(port):
     """The exact commands a person runs, in order, to install, check, load and confirm."""
     rules, plist = '"%s"' % PF_RULES_PATH, PF_DAEMON_PLIST
     return (["sudo mkdir -p \"%s\"" % PF_RULES_DIR,
+             # 755, explicitly: sudo unions the caller's umask with its own, so a login
+             # umask of 077 would otherwise leave this directory unreadable — pf would
+             # still load the rule as root, while `verify` could not read the file and
+             # would call it missing (review of PR #147, finding 15).
+             "sudo chmod 755 \"%s\"" % PF_RULES_DIR,
              "sudo tee %s > /dev/null <<'RULES'" % rules]
             + pf_rules(port).splitlines()
             + ["RULES",
@@ -584,7 +677,11 @@ def parse_conf(text, source="chat-lane.conf"):
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
-            errors.append("%s:%d: not KEY=value: %r" % (source, n, raw[:60]))
+            # NEVER echo this line. A pasted bot token or signing secret has no `=`, so
+            # it lands here, and the credential-shape guard below never sees it. The line
+            # number is enough to find it (review of PR #147, finding 10).
+            errors.append("%s:%d: not KEY=value (%d characters; the line is not shown, in "
+                          "case it is a pasted credential)" % (source, n, len(line)))
             continue
         key, val = [part.strip() for part in line.split("=", 1)]
         if not re.match(r"^[A-Z][A-Z0-9_]*$", key):
@@ -662,7 +759,7 @@ def load_conf(path):
 # compose
 # --------------------------------------------------------------------------- #
 def cmd_compose(conf, conf_path="chat-lane.conf"):
-    problems = grant_problems(OWNER_GRANT)
+    problems = grant_problems(owner_grant())
     if problems:
         # The approved list is a constant; a broken one is a defect in this file.
         say("BUG: the composed grant breaks the owner's decision: " + "; ".join(problems))
@@ -691,7 +788,24 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "the dispatcher rewrites it itself to store refreshed tracker tokens "
          "(EdgeWorker.js:5154-5211)." % conf["DISPATCHER_CONFIG"])
     say("")
-    say('    "slackAllowedTools": ' + json.dumps(OWNER_GRANT))
+    say('    "slackAllowedTools": ' + json.dumps(owner_grant()))
+    say("")
+    para("THE LAST TWO RULES ARE A TEMPLATE, NOT A VALUE. %s stands for one repository the "
+         "dispatcher serves, written exactly as its entry's repositoryPath. Repeat BOTH "
+         "rules for EVERY repository, with that repository's own path:"
+         % PLACEHOLDER_REPO_PATH)
+    for form in PULL_RULE_FORMS:
+        say("      " + json.dumps(form % PLACEHOLDER_REPO_PATH))
+    para("The path is literal on purpose. `Bash(git -C * pull)`, which this list used to "
+         "carry, also matches `git -C <dir> -c core.fsmonitor='<any command>' status pull`: "
+         "a Bash rule matches the whole command text, the words before the first * are all "
+         "that limit it, and git's -c option runs a program the caller names. On this lane "
+         "the list is the only fence, so that was arbitrary command execution. A fixed path "
+         "leaves nothing that can stand before `pull`.")
+    para("THE COST, SAID PLAINLY: add a repository to the dispatcher and its pull stops "
+         "working in chat until you add both rules for it. Nothing announces that; the tool "
+         "call is simply refused. `verify` reads the live repository paths and names any "
+         "repository with no pull rule.")
     say("")
     say("  THE DISPATCHER STILL ADDS mcp__cyrus-tools AND mcp__cyrus-docs, WHATEVER THIS")
     say("  LIST SAYS. It appends every tool server it built for the session after the list")
@@ -700,10 +814,12 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
     for name, what in APPENDED_SERVERS:
         say("    %s" % name)
         para(what, "      ")
-    para("One more path adds tools: any tool starting mcp__ in the FIRST repository entry's "
-         "allowedTools joins this grant (RunnerConfigBuilder.js:63-66; "
-         "ChatRepositoryProvider.js:18-20). Keep that entry's allowedTools free of mcp__ "
-         "names; `verify` checks it.")
+    para("One more path adds tools: any tool starting mcp__ in the FIRST ACTIVE repository "
+         "entry's allowedTools joins this grant (RunnerConfigBuilder.js:63-66; "
+         "ChatRepositoryProvider.js:18-20). First ACTIVE, not first in the file: the "
+         "dispatcher skips entries with isActive false (EdgeWorker.js:274-290), so "
+         "retiring one promotes the next. Keep every entry's allowedTools free of mcp__ "
+         "names; `verify` checks the live order.")
     say("")
 
     # -- Piece 2 -------------------------------------------------------------
@@ -979,12 +1095,20 @@ CARDS = {
                "From anywhere, ask the door for the new path with no signature:",
                "    curl -s -o /dev/null -w '%{http_code}\\n' -X POST \\",
                "      https://${FRONT_DOOR_HOST}/slack-webhook",
-               "Good: 401. Not that: 404 or a timeout — the path is not reaching it.",
-               "Ask the door for a path it must still refuse:",
-               "    curl -s -m 5 https://${FRONT_DOOR_HOST}/status",
-               "Good: the proxy's refusal. Not that: a JSON status — the door is too wide."],
-        "good": "401 on /slack-webhook, and refused on /status",
-        "not": "a JSON status through the door — it lets more than one path through",
+               "Good: 401 — the door forwarded it and the dispatcher asked for a",
+               "signature. Not that: 404 or a timeout — the path is not reaching it.",
+               "Now a route that must NEVER be reachable. The dispatcher answers it 401,",
+               "and nothing else does, so a 401 here means the door forwards it:",
+               "    curl -sS -m 5 -o /dev/null -w '%{http_code}\\n' -X POST \\",
+               "      https://${FRONT_DOOR_HOST}/api/update/cyrus-config",
+               "Good: anything but 401 — 403 or 404 from the proxy, or a connection error.",
+               "Not that: 401. That is the dispatcher's config-update route answering, so",
+               "the allowlist is letting more than /slack-webhook through. Fix the door",
+               "before going on.",
+               "(A status or version path is not the test: a front door may forward one on",
+               "purpose for monitoring.)"],
+        "good": "401 on /slack-webhook, and anything but 401 on the config-update route",
+        "not": "401 on the config-update route — the door forwards more than one path",
     },
     "CK-C4": {
         "title": "Prove the dispatcher's port is closed, from a second device",
@@ -997,19 +1121,36 @@ CARDS = {
         "do": ["On THIS machine, find its network address (en1 if en0 prints nothing):",
                "    ipconfig getifaddr en0",
                "On THIS machine, check the dispatcher answers locally:",
-               "    curl -s -m 5 http://127.0.0.1:${DISPATCHER_PORT}/status",
-               "Good: a JSON status. Not that: nothing — the dispatcher is not running.",
-               "On a SECOND device on the same network (another computer, or a phone",
-               "with a terminal app), ask for the same page at that address:",
-               "    curl -s -m 5 http://<this machine's network address>:${DISPATCHER_PORT}/status",
-               "Good: \"Connection refused\", or a timeout after 5 seconds.",
-               "Not that: a JSON status — the port is open to the network. Remove",
-               "CYRUS_HOST_EXTERNAL from the dispatcher's env file, restart the dispatcher,",
-               "and fix piece 4 before anything else.",
-               "After the next reboot, run both checks again: the rule is loaded at boot."],
-        "good": ("a JSON status from 127.0.0.1 on this machine, and refused or timed out "
-                 "from the second device"),
-        "not": "a JSON status on the second device — every route is open past the door",
+               "    curl -sS -m 5 http://127.0.0.1:${DISPATCHER_PORT}/status; echo \"exit=$?\"",
+               "Good: a JSON status, exit=0. Not that: exit=7 — the dispatcher is not",
+               "running, so the next check would pass for the wrong reason.",
+               "",
+               "FIRST, ON THE SECOND DEVICE, A CONTROL. Ask it for a port nothing listens",
+               "on, so you learn what a refusal looks like from there:",
+               "    curl -sS -m 5 http://<this machine's network address>:9/; echo \"exit=$?\"",
+               "Good: exit=7, 'Connection refused' or 'Couldn't connect'. The device can",
+               "reach this machine and closed ports answer.",
+               "Not that: exit=28 (a timeout). Then this network cannot tell you anything:",
+               "the device is isolated, on a guest network or VPN, or the address is of an",
+               "interface it cannot reach. Fix that, or use another device or network. Do",
+               "NOT record the port as closed from a timeout.",
+               "",
+               "THEN THE PORT ITSELF, from the same device:",
+               "    curl -sS -m 5 http://<this machine's network address>:${DISPATCHER_PORT}/status; echo \"exit=$?\"",
+               "Good: exit=7 with a refusal, the SAME answer the control gave. The rule",
+               "is `block return`, which answers at once with a reset, so a refusal is",
+               "what a working rule produces.",
+               "Not that: exit=0 and a JSON status — the port is open to the network.",
+               "Remove CYRUS_HOST_EXTERNAL from the dispatcher's env file, restart the",
+               "dispatcher, and fix piece 4 before anything else.",
+               "Not that either: exit=28, a timeout, when the control was refused. That is",
+               "not this rule's doing — `block return` never produces it — so something",
+               "else is dropping the packets and the rule is unproven.",
+               "After the next reboot, run all three again: the rule is loaded at boot."],
+        "good": ("a JSON status from 127.0.0.1 here, a refusal on the control from the "
+                 "second device, and the same refusal on the dispatcher's port"),
+        "not": ("a JSON status on the second device — the port is open; or a timeout, "
+                "which proves nothing either way"),
     },
     "CK-C3": {
         "title": "Ask the bot, in the private channel, what it holds",
@@ -1153,6 +1294,8 @@ def config(path):
             "mcpAllowedTools": [str(t)[:200] for t in allowed
                                 if isinstance(t, str) and t.startswith("mcp__")]
                                if isinstance(allowed, list) else [],
+            "isActive": r.get("isActive") is not False,
+            "repositoryPath": str(r.get("repositoryPath") or "")[:300],
             "instructionHead": str(r.get("appendInstruction") or "")[:HEAD],
         })
     return {"slackAllowedTools": tools(c.get("slackAllowedTools")),
@@ -1231,14 +1374,23 @@ def facts_command(conf):
 # and pfctl(8)'s load, enable, flush and release flags (-f, -E, -e, -F, -X) never appear.
 PF_READ_RULES = ["/sbin/pfctl", "-a", PF_ANCHOR, "-s", "rules"]
 PF_READ_INFO = ["/sbin/pfctl", "-s", "info"]
+# The MAIN ruleset, which is what recurses into the anchor. A child anchor keeps its rules
+# whether or not anything evaluates them, so `pfctl -a <anchor> -s rules` looks identical
+# after another tool loads its own main ruleset — and the block would be inert. Both the
+# loaded ruleset and the file that restores it at boot are read (review of PR #147, 12).
+PF_READ_MAIN = ["/sbin/pfctl", "-s", "rules"]
+PF_CONF = "/etc/pf.conf"
+PF_ANCHOR_POINT_RE = re.compile(r'^\s*anchor\s+"?com\.apple/\*"?', re.M)
 
 
 def pf_probe(runner):
-    """Four read-only answers. Nothing here parses them; `check_port_block` does."""
+    """Six read-only answers. Nothing here parses them; `check_port_block` does."""
     def answer(res):
         return {"rc": res.rc, "out": res.out, "err": (res.err or "").strip()[:160]}
     return {"rules": answer(runner.as_root(PF_READ_RULES)),
             "info": answer(runner.as_root(PF_READ_INFO)),
+            "main": answer(runner.as_root(PF_READ_MAIN)),
+            "pfConf": answer(runner.read(["/bin/cat", PF_CONF])),
             "plist": answer(runner.read(["/bin/cat", PF_DAEMON_PLIST])),
             "rulesFile": answer(runner.read(["/bin/cat", PF_RULES_PATH]))}
 
@@ -1259,39 +1411,86 @@ def _config_unmeasured(cfg, checks):
             for c in checks]
 
 
+def _entry_label(entry):
+    return entry.get("id") or entry.get("name") or "#%d" % entry.get("index", 0)
+
+
+def active_entries(cfg):
+    """The entries the dispatcher actually loads: it skips isActive === false
+    (EdgeWorker.js:274-290), and the chat lane's default repository is the FIRST of those
+    (ChatRepositoryProvider.js:18-20) — not the first line of the file."""
+    return [e for e in (cfg.get("entries") or []) if e.get("isActive") is not False]
+
+
 def check_grant(cfg):
     live = cfg.get("slackAllowedTools")
-    entries = cfg.get("entries") or []
+    active = active_entries(cfg)
     lines, problems = [], []
     if live == "not-a-list":
         return _row("grant", FAILED, "slackAllowedTools is not a list")
+    # The approved grant is the base list plus one pair of literal pull rules per repository
+    # the dispatcher serves. Paths come from the live config, because compose cannot know
+    # them (owner decision after the review of PR #147, finding 1).
+    paths, unpathed = [], []
+    for e in active:
+        path = e.get("repositoryPath")
+        if path:
+            if path not in paths:
+                paths.append(path)
+        else:
+            unpathed.append(_entry_label(e))
+    wanted = owner_grant(paths)
     if not live:
         problems.append("slackAllowedTools is unset or empty, so the built-in chat grant "
                         "applies, Monitor and Task included (ToolPermissionResolver.js:69-71)")
     else:
-        extra = [t for t in live if t not in OWNER_GRANT]
-        missing = [t for t in OWNER_GRANT if t not in live]
+        for bad in grant_problems(live):
+            problems.append("the live grant is unsafe: %s" % bad)
+        extra = [t for t in live if t not in wanted]
+        missing = [t for t in wanted if t not in live]
         if extra:
             problems.append("slackAllowedTools holds what the owner did not approve: %s"
                             % ", ".join(extra))
-        if missing:
-            problems.append("slackAllowedTools lacks: %s" % ", ".join(missing))
-    if entries and entries[0].get("mcpAllowedTools"):
-        first = entries[0]
-        problems.append("the first repository entry %s lists %s in allowedTools, and the "
-                        "dispatcher adds those to the chat grant (RunnerConfigBuilder.js:63-66)"
-                        % (first.get("id") or first.get("name") or "#0",
-                           ", ".join(first["mcpAllowedTools"])))
-    for e in entries[1:]:
+        for path in paths:
+            gone = [r for r in pull_rules(path) if r not in live]
+            if gone and len(gone) < len(pull_rules(path)):
+                problems.append("the repository at %s has only part of its pull rule pair; "
+                                "missing %s" % (path, ", ".join(gone)))
+            elif gone:
+                problems.append("the repository at %s has no pull rule, so the chat lane's "
+                                "pull of it is refused with nothing to say why" % path)
+        rest = [t for t in missing
+                if not any(t in pull_rules(path) for path in paths)]
+        if rest:
+            problems.append("slackAllowedTools lacks: %s" % ", ".join(rest))
+    if unpathed:
+        lines.append("note: %s carr%s no repositoryPath, so no pull rule is composed for "
+                     "%s." % (", ".join(unpathed), "ies" if len(unpathed) == 1 else "y",
+                              "it" if len(unpathed) == 1 else "them"))
+    if active and active[0].get("mcpAllowedTools"):
+        first = active[0]
+        problems.append("the first ACTIVE repository entry %s lists %s in allowedTools, and "
+                        "the dispatcher adds those to the chat grant "
+                        "(RunnerConfigBuilder.js:63-66; ChatRepositoryProvider.js:18-20)"
+                        % (_entry_label(first), ", ".join(first["mcpAllowedTools"])))
+    for e in active[1:]:
         if e.get("mcpAllowedTools"):
-            lines.append("note: entry %s lists %s in allowedTools. Harmless while it is not "
-                         "the first entry; the chat grant takes the first "
-                         "(ChatRepositoryProvider.js:18-20)."
-                         % (e.get("id") or e.get("name"), ", ".join(e["mcpAllowedTools"])))
+            lines.append("note: active entry %s lists %s in allowedTools. It joins the chat "
+                         "grant if it ever becomes the first active entry — which removing "
+                         "or deactivating an earlier one does."
+                         % (_entry_label(e), ", ".join(e["mcpAllowedTools"])))
+    for e in cfg.get("entries") or []:
+        if e.get("isActive") is False and e.get("mcpAllowedTools"):
+            lines.append("note: inactive entry %s lists %s in allowedTools. The dispatcher "
+                         "skips it today (EdgeWorker.js:274-290); activating it would put "
+                         "those in the chat grant."
+                         % (_entry_label(e), ", ".join(e["mcpAllowedTools"])))
     if problems:
         return _problem_row("grant", BLOCKED, problems, lines + [
-            '  paste at the top level:  "slackAllowedTools": ' + json.dumps(OWNER_GRANT)])
-    return _row("grant", ALREADY_DONE, "slackAllowedTools is the approved list", lines)
+            '  paste at the top level:  "slackAllowedTools": ' + json.dumps(wanted)])
+    return _row("grant", ALREADY_DONE,
+                "slackAllowedTools is the approved list, with a pull rule pair for each of "
+                "the %d repository path(s) the dispatcher serves" % len(paths), lines)
 
 
 def check_fence(cfg, env_facts):
@@ -1310,10 +1509,17 @@ def check_fence(cfg, env_facts):
             problems.append("%s: disallowedTools is not a list" % label)
             continue
         if kind == "review":
+            # NOT a note. Piece 2 skips review entries only because their own fence already
+            # names the Slack server; when it does not, that assumption is false and every
+            # review session gets a working Slack server holding the chat token. verify used
+            # to pass while that was true (review of PR #147, findings 4 and 5).
             _l, missing, _s = fence_entry(own, default)
             if missing:
-                lines.append("note: review entry %s lacks %s. Its own installer owns it: "
-                             "run the Stage E installer's verify." % (label, ", ".join(missing)))
+                problems.append("review entry %s lacks %s. Piece 2 skips review entries "
+                                "because their fence already names the Slack server, and "
+                                "this one does not: fix it by running the Stage E "
+                                "installer, whose entries these are"
+                                % (label, ", ".join(missing)))
             continue
         fenced_count += 1
         composed, missing, source = fence_entry(own, default)
@@ -1335,7 +1541,8 @@ def check_fence(cfg, env_facts):
         for ptype in prompt_type_gaps(cfg.get("promptDefaults")):
             problems.append("promptDefaults: prompt type %s has its own disallowedTools, "
                             "which replaces every entry's list for that type and lacks the "
-                            "Slack rules" % ptype)
+                            "Slack rules. Add both rules to that list rather than deleting "
+                            "the key: %s" % (ptype, REMOVAL_NOTE))
     if problems:
         return _problem_row("coding-fence", FAILED if any("not a list" in p for p in problems)
                             else BLOCKED, problems, lines)
@@ -1346,10 +1553,25 @@ def check_fence(cfg, env_facts):
                 % (fenced_count, "y" if fenced_count == 1 else "ies"), lines)
 
 
+# What a reload does NOT do: a key REMOVED from the config file keeps its old in-memory
+# value, because the merge is `parsedConfig.<key> || this.config.<key>` (ConfigManager.js:176,
+# 181, 183). Worse, the merged config then equals the old one, so detectGlobalConfigChanges
+# returns false and nothing is re-applied at all — while the watcher has already logged the
+# reload line the doc tells the operator to look for. Removing a key therefore needs a
+# restart, and every row that can go green by removal says so (review of PR #147, 7 and 16).
+REMOVAL_NOTE = ("if you fixed this by DELETING the key rather than setting it empty, the "
+                "running dispatcher keeps the old value until it is restarted "
+                "(ConfigManager.js:176-183): restart it, or set the key to an empty value "
+                "instead")
+
+
 def check_chat_mcp(cfg):
     rows = cfg.get("slackMcpConfigs")
+    if rows is None:
+        return _row("chat-mcp-configs", ALREADY_DONE, "slackMcpConfigs is unset",
+                    ["note: " + REMOVAL_NOTE])
     if not rows:
-        return _row("chat-mcp-configs", ALREADY_DONE, "slackMcpConfigs is empty or unset")
+        return _row("chat-mcp-configs", ALREADY_DONE, "slackMcpConfigs is empty")
     lines = []
     for r in rows:
         if r.get("servers") is not None:
@@ -1359,7 +1581,8 @@ def check_chat_mcp(cfg):
             lines.append("WARN: %s: %s" % (r.get("path"), r.get("error")))
     return _row("chat-mcp-configs", BLOCKED,
                 "slackMcpConfigs loads extra servers into every chat session "
-                "(RunnerConfigBuilder.js:52-57); the approved lane has none", lines)
+                "(RunnerConfigBuilder.js:52-57); the approved lane has none",
+                lines + ["set it to [] rather than deleting the key: " + REMOVAL_NOTE])
 
 
 def check_env(conf, env_facts):
@@ -1453,6 +1676,16 @@ def check_hosted_keys_absent(env_facts):
                 % " nor ".join(HOSTED_PAIRING_NAMES))
 
 
+def _read_denied(answer):
+    """True when a read failed for a reason that is NOT the file being absent: permission,
+    a directory that cannot be traversed, an interrupted read. Absent is a fact about the
+    machine; the rest is this command failing to measure it (contract §13)."""
+    err = (answer.get("err") or "").lower()
+    if re.search(r"no such file|not found", err):
+        return False
+    return bool(err)
+
+
 def check_port_block(conf, pf, env_facts):
     """The anchor holds both refusals, pf is enabled, and the boot files are installed."""
     port = conf["DISPATCHER_PORT"]
@@ -1478,10 +1711,40 @@ def check_port_block(conf, pf, env_facts):
     else:
         unknown.append("pfctl could not show pf's status (exit %s: %s)"
                        % (info.get("rc"), info.get("err")))
+    # The anchor point: without it nothing evaluates the anchor, however full it looks.
+    main = pf.get("main") or {}
+    conf_file = pf.get("pfConf") or {}
+    point_loaded = (PF_ANCHOR_POINT_RE.search(main.get("out") or "")
+                    if main.get("rc") == 0 else None)
+    point_in_file = (PF_ANCHOR_POINT_RE.search(conf_file.get("out") or "")
+                     if conf_file.get("rc") == 0 else None)
+    if conf_file.get("rc") != 0:
+        unknown.append("%s could not be read (%s), so whether a reboot restores the anchor "
+                       "point was not measured" % (PF_CONF, conf_file.get("err")))
+    elif not point_in_file:
+        problems.append("%s no longer carries an anchor \"com.apple/*\" line, so the next "
+                        "boot loads a main ruleset that never reaches this anchor and the "
+                        "rule is inert" % PF_CONF)
+    if main.get("rc") != 0:
+        unknown.append("the loaded main ruleset could not be read (%s), so whether anything "
+                       "evaluates the anchor was not measured" % main.get("err"))
+    elif not point_loaded and point_in_file:
+        unknown.append("the loaded main ruleset does not show an anchor \"com.apple/*\" "
+                       "line, though %s has one. Check by hand: sudo pfctl -s rules | grep "
+                       "com.apple" % PF_CONF)
+    elif not point_loaded:
+        problems.append("nothing evaluates this anchor: the loaded main ruleset has no "
+                        "anchor \"com.apple/*\" line, so the block rules are inert however "
+                        "full the anchor looks")
     plist = pf.get("plist") or {}
     if plist.get("rc") != 0:
-        problems.append("the boot LaunchDaemon is not installed at %s, so a reboot drops the "
-                        "rule" % PF_DAEMON_PLIST)
+        # Could-not-read and is-not-there are opposite facts with the same rc (§13).
+        if _read_denied(plist):
+            unknown.append("%s could not be read (%s): its directory may not be traversable "
+                           "by this account" % (PF_DAEMON_PLIST, plist.get("err")))
+        else:
+            problems.append("the boot LaunchDaemon is not installed at %s, so a reboot drops "
+                            "the rule" % PF_DAEMON_PLIST)
     else:
         text = plist.get("out") or ""
         lacks = [part for part in (PF_ANCHOR, PF_RULES_PATH, "<string>-E</string>",
@@ -1491,8 +1754,13 @@ def check_port_block(conf, pf, env_facts):
                             % (PF_DAEMON_PLIST, ", ".join(lacks)))
     rules_file = pf.get("rulesFile") or {}
     if rules_file.get("rc") != 0:
-        problems.append("the rules file is not installed at %s, so a reboot loads nothing"
-                        % PF_RULES_PATH)
+        if _read_denied(rules_file):
+            unknown.append("%s could not be read (%s): its directory may not be traversable "
+                           "by this account — `sudo chmod 755 \"%s\"` if so"
+                           % (PF_RULES_PATH, rules_file.get("err"), PF_RULES_DIR))
+        else:
+            problems.append("the rules file is not installed at %s, so a reboot loads nothing"
+                            % PF_RULES_PATH)
     else:
         missing = pf_missing_families(rules_file.get("out"), port)
         if missing:
@@ -1507,9 +1775,9 @@ def check_port_block(conf, pf, env_facts):
     if unknown:
         return _problem_row("port-block", UNKNOWN, unknown)
     return _row("port-block", ALREADY_DONE,
-                "%s refuses port %s for inet and inet6 off loopback, pf is enabled, and the "
-                "boot files are installed. Card CK-C4 is the proof from the network"
-                % (PF_ANCHOR, port))
+                "%s refuses port %s for inet and inet6 off loopback, the loaded main ruleset "
+                "still evaluates it, pf is enabled, and the boot files are installed. Card "
+                "CK-C4 is the proof from the network" % (PF_ANCHOR, port))
 
 
 def check_user_settings(conf, us, env_facts):
@@ -1691,7 +1959,14 @@ def main(argv=None, runner=None, sudo=None):
     try:
         return cmd_verify(conf, runner or Runner(dry_run=True), sudo or SudoSession())
     except NoPrivilege as exc:
-        say(str(exc))
+        # The text comes from the Stage E installer's SudoSession, so its "run the same
+        # command again" line names THAT script and drops the --conf this run was given.
+        # Following it would run a different installer's verify and leave the chat lane
+        # unmeasured (review of PR #147, finding 8).
+        mine = "python3 %s verify --conf %s" % (_self_path(), args.conf)
+        say(str(exc).replace("python3 %s verify" % _stage_e_self_path(), mine))
+        say("")
+        say("The command to run again is this one:  %s" % mine)
         return EX_NOPRIV
 
 
@@ -1723,7 +1998,12 @@ class _FakeRunner(Runner):
         self.default = default
         self.argvs = []
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None, **kwargs):
+        # cwd/**kwargs: the Stage E Runner this subclasses is gaining a `cwd` argument in a
+        # sibling pull request, and its read() forwards it on every call. Without these the
+        # battery raises TypeError the moment both land, and Kit checks go red on main for
+        # whichever merged second — a break neither pull request's own CI can see (review
+        # of PR #147, finding 2). Accepting and ignoring them passes either way.
         from pipeline_stage_e_setup import Result
         self.argvs.append(list(argv))
         line = " ".join(argv)
@@ -1739,10 +2019,22 @@ GOOD_PF_RULES_OUT = (
 GOOD_PF_INFO_OUT = "Status: Enabled for 0 days 00:04:12           Debug: Urgent\n"
 
 
-def _pf_answers(rules=None, info=None, plist=None, rules_file=None):
-    """The four read-only pf answers, healthy unless one is overridden."""
+GOOD_PF_MAIN_OUT = ("scrub-anchor \"com.apple/*\" all fragment reassemble\n"
+                    "anchor \"com.apple/*\" all\n")
+GOOD_PF_CONF_OUT = ("#\n# Default PF configuration file.\n#\n"
+                    "scrub-anchor \"com.apple/*\"\n"
+                    "anchor \"com.apple/*\"\n"
+                    "load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"\n")
+
+
+def _pf_answers(rules=None, info=None, plist=None, rules_file=None, main=None, pf_conf=None):
+    """The six read-only pf answers, healthy unless one is overridden. The order matters:
+    the first needle found in the joined argv wins, so the anchor read (`-a … -s rules`)
+    must be listed before the main-ruleset read (`-s rules`), which is a substring of it."""
     return [("pfctl -a %s -s rules" % PF_ANCHOR,) + (rules or (0, GOOD_PF_RULES_OUT, "")),
             ("pfctl -s info",) + (info or (0, GOOD_PF_INFO_OUT, "")),
+            ("pfctl -s rules",) + (main or (0, GOOD_PF_MAIN_OUT, "")),
+            ("/bin/cat %s" % PF_CONF,) + (pf_conf or (0, GOOD_PF_CONF_OUT, "")),
             ("/bin/cat %s" % PF_DAEMON_PLIST,) + (plist or (0, pf_plist(), "")),
             ("/bin/cat %s" % PF_RULES_PATH,) + (rules_file or (0, pf_rules("3456"), ""))]
 
@@ -1752,6 +2044,7 @@ def _argv_allowed(argv, account):
     if argv[:6] == ["sudo", "-u", account, "-H", "/bin/sh", "-c"] and len(argv) == 7:
         return argv[6].startswith("cd / && /usr/bin/python3 -c ")
     return argv in (["sudo"] + PF_READ_RULES, ["sudo"] + PF_READ_INFO,
+                    ["sudo"] + PF_READ_MAIN, ["/bin/cat", PF_CONF],
                     ["/bin/cat", PF_DAEMON_PLIST], ["/bin/cat", PF_RULES_PATH])
 
 
@@ -1788,6 +2081,11 @@ DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env
 FRONT_DOOR_HOST=chat.example.com
 """
 
+# The repository paths the fake dispatcher config serves, and therefore the paths the
+# composed pull rules must name.
+REPO_ONE = "/srv/example/repo-one"
+REPO_TWO = "/srv/example/repo-two"
+
 # Distinctive values the fake env file carries. None may appear in any output.
 SENTINELS = ("sentinel-chat-bot-value-4f1c9a", "sentinel-signing-value-83bd20",
              "sentinel-notifier-value-c07e55", "sentinel-debug-value-19aa3e",
@@ -1819,35 +2117,69 @@ def _selftest_body():
     expect("good-conf", not errs, errs)
 
     # -- 1. the grant is the approved list, and holds nothing forbidden ---------
-    approved_literal = ["Read", "Bash(git -C * pull)", "WebFetch", "WebSearch", "SendMessage",
-                        "ToolSearch", "mcp__slack", "mcp__linear"]
-    expect("grant-is-approved", OWNER_GRANT == approved_literal, OWNER_GRANT)
-    expect("grant-clean", grant_problems(OWNER_GRANT) == [], grant_problems(OWNER_GRANT))
+    approved_literal = ["Read", "WebFetch", "WebSearch", "SendMessage", "ToolSearch",
+                        "mcp__slack", "mcp__linear",
+                        "Bash(git -C /srv/repo-one pull)",
+                        "Bash(git -C /srv/repo-one pull --ff-only)",
+                        "Bash(git -C /srv/repo-two pull)",
+                        "Bash(git -C /srv/repo-two pull --ff-only)"]
+    expect("pull-rule-forms-are-literal",
+           all(f.count("%s") == 1 and "*" not in f for f in PULL_RULE_FORMS),
+           PULL_RULE_FORMS)
+    two = owner_grant(["/srv/repo-one", "/srv/repo-two"])
+    expect("grant-is-approved", two == approved_literal, two)
+    expect("grant-base-has-no-bash", not any(t.startswith("Bash") for t in OWNER_GRANT_BASE),
+           OWNER_GRANT_BASE)
+    expect("grant-clean", grant_problems(two) == [], grant_problems(two))
+    expect("grant-placeholder-clean", grant_problems(owner_grant()) == [])
+    expect("grant-dedupes-a-repeated-path",
+           owner_grant(["/srv/one", "/srv/one"]) == owner_grant(["/srv/one"]))
     for tool in ("Monitor", "Task", "Agent", "ScheduleWakeup", "Skill", "Write", "Edit",
                  "NotebookEdit", "CronCreate", "RemoteTrigger", "Workflow"):
-        expect("grant-lacks-" + tool, tool not in OWNER_GRANT)
-        expect("grant-mutant-" + tool, grant_problems(OWNER_GRANT + [tool]) != [],
+        expect("grant-lacks-" + tool, tool not in two)
+        expect("grant-mutant-" + tool, grant_problems(two + [tool]) != [],
                "a grant holding %s passed" % tool)
-    for bash in ("Bash", "Bash(*)", "Bash( * )"):
-        expect("grant-no-unscoped-bash", not any(t == bash for t in OWNER_GRANT))
-        expect("grant-mutant-unscoped-bash", grant_problems(OWNER_GRANT + [bash]) != [],
-               "a grant holding %s passed" % bash)
+    # THE RULE SHAPE THE OWNER REMOVED, and its neighbours. Each must be reported.
+    for bad in ("Bash", "Bash(*)", "Bash( * )", "Bash(git -C * pull)", "Bash(git * main)",
+                "Bash(sh -c *)", "Bash(bash *)", "Bash(git -C * status *)",
+                "Bash(/bin/sh -c 'git pull')", "Bash(git -C /srv/one pull && sh)",
+                "Bash(env FOO=1 git -C /srv/one pull)", "Bash(xargs git pull)",
+                "Bash(git -c * pull)"):
+        expect("grant-refuses:" + bad, grant_problems([bad]) != [],
+               "%s passed grant_problems" % bad)
+        expect("grant-mutant:" + bad, grant_problems(two + [bad]) != [],
+               "a grant holding %s passed" % bad)
+    expect("grant-old-rule-gone", "Bash(git -C * pull)" not in two
+           and not any("*" in t for t in two), two)
+    # …and rules that are genuinely narrow still pass, so the checker is not a blanket no.
+    for ok in ("Bash(git -C /srv/one pull)", "Bash(git -C /srv/one pull --ff-only)",
+               "Bash(npm run lint:*)", "Bash(git status)"):
+        expect("grant-allows:" + ok, grant_problems([ok]) == [], grant_problems([ok]))
     rc, out = _capture(cmd_compose, conf)
     shown = None
     for line in out.splitlines():
         if line.strip().startswith('"slackAllowedTools":'):
             shown = json.loads(line.split(":", 1)[1])
-    expect("compose-prints-approved-grant", rc == EX_OK and shown == approved_literal,
-           (rc, shown))
+    expect("compose-prints-approved-grant",
+           rc == EX_OK and shown == owner_grant(), (rc, shown))
+    expect("compose-grant-uses-placeholder",
+           shown and shown[-2:] == pull_rules(PLACEHOLDER_REPO_PATH), shown)
+    flat_all = " ".join(out.split())
+    expect("compose-says-one-pair-per-repository",
+           "Repeat BOTH rules for EVERY repository" in flat_all
+           and "its pull stops working in chat until you add both rules" in flat_all,
+           "piece 1 does not say a new repository needs its own rules")
 
     # -- 2. a mutant grant containing Monitor turns compose red ----------------
-    real_grant = globals()["OWNER_GRANT"]
-    try:
-        globals()["OWNER_GRANT"] = real_grant + ["Monitor"]
-        rc_mutant, _o = _capture(cmd_compose, conf)
-        expect("compose-mutant-monitor-red", rc_mutant == EX_FAILED, rc_mutant)
-    finally:
-        globals()["OWNER_GRANT"] = real_grant
+    real_base = globals()["OWNER_GRANT_BASE"]
+    for mutant, label in ((real_base + ["Monitor"], "monitor"),
+                          (real_base + ["Bash(git -C * pull)"], "wildcard-pull")):
+        try:
+            globals()["OWNER_GRANT_BASE"] = mutant
+            rc_mutant, _o = _capture(cmd_compose, conf)
+            expect("compose-mutant-%s-red" % label, rc_mutant == EX_FAILED, rc_mutant)
+        finally:
+            globals()["OWNER_GRANT_BASE"] = real_base
 
     # compose shape: one-member warning first, the appended servers right under the grant
     flat = " ".join(out.split())
@@ -2039,6 +2371,21 @@ def _selftest_body():
                    "a name the dispatcher itself reads", "DISPATCHER_PORT must be a port",
                    "unknown key SURPRISE", "not KEY=value"):
         expect("conf-all-errors:" + needle, any(needle in e for e in allerrs), allerrs)
+    # A pasted token has no `=`, so it lands in the not-KEY=value branch, where the
+    # credential-shape guard never sees it. That branch must not echo the line (review of
+    # PR #147, finding 10).
+    # Assembled, never written out: a literal of this shape is what a code host's secret
+    # scanner blocks a push for, and a fixture is not worth an exception to that.
+    bot_shaped = "-".join(["xoxb", "9" * 10, "8" * 10, "abcdefGHIJKLmnopQRSTUvwx"])
+    for pasted in (bot_shaped,
+                   "0123456789abcdef0123456789abcdef",
+                   "not a conf line at all"):
+        _v, perrs2 = parse_conf("ROLE_ACCOUNT=_x\n%s\n" % pasted)
+        joined2 = " ".join(perrs2)
+        expect("conf-never-echoes-a-bare-line:" + pasted[:12],
+               len(perrs2) == 1 and "not KEY=value" in joined2
+               and pasted not in joined2 and pasted[:12] not in joined2
+               and ":2:" in joined2 and str(len(pasted)) in joined2, perrs2)
     _v, cerrs = parse_conf("FRONT_DOOR_HOST=xoxb-%s\n" % ("1" * 12))
     expect("conf-credential-shape", any("CREDENTIAL SHAPE" in e for e in cerrs)
            and not any("1" * 12 in e for e in cerrs), cerrs)
@@ -2061,12 +2408,13 @@ def _selftest_body():
         def good_config():
             return {
                 "linearWorkspaces": {"ws": {"linearToken": SENTINELS[3]}},
-                "slackAllowedTools": list(OWNER_GRANT),
+                "slackAllowedTools": owner_grant([REPO_ONE, REPO_TWO]),
                 "defaultDisallowedTools": ["Bash(rm -rf *)", "mcp__slack", "mcp__slack__*"],
                 "repositories": [
                     {"id": "coding-a", "name": "a", "allowedTools": ["Read"],
+                     "repositoryPath": REPO_ONE,
                      "disallowedTools": ["Edit", "mcp__slack", "mcp__slack__*"]},
-                    {"id": "coding-b", "name": "b",
+                    {"id": "coding-b", "name": "b", "repositoryPath": REPO_TWO,
                      "labelPrompts": {"builder": ["Bug"]}},
                     {"id": "reviews-a", "name": "reviews-a", "appendInstruction": review_brief,
                      "disallowedTools": ["Bash", "mcp__slack", "mcp__slack__*"]},
@@ -2150,7 +2498,7 @@ def _selftest_body():
 
         # grant mismatch
         cfg_m = good_config()
-        cfg_m["slackAllowedTools"] = list(OWNER_GRANT) + ["Monitor"]
+        cfg_m["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO]) + ["Monitor"]
         ran = probe(cfg_m, good_env(), good_settings)
         rc_v, printed, _f, _s = verify_with(ran)
         outputs.append(printed)
@@ -2165,6 +2513,67 @@ def _selftest_body():
         rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
         expect("verify-first-entry-mcp-tools", rows[0]["outcome"] == BLOCKED
                and "mcp__github" in _row_text(rows[0]), rows[0])
+
+        # THE FIRST **ACTIVE** ENTRY, not the first line of the file: the dispatcher skips
+        # isActive:false entries, so an inactive first entry hides a live one (review of
+        # PR #147, findings 9, 11 and 14).
+        cfg_m = good_config()
+        cfg_m["repositories"].insert(0, {"id": "retired", "name": "retired",
+                                         "isActive": False,
+                                         "repositoryPath": "/srv/example/retired",
+                                         "allowedTools": ["Read"],
+                                         "disallowedTools": list(SLACK_FENCE_RULES)})
+        cfg_m["repositories"][1]["allowedTools"] = ["Read", "mcp__github"]
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        grant_row = [r for r in rows if r["check"] == "grant"][0]
+        expect("verify-grant-first-active-entry", grant_row["outcome"] == BLOCKED
+               and "first ACTIVE repository entry coding-a" in _row_text(grant_row),
+               grant_row)
+        # an inactive entry's mcp__ tools are a note, and say what activating it would do
+        cfg_m = good_config()
+        cfg_m["repositories"].insert(0, {"id": "retired", "name": "retired",
+                                         "isActive": False,
+                                         "allowedTools": ["Read", "mcp__github"],
+                                         "disallowedTools": list(SLACK_FENCE_RULES)})
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        grant_row = [r for r in rows if r["check"] == "grant"][0]
+        expect("verify-grant-inactive-entry-is-a-note",
+               grant_row["outcome"] == ALREADY_DONE
+               and "inactive entry retired" in _row_text(grant_row), grant_row)
+
+        # THE PULL RULES ARE PER REPOSITORY, from the live paths.
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
+        grant_row = [r for r in rows if r["check"] == "grant"][0]
+        expect("verify-grant-pull-rules-match-live-paths",
+               grant_row["outcome"] == ALREADY_DONE and "2 repository path(s)"
+               in grant_row["detail"], grant_row)
+        cfg_m = good_config()
+        cfg_m["repositories"].append({"id": "coding-c", "name": "c",
+                                      "repositoryPath": "/srv/example/repo-three",
+                                      "disallowedTools": list(SLACK_FENCE_RULES)})
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        grant_row = [r for r in rows if r["check"] == "grant"][0]
+        expect("verify-grant-new-repository-has-no-pull-rule",
+               grant_row["outcome"] == BLOCKED
+               and "/srv/example/repo-three has no pull rule" in _row_text(grant_row),
+               grant_row)
+        expect("verify-grant-paste-line-carries-every-repository",
+               any("repo-three pull)" in l for l in grant_row["lines"]), grant_row["lines"])
+        cfg_m = good_config()
+        cfg_m["slackAllowedTools"] = [t for t in cfg_m["slackAllowedTools"]
+                                      if t != "Bash(git -C %s pull --ff-only)" % REPO_TWO]
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        grant_row = [r for r in rows if r["check"] == "grant"][0]
+        expect("verify-grant-half-a-pull-pair", grant_row["outcome"] == BLOCKED
+               and "only part of its pull rule pair" in _row_text(grant_row), grant_row)
+        # a live grant carrying the shape the owner removed is reported as unsafe
+        cfg_m = good_config()
+        cfg_m["slackAllowedTools"] = OWNER_GRANT_BASE + ["Bash(git -C * pull)"]
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        grant_row = [r for r in rows if r["check"] == "grant"][0]
+        expect("verify-grant-live-wildcard-is-unsafe", grant_row["outcome"] == BLOCKED
+               and "the live grant is unsafe" in _row_text(grant_row)
+               and "wildcard where the subcommand goes" in _row_text(grant_row), grant_row)
 
         # a coding entry missing the fence — and the composed list keeps the default
         cfg_m = good_config()
@@ -2193,12 +2602,25 @@ def _selftest_body():
         fence_row = [r for r in rows if r["check"] == "coding-fence"][0]
         expect("verify-fence-planning-entry", fence_row["outcome"] == BLOCKED
                and "stage-a-planning-plan" in _row_text(fence_row), fence_row)
+        # A review entry whose own fence lacks the Slack rules is a FAILURE, not a note:
+        # piece 2 skips those entries only because that fence is supposed to name the
+        # server (review of PR #147, findings 4 and 5).
         cfg_m = good_config()
         cfg_m["repositories"][2]["disallowedTools"] = ["Bash"]
-        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        ran_rev = probe(cfg_m, good_env(), good_settings)
+        rows = evaluate(facts_of(ran_rev), vconf)
         fence_row = [r for r in rows if r["check"] == "coding-fence"][0]
-        expect("verify-fence-review-skipped", fence_row["outcome"] == ALREADY_DONE
-               and any("reviews-a" in l for l in fence_row["lines"]), fence_row)
+        expect("verify-fence-review-unfenced-is-a-problem",
+               fence_row["outcome"] == BLOCKED and "reviews-a" in _row_text(fence_row)
+               and "Stage E" in _row_text(fence_row), fence_row)
+        rc_v, printed, _f, _s = verify_with(ran_rev)
+        expect("verify-fence-review-unfenced-exit",
+               rc_v == EX_BLOCKED and "No drift" not in printed, printed)
+        # …and a review entry that IS fenced stays quiet.
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
+        expect("verify-fence-review-fenced-quiet",
+               [r for r in rows if r["check"] == "coding-fence"][0]["outcome"]
+               == ALREADY_DONE)
 
         # -- 4. a prompt-type override is warned by name
         cfg_m = good_config()
@@ -2218,6 +2640,28 @@ def _selftest_body():
         expect("verify-fence-env-override-unknown",
                [r for r in rows if r["check"] == "coding-fence"][0]["outcome"] == UNKNOWN,
                rows)
+
+        # A key that was REMOVED rather than emptied keeps its old value in the running
+        # dispatcher, so the rows that can go green by removal say so (PR #147, 7 and 16).
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
+        mcp_row = [r for r in rows if r["check"] == "chat-mcp-configs"][0]
+        expect("verify-mcp-unset-carries-the-removal-note",
+               mcp_row["outcome"] == ALREADY_DONE
+               and "keeps the old value until it is restarted" in _row_text(mcp_row),
+               mcp_row)
+        cfg_m = good_config()
+        cfg_m["slackMcpConfigs"] = []
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        mcp_row = [r for r in rows if r["check"] == "chat-mcp-configs"][0]
+        expect("verify-mcp-empty-list-needs-no-restart",
+               mcp_row["outcome"] == ALREADY_DONE
+               and "keeps the old value" not in _row_text(mcp_row), mcp_row)
+        cfg_m = good_config()
+        cfg_m["promptDefaults"] = {"scoper": {"disallowedTools": ["Write"]}}
+        rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
+        fence_row = [r for r in rows if r["check"] == "coding-fence"][0]
+        expect("verify-promptdefaults-says-not-to-delete-the-key",
+               "rather than deleting the key" in _row_text(fence_row), fence_row)
 
         # extra slackMcpConfigs
         extra_path = os.path.join(tmp, "dispatcher", "extra.json")
@@ -2301,6 +2745,53 @@ def _selftest_body():
             expect("verify-port-block-" + label,
                    rc_v == want_rc and got and got.group(1) == want_row
                    and needle in " ".join(printed.split()), printed)
+        # THE ANCHOR POINT. A child anchor keeps its rules whether or not anything
+        # evaluates them, so the main ruleset is what decides (PR #147, finding 12).
+        for label, pf, want_row, needle in (
+                # both gone: nothing evaluates the anchor, and that is a fact, not a guess
+                ("anchor-point-gone-everywhere",
+                 {"main": (0, "block drop in all\n", ""),
+                  "pf_conf": (0, "# emptied by an update\n", "")}, BLOCKED,
+                 "nothing evaluates this anchor"),
+                # the file has it but the loaded ruleset does not SHOW it: this command has
+                # never observed how pfctl prints an anchor line, so it says so rather than
+                # claiming drift (contract §13)
+                ("main-ruleset-lost-the-anchor",
+                 {"main": (0, "block drop in all\n", "")}, UNKNOWN,
+                 "does not show an anchor"),
+                ("pf-conf-lost-the-anchor",
+                 {"pf_conf": (0, "# emptied by an update\n", "")}, BLOCKED,
+                 "no longer carries an anchor"),
+                ("main-ruleset-unreadable",
+                 {"main": (1, "", "pfctl: Operation not permitted")}, UNKNOWN,
+                 "loaded main ruleset could not be read"),
+                ("pf-conf-unreadable",
+                 {"pf_conf": (1, "", "cat: /etc/pf.conf: Permission denied")}, UNKNOWN,
+                 "could not be read"),
+                ("anchor-in-file-not-in-loaded-ruleset",
+                 {"main": (0, "block drop in all\n", ""),
+                  "pf_conf": (0, GOOD_PF_CONF_OUT, "")}, UNKNOWN,
+                 "Check by hand: sudo pfctl -s rules"),
+                # could-not-read is NOT is-not-there (PR #147, finding 15)
+                ("rules-file-unreadable",
+                 {"rules_file": (1, "", "cat: …/pf.rules: Permission denied")}, UNKNOWN,
+                 "may not be traversable"),
+                ("plist-unreadable",
+                 {"plist": (1, "", "cat: …plist: Permission denied")}, UNKNOWN,
+                 "may not be traversable")):
+            rc_v, printed, _f, _s = verify_with(ran, **pf)
+            got = port_row((rc_v, printed))
+            expect("verify-port-block-" + label,
+                   got and got.group(1) == want_row and needle in " ".join(printed.split()),
+                   printed)
+        expect("pf-install-makes-the-directory-traversable",
+               any(l.startswith("sudo chmod 755") and PF_RULES_DIR in l
+                   for l in pf_install_commands("3456")), pf_install_commands("3456")[:4])
+        expect("read-denied-tells-absent-from-unreadable",
+               _read_denied({"err": "cat: x: Permission denied"}) is True
+               and _read_denied({"err": "cat: x: No such file or directory"}) is False
+               and _read_denied({"err": ""}) is False)
+
         for port_line, want_row in (("CYRUS_SERVER_PORT=4000\n", BLOCKED),
                                     ("CYRUS_SERVER_PORT=3456\n", ALREADY_DONE),
                                     ("CYRUS_SERVER_PORT=not-a-port\n", ALREADY_DONE)):
@@ -2363,6 +2854,57 @@ def _selftest_body():
         expect("probe-open-read-only", not re.search(r"open\([^)]*,", FACTS_PY),
                "the probe opens a file with a mode")
 
+    # -- the fake runner survives the Runner it subclasses growing a cwd argument.
+    # A sibling pull request adds cwd to Stage E's Runner.read/_exec, and read() forwards
+    # it on every call. Without this the battery raises TypeError once both land, and it is
+    # main that goes red, not either pull request (review of PR #147, finding 2).
+    probe_fake = _FakeRunner([("anything", 0, "out", "")])
+    try:
+        probe_fake._exec(["/bin/echo", "x"], None, 60, cwd="/")
+        probe_fake._exec(["/bin/echo", "x"], None, 60, cwd="/", env={})
+        probe_fake.read(["/bin/echo", "x"])
+        cwd_ok = True
+    except TypeError as exc:
+        cwd_ok = str(exc)
+    expect("fake-runner-takes-cwd", cwd_ok is True, cwd_ok)
+    expect("fake-runner-signature-is-forward-compatible",
+           "cwd" in inspect.signature(_FakeRunner._exec).parameters
+           and any(q.kind == inspect.Parameter.VAR_KEYWORD
+                   for q in inspect.signature(_FakeRunner._exec).parameters.values()),
+           str(inspect.signature(_FakeRunner._exec)))
+
+    # -- the command verify really sends to the role account is RUN here, not just
+    # matched as a substring: a swapped argument or a lost quote stays green otherwise
+    # (review of PR #147, finding 13).
+    with tempfile.TemporaryDirectory() as tmp2:
+        home2 = os.path.join(tmp2, "home space")
+        cfg2 = os.path.join(tmp2, "dir with space", "config.json")
+        env2 = os.path.join(tmp2, "dir with space", ".env")
+        conf2 = dict(conf, DISPATCHER_CONFIG=cfg2, DISPATCHER_ENV_FILE=env2,
+                     DISPATCHER_PORT="4567")
+        _put(cfg2, json.dumps({"slackAllowedTools": ["Read"], "repositories": []}))
+        _put(env2, "CYRUS_SERVER_PORT=4567\nSLACK_BOT_TOKEN=%s\n" % SENTINELS[0])
+        _put(os.path.join(home2, ".claude", "settings.json"), json.dumps({}))
+        script = facts_command(conf2)
+        expect("facts-command-runs-the-system-python",
+               script.startswith("/usr/bin/python3 -c "), script[:40])
+        # the same string, with only the interpreter swapped so this runs anywhere CI does
+        local = script.replace("/usr/bin/python3", shlex.quote(sys.executable), 1)
+        ran2 = subprocess.run(["/bin/sh", "-c", "cd / && " + local], capture_output=True,
+                              text=True, env=dict(os.environ, HOME=home2))
+        try:
+            facts2 = json.loads(ran2.stdout)
+        except ValueError:
+            facts2 = {}
+        expect("facts-command-is-quoted-and-ordered",
+               ran2.returncode == 0
+               and (facts2.get("config") or {}).get("slackAllowedTools") == ["Read"]
+               and (facts2.get("env") or {}).get("serverPortMatches") is True
+               and (facts2.get("env") or {}).get("names") == ["CYRUS_SERVER_PORT",
+                                                              "SLACK_BOT_TOKEN"],
+               (ran2.returncode, ran2.stdout[:200], ran2.stderr[-200:]))
+        expect("facts-command-leaks-no-value", SENTINELS[0] not in ran2.stdout + ran2.stderr)
+
     # -- 8. verify refuses in an agent environment, before the conf is read ----
     marker = AGENT_ENV_MARKERS[0]
     try:
@@ -2379,6 +2921,27 @@ def _selftest_body():
     finally:
         os.environ.pop(marker, None)
 
+    # -- a declined sudo names THIS script, with the conf that was passed. The text comes
+    # from the Stage E installer's session, whose own rerun line names Stage E's verify —
+    # a different installer, and one that would leave the chat lane unmeasured (review of
+    # PR #147, finding 8).
+    class _DecliningSudo(object):
+        def acquire(self, why, resume):
+            raise NoPrivilege("NO ADMINISTRATOR ACCESS — nothing was attempted.\n"
+                              "  Fix that and run the same command again:\n"
+                              "      python3 %s %s" % (_stage_e_self_path(), resume))
+
+    with tempfile.TemporaryDirectory() as tmp3:
+        cpath3 = os.path.join(tmp3, "chat-lane.conf")
+        _put(cpath3, GOOD_CONF_TEXT)
+        rc_np, out_np = _capture(main, ["verify", "--conf", cpath3],
+                                 _FakeRunner([("", 0, "{}", "")]), _DecliningSudo())
+        expect("no-sudo-exit-5", rc_np == EX_NOPRIV, rc_np)
+        expect("no-sudo-names-this-script",
+               "pipeline_stage_e_setup.py verify" not in out_np
+               and "pipeline_chat_lane_setup.py verify --conf %s" % cpath3 in out_np,
+               out_np[-400:])
+
     # cards
     for cid in ("CK-C1", "CK-C2", "CK-C3", "CK-C4"):
         rc_card, card_out = _capture(print_card, cid, conf)
@@ -2386,15 +2949,38 @@ def _selftest_body():
                and "NEVER" in card_out and "${" not in card_out, card_out[:200])
     _rc, c4 = _capture(print_card, "CK-C4", conf)
     flat_c4 = " ".join(c4.split())
-    expect("card-c4-content", all(t in flat_c4 for t in (
-        "curl -s -m 5 http://127.0.0.1:3456/status", "SECOND device",
-        "<this machine's network address>:3456/status", "Connection refused", "timeout",
-        "proves nothing")), c4)
+    # The card must demand a REFUSAL, show curl's error, and refuse to read a timeout as
+    # proof — a timeout is what an unreachable device looks like, and `block return` never
+    # produces one (review of PR #147, finding 3).
+    expect("card-c4-requires-a-refusal", all(t in flat_c4 for t in (
+        "curl -sS -m 5 http://127.0.0.1:3456/status", "SECOND DEVICE",
+        "<this machine's network address>:3456/status", "exit=7", "exit=28")), c4)
+    expect("card-c4-shows-curl-errors", " -s " not in flat_c4 and "curl -s " not in flat_c4,
+           "the card still hides curl's error text with -s")
+    expect("card-c4-has-a-reachability-control",
+           "A CONTROL" in flat_c4 and ":9/" in flat_c4, "no control step")
+    expect("card-c4-timeout-is-not-proof",
+           "Do NOT record the port as closed from a timeout" in flat_c4
+           and "the rule is unproven" in flat_c4
+           and "Good: exit=7" in flat_c4, "the card still treats a timeout as Good")
+    expect("card-c4-good-line-wants-the-refusal",
+           "refusal" in CARDS["CK-C4"]["good"] and "timed out" not in CARDS["CK-C4"]["good"],
+           CARDS["CK-C4"]["good"])
     _rc, c3 = _capture(print_card, "CK-C3", conf)
     expect("card-c3-content", all(t in c3 for t in ("Monitor", "Task", "ScheduleWakeup",
                                                     "mcp__cyrus-tools", "expected")))
     _rc, c2 = _capture(print_card, "CK-C2", conf)
+    flat_c2 = " ".join(c2.split())
     expect("card-c2-filled", "https://chat.example.com/slack-webhook" in c2)
+    # CK-C2 must test a route that must ALWAYS be refused, not /status, which a front door
+    # may forward on purpose (review of PR #147, finding 3).
+    expect("card-c2-checks-a-never-route",
+           "/api/update/cyrus-config" in flat_c2
+           and "Good: anything but 401" in flat_c2
+           and "may forward one on purpose" in flat_c2, c2)
+    expect("card-c2-no-status-assumption",
+           "curl -s -m 5 https://chat.example.com/status" not in flat_c2,
+           "CK-C2 still assumes /status is refused")
     expect("card-unknown", _capture(main, ["card", "CK-9", "--conf", "/nonexistent"])[0]
            == EX_USAGE)
 
