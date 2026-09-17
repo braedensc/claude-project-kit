@@ -208,6 +208,17 @@ SHELL_PROGRAMS = ("sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "en
 # Shell punctuation inside a rule: a second command hides behind any of them.
 SHELL_OPERATORS = ("&&", "||", ";", "|", "`", "$(", ">", "<", "&")
 
+# Options that name a program the command will run. A rule carrying one is a shell even
+# with no wildcard in it: `Bash(git -c core.fsmonitor=/tmp/x -C /repo pull)` matches only
+# that exact text, but that text already runs /tmp/x. The wildcard checks below never see
+# it, and `verify` runs this over the LIVE grant, where a hand edit back toward "let it
+# pull with a config override" would land. `-c` and `--config-env` set git config such as
+# core.fsmonitor, core.pager, core.sshCommand or an alias; the other three name a binary
+# outright. `-C`, which the composed rules use, only changes directory (found in the
+# second review of PR #147).
+PROGRAM_RUNNING_OPTIONS = ("-c", "--config-env", "--exec-path", "--upload-pack",
+                           "--receive-pack")
+
 # What the dispatcher appends whatever the list says: `mcp__<name>` for every server it
 # built for the session (ToolPermissionResolver.js:72-77), with the chat lane's
 # disallowedTools hard-coded empty (RunnerConfigBuilder.js:78). `mcp__linear` and
@@ -254,6 +265,13 @@ def bash_rule_problems(tool):
                                         for t in tokens[1:]):
         problems.append("%s names a shell, or a program that runs one: it grants whatever "
                         "it is handed" % tool)
+    named = [t for t in tokens if t.split("=", 1)[0] in PROGRAM_RUNNING_OPTIONS]
+    if named:
+        problems.append("%s carries %s, an option that names a program the command will "
+                        "run: git's -c and --config-env set config such as core.fsmonitor "
+                        "or core.pager, and --exec-path, --upload-pack and --receive-pack "
+                        "name a binary. A pull rule may carry no git option but --ff-only"
+                        % (tool, ", ".join(sorted(set(named)))))
     wild = [i for i, t in enumerate(tokens) if "*" in t]
     if wild:
         before = tokens[1:wild[0]]            # the fixed words after the program name
@@ -802,6 +820,10 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "that limit it, and git's -c option runs a program the caller names. On this lane "
          "the list is the only fence, so that was arbitrary command execution. A fixed path "
          "leaves nothing that can stand before `pull`.")
+    para("A pull rule may carry no git option other than --ff-only. -c, --config-env, "
+         "--exec-path, --upload-pack and --receive-pack each name a program git then runs, "
+         "so a rule holding one is a shell even with the path written out. `verify` "
+         "refuses any it finds in the live list.")
     para("THE COST, SAID PLAINLY: add a repository to the dispatcher and its pull stops "
          "working in chat until you add both rules for it. Nothing announces that; the tool "
          "call is simply refused. `verify` reads the live repository paths and names any "
@@ -2144,7 +2166,14 @@ def _selftest_body():
                 "Bash(sh -c *)", "Bash(bash *)", "Bash(git -C * status *)",
                 "Bash(/bin/sh -c 'git pull')", "Bash(git -C /srv/one pull && sh)",
                 "Bash(env FOO=1 git -C /srv/one pull)", "Bash(xargs git pull)",
-                "Bash(git -c * pull)"):
+                "Bash(git -c * pull)",
+                # literal rules with no wildcard at all, whose own text runs a program
+                "Bash(git -c x=y -C /repo pull)",
+                "Bash(git -c core.fsmonitor=/tmp/x -C /repo pull)",
+                "Bash(git --exec-path=/tmp -C /repo pull)",
+                "Bash(git -C /repo pull --upload-pack=/tmp/x)",
+                "Bash(git -C /repo fetch --receive-pack /tmp/x)",
+                "Bash(git --config-env=core.pager=EVIL -C /repo pull)"):
         expect("grant-refuses:" + bad, grant_problems([bad]) != [],
                "%s passed grant_problems" % bad)
         expect("grant-mutant:" + bad, grant_problems(two + [bad]) != [],
@@ -2152,9 +2181,19 @@ def _selftest_body():
     expect("grant-old-rule-gone", "Bash(git -C * pull)" not in two
            and not any("*" in t for t in two), two)
     # …and rules that are genuinely narrow still pass, so the checker is not a blanket no.
+    # -C only changes directory and --ff-only names nothing, so both composed forms stay
+    # legal however strict the option check gets.
     for ok in ("Bash(git -C /srv/one pull)", "Bash(git -C /srv/one pull --ff-only)",
                "Bash(npm run lint:*)", "Bash(git status)"):
         expect("grant-allows:" + ok, grant_problems([ok]) == [], grant_problems([ok]))
+    for path in ("/srv/one", "/opt/example/two", PLACEHOLDER_REPO_PATH):
+        for rule in pull_rules(path):
+            expect("grant-allows-composed-pull:" + rule, grant_problems([rule]) == [],
+                   grant_problems([rule]))
+    for opt in ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack"):
+        said = " ".join(grant_problems(["Bash(git %s=v -C /r pull)" % opt]))
+        expect("grant-option-message-names:" + opt,
+               opt in said and "names a program the command will run" in said, said)
     rc, out = _capture(cmd_compose, conf)
     shown = None
     for line in out.splitlines():
@@ -2169,6 +2208,11 @@ def _selftest_body():
            "Repeat BOTH rules for EVERY repository" in flat_all
            and "its pull stops working in chat until you add both rules" in flat_all,
            "piece 1 does not say a new repository needs its own rules")
+    expect("compose-says-no-git-option-but-ff-only",
+           "A pull rule may carry no git option other than --ff-only" in flat_all
+           and all(opt in flat_all for opt in ("--exec-path", "--upload-pack",
+                                               "--receive-pack", "--config-env")),
+           "piece 1 does not rule out the program-running git options")
 
     # -- 2. a mutant grant containing Monitor turns compose red ----------------
     real_base = globals()["OWNER_GRANT_BASE"]

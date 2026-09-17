@@ -130,6 +130,12 @@ the words before the first `*` limit it — here, `git -C `. So that rule also m
 program it names. On this lane the grant is the only fence, so the rule would be a shell.
 A literal path leaves nothing that can stand before `pull`.
 
+Don't, either: **a pull rule may carry no git option other than `--ff-only`.** `-c`,
+`--config-env`, `--exec-path`, `--upload-pack` and `--receive-pack` each name a program git
+then runs, so a rule holding one runs that program even with the path written out and no
+wildcard anywhere. `-C` is safe: it only changes directory. `verify` refuses any of the
+others it finds in the live list.
+
 **The cost, plainly: a new repository needs new rules, or its pull stops working.** Nothing
 announces it — the tool call is simply refused. `verify` reads the live repository paths and
 names any repository with no pull rule.
