@@ -1,4 +1,4 @@
-# chat-lane.conf.example — the five values the chat-lane composer asks you for.
+# chat-lane.conf.example — the six values the chat-lane composer asks you for.
 #
 # ---------------------------------------------------------------------------
 # HOW TO USE THIS FILE
@@ -44,6 +44,12 @@ DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env
 # no https://, no path. The Slack app's request URL becomes
 # https://<this>/slack-webhook.
 FRONT_DOOR_HOST=chat.example.com
+
+# The TCP port the dispatcher listens on. The composed packet-filter rule refuses
+# this port to every network interface except loopback. It must match the
+# dispatcher's CYRUS_SERVER_PORT, which is 3456 when unset; `verify` compares the
+# two without reading the value.
+DISPATCHER_PORT=3456
 
 # The NAME of the notifier's own token variable. `verify` checks that this name
 # is NOT in the dispatcher's env file: every dispatcher session inherits that

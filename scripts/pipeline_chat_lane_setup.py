@@ -14,9 +14,11 @@ each piece by hand.
 
     compose   prints every piece. Reads no live file, needs no role-account access, runs
               anywhere. Exit 0, or 2 on a conf error.
-    verify    read-only live measurement, as the role account. One outcome per check.
+    verify    read-only live measurement: three files as the role account, and pf's
+              loaded rules as root. One outcome per check.
     card      prints a checkpoint card: CK-C1 (create the chat app), CK-C2 (the front
-              door), CK-C3 (the live check in the channel).
+              door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
+              from a second device).
 
 WHAT IT NEVER DOES.  It never writes the dispatcher's config, its env file, or any
 settings file. `compose` prints; `verify` reads. There is no merge, approve, label or
@@ -59,7 +61,8 @@ THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
       (EdgeWorker.js:516-521), the dispatcher's tool server at /mcp/cyrus-tools
       (EdgeWorker.js:97, 3948-3965), whose auth check passes everything when
       CYRUS_API_KEY is unset (McpConfigService.js:166-170), /status (533-541) and every
-      webhook. Read at start only. NOT in the owner's accepted residuals list.
+      webhook. Read at start only. The owner's answer (2026-09-17) is piece 4: a
+      packet-filter rule refusing the port off loopback, proven by card CK-C4.
    c. Webhook source-address checks turn on by default (EdgeWorker.js:241-252) unless
       WEBHOOK_IP_VALIDATION=false, and the dispatcher fetches api.github.com/meta at
       start (EdgeWorker.js:411-416; core WebhookIpValidator.js:122-141). The tracker
@@ -267,8 +270,126 @@ def entry_kind(entry):
 # --------------------------------------------------------------------------- #
 ENV_NAMES = ("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET", "CYRUS_HOST_EXTERNAL")
 
+# NEVER SET — owner decision of 2026-09-17 (KIT-117). Any CYRUS_API_KEY makes the dispatcher
+# act as paired with the vendor's hosted service: it registers `log_failure_mode`
+# (EdgeWorker.js:4016-4027, 4142-4147; mcp-tools cyrus-tools/index.js:636-642), which POSTs
+# the session id, a recap, a quote from the conversation, the failure text, the ticket
+# identifier and the workspace path to <CYRUS_APP_URL>/api/failure-modes
+# (cyrus-tools/failure-modes-http-client.js:4-35), defaulting to https://app.atcyrus.com
+# (cloudflare-tunnel-client ConfigApiClient.js:5-12), from the dispatcher's own unsandboxed
+# process. Every session's prompt tells it to call that tool (RunnerConfigBuilder.js:87, 207;
+# prompts/failureModePromptAddendum.js:21-27). With CYRUS_TEAM_ID as well, session transcripts
+# mirror there (EdgeWorker.js:152-173). `verify` checks the first two by name.
+HOSTED_PAIRING_NAMES = ("CYRUS_API_KEY", "CYRUS_TEAM_ID")
+HOSTED_DO_NOT_SET = HOSTED_PAIRING_NAMES + ("CYRUS_APP_URL",)
+
 # --------------------------------------------------------------------------- #
-# Piece 4 — the role account's user-level settings: secret-file read denies, nothing else.
+# Piece 4 — block the dispatcher's port from the network (owner decision, 2026-09-17).
+#
+# CYRUS_HOST_EXTERNAL=true binds the server to 0.0.0.0 (WorkerService.js:191;
+# EdgeWorker.js:254-257). A packet-filter rule refuses its port on every interface but
+# loopback. The front door is unaffected: it connects locally.
+#
+# WHERE THE RULE LIVES. Not in /etc/pf.conf, which a macOS update can reset. Apple's own
+# /etc/pf.conf evaluates every anchor attached under `com.apple` — its line 26 reads
+# `anchor "com.apple/*"` (read on macOS 26.6.2, 2026-09-17) — and pf.conf(5) says an anchor
+# ending in `/*` evaluates every anchor attached at that point, in alphabetical order. So the
+# rule loads into its own child anchor there, from its own file, by a root LaunchDaemon at
+# boot that also enables pf with `-E` ("Enable the packet filter and increment the pf enable
+# reference count", pfctl(8)). With `-a`, `-f` applies only to that anchor (pfctl(8)), so the
+# main ruleset is not flushed.
+#
+# BOTH ADDRESS FAMILIES. The dispatcher passes its host straight to Fastify's listen
+# (SharedApplicationServer.js:75-78), and Fastify's server reference says `0.0.0.0` "will
+# listen on all IPv4 addresses", while `::` "may also listen on all IPv4 addresses". So
+# IPv6 is not expected to answer today; the rule refuses inet6 too, at no cost, in case the
+# listen address ever changes.
+#
+# `quick` because a later anchor's `pass` would otherwise win: pf.conf(5), "The last
+# matching rule decides", unless a rule has `quick`. `return` so the refusal is immediate.
+# --------------------------------------------------------------------------- #
+DEFAULT_DISPATCHER_PORT = "3456"   # cli config/constants.js:7; EdgeWorker.js:254
+PF_ANCHOR = "com.apple/250.pipeline-dispatcher-port"
+PF_RULES_DIR = "/Library/Application Support/pipeline-dispatcher-port"
+PF_RULES_PATH = PF_RULES_DIR + "/pf.rules"
+PF_DAEMON_LABEL = "local.pipeline-dispatcher-port"
+PF_DAEMON_PLIST = "/Library/LaunchDaemons/%s.plist" % PF_DAEMON_LABEL
+PF_DAEMON_LOG = "/var/log/pipeline-dispatcher-port.log"
+PF_FAMILIES = ("inet", "inet6")
+
+
+def pf_rules(port):
+    """The anchor file's text: one refusal per address family, loopback exempt."""
+    lines = ["# Refuse the dispatcher's port on every interface except loopback, IPv4 and IPv6.",
+             "# Loaded into %s at boot by %s." % (PF_ANCHOR, PF_DAEMON_LABEL)]
+    for family in PF_FAMILIES:
+        lines.append("block return in quick on ! lo0 %s proto tcp from any to any port %s"
+                     % (family, port))
+    return "\n".join(lines) + "\n"
+
+
+def pf_plist():
+    """The root LaunchDaemon: at load and at every boot, load the anchor and enable pf."""
+    args = ["/sbin/pfctl", "-E", "-a", PF_ANCHOR, "-f", PF_RULES_PATH]
+    return "\n".join(
+        ['<?xml version="1.0" encoding="UTF-8"?>',
+         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+         '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+         '<plist version="1.0">',
+         "<dict>",
+         "  <key>Label</key>",
+         "  <string>%s</string>" % PF_DAEMON_LABEL,
+         "  <key>ProgramArguments</key>",
+         "  <array>"]
+        + ["    <string>%s</string>" % a for a in args]
+        + ["  </array>",
+           "  <key>RunAtLoad</key>",
+           "  <true/>",
+           "  <key>StandardOutPath</key>",
+           "  <string>%s</string>" % PF_DAEMON_LOG,
+           "  <key>StandardErrorPath</key>",
+           "  <string>%s</string>" % PF_DAEMON_LOG,
+           "</dict>",
+           "</plist>"]) + "\n"
+
+
+def pf_install_commands(port):
+    """The exact commands a person runs, in order, to install, check, load and confirm."""
+    rules, plist = '"%s"' % PF_RULES_PATH, PF_DAEMON_PLIST
+    return (["sudo mkdir -p \"%s\"" % PF_RULES_DIR,
+             "sudo tee %s > /dev/null <<'RULES'" % rules]
+            + pf_rules(port).splitlines()
+            + ["RULES",
+               "sudo /sbin/pfctl -n -a %s -f %s" % (PF_ANCHOR, rules),
+               "sudo tee %s > /dev/null <<'PLIST'" % plist]
+            + pf_plist().splitlines()
+            + ["PLIST",
+               "sudo chown root:wheel %s %s" % (rules, plist),
+               "sudo chmod 644 %s %s" % (rules, plist),
+               "plutil -lint %s" % plist,
+               "sudo launchctl bootstrap system %s" % plist,
+               "sudo /sbin/pfctl -a %s -s rules" % PF_ANCHOR,
+               "sudo /sbin/pfctl -s info | grep Status",
+               "curl -s -m 5 http://127.0.0.1:%s/status" % port])
+
+
+PF_COPY_START = "----- copy from the next line -----"
+PF_COPY_END = "----- to the line above -----"
+
+
+def pf_missing_families(rules_text, port):
+    """The address families with no loaded refusal of `port`, from `pfctl -s rules` output
+    or from the rules file. pfctl prints a port match as `port = N`."""
+    missing = []
+    for family in PF_FAMILIES:
+        pattern = (r"^\s*block\b[^\n]*\bin\b[^\n]*\bquick\b[^\n]*\bon\s+!\s*lo0\s+%s\s+"
+                   r"proto\s+tcp\b[^\n]*\bport\s*=?\s*%s\b" % (family, re.escape(str(port))))
+        if not re.search(pattern, rules_text or "", re.M):
+            missing.append(family)
+    return missing
+
+# --------------------------------------------------------------------------- #
+# Piece 5 — the role account's user-level settings: secret-file read denies, nothing else.
 #
 # REPO_DENY_PATTERNS is this repository's .claude/settings.json `permissions.deny`, read
 # 2026-09-17 and PINNED: the selftest fails the moment the two differ.
@@ -332,7 +453,7 @@ def repo_deny_drift(settings):
 
 
 # --------------------------------------------------------------------------- #
-# Piece 5 — the chat app's Slack manifest.  EXACTLY the scopes and events the dispatcher's
+# Piece 6 — the chat app's Slack manifest.  EXACTLY the scopes and events the dispatcher's
 # own Slack code uses, each cited to its call. `auth.test` needs no scope
 # (slack-event-transport SlackMessageService.js:47-55). Deliberately absent: public-channel
 # and direct-message history and events (the lane is one private channel), token rotation
@@ -425,7 +546,8 @@ class ConfError(Exception):
 # The conf.  Every error in one pass.
 # --------------------------------------------------------------------------- #
 CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE", "FRONT_DOOR_HOST")
-CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN"}
+CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
+                 "DISPATCHER_PORT": DEFAULT_DISPATCHER_PORT}
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 _HOST_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _EXTRA_CRED_PREFIXES = ("xoxp-", "xoxa-", "xoxe", "xapp-")
@@ -485,6 +607,11 @@ def validate_conf(values):
                       % host)
     elif host and not _HOST_RE.match(host):
         errors.append("FRONT_DOOR_HOST %r is not a host name" % host)
+    port = conf.get("DISPATCHER_PORT") or ""
+    if not (port.isdigit() and 1 <= int(port) <= 65535 and not port.startswith("0")):
+        errors.append("DISPATCHER_PORT must be a port number from 1 to 65535, the one the "
+                      "dispatcher listens on: its CYRUS_SERVER_PORT, or 3456 when that is "
+                      "unset (got %r)" % port)
     name = conf.get("NOTIFIER_TOKEN_ENV") or ""
     if not _ENV_NAME_RE.match(name):
         errors.append("NOTIFIER_TOKEN_ENV must be the NAME of an environment variable "
@@ -604,18 +731,36 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "ping. Never add %s to this file." % (conf["NOTIFIER_TOKEN_ENV"],
                                                conf["NOTIFIER_TOKEN_ENV"]))
     say("")
+    say("  DO NOT SET %s OR %s IN THIS FILE." % (", ".join(HOSTED_DO_NOT_SET[:-1]),
+                                               HOSTED_DO_NOT_SET[-1]))
+    para("Any CYRUS_API_KEY at all makes the dispatcher act as paired with the vendor's "
+         "hosted service. It then gives sessions a log_failure_mode tool "
+         "(EdgeWorker.js:4016-4027, 4142-4147; cyrus-tools/index.js:636-642), and every "
+         "session's prompt tells it to use it (RunnerConfigBuilder.js:87, 207; "
+         "failureModePromptAddendum.js:21-27). That tool sends the session id, a recap, a "
+         "quote from the conversation, the failure text, the ticket id and the workspace "
+         "path to https://app.atcyrus.com/api/failure-modes (failure-modes-http-client.js:"
+         "4-35; ConfigApiClient.js:5-12), from the dispatcher's own unsandboxed process. "
+         "There is no opt-out except leaving the key unset. With CYRUS_TEAM_ID as well, "
+         "whole session transcripts go there too (EdgeWorker.js:152-173). CYRUS_APP_URL "
+         "only changes where they go. `verify` checks the first two are absent, by name.")
+    para("What leaving the key unset costs, accepted: any process already running on this "
+         "machine can call the dispatcher's tool server, whose auth check passes everything "
+         "while no key is set. It needs a live session's id to do anything "
+         "(McpConfigService.js:166-181). Piece 4 keeps the rest of the network out.")
+    say("")
     say("  WHAT CYRUS_HOST_EXTERNAL=true CHANGES — EVERY EFFECT, NOT ONLY THE HMAC CHECK")
     effects = (
         "1. Slack requests are HMAC-checked with SLACK_SIGNING_SECRET (EdgeWorker.js:730-752). "
         "This is re-read per request, so it switches on without a restart "
         "(SlackEventTransport.js:65-80).",
-        "2. NOT IN THE ACCEPTED RESIDUALS. The dispatcher's web server listens on EVERY "
-        "network interface instead of this machine only (WorkerService.js:149, 191; "
-        "EdgeWorker.js:254-257). Every route is then reachable from the local network "
-        "without the front door: the config-update routes, the tool server at "
-        "/mcp/cyrus-tools, whose auth check passes everything when CYRUS_API_KEY is unset "
-        "(McpConfigService.js:166-170), /status and every webhook. Read at start only. "
-        "Card CK-C2 has the check.",
+        "2. The dispatcher's web server listens on EVERY network interface instead of this "
+        "machine only (WorkerService.js:149, 191; EdgeWorker.js:254-257). Every route is "
+        "then reachable from the local network without the front door: the config-update "
+        "routes, the tool server at /mcp/cyrus-tools, whose auth check passes everything "
+        "while CYRUS_API_KEY is unset (McpConfigService.js:166-170), /status and every "
+        "webhook. Read at start only. CLOSED BY PIECE 4 once it is loaded and card CK-C4 "
+        "passes; open until then.",
         "3. Webhook source-address checks turn on (EdgeWorker.js:241-252) unless "
         "WEBHOOK_IP_VALIDATION=false, and the dispatcher fetches GitHub's address list from "
         "api.github.com at start (EdgeWorker.js:411-416). The tracker webhook is checked "
@@ -635,7 +780,50 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
     say("")
 
     # -- Piece 4 -------------------------------------------------------------
-    say("PIECE 4 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES ONLY")
+    port = conf["DISPATCHER_PORT"]
+    say("PIECE 4 — BLOCK THE DISPATCHER'S PORT FROM THE NETWORK (load it BEFORE piece 3)")
+    para("Why: CYRUS_HOST_EXTERNAL=true makes the dispatcher listen on every network "
+         "interface (piece 3, effect 2). This packet-filter rule refuses port %s on every "
+         "interface except loopback, in both address families. The front door is "
+         "unaffected: it connects locally. The port is DISPATCHER_PORT in your conf, and it "
+         "must be the port the dispatcher reads from CYRUS_SERVER_PORT, 3456 when that is "
+         "unset (WorkerService.js:190; config/constants.js:7). `verify` compares the two "
+         "without reading the value." % port)
+    para("Not the application firewall: it does not close a port that a signed app already "
+         "holds (measured on a deployment; KIT-117, owner decision of 2026-09-17).")
+    para("Where it lives: not in /etc/pf.conf, which a macOS update can reset. macOS's own "
+         "/etc/pf.conf already evaluates every anchor under com.apple (line 26 of the file "
+         "macOS 26.6.2 ships: anchor \"com.apple/*\"; pf.conf(5): an anchor ending in /* "
+         "evaluates every anchor attached there). The rule loads into its own anchor, %s, "
+         "from %s, by a root LaunchDaemon at boot that also enables pf (pfctl -E). With -a, "
+         "pfctl -f loads only that anchor and leaves the main ruleset alone (pfctl(8)). "
+         "Check your /etc/pf.conf still has that line first:" % (PF_ANCHOR, PF_RULES_PATH))
+    say("    grep -n 'anchor \"com.apple/\\*\"' /etc/pf.conf")
+    para("IPv6: the dispatcher hands 0.0.0.0 to Fastify's listen (SharedApplicationServer.js:"
+         "75-78), which Fastify documents as all IPv4 addresses only. So IPv6 should not "
+         "answer today. The rule refuses IPv6 too, in case the listen address ever changes.")
+    say("")
+    para("Run these in order in a terminal on this machine, and stop at the first error. "
+         "They are printed flush left on purpose: a heredoc's closing word must start its "
+         "line, and a plist may not start with a space.")
+    say("")
+    say(PF_COPY_START)
+    for line in pf_install_commands(port):
+        say(line)
+    say(PF_COPY_END)
+    say("")
+    para("Good: the rules command prints two block lines, one inet and one inet6, for port "
+         "%s; the info command prints \"Status: Enabled\"; the curl on 127.0.0.1 answers "
+         "with a JSON status." % port)
+    para("Not that: no rules, or \"Status: Disabled\". Stop there, and do NOT set "
+         "CYRUS_HOST_EXTERNAL in piece 3 until both are right.")
+    para("After piece 3's restart, card CK-C4 proves the rule from a second device on the "
+         "same network. A test from this machine to its own network address proves "
+         "nothing.")
+    say("")
+
+    # -- Piece 5 -------------------------------------------------------------
+    say("PIECE 5 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES ONLY")
     para("Where: ~/.claude/settings.json in %s's home. A chat session loads user, project "
          "and local settings (ClaudeRunner.js:499), and its folder is not a project "
          "(ChatSessionHandler.js:427-432), so this is the only settings file it gets. "
@@ -659,8 +847,8 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "loads user settings (ClaudeRunner.js:499).")
     say("")
 
-    # -- Piece 5 -------------------------------------------------------------
-    say("PIECE 5 — THE CHAT APP'S SLACK MANIFEST (a SECOND app; the notifier keeps its own)")
+    # -- Piece 6 -------------------------------------------------------------
+    say("PIECE 6 — THE CHAT APP'S SLACK MANIFEST (a SECOND app; the notifier keeps its own)")
     para("Slack: Create New App -> From a manifest -> paste this. Card CK-C1 walks it.")
     say("")
     for line in json.dumps(slack_manifest(conf), indent=2).splitlines():
@@ -683,31 +871,34 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "the app.")
     say("")
 
-    # -- Piece 6 -------------------------------------------------------------
-    say("PIECE 6 — THE FRONT DOOR")
+    # -- Piece 7 -------------------------------------------------------------
+    say("PIECE 7 — THE FRONT DOOR")
     para("The reverse proxy's path allowlist gains /slack-webhook, and nothing else. "
-         "Slack's request URL is then https://%s/slack-webhook. Card CK-C2 walks it, with "
-         "the check that the dispatcher's own port does not answer the local network."
+         "Slack's request URL is then https://%s/slack-webhook. Card CK-C2 walks it."
          % conf["FRONT_DOOR_HOST"])
     say("")
 
     # -- Order ---------------------------------------------------------------
-    say("THE ORDER — so no session ever holds the chat token before the fence is in")
+    say("THE ORDER — the fence before the token, the port block before the listen")
     steps = (
         "1. Confirm the Slack workspace has one member.",
         "2. Piece 2, then piece 1, in the dispatcher config.",
-        "3. Piece 4, in the role account's user settings.",
-        "4. Card CK-C1: create the chat app from piece 5 and install it.",
-        "5. Piece 3, then restart the dispatcher when no session is in flight. "
+        "3. Piece 5, in the role account's user settings.",
+        "4. Piece 4: install and load the port block. Go on only when pfctl shows both "
+        "rules and \"Status: Enabled\" — the next restart makes the dispatcher listen on "
+        "every interface.",
+        "5. Card CK-C1: create the chat app from piece 6 and install it.",
+        "6. Piece 3, then restart the dispatcher when no session is in flight. "
         "slackAllowedTools reloads live (ConfigManager.js:51-62, 181), but the listening "
         "address and address checks are read at start only, and a removed env name stays "
         "set until a restart (Application.js:54). Restart on purpose, now, not at the next "
         "reboot.",
-        "6. Piece 6 and card CK-C2: the front door, and the port check.",
-        "7. In the Slack app, retry the request URL under Event Subscriptions. Make a "
+        "7. Card CK-C4, from a second device: the port refuses the network.",
+        "8. Piece 7 and card CK-C2: the front door.",
+        "9. In the Slack app, retry the request URL under Event Subscriptions. Make a "
         "private channel and invite the bot.",
-        "8. python3 %s verify" % _self_path(),
-        "9. Card CK-C3: the live check, in the channel.",
+        "10. python3 %s verify" % _self_path(),
+        "11. Card CK-C3: the live check, in the channel.",
     )
     for step in steps:
         para(step, "  ")
@@ -725,7 +916,7 @@ CARDS = {
                 "wants none. It is a SECOND app: the notifier keeps its own app and token, so "
                 "the token every dispatcher session can read is never the notifier's."),
         "do": ["Check the workspace has exactly one member: you.",
-               "Print the manifest (piece 5):",
+               "Print the manifest (piece 6):",
                "    python3 scripts/pipeline_chat_lane_setup.py compose",
                "In Slack's app settings: Create New App -> From a manifest -> choose the",
                "workspace -> paste the JSON. The request URL is",
@@ -736,16 +927,14 @@ CARDS = {
                "    SLACK_BOT_TOKEN       <- OAuth & Permissions: Bot User OAuth Token",
                "    SLACK_SIGNING_SECRET  <- Basic Information: Signing Secret",
                "Never paste either into a chat, a ticket, a pull request or a repository."],
-        "good": ("an app with exactly the four bot scopes of piece 5, no user scopes, and "
+        "good": ("an app with exactly the four bot scopes of piece 6, no user scopes, and "
                  "the two names in the dispatcher's env file"),
         "not": "the notifier's token under SLACK_BOT_TOKEN — every session could read it",
     },
     "CK-C2": {
-        "title": "Open the front door for one path, and check the port behind it",
-        "why": ("The reverse proxy lives outside this repository. And CYRUS_HOST_EXTERNAL=true "
-                "makes the dispatcher listen on every network interface at its next start, "
-                "which nothing here can measure. The door only protects the dispatcher if "
-                "the port behind it does not answer the network directly."),
+        "title": "Open the front door for one path",
+        "why": ("The reverse proxy lives outside this repository, so nothing here can measure "
+                "its path allowlist. The port behind it is card CK-C4's: do that one first."),
         "do": ["Add /slack-webhook to the proxy's path allowlist. Nothing else.",
                "From anywhere, ask the door for the new path with no signature:",
                "    curl -s -o /dev/null -w '%{http_code}\\n' -X POST \\",
@@ -753,15 +942,34 @@ CARDS = {
                "Good: 401. Not that: 404 or a timeout — the path is not reaching it.",
                "Ask the door for a path it must still refuse:",
                "    curl -s -m 5 https://${FRONT_DOOR_HOST}/status",
-               "Good: the proxy's refusal. Not that: a JSON status — the door is too wide.",
-               "From ANOTHER device on the same network, after the restart, try the",
-               "dispatcher's port on this machine's network address (3456 unless",
-               "CYRUS_SERVER_PORT says otherwise). Never test 127.0.0.1:",
-               "    curl -s -m 5 http://<this machine's network address>:3456/status",
-               "Good: no answer. Not that: a JSON status — the dispatcher answers the",
-               "network past the door. Stop and decide before going further."],
-        "good": "401 on /slack-webhook, refused on /status, and no answer on the port",
-        "not": "the port answering another device — every route is open past the door",
+               "Good: the proxy's refusal. Not that: a JSON status — the door is too wide."],
+        "good": "401 on /slack-webhook, and refused on /status",
+        "not": "a JSON status through the door — it lets more than one path through",
+    },
+    "CK-C4": {
+        "title": "Prove the dispatcher's port is closed, from a second device",
+        "why": ("The port block only counts once something outside this machine is refused. "
+                "A connection from this machine to its own network address never crosses "
+                "the network, so it proves nothing either way. It needs a second device on "
+                "the same network, after the restart that turns CYRUS_HOST_EXTERNAL on — "
+                "before that, the dispatcher listens on this machine only, and every test "
+                "passes for the wrong reason."),
+        "do": ["On THIS machine, find its network address (en1 if en0 prints nothing):",
+               "    ipconfig getifaddr en0",
+               "On THIS machine, check the dispatcher answers locally:",
+               "    curl -s -m 5 http://127.0.0.1:${DISPATCHER_PORT}/status",
+               "Good: a JSON status. Not that: nothing — the dispatcher is not running.",
+               "On a SECOND device on the same network (another computer, or a phone",
+               "with a terminal app), ask for the same page at that address:",
+               "    curl -s -m 5 http://<this machine's network address>:${DISPATCHER_PORT}/status",
+               "Good: \"Connection refused\", or a timeout after 5 seconds.",
+               "Not that: a JSON status — the port is open to the network. Remove",
+               "CYRUS_HOST_EXTERNAL from the dispatcher's env file, restart the dispatcher,",
+               "and fix piece 4 before anything else.",
+               "After the next reboot, run both checks again: the rule is loaded at boot."],
+        "good": ("a JSON status from 127.0.0.1 on this machine, and refused or timed out "
+                 "from the second device"),
+        "not": "a JSON status on the second device — every route is open past the door",
     },
     "CK-C3": {
         "title": "Ask the bot, in the private channel, what it holds",
@@ -929,7 +1137,7 @@ def env(path):
             text = fh.read()
     except Exception as exc:
         return {"error": why(exc)}
-    seen, external = {}, None
+    seen, external, port = {}, None, None
     for line in text.splitlines():
         m = LINE.match(line)
         if not m:
@@ -938,10 +1146,16 @@ def env(path):
         seen[m.group(1)] = bool(value)
         if m.group(1) == "CYRUS_HOST_EXTERNAL":
             external = value.strip().lower() == "true"
+        if m.group(1) == "CYRUS_SERVER_PORT":
+            digits = re.match(r"^\s*(\d+)", value)
+            port = int(digits.group(1)) if digits else 0
         value = None
+    # The dispatcher's parsePort: unset, unparseable or out of range means 3456.
+    live_port = port if port and 1 <= port <= 65535 else 3456
     return {"names": sorted(k for k, v in seen.items() if v),
             "empty": sorted(k for k, v in seen.items() if not v),
-            "hostExternalTrue": external}
+            "hostExternalTrue": external,
+            "serverPortMatches": live_port == int(sys.argv[3])}
 
 def user_settings():
     path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
@@ -963,9 +1177,27 @@ print(json.dumps({"config": config(sys.argv[1]), "env": env(sys.argv[2]),
 
 def facts_command(conf):
     """The /bin/sh script `as_role` runs. Paths are arguments, never spliced into code."""
-    return "/usr/bin/python3 -c %s %s %s" % (shlex.quote(FACTS_PY),
-                                             shlex.quote(conf["DISPATCHER_CONFIG"]),
-                                             shlex.quote(conf["DISPATCHER_ENV_FILE"]))
+    return "/usr/bin/python3 -c %s %s %s %s" % (shlex.quote(FACTS_PY),
+                                                shlex.quote(conf["DISPATCHER_CONFIG"]),
+                                                shlex.quote(conf["DISPATCHER_ENV_FILE"]),
+                                                shlex.quote(conf["DISPATCHER_PORT"]))
+
+
+# The root reads `verify` makes for the port block — the Stage E installer's `as_root`
+# helper — and the two world-readable files it cats. Every one only reads: `-s` shows,
+# and pfctl(8)'s load, enable, flush and release flags (-f, -E, -e, -F, -X) never appear.
+PF_READ_RULES = ["/sbin/pfctl", "-a", PF_ANCHOR, "-s", "rules"]
+PF_READ_INFO = ["/sbin/pfctl", "-s", "info"]
+
+
+def pf_probe(runner):
+    """Four read-only answers. Nothing here parses them; `check_port_block` does."""
+    def answer(res):
+        return {"rc": res.rc, "out": res.out, "err": (res.err or "").strip()[:160]}
+    return {"rules": answer(runner.as_root(PF_READ_RULES)),
+            "info": answer(runner.as_root(PF_READ_INFO)),
+            "plist": answer(runner.read(["/bin/cat", PF_DAEMON_PLIST])),
+            "rulesFile": answer(runner.read(["/bin/cat", PF_RULES_PATH]))}
 
 
 def _row(check, outcome, detail, lines=()):
@@ -1127,6 +1359,88 @@ def check_notifier_absent(conf, env_facts):
                 "the dispatcher env file does not set %s" % name)
 
 
+def check_hosted_keys_absent(env_facts):
+    err = env_facts.get("error")
+    if err == "missing":
+        return _row("hosted-keys-absent", ALREADY_DONE,
+                    "no dispatcher env file, so neither %s is in it"
+                    % " nor ".join(HOSTED_PAIRING_NAMES))
+    if err:
+        return _row("hosted-keys-absent", UNKNOWN, "the env file is %s" % err)
+    present_names = set(env_facts.get("names") or []) | set(env_facts.get("empty") or [])
+    found = [n for n in HOSTED_PAIRING_NAMES if n in present_names]
+    if found:
+        return _row("hosted-keys-absent", BLOCKED,
+                    "the dispatcher env file sets %s. Any CYRUS_API_KEY pairs the dispatcher "
+                    "with the vendor's hosted service, and log_failure_mode then sends "
+                    "session recaps and conversation quotes there (EdgeWorker.js:4016-4027); "
+                    "with CYRUS_TEAM_ID, whole transcripts (EdgeWorker.js:152-173). Delete "
+                    "the line, and restart: a reload does not unset a name "
+                    "(Application.js:54)" % " and ".join(found))
+    return _row("hosted-keys-absent", ALREADY_DONE,
+                "the dispatcher env file sets neither %s (checked by name)"
+                % " nor ".join(HOSTED_PAIRING_NAMES))
+
+
+def check_port_block(conf, pf, env_facts):
+    """The anchor holds both refusals, pf is enabled, and the boot files are installed."""
+    port = conf["DISPATCHER_PORT"]
+    problems, unknown = [], []
+    rules = pf.get("rules") or {}
+    if rules.get("rc") == 0:
+        missing = pf_missing_families(rules.get("out"), port)
+        if missing:
+            problems.append("the anchor %s does not refuse port %s for %s: `sudo pfctl -a %s "
+                            "-s rules` shows no such block rule. Load piece 4, and do not set "
+                            "CYRUS_HOST_EXTERNAL until it shows"
+                            % (PF_ANCHOR, port, " and ".join(missing), PF_ANCHOR))
+    elif re.search(r"does not exist|No such|Invalid argument", rules.get("err") or "", re.I):
+        problems.append("the anchor %s is not loaded (pfctl: %s)" % (PF_ANCHOR, rules["err"]))
+    else:
+        unknown.append("pfctl could not show the anchor's rules (exit %s: %s)"
+                       % (rules.get("rc"), rules.get("err")))
+    info = pf.get("info") or {}
+    if info.get("rc") == 0:
+        if not re.search(r"^Status:\s*Enabled\b", info.get("out") or "", re.M):
+            problems.append("pf is not enabled (`sudo pfctl -s info` does not say "
+                            "\"Status: Enabled\"), so no rule applies")
+    else:
+        unknown.append("pfctl could not show pf's status (exit %s: %s)"
+                       % (info.get("rc"), info.get("err")))
+    plist = pf.get("plist") or {}
+    if plist.get("rc") != 0:
+        problems.append("the boot LaunchDaemon is not installed at %s, so a reboot drops the "
+                        "rule" % PF_DAEMON_PLIST)
+    else:
+        text = plist.get("out") or ""
+        lacks = [part for part in (PF_ANCHOR, PF_RULES_PATH, "<string>-E</string>",
+                                   "<key>RunAtLoad</key>") if part not in text]
+        if lacks:
+            problems.append("%s does not carry %s, so it would not load the rule at boot"
+                            % (PF_DAEMON_PLIST, ", ".join(lacks)))
+    rules_file = pf.get("rulesFile") or {}
+    if rules_file.get("rc") != 0:
+        problems.append("the rules file is not installed at %s, so a reboot loads nothing"
+                        % PF_RULES_PATH)
+    else:
+        missing = pf_missing_families(rules_file.get("out"), port)
+        if missing:
+            problems.append("%s does not refuse port %s for %s"
+                            % (PF_RULES_PATH, port, " and ".join(missing)))
+    if env_facts and not env_facts.get("error") and env_facts.get("serverPortMatches") is False:
+        problems.append("the dispatcher does not listen on DISPATCHER_PORT %s: its env file "
+                        "sets CYRUS_SERVER_PORT to another port (value compared, not shown). "
+                        "The rule guards the wrong port" % port)
+    if problems:
+        return _problem_row("port-block", BLOCKED, problems, unknown)
+    if unknown:
+        return _problem_row("port-block", UNKNOWN, unknown)
+    return _row("port-block", ALREADY_DONE,
+                "%s refuses port %s for inet and inet6 off loopback, pf is enabled, and the "
+                "boot files are installed. Card CK-C4 is the proof from the network"
+                % (PF_ANCHOR, port))
+
+
 def check_user_settings(conf, us, env_facts):
     wanted = user_deny_patterns(conf)
     names = set((env_facts or {}).get("names") or [])
@@ -1138,7 +1452,7 @@ def check_user_settings(conf, us, env_facts):
     err = us.get("error")
     if err == "missing":
         return _row("user-settings", BLOCKED, "no user settings file at %s" % path,
-                    ["compose piece 4 has the block to merge"])
+                    ["compose piece 5 has the block to merge"])
     if err and err.startswith("unparseable"):
         return _row("user-settings", FAILED, "%s is %s" % (path, err))
     if err:
@@ -1152,21 +1466,36 @@ def check_user_settings(conf, us, env_facts):
                 "%s carries every composed deny rule" % path)
 
 
-def evaluate(facts, conf):
-    cfg = facts.get("config") or {"error": "missing"}
-    env_facts = facts.get("env") or {"error": "missing"}
-    us = facts.get("userSettings") or {"error": "missing"}
+CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env",
+          "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings")
+
+
+def evaluate(facts, conf, pf=None):
+    """One row per CHECKS entry, in that order. `facts` is None when the role-account
+    probe did not run; `pf` is None when the root reads were not made."""
     rows = []
-    if cfg.get("error"):
-        rows.extend(_config_unmeasured(cfg, ("grant", "coding-fence", "chat-mcp-configs")))
+    if facts is None:
+        rows.extend(_row(c, UNKNOWN, "the read-only probe as the role account did not run")
+                    for c in CHECKS if c != "port-block")
+        env_facts = None
     else:
-        rows.append(check_grant(cfg))
-        rows.append(check_fence(cfg, env_facts))
-        rows.append(check_chat_mcp(cfg))
-    rows.append(check_env(conf, env_facts))
-    rows.append(check_notifier_absent(conf, env_facts))
-    rows.append(check_user_settings(conf, us, env_facts))
-    return rows
+        cfg = facts.get("config") or {"error": "missing"}
+        env_facts = facts.get("env") or {"error": "missing"}
+        us = facts.get("userSettings") or {"error": "missing"}
+        if cfg.get("error"):
+            rows.extend(_config_unmeasured(cfg, ("grant", "coding-fence", "chat-mcp-configs")))
+        else:
+            rows.append(check_grant(cfg))
+            rows.append(check_fence(cfg, env_facts))
+            rows.append(check_chat_mcp(cfg))
+        rows.append(check_env(conf, env_facts))
+        rows.append(check_notifier_absent(conf, env_facts))
+        rows.append(check_hosted_keys_absent(env_facts))
+        rows.append(check_user_settings(conf, us, env_facts))
+    rows.append(check_port_block(conf, pf, env_facts) if pf is not None else
+                _row("port-block", UNKNOWN, "the root reads of pf were not made"))
+    order = {c: i for i, c in enumerate(CHECKS)}
+    return sorted(rows, key=lambda r: order.get(r["check"], len(CHECKS)))
 
 
 _SEVERITY = (FAILED, UNKNOWN, BLOCKED, ALREADY_DONE)
@@ -1199,9 +1528,10 @@ def cmd_verify(conf, runner, sudo):
     account = conf["ROLE_ACCOUNT"]
     say("Chat lane verify — read-only. It reads the dispatcher config, its env file and the")
     say("user settings as %s, through one program that prints names and tool lists and" % account)
-    say("never a value. Your login password may be asked for, once.")
-    sudo.acquire("`verify` reads three files as the %s role account. It changes nothing."
-                 % account, "verify")
+    say("never a value, and asks pf, as root, what it has loaded. Your login password may be")
+    say("asked for, once.")
+    sudo.acquire("`verify` reads three files as the %s role account and asks pf, as root, "
+                 "which rules it holds. It changes nothing." % account, "verify")
     res = runner.as_role(account, facts_command(conf))
     facts = None
     if res.ok:
@@ -1209,14 +1539,13 @@ def cmd_verify(conf, runner, sudo):
             facts = json.loads(res.out)
         except ValueError:
             facts = None
+    rows = evaluate(facts, conf, pf_probe(runner))
     if facts is None:
         why = ("exit %d: %s" % (res.rc, (res.err or "").strip()[:160]) if not res.ok
                else "its output was not JSON")
-        rows = [_row(c, UNKNOWN, "the read-only probe as %s did not run (%s)" % (account, why))
-                for c in ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env",
-                          "notifier-token-absent", "user-settings")]
-    else:
-        rows = evaluate(facts, conf)
+        for r in rows:
+            if r["outcome"] == UNKNOWN and r["check"] != "port-block":
+                r["detail"] = "the read-only probe as %s did not run (%s)" % (account, why)
     say("")
     say("-- checks --")
     for r in rows:
@@ -1238,8 +1567,9 @@ def cmd_verify(conf, runner, sudo):
     code = worst_exit(rows)
     say("")
     say("No drift: every check measures as applied." if code == EX_OK else
-        "Not clean (exit %d). Apply what the rows name, then run verify again. The front door "
-        "and the Slack workspace are cards: CK-C1, CK-C2, CK-C3." % code)
+        "Not clean (exit %d). Apply what the rows name, then run verify again." % code)
+    say("Not measured from here, so they are cards: the Slack app (CK-C1), the front door "
+        "(CK-C2), the live session (CK-C3) and the port from a second device (CK-C4).")
     return code
 
 
@@ -1297,11 +1627,13 @@ def main(argv=None, runner=None, sudo=None):
 # Everything above this line is scanned for write and merge tokens by the selftest.
 SELFTEST_SENTINEL = "# ----------------------------- SELFTEST BELOW"
 
-# Tokens the part above may never hold: a content write of any kind, and any merge,
-# approve, protected-label or ticket-state path.  # banned-token-list
+# Tokens the part above may never hold: a content write of any kind from THIS process, and
+# any merge, approve, protected-label or ticket-state path.  # banned-token-list
+# Shell writes (`sudo tee …`) are not scanned for: piece 4 PRINTS them for a person. What
+# this file itself RUNS is pinned instead, by the argv allowlist in the selftest.
 WRITE_TOKENS = ('"w"', "'w'", '"a"', "'a'", '"x"', "'x'", '"w+"', '"r+"',  # banned-token-list
                 "json.dump(", "write_text", "os.replace", "os.rename",  # banned-token-list
-                "shutil", "why=", ".write(", "sed -i", "tee ", "os.remove")  # banned-token-list
+                "shutil", "why=", ".write(", "os.remove")  # banned-token-list
 FORBIDDEN_TOKENS = ("pr merge", "--squash", "--auto", "pr review", "--approve",  # banned-token-list
                     "APPROVE", "--add-label", "--remove-label", "/labels",  # banned-token-list
                     "issues/", "/merge", "enable-auto-merge", "issueUpdate",  # banned-token-list
@@ -1310,17 +1642,45 @@ _BANNED_MARK = "banned-token-list"
 
 
 class _FakeRunner(Runner):
-    """Answers the probe with scripted output; records every write."""
+    """Answers each command from a table of (needle, rc, out, err): the first needle found
+    in the joined argv wins. Records every argv it was asked to run, and every write."""
 
-    def __init__(self, rc=0, out="", err=""):
+    def __init__(self, answers=(), default=(1, "", "FakeRunner: nothing scripted")):
         Runner.__init__(self, dry_run=True)
-        self.answer = (rc, out, err)
+        self.answers = list(answers)
+        self.default = default
         self.argvs = []
 
     def _exec(self, argv, stdin, timeout):
         from pipeline_stage_e_setup import Result
-        self.argvs.append(argv)
-        return Result(*self.answer)
+        self.argvs.append(list(argv))
+        line = " ".join(argv)
+        for needle, rc, out, err in self.answers:
+            if needle in line:
+                return Result(rc, out, err)
+        return Result(*self.default)
+
+
+GOOD_PF_RULES_OUT = (
+    "block return in quick on ! lo0 inet proto tcp from any to any port = 3456\n"
+    "block return in quick on ! lo0 inet6 proto tcp from any to any port = 3456\n")
+GOOD_PF_INFO_OUT = "Status: Enabled for 0 days 00:04:12           Debug: Urgent\n"
+
+
+def _pf_answers(rules=None, info=None, plist=None, rules_file=None):
+    """The four read-only pf answers, healthy unless one is overridden."""
+    return [("pfctl -a %s -s rules" % PF_ANCHOR,) + (rules or (0, GOOD_PF_RULES_OUT, "")),
+            ("pfctl -s info",) + (info or (0, GOOD_PF_INFO_OUT, "")),
+            ("/bin/cat %s" % PF_DAEMON_PLIST,) + (plist or (0, pf_plist(), "")),
+            ("/bin/cat %s" % PF_RULES_PATH,) + (rules_file or (0, pf_rules("3456"), ""))]
+
+
+def _argv_allowed(argv, account):
+    """True only for the five reads `verify` may run."""
+    if argv[:6] == ["sudo", "-u", account, "-H", "/bin/sh", "-c"] and len(argv) == 7:
+        return argv[6].startswith("cd / && /usr/bin/python3 -c ")
+    return argv in (["sudo"] + PF_READ_RULES, ["sudo"] + PF_READ_INFO,
+                    ["/bin/cat", PF_DAEMON_PLIST], ["/bin/cat", PF_RULES_PATH])
 
 
 class _FakeSudo(object):
@@ -1358,7 +1718,8 @@ FRONT_DOOR_HOST=chat.example.com
 
 # Distinctive values the fake env file carries. None may appear in any output.
 SENTINELS = ("sentinel-chat-bot-value-4f1c9a", "sentinel-signing-value-83bd20",
-             "sentinel-notifier-value-c07e55", "sentinel-debug-value-19aa3e")
+             "sentinel-notifier-value-c07e55", "sentinel-debug-value-19aa3e",
+             "sentinel-hosted-key-value-5d2e71", "sentinel-hosted-team-value-a90b3c")
 
 
 def selftest():
@@ -1432,6 +1793,94 @@ def _selftest_body():
     expect("compose-front-door", "gains /slack-webhook, and nothing else" in flat)
     expect("compose-deny-limit", "do not stop the upload tool" in flat)
 
+    # piece 4, the port block: between pieces 3 and 5, and complete
+    p3, p4, p5 = out.find("PIECE 3"), out.find("PIECE 4"), out.find("PIECE 5")
+    expect("compose-port-block-between-3-and-5", 0 < p3 < p4 < p5, (p3, p4, p5))
+    piece4 = out[p4:p5]
+    for needle in (PF_ANCHOR, "block return in quick on ! lo0 inet proto tcp from any to any "
+                   "port 3456", "block return in quick on ! lo0 inet6 proto tcp from any to "
+                   "any port 3456", "<string>-E</string>", "<key>RunAtLoad</key>",
+                   "sudo launchctl bootstrap system %s" % PF_DAEMON_PLIST,
+                   "sudo /sbin/pfctl -n -a %s -f" % PF_ANCHOR,
+                   "sudo /sbin/pfctl -a %s -s rules" % PF_ANCHOR, "sudo /sbin/pfctl -s info",
+                   "curl -s -m 5 http://127.0.0.1:3456/status"):
+        expect("compose-port-block:" + needle[:40], needle in piece4, needle)
+    flat4 = " ".join(piece4.split())
+    for needle in ("Not the application firewall", "anchor \"com.apple/*\"", "IPv6",
+                   "CYRUS_SERVER_PORT", "card CK-C4"):
+        expect("compose-port-block-says:" + needle, needle in flat4, needle)
+    order_at = out.find("THE ORDER")
+    load_step = out.find("Piece 4: install and load the port block", order_at)
+    restart_step = out.find("Piece 3, then restart", order_at)
+    c4_step = out.find("Card CK-C4", order_at)
+    expect("order-port-block-before-restart", order_at < load_step < restart_step < c4_step,
+           (load_step, restart_step, c4_step))
+    expect("compose-do-not-hosted", "DO NOT SET CYRUS_API_KEY, CYRUS_TEAM_ID OR CYRUS_APP_URL"
+           in flat and "app.atcyrus.com/api/failure-modes" in flat
+           and "McpConfigService.js:166-181" in flat, "piece 3 lacks the hosted-service DO NOT")
+    # the printed block is what a person pastes: parse it as a shell would see it
+    lines4 = piece4.splitlines()
+    try:
+        block = lines4[lines4.index(PF_COPY_START) + 1:lines4.index(PF_COPY_END)]
+    except ValueError:
+        block = []
+    expect("pf-block-delimited", block and block == pf_install_commands("3456"), block[:3])
+
+    def between(start, end):
+        try:
+            i = block.index(start)
+            return "\n".join(block[i + 1:block.index(end, i + 1)]) + "\n"
+        except ValueError:
+            return None
+    rules_heredoc = [l for l in block if l.endswith("<<'RULES'")]
+    plist_heredoc = [l for l in block if l.endswith("<<'PLIST'")]
+    expect("pf-heredoc-rules-exact", rules_heredoc and between(rules_heredoc[0], "RULES")
+           == pf_rules("3456"), between(rules_heredoc[0], "RULES") if rules_heredoc else None)
+    expect("pf-heredoc-plist-exact", plist_heredoc and between(plist_heredoc[0], "PLIST")
+           == pf_plist())
+    expect("pf-block-flush-left", all(l == l.lstrip() or l.startswith("  <")
+                                      or l.startswith("    <") for l in block)
+           and "RULES" in block and "PLIST" in block and block[block.index("PLIST") - 1]
+           == "</plist>", [l for l in block if l != l.lstrip()][:3])
+    try:
+        shell_check = subprocess.run(["/bin/bash", "-n"], input="\n".join(block) + "\n",
+                                     capture_output=True, text=True, timeout=10)
+        expect("pf-block-bash-syntax", shell_check.returncode == 0, shell_check.stderr[-300:])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        expect("pf-block-bash-syntax", False, "bash -n could not run: %s" % exc)
+    rules_text, plist_text = pf_rules("3456"), pf_plist()
+    expect("pf-rules-parse-own", pf_missing_families(rules_text, "3456") == [], rules_text)
+    expect("pf-rules-parse-pfctl-form", pf_missing_families(GOOD_PF_RULES_OUT, "3456") == [])
+    for label, mutant, want in (
+            ("empty", "", ["inet", "inet6"]),
+            ("inet-only", GOOD_PF_RULES_OUT.splitlines()[0], ["inet6"]),
+            ("wrong-port", GOOD_PF_RULES_OUT.replace("3456", "34567"), ["inet", "inet6"]),
+            ("not-quick", GOOD_PF_RULES_OUT.replace(" quick", ""), ["inet", "inet6"]),
+            ("lo0-not-negated", GOOD_PF_RULES_OUT.replace("! lo0", "lo0"), ["inet", "inet6"]),
+            ("pass-not-block", GOOD_PF_RULES_OUT.replace("block return", "pass"),
+             ["inet", "inet6"]),
+            ("commented", "\n".join("# " + l for l in GOOD_PF_RULES_OUT.splitlines()),
+             ["inet", "inet6"])):
+        expect("pf-rules-mutant-" + label, pf_missing_families(mutant, "3456") == want,
+               pf_missing_families(mutant, "3456"))
+    import plistlib
+    try:
+        parsed = plistlib.loads(plist_text.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — any parse failure is the finding
+        parsed = {"error": str(exc)}
+    expect("pf-plist-parses", parsed.get("Label") == PF_DAEMON_LABEL
+           and parsed.get("ProgramArguments") == ["/sbin/pfctl", "-E", "-a", PF_ANCHOR,
+                                                  "-f", PF_RULES_PATH]
+           and parsed.get("RunAtLoad") is True, parsed)
+    expect("pf-anchor-under-com-apple", PF_ANCHOR.startswith("com.apple/")
+           and "/" not in PF_ANCHOR[len("com.apple/"):], PF_ANCHOR)
+    conf_4567, errs_4567 = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0],
+                                              DISPATCHER_PORT="4567"))
+    _rc, out_4567 = _capture(cmd_compose, conf_4567)
+    expect("compose-port-from-conf", not errs_4567 and "port 4567" in out_4567
+           and "127.0.0.1:4567" in out_4567 and "port 3456" not in out_4567, errs_4567)
+    expect("conf-port-default", conf.get("DISPATCHER_PORT") == "3456", conf)
+
     # -- 3. the effective list keeps an inherited default and adds the rules ---
     default = ["Bash(rm -rf *)", "WebFetch"]
     composed, missing, source = fence_entry(None, default)
@@ -1494,6 +1943,7 @@ def _selftest_body():
            "DISPATCHER_ENV_FILE=\n"
            "FRONT_DOOR_HOST=https://chat.example.com/slack-webhook\n"
            "NOTIFIER_TOKEN_ENV=SLACK_BOT_TOKEN\n"
+           "DISPATCHER_PORT=99999\n"
            "SURPRISE=1\n"
            "no equals sign here\n")
     values, perrs = parse_conf(bad)
@@ -1502,8 +1952,8 @@ def _selftest_body():
     for needle in ("duplicate key ROLE_ACCOUNT", "not a local account name",
                    "DISPATCHER_CONFIG must be an absolute path",
                    "DISPATCHER_ENV_FILE is required", "host name only",
-                   "a name the dispatcher itself reads", "unknown key SURPRISE",
-                   "not KEY=value"):
+                   "a name the dispatcher itself reads", "DISPATCHER_PORT must be a port",
+                   "unknown key SURPRISE", "not KEY=value"):
         expect("conf-all-errors:" + needle, any(needle in e for e in allerrs), allerrs)
     _v, cerrs = parse_conf("FRONT_DOOR_HOST=xoxb-%s\n" % ("1" * 12))
     expect("conf-credential-shape", any("CREDENTIAL SHAPE" in e for e in cerrs)
@@ -1512,7 +1962,7 @@ def _selftest_body():
         cpath = os.path.join(tmp, "chat-lane.conf")
         _put(cpath, bad)
         rc_bad, out_bad = _capture(main, ["compose", "--conf", cpath])
-        expect("conf-errors-exit-2", rc_bad == EX_USAGE and out_bad.count("\n  - ") >= 8,
+        expect("conf-errors-exit-2", rc_bad == EX_USAGE and out_bad.count("\n  - ") >= 9,
                (rc_bad, out_bad))
 
     # -- 6/7. verify against fake configs, through the REAL probe --------------
@@ -1561,7 +2011,8 @@ def _selftest_body():
                     os.unlink(spath)
             else:
                 _put(spath, settings_text)
-            ran = subprocess.run([sys.executable, "-c", FACTS_PY, cfg_path, env_path],
+            ran = subprocess.run([sys.executable, "-c", FACTS_PY, cfg_path, env_path,
+                                  vconf["DISPATCHER_PORT"]],
                                  capture_output=True, text=True,
                                  env=dict(os.environ, HOME=home))
             # EVERY probe's whole output is kept for the no-value scan at the end.
@@ -1578,14 +2029,19 @@ def _selftest_body():
                        "JSON line (%d bytes)" % len(ran.stdout))
                 return {}
 
-        def verify_with(ran):
-            fake = _FakeRunner(ran.returncode, ran.stdout, ran.stderr)
+        def verify_with(ran, **pf):
+            fake = _FakeRunner([("/usr/bin/python3 -c", ran.returncode, ran.stdout,
+                                 ran.stderr)] + _pf_answers(**pf))
+            fakes.append(fake)
             sudo = _FakeSudo()
             rc_v, printed = _capture(cmd_verify, vconf, fake, sudo)
             outputs.append(printed)
             return rc_v, printed, fake, sudo
 
-        outputs = []
+        def port_row(printed_rc_fake):
+            return re.search(r"port-block\s+(\S+)", printed_rc_fake[1])
+
+        outputs, fakes = [], []
         good_settings = settings_with(user_deny_patterns(vconf) + ["Read(~/.ssh/**)"])
 
         ran = probe(good_config(), good_env(), good_settings)
@@ -1700,6 +2156,57 @@ def _selftest_body():
         expect("verify-notifier-token-present", rc_v == EX_BLOCKED
                and re.search(r"notifier-token-absent\s+BLOCKED-ON-HUMAN", printed), printed)
 
+        # CYRUS_API_KEY and CYRUS_TEAM_ID: each alone turns the check red, by name only
+        for name, sentinel in (("CYRUS_API_KEY", SENTINELS[4]), ("CYRUS_TEAM_ID", SENTINELS[5])):
+            ran = probe(good_config(), good_env() + "%s=%s\n" % (name, sentinel), good_settings)
+            rc_v, printed, _f, _s = verify_with(ran)
+            expect("verify-hosted-key-present:" + name, rc_v == EX_BLOCKED
+                   and re.search(r"hosted-keys-absent\s+BLOCKED-ON-HUMAN", printed)
+                   and name in printed, printed)
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf,
+                        {"rules": {"rc": 0, "out": GOOD_PF_RULES_OUT},
+                         "info": {"rc": 0, "out": GOOD_PF_INFO_OUT},
+                         "plist": {"rc": 0, "out": pf_plist()},
+                         "rulesFile": {"rc": 0, "out": pf_rules("3456")}})
+        expect("verify-hosted-keys-absent-clean",
+               [r for r in rows if r["check"] == "hosted-keys-absent"][0]["outcome"]
+               == ALREADY_DONE and [r["check"] for r in rows] == list(CHECKS),
+               [(r["check"], r["outcome"]) for r in rows])
+
+        # the port block: healthy, then one mutant per way it can be wrong
+        ran = probe(good_config(), good_env(), good_settings)
+        for label, pf, want_row, want_rc, needle in (
+                ("empty-anchor", {"rules": (0, "", "")}, BLOCKED, EX_BLOCKED, "inet and inet6"),
+                ("inet-only", {"rules": (0, GOOD_PF_RULES_OUT.splitlines()[0] + "\n", "")},
+                 BLOCKED, EX_BLOCKED, "for inet6"),
+                ("anchor-absent", {"rules": (1, "", "pfctl: Anchor does not exist.")},
+                 BLOCKED, EX_BLOCKED, "is not loaded"),
+                ("pf-disabled", {"info": (0, "Status: Disabled\n", "")}, BLOCKED, EX_BLOCKED,
+                 "pf is not enabled"),
+                ("plist-missing", {"plist": (1, "", "No such file or directory")}, BLOCKED,
+                 EX_BLOCKED, "is not installed at %s" % PF_DAEMON_PLIST),
+                ("plist-without-E", {"plist": (0, pf_plist().replace(
+                    "<string>-E</string>", ""), "")}, BLOCKED, EX_BLOCKED,
+                 "<string>-E</string>"),
+                ("rules-file-missing", {"rules_file": (1, "", "No such file")}, BLOCKED,
+                 EX_BLOCKED, "rules file is not installed"),
+                ("pfctl-unreadable", {"rules": (1, "", "sudo: a password is required"),
+                                      "info": (1, "", "sudo: a password is required")},
+                 UNKNOWN, EX_UNKNOWN, "could not show")):
+            rc_v, printed, _f, _s = verify_with(ran, **pf)
+            got = port_row((rc_v, printed))
+            expect("verify-port-block-" + label,
+                   rc_v == want_rc and got and got.group(1) == want_row
+                   and needle in " ".join(printed.split()), printed)
+        for port_line, want_row in (("CYRUS_SERVER_PORT=4000\n", BLOCKED),
+                                    ("CYRUS_SERVER_PORT=3456\n", ALREADY_DONE),
+                                    ("CYRUS_SERVER_PORT=not-a-port\n", ALREADY_DONE)):
+            ran_p = probe(good_config(), good_env() + port_line, good_settings)
+            rc_v, printed, _f, _s = verify_with(ran_p)
+            got = port_row((rc_v, printed))
+            expect("verify-port-matches:" + port_line.strip(),
+                   got and got.group(1) == want_row, printed)
+
         # a missing user settings file
         ran = probe(good_config(), good_env(), None)
         rc_v, printed, _f, _s = verify_with(ran)
@@ -1730,9 +2237,20 @@ def _selftest_body():
         outputs.append(printed)
         outputs.append(ran.stdout)
         expect("verify-config-unparseable", rc_v == EX_FAILED, printed)
-        rc_v, printed, _f, _s = _capture_verify_fail(vconf)
+        rc_v, printed, fake_fail, _s = _capture_verify_fail(vconf)
+        fakes.append(fake_fail)
         outputs.append(printed)
         expect("verify-probe-failed-unknown", rc_v == EX_UNKNOWN, printed)
+
+        # every command verify ran, in every case above, is one of its five reads
+        ran_argvs = [a for f in fakes for a in f.argvs]
+        bad_argvs = [a for a in ran_argvs if not _argv_allowed(a, "_exdispatch")]
+        expect("verify-runs-only-reads", ran_argvs and not bad_argvs, bad_argvs[:3])
+        for a in ran_argvs:
+            if a[:1] == ["sudo"] and "/sbin/pfctl" in a:
+                expect("verify-pfctl-read-only", not set(a) & {"-f", "-E", "-e", "-F", "-X"}, a)
+        expect("argv-allowlist-mutant", not _argv_allowed(
+            ["sudo", "/sbin/pfctl", "-a", PF_ANCHOR, "-f", PF_RULES_PATH], "_exdispatch"))
 
         # -- 7. no value from the fake env file, config or settings in any output
         joined = "\n".join(outputs)
@@ -1746,7 +2264,7 @@ def _selftest_body():
     marker = AGENT_ENV_MARKERS[0]
     try:
         os.environ[marker] = ""
-        fake = _FakeRunner(0, "{}")
+        fake = _FakeRunner([("", 0, "{}", "")])
         rc_r, out_r = _capture(main, ["verify", "--conf", "/nonexistent/chat-lane.conf"],
                                fake, _FakeSudo())
         expect("verify-refused-agent-env", rc_r == EX_REFUSED and "REFUSED" in out_r
@@ -1759,10 +2277,16 @@ def _selftest_body():
         os.environ.pop(marker, None)
 
     # cards
-    for cid in ("CK-C1", "CK-C2", "CK-C3"):
+    for cid in ("CK-C1", "CK-C2", "CK-C3", "CK-C4"):
         rc_card, card_out = _capture(print_card, cid, conf)
         expect("card-" + cid, rc_card == EX_OK and "WHY THIS IS YOURS" in card_out
-               and "NEVER" in card_out, card_out[:200])
+               and "NEVER" in card_out and "${" not in card_out, card_out[:200])
+    _rc, c4 = _capture(print_card, "CK-C4", conf)
+    flat_c4 = " ".join(c4.split())
+    expect("card-c4-content", all(t in flat_c4 for t in (
+        "curl -s -m 5 http://127.0.0.1:3456/status", "SECOND device",
+        "<this machine's network address>:3456/status", "Connection refused", "timeout",
+        "proves nothing")), c4)
     _rc, c3 = _capture(print_card, "CK-C3", conf)
     expect("card-c3-content", all(t in c3 for t in ("Monitor", "Task", "ScheduleWakeup",
                                                     "mcp__cyrus-tools", "expected")))
@@ -1795,12 +2319,12 @@ def _selftest_body():
         say("chat-lane setup selftest: %d of %d cases FAILED" % (len(failures), cases[0]))
         return EX_FAILED
     say("ok — chat-lane setup selftest: %d cases, %d cards, %d checks, %d scopes"
-        % (cases[0], len(CARDS), 6, len(SCOPE_CITES)))
+        % (cases[0], len(CARDS), len(CHECKS), len(SCOPE_CITES)))
     return EX_OK
 
 
 def _capture_verify_fail(vconf):
-    fake = _FakeRunner(1, "", "sudo: a password is required")
+    fake = _FakeRunner([], default=(1, "", "sudo: a password is required"))
     rc_v, printed = _capture(cmd_verify, vconf, fake, _FakeSudo())
     return rc_v, printed, fake, None
 
