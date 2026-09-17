@@ -172,9 +172,9 @@ And no budget applies: Cyrus does hold GitHub sessions to `maxTurns: 200`
 is in fact the *better*-bounded of the two, but 200 turns is a runaway ceiling, not a
 review budget.
 
-**An unattended session can consume the subscription window.** Braeden accepted this
-explicitly, and the reasoning is recorded because it is what makes the trade acceptable
-and it would otherwise be lost:
+**An unattended session can consume the subscription window.** The maintainer accepted
+this explicitly, and the reasoning is recorded because it is what makes the trade
+acceptable and it would otherwise be lost:
 
 > *"if I hit the limit the answer is just to wait, I can pace my work a little slower
 > since this is working around the clock"*

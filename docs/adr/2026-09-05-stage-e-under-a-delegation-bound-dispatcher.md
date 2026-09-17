@@ -325,16 +325,16 @@ or edits a service, and deployment-specific values stay out of this repository.
 
 **The GitHub webhook side of Cyrus is not wired by this ADR, and this ADR does not
 authorize wiring it.** That remains refused for the reason the audit gave — see
-[Trigger](#1-trigger) — and reopening it needs its own written decision and Braeden's
-confirmation.
+[Trigger](#1-trigger) — and reopening it needs its own written decision and the
+maintainer's confirmation.
 
 The first slice — the reviewer core plus the publish-or-decline path
 (`scripts/pipeline_review_local.py`) — is built with this ADR and proven on a real PR
 (KIT-90). Everything else is filed as KIT-91 … KIT-95 under the KIT-89 epic.
 
 This is an **epic-level** ADR: it records the *direction* for all six decisions so the
-children are coherent, at `Status: Accepted` because that direction is Braeden's call and
-is settled. It does not pre-empt each child's implementation review — KIT-91 (trigger),
+children are coherent, at `Status: Accepted` because that direction is the maintainer's
+call and is settled. It does not pre-empt each child's implementation review — KIT-91 (trigger),
 KIT-93 (bounce) and KIT-95 (the daemon lift) are each built and reviewed on their own
 diff, and this ADR is amended if one of them forces a change of direction.
 
@@ -461,7 +461,7 @@ with a reused worktree — wrong for review. Not chosen.
 This is the refused surface: on public repos a fork branch name or a stranger comment is
 attacker-reachable, and KIT-25's mitigation is unavailable. **Reopening it is gated on**
 either making the repos private (KIT-25) or an author-association gate on the event plus a
-signed-payload check, **and Braeden's written confirmation.** Not done here.
+signed-payload check, **and the maintainer's written confirmation.** Not done here.
 
 **Rejected — the coding session requesting its own review as its last act.** This is the
 2026-08-26 ADR's vector #5 with the safety filed off: the reviewed party authoring the
