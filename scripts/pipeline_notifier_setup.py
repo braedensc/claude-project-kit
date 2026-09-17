@@ -30,13 +30,17 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
     slack-app    CK-N1: a Slack app for the notifier alone, and a PRIVATE channel
     credentials  the Slack token in the role account's env file — its shape measured in that
                  account's shell, its value never read into this process
-    labels       agent:blocked and agent:needs-human resolved by exact name, and `self`
+    labels       agent:blocked and agent:needs-human resolved by exact name, every team key
+                 resolved, and `self`
     config       the notifier's config, composed and passed through the notifier's OWN
                  loader before anything is written
-    job          the LaunchDaemon plist, installed and not loaded
+    job          the LaunchDaemon plist, installed and not loaded — and never over another
+                 job's plist, whatever JOB_LABEL says
     dry-run      the notifier run once as the role account with --dry-run, through the job's
                  own shell command, so the env-file sourcing is exercised
-    enable       CK-N3: you load it; this measures whether it is loaded
+    enable       CK-N3: you load it. This measures three things, not one — that launchd has
+                 it, that what launchd holds is THIS plist, and that the loaded job's own
+                 passes are getting through
     first-ping   CK-N4: one throwaway escalation watched end to end
     handover     what is on, what is off, and what is not proven — each with a ticket id
 
@@ -126,8 +130,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -159,10 +165,6 @@ SetupError, Blocked, Unknown, Refusal, NoPrivilege = (
 say, warn = se.say, se.warn
 
 NOTIFIER_SCRIPT = "pipeline_notify_local.py"
-# What the job execs: the notifier, and every script it imports at run time, transitively. The
-# selftest derives this closure from the sources and fails when the tuple drifts from it.
-REQUIRED_SCRIPTS = ("pipeline_notify_local.py", "pipeline_review_local.py", "check_schemas.py",
-                    "jsonschema_mini.py")
 # The two lifecycle labels the notifier applies, read out of its own marks table.
 LABEL_KEYS = tuple(sorted({m["label"] for m in notify.MARKS.values() if m["label"]}))
 EXECUTOR_SELF = "self"
@@ -179,6 +181,84 @@ A_PRIVATE = "A-PRIVATE-CHANNEL"
 A_FIRST_PING = "A-FIRST-PING"
 NOTE_CONFIG = "config_sha256"
 NOTE_DRY_RUN = "dry_run"
+
+
+# --------------------------------------------------------------------------- #
+# What the job execs: the notifier, and every script in this kit it imports when it RUNS,
+# transitively. Preflight checks the role account's clone carries all of them.
+#
+# DERIVED, NEVER LISTED. A hard-coded tuple is a tuple that goes stale the moment the notifier
+# grows a lazy import — and stale in the direction that matters: preflight would pass a clone
+# missing a script the notifier needs, and the drift check that was meant to catch that would
+# instead turn CI red on a merge that did nothing wrong. So the list is read from the sources
+# themselves, here, the same way the notifier's own imports resolve at run time.
+#
+# The GUARANTEE this keeps is the one the old check existed for: what preflight demands of the
+# clone is exactly what the notifier imports when it runs, with nothing missed and nothing
+# invented. What it no longer does is fail when that set CHANGES, because a change is not a
+# defect; the selftest instead proves the derivation tracks a new import and never silently
+# collapses to nothing.
+# --------------------------------------------------------------------------- #
+def _module_imports(path, skip_functions):
+    """Every kit script imported by `path`. `skip_functions=None` means module level only;
+    otherwise every function body counts except the named ones."""
+    import ast
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    found = set()
+
+    def take(node):
+        if isinstance(node, ast.Import):
+            found.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            found.add(node.module.split(".")[0])
+
+    if skip_functions is None:
+        for child in tree.body:
+            take(child)
+    else:
+        def walk(node, skipped):
+            for child in ast.iter_child_nodes(node):
+                now = skipped or (isinstance(child, ast.FunctionDef)
+                                  and child.name in skip_functions)
+                if not now:
+                    take(child)
+                walk(child, now)
+        walk(tree, False)
+    return set(m + ".py" for m in found if os.path.exists(os.path.join(HERE, m + ".py")))
+
+
+# A battery's imports are not the job's: the notifier's `--selftest` reaches for modules a real
+# pass never touches, and demanding them of the clone would block an install for nothing.
+NOTIFIER_SELFTEST_FUNCTIONS = ("selftest", "_selftest_body", "_relay_selftest")
+# What the notifier cannot run without, whatever any walk says: itself, and the shared secret
+# scrub it consults on every outbound body. A derivation that returned less than this would be
+# a derivation that had stopped working.
+REQUIRED_FLOOR = (NOTIFIER_SCRIPT, "pipeline_review_local.py")
+
+
+def runtime_closure(root=NOTIFIER_SCRIPT):
+    """The kit scripts the notifier imports when it runs, transitively, as a sorted tuple.
+
+    Unreadable sources fall back to the floor rather than to nothing: a preflight that demands
+    no script at all would report a clone with nothing in it as complete."""
+    try:
+        closure, todo = {root}, list(_module_imports(os.path.join(HERE, root),
+                                                     NOTIFIER_SELFTEST_FUNCTIONS))
+        while todo:
+            name = todo.pop()
+            if name in closure:
+                continue
+            closure.add(name)
+            todo.extend(_module_imports(os.path.join(HERE, name), None))
+    except (OSError, SyntaxError, ValueError) as exc:             # noqa: BLE001
+        warn("could not read the notifier's imports (%s) — preflight will check only %s"
+             % (exc, ", ".join(REQUIRED_FLOOR)))
+        return tuple(sorted(REQUIRED_FLOOR))
+    return tuple(sorted(closure | set(REQUIRED_FLOOR)))
+
+
+REQUIRED_SCRIPTS = runtime_closure()
 
 
 # --------------------------------------------------------------------------- #
@@ -273,10 +353,15 @@ def parse_conf(text, source=DEFAULT_CONF):
 
 
 def resolve_path(value, home):
-    """A conf path as the role account sees it: `~/x` under `home`, anything else as written."""
+    """A conf path as the role account sees it: `~/x` under `home`, anything else as written.
+
+    REALPATH, NOT NORMPATH, and the Stage E installer's `credential_home_problem` does the same.
+    `/var` is a symlink to `/private/var` on macOS, so two spellings of ONE file compare unequal
+    under a lexical normalise — and the rules below, which exist to refuse writing a credential
+    into the dispatcher's own file, would pass it."""
     if value.startswith("~/"):
-        return os.path.normpath(home.rstrip("/") + "/" + value[2:])
-    return os.path.normpath(value)
+        value = home.rstrip("/") + "/" + value[2:]
+    return os.path.realpath(value)
 
 
 def _under(child, parent):
@@ -386,8 +471,10 @@ def validate_conf(values, invoking_user=None):
             "reads from the dispatcher's environment, which is copied into every session. The "
             "notifier uses a SEPARATE Slack app with its own token (owner decision, 2026-09-17), "
             "so a chat token leaked from a session cannot post a ping that looks like the "
-            "notifier's — and a different variable name is what keeps the two tokens from ever "
-            "being the same value. Keep the default, NOTIFIER_SLACK_BOT_TOKEN"
+            "notifier's — and one name read by both lanes would make them one value by "
+            "construction. Keep the default, NOTIFIER_SLACK_BOT_TOKEN. WHICH token you paste "
+            "is still yours to get right: nothing here compares it with the dispatcher's, and "
+            "card CK-N1 is where you sign that the notifier has its own app"
             % DISPATCHER_CHAT_TOKEN_ENV)
     if conf.get("CHAT_TOKEN_ENV") and conf.get("CHAT_TOKEN_ENV") == conf.get("LINEAR_KEY_ENV"):
         errors.append("CHAT_TOKEN_ENV and LINEAR_KEY_ENV name the same variable — one of the two "
@@ -410,8 +497,11 @@ def validate_conf(values, invoking_user=None):
     ints = {}
     for key in NUMERIC_KEYS:
         value = conf.get(key) or ""
-        if not value.isdigit() or int(value) <= 0:
-            errors.append("%s must be a positive integer (got %r)" % (key, value))
+        # `isascii()` first: `str.isdigit()` is true for '²' and '③', which `int()` then
+        # refuses — and a ValueError here would end the pass with a traceback instead of
+        # reporting this key beside every other bad one.
+        if not (value.isascii() and value.isdigit()) or int(value) <= 0:
+            errors.append("%s must be a positive integer, in ASCII digits (got %r)" % (key, value))
         else:
             ints[key] = int(value)
     if len(ints) == len(NUMERIC_KEYS) and ints["RUN_TIMEOUT_SECONDS"] >= ints["INTERVAL_SECONDS"]:
@@ -426,6 +516,20 @@ def validate_conf(values, invoking_user=None):
 def invoking_user():
     import pwd
     return pwd.getpwuid(os.getuid()).pw_name
+
+
+def key_hand_off(name, command="run"):
+    """How to hand this ONE command the tracker key, and no other process ever.
+
+    NOT `export`. An exported key lives for the whole shell, and every process started from
+    that shell afterwards inherits it — a `claude` session among them, whose every Bash call
+    would then hold the owner's tracker key. This installer's own docstring cites that exact
+    incident. A per-command environment costs one more line and ends when the command does."""
+    return ("hand it to that one command, and nothing else — `read -rs` does not echo it, and\n"
+            "the variable is NOT exported, so no later process inherits it:\n"
+            "    read -rs %s\n"
+            "    %s=\"$%s\" python3 %s %s\n"
+            "    unset %s" % (name, name, name, _self_path(), command, name))
 
 
 def load_conf(path, user=None):
@@ -473,7 +577,11 @@ def plist_path(conf):
 
 
 def log_path(conf, home):
-    return resolve_path(os.path.dirname(conf["NOTIFIER_CONFIG"].rstrip("/")), home) + "/" + LOG_NAME
+    """The daemon's log, beside its config. RESOLVE FIRST, then take the directory: a config at
+    `~/notifier.json` has the bare `~` for a directory, which resolves to nothing and would put
+    a literal `~/notifier.log` in the plist — a relative path launchd never expands, so both
+    streams would go nowhere and a crashing pass would leave no trace."""
+    return os.path.dirname(resolve_path(conf["NOTIFIER_CONFIG"].rstrip("/"), home)) + "/" + LOG_NAME
 
 
 def render_plist(conf, home):
@@ -534,12 +642,19 @@ def _sha(text):
 # --------------------------------------------------------------------------- #
 # Scrubbing — everything printed or recorded passes through here
 # --------------------------------------------------------------------------- #
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
 def scrub(text, held=()):
     """Any credential VALUE this process holds is replaced, by the notifier's own `redact`; then
     any line still carrying a credential SHAPE, by the notifier's own scan, is withheld whole.
     The second half matters because the Slack token is never held here: if a component echoes
-    it, only its shape can catch it. A scan that cannot run withholds everything it was given."""
-    out = notify.redact(text or "", [h for h in held if h])
+    it, only its shape can catch it. A scan that cannot run withholds everything it was given.
+
+    CONTROL CHARACTERS GO FIRST. Some of what passes through here is session-writable — a
+    ticket title reaches this terminal by way of the notifier's dry run — and an escape
+    sequence in one can erase or forge the lines printed after it, a FAILED row included."""
+    out = _CONTROL.sub("?", notify.redact(text or "", [h for h in held if h]))
     lines = []
     for line in out.split("\n"):
         try:
@@ -578,6 +693,8 @@ class TrackerReader(object):
     Q_VIEWER = "query NotifierSetupViewer { viewer { id } }"
     Q_LABELS = ("query NotifierSetupLabelByName($name: String!) { issueLabels(filter: "
                 "{ name: { eq: $name } }, first: 50) { nodes { id name team { id key } } } }")
+    Q_TEAM = ("query NotifierSetupTeamByKey($key: String!) { teams(filter: "
+              "{ key: { eq: $key } }, first: 10) { nodes { id key name } } }")
 
     def __init__(self, key):
         handlers = [_RefuseRedirect()] + [h() for h in self._EXTRA_HANDLERS]
@@ -637,6 +754,17 @@ class TrackerReader(object):
         return [{"id": n.get("id"), "name": n.get("name"),
                  "team": ((n.get("team") or {}).get("key")) or None}
                 for n in nodes if isinstance(n, dict)]
+
+    def team_named(self, key):
+        """The team with this exact key, or None. A team key is a filter, not a lookup: the
+        notifier's own scan of a key that matches nothing comes back empty and reads as a quiet
+        day, so a typo has to be caught here, where it is still a question."""
+        data = self._ask(self.Q_TEAM, {"key": key})
+        nodes = ((data.get("teams") or {}).get("nodes")) or []
+        for node in nodes:
+            if isinstance(node, dict) and node.get("key") == key:
+                return {"id": node.get("id"), "key": node.get("key"), "name": node.get("name")}
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -732,14 +860,19 @@ CARDS = {
                 "measures whether the job is loaded and never loads it."),
         "do": ["Read the dry-run row above. Then load the job:",
                "    sudo launchctl bootstrap system ${PLIST}",
-               "If it was already loaded and this run changed its plist, unload it first, wait",
-               "a few seconds, then load it. A load straight after an unload can answer",
-               "`Input/output error`; wait and run the load again:",
+               "If it was already loaded and the plist changed, unload it FIRST — launchd keeps",
+               "what it was given until it is told again, and the installer compares the two on",
+               "every run, so this card comes back until you do. Wait a few seconds between",
+               "them: a load straight after an unload can answer `Input/output error`; wait and",
+               "run the load again.",
                "    sudo launchctl bootout system/${JOB_LABEL}",
-               "Check it, then run the installer again:",
+               "    sudo launchctl bootstrap system ${PLIST}",
+               "Check it, then run the installer again — the job takes its first pass at load,",
+               "so give it a moment:",
                "    sudo launchctl print system/${JOB_LABEL}",
                "    python3 scripts/pipeline_notifier_setup.py run"],
-        "good": "`sudo launchctl print system/${JOB_LABEL}` finds the job",
+        "good": ("`sudo launchctl print system/${JOB_LABEL}` shows this plist's own command, and "
+                 "the job's next pass writes a heartbeat"),
         "attest": None,
     },
     "CK-N4": {
@@ -973,6 +1106,11 @@ class Ctx(object):
         self.job_current = False
         self.plist_changed = False
         self.loaded = None
+        self.loaded_interval = None
+        # True once THIS process has run the rehearsal, so `enable` can say whose dry heartbeat
+        # it is looking at rather than leaving the operator to guess.
+        self.rehearsed = False
+        self.clock = time.time
 
     @property
     def account(self):
@@ -1259,20 +1397,21 @@ def step_labels(ctx, apply_it):
             % (", ".join(ctx.agent), " and ".join(LABEL_KEYS),
                " and EXECUTOR_ACTOR_IDS=self" if wants_self else "",
                " Ids an earlier run recorded are kept, unchecked." if ctx.ids.get("label_ids") else ""),
-            "a person runs the same command with $%s exported in their shell" % conf["LINEAR_KEY_ENV"])
+            "a person runs the same command with $%s in the environment of that ONE command"
+            % conf["LINEAR_KEY_ENV"])
     name = conf["LINEAR_KEY_ENV"]
     key = (ctx.env.get(name) or "").strip()
     if not key:
         raise Unknown(
             "NOT MEASURED — $%s is not set in your shell. This step reads the tracker key from YOUR "
             "environment, for this one command; it never reads the role account's file." % name,
-            "export it for this shell, then run the same command again:\n"
-            "    read -rs %s && export %s" % (name, name))
+            key_hand_off(name))
     ctx.held.append(key)
     api = ctx.transport_factory(key)
     try:
         viewer = api.viewer_id() if wants_self else ""
         found = dict((label, api.labels_named(label)) for label in LABEL_KEYS)
+        teams = dict((team, api.team_named(team)) for team in split_list(conf["TEAM_KEYS"]))
     except TrackerError as exc:
         if exc.rejected:
             raise SetupError("the tracker refused the key in $%s (%s). Nothing was resolved. (The "
@@ -1298,6 +1437,16 @@ def step_labels(ctx, apply_it):
             problems.append("%s does not exist in this workspace. `/setup-board` creates it (the "
                             "pipeline contract's §6 labels); this installer never creates a label"
                             % label)
+    # EVERY TEAM KEY IS RESOLVED, because the notifier cannot tell a team that does not exist
+    # from a team with nothing to say. Its scan filters `team.key eq <KEY>`, so `TDO` for `TOD`
+    # answers with an empty list, every pass, for ever — exit 0, "nothing to do", no ping. The
+    # only moment that typo is still visible is here, while a person is watching.
+    missing_teams = [k for k in split_list(conf["TEAM_KEYS"]) if not teams.get(k)]
+    if missing_teams:
+        problems.append("TEAM_KEYS names %s, which this workspace has no team for. The notifier "
+                        "would scan %s every pass, find nothing, and report 'nothing to do' — a "
+                        "typo reads exactly like a quiet week"
+                        % (", ".join(missing_teams), "it" if len(missing_teams) == 1 else "them"))
     actors = []
     for actor in actors_conf:
         value = viewer if actor == EXECUTOR_SELF else actor
@@ -1310,11 +1459,14 @@ def step_labels(ctx, apply_it):
                          % (len(problems), "\n".join("  - " + p for p in problems)))
     before = ctx.ids.get("label_ids") or {}
     changed = [k for k in LABEL_KEYS if before.get(k) and before.get(k) != label_ids[k]]
-    ctx.ids = {"label_ids": label_ids, "executor_actor_ids": actors}
-    detail = ("%s resolved by exact name at workspace scope (%s); %d executor author id(s)%s"
+    ctx.ids = {"label_ids": label_ids, "executor_actor_ids": actors,
+               "team_ids": dict((k, str(v.get("id"))) for k, v in sorted(teams.items()) if v)}
+    detail = ("%s resolved by exact name at workspace scope (%s); %d executor author id(s)%s; "
+              "%d team key(s) resolved (%s)"
               % (" and ".join(LABEL_KEYS),
                  ", ".join("%s…" % label_ids[k][:8] for k in LABEL_KEYS), len(actors),
-                 ", `self` looked up" if wants_self else ""))
+                 ", `self` looked up" if wants_self else "", len(teams),
+                 ", ".join(sorted(teams))))
     if changed:
         detail += "; CHANGED since the ledger: %s" % ", ".join(changed)
     return True, detail, []
@@ -1384,6 +1536,29 @@ def step_config(ctx, apply_it):
     return False, "wrote %s (%s; sha256 %s…, mode 600)" % (conf["NOTIFIER_CONFIG"], why, sha[:12]), []
 
 
+def foreign_plist(body):
+    """What is in this plist if it is not a notifier's, or None. Said in the words of the file
+    itself — its label and what it runs — so a refusal names the thing it refused to destroy."""
+    if body is None:
+        return None
+    try:
+        doc = plistlib.loads(body.encode("utf-8"))
+    except Exception:                                             # noqa: BLE001
+        return "it does not parse as a plist at all"
+    argv = doc.get("ProgramArguments") or []
+    text = " ".join(str(a) for a in argv) if isinstance(argv, list) else str(argv)
+    if NOTIFIER_SCRIPT in text:
+        return None
+    # Name WHAT IT RUNS, not the first N characters: every daemon of this shape opens with the
+    # same `set -a; . …; exec …` boilerplate, so a truncated head describes nothing.
+    runs = [os.path.basename(m) for m in re.findall(r"[\w./-]+\.(?:py|js|rb|sh)\b", text)]
+    program = str(doc.get("Program") or "").strip()
+    return ("label %r, running %s — nothing in it names %s"
+            % (doc.get("Label"),
+               ", ".join(dict.fromkeys(runs)) or program or "something this cannot read",
+               NOTIFIER_SCRIPT))
+
+
 def step_job(ctx, apply_it):
     conf = ctx.conf
     if not ctx.role_home:
@@ -1414,6 +1589,18 @@ def step_job(ctx, apply_it):
     if have == body:
         ctx.job_current = True
         return True, "%s is installed and current; this installer never loads it (CK-N3)" % path, []
+    # WHOSE PLIST IS THIS? `install` as root would replace whatever is there, and JOB_LABEL is
+    # free-typed: one wrong label and the file replaced is the dispatcher's own, or a Stage E
+    # daemon's — destroyed with no backup, and CK-N3 would then walk the operator through
+    # unloading the victim. Only a plist that runs the notifier may be replaced.
+    foreign = foreign_plist(have)
+    if foreign:
+        raise SetupError(
+            "%s already exists and it is NOT the notifier's: %s.\n"
+            "  Replacing it would destroy that job's definition — this installer will not, and "
+            "it keeps no backup of it.\n"
+            "  JOB_LABEL is yours to choose: pick a label nothing else on this machine uses, or "
+            "remove that file yourself if you are certain it is stale." % (path, foreign))
     why = "absent" if have is None else "differs"
     if not apply_it:
         return False, "would install %s (%s), not loaded" % (path, why), []
@@ -1453,10 +1640,14 @@ def step_dry_run(ctx, apply_it):
     """The notifier, once, as the role account, through the job's own command plus `--dry-run`.
     Exit 0 or 3 is done; 1, 2 or 4 is a failure carrying the notifier's own words, scrubbed.
 
-    A pass that already ran against this exact config and command is not re-run: its binding is
-    in the ledger, and the notifier's latest heartbeat is read instead. Re-running it on every
-    `run` would overwrite a loaded job's real heartbeat with a rehearsal's. `verify` and a dry run
-    never run it at all — they read that heartbeat, and a failing latest pass is a failed row."""
+    A rehearsal that already passed against this exact config and command is not repeated: the
+    ledger says so, and repeating it would overwrite a loaded job's real heartbeat with a
+    rehearsal's. `verify` and a dry run never run it at all.
+
+    THIS ROW IS ABOUT THE REHEARSAL, AND ONLY THAT. Judging the loaded job's own passes belongs
+    to `enable`, which is the step that knows whether there IS a loaded job: a heartbeat says
+    nothing without that, and reading one here let a real pass that could not deliver a single
+    ping be graded with the rehearsal's accept-set and called done."""
     conf = ctx.conf
     command = job_command(conf) + " --dry-run"
     if not (ctx.config_current and ctx.job_current):
@@ -1468,25 +1659,15 @@ def step_dry_run(ctx, apply_it):
         return False, what, []
     bind = {"config_sha256": ctx.composed["sha256"], "command_sha256": _sha(command)}
     note = (ctx.state.data.get("notes") or {}).get(NOTE_DRY_RUN) or {}
-    bound = all(note.get(k) == v for k, v in bind.items()) and note.get("exit") in DRY_RUN_OK
-    if bound:
-        beat, why_not = read_heartbeat(ctx)
-        if beat is not None:
-            kind = "a dry run" if beat.get("dry") else "a real pass"
-            if beat.get("exit") in DRY_RUN_OK:
-                return True, ("passed as %s at %s (exit %s); the notifier's latest pass was %s at "
-                              "%s, exit %s" % (ctx.account, str(note.get("at"))[:16], note.get("exit"),
-                                              kind, str(beat.get("at"))[:16], beat.get("exit"))), []
-            if not apply_it:
-                raise SetupError("the notifier's latest pass (%s, at %s) exited %s: %s"
-                                 % (kind, beat.get("at"), beat.get("exit"),
-                                    ctx.scrub(str(beat.get("summary")))[:300]))
-        elif why_not != "absent":
-            raise Unknown("the notifier's heartbeat is %s" % why_not, "run the same command again")
+    if all(note.get(k) == v for k, v in bind.items()) and note.get("exit") in DRY_RUN_OK:
+        return True, ("the rehearsal passed as %s at %s (exit %s), against this config and this "
+                      "command; `enable` reads what the loaded job has done since"
+                      % (ctx.account, str(note.get("at"))[:16], note.get("exit"))), []
     if not apply_it:
         return False, "would run the notifier once as %s: %s" % (ctx.account, command), []
     res = ctx.as_role(command, what="running the notifier's dry run",
                       timeout=int(conf["RUN_TIMEOUT_SECONDS"]) + 60)
+    ctx.rehearsed = True
     lines = ctx.scrub(((res.out or "") + (res.err or "")).strip()).splitlines()
     say("")
     say("  -- the notifier's dry run, as %s (exit %d) --" % (ctx.account, res.rc))
@@ -1504,10 +1685,63 @@ def step_dry_run(ctx, apply_it):
                         "\n".join("  " + l[:200] for l in lines[-8:]) or "  (it printed nothing)"))
 
 
+def loaded_job(text):
+    """What launchd says it is running for this label: {"arguments": [...], "interval": int|None},
+    or None when the print gives neither. `launchctl print` lists the arguments one per line
+    inside `arguments = { … }` and, for an interval job, `run interval = N seconds`."""
+    lines = (text or "").splitlines()
+    arguments, interval, collecting = None, None, False
+    for line in lines:
+        stripped = line.strip()
+        if collecting:
+            if stripped == "}":
+                collecting = False
+                continue
+            arguments.append(stripped)
+            continue
+        if stripped.startswith("arguments = {"):
+            arguments, collecting = [], True
+        elif stripped.startswith("run interval ="):
+            digits = re.search(r"(\d+)", stripped)
+            interval = int(digits.group(1)) if digits else None
+    if arguments is None and interval is None:
+        return None
+    return {"arguments": arguments, "interval": interval}
+
+
+def stale_after_seconds(conf):
+    """Older than this, a loaded job's heartbeat means NOT RUNNING: two intervals, plus the
+    longest one pass may legitimately take, plus two minutes. The conflict waker's installer
+    dates its own heartbeats the same way."""
+    return 2 * int(conf["INTERVAL_SECONDS"]) + int(conf["RUN_TIMEOUT_SECONDS"]) + 120
+
+
+def heartbeat_age(ctx, beat):
+    """Seconds since the heartbeat was written, or None when its stamp cannot be read."""
+    stamp = str((beat or {}).get("at") or "")
+    try:
+        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return ctx.clock() - when.timestamp()
+
+
 def step_enable(ctx, apply_it):
-    label = ctx.conf["JOB_LABEL"]
+    """Loaded, running THIS plist, and getting through its passes — three questions, not one.
+
+    `launchctl print` is asked what it is actually running, because a plist on disk is not what
+    launchd holds: change the conf while the job is loaded and the file moves on while the
+    running job does not. A flag that lived only in this process said so once and forgot by the
+    next run, which then called the stale job settled.
+
+    Then the heartbeat, which only means something here: a loaded job that has finished no real
+    pass, whose last pass is older than a pass may take, or whose last real pass could not
+    deliver what it found, is NOT a working job — and each of those is a different sentence."""
+    conf, label = ctx.conf, ctx.conf["JOB_LABEL"]
     res = ctx.as_root(["launchctl", "print", "system/" + label],
-                      what="asking launchd whether system/%s is loaded" % label)
+                      what="asking launchd what it is running for system/%s" % label)
     text = (res.out or "") + (res.err or "")
     if res.ok:
         loaded = True
@@ -1517,13 +1751,82 @@ def step_enable(ctx, apply_it):
         raise Unknown("could not ask launchd about system/%s (exit %d): %s"
                       % (label, res.rc, text.strip()[:160]), "run the same command again")
     ctx.loaded = loaded
-    if loaded and ctx.plist_changed:
-        raise Blocked("CK-N3", "system/%s is loaded and this run changed its plist, so the loaded "
-                               "job still runs the old one — unload it, then load it" % label)
-    if loaded:
-        return True, "system/%s is loaded: a pass every %s s as %s" % (
-            label, ctx.conf["INTERVAL_SECONDS"], ctx.account), []
-    raise Blocked("CK-N3", "system/%s is not loaded; this installer never loads it" % label)
+    if not loaded:
+        raise Blocked("CK-N3", "system/%s is not loaded; this installer never loads it" % label)
+
+    # WHAT IS LOADED, not what is on disk.
+    want = plistlib.loads(render_plist(conf, ctx.role_home).encode("utf-8")) if ctx.role_home else {}
+    running = loaded_job(text)
+    if running is None:
+        raise Unknown(
+            "system/%s is loaded, and launchd's own print named neither its arguments nor its "
+            "run interval, so whether it is running THIS plist could not be measured. A loaded "
+            "job and a current plist are different facts." % label,
+            "read it yourself and compare it with %s:\n    sudo launchctl print system/%s"
+            % (plist_path(conf), label))
+    if want and running["arguments"] and running["arguments"] != [str(a) for a in
+                                                                 want.get("ProgramArguments") or []]:
+        raise Blocked("CK-N3", "system/%s is loaded and running a DIFFERENT command from the plist "
+                               "on disk — launchd keeps what it was given until it is told again. "
+                               "Unload it, then load it" % label)
+    if want and running["interval"] is not None and running["interval"] != int(
+            conf["INTERVAL_SECONDS"]):
+        raise Blocked("CK-N3", "system/%s is loaded with a %s s interval and the plist on disk says "
+                               "%s s — launchd keeps what it was given. Unload it, then load it"
+                      % (label, running["interval"], conf["INTERVAL_SECONDS"]))
+
+    # THE LOADED JOB'S OWN PASSES.
+    beat, why_not = read_heartbeat(ctx)
+    if beat is None:
+        if why_not == "absent":
+            raise Unknown(
+                "system/%s is loaded and has written NO heartbeat, so no pass of it has ever "
+                "finished. The plist runs it at load, so this is not a job waiting for its first "
+                "interval." % label,
+                "read %s as %s — a pass that cannot start writes nothing to its heartbeat"
+                % (log_path(conf, ctx.role_home or "~"), ctx.account))
+        raise Unknown("system/%s is loaded and its heartbeat is %s" % (label, why_not),
+                      "run the same command again")
+    age = heartbeat_age(ctx, beat)
+    stale = stale_after_seconds(conf)
+    if beat.get("dry"):
+        raise Unknown(
+            "system/%s is loaded, and the latest heartbeat is a REHEARSAL (%s), not a pass of the "
+            "loaded job%s. Nothing here has seen that job complete a pass."
+            % (label, str(beat.get("at"))[:16],
+               " — this run's own, a moment ago" if ctx.rehearsed else ""),
+            "wait one interval (%s s) for its next pass, then:\n    python3 %s verify"
+            % (conf["INTERVAL_SECONDS"], _self_path()))
+    if age is None:
+        raise Unknown("system/%s is loaded and its heartbeat carries no readable time (%r)"
+                      % (label, str(beat.get("at"))[:40]), "run the same command again")
+    if age > stale:
+        raise Unknown(
+            "system/%s is loaded and NOT RUNNING: its last pass was %d s ago, past the %d s a "
+            "pass may take" % (label, int(age), stale),
+            "read %s as %s, and `sudo launchctl print system/%s` for its last exit"
+            % (log_path(conf, ctx.role_home or "~"), ctx.account, label))
+    exit_code = beat.get("exit")
+    if exit_code == notify.EXIT_DECLINED:
+        # A REAL pass's exit 3 is not the rehearsal's. The rehearsal cannot post, so its
+        # declines are withheld titles and the per-pass cap; a real pass declines when the chat
+        # refused the ping or the label did not apply — an escalation nobody was told about.
+        # Reading the two the same way is how a revoked token reads as "no drift".
+        raise SetupError(
+            "system/%s ran %s ago and DECLINED what it found (exit 3): %s\n"
+            "  On a real pass that means a ping or a label did not land — a revoked token, a bot "
+            "removed from the channel, a label id that no longer resolves. The escalation is "
+            "waiting and nobody has been told."
+            % (label, "%d s" % int(age), ctx.scrub(str(beat.get("summary")))[:400]))
+    if exit_code != notify.EXIT_OK:
+        raise SetupError("system/%s ran %s ago and exited %s: %s"
+                         % (label, "%d s" % int(age), exit_code,
+                            ctx.scrub(str(beat.get("summary")))[:400]))
+    ctx.loaded_interval = running["interval"]
+    return True, ("system/%s is loaded, running this plist's command%s; its last real pass was %d s "
+                  "ago and exited 0 (%s)"
+                  % (label, " every %s s" % running["interval"] if running["interval"] else "",
+                     int(age), ctx.scrub(str(beat.get("summary")))[:80])), []
 
 
 def step_first_ping(ctx, apply_it):
@@ -1545,8 +1848,12 @@ def step_first_ping(ctx, apply_it):
 
 def handover_lines(ctx):
     conf = ctx.conf
+    # The interval launchd reported, never the conf's: the conf says what the file asks for,
+    # and the two differ exactly when it matters.
     loaded = {True: "LOADED — one pass every %s s as %s, paging channel %s"
-                    % (conf["INTERVAL_SECONDS"], ctx.account, conf["CHAT_CHANNEL_ID"]),
+                    % (ctx.loaded_interval if ctx.loaded_interval else "%s (from the plist; launchd "
+                       "did not say)" % conf["INTERVAL_SECONDS"], ctx.account,
+                       conf["CHAT_CHANNEL_ID"]),
               False: "NOT loaded (card CK-N3)"}.get(ctx.loaded, "not measured on this pass")
     on = ["the notifier job system/%s: %s (KIT-116)" % (conf["JOB_LABEL"], loaded),
           "its only tracker write: %s, added on the marks that name them (KIT-116)"
@@ -1693,9 +2000,10 @@ def _banner(ctx, title):
     say("  conf          %s" % conf.get("__source__", DEFAULT_CONF))
     say("  role account  %s" % ctx.account)
     say("  job           system/%s (%s) — never loaded by this installer" % (conf["JOB_LABEL"], plist_path(conf)))
-    say("  channel       %s" % conf["CHAT_CHANNEL_ID"])
+    say("  channel       %s at %s" % (conf["CHAT_CHANNEL_ID"], conf["CHAT_API_BASE"]))
     say("  token         $%s, in %s as %s" % (conf["CHAT_TOKEN_ENV"], conf["ENV_FILE"], ctx.account))
-    say("  tracker key   $%s from YOUR shell, for the labels step only" % conf["LINEAR_KEY_ENV"])
+    say("  tracker key   $%s from THIS command's environment, for the labels step only"
+        % conf["LINEAR_KEY_ENV"])
     if ctx.agent:
         say("  AGENT ENVIRONMENT (%s set): nothing is asked for, nothing needing sudo is" % ", ".join(ctx.agent))
         say("  attempted, no tracker request is made, and nothing is recorded. Those rows say")
@@ -1918,8 +2226,8 @@ def _selftest_body():
                  "CHAT_CHANNEL_ID=C0SYNTHETIC1\nEXECUTOR_ACTOR_IDS=self\n"
                  "JOB_LABEL=com.example.notifier\n")
 
-    def good_conf(extra=""):
-        values, errors = parse_conf(good_text + extra)
+    def good_conf(extra="", text=None):
+        values, errors = parse_conf((text or good_text) + extra)
         conf, more = validate_conf(values, person)
         assert not errors + more, errors + more
         conf["__source__"] = "notifier.conf"
@@ -2025,13 +2333,36 @@ def _selftest_body():
             se.Runner.__init__(self, dry_run=dry_run)
             self.home = home
             self.role = role
-            self.plists = {}
+            self.plists = {}                  # what is on disk
             self.loaded = False
+            self.loaded_body = None           # what launchd holds, which is NOT the same thing
+            self.print_arguments = True
             self.selftest_rc = 0
             self.role_scripts = []
             self.sudo_argv = []
 
-        def _exec(self, argv, stdin, timeout):
+        def bootstrap(self, path):
+            """What a person does at CK-N3: launchd takes a COPY of the file as it is now."""
+            self.loaded_body = self.plists.get(path)
+            self.loaded = True
+
+        def _print_text(self, label):
+            """`launchctl print` as macOS 26 prints it: the arguments one per line, and the run
+            interval. Read off what launchd HOLDS, never off the file."""
+            doc = plistlib.loads((self.loaded_body or "").encode("utf-8"))
+            lines = ["system/%s = {" % label, "\tstate = not running", "\tprogram = /bin/sh"]
+            if self.print_arguments:
+                lines.append("\targuments = {")
+                lines += ["\t\t" + str(a) for a in doc.get("ProgramArguments") or []]
+                lines.append("\t}")
+                lines.append("\trun interval = %d seconds" % int(doc.get("StartInterval") or 0))
+            lines.append("}")
+            return "\n".join(lines) + "\n"
+
+        # `cwd` is accepted and ignored: the Stage E runner this subclasses gains it in a
+        # sibling pull request, and every script here starts by standing somewhere it can read.
+        # A fake whose signature is narrower than its base breaks only once both land.
+        def _exec(self, argv, stdin, timeout, cwd=None, **kwargs):
             argv = list(argv)
             if argv[0] == "sudo":
                 self.sudo_argv.append(argv)
@@ -2065,8 +2396,9 @@ def _selftest_body():
                     self.plists[argv[-1]] = fh.read()
                 return se.Result(0)
             if argv[:3] == ["sudo", "launchctl", "print"]:
-                return (se.Result(0, "state = not running\n") if self.loaded
-                        else se.Result(113, "", "Could not find service"))
+                if not self.loaded:
+                    return se.Result(113, "", "Could not find service")
+                return se.Result(0, self._print_text(argv[3].split("/", 1)[-1]))
             return se.Result(1, "", "FakeMachine: nothing scripted for %s" % se._fmt(argv)[:120])
 
     class FakeTracker(object):
@@ -2094,6 +2426,23 @@ def _selftest_body():
         def labels_named(self, name):
             self._gate()
             return [dict(l) for l in self.labels if l["name"] == name]
+
+        def team_named(self, key):
+            self._gate()
+            return {"id": "team-" + key, "key": key, "name": key} if key in self.teams else None
+
+    FakeTracker.teams = ("KIT", "TOD")
+
+    def real_pass(home, exit_code=0, dry=False, ago=30, summary="sent 1, labelled 1, declined 0"):
+        """What the LOADED job leaves behind, which is not what the rehearsal leaves behind."""
+        state = os.path.join(home, ".stage-e", "state")
+        if not os.path.isdir(state):
+            os.makedirs(state)
+        when = datetime.fromtimestamp(time.time() - ago, timezone.utc)
+        with open(os.path.join(state, "notifier-heartbeat.json"), "w", encoding="utf-8") as fh:
+            json.dump({"schema": notify.HEARTBEAT_SCHEMA,
+                       "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "dry": dry, "exit": exit_code,
+                       "summary": summary}, fh)
 
     def new_home(root, with_token=True, with_key=True, extra_lines=()):
         home = os.path.join(root, "role-home")
@@ -2207,14 +2556,26 @@ def _selftest_body():
         ok("secret: a token a component echoes is withheld by shape, never printed",
            token not in out and "withheld" in out, out[-1200:])
 
-        fake.loaded = True
+        # The person does CK-N3 themselves, and the loaded job then takes its own passes.
+        plists = fake.plists
         ctx, fake2 = machine_ctx(root, home=home, state=State(ledger))
-        fake2.plists, fake2.loaded = fake.plists, True
+        fake2.plists = plists
+        fake2.bootstrap(plist_file)
+        code, out = quiet(lambda: cmd_run(ctx, dry_run=False))
+        ok("enable: loaded, but the only heartbeat is the rehearsal's — NOT MEASURED, not done",
+           code == EX_UNKNOWN and rows_of(run_steps_rows(ctx)).get("enable") == UNKNOWN
+           and "REHEARSAL" in out and "wait one interval" in out, out[-900:])
+        real_pass(home)
+        ctx, fake2 = machine_ctx(root, home=home, state=State(ledger))
+        fake2.plists = plists
+        fake2.bootstrap(plist_file)
         code, out = quiet(lambda: cmd_run(ctx, dry_run=False))
         captured.append(out)
-        ok("run: loaded, it stops at CK-N4 and does NOT re-run the dry run",
+        ok("run: loaded and running, it stops at CK-N4 and does NOT re-run the rehearsal",
            code == EX_BLOCKED and "CK-N4" in out
-           and not [s for s in fake2.role_scripts if s.endswith(" --dry-run")], out[-900:])
+           and rows_of(run_steps_rows(ctx)).get("enable") == ALREADY_DONE
+           and not [s for s in fake2.role_scripts if s.endswith(" --dry-run")],
+           "%s\n%s" % (rows_of(run_steps_rows(ctx)), out[-900:]))
         ok("never loads: no launchctl bootstrap was ever issued",
            not [a for a in fake.sudo_argv + fake2.sudo_argv if "bootstrap" in a])
 
@@ -2222,30 +2583,132 @@ def _selftest_body():
                                            "opened, label landed", env={}))
         captured.append(out)
         ctx, fake3 = machine_ctx(root, home=home, state=State(ledger))
-        fake3.plists, fake3.loaded = fake.plists, True
+        fake3.plists = plists
+        fake3.bootstrap(plist_file)
         code, out = quiet(lambda: cmd_run(ctx, dry_run=False))
         captured.append(out)
         ok("run: a settled machine exits 0 and says what is on, off and not proven",
            code == EX_OK and "KIT-156" in out and "KIT-118" in out and "KIT-157" in out
            and "NOT PROVEN" in out and not fake3.writes, out[-1500:])
+        ok("handover: the interval it reports is the one launchd holds, not the conf's",
+           "every 300 s" in out and "LOADED" in out, out[-1200:])
 
-        # ── 4. verify never writes, never records, and on a settled machine exits 0 ──────
+        def settled(**kw):
+            """A machine on which every row holds: loaded, running this plist, passing."""
+            c, f = machine_ctx(root, home=home, state=State(ledger), **kw)
+            f.plists = plists
+            f.bootstrap(plist_file)
+            return c, f
+
+        # ── 4. a loaded job that is NOT working is never a green row ────────────────────
+        for name, kwargs, want, needle in (
+                ("its last real pass declined every ping (exit 3)",
+                 {"exit_code": 3, "summary": "sent 0, labelled 0, declined 2 | KIT-1: chat refused "
+                                             "(invalid_auth)"}, FAILED, "DECLINED what it found"),
+                ("its last real pass exited 1", {"exit_code": 1, "summary": "tracker unreachable"},
+                 FAILED, "exited 1"),
+                ("its last real pass exited 4", {"exit_code": 4, "summary": "deadline"}, FAILED,
+                 "exited 4"),
+                ("nothing has run since the rehearsal", {"dry": True}, UNKNOWN, "REHEARSAL"),
+                ("the last pass is older than a pass may take", {"ago": 10 ** 6}, UNKNOWN,
+                 "NOT RUNNING")):
+            real_pass(home, **kwargs)
+            c, f = settled()
+            code, out = quiet(lambda: cmd_verify(c))
+            captured.append(out)
+            row = rows_of(run_steps_rows(c)).get("enable")
+            ok("enable: %s is not done" % name,
+               row == want and needle in out and "No drift" not in out
+               and code in (EX_FAILED, EX_UNKNOWN) and not [s for s in f.role_scripts
+                                                            if "--dry-run" in s],
+               "%s %s\n%s" % (row, code, out[-700:]))
+        beat_file = os.path.join(home, ".stage-e", "state", "notifier-heartbeat.json")
+        os.remove(beat_file)
+        c, f = settled()
+        code, out = quiet(lambda: cmd_verify(c))
+        captured.append(out)
+        ok("enable: a loaded job that has written NO heartbeat is not done",
+           rows_of(run_steps_rows(c)).get("enable") == UNKNOWN and "NO heartbeat" in out
+           and "No drift" not in out, out[-700:])
+        real_pass(home, exit_code=4, summary="deadline: overran RUN_TIMEOUT_SECONDS")
+        hb_before = open(os.path.join(home, ".stage-e", "state",
+                                      "notifier-heartbeat.json"), encoding="utf-8").read()
+        c, f = settled()
+        code, out = quiet(lambda: cmd_run(c, dry_run=False))
+        captured.append(out)
+        hb_after = open(os.path.join(home, ".stage-e", "state",
+                                     "notifier-heartbeat.json"), encoding="utf-8").read()
+        ok("run: a failing real pass is not answered by re-running the rehearsal over it",
+           code == EX_FAILED and hb_after == hb_before and "exited 4" in out
+           and not [s for s in f.role_scripts if "--dry-run" in s], "%s\n%s" % (code, out[-700:]))
+
+        # ── 5. a loaded job running a DIFFERENT plist stays blocked, run after run ───────
+        real_pass(home)
+        moved = dict(good_conf())
+        moved["INTERVAL_SECONDS"] = "600"
+        c, f = settled(conf=moved)
+        code, out = quiet(lambda: cmd_run(c, dry_run=False))
+        captured.append(out)
+        ok("enable: the plist changed under a loaded job — CK-N3, naming the interval",
+           code == EX_BLOCKED and rows_of(run_steps_rows(c)).get("enable") == BLOCKED
+           and "600 s" in out and "CK-N3" in out, out[-800:])
+        c2, f2 = machine_ctx(root, home=home, state=State(ledger), conf=moved)
+        f2.plists, f2.loaded_body, f2.loaded = f.plists, f.loaded_body, True
+        code, out = quiet(lambda: cmd_run(c2, dry_run=False))
+        captured.append(out)
+        ok("enable: a SECOND run with nothing reloaded still blocks — the warning is not one-shot",
+           code == EX_BLOCKED and rows_of(run_steps_rows(c2)).get("job") == ALREADY_DONE
+           and rows_of(run_steps_rows(c2)).get("enable") == BLOCKED, out[-800:])
+        c3, f3 = machine_ctx(root, home=home, state=State(ledger), conf=moved)
+        f3.plists = f.plists
+        f3.bootstrap(plist_file)
+        real_pass(home)
+        code, out = quiet(lambda: cmd_run(c3, dry_run=False))
+        ok("enable: once the person reloads it, the row clears", code == EX_OK, out[-800:])
+        # A path change keeps the interval and moves the COMMAND: the loaded job then pages
+        # from the old config file, which is the damaging half of the same defect.
+        elsewhere = dict(good_conf())
+        elsewhere["NOTIFIER_CONFIG"] = "~/.stage-e/notifier-v2.json"
+        c6, f6 = machine_ctx(root, home=home, state=State(ledger), conf=elsewhere)
+        f6.plists, f6.loaded_body, f6.loaded = f3.plists, f3.loaded_body, True
+        code, out = quiet(lambda: cmd_run(c6, dry_run=False))
+        captured.append(out)
+        ok("enable: a loaded job whose COMMAND differs blocks, even at the same interval",
+           code == EX_BLOCKED and rows_of(run_steps_rows(c6)).get("enable") == BLOCKED
+           and "DIFFERENT command" in out, out[-800:])
+        c4, f4 = settled()
+        f4.print_arguments = False
+        code, out = quiet(lambda: cmd_verify(c4))
+        captured.append(out)
+        ok("enable: a launchd print naming neither arguments nor interval is NOT MEASURED",
+           rows_of(run_steps_rows(c4)).get("enable") == UNKNOWN and "could not be measured" in out,
+           out[-700:])
+
+        # …and put the fixture back the way section 3 left it: the conf's own plist, installed,
+        # loaded, with a real pass behind it.
+        c5, f5 = settled()
+        quiet(lambda: cmd_run(c5, dry_run=False))
+        f5.bootstrap(plist_file)
+        real_pass(home)
+        code, out = quiet(lambda: cmd_run(c5, dry_run=False))
+        ok("the fixture is settled again after the reload cases", code == EX_OK, out[-600:])
+
+        # ── 6. verify never writes, never records, and on a settled machine exits 0 ──────
+        real_pass(home)
         before_home, before_ledger = snapshot(home), snapshot(ledger)
-        ctx, fake4 = machine_ctx(root, home=home, state=State(ledger))
-        fake4.plists, fake4.loaded = fake.plists, True
+        ctx, fake4 = settled()
         code, out = quiet(lambda: cmd_verify(ctx))
         captured.append(out)
         ok("verify: a settled machine exits 0", code == EX_OK, out[-1200:])
         ok("verify: no write, and the role home and the ledger are byte-identical after",
            not fake4.writes and snapshot(home) == before_home and snapshot(ledger) == before_ledger)
-        ok("verify: the dry run is read from the heartbeat, never re-run",
+        ok("verify: the rehearsal is never re-run",
            not [s for s in fake4.role_scripts if "--dry-run" in s])
 
         def boom(_ctx, _apply):
             raise RuntimeError("an escaped bug\ncarrying %s" % key)
 
-        ctx, fake5 = machine_ctx(root, home=home, state=State(ledger))
-        fake5.plists, fake5.loaded = fake.plists, True
+        ctx, fake5 = settled()
         broken = tuple((s, t, boom if s == "labels" else f) for s, t, f in STEPS)
         saved_steps = globals()["STEPS"]
         globals()["STEPS"] = broken
@@ -2488,6 +2951,35 @@ def _selftest_body():
         custom = good_conf("ENV_FILE=/var/example role/env\n")
         ok("plist: an absolute ENV_FILE is sourced, quoted",
            job_command(custom).startswith('set -a; . "/var/example role/env"; set +a;'), job_command(custom))
+        # A config directly in the role home leaves `~` as its directory. Resolved in the wrong
+        # order that reaches the plist as a literal `~/notifier.log`, which launchd never opens.
+        flat = good_conf("NOTIFIER_CONFIG=~/notifier.json\n")
+        flat_doc = plistlib.loads(render_plist(flat, "/private/var/_exnotify").encode("utf-8"))
+        ok("plist: a config directly in the role home still logs to an ABSOLUTE path",
+           flat_doc["StandardOutPath"] == "/private/var/_exnotify/notifier.log"
+           and flat_doc["StandardErrorPath"] == flat_doc["StandardOutPath"],
+           flat_doc["StandardOutPath"])
+
+        # ── 12b. a plist at that path that is NOT the notifier's is never replaced ──────
+        root12 = os.path.join(tmp_root, "foreign")
+        os.makedirs(root12)
+        ctx12, fake12 = machine_ctx(root12)
+        ctx12.role_home = fake12.home
+        other = se.PLIST.format(label="com.example.notifier", account="_exnotify",
+                                home="/private/var/_exdispatch", path=se.DAEMON_PATH,
+                                command=se.DAEMON_EXEC + '"/x/scripts/pipeline_review_poller.py" run',
+                                interval=300, log="/private/var/_exdispatch/poller.log")
+        fake12.plists[plist_path(ctx12.conf)] = other
+        try:
+            quiet(lambda: step_job(ctx12, True))
+            ok("job: another daemon's plist at that label is never overwritten", False)
+        except SetupError as exc:
+            ok("job: another daemon's plist at that label is never overwritten",
+               "is NOT the notifier's" in str(exc) and "pipeline_review_poller" in str(exc)
+               and fake12.plists[plist_path(ctx12.conf)] == other and not fake12.writes, str(exc)[:300])
+        ok("job: a plist that DOES run the notifier is its own to replace",
+           foreign_plist(render_plist(good_conf(), "/private/var/_exnotify")) is None
+           and foreign_plist(other) is not None and foreign_plist(None) is None)
 
         # ── 13. the dry run: 0 and 3 done; 1, 2 and 4 failed with the notifier's words ───
         for rc in (0, 3, 1, 2, 4):
@@ -2612,47 +3104,181 @@ def _selftest_body():
         ok("transport: the production endpoint is the one fixed HTTPS address",
            TrackerReader._ENDPOINT == "https://api.linear.app/graphql" and not TrackerReader._EXTRA_HANDLERS)
 
-        # ── 16. drift guards: the import closure and the label keys ──────────────────────
+        # ── 16. what preflight demands of the clone is DERIVED, and tracks the sources ──
         import ast
 
-        def imports(path, skip_functions):
-            with open(path, encoding="utf-8") as fh:
-                tree = ast.parse(fh.read())
-            found = set()
-
-            def walk(node, inside_skipped):
-                for child in ast.iter_child_nodes(node):
-                    skipped = inside_skipped or (isinstance(child, ast.FunctionDef)
-                                                 and child.name in skip_functions)
-                    if not skipped and isinstance(child, ast.Import):
-                        found.update(a.name.split(".")[0] for a in child.names)
-                    elif not skipped and isinstance(child, ast.ImportFrom) and child.module:
-                        found.add(child.module.split(".")[0])
-                    walk(child, skipped)
-
-            if skip_functions is None:
-                for child in tree.body:
-                    if isinstance(child, ast.Import):
-                        found.update(a.name.split(".")[0] for a in child.names)
-                    elif isinstance(child, ast.ImportFrom) and child.module:
-                        found.add(child.module.split(".")[0])
-            else:
-                walk(tree, False)
-            return set(m + ".py" for m in found if os.path.exists(os.path.join(HERE, m + ".py")))
-
-        closure = set([NOTIFIER_SCRIPT])
-        todo = list(imports(os.path.join(HERE, NOTIFIER_SCRIPT), ("selftest",)))
-        while todo:
-            name = todo.pop()
-            if name not in closure:
-                closure.add(name)
-                todo.extend(imports(os.path.join(HERE, name), None))
-        ok("drift: REQUIRED_SCRIPTS is exactly what the notifier imports when it runs",
-           closure == set(REQUIRED_SCRIPTS), "%s vs %s" % (sorted(closure), sorted(REQUIRED_SCRIPTS)))
+        ok("required scripts: what preflight demands is DERIVED from the sources, not listed",
+           REQUIRED_SCRIPTS == runtime_closure()
+           and set(REQUIRED_SCRIPTS) >= {NOTIFIER_SCRIPT, "pipeline_review_local.py"}
+           and all(os.path.exists(os.path.join(HERE, s)) for s in REQUIRED_SCRIPTS),
+           repr(REQUIRED_SCRIPTS))
+        # A LAZY IMPORT A SIBLING CHANGE ADDS MUST BE PICKED UP, and its own imports with it.
+        # A hard-coded list could not, and turned a clean merge into a red check on main.
+        grown = os.path.join(tmp_root, "grown")
+        os.makedirs(grown)
+        saved_here = globals()["HERE"]
+        globals()["HERE"] = grown
+        try:
+            with open(os.path.join(grown, "leaf_mod.py"), "w", encoding="utf-8") as fh:
+                fh.write("import json\n")
+            with open(os.path.join(grown, "mid_mod.py"), "w", encoding="utf-8") as fh:
+                fh.write("import leaf_mod\n")
+            with open(os.path.join(grown, "root_mod.py"), "w", encoding="utf-8") as fh:
+                fh.write("def f():\n    import mid_mod\n\n\ndef selftest():\n"
+                         "    import never_mod\n")
+            with open(os.path.join(grown, "never_mod.py"), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+            grew = runtime_closure("root_mod.py")
+            ok("required scripts: a lazy import in a run-time function is followed, "
+               "transitively, and a battery-only one is not",
+               set(grew) >= {"root_mod.py", "mid_mod.py", "leaf_mod.py"}
+               and "never_mod.py" not in grew, repr(grew))
+            with open(os.path.join(grown, "broken_mod.py"), "w", encoding="utf-8") as fh:
+                fh.write("def f(:\n")
+            floored, floor_out = quiet(lambda: runtime_closure("broken_mod.py"))
+            ok("required scripts: a source it cannot read falls back to the floor, loudly, "
+               "never to nothing",
+               floored == tuple(sorted(REQUIRED_FLOOR)) and "could not read" in floor_out,
+               "%s %s" % (floored, floor_out))
+        finally:
+            globals()["HERE"] = saved_here
         ok("drift: the notifier's labelled marks are exactly agent:blocked and agent:needs-human",
            LABEL_KEYS == ("agent:blocked", "agent:needs-human"), repr(LABEL_KEYS))
-        ok("drift: the dry run's done codes are the notifier's 0 and 3",
-           DRY_RUN_OK == (0, 3))
+        ok("drift: the rehearsal's done codes are the notifier's 0 and 3", DRY_RUN_OK == (0, 3))
+
+        # ── 16b. the fake runner keeps the signature its base may grow ─────────────────
+        import inspect
+        probe_fake = FakeMachine(os.path.join(tmp_root, "sig"), "_exnotify")
+        params = inspect.signature(probe_fake._exec).parameters
+        ok("selftest: the fake runner accepts a `cwd` its base class may pass, and any other "
+           "keyword, so this battery survives a change to the runner it subclasses",
+           "cwd" in params and any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+           and probe_fake._exec(["dscl", "."], None, 10, cwd="/").ok,
+           str(params))
+
+        # ── 16c. the guarantees a mutant could have taken quietly ──────────────────────
+        acquired = []
+
+        class _CountingSudo(object):
+            held = False
+
+            def acquire(self, why, resume):
+                acquired.append(why)
+                return True
+
+        agent_ctx, _f = machine_ctx(os.path.join(tmp_root, "nosudo"),
+                                    env={"CLAUDECODE": "", "STAGE_E_LINEAR_API_KEY": key})
+        agent_ctx.sudo = _CountingSudo()
+        person_ctx, _f2 = machine_ctx(os.path.join(tmp_root, "sudo"))
+        person_ctx.sudo = _CountingSudo()
+        acquire_privilege(agent_ctx, "verify", False)
+        under_model = list(acquired)
+        acquire_privilege(person_ctx, "verify", False)
+        ok("agent: no administrator password is acquired under a model, and one is in a "
+           "person's shell", under_model == [] and len(acquired) == 1, repr(acquired))
+
+        cfg_ctx, _f3 = machine_ctx(os.path.join(tmp_root, "mode644"))
+        saved_probe = globals()["_probe_credentials"]
+        globals()["_probe_credentials"] = lambda _c: {"mode": "644", "owner": "_exnotify",
+                                                      "chat": "ok", "key": "ok", "exists": True}
+        try:
+            loose = step_credentials(cfg_ctx, False)
+        finally:
+            globals()["_probe_credentials"] = saved_probe
+        ok("credentials: a token file at mode 644 is WOULD-CHANGE, never already-done",
+           loose[0] is False and "mode 644, want 600" in loose[1], repr(loose))
+
+        # The real-home path rules are load-bearing: `~/x` and an absolute spelling of the same
+        # file can only be compared once the role account's home is known.
+        real_home_conf = good_conf("DISPATCHER_ENV_FILE=/private/var/_exnotify/.stage-e/env\n")
+        ok("paths: a rule that needs the real home passes the sentinel and fails the home",
+           not path_problems(real_home_conf, ROLE_HOME_SENTINEL)
+           and any("dispatcher's own env file" in p
+                   for p in path_problems(real_home_conf, "/private/var/_exnotify")),
+           repr(path_problems(real_home_conf, "/private/var/_exnotify")))
+        # …and PREFLIGHT is what applies it: the conf-time pass cannot, so a preflight that
+        # stopped calling it would let a token be written into the dispatcher's own env file.
+        pf_root = os.path.join(tmp_root, "preflight-paths")
+        os.makedirs(pf_root)
+        pf_home = new_home(pf_root)
+        pf_conf = good_conf("DISPATCHER_ENV_FILE=%s/.stage-e/env\n" % pf_home)
+        pf_ctx, _f7 = machine_ctx(pf_root, home=pf_home, conf=pf_conf)
+        try:
+            quiet(lambda: step_preflight(pf_ctx, False))
+            ok("preflight: the dispatcher-path rules are re-checked against the REAL home", False)
+        except SetupError as exc:
+            ok("preflight: the dispatcher-path rules are re-checked against the REAL home",
+               "dispatcher's own env file" in str(exc), str(exc)[:200])
+        # …and they compare the FILE, not the spelling: /var and /private/var are one tree.
+        link_root = os.path.join(tmp_root, "symlink")
+        os.makedirs(os.path.join(link_root, "real", ".stage-e"))
+        os.symlink(os.path.join(link_root, "real"), os.path.join(link_root, "link"))
+        linked = good_conf("DISPATCHER_ENV_FILE=%s/real/.stage-e/env\n" % link_root)
+        ok("paths: two spellings of one file are one file (a symlinked home included)",
+           any("dispatcher's own env file" in p
+               for p in path_problems(linked, os.path.join(link_root, "link"))),
+           repr(path_problems(linked, os.path.join(link_root, "link"))))
+
+        first_ping_ctx, _f4 = machine_ctx(os.path.join(tmp_root, "rebind-config"))
+        first_ping_ctx.state.attest(A_FIRST_PING, "pq", "n", config_sha256="a" * 64)
+        first_ping_ctx.composed = {"body": "{}", "sha256": "b" * 64}
+        try:
+            step_first_ping(first_ping_ctx, False)
+            ok("first-ping: a changed config brings CK-N4 back", False)
+        except Blocked as exc:
+            ok("first-ping: a changed config brings CK-N4 back",
+               exc.card_id == "CK-N4" and "config changed" in exc.extra, exc.extra)
+
+        # ── 16d. output this terminal must survive, and a key that outlives no command ──
+        ok("scrub: an escape sequence in session-writable text never reaches the terminal",
+           "\x1b" not in scrub("WOULD SEND KIT-9 \x1b[2K\x1b]52;c;x\x07 title")
+           and "title" in scrub("WOULD SEND KIT-9 \x1b[2K title"),
+           repr(scrub("WOULD SEND \x1b[2K title")))
+        hand_off = key_hand_off("STAGE_E_LINEAR_API_KEY")
+        ok("labels: the key is handed to ONE command, never exported into the shell",
+           "export STAGE_E_LINEAR_API_KEY" not in hand_off
+           and "unset STAGE_E_LINEAR_API_KEY" in hand_off
+           and 'STAGE_E_LINEAR_API_KEY="$STAGE_E_LINEAR_API_KEY" python3' in hand_off, hand_off)
+        no_key_ctx, _f5 = machine_ctx(os.path.join(tmp_root, "nokey"), env={})
+        try:
+            step_labels(no_key_ctx, False)
+            ok("labels: the remedy it prints is that one", False)
+        except Unknown as exc:
+            ok("labels: the remedy it prints is that one",
+               "export STAGE_E_LINEAR_API_KEY" not in exc.remedy and "unset" in exc.remedy,
+               exc.remedy)
+
+        # ── 16e. a conf value no int() accepts is reported, not raised ─────────────────
+        for bad_number in ("²", "③"):
+            values_b, errs_b = parse_conf(good_text + "INTERVAL_SECONDS=%s\n" % bad_number)
+            try:
+                _c, more_b = validate_conf(values_b, person)
+                ok("conf: a non-ASCII digit is an error beside the others, never a traceback",
+                   any("INTERVAL_SECONDS must be a positive integer" in e for e in errs_b + more_b),
+                   repr(errs_b + more_b))
+            except Exception as exc:                              # noqa: BLE001
+                ok("conf: a non-ASCII digit is an error beside the others, never a traceback",
+                   False, "%s: %s" % (type(exc).__name__, exc))
+        bad_conf_path = os.path.join(tmp_root, "bad-number.conf")
+        with open(bad_conf_path, "w", encoding="utf-8") as fh:
+            fh.write(good_text + "INTERVAL_SECONDS=²\n")
+        code, out = quiet(lambda: main(["run", "--dry-run", "--conf", bad_conf_path,
+                                        "--state", os.path.join(tmp_root, "bad-number-state")]))
+        ok("conf: and the command exits 2 with the report, not 1 with a traceback",
+           code == EX_USAGE and "INTERVAL_SECONDS" in out, "%s\n%s" % (code, out[-400:]))
+
+        # ── 16f. a team key the tracker does not know is a failure, not a quiet day ────
+        typo = good_conf(text=good_text.replace("TEAM_KEYS=KIT,TOD", "TEAM_KEYS=KIT,TDO"))
+        typo_ctx, _f6 = machine_ctx(os.path.join(tmp_root, "team-typo"), conf=typo)
+        try:
+            step_labels(typo_ctx, True)
+            ok("labels: a TEAM_KEYS typo is refused, naming the key", False)
+        except SetupError as exc:
+            ok("labels: a TEAM_KEYS typo is refused, naming the key",
+               "TDO" in str(exc) and "quiet week" in str(exc), str(exc)[:200])
+        ok("conf: the CHAT_TOKEN_ENV refusal does not claim the two VALUES are compared",
+           not any("same value" in e for e in validate_conf(
+               parse_conf(good_text + "CHAT_TOKEN_ENV=SLACK_BOT_TOKEN\n")[0], person)[1]))
 
         # ── 17. what this file can never do, read from its own source ──────────────────
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:

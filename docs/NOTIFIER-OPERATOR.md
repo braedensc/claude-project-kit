@@ -89,6 +89,11 @@ structural: the two values can never be the same variable by accident.
 Good: `CHAT_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN`, and a bot token from the notifier's own app.
 Not: the dispatcher's bot token, under any name.
 
+**Nothing compares the two values.** The installer refuses the *name*; which token you paste
+at the hidden prompt is yours to get right, and card `CK-N1` is where you sign that the
+notifier has an app of its own. The run banner prints the channel and the API base the token
+will be sent to — read that line before you load the job.
+
 ## Where the token lives
 
 In the role account's own env file, `~/.stage-e/env`, at mode 600, beside the tracker key.
@@ -127,13 +132,20 @@ It checks your work and carries on.
 | `attest A-PRIVATE-CHANNEL --initials YOUR-INITIALS --note "..."` | record something no computer can check. `YOUR-INITIALS` is refused as typed |
 
 **The labels step reads the tracker key from YOUR shell,** for that one command. It never
-reads the role account's file. Export it first:
+reads the role account's file. Give it to that one command, and to nothing else:
 
 ```sh
-read -rs STAGE_E_LINEAR_API_KEY && export STAGE_E_LINEAR_API_KEY
+read -rs STAGE_E_LINEAR_API_KEY                                    # hidden, and NOT exported
+STAGE_E_LINEAR_API_KEY="$STAGE_E_LINEAR_API_KEY" python3 scripts/pipeline_notifier_setup.py run
+unset STAGE_E_LINEAR_API_KEY
 ```
 
-Not set, the labels row says **NOT MEASURED** and names this command.
+**Do not `export` it.** An exported key lives as long as the shell, and every process you
+start from that shell inherits it — a `claude` session among them, whose every command would
+then hold your tracker key. That is the incident this kit's own installers are shaped
+against.
+
+Not set, the labels row says **NOT MEASURED** and prints those three lines.
 
 **Your login password is asked for once,** at the start of `run`, `run --dry-run` and
 `verify`. Declined, the command stops at exit 5 having done nothing.
@@ -145,11 +157,11 @@ Not set, the labels row says **NOT MEASURED** and names this command.
 | `preflight` | reads the conf, finds the role account's home, checks the notifier is in that account's clone, and runs the notifier's own selftest | any problem, all listed at once |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private | card `CK-N1` |
 | `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer |
-| `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, and looks up `self` | a missing label fails and names `/setup-board`. The installer never creates one |
+| `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
 | `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it | a composition the notifier would refuse fails here, before anything is written |
-| `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | — |
+| `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
-| `enable` | checks whether you loaded the job | card `CK-N3` |
+| `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
 | `handover` | prints what is on, what is off, and what is not proven, each with a ticket id | — |
 
@@ -188,16 +200,22 @@ sudo -u <role-account> -H /bin/sh -c 'cd / && set -a; . "$HOME/.stage-e/env"; se
 
 It sends nothing and labels nothing. It still reads the tracker, so it needs both values.
 
-| Exit | Meaning | The installer |
+| Exit | Meaning for the REHEARSAL | The installer |
 |---|---|---|
 | 0 | ran; the summary says what it would send, or says "nothing to do" | done |
-| 3 | ran, and declined something it names: a title withheld for carrying a credential shape, or events over the per-pass cap | done — read what it declined |
+| 3 | ran, and declined something it names. A rehearsal posts nothing, so its declines are a title withheld for carrying a credential shape, or events over the per-pass cap | done — read what it declined |
 | 1 | could not do it: the tracker could not be read, or an unexpected error | failed |
 | 2 | config or usage: often a token that is not set | failed |
 | 4 | ran out of time | failed |
 
-A `run` that already passed this step does not repeat it. It reads the notifier's latest
-heartbeat instead, so a loaded job's real heartbeat is not replaced by a rehearsal's.
+**Exit 3 does not mean the same thing for a real pass.** A loaded job posts, so it also
+declines when the chat refused the ping or the label did not apply — an escalation nobody
+was told about. The `enable` row reads the loaded job's heartbeat, and treats a real pass's
+exit 3 as a failure with the notifier's own summary, never as done.
+
+A `run` that already passed the rehearsal does not repeat it, so a loaded job's real
+heartbeat is not replaced by a rehearsal's — including when that heartbeat is the one
+reporting a failure.
 
 ## Turn it on — card CK-N3
 
@@ -212,6 +230,11 @@ python3 scripts/pipeline_notifier_setup.py run
 Changed the plist while it was loaded? Unload it first:
 `sudo launchctl bootout system/<JOB_LABEL>`. Wait a few seconds before loading again. A load
 straight after an unload can answer `Input/output error`; wait and repeat it.
+
+**launchd keeps what it was given.** Change `INTERVAL_SECONDS`, or a path the job's command
+names, and the file on disk moves on while the running job does not. The installer asks
+launchd what it is actually running and compares it with the plist, on every run — so this
+card keeps coming back until you reload it, not just on the run that rewrote the file.
 
 To pause the notifier, unload it. A later `run` does not load it again.
 
@@ -238,14 +261,22 @@ their test.
 right not to page: a neutralised mark never pages. Post the comment through the tracker's
 API instead, from your own shell. Find the ticket's internal id, then post:
 
+The header goes in on **stdin**, not on the command line: a shell expands `-H "Authorization:
+$KEY"` before `curl` starts, and on macOS any local account can read another's command line
+with `ps`. The same rule the installer states when it asks for the Slack token.
+
 ```sh
-read -rs STAGE_E_LINEAR_API_KEY && export STAGE_E_LINEAR_API_KEY
-curl -s https://api.linear.app/graphql \
-  -H "Authorization: $STAGE_E_LINEAR_API_KEY" -H "Content-Type: application/json" \
+read -rs STAGE_E_LINEAR_API_KEY            # hidden, and NOT exported
+
+printf 'Authorization: %s\n' "$STAGE_E_LINEAR_API_KEY" | curl -s https://api.linear.app/graphql \
+  -H @- -H "Content-Type: application/json" \
   --data '{"query":"query($t:String!,$n:Float!){issues(filter:{team:{key:{eq:$t}},number:{eq:$n}}){nodes{id}}}","variables":{"t":"<TEAM>","n":<NUMBER>}}'
-curl -s https://api.linear.app/graphql \
-  -H "Authorization: $STAGE_E_LINEAR_API_KEY" -H "Content-Type: application/json" \
+
+printf 'Authorization: %s\n' "$STAGE_E_LINEAR_API_KEY" | curl -s https://api.linear.app/graphql \
+  -H @- -H "Content-Type: application/json" \
   --data '{"query":"mutation($i:String!,$b:String!){commentCreate(input:{issueId:$i,body:$b}){success}}","variables":{"i":"<ID FROM ABOVE>","b":"<!-- pipeline-escalation: agent:blocked -->\nnotifier live test"}}'
+
+unset STAGE_E_LINEAR_API_KEY
 ```
 
 Still nothing? Read `~/.stage-e/notifier.log` as the role account, and its heartbeat,
@@ -260,9 +291,19 @@ a non-zero `exit` means RAN AND COULD NOT, and its `summary` says why.
 Run `verify` after any merge that moves the role account's clone, and whenever `status`
 looks better than the channel feels.
 
-`verify` reads the notifier's latest heartbeat. A latest pass that exited 1, 2 or 4 is a
-failed `dry-run` row, with the notifier's summary. That is the only place a dead notifier
-shows up, and only when you run it.
+`verify` reads the loaded job's latest heartbeat, in the `enable` row. Each of these is a
+row you can act on, and none of them is green:
+
+| What the heartbeat says | The row |
+|---|---|
+| a real pass, exit 0, recent | done |
+| a real pass that declined (exit 3) | FAILED, with the summary: a ping or a label did not land |
+| a real pass that exited 1, 2 or 4 | FAILED, with the summary |
+| only the installer's own rehearsal | NOT MEASURED: the loaded job has finished no pass |
+| older than two intervals plus a pass | NOT MEASURED: loaded and NOT RUNNING |
+| no heartbeat at all | NOT MEASURED: the job has never finished a pass |
+
+That is the only place a dead notifier shows up, and only when you run it.
 
 ---
 
