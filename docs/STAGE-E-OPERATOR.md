@@ -394,7 +394,7 @@ poller would.
 |---|---|---|
 | Poller + bounce driver | **The dispatcher's own role account**, system LaunchDaemon | Holds an owner-scoped Linear key and a GitHub token, in their own env file under that account's home. Plain Python, one pass per interval. Not a session. |
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
-| Reviewer | The same account, sandboxed, the Reviews entry | No shell, no edits, no fetch. Reads its ticket body. Linear MCP tools present (accepted risk, below). |
+| Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
 | Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats and one tracker key. Posts one comment per incident on one ticket, and nothing else. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
@@ -526,9 +526,17 @@ first (why, two paragraphs down).
   "teamKeys": ["REV"],
   "isActive": true,
   "disallowedTools": [
-    "Bash", "Edit", "Write", "NotebookEdit",
-    "WebFetch", "WebSearch", "Task", "Agent",
-    "EnterWorktree", "ExitWorktree",
+    "Bash", "Monitor", "REPL",
+    "Edit", "Write", "NotebookEdit",
+    "WebFetch", "WebSearch",
+    "Task", "Agent", "Workflow", "RemoteTrigger", "Skill",
+    "TaskStop", "EnterWorktree", "ExitWorktree",
+    "CronCreate", "CronDelete", "ScheduleWakeup",
+    "SendMessage", "SendUserMessage", "PushNotification",
+    "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
+    "EnterPlanMode", "ExitPlanMode",
+    "ListMcpResourcesTool", "ReadMcpResourceTool",
+    "ReadMcpResourceDirTool",
     "mcp__linear", "mcp__linear__*",
     "mcp__cyrus-tools", "mcp__cyrus-tools__*",
     "mcp__cyrus-docs", "mcp__cyrus-docs__*",
@@ -567,9 +575,10 @@ swallow every delegated ticket from a team you have not configured. Today that r
 | A bare `mcp__*`, or any rule naming no single server | The runtime skips an unanchored MCP rule with no error, so the fence would read closed and be open. Name each server, in both forms. The installer refuses anything else. |
 
 Then **restart the dispatcher**, once, *because the file changed*. Do not rely on hot
-reload for a new entry. Confirm in its log that **every** `reviews-…` entry loaded and
-that the runner reports eighteen disallowed tools. One missing entry is one repository whose
-reviews fall back to another repository's clone.
+reload for a new entry. Confirm that the banner the **new** process printed names
+**every** `reviews-…` entry. The old process's banner names them too, so read only the
+lines after the restart. The runner's debug log lists the disallowed tools it passed on.
+One missing entry is one repository whose reviews fall back to another repository's clone.
 
 The installer restarts it on exactly that condition: a pass that finds every entry already
 byte-identical, with nothing left to remove, does **not** bounce the service, because a
@@ -577,7 +586,22 @@ restart kills every in-flight coding session and you are told to re-run the same
 clear the cards downstream of here. Whether the entries match and whether their load has
 been proven are recorded separately, so a re-run re-reads the log without re-starting
 anything. A recorded proof names the entries it proved, so adding a repository does not
-inherit it. If the log names one of them nowhere, the run reports `UNKNOWN` and prints the
+inherit it.
+
+After a restart, the installer reads only what the new process wrote. It notes the log's
+size once the old process has left the domain, and searches past that point. It keeps that
+size in its ledger until a banner past it proves the entries. So a re-run after a restart
+that printed no banner still reads only past that point, even though it restarts nothing.
+If the log is now shorter than that point, it was rotated or truncated, and the whole log
+is read. A re-run with no restart waiting on its proof searches the whole log.
+
+A pass that rewrites the entries drops any earlier banner proof. If its restart stops
+before it reads the size, there is no point to read past. The next run then saves the
+log's size as it is at that moment and reports `UNKNOWN`. Restart the dispatcher and run
+again: only what the log gains past that size counts. A rewrite keeps an `A-ENTRY-LOADED`
+sign-off, so a sign-off made for the old entries settles the new ones (no ticket yet).
+
+If the log names one of them nowhere, the run reports `UNKNOWN` and prints the
 restart-and-re-read commands; signing off `A-ENTRY-LOADED` is the other way out, and
 watching `CK-7` is a third — slower, because it is downstream of this step.
 
@@ -632,9 +656,25 @@ guessing a clone is the defect this whole shape exists to remove.
 
 ### The fence: what the reviewer loses, and why the tracker is in it
 
-Ten built-ins go: everything that runs, writes, fetches, or starts another agent. `Agent`
-is the subagent tool's current name and `Task` its older one, so both are listed — a deny
-rule naming a tool that does not exist is ignored without a word.
+The reviewer needs to read files, and nothing else. So 31 built-in tools go: every tool
+that runs, writes, fetches, schedules, messages, publishes or starts other work. The names
+come from the dispatcher's own list of available tools and from the SDK it depends on. A few
+need a word:
+
+- `Monitor` runs a shell command. A `Bash` rule does not stop it: a deny rule matches the
+  tool's own name.
+- `RemoteTrigger` starts a cloud agent, outside the sandbox.
+- `AskUserQuestion` becomes a question posted on the tracker.
+- `ListMcpResourcesTool`, `ReadMcpResourceTool` and `ReadMcpResourceDirTool` read any
+  connected MCP server. Their names do not start with `mcp__`, so no server rule reaches
+  them.
+- `Agent` is the subagent tool's current name and `Task` its older one, so both are listed.
+  A deny rule naming a tool that does not exist is ignored without a word.
+
+The reviewer keeps `Read`, `Grep`, `Glob`, `LSP`, `ToolSearch`, `TaskOutput`, `CronList`,
+`TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`, `TodoWrite` and `ReportFindings`. Each one
+only reads, or tracks the session's own work. This is the **read-only set**
+(`REVIEWER_READ_ONLY_TOOLS` in the installer). The probe below checks against it.
 
 **So do the four MCP servers the dispatcher injects into every session** (KIT-132,
 2026-09-16). `linear` is the tracker's whole write surface under the dispatcher's own
@@ -643,10 +683,27 @@ upload files. `cyrus-docs` fetches from a third-party host. `slack` appears when
 dispatcher holds a bot token. A reviewer needs none of them: its deliverable is its final
 message, and the dispatcher posts that itself.
 
+**And so does every server your platform MCP configs add.** A review entry has no
+`allowedTools`. For such an entry, the dispatcher loads every server in the files its
+config's `linearMcpConfigs` names. The installer reads those files as the role account and
+fences each server it finds, in both forms. It reads names only; those files hold tokens.
+A file it cannot read or parse stops the run and names the file. So does a server name no
+rule can spell. On such a machine the entry's list is longer than the one above.
+
+Change a file on that list, and `verify` reports the entries as `WOULD-CHANGE` until `run`
+rewrites them. Until then the reviewer holds the new server (no ticket yet).
+
 Each server is named twice, `mcp__<server>` and `mcp__<server>__*`. Both forms are
 documented, a form the runtime does not honour fails silently, and only a probe of a live
-reviewer can say which one did the work. What the fence does **not** cover: an MCP server
-a repository's own `.mcp.json` adds, whose name the installer cannot know (no ticket yet).
+reviewer can say which one did the work. What the fence does **not** cover:
+
+- An MCP server a repository's own `.mcp.json` adds, whose name the installer cannot know
+  (no ticket yet).
+- A tool the dispatcher or its SDK adds later. A deny list names only tools that exist
+  today, so a new one reaches the reviewer until the installer names it (no ticket yet).
+
+The probe catches both, because it checks the reviewer's list against the read-only set,
+not against the deny list.
 
 Until 2026-09-16 the tracker servers stayed, by an owner decision of 2026-09-06, and the
 installer's selftest refused any `mcp__` entry. So the closure was never the one-line
@@ -654,24 +711,53 @@ config edit this document once described: a hand edit was reverted by the next `
 
 ### Changing the fence — the order, and how to know it took
 
-The fence is a constant in the installer, `DISALLOWED_TOOLS`. The dispatcher reads it from
-its own config only at start. So a change is four steps, in this order, and the last is
-not optional:
+The fence is `DISALLOWED_TOOLS` in the installer, plus the rules for your platform MCP
+servers. The dispatcher watches its config file. Within seconds it applies a changed entry,
+`disallowedTools` included, to the next session that starts. So a hand edit to a review
+entry takes effect at once, and the next `run` puts the installer's version back.
+
+The restart in step 3 is not what applies the change. It loads new entries through the
+dispatcher's startup path, and the new process prints a banner the installer reads as
+proof. A change is five steps, in this order, and the last two are not optional:
 
 1. **A kit pull request** changing the constant and its selftest together, labelled
    `hooks-change` by a person. Merge it.
 2. **Pull your checkout, then dry-run.** The `dispatcher-entry` row must read
    `WOULD-CHANGE`: the entries will be rewritten and the dispatcher restarted.
 3. **Run the installer with no coding session in flight.** The restart kills every one.
-   Confirm the banner names every `reviews-…` entry, as above.
+   The installer reads only the banner the new process prints. The run then stops at
+   `CK-7`: the end-to-end sign-off names the fence it watched, and this fence is new.
 4. **Probe a live reviewer.** A config file says what was asked for, not what the session
-   got. Delegate a hand-made Reviews ticket routed to a review entry, asking the reviewer
-   to list every tool it has by exact name and to try `git status`. Nothing posts on any
-   pull request: the poller collects only tickets it created. The fence took when no
-   fenced name appears in the list. Record the list (KIT-99, test 4).
+   got. Create a ticket by hand in the Reviews team, with `[repo=reviews-<repo name>]` as
+   its first line, and delegate it to the agent. Ask the reviewer to list every tool it has
+   by exact name, and to try `git status`. Nothing posts on any pull request: the poller
+   collects only tickets it created. The fence took when the list holds **no** name outside
+   the read-only set and no `mcp__` name at all. Any other name is a tool the fence misses:
+   do not sign, change the fence first. Record the list (live test 5).
+5. **Sign `CK-7` again**, with your own initials. The sign-off records the fence the entries
+   carry now.
 
-A review ticket created before step 3 was answered by the old fence. Judge the change by a
-review that started after the restart.
+A review session that started before step 3 may have run under the old fence. Judge the
+change by one that started after it.
+
+A machine upgraded to an installer that ties the sign-off to its fence stops at `CK-7`
+once, for the same reason: no reviewer there has been probed under the current fence.
+
+The `handover` row matches the sign-off only against the fence the `dispatcher-entry` step
+read on the same pass. When that step fails before it reads the entries, `handover` reads
+`UNKNOWN`. Clear `dispatcher-entry` first.
+
+**A prompt type's list replaces the fence.** The dispatcher picks a session's
+`disallowedTools` in this order: the entry's `labelPrompts.<type>`, then the global
+`promptDefaults.<type>`, then the entry's own list. A ticket's labels pick the type. The
+label `orchestrator` picks the orchestrator type on every entry, with or without
+`labelPrompts`. On an entry with no `labelPrompts`, it is the only label that picks a type.
+So a review ticket with such a label runs under that type's list, not the reviewer fence.
+The poller adds only `MODEL_LABEL` to a review ticket, but anyone with write access to the
+tracker can add a label. The installer does not refuse this, because `promptDefaults` is
+there for coding sessions. After the steps table it prints a note from the
+`dispatcher-entry` step that names each type with a list. Nothing stops a label from
+reaching a review ticket (no ticket yet).
 
 ### The reviewer brief — the value of `appendInstruction`
 
@@ -1385,9 +1471,10 @@ live system can confirm.
    tickets it created itself, so use `scan` for this test, not the tracker's UI.
 5. **`disallowedTools` really removes what it names from the model's tool list.** Add one
    line to the throwaway review ticket asking the reviewer to list every tool it has by
-   exact name, and to run `git status`. Expect no `Bash`, no `Agent`, no `mcp__linear…` or
-   other fenced server in the list, and no command output. Confirm the runner log shows
-   the eighteen disallowed tools.
+   exact name, and to run `git status`. Expect every name in the list to be in the
+   read-only set (*The fence*, Step 2), no `mcp__` name at all, and no command output. A
+   name outside the set fails this test even when the fence never mentions it: that is a
+   tool the fence misses. Confirm the runner's debug log lists the disallowed tools.
 6. **A re-prompt comment resumes the original session, and it pushes to the same
    branch.** Post a comment as yourself in the throwaway coding ticket's agent-session
    thread — a reply under the session's root comment — asking for one trivial in-scope
@@ -1697,7 +1784,7 @@ or cron: `docs/COLLABORATION.md`, parallel-session item 8.
 | Risk | Why it is accepted, and what to watch |
 |---|---|
 | **The poller shares a uid with the sessions it reviews** | It runs as the dispatcher's role account so that a reboot brings it back without a login. The delegation key is therefore kept from sessions by the sandbox's deny-read of that home, and by nothing else — not a permission boundary. **Revisit the moment either is true:** a non-Claude runner label appears (a runner outside that sandbox), or the session Linear token is tightened to read-only (which makes a separate role account cheap). Then move the poller to its own account. |
-| The Linear MCP tools stay in every **coding** session | Sessions may read Linear and comment across tickets. The brief says not to; the brief is not a boundary. Live test 7 measures it. **Closed for the reviewer on 2026-09-16 (KIT-132):** the review entries fence every dispatcher-injected MCP server, and that closure is an installer change plus a restart — see *Changing the fence*. A coding session still needs the tracker to report its work. |
+| The Linear MCP tools stay in every **coding** session | Sessions may read Linear and comment across tickets. The brief says not to; the brief is not a boundary. Live test 7 measures it. **Closed for the reviewer on 2026-09-16 (KIT-132):** the review entries fence every dispatcher-injected MCP server and every server the platform MCP configs add. That closure is an installer change, a run of the installer and a probe of a live reviewer — see *Changing the fence*. A coding session still needs the tracker to report its work. |
 | The re-prompt access check tests the *delegator*, not the commenter | Anyone who can comment in the thread can resume a session the owner delegated. Accepted for a single-owner workspace. Watch for comments not yours. |
 | The mid-work criteria-edit gap (ADR decision 2) is narrowed, not closed (no ticket yet) | The snapshot is taken on the first driver pass after a person delegates, not at delegation (step 10). An edit inside that gap is recorded as an edit, and the flag then reads `unknown` rather than `false`. Watch `lag_seconds` in the snapshots. |
 

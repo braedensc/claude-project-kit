@@ -22,11 +22,14 @@ WHAT IT BUILDS
 
 THE FENCE — the one security choice, and why it is shaped this way (fallback b)
   The whole no-self-approval guarantee rests on ONE thing: the planning session
-  must hold no tool that can write the tracker. The built review installer proved
-  that per-tool tracker fencing is NOT demonstrated in the running system — its
-  `disallowedTools` names only built-in tools and its selftest forbids any
-  `mcp__` entry. So this installer does NOT rest the guarantee on naming
-  individual tracker tools. It takes the STRUCTURAL route:
+  must hold no tool that can write the tracker. When this installer was designed,
+  no MCP fence had ever run in the live system: the review installer's
+  `disallowedTools` named only built-in tools and its selftest forbade any `mcp__`
+  entry. Since KIT-132 the review installer fences whole servers by name
+  (`mcp__<server>` and `mcp__<server>__*`), and its card CK-7 has a person probe a
+  live reviewer's tool list under that fence. Either way, this installer does NOT
+  rest the guarantee on naming individual tracker tools. It takes the STRUCTURAL
+  route:
 
     * the Planning entry attaches NO Linear MCP server at all
       (PLANNING_ENTRY["linearMcpAttached"] is False) — the session simply has no
