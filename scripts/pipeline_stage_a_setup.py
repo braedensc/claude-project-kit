@@ -600,6 +600,26 @@ class Runner(object):
 LINEAR_API = "https://api.linear.app/graphql"
 
 
+def _label_rows(rows, name):
+    return [r for r in rows if r.get("name") == name]
+
+
+def _match_label(rows, name):
+    """(id, False) for the workspace-scoped label called `name`. A team-scoped
+    label of the same name is used ONLY to explain a refusal, and never picked
+    by the order rows happen to come back in: a workspace-scoped one, if it
+    exists anywhere in the list, always wins."""
+    hits = _label_rows(rows, name)
+    workspace = [r for r in hits if not r.get("team")]
+    if workspace:
+        return workspace[0]["id"], False
+    raise SetupError(
+        "the label %r exists only scoped to one team, and a team label cannot be "
+        "made workspace-wide. Before deleting it, check which tickets carry it — "
+        "deleting removes it from all of them — and re-run the board setup in every "
+        "repository whose delivery.json recorded its id." % name)
+
+
 class _NoRedirect(object):
     """A redirect would carry the Authorization header to whatever host the
     answer named. One fixed endpoint; a redirect is never expected."""
@@ -702,15 +722,9 @@ class LinearTransport(object):
         cannot have its scope changed afterwards, so a team-scoped twin is a
         failure to report, not something to quietly use."""
         rows = existing if existing is not None else self.workspace_labels()
-        for row in rows:
-            if row.get("name") != name:
-                continue
-            if row.get("team"):
-                raise SetupError(
-                    "the label %r exists but is scoped to one team; scope cannot be "
-                    "changed after creation. Delete it in the tracker and run again."
-                    % name)
-            return row["id"], False
+        return _match_label(rows, name) if _label_rows(rows, name) else self._create_label(name, apply_it)
+
+    def _create_label(self, name, apply_it):
         if not apply_it:
             return None, False
         data = self.post(
@@ -741,7 +755,11 @@ class Host(object):
         import subprocess
         try:
             proc = subprocess.run(
-                ["sudo", "-n", "-u", account, "/bin/sh", "-c", script],
+                # -H: without it, sudo on macOS keeps the CALLER's HOME, and every
+                # "$HOME/..." below would point at the operator's home, not the
+                # executor account's. The review installer passes -H for the same
+                # reason, and that call is proven on a live machine.
+                ["sudo", "-n", "-H", "-u", account, "/bin/sh", "-c", script],
                 input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1356,27 +1374,17 @@ class FakeLinear(object):
                 for name, lid in self.labels.items()]
 
     def ensure_label(self, name, apply_it, existing=None):
-        return LinearTransport.ensure_label.__func__(self, name, apply_it, existing) \
-            if hasattr(LinearTransport.ensure_label, "__func__") \
-            else _fake_ensure_label(self, name, apply_it, existing)
-
-
-def _fake_ensure_label(fake, name, apply_it, existing):
-    """The LIVE matching rule, run over fake rows — the scoped-twin refusal is
-    the real code path, not a copy of it."""
-    rows = existing if existing is not None else fake.workspace_labels()
-    for row in rows:
-        if row.get("name") != name:
-            continue
-        if row.get("team"):
-            raise SetupError("the label %r exists but is scoped to one team; scope "
-                             "cannot be changed after creation." % name)
-        return row["id"], False
-    if not apply_it:
-        return None, False
-    fake.labels[name] = "lbl-%s" % re.sub(r"[^a-z]", "-", name.lower())
-    fake.created.append("label:" + name)
-    return fake.labels[name], True
+        """The SAME matching rule the live transport uses (`_match_label`), not a
+        copy of it: a fake with its own rule would pass a selftest the real
+        transport fails."""
+        rows = existing if existing is not None else self.workspace_labels()
+        if _label_rows(rows, name):
+            return _match_label(rows, name)
+        if not apply_it:
+            return None, False
+        self.labels[name] = "lbl-%s" % re.sub(r"[^a-z]", "-", name.lower())
+        self.created.append("label:" + name)
+        return self.labels[name], True
 
 
 class FakeHost(object):
@@ -1689,6 +1697,21 @@ def selftest():
         sctx._out = []
         cmd_verify(sctx)
         check("scoped-label-fails", sctx.state.outcome("tracker"), FAILED)
+        # A workspace label wins over a same-named team label in EITHER row order;
+        # the first version decided by whichever row the tracker returned first.
+        ws, team = {"id": "ws-1", "name": "track:meta", "team": None}, \
+            {"id": "tm-1", "name": "track:meta", "team": {"id": "t"}}
+        check("label-order-team-first", _match_label([team, ws], "track:meta"), ("ws-1", False))
+        check("label-order-workspace-first", _match_label([ws, team], "track:meta"), ("ws-1", False))
+        only_team = False
+        try:
+            _match_label([team], "track:meta")
+        except SetupError:
+            only_team = True
+        check("label-only-team-scoped-refused", only_team, True)
+        # The role account's own HOME: without -H, sudo on macOS keeps the
+        # caller's, and every "$HOME/..." would point at the operator's home.
+        check("sudo-sets-target-home", '"sudo", "-n", "-H", "-u"' in src, True)
 
         # 12. AN UNREADABLE LEDGER is reported, and `status` does not answer
         #     "nothing done" for it.
