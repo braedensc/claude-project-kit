@@ -81,9 +81,20 @@ script the four jobs load, their imports included, and `schemas/`, which a revie
 telemetry row are judged against. A merge that touched none of them — a doc, an ADR,
 another project's script — leaves `verify` at `ALREADY-DONE`, naming both commits. `run`
 still fast-forwards whenever the commits differ, so the clone never drifts.
-Good: `code ALREADY-DONE — every file the jobs run is identical at origin HEAD`.
-Not: `code WOULD-CHANGE — … changed there: scripts/…`. Run `run` when no session is in
-flight.
+
+Reading that costs one write: a read-only pass **fetches origin's objects into the role
+account's clone**, which moves `FETCH_HEAD` and nothing else — no branch, no file, no
+working tree. It is the only write either read-only command makes.
+
+The step has four answers, not one:
+Good: `code ALREADY-DONE — every file the jobs run is identical at origin HEAD`. A dry run
+says instead that `run` would still fast-forward and restart the jobs.
+Not: `code WOULD-CHANGE — … changed there: scripts/…`, which names the files that moved.
+Run `run` when no session is in flight.
+Not: `code UNKNOWN`, which means the fetch or the comparison could not be made — never
+that nothing moved.
+Not: `code FAILED`, which means the clone itself cannot be compared: a working tree
+somebody edited, or an origin pointing at a different repository. Put it back by hand.
 
 It stops at the first step only a person can do, prints a numbered checkpoint card saying
 exactly what to do, and exits 10. Do that one thing and run the same command again: it

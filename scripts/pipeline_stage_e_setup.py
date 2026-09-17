@@ -2234,6 +2234,42 @@ def job_files_moved_sh(kit):
             ).format(kit=kit, paths=paths)
 
 
+CLONE_HEALTH_SH = ('d=$(git -C {kit} status --porcelain 2>/dev/null | head -5); '
+                   'u=$(git -C {kit} remote get-url origin 2>/dev/null); '
+                   'printf \'ORIGIN %s\\n\' "$u"; '
+                   'printf \'DIRTY %s\\n\' "$(printf \'%s\' "$d" | head -c 300)"')
+
+
+def clone_health(ctx):
+    """The reason the clone cannot be compared with origin at all, or None (review of #136).
+
+    THE NARROWED CHECK ANSWERS ONE QUESTION ONLY: did a file the jobs run move between two
+    COMMITS? It says nothing about a working tree somebody edited by hand, or a clone whose
+    origin is a different repository — and either would make "every file the jobs run is
+    identical at origin HEAD" false while the row said it was true. The waker's installer
+    refuses both; this one did not. A modified file under the daemons is the loud case: they
+    are running code nobody merged."""
+    res = ctx.runner.as_role(ctx.account, CLONE_HEALTH_SH.format(kit="%s/kit" % ctx.stage_home))
+    if not res.ok:
+        return None                      # cannot look — the caller's own unknown path says so
+    origin, dirty = "", ""
+    for line in (res.out or "").splitlines():
+        if line.startswith("ORIGIN "):
+            origin = line[len("ORIGIN "):].strip()
+        elif line.startswith("DIRTY "):
+            dirty = line[len("DIRTY "):].strip()
+    want = str(ctx.conf.get("KIT_REPO_URL") or "").strip()
+    if origin and want and origin.rstrip("/").removesuffix(".git") != want.rstrip("/").removesuffix(".git"):
+        return ("the clone at %s/kit has origin %s, and this conf says the daemons run %s. "
+                "Nothing here can say whether their code matches: they are two different "
+                "repositories" % (ctx.stage_home, origin, want))
+    if dirty:
+        return ("the clone at %s/kit has uncommitted changes (%s). The daemons exec out of that "
+                "working tree, so they are running code nobody merged — and comparing commits "
+                "cannot see it" % (ctx.stage_home, dirty.replace("\n", "; ")[:200]))
+    return None
+
+
 def _job_files_moved(ctx):
     """(moved, why_unknown, origin_short). `moved` is the list of files the jobs run or
     read that differ between the clone's HEAD and origin's; None when it could not tell.
@@ -2274,6 +2310,10 @@ def step_code(ctx, apply_it):
     missing = [s for s in REQUIRED_SCRIPTS if s not in have]
     head = r.as_role(ctx.account, "git -C %s/kit rev-parse --short HEAD 2>/dev/null"
                      % ctx.stage_home)
+    unhealthy = clone_health(ctx)
+    if unhealthy:
+        raise SetupError(unhealthy + ".\n  Put the clone back on origin's commit by hand, then "
+                         "run this again; look before discarding anything.")
     differs, why_unknown = _clone_differs_from_origin(ctx)
     if not missing and differs is False:
         return True, "clone at %s/kit is at %s, level with origin HEAD, all %d scripts " \
@@ -3997,7 +4037,8 @@ def entry_signoff_holds(state, want):
     signed = (state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
     if not signed:
         return False, None
-    bound = signed.get("entries_sha256") if isinstance(signed, dict) else None
+    signed = signed if isinstance(signed, dict) else {}
+    bound = signed.get("entries_sha256")
     if not bound:
         return False, ("the hand sign-off of their load (%s) names no entries, so it proves "
                        "none of these — it predates the binding" % signed.get("at", "undated"))
@@ -5102,6 +5143,22 @@ def cmd_run(ctx, dry_run):
            "; this run asks for nothing" if dry_run else "; asked for only if absent"))
     _agent_credential_notice()
     say("  utc           %s" % now_iso())
+    # WHAT A READ-ONLY PASS STILL WRITES (review of #136). Comparing the jobs' files with
+    # origin needs origin's objects, so `verify` and `--dry-run` fetch into the role
+    # account's clone: new objects and FETCH_HEAD, no branch moved, no working tree touched.
+    say("  reads         a read-only pass fetches origin's objects into %s/kit (FETCH_HEAD "
+        "only; no branch or file moves)" % ctx.stage_home)
+    # AND WHAT WILL STOP THIS RUN LATER, said BEFORE anything unloads a daemon. An
+    # A-ENTRY-LOADED sign-off made before the binding stops counting at `dispatcher-entry`,
+    # which is downstream of the step that takes the daemons down — so without this line the
+    # first upgrade run leaves them off while a person works out what to sign.
+    signed_early = (ctx.state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
+    if isinstance(signed_early, dict) and not signed_early.get("entries_sha256"):
+        say("")
+        say("  NOTE: the A-ENTRY-LOADED sign-off on record names no entries, so it no longer")
+        say("  counts (KIT-149). If the dispatcher's log does not name every review entry,")
+        say("  this run stops at `dispatcher-entry` — after the daemons are unloaded. Run")
+        say("  `verify` first, then `attest A-ENTRY-LOADED --initials <yours> --note \"...\"`.")
     # A DRY RUN IS `apply_it=False`, NOT "apply, but skip the Runner".
     # `Runner.write` was the only dry-run seam, and every tracker mutation goes
     # straight out through the transport, which the Runner never sees — so the
@@ -6053,6 +6110,21 @@ def _selftest_body():
     how, said = _configs_with_log_root(0)
     expect("KIT-149 log-root-ok-is-quiet", how == "returned" and "session-log root" not in said,
            "a healthy log root was noted: %s %r" % (how, said[:160]))
+    # Both new probes ask the ROLE ACCOUNT, not the installing user (review of #136): run as
+    # you, every one of these cases would pass while measuring the wrong account's access.
+    cases += 1
+    ctxA, fakeA = _settled_ctx(conf)
+    fakeA.answers = [("d=/opt/example-dispatch/logs;", 0, ""),
+                     ("status --porcelain", 0, "ORIGIN %s\nDIRTY \n" % conf["KIT_REPO_URL"])] + list(fakeA.answers)
+    _quiet(lambda: step_configs(ctxA, apply_it=True))
+    _quiet(lambda: step_code(ctxA, apply_it=False))
+    role_prefix = ["sudo", "-u", conf["ROLE_ACCOUNT"], "-H", "/bin/sh", "-c"]
+    for needle, what in (("d=/opt/example-dispatch/logs;", "the session-log probe"),
+                         ("status --porcelain", "the clone-health probe")):
+        ran = [a for a in fakeA.reads if needle in _fmt(a)]
+        expect("KIT-149 probes-run-as-the-role-account",
+               ran and all(list(a[:6]) == role_prefix for a in ran),
+               "%s did not run as %s: %r" % (what, conf["ROLE_ACCOUNT"], [_fmt(a)[:80] for a in ran][:2]))
 
     # -- 9b. the finding config lands in its OWN subdir, made first ----------
     # It is the only config under ~/.stage-e/finding, which `cat >` cannot
@@ -7909,7 +7981,11 @@ def _selftest_body():
     cases += 1
     ctxS, fakeS, _apiS = _healthy_ctx(conf)
     fakeS.answers = ([("ls-remote origin HEAD",
-                       0, "beef000000000000000000000000000000000000\tHEAD\n")]
+                       0, "beef000000000000000000000000000000000000\tHEAD\n"),
+                      # A JOB SCRIPT MOVED, so this still pins WOULD-CHANGE rather than passing
+                      # through the narrowed check's "could not compare" (review of #136).
+                      ("fetch --quiet --no-tags origin HEAD", 0,
+                       "FETCH_HEAD beef00000000\nscripts/pipeline_review_poller.py\n")]
                      + [a for a in fakeS.answers if a[0] != "ls-remote origin HEAD"])
     (_codeS, rowsS), _pS = _quiet(lambda: run_steps(ctxS, apply_it=False, keep_going=True))
     codeRowS = dict((st, o) for st, o, _d in rowsS).get("code")
@@ -7980,6 +8056,16 @@ def _selftest_body():
     outE, _c = _entry_row_with_signoff(None)
     expect("KIT-149 entry-signoff-unbound-does-not", outE != ALREADY_DONE,
            "a legacy sign-off naming no entries settled these: %s" % outE)
+    # THE PROPERTY ITEM 2 EXISTS FOR (review of #136): a fence rewrite that keeps every entry
+    # NAME must still invalidate the sign-off. Names alone would not have caught it.
+    if callable(_fp):
+        want_probe = reviews_entries(ctx_probe)
+        fenced = [dict(e) for e in want_probe]
+        fenced[0]["disallowedTools"] = list(fenced[0].get("disallowedTools") or []) + ["NewTool"]
+        expect("KIT-149 entry-fingerprint-is-fence-sensitive",
+               (_fp(fenced) != _fp(want_probe),
+                [e["name"] for e in fenced] == [e["name"] for e in want_probe]),
+               (True, True))
     expect("KIT-149 entry-signoff-verify-says-why", "names no entries" in details["last"],
            "verify did not say the legacy sign-off names no entries: %r" % details["last"][:200])
 
@@ -8008,6 +8094,11 @@ def _selftest_body():
            "the settled row does not say why it settled: %r" % dB[:160])
     expect("KIT-149 behind-compare-is-a-read", not fakeB.writes,
            "the narrowed comparison recorded writes: %s" % [w["why"] for w in fakeB.writes])
+    fetched = [a for a in fakeB.reads if _fetch in _fmt(a)]
+    expect("KIT-149 behind-compare-runs-as-the-role-account",
+           fetched and all(list(a[:4]) == ["sudo", "-u", conf["ROLE_ACCOUNT"], "-H"] for a in fetched),
+           "the narrowed comparison did not run as the role account: %r"
+           % [_fmt(a)[:80] for a in fetched][:2])
 
     cases += 1
     (oB, dB), _f = _code_row_when_behind(
@@ -8027,12 +8118,64 @@ def _selftest_body():
     (oB, dB), _f = _code_row_when_behind((_fetch, 7, ""))
     expect("KIT-149 behind-could-not-fetch-is-unknown", oB == UNKNOWN,
            "a fetch that failed read %s, which is not 'could not tell': %r" % (oB, dB[:160]))
+    # …and a comparison that fails AFTER the fetch is the other could-not (review of #136).
+    (oB, dB), _f = _code_row_when_behind((_fetch, 8, "FETCH_HEAD beef00000000\n"))
+    expect("KIT-149 behind-could-not-compare-is-unknown", oB == UNKNOWN,
+           "a failed comparison read %s, which is not 'could not tell': %r" % (oB, dB[:160]))
 
     cases += 1
     (oB, dB), _f = _code_row_when_behind((_fetch, 0, "FETCH_HEAD beef00000000\n"), dry=True)
     expect("KIT-149 behind-dry-run-names-the-restart", oB == WOULD_CHANGE
            and "fast-forward" in dB,
            "a dry run hid that `run` would fast-forward and restart: %s %r" % (oB, dB[:160]))
+
+    # KIT-149 (review of #136). A clone the narrowed check calls "identical at origin HEAD"
+    # must really be one: a working tree somebody edited, or an origin pointing at another
+    # repository, are both invisible to a commit-to-commit diff. Executed for real.
+    cases += 1
+    health_sh = globals().get("CLONE_HEALTH_SH")
+    expect("KIT-149 clone-health runs", isinstance(health_sh, str), "no clone-health fragment")
+    if isinstance(health_sh, str):
+        with tempfile.TemporaryDirectory() as tmpH:
+            def _gitH(*a, cwd=None):
+                return subprocess.run(["git"] + list(a), cwd=cwd, capture_output=True, text=True,
+                                      env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e",
+                                               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e"))
+            originH, kitH = os.path.join(tmpH, "origin"), os.path.join(tmpH, "kit")
+            _gitH("init", "-q", originH)
+            _gitH("commit", "-q", "--allow-empty", "-m", "one", cwd=originH)
+            _gitH("clone", "-q", originH, kitH)
+
+            def _health(path):
+                res = Runner().read(["/bin/sh", "-c", health_sh.format(kit=path)])
+                lines = dict(ln.split(" ", 1) if " " in ln else (ln, "")
+                             for ln in res.out.splitlines() if ln.strip())
+                return res.rc, lines.get("ORIGIN", "").strip(), lines.get("DIRTY", "").strip()
+
+            rcH, originOut, dirtyOut = _health(kitH)
+            expect("KIT-149 clone-health runs", rcH == 0 and originOut == originH and not dirtyOut,
+                   "a clean clone read rc %s origin %r dirty %r" % (rcH, originOut, dirtyOut))
+            with open(os.path.join(kitH, "scripts-edited-by-hand.py"), "w") as fh:
+                fh.write("x = 1\n")
+            rcH, _o, dirtyOut = _health(kitH)
+            expect("KIT-149 clone-health runs", rcH == 0 and "scripts-edited-by-hand" in dirtyOut,
+                   "a dirty clone did not report its working tree: %r" % dirtyOut)
+
+    # …and the step refuses both, rather than calling the jobs' files identical.
+    cases += 1
+    conf_h, _ = validate_conf(parse_conf(GOOD_CONF)[0])
+    for label, answer, needle in (
+            ("a dirty working tree", "ORIGIN %s\nDIRTY  M scripts/pipeline_bounce_local.py\n"
+             % conf_h["KIT_REPO_URL"], "uncommitted changes"),
+            ("a foreign origin", "ORIGIN https://github.com/someone/else.git\nDIRTY \n",
+             "two different repositories")):
+        ctx_h, fake_h, _api_h = _healthy_ctx(conf_h)
+        fake_h.answers = [("status --porcelain", 0, answer)] + list(fake_h.answers)
+        (_ch, rows_h), _ph = _quiet(lambda: run_steps(ctx_h, apply_it=False, keep_going=True))
+        row_h = dict((st, (o, d)) for st, o, d in rows_h).get("code") or (None, "")
+        expect("KIT-149 clone-health refuses %s" % label,
+               row_h[0] == FAILED and needle in row_h[1],
+               "%s read %s: %r" % (label, row_h[0], row_h[1][:160]))
 
     # …and the shell itself, EXECUTED against two real repositories. Three commits on
     # origin: one touches a doc, one a job script, one a schema.
