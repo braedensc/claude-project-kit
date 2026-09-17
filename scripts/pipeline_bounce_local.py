@@ -2598,7 +2598,8 @@ def post_pr_comment(pr_number, body, owner_repo, dry_run):
 
 
 def announce_could_not(sit, reason, state_dir, dry_run):
-    """Best effort, and the caller keeps its exit 2 either way: ONE PR comment saying what
+    """Best effort, and the caller keeps its own exit code either way — 2 for a could-not,
+    3 for a pull request that was never this driver's (KIT-112). ONE PR comment saying what
     the driver could not do — when the PR is known, open and ours (never a fork's), and
     the same reason was not already said. A marker under <state_dir>/declines/ dedupes
     per reason, so a poller on a five-minute cycle says it once. Never a ledger row: the
