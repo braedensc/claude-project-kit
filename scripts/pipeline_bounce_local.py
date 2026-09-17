@@ -1437,6 +1437,25 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
+def partial_review_note(outcome, fresh, trigger_ok, cannot_evaluate):
+    """The one sentence that routes a PARTIAL review to a person, or "" (KIT-138).
+
+    A review that saw only part of a change can bounce on what it found, but it can never
+    conclude, so without this the driver would hold it in silence forever. It fills the
+    §13 third state — `cannot_evaluate` — exactly where the quiet skip would otherwise sit:
+    no live trigger, a fresh usable review, nothing else already unreadable. The sentence
+    is stable for a given outcome, so the PR comment it becomes is said once."""
+    if trigger_ok or cannot_evaluate or not fresh or not outcome:
+        return ""
+    if not outcome.get("usable") or outcome.get("coverage") != "partial":
+        return ""
+    withheld = [str(p) for p in (outcome.get("withheld_files") or [])]
+    return ("the review saw only part of this change: %d file(s) were withheld from the reviewer "
+            "over the size cap (%s). Stage E can bounce on what it found but can never conclude "
+            "this PR, so a person must review the withheld files"
+            % (len(withheld), ", ".join(withheld[:5]) + (" …" if len(withheld) > 5 else "")))
+
+
 def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
     """'clean' | 'below-threshold' | None — the basis for a DURABLE conclusion, or None
     when there is nothing to conclude yet. This is the answer the driver used to compute,
@@ -1459,6 +1478,8 @@ def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
         return None
     if not outcome.get("usable") or outcome.get("meets_threshold"):
         return None
+    if outcome.get("coverage") == "partial":
+        return None     # KIT-138: a review of part of a change is never a clean bill for all of it
     if checks_status not in ("green", "none"):
         return None
     return "below-threshold" if (outcome.get("findings") or outcome.get("max_severity")) else "clean"
@@ -2807,6 +2828,8 @@ def decision_for(sit, cfg):
     trigger_ok, trigger_reason, kind, cannot_evaluate = compute_trigger(
         sit.get("checks_status"), sit.get("failing_checks") or [], sit.get("outcome"),
         fresh, fresh_reason, cannot_note)
+    cannot_evaluate = cannot_evaluate or partial_review_note(
+        sit.get("outcome"), fresh, trigger_ok, cannot_evaluate)
     # The note rides along on an ordinary skip as before — and ALSO on a bounce that a
     # review triggered while CI stayed unreadable, so "we bounced, but half the evidence
     # was never available" is said rather than implied. A check waiting on a PERSON is
@@ -3960,6 +3983,22 @@ def selftest():
           conclusion_basis("green", below, True, False), "below-threshold")
     check("a review that TRIGGERS a bounce never concludes", conclusion_basis("green", below, True, True), None)
     check("an at-threshold review never concludes", conclusion_basis("green", above, True, False), None)
+    #   KIT-138: a partial review never concludes, and is routed to a person only where
+    #   nothing else already speaks for the PR.
+    _prn = globals().get("partial_review_note") or (lambda *a: "")
+    part = {"usable": True, "meets_threshold": False, "findings": [], "max_severity": None,
+            "coverage": "partial", "withheld_files": ["src/big.py"]}
+    check("KIT-138 a clean PARTIAL review never concludes",
+          conclusion_basis("green", part, True, False), None)
+    check("KIT-138 …the same review of the whole change still does",
+          conclusion_basis("green", dict(part, coverage=None), True, False), "clean")
+    check("KIT-138 a partial review with nothing else to say is routed to a person",
+          "a person must review" in _prn(part, True, False, ""), True)
+    check("KIT-138 …but never over a live trigger, another could-not, a stale review, "
+          "or a review of the whole change",
+          (_prn(part, True, True, ""), _prn(part, True, False, "CI unreadable"),
+           _prn(part, False, False, ""), _prn(dict(part, coverage=None), True, False, "")),
+          ("", "", "", ""))
     check("a DECLINE is a could-not, never a clean bill", conclusion_basis("green", {"usable": False}, True, False), None)
     check("a stale review never concludes", conclusion_basis("green", spotless, False, False), None)
     check("no review at all never concludes", conclusion_basis("green", None, True, False), None)

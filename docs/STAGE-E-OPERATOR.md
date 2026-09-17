@@ -813,8 +813,18 @@ ticket, in the tracker (live test 3). In order:
 6. *Never approve, merge, push or edit — you have no tools to, and must not try.*
 7. The diff, inside an `<untrusted-diff>` fence with a treat-as-data preamble.
 
-The whole body stays under `diff_cap_chars`. Above it, the poller declines with the reason
-*diff too large to deliver* and posts that on the PR.
+The whole body stays under `diff_cap_chars`. **Above it, the review runs in part.** The
+poller withholds whole files from the diff, largest first, until the body fits, and never
+cuts a file in half. The body gains a section naming every withheld file and telling the
+reviewer it is judging part of a change. The PR comment opens with *Partial review — N of M
+files* and names them. The outcome carries `coverage: partial`, so the bounce driver can
+bounce on what the review found but never concludes the PR. With nothing to bounce, it says
+once on the PR that a person must review the withheld files (KIT-138).
+
+Good: `PARTIAL o/r#N: … 2 of 3 file(s) withheld` in the poller log, and a ticket that
+opens.
+Not: *diff too large to deliver … and no single file fits alone*. One file is over the cap
+by itself; that PR is declined as before.
 
 ### Turning the review entries off again
 

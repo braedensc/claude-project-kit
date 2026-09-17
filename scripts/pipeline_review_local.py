@@ -322,6 +322,20 @@ def render_comment(verdict, ticket, basis):
             "still needed._",
         ])
     lines = [f"## 🤖 Stage E review — {tag}  {REVIEW_MARKER}", ""]
+    partial = verdict.get("partial") or None
+    if partial:
+        # KIT-138: a change over the size cap is reviewed in part, whole files withheld,
+        # and the comment must never read as a review of the whole.
+        withheld = [str(p) for p in (partial.get("withheld") or [])]
+        named = ", ".join(f"`{p}`" for p in withheld[:10]) + (" …" if len(withheld) > 10 else "")
+        lines += [
+            f"> ⚠️ **Partial review — {partial.get('shown', '?')} of {partial.get('total', '?')} "
+            f"files.** The change was larger than one review can carry, so {len(withheld)} "
+            f"file(s) were withheld from the reviewer, largest first: {named}. Nothing below "
+            "speaks for them. **A person must review the withheld files before this PR is "
+            "treated as reviewed.**",
+            "",
+        ]
     lines.append(verdict["summary"] or "_No summary._")
     lines.append("")
     if basis and basis.get("basis_tier"):
@@ -330,7 +344,8 @@ def render_comment(verdict, ticket, basis):
             note += " ⚠️ _The ticket's criteria were edited after work was delegated._"
         lines += [note, ""]
     if not verdict["findings"]:
-        lines.append("No findings against correctness, security, test assertions, or scope.")
+        lines.append("No findings against correctness, security, test assertions, or scope"
+                     + (" in the files shown." if partial else "."))
     else:
         n, top, thr = len(verdict["findings"]), verdict["max_severity"], verdict["threshold"]
         head = f"**{n} finding(s)** · highest `{top}` · threshold `{thr}`"
@@ -674,6 +689,12 @@ def selftest():
     check("clean-usable", clean_v["usable"], True)
     check("clean-maxsev", clean_v["max_severity"], None)
     check("clean-exit", exit_code_for(clean_v), EXIT_REVIEWED)
+    partial_v = dict(clean_v, partial={"withheld": ["src/big.py"], "shown": 2, "total": 3})
+    partial_c = render_comment(partial_v, "KIT-138", None)
+    check("KIT-138 a partial review says so first, and names what it could not see",
+          ("Partial review — 2 of 3 files" in partial_c, "`src/big.py`" in partial_c,
+           "in the files shown" in partial_c, "A person must review" in partial_c),
+          (True, True, True, True))
 
     findings = {"schema": "pipeline-review/1", "summary": "found things", "findings": [
         {"severity": "medium", "category": "scope", "summary": "drive-by", "detail": "why"},
