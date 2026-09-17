@@ -399,21 +399,29 @@ What was measured, and what each fact decided:
 | It gets no sandbox. Only the ticket path passes sandbox settings | No egress allowlist and no write confinement |
 | Its tool allowlist is enforced. The permission callback that allows every tool is attached only on the ticket path | Trimming the grant is a real fence |
 | Its `disallowedTools` is hard-coded empty | Only the allowlist can fence it |
-| Its default grant includes `Monitor`, whose parameter is a shell command; `Task`; and the dispatcher's own tool server, which can inject a prompt into any running session | These are the removals |
+| Its default grant includes `Monitor`, whose parameter is a shell command, and `Task` | These are the removals |
+| After the trim, the dispatcher re-appends every tool server it built for the session: the tracker, its own tools, its docs and Slack | **The trim cannot remove the dispatcher's tool server** |
+| That server runs in the dispatcher's unsandboxed process. One tool delivers a message into any running session by id without checking the caller; another reads any file path and uploads it, optionally public | The lane can steer any session and read any file the role account can (KIT-162) |
 | Its working directory is a fresh folder, not a repository | The kit's PreToolUse hooks do not apply. Only the role account's user-level settings would |
 | The dispatcher rewrites its own config file when the tracker token refreshes | That file cannot be made read-only to the role account, so the lane can rewrite every other session's fence |
 | It is inbound only, on a webhook path, verified by Slack's signing-secret HMAC when the secret is set | The front door gains a path (2, below) |
+| The access check runs only on tracker webhooks. The Slack path has no user or channel allowlist | Any member of the Slack workspace can start a session |
 | Its bot token is read from the dispatcher's environment, which every session inherits, and a Slack tool server is injected into every lane when the token is set | Every coding session holds the chat bot's token (KIT-157) |
 
-**Conditions.** The grant is cut to a read set, with no `Monitor`, `Task`, `ScheduleWakeup` or
-dispatcher tool server. The role account gets a user-level guard the lane cannot edit. The
-channel is private with one member. There are **two Slack apps**, so the notifier's token never
-enters the dispatcher's environment and a leaked chat token cannot pass as a notifier ping. The
-Slack tool server is fenced off every coding entry.
+**Conditions.** The grant drops `Monitor`, `Task` and `ScheduleWakeup`. The role account's
+user-level settings deny reads of secret files through the `Read` tool; they do not stop the
+upload tool. The Slack workspace has one member, because workspace membership is the only gate.
+There are **two Slack apps**, so the notifier's token never enters the dispatcher's environment
+and a leaked chat token cannot pass as a notifier ping. The Slack tool server is fenced off every
+coding entry (KIT-157).
 
 **Accepted residuals.** No sandbox on that lane. It can rewrite the dispatcher's config. There is
-no per-user identity check, so channel membership is the only gate. Any coding session can read
-the chat bot's token.
+no identity check beyond Slack workspace membership. It can steer any running session. It can
+read any file the role account can read and upload it, optionally public, so a fetched web page
+can drive a credential to a public link without a shell. Any coding session can read the chat
+bot's token. Steering and file upload were accepted after a recommendation to hold the lane
+until a deny rule was measured, which the owner declined. Coding sessions keep the same tool
+server, also by decision (KIT-162).
 
 This reverses *Who sends* for this one lane: it is the shape rejected there, a channel
 credential in the environment every session inherits. It is accepted with that named. The
