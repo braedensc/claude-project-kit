@@ -865,8 +865,12 @@ MCP session) must still never create a ticket itself; that path is closed by the
 
 A **planning session** (the idea-gate: an idea ticket delegated into a Planning team, run
 sandboxed by the dispatcher) does not file findings — it proposes a whole **epic tree**.
-It holds no tracker tool at all, so it cannot write to the board directly; its only output
-is a proposed tree, which a credential-holding executor validates and materialises. The
+It holds no tracker tool and no tool that writes a file — its entry's deny list removes
+both — so it cannot write to the board or to its own supervision; its only output is a
+proposed tree, in its final message, which a credential-holding executor validates and
+materialises. The executor neutralizes every dispatcher routing directive (`[repo=…]`,
+`repo=`, `[model=…]`, `[agent=…]`) in every title and body the session wrote before the
+readiness gate reads them, because a filed child is text a person may later delegate. The
 tree is the *same* `ticket-create` type, carrying `epic` and `children` instead of a flat
 `title`/`body`:
 
@@ -925,7 +929,7 @@ backlog — and the tree shape adds these:
   `source_ticket_id` would compare the session's claim with itself. Nothing in the kit supplies
   that pin or invokes the executor yet (KIT-150).
 
-**The planning session's only channel is this file, so a QUESTION rides it too.** Because the
+**The planning session's only channel is this document, so a QUESTION rides it too.** Because the
 session holds no tracker tool, every way it reaches the owner travels through the executor. A
 session that needs a design decision it cannot resolve from the code emits a `ticket-comment`
 (§8's ordinary kind) in the same batch, naming its own pinned ticket. The executor posts it on

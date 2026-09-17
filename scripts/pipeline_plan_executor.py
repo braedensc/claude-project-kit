@@ -4,11 +4,17 @@
 The direct analog of the review publisher (docs/PIPELINE-CONTRACT.md §14,
 scripts/pipeline_review_local.py), pointed at planning instead of review. A
 planning session — an idea ticket delegated into a Planning team, run sandboxed
-by the dispatcher — holds NO tracker tool at all (the fence is structural: no
-Linear MCP is attached to that session; see
-docs/adr/2026-09-06-stage-a-triggered-from-linear.md). Its whole deliverable is
-one `pipeline-safe-outputs/1` request file carrying a tree-shaped `ticket-create`
-(§8 "Filing a plan"). This module, run on the dispatcher host as an owner-scoped
+by the dispatcher — holds no tracker tool and no tool that writes a file: the
+Planning entry's deny list removes every tracker server the dispatcher injects,
+and Write with them (docs/adr/2026-09-06-stage-a-triggered-from-linear.md, its
+2026-09-17 update). Its whole deliverable is one `pipeline-safe-outputs/1`
+document carrying a tree-shaped `ticket-create` (§8 "Filing a plan"), in its final
+message; a reader that does not exist yet (KIT-150) hands it to this file.
+
+EVERY TITLE AND BODY THE SESSION WROTE IS SCRUBBED OF DISPATCHER ROUTING DIRECTIVES
+before the readiness gate reads it and before anything is filed (`scrub_plan`): a
+filed child is text a person may later delegate, and a tag left in it would pick
+that child's repository, branch or runner. This module, run on the dispatcher host as an owner-scoped
 role account that DOES hold the credential, then
 
     validates   the batch WHOLE against schemas/safe-outputs.schema.json     find_requests / validate_plan
@@ -198,6 +204,42 @@ def split_ticket_id(ticket_id):
     return m.group(1), m.group(2)
 
 
+# THE DISPATCHER READS ROUTING DIRECTIVES OUT OF A TICKET DESCRIPTION: a bracketed
+# `[repo=…]` (optionally `#branch`, and Linear's escaped `\[…\]`), an unbracketed
+# `repo=`/`repos=`, and the `[model=…]` / `[agent=…]` runner selectors. Everything a
+# planning session wrote becomes a title or description a person may later delegate,
+# and a tag left in it would pick that child's repository, branch or runner — one that
+# loads none of the kit's guards (KIT-41). These patterns are COPIED from the review
+# poller, which verified them against the dispatcher's source; --selftest asserts the
+# two files still agree, so neither can drift.
+_BRACKET_TAG_RE = re.compile(r"\\?\[\s*(?:repos?|model|agent)\s*=[^\]\n]*\\?\]", re.IGNORECASE)
+_UNBRACKETED_REPO_RE = re.compile(r"(^|[^A-Za-z0-9_])repos?=[A-Za-z0-9_\-/.#,]+",
+                                  re.IGNORECASE | re.MULTILINE)
+ROUTING_TAG_MARK = "(removed-routing-tag)"
+
+
+def neutralize_routing(text):
+    """Replace every dispatcher routing directive with a mark that contains none."""
+    if not text:
+        return text
+    out = _BRACKET_TAG_RE.sub(ROUTING_TAG_MARK, str(text))
+    return _UNBRACKETED_REPO_RE.sub(lambda m: m.group(1) + ROUTING_TAG_MARK, out)
+
+
+def scrub_plan(plan, comments):
+    """A copy of the plan and questions with every session-written title and body
+    neutralized. Applied once, before the readiness gate and before any create, so
+    the gate judges exactly the text that would be filed."""
+    plan = json.loads(json.dumps(plan)) if plan else plan
+    if plan:
+        for part in [plan.get("epic") or {}] + list(plan.get("children") or []):
+            for key in ("title", "body"):
+                if key in part:
+                    part[key] = neutralize_routing(part[key])
+    comments = [dict(c, body=neutralize_routing(c.get("body"))) for c in (comments or [])]
+    return plan, comments
+
+
 class ExecutorError(Exception):
     """This executor / its config / the tracker failed — verdict `errored`."""
 
@@ -373,8 +415,13 @@ def build_child_tickets(plan, team_key, landing_state_id):
     return tickets
 
 
-def render_success_comment(idea_id, epic, children):
-    """One markdown comment posted back on the idea ticket, for the owner."""
+def render_success_comment(idea_id, epic, children, epic_title):
+    """One markdown comment posted back on the idea ticket, for the owner.
+
+    `epic` is the tracker's create response, which carries only id, identifier and
+    url. Titles come from the plan: an earlier version read `epic["title"]`, which
+    the fake returned and the live API never does, so every real filing crashed
+    AFTER the whole tree was created, with no summary and no page."""
     lines = [
         _marker(ESC_AWAITING_APPROVAL),
         "### Epic plan ready — awaiting your approval",
@@ -386,7 +433,7 @@ def render_success_comment(idea_id, epic, children):
         "(§5 rule 2)." % (idea_id, len(children)),
         "",
         "- **Epic** [%s](%s) — `%s` (`provenance:agent`)"
-        % (epic["identifier"], epic.get("url") or "", _sanitize(epic["title"])),
+        % (epic["identifier"], epic.get("url") or "", _sanitize(epic_title)),
     ]
     for created, child in children:
         dep = ""
@@ -502,13 +549,14 @@ class LinearClient:
     network. Every mutation here CREATES or COMMENTS — none MOVES a ticket."""
 
     def __init__(self, api_key):
-        self._key = api_key
+        # A personal key goes in Authorization raw; an OAuth token needs Bearer.
+        # The installer accepts both, so the executor must send both correctly.
+        self._key = ("Bearer " + api_key) if api_key.startswith("lin_oauth_") else api_key
 
     def _gql(self, query, variables):
         body = json.dumps({"query": query, "variables": variables}).encode()
         req = urllib.request.Request(LINEAR_API, data=body, headers={
             "Content-Type": "application/json",
-            # Linear personal API keys go in Authorization RAW (no "Bearer ").
             "Authorization": self._key,
         })
         try:
@@ -636,6 +684,15 @@ def materialise(args, client=None):
     # ── Config (§2: absent delivery.json is OFF, not broken) ────────────────
     config_path = args.config or "delivery.json"
     if not os.path.exists(config_path):
+        if args.pinned and not args.dry_run:
+            # §2's "absent is off" answers "is this project configured?". A PINNED
+            # run was started for a real delegated ticket: a planning session ran,
+            # and calling its output "nothing to do" would lose it in silence.
+            print("::error:: no %s, but this run is pinned to %s — a planning session "
+                  "ran and its output cannot be filed. The reader handed this executor "
+                  "the wrong path, or the planned repository lost its config. Nothing "
+                  "was created." % (config_path, args.pinned), file=sys.stderr)
+            return EXIT_ERRORED
         print("::notice:: no %s — the pipeline is not configured, so there is no "
               "tree to materialise (§2)." % config_path)
         return EXIT_OK
@@ -679,6 +736,7 @@ def materialise(args, client=None):
             print("::error:: --pinned %s" % exc, file=sys.stderr)
             return EXIT_ERRORED
     pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
+    plan, comments = scrub_plan(plan, comments)
     if not errors and plan:
         errors = validate_plan(plan, pinned, bool(finding_cfg))
     if not errors:
@@ -700,6 +758,16 @@ def materialise(args, client=None):
     if not plan:
         return _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments)
 
+    # ── The ids this executor must force (§5, §6). A gap here is the CONFIG's
+    #    failure, not the planner's: checked before the gate, so it is never
+    #    reported back as a rejected plan, and before a dry run, so a dry run
+    #    never calls an unusable config valid. ─────────────────────────────
+    try:
+        forced = _forced_ids(cfg, finding_cfg)
+    except ExecutorError as exc:
+        print("::error:: %s" % exc, file=sys.stderr)
+        return EXIT_ERRORED
+
     # ── The DoR gate over every child (§5) ─────────────────────────────────
     children = plan["children"]
     child_tickets = build_child_tickets(plan, team_key, _landing_state_or_placeholder(cfg, finding_cfg))
@@ -720,12 +788,6 @@ def materialise(args, client=None):
               "children, %d note(s) — nothing created."
               % (pinned, len(children), len(comments)))
         return EXIT_OK
-
-    try:
-        forced = _forced_ids(cfg, finding_cfg)
-    except ExecutorError as exc:
-        print("::error:: %s" % exc, file=sys.stderr)
-        return EXIT_ERRORED
 
     client = client or _live_client(args)
     if client is None:
@@ -888,7 +950,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # Report the plan back on the idea ticket for the owner, then any notes the
         # session left alongside it (its open questions ride in the epic PRD; these
         # are top-level asides). The plan is filed either way — a note never blocks.
-        client.post_comment(src["id"], render_success_comment(pinned, epic, created_children))
+        client.post_comment(src["id"], render_success_comment(pinned, epic, created_children, plan["epic"]["title"]))
         for c in comments:
             client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
     except ExecutorError as exc:
@@ -1206,11 +1268,12 @@ def selftest():
               EXIT_ERRORED)
         check("config-gap-no-create", len(fakeC.issues), 0)
 
-        # 14. Absent delivery.json → OFF, exit ok, nothing created (§2).
+        # 14. Absent delivery.json, with no pin → OFF, exit ok, nothing created (§2).
+        #     (A PINNED run with no config is a lost planning run, not "off": case 38.)
         fakeD = FakeLinear()
         args = argparse.Namespace(requests=os.path.join(tmp, "requests.json"),
                                   config=os.path.join(tmp, "no-delivery.json"),
-                                  repo_root=tmp, dry_run=False, pinned="KIT-777")
+                                  repo_root=tmp, dry_run=False, pinned=None)
         json.dump(_tree(), open(os.path.join(tmp, "requests.json"), "w"))
         check("no-config-off", materialise(args, client=fakeD), EXIT_OK)
         check("no-config-no-create", len(fakeD.issues), 0)
@@ -1365,6 +1428,60 @@ def selftest():
         check("finding-off-names-the-fix",
               any("provenance:agent" in c[1] and "default branch" in c[1]
                   for c in fakeO.comments), True)
+
+        # ── Audit findings, 2026-09-17 ───────────────────────────────────────
+        # 35. THE LIVE CREATE RESPONSE CARRIES NO TITLE. A fake that returns only
+        #     what the live mutation selects must still get a summary comment.
+        class LiveShapedLinear(FakeLinear):
+            def create_issue(self, *a, **kw):
+                full = FakeLinear.create_issue(self, *a, **kw)
+                return {"id": full["id"], "identifier": full["identifier"], "url": full["url"]}
+        fakeT = LiveShapedLinear()
+        check("live-shape-files-and-summarises", run(_tree(), client=fakeT), EXIT_OK)
+        check("live-shape-summary-posted",
+              any(_marker(ESC_AWAITING_APPROVAL) in c[1] for c in fakeT.comments), True)
+
+        # 36. ROUTING DIRECTIVES IN SESSION TEXT NEVER REACH A FILED TICKET.
+        fakeR = FakeLinear()
+        tagged = _tree()
+        tagged["requests"][0]["epic"]["body"] = "Plan it. [agent=codex] and repo=other/repo"
+        tagged["requests"][0]["children"][0]["body"] = (
+            _GOOD_CHILD_BODY + "\n[repo=other-repo#evil-branch] \\[model=x\\]\n")
+        tagged["requests"][0]["children"][1]["title"] = "Do it [agent=codex]"
+        check("tagged-tree-files", run(tagged, client=fakeR), EXIT_OK)
+        filed = " ".join(i["title"] + "\n" + i["description"] for i in fakeR.issues)
+        for tag in ("[agent=codex]", "repo=other/repo", "[repo=other-repo#evil-branch]", "[model=x"):
+            check("tag-neutralized:%s" % tag, tag in filed, False)
+        check("tag-mark-present", ROUTING_TAG_MARK in filed, True)
+        check("routing-mark-has-no-directive", neutralize_routing(ROUTING_TAG_MARK), ROUTING_TAG_MARK)
+        # …and the patterns are the review poller's, not a drifting copy.
+        import pipeline_review_poller as _poller
+        check("routing-patterns-match-poller",
+              (_BRACKET_TAG_RE.pattern, _UNBRACKETED_REPO_RE.pattern, ROUTING_TAG_MARK),
+              (_poller._BRACKET_TAG_RE.pattern, _poller._UNBRACKETED_REPO_RE.pattern,
+               _poller.ROUTING_TAG_MARK))
+
+        # 37. A CONFIG GAP IS THE EXECUTOR'S FAILURE, before the gate and before a
+        #     dry run can call it valid.
+        fakeG = FakeLinear()
+        argsG = argparse.Namespace(requests=req, config=np_path, repo_root=tmp,
+                                   dry_run=True, pinned="KIT-777")
+        json.dump(_tree(), open(req, "w"))
+        check("config-gap-dry-run-errored", materialise(argsG, client=fakeG), EXIT_ERRORED)
+        check("config-gap-not-reported-as-rejection",
+              any("rejected" in c[1].lower() for c in fakeG.comments), False)
+
+        # 38. A PINNED RUN WITH NO CONFIG IS NOT "OFF".
+        argsN = argparse.Namespace(requests=req, config=os.path.join(tmp, "gone.json"),
+                                   repo_root=tmp, dry_run=False, pinned="KIT-777")
+        check("pinned-no-config-errored", materialise(argsN, client=FakeLinear()), EXIT_ERRORED)
+        argsN2 = argparse.Namespace(requests=req, config=os.path.join(tmp, "gone.json"),
+                                    repo_root=tmp, dry_run=False, pinned=None)
+        check("unpinned-no-config-still-off", materialise(argsN2, client=FakeLinear()), EXIT_OK)
+
+        # 39. AN OAUTH TOKEN IS SENT AS BEARER; A PERSONAL KEY RAW.
+        check("oauth-bearer", LinearClient("lin_oauth_abc")._key, "Bearer lin_oauth_abc")
+        check("personal-key-raw", LinearClient("lin_api_abc")._key, "lin_api_abc")
 
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
