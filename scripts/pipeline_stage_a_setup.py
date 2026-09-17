@@ -540,9 +540,11 @@ CARDS = {
                 "the switch that lets a machine's proposal become tickets, so it lives "
                 "in a file a person reviews and merges — never in a file this installer "
                 "writes."),
-        "do": ["The block to add was printed above, with this workspace's label ids.",
-               "Add it to the `linear` section of the planned repository's",
-               "delivery.json on a branch, open a pull request, and merge it yourself.",
+        "do": ["Read what the run printed above. If the planned repository has no",
+               "delivery.json at all, set that repository up first. Otherwise it printed",
+               "a block: add `findingTicket` as a new key under `linear`, and put the two",
+               "label ids inside the existing `linear.labels.ids`. Do it on a branch, open",
+               "a pull request, and merge it yourself.",
                "Then run the config validator in that repository:",
                "    python3 scripts/check_delivery_config.py",
                "Nothing to sign: this step reads the merged file on the next run."],
@@ -1069,9 +1071,14 @@ def delivery_patch(ctx):
     return {
         "findingTicket": {"landing": "raw", "notify": "subscribe",
                           "ownerUserId": ctx.conf["OWNER_USER_ID"]},
-        "labels": {"ids": dict((n, labels.get(n) or "<run the tracker step first>")
+        "labels": {"ids": dict((n, labels.get(n) or UNRESOLVED_LABEL_ID)
                                for n in PLAN_KIND_LABELS)},
     }
+
+
+# Printed in place of a label id the tracker step has not resolved yet — in a dry
+# run, or before the first real run. Never a value a person should paste.
+UNRESOLVED_LABEL_ID = "<not resolved yet: do one real `run` first>"
 
 
 def step_delivery_config(ctx, apply_it):
@@ -1084,6 +1091,11 @@ def step_delivery_config(ctx, apply_it):
     doc, branch, why = ctx.github.delivery_config(repo)
     if doc is None and why == "absent":
         ctx.state.data["notes"]["delivery_gaps"] = ["delivery.json is absent on %s" % branch]
+        ctx.say("")
+        ctx.say("----- %s has no delivery.json on %s -----" % (repo, branch))
+        ctx.say("The planned repository is not set up for the pipeline at all. Set it up")
+        ctx.say("first (the board setup writes delivery.json), merge that, then run again.")
+        ctx.say("There is no block to add until the file exists.")
         raise Blocked("CA-DELIVERY")
     if doc is None:
         raise Unknown("could not read %s's delivery config: %s" % (repo, why),
@@ -1096,8 +1108,15 @@ def step_delivery_config(ctx, apply_it):
         for gap in gaps:
             ctx.say("  - " + gap)
         ctx.say("")
-        ctx.say("Merge these keys into its `linear` block (keep everything else):")
-        ctx.say(json.dumps(delivery_patch(ctx), indent=2))
+        patch = delivery_patch(ctx)
+        ctx.say("Add these to its `linear` block. `findingTicket` is a new key. The two")
+        ctx.say("label ids go INSIDE the existing `linear.labels.ids` — never a second")
+        ctx.say("`labels` key. Keep everything else.")
+        ctx.say(json.dumps(patch, indent=2))
+        if UNRESOLVED_LABEL_ID in json.dumps(patch):
+            ctx.say("")
+            ctx.say("Some label ids are not resolved yet. Do not paste those; do one real")
+            ctx.say("`run` first, and this block will print again with the real ids.")
         raise Blocked("CA-DELIVERY")
     ctx.state.data["notes"].pop("delivery_gaps", None)
     return True, "%s's delivery.json on %s turns the plan kind on" % (repo, branch), []
@@ -1964,6 +1983,17 @@ def selftest():
         actx2._out = []
         cmd_verify(actx2)
         check("delivery-absent-blocks", actx2.state.outcome("delivery-config"), BLOCKED)
+        check("delivery-absent-says-set-up-first",
+              any("has no delivery.json" in line for line in actx2._out)
+              and not any('"findingTicket"' in line for line in actx2._out), True)
+        # a dry run has resolved no ids yet: the block says so rather than printing
+        # a placeholder a person might paste
+        pctx = _ctx(os.path.join(tmp, "delivery-unresolved"),
+                    tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS),
+                    github=FakeGitHub(doc=off))
+        pctx.state.data["ids"] = {}
+        check("patch-flags-unresolved-ids",
+              UNRESOLVED_LABEL_ID in json.dumps(delivery_patch(pctx)), True)
         uctx2 = _ctx(os.path.join(tmp, "delivery-unread"),
                      tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS),
                      github=FakeGitHub(why="gh api failed: HTTP 401"))
