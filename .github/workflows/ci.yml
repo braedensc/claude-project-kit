@@ -224,8 +224,18 @@ jobs:
       # with every config error reported in one pass, the three §13 states carry three
       # different exit codes, a corrupt seen-set refuses to run rather than re-paging, dry
       # run writes nothing, a heartbeat is left on the failing path, and no merge/approve/
-      # state-change path exists — the only tracker mutation is one label.
-      - name: Human-action notifier selftest (marks, §13 states, label-only mutation)
+      # state-change path exists. With reply_relay OFF (the default) the only tracker
+      # mutation is one label; with it ON there is exactly one more, a thread reply that only
+      # ever carries an owner's relayed reply (KIT-118). The relay half asserts: off means no
+      # thread read and no new write; only an agent:blocked ping becomes a target; a second
+      # chat account, a non-threaded message, a reply to a message the notifier did not send,
+      # a bot post and an edit are each dropped; an oversize reply is dropped, never
+      # truncated; the seventh relay in an hour is dropped; the target is the recorded
+      # ticket, never parsed from the text; entities are decoded THEN every angle bracket is
+      # stripped; pending is saved before the post, so a replay posts once and a crash is
+      # named unconfirmed (exit 3), never re-posted; a missing groups:history scope is a
+      # named failure; and a comment write anywhere outside the relay path turns it red.
+      - name: Human-action notifier selftest (marks, §13 states, label + relay-reply mutations)
         run: python3 scripts/pipeline_notify_local.py --selftest
 
       # The heartbeat monitor: the one job that READS the other three's heartbeats, which
