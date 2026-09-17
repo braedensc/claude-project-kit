@@ -622,7 +622,7 @@ into every tracker-triggered session. The entry's `disallowedTools` named six in
 surface apart from those six. Nothing was exposed: Stage A has never run on any machine.
 
 **What is true now.** The fence is the shape
-[KIT-132](https://linear.app/braedenclaw/issue/KIT-132) gave the reviewer. Every server the
+KIT-132 gave the reviewer. Every server the
 dispatcher injects is named in `disallowedTools` in both documented rule forms,
 `mcp__<server>` and `mcp__<server>__*`; `MCP_FENCE_RULE_RE` refuses any other shape, because
 a rule the runtime does not honour is skipped in silence and reads as a closed fence. The
@@ -641,13 +641,13 @@ planning procedure's rubric panel is five passes in fresh contexts. Whether a su
 started by `Task` inherits its parent's `disallowedTools` is **unverified**, and if it does
 not, one Task call reopens the fence. No selftest can answer it; the activation checklist
 carries a live probe for a person to run before the gate goes on
-([KIT-140](https://linear.app/braedenclaw/issue/KIT-140)).
+(KIT-140).
 
 **Two consequences of holding no tracker tool that this ADR still overstates.** The
 decomposition section says the executor "can run dedupe instead" of the planner's Linear
 search pass; the executor does not, and no ticket asked it to
-([KIT-141](https://linear.app/braedenclaw/issue/KIT-141)). And the installer's own live path
+(KIT-141). And the installer's own live path
 does not work at all — its ledger is never written, `verify` raises, and every tracker call
-fails ([KIT-135](https://linear.app/braedenclaw/issue/KIT-135)), with the installer and the
-executor reading different config files ([KIT-136](https://linear.app/braedenclaw/issue/KIT-136)).
+fails (KIT-135), with the installer and the
+executor reading different config files (KIT-136).
 Activation is blocked on those three before any operator step can succeed.
