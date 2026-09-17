@@ -533,6 +533,7 @@ first (why, two paragraphs down).
     "TaskStop", "EnterWorktree", "ExitWorktree",
     "CronCreate", "CronDelete", "ScheduleWakeup",
     "SendMessage", "SendUserMessage", "PushNotification",
+    "ListAgents",
     "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
     "EnterPlanMode", "ExitPlanMode",
     "ListMcpResourcesTool", "ReadMcpResourceTool",
@@ -656,7 +657,7 @@ guessing a clone is the defect this whole shape exists to remove.
 
 ### The fence: what the reviewer loses, and why the tracker is in it
 
-The reviewer needs to read files, and nothing else. So 31 built-in tools go: every tool
+The reviewer needs to read files, and nothing else. So 32 built-in tools go: every tool
 that runs, writes, fetches, schedules, messages, publishes or starts other work. The names
 come from the dispatcher's own list of available tools and from the SDK it depends on. A few
 need a word:
@@ -665,6 +666,8 @@ need a word:
   tool's own name.
 - `RemoteTrigger` starts a cloud agent, outside the sandbox.
 - `AskUserQuestion` becomes a question posted on the tracker.
+- `ListAgents` names the other agent sessions a session could message. It is on neither
+  list the names come from; the live probe of 2026-09-17 found it in a reviewer's tools.
 - `ListMcpResourcesTool`, `ReadMcpResourceTool` and `ReadMcpResourceDirTool` read any
   connected MCP server. Their names do not start with `mcp__`, so no server rule reaches
   them.

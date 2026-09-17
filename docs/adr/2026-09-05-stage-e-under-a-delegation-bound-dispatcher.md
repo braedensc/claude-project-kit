@@ -220,7 +220,7 @@ redesigns Stage E for what actually runs.
 > - **Review follow-up, same day: the built-ins were not complete either.** `Monitor` runs a
 >   shell command that a `Bash` rule does not stop, `RemoteTrigger` starts a cloud agent, and
 >   the MCP resource tools read a fenced server's resources past its server rule. The fence
->   now removes 31 built-ins: every tool the dispatcher lists, or the SDK it uses defines,
+>   now removes 32 built-ins: every tool the dispatcher lists, or the SDK it uses defines,
 >   that runs, writes, fetches, schedules, messages, publishes or starts other work. What
 >   the reviewer keeps is a named read-only set, and the live probe is an allowlist check
 >   against it. A deny list cannot name a tool added later (no ticket yet).
