@@ -2100,11 +2100,15 @@ def review_run_id(artifact):
 
 def emit_telemetry(cfg, artifact, dry_run, started_at):
     """One §4 block on the ORIGINAL ticket via scripts/pipeline_telemetry_local.py when it
-    is present. Reporting only — it buys nothing. Absence is logged, never silent."""
+    is present. Reporting only — it buys nothing. Absence is logged, never silent.
+
+    Three answers, not two (KIT-139): True emitted, False it FAILED and is worth a retry,
+    None the module is not installed — nothing to do, said here, and never retried, because
+    a deployment that runs without telemetry is not a deployment whose telemetry broke."""
     mod = _optional_module("pipeline_telemetry_local")
     if mod is None:
         log("NOTE: telemetry not emitted: module absent (scripts/pipeline_telemetry_local.py)")
-        return False
+        return None
     # The artifact file the sibling reads: under state_dir for real, in a throwaway
     # tempdir on --dry-run so a dry pass leaves no state behind at all.
     import tempfile
@@ -2295,10 +2299,15 @@ def settle(cfg, key, record, seen, linear_key, dry_run, result):
                     % (review_ticket, exc, attempts, CLOSE_RETRY_PASSES))
         persist(cfg, seen, key, record, dry_run)
     telemetry_pending = gave_up_telemetry = False
-    if not record.get("telemetry_emitted") and not record.get("telemetry_failed"):
+    if not record.get("telemetry_emitted") and not record.get("telemetry_failed") \
+            and not record.get("telemetry_absent"):
         # THE RETURN VALUE IS THE FACT (KIT-139). This flag used to flip whatever the emit
         # returned, so a row that failed once was lost for good and nothing said so.
-        if emit_telemetry(cfg, artifact, dry_run, started_at):
+        emitted = emit_telemetry(cfg, artifact, dry_run, started_at)
+        if emitted is None:
+            record["telemetry_emitted"] = False
+            record["telemetry_absent"] = True          # nothing to do, said in the log; not retried
+        elif emitted:
             record["telemetry_emitted"] = True
         else:
             attempts = int(record.get("telemetry_attempts") or 0) + 1
@@ -2760,7 +2769,8 @@ def collect(cfg, dry_run):
     for key, record in work:
         try:
             if record.get("status") != "pending":
-                # publish-failed / close-pending: the verdict is settled; resume its delivery.
+                # publish-failed / close-pending / telemetry-pending: the verdict is settled;
+                # resume its delivery at the first stage that has not landed.
                 settle(cfg, key, record, seen, linear_key, dry_run, result)
             elif record.get("review_ticket_id") in (None, "dry-run"):
                 # A pending record with no ticket to read is a "could not", not a "nothing
@@ -4784,7 +4794,7 @@ def selftest():
                 said = sys.stderr.getvalue()
             finally:
                 sys.stderr = err
-            check("telemetry absent → returns False", ok, False)
+            check("KIT-139 telemetry absent → returns None: nothing to do, not a failure", ok, None)
             check("telemetry absent → says so", "telemetry not emitted: module absent" in said, True)
             # …and a present module is driven through its run() once
             class _Mod:
@@ -4863,14 +4873,16 @@ def selftest():
             rid = _Flaky.calls[0] if _Flaky.calls else ""
             check("KIT-139 the run id names the repository, the PR and the review",
                   ("o__r" in rid, "_7_" in rid, rid.endswith("REV-9")), (True, True, True))
+            # Unconditional: a renamed or missing function fails here, never skips (review).
             _rrid = globals().get("review_run_id")
-            if callable(_rrid):
-                check("KIT-139 a decline with no review ticket is named by its head",
-                      _rrid({"repo": "o/r", "pr": 7, "review_ticket": "", "head_sha": "abcdef1234567890"}),
-                      "r_review_o__r_7_abcdef123456")
-                check("KIT-139 a re-review is a different run",
-                      _rrid({"repo": "o/r", "pr": 7, "review_ticket": "REV-9"})
-                      != _rrid({"repo": "o/r", "pr": 7, "review_ticket": "REV-12"}), True)
+            check("KIT-139 review_run_id exists", callable(_rrid), True)
+            _rrid = _rrid if callable(_rrid) else (lambda artifact: None)
+            check("KIT-139 a decline with no review ticket is named by its head",
+                  _rrid({"repo": "o/r", "pr": 7, "review_ticket": "", "head_sha": "abcdef1234567890"}),
+                  "r_review_o__r_7_abcdef123456")
+            check("KIT-139 a re-review is a different run",
+                  _rrid({"repo": "o/r", "pr": 7, "review_ticket": "REV-9"})
+                  != _rrid({"repo": "o/r", "pr": 7, "review_ticket": "REV-12"}), True)
 
             rec3 = _settled_record(8)
             seen3 = {pr_key("o/r", 8): rec3}
@@ -4887,6 +4899,18 @@ def selftest():
                   (3, True, "collected", [1, 1, 1]))
             check("KIT-139 …and a settled record is not collected again",
                   rec3.get("status") in COLLECT_STATUSES, False)
+
+            # An absent telemetry module is nothing to do: said once, settled at once, and
+            # never retried or counted as an error (review of #142).
+            globals()["_optional_module"] = lambda name: None
+            rec4 = _settled_record(9)
+            seen4 = {pr_key("o/r", 9): rec4}
+            r4 = PassResult()
+            settle(c139, pr_key("o/r", 9), rec4, seen4, "k", False, r4)
+            check("KIT-139 an absent telemetry module settles at once, with no error and no retry",
+                  (rec4.get("status"), r4.errors, bool(rec4.get("telemetry_failed")),
+                   bool(rec4.get("telemetry_absent"))),
+                  ("collected", 0, False, True))
         globals()["_optional_module"] = real_import
         # basis_resolver_missing: "" when the sibling imports, a FAIL line naming it when not
         globals()["basis_resolver_missing"] = saved["basis_resolver_missing"]

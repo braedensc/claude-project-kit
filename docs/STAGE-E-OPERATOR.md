@@ -897,8 +897,11 @@ the sessions it counts.
 `telemetry-pending` means the review is published and only its telemetry row did not land.
 The next pass re-sends it under the same run id, so the dashboard counts it once. After
 three passes the record settles with `telemetry_failed: true`, and the log says the run is
-missing from the dashboard (KIT-139). Two mean *not finished, select it again next pass*, and they are
-two because they mean different things:
+missing from the dashboard (KIT-139). A deployment with no telemetry module is not a failure:
+it says so once per review and settles.
+
+Two statuses mean *not finished, select it again next pass*, and they are two because they
+mean different things:
 
 | Status | What it means | Gives up? |
 |---|---|---|
