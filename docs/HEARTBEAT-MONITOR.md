@@ -46,7 +46,10 @@ again, and a pause nobody remembers is indistinguishable from a lane that quietl
 
 The review poller's `declined` (exit 3) is a good result. That pass settled a NOT-reviewed
 verdict and said so on the pull request: no acceptance criteria, a review that timed out, a
-diff over the cap. That is the poller doing its job, and the notifier does not page on it
+reviewer that reported it could not see the change, or a change with no single file small
+enough to deliver. (A large change is no longer one of these — since KIT-138 it gets a
+*partial* review, and only a lone file over the cap still declines.) That is the poller
+doing its job, and the notifier does not page on it
 either. The bounce driver's `declined` (exit 3) is good for the same reason: its only
 non-clean pull requests were ones it was never meant to act on, and it said so on each. Its
 `paused` is a person's decision, written as a `PAUSED` file, and the job still beats on
