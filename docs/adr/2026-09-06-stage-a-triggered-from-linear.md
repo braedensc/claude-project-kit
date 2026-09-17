@@ -646,8 +646,17 @@ carries a live probe for a person to run before the gate goes on
 **Two consequences of holding no tracker tool that this ADR still overstates.** The
 decomposition section says the executor "can run dedupe instead" of the planner's Linear
 search pass; the executor does not, and no ticket asked it to
-([KIT-141](https://linear.app/braedenclaw/issue/KIT-141)). And the installer's own live path
-does not work at all — its ledger is never written, `verify` raises, and every tracker call
-fails ([KIT-135](https://linear.app/braedenclaw/issue/KIT-135)), with the installer and the
-executor reading different config files ([KIT-136](https://linear.app/braedenclaw/issue/KIT-136)).
-Activation is blocked on those three before any operator step can succeed.
+([KIT-141](https://linear.app/braedenclaw/issue/KIT-141)). And "the executor reads the
+Write artifact" has no reader behind it: nothing in the kit discovers a finished planning
+session, fetches its tree, or invokes the executor with the delegated ticket pinned
+([KIT-150](https://linear.app/braedenclaw/issue/KIT-150)). The installer now stops on that,
+by name, **before** it hands over the Planning entry — applying the entry turns on a producer
+whose output nothing would read.
+
+**The installer's live path.** Until 2026-09-17 the installer was a selftest-only scaffold:
+its ledger was never written, `verify` raised, and every tracker call failed by construction
+([KIT-135](https://linear.app/braedenclaw/issue/KIT-135)). It now keeps a mode-600 ledger that
+`status` replays, reports every step as done, already done, would-change, blocked on a person,
+failed, or could-not-measure, and provisions the Planning team and labels over a transport
+that refuses redirects. The installer and the executor still read different config files
+([KIT-136](https://linear.app/braedenclaw/issue/KIT-136)).
