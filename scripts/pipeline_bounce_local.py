@@ -3116,7 +3116,7 @@ def perform_refresh(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
-def record_conclusion(sit, cfg, state_dir, basis, dry_run):
+def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
     """The durable "Stage E is done with this PR" record, and the lane move that follows
     it. Returns (settled, problems).
 
@@ -3159,10 +3159,16 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run):
             linear_set_state(issue_id, state_id, cfg)
         except BounceError as exc:
             lane, problems = "failed", ["needs-approval move: %s" % exc]
+    # BETWEEN THE BOARD SIGNAL AND THE LEDGER ROW (review of #140). The lane move is what
+    # a person sees, so it goes first; the §4 row is reporting and goes second; the ledger
+    # row goes last and records whether that row landed, so a pass that comes back for a
+    # failed move does not post a second one.
+    told = after_move() if after_move is not None else None
+    extra = {} if told is None else {"telemetry": told}
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"],
                ticket_id=sit.get("ticket_id"), outcome="concluded", basis=basis,
                head_sha=sit.get("head_sha"),
-               moved=(lane == "moved"), lane=lane, note=note, problems=problems)
+               moved=(lane == "moved"), lane=lane, note=note, problems=problems, **extra)
     # The hand-off is done, so no queued re-review may outlive it and post a second review
     # comment on a pull request a person already owns.
     retired = retire_rereview_request(state_dir, sit["repo"], sit["pr"])
@@ -3185,14 +3191,29 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     for two releases while a comment landed on every conclusion — which is the reading a
     person does when a comment appears and they go looking for the code that posts it."""
     basis = verdict.get("basis") or "clean"
-    _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run)
+    # ONE ROW PER CONCLUSION, not one per pass that completes it (review of #140). A
+    # needs-approval move that keeps failing brings this path back every pass, and each
+    # visit used to post another §4 comment on the coding ticket — the identical defect
+    # KIT-152 fixed one step over. A first emission that FAILED is still retried.
     if dry_run:
+        record_conclusion(sit, cfg, state_dir, basis, dry_run)
         return EXIT_OK
-    emit_status = emit_telemetry(state_dir, {
-        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-        "outcome": "completed", "bounce_no": 0, "max_bounces": sit.get("max_bounces", 0),
-        "reason": verdict["reason"]}, cfg,
-        no_session="this row records a conclusion; no model session runs for it")
+    prev_concl = ledger_view(ledger_path(state_dir), sit["repo"], sit["pr"]).get("concluded") or {}
+    said = {}
+
+    def tell():
+        if str(prev_concl.get("telemetry") or "") == "emitted":
+            said["status"] = "not re-emitted: an earlier pass already sent this conclusion's row"
+        else:
+            said["status"] = emit_telemetry(state_dir, {
+                "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+                "outcome": "completed", "bounce_no": 0, "max_bounces": sit.get("max_bounces", 0),
+                "reason": verdict["reason"]}, cfg,
+                no_session="this row records a conclusion; no model session runs for it")
+        return said["status"]
+
+    _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=tell)
+    emit_status = said.get("status", "not emitted: the conclusion was never recorded")
     if problems:
         sys.stderr.write("FAIL: %s#%d concluded (%s) but the needs-approval move did not land "
                          "(%s); the conclusion is on the ledger and the next run retries the "
@@ -5304,6 +5325,36 @@ def selftest():
                 check("%s review: still exactly one concluded row" % label,
                       len([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"]), 1)
 
+        # A LANE MOVE THAT KEEPS FAILING MUST NOT KEEP REPORTING (review of #140). The
+        # conclusion comes back every pass while the move is owed, and each visit used to
+        # post another §4 comment on the coding ticket — KIT-152's defect, one path over.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            saved_state = globals()["linear_set_state"]
+
+            def refusing_state(issue_id, state_id, cfg_):
+                calls.append(("state", issue_id, state_id))
+                raise BounceError("simulated: the tracker refused the move")
+            globals()["linear_set_state"] = refusing_state
+            try:
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc_c1 = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                first = [c[0] for c in calls]
+            finally:
+                globals()["linear_set_state"] = saved_state
+            check("KIT-152 a refused lane move is exit 2, and the row is still reported once",
+                  (rc_c1, first), (EXIT_USAGE, ["state", "telemetry"]))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc_c2 = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("KIT-152 …and the retry moves the ticket without a SECOND telemetry comment",
+                  (rc_c2, [c[0] for c in calls]), (EXIT_OK, ["state"]))
+            check("KIT-152 …each concluded row saying whether its row landed",
+                  [str(r.get("telemetry") or "")[:8]
+                   for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"],
+                  ["emitted", "not re-e"])
+
         #       EVERY TERMINAL STATE REMAINS BANNED. The fixture names all six canonical
         #       states; the driver can reach exactly one of them. `done` is the one that
         #       matters most — a coding ticket in a terminal state makes the dispatcher
@@ -6262,6 +6313,25 @@ def selftest():
             check("KIT-152 the verdict holds a no-id exhaustion, and re-opens it when an id appears",
                   (announcement_complete(ex_row["announced"], False),
                    announcement_complete(ex_row["announced"], True)), (True, False))
+            # …through decision_for, not only through the helper (review of #140). The
+            # helper was tested and the WIRING was not, so dropping `label_configured` from
+            # the call left every battery green and the exhaustion re-announcing for good.
+            above_x = {"usable": True, "meets_threshold": True, "max_severity": "high",
+                       "findings": [{"severity": "high", "category": "tests",
+                                     "summary": "s", "detail": "d"}], "head_sha": "sha-x"}
+            sit_v = {"config_state": "ok", "repo": "o/r", "pr": 5, "head_sha": "sha-x",
+                     "outcome": above_x, "checks_status": "green", "failing_checks": [],
+                     "prior": 3, "max_bounces": 3, "visible_bounces": 3,
+                     "pr_meta": {"open": True}, "ticket_state_type": "started",
+                     "ticket_state_name": "In Progress",
+                     "exhausted": {"announced": {"ticket_comment": True,
+                                                 "label": LABEL_NOT_CONFIGURED}}}
+            cfg_v = {"in_flight_hours": 6, "blocked_after_seconds": 3600}
+            check("KIT-152 a no-id exhaustion is a quiet noop, pass after pass",
+                  decision_for(dict(sit_v), cfg_v)["action"], "noop")
+            check("KIT-152 …and the day an id is configured, the same situation announces",
+                  decision_for(dict(sit_v, needs_human_label_id="lbl-1"), cfg_v)["action"],
+                  "exhaust")
 
         # …and a label the TRACKER REFUSES is different from one nobody configured: it is
         # retried, loudly, and never recorded as not-configured (review of #140).
