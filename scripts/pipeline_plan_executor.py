@@ -40,7 +40,8 @@ THE THINGS THIS FILE IS SHAPED AROUND
      Every issue is CREATED in the backlog state and left there; the executor
      issues no state-move mutation at all. The epic carries `provenance:agent`, which by
      §5 never auto-approves — so the epic cannot approve itself, and a person
-     moving it out of intake is the one gate that releases the tree (§4).
+     moving it to exactly `ready` is the one gate that releases the tree (§5
+     rule 2: any other out-of-intake state releases nothing).
      --selftest asserts no state-move / approve / merge path exists in this file.
 
   3. All-or-nothing, including the DoR gate (contract §8, §13). One malformed
@@ -78,9 +79,26 @@ WHAT IT IS AND IS NOT
   backlog and stops; releasing them is the human's move and the approve tier's.
 
 Usage:
-    pipeline_plan_executor.py --requests F [--config delivery.json]
-                              [--repo-root DIR] [--dry-run]
+    pipeline_plan_executor.py --requests F --pinned TEAM-123
+                              --config <planned repo>/delivery.json
+                              --repo-root <planned repo checkout>
+                              [--key-env NAME] [--dry-run]
     pipeline_plan_executor.py --selftest
+
+  WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
+    --pinned     the delegated idea ticket, from whatever started the session —
+                 never the tree's own source_ticket_id. A run that can write
+                 refuses without it. The idea is resolved in ITS OWN team.
+    --config     the PLANNED repository's committed delivery.json. It names the
+                 work team the tree is filed into, that team's state and label
+                 ids, and `linear.findingTicket`, which turns plans on.
+    --repo-root  a checkout of that same planned repository, so the readiness
+                 gate checks each child's Pointers against the code the planner
+                 read, not against this executor's own checkout.
+    --key-env    the NAME of the variable holding the tracker key; the installer
+                 records it as LINEAR_KEY_ENV. Default LINEAR_API_KEY.
+  Nothing invokes this executor yet: the reader that finds a finished planning
+  session and supplies these arguments does not exist (KIT-150).
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker
@@ -362,9 +380,10 @@ def render_success_comment(idea_id, epic, children):
         "### Epic plan ready — awaiting your approval",
         "",
         "A planning session decomposed **%s** into an epic and %d "
-        "child ticket(s), all in the backlog. **Nothing is dispatchable until you "
-        "move the epic out of intake** — that is the one human gate (§4)."
-        % (idea_id, len(children)),
+        "child ticket(s), all in the backlog. **Nothing here starts on its own.** "
+        "To approve, move the epic to the state this project maps to `ready` — any "
+        "other state, including one merely out of the backlog, approves nothing "
+        "(§5 rule 2)." % (idea_id, len(children)),
         "",
         "- **Epic** [%s](%s) — `%s` (`provenance:agent`)"
         % (epic["identifier"], epic.get("url") or "", _sanitize(epic["title"])),
@@ -379,8 +398,10 @@ def render_success_comment(idea_id, epic, children):
                         _sanitize(child["title"]), dep))
     lines += [
         "",
-        "Approve the epic to release the tree; each child re-checks the "
-        "Definition-of-Ready gate as it is released (§5, §11).",
+        "After that, a child reaches `ready` only by the approve tier, if it is "
+        "switched on for this project (it re-checks each child against the "
+        "readiness gate first), or by you moving it. A child starts work only "
+        "when someone delegates it (§11).",
     ]
     return "\n".join(lines)
 
@@ -1065,7 +1086,10 @@ def selftest():
         check("relation-direction", fake.relations[0], (kids[0]["id"], kids[1]["id"]))
         check("summary-comment-on-idea", len(fake.comments), 1)
         check("summary-comment-target", fake.comments[0][0], "idea-KIT-777")
-        check("summary-names-approval", "move the epic out of intake" in fake.comments[0][1], True)
+        check("summary-names-approval", "move the epic to the state this project maps to `ready`"
+              in fake.comments[0][1], True)
+        check("summary-no-out-of-intake-claim", "out of intake" in fake.comments[0][1], False)
+        check("summary-says-approve-tier-is-conditional", "if it is switched on" in fake.comments[0][1], True)
         check("summary-carries-approval-marker",
               _marker(ESC_AWAITING_APPROVAL) in fake.comments[0][1], True)
 

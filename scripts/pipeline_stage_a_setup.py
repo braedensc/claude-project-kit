@@ -266,14 +266,23 @@ def refuse_if_agent(action, env=None):
 # --------------------------------------------------------------------------- #
 CONF_KEYS = {
     "ROLE_ACCOUNT": "the local role account the executor runs as (never your login)",
-    "PLANNING_TEAM_KEY": "the Linear team key ideas are delegated into (e.g. PLAN)",
-    "LINEAR_WORKSPACE": "the Linear workspace slug",
-    "OWNER_USER_ID": "the Linear user id notified on every filed plan",
-    "LINEAR_KEY_ENV": "the env-var NAME holding the executor's Linear key",
-    "KIT_REPO_URL": "the https URL the role account clones the kit from",
+    "PLANNING_TEAM_KEY": "the tracker team key ideas are delegated into (e.g. PLAN)",
+    "OWNER_USER_ID": "the tracker user id notified on every filed plan",
     "PLANNED_REPO": "owner/repo whose ideas this Planning team plans — its committed "
                     "delivery.json is the executor's only config",
+    "OPERATOR_KEY_ENV": "the env-var NAME holding YOUR tracker key, used by this "
+                        "installer to provision the team and labels",
+    "LINEAR_KEY_ENV": "the env-var NAME the EXECUTOR's key is stored under, in the role "
+                      "account's own env file",
 }
+# Read when present, never required. The reader job that will run the executor
+# clones the kit from it (KIT-150); until that job exists nothing consumes it, and
+# a required value nothing reads is a question the operator answers for nobody.
+OPTIONAL_CONF_KEYS = {
+    "KIT_REPO_URL": "the https URL the role account will clone the kit from (KIT-150)",
+}
+TEAM_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def parse_conf(text):
@@ -301,17 +310,29 @@ def validate_conf(conf):
     if role and role == os.environ.get("USER"):
         errors.append("ROLE_ACCOUNT is your own login (%s) — the executor must run "
                       "as a separate account so a session cannot read its key" % role)
+    team = conf.get("PLANNING_TEAM_KEY", "")
+    if team and not TEAM_KEY_RE.match(team):
+        errors.append("PLANNING_TEAM_KEY must be an upper-case team key of at most ten "
+                      "characters (got %r)" % team)
     planned = conf.get("PLANNED_REPO", "")
     if planned and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", planned):
         errors.append("PLANNED_REPO must be owner/repo (got %r)" % planned)
     url = conf.get("KIT_REPO_URL", "")
     if url and not url.startswith("https://"):
         errors.append("KIT_REPO_URL must be https:// (got %r)" % url)
-    env_name = conf.get("LINEAR_KEY_ENV", "")
-    if env_name and not re.fullmatch(r"[A-Z][A-Z0-9_]*", env_name):
-        errors.append("LINEAR_KEY_ENV must be an env-var NAME (UPPER_SNAKE), not a "
-                      "value — a key in a tracked conf is a leaked key (got %r)"
-                      % env_name)
+    for key in ("OPERATOR_KEY_ENV", "LINEAR_KEY_ENV"):
+        name = conf.get(key, "")
+        if name and not ENV_NAME_RE.match(name):
+            errors.append("%s must be an env-var NAME (UPPER_SNAKE), not a value — a "
+                          "key in a conf file is a leaked key (got %r)" % (key, name))
+    if conf.get("OPERATOR_KEY_ENV") and conf.get("OPERATOR_KEY_ENV") == conf.get("LINEAR_KEY_ENV"):
+        errors.append("OPERATOR_KEY_ENV and LINEAR_KEY_ENV name the same variable. They "
+                      "are two different keys — yours, for provisioning, and the "
+                      "executor's, stored under the role account — and one name for both "
+                      "is how your own key ends up in the executor's file")
+    for key in conf:
+        if key not in CONF_KEYS and key not in OPTIONAL_CONF_KEYS:
+            errors.append("unknown key %s — a misspelled key is read as missing" % key)
     return errors
 
 
@@ -872,8 +893,8 @@ def step_tracker(ctx, apply_it):
         raise Unknown(
             "no tracker credential in this pass, so the Planning team and the labels "
             "could not be measured",
-            "export the key under the name LINEAR_KEY_ENV gives in your conf, in the "
-            "terminal you run this from; it is read, never stored by this program")
+            "export YOUR tracker key under the name OPERATOR_KEY_ENV gives in your "
+            "conf, in the terminal you run this from; it is read, never stored")
     key = ctx.conf["PLANNING_TEAM_KEY"]
     outstanding, made = [], []
     team_id, created = ctx.tracker.ensure_team(key, apply_it)
@@ -984,7 +1005,7 @@ class GitHubReader(object):
             return None, branch, "delivery.json on %s is not JSON (%s)" % (branch, exc)
 
 
-def delivery_gaps(doc, owner_user_id):
+def delivery_gaps(doc, owner_user_id, planning_team_key=None):
     """Every reason the committed config would make the executor refuse or
     error on a valid tree — in ONE pass, mirroring the executor's own checks."""
     gaps = []
@@ -993,6 +1014,11 @@ def delivery_gaps(doc, owner_user_id):
     linear = doc.get("linear") or {}
     if not linear.get("teamKey"):
         gaps.append("`linear.teamKey` is missing — the tree has no work team to land in")
+    elif planning_team_key and linear.get("teamKey") == planning_team_key:
+        gaps.append("`linear.teamKey` is %s, the same team as PLANNING_TEAM_KEY. The "
+                    "Planning entry would claim the work team's key, and every ticket "
+                    "delegated there would route to the planner or collide with the "
+                    "coding entry. Use a separate Planning team." % planning_team_key)
     finding = linear.get("findingTicket")
     if not isinstance(finding, dict):
         gaps.append("`linear.findingTicket` is missing — the plan kind is OFF, so every "
@@ -1044,7 +1070,7 @@ def step_delivery_config(ctx, apply_it):
     if doc is None:
         raise Unknown("could not read %s's delivery config: %s" % (repo, why),
                       "check `gh auth status`, then run the same command again")
-    gaps = delivery_gaps(doc, ctx.conf.get("OWNER_USER_ID"))
+    gaps = delivery_gaps(doc, ctx.conf.get("OWNER_USER_ID"), ctx.conf.get("PLANNING_TEAM_KEY"))
     if gaps:
         ctx.state.data["notes"]["delivery_gaps"] = gaps
         ctx.say("")
@@ -1160,7 +1186,9 @@ class Ctx(object):
 
     def prompt_secret(self, name):
         import getpass
-        return getpass.getpass("paste %s (it is not echoed): " % name).strip()
+        return getpass.getpass("paste the EXECUTOR's tracker key, to be stored as %s "
+                               "(not your own provisioning key; it is not echoed): "
+                               % name).strip()
 
 
 def _self_path():
@@ -1561,11 +1589,11 @@ class FakeGitHub(object):
 GOOD_CONF = {
     "ROLE_ACCOUNT": "_planclaw",
     "PLANNING_TEAM_KEY": "PLAN",
-    "LINEAR_WORKSPACE": "acme",
     "OWNER_USER_ID": "owner-1",
+    "PLANNED_REPO": "example-org/product",
+    "OPERATOR_KEY_ENV": "LINEAR_API_KEY",
     "LINEAR_KEY_ENV": "STAGE_A_LINEAR_API_KEY",
     "KIT_REPO_URL": "https://github.com/x/kit.git",
-    "PLANNED_REPO": "example-org/product",
 }
 
 
@@ -1930,6 +1958,29 @@ def selftest():
         check("delivery-ready-no-gaps", delivery_gaps(READY_DELIVERY, "owner-1"), [])
         check("installer-never-writes-delivery", "delivery.json\"" in "".join(
             ln for ln in src.splitlines() if "write_role_file" in ln), False)
+        # The committed example parses clean under the same validator, so the file a
+        # person copies can never name a key this installer calls unknown or missing.
+        example = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                               "stage-a.conf.example")
+        with open(example, encoding="utf-8") as fh:
+            ex_conf, ex_parse = parse_conf(fh.read())
+        check("conf-example-parses", ex_parse, [])
+        check("conf-example-validates",
+              validate_conf(dict(ex_conf, ROLE_ACCOUNT="_x_selftest")), [])
+        check("conf-good-has-no-errors", validate_conf(dict(GOOD_CONF, ROLE_ACCOUNT="_x_selftest")), [])
+        check("conf-flags-same-key-names",
+              any("same variable" in e for e in validate_conf(
+                  dict(GOOD_CONF, OPERATOR_KEY_ENV="STAGE_A_LINEAR_API_KEY"))), True)
+        check("conf-flags-bad-team-key",
+              any("PLANNING_TEAM_KEY" in e for e in validate_conf(dict(GOOD_CONF, PLANNING_TEAM_KEY="plan team"))), True)
+        check("conf-flags-unknown-key",
+              any("LINEAR_WORKSPACE" in e for e in validate_conf(dict(GOOD_CONF, LINEAR_WORKSPACE="x"))), True)
+        check("conf-kit-url-optional",
+              validate_conf(dict((k, v) for k, v in GOOD_CONF.items() if k != "KIT_REPO_URL")), [])
+        clash = json.loads(json.dumps(READY_DELIVERY))
+        clash["linear"]["teamKey"] = "PLAN"
+        check("delivery-gap-planning-team-is-work-team",
+              any("same team" in g for g in delivery_gaps(clash, "owner-1", "PLAN")), True)
         check("conf-flags-bad-planned-repo",
               any("PLANNED_REPO" in e for e in validate_conf(dict(GOOD_CONF, PLANNED_REPO="nope"))),
               True)
@@ -1991,7 +2042,7 @@ def _live_ctx(conf, state_home):
     markers = agent_markers_present()
     tracker = None
     if not markers:
-        key = os.environ.get(conf.get("LINEAR_KEY_ENV", "")) or ""
+        key = os.environ.get(conf.get("OPERATOR_KEY_ENV", "")) or ""
         tracker = LinearTransport(key) if len(key) >= 20 else None
     ctx = Ctx(conf, Runner(apply_it=False), tracker, Host(), State(state_home),
               github=GitHubReader())

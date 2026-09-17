@@ -36,20 +36,30 @@ ROLE_ACCOUNT=_planclaw
 # from a label or text inside the ticket.
 PLANNING_TEAM_KEY=PLAN
 
-# The Linear workspace slug (builds ticket URLs).
-LINEAR_WORKSPACE=example
-
 # Your own Linear USER ID — the person notified on every filed plan and named as
 # the subscriber on each epic. A plan nobody is notified about dies in the
 # backlog. This is the user id, not an email.
 OWNER_USER_ID=REPLACE_WITH_YOUR_LINEAR_USER_ID
 
-# The NAME — never the value — of the environment variable the executor reads its
-# Linear key from. The installer writes the value into the role account's env
-# file (mode 600); a value here would be a leaked key.
+# The planned repository, as owner/repo. Its COMMITTED delivery.json, on its default
+# branch, is the executor's only config: the work team the tree lands in, its state
+# and label ids, and the `linear.findingTicket` block that turns plans on. The
+# installer reads that file and never writes it; when it is not ready, it prints the
+# exact block for you to add in a pull request of your own.
+PLANNED_REPO=example-org/product
+
+# The NAME — never the value — of the variable holding YOUR tracker key, in the
+# terminal you run the installer from. It provisions the Planning team and the
+# labels. It is read, never stored.
+OPERATOR_KEY_ENV=LINEAR_API_KEY
+
+# The NAME — never the value — of the variable the EXECUTOR's key is stored under,
+# in the role account's own env file (mode 600). A different key from yours, and a
+# different name: one name for both is how your key ends up in the executor's file.
+# The executor is started with `--key-env` set to this name.
 LINEAR_KEY_ENV=STAGE_A_LINEAR_API_KEY
 
-# The https clone URL the role account fetches the kit from (the executor runs
-# scripts/pipeline_plan_executor.py out of it). Not ssh — the role account has no
-# keys.
+# OPTIONAL. The https clone URL the role account will run the executor out of. Not
+# read by anything yet: the job that runs the executor does not exist (KIT-150).
+# Not ssh — the role account has no keys.
 KIT_REPO_URL=https://github.com/example-org/claude-project-kit

@@ -897,7 +897,8 @@ backlog — and the tree shape adds these:
 
 - **The epic carries `provenance:agent`.** An epic a session drafted is agent-authored, and
   by §5 rule 1 `provenance:agent` never auto-approves, so the epic cannot approve itself; it
-  waits for the human to move it out of intake (§4). A human-written epic (manual
+  waits for the human to move it to exactly `ready` (§5 rule 2 — any other out-of-intake
+  state releases nothing). A human-written epic (manual
   `/plan-epic`) stays `provenance:human`; an idea-triggered one is `provenance:agent`.
 - **The executor sets each child's parent**, forced to the epic it created in this same
   batch. The session cannot supply a parent id — which would otherwise let it name an
@@ -911,7 +912,18 @@ backlog — and the tree shape adds these:
   executor constant like the flat kind's cap-of-3 — not a `delivery.json` budget), still
   all-or-nothing: one malformed or DoR-failing child rejects the whole tree.
 - **The executor posts a summary comment** on the idea ticket so the owner can read the plan
-  and approve the epic — the one human gate that releases the tree.
+  and approve the epic — the one human gate that releases the tree. Approval makes children
+  *eligible*; each reaches `ready` only through the approve tier (§11, which re-runs the
+  gate and is off unless a project switches it on) or a person, and starts only when
+  delegated.
+- **Where its inputs come from.** The executor's only config is the **planned repository's
+  committed `delivery.json`**: the work team the tree is filed into (`linear.teamKey`), that
+  team's state and label ids, and `linear.findingTicket`. It resolves the **idea ticket in its
+  own team** — the prefix of the pinned id — which is normally a separate Planning team, and
+  files the tree into the work team. The pinned id comes from whatever started the session,
+  never from the tree: a run that can write refuses without it, because a pin defaulted from
+  `source_ticket_id` would compare the session's claim with itself. Nothing in the kit supplies
+  that pin or invokes the executor yet (KIT-150).
 
 **The planning session's only channel is this file, so a QUESTION rides it too.** Because the
 session holds no tracker tool, every way it reaches the owner travels through the executor. A

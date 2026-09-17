@@ -270,7 +270,7 @@ and only two:
   forced — the epic as `provenance:agent`, each child's parent as the just-created epic.
 - **The epic is `provenance:agent`, not `provenance:human`.** A session drafted it, so it
   is agent-authored, and by §5 it never auto-approves. The human gate is identical: move
-  the epic out of intake to release the tree.
+  the epic to exactly `ready` (§5 rule 2) to release the tree.
 
 Everything else — the PRD read from real code, the decomposition, the rubric panel, the
 DoR gate — is the same. The interactive path stays the default; the unattended path is what
