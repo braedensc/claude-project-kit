@@ -507,6 +507,32 @@ def selftest():
                        "— an unusable review that does not say so reads as clean: %r"
                        % (label, verdict))
 
+            # KIT-137: the cloud lane reads `blocked` exactly as the local publisher does.
+            # A conforming document that says it could not see the change is UNUSABLE on
+            # both lanes; the tolerant "not blocked" spellings are a review on both. Run
+            # over the same inputs, so the two publishers cannot drift apart.
+            try:
+                import pipeline_review_local as _prl
+                local_reading = _prl.blocked_reason
+            except Exception as exc:                          # the check, never a crash
+                local_reading = None
+                expect(False, "pipeline_review_local.blocked_reason could not be imported: %s" % exc)
+            clean_doc = cs._with(cs.VALID_REVIEW_FINDINGS, "findings", [])
+            for spelling in (None, False, True, "", "no", "None", "false", "N/A", "not blocked.",
+                             "the description carried no diff"):
+                doc = dict(clean_doc) if spelling is None else cs._with(clean_doc, "blocked", spelling)
+                verdict = _run_normalize(block, doc, tmpdir)
+                if callable(local_reading):
+                    want_usable = local_reading(doc) is None
+                    expect(verdict.get("usable") is want_usable,
+                           "the cloud lane read blocked=%r as usable=%r; the local publisher "
+                           "reads it as usable=%r — the two lanes disagree: %r"
+                           % (spelling, verdict.get("usable"), want_usable, verdict))
+                    if not want_usable:
+                        expect("UNREVIEWED" in str(verdict.get("summary", "")),
+                               "a blocked review on the cloud lane did not say the PR is "
+                               "UNREVIEWED: %r" % verdict)
+
             # An unreachable gate is itself a shape failure. A step that cannot
             # check the document must not be the step that calls it good.
             verdict = _run_normalize(block, cs.VALID_REVIEW_FINDINGS, tmpdir, stage_gate=False)

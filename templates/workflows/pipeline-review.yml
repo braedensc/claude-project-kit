@@ -397,6 +397,9 @@ jobs:
           python3 - <<'PY'
           import json, os, sys
           RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+          # KIT-137: the spellings of "not blocked" that pipeline_review_local.blocked_reason
+          # also reads as not blocked. emit_document's battery runs both over the same inputs.
+          NOT_BLOCKED = {"", "no", "none", "null", "false", "n/a", "na", "not blocked", "nothing", "not applicable"}
           # Contract §14, held to schemas/review-findings.schema.json — staged in
           # the prep step from the DEFAULT BRANCH, never read out of the head this
           # job checked out. An unreachable gate is itself a shape failure: a
@@ -430,6 +433,16 @@ jobs:
               problems = document_problems(doc, "review-findings")
               if problems:
                   raise ValueError("; ".join(problems[:5]))
+              # A CONFORMING DOCUMENT CAN STILL BE A NON-REVIEW (KIT-137). A reviewer that
+              # could not see the change says so in `blocked`, and an empty findings list
+              # beside it means "could not review", never "clean". The schema accepts the
+              # field, so this lane must read it or it would publish that as clean.
+              blocked = doc.get("blocked")
+              said = " ".join(str(blocked).split()) if blocked not in (None, False, True) else ""
+              if blocked is True or (blocked not in (None, False)
+                                     and said.lower().strip(".!") not in NOT_BLOCKED):
+                  raise ValueError("the reviewer reported it could not review this change: %s"
+                                   % (said[:300] or "no reason given"))
               findings = doc["findings"]
               out["summary"] = doc["summary"][:2000]
               out["findings"] = findings[:50]

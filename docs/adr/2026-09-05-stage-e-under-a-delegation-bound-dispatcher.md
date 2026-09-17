@@ -266,9 +266,11 @@ redesigns Stage E for what actually runs.
 >   only after its owner re-runs the installer, which restarts the dispatcher. The first
 >   sentence of that brief is unchanged, because the installer uses it to recognise the
 >   entries it owns.
-> - **Order of rollout is safe.** The schema accepts `blocked` before any reviewer is told
->   to write it. A reviewer that writes it against an older publisher is declined as
->   malformed: noisy, never clean.
+> - **Both publishers learn it together.** The schema accepts `blocked`, so any publisher
+>   that validates against it must read the field too, or a blocked review would pass as a
+>   clean one. The local publisher and the cloud template's normalize step both decline on
+>   it, and the emit battery runs both over the same spellings so they cannot drift. A
+>   project must take the schema and its review workflow in the same sync.
 > - **Still open.** The field is reviewer-authored, so it is reporting and never authority.
 >   A reviewer that is blocked and says nothing is unchanged by it (no ticket yet). A
 >   declined review is announced once, on the PR, and then held in silence by the bounce
