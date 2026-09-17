@@ -1,0 +1,52 @@
+# chat-lane.conf.example — the five values the chat-lane composer asks you for.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp chat-lane.conf.example chat-lane.conf && chmod 600 chat-lane.conf
+#   $EDITOR chat-lane.conf                                    # none of them secret
+#   python3 scripts/pipeline_chat_lane_setup.py compose       # prints every piece
+#   python3 scripts/pipeline_chat_lane_setup.py verify        # after you apply them
+#
+# Both commands check this file first and report EVERY bad value in one pass.
+# Neither one writes anything: `compose` prints, `verify` reads. You apply each
+# piece by hand. The steps are in docs/CHAT-LANE-OPERATOR.md.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
+#
+#   FORMAT.  `KEY=value`, one per line.  `#` starts a comment ONLY at the start
+#   of a line.  It is PARSED, never SOURCED.  A duplicate key is an error.
+#
+#   NO KEY HERE EVER HOLDS A CREDENTIAL.  The loader refuses a value with a
+#   credential shape and names the KEY only.  The chat app's token and signing
+#   secret go into the dispatcher's env file, typed by you, and nowhere else.
+#
+#   MODE 600.  It holds no secret, but it holds the shape of your deployment.
+#   `chat-lane.conf` is gitignored; this example is committed.  Every value
+#   below is reserved or invented (`example.com`, the namespaced `_exdispatch`).
+# ---------------------------------------------------------------------------
+
+
+# The local account the dispatcher runs as. `verify` reads three files as this
+# account, through `sudo -u`. Never your own login.
+ROLE_ACCOUNT=_exdispatch
+
+# The dispatcher's config file, as an absolute path. The chat grant and the
+# Slack fence go in here. The composer never writes it.
+DISPATCHER_CONFIG=/opt/example-dispatcher/config.json
+
+# The env file the dispatcher loads, as an absolute path. By default that is
+# `.env` in the dispatcher's home. The three chat-lane names go in here.
+DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env
+
+# The public host name of your front door (the reverse proxy). Host name only:
+# no https://, no path. The Slack app's request URL becomes
+# https://<this>/slack-webhook.
+FRONT_DOOR_HOST=chat.example.com
+
+# The NAME of the notifier's own token variable. `verify` checks that this name
+# is NOT in the dispatcher's env file: every dispatcher session inherits that
+# file, and the notifier's token must never reach one. Leave the default unless
+# your notifier uses a different name.
+NOTIFIER_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN

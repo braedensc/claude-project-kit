@@ -263,6 +263,15 @@ jobs:
       - name: Stage A installer selftest (fence composition, agent-refused, human gates)
         run: python3 scripts/pipeline_stage_a_setup.py --selftest
 
+      # The chat-lane composer: prints every piece of the dispatcher's built-in Slack
+      # lane for a person to apply, and never writes the dispatcher's config. The grant
+      # is the owner's list (a mutant holding Monitor turns it red), the Slack fence keeps
+      # every inherited default, the deny rules are pinned to .claude/settings.json,
+      # verify's six checks run against fake configs with no env value in any output,
+      # verify is refused in an agent environment, and the source has no write path.
+      - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
+        run: python3 scripts/pipeline_chat_lane_setup.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
