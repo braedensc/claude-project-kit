@@ -233,7 +233,10 @@ WATCHERS = {
         "ts_fields": ("finished_at", "at", "started_at"),
         "result_field": "result",
         "bool_field": None,
-        "good": ("ok", "idle"),
+        # `declined` is a pass whose only non-clean PRs were ones it was never meant to act
+        # on, and `paused` is a pass a person stopped on purpose with a PAUSED file (KIT-112).
+        # Both beat on schedule and neither is a job that is down or failing.
+        "good": ("ok", "idle", "declined", "paused"),
         "running": ("running",),
     },
     "finding-poller": {

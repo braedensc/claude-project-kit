@@ -1360,9 +1360,11 @@ not yours, so reading them takes `sudo -u`:
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
 ```
 
-The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours —
-and the `cd /` suppresses the `shell-init: … getcwd … Permission denied` lines that
-otherwise appear, harmlessly, because that account cannot traverse your home.
+The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours.
+Type it from `/`. Started from your home, the role account's shell prints two
+`shell-init: … getcwd … Permission denied` lines before the `cd /` inside the command runs,
+because that account cannot traverse your home. They are harmless. The installer starts
+every role-account command at `/`, so it no longer prints them (KIT-112).
 
 Two cases leave no heartbeat at all: a config that cannot be read (the job exits before it
 learns where its state directory is), and somebody stopping the process on purpose.
@@ -1524,6 +1526,32 @@ python3 <scripts dir>/pipeline_bounce_local.py exhaust --pr <n> --repo OWNER/REP
 
 `decide` only reports. `bounce` and `exhaust` act on one PR. `run` takes neither `--pr`
 nor `--all`: it is the daemon's whole pass.
+
+**To pause the driver, write a file; do not unload the job.** An unloaded job comes back on
+the next installer `run` and on every reboot, and a reloaded job takes a full pass within
+seconds. A file named `PAUSED` in the driver's state directory survives both. Its first
+line is the reason.
+
+```bash
+sudo -u <role account> -H /bin/sh -c 'cd / && echo "live test block B" > ~/.stage-e/state/PAUSED'
+```
+
+Good: the next pass prints `PAUSED: … — live test block B. This pass did nothing.`, and the
+heartbeat reads `"result": "paused"`. The heartbeat monitor reads that as healthy.
+Not: `pass complete`. The file is in the wrong directory; the heartbeat's own directory is
+the right one.
+
+A paused pass does nothing at all: no bounce, no conclusion, no conflict fix, and no
+criteria snapshot. A ticket delegated during the pause gets its snapshot on the first pass
+after, with the lag recorded. `bounce` and `exhaust`, typed by hand, ignore the file. The
+review poller and the finding poller have no pause of their own (no ticket yet). Delete the
+file to resume.
+
+**Exit codes.** `0` is a clean pass. `3` is a pass that declined — a pull request the
+driver was never meant to act on, such as a branch that is not a pipeline ticket branch, or
+a paused pass. `2` is a pass that could not do something, and a decline never hides one: a
+pass with a declined PR and a broken one exits `2`. The heartbeat's `result` says the same:
+`ok`, `declined`, `paused`, or `problems`.
 
 - **The budget is not yours to type.** `budgets.maxBounces` and
   `budgets.reviewSeverityThreshold` are read from `delivery.json` on the repo's

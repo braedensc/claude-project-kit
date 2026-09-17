@@ -813,11 +813,11 @@ class Runner(object):
         self.writes = []      # every mutation, applied or merely planned
         self.reads = []
 
-    def read(self, argv, stdin=None, timeout=60):
+    def read(self, argv, stdin=None, timeout=60, cwd=None):
         self.reads.append(argv)
-        return self._exec(argv, stdin, timeout)
+        return self._exec(argv, stdin, timeout, cwd=cwd)
 
-    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False):
+    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False, cwd=None):
         self.writes.append({"why": why, "argv": argv,
                             "stdin": "<hidden>" if secret_stdin else stdin})
         if self.dry_run:
@@ -827,12 +827,12 @@ class Runner(object):
                 say("    (stdin: %s)" % ("<a credential, never shown>" if secret_stdin
                                          else "%d bytes" % len(stdin)))
             return Result(0, skipped=True)
-        return self._exec(argv, stdin, timeout)
+        return self._exec(argv, stdin, timeout, cwd=cwd)
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         try:
             p = subprocess.run(argv, input=stdin, capture_output=True, text=True,
-                               timeout=timeout)
+                               timeout=timeout, cwd=cwd)
         except FileNotFoundError as exc:
             return Result(127, "", str(exc))
         except subprocess.TimeoutExpired:
@@ -844,11 +844,19 @@ class Runner(object):
                 secret_stdin=False):
         """Run a /bin/sh script as the role account. `sudo -u … -H` keeps the
         caller's cwd, and that account cannot traverse into your worktree, so
-        every wrapper starts by standing somewhere it can read."""
+        every wrapper starts by standing somewhere it can read.
+
+        THE CHILD STARTS AT `/` TOO (KIT-112). The `cd /` inside the script runs
+        after the shell has initialised, and the shell's own initialisation calls
+        getcwd first — in a directory this account cannot enter. That printed two
+        `getcwd: cannot access parent directories` lines on every role-account
+        command, mid-install, reading like a fault. No caller depends on the
+        inherited directory: every git call names its tree with -C and every
+        script starts with its own `cd /`."""
         argv = ["sudo", "-u", account, "-H", "/bin/sh", "-c", "cd / && " + script]
         if why is None:
-            return self.read(argv, stdin, timeout)
-        return self.write(why, argv, stdin, timeout, secret_stdin)
+            return self.read(argv, stdin, timeout, cwd="/")
+        return self.write(why, argv, stdin, timeout, secret_stdin, cwd="/")
 
     def as_root(self, argv, why=None, stdin=None, timeout=300):
         argv = ["sudo"] + list(argv)
@@ -5226,7 +5234,8 @@ class FakeRunner(Runner):
         self.answers = list(answers or [])
         self.applied = []
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
+        self.last_cwd = cwd
         line = _fmt(argv)
         for needle, rc, out in self.answers:
             if needle in line:
@@ -5271,7 +5280,7 @@ class FakeLaunchd(FakeRunner):
         self.polls = 0
         self.attempts = 0
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         line = _fmt(argv)
         if "launchctl bootout system/" in line:
             if not self.stuck:
@@ -5310,14 +5319,14 @@ class FakeLaunchdWithLog(FakeLaunchd):
         FakeLaunchd.__init__(self, **kw)
         self.log_path, self.new_output = log_path, new_output
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         line = _fmt(argv)
         if "Print :StandardOutPath" in line:
             return Result(0, self.log_path + "\n", "")
         if list(argv[:3]) == ["sudo", "/bin/sh", "-c"] and self.log_path in argv[3]:
             ran = subprocess.run(["/bin/sh", "-c", argv[3]], capture_output=True, text=True)
             return Result(ran.returncode, ran.stdout, ran.stderr)
-        res = FakeLaunchd._exec(self, argv, stdin, timeout)
+        res = FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
         if "launchctl bootstrap system" in line and res.ok and self.present:
             with open(self.log_path, "a", encoding="utf-8") as fh:
                 fh.write(self.new_output)
@@ -5782,6 +5791,26 @@ def _selftest_body():
     cases += 1
     expect("secret-never-printed-mutant", SECRET in ("stdin: K=" + SECRET),
            "the leak scan cannot see a secret in an output line")
+
+    # -- KIT-112. A ROLE-ACCOUNT COMMAND STARTS WHERE THAT ACCOUNT CAN STAND ----
+    # The script's own `cd /` runs after the shell has initialised, and initialising calls
+    # getcwd in the caller's directory, which the role account cannot enter: two noise
+    # lines on every role-account command. The child process must start at `/`.
+    cases += 1
+    fr_cwd = FakeRunner([("true", 0, "")])
+    fr_cwd.as_role("_x", "true")
+    read_cwd = getattr(fr_cwd, "last_cwd", None)
+    fr_cwd.as_role("_x", "true", why="a write")
+    write_cwd = getattr(fr_cwd, "last_cwd", None)
+    expect("KIT-112 role-commands-start-at-root", (read_cwd, write_cwd) == ("/", "/"),
+           "role-account commands start in the caller's directory: read %r, write %r"
+           % (read_cwd, write_cwd))
+    try:
+        here_out = Runner().read(["/bin/sh", "-c", "pwd"], cwd="/").out.strip()
+    except TypeError as exc:
+        here_out = "Runner.read takes no cwd: %s" % exc
+    expect("KIT-112 role-commands-start-at-root", here_out == "/",
+           "a real child given cwd=/ printed %r" % here_out)
 
     # -- 8. a dry run makes no change --------------------------------------
     cases += 1
@@ -8653,10 +8682,10 @@ def _selftest_body():
             self.answers = []
             self.applied = []
 
-        def _exec(self, argv, stdin, timeout):
+        def _exec(self, argv, stdin, timeout, cwd=None):
             if argv and argv[0] == "sudo":
                 order.append("probe")
-            return FakeRunner._exec(self, argv, stdin, timeout)
+            return FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd)
 
     main_tmp = tempfile.mkdtemp(prefix="stage-e-main.")
     main_conf = os.path.join(main_tmp, "stage-e.conf")
@@ -9122,7 +9151,7 @@ def _selftest_body():
         ctxA.unloaded = [mlabel]
         # Every command, read or write, in the order it ran.
         seqA, _execA = [], fakeA._exec
-        fakeA._exec = lambda argv, stdin, timeout: (seqA.append(_fmt(argv)),
+        fakeA._exec = lambda argv, stdin, timeout, cwd=None: (seqA.append(_fmt(argv)),
                                                     _execA(argv, stdin, timeout))[1]
         (okA, detailA, _x), printedA = _quiet(lambda: step_heartbeat_monitor(ctxA, apply_it=True))
         whysA = [w["why"] for w in fakeA.writes]
@@ -9191,7 +9220,7 @@ def _selftest_body():
                           (MONITOR_SCRIPT + " check --config", 0, ""),
                           (_rearm_cmd, 0, "")] + fakeRL.answers
         seqRL, _execRL = [], fakeRL._exec
-        fakeRL._exec = lambda argv, stdin, timeout: (seqRL.append(_fmt(argv)),
+        fakeRL._exec = lambda argv, stdin, timeout, cwd=None: (seqRL.append(_fmt(argv)),
                                                      _execRL(argv, stdin, timeout))[1]
         _quiet(lambda: step_heartbeat_monitor(ctxRL, apply_it=True))
         _gone_at = max([i for i, line in enumerate(seqRL)

@@ -444,6 +444,19 @@ import pr_conflict as prc  # noqa: E402
 
 EXIT_OK = 0
 EXIT_USAGE = 2
+# NOT A FAILURE, AND NOT NOTHING (KIT-112). A pass that deliberately did nothing for a pull
+# request it was never meant to act on, or a whole pass a person paused. The review poller
+# has used 3 for the same sentence since it shipped; the selftest asserts the two agree.
+# Before this every such decline returned 2, the pass took the worst code, its heartbeat
+# read `problems`, and the heartbeat monitor paged — for as long as that PR stayed open.
+EXIT_DECLINED = 3
+
+# The durable pause (KIT-112). A file of this name in the state directory makes the daemon's
+# pass do nothing and say so. It lives on disk under the role account, so neither an
+# installer run (which re-loads every job) nor a reboot re-arms a paused driver — the
+# failure that re-prompted a session twelve seconds after an unrelated `run` on 2026-09-08.
+# Its first line, if any, is the reason, and it is printed on every pass.
+PAUSE_FILE = "PAUSED"
 
 # Everything this driver reads or writes lives under the DAEMON ACCOUNT's home — the
 # dispatcher's own role account (owner decision "C1") — beside the mode-600 env file the
@@ -620,6 +633,16 @@ class Decline(BounceError):
     def __init__(self, reason, sit):
         super().__init__(reason)
         self.sit = sit
+
+
+class NotEligible(Decline):
+    """A pull request this driver was never meant to act on: its branch is not a pipeline
+    ticket branch, names no ticket this project runs, or names a ticket that does not own
+    it. Said on the PR exactly like any decline, and exit 3, not 2 (KIT-112). It is nothing
+    to do for THIS pull request; reading it as a failure made one such PR page the owner on
+    every monitor pass for as long as it stayed open. A refusal because something is WRONG
+    — a credential, a withheld secret, a ledger that disagrees with the PR — stays a plain
+    Decline, exit 2, because a person does need to look at those."""
 
 
 def _now_iso():
@@ -2707,7 +2730,7 @@ def _gather_after_pr(sit, cfg, state_dir):
         return sit
 
     if not PIPELINE_BRANCH_RE.fullmatch(sit["branch"]):
-        raise Decline("head branch %r is not a pipeline ticket branch (<type>/<team>-<n>-<slug>, "
+        raise NotEligible("head branch %r is not a pipeline ticket branch (<type>/<team>-<n>-<slug>, "
                       "[a-z0-9-] only) — not this driver's to bounce, and a character outside "
                       "that alphabet would break the fallback ticket's routing tag" % sit["branch"], sit)
 
@@ -2743,7 +2766,7 @@ def _gather_after_pr(sit, cfg, state_dir):
                              "Linear's record.\n"
                              % (owner_repo, pr_number, sit["branch"], why))
     if not sit["ticket_id"]:
-        raise Decline("no pipeline ticket identified for branch %r (its team key is not one this "
+        raise NotEligible("no pipeline ticket identified for branch %r (its team key is not one this "
                       "driver manages) — a bounce needs a ticket to re-prompt" % sit["branch"], sit)
 
     required, checks_source, checks_detail = required_checks(
@@ -2764,7 +2787,7 @@ def _gather_after_pr(sit, cfg, state_dir):
     state = issue.get("state") or {}
     sit["ticket_state_type"], sit["ticket_state_name"] = state.get("type"), state.get("name")
     if sit["ticket_source"] == "branch" and not ticket_owns_pr(issue, sit["branch"], sit["pr_url"]):
-        raise Decline("branch names a ticket that does not own this PR: %s's suggested branch is %r "
+        raise NotEligible("branch names a ticket that does not own this PR: %s's suggested branch is %r "
                       "and none of its attachments is %s — the branch name is a hint the session "
                       "chose, not an identity" % (sit["ticket_id"], issue.get("branchName") or "",
                                                  sit["pr_url"] or "the PR"), sit)
@@ -3500,10 +3523,12 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
     acting modes every could-not with a PR to say it on is said there (announce_could_not,
     once per reason) — the one exemption is plain unreachability, see Unreachable."""
     def declined(exc):
-        sys.stderr.write("FAIL: %s#%d: declined — %s\n" % (owner_repo, pr_number, exc))
+        not_ours = isinstance(exc, NotEligible)
+        sys.stderr.write("%s: %s#%d: declined — %s\n"
+                         % ("DECLINED" if not_ours else "FAIL", owner_repo, pr_number, exc))
         if mode != "decide":
             announce_could_not(exc.sit, str(exc), state_dir, dry_run)
-        return EXIT_USAGE
+        return EXIT_DECLINED if not_ours else EXIT_USAGE
 
     try:
         sit = gather(pr_number, owner_repo, cfg, state_dir)
@@ -3703,6 +3728,35 @@ def criteria_snapshots(cfg, state_dir, dry_run, deadline):
             "problems": ["criteria snapshots: %s" % p for p in result["problems"]], "counts": counts}
 
 
+def pause_state(state_dir):
+    """None, or {"path", "reason", "since"} when a person has paused this driver.
+
+    Presence is the whole signal: a PAUSED file that cannot be read still pauses, with that
+    said as its reason, because the safe reading of "someone meant to stop this" is to stop."""
+    path = os.path.join(state_dir, PAUSE_FILE)
+    if not os.path.lexists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            reason = " ".join((fh.readline() or "").split())[:300]
+    except OSError as exc:
+        reason = "(the file is there and could not be read: %s)" % exc
+    try:
+        since = datetime.fromtimestamp(os.lstat(path).st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        since = None
+    return {"path": path, "reason": reason or "(no reason written in the file)", "since": since}
+
+
+# The order a pass's codes are worst in. A decline outranks a clean pass and never hides a
+# failure: a pass with one declined PR and one broken one is a broken pass.
+_EXIT_RANK = {EXIT_OK: 0, EXIT_DECLINED: 1, EXIT_USAGE: 2}
+
+
+def _worse(a, b):
+    return a if _EXIT_RANK.get(a, 2) >= _EXIT_RANK.get(b, 2) else b
+
+
 def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     """One scan-decide-act pass. Returns an exit code and leaves a heartbeat on EVERY
     path, success or not.
@@ -3715,6 +3769,17 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     of time exits 2 with the remainder named — a partial pass reported as partial.
     """
     started_at, deadline = _now_iso(), time.monotonic() + float(timeout_seconds)
+    paused = pause_state(state_dir)
+    if paused:
+        # Nothing at all: no bounce, no conclusion, no conflict fix, and no criteria
+        # snapshot either — a ticket delegated during the pause gets its snapshot on the
+        # first pass after, with the lag recorded. Said every pass, never silent.
+        print("PAUSED: %s exists since %s — %s. This pass did nothing. Remove the file to resume."
+              % (paused["path"], paused["since"] or "an unknown time", paused["reason"]))
+        write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
+                        result="paused", detail=paused["reason"], paused_since=paused["since"],
+                        pause_file=paused["path"], dry_run=bool(dry_run), exit_code=EXIT_DECLINED)
+        return EXIT_DECLINED
     write_heartbeat(state_dir, started_at=started_at, result="running")
     # KIT-131, first and bounded: the delegation-time criteria snapshots the review's basis
     # resolver reads. Its problems are this pass's problems; its absence never stops a bounce.
@@ -3755,17 +3820,18 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
             problems.append("%s#%d: %s: %s" % (owner_repo, pr_number, exc.__class__.__name__, exc))
             sys.stderr.write("FAIL: %s#%d raised %s: %s — the pass continues with the next PR\n"
                              % (owner_repo, pr_number, exc.__class__.__name__, exc))
-        worst = max(worst, rc)
+        worst = _worse(worst, rc)
         done += 1
 
     remaining = len(targets) - done
     if timed_out:
-        worst = max(worst, EXIT_USAGE)
+        worst = _worse(worst, EXIT_USAGE)
         sys.stderr.write("FAIL: the %ds run deadline passed with %d of %d PR(s) unexamined — "
                          "this pass is PARTIAL, not clean; launchd starts the next one at the "
                          "configured interval\n" % (timeout_seconds, remaining, len(targets)))
     write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
-                    result=("deadline" if timed_out else ("problems" if worst else "ok")),
+                    result=("deadline" if timed_out else
+                            {EXIT_OK: "ok", EXIT_DECLINED: "declined"}.get(worst, "problems")),
                     considered=len(targets), examined=done, remaining=remaining,
                     timeout_seconds=timeout_seconds, dry_run=bool(dry_run),
                     problems=problems[:20], exit_code=worst, snapshots=snap["counts"])
@@ -5591,13 +5657,13 @@ def selftest():
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("unowned ticket: exit 2, nothing to Linear, no ledger",
-                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+            check("KIT-112 unowned ticket: DECLINED (3), nothing to Linear, no ledger",
+                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (globals().get("EXIT_DECLINED", 3), [], False))
             check("unowned ticket: one PR comment naming the reason", kinds(), ["prComment"])
             check("unowned ticket: the reason", "does not own this PR" in body_of("prComment"), True)
             calls.clear()
-            check("unowned ticket under exhaust: exit 2, zero Linear writes",
-                  (run_one(41, "o/r", cfg, tmp, "exhaust", False), linear_writes()), (EXIT_USAGE, []))
+            check("KIT-112 unowned ticket under exhaust: DECLINED (3), zero Linear writes",
+                  (run_one(41, "o/r", cfg, tmp, "exhaust", False), linear_writes()), (globals().get("EXIT_DECLINED", 3), []))
         #      …but a PR attachment on the ticket is ownership, and so is the poller's outcome record.
         world["issue"] = dict(live_issue, branchName="feat/eng-41-real-work",
                               attachments={"nodes": [{"url": "https://example.invalid/pr/41"}]})
@@ -5723,13 +5789,13 @@ def selftest():
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("bad branch: exit 2, nothing to Linear, no ledger",
-                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+            check("KIT-112 bad branch: DECLINED (3), nothing to Linear, no ledger",
+                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (globals().get("EXIT_DECLINED", 3), [], False))
             check("bad branch: one PR comment naming the shape", kinds() == ["prComment"]
                   and "not a pipeline ticket branch" in calls[0][2], True)
             calls.clear()
-            check("bad branch under decide: exit 2, nothing posted",
-                  (run_one(41, "o/r", cfg, tmp, "decide", False), calls), (EXIT_USAGE, []))
+            check("KIT-112 bad branch under decide: DECLINED (3), nothing posted",
+                  (run_one(41, "o/r", cfg, tmp, "decide", False), calls), (globals().get("EXIT_DECLINED", 3), []))
         world["pr"] = open_pr
 
         # 10q. A corrupt ledger makes the DRIVER refuse: exit 2, nothing sent — never a reset budget.
@@ -6308,6 +6374,45 @@ def selftest():
             check("a clean pass exits 0 and records what it examined",
                   (rc, beat["result"], beat["examined"], beat["dry_run"]), (EXIT_OK, "ok", 2, True))
 
+            declined_code = globals().get("EXIT_DECLINED", 3)
+            globals()["run_one"] = lambda pr, *a, **k: declined_code if pr == 41 else EXIT_OK
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("KIT-112 a pass whose only non-clean PR was declined exits 3 and says declined",
+                  (rc, beat["result"]), (3, "declined"))
+            globals()["run_one"] = lambda pr, *a, **k: declined_code if pr == 41 else EXIT_USAGE
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("KIT-112 …and a decline never hides a failure beside it",
+                  (rc, beat["result"]), (EXIT_USAGE, "problems"))
+
+            # THE DURABLE PAUSE. A file, so no installer run and no reboot re-arms it.
+            examined = []
+            globals()["run_one"] = lambda pr, *a, **k: examined.append(pr) or EXIT_OK
+            with open(os.path.join(tmp, "PAUSED"), "w") as fh:
+                fh.write("live test block B in progress\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("KIT-112 a PAUSED file stops the whole pass: nothing examined, exit 3",
+                  (rc, examined, beat["result"]), (3, [], "paused"))
+            check("KIT-112 …and the heartbeat and the log both carry the reason",
+                  ("live test block B" in (beat.get("detail") or ""),
+                   "live test block B" in out.getvalue(), "Remove the file" in out.getvalue()),
+                  (True, True, True))
+            os.remove(os.path.join(tmp, "PAUSED"))
+            os.makedirs(os.path.join(tmp, "PAUSED"))           # there, and unreadable as a file
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            check("KIT-112 a PAUSED that cannot be read still pauses", (rc, examined), (3, []))
+            os.rmdir(os.path.join(tmp, "PAUSED"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            check("KIT-112 removing it resumes", (rc, sorted(examined)), (EXIT_OK, [41, 88]))
+
         # 10p. KIT-131: the criteria snapshot pass runs first in every `run`. Its problems
         #      are the pass's problems — a heartbeat that says `idle` while the snapshots
         #      could not even look would be the §13 conflation — and it never stops the
@@ -6388,6 +6493,23 @@ def selftest():
         globals()["run_one"] = saved_run_one
         globals()["criteria_snapshots"] = saved_snapshots
 
+    # KIT-112: one sentence, one code, in both Stage E loops — and every result word this
+    # driver writes that is not a problem is one the heartbeat monitor reads as healthy,
+    # or a paused driver pages its owner.
+    try:
+        import pipeline_review_poller as _prp
+        poller_declined = _prp.EXIT_DECLINED
+    except Exception as exc:                                   # the check, not a crash
+        poller_declined = "unimportable: %s" % exc
+    check("KIT-112 the declined code is the review poller's",
+          (globals().get("EXIT_DECLINED"), poller_declined), (poller_declined, poller_declined))
+    try:
+        import pipeline_heartbeat_monitor as _phm
+        good = set(_phm.WATCHERS["bounce-driver"]["good"])
+    except Exception:
+        good = set()
+    check("KIT-112 the monitor reads declined and paused as healthy, not failing",
+          {"ok", "idle", "declined", "paused"} <= good, True)
     # 11. Source-level guards. Each banned token appears exactly once — here. A count
     #     above one means a real merge/approve/auto-merge/label/launch path slipped in.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()

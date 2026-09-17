@@ -35,14 +35,17 @@ three daemons for one reader's convenience would be the larger change:
 | Job | File | Freshness from | Good result |
 |---|---|---|---|
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `declined` |
-| bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle` |
+| bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle`, `declined`, `paused` |
 | finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 
 The review poller's `declined` (exit 3) is a good result. That pass settled a NOT-reviewed
 verdict and said so on the pull request: no acceptance criteria, a review that timed out, a
 diff over the cap. That is the poller doing its job, and the notifier does not page on it
-either. The bounce driver's `problems` and `deadline` stay bad: each is a pull request it
-could not act on, or a pass cut short. The finding poller has no exit 3.
+either. The bounce driver's `declined` (exit 3) is good for the same reason: its only
+non-clean pull requests were ones it was never meant to act on, and it said so on each. Its
+`paused` is a person's decision, written as a `PAUSED` file, and the job still beats on
+schedule. Its `problems` and `deadline` stay bad: each is a pull request it could not act
+on, or a pass cut short. The finding poller has no exit 3.
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
 cross-checks every schema string and filename against the three writers, and judges
