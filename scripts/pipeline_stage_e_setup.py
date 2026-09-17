@@ -275,6 +275,11 @@ _BANNED_MARK = "banned-token-list"
 #
 # `Monitor` runs a shell command, and a `Bash` rule does not stop it: a deny rule
 # matches the tool's own name.
+#
+# `ListAgents` names the other agent sessions a session could message. It appears in
+# neither list above; the live probe of 2026-09-17 (card CK-7) found it in a reviewer's
+# tools. A reviewer has no one to message, and anything it lists can reach a pull
+# request comment.
 DISALLOWED_BUILTINS = [
     "Bash", "Monitor", "REPL",                                    # runs
     "Edit", "Write", "NotebookEdit",                              # writes
@@ -283,6 +288,7 @@ DISALLOWED_BUILTINS = [
     "TaskStop", "EnterWorktree", "ExitWorktree",
     "CronCreate", "CronDelete", "ScheduleWakeup",                 # schedules
     "SendMessage", "SendUserMessage", "PushNotification",         # messages, publishes
+    "ListAgents",
     "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
     "EnterPlanMode", "ExitPlanMode",                              # switches its mode
     "ListMcpResourcesTool", "ReadMcpResourceTool",                # reads MCP resources
@@ -6219,8 +6225,8 @@ def _selftest_body():
                "the written entry does not remove %s — a dispatcher-injected server the "
                "reviewer would keep" % rule)
     expect("fence-servers-pinned",
-           len(DISALLOWED_TOOLS) == 39 and len(entries7[0]["disallowedTools"]) == 39,
-           "the fence has %d rules and the entry %d, not 31 built-ins and 8 server rules"
+           len(DISALLOWED_TOOLS) == 40 and len(entries7[0]["disallowedTools"]) == 40,
+           "the fence has %d rules and the entry %d, not 32 built-ins and 8 server rules"
            % (len(DISALLOWED_TOOLS), len(entries7[0]["disallowedTools"])))
 
     # -- 14-fence-builtins. EVERY TOOL THAT RUNS, WRITES, FETCHES, SCHEDULES, --- #
@@ -6233,14 +6239,14 @@ def _selftest_body():
                  "WebSearch", "Task", "Agent", "Workflow", "RemoteTrigger", "Skill",
                  "TaskStop", "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
                  "ScheduleWakeup", "SendMessage", "SendUserMessage", "PushNotification",
-                 "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
+                 "ListAgents", "AskUserQuestion", "ShareOnboardingGuide", "DesignSync", "Artifact",
                  "EnterPlanMode", "ExitPlanMode", "ListMcpResourcesTool",
                  "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
         expect("fence-builtins-pinned", name in entries7[0]["disallowedTools"],
                "the written entry leaves the reviewer %s" % name)
-    expect("fence-builtins-pinned", len(DISALLOWED_BUILTINS) == 31
-           and len(set(DISALLOWED_BUILTINS)) == 31,
-           "the built-in fence has %d names, not 31" % len(DISALLOWED_BUILTINS))
+    expect("fence-builtins-pinned", len(DISALLOWED_BUILTINS) == 32
+           and len(set(DISALLOWED_BUILTINS)) == 32,
+           "the built-in fence has %d names, not 32" % len(DISALLOWED_BUILTINS))
     # The dispatcher's own list of available tools, v0.2.69, copied here as a literal.
     # A name on neither side of the line is a tool nobody decided about.
     dispatcher_tools_0_2_69 = (
@@ -6297,7 +6303,8 @@ def _selftest_body():
                  "mcp__search_index__*"):
         expect("platform-mcp-fenced", rule in fenceP,
                "a server the machine's platform MCP config adds is not fenced: %s" % rule)
-    expect("platform-mcp-fenced", len(fenceP) == 43 and fenceP.count("mcp__linear") == 1,
+    expect("platform-mcp-fenced", len(fenceP) == len(DISALLOWED_TOOLS) + 4
+           and fenceP.count("mcp__linear") == 1,
            "the platform servers were not added once each on top of the base fence: %r"
            % fenceP[len(DISALLOWED_TOOLS):])
     for rule in (t for t in fenceP if t.startswith("mcp__")):
