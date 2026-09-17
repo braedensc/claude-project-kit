@@ -814,6 +814,37 @@ text isolated — *worktree force-deletion on ticket close* (KIT-51) — is the 
 one of eight rather than the only one, and E's answer is unchanged: never move the
 original ticket, never merge.
 
+> **Update (2026-09-17) — the finalization round: what no longer says one thing and does
+> another.** Six changes, each its own pull request and ticket, none changing a decision
+> above. Each closed a place where a component reported a fact the machine did not support.
+>
+> - **A review that could not see the change declines (KIT-137).** Recorded in its own
+>   Update block, dated the same day, near the top of this record.
+> - **A change over the size cap is reviewed in part (KIT-138).** Whole files are withheld,
+>   largest first, and the review is marked `coverage: partial`. A partial review can
+>   bounce on what it found and can never conclude. This replaces decline-at-the-cap, which
+>   left the largest changes with no review at all. Splitting into several paid reviews was
+>   rejected on cost; a page was rejected because the notifier deliberately does not page on
+>   a review verdict.
+> - **A failed telemetry row is retried under a stable run id (KIT-139).** The row's id is
+>   now the review's, as §4 already required.
+> - **The bounce driver has a declined exit code and a durable pause (KIT-112).** Exit 3 is
+>   the review poller's code for the same sentence. A `PAUSED` file in the state directory
+>   survives an installer run and a reboot, which unloading the job never did.
+> - **A label with no id is said once (KIT-152).** Exhaustion used to re-run on every pass.
+> - **The installer's `code`, `dispatcher-entry` and `configs` checks tell the truth
+>   (KIT-149).** `verify` reads *behind* only when a file the jobs run moved; the hand
+>   sign-off of the entries' load binds to the entries; the session-log root is checked.
+>
+> **The conflict loop reaches the product repository.** Its monitor is ported there
+> (TOD-125), so a dispatcher's conflicted pull request there now gets a fix request the
+> bounce driver answers. On the kit itself bounce stays off by design, so a kit dispatcher
+> PR's conflict is paged, not fixed.
+>
+> **Still open, each with a home.** A declined review is held in silence after its one PR
+> comment (KIT-142). No job's log is trimmed (KIT-159). `auth_mode` is a literal on every
+> row (KIT-160). None of the paths the live tests cover has run yet (KIT-99).
+
 ## Where Stage E lives
 
 E is split the way the whole pipeline already splits, and the split answers "does E belong
