@@ -3577,8 +3577,8 @@ def step_dispatcher_entry(ctx, apply_it):
         if differs:
             return False, ("%s differ(s) from what this conf produces"
                            % ", ".join(differs)), row_notes()
-        return False, "the review entries match; their load has not been proven yet", \
-            row_notes()
+        return False, "the review entries match; their load has not been proven yet%s" % (
+            " — %s" % signoff_why_not if signoff_why_not else ""), row_notes()
 
     if not same:
         body = json.dumps({"entries": want, "remove": stale},
@@ -7953,6 +7953,8 @@ def _selftest_body():
         expect("KIT-149 attest-binds-entries", not st_ne.attested("A-ENTRY-LOADED"),
                "refused, and recorded anyway")
 
+    details = {"last": ""}
+
     def _entry_row_with_signoff(entries_sha):
         ctxE, fakeE, _apiE = _healthy_ctx(conf)
         ctxE.state.data["notes"].pop(ENTRY_PROOF_NOTE, None)     # the banner proved nothing
@@ -7961,6 +7963,7 @@ def _selftest_body():
             signed["entries_sha256"] = entries_sha
         ctxE.state.data["attestations"]["A-ENTRY-LOADED"] = signed
         (_cE, rowsE), _pE = _quiet(lambda: run_steps(ctxE, apply_it=False, keep_going=True))
+        details["last"] = dict((st, d) for st, _o, d in rowsE).get("dispatcher-entry") or ""
         return dict((st, o) for st, o, _d in rowsE).get("dispatcher-entry"), ctxE
 
     cases += 1
@@ -7972,9 +7975,13 @@ def _selftest_body():
     outE, _c = _entry_row_with_signoff("0" * 64)
     expect("KIT-149 entry-signoff-for-other-entries-does-not", outE != ALREADY_DONE,
            "a sign-off made for DIFFERENT entries settled these: %s" % outE)
+    expect("KIT-149 entry-signoff-verify-says-why", "changed since the hand sign-off" in details["last"],
+           "verify did not say why the sign-off stopped counting: %r" % details["last"][:200])
     outE, _c = _entry_row_with_signoff(None)
     expect("KIT-149 entry-signoff-unbound-does-not", outE != ALREADY_DONE,
            "a legacy sign-off naming no entries settled these: %s" % outE)
+    expect("KIT-149 entry-signoff-verify-says-why", "names no entries" in details["last"],
+           "verify did not say the legacy sign-off names no entries: %r" % details["last"][:200])
 
     # -- KIT-149 (1). "BEHIND" MEANS A FILE THE JOBS RUN MOVED, NOT THAT A COMMIT DID ------
     # `verify` compared whole commits, so every merge to main — a doc, an ADR, another
