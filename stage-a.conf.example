@@ -31,9 +31,11 @@
 # the dispatcher kept starting planning sessions. The installer never creates it.
 ROLE_ACCOUNT=_planclaw
 
-# The Linear team key you delegate idea tickets into. Being on this team is what
-# makes a session a PLANNING session — the job kind comes from the team, never
-# from a label or text inside the ticket.
+# The Linear team key you delegate idea tickets into. Being on this team routes an
+# idea to the Planning entry — UNLESS the idea's own description carries a routing
+# tag, or a label selects a prompt type, either of which outranks the team (KIT-154).
+# Until that closes, write ideas yourself; never paste idea text from elsewhere.
+# Must not be the planned repository's work team.
 PLANNING_TEAM_KEY=PLAN
 
 # Your own Linear USER ID — the person notified on every filed plan and named as
