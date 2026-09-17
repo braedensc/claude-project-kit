@@ -232,6 +232,15 @@ was wired: no bot, no token, no allowlist edit, no test message.
 - That the deployed dispatcher's sandbox is on: the startup banner read "deny-all with 19
   allowed domains" on 2026-09-03 per the field guide; the config file was not re-read here.
 
+> **Update, 2026-09-17 — the first gate was met in production on 2026-09-08.** A comment
+> created through the tracker API in a session thread did resume that session. The bounce
+> driver posted "Stage E bounce 1 of 3" into a ticket's agent-session thread with the owner's
+> key at 17:44:38 UTC, and the dispatcher's agent replied in the same thread at 17:45:58,
+> answering it (TOD-117). That is the mechanism the relay uses, for the identity the relay
+> writes with. **It does not show** that a comment from a *different* identity resumes a
+> session: that is the cross-session question KIT-99 test 7 measures, still unrun. The owner
+> accepted this as the relay's gate on 2026-09-17 (KIT-118).
+
 ## Owner decisions — all six ratified 2026-09-11
 
 *Kept as the record of what was asked. Every one is now answered in the section below; nothing
@@ -365,3 +374,73 @@ notifier cannot page on never exists silently.
 > requests the label, this job applies it. Recorded here rather than changed in the decision,
 > which stays the owner's to confirm. The reasoning lives beside `MARKS` in
 > `scripts/pipeline_notify_local.py`.
+
+> **Confirmed by the owner, 2026-09-17.** The shipped mapping is the decision. Read the table's
+> `agent:needs-human` row as applying **`agent:needs-human`**, for the reason in the note above
+> (KIT-115).
+
+## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
+
+Five owner decisions, taken after the dispatcher's source was read at the installed version,
+0.2.69. Each amends one piece of this record. The six decisions above otherwise stand.
+
+### 1. The conversational lane runs on the dispatcher's own Slack transport
+
+Decision 3 put a conversational channel in the MVP without saying where its agent runs. The
+design note that followed recommended a sandboxed dispatcher entry fed by this notifier, in the
+review lane's shape. **The owner chose the dispatcher's built-in Slack transport instead, with
+its tool grant trimmed** (KIT-117). His reason: he prompts it directly, and a faster, more
+capable agent is worth the residual risk.
+
+What was measured, and what each fact decided:
+
+| Fact about the built-in chat lane | Consequence |
+| --- | --- |
+| It gets no sandbox. Only the ticket path passes sandbox settings | No egress allowlist and no write confinement |
+| Its tool allowlist is enforced. The permission callback that allows every tool is attached only on the ticket path | Trimming the grant is a real fence |
+| Its `disallowedTools` is hard-coded empty | Only the allowlist can fence it |
+| Its default grant includes `Monitor`, whose parameter is a shell command; `Task`; and the dispatcher's own tool server, which can inject a prompt into any running session | These are the removals |
+| Its working directory is a fresh folder, not a repository | The kit's PreToolUse hooks do not apply. Only the role account's user-level settings would |
+| The dispatcher rewrites its own config file when the tracker token refreshes | That file cannot be made read-only to the role account, so the lane can rewrite every other session's fence |
+| It is inbound only, on a webhook path, verified by Slack's signing-secret HMAC when the secret is set | The front door gains a path (2, below) |
+| Its bot token is read from the dispatcher's environment, which every session inherits, and a Slack tool server is injected into every lane when the token is set | Every coding session holds the chat bot's token (KIT-157) |
+
+**Conditions.** The grant is cut to a read set, with no `Monitor`, `Task`, `ScheduleWakeup` or
+dispatcher tool server. The role account gets a user-level guard the lane cannot edit. The
+channel is private with one member. There are **two Slack apps**, so the notifier's token never
+enters the dispatcher's environment and a leaked chat token cannot pass as a notifier ping. The
+Slack tool server is fenced off every coding entry.
+
+**Accepted residuals.** No sandbox on that lane. It can rewrite the dispatcher's config. There is
+no per-user identity check, so channel membership is the only gate. Any coding session can read
+the chat bot's token.
+
+This reverses *Who sends* for this one lane: it is the shape rejected there, a channel
+credential in the environment every session inherits. It is accepted with that named. The
+notifier is unchanged and stays the only sender of pings, outside every session.
+
+### 2. The front door gains the Slack webhook path
+
+The one inbound path this record avoided is added, for the conversational lane only, and
+verified per request against Slack's signing secret. Without the secret the dispatcher falls
+back to a bearer check that no client can currently satisfy. That accident is not relied on.
+The notifier still needs no inbound path.
+
+### 3. Heartbeat-monitor incidents page through the notifier
+
+The monitor posts under the owner's own key, and the tracker does not notify a user of their own
+comments, so its page reached nobody. Its incident and recovery comments gain marks the notifier
+pages on. They carry no label and are accepted only from the monitor's author. The monitor also
+starts watching the notifier's own heartbeat (KIT-156). Still uncovered: the notifier's own death,
+which needs an off-box probe (KIT-45).
+
+### 4. The relay is built now, off by default
+
+Its gate is met (the update under *Not verified*). It ships behind a switch that defaults off, so
+the notifier stays send-only until the owner turns it on (KIT-118). The reviewer's basis does not
+yet include comments that arrived after delegation, so a relayed instruction still lands outside
+what review checks. That half is open (KIT-118).
+
+### 5. The needs-human label stands
+
+Recorded under the marks table.
