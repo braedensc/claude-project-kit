@@ -72,7 +72,7 @@ all?"**
 | `wipLimit` | **none** — tier 0 keeps no state record | enforced twice: `max-parallel` within a run, the `working` count across runs | **none** |
 | `totalAttempts` | **none** — a local dispatch consumes no slot | enforced; `claim` increments *before* the session starts | **none** |
 | `dailyUsd` | **none** — reserves nothing | enforced; each ticket's `maxUsd` reserved at dispatch over a rolling 24h | **none** |
-| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | n/a |
+| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | **enforced** — from the bounce driver's own append-only ledger, which the fix session cannot write. The one limit in this table that *does* hold on this lane |
 | `fixIterations` | prompt material only | prompt material only | prompt material only |
 
 Tier 0's column is deliberate, and [spelled out below](#tier-0--local-and-why-it-exists) —
@@ -85,6 +85,13 @@ say which attempt it is honestly. It is the last column that surprises people.
 > ([ADR 2026-09-05](adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md)). Read
 > the column as the live answer for that lane, and the tier-0 and tier-1 columns as what
 > you get by dispatching through something that writes a pin.
+>
+> **`maxBounces` is the exception in that column, and the exception is the interesting
+> part.** It holds without a pin because it is not carried by one: the bounce driver
+> appends to its own ledger, outside every worktree, *before* it delivers a bounce. The
+> session being bounced cannot read or write that file. That is the shape any future
+> budget on this lane has to copy — a counter kept by the thing doing the counting, not a
+> number handed to the party it bounds.
 
 ### The last column: a daemon that starts sessions from tracker events
 
