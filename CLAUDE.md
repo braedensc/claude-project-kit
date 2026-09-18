@@ -190,6 +190,7 @@ npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idemp
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
                              #   (no Linear MCP), agent-refused, conf-all-errors, human gates
+npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,
                              #   local-session-only worktrees, capped pass, heartbeat
