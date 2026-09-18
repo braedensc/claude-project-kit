@@ -434,17 +434,24 @@ REVIEWER_BRIEF = (
     "YOUR DELIVERABLE IS ONE FENCED JSON BLOCK IN YOUR FINAL MESSAGE with "
     "\"schema\": \"pipeline-review/1\", a \"summary\", and a \"findings\" array of objects "
     "{severity, category, file, line, summary, detail}, severity one of "
-    "low|medium|high|critical. A malformed block means your whole review is discarded as "
+    "low|medium|high|critical, and an optional \"blocked\" field. A malformed block means "
+    "your whole review is discarded as "
     "unusable, never partly used. If you write more than one such block, the LAST one is "
     "taken as your verdict. Put nothing else inside the fence.\n\n"
     "WHAT HAPPENS NEXT. A poller reads your final message from this ticket, validates the "
     "block whole, and posts one comment on the PR. Findings at or above the threshold may be "
     "sent back to the coding session as a fix request, a bounded number of times. Your words "
     "become that prompt: be specific, cite file and line, say why.\n\n"
-    "RUNBOOK. If the body is missing the diff or the criteria, say so in \"summary\" and "
-    "return an EMPTY findings list with the schema intact; never invent. Never ask anyone a "
+    "RUNBOOK. If you cannot judge the change at all (the body is missing the diff or the "
+    "criteria, or stops mid-way), set \"blocked\" to one line saying what was missing and "
+    "return an EMPTY findings list with the schema intact; never invent. An empty findings "
+    "list WITHOUT \"blocked\" is published as a clean review of a change you never saw. "
+    "Leave \"blocked\" out of every review you could do. A ticket that says files were "
+    "WITHHELD is not one of these: review what you were given and say in \"summary\" that "
+    "it was partial, because \"blocked\" would throw away the findings you did make. "
+    "Never ask anyone a "
     "question; nobody is watching and no question tool is available to you. If something "
-    "blocks you, say what in the block's \"summary\" and still finish with the block. "
+    "blocks you, set \"blocked\" to say what, and still finish with the block. "
     "Weakened or deleted test assertions are your headline "
     "finding. Anything the ticket did not ask for is a scope finding."
 )
@@ -6539,17 +6546,43 @@ def _selftest_body():
     brief5 = _section(brief_text, 5)
     expect("session-brief-reviewer", brief5,
            "no §5 in docs/SESSION-BRIEF.md, so this check measures nothing")
+    # KIT-137: the blocker goes in the block's machine-readable `blocked` field. A
+    # `summary` is prose nothing downstream parses, so a brief that still sends the
+    # blocker there is a brief that publishes "could not review" as a clean review.
     expect("session-brief-reviewer",
-           "no tracker tool" in brief5 and "summary" in brief5
+           "no tracker tool" in brief5 and "`blocked`" in brief5
            and "as a comment" not in brief5 and "own ticket" not in brief5,
            "§5 of docs/SESSION-BRIEF.md still sends a blocked reviewer to comment on its "
-           "ticket")
+           "ticket, or to a `summary` nothing reads instead of the `blocked` field")
+    # The RUNBOOK sentence, not merely the field's name somewhere in the brief: the
+    # deliverable paragraph mentions "blocked" too, so the old check passed with the
+    # instruction itself reverted to "say so in summary" (review of #134).
+    expect("session-brief-reviewer",
+           'set "blocked" to one line saying what was missing' in REVIEWER_BRIEF,
+           "the installer's reviewer brief no longer tells a blocked reviewer to set "
+           '"blocked" — the RUNBOOK sentence is what production reviewers read')
+    expect("session-brief-reviewer",
+           "WITHHELD is not one of these" in REVIEWER_BRIEF,
+           'the installer\'s reviewer brief no longer carves partial reviews out of '
+           '"blocked", so a withheld file discards the whole review (KIT-138)')
     for number in (3, 7):
         section = _section(brief_text, number)
         expect("session-brief-reviewer",
                "comment on" in section.lower() and "reviewer" in section,
                "§%d of docs/SESSION-BRIEF.md tells a session to comment on its ticket and "
                "never says a reviewer cannot" % number)
+    # …and EVERY section that routes a reviewer's blocker must route it to the same field.
+    # §5 said `blocked` while the preamble and the §7 runbook still said `summary`, and §7
+    # is the one a blocked reviewer opens (review of #144).
+    for where, text in (("the preamble", brief_text.split("---", 1)[0]),
+                        ("§7", _section(brief_text, 7))):
+        if "blocker" not in text and "blocked reviewer" not in text:
+            continue
+        expect("session-brief-reviewer",
+               "`blocked`" in text and "in its block's `summary`" not in text
+               and "review block's `summary`" not in text,
+               "%s of docs/SESSION-BRIEF.md still sends a reviewer's blocker to `summary`, "
+               "which nothing downstream reads (§5 says `blocked`)" % where)
 
     # -- 14e. two repositories that differ only by owner are REFUSED --------- #
     # They would want one entry name, and the poller derives the tag from the

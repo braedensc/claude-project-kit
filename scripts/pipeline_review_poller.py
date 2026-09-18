@@ -869,7 +869,8 @@ OUTPUT_SHAPE = (
     '{"schema":"pipeline-review/1","summary":"two or three sentences a human can read in '
     'ten seconds","findings":[{"severity":"low|medium|high|critical","category":'
     '"correctness|security|tests|scope","file":"path/or/null","line":42,'
-    '"summary":"one line: the claim","detail":"why it is wrong and what would fix it"}]}')
+    '"summary":"one line: the claim","detail":"why it is wrong and what would fix it"}],'
+    '"blocked":null}')
 
 
 # WHAT THE REVIEWER ACTUALLY HAS, said in the reviewer's own ticket.
@@ -1046,8 +1047,12 @@ def build_review_body(owner_repo, pr, ticket_id, basis, threshold, diff):
         "everything you found is lost with it. Omit `line` (or use null) when it does not "
         "apply; `file` may be null.",
         "- A clean change is an EMPTY findings list with a short summary saying so.",
-        "- If this description is missing the diff or the acceptance criteria, say so in "
-        "`summary` and return an empty findings list with the schema intact. Never invent.",
+        "- IF YOU CANNOT JUDGE THIS CHANGE AT ALL — the diff or the acceptance criteria "
+        "are missing, or this description stops mid-way — set `blocked` to one line saying "
+        "what was missing, and return an empty findings list with the schema intact. Never "
+        "invent either. `blocked` is the ONLY thing that makes your inability "
+        "machine-readable: an empty findings list on its own is published as a CLEAN REVIEW "
+        "of a change you never saw. Leave `blocked` null on every review you could do.",
         "- Never approve, merge, push, edit, or comment anywhere — you have no tools to, "
         "and you must not try. Never ask a user anything: nobody is watching this session.",
         "",
@@ -2673,6 +2678,24 @@ def collect_entry(cfg, key, record, seen, linear_key, dry_run, result):
     if doc is None:
         return declined("the reviewer's final message carried no pipeline-review/1 block")
     verdict = prl.classify(doc, cfg["threshold"])
+    if verdict.get("blocked"):
+        # Conforming, and still not a review: the reviewer said so in the one field a
+        # machine can read (KIT-137). Reported as its own decline, because telling a human
+        # this document was "malformed" would send them hunting a schema bug that is not
+        # there. The reviewer's own words stay in the owner's log, as every other
+        # reviewer-authored string does.
+        # The publisher's reason, not just the field: it carries the count of findings this
+        # decline throws away, and a count that exists nowhere reads as "there were none"
+        # (§13, review of #134). The count is a NUMBER, so it is safe on the PR; the
+        # reviewer's own words stay in the owner's log as every reviewer string does.
+        unacted = int(verdict.get("unacted_findings") or 0)
+        log("reviewer on %s reported it could not review the change: %s"
+            % (review_ticket, verdict.get("reason") or verdict.get("blocked")))
+        return declined("the reviewer reported it could NOT review this change — treat this "
+                        "PR as unreviewed%s (reason in the poller log; see review ticket %s)"
+                        % ("" if not unacted else
+                           "; it also listed %d finding(s), which are NOT acted on" % unacted,
+                           review_ticket))
     if not verdict["usable"]:
         # The publisher's reason quotes the reviewer's own field values; those are
         # reviewer-authored text and stay in the owner's log. The PR gets fixed text.
@@ -3859,6 +3882,60 @@ def selftest():
             check("malformed → fixed reason posted", "did not conform to pipeline-review/1" in posted[0][1], True)
             check("malformed → reviewer's values NOT posted", "Critical" in posted[0][1], False)
             check("malformed → reviewer's values logged", "Critical" in sys.stderr.getvalue(), True)
+
+        # A blocked review that DID find things says how many, on the PR and in the log.
+        # Findings nobody will act on, reported as nothing at all, is the §13 defect this
+        # decline would otherwise introduce (review of #134).
+        with tempfile.TemporaryDirectory() as tmp:
+            c = fresh_state(tmp)
+            found_doc = {"schema": FINDINGS_SCHEMA, "summary": "partial look",
+                         "blocked": "the description stops mid-way SENTINEL-TWO",
+                         "findings": [{"severity": "low", "category": "tests", "summary": "a",
+                                       "detail": "d"},
+                                      {"severity": "high", "category": "scope", "summary": "b",
+                                       "detail": "d"}]}
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(found_doc))
+            check("KIT-137 a blocked review with findings is still declined",
+                  collect(c, False), EXIT_DECLINED)
+            said137 = posted[0][1] if posted else ""
+            check("KIT-137 …and the PR is told how many findings it discards",
+                  ("2 finding(s), which are NOT acted on" in said137,
+                   "SENTINEL-TWO" in said137), (True, False))
+            check("KIT-137 …while the reviewer's own reason and the count stay in the log",
+                  ("SENTINEL-TWO" in sys.stderr.getvalue(),
+                   "it also listed 2 finding(s)" in sys.stderr.getvalue()), (True, True))
+
+        # THE TICKET BODY IS THE REVIEWER'S ENTIRE WORLD, so the rule that tells it to set
+        # `blocked` lives there or nowhere (review of #134). Untested, this text could go
+        # back to "say so in `summary`" with the publisher's own battery still green.
+        body137 = build_review_body("o/r", [p for p in fixture if p["number"] == 5][0],
+                                    "KIT-5", basis, cfg["threshold"],
+                                    "diff --git a/x.py b/x.py\n+++ b/x.py\n+x\n")
+        check("KIT-137 the ticket body tells a blocked reviewer which field to set",
+              ("set `blocked` to one line saying what was missing" in body137,
+               "published as a CLEAN REVIEW" in body137), (True, True))
+        check("KIT-137 …and the output shape it is given has the field in it",
+              ('"blocked":null' in OUTPUT_SHAPE, '"blocked":null' in body137), (True, True))
+
+        with tempfile.TemporaryDirectory() as tmp:   # KIT-137: well-formed, blocked → decline
+            c = fresh_state(tmp)
+            blocked_doc = {"schema": FINDINGS_SCHEMA, "summary": "I could not see a diff",
+                           "findings": [], "blocked": "the description carried no diff SENTINEL-WORDS"}
+            fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(blocked_doc))
+            check("KIT-137 blocked → declined exit", collect(c, False), EXIT_DECLINED)
+            check("KIT-137 blocked → one NOT-reviewed comment",
+                  len(posted) == 1 and "was NOT reviewed" in posted[0][1], True)
+            check("KIT-137 blocked → says could NOT review, not malformed",
+                  ("could NOT review" in posted[0][1], "did not conform" in posted[0][1]), (True, False))
+            check("KIT-137 blocked → reviewer's words NOT posted", "SENTINEL-WORDS" in posted[0][1], False)
+            check("KIT-137 blocked → reviewer's words logged", "SENTINEL-WORDS" in sys.stderr.getvalue(), True)
+            written = json.load(open(outcome_path(tmp, "o/r", 5)))
+            check("KIT-137 blocked → outcome unusable", written["usable"], False)
+            check("KIT-137 blocked → seen declined", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "declined")
+            # The point of the ticket: the outcome this pass wrote can never conclude the PR
+            # clean, on green checks, fresh, with nothing triggering a bounce.
+            check("KIT-137 blocked → the bounce driver cannot conclude it",
+                  pbl.conclusion_basis("green", written, True, False), None)
 
         with tempfile.TemporaryDirectory() as tmp:
             # A reviewer that thinks out loud: a preliminary "clean" block, then its real
