@@ -280,7 +280,11 @@ STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either w
       `outcomes/<OWNER>__<REPO>/pr-<n>.json` and `outcomes/pr-<n>.json` are still read):
       {"outcome_schema": "pipeline-review-outcome/1", "repo", "pr", "ticket_id" (or the
        older "ticket"), "head_branch", "usable", "max_severity", "meets_threshold",
-       "review_ticket", "threshold", "summary", "findings", "reason", "at", "head_sha"?}
+       "review_ticket", "threshold", "summary", "findings", "reason", "at", "head_sha"?,
+       "coverage"?, "withheld_files"?}
+      An absent `coverage` means the review saw the WHOLE change. `"partial"` means whole
+      files were withheld from the reviewer over the size cap, and it can never be read as
+      clean: such a review may bounce on what it found, and never concludes (KIT-138).
       A record carrying a DIFFERENT `outcome_schema`, or one that cannot be read, is
       REFUSED — exit 2 and a PR comment — never read as "no review" (§13): the
       difference between "never reviewed" and "reviewed, record unreadable" is the whole
@@ -1460,6 +1464,32 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
+def partial_review_note(outcome, fresh, trigger_ok, cannot_evaluate, already_said=()):
+    """The one sentence that routes a PARTIAL review to a person, or "" (KIT-138).
+
+    A review that saw only part of a change can bounce on what it found, but it can never
+    conclude, so without this the driver would hold it in silence forever. It fills the
+    §13 third state — `cannot_evaluate` — exactly where the quiet skip would otherwise sit:
+    no live trigger, a fresh usable review, nothing else already unreadable.
+
+    SAID ONCE, THEN HELD (review of #143). `cannot_evaluate` makes the pass exit 2, and a
+    partial review is permanent for the life of the pull request — so left unqualified this
+    pinned the driver's heartbeat at `problems` forever, which pages once and then MASKS
+    every later failure behind the same fingerprint. `already_said` is the decline marker
+    this driver keeps per reason: once the sentence is on the pull request, the hand-off is
+    done and the pass goes quiet about it. A person has it; repeating is not escalation."""
+    if trigger_ok or cannot_evaluate or not fresh or not outcome:
+        return ""
+    if not outcome.get("usable") or outcome.get("coverage") != "partial":
+        return ""
+    withheld = [str(p) for p in (outcome.get("withheld_files") or [])]
+    note = ("the review saw only part of this change: %d file(s) were withheld from the reviewer "
+            "over the size cap (%s). Stage E can bounce on what it found but can never conclude "
+            "this PR, so a person must review the withheld files"
+            % (len(withheld), ", ".join(withheld[:5]) + (" …" if len(withheld) > 5 else "")))
+    return "" if note in set(already_said or ()) else note
+
+
 def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
     """'clean' | 'below-threshold' | None — the basis for a DURABLE conclusion, or None
     when there is nothing to conclude yet. This is the answer the driver used to compute,
@@ -1482,6 +1512,8 @@ def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
         return None
     if not outcome.get("usable") or outcome.get("meets_threshold"):
         return None
+    if outcome.get("coverage") == "partial":
+        return None     # KIT-138: a review of part of a change is never a clean bill for all of it
     if checks_status not in ("green", "none"):
         return None
     return "below-threshold" if (outcome.get("findings") or outcome.get("max_severity")) else "clean"
@@ -2648,6 +2680,20 @@ def post_pr_comment(pr_number, body, owner_repo, dry_run):
     prl.post_comment(pr_number, body, owner_repo, dry_run)
 
 
+def said_reasons(state_dir, owner_repo, pr_number):
+    """Every could-not this driver has already said on a pull request. The marker
+    `announce_could_not` writes, read back — so a verdict can tell a first hand-off from a
+    repetition, rather than repeating one for the life of the PR (review of #143)."""
+    marker = os.path.join(state_dir, "declines", repo_slug(owner_repo), "pr-%d.json" % pr_number)
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            said = json.load(fh) or {}
+    except (OSError, ValueError):
+        return ()
+    reasons = said.get("reasons")
+    return tuple(reasons) if isinstance(reasons, dict) else ()
+
+
 def announce_could_not(sit, reason, state_dir, dry_run):
     """Best effort, and the caller keeps its own exit code either way — 2 for a could-not,
     3 for a pull request that was never this driver's (KIT-112). ONE PR comment saying what
@@ -2840,6 +2886,9 @@ def _gather_after_pr(sit, cfg, state_dir):
     # Whether a second look is already coming. Read here, with the rest of the facts, so
     # the verdict stays a pure function of the situation.
     sit["rereview_queued"] = rereview_request_outstanding(state_dir, owner_repo, pr_number)
+    # What this driver has ALREADY said on this pull request, read here with every other
+    # fact so the verdict stays a pure function of the situation (review of #143).
+    sit["said_reasons"] = said_reasons(state_dir, owner_repo, pr_number)
 
     issue = linear_issue(sit["ticket_id"], cfg)
     sit["issue"] = issue
@@ -2889,6 +2938,8 @@ def decision_for(sit, cfg):
     trigger_ok, trigger_reason, kind, cannot_evaluate = compute_trigger(
         sit.get("checks_status"), sit.get("failing_checks") or [], sit.get("outcome"),
         fresh, fresh_reason, cannot_note)
+    cannot_evaluate = cannot_evaluate or partial_review_note(
+        sit.get("outcome"), fresh, trigger_ok, cannot_evaluate, sit.get("said_reasons") or ())
     # The note rides along on an ordinary skip as before — and ALSO on a bounce that a
     # review triggered while CI stayed unreadable, so "we bounced, but half the evidence
     # was never available" is said rather than implied. A check waiting on a PERSON is
@@ -4121,6 +4172,55 @@ def selftest():
           conclusion_basis("green", below, True, False), "below-threshold")
     check("a review that TRIGGERS a bounce never concludes", conclusion_basis("green", below, True, True), None)
     check("an at-threshold review never concludes", conclusion_basis("green", above, True, False), None)
+    #   KIT-138: a partial review never concludes, and is routed to a person only where
+    #   nothing else already speaks for the PR.
+    _prn = partial_review_note
+    part = {"usable": True, "meets_threshold": False, "findings": [], "max_severity": None,
+            "coverage": "partial", "withheld_files": ["src/big.py"]}
+    check("KIT-138 a clean PARTIAL review never concludes",
+          conclusion_basis("green", part, True, False), None)
+    check("KIT-138 …the same review of the whole change still does",
+          conclusion_basis("green", dict(part, coverage=None), True, False), "clean")
+    check("KIT-138 a partial review with nothing else to say is routed to a person",
+          "a person must review" in _prn(part, True, False, ""), True)
+    check("KIT-138 …but never over a live trigger, another could-not, a stale review, "
+          "or a review of the whole change",
+          (_prn(part, True, True, ""), _prn(part, True, False, "CI unreadable"),
+           _prn(part, False, False, ""), _prn(dict(part, coverage=None), True, False, "")),
+          ("", "", "", ""))
+    #   SAID ONCE, THEN HELD (review of #143). A partial review is permanent for the life of
+    #   the PR, and `cannot_evaluate` makes every pass exit 2 — so repeating this would pin
+    #   the driver's heartbeat at `problems` forever, and a pinned heartbeat pages once and
+    #   then masks every later failure behind the same fingerprint.
+    note138 = _prn(part, True, False, "")
+    check("KIT-138 the hand-off is said once, then held",
+          _prn(part, True, False, "", already_said=(note138,)), "")
+    check("KIT-138 …and a DIFFERENT could-not already said does not silence it",
+          "a person must review" in _prn(part, True, False, "", already_said=("something else",)), True)
+    with tempfile.TemporaryDirectory() as tmp:
+        check("KIT-138 nothing said yet reads as nothing said", said_reasons(tmp, "o/r", 7), ())
+        mark138 = os.path.join(tmp, "declines", repo_slug("o/r"), "pr-7.json")
+        os.makedirs(os.path.dirname(mark138), exist_ok=True)
+        with open(mark138, "w", encoding="utf-8") as fh:
+            json.dump({"pr": 7, "repo": "o/r", "reasons": {note138: "2026-09-17T00:00:00Z"}}, fh)
+        check("KIT-138 …and the marker the driver writes is what a later pass reads back",
+              said_reasons(tmp, "o/r", 7), (note138,))
+        check("KIT-138 a marker for another PR is not this PR's", said_reasons(tmp, "o/r", 8), ())
+    #   …and the whole verdict, not just the sentence: a partial review is a could-not on
+    #   the pass that hands it over, and an ordinary quiet skip on every pass after.
+    sit138 = {"config_state": "ok", "repo": "o/r", "pr": 5, "head_sha": "sha138",
+              "outcome": dict(part, head_sha="sha138"), "checks_status": "green",
+              "failing_checks": [], "prior": 0, "max_bounces": 3, "visible_bounces": 0,
+              "pr_meta": {"open": True}, "ticket_state_type": "started",
+              "ticket_state_name": "In Progress"}
+    cfg138 = {"in_flight_hours": 6, "blocked_after_seconds": 3600}
+    first138 = decision_for(dict(sit138), cfg138)
+    held138 = decision_for(dict(sit138, said_reasons=(note138,)), cfg138)
+    check("KIT-138 the first pass hands the PR to a person and says why",
+          (first138["action"], "a person must review" in (first138.get("cannot_evaluate") or "")),
+          ("unknown", True))
+    check("KIT-138 …and every pass after is a quiet skip, not a second page",
+          (held138["action"], held138.get("cannot_evaluate")), ("skip", None))
     check("a DECLINE is a could-not, never a clean bill", conclusion_basis("green", {"usable": False}, True, False), None)
     check("a stale review never concludes", conclusion_basis("green", spotless, False, False), None)
     check("no review at all never concludes", conclusion_basis("green", None, True, False), None)

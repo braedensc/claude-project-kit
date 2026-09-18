@@ -843,8 +843,34 @@ ticket, in the tracker (live test 3). In order:
 6. *Never approve, merge, push or edit — you have no tools to, and must not try.*
 7. The diff, inside an `<untrusted-diff>` fence with a treat-as-data preamble.
 
-The whole body stays under `diff_cap_chars`. Above it, the poller declines with the reason
-*diff too large to deliver* and posts that on the PR.
+The whole body stays under `diff_cap_chars`. **Above it, the review runs in part.** The
+poller withholds whole files from the diff, largest first, until the body fits, and never
+cuts a file in half. The body gains a section naming every withheld file and telling the
+reviewer it is judging part of a change. The PR comment opens with *Partial review — N of M
+files* and names them. The outcome carries `coverage: partial`, so the bounce driver can
+bounce on what the review found but never concludes the PR. With nothing to bounce, it says
+once on the PR that a person must review the withheld files (KIT-138).
+
+**Said once means said once.** The PR gets that sentence on one pass only. Every pass after
+it is an ordinary quiet skip, because a partial review never stops being partial, and a
+driver that reported it as a problem every five minutes would hold its heartbeat at
+`problems` for good — which pages you once and then hides every later failure behind the
+same fingerprint. The PR is a person's from the first sentence on.
+
+Three other places repeat the coverage, so *partial* never reads as *clean*:
+
+- The telemetry row on the original ticket opens with **PARTIAL REVIEW — N file(s) were
+  never read** and names them, above the reviewer's own summary.
+- A reused review ticket takes its coverage from the body Linear holds, not from what this
+  pass would have fitted. A force-push between passes changes the diff, never the ticket
+  the reviewer actually answered.
+- Auto-merge refuses it. A partial review cannot qualify a PR for the merge tier however
+  few findings it carries (§11).
+
+Good: `PARTIAL o/r#N: … 2 of 3 file(s) withheld` in the poller log, and a ticket that
+opens.
+Not: *diff too large to deliver … and no single file fits alone*. One file is over the cap
+by itself; that PR is declined as before.
 
 ### Turning the review entries off again
 
