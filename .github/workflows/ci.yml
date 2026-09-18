@@ -300,6 +300,12 @@ jobs:
       - name: Plan-tree executor selftest (forced fields, DoR gate, §8/§13 verdicts)
         run: python3 scripts/pipeline_plan_executor.py --selftest
 
+      # User-scope skill drift: a project with no skills directory runs whatever
+      # copy sits in ~/.claude/skills, which nothing updates. The check is read-only;
+      # --apply refuses in an agent environment.
+      - name: User-scope skill sync selftest (drift report, refusal, whole replace)
+        run: python3 scripts/sync_user_skills.py --selftest
+
       # The conflict loop (pr-conflict-monitor.yml + the local waker). Offline, GitHub and
       # the model stubbed, git real: a new conflict requests a fix and pages nobody; the
       # budget (3 per PR) and forks page instead; a missed ack, a missed result, and a

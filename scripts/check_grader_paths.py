@@ -129,6 +129,13 @@ FLOOR = (
     # drop "never merge" from that prompt or widen the one label it writes, and no
     # hook would see it — so a person's label, like the workflow that runs it.
     "scripts/pr_conflict.py",
+    # sync_user_skills.py decides nothing about a change, but it can rewrite
+    # ~/.claude/skills — the instructions every future session on a machine loads —
+    # and the only thing keeping a session from doing so is the agent-environment
+    # refusal inside it. An edit that dropped that refusal would hand a session its
+    # own future supervision, and no hook would see it. Same capability test as
+    # gh_fallback.py above: the file itself is the boundary.
+    "scripts/sync_user_skills.py",
     # …and its staged twin, by the same capability test. It was excused as a stack template
     # before the conflict loop existed; it now becomes a workflow that holds a write token
     # and posts the request marker a waker turns into a paid session start on a person's
