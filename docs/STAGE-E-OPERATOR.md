@@ -923,8 +923,28 @@ the sessions it counts.
 
 **Each `seen-prs.json` record carries a `status`.** Most are self-explanatory —
 `pending` (waiting on the reviewer), `delivering`, `publish-failed`, `close-pending`,
-`collected`, `declined`. Two mean *not finished, select it again next pass*, and they are
-two because they mean different things:
+`telemetry-pending`, `collected`, `declined`.
+
+`telemetry-pending` means the review is published and only its telemetry row did not land.
+The next pass re-sends it under the same run id, so the dashboard counts it once. After
+three passes the record settles with `telemetry_failed: true`, and the log says the run is
+missing from the dashboard (KIT-139). A deployment with no telemetry module is not a failure:
+it says so once per review and settles.
+
+**Each of those passes exits 1, and that is a heartbeat-monitor incident.** The review
+itself delivered — the comment is on the pull request — so this is an incident about
+*reporting*, and it is the one class of poller incident where nothing is wrong with the
+review lane. Read the poller log before treating it as one: `telemetry-pending, retried
+next pass` is the transient shape, and `giving up … MISSING from the dashboard` is the
+terminal one. Nothing retries after the give-up.
+
+**Reporting never delays delivery.** If a bounce asks for a re-review while a record is
+still `telemetry-pending`, the re-review wins: the record re-opens, the outstanding row is
+never written, and the log says `TELEMETRY LOST` for that pull request. A §4 row may never
+buy or cost a session anything, and holding a paid-for re-review would be it costing one.
+
+Two statuses mean *not finished, select it again next pass*, and they are two because they
+mean different things:
 
 | Status | What it means | Gives up? |
 |---|---|---|
