@@ -839,11 +839,11 @@ class Runner(object):
         self.writes = []      # every mutation, applied or merely planned
         self.reads = []
 
-    def read(self, argv, stdin=None, timeout=60):
+    def read(self, argv, stdin=None, timeout=60, cwd=None):
         self.reads.append(argv)
-        return self._exec(argv, stdin, timeout)
+        return self._exec(argv, stdin, timeout, cwd=cwd)
 
-    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False):
+    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False, cwd=None):
         self.writes.append({"why": why, "argv": argv,
                             "stdin": "<hidden>" if secret_stdin else stdin})
         if self.dry_run:
@@ -853,12 +853,12 @@ class Runner(object):
                 say("    (stdin: %s)" % ("<a credential, never shown>" if secret_stdin
                                          else "%d bytes" % len(stdin)))
             return Result(0, skipped=True)
-        return self._exec(argv, stdin, timeout)
+        return self._exec(argv, stdin, timeout, cwd=cwd)
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         try:
             p = subprocess.run(argv, input=stdin, capture_output=True, text=True,
-                               timeout=timeout)
+                               timeout=timeout, cwd=cwd)
         except FileNotFoundError as exc:
             return Result(127, "", str(exc))
         except subprocess.TimeoutExpired:
@@ -870,11 +870,19 @@ class Runner(object):
                 secret_stdin=False):
         """Run a /bin/sh script as the role account. `sudo -u … -H` keeps the
         caller's cwd, and that account cannot traverse into your worktree, so
-        every wrapper starts by standing somewhere it can read."""
+        every wrapper starts by standing somewhere it can read.
+
+        THE CHILD STARTS AT `/` TOO (KIT-112). The `cd /` inside the script runs
+        after the shell has initialised, and the shell's own initialisation calls
+        getcwd first — in a directory this account cannot enter. That printed two
+        `getcwd: cannot access parent directories` lines on every role-account
+        command, mid-install, reading like a fault. No caller depends on the
+        inherited directory: every git call names its tree with -C and every
+        script starts with its own `cd /`."""
         argv = ["sudo", "-u", account, "-H", "/bin/sh", "-c", "cd / && " + script]
         if why is None:
-            return self.read(argv, stdin, timeout)
-        return self.write(why, argv, stdin, timeout, secret_stdin)
+            return self.read(argv, stdin, timeout, cwd="/")
+        return self.write(why, argv, stdin, timeout, secret_stdin, cwd="/")
 
     def as_root(self, argv, why=None, stdin=None, timeout=300):
         argv = ["sudo"] + list(argv)
@@ -4569,12 +4577,26 @@ def step_enable(ctx, apply_it):
                       "printf '%%s missing\\n' \"$f\"; done" % ctx.stage_home)
     have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
 
+    # A PAUSE IS INVISIBLE TO EVERY ALARM (KIT-112, review of #137). A paused bounce driver
+    # beats on schedule and reads healthy, by design — so nothing would ever mention a pause
+    # somebody forgot. This step is where a person looks on every install, so it says so
+    # here, as a note on the row rather than as a fault: pausing on purpose is not a defect.
+    paused = r.as_role(ctx.account, "p=%s/state/PAUSED; [ -e \"$p\" ] || exit 9; "
+                                    "head -c 200 \"$p\" 2>/dev/null; exit 0" % ctx.stage_home)
+    pause_notes = []
+    if paused.rc == 0:
+        pause_notes.append(
+            "the bounce driver is PAUSED on purpose: %s/state/PAUSED exists%s. It does nothing "
+            "while that file is there, and this step does not remove it — delete it to resume"
+            % (ctx.stage_home,
+               " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
+
     if not missing and len(have_beats) == 3:
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
-        return True, "all three daemons loaded and all heartbeats present", []
+        return True, "all three daemons loaded and all heartbeats present", pause_notes
     if not apply_it:
         return False, "would load %s; heartbeats present: %s" % (
-            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), []
+            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), pause_notes
 
     # THIS STEP RE-ARMS A DAEMON YOU STOPPED ON PURPOSE, and says so before it
     # does. `launchctl bootout` is the documented way to pause one half — but the
@@ -4586,8 +4608,11 @@ def step_enable(ctx, apply_it):
     if not r.dry_run:
         say("")
         say("  LOADING the daemons. Each takes a full pass within seconds of loading.")
-        say("  If you stopped one on purpose with `launchctl bootout`, that pause does NOT")
-        say("  survive this step — stop it again after this run, or let it run.")
+        say("  A `launchctl bootout` pause does NOT survive this step. To pause the BOUNCE")
+        say("  DRIVER so that it does — through this step and through a reboot — write the")
+        say("  reason into its state directory instead (KIT-112):")
+        say("      sudo -u %s -H /bin/sh -c 'cd / && echo \"why\" > ~/.stage-e/state/PAUSED'"
+            % ctx.account)
         say("")
     for label in labels:
         out = r.as_root(["launchctl", "bootout", "system/" + label],
@@ -5538,7 +5563,8 @@ class FakeRunner(Runner):
         self.answers = list(answers or [])
         self.applied = []
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
+        self.last_cwd = cwd
         line = _fmt(argv)
         for needle, rc, out in self.answers:
             if needle in line:
@@ -5583,7 +5609,7 @@ class FakeLaunchd(FakeRunner):
         self.polls = 0
         self.attempts = 0
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         line = _fmt(argv)
         if "launchctl bootout system/" in line:
             if not self.stuck:
@@ -5622,14 +5648,14 @@ class FakeLaunchdWithLog(FakeLaunchd):
         FakeLaunchd.__init__(self, **kw)
         self.log_path, self.new_output = log_path, new_output
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         line = _fmt(argv)
         if "Print :StandardOutPath" in line:
             return Result(0, self.log_path + "\n", "")
         if list(argv[:3]) == ["sudo", "/bin/sh", "-c"] and self.log_path in argv[3]:
             ran = subprocess.run(["/bin/sh", "-c", argv[3]], capture_output=True, text=True)
             return Result(ran.returncode, ran.stdout, ran.stderr)
-        res = FakeLaunchd._exec(self, argv, stdin, timeout)
+        res = FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
         if "launchctl bootstrap system" in line and res.ok and self.present:
             with open(self.log_path, "a", encoding="utf-8") as fh:
                 fh.write(self.new_output)
@@ -6094,6 +6120,43 @@ def _selftest_body():
     cases += 1
     expect("secret-never-printed-mutant", SECRET in ("stdin: K=" + SECRET),
            "the leak scan cannot see a secret in an output line")
+
+    # -- KIT-112. A ROLE-ACCOUNT COMMAND STARTS WHERE THAT ACCOUNT CAN STAND ----
+    # The script's own `cd /` runs after the shell has initialised, and initialising calls
+    # getcwd in the caller's directory, which the role account cannot enter: two noise
+    # lines on every role-account command. The child process must start at `/`.
+    # KIT-112 (review of #137). A pause is healthy to every alarm by design, so the one
+    # place a person always looks — the install — has to mention one it finds.
+    cases += 1
+    conf_p, _ = validate_conf(parse_conf(GOOD_CONF)[0])
+    ctx_p, fake_p = _settled_ctx(conf_p)
+    fake_p.answers = [("state/PAUSED", 0, "live test block B in progress\n")] + list(fake_p.answers)
+    (_okp, _detp, notes_p), _pp = _quiet(lambda: step_enable(ctx_p, apply_it=False))
+    expect("KIT-112 a PAUSED file the installer finds is said on the row",
+           any("PAUSED" in str(n) and "live test block B" in str(n) for n in (notes_p or [])),
+           "step_enable said nothing about a paused bounce driver: %r" % (notes_p,))
+    ctx_q, fake_q = _settled_ctx(conf_p)
+    fake_q.answers = [("state/PAUSED", 9, "")] + list(fake_q.answers)
+    (_okq, _detq, notes_q), _pq = _quiet(lambda: step_enable(ctx_q, apply_it=False))
+    expect("KIT-112 a PAUSED file the installer finds is said on the row",
+           not [n for n in (notes_q or []) if "PAUSED" in str(n)],
+           "step_enable invented a pause where there is none: %r" % (notes_q,))
+
+    cases += 1
+    fr_cwd = FakeRunner([("true", 0, "")])
+    fr_cwd.as_role("_x", "true")
+    read_cwd = getattr(fr_cwd, "last_cwd", None)
+    fr_cwd.as_role("_x", "true", why="a write")
+    write_cwd = getattr(fr_cwd, "last_cwd", None)
+    expect("KIT-112 role-commands-start-at-root", (read_cwd, write_cwd) == ("/", "/"),
+           "role-account commands start in the caller's directory: read %r, write %r"
+           % (read_cwd, write_cwd))
+    try:
+        here_out = Runner().read(["/bin/sh", "-c", "pwd"], cwd="/").out.strip()
+    except TypeError as exc:
+        here_out = "Runner.read takes no cwd: %s" % exc
+    expect("KIT-112 role-commands-start-at-root", here_out == "/",
+           "a real child given cwd=/ printed %r" % here_out)
 
     # -- 8. a dry run makes no change --------------------------------------
     cases += 1
@@ -9359,10 +9422,10 @@ def _selftest_body():
             self.answers = []
             self.applied = []
 
-        def _exec(self, argv, stdin, timeout):
+        def _exec(self, argv, stdin, timeout, cwd=None):
             if argv and argv[0] == "sudo":
                 order.append("probe")
-            return FakeRunner._exec(self, argv, stdin, timeout)
+            return FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd)
 
     main_tmp = tempfile.mkdtemp(prefix="stage-e-main.")
     main_conf = os.path.join(main_tmp, "stage-e.conf")
@@ -9882,7 +9945,7 @@ def _selftest_body():
         ctxA.unloaded = [mlabel]
         # Every command, read or write, in the order it ran.
         seqA, _execA = [], fakeA._exec
-        fakeA._exec = lambda argv, stdin, timeout: (seqA.append(_fmt(argv)),
+        fakeA._exec = lambda argv, stdin, timeout, cwd=None: (seqA.append(_fmt(argv)),
                                                     _execA(argv, stdin, timeout))[1]
         (okA, detailA, _x), printedA = _quiet(lambda: step_heartbeat_monitor(ctxA, apply_it=True))
         whysA = [w["why"] for w in fakeA.writes]
@@ -9951,7 +10014,7 @@ def _selftest_body():
                           (MONITOR_SCRIPT + " check --config", 0, ""),
                           (_rearm_cmd, 0, "")] + fakeRL.answers
         seqRL, _execRL = [], fakeRL._exec
-        fakeRL._exec = lambda argv, stdin, timeout: (seqRL.append(_fmt(argv)),
+        fakeRL._exec = lambda argv, stdin, timeout, cwd=None: (seqRL.append(_fmt(argv)),
                                                      _execRL(argv, stdin, timeout))[1]
         _quiet(lambda: step_heartbeat_monitor(ctxRL, apply_it=True))
         _gone_at = max([i for i, line in enumerate(seqRL)

@@ -907,6 +907,7 @@ heartbeat files with the same name in the same place cannot be told apart.
 | `heartbeat.json` | poller | last run, last result |
 | `bounce-ledger.jsonl` | bounce driver | append-only, the budget authority |
 | `bounce-heartbeat.json` | bounce driver | last run, last result |
+| `PAUSED` | **you** | the durable pause: while it exists the bounce driver does nothing and says so. Its first line is the reason. Nothing removes it but you — an installer `run` and a reboot both leave it |
 | `basis-snapshots/<TICKET>.json` | bounce driver, read by the poller | the criteria as a person delegated the ticket, with the lag and any edit since delegation (step 10). Its criteria never change; it also records the notices said and the sessions held. Still read by the poller when `criteria_snapshots` is `false` |
 | `basis-snapshots/<TICKET>.<session>.json` | bounce driver | an earlier snapshot, kept when a person delegating the ticket again replaced it |
 | `telemetry/` | poller | its telemetry artifacts (a dry run writes them to a temp dir instead) |
@@ -1379,7 +1380,10 @@ Input/output error` and leaves you with nothing loaded. Poll
 **Monitor the heartbeats, not the log — there are three.**
 `state/heartbeat.json`, `state/bounce-heartbeat.json` and `finding/heartbeat.json` carry a
 timestamp and a result on every terminal path, including a failed one. A stale heartbeat
-means *not running*; a fresh one with a non-`ok` result means *ran and could not do it*.
+means *not running*. A fresh one with a result outside that job's good list means *ran and
+could not do it* — the good lists differ per job, and `docs/HEARTBEAT-MONITOR.md` has them:
+the review poller's `declined`, and the bounce driver's `idle`, `declined` and `paused`,
+are healthy.
 **Count them**: two fresh heartbeats out of three is one whole daemon that is not running,
 and nothing else on the machine will say so. They live under the **role account's** home,
 not yours, so reading them takes `sudo -u`:
@@ -1399,9 +1403,11 @@ not yours, so reading them takes `sudo -u`:
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
 ```
 
-The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours —
-and the `cd /` suppresses the `shell-init: … getcwd … Permission denied` lines that
-otherwise appear, harmlessly, because that account cannot traverse your home.
+The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours.
+Type it from `/`. Started from your home, the role account's shell prints two
+`shell-init: … getcwd … Permission denied` lines before the `cd /` inside the command runs,
+because that account cannot traverse your home. They are harmless. The installer starts
+every role-account command at `/`, so it no longer prints them (KIT-112).
 
 Two cases leave no heartbeat at all: a config that cannot be read (the job exits before it
 learns where its state directory is), and somebody stopping the process on purpose.
@@ -1564,6 +1570,32 @@ python3 <scripts dir>/pipeline_bounce_local.py exhaust --pr <n> --repo OWNER/REP
 `decide` only reports. `bounce` and `exhaust` act on one PR. `run` takes neither `--pr`
 nor `--all`: it is the daemon's whole pass.
 
+**To pause the driver, write a file; do not unload the job.** An unloaded job comes back on
+the next installer `run` and on every reboot, and a reloaded job takes a full pass within
+seconds. A file named `PAUSED` in the driver's state directory survives both. Its first
+line is the reason.
+
+```bash
+sudo -u <role account> -H /bin/sh -c 'cd / && echo "live test block B" > ~/.stage-e/state/PAUSED'
+```
+
+Good: the next pass prints `PAUSED: … — live test block B. This pass did nothing.`, and the
+heartbeat reads `"result": "paused"`. The heartbeat monitor reads that as healthy.
+Not: `pass complete`. The file is in the wrong directory; the heartbeat's own directory is
+the right one.
+
+A paused pass does nothing at all: no bounce, no conclusion, no conflict fix, and no
+criteria snapshot. A ticket delegated during the pause gets its snapshot on the first pass
+after, with the lag recorded. `bounce` and `exhaust`, typed by hand, ignore the file. The
+review poller and the finding poller have no pause of their own (no ticket yet). Delete the
+file to resume.
+
+**Exit codes.** `0` is a clean pass. `3` is a pass that declined — a pull request the
+driver was never meant to act on, such as a branch that is not a pipeline ticket branch, or
+a paused pass. `2` is a pass that could not do something, and a decline never hides one: a
+pass with a declined PR and a broken one exits `2`. The heartbeat's `result` says the same:
+`ok`, `declined`, `paused`, or `problems`.
+
 - **The budget is not yours to type.** `budgets.maxBounces` and
   `budgets.reviewSeverityThreshold` are read from `delivery.json` on the repo's
   **committed default branch**, fetched fresh. If that file is absent the bounce tier is
@@ -1600,9 +1632,10 @@ nor `--all`: it is the daemon's whole pass.
   is missing or misspelled for that repository. `unknown` means nobody answered: no
   override, and the forge refused. `checks_note` names the remedy, and on `unknown` the
   command exits 2. This is the only check on a block the whole CI half depends on, so run
-  it against a real PR once. If you get no JSON — only a `FAIL: …` line — the driver refused
-  the PR before it read any checks, which is not a `required_checks` failure; pick another
-  PR.
+  it against a real PR once. If you get no JSON — only a `DECLINED: …` or `FAIL: …` line —
+  the driver refused the PR before it read any checks, which is not a `required_checks`
+  failure; pick another PR. `DECLINED` means it was never this driver's pull request
+  (exit 3); `FAIL` means it could not act (exit 2).
 - **Whose ticket it is.** The driver takes the poller's outcome record first, Linear's own
   PR attachment second, and the branch name only third — and then only if Linear ties that
   ticket to this PR. Otherwise it declines. A branch name is a hint a session chose.
