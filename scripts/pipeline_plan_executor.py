@@ -79,7 +79,8 @@ WHAT IT IS AND IS NOT
   plan kind is off on the same discriminator the finding kind is.
 
   It is not: the dispatcher that delegates the idea ticket and starts the
-  sandboxed planning session, the planning brief the session runs (KIT-98), or
+  sandboxed planning session, the planning brief the session runs
+  (`PLANNING_BRIEF` in scripts/pipeline_stage_a_setup.py), or
   the approve tier that later releases DoR-passing children when the human moves
   the epic (scripts/check_auto_approve.py). It creates every ticket in the
   backlog and stops; releasing them is the human's move and the approve tier's.
@@ -415,6 +416,23 @@ def build_child_tickets(plan, team_key, landing_state_id):
     return tickets
 
 
+# A child that changes a guard needs the guard-change acknowledgement label, which is
+# a person's to apply (contract §6) — the session cannot request it and this executor
+# never applies it. So the planning brief tells a planner to open such a child's
+# Context with this exact line, and the summary lists every child that carries it OR
+# names a guarded path, for the owner. Both, because a planner that forgets the line
+# has still named the path under Pointers.
+GUARD_CHANGE_MARKER = "Guard change: needs the owner's acknowledgement."
+_GUARD_PATH_RE = re.compile(r"\.claude/(?:hooks/|settings[A-Za-z0-9_.-]*\.json)")
+
+
+def guard_change_children(children):
+    """0-based positions of the proposed children that change a guard."""
+    return [i for i, child in enumerate(children or [])
+            if GUARD_CHANGE_MARKER in (child.get("body") or "")
+            or _GUARD_PATH_RE.search(child.get("body") or "")]
+
+
 def render_success_comment(idea_id, epic, children, epic_title):
     """One markdown comment posted back on the idea ticket, for the owner.
 
@@ -443,6 +461,15 @@ def render_success_comment(idea_id, epic, children, epic_title):
         lines.append("  - [%s](%s) — `%s`%s"
                      % (created["identifier"], created.get("url") or "",
                         _sanitize(child["title"]), dep))
+    guarded = guard_change_children([child for _created, child in children])
+    if guarded:
+        lines += [
+            "",
+            "**Guard changes — yours to acknowledge.** These children change "
+            "`.claude/hooks/` or `.claude/settings*.json`, so their work needs the "
+            "guard-change acknowledgement label, which only you apply: %s."
+            % ", ".join(children[i][0]["identifier"] for i in guarded),
+        ]
     lines += [
         "",
         "After that, a child reaches `ready` only by the approve tier, if it is "
@@ -1482,6 +1509,42 @@ def selftest():
         # 39. AN OAUTH TOKEN IS SENT AS BEARER; A PERSONAL KEY RAW.
         check("oauth-bearer", LinearClient("lin_oauth_abc")._key, "Bearer lin_oauth_abc")
         check("personal-key-raw", LinearClient("lin_api_abc")._key, "lin_api_abc")
+
+        # 40. A CHILD THAT CHANGES A GUARD IS NAMED FOR THE OWNER (KIT-163). The
+        #     session cannot request the guard-change label and this executor never
+        #     applies it, so the summary lists the child — by the brief's marker line,
+        #     or by a guarded path the planner named without the line.
+        os.makedirs(os.path.join(tmp, ".claude", "hooks"), exist_ok=True)
+        open(os.path.join(tmp, ".claude", "hooks", "guard.py"), "w").close()
+        marked = _GOOD_CHILD_BODY.replace(
+            "## Context\n\n", "## Context\n\n" + GUARD_CHANGE_MARKER + "\n\n", 1)
+        by_path = _GOOD_CHILD_BODY + "- `.claude/hooks/guard.py` — the guard this changes\n"
+        guard_tree = _tree(children=[
+            {"title": "Plain child", "body": _GOOD_CHILD_BODY,
+             "labels": ["track:meta", "effort:S"]},
+            {"title": "Marked guard child", "body": marked,
+             "labels": ["track:meta", "effort:S"]},
+            {"title": "Guard path child", "body": by_path,
+             "labels": ["track:meta", "effort:S"]},
+        ])
+        fakeH2 = FakeLinear()
+        check("guard-tree-files", run(guard_tree, client=fakeH2), EXIT_OK)
+        summary = fakeH2.comments[0][1]
+        kids = fakeH2.issues[1:]
+        check("guard-children-found", guard_change_children(
+            guard_tree["requests"][0]["children"]), [1, 2])
+        check("guard-summary-names-marked-child", kids[1]["identifier"] in summary.split(
+            "Guard changes")[-1], True)
+        check("guard-summary-names-path-child", kids[2]["identifier"] in summary.split(
+            "Guard changes")[-1], True)
+        check("guard-summary-skips-plain-child", kids[0]["identifier"] in summary.split(
+            "Guard changes")[-1], False)
+        check("guard-label-never-applied",
+              any("hooks-change" in str(i["label_ids"]) for i in fakeH2.issues), False)
+        check("guard-none-no-section", "Guard changes" in render_success_comment(
+            "KIT-1", {"identifier": "KIT-2"}, [({"identifier": "KIT-3"},
+                                                {"title": "t", "body": "plain"})], "e"),
+              False)
 
     if failures:
         print("FAIL: pipeline_plan_executor selftest")

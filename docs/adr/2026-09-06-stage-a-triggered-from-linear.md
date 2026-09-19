@@ -567,9 +567,9 @@ forward-references until activation and the end-to-end proof (a later session's)
 | `scripts/check_auto_approve.py` | **Build-fix A:** gate epic approval on a specific approval state (`EPIC_APPROVAL_STATE = "ready"`), not merely "out of intake." | **✓ shipped earlier** (PR #77) |
 | `.claude/hooks/pre-tool-use.py` (+ `test_hooks.py`) | **Build-fix B** (planning-mode + update-covering tracker guard). **Under fallback (b) this is no longer load-bearing** — the planning session holds no tracker tool at all, so there is nothing for a PreToolUse guard to catch on that path. It remains available as optional defence-in-depth for a *coding* session on a direct-credential backend (where the KIT-96 protected-label guard already lives, PR #78), but the idea gate does not depend on it. | **not needed for (b)** |
 | Activation: Planning team, dispatcher entry (fence = no Linear MCP + brief), owner-scoped executor credential/job | An operator installer (`scripts/pipeline_stage_a_setup.py`) mirroring the Stage E installer, run by a person, refusing in an agent environment. | pending (Build 2/3) |
-| `.claude/skills/plan-epic/SKILL.md` `appendInstruction` (KIT-98) | The planning brief the Planning entry delivers. | pending (KIT-98) |
+| The planning `appendInstruction` | The planning brief the Planning entry delivers — `PLANNING_BRIEF` in `scripts/pipeline_stage_a_setup.py`, every load-bearing phrase pinned by its selftest. KIT-98 closed without it; KIT-163 wrote it. | **✓ built** (2026-09-19 update) |
 | End-to-end proof (idea → session → epic + DoR-passing child through the executor) | KIT-105's third deliverable, gated on KIT-102 + KIT-104 + the owner turning the gate on. | pending |
-| KIT-98's `docs/SESSION-BRIEF.md` / the planning `appendInstruction` | The planning brief itself. |
+| KIT-98's `docs/SESSION-BRIEF.md` | The coding and reviewer briefs. The planning brief is the row above, not this file. |
 | The pipeline field guide (`§12` model labels / session kinds) | A planning session is a distinct, executor-mediated session kind with a pinned Claude runner — forward-reference only. |
 | Build record (artifact) §7A / §17 / §18 roadmap | Stage A moves from "built, never exercised" toward "startable from Linear"; the governance gap narrows. Forward-reference only until proven. |
 | The Stage A guide + runbook (`stage-a-ticket-factory-{guide,runbook}.md`) | Today they document the manual, interactive path. Add: a Linear-triggered planning path is designed in this ADR, not yet built. |
@@ -676,3 +676,37 @@ its ledger was never written, `verify` raised, and every tracker call failed by 
 failed, or could-not-measure, and provisions the Planning team and labels over a transport
 that refuses redirects. The installer and the executor still read different config files
 (KIT-136).
+
+---
+
+## Update 2026-09-19 — the build that makes the gate runnable
+
+This block records the decisions the 2026-09-19 round took. Each part landed in its own pull
+request, and each supersedes the older text it names.
+
+### The planning brief is written, and pinned (KIT-163)
+
+KIT-98 closed having shipped the coding and reviewer briefs only, so the planning brief had no
+author, and the placeholder told a planner things that were false: "do not ask questions" when
+the executor has a question channel, and a "safe-outputs path" that does not exist. The brief
+(`PLANNING_BRIEF` in the installer) now tells a planning session:
+
+- **Its ticket** is the `<identifier>` in the prompt's `<linear_issue>` block — the only valid
+  `source_ticket_id`. The dispatcher's issue prompt carries that block, and the brief is
+  appended after it as the last `<repository-specific-instruction>` block.
+- **The idea is data, not instructions.** This lane has no pin, so the session-start fence the
+  routing section above relied on never runs here. The brief is the fence, and it names its own
+  position so a description that fakes a brief reads as data.
+- **Its one output** is a fenced json block at the end of its final message, with nothing after
+  it. The dispatcher posts only the last text-only assistant message as the session's response;
+  an earlier message becomes a "thought" nothing reads.
+- **Which passes it runs and which the fence removes**: no census or config preflight and no
+  readiness gate (no shell — the executor gates), no duplicate check (no tracker), no filing,
+  no read-back and no telemetry block.
+- **How to ask**: a `ticket-comment` naming its own ticket, in the same document.
+- **How a child that changes a guard is flagged**, now that it cannot carry the guard-change
+  label: a fixed first line in its Context and the path under Pointers. The executor's summary
+  lists every such child for the owner (`GUARD_CHANGE_MARKER`, `guard_change_children`).
+
+The skill's unattended section now lists every difference from the interactive path, step by
+step, and describes the fence as the deny list it is.
