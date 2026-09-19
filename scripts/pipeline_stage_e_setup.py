@@ -2133,23 +2133,24 @@ def step_preflight(ctx, apply_it):
                         % (conf["DISPATCHER_CONFIG"], ctx.account,
                            (cfg.err or cfg.out).strip()[:160]))
 
-    # A REFUSAL THE RUN WOULD REACH ANYWAY, MOVED IN FRONT OF THE DAMAGE (review of #136).
-    # `dispatcher-entry` (step 6) refuses a hand sign-off that names no entries — it
-    # predates the binding and proves nothing. `code` (step 2) has by then already booted
-    # the daemons out to fast-forward the clone, so an upgrade on such a machine stops with
-    # review and bounce OFF and the operator holding a re-sign they cannot do until they
-    # re-run. Preflight cannot know the entries yet, so it cannot judge a FINGERPRINT — but
-    # a sign-off carrying no fingerprint at all needs nothing but the state file.
+    # AN OLD HAND SIGN-OFF IS SAID, NEVER REFUSED (KIT-176). A sign-off of the entries'
+    # load made before KIT-149 names no entries, so it proves none of them and
+    # `dispatcher-entry` gives it no weight. For one release this refused the whole run
+    # instead — and that was a dead end: the remedy it printed (re-sign) needs the entries
+    # recorded, which only `dispatcher-entry` records, four steps past the refusal. It also
+    # blocked the ordinary upgrade, where the dispatcher's own banner proves the load and
+    # the old sign-off is never consulted at all. The dispatcher-entry step stopping on a
+    # card when the banner cannot prove the load is the same stop, with or without an old
+    # sign-off on record; so preflight names it, and goes on.
+    notes = []
     signed_pre = (ctx.state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
     signed_pre = signed_pre if isinstance(signed_pre, dict) else {}
     if signed_pre and not signed_pre.get("entries_sha256"):
-        problems.append(
-            "the hand sign-off of the review entries' load (%s) names no entries, so it "
-            "proves none of them — it predates the binding.\n      This run would refuse it "
-            "at `dispatcher-entry`, four steps after it takes the daemons down, so it is "
-            "refused here instead.\n      Re-sign it after this run reaches that step:\n"
-            "      $ %s attest A-ENTRY-LOADED"
-            % (signed_pre.get("at", "undated"), os.path.basename(sys.argv[0] or "setup")))
+        notes.append(
+            "the hand sign-off of the review entries' load (%s) predates KIT-149 and names "
+            "no entries, so it counts for nothing now. The dispatcher's own log is what proves "
+            "the load; if that cannot, the dispatcher-entry step will ask you to sign again, "
+            "against the entries it just measured" % signed_pre.get("at", "undated"))
 
     if problems:
         # EVERY problem, in one pass. A preflight that stops at the first one
@@ -2158,7 +2159,7 @@ def step_preflight(ctx, apply_it):
             "preflight found %d problem(s) — all of them, in one pass:\n%s"
             % (len(problems), "\n".join("  - " + p for p in problems)))
     return True, ("role home %s, dispatcher running, %d existing repository entries"
-                  % (ctx.role_home, len(ctx.dispatcher.get("entries", [])))), []
+                  % (ctx.role_home, len(ctx.dispatcher.get("entries", [])))), notes
 
 
 def _read_dispatcher_facts_py(path):
@@ -6180,31 +6181,38 @@ def _selftest_body():
     expect("idempotent", ok2 is True, "configs did not read as already-done")
     expect("idempotent", not fake2.writes, "configs were rewritten when they already matched")
 
-    # -- A REFUSAL IN FRONT OF THE DAMAGE (review of #136) ------------------------------
-    # An upgrade resting on a pre-binding sign-off used to stop at step 6, with the daemons
-    # already down since step 2. Preflight now refuses it while everything is still running.
+    # -- AN OLD SIGN-OFF IS SAID, NEVER A DEAD END (KIT-176) ---------------------------
+    # For one release preflight REFUSED a sign-off of the entries' load that predates
+    # KIT-149, and the remedy it printed — re-sign — needs the entries recorded, which only
+    # dispatcher-entry records, four steps past the refusal. On the one live machine that
+    # carried such a record, every `run` stopped at step 0, for good. Pinned three ways.
     cases += 1
+    legacy = {"A-ENTRY-LOADED": {"at": "2026-09-08T03:31:23Z", "initials": "bc",
+                                 "note": "saw the banner"}}
     ctxP, _fakeP = _settled_ctx(conf)
     okP, _saidP, _nP = _quiet(lambda: step_preflight(ctxP, apply_it=False))[0]
-    expect("KIT-149 preflight-legacy-signoff", okP is True,
-           "preflight refused a machine with no hand sign-off at all")
+    expect("KIT-176 preflight-legacy-signoff", okP is True and not _nP,
+           "preflight refused, or noted, a machine with no hand sign-off at all")
     ctxL, _fakeL = _settled_ctx(conf)
-    ctxL.state.data["attestations"] = {"A-ENTRY-LOADED": {"at": "2026-09-01T00:00:00Z",
-                                                          "by": "a person"}}
+    ctxL.state.data["attestations"] = dict(legacy)
     try:
-        _quiet(lambda: step_preflight(ctxL, apply_it=False))
-        saidL, refused = "", False
+        okL, _saidL, notesL = _quiet(lambda: step_preflight(ctxL, apply_it=False))[0]
+        refusedL = ""
     except SetupError as exc:
-        saidL, refused = str(exc), True
-    expect("KIT-149 preflight-legacy-signoff",
-           refused and "predates the binding" in saidL and "takes the daemons down" in saidL,
-           "a pre-binding sign-off was not refused before the daemons go down: %r" % saidL[:200])
-    ctxB, _fakeB = _settled_ctx(conf)
-    ctxB.state.data["attestations"] = {"A-ENTRY-LOADED": {"at": "2026-09-17T00:00:00Z",
-                                                          "entries_sha256": "deadbeef"}}
-    okB, _saidB, _nB = _quiet(lambda: step_preflight(ctxB, apply_it=False))[0]
-    expect("KIT-149 preflight-legacy-signoff", okB is True,
-           "preflight refused a BOUND sign-off, which only dispatcher-entry may judge")
+        okL, notesL, refusedL = False, [], str(exc)
+    expect("KIT-176 preflight-legacy-signoff", okL is True and not refusedL,
+           "preflight REFUSED a pre-binding sign-off — the dead end: %r" % refusedL[:200])
+    expect("KIT-176 preflight-legacy-signoff",
+           any("counts for nothing" in str(n) and "2026-09-08" in str(n) for n in notesL),
+           "…and it said nothing about it either: %r" % notesL)
+    # …and the whole `run` a person types, on a machine whose banner already proved the
+    # load: no step fails, and nothing stops on the old record.
+    ctxR, _fR, _aR = _healthy_ctx(conf)
+    ctxR.state.data["attestations"].update(legacy)
+    (codeR, rowsR), _pR = _quiet(lambda: run_steps(ctxR, apply_it=True))
+    failedR = [(st, d) for st, o, d in rowsR if o in (FAILED, UNKNOWN, BLOCKED)]
+    expect("KIT-176 run-with-legacy-signoff", codeR == 0 and not failedR,
+           "a `run` over an old sign-off did not go through (exit %s): %s" % (codeR, failedR[:2]))
 
     # -- KIT-149 (3). THE SESSION-LOG ROOT IS LOOKED AT, NOT ONLY WRITTEN ---------------
     # The probe, EXECUTED: an enterable directory, a missing one, and one that exists but
