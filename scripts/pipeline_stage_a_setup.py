@@ -20,29 +20,57 @@ WHAT IT BUILDS
     that config lives outside this repo and a session must never write its own
     supervision.
 
-THE FENCE — the one security choice, and why it is shaped this way (fallback b)
+THE FENCE — the one security choice, and how it is enforced
   The whole no-self-approval guarantee rests on ONE thing: the planning session
-  must hold no tool that can write the tracker. When this installer was designed,
-  no MCP fence had ever run in the live system: the review installer's
-  `disallowedTools` named only built-in tools and its selftest forbade any `mcp__`
-  entry. Since KIT-132 the review installer fences whole servers by name
-  (`mcp__<server>` and `mcp__<server>__*`), and its card CK-7 has a person probe a
-  live reviewer's tool list under that fence. Either way, this installer does NOT
-  rest the guarantee on naming individual tracker tools. It takes the STRUCTURAL
-  route:
+  must hold no tool that can write the tracker. There is exactly one mechanism
+  that removes a tool from a dispatched session — the repository entry's
+  `disallowedTools` — and every claim below is made in that list or not at all.
 
-    * the Planning entry attaches NO Linear MCP server at all
-      (PLANNING_ENTRY["linearMcpAttached"] is False) — the session simply has no
-      `mcp__linear__*` tool, whatever a runner or a guard does;
-    * the planner keeps Read/Grep/Glob (to decompose against real code), Write
-      (to emit its proposal file) and Task (its sub-passes);
-    * `disallowedTools` ALSO names the tracker mutation tools, belt-and-braces,
-      in case a future entry format attaches Linear despite the above.
+  THIS INSTALLER ONCE CLAIMED IT ANOTHER WAY, AND THE CLAIM WAS EMPTY. The entry
+  carried `linearMcpAttached: False` and this file called it "the STRUCTURAL
+  fence". The dispatcher (0.2.69) never reads that key — zero references across
+  its packages — while its MCP config service injects `linear`, `cyrus-tools` and
+  `cyrus-docs` into every tracker-triggered session. A planner would have held the
+  tracker's entire write surface minus the six tool names the old denylist
+  happened to spell. The key is gone; a control nothing reads must not sit in a
+  config file reading like one.
 
-  A session with no key cannot write the board, regardless of `disallowedTools`
-  granularity, PreToolUse pattern-matching, or which runner loaded — so this also
-  closes the runner-selection hole for the tracker-write path. `--selftest`
-  pins every part of this shape.
+  WHAT REPLACES IT is the shape KIT-132 gave the reviewer. Each server the
+  dispatcher injects is named in `disallowedTools` in BOTH documented rule forms,
+  `mcp__<server>` and `mcp__<server>__*`, because a rule in a form the runtime
+  does not honour fails silently — and a fence that fails silently reads closed
+  and is open. `MCP_FENCE_RULE_RE` pins the only shape a rule may take: one named
+  server, whole or by wildcard. An unanchored `mcp__*` is skipped by the runtime
+  with no error, so this file refuses to write one.
+
+  WHAT THE PLANNER KEEPS, and why each is needed: Read/Grep/Glob to decompose
+  against real code, and Task/Agent because the planning procedure's rubric panel
+  is five independent passes in fresh contexts.
+
+  IT DOES NOT KEEP `Write`. An earlier version of this fence kept it, for the
+  proposal file. The dispatcher's OS sandbox confines only the shell commands a
+  session runs, not the in-process Write tool, and the dispatcher hot-reloads its
+  own config file and loads a `.mcp.json` from the session's working directory. A
+  planner steered by the idea's text could therefore rewrite its own entry's deny
+  list, or add a tool server, and hold the tracker on its next resume. So the
+  planner writes nothing: its proposal travels in its FINAL MESSAGE, which the
+  dispatcher posts to the idea ticket, and the reader reads it back from there —
+  the route the reviewer already uses (KIT-150).
+  Everything else that runs, edits, fetches, schedules, messages, publishes or
+  starts other work is named in the fence — including the three MCP resource
+  tools, whose names do not start with `mcp__`, so a server rule never reaches
+  them.
+
+  WHAT IS NOT PROVEN, and must be probed on the live dispatcher before the gate
+  is switched on (the activation checklist has the step): whether a subagent
+  started by `Task` inherits its parent's `disallowedTools`. If it does not, one
+  Task call reopens everything this list closes. `--selftest` cannot answer it;
+  only a person watching a live planning session can (KIT-140).
+
+  ONE CAPABILITY IS LOST, NOT REHOMED. The planning procedure's fifth pass searches
+  the tracker for duplicates before anything is filed, and the planner can no longer
+  run it. The design said the executor would run dedupe instead; the executor does
+  not (KIT-141). Stated here rather than left to be rediscovered.
 
 WHAT IT REFUSES (the mechanism-in-kit / operator-runs-it / refuses-in-agent-env
 doctrine, identical to the review installer)
@@ -92,25 +120,76 @@ EX_REFUSED = 3
 EX_BLOCKED = 10
 
 # --------------------------------------------------------------------------- #
-# The fence (fallback b) — the security core. Pinned by --selftest.
+# The fence — the security core. Pinned by --selftest.
 # --------------------------------------------------------------------------- #
-# Tools the planner KEEPS — it must read code and write its proposal file.
-PLANNING_KEEP_TOOLS = ["Read", "Grep", "Glob", "Write", "Task"]
+# The MCP servers the dispatcher injects into EVERY tracker-triggered session
+# (its McpConfigService, v0.2.69): `linear` — the tracker's whole write surface
+# under the dispatcher's own token; `cyrus-tools` — feedback into another agent
+# session, issue relations, uploads; `cyrus-docs` — a third-party documentation
+# fetch; `slack` — present whenever the dispatcher holds a bot token. A planner
+# needs none of them: its deliverable is a file the executor reads.
+#
+# These four are the servers every machine has. A machine can add more, through
+# the files the dispatcher config's `linearMcpConfigs` names. This installer does
+# not read that config (the review installer does, and fences what it finds), so
+# a machine carrying extra servers must have them added here before the gate goes
+# on — named in the activation checklist, not assumed away.
+PLANNER_FENCE_SERVERS = ("linear", "cyrus-tools", "cyrus-docs", "slack")
 
-# Belt-and-braces denylist. The STRUCTURAL control is linearMcpAttached=False
-# below; these names are defence-in-depth for a future entry format that attaches
-# Linear despite that. Naming them costs nothing and the guarantee does not
-# depend on them working.
-PLANNING_DISALLOWED_TOOLS = [
-    "Edit", "NotebookEdit", "WebFetch", "WebSearch",
+
+def _server_rules(server):
+    return ["mcp__%s" % server, "mcp__%s__*" % server]
+
+
+# The only shape an `mcp__` fence entry may take: one named server, whole or by
+# wildcard. An unanchored `mcp__*` or a bare `mcp__` is skipped by the runtime
+# with no error, which would read as a closed fence and be an open one. A rule
+# naming one tool (`mcp__linear__save_issue`) is refused for the same reason it
+# is unnecessary: the wildcard already covers it, and a mixed list invites the
+# belief that the named ones are the fence.
+MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
+
+# What the planner KEEPS. None of these is in the fence below, and --selftest
+# asserts it. The live probe a person runs (the activation checklist) passes only
+# when a planning session's tool list holds no name outside this set: an
+# allowlist check, because a deny list cannot name a tool the dispatcher or its
+# SDK adds later. Such a tool reaches the planner until someone adds it below.
+#
+# `Task` and `Agent` are here because the planning procedure's rubric panel is
+# five passes in fresh contexts, and collapsing them into one context is a quality
+# change, not a security one — see the docstring's "not proven" note on whether a
+# subagent inherits this fence. `Write` is NOT here: see the docstring.
+PLANNER_KEEP_TOOLS = (
+    "Read", "Grep", "Glob", "Task", "Agent", "LSP", "ToolSearch",
+    "TaskOutput", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite",
+    "CronList", "ReportFindings")
+
+# What the planner loses. The names come from the dispatcher's own list of
+# available tools (v0.2.69) and the SDK it depends on. `Agent` is the subagent
+# tool's current name and `Task` its older one; both are KEPT, deliberately.
+#
+# `Monitor` runs a shell command, and a `Bash` rule does not stop it: a deny rule
+# matches the tool's own name. The three MCP resource tools read any connected
+# server by a `server` argument, and their names do not start with `mcp__`, so
+# the server rules never reach them. `ListAgents` names the other sessions this
+# one could message, and anything it lists can reach a ticket.
+DISALLOWED_BUILTINS = [
+    "Bash", "Monitor", "REPL",                                    # runs
+    "Edit", "Write", "NotebookEdit",                              # writes any file
+    "WebFetch", "WebSearch",                                      # fetches
+    "Workflow", "RemoteTrigger", "Skill", "TaskStop",             # starts other work
     "EnterWorktree", "ExitWorktree",
-    "mcp__linear__save_issue",
-    "mcp__linear__save_issue_label",
-    "mcp__linear__create_issue_label",
-    "mcp__linear__save_comment",
-    "mcp__linear__save_project",
-    "mcp__linear__save_document",
+    "CronCreate", "CronDelete", "ScheduleWakeup",                 # schedules
+    "SendMessage", "SendUserMessage", "PushNotification",         # messages, publishes
+    "ListAgents", "Artifact", "ShareOnboardingGuide", "DesignSync",
+    "AskUserQuestion",                                            # asks a person
+    "EnterPlanMode", "ExitPlanMode",                              # switches its mode
+    "ListMcpResourcesTool", "ReadMcpResourceTool",                # reads MCP resources
+    "ReadMcpResourceDirTool",
 ]
+
+PLANNING_DISALLOWED_TOOLS = DISALLOWED_BUILTINS + [
+    rule for server in PLANNER_FENCE_SERVERS for rule in _server_rules(server)]
 
 # A label no ticket carries, so the Planning entry is NEVER label-routed — its job
 # kind comes from the team it maps to, not from text a ticket could hold (KIT-41).
@@ -125,9 +204,9 @@ PLANNING_BRIEF = (
     "tool: you cannot create, move, comment on, or label any ticket, and trying is "
     "itself a finding against you. Read the real codebase (Read/Grep/Glob), run the "
     "PRD, decomposition and rubric passes from the plan-epic procedure, then EMIT "
-    "the whole tree as ONE pipeline-safe-outputs/1 request file (a ticket-create "
-    "carrying `epic` and `children` with `depends_on`), written with the Write tool "
-    "to the run's safe-outputs path. Do not open a pull request. Do not ask "
+    "the whole tree as ONE pipeline-safe-outputs/1 document (a ticket-create "
+    "carrying `epic` and `children` with `depends_on`) in a fenced json block in "
+    "your FINAL MESSAGE. You can write no file. Do not open a pull request. Do not ask "
     "questions. A credential-holding executor validates your proposal, runs the "
     "Definition-of-Ready gate on every child, and files the tree for a person to "
     "approve — your proposal approves nothing and starts nothing."
@@ -241,16 +320,20 @@ def load_conf(path):
 def planning_entry(conf):
     """The dispatcher repository-entry that makes a delegated idea a PLANNING
     session. Composed here; a person applies it to the dispatcher's own config
-    (this installer never writes that config — see the docstring)."""
+    (this installer never writes that config — see the docstring).
+
+    NO `allowedTools` KEY. The dispatcher's permission callback allows every tool
+    whatever an `allowedTools` list says, so the key narrows nothing — and an
+    entry that carries one gets a DIFFERENT set of injected MCP servers than one
+    that does not. A key that reads as a control and is not one is the defect
+    this entry was rebuilt to remove, so it is absent, exactly as it is on a
+    review entry. What the planner keeps is whatever `disallowedTools` leaves,
+    and `PLANNER_KEEP_TOOLS` is the allowlist a person probes that against."""
     return {
         "name": "stage-a-planning-%s" % conf["PLANNING_TEAM_KEY"].lower(),
         "teamKeys": [conf["PLANNING_TEAM_KEY"]],
         "routingLabels": [PLANNING_ENTRY_NEVER_LABEL],
         "isActive": True,
-        # THE STRUCTURAL FENCE (fallback b): no Linear MCP is attached, so the
-        # session holds no mcp__linear__* tool at all.
-        "linearMcpAttached": False,
-        "allowedTools": list(PLANNING_KEEP_TOOLS),
         "disallowedTools": list(PLANNING_DISALLOWED_TOOLS),
         "appendInstruction": PLANNING_BRIEF,
     }
@@ -258,19 +341,39 @@ def planning_entry(conf):
 
 def entry_problems(entry):
     """Every way a composed entry would break the fence. --selftest asserts a
-    good entry has none, and a mutated one has the matching problem."""
+    good entry has none, and a mutated one has the matching problem.
+
+    The checks are written against LITERAL names, never against the constants
+    that BUILD the entry: a check that loops over `PLANNER_FENCE_SERVERS` stays
+    green when someone empties it, which is the one change that matters."""
     problems = []
-    if entry.get("linearMcpAttached") is not False:
-        problems.append("linearMcpAttached is not False — the STRUCTURAL fence is "
-                        "that the planner has no Linear MCP at all")
-    keep = set(entry.get("allowedTools") or [])
-    if "Write" not in keep:
-        problems.append("the planner cannot Write its proposal file")
-    if not ({"Read", "Grep", "Glob"} <= keep):
-        problems.append("the planner cannot read code (Read/Grep/Glob)")
-    disallowed = set(entry.get("disallowedTools") or [])
-    if "mcp__linear__save_issue" not in disallowed:
-        problems.append("belt-and-braces: save_issue is not in disallowedTools")
+    if "linearMcpAttached" in entry:
+        problems.append("the entry carries `linearMcpAttached` — a key the dispatcher "
+                        "never reads, which once stood in for the whole fence")
+    if "allowedTools" in entry:
+        problems.append("the entry carries `allowedTools` — it narrows nothing, and an "
+                        "entry that has one is injected a different server set")
+    disallowed = entry.get("disallowedTools") or []
+    seen = set(disallowed)
+    for server in ("linear", "cyrus-tools", "cyrus-docs", "slack"):
+        for rule in _server_rules(server):
+            if rule not in seen:
+                problems.append("the fence does not remove %s — a server the dispatcher "
+                                "injects into every session" % rule)
+    for rule in (r for r in disallowed if r.startswith("mcp__")):
+        match = MCP_FENCE_RULE_RE.match(rule)
+        if not (match and match.group(1) in PLANNER_FENCE_SERVERS):
+            problems.append("%r is not a rule anchored to one fenced server; an "
+                            "unanchored or per-tool rule is skipped by the runtime with "
+                            "no error" % rule)
+    for runs in ("Bash", "Monitor", "Edit", "Write", "NotebookEdit", "WebFetch",
+                 "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
+        if runs not in seen:
+            problems.append("the fence leaves the planner %s" % runs)
+    for kept in ("Read", "Grep", "Glob"):
+        if kept in seen:
+            problems.append("the fence removes %s, which the planner needs to read code"
+                            % kept)
     if not (entry.get("appendInstruction") or "").startswith(PLANNING_BRIEF_FINGERPRINT):
         problems.append("the entry carries no planning brief")
     if entry.get("routingLabels") != [PLANNING_ENTRY_NEVER_LABEL]:
@@ -566,26 +669,91 @@ def selftest():
         check("no-move-approve-merge:%s" % tok, tok in scanned, False)
 
     # 2. THE FENCE. A good Planning entry has no fence problems; each mutation
-    #    that breaks the fence is caught.
+    #    that breaks it is caught. The servers are pinned as LITERALS, not read
+    #    back out of the constant that builds the fence — a check that loops over
+    #    PLANNER_FENCE_SERVERS stays green when someone empties it.
     good = planning_entry(GOOD_CONF)
     check("fence-good-clean", entry_problems(good), [])
-    check("fence-structural-no-linear-mcp", good["linearMcpAttached"], False)
-    check("fence-keeps-write", "Write" in good["allowedTools"], True)
-    check("fence-keeps-read", {"Read", "Grep", "Glob"} <= set(good["allowedTools"]), True)
-    check("fence-belt-names-save_issue",
-          "mcp__linear__save_issue" in good["disallowedTools"], True)
+    check("fence-servers-pinned", PLANNER_FENCE_SERVERS,
+          ("linear", "cyrus-tools", "cyrus-docs", "slack"))
+    for rule in ("mcp__linear", "mcp__linear__*", "mcp__cyrus-tools",
+                 "mcp__cyrus-tools__*", "mcp__cyrus-docs", "mcp__cyrus-docs__*",
+                 "mcp__slack", "mcp__slack__*"):
+        check("fence-removes:%s" % rule, rule in good["disallowedTools"], True)
+    # The key that once stood in for the whole fence is GONE, and its absence is
+    # asserted rather than assumed: the dispatcher never read it.
+    check("fence-no-unread-key", "linearMcpAttached" in good, False)
+    check("fence-no-allowed-tools", "allowedTools" in good, False)
+    # Every tool that runs, writes elsewhere, fetches, schedules, messages or
+    # reads an MCP resource by argument is named.
+    for name in ("Bash", "Monitor", "REPL", "Edit", "Write", "NotebookEdit", "WebFetch",
+                 "WebSearch", "Workflow", "RemoteTrigger", "Skill", "TaskStop",
+                 "EnterWorktree", "ExitWorktree", "CronCreate", "CronDelete",
+                 "ScheduleWakeup", "SendMessage", "SendUserMessage", "PushNotification",
+                 "ListAgents", "Artifact", "ShareOnboardingGuide", "DesignSync",
+                 "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+                 "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool"):
+        check("fence-removes-builtin:%s" % name, name in good["disallowedTools"], True)
+    check("fence-builtin-count", len(DISALLOWED_BUILTINS) == 30
+          and len(set(DISALLOWED_BUILTINS)) == 30, True)
+    check("fence-rule-count", len(good["disallowedTools"]), 30 + 8)
+    # …and what it KEEPS is kept: nothing the planner needs is in the fence, and
+    # nothing is on both sides of the line.
+    for kept in ("Read", "Grep", "Glob", "Task", "Agent"):
+        check("fence-keeps:%s" % kept, kept in good["disallowedTools"], False)
+    # WRITE IS FENCED. The OS sandbox confines only shell commands, and the
+    # dispatcher hot-reloads its config and loads a worktree `.mcp.json`: a planner
+    # that could Write could rewrite its own fence.
+    check("fence-removes-write", "Write" in good["disallowedTools"], True)
+    check("fence-keep-set-has-no-writer",
+          [t for t in ("Write", "Edit", "NotebookEdit", "Bash") if t in PLANNER_KEEP_TOOLS], [])
+    check("brief-says-no-file",
+          "FINAL MESSAGE" in PLANNING_BRIEF and "Write tool" not in PLANNING_BRIEF, True)
+    check("fence-keep-set-disjoint",
+          sorted(set(DISALLOWED_BUILTINS) & set(PLANNER_KEEP_TOOLS)), [])
+    # The dispatcher's own list of available tools, v0.2.69, as a literal. A name
+    # on neither side of the line is a tool nobody decided about.
+    dispatcher_tools_0_2_69 = (
+        "Read", "Edit", "Write", "Bash", "Task", "WebFetch", "WebSearch", "TaskCreate",
+        "TaskUpdate", "TaskGet", "TaskList", "NotebookEdit", "Skill", "SendMessage",
+        "PushNotification", "ShareOnboardingGuide", "EnterWorktree", "ExitWorktree",
+        "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "Monitor", "LSP",
+        "RemoteTrigger", "TaskOutput", "TaskStop", "ToolSearch", "DesignSync", "Workflow",
+        "ReportFindings")
+    check("fence-every-dispatcher-tool-classified",
+          [t for t in dispatcher_tools_0_2_69
+           if t not in DISALLOWED_BUILTINS and t not in PLANNER_KEEP_TOOLS], [])
     check("fence-brief-present",
           good["appendInstruction"].startswith(PLANNING_BRIEF_FINGERPRINT), True)
     check("fence-never-label-routed", good["routingLabels"], [PLANNING_ENTRY_NEVER_LABEL])
-    # mutants
-    m = dict(good); m["linearMcpAttached"] = True
-    check("fence-mutant-attaches-linear", bool(entry_problems(m)), True)
-    m = dict(good); m["allowedTools"] = ["Read", "Grep", "Glob"]  # no Write
-    check("fence-mutant-no-write", bool(entry_problems(m)), True)
-    m = dict(good); m["disallowedTools"] = ["Edit"]  # belt dropped
-    check("fence-mutant-no-belt", bool(entry_problems(m)), True)
+    # mutants — each one is a way the fence could be quietly reopened.
+    m = dict(good); m["linearMcpAttached"] = False
+    check("fence-mutant-reintroduces-unread-key", bool(entry_problems(m)), True)
+    m = dict(good); m["allowedTools"] = ["Read", "Grep"]
+    check("fence-mutant-adds-allowed-tools", bool(entry_problems(m)), True)
+    m = dict(good)
+    m["disallowedTools"] = [t for t in good["disallowedTools"] if t != "mcp__linear__*"]
+    check("fence-mutant-drops-wildcard-form", bool(entry_problems(m)), True)
+    m = dict(good)
+    m["disallowedTools"] = [t for t in good["disallowedTools"]
+                            if not t.startswith("mcp__cyrus-tools")]
+    check("fence-mutant-drops-a-server", bool(entry_problems(m)), True)
+    m = dict(good); m["disallowedTools"] = [t for t in good["disallowedTools"] if t != "Write"]
+    check("fence-mutant-gives-back-write", bool(entry_problems(m)), True)
+    m = dict(good); m["disallowedTools"] = good["disallowedTools"] + ["Read"]
+    check("fence-mutant-removes-read", bool(entry_problems(m)), True)
+    m = dict(good)
+    m["disallowedTools"] = [t for t in good["disallowedTools"] if t != "Bash"]
+    check("fence-mutant-leaves-bash", bool(entry_problems(m)), True)
     m = dict(good); m["routingLabels"] = ["ready"]  # label-routable
     check("fence-mutant-label-routed", bool(entry_problems(m)), True)
+    # A rule the runtime would skip in SILENCE is refused, not accepted as fence.
+    for bad in ("mcp__*", "mcp__", "mcp__linear__save_issue", "mcp__linear__foo__*"):
+        m = dict(good); m["disallowedTools"] = good["disallowedTools"] + [bad]
+        check("fence-rejects-shape:%s" % bad, bool(entry_problems(m)), True)
+        match = MCP_FENCE_RULE_RE.match(bad)
+        check("fence-rule-re-refuses:%s" % bad,
+              bool(match and match.group(1) in PLANNER_FENCE_SERVERS), False)
 
     # 3. Conf validator reports EVERY error in one pass.
     bad_conf, _ = parse_conf("PLANNING_TEAM_KEY=PLAN\nKIT_REPO_URL=git@x\n"
