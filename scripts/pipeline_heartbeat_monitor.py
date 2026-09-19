@@ -233,7 +233,10 @@ WATCHERS = {
         "ts_fields": ("finished_at", "at", "started_at"),
         "result_field": "result",
         "bool_field": None,
-        "good": ("ok", "idle"),
+        # `declined` is a pass whose only non-clean PRs were ones it was never meant to act
+        # on, and `paused` is a pass a person stopped on purpose with a PAUSED file (KIT-112).
+        # Both beat on schedule and neither is a job that is down or failing.
+        "good": ("ok", "idle", "declined", "paused"),
         "running": ("running",),
     },
     "finding-poller": {
@@ -256,7 +259,13 @@ WATCHERS = {
 # Verdicts that mean a person should look. `unreadable` is in here on purpose: a monitor
 # that cannot judge must be as loud as a job that is down, or "I could not tell" quietly
 # becomes "nothing to report".
-PROBLEM_VERDICTS = ("missing", "unreadable", "failing", "stale", "wedged")
+PROBLEM_VERDICTS = ("missing", "unreadable", "failing", "stale", "wedged", "paused-too-long")
+# A DELIBERATE PAUSE IS HEALTHY; A FORGOTTEN ONE IS NOT (review of #137). A `PAUSED` file
+# stops the bounce driver and survives a reboot and an installer run by design, so nothing
+# ever clears it but a person — and to every alarm a paused driver reads exactly like a
+# working one. After this many hours the monitor says so once, which is the only thing in
+# the system that would ever bring someone back to the file they wrote.
+PAUSED_MAX_SECONDS = 48 * 3600
 # Verdicts that do not page. `unknown-after-gap` is the sleep blind spot: not a problem,
 # not a clean bill of health either, and it is always NAMED in the report.
 QUIET_VERDICTS = ("ok", "running", "unknown-after-gap")
@@ -273,6 +282,7 @@ VERDICT_SENTENCE = {
     "stale": "has not written since",
     "wedged": "started a pass and never finished it",
     "unknown-after-gap": "staleness not judged (this monitor had no recent run to measure from)",
+    "paused-too-long": "is paused, and has been for longer than anyone plausibly meant",
 }
 
 CONFIG_KEYS = {
@@ -448,9 +458,22 @@ def judge_one(job, spec, raw, now, limit, blind):
                             "never finished" if running else ""))
         return out
     if out["result"] in (spec.get("good") or ()):
+        paused_for = _paused_seconds(raw.get("doc") or {}, now)
+        if out["result"] == "paused" and paused_for is not None and paused_for > PAUSED_MAX_SECONDS:
+            out["verdict"] = "paused-too-long"
+            out["detail"] = ("paused on purpose since %s (%s) — beating normally and doing "
+                             "nothing. Nothing clears a pause but a person, so this says so "
+                             "once: remove %s, or write down that it stays"
+                             % ((raw.get("doc") or {}).get("paused_since") or "an unknown time",
+                                human_age(paused_for), (raw.get("doc") or {}).get("pause_path")
+                                or "the PAUSED file in the driver's state directory"))
+            return out
         out["verdict"] = "ok"
-        out["detail"] = "last beat %s ago, result %r" % (human_age(out["age_seconds"]),
-                                                         out["result"])
+        out["detail"] = "last beat %s ago, result %r%s" % (
+            human_age(out["age_seconds"]), out["result"],
+            "" if out["result"] != "paused" else
+            " (paused on purpose since %s — it is doing nothing, deliberately)"
+            % ((raw.get("doc") or {}).get("paused_since") or "an unknown time"))
     elif running:
         out["verdict"] = "running"
         out["detail"] = "last beat %s ago, a pass was in flight" % human_age(out["age_seconds"])
@@ -460,6 +483,17 @@ def judge_one(job, spec, raw, now, limit, blind):
                          "which is not the same as being down"
                          % (human_age(out["age_seconds"]), out["result"]))
     return out
+
+
+def _paused_seconds(doc, now):
+    """How long this driver has been paused, or None when the beat does not say.
+
+    The driver writes `paused_since` from the PAUSE file's own mtime, so this measures the
+    file a person left behind rather than anything the driver could drift on."""
+    when = parse_iso(doc.get("paused_since"))
+    if when is None:
+        return None
+    return max(0, now - when)      # parse_iso answers in seconds, as every caller here reads it
 
 
 def human_age(seconds):
@@ -1168,6 +1202,25 @@ def selftest():
     ok("bounce driver: finished_at is preferred over the running beat's at",
        verdict("bounce-driver", beat("bounce-driver", result="ok", at=old,
                                      finished_at=fresh)) == "ok")
+    # A DELIBERATE PAUSE IS HEALTHY; A FORGOTTEN ONE IS NOT (review of #137). Nothing but a
+    # person clears a PAUSED file, and to every other alarm a paused driver looks like a
+    # working one — so this is the only thing that would ever bring someone back to it.
+    ok("bounce driver: a fresh pause is a GOOD result, not a problem",
+       verdict("bounce-driver", beat("bounce-driver", result="paused", at=fresh,
+                                     paused_since=_iso(NOW - 3600))) == "ok")
+    ok("bounce driver: …and the row says it is paused rather than merely fine",
+       "paused on purpose" in judge_one("bounce-driver", WATCHERS["bounce-driver"],
+                                        beat("bounce-driver", result="paused", at=fresh,
+                                             paused_since=_iso(NOW - 3600)),
+                                        NOW, 600, False)["detail"])
+    ok("bounce driver: a pause older than the bound is a problem, said once",
+       verdict("bounce-driver", beat("bounce-driver", result="paused", at=fresh,
+                                     paused_since=_iso(NOW - PAUSED_MAX_SECONDS - 60)))
+       == "paused-too-long")
+    ok("bounce driver: …and that verdict pages",
+       "paused-too-long" in PROBLEM_VERDICTS and "paused-too-long" not in QUIET_VERDICTS)
+    ok("bounce driver: a pause whose beat does not say when stays good",
+       verdict("bounce-driver", beat("bounce-driver", result="paused", at=fresh)) == "ok")
     ok("finding poller: result ok ⇒ ok",
        verdict("finding-poller", beat("finding-poller", result="ok", ended_at=fresh)) == "ok")
     ok("finding poller: result error ⇒ failing",

@@ -244,6 +244,38 @@ redesigns Stage E for what actually runs.
 >   the restart. Coding sessions keep the tracker tools, which they need to report their
 >   work, so accepted risk 2 and live test 7 still stand for them.
 
+> **Update (2026-09-17) — a review that could not see the change is a decline, not a pass
+> (KIT-137).** Decision 4 says a review that could not run is visibly different from one
+> that ran clean. One path broke that from the start.
+>
+> - **The gap.** A reviewer handed a description with no diff, or no criteria, was told to
+>   say so in `summary` and return an empty findings list. That document conforms, so the
+>   publisher read it as usable and clean. It posted the ordinary review comment, and the
+>   bounce driver concluded the pull request and moved its ticket to Needs Approval.
+>   `summary` is prose, and nothing downstream reads prose.
+> - **The fix is one optional field.** `pipeline-review/1` gains `blocked`: one line saying
+>   what the reviewer could not see. Set, the publisher declines exactly as it does for a
+>   malformed document — the same *NOT reviewed* comment, the same `usable: false` — so the
+>   bounce driver's existing refusal to conclude an unusable review covers it with no change
+>   of its own. The PR comment says *could not review*, not *malformed*, so nobody goes
+>   hunting a schema bug. Absent, `null`, `false` and the usual negative words mean not
+>   blocked, because a false decline is its own kind of noise.
+> - **Every copy of the brief moved together.** The ticket body, the local rubric, the
+>   installer's `appendInstruction`, this repository's session brief and the operator doc
+>   all tell a blocked reviewer to set `blocked`. The installer's copy reaches the reviewer
+>   only after its owner re-runs the installer, which restarts the dispatcher. The first
+>   sentence of that brief is unchanged, because the installer uses it to recognise the
+>   entries it owns.
+> - **Both publishers learn it together.** The schema accepts `blocked`, so any publisher
+>   that validates against it must read the field too, or a blocked review would pass as a
+>   clean one. The local publisher and the cloud template's normalize step both decline on
+>   it, and the emit battery runs both over the same spellings so they cannot drift. A
+>   project must take the schema and its review workflow in the same sync.
+> - **Still open.** The field is reviewer-authored, so it is reporting and never authority.
+>   A reviewer that is blocked and says nothing is unchanged by it (no ticket yet). A
+>   declined review is announced once, on the PR, and then held in silence by the bounce
+>   driver (KIT-142).
+
 ## Decision
 
 **Stage E is a poller running as the dispatcher's own role account that speaks to the
@@ -371,7 +403,9 @@ fence tags; it writes exactly one routing tag of its own, in its trusted header
 (amended 2026-09-08) — and then creates **and** delegates, in one `issueCreate{…, delegateId}`
 carrying an owner-scoped Linear key, a review ticket in a dedicated Reviews team: title
 `Review PR #<n> — <TICKET-ID>`, description = the review brief with the diff inlined under
-a size cap (above the cap ⇒ decline, reason *diff too large to deliver*), **never
+a size cap (above the cap ⇒ whole files are withheld, largest first, and the review is
+marked `coverage: partial` — *amended 2026-09-17, KIT-138*; a change where no single file
+fits alone is still declined, reason *diff too large to deliver*), **never
 parented** (a sub-issue would be based on its parent's branch), never linked to the PR by
 branch, title or body. The dispatcher sees a delegation by the owner and starts a session
 in the Reviews entry, exactly as it starts any other. The poller then reads that ticket's
@@ -813,6 +847,49 @@ Change dispatchers and this table is the porting checklist. The one Cyrus fact t
 text isolated — *worktree force-deletion on ticket close* (KIT-51) — is the last row, now
 one of eight rather than the only one, and E's answer is unchanged: never move the
 original ticket, never merge.
+
+> **Update (2026-09-17) — the finalization round: what no longer says one thing and does
+> another.** Six changes, each its own pull request and ticket, none changing a decision
+> above. Each closed a place where a component reported a fact the machine did not support.
+>
+> - **A review that could not see the change declines (KIT-137).** Recorded in its own
+>   Update block, dated the same day, near the top of this record.
+> - **A change over the size cap is reviewed in part (KIT-138).** Whole files are withheld,
+>   largest first, and the review is marked `coverage: partial`. A partial review can
+>   bounce on what it found and can never conclude. This replaces decline-at-the-cap, which
+>   left the largest changes with no review at all. Splitting into several paid reviews was
+>   rejected on cost; a page was rejected because the notifier deliberately does not page on
+>   a review verdict.
+> - **A failed review-telemetry row is retried under a stable run id (KIT-139).** The row's
+>   id is now the review's, as §4 already required. The *review poller's* row only — the
+>   bounce driver's ids are still time-based and its first failure is still lost (KIT-165).
+> - **The bounce driver has a declined exit code and a durable pause (KIT-112).** Exit 3 is
+>   the review poller's code for the same sentence. A `PAUSED` file in the state directory
+>   survives an installer run and a reboot, which unloading the job never did.
+> - **A label with no id is said once (KIT-152).** Exhaustion used to re-run on every pass.
+> - **The installer's `code`, `dispatcher-entry` and `configs` checks tell the truth
+>   (KIT-149).** `verify` reads *behind* only when a file the jobs run moved; the hand
+>   sign-off of the entries' load binds to the entries; the session-log root is checked.
+>
+> **The conflict loop is ported to the product repository, on an open pull request**
+> (TOD-125). When it merges, a dispatcher's conflicted pull request there gets a fix
+> request the bounce driver answers; until then that repository is where it was. On the
+> kit itself bounce stays off by design, so a kit dispatcher PR's conflict is paged, not
+> fixed.
+>
+> **Still open, each with a home — and this list is not the whole of it.** A declined
+> review is held in silence after its one PR comment (KIT-142). No job's log is trimmed
+> (KIT-159). `auth_mode` is a literal on every row (KIT-160). The *bounce driver's*
+> telemetry ids can still collide, and its failed first row is not retried (KIT-165) — the
+> retry above is the review poller's row only. The review sanitizer still rewrites
+> config-shaped text inside a diff (KIT-168).
+>
+> **None of the six changes above has run on a deployment.** They are proven by selftest,
+> by a fail-first run of each new check, and by the seven branches passing as a union — not
+> by a live pull request. What the 2026-09-12 block lists as unestablished is unchanged, and
+> everything this round touched joins it (KIT-99). The loop itself is not unexercised: that
+> block records it running end to end on 2026-09-08, and this sentence narrows the claim to
+> this round's code.
 
 ## Where Stage E lives
 

@@ -350,7 +350,8 @@ jobs:
              "findings":[
                {"severity":"high","category":"security","file":"src/x.ts","line":42,
                 "summary":"one line","detail":"why it is wrong and what would fix it"}
-             ]}
+             ],
+             "blocked":null}
 
             `category` is one of correctness, security, tests, scope. Omit `line` if it
             does not apply. `detail` is read by the humans on this PR and by the fix
@@ -364,6 +365,14 @@ jobs:
             `detail`, or a field the schema does not define, and the ENTIRE review is
             reported as unusable — the PR is treated as unreviewed, and everything you
             did find is lost with it. Lower case, exact field names, nothing extra.
+
+            IF YOU CANNOT JUDGE THIS CHANGE AT ALL — the diff file is missing, empty or
+            truncated, or the criteria never arrived — set `blocked` to one line saying
+            what was missing and return an EMPTY findings list with the schema intact.
+            Never invent either. `blocked` is the ONLY thing that makes your inability
+            machine-readable: an empty findings list on its own is published as a CLEAN
+            REVIEW of a change you never saw. Leave `blocked` null on every review you
+            could do — including one where the diff was large but complete.
 
             Do not post a comment, do not approve, do not push,
             do not modify any source file — you have no tools to do any of it, and the file
@@ -395,8 +404,25 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/findings"
           python3 - <<'PY'
-          import json, os, sys
+          import json, os, re, sys
           RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+          # KIT-137: the spellings of "not blocked" that pipeline_review_local.blocked_reason
+          # also reads as not blocked. emit_document's battery runs both over the same inputs.
+          NOT_BLOCKED = {"", "no", "none", "null", "false", "nil", "n/a", "na", "n a",
+                         "not blocked", "nothing", "not applicable", "no blockers",
+                         "no blocker", "none applicable", "nothing to report",
+                         "nothing blocking", "no issues", "no problems", "not needed",
+                         "empty", "false alarm", "unblocked"}
+          NOT_BLOCKED_TAIL = re.compile(r"^(?P<head>[a-z/ ]{1,16}?)\s*[-—:;,(]")
+
+          def reads_as_not_blocked(text):
+              # The head of the value, up to the first punctuation: "none — the diff was
+              # complete" is "none". One direction only, as in the local publisher.
+              core = str(text or "").strip().lower().strip(".!?*`\"' ")
+              if core in NOT_BLOCKED:
+                  return True
+              m = NOT_BLOCKED_TAIL.match(core)
+              return bool(m) and m.group("head").strip() in NOT_BLOCKED
           # Contract §14, held to schemas/review-findings.schema.json — staged in
           # the prep step from the DEFAULT BRANCH, never read out of the head this
           # job checked out. An unreachable gate is itself a shape failure: a
@@ -430,6 +456,22 @@ jobs:
               problems = document_problems(doc, "review-findings")
               if problems:
                   raise ValueError("; ".join(problems[:5]))
+              # A CONFORMING DOCUMENT CAN STILL BE A NON-REVIEW (KIT-137). A reviewer that
+              # could not see the change says so in `blocked`, and an empty findings list
+              # beside it means "could not review", never "clean". The schema accepts the
+              # field, so this lane must read it or it would publish that as clean.
+              blocked = doc.get("blocked")
+              said = " ".join(str(blocked).split()) if blocked not in (None, False, True) else ""
+              if blocked is True or (blocked not in (None, False)
+                                     and not reads_as_not_blocked(said)):
+                  # The count of findings that will NOT be acted on is said out loud, here
+                  # as in the local lane: a blocked review that found things still found
+                  # them, and silence about that reads as "there was nothing" (§13).
+                  also = len(doc.get("findings") or [])
+                  raise ValueError("the reviewer reported it could not review this change: %s%s"
+                                   % (said[:300] or "no reason given",
+                                      "" if not also else
+                                      " (it also listed %d finding(s), which are not acted on)" % also))
               findings = doc["findings"]
               out["summary"] = doc["summary"][:2000]
               out["findings"] = findings[:50]

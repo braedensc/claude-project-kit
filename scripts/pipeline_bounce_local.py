@@ -280,7 +280,11 @@ STATE-DIR CONTRACT WITH THE POLLER (file conventions only — no import either w
       `outcomes/<OWNER>__<REPO>/pr-<n>.json` and `outcomes/pr-<n>.json` are still read):
       {"outcome_schema": "pipeline-review-outcome/1", "repo", "pr", "ticket_id" (or the
        older "ticket"), "head_branch", "usable", "max_severity", "meets_threshold",
-       "review_ticket", "threshold", "summary", "findings", "reason", "at", "head_sha"?}
+       "review_ticket", "threshold", "summary", "findings", "reason", "at", "head_sha"?,
+       "coverage"?, "withheld_files"?}
+      An absent `coverage` means the review saw the WHOLE change. `"partial"` means whole
+      files were withheld from the reviewer over the size cap, and it can never be read as
+      clean: such a review may bounce on what it found, and never concludes (KIT-138).
       A record carrying a DIFFERENT `outcome_schema`, or one that cannot be read, is
       REFUSED — exit 2 and a PR comment — never read as "no review" (§13): the
       difference between "never reviewed" and "reviewed, record unreadable" is the whole
@@ -444,6 +448,19 @@ import pr_conflict as prc  # noqa: E402
 
 EXIT_OK = 0
 EXIT_USAGE = 2
+# NOT A FAILURE, AND NOT NOTHING (KIT-112). A pass that deliberately did nothing for a pull
+# request it was never meant to act on, or a whole pass a person paused. The review poller
+# has used 3 for the same sentence since it shipped; the selftest asserts the two agree.
+# Before this every such decline returned 2, the pass took the worst code, its heartbeat
+# read `problems`, and the heartbeat monitor paged — for as long as that PR stayed open.
+EXIT_DECLINED = 3
+
+# The durable pause (KIT-112). A file of this name in the state directory makes the daemon's
+# pass do nothing and say so. It lives on disk under the role account, so neither an
+# installer run (which re-loads every job) nor a reboot re-arms a paused driver — the
+# failure that re-prompted a session twelve seconds after an unrelated `run` on 2026-09-08.
+# Its first line, if any, is the reason, and it is printed on every pass.
+PAUSE_FILE = "PAUSED"
 
 # Everything this driver reads or writes lives under the DAEMON ACCOUNT's home — the
 # dispatcher's own role account (owner decision "C1") — beside the mode-600 env file the
@@ -620,6 +637,16 @@ class Decline(BounceError):
     def __init__(self, reason, sit):
         super().__init__(reason)
         self.sit = sit
+
+
+class NotEligible(Decline):
+    """A pull request this driver was never meant to act on: its branch is not a pipeline
+    ticket branch, names no ticket this project runs, or names a ticket that does not own
+    it. Said on the PR exactly like any decline, and exit 3, not 2 (KIT-112). It is nothing
+    to do for THIS pull request; reading it as a failure made one such PR page the owner on
+    every monitor pass for as long as it stayed open. A refusal because something is WRONG
+    — a credential, a withheld secret, a ledger that disagrees with the PR — stays a plain
+    Decline, exit 2, because a person does need to look at those."""
 
 
 def _now_iso():
@@ -1437,6 +1464,32 @@ def compute_trigger(checks_status, failing, outcome, fresh, fresh_reason, cannot
     return False, "checks are %s and no review outcome is recorded" % checks_status, None, cannot
 
 
+def partial_review_note(outcome, fresh, trigger_ok, cannot_evaluate, already_said=()):
+    """The one sentence that routes a PARTIAL review to a person, or "" (KIT-138).
+
+    A review that saw only part of a change can bounce on what it found, but it can never
+    conclude, so without this the driver would hold it in silence forever. It fills the
+    §13 third state — `cannot_evaluate` — exactly where the quiet skip would otherwise sit:
+    no live trigger, a fresh usable review, nothing else already unreadable.
+
+    SAID ONCE, THEN HELD (review of #143). `cannot_evaluate` makes the pass exit 2, and a
+    partial review is permanent for the life of the pull request — so left unqualified this
+    pinned the driver's heartbeat at `problems` forever, which pages once and then MASKS
+    every later failure behind the same fingerprint. `already_said` is the decline marker
+    this driver keeps per reason: once the sentence is on the pull request, the hand-off is
+    done and the pass goes quiet about it. A person has it; repeating is not escalation."""
+    if trigger_ok or cannot_evaluate or not fresh or not outcome:
+        return ""
+    if not outcome.get("usable") or outcome.get("coverage") != "partial":
+        return ""
+    withheld = [str(p) for p in (outcome.get("withheld_files") or [])]
+    note = ("the review saw only part of this change: %d file(s) were withheld from the reviewer "
+            "over the size cap (%s). Stage E can bounce on what it found but can never conclude "
+            "this PR, so a person must review the withheld files"
+            % (len(withheld), ", ".join(withheld[:5]) + (" …" if len(withheld) > 5 else "")))
+    return "" if note in set(already_said or ()) else note
+
+
 def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
     """'clean' | 'below-threshold' | None — the basis for a DURABLE conclusion, or None
     when there is nothing to conclude yet. This is the answer the driver used to compute,
@@ -1459,6 +1512,8 @@ def conclusion_basis(checks_status, outcome, fresh, trigger_ok):
         return None
     if not outcome.get("usable") or outcome.get("meets_threshold"):
         return None
+    if outcome.get("coverage") == "partial":
+        return None     # KIT-138: a review of part of a change is never a clean bill for all of it
     if checks_status not in ("green", "none"):
         return None
     return "below-threshold" if (outcome.get("findings") or outcome.get("max_severity")) else "clean"
@@ -1496,8 +1551,57 @@ def notice_pending(notices, head_sha, kind):
     return (str(head_sha or ""), str(kind or "")) not in seen
 
 
+# A LABEL THAT CANNOT BE APPLIED BECAUSE NOBODY CONFIGURED ITS ID (KIT-152). Not a
+# transient failure, so not something to retry every pass: `announced["label"]` records
+# this instead of False, the announcement counts as complete while no id is configured,
+# and the gap is said ONCE. Before, the label step could never land, so every pass re-ran
+# the announcement, appended a ledger row, posted another telemetry comment on the coding
+# ticket and exited 2 — paging the owner on every monitor pass, forever.
+LABEL_NOT_CONFIGURED = "no-id"
+
+
+def announcement_complete(announced, label_configured):
+    """Whether every step of an exhaustion or no-push announcement has landed. A label
+    recorded as LABEL_NOT_CONFIGURED counts only while there is still no id: configure one
+    and the next pass applies it, and nothing else."""
+    if not announced:
+        return False
+    for step, value in announced.items():
+        if value is True:
+            continue
+        if step == "label" and value == LABEL_NOT_CONFIGURED and not label_configured:
+            continue
+        return False
+    return True
+
+
+def seed_label(prev_value):
+    """What a previous row said about the label, kept as one of True / False / no-id."""
+    return LABEL_NOT_CONFIGURED if prev_value == LABEL_NOT_CONFIGURED else bool(prev_value)
+
+
+def apply_needs_human(issue, label_id, current, cfg):
+    """(new label state, problem or None). The one place both announcements apply the label."""
+    if current is True:
+        return True, None
+    if not issue.get("id"):
+        return current, "label: no original ticket resolved for this PR"
+    if not label_id:
+        if current == LABEL_NOT_CONFIGURED:
+            return current, None                     # said once already; holding, not retrying
+        return LABEL_NOT_CONFIGURED, (
+            "label: no id for %s, so it was not applied (set linear.labels.ids in the committed "
+            "delivery.json or needs_human_label_id in the config). Said once: later passes hold "
+            "instead of retrying, and apply it on the first pass that finds an id" % NEEDS_HUMAN_KEY)
+    try:
+        linear_add_label(issue["id"], label_id, cfg)
+        return True, None
+    except BounceError as exc:
+        return False, "label: %s" % exc
+
+
 def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
-                   blocked_after_seconds):
+                   blocked_after_seconds, label_configured=True):
     """The one thing that was missing when a re-prompted session stops: a MEASURED signal
     that it has, once per bounce. Returns {'bounce_no', 'at', 'waited_seconds', 'head_sha'}
     or None.
@@ -1528,7 +1632,10 @@ def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
     bounce number is the stop. A later bounce that is itself ignored signals again — once
     per bounce, which is what makes the budget still mean something. A partly-announced
     row (the comment landed, the label did not) is not a stop, so the next pass completes
-    it, exactly as a partial exhaustion is completed.
+    it, exactly as a partial exhaustion is completed — with one exception (KIT-152). A
+    label recorded as LABEL_NOT_CONFIGURED counts as landed while `label_configured` is
+    False: no id exists to apply, so retrying every pass would only repeat the problem.
+    Configure an id and the row is incomplete again, so the next pass applies the label.
 
     Never fires for an unreadable timestamp: a clock that cannot be read has not told us
     the deadline passed, and inventing one would page a person from a hand-edited ledger."""
@@ -1549,8 +1656,7 @@ def blocked_signal(*, last_spent, delivered_bounces, blocked_row, head_sha, now,
         return None
     prior = blocked_row or {}
     if prior.get("bounce_no") == bounce_no:
-        announced = prior.get("announced") or {}
-        if announced and all(bool(v) for v in announced.values()):
+        if announcement_complete(prior.get("announced") or {}, label_configured):
             return None
     return {"bounce_no": bounce_no, "at": last_spent.get("at"), "waited_seconds": int(waited),
             "head_sha": str(head_sha)}
@@ -2574,8 +2680,23 @@ def post_pr_comment(pr_number, body, owner_repo, dry_run):
     prl.post_comment(pr_number, body, owner_repo, dry_run)
 
 
+def said_reasons(state_dir, owner_repo, pr_number):
+    """Every could-not this driver has already said on a pull request. The marker
+    `announce_could_not` writes, read back — so a verdict can tell a first hand-off from a
+    repetition, rather than repeating one for the life of the PR (review of #143)."""
+    marker = os.path.join(state_dir, "declines", repo_slug(owner_repo), "pr-%d.json" % pr_number)
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            said = json.load(fh) or {}
+    except (OSError, ValueError):
+        return ()
+    reasons = said.get("reasons")
+    return tuple(reasons) if isinstance(reasons, dict) else ()
+
+
 def announce_could_not(sit, reason, state_dir, dry_run):
-    """Best effort, and the caller keeps its exit 2 either way: ONE PR comment saying what
+    """Best effort, and the caller keeps its own exit code either way — 2 for a could-not,
+    3 for a pull request that was never this driver's (KIT-112). ONE PR comment saying what
     the driver could not do — when the PR is known, open and ours (never a fork's), and
     the same reason was not already said. A marker under <state_dir>/declines/ dedupes
     per reason, so a poller on a five-minute cycle says it once. Never a ledger row: the
@@ -2707,7 +2828,7 @@ def _gather_after_pr(sit, cfg, state_dir):
         return sit
 
     if not PIPELINE_BRANCH_RE.fullmatch(sit["branch"]):
-        raise Decline("head branch %r is not a pipeline ticket branch (<type>/<team>-<n>-<slug>, "
+        raise NotEligible("head branch %r is not a pipeline ticket branch (<type>/<team>-<n>-<slug>, "
                       "[a-z0-9-] only) — not this driver's to bounce, and a character outside "
                       "that alphabet would break the fallback ticket's routing tag" % sit["branch"], sit)
 
@@ -2743,7 +2864,14 @@ def _gather_after_pr(sit, cfg, state_dir):
                              "Linear's record.\n"
                              % (owner_repo, pr_number, sit["branch"], why))
     if not sit["ticket_id"]:
-        raise Decline("no pipeline ticket identified for branch %r (its team key is not one this "
+        if not (cfg.get("team_keys") or []):
+            # NOT an eligibility refusal (review of #137). With no team keys configured, EVERY
+            # pull request lands here, and a decline reads as healthy — so a misconfiguration
+            # would look exactly like a quiet machine. A configuration fault is exit 2.
+            raise Decline("no team keys are configured (`team_keys` is empty), so no branch can "
+                          "name a ticket this driver manages — every PR would decline. Set it in "
+                          "the driver's config", sit)
+        raise NotEligible("no pipeline ticket identified for branch %r (its team key is not one this "
                       "driver manages) — a bounce needs a ticket to re-prompt" % sit["branch"], sit)
 
     required, checks_source, checks_detail = required_checks(
@@ -2758,13 +2886,16 @@ def _gather_after_pr(sit, cfg, state_dir):
     # Whether a second look is already coming. Read here, with the rest of the facts, so
     # the verdict stays a pure function of the situation.
     sit["rereview_queued"] = rereview_request_outstanding(state_dir, owner_repo, pr_number)
+    # What this driver has ALREADY said on this pull request, read here with every other
+    # fact so the verdict stays a pure function of the situation (review of #143).
+    sit["said_reasons"] = said_reasons(state_dir, owner_repo, pr_number)
 
     issue = linear_issue(sit["ticket_id"], cfg)
     sit["issue"] = issue
     state = issue.get("state") or {}
     sit["ticket_state_type"], sit["ticket_state_name"] = state.get("type"), state.get("name")
     if sit["ticket_source"] == "branch" and not ticket_owns_pr(issue, sit["branch"], sit["pr_url"]):
-        raise Decline("branch names a ticket that does not own this PR: %s's suggested branch is %r "
+        raise NotEligible("branch names a ticket that does not own this PR: %s's suggested branch is %r "
                       "and none of its attachments is %s — the branch name is a hint the session "
                       "chose, not an identity" % (sit["ticket_id"], issue.get("branchName") or "",
                                                  sit["pr_url"] or "the PR"), sit)
@@ -2807,6 +2938,8 @@ def decision_for(sit, cfg):
     trigger_ok, trigger_reason, kind, cannot_evaluate = compute_trigger(
         sit.get("checks_status"), sit.get("failing_checks") or [], sit.get("outcome"),
         fresh, fresh_reason, cannot_note)
+    cannot_evaluate = cannot_evaluate or partial_review_note(
+        sit.get("outcome"), fresh, trigger_ok, cannot_evaluate, sit.get("said_reasons") or ())
     # The note rides along on an ordinary skip as before — and ALSO on a bounce that a
     # review triggered while CI stayed unreadable, so "we bounced, but half the evidence
     # was never available" is said rather than implied. A check waiting on a PERSON is
@@ -2825,7 +2958,8 @@ def decision_for(sit, cfg):
             in_flight = last
 
     ex = sit.get("exhausted") or {}
-    announced = bool(ex.get("announced")) and all(bool(v) for v in ex["announced"].values())
+    announced = announcement_complete(ex.get("announced") or {},
+                                      bool(sit.get("needs_human_label_id")))
 
     # The conclusion, and whether one is already on the ledger. `lane_on` is read from
     # the situation, never from the verdict: a project with no needs-approval lane still
@@ -2861,7 +2995,8 @@ def decision_for(sit, cfg):
                              blocked_row=sit.get("blocked"), head_sha=sit.get("head_sha"),
                              now=datetime.now(timezone.utc),
                              blocked_after_seconds=cfg.get("blocked_after_seconds")
-                             or DEFAULT_BLOCKED_AFTER_SECONDS)
+                             or DEFAULT_BLOCKED_AFTER_SECONDS,
+                             label_configured=bool(sit.get("needs_human_label_id")))
 
     meta = sit.get("pr_meta") or {}
     verdict = decide(pr_open=bool(meta.get("open")), is_draft=bool(meta.get("isDraft")),
@@ -3063,7 +3198,7 @@ def perform_refresh(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
-def record_conclusion(sit, cfg, state_dir, basis, dry_run):
+def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
     """The durable "Stage E is done with this PR" record, and the lane move that follows
     it. Returns (settled, problems).
 
@@ -3106,10 +3241,16 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run):
             linear_set_state(issue_id, state_id, cfg)
         except BounceError as exc:
             lane, problems = "failed", ["needs-approval move: %s" % exc]
+    # BETWEEN THE BOARD SIGNAL AND THE LEDGER ROW (review of #140). The lane move is what
+    # a person sees, so it goes first; the §4 row is reporting and goes second; the ledger
+    # row goes last and records whether that row landed, so a pass that comes back for a
+    # failed move does not post a second one.
+    told = after_move() if after_move is not None else None
+    extra = {} if told is None else {"telemetry": told}
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"],
                ticket_id=sit.get("ticket_id"), outcome="concluded", basis=basis,
                head_sha=sit.get("head_sha"),
-               moved=(lane == "moved"), lane=lane, note=note, problems=problems)
+               moved=(lane == "moved"), lane=lane, note=note, problems=problems, **extra)
     # The hand-off is done, so no queued re-review may outlive it and post a second review
     # comment on a pull request a person already owns.
     retired = retire_rereview_request(state_dir, sit["repo"], sit["pr"])
@@ -3132,14 +3273,29 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     for two releases while a comment landed on every conclusion — which is the reading a
     person does when a comment appears and they go looking for the code that posts it."""
     basis = verdict.get("basis") or "clean"
-    _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run)
+    # ONE ROW PER CONCLUSION, not one per pass that completes it (review of #140). A
+    # needs-approval move that keeps failing brings this path back every pass, and each
+    # visit used to post another §4 comment on the coding ticket — the identical defect
+    # KIT-152 fixed one step over. A first emission that FAILED is still retried.
     if dry_run:
+        record_conclusion(sit, cfg, state_dir, basis, dry_run)
         return EXIT_OK
-    emit_status = emit_telemetry(state_dir, {
-        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-        "outcome": "completed", "bounce_no": 0, "max_bounces": sit.get("max_bounces", 0),
-        "reason": verdict["reason"]}, cfg,
-        no_session="this row records a conclusion; no model session runs for it")
+    prev_concl = ledger_view(ledger_path(state_dir), sit["repo"], sit["pr"]).get("concluded") or {}
+    said = {}
+
+    def tell():
+        if str(prev_concl.get("telemetry") or "") == "emitted":
+            said["status"] = "not re-emitted: an earlier pass already sent this conclusion's row"
+        else:
+            said["status"] = emit_telemetry(state_dir, {
+                "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+                "outcome": "completed", "bounce_no": 0, "max_bounces": sit.get("max_bounces", 0),
+                "reason": verdict["reason"]}, cfg,
+                no_session="this row records a conclusion; no model session runs for it")
+        return said["status"]
+
+    _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=tell)
+    emit_status = said.get("status", "not emitted: the conclusion was never recorded")
     if problems:
         sys.stderr.write("FAIL: %s#%d concluded (%s) but the needs-approval move did not land "
                          "(%s); the conclusion is on the ledger and the next run retries the "
@@ -3209,6 +3365,18 @@ def perform_notice(sit, verdict, cfg, state_dir, dry_run):
     return EXIT_OK
 
 
+def _label_said(state):
+    """What the success line may claim about the label (review of #140). A pass that held
+    a not-configured label used to print "agent:needs-human applied" and exit 0, so the log
+    and the heartbeat both said a write had happened that never did."""
+    if state is True:
+        return "%s applied" % NEEDS_HUMAN_KEY
+    if state == LABEL_NOT_CONFIGURED:
+        return ("%s NOT applied — no id is configured for it; it goes on the first pass that "
+                "finds one" % NEEDS_HUMAN_KEY)
+    return "%s not applied" % NEEDS_HUMAN_KEY
+
+
 def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     """The two budget-spent comments, the ONE label and the conclusion, each done once:
     a previous partial announcement is completed, not repeated. Recorded as an 'exhausted'
@@ -3222,10 +3390,17 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
     spent, max_bounces = sit.get("prior", 0), sit.get("max_bounces", 0)
     reason = verdict.get("trigger_reason") or verdict.get("reason") or "budget exhausted"
     issue = sit.get("issue") or {}
-    prev = ((sit.get("exhausted") or {}).get("announced")) or {}
+    prev_row = sit.get("exhausted") or {}
+    # ONLY THIS exhaustion's row seeds it (review of #140). A person who raises
+    # budgets.maxBounces buys more bounces, and spending those exhausts the budget AGAIN at a
+    # higher bounce number. Seeding from the older row would read that second exhaustion as
+    # already announced and say nothing at all about it.
+    if prev_row.get("bounce_no") != verdict.get("bounce_no"):
+        prev_row = {}
+    prev = prev_row.get("announced") or {}
     announced = {"pr_comment": bool(prev.get("pr_comment")),
                  "ticket_comment": bool(prev.get("ticket_comment")),
-                 "label": bool(prev.get("label")),
+                 "label": seed_label(prev.get("label")),
                  "concluded": bool(prev.get("concluded"))}
     pr_body = render_exhaustion_pr_comment(sit.get("ticket_id"), sit["pr"], spent, max_bounces, reason)
     ticket_body = render_exhaustion_ticket_comment(sit["pr"], sit.get("pr_url") or "", spent, max_bounces, reason)
@@ -3260,40 +3435,38 @@ def perform_exhaust(sit, verdict, cfg, state_dir, dry_run):
                 problems.append("ticket comment: %s" % exc)
         else:
             problems.append("ticket comment: no original ticket resolved for this PR")
-    if not announced["label"]:
-        label_id = sit.get("needs_human_label_id") or ""
-        if not issue.get("id"):
-            problems.append("label: no original ticket resolved for this PR")
-        elif not label_id:
-            problems.append("label: no id for %s (set linear.labels.ids in the committed "
-                            "delivery.json or needs_human_label_id in the config)" % NEEDS_HUMAN_KEY)
-        else:
-            try:
-                linear_add_label(issue["id"], label_id, cfg)
-                announced["label"] = True
-            except BounceError as exc:
-                problems.append("label: %s" % exc)
+    announced["label"], label_problem = apply_needs_human(
+        issue, sit.get("needs_human_label_id") or "", announced["label"], cfg)
+    if label_problem:
+        problems.append(label_problem)
 
     if not announced["concluded"]:
         settled, conclusion_problems = record_conclusion(sit, cfg, state_dir, EXHAUSTED_BASIS, False)
         announced["concluded"] = settled
         problems += conclusion_problems
 
+    if str(prev_row.get("telemetry") or "") == "emitted":
+        # ONE ROW PER EXHAUSTION, not one per pass that completes it (KIT-152) — but a first
+        # attempt that FAILED is retried, exactly like a failed comment (review of #140), so
+        # the row below records which of the two happened. The emission sits after every send
+        # and before the row, so the sends still come first and the ledger still holds one row.
+        emit_status = "not re-emitted: an earlier pass already sent this exhaustion's row"
+    else:
+        emit_status = emit_telemetry(state_dir, {
+            "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+            "outcome": "budget", "error_class": "bounce_budget_exhausted",
+            "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
+            no_session="this row records a spent bounce budget; no model session runs for it")
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                bounce_no=verdict.get("bounce_no"), outcome="exhausted", announced=announced,
-               problems=problems)
-    emit_status = emit_telemetry(state_dir, {
-        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-        "outcome": "budget", "error_class": "bounce_budget_exhausted",
-        "bounce_no": verdict.get("bounce_no"), "max_bounces": max_bounces, "reason": reason}, cfg,
-        no_session="this row records a spent bounce budget; no model session runs for it")
+               problems=problems, telemetry=emit_status)
     if problems:
         sys.stderr.write("FAIL: exhaustion for %s#%d only partly announced (%s); the next run "
                          "completes the missing step(s). telemetry: %s\n"
                          % (sit["repo"], sit["pr"], "; ".join(problems), emit_status))
         return EXIT_USAGE
-    print("%s — announced on the PR and the ticket, %s applied; telemetry: %s"
-          % (describe(sit, verdict), NEEDS_HUMAN_KEY, emit_status))
+    print("%s — announced on the PR and the ticket, %s; telemetry: %s"
+          % (describe(sit, verdict), _label_said(announced["label"]), emit_status))
     return EXIT_OK
 
 
@@ -3324,7 +3497,7 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
     prev = sit.get("blocked") or {}
     prev_announced = (prev.get("announced") or {}) if prev.get("bounce_no") == bounce_no else {}
     announced = {"ticket_comment": bool(prev_announced.get("ticket_comment")),
-                 "label": bool(prev_announced.get("label"))}
+                 "label": seed_label(prev_announced.get("label"))}
     body = render_blocked_ticket_comment(
         sit["pr"], sit.get("pr_url") or "", bounce_no, sit.get("max_bounces", 0),
         sit.get("prior", 0), signal.get("head_sha") or sit.get("head_sha"),
@@ -3353,38 +3526,34 @@ def perform_blocked(sit, verdict, cfg, state_dir, dry_run):
                 problems.append("ticket comment: %s" % exc)
         else:
             problems.append("ticket comment: no original ticket resolved for this PR")
-    if not announced["label"]:
-        label_id = sit.get("needs_human_label_id") or ""
-        if not issue.get("id"):
-            problems.append("label: no original ticket resolved for this PR")
-        elif not label_id:
-            problems.append("label: no id for %s (set linear.labels.ids in the committed "
-                            "delivery.json or needs_human_label_id in the config)" % NEEDS_HUMAN_KEY)
-        else:
-            try:
-                linear_add_label(issue["id"], label_id, cfg)
-                announced["label"] = True
-            except BounceError as exc:
-                problems.append("label: %s" % exc)
+    announced["label"], label_problem = apply_needs_human(
+        issue, sit.get("needs_human_label_id") or "", announced["label"], cfg)
+    if label_problem:
+        problems.append(label_problem)
 
+    if str((prev if prev.get("bounce_no") == bounce_no else {}).get("telemetry") or "") == "emitted":
+        # One row per signal, not per pass — but an attempt that FAILED is retried, exactly
+        # like a failed comment, and the row records which happened (review of #140).
+        emit_status = "not re-emitted: an earlier pass already sent this no-push signal's row"
+    else:
+        emit_status = emit_telemetry(state_dir, {
+            "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
+            "outcome": "blocked", "error_class": "bounce_no_push",
+            "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
+            "reason": verdict["reason"]}, cfg,
+            no_session="this row records a session that stopped pushing; no model session "
+                       "runs for it")
     append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"], ticket_id=sit.get("ticket_id"),
                bounce_no=bounce_no, head_sha=signal.get("head_sha") or sit.get("head_sha"),
                waited_seconds=signal.get("waited_seconds"), outcome="blocked",
-               announced=announced, problems=problems)
-    emit_status = emit_telemetry(state_dir, {
-        "repo": sit["repo"], "pr": sit["pr"], "ticket_id": sit.get("ticket_id"),
-        "outcome": "blocked", "error_class": "bounce_no_push",
-        "bounce_no": bounce_no, "max_bounces": sit.get("max_bounces", 0),
-        "reason": verdict["reason"]}, cfg,
-        no_session="this row records a session that stopped pushing; no model session "
-                   "runs for it")
+               announced=announced, problems=problems, telemetry=emit_status)
     if problems:
         sys.stderr.write("FAIL: the no-push signal for %s#%d only partly landed (%s); the next "
                          "run completes the missing step(s). telemetry: %s\n"
                          % (sit["repo"], sit["pr"], "; ".join(problems), emit_status))
         return EXIT_USAGE
-    print("%s — said on the ticket, %s applied, no bounce spent (%d of %d still); telemetry: %s"
-          % (describe(sit, verdict), NEEDS_HUMAN_KEY, sit.get("prior", 0),
+    print("%s — said on the ticket, %s, no bounce spent (%d of %d still); telemetry: %s"
+          % (describe(sit, verdict), _label_said(announced["label"]), sit.get("prior", 0),
              sit.get("max_bounces", 0), emit_status))
     return EXIT_OK
 
@@ -3500,10 +3669,12 @@ def run_one(pr_number, owner_repo, cfg, state_dir, mode, dry_run, as_json=False)
     acting modes every could-not with a PR to say it on is said there (announce_could_not,
     once per reason) — the one exemption is plain unreachability, see Unreachable."""
     def declined(exc):
-        sys.stderr.write("FAIL: %s#%d: declined — %s\n" % (owner_repo, pr_number, exc))
+        not_ours = isinstance(exc, NotEligible)
+        sys.stderr.write("%s: %s#%d: declined — %s\n"
+                         % ("DECLINED" if not_ours else "FAIL", owner_repo, pr_number, exc))
         if mode != "decide":
             announce_could_not(exc.sit, str(exc), state_dir, dry_run)
-        return EXIT_USAGE
+        return EXIT_DECLINED if not_ours else EXIT_USAGE
 
     try:
         sit = gather(pr_number, owner_repo, cfg, state_dir)
@@ -3703,6 +3874,35 @@ def criteria_snapshots(cfg, state_dir, dry_run, deadline):
             "problems": ["criteria snapshots: %s" % p for p in result["problems"]], "counts": counts}
 
 
+def pause_state(state_dir):
+    """None, or {"path", "reason", "since"} when a person has paused this driver.
+
+    Presence is the whole signal: a PAUSED file that cannot be read still pauses, with that
+    said as its reason, because the safe reading of "someone meant to stop this" is to stop."""
+    path = os.path.join(state_dir, PAUSE_FILE)
+    if not os.path.lexists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            reason = " ".join((fh.readline() or "").split())[:300]
+    except OSError as exc:
+        reason = "(the file is there and could not be read: %s)" % exc
+    try:
+        since = datetime.fromtimestamp(os.lstat(path).st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        since = None
+    return {"path": path, "reason": reason or "(no reason written in the file)", "since": since}
+
+
+# The order a pass's codes are worst in. A decline outranks a clean pass and never hides a
+# failure: a pass with one declined PR and one broken one is a broken pass.
+_EXIT_RANK = {EXIT_OK: 0, EXIT_DECLINED: 1, EXIT_USAGE: 2}
+
+
+def _worse(a, b):
+    return a if _EXIT_RANK.get(a, 2) >= _EXIT_RANK.get(b, 2) else b
+
+
 def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     """One scan-decide-act pass. Returns an exit code and leaves a heartbeat on EVERY
     path, success or not.
@@ -3715,6 +3915,17 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
     of time exits 2 with the remainder named — a partial pass reported as partial.
     """
     started_at, deadline = _now_iso(), time.monotonic() + float(timeout_seconds)
+    paused = pause_state(state_dir)
+    if paused:
+        # Nothing at all: no bounce, no conclusion, no conflict fix, and no criteria
+        # snapshot either — a ticket delegated during the pause gets its snapshot on the
+        # first pass after, with the lag recorded. Said every pass, never silent.
+        print("PAUSED: %s exists since %s — %s. This pass did nothing. Remove the file to resume."
+              % (paused["path"], paused["since"] or "an unknown time", paused["reason"]))
+        write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
+                        result="paused", detail=paused["reason"], paused_since=paused["since"],
+                        pause_file=paused["path"], dry_run=bool(dry_run), exit_code=EXIT_DECLINED)
+        return EXIT_DECLINED
     write_heartbeat(state_dir, started_at=started_at, result="running")
     # KIT-131, first and bounded: the delegation-time criteria snapshots the review's basis
     # resolver reads. Its problems are this pass's problems; its absence never stops a bounce.
@@ -3755,17 +3966,18 @@ def run_pass(cfg, state_dir, dry_run, timeout_seconds):
             problems.append("%s#%d: %s: %s" % (owner_repo, pr_number, exc.__class__.__name__, exc))
             sys.stderr.write("FAIL: %s#%d raised %s: %s — the pass continues with the next PR\n"
                              % (owner_repo, pr_number, exc.__class__.__name__, exc))
-        worst = max(worst, rc)
+        worst = _worse(worst, rc)
         done += 1
 
     remaining = len(targets) - done
     if timed_out:
-        worst = max(worst, EXIT_USAGE)
+        worst = _worse(worst, EXIT_USAGE)
         sys.stderr.write("FAIL: the %ds run deadline passed with %d of %d PR(s) unexamined — "
                          "this pass is PARTIAL, not clean; launchd starts the next one at the "
                          "configured interval\n" % (timeout_seconds, remaining, len(targets)))
     write_heartbeat(state_dir, started_at=started_at, finished_at=_now_iso(),
-                    result=("deadline" if timed_out else ("problems" if worst else "ok")),
+                    result=("deadline" if timed_out else
+                            {EXIT_OK: "ok", EXIT_DECLINED: "declined"}.get(worst, "problems")),
                     considered=len(targets), examined=done, remaining=remaining,
                     timeout_seconds=timeout_seconds, dry_run=bool(dry_run),
                     problems=problems[:20], exit_code=worst, snapshots=snap["counts"])
@@ -3960,6 +4172,55 @@ def selftest():
           conclusion_basis("green", below, True, False), "below-threshold")
     check("a review that TRIGGERS a bounce never concludes", conclusion_basis("green", below, True, True), None)
     check("an at-threshold review never concludes", conclusion_basis("green", above, True, False), None)
+    #   KIT-138: a partial review never concludes, and is routed to a person only where
+    #   nothing else already speaks for the PR.
+    _prn = partial_review_note
+    part = {"usable": True, "meets_threshold": False, "findings": [], "max_severity": None,
+            "coverage": "partial", "withheld_files": ["src/big.py"]}
+    check("KIT-138 a clean PARTIAL review never concludes",
+          conclusion_basis("green", part, True, False), None)
+    check("KIT-138 …the same review of the whole change still does",
+          conclusion_basis("green", dict(part, coverage=None), True, False), "clean")
+    check("KIT-138 a partial review with nothing else to say is routed to a person",
+          "a person must review" in _prn(part, True, False, ""), True)
+    check("KIT-138 …but never over a live trigger, another could-not, a stale review, "
+          "or a review of the whole change",
+          (_prn(part, True, True, ""), _prn(part, True, False, "CI unreadable"),
+           _prn(part, False, False, ""), _prn(dict(part, coverage=None), True, False, "")),
+          ("", "", "", ""))
+    #   SAID ONCE, THEN HELD (review of #143). A partial review is permanent for the life of
+    #   the PR, and `cannot_evaluate` makes every pass exit 2 — so repeating this would pin
+    #   the driver's heartbeat at `problems` forever, and a pinned heartbeat pages once and
+    #   then masks every later failure behind the same fingerprint.
+    note138 = _prn(part, True, False, "")
+    check("KIT-138 the hand-off is said once, then held",
+          _prn(part, True, False, "", already_said=(note138,)), "")
+    check("KIT-138 …and a DIFFERENT could-not already said does not silence it",
+          "a person must review" in _prn(part, True, False, "", already_said=("something else",)), True)
+    with tempfile.TemporaryDirectory() as tmp:
+        check("KIT-138 nothing said yet reads as nothing said", said_reasons(tmp, "o/r", 7), ())
+        mark138 = os.path.join(tmp, "declines", repo_slug("o/r"), "pr-7.json")
+        os.makedirs(os.path.dirname(mark138), exist_ok=True)
+        with open(mark138, "w", encoding="utf-8") as fh:
+            json.dump({"pr": 7, "repo": "o/r", "reasons": {note138: "2026-09-17T00:00:00Z"}}, fh)
+        check("KIT-138 …and the marker the driver writes is what a later pass reads back",
+              said_reasons(tmp, "o/r", 7), (note138,))
+        check("KIT-138 a marker for another PR is not this PR's", said_reasons(tmp, "o/r", 8), ())
+    #   …and the whole verdict, not just the sentence: a partial review is a could-not on
+    #   the pass that hands it over, and an ordinary quiet skip on every pass after.
+    sit138 = {"config_state": "ok", "repo": "o/r", "pr": 5, "head_sha": "sha138",
+              "outcome": dict(part, head_sha="sha138"), "checks_status": "green",
+              "failing_checks": [], "prior": 0, "max_bounces": 3, "visible_bounces": 0,
+              "pr_meta": {"open": True}, "ticket_state_type": "started",
+              "ticket_state_name": "In Progress"}
+    cfg138 = {"in_flight_hours": 6, "blocked_after_seconds": 3600}
+    first138 = decision_for(dict(sit138), cfg138)
+    held138 = decision_for(dict(sit138, said_reasons=(note138,)), cfg138)
+    check("KIT-138 the first pass hands the PR to a person and says why",
+          (first138["action"], "a person must review" in (first138.get("cannot_evaluate") or "")),
+          ("unknown", True))
+    check("KIT-138 …and every pass after is a quiet skip, not a second page",
+          (held138["action"], held138.get("cannot_evaluate")), ("skip", None))
     check("a DECLINE is a could-not, never a clean bill", conclusion_basis("green", {"usable": False}, True, False), None)
     check("a stale review never concludes", conclusion_basis("green", spotless, False, False), None)
     check("no review at all never concludes", conclusion_basis("green", None, True, False), None)
@@ -5238,6 +5499,36 @@ def selftest():
                 check("%s review: still exactly one concluded row" % label,
                       len([r for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"]), 1)
 
+        # A LANE MOVE THAT KEEPS FAILING MUST NOT KEEP REPORTING (review of #140). The
+        # conclusion comes back every pass while the move is owed, and each visit used to
+        # post another §4 comment on the coding ticket — KIT-152's defect, one path over.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            saved_state = globals()["linear_set_state"]
+
+            def refusing_state(issue_id, state_id, cfg_):
+                calls.append(("state", issue_id, state_id))
+                raise BounceError("simulated: the tracker refused the move")
+            globals()["linear_set_state"] = refusing_state
+            try:
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc_c1 = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                first = [c[0] for c in calls]
+            finally:
+                globals()["linear_set_state"] = saved_state
+            check("KIT-152 a refused lane move is exit 2, and the row is still reported once",
+                  (rc_c1, first), (EXIT_USAGE, ["state", "telemetry"]))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc_c2 = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("KIT-152 …and the retry moves the ticket without a SECOND telemetry comment",
+                  (rc_c2, [c[0] for c in calls]), (EXIT_OK, ["state"]))
+            check("KIT-152 …each concluded row saying whether its row landed",
+                  [str(r.get("telemetry") or "")[:8]
+                   for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"],
+                  ["emitted", "not re-e"])
+
         #       EVERY TERMINAL STATE REMAINS BANNED. The fixture names all six canonical
         #       states; the driver can reach exactly one of them. `done` is the one that
         #       matters most — a coding ticket in a terminal state makes the dispatcher
@@ -5591,13 +5882,13 @@ def selftest():
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("unowned ticket: exit 2, nothing to Linear, no ledger",
-                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+            check("KIT-112 unowned ticket: DECLINED (3), nothing to Linear, no ledger",
+                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (globals().get("EXIT_DECLINED", 3), [], False))
             check("unowned ticket: one PR comment naming the reason", kinds(), ["prComment"])
             check("unowned ticket: the reason", "does not own this PR" in body_of("prComment"), True)
             calls.clear()
-            check("unowned ticket under exhaust: exit 2, zero Linear writes",
-                  (run_one(41, "o/r", cfg, tmp, "exhaust", False), linear_writes()), (EXIT_USAGE, []))
+            check("KIT-112 unowned ticket under exhaust: DECLINED (3), zero Linear writes",
+                  (run_one(41, "o/r", cfg, tmp, "exhaust", False), linear_writes()), (globals().get("EXIT_DECLINED", 3), []))
         #      …but a PR attachment on the ticket is ownership, and so is the poller's outcome record.
         world["issue"] = dict(live_issue, branchName="feat/eng-41-real-work",
                               attachments={"nodes": [{"url": "https://example.invalid/pr/41"}]})
@@ -5722,14 +6013,45 @@ def selftest():
         world["pr"] = dict(open_pr, headRefName="feat/eng-41-x=y")
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             calls.clear()
+            mark = len(err.getvalue())
             rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("bad branch: exit 2, nothing to Linear, no ledger",
-                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (EXIT_USAGE, [], False))
+            check("KIT-112 bad branch: DECLINED (3), nothing to Linear, no ledger",
+                  (rc, linear_writes(), os.path.exists(ledger_path(tmp))), (globals().get("EXIT_DECLINED", 3), [], False))
             check("bad branch: one PR comment naming the shape", kinds() == ["prComment"]
                   and "not a pipeline ticket branch" in calls[0][2], True)
             calls.clear()
-            check("bad branch under decide: exit 2, nothing posted",
-                  (run_one(41, "o/r", cfg, tmp, "decide", False), calls), (EXIT_USAGE, []))
+            check("KIT-112 bad branch under decide: DECLINED (3), nothing posted",
+                  (run_one(41, "o/r", cfg, tmp, "decide", False), calls), (globals().get("EXIT_DECLINED", 3), []))
+            # …and the log says DECLINED, not FAIL: the two words are the §13 distinction,
+            # and nothing asserted them before (review of #137). Read only THIS block's
+            # stderr — `err` accumulates across the whole battery.
+            said = err.getvalue()[mark:]
+            check("KIT-112 an eligibility decline logs DECLINED, never FAIL",
+                  ("DECLINED: o/r#41" in said, "FAIL: o/r#41" in said), (True, False))
+        world["pr"] = open_pr
+
+        # 10p-ii. The THIRD eligibility refusal — a real branch shape whose team key this
+        #         driver does not manage — was claimed and never tested (review of #137).
+        world["pr"] = dict(open_pr, headRefName="feat/xyz-41-other-team")
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            calls.clear()
+            rc = run_one(41, "o/r", dict(cfg, team_keys=["ENG"]), tmp, "bounce", False)
+            check("KIT-112 an unmanaged team key is a DECLINE (3), one PR comment, no ledger",
+                  (rc, kinds(), os.path.exists(ledger_path(tmp))),
+                  (globals().get("EXIT_DECLINED", 3), ["prComment"], False))
+            check("KIT-112 …and it names why", "team key is not one this driver manages" in calls[0][2], True)
+            # A review asked whether an empty `team_keys` makes EVERY pull request a healthy
+            # decline. It does not: the shape check and resolve_ticket admit exactly the same
+            # branches when no key is set, so "no pipeline ticket identified" is unreachable
+            # there, and an unshaped branch is refused one step earlier for a reason that is
+            # true whatever the configuration. Pinned so the claim is not re-raised.
+            check("KIT-112 with no team keys, a shaped branch still names a ticket and an "
+                  "unshaped one is refused for its shape",
+                  (bool(PIPELINE_BRANCH_RE.fullmatch("feat/eng-41-x")),
+                   prl.resolve_ticket("feat/eng-41-x", []),
+                   bool(PIPELINE_BRANCH_RE.fullmatch("chore/no-ticket-in-this-branch")),
+                   prl.resolve_ticket("chore/no-ticket-in-this-branch", [])),
+                  (True, "ENG-41", False, None))
         world["pr"] = open_pr
 
         # 10q. A corrupt ledger makes the DRIVER refuse: exit 2, nothing sent — never a reset budget.
@@ -6093,15 +6415,157 @@ def selftest():
             check("a missing label id makes the signal PARTIAL: exit 2, the comment still said",
                   (rc, kinds()), (EXIT_USAGE, ["ticketComment", "telemetry"]))
             row = ledger_view(ledger_path(tmp), "o/r", 41)["blocked"]
-            check("…and the row records which half landed",
-                  row["announced"], {"ticket_comment": True, "label": False})
+            check("KIT-152 …and the row records the label as not configured, not as failed",
+                  row["announced"], {"ticket_comment": True, "label": globals().get("LABEL_NOT_CONFIGURED", "no-id")})
             world["delivery"] = delivery_lane
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()):
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("the next pass completes the label and does NOT comment again",
-                  (rc, kinds()), (EXIT_OK, ["label", "telemetry"]))
+            check("KIT-152 the pass that finds an id applies the label, and neither comments "
+                  "nor posts a second telemetry row", (rc, kinds()), (EXIT_OK, ["label"]))
         check("a partial signal is loud on stderr", "only partly landed" in err.getvalue(), True)
+
+        # KIT-152: THE LOOP ITSELF. With no label id, every pass used to re-run the signal:
+        # a new row, another telemetry comment on the ticket, exit 2, a page. Said once,
+        # then held; applied on the first pass that finds an id.
+        world["delivery"] = no_label
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            stalled(tmp, hours_ago(10))
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_one(41, "o/r", cfg, tmp, "bounce", False)
+            rows_after_first = len(read_ledger(ledger_path(tmp)))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("KIT-152 a second pass with still no id is QUIET: exit 0, nothing sent, no new row",
+                  (rc, kinds(), len(read_ledger(ledger_path(tmp)))), (EXIT_OK, [], rows_after_first))
+        world["delivery"] = delivery_ok
+
+        # …and the same for a spent budget, driven straight through the announcement.
+        _complete = globals().get("announcement_complete")
+        check("KIT-152 the completeness rule exists", callable(_complete), True)
+        if callable(_complete):
+            check("KIT-152 not-configured counts as announced only while no id is configured",
+                  (_complete({"a": True, "label": globals().get("LABEL_NOT_CONFIGURED", "no-id")}, False),
+                   _complete({"a": True, "label": globals().get("LABEL_NOT_CONFIGURED", "no-id")}, True),
+                   _complete({"a": True, "label": False}, False), _complete({}, False)),
+                  (True, False, False, False))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            sit_x = {"repo": "o/r", "pr": 41, "ticket_id": "ENG-41", "issue": {"id": "iss-uuid"},
+                     "prior": 2, "max_bounces": 2, "pr_url": "https://github.com/o/r/pull/41",
+                     "head_sha": "aaaa1111", "needs_human_label_id": "", "needs_approval_state_id": ""}
+            verdict_x = {"action": "exhaust", "trigger_reason": "review at threshold", "bounce_no": 2,
+                         "reason": "bounce budget exhausted (2 of 2 spent)"}
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc1 = perform_exhaust(dict(sit_x), verdict_x, cfg, tmp, False)
+            first = ledger_view(ledger_path(tmp), "o/r", 41)["exhausted"]
+            check("KIT-152 exhaustion with no label id: loud once, two comments and ONE telemetry row",
+                  (rc1, kinds(), (first["announced"] or {}).get("label")),
+                  (EXIT_USAGE, ["prComment", "ticketComment", "telemetry"], globals().get("LABEL_NOT_CONFIGURED", "no-id")))
+            if callable(_complete):
+                check("KIT-152 …and the verdict now reads it as announced, so later passes hold",
+                      _complete(first["announced"], False), True)
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc2 = perform_exhaust(dict(sit_x, exhausted=first, needs_human_label_id="lbl-nh"),
+                                      verdict_x, cfg, tmp, False)
+            check("KIT-152 an id configured later: the label and nothing else, no second telemetry row",
+                  (rc2, kinds()), (EXIT_OK, ["label"]))
+
+            # …and the line it prints never claims a label it did not apply (review of #140).
+            calls.clear()
+            out_ne = io.StringIO()
+            with contextlib.redirect_stdout(out_ne):
+                perform_exhaust(dict(sit_x, exhausted=first), verdict_x, cfg, tmp, False)
+            said_ne = out_ne.getvalue()
+            check("KIT-152 a pass that held a not-configured label does not claim it applied",
+                  ("NOT applied" in said_ne, "%s applied" % NEEDS_HUMAN_KEY in said_ne), (True, False))
+
+            # A first telemetry attempt that FAILED is retried; one that landed is not.
+            saved_emit_t = globals()["emit_telemetry"]
+            globals()["emit_telemetry"] = lambda *a, **k: "not emitted: publisher exit 1"
+            with tempfile.TemporaryDirectory() as tmp_t, contextlib.redirect_stdout(io.StringIO()):
+                sit_t = dict(sit_x, needs_human_label_id="lbl-nh")
+                perform_exhaust(dict(sit_t), verdict_x, cfg, tmp_t, False)
+                row_t = ledger_view(ledger_path(tmp_t), "o/r", 41)["exhausted"]
+                globals()["emit_telemetry"] = saved_emit_t
+                calls.clear()
+                perform_exhaust(dict(sit_t, exhausted=row_t), verdict_x, cfg, tmp_t, False)
+                row_t2 = ledger_view(ledger_path(tmp_t), "o/r", 41)["exhausted"]
+            globals()["emit_telemetry"] = saved_emit_t
+            check("KIT-152 a telemetry row that FAILED first is retried, and the ledger says so",
+                  (str(row_t.get("telemetry")).startswith("not emitted"),
+                   [c[0] for c in calls], row_t2.get("telemetry")),
+                  (True, ["telemetry"], "emitted"))
+
+            # A SECOND exhaustion, after a person raised the budget, is its own announcement.
+            with tempfile.TemporaryDirectory() as tmp_2, contextlib.redirect_stdout(io.StringIO()):
+                sit_2 = dict(sit_x, needs_human_label_id="lbl-nh")
+                perform_exhaust(dict(sit_2), verdict_x, cfg, tmp_2, False)
+                first_2 = ledger_view(ledger_path(tmp_2), "o/r", 41)["exhausted"]
+                calls.clear()
+                perform_exhaust(dict(sit_2, exhausted=first_2, prior=4, max_bounces=4),
+                                dict(verdict_x, bounce_no=4), cfg, tmp_2, False)
+            check("KIT-152 a second exhaustion after a raised budget says everything again",
+                  [c[0] for c in calls], ["prComment", "ticketComment", "label", "telemetry"])
+
+            # …and the verdict wiring itself: an exhausted row whose label is not configured
+            # holds, and stops holding the moment an id exists (review of #140).
+            ex_row = {"outcome": "exhausted", "bounce_no": 3,
+                      "announced": {"pr_comment": True, "ticket_comment": True,
+                                    "label": LABEL_NOT_CONFIGURED, "concluded": True}}
+            check("KIT-152 the verdict holds a no-id exhaustion, and re-opens it when an id appears",
+                  (announcement_complete(ex_row["announced"], False),
+                   announcement_complete(ex_row["announced"], True)), (True, False))
+            # …through decision_for, not only through the helper (review of #140). The
+            # helper was tested and the WIRING was not, so dropping `label_configured` from
+            # the call left every battery green and the exhaustion re-announcing for good.
+            above_x = {"usable": True, "meets_threshold": True, "max_severity": "high",
+                       "findings": [{"severity": "high", "category": "tests",
+                                     "summary": "s", "detail": "d"}], "head_sha": "sha-x"}
+            sit_v = {"config_state": "ok", "repo": "o/r", "pr": 5, "head_sha": "sha-x",
+                     "outcome": above_x, "checks_status": "green", "failing_checks": [],
+                     "prior": 3, "max_bounces": 3, "visible_bounces": 3,
+                     "pr_meta": {"open": True}, "ticket_state_type": "started",
+                     "ticket_state_name": "In Progress",
+                     "exhausted": {"announced": {"ticket_comment": True,
+                                                 "label": LABEL_NOT_CONFIGURED}}}
+            cfg_v = {"in_flight_hours": 6, "blocked_after_seconds": 3600}
+            check("KIT-152 a no-id exhaustion is a quiet noop, pass after pass",
+                  decision_for(dict(sit_v), cfg_v)["action"], "noop")
+            check("KIT-152 …and the day an id is configured, the same situation announces",
+                  decision_for(dict(sit_v, needs_human_label_id="lbl-1"), cfg_v)["action"],
+                  "exhaust")
+
+        # …and a label the TRACKER REFUSES is different from one nobody configured: it is
+        # retried, loudly, and never recorded as not-configured (review of #140).
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            saved_add_label = globals()["linear_add_label"]
+
+            def refusing_label(issue_id, label_id, cfg_):
+                calls.append(("label", issue_id, label_id))
+                raise BounceError("simulated: the tracker refused the label")
+            globals()["linear_add_label"] = refusing_label
+            try:
+                sit_r = dict(sit_x, needs_human_label_id="lbl-nh")
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc_r = perform_exhaust(dict(sit_r), verdict_x, cfg, tmp, False)
+                row_r = ledger_view(ledger_path(tmp), "o/r", 41)["exhausted"]
+                check("KIT-152 a label the tracker REFUSES is retried: loud, recorded as not landed",
+                      (rc_r, (row_r["announced"] or {}).get("label"),
+                       any("simulated: the tracker refused" in p for p in (row_r.get("problems") or []))),
+                      (EXIT_USAGE, False, True))
+                check("KIT-152 …so the verdict still reads it as unannounced, and the next pass retries",
+                      announcement_complete(row_r["announced"], True), False)
+            finally:
+                globals()["linear_add_label"] = saved_add_label
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_r2 = perform_exhaust(dict(sit_r, exhausted=row_r), verdict_x, cfg, tmp, False)
+            check("KIT-152 …and the next pass applies it, and nothing else",
+                  (rc_r2, kinds()), (EXIT_OK, ["label"]))
         world["delivery"] = delivery_ok
 
         # 10q. CONFLICTS — the dispatched lane of the conflict loop. A dispatcher's pull request
@@ -6308,6 +6772,45 @@ def selftest():
             check("a clean pass exits 0 and records what it examined",
                   (rc, beat["result"], beat["examined"], beat["dry_run"]), (EXIT_OK, "ok", 2, True))
 
+            declined_code = globals().get("EXIT_DECLINED", 3)
+            globals()["run_one"] = lambda pr, *a, **k: declined_code if pr == 41 else EXIT_OK
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("KIT-112 a pass whose only non-clean PR was declined exits 3 and says declined",
+                  (rc, beat["result"]), (3, "declined"))
+            globals()["run_one"] = lambda pr, *a, **k: declined_code if pr == 41 else EXIT_USAGE
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("KIT-112 …and a decline never hides a failure beside it",
+                  (rc, beat["result"]), (EXIT_USAGE, "problems"))
+
+            # THE DURABLE PAUSE. A file, so no installer run and no reboot re-arms it.
+            examined = []
+            globals()["run_one"] = lambda pr, *a, **k: examined.append(pr) or EXIT_OK
+            with open(os.path.join(tmp, "PAUSED"), "w") as fh:
+                fh.write("live test block B in progress\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            beat = json.load(open(heartbeat_path(tmp), encoding="utf-8"))
+            check("KIT-112 a PAUSED file stops the whole pass: nothing examined, exit 3",
+                  (rc, examined, beat["result"]), (3, [], "paused"))
+            check("KIT-112 …and the heartbeat and the log both carry the reason",
+                  ("live test block B" in (beat.get("detail") or ""),
+                   "live test block B" in out.getvalue(), "Remove the file" in out.getvalue()),
+                  (True, True, True))
+            os.remove(os.path.join(tmp, "PAUSED"))
+            os.makedirs(os.path.join(tmp, "PAUSED"))           # there, and unreadable as a file
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            check("KIT-112 a PAUSED that cannot be read still pauses", (rc, examined), (3, []))
+            os.rmdir(os.path.join(tmp, "PAUSED"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_pass(base_cfg, tmp, False, 60)
+            check("KIT-112 removing it resumes", (rc, sorted(examined)), (EXIT_OK, [41, 88]))
+
         # 10p. KIT-131: the criteria snapshot pass runs first in every `run`. Its problems
         #      are the pass's problems — a heartbeat that says `idle` while the snapshots
         #      could not even look would be the §13 conflation — and it never stops the
@@ -6388,6 +6891,42 @@ def selftest():
         globals()["run_one"] = saved_run_one
         globals()["criteria_snapshots"] = saved_snapshots
 
+    # KIT-112: `decide --all` ranks its codes like a pass does. run_pass was fixed and
+    # main()'s own loop was not, so one declined PR (3) hid a failed one (2) — and the
+    # installer's dry-run gate accepts 3 (review of #137).
+    cases_main = {41: EXIT_USAGE, 42: globals().get("EXIT_DECLINED", 3)}
+    saved_run_one_main, saved_targets_main = globals()["run_one"], globals()["list_outcomes"]
+    globals()["run_one"] = lambda pr, repo, c, sd, mode, dry, as_json=False: cases_main[pr]
+    globals()["list_outcomes"] = lambda sd, c: [("o/r", 41), ("o/r", 42)]
+    try:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+            conf_main = os.path.join(tmp, "config.json")
+            with open(conf_main, "w", encoding="utf-8") as fh:
+                json.dump({"state_dir": tmp, "repos": ["o/r"], "team_keys": ["ENG"]}, fh)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_main = main(["decide", "--all", "--config", conf_main, "--dry-run"])
+        check("KIT-112 `decide --all` reports the FAILURE, not the decline that outranks it",
+              rc_main, EXIT_USAGE)
+    finally:
+        globals()["run_one"], globals()["list_outcomes"] = saved_run_one_main, saved_targets_main
+
+    # KIT-112: one sentence, one code, in both Stage E loops — and every result word this
+    # driver writes that is not a problem is one the heartbeat monitor reads as healthy,
+    # or a paused driver pages its owner.
+    try:
+        import pipeline_review_poller as _prp
+        poller_declined = _prp.EXIT_DECLINED
+    except Exception as exc:                                   # the check, not a crash
+        poller_declined = "unimportable: %s" % exc
+    check("KIT-112 the declined code is the review poller's",
+          (globals().get("EXIT_DECLINED"), poller_declined), (poller_declined, poller_declined))
+    try:
+        import pipeline_heartbeat_monitor as _phm
+        good = set(_phm.WATCHERS["bounce-driver"]["good"])
+    except Exception:
+        good = set()
+    check("KIT-112 the monitor reads declined and paused as healthy, not failing",
+          {"ok", "idle", "declined", "paused"} <= good, True)
     # 11. Source-level guards. Each banned token appears exactly once — here. A count
     #     above one means a real merge/approve/auto-merge/label/launch path slipped in.
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
@@ -6446,8 +6985,12 @@ def selftest():
     check("…never concludes and never moves the ticket",
           ("record_conclusion" in _pb, "linear_set_state" in _pb), (False, False))
     check("…and never asks for a re-review", "write_rereview_request" in _pb, False)
-    check("it posts exactly one TOP-LEVEL ticket comment and applies exactly one label",
-          (_pb.count("linear_comment("), _pb.count("linear_add_label(")), (1, 1))
+    _label_step = inspect.getsource(globals()["apply_needs_human"]) if "apply_needs_human" in globals() else ""
+    check("it posts exactly one TOP-LEVEL ticket comment and applies exactly one label "
+          "(KIT-152: through the one shared label step, and never directly)",
+          (_pb.count("linear_comment("), _pb.count("apply_needs_human("),
+           _pb.count("linear_add_label("), _label_step.count("linear_add_label(")),
+          (1, 1, 0, 1))
 
     # 11c. THE NOTICE PATH IS A COMMENT AND NOTHING ELSE. The defect this closes was a
     #      re-prompt reaching a PR a person already held, so the checks are about what the
@@ -6615,7 +7158,7 @@ def main(argv=None):
     worst = EXIT_OK
     for owner_repo, pr_number in targets:
         rc = run_one(pr_number, owner_repo, cfg, state_dir, args.mode, args.dry_run, as_json=args.json)
-        worst = max(worst, rc)
+        worst = _worse(worst, rc)     # KIT-112: a decline (3) must never hide a failure (2)
     return worst
 
 

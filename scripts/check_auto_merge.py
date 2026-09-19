@@ -239,6 +239,17 @@ def gate_review(findings, findings_error, threshold, v):
             "review", False,
             "findings declare schema %r, not pipeline-review/1" % findings.get("schema"),
         )
+    if str(findings.get("coverage") or "full") != "full":
+        # A PARTIAL review is not a clean one (KIT-138). Whole files were withheld from the
+        # reviewer over the size cap; nothing judged them, so this lane must not merge on it.
+        withheld = [str(f) for f in (findings.get("withheld_files") or [])]
+        return v.gate(
+            "review", False,
+            "the review saw only part of this change — %d file(s) were withheld from the "
+            "reviewer (%s). PARTIAL is not clean."
+            % (len(withheld), ", ".join(withheld[:5]) + (" …" if len(withheld) > 5 else "")
+               or "named in the review ticket"),
+        )
     if not findings.get("usable"):
         return v.gate(
             "review", False,
@@ -475,6 +486,14 @@ def selftest():
     above = copy.deepcopy(GOOD_FINDINGS)
     above["findings"] = [{"severity": "critical", "category": "security", "summary": "leak"}]
     expect("finding above threshold holds", run(findings=above), False, "review")
+    # KIT-138: a PARTIAL review is not a clean one, however few findings it carries.
+    partial = copy.deepcopy(GOOD_FINDINGS)
+    partial["coverage"] = "partial"
+    partial["withheld_files"] = ["src/big_one.py", "src/big_two.py"]
+    expect("a partial review holds, however clean", run(findings=partial), False, "review")
+    whole = copy.deepcopy(GOOD_FINDINGS)
+    whole["coverage"] = "full"
+    expect("…and an explicit full coverage still merges", run(findings=whole), True)
     below = copy.deepcopy(GOOD_FINDINGS)
     below["findings"] = [{"severity": "low", "category": "tests", "summary": "nit"}]
     expect("finding below threshold still qualifies", run(findings=below), True)
