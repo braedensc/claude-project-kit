@@ -666,7 +666,9 @@ again: only what the log gains past that size counts.
 **A hand sign-off counts only for the entries it was made against.** `A-ENTRY-LOADED`
 records a fingerprint of every review entry, fence included. Rewrite the entries and the
 sign-off stops counting; the step says so and names the date it was made. A sign-off from
-before this binding names no entries, so it counts for none. Run `verify` first, so the
+before this binding names no entries, so it counts for none. It never stops a run:
+`preflight` names it as a note and goes on, and on a machine whose dispatcher log proves
+the load, nothing more is needed (KIT-176). To sign again, run `verify` first, so the
 installer has measured the entries, then sign.
 
 If the log names one of them nowhere, the run reports `UNKNOWN` and prints the
