@@ -224,8 +224,24 @@ jobs:
       # with every config error reported in one pass, the three §13 states carry three
       # different exit codes, a corrupt seen-set refuses to run rather than re-paging, dry
       # run writes nothing, a heartbeat is left on the failing path, and no merge/approve/
-      # state-change path exists — the only tracker mutation is one label.
-      - name: Human-action notifier selftest (marks, §13 states, label-only mutation)
+      # state-change path exists. With reply_relay OFF (the default) the only tracker
+      # mutation is one label; with it ON there is exactly one more, a thread reply that only
+      # ever carries an owner's relayed reply (KIT-118). The relay half asserts: off means no
+      # thread read and no new write; only an agent:blocked ping becomes a target; a second
+      # chat account, a non-threaded message, a reply to a message the notifier did not send,
+      # a bot post, an edit and a file share are each dropped; an oversize reply is dropped,
+      # never truncated; the seventh relay in an hour is dropped; the target is the ticket AND
+      # THREAD recorded when the ping went out — the thread the session's own mark sits in —
+      # so a newer session on the same ticket never receives the answer, and a recorded thread
+      # that is gone declines instead of falling back; decode and bracket-strip repeat to a
+      # FIXED POINT, so a bracket hidden inside an entity cannot be glued back together, and
+      # the result is re-checked before it is posted; pending is saved before the post, so a
+      # replay posts once, a crash is named unconfirmed (exit 3) and a post that raised is
+      # never retried; every failed thread read is exit 1, a ping that is not (or is no
+      # longer) a relay target names itself once, and a pass that failed or declined only in
+      # the relay never claims 'nothing to do, not a failure'; and a comment write anywhere
+      # outside the relay path — including through a from-import — turns it red.
+      - name: Human-action notifier selftest (marks, §13 states, label + relay-reply mutations)
         run: python3 scripts/pipeline_notify_local.py --selftest
 
       # The heartbeat monitor: the one job that READS the other three's heartbeats, which
