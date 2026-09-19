@@ -123,6 +123,9 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import check_schemas  # noqa: E402  document_problems: the one definition of "conforms"
+# The publisher's credential scan, imported rather than copied (KIT-170): the same
+# shapes that keep a secret off a pull request keep it out of a filed ticket.
+import pipeline_review_local as _publisher  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -243,6 +246,66 @@ def scrub_plan(plan, comments):
 
 class ExecutorError(Exception):
     """This executor / its config / the tracker failed — verdict `errored`."""
+
+
+# --------------------------------------------------------------------------- #
+# Safe to retry (KIT-170). A reader polls finished sessions, so the same proposal can
+# reach this executor twice: a retry after an error, or a reader whose state was lost.
+# --------------------------------------------------------------------------- #
+# THE RECEIPT. Every filed epic carries a plain-text line naming the pinned ticket and
+# a digest of the proposal as filed. Before creating anything the executor asks the
+# work team for an issue carrying that line, and a second run on the same proposal
+# files nothing. Plain text, not an HTML comment: the tracker may normalise markdown
+# on save, and a marker it strips is a receipt that is never found.
+PLAN_RECEIPT_PREFIX = "Plan id: "
+
+
+def plan_digest(pinned, plan):
+    """12 hex characters over the pinned ticket and the plan AS FILED (scrubbed), so a
+    re-plan that changes anything is a different proposal and files again."""
+    import hashlib
+    canon = json.dumps({"pinned": pinned, "plan": plan}, sort_keys=True,
+                       separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:12]
+
+
+def plan_receipt(pinned, digest):
+    return "%s%s/%s" % (PLAN_RECEIPT_PREFIX, pinned, digest)
+
+
+# A planning session's §4 telemetry block is a `ticket-comment`, and without this it
+# was delivered to the owner as a QUESTION — a JSON blob paging a person. The brief
+# says to emit none; a session that emits one anyway has it set aside, and said so.
+_TELEMETRY_RE = re.compile(r'"schema"\s*:\s*"pipeline-telemetry/1"')
+
+
+def split_telemetry(comments):
+    """(questions, telemetry): the batch's ticket-comments, telemetry blocks apart."""
+    questions, telemetry = [], []
+    for c in comments or []:
+        (telemetry if _TELEMETRY_RE.search(c.get("body") or "") else questions).append(c)
+    return questions, telemetry
+
+
+def secret_hits_in(plan, comments):
+    """The credential shapes found in any session-written title or body. The planner
+    holds Read, and anything it read can be pasted into a child; a filed ticket is
+    readable by every member of the workspace."""
+    texts = []
+    if plan:
+        for part in [plan.get("epic") or {}] + list(plan.get("children") or []):
+            texts += [part.get("title") or "", part.get("body") or ""]
+    texts += [c.get("body") or "" for c in comments or []]
+    hits = []
+    for text in texts:
+        for label in _publisher.secret_hits(text):
+            if label not in hits:
+                hits.append(label)
+    return hits
+
+
+SECRET_REJECT_REASON = ("the proposal carried text shaped like a credential — nothing was "
+                        "filed, and the text is not quoted here")
 
 
 # --------------------------------------------------------------------------- #
@@ -514,6 +577,46 @@ def render_note_comment(idea_id, body):
             "the plan for **%s**:\n\n%s" % (idea_id, _sanitize(body)))
 
 
+def render_refiled_summary(idea_id, epic, receipt):
+    """The summary for a tree an earlier run filed whole but never reported: the
+    same approval gesture, from what the tracker holds now."""
+    return "\n".join([
+        _marker(ESC_AWAITING_APPROVAL),
+        "### Epic plan ready — awaiting your approval",
+        "",
+        "An earlier run filed the plan for **%s** as [%s](%s), with %d child ticket(s): "
+        "%s. Its summary never reached this ticket, so this is that summary. Nothing "
+        "was filed again. To approve, move the epic to the state this project maps to "
+        "`ready`." % (idea_id, epic["identifier"], epic.get("url") or "",
+                      len(epic["children"]), ", ".join(epic["children"]) or "none"),
+        "",
+        receipt,
+    ])
+
+
+def render_partial_comment(idea_id, created, reason):
+    """A run that failed partway says EXACTLY what it left behind (KIT-170). The
+    tracker has no transaction; all-or-nothing covers validation, not the network."""
+    lines = [
+        _marker(ESC_REJECTED),
+        "### Filing the plan for **%s** failed partway" % idea_id,
+        "",
+        "The plan passed every check, and the tracker then failed while it was being "
+        "filed. %d item(s) were created before the failure:" % len(created),
+        "",
+    ]
+    lines += ["- %s" % item for item in created] or ["- nothing"]
+    lines += [
+        "",
+        "Nothing else was filed. Delete or finish what is listed, then hand the idea off "
+        "again. A new run on this same proposal will find the epic by its plan id and "
+        "file nothing on top of it.",
+        "",
+        "Failure: %s" % _sanitize(str(reason))[:300],
+    ]
+    return "\n".join(lines)
+
+
 def render_no_output_comment(idea_id):
     """The run produced nothing. Absence must not be SILENT on the board (§13):
     the owner is told the miss, marked so the notifier can surface it."""
@@ -626,6 +729,34 @@ class LinearClient:
         if not nodes:
             raise ExecutorError("work team %s not found" % team_key)
         return nodes[0]["id"]
+
+    def find_filed_plan(self, team_id, receipt):
+        """The epic an earlier run filed for this exact proposal, or None. Archived
+        issues count: a tree someone archived still means this proposal was filed.
+        A search that fails raises — "could not ask" is never "nothing there" (§13),
+        and the difference is a second copy of the whole tree."""
+        data = self._gql(
+            "query($filter: IssueFilter!) { issues(filter: $filter, first: 5, "
+            "includeArchived: true) { nodes { id identifier url description "
+            "children(first: 50) { nodes { id identifier } } } } }",
+            {"filter": {"team": {"id": {"eq": team_id}},
+                        "description": {"contains": receipt}}})
+        for node in (data.get("issues") or {}).get("nodes") or []:
+            if receipt in (node.get("description") or ""):
+                kids = ((node.get("children") or {}).get("nodes")) or []
+                return {"id": node["id"], "identifier": node["identifier"],
+                        "url": node.get("url") or "",
+                        "children": [k.get("identifier") or "?" for k in kids]}
+        return None
+
+    def comment_bodies(self, issue_id):
+        """The bodies of the idea's comments, newest 100 — to ask whether a summary
+        for this proposal already landed before posting another."""
+        data = self._gql(
+            "query($id: String!) { issue(id: $id) { comments(first: 100) "
+            "{ nodes { body } } } }", {"id": issue_id})
+        nodes = (((data.get("issue") or {}).get("comments") or {}).get("nodes")) or []
+        return [n.get("body") or "" for n in nodes]
 
     def create_project(self, team_id, name, description):
         data = self._gql(
@@ -764,12 +895,26 @@ def materialise(args, client=None):
             return EXIT_ERRORED
     pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
     plan, comments = scrub_plan(plan, comments)
+    comments, telemetry = split_telemetry(comments)
+    if telemetry:
+        print("::notice:: set aside %d telemetry block(s) the session emitted — a "
+              "planning batch carries no telemetry, and a block is never a question"
+              % len(telemetry))
+    if secret_hits_in(plan, comments):
+        # Checked before every other rule, and whatever else is wrong, so no other
+        # rejection can quote the text. The shapes go to this job's log, never the
+        # text itself.
+        print("::error:: credential shapes in the proposal: %s"
+              % ", ".join(secret_hits_in(plan, comments)), file=sys.stderr)
+        return _reject(args, client, cfg, team_key, finding_cfg, pinned,
+                       SECRET_REJECT_REASON, [])
     if not errors and plan:
         errors = validate_plan(plan, pinned, bool(finding_cfg))
     if not errors:
         errors = comment_errors(comments, pinned)
     if not errors and not plan and not comments:
-        errors = ["the batch carried neither a plan nor a question"]
+        errors = ["the batch carried neither a plan nor a question%s"
+                  % (" (only a telemetry block)" if telemetry else "")]
     if not errors and (plan or comments) and pinned is None:
         errors = ["no dispatcher-pinned ticket id — cannot verify the target; the "
                   "dispatcher supplies it via --pinned"]
@@ -842,7 +987,11 @@ def _no_output(args, client, cfg, team_key, finding_cfg, message):
     (§13). When the ticket is known (a real dispatch: --pinned), leave a visible
     'no plan produced' comment so the owner sees the miss. Without a pinned ticket
     (a local or dry run) it stays a quiet notice — there is nobody's ticket to
-    notify. `skipped` (exit 0) either way: this is an answer, not a failure."""
+    notify. `skipped` (exit 0) when the note landed: this is an answer, not a failure.
+
+    A NOTE THAT COULD NOT BE POSTED IS `errored` (KIT-170). It used to warn and exit
+    0, so an empty run whose note failed was silent twice over: nothing on the board
+    and a clean exit for the reader. A reader retries an errored run."""
     print("::notice:: %s" % message)
     target = args.pinned
     # Not gated on the plan kind: an empty run is visible whether or not the
@@ -851,17 +1000,18 @@ def _no_output(args, client, cfg, team_key, finding_cfg, message):
         return EXIT_OK
     client = client or _live_client(args)
     if client is None:
-        print("::warning:: no credential — could not surface the empty run on %s"
-              % target, file=sys.stderr)
-        return EXIT_OK
+        print("::error:: no credential — the empty run on %s could not be surfaced, so "
+              "nothing anywhere says it happened" % target, file=sys.stderr)
+        return EXIT_ERRORED
     try:
         src = client.resolve_idea(target)
         client.post_comment(src["id"], render_no_output_comment(target))
         print("::notice:: verdict=skipped (surfaced): the empty run is now visible on %s"
               % target)
     except (ExecutorError, IndexError) as exc:
-        print("::warning:: could not surface the empty run on %s: %s" % (target, exc),
+        print("::error:: could not surface the empty run on %s: %s" % (target, exc),
               file=sys.stderr)
+        return EXIT_ERRORED
     return EXIT_OK
 
 
@@ -897,8 +1047,10 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     """Post the rejection back on the idea ticket (best-effort) and exit rejected.
     A tree that was READ and REFUSED is the session's own output, never this
     executor's failure (§13) — so the exit code is `rejected`, even if the
-    report-back comment cannot be delivered. The report ALWAYS goes to the pinned
-    (own) ticket, never to a ticket a retargeting session named."""
+    report-back comment is what failed, the run is `errored` (KIT-170): it used to
+    warn and exit 3, and a rejection only this job's log held was a rejection
+    nobody read. A reader retries an errored run. The report ALWAYS goes to the
+    pinned (own) ticket, never to a ticket a retargeting session named."""
     for line in [reason] + detail_lines:
         print("::error:: plan rejected: %s" % line, file=sys.stderr)
     target = args.pinned or source_id
@@ -907,54 +1059,110 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     # report only in this job's log is a report nobody reads (§13).
     if not args.dry_run and target:
         client = client or _live_client(args)
-        if client is not None:
-            body = render_rejection_comment(target, reason, detail_lines)
-            try:
-                src = client.resolve_idea(target)
-                client.post_comment(src["id"], body)
-                print("::notice:: reported the rejection back on %s" % target)
-            except (ExecutorError, IndexError) as exc:
-                print("::warning:: could not post the rejection comment on %s: %s"
-                      % (target, exc), file=sys.stderr)
+        if client is None:
+            print("::error:: no credential — the rejection could not be reported on %s"
+                  % target, file=sys.stderr)
+            return EXIT_ERRORED
+        body = render_rejection_comment(target, reason, detail_lines)
+        try:
+            src = client.resolve_idea(target)
+            client.post_comment(src["id"], body)
+            print("::notice:: reported the rejection back on %s" % target)
+        except (ExecutorError, IndexError) as exc:
+            print("::error:: could not post the rejection comment on %s: %s"
+                  % (target, exc), file=sys.stderr)
+            return EXIT_ERRORED
     return EXIT_REJECTED
 
 
 def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None):
     """The only path that mutates. Any failure here is `errored`, never
     `rejected` — the tree was accepted; the tracker is what failed, and it may be
-    partly written (§8, §13)."""
+    partly written (§8, §13).
+
+    SAFE TO RETRY (KIT-170). The epic carries a receipt naming the pinned ticket and
+    a digest of this proposal, and nothing is created until the work team has been
+    asked for it. A second run on the same proposal finds the receipt and files
+    nothing. A run that fails partway posts EXACTLY what it created on the idea."""
     comments = comments or []
-    created_count = 0
+    created = []          # human-readable names of everything this run made
 
     def errored(msg):
         print("::error:: %s" % msg, file=sys.stderr)
-        print("::error:: created %d ticket(s) before this failure. All-or-nothing "
-              "covers VALIDATION, not the network — the tracker may be partly "
-              "written." % created_count, file=sys.stderr)
+        print("::error:: created %d item(s) before this failure. All-or-nothing covers "
+              "VALIDATION, not the network — the tracker may be partly written."
+              % len(created), file=sys.stderr)
+        if created:
+            try:
+                client.post_comment(src_id[0], render_partial_comment(pinned, created, msg))
+                print("::notice:: listed the %d item(s) created on %s" % (len(created), pinned))
+            except (ExecutorError, IndexError, KeyError, TypeError) as exc:
+                print("::error:: could not list what was created on %s: %s — the partial "
+                      "tree is visible only in this log" % (pinned, exc), file=sys.stderr)
         return EXIT_ERRORED
 
+    src_id = [None]
+    digest = plan_digest(pinned, plan)
+    receipt = plan_receipt(pinned, digest)
     try:
         # The idea is on the Planning team; the tree lands in the WORK team the
         # project config names, whose state and label ids `forced` carries.
         src = client.resolve_idea(pinned)
+        src_id[0] = src["id"]
         team_id = client.resolve_team(team_key)
+
+        # Asked BEFORE anything is created. A search that fails raises, and that is
+        # errored: "could not look" must never become a second copy of the tree.
+        earlier = client.find_filed_plan(team_id, receipt)
+        if earlier is not None:
+            want = len(plan["children"])
+            have = earlier["children"]
+            if len(have) >= want:
+                # Filed whole. Its summary may still be missing — a run that created
+                # everything and then failed to comment — so the idea is asked, and a
+                # summary is posted only when none for this receipt landed.
+                if not any(receipt in b for b in client.comment_bodies(src["id"])):
+                    client.post_comment(src["id"], render_refiled_summary(
+                        pinned, earlier, receipt))
+                    print("::notice:: the summary for %s had never landed; posted it now"
+                          % earlier["identifier"])
+                print("::notice:: verdict=already-filed: this proposal was filed earlier as "
+                      "%s (%s) with its %d child(ren); nothing was filed again."
+                      % (earlier["identifier"], receipt, want))
+                return EXIT_OK
+            msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
+                   "children — an earlier run failed partway. Nothing was filed again."
+                   % (earlier["identifier"], len(have), want))
+            try:
+                client.post_comment(src["id"], render_partial_comment(
+                    pinned, ["%s (the epic, with %d of %d children%s)"
+                             % (earlier["identifier"], len(have), want,
+                                ": " + ", ".join(have) if have else "")], msg))
+            except (ExecutorError, IndexError) as exc:
+                print("::error:: could not report the incomplete tree on %s: %s"
+                      % (pinned, exc), file=sys.stderr)
+            print("::error:: %s" % msg, file=sys.stderr)
+            return EXIT_ERRORED
+
         subscribers = [forced["owner"]] if forced["subscribe"] else []
 
         # The project holds the PRD and the tree (mirrors /plan-epic step 1).
         project_id = client.create_project(
             team_id, plan["epic"]["title"],
             "Idea-gate epic proposed from %s. Awaiting approval." % pinned)
+        created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
         # nothing: provenance:agent never auto-approves (§5).
         epic_desc = ("> Epic drafted by a planning session from **%s**. "
                      "`provenance:agent` — awaiting a person's approval to release "
-                     "its children (§4, §5).\n\n%s" % (pinned, plan["epic"]["body"]))
+                     "its children (§4, §5).\n>\n> %s\n\n%s"
+                     % (pinned, receipt, plan["epic"]["body"]))
         epic = client.create_issue(
             team_id, plan["epic"]["title"], epic_desc, forced["landing_state"],
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
             subscriber_ids=subscribers)
-        created_count += 1
+        created.append("epic %s" % epic["identifier"])
 
         # The children — backlog, provenance:epic, parent FORCED to the epic
         # created just now. The session supplied no parent id.
@@ -965,7 +1173,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             issue = client.create_issue(
                 team_id, child["title"], child["body"], forced["landing_state"],
                 label_ids, parent_id=epic["id"], project_id=project_id)
-            created_count += 1
+            created.append("child %s" % issue["identifier"])
             created_children.append((issue, child))
 
         # Dependency edges → blockedBy relations.
@@ -977,7 +1185,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # Report the plan back on the idea ticket for the owner, then any notes the
         # session left alongside it (its open questions ride in the epic PRD; these
         # are top-level asides). The plan is filed either way — a note never blocks.
-        client.post_comment(src["id"], render_success_comment(pinned, epic, created_children, plan["epic"]["title"]))
+        client.post_comment(src["id"], render_success_comment(
+            pinned, epic, created_children, plan["epic"]["title"]) + "\n\n" + receipt)
         for c in comments:
             client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
     except ExecutorError as exc:
@@ -986,8 +1195,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         return errored("unexpected tracker response shape: %s" % exc)
 
     print("::notice:: filed epic %s and %d child(ren) for %s (all backlog, "
-          "provenance:agent/epic)%s — awaiting the owner's approval."
-          % (epic["identifier"], len(created_children), pinned,
+          "provenance:agent/epic, %s)%s — awaiting the owner's approval."
+          % (epic["identifier"], len(created_children), pinned, receipt,
              " + %d note(s)" % len(comments) if comments else ""))
     return EXIT_OK
 
@@ -1041,6 +1250,8 @@ class FakeLinear:
     def create_issue(self, team_id, title, description, state_id, label_ids,
                      parent_id=None, project_id=None, subscriber_ids=None,
                      assignee_id=None):
+        if getattr(self, "fail_on_create", None) == len(self.issues) + 1:
+            raise ExecutorError("simulated tracker failure on create %d" % (len(self.issues) + 1))
         self._n += 1
         issue = {"team_id": team_id, "id": "iss-%d" % self._n, "identifier": "KIT-%d" % (100 + self._n),
                  "url": "https://linear.app/x/issue/KIT-%d" % (100 + self._n),
@@ -1058,6 +1269,21 @@ class FakeLinear:
         if getattr(self, "fail_post", False):
             raise ExecutorError("simulated tracker failure on comment")
         self.comments.append((issue_id, body))
+
+    def find_filed_plan(self, team_id, receipt):
+        """The SAME question the live client asks: an issue in the work team whose
+        description carries the receipt, archived ones included."""
+        if getattr(self, "fail_search", False):
+            raise ExecutorError("simulated tracker failure on search")
+        for issue in self.issues:
+            if issue["team_id"] == team_id and receipt in issue["description"]:
+                kids = [i["identifier"] for i in self.issues if i["parent_id"] == issue["id"]]
+                return {"id": issue["id"], "identifier": issue["identifier"],
+                        "url": issue["url"], "children": kids}
+        return None
+
+    def comment_bodies(self, issue_id):
+        return [b for i, b in self.comments if i == issue_id]
 
 
 _GOOD_CHILD_BODY = """## Context
@@ -1509,6 +1735,102 @@ def selftest():
         # 39. AN OAUTH TOKEN IS SENT AS BEARER; A PERSONAL KEY RAW.
         check("oauth-bearer", LinearClient("lin_oauth_abc")._key, "Bearer lin_oauth_abc")
         check("personal-key-raw", LinearClient("lin_api_abc")._key, "lin_api_abc")
+
+        # ── Safe to retry, loud when it cannot report (KIT-170) ──────────────
+        # 41. THE SAME PROPOSAL TWICE FILES ONCE. The receipt on the epic is found
+        #     on the second run, which creates nothing and posts nothing new.
+        fakeP = FakeLinear()
+        check("retry-first-run-files", run(_tree(), client=fakeP), EXIT_OK)
+        first = (len(fakeP.issues), len(fakeP.projects), len(fakeP.comments))
+        check("retry-epic-carries-receipt",
+              plan_receipt("KIT-777", "") in fakeP.issues[0]["description"], True)
+        check("retry-summary-carries-receipt",
+              PLAN_RECEIPT_PREFIX + "KIT-777/" in fakeP.comments[0][1], True)
+        check("retry-second-run-ok", run(_tree(), client=fakeP), EXIT_OK)
+        check("retry-second-run-files-nothing",
+              (len(fakeP.issues), len(fakeP.projects), len(fakeP.comments)), first)
+        # …but a DIFFERENT proposal for the same idea is a re-plan, and files.
+        replan = _tree()
+        replan["requests"][0]["epic"]["title"] = "Safe follow-up ticket filing, revised"
+        check("retry-replan-files", run(replan, client=fakeP), EXIT_OK)
+        check("retry-replan-created", len(fakeP.issues), first[0] * 2)
+        check("digest-differs-on-change",
+              plan_digest("KIT-777", {"a": 1}) != plan_digest("KIT-777", {"a": 2}), True)
+        check("digest-differs-on-pin",
+              plan_digest("KIT-1", {"a": 1}) != plan_digest("KIT-2", {"a": 1}), True)
+        # 42. A SEARCH THAT FAILS IS ERRORED, never "nothing there" — the difference
+        #     is a second copy of the tree.
+        fakeS = FakeLinear(); fakeS.fail_search = True
+        check("search-failure-errored", run(_tree(), client=fakeS), EXIT_ERRORED)
+        check("search-failure-created-nothing", fakeS.issues, [])
+        # 43. A FAILURE PARTWAY LISTS EXACTLY WHAT WAS CREATED on the idea, and a
+        #     retry finds the incomplete tree, files nothing, and says so loudly.
+        fakeF2 = FakeLinear(); fakeF2.fail_on_create = 3   # epic, child 0, then fail
+        check("partial-errored", run(_tree(), client=fakeF2), EXIT_ERRORED)
+        listed = fakeF2.comments[-1][1]
+        check("partial-lists-epic", fakeF2.issues[0]["identifier"] in listed, True)
+        check("partial-lists-child", fakeF2.issues[1]["identifier"] in listed, True)
+        check("partial-says-failed-partway", "failed partway" in listed, True)
+        fakeF2.fail_on_create = None
+        before = len(fakeF2.issues)
+        check("partial-retry-errored", run(_tree(), client=fakeF2), EXIT_ERRORED)
+        check("partial-retry-files-nothing", len(fakeF2.issues), before)
+        check("partial-retry-names-count", "1 of its 2 children" in fakeF2.comments[-1][1], True)
+        # 44. A TREE FILED WHOLE WHOSE SUMMARY NEVER LANDED gets its summary on retry
+        #     — once.
+        fakeW = FakeLinear()
+        run(_tree(), client=fakeW)
+        fakeW.comments = []                      # the summary was lost
+        check("lost-summary-retry-ok", run(_tree(), client=fakeW), EXIT_OK)
+        check("lost-summary-reposted", len(fakeW.comments), 1)
+        check("lost-summary-marked", _marker(ESC_AWAITING_APPROVAL) in fakeW.comments[0][1], True)
+        run(_tree(), client=fakeW)
+        check("lost-summary-not-reposted-twice", len(fakeW.comments), 1)
+        # 45. A REPORT THAT CANNOT BE POSTED IS ERRORED, never 0 or 3.
+        fakeR2 = FakeLinear(); fakeR2.fail_post = True
+        bad = _tree(); bad["requests"][0]["children"][0]["depends_on"] = [9]
+        check("reject-report-failed-errored", run(bad, client=fakeR2), EXIT_ERRORED)
+        fakeN = FakeLinear(); fakeN.fail_post = True
+        argsNo = argparse.Namespace(requests=os.path.join(tmp, "nope.json"), config=cfg_path,
+                                    repo_root=tmp, dry_run=False, pinned="KIT-777")
+        check("no-output-report-failed-errored", materialise(argsNo, client=fakeN), EXIT_ERRORED)
+        saved_env = dict(os.environ)
+        try:
+            os.environ.pop("STAGE_A_SELFTEST_KEY", None)
+            argsNk = argparse.Namespace(requests=os.path.join(tmp, "nope.json"), config=cfg_path,
+                                        repo_root=tmp, dry_run=False, pinned="KIT-777",
+                                        key_env="STAGE_A_SELFTEST_KEY")
+            check("no-output-no-key-errored", materialise(argsNk, client=None), EXIT_ERRORED)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+        # 46. A TELEMETRY BLOCK IS NEVER A QUESTION.
+        tele = _comment('```json\n{"schema": "pipeline-telemetry/1", "runs": []}\n```')
+        fakeT2 = FakeLinear()
+        with_tele = _tree(); with_tele["requests"].append(tele)
+        check("telemetry-with-plan-ok", run(with_tele, client=fakeT2), EXIT_OK)
+        check("telemetry-not-posted-as-note",
+              any("pipeline-telemetry" in b for _, b in fakeT2.comments), False)
+        fakeT3 = FakeLinear()
+        check("telemetry-only-rejected", run(_batch(tele), client=fakeT3), EXIT_REJECTED)
+        check("telemetry-only-no-question",
+              any(_marker(ESC_NEEDS_INPUT) in b for _, b in fakeT3.comments), False)
+        check("telemetry-split", split_telemetry([tele, _comment("q")]),
+              ([_comment("q")], [tele]))
+        # 47. A CREDENTIAL IN SESSION TEXT IS NEVER FILED OR QUOTED.
+        fake_key = "lin_" + "api_" + "SELFTESTNOTAREALKEY0123456789"
+        leaky = _tree()
+        leaky["requests"][0]["children"][1]["body"] = _GOOD_CHILD_BODY + "\nkey: " + fake_key + "\n"
+        fakeK2 = FakeLinear()
+        check("secret-rejected", run(leaky, client=fakeK2), EXIT_REJECTED)
+        check("secret-nothing-filed", fakeK2.issues, [])
+        check("secret-not-quoted", any(fake_key in b for _, b in fakeK2.comments), False)
+        check("secret-reason-posted", any(SECRET_REJECT_REASON in b for _, b in fakeK2.comments), True)
+        leaky_q = _batch(_comment("is this right? " + fake_key))
+        fakeK3 = FakeLinear()
+        check("secret-in-question-rejected", run(leaky_q, client=fakeK3), EXIT_REJECTED)
+        check("secret-in-question-not-quoted", any(fake_key in b for _, b in fakeK3.comments), False)
+        check("secret-scan-is-publishers", _publisher.secret_hits("x " + fake_key) != [], True)
 
         # 40. A CHILD THAT CHANGES A GUARD IS NAMED FOR THE OWNER (KIT-163). The
         #     session cannot request the guard-change label and this executor never

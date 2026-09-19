@@ -710,3 +710,16 @@ the executor has a question channel, and a "safe-outputs path" that does not exi
 
 The skill's unattended section now lists every difference from the interactive path, step by
 step, and describes the fence as the deny list it is.
+
+### The executor is safe to retry and loud when it cannot report (KIT-170, part)
+
+A reader that polls finished sessions will hand the executor the same proposal twice: after
+an error, or after its own state is lost. Before this round that filed a second tree, and a
+rejection or no-output note that failed to post exited 0 or 3 with nothing on the board. Now
+the epic carries a plain-text receipt over the pinned ticket and the proposal as filed; the
+executor asks for it before creating anything, and files nothing a second time. A run that
+fails partway lists what it created on the ticket. A report that cannot be posted is
+`errored`. Session text is scanned with the review publisher's credential scan before it is
+filed or quoted, and a telemetry block is never delivered as a question. KIT-170's other
+items (the `notify` modes, advisory `depends_on`, dependency positions in the summary) stay
+open on that ticket.
