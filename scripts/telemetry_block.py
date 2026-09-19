@@ -557,10 +557,25 @@ def bounce_comment(artifact, block, notes=None):
 
 
 def review_comment(artifact, block, notes=None):
-    """The ticket comment body carrying `block`, trimmed to §8's cap out loud."""
+    """The ticket comment body carrying `block`, trimmed to §8's cap out loud.
+
+    A review that saw only part of the change says so FIRST (KIT-138). This comment is the
+    row a person reads on the original ticket, and findings from a partial review read
+    exactly like findings from a whole one — "no findings" most of all. Contract §13: the
+    difference between *nothing to report* and *most of it was never read* must survive
+    into every place the result is repeated, not only the pull request."""
     notes = notes if notes is not None else []
     summary = str(artifact.get("summary") or "").strip()
     head = ["**Pipeline review** — PR #%s" % artifact.get("pr")]
+    if str(artifact.get("coverage") or "") == "partial":
+        withheld = [str(p) for p in (artifact.get("withheld_files") or [])]
+        named = ", ".join(withheld[:5]) + (" …" if len(withheld) > 5 else "")
+        head.append("")
+        head.append("**PARTIAL REVIEW — %d file(s) were never read**%s. What follows is about "
+                    "the files the reviewer saw. It is not a verdict on this change, and no "
+                    "absence of findings below covers the withheld files."
+                    % (len(withheld), (": " + named) if named else ""))
+        notes.append("the review was partial: %d file(s) withheld over the size cap" % len(withheld))
     if summary:
         head.append("")
         head.append(summary[:1500])
@@ -791,6 +806,20 @@ def selftest():
     body_fat = review_comment(GOOD_ARTIFACT, fat, notes)
     check("an over-cap comment is trimmed", len(body_fat) <= MAX_BODY, str(len(body_fat)))
     check("...and says so rather than truncating in silence", notes, "no note emitted")
+
+    # KIT-138: a partial review is repeated HERE as a partial one, never as a clean row.
+    part_art = dict(GOOD_ARTIFACT, coverage="partial", summary="nothing in the files shown",
+                    withheld_files=["src/big_one.py", "src/big_two.py"], findings=[],
+                    max_severity=None)
+    notes = []
+    part_body = review_comment(part_art, copy.deepcopy(block_bad), notes)
+    check("a partial review says so before its summary",
+          part_body.index("PARTIAL REVIEW") < part_body.index("nothing in the files shown"))
+    check("...names the files nobody read", "src/big_two.py" in part_body)
+    check("...and the operator's note says it too",
+          any("partial" in n for n in notes), "; ".join(notes) or "no note emitted")
+    check("...while a whole-change review adds no such banner",
+          "PARTIAL REVIEW" not in review_comment(GOOD_ARTIFACT, copy.deepcopy(block), []))
 
     batch = review_requests(GOOD_ARTIFACT, body)
     check("the batch is a §8 document", batch["schema"] == SAFE_OUTPUTS_SCHEMA)

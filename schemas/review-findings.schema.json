@@ -21,8 +21,12 @@
     },
     "findings": {
       "type": "array",
-      "description": "Empty means the change is clean, and saying so with an empty list is the correct output for a clean change. There is no cap here on purpose: a review that found sixty things has found sixty things, and the artifact's own rendering limit is a downstream concern that reports what it shed.",
+      "description": "Empty means the change is clean — UNLESS `blocked` says the reviewer could not see it. There is no cap here on purpose: a review that found sixty things has found sixty things, and the artifact's own rendering limit is a downstream concern that reports what it shed.",
       "items": {"$ref": "#/$defs/finding"}
+    },
+    "blocked": {
+      "type": ["string", "boolean", "null"],
+      "description": "OMITTED unless the reviewer could not judge the change at all — no diff, no criteria, a truncated description. Set it to one line saying what was missing. An empty findings list then means COULD NOT REVIEW, not clean: the publisher declines and the PR is reported as unreviewed. Before this field the runbook asked a blocked reviewer to say so in `summary`, which nothing downstream could read, so 'I could not review this' arrived as 'this is clean' — the one thing a review must never do. Absent, null, false, or any of the negative spellings a model reaches for (`no`, `none`, `false`, `n/a`) all mean NOT blocked, because a false decline is noise and the tolerant reading is the safe one here."
     }
   },
 

@@ -1265,7 +1265,7 @@ auto-merge" enabled. **Without required checks, auto-merge merges the instant it
 enabled** and the gates below become the only gates, which is exactly what they are not
 designed to be. `docs/AUTONOMY.md` carries the copy-paste setup.
 
-Eight conditions, all required:
+Nine conditions, all required:
 
 | Condition | Read from (never from) |
 |---|---|
@@ -1273,6 +1273,7 @@ Eight conditions, all required:
 | The ticket still passes the approve tier, **recomputed** | a live re-run (a stored "was approved" flag) |
 | **Zero bounces** | Actions run history (`pipeline:bounce-N` PR labels — the fix session's token can edit PR labels) |
 | Review findings usable, none at or above `reviewSeverityThreshold` | the review artifact (a PR comment — the author can edit it) |
+| The review covered the **whole** change — `coverage` is not `partial` | the review artifact's own coverage (the findings list's length: a partial review is clean about the files it saw) |
 | Every check run terminal and green | the check-runs API ("CI passed" asserted in a commit message) |
 | `mergeStateStatus` is not `DIRTY` / `UNSTABLE` / `UNKNOWN` | the PR API |
 | The diff touches no `riskPaths` | `git diff base...head` (the PR body's description of its own size) |
@@ -1510,7 +1511,8 @@ file by a deterministic publisher, never reported **in** it.
       "summary": "one line — the claim",
       "detail": "why it is wrong and what would fix it"
     }
-  ]
+  ],
+  "blocked": null
 }
 ```
 
@@ -1518,7 +1520,8 @@ file by a deterministic publisher, never reported **in** it.
 |---|---|---|
 | `schema` | const `pipeline-review/1` | The marker. An unrecognized value makes the review **unusable**, which is reported as *treat this PR as unreviewed* — never as clean. |
 | `summary` | string | Two or three sentences. May be empty: an empty findings list with an empty summary is still a verdict. |
-| `findings` | array | Empty means the change is clean, and saying so with an empty list is the correct output. |
+| `findings` | array | Empty means the change is clean, and saying so with an empty list is the correct output — **unless `blocked` is set**. |
+| `blocked` | string \| boolean \| null, optional | Omitted unless the reviewer could not judge the change at all. One line saying what was missing. A set `blocked` means *could not review*, and the publisher declines: the PR is reported unreviewed, never clean. Absent, `null`, `false` and the negative spellings a model reaches for (`no`, `none`, `n/a`, `no blockers`, and any of them followed by a dash and an explanation) all mean not blocked — tolerant in that direction only, because a false decline discards a review that was done. A **partial** review (§11, files withheld over the size cap) is not a blocker and must not set it. Findings listed beside a set `blocked` are **not acted on**, so both publishers say how many there were: silence about them reads as *there were none* (§13). |
 
 Each finding:
 
@@ -1544,6 +1547,16 @@ document is now held to the schema: it conforms and every finding survives, or t
 review is **unusable** and the PR is reported as unreviewed. Fail-closed on shape,
 fail-open on outcome — an unusable review must not read as clean, and must not wedge the
 PR either.
+
+**And a well-formed document can still be a non-review.** A reviewer handed a description
+with no diff in it conforms perfectly and finds nothing, because there was nothing to
+find. Read as a clean bill that is a lie, and it was one that nothing downstream could
+detect: the runbook asked the reviewer to explain itself in `summary`, which is prose no
+consumer parses. `blocked` is the machine-readable half of that sentence. Set, it makes
+the publisher decline exactly as a malformed document does — same loud comment, same
+`usable: false` — so the two ways of not-reviewing arrive as one. It rests on the reviewer
+being honest about being stuck, which is reporting and not authority (§14's `$comment`); a
+reviewer that is blocked and stays silent is unchanged by this field.
 
 ### Why the boundary, and not `--json-schema`
 
