@@ -263,6 +263,21 @@ jobs:
       - name: Heartbeat monitor selftest (one comment per incident, §13 exit codes)
         run: python3 scripts/pipeline_heartbeat_monitor.py --selftest
 
+      # The notifier's installer (KIT-116). Offline, every transport stubbed, a real /bin/sh
+      # standing in for the role account: every conf error in one pass (a first-error-wins
+      # mutant turns it red), and each refusal by name — the invoking user as the role
+      # account, the dispatcher's own SLACK_BOT_TOKEN name, the dispatcher's env file and
+      # state root; run and attest refused under a model, and a model's dry run attempts no
+      # sudo, makes no tracker request and records nothing; a planted token and key reach no
+      # output and not the ledger, and the token meets only shell builtins; the ledger read
+      # back by `status` in a fresh process; verify never writes and never raises; the
+      # composed config accepted by the notifier's own loader and a broken one refused before
+      # any write; the plist sources the env file like every Stage E daemon; the dry run
+      # passes 0 and 3 and fails 1, 2 and 4; a redirect refused by the real transport; and no
+      # merge, approve, label-write, state-move or job-loading path in its source.
+      - name: Notifier installer selftest (agent-refused, no secret in output, §13 exit codes)
+        run: python3 scripts/pipeline_notifier_setup.py --selftest
+
       # Stage E's installer — the one command an operator runs. Offline, every
       # transport stubbed: the conf validator reports EVERY bad value in one pass
       # (a first-error-wins mutant turns it red), a settled machine is written to

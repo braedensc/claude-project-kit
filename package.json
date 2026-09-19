@@ -42,6 +42,7 @@
     "test:bounce": "python3 scripts/pipeline_bounce_local.py --selftest",
     "test:notifier": "python3 scripts/pipeline_notify_local.py --selftest",
     "test:heartbeat-monitor": "python3 scripts/pipeline_heartbeat_monitor.py --selftest",
+    "test:notifier-setup": "python3 scripts/pipeline_notifier_setup.py --selftest",
     "test:conflict": "python3 scripts/pr_conflict.py --selftest",
     "test:conflict-waker-setup": "python3 scripts/pipeline_conflict_waker_setup.py --selftest",
     "test:union": "python3 scripts/check_pr_union.py --selftest",
