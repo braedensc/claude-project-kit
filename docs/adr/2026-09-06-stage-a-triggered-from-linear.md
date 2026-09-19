@@ -630,10 +630,21 @@ unread key is gone, and so is `allowedTools`, which narrows nothing and changes 
 are injected. Twenty-nine built-in tools go with them — everything that runs, edits, fetches,
 schedules, messages, publishes or reads an MCP resource by argument.
 
-**Fallback (b) is still the decision.** What changed is only the mechanism that delivers it:
-a named deny list instead of a field nobody consumes. The security argument above is
-unaffected, because it always rested on the session holding no tracker tool — that claim is
-now made in the one list the dispatcher actually reads.
+**Fallback (b) is still the decision, and two of its claims no longer hold.** The mechanism
+is now a named deny list instead of a field nobody consumes. That keeps the claim that a
+correctly routed planning session holds no tracker tool. It loses two things this ADR said
+fallback (b) delivered:
+
+- **Runner independence.** Fallback (b) was said to close the KIT-41 runner-selection hole
+  because a session with no MCP server attached has no tracker tool whatever runner loads.
+  The servers are attached now, and denied by name. Whether a non-Claude runner honours that
+  deny list is unverified, so KIT-41 is not moot.
+- **"Routing by entry, not by label."** The routing decision above says the job kind comes
+  from the team's entry, never from text or labels on the ticket. The dispatcher reads a
+  description routing tag before team keys, and a label-selected prompt type's tool list
+  before the entry's own. An idea's own text or labels can therefore start a session outside
+  the planner's fence (KIT-154). Until that closes, the trigger is safe only for ideas a
+  person writes, not for pasted text.
 
 **What the planner keeps, and the one thing that is not proven.** It keeps Read, Grep and
 Glob to decompose against real code, and Task/Agent because the planning procedure's rubric
