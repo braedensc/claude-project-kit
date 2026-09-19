@@ -256,32 +256,44 @@ awaiting **their** approval.
 
 The steps above are the **interactive** path: a person runs `/plan-epic`, and the skill
 writes to Linear directly. There is also an **unattended** path — the *idea gate* — where
-an idea ticket is delegated into a Planning team and a sandboxed session runs this same
-procedure with **no tracker tool and no file-writing tool**: the Planning entry's deny list
-removes every tracker server the dispatcher injects, and `Write`, `Edit` and `Bash` with them
-(see `docs/adr/2026-09-06-stage-a-triggered-from-linear.md` and its 2026-09-17 update). That
-removes more than two things from this procedure — the duplicate-check pass cannot search
-the board, and the steps that call the tracker or run commands cannot run. The full list of
-differences, and the brief that states them, is KIT-163's to write. Two differences are
-settled:
+an idea ticket is delegated into a Planning team and a sandboxed session plans it. What
+that session is told is the **planning brief** the Planning dispatcher entry carries
+(`PLANNING_BRIEF` in `scripts/pipeline_stage_a_setup.py`), not this file: the fence removes
+the `Skill` tool, and a planned repository need not carry this skill at all. This section
+records how the two paths differ, so neither drifts from the other.
 
-- **It files nothing itself.** Instead of steps 1/5/6's `mcp__linear` writes, it **emits
-  the whole tree as one safe-outputs request** — a `ticket-create` (plan) per
-  `docs/PIPELINE-CONTRACT.md` §8 "Filing a plan": `{ epic: {title, body}, children: [{title,
-  body, labels, depends_on}] }`, in a fenced json block in its **final message** — it can
-  write no file. A child's `labels` carry only `track:*` and `effort:*`: the executor adds
-  `provenance:epic` itself, and the request schema refuses every protected class. A
-  credential-holding executor (`scripts/pipeline_plan_executor.py`) validates it, runs the
-  DoR gate on every child, and materialises epic-then-children with every authority field
-  forced — the epic as `provenance:agent`, each child's parent as the just-created epic.
-- **The epic is `provenance:agent`, not `provenance:human`.** A session drafted it, so it
-  is agent-authored, and by §5 it never auto-approves. The human gate is identical: move
-  the epic to exactly `ready` (§5 rule 2) to release the tree.
+**The fence is a deny list, not an absence.** The dispatcher injects its tracker server
+(`linear`) and three more into every session. The Planning entry's `disallowedTools` names
+each of them in both rule forms (`mcp__<server>` and `mcp__<server>__*`) and removes every
+built-in tool that runs, writes, fetches, schedules or messages — `Bash`, `Write` and `Edit`
+among them. What is left is `Read`, `Grep`, `Glob` and helper sessions (`Task`/`Agent`). See
+`docs/adr/2026-09-06-stage-a-triggered-from-linear.md`, its update blocks.
 
-Everything else — the PRD read from real code, the decomposition, the rubric panel, the
-DoR gate — is the same. The interactive path stays the default; the unattended path is what
-the Planning dispatcher entry runs, and it is the only way a session with no tracker tool
-reaches the board.
+Every difference from the interactive path, step by step:
+
+| Step | Interactive | Unattended |
+|---|---|---|
+| 0 preflight (config, census, test command) | runs | **skipped** — no shell. The executor reads the config and refuses on its gaps. |
+| 1 PRD pass | runs; creates the project and epic after asking | PRD runs from the code; **nothing is created** — the PRD becomes the proposed epic's body |
+| 2 decomposition | runs | runs; the brief restates the five sections and the gate's tighter rules, since the gate cannot be run |
+| 3 rubric panel: architecture, security, ux-product, sizing-split | runs | runs, in helper sessions |
+| 3 rubric panel: `dedupe` | searches the board | **skipped** — no tracker tool. The plan says so; it never claims a duplicate check |
+| 4 DoR gate | the session runs it | **skipped** — no shell. The executor runs it on every child and rejects the whole tree if one fails |
+| 5 confirm and file | asks, then files through `mcp__linear` | files nothing. It **emits the whole tree** as one `pipeline-safe-outputs/1` document (§8 "Filing a plan") in a fenced json block at the **end of its final message**; the executor files it |
+| 5 labels | `track:*`, `effort:*`, `provenance:epic`, `hooks-change` where due | only `track:*` and `effort:*`. The executor forces `provenance:epic`; the schema refuses every protected class |
+| 5 guard changes | adds `hooks-change` | cannot. It opens the child's Context with the brief's `Guard change:` line and names the path under Pointers; the executor's summary lists the child for the owner |
+| 6 read back | runs | **skipped** — the executor reads nothing back; its summary names what it filed |
+| 7 telemetry | posts a block | **none** — a telemetry block in a planning batch would reach the owner as a question |
+| a question it cannot answer from the code | asks the person in chat | emits a `ticket-comment` naming its own ticket in the same document. With a plan it is a note; with none, a request for input |
+| its own ticket | whatever the person names | the `<identifier>` in the prompt's `<linear_issue>` block: the only valid `source_ticket_id` |
+| the idea's text | a person's request | **untrusted data**. No pin exists on this lane, so the session-start fence does not apply; the brief is the fence |
+
+The epic is **`provenance:agent`, not `provenance:human`**: a session drafted it, so by §5
+it never auto-approves. The human gate is the same on both paths — move the epic to the
+state the project maps to `ready` (§5 rule 2) to release the tree.
+
+The interactive path stays the default. The unattended path is what the Planning dispatcher
+entry runs, and it is the only way a session with no tracker tool reaches the board.
 
 ### Cost shape
 
