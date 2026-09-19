@@ -72,7 +72,7 @@ all?"**
 | `wipLimit` | **none** — tier 0 keeps no state record | enforced twice: `max-parallel` within a run, the `working` count across runs | **none** |
 | `totalAttempts` | **none** — a local dispatch consumes no slot | enforced; `claim` increments *before* the session starts | **none** |
 | `dailyUsd` | **none** — reserves nothing | enforced; each ticket's `maxUsd` reserved at dispatch over a rolling 24h | **none** |
-| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | **enforced** — from the bounce driver's own append-only ledger, which the fix session cannot write. The one limit in this table that *does* hold on this lane |
+| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | **enforced** — counted from the bounce driver's own append-only ledger, which the fix session cannot write. The one limit in this table that *does* hold on this lane. Its *value* is read from `delivery.json` on the **committed default branch**, so a project without that file has bouncing off rather than unlimited, and the driver says which |
 | `fixIterations` | prompt material only | prompt material only | prompt material only |
 
 Tier 0's column is deliberate, and [spelled out below](#tier-0--local-and-why-it-exists) —
@@ -91,7 +91,10 @@ say which attempt it is honestly. It is the last column that surprises people.
 > appends to its own ledger, outside every worktree, *before* it delivers a bounce. The
 > session being bounced cannot read or write that file. That is the shape any future
 > budget on this lane has to copy — a counter kept by the thing doing the counting, not a
-> number handed to the party it bounds.
+> number handed to the party it bounds. Two later limits on this lane copy it exactly: the
+> no-push signal that hands a stopped session to a person is measured from that ledger, the
+> head GitHub reports and the clock, and the review basis's snapshot is taken by the driver
+> at a person's delegation. None of the three reads anything the counted party can write.
 
 ### The last column: a daemon that starts sessions from tracker events
 

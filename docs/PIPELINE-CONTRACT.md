@@ -865,8 +865,12 @@ MCP session) must still never create a ticket itself; that path is closed by the
 
 A **planning session** (the idea-gate: an idea ticket delegated into a Planning team, run
 sandboxed by the dispatcher) does not file findings — it proposes a whole **epic tree**.
-It holds no tracker tool at all, so it cannot write to the board directly; its only output
-is a proposed tree, which a credential-holding executor validates and materialises. The
+It holds no tracker tool and no tool that writes a file — its entry's deny list removes
+both — so it cannot write to the board or to its own supervision; its only output is a
+proposed tree, in its final message, which a credential-holding executor validates and
+materialises. The executor neutralizes every dispatcher routing directive (`[repo=…]`,
+`repo=`, `[model=…]`, `[agent=…]`) in every title and body the session wrote before the
+readiness gate reads them, because a filed child is text a person may later delegate. The
 tree is the *same* `ticket-create` type, carrying `epic` and `children` instead of a flat
 `title`/`body`:
 
@@ -897,7 +901,8 @@ backlog — and the tree shape adds these:
 
 - **The epic carries `provenance:agent`.** An epic a session drafted is agent-authored, and
   by §5 rule 1 `provenance:agent` never auto-approves, so the epic cannot approve itself; it
-  waits for the human to move it out of intake (§4). A human-written epic (manual
+  waits for the human to move it to exactly `ready` (§5 rule 2 — any other out-of-intake
+  state releases nothing). A human-written epic (manual
   `/plan-epic`) stays `provenance:human`; an idea-triggered one is `provenance:agent`.
 - **The executor sets each child's parent**, forced to the epic it created in this same
   batch. The session cannot supply a parent id — which would otherwise let it name an
@@ -911,9 +916,20 @@ backlog — and the tree shape adds these:
   executor constant like the flat kind's cap-of-3 — not a `delivery.json` budget), still
   all-or-nothing: one malformed or DoR-failing child rejects the whole tree.
 - **The executor posts a summary comment** on the idea ticket so the owner can read the plan
-  and approve the epic — the one human gate that releases the tree.
+  and approve the epic — the one human gate that releases the tree. Approval makes children
+  *eligible*; each reaches `ready` only through the approve tier (§11, which re-runs the
+  gate and is off unless a project switches it on) or a person, and starts only when
+  delegated.
+- **Where its inputs come from.** The executor's only config is the **planned repository's
+  committed `delivery.json`**: the work team the tree is filed into (`linear.teamKey`), that
+  team's state and label ids, and `linear.findingTicket`. It resolves the **idea ticket in its
+  own team** — the prefix of the pinned id — which is normally a separate Planning team, and
+  files the tree into the work team. The pinned id comes from whatever started the session,
+  never from the tree: a run that can write refuses without it, because a pin defaulted from
+  `source_ticket_id` would compare the session's claim with itself. Nothing in the kit supplies
+  that pin or invokes the executor yet (KIT-150).
 
-**The planning session's only channel is this file, so a QUESTION rides it too.** Because the
+**The planning session's only channel is this document, so a QUESTION rides it too.** Because the
 session holds no tracker tool, every way it reaches the owner travels through the executor. A
 session that needs a design decision it cannot resolve from the code emits a `ticket-comment`
 (§8's ordinary kind) in the same batch, naming its own pinned ticket. The executor posts it on
@@ -1249,7 +1265,7 @@ auto-merge" enabled. **Without required checks, auto-merge merges the instant it
 enabled** and the gates below become the only gates, which is exactly what they are not
 designed to be. `docs/AUTONOMY.md` carries the copy-paste setup.
 
-Eight conditions, all required:
+Nine conditions, all required:
 
 | Condition | Read from (never from) |
 |---|---|
@@ -1257,6 +1273,7 @@ Eight conditions, all required:
 | The ticket still passes the approve tier, **recomputed** | a live re-run (a stored "was approved" flag) |
 | **Zero bounces** | Actions run history (`pipeline:bounce-N` PR labels — the fix session's token can edit PR labels) |
 | Review findings usable, none at or above `reviewSeverityThreshold` | the review artifact (a PR comment — the author can edit it) |
+| The review covered the **whole** change — `coverage` is not `partial` | the review artifact's own coverage (the findings list's length: a partial review is clean about the files it saw) |
 | Every check run terminal and green | the check-runs API ("CI passed" asserted in a commit message) |
 | `mergeStateStatus` is not `DIRTY` / `UNSTABLE` / `UNKNOWN` | the PR API |
 | The diff touches no `riskPaths` | `git diff base...head` (the PR body's description of its own size) |
@@ -1494,7 +1511,8 @@ file by a deterministic publisher, never reported **in** it.
       "summary": "one line — the claim",
       "detail": "why it is wrong and what would fix it"
     }
-  ]
+  ],
+  "blocked": null
 }
 ```
 
@@ -1502,7 +1520,8 @@ file by a deterministic publisher, never reported **in** it.
 |---|---|---|
 | `schema` | const `pipeline-review/1` | The marker. An unrecognized value makes the review **unusable**, which is reported as *treat this PR as unreviewed* — never as clean. |
 | `summary` | string | Two or three sentences. May be empty: an empty findings list with an empty summary is still a verdict. |
-| `findings` | array | Empty means the change is clean, and saying so with an empty list is the correct output. |
+| `findings` | array | Empty means the change is clean, and saying so with an empty list is the correct output — **unless `blocked` is set**. |
+| `blocked` | string \| boolean \| null, optional | Omitted unless the reviewer could not judge the change at all. One line saying what was missing. A set `blocked` means *could not review*, and the publisher declines: the PR is reported unreviewed, never clean. Absent, `null`, `false` and the negative spellings a model reaches for (`no`, `none`, `n/a`, `no blockers`, and any of them followed by a dash and an explanation) all mean not blocked — tolerant in that direction only, because a false decline discards a review that was done. A **partial** review (§11, files withheld over the size cap) is not a blocker and must not set it. Findings listed beside a set `blocked` are **not acted on**, so both publishers say how many there were: silence about them reads as *there were none* (§13). |
 
 Each finding:
 
@@ -1528,6 +1547,16 @@ document is now held to the schema: it conforms and every finding survives, or t
 review is **unusable** and the PR is reported as unreviewed. Fail-closed on shape,
 fail-open on outcome — an unusable review must not read as clean, and must not wedge the
 PR either.
+
+**And a well-formed document can still be a non-review.** A reviewer handed a description
+with no diff in it conforms perfectly and finds nothing, because there was nothing to
+find. Read as a clean bill that is a lie, and it was one that nothing downstream could
+detect: the runbook asked the reviewer to explain itself in `summary`, which is prose no
+consumer parses. `blocked` is the machine-readable half of that sentence. Set, it makes
+the publisher decline exactly as a malformed document does — same loud comment, same
+`usable: false` — so the two ways of not-reviewing arrive as one. It rests on the reviewer
+being honest about being stuck, which is reporting and not authority (§14's `$comment`); a
+reviewer that is blocked and stays silent is unchanged by this field.
 
 ### Why the boundary, and not `--json-schema`
 

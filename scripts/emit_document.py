@@ -507,6 +507,73 @@ def selftest():
                        "— an unusable review that does not say so reads as clean: %r"
                        % (label, verdict))
 
+            # KIT-137: the cloud lane reads `blocked` exactly as the local publisher does.
+            # A conforming document that says it could not see the change is UNUSABLE on
+            # both lanes; the tolerant "not blocked" spellings are a review on both. Run
+            # over the same inputs, so the two publishers cannot drift apart.
+            try:
+                import pipeline_review_local as _prl
+                local_reading = _prl.blocked_reason
+            except Exception as exc:                          # the check, never a crash
+                local_reading = None
+                expect(False, "pipeline_review_local.blocked_reason could not be imported: %s" % exc)
+            # …and the reviewer on THIS lane is told the field exists. The normalize step
+            # declines on `blocked`, so a prompt that never mentions it leaves the branch
+            # firing only when a model volunteers the field (review of #134).
+            wf_text = open(os.path.join(cs.REPO_ROOT, REVIEW_WORKFLOW), encoding="utf-8").read()
+            prompt_text = wf_text.split("WRITE YOUR RESULT", 1)[-1].split("- name:", 1)[0]
+            expect("set `blocked` to one line saying" in prompt_text,
+                   "the cloud reviewer prompt never tells the reviewer to set `blocked`, "
+                   "though this lane declines on it")
+            expect('"blocked":null' in prompt_text,
+                   "the output shape the cloud reviewer is given omits `blocked`, so the "
+                   "field reads as one the schema does not define")
+
+            clean_doc = cs._with(cs.VALID_REVIEW_FINDINGS, "findings", [])
+            # EVERY spelling either lane knows, not a sample of them (review of #134): the
+            # point of this battery is that no value reads one way here and the other way
+            # there, and a spelling only one lane was ever run over proves nothing. The
+            # tail forms ("none - the diff was complete") and a review that is blocked AND
+            # carried findings are in here for the same reason.
+            spellings = [None, False, True, "", "no", "None", "false", "N/A", "n/a", "na",
+                         "nil", "not blocked.", "nothing", "not applicable", "No blockers.",
+                         "no blocker", "none applicable", "nothing to report",
+                         "nothing blocking", "no issues", "no problems", "not needed",
+                         "empty", "unblocked", "none - the diff was complete",
+                         "none — nothing was missing", "no: everything was present",
+                         "the description carried no diff", "the diff stops mid-way",
+                         "  None  ", "NONE"]
+            for spelling in spellings:
+                doc = dict(clean_doc) if spelling is None else cs._with(clean_doc, "blocked", spelling)
+                verdict = _run_normalize(block, doc, tmpdir)
+                if callable(local_reading):
+                    want_usable = local_reading(doc) is None
+                    expect(verdict.get("usable") is want_usable,
+                           "the cloud lane read blocked=%r as usable=%r; the local publisher "
+                           "reads it as usable=%r — the two lanes disagree: %r"
+                           % (spelling, verdict.get("usable"), want_usable, verdict))
+                    if not want_usable:
+                        expect("UNREVIEWED" in str(verdict.get("summary", "")),
+                               "a blocked review on the cloud lane did not say the PR is "
+                               "UNREVIEWED: %r" % verdict)
+            # …and a blocked review that DID list findings says how many on both lanes,
+            # rather than reporting them as nothing at all (§13, review of #134).
+            with_findings = cs._with(cs.VALID_REVIEW_FINDINGS, "blocked", "the diff stops mid-way")
+            cloud = _run_normalize(block, with_findings, tmpdir)
+            local_verdict = _prl.classify(with_findings, "medium") if callable(local_reading) else {}
+            n_found = len(with_findings.get("findings") or [])
+            expect(n_found > 0, "the shared fixture carries no findings, so this proves nothing")
+            expect(("%d finding" % n_found) in str(local_verdict.get("reason") or ""),
+                   "the local publisher dropped the count of findings a blocked review "
+                   "listed: %r" % local_verdict.get("reason"))
+            expect(local_verdict.get("unacted_findings") == n_found,
+                   "the local publisher's verdict carries no machine-readable count of the "
+                   "findings nobody will act on: %r" % local_verdict.get("unacted_findings"))
+            cloud_said = "%s %s" % (cloud.get("summary") or "", cloud.get("reason") or "")
+            expect(("%d finding" % n_found) in cloud_said,
+                   "the cloud lane dropped the count of findings a blocked review listed, "
+                   "so the two lanes report the same document differently: %r" % cloud)
+
             # An unreachable gate is itself a shape failure. A step that cannot
             # check the document must not be the step that calls it good.
             verdict = _run_normalize(block, cs.VALID_REVIEW_FINDINGS, tmpdir, stage_gate=False)

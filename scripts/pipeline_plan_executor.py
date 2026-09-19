@@ -4,11 +4,17 @@
 The direct analog of the review publisher (docs/PIPELINE-CONTRACT.md §14,
 scripts/pipeline_review_local.py), pointed at planning instead of review. A
 planning session — an idea ticket delegated into a Planning team, run sandboxed
-by the dispatcher — holds NO tracker tool at all (the fence is structural: no
-Linear MCP is attached to that session; see
-docs/adr/2026-09-06-stage-a-triggered-from-linear.md). Its whole deliverable is
-one `pipeline-safe-outputs/1` request file carrying a tree-shaped `ticket-create`
-(§8 "Filing a plan"). This module, run on the dispatcher host as an owner-scoped
+by the dispatcher — holds no tracker tool and no tool that writes a file: the
+Planning entry's deny list removes every tracker server the dispatcher injects,
+and Write with them (docs/adr/2026-09-06-stage-a-triggered-from-linear.md, its
+2026-09-17 update). Its whole deliverable is one `pipeline-safe-outputs/1`
+document carrying a tree-shaped `ticket-create` (§8 "Filing a plan"), in its final
+message; a reader that does not exist yet (KIT-150) hands it to this file.
+
+EVERY TITLE AND BODY THE SESSION WROTE IS SCRUBBED OF DISPATCHER ROUTING DIRECTIVES
+before the readiness gate reads it and before anything is filed (`scrub_plan`): a
+filed child is text a person may later delegate, and a tag left in it would pick
+that child's repository, branch or runner. This module, run on the dispatcher host as an owner-scoped
 role account that DOES hold the credential, then
 
     validates   the batch WHOLE against schemas/safe-outputs.schema.json     find_requests / validate_plan
@@ -40,7 +46,8 @@ THE THINGS THIS FILE IS SHAPED AROUND
      Every issue is CREATED in the backlog state and left there; the executor
      issues no state-move mutation at all. The epic carries `provenance:agent`, which by
      §5 never auto-approves — so the epic cannot approve itself, and a person
-     moving it out of intake is the one gate that releases the tree (§4).
+     moving it to exactly `ready` is the one gate that releases the tree (§5
+     rule 2: any other out-of-intake state releases nothing).
      --selftest asserts no state-move / approve / merge path exists in this file.
 
   3. All-or-nothing, including the DoR gate (contract §8, §13). One malformed
@@ -78,9 +85,26 @@ WHAT IT IS AND IS NOT
   backlog and stops; releasing them is the human's move and the approve tier's.
 
 Usage:
-    pipeline_plan_executor.py --requests F [--config delivery.json]
-                              [--repo-root DIR] [--dry-run]
+    pipeline_plan_executor.py --requests F --pinned TEAM-123
+                              --config <planned repo>/delivery.json
+                              --repo-root <planned repo checkout>
+                              [--key-env NAME] [--dry-run]
     pipeline_plan_executor.py --selftest
+
+  WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
+    --pinned     the delegated idea ticket, from whatever started the session —
+                 never the tree's own source_ticket_id. A run that can write
+                 refuses without it. The idea is resolved in ITS OWN team.
+    --config     the PLANNED repository's committed delivery.json. It names the
+                 work team the tree is filed into, that team's state and label
+                 ids, and `linear.findingTicket`, which turns plans on.
+    --repo-root  a checkout of that same planned repository, so the readiness
+                 gate checks each child's Pointers against the code the planner
+                 read, not against this executor's own checkout.
+    --key-env    the NAME of the variable holding the tracker key; the installer
+                 records it as LINEAR_KEY_ENV. Default LINEAR_API_KEY.
+  Nothing invokes this executor yet: the reader that finds a finished planning
+  session and supplies these arguments does not exist (KIT-150).
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker
@@ -165,6 +189,55 @@ def _sanitize(text):
     if not isinstance(text, str):
         return text
     return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
+
+TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([1-9][0-9]*)$")
+
+
+def split_ticket_id(ticket_id):
+    """(team key, number) — or ExecutorError. A pinned id is the only thing that
+    names which ticket a report lands on, so a malformed one is refused rather
+    than half-parsed."""
+    m = TICKET_ID_RE.match(ticket_id or "")
+    if not m:
+        raise ExecutorError("%r is not a ticket id of the form TEAM-123" % (ticket_id,))
+    return m.group(1), m.group(2)
+
+
+# THE DISPATCHER READS ROUTING DIRECTIVES OUT OF A TICKET DESCRIPTION: a bracketed
+# `[repo=…]` (optionally `#branch`, and Linear's escaped `\[…\]`), an unbracketed
+# `repo=`/`repos=`, and the `[model=…]` / `[agent=…]` runner selectors. Everything a
+# planning session wrote becomes a title or description a person may later delegate,
+# and a tag left in it would pick that child's repository, branch or runner — one that
+# loads none of the kit's guards (KIT-41). These patterns are COPIED from the review
+# poller, which verified them against the dispatcher's source; --selftest asserts the
+# two files still agree, so neither can drift.
+_BRACKET_TAG_RE = re.compile(r"\\?\[\s*(?:repos?|model|agent)\s*=[^\]\n]*\\?\]", re.IGNORECASE)
+_UNBRACKETED_REPO_RE = re.compile(r"(^|[^A-Za-z0-9_])repos?=[A-Za-z0-9_\-/.#,]+",
+                                  re.IGNORECASE | re.MULTILINE)
+ROUTING_TAG_MARK = "(removed-routing-tag)"
+
+
+def neutralize_routing(text):
+    """Replace every dispatcher routing directive with a mark that contains none."""
+    if not text:
+        return text
+    out = _BRACKET_TAG_RE.sub(ROUTING_TAG_MARK, str(text))
+    return _UNBRACKETED_REPO_RE.sub(lambda m: m.group(1) + ROUTING_TAG_MARK, out)
+
+
+def scrub_plan(plan, comments):
+    """A copy of the plan and questions with every session-written title and body
+    neutralized. Applied once, before the readiness gate and before any create, so
+    the gate judges exactly the text that would be filed."""
+    plan = json.loads(json.dumps(plan)) if plan else plan
+    if plan:
+        for part in [plan.get("epic") or {}] + list(plan.get("children") or []):
+            for key in ("title", "body"):
+                if key in part:
+                    part[key] = neutralize_routing(part[key])
+    comments = [dict(c, body=neutralize_routing(c.get("body"))) for c in (comments or [])]
+    return plan, comments
 
 
 class ExecutorError(Exception):
@@ -298,7 +371,11 @@ def validate_plan(plan, pinned_id, finding_configured):
     errors = []
     if not finding_configured:
         errors.append("linear.findingTicket is not configured — the plan kind is "
-                      "off on this project exactly as the finding kind is (§8)")
+                      "off on this project exactly as the finding kind is (§8). "
+                      "To turn it on, the planned repository's delivery.json needs "
+                      "linear.findingTicket {landing, notify, ownerUserId} and a "
+                      "resolved linear.labels.ids entry for provenance:agent and "
+                      "provenance:epic, merged to its default branch")
     source = plan.get("source_ticket_id")
     if source != pinned_id:
         # The central check: the agent NAMES a ticket, the executor COMPARES it
@@ -338,19 +415,25 @@ def build_child_tickets(plan, team_key, landing_state_id):
     return tickets
 
 
-def render_success_comment(idea_id, epic, children):
-    """One markdown comment posted back on the idea ticket, for the owner."""
+def render_success_comment(idea_id, epic, children, epic_title):
+    """One markdown comment posted back on the idea ticket, for the owner.
+
+    `epic` is the tracker's create response, which carries only id, identifier and
+    url. Titles come from the plan: an earlier version read `epic["title"]`, which
+    the fake returned and the live API never does, so every real filing crashed
+    AFTER the whole tree was created, with no summary and no page."""
     lines = [
         _marker(ESC_AWAITING_APPROVAL),
         "### Epic plan ready — awaiting your approval",
         "",
         "A planning session decomposed **%s** into an epic and %d "
-        "child ticket(s), all in the backlog. **Nothing is dispatchable until you "
-        "move the epic out of intake** — that is the one human gate (§4)."
-        % (idea_id, len(children)),
+        "child ticket(s), all in the backlog. **Nothing here starts on its own.** "
+        "To approve, move the epic to the state this project maps to `ready` — any "
+        "other state, including one merely out of the backlog, approves nothing "
+        "(§5 rule 2)." % (idea_id, len(children)),
         "",
         "- **Epic** [%s](%s) — `%s` (`provenance:agent`)"
-        % (epic["identifier"], epic.get("url") or "", _sanitize(epic["title"])),
+        % (epic["identifier"], epic.get("url") or "", _sanitize(epic_title)),
     ]
     for created, child in children:
         dep = ""
@@ -362,8 +445,10 @@ def render_success_comment(idea_id, epic, children):
                         _sanitize(child["title"]), dep))
     lines += [
         "",
-        "Approve the epic to release the tree; each child re-checks the "
-        "Definition-of-Ready gate as it is released (§5, §11).",
+        "After that, a child reaches `ready` only by the approve tier, if it is "
+        "switched on for this project (it re-checks each child against the "
+        "readiness gate first), or by you moving it. A child starts work only "
+        "when someone delegates it (§11).",
     ]
     return "\n".join(lines)
 
@@ -464,13 +549,14 @@ class LinearClient:
     network. Every mutation here CREATES or COMMENTS — none MOVES a ticket."""
 
     def __init__(self, api_key):
-        self._key = api_key
+        # A personal key goes in Authorization raw; an OAuth token needs Bearer.
+        # The installer accepts both, so the executor must send both correctly.
+        self._key = ("Bearer " + api_key) if api_key.startswith("lin_oauth_") else api_key
 
     def _gql(self, query, variables):
         body = json.dumps({"query": query, "variables": variables}).encode()
         req = urllib.request.Request(LINEAR_API, data=body, headers={
             "Content-Type": "application/json",
-            # Linear personal API keys go in Authorization RAW (no "Bearer ").
             "Authorization": self._key,
         })
         try:
@@ -484,17 +570,35 @@ class LinearClient:
             raise ExecutorError("Linear API error: %s" % json.dumps(payload["errors"])[:500])
         return payload["data"]
 
-    def resolve_source(self, team_key, number):
+    def resolve_idea(self, pinned_id):
+        """The idea ticket, looked up in ITS OWN team — the prefix of the pinned
+        id. An earlier version looked the NUMBER up inside the work team the
+        project config names, so an idea `PLAN-7` resolved as `<WORK>-7`: a
+        different ticket, which then received the plan summary, the rejection,
+        or the planner's questions."""
+        key, number = split_ticket_id(pinned_id)
         data = self._gql(
             "query($teamKey: String!, $number: Float!) {"
             "  issues(filter: { team: { key: { eq: $teamKey } }, "
             "number: { eq: $number } }, first: 1) {"
-            "    nodes { id identifier team { id } } } }",
-            {"teamKey": team_key, "number": float(number)})
+            "    nodes { id identifier } } }",
+            {"teamKey": key, "number": float(number)})
         nodes = data["issues"]["nodes"]
+        if not nodes or nodes[0].get("identifier") != pinned_id:
+            raise ExecutorError("idea ticket %s not found" % pinned_id)
+        return {"id": nodes[0]["id"], "identifier": nodes[0]["identifier"]}
+
+    def resolve_team(self, team_key):
+        """The WORK team the tree is filed into — the one whose state and label
+        ids the project config holds. A tree filed into any other team would
+        carry state ids that do not belong to it."""
+        data = self._gql(
+            "query($k: String!) { teams(filter: { key: { eq: $k } }, first: 1) "
+            "{ nodes { id key } } }", {"k": team_key})
+        nodes = (data.get("teams") or {}).get("nodes") or []
         if not nodes:
-            raise ExecutorError("source ticket %s-%s not found" % (team_key, number))
-        return {"id": nodes[0]["id"], "team_id": (nodes[0].get("team") or {}).get("id")}
+            raise ExecutorError("work team %s not found" % team_key)
+        return nodes[0]["id"]
 
     def create_project(self, team_id, name, description):
         data = self._gql(
@@ -580,6 +684,15 @@ def materialise(args, client=None):
     # ── Config (§2: absent delivery.json is OFF, not broken) ────────────────
     config_path = args.config or "delivery.json"
     if not os.path.exists(config_path):
+        if args.pinned and not args.dry_run:
+            # §2's "absent is off" answers "is this project configured?". A PINNED
+            # run was started for a real delegated ticket: a planning session ran,
+            # and calling its output "nothing to do" would lose it in silence.
+            print("::error:: no %s, but this run is pinned to %s — a planning session "
+                  "ran and its output cannot be filed. The reader handed this executor "
+                  "the wrong path, or the planned repository lost its config. Nothing "
+                  "was created." % (config_path, args.pinned), file=sys.stderr)
+            return EXIT_ERRORED
         print("::notice:: no %s — the pipeline is not configured, so there is no "
               "tree to materialise (§2)." % config_path)
         return EXIT_OK
@@ -606,7 +719,24 @@ def materialise(args, client=None):
 
     # ── Validate the batch WHOLE, partition into plan + questions ──────────
     plan, comments, errors = find_requests(doc)
+    # THE PIN COMES FROM OUTSIDE THE TREE. The retarget check compares the tree's
+    # `source_ticket_id` with the pin, so a pin DEFAULTED from that same field
+    # compares the session's claim with itself. A dry run may default it, for a
+    # local measurement; a run that can write may not.
+    if not args.pinned and not args.dry_run and (plan or comments):
+        print("::error:: no --pinned ticket. A run that can write needs the delegated "
+              "ticket from whatever started the session, never the tree's own "
+              "source_ticket_id — defaulting it would compare the session's claim "
+              "with itself. Nothing was created.", file=sys.stderr)
+        return EXIT_ERRORED
+    if args.pinned:
+        try:
+            split_ticket_id(args.pinned)
+        except ExecutorError as exc:
+            print("::error:: --pinned %s" % exc, file=sys.stderr)
+            return EXIT_ERRORED
     pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
+    plan, comments = scrub_plan(plan, comments)
     if not errors and plan:
         errors = validate_plan(plan, pinned, bool(finding_cfg))
     if not errors:
@@ -627,6 +757,16 @@ def materialise(args, client=None):
     # ── No plan, only question(s): the planner needs the owner's input ─────
     if not plan:
         return _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments)
+
+    # ── The ids this executor must force (§5, §6). A gap here is the CONFIG's
+    #    failure, not the planner's: checked before the gate, so it is never
+    #    reported back as a rejected plan, and before a dry run, so a dry run
+    #    never calls an unusable config valid. ─────────────────────────────
+    try:
+        forced = _forced_ids(cfg, finding_cfg)
+    except ExecutorError as exc:
+        print("::error:: %s" % exc, file=sys.stderr)
+        return EXIT_ERRORED
 
     # ── The DoR gate over every child (§5) ─────────────────────────────────
     children = plan["children"]
@@ -649,17 +789,12 @@ def materialise(args, client=None):
               % (pinned, len(children), len(comments)))
         return EXIT_OK
 
-    try:
-        forced = _forced_ids(cfg, finding_cfg)
-    except ExecutorError as exc:
-        print("::error:: %s" % exc, file=sys.stderr)
-        return EXIT_ERRORED
-
-    client = client or _live_client()
+    client = client or _live_client(args)
     if client is None:
-        print("::error:: LINEAR_API_KEY is empty — this executor holds the only "
-              "tracker credential, so the validated tree cannot be filed. Nothing "
-              "was created, and this is not a verdict on the tree.", file=sys.stderr)
+        print("::error:: %s is empty — this executor holds the only tracker "
+              "credential, so the validated tree cannot be filed. Nothing was "
+              "created, and this is not a verdict on the tree." % _key_env(args),
+              file=sys.stderr)
         return EXIT_ERRORED
 
     return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments)
@@ -683,15 +818,17 @@ def _no_output(args, client, cfg, team_key, finding_cfg, message):
     notify. `skipped` (exit 0) either way: this is an answer, not a failure."""
     print("::notice:: %s" % message)
     target = args.pinned
-    if args.dry_run or not target or not finding_cfg:
+    # Not gated on the plan kind: an empty run is visible whether or not the
+    # project has turned plans on, because a session ran either way.
+    if args.dry_run or not target:
         return EXIT_OK
-    client = client or _live_client()
+    client = client or _live_client(args)
     if client is None:
         print("::warning:: no credential — could not surface the empty run on %s"
               % target, file=sys.stderr)
         return EXIT_OK
     try:
-        src = client.resolve_source(team_key, target.rsplit("-", 1)[1])
+        src = client.resolve_idea(target)
         client.post_comment(src["id"], render_no_output_comment(target))
         print("::notice:: verdict=skipped (surfaced): the empty run is now visible on %s"
               % target)
@@ -710,14 +847,14 @@ def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
           "on %s and filed no plan." % (len(comments), pinned))
     if args.dry_run:
         return EXIT_OK
-    client = client or _live_client()
+    client = client or _live_client(args)
     if client is None:
         print("::error:: no credential — the planner's question(s) on %s could not be "
               "delivered. A question nobody sees is worse than none." % pinned,
               file=sys.stderr)
         return EXIT_ERRORED
     try:
-        src = client.resolve_source(team_key, pinned.rsplit("-", 1)[1])
+        src = client.resolve_idea(pinned)
         for c in comments:
             client.post_comment(src["id"], render_question_comment(pinned, c["body"]))
     except (ExecutorError, IndexError) as exc:
@@ -738,12 +875,15 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     for line in [reason] + detail_lines:
         print("::error:: plan rejected: %s" % line, file=sys.stderr)
     target = args.pinned or source_id
-    if not args.dry_run and target and finding_cfg:
-        client = client or _live_client()
+    # NOT gated on the plan kind being on. A rejection BECAUSE the plan kind is
+    # off is the one an owner most needs to see: a planning session ran, and a
+    # report only in this job's log is a report nobody reads (§13).
+    if not args.dry_run and target:
+        client = client or _live_client(args)
         if client is not None:
             body = render_rejection_comment(target, reason, detail_lines)
             try:
-                src = client.resolve_source(team_key, target.rsplit("-", 1)[1])
+                src = client.resolve_idea(target)
                 client.post_comment(src["id"], body)
                 print("::notice:: reported the rejection back on %s" % target)
             except (ExecutorError, IndexError) as exc:
@@ -767,8 +907,10 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         return EXIT_ERRORED
 
     try:
-        src = client.resolve_source(team_key, pinned.rsplit("-", 1)[1])
-        team_id = src["team_id"]
+        # The idea is on the Planning team; the tree lands in the WORK team the
+        # project config names, whose state and label ids `forced` carries.
+        src = client.resolve_idea(pinned)
+        team_id = client.resolve_team(team_key)
         subscribers = [forced["owner"]] if forced["subscribe"] else []
 
         # The project holds the PRD and the tree (mirrors /plan-epic step 1).
@@ -808,7 +950,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # Report the plan back on the idea ticket for the owner, then any notes the
         # session left alongside it (its open questions ride in the epic PRD; these
         # are top-level asides). The plan is filed either way — a note never blocks.
-        client.post_comment(src["id"], render_success_comment(pinned, epic, created_children))
+        client.post_comment(src["id"], render_success_comment(pinned, epic, created_children, plan["epic"]["title"]))
         for c in comments:
             client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
     except ExecutorError as exc:
@@ -823,8 +965,19 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
     return EXIT_OK
 
 
-def _live_client():
-    key = os.environ.get("LINEAR_API_KEY")
+DEFAULT_KEY_ENV = "LINEAR_API_KEY"
+KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _key_env(args=None):
+    return getattr(args, "key_env", None) or DEFAULT_KEY_ENV
+
+
+def _live_client(args=None):
+    """The one tracker credential, read from the variable `--key-env` names. The
+    installer records the same name in its conf, so the two cannot disagree
+    about where the key lives without one of them saying so."""
+    key = os.environ.get(_key_env(args))
     return LinearClient(key) if key else None
 
 
@@ -836,14 +989,22 @@ class FakeLinear:
 
     def __init__(self, source_team_id="team-uuid"):
         self.source_team_id = source_team_id
+        self.resolved_ideas = []   # every pinned id a report was aimed at
+        self.team_ids = {}         # work team key -> id, as resolved
         self.projects = []
         self.issues = []          # dicts as passed to create_issue
         self.relations = []       # (blocker_id, blocked_id)
         self.comments = []        # (issue_id, body)
         self._n = 0
 
-    def resolve_source(self, team_key, number):
-        return {"id": "src-%s-%s" % (team_key, number), "team_id": self.source_team_id}
+    def resolve_idea(self, pinned_id):
+        split_ticket_id(pinned_id)  # the live client refuses a malformed id; so does this
+        self.resolved_ideas.append(pinned_id)
+        return {"id": "idea-%s" % pinned_id, "identifier": pinned_id}
+
+    def resolve_team(self, team_key):
+        self.team_ids[team_key] = "team-%s" % team_key
+        return self.team_ids[team_key]
 
     def create_project(self, team_id, name, description):
         pid = "proj-%d" % len(self.projects)
@@ -854,7 +1015,7 @@ class FakeLinear:
                      parent_id=None, project_id=None, subscriber_ids=None,
                      assignee_id=None):
         self._n += 1
-        issue = {"id": "iss-%d" % self._n, "identifier": "KIT-%d" % (100 + self._n),
+        issue = {"team_id": team_id, "id": "iss-%d" % self._n, "identifier": "KIT-%d" % (100 + self._n),
                  "url": "https://linear.app/x/issue/KIT-%d" % (100 + self._n),
                  "title": title, "description": description, "state_id": state_id,
                  "label_ids": list(label_ids), "parent_id": parent_id,
@@ -986,8 +1147,11 @@ def selftest():
         check("one-relation", len(fake.relations), 1)
         check("relation-direction", fake.relations[0], (kids[0]["id"], kids[1]["id"]))
         check("summary-comment-on-idea", len(fake.comments), 1)
-        check("summary-comment-target", fake.comments[0][0], "src-KIT-777")
-        check("summary-names-approval", "move the epic out of intake" in fake.comments[0][1], True)
+        check("summary-comment-target", fake.comments[0][0], "idea-KIT-777")
+        check("summary-names-approval", "move the epic to the state this project maps to `ready`"
+              in fake.comments[0][1], True)
+        check("summary-no-out-of-intake-claim", "out of intake" in fake.comments[0][1], False)
+        check("summary-says-approve-tier-is-conditional", "if it is switched on" in fake.comments[0][1], True)
         check("summary-carries-approval-marker",
               _marker(ESC_AWAITING_APPROVAL) in fake.comments[0][1], True)
 
@@ -1104,11 +1268,12 @@ def selftest():
               EXIT_ERRORED)
         check("config-gap-no-create", len(fakeC.issues), 0)
 
-        # 14. Absent delivery.json → OFF, exit ok, nothing created (§2).
+        # 14. Absent delivery.json, with no pin → OFF, exit ok, nothing created (§2).
+        #     (A PINNED run with no config is a lost planning run, not "off": case 38.)
         fakeD = FakeLinear()
         args = argparse.Namespace(requests=os.path.join(tmp, "requests.json"),
                                   config=os.path.join(tmp, "no-delivery.json"),
-                                  repo_root=tmp, dry_run=False, pinned="KIT-777")
+                                  repo_root=tmp, dry_run=False, pinned=None)
         json.dump(_tree(), open(os.path.join(tmp, "requests.json"), "w"))
         check("no-config-off", materialise(args, client=fakeD), EXIT_OK)
         check("no-config-no-create", len(fakeD.issues), 0)
@@ -1128,7 +1293,7 @@ def selftest():
         check("question-only-escalated", run(q, client=fakeE), EXIT_OK)
         check("question-only-no-create", len(fakeE.issues), 0)
         check("question-only-delivered", len(fakeE.comments), 1)
-        check("question-only-on-idea", fakeE.comments[0][0], "src-KIT-777")
+        check("question-only-on-idea", fakeE.comments[0][0], "idea-KIT-777")
         check("question-only-marked",
               _marker(ESC_NEEDS_INPUT) in fakeE.comments[0][1], True)
 
@@ -1195,6 +1360,129 @@ def selftest():
         check("forged-title-real-mark-survives",
               _marker(ESC_AWAITING_APPROVAL) in summary, True)
 
+        # ── The config seam (KIT-136) ────────────────────────────────────────
+        # 30. AN IDEA ON A PLANNING TEAM, A TREE IN THE WORK TEAM. The idea is
+        #     resolved by ITS OWN id; the tree is created in the work team the
+        #     config names; the summary lands on the idea. The old code looked
+        #     `PLAN-7`'s number up in the work team and commented on `KIT-7`.
+        fakeX = FakeLinear()
+        cross = _tree()
+        cross["requests"][0]["source_ticket_id"] = "PLAN-7"
+        req = os.path.join(tmp, "cross.json")
+        json.dump(cross, open(req, "w"))
+        argsX = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                   dry_run=False, pinned="PLAN-7")
+        check("cross-team-ok", materialise(argsX, client=fakeX), EXIT_OK)
+        check("cross-team-idea-resolved-by-own-id", fakeX.resolved_ideas, ["PLAN-7"])
+        check("cross-team-summary-on-the-idea",
+              [c[0] for c in fakeX.comments], ["idea-PLAN-7"])
+        check("cross-team-tree-in-work-team",
+              sorted(set(i["team_id"] for i in fakeX.issues)), ["team-KIT"])
+
+        # 31. A rejection and a question land on the idea too, never on
+        #     <work team>-<number>.
+        fakeY = FakeLinear()
+        bad = _tree()
+        bad["requests"][0]["source_ticket_id"] = "PLAN-7"
+        bad["requests"][0]["children"][0]["depends_on"] = [9]
+        json.dump(bad, open(req, "w"))
+        check("cross-team-reject", materialise(argsX, client=fakeY), EXIT_REJECTED)
+        check("cross-team-rejection-on-the-idea",
+              [c[0] for c in fakeY.comments], ["idea-PLAN-7"])
+
+        # 32. NO PIN, NO WRITE. A run that can write, with no --pinned, is refused
+        #     before anything is resolved or created; a dry run may still measure.
+        fakeZ = FakeLinear()
+        json.dump(_tree(), open(req, "w"))
+        argsZ = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                   dry_run=False, pinned=None)
+        check("unpinned-live-refused", materialise(argsZ, client=fakeZ), EXIT_ERRORED)
+        check("unpinned-live-created-nothing", (fakeZ.issues, fakeZ.comments), ([], []))
+        argsZd = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                    dry_run=True, pinned=None)
+        check("unpinned-dry-run-measures", materialise(argsZd, client=FakeLinear()), EXIT_OK)
+        argsZm = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                    dry_run=False, pinned="plan 7")
+        check("malformed-pin-refused", materialise(argsZm, client=FakeLinear()), EXIT_ERRORED)
+
+        # 33. THE KEY'S VARIABLE IS NAMED, and an empty one is loud, by name.
+        saved_env = dict(os.environ)
+        try:
+            os.environ.pop("STAGE_A_SELFTEST_KEY", None)
+            argsK = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                       dry_run=False, pinned="KIT-777",
+                                       key_env="STAGE_A_SELFTEST_KEY")
+            check("key-env-empty-errored", materialise(argsK, client=None), EXIT_ERRORED)
+            check("key-env-default", _key_env(argparse.Namespace()), "LINEAR_API_KEY")
+            check("key-env-flag-read", _key_env(argsK), "STAGE_A_SELFTEST_KEY")
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+        check("key-env-refuses-a-value", bool(KEY_ENV_RE.match("lin_api_abc")), False)
+
+        # 34. The plan-kind-off rejection names the fix.
+        fakeO = FakeLinear()
+        argsO = argparse.Namespace(requests=req, config=off_path, repo_root=tmp,
+                                   dry_run=False, pinned="KIT-777")
+        materialise(argsO, client=fakeO)
+        check("finding-off-names-the-fix",
+              any("provenance:agent" in c[1] and "default branch" in c[1]
+                  for c in fakeO.comments), True)
+
+        # ── Audit findings, 2026-09-17 ───────────────────────────────────────
+        # 35. THE LIVE CREATE RESPONSE CARRIES NO TITLE. A fake that returns only
+        #     what the live mutation selects must still get a summary comment.
+        class LiveShapedLinear(FakeLinear):
+            def create_issue(self, *a, **kw):
+                full = FakeLinear.create_issue(self, *a, **kw)
+                return {"id": full["id"], "identifier": full["identifier"], "url": full["url"]}
+        fakeT = LiveShapedLinear()
+        check("live-shape-files-and-summarises", run(_tree(), client=fakeT), EXIT_OK)
+        check("live-shape-summary-posted",
+              any(_marker(ESC_AWAITING_APPROVAL) in c[1] for c in fakeT.comments), True)
+
+        # 36. ROUTING DIRECTIVES IN SESSION TEXT NEVER REACH A FILED TICKET.
+        fakeR = FakeLinear()
+        tagged = _tree()
+        tagged["requests"][0]["epic"]["body"] = "Plan it. [agent=codex] and repo=other/repo"
+        tagged["requests"][0]["children"][0]["body"] = (
+            _GOOD_CHILD_BODY + "\n[repo=other-repo#evil-branch] \\[model=x\\]\n")
+        tagged["requests"][0]["children"][1]["title"] = "Do it [agent=codex]"
+        check("tagged-tree-files", run(tagged, client=fakeR), EXIT_OK)
+        filed = " ".join(i["title"] + "\n" + i["description"] for i in fakeR.issues)
+        for tag in ("[agent=codex]", "repo=other/repo", "[repo=other-repo#evil-branch]", "[model=x"):
+            check("tag-neutralized:%s" % tag, tag in filed, False)
+        check("tag-mark-present", ROUTING_TAG_MARK in filed, True)
+        check("routing-mark-has-no-directive", neutralize_routing(ROUTING_TAG_MARK), ROUTING_TAG_MARK)
+        # …and the patterns are the review poller's, not a drifting copy.
+        import pipeline_review_poller as _poller
+        check("routing-patterns-match-poller",
+              (_BRACKET_TAG_RE.pattern, _UNBRACKETED_REPO_RE.pattern, ROUTING_TAG_MARK),
+              (_poller._BRACKET_TAG_RE.pattern, _poller._UNBRACKETED_REPO_RE.pattern,
+               _poller.ROUTING_TAG_MARK))
+
+        # 37. A CONFIG GAP IS THE EXECUTOR'S FAILURE, before the gate and before a
+        #     dry run can call it valid.
+        fakeG = FakeLinear()
+        argsG = argparse.Namespace(requests=req, config=np_path, repo_root=tmp,
+                                   dry_run=True, pinned="KIT-777")
+        json.dump(_tree(), open(req, "w"))
+        check("config-gap-dry-run-errored", materialise(argsG, client=fakeG), EXIT_ERRORED)
+        check("config-gap-not-reported-as-rejection",
+              any("rejected" in c[1].lower() for c in fakeG.comments), False)
+
+        # 38. A PINNED RUN WITH NO CONFIG IS NOT "OFF".
+        argsN = argparse.Namespace(requests=req, config=os.path.join(tmp, "gone.json"),
+                                   repo_root=tmp, dry_run=False, pinned="KIT-777")
+        check("pinned-no-config-errored", materialise(argsN, client=FakeLinear()), EXIT_ERRORED)
+        argsN2 = argparse.Namespace(requests=req, config=os.path.join(tmp, "gone.json"),
+                                    repo_root=tmp, dry_run=False, pinned=None)
+        check("unpinned-no-config-still-off", materialise(argsN2, client=FakeLinear()), EXIT_OK)
+
+        # 39. AN OAUTH TOKEN IS SENT AS BEARER; A PERSONAL KEY RAW.
+        check("oauth-bearer", LinearClient("lin_oauth_abc")._key, "Bearer lin_oauth_abc")
+        check("personal-key-raw", LinearClient("lin_api_abc")._key, "lin_api_abc")
+
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
         for f in failures:
@@ -1212,8 +1500,12 @@ def main(argv=None):
     ap.add_argument("--requests", help="path to the session's pipeline-safe-outputs/1 file")
     ap.add_argument("--config", help="path to delivery.json (default: ./delivery.json)")
     ap.add_argument("--repo-root", default=".", help="checkout root for DoR pointer checks")
-    ap.add_argument("--pinned", help="the dispatcher-pinned ticket id (default: the "
-                                     "tree's own source_ticket_id — an unpinned local run)")
+    ap.add_argument("--pinned", help="the delegated ticket id, from whatever started the "
+                                     "session. Required for any run that can write; a "
+                                     "dry run may omit it")
+    ap.add_argument("--key-env", default=DEFAULT_KEY_ENV,
+                    help="the NAME of the environment variable holding the tracker key "
+                         "(default %s)" % DEFAULT_KEY_ENV)
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and DoR-gate, but create nothing")
     ap.add_argument("--selftest", action="store_true", help="run built-in fixtures and exit")
@@ -1222,6 +1514,8 @@ def main(argv=None):
         return selftest()
     if not args.requests:
         ap.error("--requests is required (or use --selftest)")
+    if not KEY_ENV_RE.match(args.key_env or ""):
+        ap.error("--key-env takes a variable NAME (UPPER_SNAKE), never a value")
     return materialise(args)
 
 

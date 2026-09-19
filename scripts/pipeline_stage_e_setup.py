@@ -400,16 +400,35 @@ def review_entry_name(repo):
     return REVIEW_ENTRY_PREFIX + str(repo or "").split("/")[-1]
 
 
-# The scripts the three daemons exec. Their absence from the role account's clone
-# means the pull requests carrying them are not merged yet (card CK-1). The bounce
-# driver imports the conflict loop's marker grammar (pr_conflict.py), which imports
-# the agent-environment markers (pipeline_dispatch_local.py), and hosts the criteria
-# snapshot pass (pipeline_criteria_snapshot.py) that the basis resolver reads.
+# Every script the four jobs that exec from the role account's clone can load: the
+# review poller, the bounce driver, the finding poller and the heartbeat monitor, and
+# everything they import, transitively — including the modules they load by name
+# (`_optional_module`). Their absence from the clone means the pull requests carrying
+# them are not merged yet (card CK-1).
+#
+# THIS TUPLE IS NOW LOAD-BEARING TWICE. It also decides what "the clone is behind"
+# means (KIT-149): `verify` compares only these files and RUNTIME_DATA_DIRS at origin
+# HEAD. A module missing from it would be a module whose change `verify` cannot see,
+# so the selftest derives the closure with `ast` and fails on any drift. It used to
+# list ten names by hand and was missing seven, among them the schema checker every
+# review is judged by.
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
+                    "pipeline_finding_poller.py", "pipeline_heartbeat_monitor.py",
                     "pipeline_review_local.py", "pipeline_review_basis.py",
-                    "pipeline_telemetry_local.py", "pipeline_finding_poller.py",
+                    "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
-                    "pipeline_criteria_snapshot.py")
+                    "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
+                    "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py")
+
+# The entry points of those four jobs — the roots the closure is walked from.
+DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
+                        "pipeline_finding_poller.py", "pipeline_heartbeat_monitor.py")
+
+# Directories of DATA the jobs read at run time out of the same clone. A review is
+# judged against schemas/review-findings.schema.json and a telemetry row against
+# schemas/telemetry-block.schema.json, so a schema change changes what the daemons do
+# without touching a single script.
+RUNTIME_DATA_DIRS = ("schemas",)
 
 # The workflow states a Reviews team needs beyond the stock set. `Ready`
 # authorises nothing here — review tickets are delegated on creation — but the
@@ -434,17 +453,24 @@ REVIEWER_BRIEF = (
     "YOUR DELIVERABLE IS ONE FENCED JSON BLOCK IN YOUR FINAL MESSAGE with "
     "\"schema\": \"pipeline-review/1\", a \"summary\", and a \"findings\" array of objects "
     "{severity, category, file, line, summary, detail}, severity one of "
-    "low|medium|high|critical. A malformed block means your whole review is discarded as "
+    "low|medium|high|critical, and an optional \"blocked\" field. A malformed block means "
+    "your whole review is discarded as "
     "unusable, never partly used. If you write more than one such block, the LAST one is "
     "taken as your verdict. Put nothing else inside the fence.\n\n"
     "WHAT HAPPENS NEXT. A poller reads your final message from this ticket, validates the "
     "block whole, and posts one comment on the PR. Findings at or above the threshold may be "
     "sent back to the coding session as a fix request, a bounded number of times. Your words "
     "become that prompt: be specific, cite file and line, say why.\n\n"
-    "RUNBOOK. If the body is missing the diff or the criteria, say so in \"summary\" and "
-    "return an EMPTY findings list with the schema intact; never invent. Never ask anyone a "
+    "RUNBOOK. If you cannot judge the change at all (the body is missing the diff or the "
+    "criteria, or stops mid-way), set \"blocked\" to one line saying what was missing and "
+    "return an EMPTY findings list with the schema intact; never invent. An empty findings "
+    "list WITHOUT \"blocked\" is published as a clean review of a change you never saw. "
+    "Leave \"blocked\" out of every review you could do. A ticket that says files were "
+    "WITHHELD is not one of these: review what you were given and say in \"summary\" that "
+    "it was partial, because \"blocked\" would throw away the findings you did make. "
+    "Never ask anyone a "
     "question; nobody is watching and no question tool is available to you. If something "
-    "blocks you, say what in the block's \"summary\" and still finish with the block. "
+    "blocks you, set \"blocked\" to say what, and still finish with the block. "
     "Weakened or deleted test assertions are your headline "
     "finding. Anything the ticket did not ask for is a scope finding."
 )
@@ -813,11 +839,11 @@ class Runner(object):
         self.writes = []      # every mutation, applied or merely planned
         self.reads = []
 
-    def read(self, argv, stdin=None, timeout=60):
+    def read(self, argv, stdin=None, timeout=60, cwd=None):
         self.reads.append(argv)
-        return self._exec(argv, stdin, timeout)
+        return self._exec(argv, stdin, timeout, cwd=cwd)
 
-    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False):
+    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False, cwd=None):
         self.writes.append({"why": why, "argv": argv,
                             "stdin": "<hidden>" if secret_stdin else stdin})
         if self.dry_run:
@@ -827,12 +853,12 @@ class Runner(object):
                 say("    (stdin: %s)" % ("<a credential, never shown>" if secret_stdin
                                          else "%d bytes" % len(stdin)))
             return Result(0, skipped=True)
-        return self._exec(argv, stdin, timeout)
+        return self._exec(argv, stdin, timeout, cwd=cwd)
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         try:
             p = subprocess.run(argv, input=stdin, capture_output=True, text=True,
-                               timeout=timeout)
+                               timeout=timeout, cwd=cwd)
         except FileNotFoundError as exc:
             return Result(127, "", str(exc))
         except subprocess.TimeoutExpired:
@@ -844,11 +870,19 @@ class Runner(object):
                 secret_stdin=False):
         """Run a /bin/sh script as the role account. `sudo -u … -H` keeps the
         caller's cwd, and that account cannot traverse into your worktree, so
-        every wrapper starts by standing somewhere it can read."""
+        every wrapper starts by standing somewhere it can read.
+
+        THE CHILD STARTS AT `/` TOO (KIT-112). The `cd /` inside the script runs
+        after the shell has initialised, and the shell's own initialisation calls
+        getcwd first — in a directory this account cannot enter. That printed two
+        `getcwd: cannot access parent directories` lines on every role-account
+        command, mid-install, reading like a fault. No caller depends on the
+        inherited directory: every git call names its tree with -C and every
+        script starts with its own `cd /`."""
         argv = ["sudo", "-u", account, "-H", "/bin/sh", "-c", "cd / && " + script]
         if why is None:
-            return self.read(argv, stdin, timeout)
-        return self.write(why, argv, stdin, timeout, secret_stdin)
+            return self.read(argv, stdin, timeout, cwd="/")
+        return self.write(why, argv, stdin, timeout, secret_stdin, cwd="/")
 
     def as_root(self, argv, why=None, stdin=None, timeout=300):
         argv = ["sudo"] + list(argv)
@@ -2099,6 +2133,25 @@ def step_preflight(ctx, apply_it):
                         % (conf["DISPATCHER_CONFIG"], ctx.account,
                            (cfg.err or cfg.out).strip()[:160]))
 
+    # AN OLD HAND SIGN-OFF IS SAID, NEVER REFUSED (KIT-176). A sign-off of the entries'
+    # load made before KIT-149 names no entries, so it proves none of them and
+    # `dispatcher-entry` gives it no weight. For one release this refused the whole run
+    # instead — and that was a dead end: the remedy it printed (re-sign) needs the entries
+    # recorded, which only `dispatcher-entry` records, four steps past the refusal. It also
+    # blocked the ordinary upgrade, where the dispatcher's own banner proves the load and
+    # the old sign-off is never consulted at all. The dispatcher-entry step stopping on a
+    # card when the banner cannot prove the load is the same stop, with or without an old
+    # sign-off on record; so preflight names it, and goes on.
+    notes = []
+    signed_pre = (ctx.state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
+    signed_pre = signed_pre if isinstance(signed_pre, dict) else {}
+    if signed_pre and not signed_pre.get("entries_sha256"):
+        notes.append(
+            "the hand sign-off of the review entries' load (%s) predates KIT-149 and names "
+            "no entries, so it counts for nothing now. The dispatcher's own log is what proves "
+            "the load; if that cannot, the dispatcher-entry step will ask you to sign again, "
+            "against the entries it just measured" % signed_pre.get("at", "undated"))
+
     if problems:
         # EVERY problem, in one pass. A preflight that stops at the first one
         # makes you run it five times to learn five facts it already knew.
@@ -2106,7 +2159,7 @@ def step_preflight(ctx, apply_it):
             "preflight found %d problem(s) — all of them, in one pass:\n%s"
             % (len(problems), "\n".join("  - " + p for p in problems)))
     return True, ("role home %s, dispatcher running, %d existing repository entries"
-                  % (ctx.role_home, len(ctx.dispatcher.get("entries", [])))), []
+                  % (ctx.role_home, len(ctx.dispatcher.get("entries", [])))), notes
 
 
 def _read_dispatcher_facts_py(path):
@@ -2203,6 +2256,86 @@ def _clone_differs_from_origin(ctx):
     return local.out.strip() != fields[0], None
 
 
+def job_files_moved_sh(kit):
+    """The shell `_job_files_moved` runs as the role account. A module-level function so
+    the selftest can EXECUTE it against real repositories — a shell fragment nobody has
+    run is a guess about a shell."""
+    paths = " ".join(shlex.quote("scripts/" + name) for name in REQUIRED_SCRIPTS)
+    paths += " " + " ".join(shlex.quote(d) for d in RUNTIME_DATA_DIRS)
+    return ("git -C {kit} fetch --quiet --no-tags origin HEAD 2>/dev/null || exit 7; "
+            "printf 'FETCH_HEAD %s\\n' \"$(git -C {kit} rev-parse FETCH_HEAD 2>/dev/null)\"; "
+            "git -C {kit} diff --name-only HEAD FETCH_HEAD -- {paths} 2>/dev/null || exit 8"
+            ).format(kit=kit, paths=paths)
+
+
+CLONE_HEALTH_SH = ('d=$(git -C {kit} status --porcelain 2>/dev/null | head -5); '
+                   'u=$(git -C {kit} remote get-url origin 2>/dev/null); '
+                   'printf \'ORIGIN %s\\n\' "$u"; '
+                   'printf \'DIRTY %s\\n\' "$(printf \'%s\' "$d" | head -c 300)"')
+
+
+def clone_health(ctx):
+    """The reason the clone cannot be compared with origin at all, or None (review of #136).
+
+    THE NARROWED CHECK ANSWERS ONE QUESTION ONLY: did a file the jobs run move between two
+    COMMITS? It says nothing about a working tree somebody edited by hand, or a clone whose
+    origin is a different repository — and either would make "every file the jobs run is
+    identical at origin HEAD" false while the row said it was true. The waker's installer
+    refuses both; this one did not. A modified file under the daemons is the loud case: they
+    are running code nobody merged."""
+    res = ctx.runner.as_role(ctx.account, CLONE_HEALTH_SH.format(kit="%s/kit" % ctx.stage_home))
+    if not res.ok:
+        return None                      # cannot look — the caller's own unknown path says so
+    origin, dirty = "", ""
+    for line in (res.out or "").splitlines():
+        if line.startswith("ORIGIN "):
+            origin = line[len("ORIGIN "):].strip()
+        elif line.startswith("DIRTY "):
+            dirty = line[len("DIRTY "):].strip()
+    want = str(ctx.conf.get("KIT_REPO_URL") or "").strip()
+    if origin and want and origin.rstrip("/").removesuffix(".git") != want.rstrip("/").removesuffix(".git"):
+        return ("the clone at %s/kit has origin %s, and this conf says the daemons run %s. "
+                "Nothing here can say whether their code matches: they are two different "
+                "repositories" % (ctx.stage_home, origin, want))
+    if dirty:
+        return ("the clone at %s/kit has uncommitted changes (%s). The daemons exec out of that "
+                "working tree, so they are running code nobody merged — and comparing commits "
+                "cannot see it" % (ctx.stage_home, dirty.replace("\n", "; ")[:200]))
+    return None
+
+
+def _job_files_moved(ctx):
+    """(moved, why_unknown, origin_short). `moved` is the list of files the jobs run or
+    read that differ between the clone's HEAD and origin's; None when it could not tell.
+
+    CALLED ONLY WHEN THE TWO HEADS DIFFER, to answer the narrower question that matters:
+    would the daemons behave differently at origin HEAD? Before KIT-149 `verify` asked
+    only whether the commits differed, so every merge to main — a doc, an ADR, a sibling
+    project's script — read as "the daemons would go on exec'ing that code". A check that
+    cries wolf on every merge teaches its reader to skip it, and then it is skipped on the
+    merge that did change a daemon. The conflict waker's installer made the same move in
+    kit #117.
+
+    A READ, and what it does write. Comparing file contents needs origin's objects, which
+    `ls-remote` cannot give, so this fetches origin's HEAD into the clone: new objects and
+    `FETCH_HEAD`, and nothing else. No branch moves, the working tree the daemons exec
+    from is untouched, and so it is safe under `verify` and `--dry-run` and recorded as a
+    read. The fetch, the rev-parse and the diff run as one shell script, so a pass pays
+    one role-account round trip rather than three.
+
+    Exit 7 is "could not fetch", 8 is "could not compare" — two different could-nots,
+    and neither is ever read as "nothing moved" (contract §13).
+    """
+    res = ctx.runner.as_role(ctx.account, job_files_moved_sh("%s/kit" % ctx.stage_home))
+    if res.rc == 7:
+        return None, "could not fetch origin HEAD into the clone (no network, or no such remote)", ""
+    lines = [ln.strip() for ln in (res.out or "").splitlines() if ln.strip()]
+    head = lines[0].split() if lines else []
+    if not res.ok or len(head) != 2 or head[0] != "FETCH_HEAD" or not head[1]:
+        return None, "could not compare the jobs' files between the clone and origin HEAD", ""
+    return lines[1:], None, head[1][:12]
+
+
 def step_code(ctx, apply_it):
     """The role account's own clone, and the scripts the daemons exec."""
     r, conf = ctx.runner, ctx.conf
@@ -2211,6 +2344,10 @@ def step_code(ctx, apply_it):
     missing = [s for s in REQUIRED_SCRIPTS if s not in have]
     head = r.as_role(ctx.account, "git -C %s/kit rev-parse --short HEAD 2>/dev/null"
                      % ctx.stage_home)
+    unhealthy = clone_health(ctx)
+    if unhealthy:
+        raise SetupError(unhealthy + ".\n  Put the clone back on origin's commit by hand, then "
+                         "run this again; look before discarding anything.")
     differs, why_unknown = _clone_differs_from_origin(ctx)
     if not missing and differs is False:
         return True, "clone at %s/kit is at %s, level with origin HEAD, all %d scripts " \
@@ -2229,9 +2366,30 @@ def step_code(ctx, apply_it):
         if missing:
             return False, "clone missing or %d script(s) absent: %s" % (
                 len(missing), ", ".join(missing)), []
-        return False, "the clone at %s/kit is at %s, which is NOT origin HEAD — the daemons " \
-                      "would go on exec'ing that code" % (ctx.stage_home,
-                                                          head.out.strip() or "?"), []
+        here = head.out.strip() or "?"
+        moved, why_moved, origin = _job_files_moved(ctx)
+        if moved is None:
+            raise Unknown(
+                "the clone at %s/kit is not at origin HEAD, and whether any file the jobs run "
+                "changed could not be told: %s." % (ctx.stage_home, why_moved),
+                "prove the role account can fetch from origin, then run this again:\n"
+                "    sudo -u %s -H /bin/sh -c 'cd / && git -C %s/kit fetch origin HEAD'"
+                % (ctx.account, ctx.stage_home))
+        if moved:
+            return False, "the clone at %s/kit is at %s, behind origin HEAD (%s), and %d file(s) " \
+                          "the jobs run changed there: %s — the daemons would go on exec'ing the " \
+                          "old ones" % (ctx.stage_home, here, origin or "?", len(moved),
+                                        ", ".join(moved[:8]) + (" …" if len(moved) > 8 else "")), []
+        same = ("every file the jobs run is identical at origin HEAD (%s): %d scripts and %s. "
+                "The clone's other files are older (%s), and no job reads them"
+                % (origin or "?", len(REQUIRED_SCRIPTS), "/, ".join(RUNTIME_DATA_DIRS) + "/", here))
+        if ctx.runner.dry_run:
+            # A dry run names what `run` would do, and `run` still fast-forwards a clone
+            # whose HEAD differs — it restarts the jobs to do it. Saying ALREADY-DONE here
+            # would hide that restart from the one command meant to show it.
+            return False, "`run` would fast-forward the clone and restart the jobs, though %s" \
+                          % same[0].lower() + same[1:], []
+        return True, same, []
 
     stop_labels = all_daemon_labels(conf)
     # The heartbeat monitor execs from the same clone. It is stopped whenever it is
@@ -2746,6 +2904,58 @@ def dispatcher_session_logs(conf):
     return os.path.join(os.path.dirname(conf["DISPATCHER_CONFIG"]), "logs")
 
 
+# WHETHER THE ROLE ACCOUNT CAN ENTER THE SESSION-LOG ROOT (KIT-149). The installer
+# derives the root and writes it into two configs; nothing ever looked at it, so a
+# wrong one surfaced only as a note on every telemetry row, much later. Entered, never
+# listed: telemetry opens <root>/<issue>/…, which needs only the search bit, so a root
+# at 0711 is fine and `-x` is the test, not `-r`. Three exits, three answers — 0 a
+# directory it can enter, 9 none there (or a directory above it closed to this
+# account, which is the same fact from where the daemons stand), 8 there and not
+# enterable. Anything else is "could not look", which is none of the three.
+# NOT-THERE AND CANNOT-SEE ARE DIFFERENT ANSWERS (contract 13, review of #136). A plain
+# `[ -d "$d" ]` fails identically for a root that does not exist and for one hidden behind
+# a parent the role account cannot search — and the second does not fix itself, while the
+# first is the ordinary state of a dispatcher that has run no session yet. So when the root
+# is not a directory, walk up until a directory answers: an unsearchable one is exit 7.
+SESSION_LOG_ROOT_PROBE_SH = (
+    'd=%s; if [ -d "$d" ]; then [ -x "$d" ] || exit 8; exit 0; fi; '
+    'p=$(dirname "$d"); '
+    'while [ "$p" != "/" ] && [ "$p" != "." ]; do '
+    'if [ -d "$p" ]; then [ -x "$p" ] || exit 7; exit 9; fi; '
+    'if [ -e "$p" ]; then exit 7; fi; '
+    'p=$(dirname "$p"); done; exit 9')
+
+
+def session_log_root_verdict(rc, root):
+    """("ok" | "absent" | "closed" | "unknown", sentence). A pure reading of the probe.
+
+    ABSENT IS A NOTE, CLOSED IS A FAILURE. A dispatcher that has not run a session yet has
+    no log directory, and blocking the install on that would make a fresh machine run
+    work before it may install the thing that reviews it. A directory the role account
+    cannot enter does not fix itself, and every telemetry row would carry the fault."""
+    if rc == 0:
+        return "ok", "the role account can enter the session-log root %s" % root
+    if rc == 9:
+        return "absent", (
+            "the session-log root %s does not exist. Telemetry reads each session's model and "
+            "cost from there, so until it exists every row says it could not. On a dispatcher "
+            "that has run no session yet that is expected; on one that has, DISPATCHER_CONFIG "
+            "names the wrong home" % root)
+    if rc == 7:
+        return "closed", (
+            "the session-log root %s cannot be reached: a directory ABOVE it is closed to the "
+            "role account, or a file sits in its path. This is not the same as a root that does "
+            "not exist yet, and it does not fix itself — every telemetry row would carry the "
+            "fault. Give the role account the search bit on each directory in that path (0711 "
+            "is enough), then run this again" % root)
+    if rc == 8:
+        return "closed", (
+            "the session-log root %s exists, and the role account cannot enter it. Telemetry "
+            "reads each session's model and cost from there, so every row would say it could "
+            "not. Give the role account the search bit on it (0711 is enough)" % root)
+    return "unknown", "could not look at the session-log root %s as the role account" % root
+
+
 def step_configs(ctx, apply_it):
     """THREE files, not one: the review poller's, the bounce driver's, and the
     finding poller's (under its own `finding/` subdirectory). The pollers REFUSE
@@ -2761,6 +2971,19 @@ def step_configs(ctx, apply_it):
     if unreadable:
         raise Blocked("CK-6", "could not read required contexts for: " + ", ".join(unreadable))
     notes = _human_pending_notes(conf, checks)
+
+    log_root = dispatcher_session_logs(conf)
+    probe = r.as_role(ctx.account, SESSION_LOG_ROOT_PROBE_SH % shlex.quote(log_root))
+    verdict, said = session_log_root_verdict(probe.rc, log_root)
+    if verdict == "closed":
+        raise SetupError(said)
+    if verdict == "unknown":
+        raise Unknown(said + ".",
+                      "prove the role account can run a command, then run this again:\n"
+                      "    sudo -u %s -H /bin/sh -c 'cd / && ls -ld %s'"
+                      % (ctx.account, shlex.quote(log_root)))
+    if verdict == "absent":
+        notes = list(notes) + [said]
 
     poller = {
         "reviews_team_key": conf["REVIEWS_TEAM_KEY"],
@@ -3421,16 +3644,19 @@ def step_dispatcher_entry(ctx, apply_it):
     notes = ctx.state.data.setdefault("notes", {})
     if same:
         notes[FENCE_NOTE] = _fence_note(want[0]["disallowedTools"])
+        notes[ENTRIES_NOTE] = _entries_note(want)
         ctx.fence_measured = notes[FENCE_NOTE]
     elif not apply_it:
         notes.pop(FENCE_NOTE, None)
+        notes.pop(ENTRIES_NOTE, None)
         ctx.fence_measured = {}
 
     # The banner proof is recorded SEPARATELY from "the entries match". They are
     # different facts, and folding them into one ledger row is what made a
     # re-run bounce a live dispatcher to re-learn something it already knew.
     proof = (ctx.state.data.get("notes") or {}).get(ENTRY_PROOF_NOTE)
-    if same and (_proof_covers(proof, names) or ctx.state.attested("A-ENTRY-LOADED")):
+    signoff_holds, signoff_why_not = entry_signoff_holds(ctx.state, want)
+    if same and (_proof_covers(proof, names) or signoff_holds):
         return True, "%d review entr%s present and matching, and the load was proven " \
                      "(%s)" % (len(want), "y is" if len(want) == 1 else "ies are",
                                (proof or {}).get("how") if _proof_covers(proof, names)
@@ -3443,8 +3669,8 @@ def step_dispatcher_entry(ctx, apply_it):
         if differs:
             return False, ("%s differ(s) from what this conf produces"
                            % ", ".join(differs)), row_notes()
-        return False, "the review entries match; their load has not been proven yet", \
-            row_notes()
+        return False, "the review entries match; their load has not been proven yet%s" % (
+            " — %s" % signoff_why_not if signoff_why_not else ""), row_notes()
 
     if not same:
         body = json.dumps({"entries": want, "remove": stale},
@@ -3462,6 +3688,7 @@ def step_dispatcher_entry(ctx, apply_it):
                         why="reconcile the review entries in the dispatcher config")
         if res.skipped:
             notes.pop(FENCE_NOTE, None)
+            notes.pop(ENTRIES_NOTE, None)
             ctx.fence_measured = {}
         else:
             if not res.ok:
@@ -3469,6 +3696,7 @@ def step_dispatcher_entry(ctx, apply_it):
                                  % (res.err or res.out).strip()[:300])
             say("  " + res.out.strip())
             notes[FENCE_NOTE] = _fence_note(want[0]["disallowedTools"])
+            notes[ENTRIES_NOTE] = _entries_note(want)
             ctx.fence_measured = notes[FENCE_NOTE]
             rewrote = True
             # The entries on disk just changed, so a proof of an earlier load proves
@@ -3534,13 +3762,16 @@ def step_dispatcher_entry(ctx, apply_it):
         notes.pop(RESTART_OFFSET_NOTE, None)
         return False, ("entries present and the dispatcher's log names them (%s)"
                        % how), row_notes()
-    if ctx.state.attested("A-ENTRY-LOADED"):
+    signoff_holds, signoff_why_not = entry_signoff_holds(ctx.state, want)
+    if signoff_holds:
         return False, "entries present; load signed off by hand (%s)" % how, row_notes()
     raise Unknown(
         "the dispatcher's log never names every review entry (%s).\n"
         "  This is the KNOWN failure mode: the loader drops keys it does not\n"
         "  recognise at process start, and the file you just read back is only the\n"
-        "  file you wrote thirty seconds ago. Not claiming success." % how,
+        "  file you wrote thirty seconds ago. Not claiming success.%s"
+        % (how, ("\n  A hand sign-off is on record and does not count: %s." % signoff_why_not)
+           if signoff_why_not else ""),
         # Reachable FROM HERE. The old remedy pointed at CK-7, which is
         # downstream of this very step, so the only way out of the block was
         # through the thing the block prevented.
@@ -3821,6 +4052,53 @@ def fence_fingerprint(tools):
 
 def _fence_note(tools):
     return {"sha256": fence_fingerprint(tools), "rules": len(tools)}
+
+
+# THE ENTRIES A HAND SIGN-OFF VOUCHED FOR (KIT-149). `A-ENTRY-LOADED` says the dispatcher
+# really loaded the review entries, for the case its banner says nothing. It used to be
+# stored bare and read as bare presence, so a sign-off made for one entry under an old
+# fence went on settling every later rewrite — including a rewrite whose restarted
+# process printed no banner at all, which is the one case the sign-off exists for. The
+# machine-made proof beside it (ENTRY_PROOF_NOTE) was already dropped on every rewrite;
+# the hand-made one now carries the fingerprint of the WHOLE rendered entry list, fence
+# included, and counts only while the entries still match it. Names alone would not
+# catch a fence rewrite, and a fence rewrite is the change this has to catch.
+#
+# `attest` has no conf and no context, so it binds from this ledger note, which the
+# `dispatcher-entry` step writes wherever it writes FENCE_NOTE. The step itself judges
+# against the entries it has just computed, never against the note.
+ENTRIES_NOTE = "dispatcher-entry-shape"
+ATTESTATIONS_BOUND_TO_ENTRIES = frozenset(("A-ENTRY-LOADED",))
+
+
+def entries_fingerprint(want):
+    """sha256 of the rendered review entries, in id order: the same entries in any order
+    are one set, and any change to any key of any entry — the fence, a path, a team key,
+    the brief — is a different set."""
+    ordered = sorted(want, key=lambda e: str(e.get("id")))
+    return hashlib.sha256(json.dumps(ordered, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _entries_note(want):
+    return {"sha256": entries_fingerprint(want), "names": [w["name"] for w in want]}
+
+
+def entry_signoff_holds(state, want):
+    """(holds, why_not). A hand sign-off of the entries' load counts only for the entries
+    it was made against. `why_not` is None when there is no sign-off at all."""
+    signed = (state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
+    if not signed:
+        return False, None
+    signed = signed if isinstance(signed, dict) else {}
+    bound = signed.get("entries_sha256")
+    if not bound:
+        return False, ("the hand sign-off of their load (%s) names no entries, so it proves "
+                       "none of these — it predates the binding" % signed.get("at", "undated"))
+    if bound != entries_fingerprint(want):
+        return False, ("the review entries changed since the hand sign-off of their load (%s), "
+                       "so it proves the entries it was made for, not these"
+                       % signed.get("at", "undated"))
+    return True, None
 
 # THE BANNER IS A REGION, NOT A LINE, and reading it as a line is what made
 # this step unclearable. A dispatcher prints what it loaded as a header with
@@ -4192,7 +4470,7 @@ def _say_declines(text):
 
 def step_dry_run(ctx, apply_it):
     """All three components' own dry runs, shape-checked. This is what CK-5 reads."""
-    r = ctx.runner
+    r, notes = ctx.runner, []
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
     poller = r.as_role(ctx.account,
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_review_poller.py "
@@ -4235,7 +4513,21 @@ def step_dry_run(ctx, apply_it):
     if poller.rc not in ok_codes:
         problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
-    if bounce.rc not in ok_codes:
+    # A FOURTH STATE, for the same reason as the third. The driver exits 2 when it CANNOT
+    # EVALUATE a pull request — and one long-lived cause of that is a pull request waiting
+    # on a person (a partial review over the size cap can never conclude). Reading that as
+    # an installer failure would make Stage E un-upgradeable while any such PR is open,
+    # which is a property of the backlog again, not of the install. So: a pass whose only
+    # non-OK verdicts are CANNOT EVALUATE, with no failure of its own, is reported and
+    # passed; anything with a FAIL line in it is still a failure (review of #136).
+    bounce_said = bounce.out + bounce.err
+    cannot = [ln for ln in bounce_said.splitlines() if "CANNOT EVALUATE" in ln]
+    bounce_failed = [ln for ln in bounce_said.splitlines() if ln.strip().startswith("FAIL:")]
+    if bounce.rc not in ok_codes and cannot and not bounce_failed:
+        notes.append("the bounce driver could not evaluate %d pull request(s) — each is "
+                     "waiting on a person, not on this install. It ran and said so; that is "
+                     "the driver working, so this run goes on." % len(cannot))
+    elif bounce.rc not in ok_codes:
         problems.append("the bounce driver's dry run failed (exit %d): %s"
                         % (bounce.rc, (bounce.err or bounce.out).strip()[-400:]))
     # The finding poller has no DECLINE state — 0 is the only success; anything
@@ -4262,7 +4554,7 @@ def step_dry_run(ctx, apply_it):
         raise Blocked("CK-5", "the counts above have not been signed off")
     return True, ("all three dry runs ran and the count is signed off; "
                   + ("the poller declined at least one pull request"
-                     if declined else "the poller did not decline")), []
+                     if declined else "the poller did not decline")), notes
 
 
 def step_enable(ctx, apply_it):
@@ -4286,12 +4578,26 @@ def step_enable(ctx, apply_it):
                       "printf '%%s missing\\n' \"$f\"; done" % ctx.stage_home)
     have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
 
+    # A PAUSE IS INVISIBLE TO EVERY ALARM (KIT-112, review of #137). A paused bounce driver
+    # beats on schedule and reads healthy, by design — so nothing would ever mention a pause
+    # somebody forgot. This step is where a person looks on every install, so it says so
+    # here, as a note on the row rather than as a fault: pausing on purpose is not a defect.
+    paused = r.as_role(ctx.account, "p=%s/state/PAUSED; [ -e \"$p\" ] || exit 9; "
+                                    "head -c 200 \"$p\" 2>/dev/null; exit 0" % ctx.stage_home)
+    pause_notes = []
+    if paused.rc == 0:
+        pause_notes.append(
+            "the bounce driver is PAUSED on purpose: %s/state/PAUSED exists%s. It does nothing "
+            "while that file is there, and this step does not remove it — delete it to resume"
+            % (ctx.stage_home,
+               " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
+
     if not missing and len(have_beats) == 3:
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
-        return True, "all three daemons loaded and all heartbeats present", []
+        return True, "all three daemons loaded and all heartbeats present", pause_notes
     if not apply_it:
         return False, "would load %s; heartbeats present: %s" % (
-            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), []
+            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), pause_notes
 
     # THIS STEP RE-ARMS A DAEMON YOU STOPPED ON PURPOSE, and says so before it
     # does. `launchctl bootout` is the documented way to pause one half — but the
@@ -4303,8 +4609,11 @@ def step_enable(ctx, apply_it):
     if not r.dry_run:
         say("")
         say("  LOADING the daemons. Each takes a full pass within seconds of loading.")
-        say("  If you stopped one on purpose with `launchctl bootout`, that pause does NOT")
-        say("  survive this step — stop it again after this run, or let it run.")
+        say("  A `launchctl bootout` pause does NOT survive this step. To pause the BOUNCE")
+        say("  DRIVER so that it does — through this step and through a reboot — write the")
+        say("  reason into its state directory instead (KIT-112):")
+        say("      sudo -u %s -H /bin/sh -c 'cd / && echo \"why\" > ~/.stage-e/state/PAUSED'"
+            % ctx.account)
         say("")
     for label in labels:
         out = r.as_root(["launchctl", "bootout", "system/" + label],
@@ -4917,6 +5226,22 @@ def cmd_run(ctx, dry_run):
            "; this run asks for nothing" if dry_run else "; asked for only if absent"))
     _agent_credential_notice()
     say("  utc           %s" % now_iso())
+    # WHAT A READ-ONLY PASS STILL WRITES (review of #136). Comparing the jobs' files with
+    # origin needs origin's objects, so `verify` and `--dry-run` fetch into the role
+    # account's clone: new objects and FETCH_HEAD, no branch moved, no working tree touched.
+    say("  reads         a read-only pass fetches origin's objects into %s/kit (FETCH_HEAD "
+        "only; no branch or file moves)" % ctx.stage_home)
+    # AND WHAT WILL STOP THIS RUN LATER, said BEFORE anything unloads a daemon. An
+    # A-ENTRY-LOADED sign-off made before the binding stops counting at `dispatcher-entry`,
+    # which is downstream of the step that takes the daemons down — so without this line the
+    # first upgrade run leaves them off while a person works out what to sign.
+    signed_early = (ctx.state.data.get("attestations") or {}).get("A-ENTRY-LOADED")
+    if isinstance(signed_early, dict) and not signed_early.get("entries_sha256"):
+        say("")
+        say("  NOTE: the A-ENTRY-LOADED sign-off on record names no entries, so it no longer")
+        say("  counts (KIT-149). If the dispatcher's log does not name every review entry,")
+        say("  this run stops at `dispatcher-entry` — after the daemons are unloaded. Run")
+        say("  `verify` first, then `attest A-ENTRY-LOADED --initials <yours> --note \"...\"`.")
     # A DRY RUN IS `apply_it=False`, NOT "apply, but skip the Runner".
     # `Runner.write` was the only dry-run seam, and every tracker mutation goes
     # straight out through the transport, which the Runner never sees — so the
@@ -5204,13 +5529,26 @@ def cmd_attest(state, aid, initials, note):
                 "no fence is recorded yet.\n  Run the installer until the dispatcher-entry "
                 "step holds, probe a reviewer's tools (card CK-7), then sign." % aid)
         bound["fence_sha256"] = fence
+    if aid in ATTESTATIONS_BOUND_TO_ENTRIES:
+        # A HAND SIGN-OFF OF A LOAD NAMES THE ENTRIES THAT WERE LOADED (KIT-149). With
+        # none recorded there is nothing to bind to, and an unbound one would not count.
+        shape = ((state.data.get("notes") or {}).get(ENTRIES_NOTE) or {}).get("sha256")
+        if not shape:
+            raise SetupError(
+                "%s records that the dispatcher loaded the review entries, and no entries "
+                "are recorded yet.\n  Run `verify` (or `run`) until the dispatcher-entry step "
+                "has measured them, then sign." % aid)
+        bound["entries_sha256"] = shape
     state.attest(aid, initials.lower(), note or "", **bound)
     state.save()
     say("recorded: %s  %s  %s  %s" % (aid, initials.lower(), now_iso(), note or ""))
     say("  (%s)" % ATTESTATIONS[aid])
-    if bound:
+    if bound.get("fence_sha256"):
         say("  under the fence %s… — change the fence and this sign-off stops counting"
             % bound["fence_sha256"][:12])
+    if bound.get("entries_sha256"):
+        say("  for the entries %s… — change the entries and this sign-off stops counting"
+            % bound["entries_sha256"][:12])
     return EX_OK
 
 
@@ -5226,7 +5564,8 @@ class FakeRunner(Runner):
         self.answers = list(answers or [])
         self.applied = []
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
+        self.last_cwd = cwd
         line = _fmt(argv)
         for needle, rc, out in self.answers:
             if needle in line:
@@ -5271,7 +5610,7 @@ class FakeLaunchd(FakeRunner):
         self.polls = 0
         self.attempts = 0
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         line = _fmt(argv)
         if "launchctl bootout system/" in line:
             if not self.stuck:
@@ -5310,14 +5649,14 @@ class FakeLaunchdWithLog(FakeLaunchd):
         FakeLaunchd.__init__(self, **kw)
         self.log_path, self.new_output = log_path, new_output
 
-    def _exec(self, argv, stdin, timeout):
+    def _exec(self, argv, stdin, timeout, cwd=None):
         line = _fmt(argv)
         if "Print :StandardOutPath" in line:
             return Result(0, self.log_path + "\n", "")
         if list(argv[:3]) == ["sudo", "/bin/sh", "-c"] and self.log_path in argv[3]:
             ran = subprocess.run(["/bin/sh", "-c", argv[3]], capture_output=True, text=True)
             return Result(ran.returncode, ran.stdout, ran.stderr)
-        res = FakeLaunchd._exec(self, argv, stdin, timeout)
+        res = FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
         if "launchctl bootstrap system" in line and res.ok and self.present:
             with open(self.log_path, "a", encoding="utf-8") as fh:
                 fh.write(self.new_output)
@@ -5783,6 +6122,43 @@ def _selftest_body():
     expect("secret-never-printed-mutant", SECRET in ("stdin: K=" + SECRET),
            "the leak scan cannot see a secret in an output line")
 
+    # -- KIT-112. A ROLE-ACCOUNT COMMAND STARTS WHERE THAT ACCOUNT CAN STAND ----
+    # The script's own `cd /` runs after the shell has initialised, and initialising calls
+    # getcwd in the caller's directory, which the role account cannot enter: two noise
+    # lines on every role-account command. The child process must start at `/`.
+    # KIT-112 (review of #137). A pause is healthy to every alarm by design, so the one
+    # place a person always looks — the install — has to mention one it finds.
+    cases += 1
+    conf_p, _ = validate_conf(parse_conf(GOOD_CONF)[0])
+    ctx_p, fake_p = _settled_ctx(conf_p)
+    fake_p.answers = [("state/PAUSED", 0, "live test block B in progress\n")] + list(fake_p.answers)
+    (_okp, _detp, notes_p), _pp = _quiet(lambda: step_enable(ctx_p, apply_it=False))
+    expect("KIT-112 a PAUSED file the installer finds is said on the row",
+           any("PAUSED" in str(n) and "live test block B" in str(n) for n in (notes_p or [])),
+           "step_enable said nothing about a paused bounce driver: %r" % (notes_p,))
+    ctx_q, fake_q = _settled_ctx(conf_p)
+    fake_q.answers = [("state/PAUSED", 9, "")] + list(fake_q.answers)
+    (_okq, _detq, notes_q), _pq = _quiet(lambda: step_enable(ctx_q, apply_it=False))
+    expect("KIT-112 a PAUSED file the installer finds is said on the row",
+           not [n for n in (notes_q or []) if "PAUSED" in str(n)],
+           "step_enable invented a pause where there is none: %r" % (notes_q,))
+
+    cases += 1
+    fr_cwd = FakeRunner([("true", 0, "")])
+    fr_cwd.as_role("_x", "true")
+    read_cwd = getattr(fr_cwd, "last_cwd", None)
+    fr_cwd.as_role("_x", "true", why="a write")
+    write_cwd = getattr(fr_cwd, "last_cwd", None)
+    expect("KIT-112 role-commands-start-at-root", (read_cwd, write_cwd) == ("/", "/"),
+           "role-account commands start in the caller's directory: read %r, write %r"
+           % (read_cwd, write_cwd))
+    try:
+        here_out = Runner().read(["/bin/sh", "-c", "pwd"], cwd="/").out.strip()
+    except TypeError as exc:
+        here_out = "Runner.read takes no cwd: %s" % exc
+    expect("KIT-112 role-commands-start-at-root", here_out == "/",
+           "a real child given cwd=/ printed %r" % here_out)
+
     # -- 8. a dry run makes no change --------------------------------------
     cases += 1
     fr = FakeRunner(dry_run=True)
@@ -5804,6 +6180,134 @@ def _selftest_body():
     ok2, _d, _x = step_configs(ctx2, apply_it=True)
     expect("idempotent", ok2 is True, "configs did not read as already-done")
     expect("idempotent", not fake2.writes, "configs were rewritten when they already matched")
+
+    # -- AN OLD SIGN-OFF IS SAID, NEVER A DEAD END (KIT-176) ---------------------------
+    # For one release preflight REFUSED a sign-off of the entries' load that predates
+    # KIT-149, and the remedy it printed — re-sign — needs the entries recorded, which only
+    # dispatcher-entry records, four steps past the refusal. On the one live machine that
+    # carried such a record, every `run` stopped at step 0, for good. Pinned three ways.
+    cases += 1
+    legacy = {"A-ENTRY-LOADED": {"at": "2026-09-08T03:31:23Z", "initials": "bc",
+                                 "note": "saw the banner"}}
+    ctxP, _fakeP = _settled_ctx(conf)
+    okP, _saidP, _nP = _quiet(lambda: step_preflight(ctxP, apply_it=False))[0]
+    expect("KIT-176 preflight-legacy-signoff", okP is True and not _nP,
+           "preflight refused, or noted, a machine with no hand sign-off at all")
+    ctxL, _fakeL = _settled_ctx(conf)
+    ctxL.state.data["attestations"] = dict(legacy)
+    try:
+        okL, _saidL, notesL = _quiet(lambda: step_preflight(ctxL, apply_it=False))[0]
+        refusedL = ""
+    except SetupError as exc:
+        okL, notesL, refusedL = False, [], str(exc)
+    expect("KIT-176 preflight-legacy-signoff", okL is True and not refusedL,
+           "preflight REFUSED a pre-binding sign-off — the dead end: %r" % refusedL[:200])
+    expect("KIT-176 preflight-legacy-signoff",
+           any("counts for nothing" in str(n) and "2026-09-08" in str(n) for n in notesL),
+           "…and it said nothing about it either: %r" % notesL)
+    # …and the whole `run` a person types, on a machine whose banner already proved the
+    # load: no step fails, and nothing stops on the old record.
+    ctxR, _fR, _aR = _healthy_ctx(conf)
+    ctxR.state.data["attestations"].update(legacy)
+    (codeR, rowsR), _pR = _quiet(lambda: run_steps(ctxR, apply_it=True))
+    failedR = [(st, d) for st, o, d in rowsR if o in (FAILED, UNKNOWN, BLOCKED)]
+    expect("KIT-176 run-with-legacy-signoff", codeR == 0 and not failedR,
+           "a `run` over an old sign-off did not go through (exit %s): %s" % (codeR, failedR[:2]))
+
+    # -- KIT-149 (3). THE SESSION-LOG ROOT IS LOOKED AT, NOT ONLY WRITTEN ---------------
+    # The probe, EXECUTED: an enterable directory, a missing one, and one that exists but
+    # has no search bit. Then the step: closed fails, absent is a note, could-not-look is
+    # UNKNOWN — three different answers, none of them "fine".
+    cases += 1
+    probe_sh = globals().get("SESSION_LOG_ROOT_PROBE_SH")
+    expect("KIT-149 log-root-probe-runs", isinstance(probe_sh, str), "no probe to execute")
+    if isinstance(probe_sh, str):
+        with tempfile.TemporaryDirectory() as tmpL:
+            ok_dir = os.path.join(tmpL, "logs")
+            os.makedirs(ok_dir)
+            got = Runner().read(["/bin/sh", "-c", probe_sh % shlex.quote(ok_dir)]).rc
+            expect("KIT-149 log-root-probe-runs", got == 0, "an enterable root exited %s" % got)
+            got = Runner().read(["/bin/sh", "-c", probe_sh % shlex.quote(ok_dir + "-nope")]).rc
+            expect("KIT-149 log-root-probe-runs", got == 9, "a missing root exited %s" % got)
+            if os.geteuid() != 0:            # root can enter anything; the case needs a user
+                shut = os.path.join(tmpL, "shut")
+                os.makedirs(shut)
+                os.chmod(shut, 0o600)
+                try:
+                    got = Runner().read(["/bin/sh", "-c", probe_sh % shlex.quote(shut)]).rc
+                finally:
+                    os.chmod(shut, 0o700)
+                expect("KIT-149 log-root-probe-runs", got == 8,
+                       "a root with no search bit exited %s" % got)
+                # …and the case the plain `[ -d ]` could not tell from "absent": the root
+                # itself is missing, and a directory ABOVE it is closed (review of #136).
+                deep = os.path.join(shut, "logs")
+                os.chmod(shut, 0o600)
+                try:
+                    got = Runner().read(["/bin/sh", "-c", probe_sh % shlex.quote(deep)]).rc
+                finally:
+                    os.chmod(shut, 0o700)
+                expect("KIT-149 log-root-probe-runs", got == 7,
+                       "a root hidden behind a closed parent exited %s — it must not read "
+                       "as the tolerant 'absent'" % got)
+                # A file where a directory belongs is the same kind of could-not.
+                filed = os.path.join(tmpL, "afile")
+                open(filed, "w").close()
+                got = Runner().read(["/bin/sh", "-c",
+                                     probe_sh % shlex.quote(os.path.join(filed, "logs"))]).rc
+                expect("KIT-149 log-root-probe-runs", got == 7,
+                       "a file in the root's path exited %s" % got)
+                # …while a genuinely missing tree under a readable parent is still absent.
+                got = Runner().read(["/bin/sh", "-c", probe_sh
+                                     % shlex.quote(os.path.join(tmpL, "no", "such", "logs"))]).rc
+                expect("KIT-149 log-root-probe-runs", got == 9,
+                       "a missing tree under a readable parent exited %s" % got)
+
+    def _configs_with_log_root(rc):
+        ctxR, fakeR = _settled_ctx(conf)
+        fakeR.answers = [("d=/opt/example-dispatch/logs;", rc, "")] + list(fakeR.answers)
+        try:
+            ok_r, _d, notes_r = _quiet(lambda: step_configs(ctxR, apply_it=True))[0]
+            return "returned", " ".join(str(n) for n in (notes_r or []))
+        except SetupError as exc:
+            return "failed", str(exc)
+        except Unknown as exc:
+            return "unknown", exc.what
+
+    cases += 1
+    how, said = _configs_with_log_root(8)
+    expect("KIT-149 log-root-closed-fails", how == "failed" and "cannot enter" in said,
+           "a log root the role account cannot enter: %s %r" % (how, said[:160]))
+    how, said = _configs_with_log_root(9)
+    expect("KIT-149 log-root-absent-is-said", how == "returned" and "does not exist" in said,
+           "a missing log root was not said: %s %r" % (how, said[:160]))
+    # A closed PARENT is a could-not, not the tolerant absent note (review of #136): the
+    # install must stop, because nothing about it improves on its own.
+    how, said = _configs_with_log_root(7)
+    expect("KIT-149 log-root-closed-above-fails",
+           how == "failed" and "ABOVE it is closed" in said,
+           "a log root hidden behind a closed parent read as %s %r" % (how, said[:160]))
+    how, said = _configs_with_log_root(1)
+    expect("KIT-149 log-root-unlooked-is-unknown", how == "unknown",
+           "a probe that could not run read as %s %r" % (how, said[:160]))
+    how, said = _configs_with_log_root(0)
+    expect("KIT-149 log-root-ok-is-quiet", how == "returned" and "session-log root" not in said,
+           "a healthy log root was noted: %s %r" % (how, said[:160]))
+    # Both new probes ask the ROLE ACCOUNT, not the installing user (review of #136): run as
+    # you, every one of these cases would pass while measuring the wrong account's access.
+    cases += 1
+    ctxA, fakeA = _settled_ctx(conf)
+    fakeA.answers = [("d=/opt/example-dispatch/logs;", 0, ""),
+                     ("status --porcelain", 0, "ORIGIN %s\nDIRTY \n" % conf["KIT_REPO_URL"])] + list(fakeA.answers)
+    _quiet(lambda: step_configs(ctxA, apply_it=True))
+    _quiet(lambda: step_code(ctxA, apply_it=False))
+    role_prefix = ["sudo", "-u", conf["ROLE_ACCOUNT"], "-H", "/bin/sh", "-c"]
+    for needle, what in (("d=/opt/example-dispatch/logs;", "the session-log probe"),
+                         ("status --porcelain", "the clone-health probe")):
+        ran = [a for a in fakeA.reads if needle in _fmt(a)]
+        expect("KIT-149 probes-run-as-the-role-account",
+               ran and all(list(a[:6]) == role_prefix for a in ran),
+               "%s did not run as %s: %r" % (what, conf["ROLE_ACCOUNT"], [_fmt(a)[:80] for a in ran][:2]))
 
     # -- 9b. the finding config lands in its OWN subdir, made first ----------
     # It is the only config under ~/.stage-e/finding, which `cat >` cannot
@@ -6539,17 +7043,43 @@ def _selftest_body():
     brief5 = _section(brief_text, 5)
     expect("session-brief-reviewer", brief5,
            "no §5 in docs/SESSION-BRIEF.md, so this check measures nothing")
+    # KIT-137: the blocker goes in the block's machine-readable `blocked` field. A
+    # `summary` is prose nothing downstream parses, so a brief that still sends the
+    # blocker there is a brief that publishes "could not review" as a clean review.
     expect("session-brief-reviewer",
-           "no tracker tool" in brief5 and "summary" in brief5
+           "no tracker tool" in brief5 and "`blocked`" in brief5
            and "as a comment" not in brief5 and "own ticket" not in brief5,
            "§5 of docs/SESSION-BRIEF.md still sends a blocked reviewer to comment on its "
-           "ticket")
+           "ticket, or to a `summary` nothing reads instead of the `blocked` field")
+    # The RUNBOOK sentence, not merely the field's name somewhere in the brief: the
+    # deliverable paragraph mentions "blocked" too, so the old check passed with the
+    # instruction itself reverted to "say so in summary" (review of #134).
+    expect("session-brief-reviewer",
+           'set "blocked" to one line saying what was missing' in REVIEWER_BRIEF,
+           "the installer's reviewer brief no longer tells a blocked reviewer to set "
+           '"blocked" — the RUNBOOK sentence is what production reviewers read')
+    expect("session-brief-reviewer",
+           "WITHHELD is not one of these" in REVIEWER_BRIEF,
+           'the installer\'s reviewer brief no longer carves partial reviews out of '
+           '"blocked", so a withheld file discards the whole review (KIT-138)')
     for number in (3, 7):
         section = _section(brief_text, number)
         expect("session-brief-reviewer",
                "comment on" in section.lower() and "reviewer" in section,
                "§%d of docs/SESSION-BRIEF.md tells a session to comment on its ticket and "
                "never says a reviewer cannot" % number)
+    # …and EVERY section that routes a reviewer's blocker must route it to the same field.
+    # §5 said `blocked` while the preamble and the §7 runbook still said `summary`, and §7
+    # is the one a blocked reviewer opens (review of #144).
+    for where, text in (("the preamble", brief_text.split("---", 1)[0]),
+                        ("§7", _section(brief_text, 7))):
+        if "blocker" not in text and "blocked reviewer" not in text:
+            continue
+        expect("session-brief-reviewer",
+               "`blocked`" in text and "in its block's `summary`" not in text
+               and "review block's `summary`" not in text,
+               "%s of docs/SESSION-BRIEF.md still sends a reviewer's blocker to `summary`, "
+               "which nothing downstream reads (§5 says `blocked`)" % where)
 
     # -- 14e. two repositories that differ only by owner are REFUSED --------- #
     # They would want one entry name, and the poller derives the tag from the
@@ -7560,6 +8090,29 @@ def _selftest_body():
             expect("declined-is-not-failed", "exit %d" % rc in str(exc),
                    "the poller's %s exit was not named: %s" % (what, exc))
 
+    # A PULL REQUEST WAITING ON A PERSON IS NOT A FAILED INSTALL (review of #136). The
+    # driver exits 2 for CANNOT EVALUATE, and a partial review is a permanent cause of it,
+    # so this used to make Stage E un-upgradeable while such a PR was open.
+    cases += 1
+    cannot_out = ("example-org/kit#75 [KIT-1]: CANNOT EVALUATE — the review saw only part "
+                  "of this change: 2 file(s) were withheld\n")
+    ctxD5, _fD5 = _dry_run_ctx(conf, bounce=(2, cannot_out))
+    rowD5, _pD5 = _quiet(lambda: _dry_run_row(ctxD5))
+    okD5 = isinstance(rowD5, tuple) and rowD5[0] is True
+    expect("cannot-evaluate-is-not-failed", okD5,
+           "a pull request the driver could not evaluate stopped the install: %s"
+           % (rowD5[1] if isinstance(rowD5, tuple) else rowD5))
+    expect("cannot-evaluate-is-not-failed",
+           okD5 and any("waiting on a person" in str(n) for n in (rowD5[2] or [])),
+           "…and it passed in SILENCE, which is the other half of the defect: %r"
+           % (rowD5[2] if isinstance(rowD5, tuple) else None))
+    # …while a driver that genuinely failed still stops the install, even beside one.
+    ctxD6, _fD6 = _dry_run_ctx(conf, bounce=(2, cannot_out + "FAIL: could not read the ledger\n"))
+    rowD6, _pD6 = _quiet(lambda: _dry_run_row(ctxD6))
+    expect("cannot-evaluate-is-not-failed", isinstance(rowD6, SetupError),
+           "a real driver failure was excused by a CANNOT EVALUATE line beside it: %r"
+           % (rowD6 if not isinstance(rowD6, SetupError) else ""))
+
     # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
     # It never was. `decide` with neither --pr nor --all is a usage error, and
     # because the poller was judged first and raised, that error was invisible:
@@ -7660,7 +8213,11 @@ def _selftest_body():
     cases += 1
     ctxS, fakeS, _apiS = _healthy_ctx(conf)
     fakeS.answers = ([("ls-remote origin HEAD",
-                       0, "beef000000000000000000000000000000000000\tHEAD\n")]
+                       0, "beef000000000000000000000000000000000000\tHEAD\n"),
+                      # A JOB SCRIPT MOVED, so this still pins WOULD-CHANGE rather than passing
+                      # through the narrowed check's "could not compare" (review of #136).
+                      ("fetch --quiet --no-tags origin HEAD", 0,
+                       "FETCH_HEAD beef00000000\nscripts/pipeline_review_poller.py\n")]
                      + [a for a in fakeS.answers if a[0] != "ls-remote origin HEAD"])
     (_codeS, rowsS), _pS = _quiet(lambda: run_steps(ctxS, apply_it=False, keep_going=True))
     codeRowS = dict((st, o) for st, o, _d in rowsS).get("code")
@@ -7679,6 +8236,226 @@ def _selftest_body():
            dict((st, o) for st, o, _d in rowsL).get("code") == ALREADY_DONE,
            "a clone level with origin did not settle: %s"
            % dict((st, o) for st, o, _d in rowsL).get("code"))
+
+    # -- KIT-149 (2). A HAND SIGN-OFF OF THE ENTRIES' LOAD COUNTS FOR THOSE ENTRIES ONLY --
+    # It used to be read as bare presence, so a sign-off made for one entry under an old
+    # fence settled every later rewrite. Four cases: attest binds (and refuses with nothing
+    # to bind to); a sign-off for THESE entries settles a machine whose banner proved
+    # nothing; one made for DIFFERENT entries does not; a legacy unbound one does not.
+    _entries_note_key = globals().get("ENTRIES_NOTE", "dispatcher-entry-shape")
+    _fp = globals().get("entries_fingerprint")
+
+    cases += 1
+    st_e = State(tempfile.mkdtemp(prefix="stage-e-attest-entries."))
+    st_e.data["notes"][_entries_note_key] = {"sha256": "ab" * 32, "names": ["reviews-kit"]}
+    _quiet(lambda: cmd_attest(st_e, "A-ENTRY-LOADED", "BC", "saw it load"))
+    expect("KIT-149 attest-binds-entries",
+           (st_e.data["attestations"].get("A-ENTRY-LOADED") or {}).get("entries_sha256") == "ab" * 32,
+           "the sign-off does not name the entries it vouches for: %s" % st_e.data["attestations"])
+    st_ne = State(tempfile.mkdtemp(prefix="stage-e-attest-noentries."))
+    try:
+        _quiet(lambda: cmd_attest(st_ne, "A-ENTRY-LOADED", "BC", "saw it load"))
+        expect("KIT-149 attest-binds-entries", False,
+               "a load sign-off was recorded with no entries to tie it to")
+    except SetupError:
+        expect("KIT-149 attest-binds-entries", not st_ne.attested("A-ENTRY-LOADED"),
+               "refused, and recorded anyway")
+
+    details = {"last": ""}
+
+    def _entry_row_with_signoff(entries_sha):
+        ctxE, fakeE, _apiE = _healthy_ctx(conf)
+        ctxE.state.data["notes"].pop(ENTRY_PROOF_NOTE, None)     # the banner proved nothing
+        signed = {"initials": "bc", "note": "watched it", "at": "2026-09-08T03:31:23Z"}
+        if entries_sha is not None:
+            signed["entries_sha256"] = entries_sha
+        ctxE.state.data["attestations"]["A-ENTRY-LOADED"] = signed
+        (_cE, rowsE), _pE = _quiet(lambda: run_steps(ctxE, apply_it=False, keep_going=True))
+        details["last"] = dict((st, d) for st, _o, d in rowsE).get("dispatcher-entry") or ""
+        return dict((st, o) for st, o, _d in rowsE).get("dispatcher-entry"), ctxE
+
+    cases += 1
+    ctx_probe, _f, _a = _healthy_ctx(conf)
+    current = _fp(reviews_entries(ctx_probe)) if callable(_fp) else "no-fingerprint-function"
+    outE, _c = _entry_row_with_signoff(current)
+    expect("KIT-149 entry-signoff-for-these-entries-settles", outE == ALREADY_DONE,
+           "a sign-off bound to the entries on the machine did not settle: %s" % outE)
+    outE, _c = _entry_row_with_signoff("0" * 64)
+    expect("KIT-149 entry-signoff-for-other-entries-does-not", outE != ALREADY_DONE,
+           "a sign-off made for DIFFERENT entries settled these: %s" % outE)
+    expect("KIT-149 entry-signoff-verify-says-why", "changed since the hand sign-off" in details["last"],
+           "verify did not say why the sign-off stopped counting: %r" % details["last"][:200])
+    outE, _c = _entry_row_with_signoff(None)
+    expect("KIT-149 entry-signoff-unbound-does-not", outE != ALREADY_DONE,
+           "a legacy sign-off naming no entries settled these: %s" % outE)
+    # THE PROPERTY ITEM 2 EXISTS FOR (review of #136): a fence rewrite that keeps every entry
+    # NAME must still invalidate the sign-off. Names alone would not have caught it.
+    if callable(_fp):
+        want_probe = reviews_entries(ctx_probe)
+        fenced = [dict(e) for e in want_probe]
+        fenced[0]["disallowedTools"] = list(fenced[0].get("disallowedTools") or []) + ["NewTool"]
+        expect("KIT-149 entry-fingerprint-is-fence-sensitive",
+               (_fp(fenced) != _fp(want_probe),
+                [e["name"] for e in fenced] == [e["name"] for e in want_probe]),
+               (True, True))
+    expect("KIT-149 entry-signoff-verify-says-why", "names no entries" in details["last"],
+           "verify did not say the legacy sign-off names no entries: %r" % details["last"][:200])
+
+    # -- KIT-149 (1). "BEHIND" MEANS A FILE THE JOBS RUN MOVED, NOT THAT A COMMIT DID ------
+    # `verify` compared whole commits, so every merge to main — a doc, an ADR, another
+    # project's script — read as "the daemons would go on exec'ing that code". The four
+    # cases pin the narrowed verdict; the fifth pins that a dry run still names the restart
+    # `run` would do; the sixth that a comparison that could not be made is never "level".
+    _fetch = "fetch --quiet --no-tags origin HEAD"
+
+    def _code_row_when_behind(fetch_answer, dry=False):
+        ctxB, fakeB, _apiB = _healthy_ctx(conf)
+        fakeB.dry_run = dry
+        fakeB.answers = ([("ls-remote origin HEAD", 0,
+                           "beef000000000000000000000000000000000000\tHEAD\n")]
+                         + ([fetch_answer] if fetch_answer else [])
+                         + [a for a in fakeB.answers if a[0] != "ls-remote origin HEAD"])
+        (_cB, rowsB), _pB = _quiet(lambda: run_steps(ctxB, apply_it=False, keep_going=True))
+        return (dict((st, (o, d)) for st, o, d in rowsB).get("code") or (None, "")), fakeB
+
+    cases += 1
+    (oB, dB), fakeB = _code_row_when_behind((_fetch, 0, "FETCH_HEAD beef00000000\n"))
+    expect("KIT-149 behind-docs-only-merge-settles", oB == ALREADY_DONE,
+           "a merge that moved no file the jobs run still reads %s: %r" % (oB, dB[:160]))
+    expect("KIT-149 behind-docs-only-merge-settles", "identical at origin HEAD" in dB,
+           "the settled row does not say why it settled: %r" % dB[:160])
+    expect("KIT-149 behind-compare-is-a-read", not fakeB.writes,
+           "the narrowed comparison recorded writes: %s" % [w["why"] for w in fakeB.writes])
+    fetched = [a for a in fakeB.reads if _fetch in _fmt(a)]
+    expect("KIT-149 behind-compare-runs-as-the-role-account",
+           fetched and all(list(a[:4]) == ["sudo", "-u", conf["ROLE_ACCOUNT"], "-H"] for a in fetched),
+           "the narrowed comparison did not run as the role account: %r"
+           % [_fmt(a)[:80] for a in fetched][:2])
+
+    cases += 1
+    (oB, dB), _f = _code_row_when_behind(
+        (_fetch, 0, "FETCH_HEAD beef00000000\nscripts/pipeline_bounce_local.py\n"))
+    expect("KIT-149 behind-script-moved-is-named", oB == WOULD_CHANGE
+           and "scripts/pipeline_bounce_local.py" in dB,
+           "a moved job script read %s: %r" % (oB, dB[:160]))
+
+    cases += 1
+    (oB, dB), _f = _code_row_when_behind(
+        (_fetch, 0, "FETCH_HEAD beef00000000\nschemas/review-findings.schema.json\n"))
+    expect("KIT-149 behind-schema-moved-is-named", oB == WOULD_CHANGE
+           and "schemas/review-findings.schema.json" in dB,
+           "a moved schema the jobs read at run time read %s: %r" % (oB, dB[:160]))
+
+    cases += 1
+    (oB, dB), _f = _code_row_when_behind((_fetch, 7, ""))
+    expect("KIT-149 behind-could-not-fetch-is-unknown", oB == UNKNOWN,
+           "a fetch that failed read %s, which is not 'could not tell': %r" % (oB, dB[:160]))
+    # …and a comparison that fails AFTER the fetch is the other could-not (review of #136).
+    (oB, dB), _f = _code_row_when_behind((_fetch, 8, "FETCH_HEAD beef00000000\n"))
+    expect("KIT-149 behind-could-not-compare-is-unknown", oB == UNKNOWN,
+           "a failed comparison read %s, which is not 'could not tell': %r" % (oB, dB[:160]))
+
+    cases += 1
+    (oB, dB), _f = _code_row_when_behind((_fetch, 0, "FETCH_HEAD beef00000000\n"), dry=True)
+    expect("KIT-149 behind-dry-run-names-the-restart", oB == WOULD_CHANGE
+           and "fast-forward" in dB,
+           "a dry run hid that `run` would fast-forward and restart: %s %r" % (oB, dB[:160]))
+
+    # KIT-149 (review of #136). A clone the narrowed check calls "identical at origin HEAD"
+    # must really be one: a working tree somebody edited, or an origin pointing at another
+    # repository, are both invisible to a commit-to-commit diff. Executed for real.
+    cases += 1
+    health_sh = globals().get("CLONE_HEALTH_SH")
+    expect("KIT-149 clone-health runs", isinstance(health_sh, str), "no clone-health fragment")
+    if isinstance(health_sh, str):
+        with tempfile.TemporaryDirectory() as tmpH:
+            def _gitH(*a, cwd=None):
+                return subprocess.run(["git"] + list(a), cwd=cwd, capture_output=True, text=True,
+                                      env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e",
+                                               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e"))
+            originH, kitH = os.path.join(tmpH, "origin"), os.path.join(tmpH, "kit")
+            _gitH("init", "-q", originH)
+            _gitH("commit", "-q", "--allow-empty", "-m", "one", cwd=originH)
+            _gitH("clone", "-q", originH, kitH)
+
+            def _health(path):
+                res = Runner().read(["/bin/sh", "-c", health_sh.format(kit=path)])
+                lines = dict(ln.split(" ", 1) if " " in ln else (ln, "")
+                             for ln in res.out.splitlines() if ln.strip())
+                return res.rc, lines.get("ORIGIN", "").strip(), lines.get("DIRTY", "").strip()
+
+            rcH, originOut, dirtyOut = _health(kitH)
+            expect("KIT-149 clone-health runs", rcH == 0 and originOut == originH and not dirtyOut,
+                   "a clean clone read rc %s origin %r dirty %r" % (rcH, originOut, dirtyOut))
+            with open(os.path.join(kitH, "scripts-edited-by-hand.py"), "w") as fh:
+                fh.write("x = 1\n")
+            rcH, _o, dirtyOut = _health(kitH)
+            expect("KIT-149 clone-health runs", rcH == 0 and "scripts-edited-by-hand" in dirtyOut,
+                   "a dirty clone did not report its working tree: %r" % dirtyOut)
+
+    # …and the step refuses both, rather than calling the jobs' files identical.
+    cases += 1
+    conf_h, _ = validate_conf(parse_conf(GOOD_CONF)[0])
+    for label, answer, needle in (
+            ("a dirty working tree", "ORIGIN %s\nDIRTY  M scripts/pipeline_bounce_local.py\n"
+             % conf_h["KIT_REPO_URL"], "uncommitted changes"),
+            ("a foreign origin", "ORIGIN https://github.com/someone/else.git\nDIRTY \n",
+             "two different repositories")):
+        ctx_h, fake_h, _api_h = _healthy_ctx(conf_h)
+        fake_h.answers = [("status --porcelain", 0, answer)] + list(fake_h.answers)
+        (_ch, rows_h), _ph = _quiet(lambda: run_steps(ctx_h, apply_it=False, keep_going=True))
+        row_h = dict((st, (o, d)) for st, o, d in rows_h).get("code") or (None, "")
+        expect("KIT-149 clone-health refuses %s" % label,
+               row_h[0] == FAILED and needle in row_h[1],
+               "%s read %s: %r" % (label, row_h[0], row_h[1][:160]))
+
+    # …and the shell itself, EXECUTED against two real repositories. Three commits on
+    # origin: one touches a doc, one a job script, one a schema.
+    cases += 1
+    fragment = globals().get("job_files_moved_sh")
+    expect("KIT-149 behind-shell-runs", callable(fragment),
+           "no job_files_moved_sh to execute")
+    if callable(fragment):
+        with tempfile.TemporaryDirectory() as tmpG:
+            def _git(*a, cwd=None):
+                return subprocess.run(["git"] + list(a), cwd=cwd, capture_output=True, text=True,
+                                      env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e",
+                                               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e"))
+            origin_dir, kit_dir = os.path.join(tmpG, "origin"), os.path.join(tmpG, "kit")
+            os.makedirs(os.path.join(origin_dir, "scripts"))
+            os.makedirs(os.path.join(origin_dir, "schemas"))
+            _git("init", "-q", origin_dir)
+            for rel in ("README.md", "scripts/pipeline_bounce_local.py",
+                        "schemas/review-findings.schema.json"):
+                with open(os.path.join(origin_dir, rel), "w") as fh:
+                    fh.write("v1\n")
+            _git("add", "-A", cwd=origin_dir)
+            _git("commit", "-qm", "one", cwd=origin_dir)
+            _git("clone", "-q", origin_dir, kit_dir)
+
+            def _moved_after(rel):
+                with open(os.path.join(origin_dir, rel), "a") as fh:
+                    fh.write("more\n")
+                _git("commit", "-qam", "touch " + rel, cwd=origin_dir)
+                res = Runner().read(["/bin/sh", "-c", fragment(kit_dir)])
+                lines = [ln for ln in res.out.splitlines() if ln.strip()]
+                return res.rc, lines
+
+            rcG, linesG = _moved_after("README.md")
+            expect("KIT-149 behind-shell-runs", rcG == 0 and len(linesG) == 1
+                   and linesG[0].startswith("FETCH_HEAD "),
+                   "a doc-only commit: rc %s, %r" % (rcG, linesG))
+            rcG, linesG = _moved_after("scripts/pipeline_bounce_local.py")
+            expect("KIT-149 behind-shell-runs", rcG == 0
+                   and linesG[1:] == ["scripts/pipeline_bounce_local.py"],
+                   "a job-script commit: rc %s, %r" % (rcG, linesG))
+            rcG, linesG = _moved_after("schemas/review-findings.schema.json")
+            expect("KIT-149 behind-shell-runs", rcG == 0
+                   and "schemas/review-findings.schema.json" in linesG[1:],
+                   "a schema commit: rc %s, %r" % (rcG, linesG))
+            gone = Runner().read(["/bin/sh", "-c", fragment(os.path.join(tmpG, "nope"))])
+            expect("KIT-149 behind-shell-runs", gone.rc == 7,
+                   "a clone that cannot fetch must exit 7, got %s" % gone.rc)
     # …and the key it used is the STORED one, read out of the env file rather
     # than requested. Same value, different provenance, and only one of the two
     # costs the owner a keystroke on every single pass.
@@ -8653,10 +9430,10 @@ def _selftest_body():
             self.answers = []
             self.applied = []
 
-        def _exec(self, argv, stdin, timeout):
+        def _exec(self, argv, stdin, timeout, cwd=None):
             if argv and argv[0] == "sudo":
                 order.append("probe")
-            return FakeRunner._exec(self, argv, stdin, timeout)
+            return FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd)
 
     main_tmp = tempfile.mkdtemp(prefix="stage-e-main.")
     main_conf = os.path.join(main_tmp, "stage-e.conf")
@@ -8860,6 +9637,60 @@ def _selftest_body():
     expect("required-scripts-cover-imports", need <= set(REQUIRED_SCRIPTS),
            "the bounce driver's local imports are not all in REQUIRED_SCRIPTS: %s"
            % sorted(need - set(REQUIRED_SCRIPTS)))
+    # KIT-149: REQUIRED_SCRIPTS now also decides what "behind" means, so a module the jobs
+    # can load that is missing from it is a change `verify` cannot see. Walk the closure of
+    # all four jobs that exec from the clone — every import outside a selftest, plus the
+    # modules loaded BY NAME through _optional_module — and require it exactly.
+    import ast as _ast
+    roots = globals().get("DAEMON_ENTRY_SCRIPTS") or ("pipeline_review_poller.py",
+                                                      "pipeline_bounce_local.py",
+                                                      "pipeline_finding_poller.py",
+                                                      "pipeline_heartbeat_monitor.py")
+
+    def _loaded(fname):
+        with open(os.path.join(here, fname), encoding="utf-8") as fh:
+            tree = _ast.parse(fh.read())
+        consts = {t.id: n.value.value for n in tree.body if isinstance(n, _ast.Assign)
+                  and isinstance(n.value, _ast.Constant) and isinstance(n.value.value, str)
+                  for t in n.targets if isinstance(t, _ast.Name)}
+        found = set()
+
+        def walk(node):
+            for child in _ast.iter_child_nodes(node):
+                if isinstance(child, _ast.FunctionDef) and (
+                        child.name == "selftest" or child.name.startswith("_selftest")):
+                    continue
+                names = []
+                if isinstance(child, _ast.Import):
+                    names = [a.name for a in child.names]
+                elif isinstance(child, _ast.ImportFrom) and child.module and not child.level:
+                    names = [child.module]
+                elif isinstance(child, _ast.Call) and child.args and (
+                        getattr(child.func, "id", None) or getattr(child.func, "attr", None)
+                ) in ("_optional_module", "import_module", "__import__"):
+                    arg = child.args[0]
+                    if isinstance(arg, _ast.Constant) and isinstance(arg.value, str):
+                        names = [arg.value]
+                    elif isinstance(arg, _ast.Name) and arg.id in consts:
+                        names = [consts[arg.id]]
+                for m in names:
+                    f = m.split(".")[0] + ".py"
+                    if os.path.exists(os.path.join(here, f)):
+                        found.add(f)
+                walk(child)
+        walk(tree)
+        return found
+
+    closure, todo = set(), list(roots)
+    while todo:
+        f = todo.pop()
+        if f not in closure:
+            closure.add(f)
+            todo.extend(sorted(_loaded(f) - closure))
+    expect("KIT-149 required-scripts-are-the-closure", closure == set(REQUIRED_SCRIPTS),
+           "the jobs can load %s; REQUIRED_SCRIPTS lacks %s and lists %s beyond them"
+           % (len(closure), sorted(closure - set(REQUIRED_SCRIPTS)),
+              sorted(set(REQUIRED_SCRIPTS) - closure)))
 
     # -- THE HEARTBEAT MONITOR STEP (KIT-127): the job that reads the three heartbeats --
     # Named ticket, `off` by name, or a card — never a silent absence. Proved to exist and
@@ -9122,7 +9953,7 @@ def _selftest_body():
         ctxA.unloaded = [mlabel]
         # Every command, read or write, in the order it ran.
         seqA, _execA = [], fakeA._exec
-        fakeA._exec = lambda argv, stdin, timeout: (seqA.append(_fmt(argv)),
+        fakeA._exec = lambda argv, stdin, timeout, cwd=None: (seqA.append(_fmt(argv)),
                                                     _execA(argv, stdin, timeout))[1]
         (okA, detailA, _x), printedA = _quiet(lambda: step_heartbeat_monitor(ctxA, apply_it=True))
         whysA = [w["why"] for w in fakeA.writes]
@@ -9191,7 +10022,7 @@ def _selftest_body():
                           (MONITOR_SCRIPT + " check --config", 0, ""),
                           (_rearm_cmd, 0, "")] + fakeRL.answers
         seqRL, _execRL = [], fakeRL._exec
-        fakeRL._exec = lambda argv, stdin, timeout: (seqRL.append(_fmt(argv)),
+        fakeRL._exec = lambda argv, stdin, timeout, cwd=None: (seqRL.append(_fmt(argv)),
                                                      _execRL(argv, stdin, timeout))[1]
         _quiet(lambda: step_heartbeat_monitor(ctxRL, apply_it=True))
         _gone_at = max([i for i, line in enumerate(seqRL)
@@ -9379,6 +10210,8 @@ def _settled_ctx(conf):
         ("cat $HOME/.stage-e/poller.json", 0, json.dumps(poller)),
         ("cat $HOME/.stage-e/config.json", 0, json.dumps(bounce)),
         ("cat $HOME/.stage-e/finding/poller.json", 0, json.dumps(finding)),
+        # The session-log root is there and the role account can enter it (KIT-149).
+        ("d=/opt/example-dispatch/logs;", 0, ""),
         ("gh api repos/example-org/kit --jq", 0, "main\n"),
         ("required_status_checks", 0, '["Kit checks", "Provenance scan"]\n'),
         # WHICH REPOSITORY A CLONE IS, asked of git rather than read off the

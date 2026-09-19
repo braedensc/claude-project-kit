@@ -164,6 +164,8 @@ npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
 npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13)
+npm run test:sync-user-skills  # user-scope skill drift: check is read-only; --apply
+                             #   refuses in an agent env (machine-local ~/.claude/skills)
 npm run test:emit       # generation-side gate: every producer REFUSES to write a malformed doc
 npm run test:telemetry  # telemetry collector selftest (§4, §10)
 npm run test:block      # telemetry block builder + the telemetry-required gate (§4, §8)
@@ -186,6 +188,7 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
                              #   states, label-only tracker mutation (KIT-115)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
+npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition

@@ -17,7 +17,10 @@ name: PR conflict monitor
 #
 # So a conflict now STARTS A FIX. The logic lives in scripts/pr_conflict.py
 # (monitor half here; one marker grammar, one selftest in CI). Per new episode:
-#   • budget left (3 automated attempts per PR, lifetime) → label + a `request`
+#   • budget left (3 automated attempts per PR, lifetime; `--max-fix-requests N`
+#     changes it, and 0 means NOTHING HERE ANSWERS — page at the first conflict
+#     instead of asking, which is the right setting for a repository with no
+#     waker and no dispatcher) → label + a `request`
 #     comment, answered by whoever owns the branch's session: a LOCAL session's
 #     PR by the conflict waker — a supervised LaunchAgent on the machine that
 #     holds the worktree (scripts/pipeline_conflict_waker_setup.py), which wakes

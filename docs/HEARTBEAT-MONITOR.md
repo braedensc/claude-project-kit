@@ -35,14 +35,26 @@ three daemons for one reader's convenience would be the larger change:
 | Job | File | Freshness from | Good result |
 |---|---|---|---|
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `declined` |
-| bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle` |
+| bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle`, `declined`, `paused` |
 | finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
+
+A **paused** bounce driver is a good result too, and the row says so rather than calling it
+merely fine: the driver beats on schedule and does nothing, on purpose, while a `PAUSED`
+file sits in its state directory. Past 48 hours that becomes `paused-too-long` — not
+because the pause is wrong, but because nothing else in the system would ever mention it
+again, and a pause nobody remembers is indistinguishable from a lane that quietly stopped.
 
 The review poller's `declined` (exit 3) is a good result. That pass settled a NOT-reviewed
 verdict and said so on the pull request: no acceptance criteria, a review that timed out, a
-diff over the cap. That is the poller doing its job, and the notifier does not page on it
-either. The bounce driver's `problems` and `deadline` stay bad: each is a pull request it
-could not act on, or a pass cut short. The finding poller has no exit 3.
+reviewer that reported it could not see the change, or a change with no single file small
+enough to deliver. (A large change is no longer one of these — since KIT-138 it gets a
+*partial* review, and only a lone file over the cap still declines.) That is the poller
+doing its job, and the notifier does not page on it
+either. The bounce driver's `declined` (exit 3) is good for the same reason: its only
+non-clean pull requests were ones it was never meant to act on, and it said so on each. Its
+`paused` is a person's decision, written as a `PAUSED` file, and the job still beats on
+schedule. Its `problems` and `deadline` stay bad: each is a pull request it could not act
+on, or a pass cut short. The finding poller has no exit 3.
 
 The two pollers' files share a filename and are told apart by **directory**. The selftest
 cross-checks every schema string and filename against the three writers, and judges
@@ -68,6 +80,7 @@ request whenever a waiting request goes unclaimed (`STAGE-E-OPERATOR.md`, Step 6
 | `failing` | Fresh, and the result is bad. It **ran and could not do it** — not the same as down | yes |
 | `missing` | A watched job has written no heartbeat here at all | yes |
 | `unreadable` | The file cannot be judged: bad JSON, an unknown schema, no parseable timestamp | yes |
+| `paused-too-long` | The bounce driver has been paused for more than 48 hours. A pause is healthy and deliberate, and nothing but a person ever clears it — so after two days this is the only thing that will remind anyone the file is still there | yes, once |
 
 `unreadable` is a claim about **the monitor**, never about the daemon, and it pages for the
 §13 reason: a monitor that cannot judge must be as loud as a job that is down, or *I could
