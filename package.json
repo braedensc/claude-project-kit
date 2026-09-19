@@ -36,6 +36,7 @@
     "test:criteria-snapshot": "python3 scripts/pipeline_criteria_snapshot.py --selftest",
     "test:stage-e-setup": "python3 scripts/pipeline_stage_e_setup.py --selftest",
     "test:stage-a-setup": "python3 scripts/pipeline_stage_a_setup.py --selftest",
+    "test:chat-lane-setup": "python3 scripts/pipeline_chat_lane_setup.py --selftest",
     "test:telemetry-local": "python3 scripts/pipeline_telemetry_local.py --selftest",
     "test:review-poller": "python3 scripts/pipeline_review_poller.py --selftest",
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
