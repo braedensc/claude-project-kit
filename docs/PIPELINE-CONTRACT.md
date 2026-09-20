@@ -920,6 +920,17 @@ backlog — and the tree shape adds these:
   *eligible*; each reaches `ready` only through the approve tier (§11, which re-runs the
   gate and is off unless a project switches it on) or a person, and starts only when
   delegated.
+- **It is safe to retry, and never silent about a report it could not post** (KIT-170).
+  The epic carries a plain-text receipt, `Plan id: <pinned>/<digest>`, over the pinned
+  ticket and the proposal as filed. Before creating anything the executor asks the work
+  team for that receipt; a second run on the same proposal files nothing, and posts the
+  summary only if none for that receipt reached the ticket. A search that fails is
+  `errored`, never "nothing there". A run that fails partway posts exactly what it created.
+  A rejection or no-output note that cannot be posted is `errored`, so the caller retries.
+- **Session text is scanned for credential shapes before anything is filed or quoted**,
+  with the review publisher's own scan (`pipeline_review_local.secret_hits`). A hit rejects
+  the whole batch with a fixed reason and quotes nothing. A §4 telemetry block in a
+  planning batch is set aside and never delivered as a question.
 - **Where its inputs come from.** The executor's only config is the **planned repository's
   committed `delivery.json`**: the work team the tree is filed into (`linear.teamKey`), that
   team's state and label ids, and `linear.findingTicket`. It resolves the **idea ticket in its
