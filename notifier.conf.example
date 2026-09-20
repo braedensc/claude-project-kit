@@ -1,0 +1,117 @@
+# notifier.conf.example — every value the notifier installer reads.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp notifier.conf.example notifier.conf && chmod 600 notifier.conf
+#   $EDITOR notifier.conf                      # seven values to fill in, none of them secret
+#   python3 scripts/pipeline_notifier_setup.py run --dry-run    # read it first
+#   python3 scripts/pipeline_notifier_setup.py run              # the only command that changes anything
+#
+# The installer validates this file before it touches anything, and reports
+# EVERY bad value in one pass. Fix them all, then run it again.
+#
+# It installs the human-action notifier (scripts/pipeline_notify_local.py)
+# beside an EXISTING Stage E install: the same role account, the same clone of
+# this kit, and the same env file, which must already hold the tracker key.
+# Install Stage E first (docs/STAGE-E-OPERATOR.md).
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
+#
+#   FORMAT.  `KEY=value`, one per line.  `#` starts a comment only at the start
+#   of a line.  No quotes, no `export`, no `$(…)`.
+#
+#   IT IS PARSED, NEVER SOURCED.
+#
+#   A DUPLICATE KEY IS A HARD ERROR, naming both line numbers.
+#
+#   NO KEY HERE EVER HOLDS A CREDENTIAL.  A value with a credential shape is
+#   refused, by key name only.  The Slack token is typed at a hidden prompt and
+#   written straight into the role account's env file at mode 600.
+#
+#   `~` MEANS THE ROLE ACCOUNT'S HOME, not yours.  It is resolved when the job
+#   runs, as that account.
+#
+#   EVERY EXAMPLE VALUE IS SYNTHETIC.  Two are placeholders the validator
+#   refuses by name, so an unedited copy cannot run: CHAT_CHANNEL_ID and
+#   TICKET_URL_TEMPLATE.
+#
+# ---------------------------------------------------------------------------
+
+
+# ===========================================================================
+# 1.  REQUIRED
+# ===========================================================================
+
+# The dispatcher's role account — the one the Stage E daemons already run as.
+# NOT your login account: the installer refuses its own invoking user.
+ROLE_ACCOUNT=_exdispatch
+
+# That account's clone of this kit, the one the Stage E daemons exec from.
+# The installer checks the notifier script is in it; it never moves the clone.
+ROLE_KIT_CLONE=~/.stage-e/kit
+
+# The tracker team keys whose tickets are scanned, comma-separated.
+TEAM_KEYS=KIT
+
+# How a ticket id becomes a link in the ping.  Must contain {id}.
+TICKET_URL_TEMPLATE=https://linear.app/example-org/issue/{id}
+
+# The PRIVATE Slack channel's id (card CK-N1 says how to find it).
+CHAT_CHANNEL_ID=C0123456789
+
+# Who may author the four planning marks.  A comma list of tracker actor ids,
+# or `self`: the user the tracker key belongs to, looked up with one read-only
+# query.  Any other author's planning mark is skipped, never paged.
+EXECUTOR_ACTOR_IDS=self
+
+# The launchd label of the notifier's system LaunchDaemon.  Reverse-DNS.
+JOB_LABEL=com.example.notifier
+
+
+# ===========================================================================
+# 2.  DEFAULTS — leave them unless you have a reason
+# ===========================================================================
+
+# The NAME of the variable holding the notifier's Slack bot token.
+# NEVER SLACK_BOT_TOKEN: that is the name the dispatcher's own Slack lane reads
+# from the dispatcher's environment, which is copied into every session.  The
+# notifier uses its own Slack app and its own token, under its own name, so a
+# token leaked from a session cannot post a ping that looks like the notifier's.
+CHAT_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
+
+# The NAME of the variable holding the tracker key.  The Stage E installer
+# stores it; this installer only checks that it is there.
+LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
+
+# The role account's own env file.  Never the dispatcher's.
+ENV_FILE=~/.stage-e/env
+
+# Where the notifier's JSON config is written (mode 600).
+NOTIFIER_CONFIG=~/.stage-e/notifier.json
+
+# The notifier's seen-set and heartbeat.  Outside every git working tree.
+STATE_DIR=~/.stage-e/state
+
+# One pass every this many seconds.
+INTERVAL_SECONDS=300
+
+# Flood guard: above this many new events, a pass declines the rest.
+MAX_EVENTS_PER_PASS=25
+
+# How many recent comments per ticket one pass reads.
+LOOKBACK_COMMENTS=20
+
+# Wall clock for one pass.  Must be shorter than INTERVAL_SECONDS.
+RUN_TIMEOUT_SECONDS=240
+
+# The chat API base URL.  https only.
+CHAT_API_BASE=https://slack.com/api
+
+# The dispatcher's own env file, and its state root.  Empty means the two
+# rules below are NOT checked against a path, and preflight says so:
+#   ENV_FILE may not be DISPATCHER_ENV_FILE;
+#   no notifier path may sit under DISPATCHER_STATE_ROOT.
+DISPATCHER_ENV_FILE=
+DISPATCHER_STATE_ROOT=
