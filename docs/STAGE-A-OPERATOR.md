@@ -117,7 +117,7 @@ What you supply, and why it is yours:
 | Checkpoint | What you do |
 |---|---|
 | `CA-DELIVERY` | Turn the plan kind on in the planned repository's committed `delivery.json`, by a pull request you merge. That file is the switch that lets a proposal become tickets. |
-| `CA-ENTRY` | Paste the composed Planning entry into the dispatcher's own config and restart it. A program that wrote its own fence would be choosing its own supervision. |
+| `CA-ENTRY` | Paste the composed Planning entry into the dispatcher's own config and restart it. A program that wrote its own fence would be choosing its own supervision. Check before you paste: every tracker server named twice (`mcp__<server>` and `mcp__<server>__*`), `Bash`, `Write` and `Edit` all denied, no `allowedTools` key, a repository path, a base branch, a workspace directory, a workspace id, and you as the only allowed user. |
 | `CA-PROBE` | Watch a live planning session, and a helper it starts, list every tool they hold. A fence is a list in a file until someone sees a session obey it. |
 | `CA-HANDOVER` | Run the planning procedure by hand once, before anything is automatic. |
 | `CA-EXECUTOR` | Load the job. The next run measures it: launchd for whether it is loaded, its own heartbeat for whether it works. |

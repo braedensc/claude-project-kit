@@ -89,3 +89,17 @@ POLL_INTERVAL_SECONDS=300
 # of the planned repository. The installer asks for the value at a hidden prompt and
 # stores it beside the tracker key. Leave empty for a public repository.
 GITHUB_TOKEN_ENV=
+
+# The local account the dispatcher itself runs as. The installer reads that account's
+# copy of the dispatcher config — as FACTS, never as a file, because it holds the
+# dispatcher's tracker tokens — for the fields a loadable Planning entry needs: the
+# clone the planner reads code in, that clone's base branch, the workspace directory
+# and the workspace id. It never writes that config.
+#
+# RULE: not the same account as ROLE_ACCOUNT. Every session can read what the
+# dispatcher's account can read, and the executor's key must be out of that reach.
+DISPATCHER_ACCOUNT=_exdispatch
+
+# The dispatcher's own config file, by absolute path. A relative path is resolved
+# against a working directory nothing here can see.
+DISPATCHER_CONFIG=/opt/example-dispatch/config.json

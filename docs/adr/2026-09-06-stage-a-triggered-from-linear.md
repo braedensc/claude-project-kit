@@ -775,3 +775,35 @@ carrying provenance labels, so it must not live in that home. The job's key must
 owner's own, because the dispatcher checks the DELEGATOR against the entry's allowed users —
 a pass whose key belongs to anyone else stops with a config error rather than filing
 planning tickets the dispatcher would refuse in silence.
+
+### The Planning entry is one the dispatcher can load (KIT-155)
+
+The composed entry carried a name, a team key, a never-used routing label, the fence and
+the brief — and nothing that makes an entry work. It now carries `repositoryPath` and
+`baseBranch` from the entry that already manages the planned repository (identity is that
+clone's `origin`, with the entry's own `githubUrl` as a second authority), the
+`workspaceBaseDir` and `linearWorkspaceId` the dispatcher uses, `userAccessControl.allowedUsers`
+set to the owner alone, and an `id` equal to its `name`. `entry_problems` names every one
+that is missing, and a selftest mutant drops each.
+
+The installer reads the dispatcher's config the way the review installer does — through
+that installer's own reader program, run as the dispatcher's account, which prints FACTS
+and never the file, because the file holds the dispatcher's tracker tokens. Four refusals
+come with it: no clone of the planned repository, entries that disagree about the workspace
+base or id, another entry already claiming the Planning team key (team routing takes the
+first claimant, so which entry ran a planning ticket would depend on file order), and a
+routing tag naming the Planning entry that another entry would also answer.
+
+**The fence now covers what this machine injects**, not only the four servers every machine
+has: every server the dispatcher's `linearMcpConfigs` files name, and every server the
+planned repository's own committed `.mcp.json` would add from the session's working
+directory. A server that cannot be named is a refusal, never a smaller fence. One more
+source was found while building it: an agent definition under the planned repository's
+`.claude/agents/` can declare `mcpServers` of its own, and those tools reach a HELPER
+session; the deny list still applies to them by name, so the installer refuses to compose
+an entry while such a definition exists rather than fence over a name it was never given.
+
+A prompt type that sets a tool list in the dispatcher's `promptDefaults` is reported rather
+than refused: the planning ticket the job writes carries no labels, so none is selected —
+but a label added to one by hand would select it, and that type's list would replace this
+fence.
