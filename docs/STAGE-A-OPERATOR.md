@@ -63,6 +63,12 @@ An idea's text is exactly the kind of text those routes read. So the gate never 
 to the router. The planning ticket is written by the job, and the job refuses to file one
 whose description carries any directive but its own.
 
+A label is closed twice over. The planning ticket carries none, and the Planning entry
+defines **every** prompt type with the planner's own fence — so even a label added to a
+planning ticket by hand selects a type whose tool list is that same fence. The installer
+refuses to compose an entry while the dispatcher sets a default for a prompt type it does
+not know how to cover.
+
 What that leaves: someone with tracker access adding a runner label to a planning ticket
 and delegating it again. Only users on the Planning entry's allowed list can start a
 session, and that list is the owner.

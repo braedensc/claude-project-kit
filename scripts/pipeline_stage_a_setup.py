@@ -227,9 +227,29 @@ DISALLOWED_BUILTINS = [
 PLANNING_DISALLOWED_TOOLS = DISALLOWED_BUILTINS + [
     rule for server in PLANNER_FENCE_SERVERS for rule in _server_rules(server)]
 
-# A label no ticket carries, so the Planning entry is NEVER label-routed — its job
-# kind comes from the team it maps to, not from text a ticket could hold (KIT-41).
+# A label no ticket carries, so the Planning entry is NEVER label-routed — its job kind
+# comes from the team it maps to, not from text a ticket could hold (KIT-41).
 PLANNING_ENTRY_NEVER_LABEL = "stage-a-planning-entry-never-label-routed"
+
+# THE PROMPT TYPES, AND WHY THE ENTRY DEFINES EVERY ONE OF THEM (KIT-154, route 2).
+#
+# A session's tool list is resolved in this order (ToolPermissionResolver,
+# `buildDisallowedToolsForRepo`, 0.2.69): the ENTRY's `labelPrompts[type]`, then the
+# global `promptDefaults[type]`, and only then the entry's own `disallowedTools`. The
+# type comes from the ticket's LABELS, and `orchestrator` selects a type on every entry
+# whether or not any `labelPrompts` exists at all (`PromptBuilder`, hardcoded).
+#
+# So a label on a planning ticket could select a type whose global list REPLACES this
+# fence. The planner job writes planning tickets with no labels, which closes that at
+# the source — but a label added to one by hand afterwards would still select a type.
+# Defining every type IN THE ENTRY, each with the same fence, closes it in the entry
+# too: whichever type a label selects, the list that wins is this one.
+#
+# `graphite-orchestrator` resolves to `orchestrator` for tools, so the four below are
+# every type this dispatcher version can select. A type a LATER version adds would not
+# be covered, which is why the installer refuses to compose an entry while the
+# dispatcher's `promptDefaults` names a type outside this set.
+PLANNING_PROMPT_TYPES = ("debugger", "builder", "scoper", "orchestrator")
 
 # The planning brief the entry delivers. It is the whole of what a planning session
 # is told about its lane, so it must be true of the lane (KIT-163): KIT-98 shipped the
@@ -556,6 +576,12 @@ def planning_entry(conf, facts=None):
     entry["linearWorkspaceId"] = facts["linearWorkspaceId"]
     entry["userAccessControl"] = {"allowedUsers": [conf["OWNER_USER_ID"]]}
     entry["disallowedTools"] = list(facts["fence"])
+    # Every prompt type, each carrying the SAME fence and a label no ticket holds: a
+    # label can still select a type, and the list it selects is this one (KIT-154).
+    entry["labelPrompts"] = dict(
+        (kind, {"labels": [PLANNING_ENTRY_NEVER_LABEL],
+                "disallowedTools": list(facts["fence"])})
+        for kind in PLANNING_PROMPT_TYPES)
     return entry
 
 
@@ -631,6 +657,16 @@ def dispatcher_facts(ctx):
             "a routing tag naming the Planning entry would ALSO match another entry, so a "
             "planning ticket could start a session there too:\n%s"
             % "\n".join("  - " + c for c in clashes))
+
+    unknown = [t for t in (facts.get("prompt_types_disallowing") or [])
+               if t not in PLANNING_PROMPT_TYPES]
+    if unknown:
+        raise SetupError(
+            "the dispatcher's promptDefaults set a tool list for the prompt type(s) %s, "
+            "which this installer does not know how to cover in the Planning entry. A "
+            "label selecting one of them would replace the planner's fence with that "
+            "list. Remove the default, or teach this installer the type."
+            % ", ".join(sorted(unknown)))
 
     claim = [e for e in (facts.get("entries") or [])
              if conf["PLANNING_TEAM_KEY"] in (e.get("teamKeys") or [])
@@ -729,6 +765,20 @@ def entry_problems(entry):
     if entry.get("id") != entry.get("name"):
         problems.append("the entry's id and name differ; a routing tag matches either, so "
                         "two spellings are two things a tag can name")
+    prompts = entry.get("labelPrompts")
+    if entry.get("repositoryPath") and not isinstance(prompts, dict):
+        problems.append("the entry defines no labelPrompts — a ticket label could select "
+                        "a prompt type whose own list replaces this fence (KIT-154)")
+    elif isinstance(prompts, dict):
+        for kind in ("debugger", "builder", "scoper", "orchestrator"):
+            got = prompts.get(kind)
+            if not isinstance(got, dict) or got.get("disallowedTools") != disallowed:
+                problems.append("the entry's %r prompt type does not carry this exact "
+                                "fence, so a label selecting it would replace the fence"
+                                % kind)
+            elif got.get("labels") != [PLANNING_ENTRY_NEVER_LABEL]:
+                problems.append("the entry's %r prompt type is selectable by a label a "
+                                "ticket could carry" % kind)
     allowed = ((entry.get("userAccessControl") or {}).get("allowedUsers")) or []
     if len(allowed) != 1 or not allowed[0]:
         problems.append("the entry does not name exactly one allowed user — without it "
@@ -1936,9 +1986,10 @@ def step_dispatcher_entry(ctx, apply_it):
         # so nothing selects one — but a label added by hand afterwards would, so the
         # machine's types are named here rather than left to be discovered.
         notes.append("the dispatcher's promptDefaults set a tool list for the prompt "
-                     "type(s) %s. A planning ticket carries no labels, so none is "
-                     "selected; a label added to one by hand would select it, and that "
-                     "type's list would replace this fence."
+                     "type(s) %s. Neither reaches a planning session: the planning ticket "
+                     "the job writes carries no labels, and this entry defines every "
+                     "prompt type with its own fence, which the dispatcher reads before "
+                     "any default. Named here for the record."
                      % ", ".join(facts["prompt_types"]))
     problems = entry_problems(entry)
     if problems:
@@ -3309,6 +3360,30 @@ def selftest():
         mutant = dict(entry, id=entry["name"] + "-2")
         check("entry-mutant-id-differs-from-name", bool(entry_problems(mutant)), True)
 
+        # Route 2 (KIT-154): every prompt type is defined IN the entry, with the same
+        # fence and a label no ticket carries, so whichever type a label selects, the
+        # list that wins is this one.
+        for kind in PLANNING_PROMPT_TYPES:
+            got = entry["labelPrompts"][kind]
+            check("prompt-type-carries-the-fence:%s" % kind,
+                  (got["disallowedTools"] == entry["disallowedTools"],
+                   got["labels"] == [PLANNING_ENTRY_NEVER_LABEL]), (True, True))
+        check("prompt-types-are-every-selectable-one", sorted(PLANNING_PROMPT_TYPES),
+              ["builder", "debugger", "orchestrator", "scoper"])
+        for kind in PLANNING_PROMPT_TYPES:
+            mutant = json.loads(json.dumps(entry))
+            del mutant["labelPrompts"][kind]
+            check("entry-mutant-drops-prompt-type:%s" % kind,
+                  bool(entry_problems(mutant)), True)
+        mutant = json.loads(json.dumps(entry))
+        mutant["labelPrompts"]["orchestrator"]["disallowedTools"] = ["Bash"]
+        check("entry-mutant-weakens-a-prompt-type", bool(entry_problems(mutant)), True)
+        mutant = json.loads(json.dumps(entry))
+        mutant["labelPrompts"]["builder"]["labels"] = ["builder"]
+        check("entry-mutant-makes-a-prompt-type-selectable", bool(entry_problems(mutant)), True)
+        mutant = json.loads(json.dumps(entry))
+        del mutant["labelPrompts"]
+        check("entry-mutant-drops-label-prompts", bool(entry_problems(mutant)), True)
         # …and the refusals: no clone of the planned repository, two workspace bases,
         # another entry claiming the team key, and a tag that would match twice.
         def refusal(name, **kw):
@@ -3332,6 +3407,15 @@ def selftest():
                   dict(DISPATCHER_ENTRY),
                   dict(DISPATCHER_ENTRY, id="coder", name="coder", teamKeys=["PLAN"],
                        githubUrl="https://github.com/example-org/other")]), True)
+        # A prompt type this installer cannot cover is a refusal, not a note: a label
+        # selecting it would replace the planner's fence with that type's list.
+        check("unknown-prompt-type-refused",
+              "does not know how to cover" in refusal(
+                  "unknown-type",
+                  extra={"promptDefaults": {"reviewer": {"disallowedTools": ["Bash"]}}}), True)
+        check("known-prompt-type-is-only-a-note",
+              "no-refusal" == refusal("known-type", extra={
+                  "promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}}), True)
         check("entry-refuses-an-ambiguous-tag",
               "ALSO match" in refusal("ambiguous", entries=[
                   dict(DISPATCHER_ENTRY),

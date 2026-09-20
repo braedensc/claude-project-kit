@@ -807,3 +807,31 @@ A prompt type that sets a tool list in the dispatcher's `promptDefaults` is repo
 than refused: the planning ticket the job writes carries no labels, so none is selected —
 but a label added to one by hand would select it, and that type's list would replace this
 fence.
+
+### A label cannot swap the fence, and the runner residual is written down (KIT-154, routes 2 and 3)
+
+**Route 2 is closed in the entry itself.** The dispatcher resolves a session's tool list as
+the entry's `labelPrompts[type]`, then the global `promptDefaults[type]`, then the entry's
+own `disallowedTools`; the type comes from the ticket's labels, and `orchestrator` selects
+one on every entry whether any `labelPrompts` exists or not. The planning ticket the job
+writes carries no labels, which closes this at the source. The entry now closes it as well:
+it defines every prompt type this dispatcher version can select — `debugger`, `builder`,
+`scoper`, `orchestrator`, with `graphite-orchestrator` resolving to the last — each with
+the same fence and a label no ticket holds. Whichever type a label selects, the list that
+wins is the planner's. A type a later dispatcher adds would not be covered, so the
+installer refuses to compose an entry while `promptDefaults` names a type outside that set.
+
+**Route 3 is not closed, and this is the wording of the residual.** The owner has not yet
+confirmed it, and it rests on a fact about the machine that only the owner can check.
+
+> A runner label (`codex`, `openai`, `gemini`, `cursor`, `opencode`, or a
+> `<provider>/<model>` label) or an `[agent=…]` / `[model=…]` tag picks the runner, and no
+> entry setting overrides that (`RunnerSelectionService.determineRunnerSelection`, 0.2.69).
+> Whether a non-Claude runner honours `disallowedTools` is unverified (KIT-41). Under the
+> pre-delegation lane, neither a runner label nor a runner tag reaches the ticket the
+> dispatcher sees: the planning ticket carries no labels and its text is stripped of both
+> tag shapes, and a session's runner is fixed when it starts. The residual is a person
+> adding a runner label to a planning ticket and delegating it again, and only the owner
+> may start a session in the Planning entry. Accepted on the additional ground that no
+> runner other than Claude has credentials in this dispatcher's environment — a fact to
+> re-check whenever another provider's key is added.
