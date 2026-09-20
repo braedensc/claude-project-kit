@@ -3288,6 +3288,13 @@ def selftest():
         check("entry-owner-is-the-only-allowed-user",
               entry["userAccessControl"]["allowedUsers"], [GOOD_CONF["OWNER_USER_ID"]])
         check("entry-id-equals-name", entry["id"] == entry["name"], True)
+        # The review installer's lookup of "which entry manages this repository" skips
+        # entries named with this prefix. Both spellings are asserted here, so neither
+        # can be renamed without the other (KIT-155).
+        from pipeline_stage_e_setup import PLANNING_ENTRY_PREFIX, _is_planning_entry
+        check("entry-name-is-skipped-by-the-review-installer",
+              (entry["name"].startswith(PLANNING_ENTRY_PREFIX), _is_planning_entry(entry)),
+              (True, True))
         check("entry-name-is-the-jobs-tag", entry["name"],
               json.loads(poller_config(ectx))["planning_entry_name"])
         # Each loadable key dropped is a problem NAMED, so a later edit cannot quietly

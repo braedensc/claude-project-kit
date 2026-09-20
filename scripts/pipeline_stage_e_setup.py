@@ -3126,9 +3126,24 @@ def _origin_slug(ctx, path):
     return ctx.origin_slugs[path]
 
 
+# The idea gate's Planning entry (scripts/pipeline_stage_a_setup.py) carries a
+# `repositoryPath` — a clone of the planned repository, which it reads code in — so it
+# answers "which entry manages this repository?" as truthfully as a coding entry does,
+# and in file order it can answer FIRST. It must not: the entry this lookup returns is
+# where a fallback fix ticket is routed, and a planning entry cannot push a fix. It is
+# recognised by the id and name that installer gives it, which is also the only thing a
+# routing tag can match.
+PLANNING_ENTRY_PREFIX = "stage-a-planning-"
+
+
+def _is_planning_entry(entry):
+    return any(str(entry.get(key) or "").startswith(PLANNING_ENTRY_PREFIX)
+               for key in ("id", "name"))
+
+
 def _entries_by_repo(ctx):
     """{OWNER/NAME lower-cased: the dispatcher entry that manages that repository}, over
-    the entries this installer does NOT own.
+    the entries this installer does NOT own, and never a Planning entry.
 
     IDENTITY IS THE CLONE'S `origin` REMOTE, with the entry's own `githubUrl` as a second
     authority — both of which NAME the repository. The matcher this replaces compared a
@@ -3138,7 +3153,7 @@ def _entries_by_repo(ctx):
     so either is a correct place to read it."""
     out = {}
     for entry in ctx.dispatcher.get("entries", []) or []:
-        if _owns_review_entry(entry):
+        if _owns_review_entry(entry) or _is_planning_entry(entry):
             continue
         slug = (_origin_slug(ctx, entry.get("repositoryPath"))
                 or _repo_slug(entry.get("githubUrl")))
@@ -6920,6 +6935,34 @@ def _selftest_body():
     except SetupError as exc:
         expect("entry-per-repo", "example-org/app" in str(exc),
                "the refusal does not name the repository: %s" % exc)
+
+    # -- 14b-ii. a PLANNING entry manages a clone too, and is never the answer - #
+    # The idea gate points its entry at a clone of the same repository. It sits first
+    # in this fixture, which is where file order would have made it win. The lookup
+    # must skip it: a fallback fix ticket routed there would reach a session with no
+    # shell and no write, which cannot fix anything (KIT-155).
+    cases += 1
+    planning = {"id": PLANNING_ENTRY_PREFIX + "plan", "name": PLANNING_ENTRY_PREFIX + "plan",
+                "repositoryPath": "/x/kit", "baseBranch": "main", "teamKeys": ["PLAN"]}
+    ctx14.dispatcher["entries"] = [planning] + list(ctx14.dispatcher["entries"])
+    ctx14.origin_slugs.clear()
+    by_repo = _entries_by_repo(ctx14)
+    expect("planning-entry-skipped",
+           all(not _is_planning_entry(e) for e in by_repo.values()),
+           "the entry lookup returned a Planning entry: %s"
+           % [e.get("id") for e in by_repo.values()])
+    expect("planning-entry-skipped",
+           (by_repo.get("example-org/kit") or {}).get("id") == "kit",
+           "example-org/kit resolved to %r, not the coding entry that manages it"
+           % (by_repo.get("example-org/kit") or {}).get("id"))
+    expect("planning-entry-skipped",
+           "example-org/kit" in _dispatcher_repo_names(ctx14)
+           and _dispatcher_repo_names(ctx14)["example-org/kit"] == "kit",
+           "the fallback fix ticket would route to %r"
+           % _dispatcher_repo_names(ctx14).get("example-org/kit"))
+    ctx14.dispatcher["entries"] = [e for e in ctx14.dispatcher["entries"]
+                                   if not _is_planning_entry(e)]
+    ctx14.origin_slugs.clear()
 
     # -- 14c. the tag names the REVIEW entry, and nothing else answers to it - #
     # `[repo=<the repository>]` matches the CODING entry too — by name and by
