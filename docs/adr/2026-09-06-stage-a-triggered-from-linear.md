@@ -723,3 +723,55 @@ fails partway lists what it created on the ticket. A report that cannot be poste
 filed or quoted, and a telemetry block is never delivered as a question. KIT-170's other
 items (the `notify` modes, advisory `depends_on`, dependency positions in the summary) stay
 open on that ticket.
+
+### The idea is never the ticket the dispatcher sees (KIT-154, option A; KIT-150)
+
+**The decision.** The owner chose the pre-delegation lane on 2026-09-19, relayed through the
+orchestrating session. The routing section above says the job kind comes from the team and
+never from the ticket's own text; that was false for three routes, and no dispatcher setting
+closes the first of them. So the gate stops showing an idea to the router at all.
+
+The owner's gesture is a **state move**, which starts nothing by itself. The planner job
+(`scripts/pipeline_plan_poller.py`) reads the idea's history for the move, checks the owner
+made it, and writes a **planning ticket**: the idea quoted inside `<untrusted-idea-data>`
+with every routing and runner directive neutralized, no labels, no project, and exactly one
+routing tag — its own, naming the Planning entry. That ticket is created and delegated in a
+single call, so no session's identity is in the loop, and `assert_one_directive` refuses to
+file a description carrying anything else.
+
+What this closes, and what it leaves:
+
+| Route | Before | Now |
+|---|---|---|
+| A `[repo=…]` tag in the idea's text | starts a coding session in every matching entry | the tag never reaches a delegated ticket |
+| A label selecting a prompt type | replaces the entry's fence | the planning ticket carries no labels |
+| A runner label or `[agent=…]` tag (KIT-41) | picks a runner that may load no guard | neither reaches the delegated ticket; the residual is a person re-delegating a planning ticket they labelled, and only the owner may start a session |
+| Anyone delegating an idea | a paid session, attributed to the owner | only the owner's own move starts a run, checked against the ticket's history |
+
+An idea handed to the agent directly still starts a session — nothing can stop that from
+inside the tracker — so the job warns on that ticket, once, and **files nothing** from it.
+
+**The read-back (KIT-150).** The route is the reviewer's, proven live: the session's final
+message is posted as its one `response` activity, and the job reads it back, hands it to the
+executor with `--message`, and pins the planning ticket's identifier — a value the session
+never chose. The executor decides what counts as a proposal: the LAST fenced
+`pipeline-safe-outputs/1` block wins, none is an empty run with a visible note, and one that
+does not parse is a rejection, because a proposal cut off mid-block must not read as silence.
+
+**The size question, measured rather than assumed.** A twenty-child plan with realistic
+bodies is **50,429 characters** as a final message end to end, through the real executor and
+the real readiness gate (`npm run test:plan-poller`). The schema's own caps allow roughly
+340,000. The tracker's limit on an activity body is **not documented and not measured**; the
+dispatcher neither truncates nor splits, and a body the tracker refuses is never posted at
+all — which arrives here as a session that finished with no plan, and therefore as the
+executor's no-output note rather than a partial tree. The first real plan's size is recorded
+at activation.
+
+**Where the job runs, and why not beside the review poller.** As the executor's own macOS
+account, under a system LaunchDaemon the installer writes and never loads. Every coding
+session can read any file the dispatcher's account can read through the dispatcher's own
+tool server (KIT-162, accepted for coding sessions); the key this job holds files tickets
+carrying provenance labels, so it must not live in that home. The job's key must be the
+owner's own, because the dispatcher checks the DELEGATOR against the entry's allowed users —
+a pass whose key belongs to anyone else stops with a config error rather than filing
+planning tickets the dispatcher would refuse in silence.

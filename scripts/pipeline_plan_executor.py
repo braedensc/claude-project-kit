@@ -3,13 +3,14 @@
 
 The direct analog of the review publisher (docs/PIPELINE-CONTRACT.md §14,
 scripts/pipeline_review_local.py), pointed at planning instead of review. A
-planning session — an idea ticket delegated into a Planning team, run sandboxed
-by the dispatcher — holds no tracker tool and no tool that writes a file: the
+planning session — a clean planning ticket the planner job writes and delegates
+into a Planning team, run sandboxed by the dispatcher — holds no tracker tool and no tool that writes a file: the
 Planning entry's deny list removes every tracker server the dispatcher injects,
 and Write with them (docs/adr/2026-09-06-stage-a-triggered-from-linear.md, its
 2026-09-17 update). Its whole deliverable is one `pipeline-safe-outputs/1`
 document carrying a tree-shaped `ticket-create` (§8 "Filing a plan"), in its final
-message; a reader that does not exist yet (KIT-150) hands it to this file.
+message; the planner job (scripts/pipeline_plan_poller.py) reads that message back
+through the tracker and hands it to this file with `--message` (KIT-150).
 
 EVERY TITLE AND BODY THE SESSION WROTE IS SCRUBBED OF DISPATCHER ROUTING DIRECTIVES
 before the readiness gate reads it and before anything is filed (`scrub_plan`): a
@@ -86,6 +87,7 @@ WHAT IT IS AND IS NOT
   backlog and stops; releasing them is the human's move and the approve tier's.
 
 Usage:
+    pipeline_plan_executor.py --message F --pinned TEAM-123    (the planner job's call)
     pipeline_plan_executor.py --requests F --pinned TEAM-123
                               --config <planned repo>/delivery.json
                               --repo-root <planned repo checkout>
@@ -104,8 +106,11 @@ Usage:
                  read, not against this executor's own checkout.
     --key-env    the NAME of the variable holding the tracker key; the installer
                  records it as LINEAR_KEY_ENV. Default LINEAR_API_KEY.
-  Nothing invokes this executor yet: the reader that finds a finished planning
-  session and supplies these arguments does not exist (KIT-150).
+    --message    the planning session's final message, read back through the
+                 tracker. Its LAST fenced pipeline-safe-outputs/1 block is the
+                 proposal; none is an empty run, one that does not parse is a
+                 rejection (`extract_proposal`).
+  The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150).
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker
@@ -329,6 +334,100 @@ def load_requests(path):
             return json.load(handle), None, None
     except (OSError, ValueError) as exc:
         return None, "errored", "request file %s could not be read: %s" % (path, exc)
+
+
+# --------------------------------------------------------------------------- #
+# The final message — where a planning session's proposal actually travels (KIT-150)
+# --------------------------------------------------------------------------- #
+# A planning session can write no file. Its proposal is a fenced json block at the
+# end of its FINAL MESSAGE, which the dispatcher posts as the session's one `response`
+# activity; the planner job reads that body back and hands it here with `--message`.
+# Deciding what counts as a proposal is this file's job, so it lives here, once.
+#
+# The fence pairing is COPIED from the review poller, which pairs fences the way
+# Markdown does (a regex hunting the next ``` cannot tell an opener from a closer);
+# --selftest asserts the two copies still agree.
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([\w+-]+)?\s*$")
+_FENCE_TAIL_RE = re.compile(r"^(.*?)(`{3,}|~{3,})\s*$")
+PROPOSAL_SCHEMA = "pipeline-safe-outputs/1"
+
+
+def fenced_blocks(text):
+    """Every fenced block in `text`, paired the way Markdown pairs them, in order,
+    plus a candidate for each same-line closer (see the review poller's copy)."""
+    blocks, fence, buf = [], None, []
+    for line in (text or "").splitlines():
+        if fence is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m:
+                fence, buf = m.group(1), []
+            continue
+        m = _FENCE_TAIL_RE.match(line)
+        if m and m.group(2)[0] == fence[0] and len(m.group(2)) >= len(fence):
+            if not m.group(1).strip():
+                blocks.append("\n".join(buf))
+                fence, buf = None, []
+                continue
+            blocks.append("\n".join(buf + [m.group(1)]))
+        buf.append(line)
+    if fence is not None and buf:
+        blocks.append("\n".join(buf))
+    return blocks
+
+
+def extract_proposal(text):
+    """(doc, None) for the LAST fenced block that parses as a JSON object carrying the
+    proposal schema — or (None, "absent") when the message proposes nothing, or
+    (None, "malformed") when it names the schema and no block parses as one.
+
+    LAST, not first: a planner drafts in its final message too, and its last word is
+    its proposal. "absent" and "malformed" are different facts about the session — the
+    first is an empty run the owner is told about; the second is a proposal that was
+    attempted and cannot be read, most likely cut off, and is a rejection."""
+    if not isinstance(text, str) or not text.strip():
+        return None, "absent"
+    found = None
+    for chunk in fenced_blocks(text):
+        try:
+            doc = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and doc.get("schema") == PROPOSAL_SCHEMA:
+            found = doc
+    if found is not None:
+        return found, None
+    try:
+        bare = json.loads(text.strip())
+        if isinstance(bare, dict) and bare.get("schema") == PROPOSAL_SCHEMA:
+            return bare, None
+    except ValueError:
+        pass
+    return None, ("malformed" if PROPOSAL_SCHEMA in text else "absent")
+
+
+def load_message(path):
+    """Read a session's final message and find its proposal. Returns (doc, verdict,
+    message) in load_requests' shape, plus "malformed" for a proposal that did not
+    parse. An absent FILE is the reader's way of saying the session posted no final
+    message at all, which is the same empty run as a message that proposes nothing."""
+    if not os.path.exists(path):
+        return None, "skipped", ("no final message at %s — the planning session posted "
+                                 "none, so there is no plan to file" % path)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except (OSError, ValueError) as exc:
+        return None, "errored", "final message %s could not be read: %s" % (path, exc)
+    doc, why = extract_proposal(text)
+    if doc is not None:
+        return doc, None, None
+    if why == "malformed":
+        return None, "malformed", (
+            "the final message names %s, but no block in it parses as one JSON "
+            "document (%d characters) — most likely it was cut off, or not fenced"
+            % (PROPOSAL_SCHEMA, len(text)))
+    return None, "skipped", ("the planning session's final message (%d characters) "
+                             "carries no proposal, so there is no plan to file" % len(text))
 
 
 def find_requests(doc):
@@ -621,9 +720,9 @@ def render_no_output_comment(idea_id):
     """The run produced nothing. Absence must not be SILENT on the board (§13):
     the owner is told the miss, marked so the notifier can surface it."""
     return ("%s\n### No plan was produced\n\nThe planning session for **%s** finished "
-            "without proposing a plan and left no message. It may have failed, hit its "
-            "budget, or judged the idea impossible to decompose as written. Nothing was "
-            "filed — re-run, or add detail to the idea and hand it off again."
+            "with no plan in its final message. It may have failed, hit its budget, or "
+            "judged the idea impossible to decompose as written. Nothing was filed — add "
+            "detail to the idea and start planning it again."
             % (_marker(ESC_NO_OUTPUT), idea_id))
 
 
@@ -868,12 +967,20 @@ def materialise(args, client=None):
     finding_cfg = cfg["linear"].get("findingTicket")
 
     # ── Load the batch. Absence is not silence (§13). ──────────────────────
-    doc, verdict, message = load_requests(args.requests)
+    if getattr(args, "message", None):
+        doc, verdict, message = load_message(args.message)
+    else:
+        doc, verdict, message = load_requests(args.requests)
     if verdict == "errored":
         print("::error:: %s" % message, file=sys.stderr)
         return EXIT_ERRORED
     if verdict == "skipped":
         return _no_output(args, client, cfg, team_key, finding_cfg, message)
+    if verdict == "malformed":
+        # The session attempted a proposal; nobody can read it. Its own output, so
+        # `rejected`, reported on its ticket like every other refusal.
+        return _reject(args, client, cfg, team_key, finding_cfg, args.pinned,
+                       "the proposal could not be read", ["- %s" % message])
 
     # ── Validate the batch WHOLE, partition into plan + questions ──────────
     plan, comments, errors = find_requests(doc)
@@ -1832,6 +1939,59 @@ def selftest():
         check("secret-in-question-not-quoted", any(fake_key in b for _, b in fakeK3.comments), False)
         check("secret-scan-is-publishers", _publisher.secret_hits("x " + fake_key) != [], True)
 
+        # ── The final message (KIT-150) ───────────────────────────────────────
+        def run_msg(text, client, pinned="KIT-777", dry_run=False, write=True):
+            path = os.path.join(tmp, "final-message.md")
+            if os.path.exists(path):
+                os.unlink(path)
+            if write:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            args = argparse.Namespace(requests=None, message=path, config=cfg_path,
+                                      repo_root=tmp, dry_run=dry_run, pinned=pinned)
+            return materialise(args, client=client)
+
+        def fence(doc):
+            return "```json\n%s\n```" % json.dumps(doc, indent=2)
+
+        # 48. THE LAST PROPOSAL IN THE FINAL MESSAGE IS THE ONE FILED; a draft
+        #     earlier in the same message, and a python block, are not.
+        draft = _tree(); draft["requests"][0]["epic"]["title"] = "A DRAFT, not the plan"
+        text = ("Working notes.\n```python\nprint(1)\n```\n" + fence(draft)
+                + "\nThen I revised it:\n" + fence(_tree()))
+        fakeM2 = FakeLinear()
+        check("message-files-last-block", run_msg(text, fakeM2), EXIT_OK)
+        check("message-last-block-wins", fakeM2.issues[0]["title"],
+              _tree()["requests"][0]["epic"]["title"])
+        check("extract-last-block",
+              extract_proposal(text)[0]["requests"][0]["epic"]["title"],
+              _tree()["requests"][0]["epic"]["title"])
+        # 49. A MESSAGE THAT PROPOSES NOTHING is the executor's no-output note.
+        fakeM3 = FakeLinear()
+        check("message-no-proposal-ok", run_msg("I could not plan this.", fakeM3), EXIT_OK)
+        check("message-no-proposal-noted",
+              _marker(ESC_NO_OUTPUT) in fakeM3.comments[0][1], True)
+        fakeM4 = FakeLinear()
+        check("message-absent-file-noted", run_msg("", fakeM4, write=False), EXIT_OK)
+        check("message-absent-file-marker", _marker(ESC_NO_OUTPUT) in fakeM4.comments[0][1], True)
+        # 50. A PROPOSAL THAT DOES NOT PARSE — cut off mid-block — is a REJECTION on
+        #     the ticket, never an empty run and never a silent pass.
+        whole = fence(_tree())
+        cut = whole[:len(whole) // 2]
+        fakeM5 = FakeLinear()
+        check("message-cut-off-rejected", run_msg("Here is the plan:\n" + cut, fakeM5),
+              EXIT_REJECTED)
+        check("message-cut-off-reported", "could not be read" in fakeM5.comments[0][1], True)
+        check("message-cut-off-nothing-filed", fakeM5.issues, [])
+        check("extract-cut-off-malformed", extract_proposal(cut)[1], "malformed")
+        check("extract-plain-absent", extract_proposal("no plan")[1], "absent")
+        # …and the fence pairing is the review poller's, not a drifting copy.
+        import pipeline_review_poller as _poller2
+        check("fence-pairing-matches-poller",
+              (_FENCE_OPEN_RE.pattern, _FENCE_TAIL_RE.pattern),
+              (_poller2._FENCE_OPEN_RE.pattern, _poller2._FENCE_TAIL_RE.pattern))
+        check("fenced-blocks-agree", fenced_blocks(text), _poller2.fenced_blocks(text))
+
         # 40. A CHILD THAT CHANGES A GUARD IS NAMED FOR THE OWNER (KIT-163). The
         #     session cannot request the guard-change label and this executor never
         #     applies it, so the summary lists the child — by the brief's marker line,
@@ -1882,7 +2042,10 @@ def selftest():
 # --------------------------------------------------------------------------- #
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--requests", help="path to the session's pipeline-safe-outputs/1 file")
+    ap.add_argument("--requests", help="path to a pipeline-safe-outputs/1 file")
+    ap.add_argument("--message", help="path to a planning session's FINAL MESSAGE, as the "
+                                      "planner job read it back; its last fenced "
+                                      "pipeline-safe-outputs/1 block is the proposal")
     ap.add_argument("--config", help="path to delivery.json (default: ./delivery.json)")
     ap.add_argument("--repo-root", default=".", help="checkout root for DoR pointer checks")
     ap.add_argument("--pinned", help="the delegated ticket id, from whatever started the "
@@ -1897,8 +2060,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
-    if not args.requests:
-        ap.error("--requests is required (or use --selftest)")
+    if bool(args.requests) == bool(args.message):
+        ap.error("give exactly one of --requests or --message (or use --selftest)")
     if not KEY_ENV_RE.match(args.key_env or ""):
         ap.error("--key-env takes a variable NAME (UPPER_SNAKE), never a value")
     return materialise(args)

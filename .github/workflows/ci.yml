@@ -300,6 +300,14 @@ jobs:
       - name: Plan-tree executor selftest (forced fields, DoR gate, §8/§13 verdicts)
         run: python3 scripts/pipeline_plan_executor.py --selftest
 
+      # The planner job: the owner's move into the trigger state is the only start,
+      # the delegated ticket is a CLEAN copy of the idea (no routing tag, no label,
+      # no project), and a finished session's final message is read back and filed
+      # by the executor. Inert here; --selftest is what has teeth, and it drives the
+      # real executor and real git over local fixtures.
+      - name: Planner job selftest (owner-triggered, clean copy, read-back)
+        run: python3 scripts/pipeline_plan_poller.py --selftest
+
       # User-scope skill drift: a project with no skills directory runs whatever
       # copy sits in ~/.claude/skills, which nothing updates. The check is read-only;
       # --apply refuses in an agent environment.

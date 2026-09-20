@@ -937,8 +937,9 @@ backlog — and the tree shape adds these:
   own team** — the prefix of the pinned id — which is normally a separate Planning team, and
   files the tree into the work team. The pinned id comes from whatever started the session,
   never from the tree: a run that can write refuses without it, because a pin defaulted from
-  `source_ticket_id` would compare the session's claim with itself. Nothing in the kit supplies
-  that pin or invokes the executor yet (KIT-150).
+  `source_ticket_id` would compare the session's claim with itself. The **planner job**
+  (`scripts/pipeline_plan_poller.py`) supplies it: it writes the planning ticket the session is
+  delegated, so the pinned id is a value the session never chose.
 
 **The planning session's only channel is this document, so a QUESTION rides it too.** Because the
 session holds no tracker tool, every way it reaches the owner travels through the executor. A
