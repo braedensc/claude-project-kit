@@ -6,7 +6,7 @@
   "engines": {
     "node": ">=20"
   },
-  "description": "Full-stack project template: Claude Code hook suite, CI/CD patterns, 3-layer security model, process docs \u2014 distilled from a production build",
+  "description": "Full-stack project template: Claude Code hook suite, CI/CD patterns, 3-layer security model, process docs — distilled from a production build",
   "type": "module",
   "scripts": {
     "test:hooks": "python3 .claude/hooks/test_hooks.py",
