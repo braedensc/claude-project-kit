@@ -61,9 +61,9 @@ OPERATOR_KEY_ENV=LINEAR_API_KEY
 # The executor is started with `--key-env` set to this name.
 LINEAR_KEY_ENV=STAGE_A_LINEAR_API_KEY
 
-# OPTIONAL. The https clone URL the role account will run the executor out of. Not
-# read by anything yet: the job that runs the executor does not exist (KIT-150).
-# Not ssh — the role account has no keys.
+# The https clone URL the role account runs the planner job and the executor out of.
+# The installer places that clone under the role account and keeps it level with origin,
+# and the job execs from it on every pass. Not ssh — the role account has no keys.
 KIT_REPO_URL=https://github.com/example-org/claude-project-kit
 
 # The display name of the dispatcher's agent user in the tracker. The planner job
