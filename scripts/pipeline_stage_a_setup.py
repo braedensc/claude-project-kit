@@ -610,10 +610,25 @@ def dispatcher_facts(ctx):
     # WHICH ENTRY MANAGES THE PLANNED REPOSITORY. Identity is the clone's `origin`
     # remote, with the entry's own githubUrl as a second authority — both of which NAME
     # the repository. A path basename is not evidence of identity.
+    #
+    # `origin` is asked FIRST because it is MEASURED from the clone on disk, while
+    # githubUrl is a field the entry declares about itself. Where both answer and they
+    # disagree about the planned repository, the entry describes a checkout it does not
+    # have: refuse rather than pick a side, because picking wrong points the planner at
+    # the wrong code — and a planner reads code for a living.
     wanted = conf["PLANNED_REPO"].lower()
     model = None
     for other in facts.get("entries") or []:
-        slug = _repo_slug(other.get("githubUrl")) or ctx.origin_slug(other.get("repositoryPath"))
+        measured = ctx.origin_slug(other.get("repositoryPath"))
+        declared = _repo_slug(other.get("githubUrl"))
+        if measured and declared and measured != declared and wanted in (measured, declared):
+            raise SetupError(
+                "the dispatcher entry %s says its repository is %s, but the clone it "
+                "points at (%s) has origin %s. One of those is wrong and this installer "
+                "will not guess which — fix the entry or the clone, then run this again."
+                % (other.get("name") or other.get("id") or "?", declared,
+                   other.get("repositoryPath"), measured))
+        slug = measured or declared
         if slug == wanted and other.get("repositoryPath"):
             model = other
             break
@@ -1947,8 +1962,8 @@ def step_dispatcher_entry(ctx, apply_it):
     if not ctx.state.attested("CA-ENTRY"):
         for note in notes:
             ctx.say("")
-            for line in _wrap(note):
-                ctx.say("  note: " + line if line is notes else "  " + line)
+            for i, line in enumerate(_wrap(note)):
+                ctx.say(("  note: " if i == 0 else "  ") + line)
         if getattr(ctx, "failed_before", False) or not getattr(ctx, "job_ready", False):
             ctx.say("")
             ctx.say("(the Planning entry is withheld: the planner job is not in place yet,")
@@ -3316,6 +3331,18 @@ def selftest():
               "manages no clone" in refusal(
                   "no-clone", entries=[dict(DISPATCHER_ENTRY, githubUrl=None)],
                   origins={}), True)
+        # An entry that NAMES a repository it does not have is refused, rather than
+        # silently believing the field over the clone.
+        check("entry-refuses-a-githubUrl-that-contradicts-the-clone",
+              "will not guess which" in refusal(
+                  "lying-url",
+                  entries=[dict(DISPATCHER_ENTRY,
+                                githubUrl="https://github.com/example-org/other")]),
+              True)
+        # ...and the agreeing case is still accepted, so the check is not just a wall.
+        check("entry-accepts-an-agreeing-githubUrl",
+              planning_entry(GOOD_CONF, dispatcher_facts(entry_ctx("agreeing")))
+              ["repositoryPath"], DISPATCHER_ENTRY["repositoryPath"])
         check("entry-refuses-two-workspace-bases",
               "workspaceBaseDir" in refusal("two-bases", entries=[
                   dict(DISPATCHER_ENTRY),
@@ -3346,7 +3373,6 @@ def selftest():
                      "mcp__repo-tools__*"):
             check("fence-covers:%s" % rule, rule in fence, True)
         check("fence-still-covers-the-four", "mcp__linear__*" in fence, True)
-        bad_mcp = entry_ctx("mcp-bad", extra={"linearMcpConfigs": ["/nope/missing.json"]})
         check("fence-refuses-an-unreadable-file",
               "could not be fenced" in refusal("mcp-bad2",
                                                extra={"linearMcpConfigs": ["/nope/missing.json"]}),
@@ -3365,6 +3391,17 @@ def selftest():
         pctx2.job_ready = True
         ok, _detail, notes = step_dispatcher_entry(pctx2, False)
         check("prompt-type-named", any("orchestrator" in n for n in notes), True)
+        # The label is the only thing marking these lines as notes where they print,
+        # directly above the entry JSON.
+        pctx3 = entry_ctx("prompt-types-printed",
+                          extra={"promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}})
+        pctx3.job_ready = True
+        try:
+            step_dispatcher_entry(pctx3, False)   # prints, then blocks on the sign-off
+        except Blocked:
+            pass
+        check("prompt-type-note-is-labelled",
+              any(line.startswith("  note: ") for line in pctx3._out), True)
 
         # 15. NOTHING SECRET IS AN ARGUMENT. The live host passes payloads on
         #     stdin; its command text never interpolates a body.
