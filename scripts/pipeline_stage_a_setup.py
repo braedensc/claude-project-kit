@@ -1311,9 +1311,6 @@ def poller_config(ctx):
                          % "\n".join("  - " + p for p in problems))
     return json.dumps(doc, indent=2, sort_keys=True) + "\n"
 
-# The ticket that must close before the executor has anything to run. Named in
-# one place so the step, the card and the selftest cannot disagree about it.
-EXECUTOR_READER_TICKET = "KIT-150"
 
 
 def step_preflight(ctx, apply_it):
