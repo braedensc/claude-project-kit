@@ -2531,7 +2531,7 @@ class FakeHost(object):
     session is in: nothing under the role account can be looked at."""
 
     def __init__(self, account_exists=True, sudo_needs_password=False,
-                 home="/Users/_planclaw"):
+                 home="/Users/<role-account>"):
         self._exists = account_exists
         self.locked = sudo_needs_password
         self.home = home
@@ -3218,7 +3218,8 @@ def selftest():
         check("job-has-an-interval-and-runs-at-load",
               "<key>StartInterval</key><integer>300</integer>" in body
               and "<key>RunAtLoad</key><true/>" in body, True)
-        check("job-home-is-the-role-accounts", "<string>/Users/_planclaw</string>" in body, True)
+        check("job-home-is-the-role-accounts",
+              "<string>/Users/<role-account></string>" in body, True)
         check("job-never-loaded-by-this-installer", sorted(jctx.host.loaded), [])
         # The config this installer writes is the config the job itself accepts, and it
         # names the key's VARIABLE, never a key.
