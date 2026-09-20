@@ -835,3 +835,18 @@ confirmed it, and it rests on a fact about the machine that only the owner can c
 > may start a session in the Planning entry. Accepted on the additional ground that no
 > runner other than Claude has credentials in this dispatcher's environment — a fact to
 > re-check whenever another provider's key is added.
+
+### The duplicate-check pass has a home again (KIT-141)
+
+The decomposition section said the executor "absorbs" the planner's tracker-searching pass.
+It did not, and nothing did, so a plain reading of the shipped documents described a check
+that was not running. The executor now runs it: before it creates anything it reads the work
+team's most recently updated tickets and compares their titles with the proposed children's,
+by shared significant words over the shorter title — deterministic, model-free, like the rest
+of the file.
+
+It is a **report, never a verdict**. It lists what looks alike in the summary the owner reads
+when approving, and never rejects a plan: whether two tickets are the same piece of work is a
+judgement about intent, and the person approving the epic is the one who can make it. All
+three outcomes are said out loud — matches, nothing alike, and a lookup that could not run —
+because an absent section would read as the second, which is the one thing it must not mean.

@@ -154,7 +154,9 @@ so, `2` config or credential — nothing was touched, `4` the pass hit its wall 
   tree. Record the size of the first real plan.
 - **Whether a helper session inherits the fence** is settled by reading the runner's
   source, and confirmed only by the live probe a person runs (`CA-PROBE`).
-- **The duplicate check is gone from the planning passes** and its replacement is named on
-  its own ticket. Until then, a plan is not checked against existing tickets, and says so.
+- **The duplicate check compares titles, not intent.** The executor lists children whose
+  titles look like recent tickets in the work team, and says so when nothing looked alike
+  or when the lookup failed. It never refuses a plan for it: whether two tickets are the
+  same piece of work is yours to judge when you approve the epic.
 - **Nothing watches the job's heartbeat automatically.** The installer's `enable` step
   reads it when you run the installer; between runs, nothing does.

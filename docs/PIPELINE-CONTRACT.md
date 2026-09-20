@@ -920,6 +920,11 @@ backlog — and the tree shape adds these:
   *eligible*; each reaches `ready` only through the approve tier (§11, which re-runs the
   gate and is off unless a project switches it on) or a person, and starts only when
   delegated.
+- **It compares the proposed children with the work team's recent tickets** and lists what
+  looks alike in its summary, deterministically and by title — the rubric pass the fence
+  took away from the planner. It never refuses a plan for a likeness: that judgement
+  belongs to the person approving the epic. Nothing alike, and a lookup that failed, are
+  both said out loud, because an absent section would read as "nothing looked alike" (§13).
 - **It is safe to retry, and never silent about a report it could not post** (KIT-170).
   The epic carries a plain-text receipt, `Plan id: <pinned>/<digest>`, over the pinned
   ticket and the proposal as filed. Before creating anything the executor asks the work

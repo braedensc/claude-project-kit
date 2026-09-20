@@ -277,7 +277,7 @@ Every difference from the interactive path, step by step:
 | 1 PRD pass | runs; creates the project and epic after asking | PRD runs from the code; **nothing is created** — the PRD becomes the proposed epic's body |
 | 2 decomposition | runs | runs; the brief restates the five sections and the gate's tighter rules, since the gate cannot be run |
 | 3 rubric panel: architecture, security, ux-product, sizing-split | runs | runs, in helper sessions |
-| 3 rubric panel: `dedupe` | searches the board | **skipped** — no tracker tool. The plan says so; it never claims a duplicate check |
+| 3 rubric panel: `dedupe` | searches the board | **skipped** — no tracker tool. The executor compares the proposed titles with the work team's recent tickets and lists what looks alike in its summary; the planner never claims the check itself |
 | 4 DoR gate | the session runs it | **skipped** — no shell. The executor runs it on every child and rejects the whole tree if one fails |
 | 5 confirm and file | asks, then files through `mcp__linear` | files nothing. It **emits the whole tree** as one `pipeline-safe-outputs/1` document (§8 "Filing a plan") in a fenced json block at the **end of its final message**; the executor files it |
 | 5 labels | `track:*`, `effort:*`, `provenance:epic`, `hooks-change` where due | only `track:*` and `effort:*`. The executor forces `provenance:epic`; the schema refuses every protected class |

@@ -78,10 +78,12 @@ THE FENCE — the one security choice, and how it is enforced
   Task call reopens everything this list closes. `--selftest` cannot answer it;
   only a person watching a live planning session can (KIT-140).
 
-  ONE CAPABILITY IS LOST, NOT REHOMED. The planning procedure's fifth pass searches
-  the tracker for duplicates before anything is filed, and the planner can no longer
-  run it. The design said the executor would run dedupe instead; the executor does
-  not (KIT-141). Stated here rather than left to be rediscovered.
+  ONE CAPABILITY MOVED, AND IT IS WEAKER WHERE IT LANDED. The planning procedure's
+  fifth pass searched the tracker for duplicates, and the planner can no longer run
+  it. The executor now compares proposed titles with the work team's recent tickets
+  and lists what looks alike in its summary (KIT-141) — deterministic, and never a
+  refusal. A duplicate is a judgement about intent, and the person approving the epic
+  is the one who makes it.
 
 THE OWNER NEVER DELEGATES AN IDEA (KIT-154, option A)
   The dispatcher routes a delegated ticket by its DESCRIPTION before its team: a
@@ -294,8 +296,10 @@ PLANNING_BRIEF = (
     "(each effort label honest; split anything larger). Apply what they find, at most "
     "two rounds.\n\n"
     "WHAT YOU SKIP, because your tools are gone. The census and config preflight: no "
-    "shell; the executor reads the config. The duplicate-check pass: no tracker. Do not "
-    "claim the plan was checked against existing tickets. The Definition-of-Ready "
+    "shell; the executor reads the config. The duplicate-check pass: no tracker. The "
+    "executor compares your children's titles with the work team's recent tickets and "
+    "lists what looks alike for the owner, so do not claim the check yourself. The "
+    "Definition-of-Ready "
     "gate: no shell; the executor runs it on every child and rejects the whole tree if "
     "one fails. So write each child to pass it: all five sections, acceptance criteria "
     "a machine can check (name the command, path or endpoint in backticks), a test "
