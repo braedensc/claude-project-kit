@@ -850,3 +850,28 @@ when approving, and never rejects a plan: whether two tickets are the same piece
 judgement about intent, and the person approving the epic is the one who can make it. All
 three outcomes are said out loud — matches, nothing alike, and a lookup that could not run —
 because an absent section would read as the second, which is the one thing it must not mean.
+
+### A helper session inherits the fence (KIT-140)
+
+The planner keeps `Task`/`Agent`, because the rubric passes are independent contexts. That
+made one question load-bearing: if a helper session were handed a fresh tool set, one call
+would reopen everything the deny list closes. It was recorded as unverifiable from the kit,
+and the activation checklist carried a live probe for it.
+
+It is answerable from source. The chain is dispatcher 0.2.69 → `cyrus-claude-runner` 0.2.69
+→ `@anthropic-ai/claude-agent-sdk` 0.3.245 → the CLI binary it runs, 2.1.245 (the version
+and its build are named in the SDK's own manifest). The SDK passes an entry's
+`disallowedTools` as `--disallowedTools`; the CLI turns that into deny rules on the
+session's permission context. In 2.1.245 the tool pool a session is offered is filtered by
+those rules, and a helper's permission context is derived from its parent's — the derivation
+changes the mode, the prompt behaviour, the allow rules and the working directories, and
+never the deny rules. So a denied tool is neither offered to a helper nor callable by one.
+
+**One exception, and it is why the entry composer reads the planned repository.** An agent
+definition's own front-matter `mcpServers` are connected for the helper without that pool
+filter. A call to one is still refused when a deny rule NAMES that server, which is what
+fencing every server the machine and the repository inject is for (KIT-155) — and why a
+definition naming servers the installer cannot name is refused outright.
+
+The live probe stays, and its card now says what to expect: the two tool lists should match.
+Source is what the runtime should do; the probe is what it did.

@@ -72,11 +72,30 @@ THE FENCE — the one security choice, and how it is enforced
   tools, whose names do not start with `mcp__`, so a server rule never reaches
   them.
 
-  WHAT IS NOT PROVEN, and must be probed on the live dispatcher before the gate
-  is switched on (the activation checklist has the step): whether a subagent
-  started by `Task` inherits its parent's `disallowedTools`. If it does not, one
-  Task call reopens everything this list closes. `--selftest` cannot answer it;
-  only a person watching a live planning session can (KIT-140).
+  A HELPER SESSION INHERITS THIS LIST — read from the runner's own source, and
+  still probed live before the gate goes on (KIT-140). The question mattered
+  because the planner KEEPS `Task`/`Agent`: if a helper were handed a fresh tool
+  set, one call would reopen everything this list closes.
+
+  The chain is dispatcher 0.2.69 -> cyrus-claude-runner 0.2.69 ->
+  @anthropic-ai/claude-agent-sdk 0.3.245 -> the CLI it runs, 2.1.245. The SDK
+  passes an entry's list as `--disallowedTools`, which the CLI turns into deny
+  rules on the session's permission context. Two things then hold for a helper:
+  the tool pool it is offered is filtered by those same deny rules, and the
+  helper's permission context is DERIVED from its parent's, changing the mode,
+  the prompt behaviour, the allow rules and the working directories — and never
+  the deny rules. So a denied tool is neither offered to a helper nor callable by
+  one.
+
+  ONE EXCEPTION, and it is why the entry composer reads the planned repository:
+  an agent definition's own front-matter `mcpServers` are connected for the
+  helper WITHOUT that pool filter. A call to one is still refused when a deny
+  rule NAMES that server, which is what fencing every server this machine and
+  that repository inject is for — and why a definition naming servers this
+  installer cannot name is refused outright.
+
+  `--selftest` cannot watch a live session, so the live probe stays: source is
+  what the runtime should do, and the probe is what it did.
 
   ONE CAPABILITY MOVED, AND IT IS WEAKER WHERE IT LANDED. The planning procedure's
   fifth pass searched the tracker for duplicates, and the planner can no longer run
@@ -194,9 +213,10 @@ MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
 # SDK adds later. Such a tool reaches the planner until someone adds it below.
 #
 # `Task` and `Agent` are here because the planning procedure's rubric panel is
-# five passes in fresh contexts, and collapsing them into one context is a quality
-# change, not a security one — see the docstring's "not proven" note on whether a
-# subagent inherits this fence. `Write` is NOT here: see the docstring.
+# passes in fresh contexts, and collapsing them into one context is a quality
+# change, not a security one. A helper inherits this fence — the docstring cites
+# where the runner's source says so, and the live probe confirms it. `Write` is
+# NOT here: see the docstring.
 PLANNER_KEEP_TOOLS = (
     "Read", "Grep", "Glob", "Task", "Agent", "LSP", "ToolSearch",
     "TaskOutput", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite",
@@ -958,11 +978,12 @@ CARDS = {
                "  1. no name beginning `mcp__` appears at all;",
                "  2. no name outside the planner's keep-set appears (the keep-set is",
                "     printed by `status`).",
-               "Then ask it to start ONE subagent and have THAT subagent list its own",
-               "tools by exact name. Check the same two things.",
-               "The second check is the one nobody remembers: whether a subagent",
-               "inherits its parent's fence is not known (KIT-140), and if it does",
-               "not, one subagent call reopens everything the fence closed."],
+               "Then ask it to start ONE helper session and have THAT helper list its",
+               "own tools by exact name. Check the same two things.",
+               "The runner's source says a helper inherits the same deny rules, so the",
+               "two lists should match. This step is where that is seen rather than",
+               "assumed: if the helper's list holds anything the session's does not,",
+               "stop and do not switch the gate on."],
         "good": "both lists hold no `mcp__` name and nothing outside the keep-set",
     },
     "CA-EXECUTOR": {
@@ -3169,8 +3190,15 @@ def selftest():
         check("conf-flags-bad-planned-repo",
               any("PLANNED_REPO" in e for e in validate_conf(dict(GOOD_CONF, PLANNED_REPO="nope"))),
               True)
-        check("probe-card-checks-subagent",
-              "subagent" in " ".join(CARDS["CA-PROBE"]["do"]), True)
+        check("probe-card-checks-a-helper",
+              "helper session" in " ".join(CARDS["CA-PROBE"]["do"]), True)
+        # The helper-fence evidence is PINNED: a later edit that drops the citation
+        # drops the only reason Task and Agent are still in the keep set (KIT-140).
+        for phrase in ("2.1.245", "deny rules", "never the deny rules",
+                       "front-matter `mcpServers`"):
+            check("helper-evidence:%s" % phrase, phrase in src, True)
+        check("helper-tools-still-kept",
+              [t for t in ("Task", "Agent") if t in PLANNER_KEEP_TOOLS], ["Task", "Agent"])
         check("placeholder-unsignable", INITIALS_PLACEHOLDER.lower() in INITIALS_PLACEHOLDERS, True)
 
         # 17. THE PLANNER JOB (KIT-150). The installer places the code, writes the

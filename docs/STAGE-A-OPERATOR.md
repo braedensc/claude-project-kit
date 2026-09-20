@@ -152,8 +152,10 @@ so, `2` config or credential — nothing was touched, `4` the pass hit its wall 
   much larger one. If the tracker refuses an overlong body, the dispatcher posts nothing,
   and the gate sees a session that finished with no plan — a visible note, never a partial
   tree. Record the size of the first real plan.
-- **Whether a helper session inherits the fence** is settled by reading the runner's
-  source, and confirmed only by the live probe a person runs (`CA-PROBE`).
+- **A helper session inherits the fence, per the runner's source** — the deny rules ride
+  on the permission context a helper derives from its parent, and the tool pool it is
+  offered is filtered by them. What the source says the runtime should do is not what it
+  did: the live probe (`CA-PROBE`) is where a person sees the helper's own tool list.
 - **The duplicate check compares titles, not intent.** The executor lists children whose
   titles look like recent tickets in the work team, and says so when nothing looked alike
   or when the lookup failed. It never refuses a plan for it: whether two tickets are the
