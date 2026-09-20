@@ -28,6 +28,14 @@ stage-a.conf
 # conflict-waker.conf.example is the committed one.
 conflict-waker.conf
 
+# The notifier installer's filled-in settings — same reasoning as stage-e.conf.
+# notifier.conf.example is the committed one.
+notifier.conf
+
+# The chat-lane composer's filled-in settings — same reasoning as stage-e.conf.
+# chat-lane.conf.example is the committed one.
+chat-lane.conf
+
 # Dependencies
 node_modules/
 
