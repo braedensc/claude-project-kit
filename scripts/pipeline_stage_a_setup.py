@@ -3194,9 +3194,15 @@ def selftest():
               "helper session" in " ".join(CARDS["CA-PROBE"]["do"]), True)
         # The helper-fence evidence is PINNED: a later edit that drops the citation
         # drops the only reason Task and Agent are still in the keep set (KIT-140).
+        # Search the module docstring ONLY. `src` is this file, so every phrase below
+        # would match the tuple it is written in, and the check could never fail.
+        # Whitespace is flattened because the docstring wraps these phrases over lines.
+        evidence = " ".join((__doc__ or "").split())
         for phrase in ("2.1.245", "deny rules", "never the deny rules",
                        "front-matter `mcpServers`"):
-            check("helper-evidence:%s" % phrase, phrase in src, True)
+            check("helper-evidence:%s" % phrase, phrase in evidence, True)
+        # ...and that scoping is itself asserted: this line is in `src`, never in `evidence`.
+        check("helper-evidence-is-scoped", "for phrase in (" in evidence, False)
         check("helper-tools-still-kept",
               [t for t in ("Task", "Agent") if t in PLANNER_KEEP_TOOLS], ["Task", "Agent"])
         check("placeholder-unsignable", INITIALS_PLACEHOLDER.lower() in INITIALS_PLACEHOLDERS, True)
