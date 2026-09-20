@@ -2698,7 +2698,7 @@ GOOD_CONF = {
 def _ctx(state_root, conf=None, tracker=None, host=None, secret="k" * 40, github=None):
     host = FakeHost() if host is None else host
     host.origins.setdefault(DISPATCHER_ENTRY["repositoryPath"],
-                            "git@github.com:example-org/product.git")
+                            "ssh://git@example.com/example-org/product.git")
     conf = dict(GOOD_CONF if conf is None else conf)
     if conf.get("DISPATCHER_CONFIG") == GOOD_CONF["DISPATCHER_CONFIG"]:
         # The synthetic path in GOOD_CONF is not a file, and the reader program is real:
