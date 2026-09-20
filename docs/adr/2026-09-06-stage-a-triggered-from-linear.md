@@ -840,7 +840,13 @@ confirmed it, and it rests on a fact about the machine that only the owner can c
 
 The decomposition section said the executor "absorbs" the planner's tracker-searching pass.
 It did not, and nothing did, so a plain reading of the shipped documents described a check
-that was not running. The executor now runs it: before it creates anything it reads the work
+that was not running.
+
+This section, with the KIT-150 one above it, also supersedes the 2026-09-17 update's **"Two
+consequences of holding no tracker tool that this ADR still overstates"** — both of them.
+A ticket did ask for the dedupe pass (this one), and the reader that paragraph said nothing
+in the kit provided is `scripts/pipeline_plan_poller.py`. That paragraph is left standing as
+written, as every superseded passage here is; read it as a record of 2026-09-17, not of now. The executor now runs it: before it creates anything it reads the work
 team's most recently updated tickets and compares their titles with the proposed children's,
 by shared significant words over the shorter title — deterministic, model-free, like the rest
 of the file.
