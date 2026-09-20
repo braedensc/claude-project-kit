@@ -297,6 +297,12 @@ twice on doc-tail merges before these rules existed:
      of an organization notifies nobody, so on an org repository whose PRs a bot opens,
      set the variable. Otherwise the page says *Nobody was paged* and the monitor's run
      fails.
+   - **Where nothing answers, page at once.** The monitor asks for a fix up to three
+     times per pull request before paging anyone. That only helps where a waker or a
+     dispatcher answers. In a repository with neither, add `--max-fix-requests 0` to the
+     workflow's `monitor` line. The first conflict then pages a person instead of posting
+     a request nobody reads.
+     Raise it again the day a waker serves that repository's checkout.
    - **The installer is macOS-only.** It builds a LaunchAgent, and on any other platform
      its preflight says so and stops. The waker itself is portable:
      `python3 scripts/pr_conflict.py wake` is one pass that exits. On Linux, do by hand
