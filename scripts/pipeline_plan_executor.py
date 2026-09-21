@@ -314,6 +314,90 @@ SECRET_REJECT_REASON = ("the proposal carried text shaped like a credential — 
 
 
 # --------------------------------------------------------------------------- #
+# The duplicate check (KIT-141) — rehomed here, and a REPORT, never a verdict.
+#
+# The planning procedure's fifth rubric pass searched the tracker for work that already
+# exists. The fence removed the planner's tracker tools, and the design said the
+# executor would absorb that pass; it did not, so for a while nothing did, and a plain
+# reading of the docs said otherwise. It lives here now, with two deliberate limits.
+#
+# DETERMINISTIC, like everything else in this file. Titles are compared as word sets,
+# not by a model: shared significant words over the smaller title, which finds
+# "Add token refresh" against "Token refresh for the API client" and does not pretend
+# to understand either.
+#
+# IT NEVER REJECTS. A duplicate is a judgement about intent, and the person approving
+# the epic is the one who can make it. The summary lists what looks similar, and says
+# out loud when nothing did and when the check could not run at all (§13) — an absent
+# section would read as "nothing looked alike", which is the one thing it must not mean.
+# --------------------------------------------------------------------------- #
+DEDUPE_SCAN_LIMIT = 250          # most-recently-updated tickets in the work team
+DEDUPE_MIN_SHARED = 2            # fewer shared words than this is a coincidence
+DEDUPE_MIN_SCORE = 0.6           # shared words over the words of the shorter title
+DEDUPE_MAX_MATCHES = 3           # per child; a list, not a report of its own
+_WORD_RE = re.compile(r"[a-z0-9]+")
+# Words that carry no subject. A title is short, so a handful of them is enough to stop
+# "Add the endpoint" matching "Add the migration" on `add` and `the`.
+_STOPWORDS = frozenset((
+    "a", "an", "and", "the", "for", "to", "of", "in", "on", "with", "without", "from",
+    "by", "into", "add", "adds", "added", "make", "makes", "fix", "fixes", "update",
+    "updates", "use", "uses", "support", "new", "it", "its", "is", "be", "that", "this",
+    "when", "then", "so", "as", "at", "or", "not", "no", "one", "per", "run", "runs"))
+
+
+def title_words(title):
+    return frozenset(w for w in _WORD_RE.findall((title or "").lower())
+                     if len(w) > 2 and w not in _STOPWORDS)
+
+
+def looks_like(a, b):
+    """(shared words, score) for two titles. Score is shared over the smaller set, so a
+    short title inside a long one still scores."""
+    wa, wb = title_words(a), title_words(b)
+    if not wa or not wb:
+        return 0, 0.0
+    shared = wa & wb
+    return len(shared), len(shared) / float(min(len(wa), len(wb)))
+
+
+def duplicate_matches(children, existing):
+    """{child index: [(identifier, title, url)]} — every existing ticket whose title
+    looks like a proposed child's, most alike first."""
+    out = {}
+    for i, child in enumerate(children or []):
+        hits = []
+        for row in existing or []:
+            shared, score = looks_like(child.get("title"), row.get("title"))
+            if shared >= DEDUPE_MIN_SHARED and score >= DEDUPE_MIN_SCORE:
+                hits.append((score, row))
+        hits.sort(key=lambda pair: (-pair[0], (pair[1].get("identifier") or "")))
+        if hits:
+            out[i] = [(row.get("identifier") or "?", row.get("title") or "",
+                       row.get("url") or "") for _score, row in hits[:DEDUPE_MAX_MATCHES]]
+    return out
+
+
+def render_duplicate_lines(children, existing, scanned, failure=None):
+    """The summary's duplicate section. One of three things is always said."""
+    if failure:
+        return ["", "**Duplicate check: not run.** %s. Nothing was compared, so treat this "
+                    "plan as unchecked against existing tickets." % _sanitize(str(failure))[:200]]
+    matches = duplicate_matches(children, existing)
+    if not matches:
+        return ["", "**Duplicate check:** nothing among the %d most recently updated "
+                    "ticket(s) in this team looked like any of these children." % scanned]
+    lines = ["", "**Duplicate check — read these before approving.** %d of these children "
+                 "look like work that already exists (compared against the %d most recently "
+                 "updated tickets, by title):" % (len(matches), scanned)]
+    for i in sorted(matches):
+        lines.append("- `%s` may duplicate: %s"
+                     % (_sanitize(children[i].get("title") or ""),
+                        ", ".join("[%s](%s) `%s`" % (ident, url, _sanitize(title))
+                                  for ident, title, url in matches[i])))
+    return lines
+
+
+# --------------------------------------------------------------------------- #
 # Pure logic — no I/O
 # --------------------------------------------------------------------------- #
 def load_requests(path):
@@ -595,7 +679,7 @@ def guard_change_children(children):
             or _GUARD_PATH_RE.search(child.get("body") or "")]
 
 
-def render_success_comment(idea_id, epic, children, epic_title):
+def render_success_comment(idea_id, epic, children, epic_title, duplicates=None):
     """One markdown comment posted back on the idea ticket, for the owner.
 
     `epic` is the tracker's create response, which carries only id, identifier and
@@ -623,6 +707,7 @@ def render_success_comment(idea_id, epic, children, epic_title):
         lines.append("  - [%s](%s) — `%s`%s"
                      % (created["identifier"], created.get("url") or "",
                         _sanitize(child["title"]), dep))
+    lines.extend(duplicates or [])
     guarded = guard_change_children([child for _created, child in children])
     if guarded:
         lines += [
@@ -828,6 +913,16 @@ class LinearClient:
         if not nodes:
             raise ExecutorError("work team %s not found" % team_key)
         return nodes[0]["id"]
+
+    def recent_issues(self, team_id, limit):
+        """The work team's most recently updated tickets, open and closed, for the
+        duplicate check. Titles and identifiers only: nothing else is compared."""
+        data = self._gql(
+            "query($filter: IssueFilter!, $first: Int!) { issues(filter: $filter, "
+            "first: $first, orderBy: updatedAt) { nodes { identifier title url "
+            "state { type } } } }",
+            {"filter": {"team": {"id": {"eq": team_id}}}, "first": min(int(limit), 250)})
+        return ((data.get("issues") or {}).get("nodes")) or []
 
     def find_filed_plan(self, team_id, receipt):
         """The epic an earlier run filed for this exact proposal, or None. Archived
@@ -1251,6 +1346,16 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             print("::error:: %s" % msg, file=sys.stderr)
             return EXIT_ERRORED
 
+        # Asked before anything is created, so the answer rides in the summary the
+        # owner reads when approving. A lookup that fails is SAID, never skipped.
+        scanned, existing, dedupe_failure = 0, [], None
+        try:
+            existing = client.recent_issues(team_id, DEDUPE_SCAN_LIMIT)
+            scanned = len(existing)
+        except ExecutorError as exc:
+            dedupe_failure = exc
+            print("::warning:: the duplicate check could not run: %s" % exc, file=sys.stderr)
+
         subscribers = [forced["owner"]] if forced["subscribe"] else []
 
         # The project holds the PRD and the tree (mirrors /plan-epic step 1).
@@ -1293,7 +1398,9 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # session left alongside it (its open questions ride in the epic PRD; these
         # are top-level asides). The plan is filed either way — a note never blocks.
         client.post_comment(src["id"], render_success_comment(
-            pinned, epic, created_children, plan["epic"]["title"]) + "\n\n" + receipt)
+            pinned, epic, created_children, plan["epic"]["title"],
+            render_duplicate_lines(plan["children"], existing, scanned, dedupe_failure))
+            + "\n\n" + receipt)
         for c in comments:
             client.post_comment(src["id"], render_note_comment(pinned, c["body"]))
     except ExecutorError as exc:
@@ -1376,6 +1483,11 @@ class FakeLinear:
         if getattr(self, "fail_post", False):
             raise ExecutorError("simulated tracker failure on comment")
         self.comments.append((issue_id, body))
+
+    def recent_issues(self, team_id, limit):
+        if getattr(self, "fail_dedupe", False):
+            raise ExecutorError("simulated tracker failure on the duplicate scan")
+        return list(getattr(self, "existing", []))
 
     def find_filed_plan(self, team_id, receipt):
         """The SAME question the live client asks: an issue in the work team whose
@@ -1991,6 +2103,44 @@ def selftest():
               (_FENCE_OPEN_RE.pattern, _FENCE_TAIL_RE.pattern),
               (_poller2._FENCE_OPEN_RE.pattern, _poller2._FENCE_TAIL_RE.pattern))
         check("fenced-blocks-agree", fenced_blocks(text), _poller2.fenced_blocks(text))
+
+        # ── The duplicate check (KIT-141) ────────────────────────────────────
+        # 51. A child whose title looks like an existing ticket is NAMED in the
+        #     summary, and nothing is rejected for it.
+        fakeD2 = FakeLinear()
+        fakeD2.existing = [
+            {"identifier": "KIT-5", "title": "Add the ticket-create tree kind to the schema",
+             "url": "u5", "state": {"type": "backlog"}},
+            {"identifier": "KIT-6", "title": "Something entirely unrelated about billing",
+             "url": "u6", "state": {"type": "completed"}}]
+        check("dedupe-files-anyway", run(_tree(), client=fakeD2), EXIT_OK)
+        summary2 = fakeD2.comments[0][1]
+        check("dedupe-names-the-match", "KIT-5" in summary2, True)
+        check("dedupe-does-not-name-a-stranger", "KIT-6" in summary2, False)
+        check("dedupe-never-rejects", len(fakeD2.issues), 3)
+        # 52. Nothing alike is SAID, not left out: an absent section would read as
+        #     "nothing looked alike", which is the one thing it must not mean.
+        fakeD3 = FakeLinear()
+        fakeD3.existing = [{"identifier": "KIT-9", "title": "Rotate the billing keys",
+                            "url": "u9", "state": {"type": "backlog"}}]
+        run(_tree(), client=fakeD3)
+        check("dedupe-says-nothing-matched",
+              "nothing among the 1 most recently updated" in fakeD3.comments[0][1], True)
+        # 53. A lookup that FAILS is said too, and the plan still files.
+        fakeD4 = FakeLinear()
+        fakeD4.fail_dedupe = True
+        check("dedupe-failure-still-files", run(_tree(), client=fakeD4), EXIT_OK)
+        check("dedupe-failure-said", "Duplicate check: not run" in fakeD4.comments[0][1], True)
+        # 54. The comparison itself: shared subject words, not stopwords.
+        check("dedupe-matches-a-reworded-title",
+              duplicate_matches([{"title": "Token refresh for the API client"}],
+                                [{"identifier": "T-1", "title": "Add token refresh",
+                                  "url": ""}]).get(0) is not None, True)
+        check("dedupe-ignores-stopword-overlap",
+              duplicate_matches([{"title": "Add the endpoint"}],
+                                [{"identifier": "T-2", "title": "Add the migration",
+                                  "url": ""}]), {})
+        check("dedupe-scan-limit-is-a-cap", DEDUPE_SCAN_LIMIT <= 250, True)
 
         # 40. A CHILD THAT CHANGES A GUARD IS NAMED FOR THE OWNER (KIT-163). The
         #     session cannot request the guard-change label and this executor never

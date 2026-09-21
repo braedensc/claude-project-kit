@@ -775,3 +775,109 @@ carrying provenance labels, so it must not live in that home. The job's key must
 owner's own, because the dispatcher checks the DELEGATOR against the entry's allowed users —
 a pass whose key belongs to anyone else stops with a config error rather than filing
 planning tickets the dispatcher would refuse in silence.
+
+### The Planning entry is one the dispatcher can load (KIT-155)
+
+The composed entry carried a name, a team key, a never-used routing label, the fence and
+the brief — and nothing that makes an entry work. It now carries `repositoryPath` and
+`baseBranch` from the entry that already manages the planned repository (identity is that
+clone's `origin`, with the entry's own `githubUrl` as a second authority), the
+`workspaceBaseDir` and `linearWorkspaceId` the dispatcher uses, `userAccessControl.allowedUsers`
+set to the owner alone, and an `id` equal to its `name`. `entry_problems` names every one
+that is missing, and a selftest mutant drops each.
+
+The installer reads the dispatcher's config the way the review installer does — through
+that installer's own reader program, run as the dispatcher's account, which prints FACTS
+and never the file, because the file holds the dispatcher's tracker tokens. Four refusals
+come with it: no clone of the planned repository, entries that disagree about the workspace
+base or id, another entry already claiming the Planning team key (team routing takes the
+first claimant, so which entry ran a planning ticket would depend on file order), and a
+routing tag naming the Planning entry that another entry would also answer.
+
+**The fence now covers what this machine injects**, not only the four servers every machine
+has: every server the dispatcher's `linearMcpConfigs` files name, and every server the
+planned repository's own committed `.mcp.json` would add from the session's working
+directory. A server that cannot be named is a refusal, never a smaller fence. One more
+source was found while building it: an agent definition under the planned repository's
+`.claude/agents/` can declare `mcpServers` of its own, and those tools reach a HELPER
+session; the deny list still applies to them by name, so the installer refuses to compose
+an entry while such a definition exists rather than fence over a name it was never given.
+
+A prompt type that sets a tool list in the dispatcher's `promptDefaults` is reported rather
+than refused: the planning ticket the job writes carries no labels, so none is selected —
+but a label added to one by hand would select it, and that type's list would replace this
+fence.
+
+### A label cannot swap the fence, and the runner residual is written down (KIT-154, routes 2 and 3)
+
+**Route 2 is closed in the entry itself.** The dispatcher resolves a session's tool list as
+the entry's `labelPrompts[type]`, then the global `promptDefaults[type]`, then the entry's
+own `disallowedTools`; the type comes from the ticket's labels, and `orchestrator` selects
+one on every entry whether any `labelPrompts` exists or not. The planning ticket the job
+writes carries no labels, which closes this at the source. The entry now closes it as well:
+it defines every prompt type this dispatcher version can select — `debugger`, `builder`,
+`scoper`, `orchestrator`, with `graphite-orchestrator` resolving to the last — each with
+the same fence and a label no ticket holds. Whichever type a label selects, the list that
+wins is the planner's. A type a later dispatcher adds would not be covered, so the
+installer refuses to compose an entry while `promptDefaults` names a type outside that set.
+
+**Route 3 is not closed, and this is the wording of the residual.** The owner has not yet
+confirmed it, and it rests on a fact about the machine that only the owner can check.
+
+> A runner label (`codex`, `openai`, `gemini`, `cursor`, `opencode`, or a
+> `<provider>/<model>` label) or an `[agent=…]` / `[model=…]` tag picks the runner, and no
+> entry setting overrides that (`RunnerSelectionService.determineRunnerSelection`, 0.2.69).
+> Whether a non-Claude runner honours `disallowedTools` is unverified (KIT-41). Under the
+> pre-delegation lane, neither a runner label nor a runner tag reaches the ticket the
+> dispatcher sees: the planning ticket carries no labels and its text is stripped of both
+> tag shapes, and a session's runner is fixed when it starts. The residual is a person
+> adding a runner label to a planning ticket and delegating it again, and only the owner
+> may start a session in the Planning entry. Accepted on the additional ground that no
+> runner other than Claude has credentials in this dispatcher's environment — a fact to
+> re-check whenever another provider's key is added.
+
+### The duplicate-check pass has a home again (KIT-141)
+
+The decomposition section said the executor "absorbs" the planner's tracker-searching pass.
+It did not, and nothing did, so a plain reading of the shipped documents described a check
+that was not running.
+
+This section, with the KIT-150 one above it, also supersedes the 2026-09-17 update's **"Two
+consequences of holding no tracker tool that this ADR still overstates"** — both of them.
+A ticket did ask for the dedupe pass (this one), and the reader that paragraph said nothing
+in the kit provided is `scripts/pipeline_plan_poller.py`. That paragraph is left standing as
+written, as every superseded passage here is; read it as a record of 2026-09-17, not of now. The executor now runs it: before it creates anything it reads the work
+team's most recently updated tickets and compares their titles with the proposed children's,
+by shared significant words over the shorter title — deterministic, model-free, like the rest
+of the file.
+
+It is a **report, never a verdict**. It lists what looks alike in the summary the owner reads
+when approving, and never rejects a plan: whether two tickets are the same piece of work is a
+judgement about intent, and the person approving the epic is the one who can make it. All
+three outcomes are said out loud — matches, nothing alike, and a lookup that could not run —
+because an absent section would read as the second, which is the one thing it must not mean.
+
+### A helper session inherits the fence (KIT-140)
+
+The planner keeps `Task`/`Agent`, because the rubric passes are independent contexts. That
+made one question load-bearing: if a helper session were handed a fresh tool set, one call
+would reopen everything the deny list closes. It was recorded as unverifiable from the kit,
+and the activation checklist carried a live probe for it.
+
+It is answerable from source. The chain is dispatcher 0.2.69 → `cyrus-claude-runner` 0.2.69
+→ `@anthropic-ai/claude-agent-sdk` 0.3.245 → the CLI binary it runs, 2.1.245 (the version
+and its build are named in the SDK's own manifest). The SDK passes an entry's
+`disallowedTools` as `--disallowedTools`; the CLI turns that into deny rules on the
+session's permission context. In 2.1.245 the tool pool a session is offered is filtered by
+those rules, and a helper's permission context is derived from its parent's — the derivation
+changes the mode, the prompt behaviour, the allow rules and the working directories, and
+never the deny rules. So a denied tool is neither offered to a helper nor callable by one.
+
+**One exception, and it is why the entry composer reads the planned repository.** An agent
+definition's own front-matter `mcpServers` are connected for the helper without that pool
+filter. A call to one is still refused when a deny rule NAMES that server, which is what
+fencing every server the machine and the repository inject is for (KIT-155) — and why a
+definition naming servers the installer cannot name is refused outright.
+
+The live probe stays, and its card now says what to expect: the two tool lists should match.
+Source is what the runtime should do; the probe is what it did.

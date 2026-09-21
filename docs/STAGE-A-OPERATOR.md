@@ -63,6 +63,12 @@ An idea's text is exactly the kind of text those routes read. So the gate never 
 to the router. The planning ticket is written by the job, and the job refuses to file one
 whose description carries any directive but its own.
 
+A label is closed twice over. The planning ticket carries none, and the Planning entry
+defines **every** prompt type with the planner's own fence — so even a label added to a
+planning ticket by hand selects a type whose tool list is that same fence. The installer
+refuses to compose an entry while the dispatcher sets a default for a prompt type it does
+not know how to cover.
+
 What that leaves: someone with tracker access adding a runner label to a planning ticket
 and delegating it again. Only users on the Planning entry's allowed list can start a
 session, and that list is the owner.
@@ -117,7 +123,7 @@ What you supply, and why it is yours:
 | Checkpoint | What you do |
 |---|---|
 | `CA-DELIVERY` | Turn the plan kind on in the planned repository's committed `delivery.json`, by a pull request you merge. That file is the switch that lets a proposal become tickets. |
-| `CA-ENTRY` | Paste the composed Planning entry into the dispatcher's own config and restart it. A program that wrote its own fence would be choosing its own supervision. |
+| `CA-ENTRY` | Paste the composed Planning entry into the dispatcher's own config and restart it. A program that wrote its own fence would be choosing its own supervision. Check before you paste: every tracker server named twice (`mcp__<server>` and `mcp__<server>__*`), `Bash`, `Write` and `Edit` all denied, no `allowedTools` key, a repository path, a base branch, a workspace directory, a workspace id, and you as the only allowed user. |
 | `CA-PROBE` | Watch a live planning session, and a helper it starts, list every tool they hold. A fence is a list in a file until someone sees a session obey it. |
 | `CA-HANDOVER` | Run the planning procedure by hand once, before anything is automatic. |
 | `CA-EXECUTOR` | Load the job. The next run measures it: launchd for whether it is loaded, its own heartbeat for whether it works. |
@@ -146,9 +152,13 @@ so, `2` config or credential — nothing was touched, `4` the pass hit its wall 
   much larger one. If the tracker refuses an overlong body, the dispatcher posts nothing,
   and the gate sees a session that finished with no plan — a visible note, never a partial
   tree. Record the size of the first real plan.
-- **Whether a helper session inherits the fence** is settled by reading the runner's
-  source, and confirmed only by the live probe a person runs (`CA-PROBE`).
-- **The duplicate check is gone from the planning passes** and its replacement is named on
-  its own ticket. Until then, a plan is not checked against existing tickets, and says so.
+- **A helper session inherits the fence, per the runner's source** — the deny rules ride
+  on the permission context a helper derives from its parent, and the tool pool it is
+  offered is filtered by them. What the source says the runtime should do is not what it
+  did: the live probe (`CA-PROBE`) is where a person sees the helper's own tool list.
+- **The duplicate check compares titles, not intent.** The executor lists children whose
+  titles look like recent tickets in the work team, and says so when nothing looked alike
+  or when the lookup failed. It never refuses a plan for it: whether two tickets are the
+  same piece of work is yours to judge when you approve the epic.
 - **Nothing watches the job's heartbeat automatically.** The installer's `enable` step
   reads it when you run the installer; between runs, nothing does.

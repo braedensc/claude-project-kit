@@ -72,16 +72,37 @@ THE FENCE — the one security choice, and how it is enforced
   tools, whose names do not start with `mcp__`, so a server rule never reaches
   them.
 
-  WHAT IS NOT PROVEN, and must be probed on the live dispatcher before the gate
-  is switched on (the activation checklist has the step): whether a subagent
-  started by `Task` inherits its parent's `disallowedTools`. If it does not, one
-  Task call reopens everything this list closes. `--selftest` cannot answer it;
-  only a person watching a live planning session can (KIT-140).
+  A HELPER SESSION INHERITS THIS LIST — read from the runner's own source, and
+  still probed live before the gate goes on (KIT-140). The question mattered
+  because the planner KEEPS `Task`/`Agent`: if a helper were handed a fresh tool
+  set, one call would reopen everything this list closes.
 
-  ONE CAPABILITY IS LOST, NOT REHOMED. The planning procedure's fifth pass searches
-  the tracker for duplicates before anything is filed, and the planner can no longer
-  run it. The design said the executor would run dedupe instead; the executor does
-  not (KIT-141). Stated here rather than left to be rediscovered.
+  The chain is dispatcher 0.2.69 -> cyrus-claude-runner 0.2.69 ->
+  @anthropic-ai/claude-agent-sdk 0.3.245 -> the CLI it runs, 2.1.245. The SDK
+  passes an entry's list as `--disallowedTools`, which the CLI turns into deny
+  rules on the session's permission context. Two things then hold for a helper:
+  the tool pool it is offered is filtered by those same deny rules, and the
+  helper's permission context is DERIVED from its parent's, changing the mode,
+  the prompt behaviour, the allow rules and the working directories — and never
+  the deny rules. So a denied tool is neither offered to a helper nor callable by
+  one.
+
+  ONE EXCEPTION, and it is why the entry composer reads the planned repository:
+  an agent definition's own front-matter `mcpServers` are connected for the
+  helper WITHOUT that pool filter. A call to one is still refused when a deny
+  rule NAMES that server, which is what fencing every server this machine and
+  that repository inject is for — and why a definition naming servers this
+  installer cannot name is refused outright.
+
+  `--selftest` cannot watch a live session, so the live probe stays: source is
+  what the runtime should do, and the probe is what it did.
+
+  ONE CAPABILITY MOVED, AND IT IS WEAKER WHERE IT LANDED. The planning procedure's
+  fifth pass searched the tracker for duplicates, and the planner can no longer run
+  it. The executor now compares proposed titles with the work team's recent tickets
+  and lists what looks alike in its summary (KIT-141) — deterministic, and never a
+  refusal. A duplicate is a judgement about intent, and the person approving the epic
+  is the one who makes it.
 
 THE OWNER NEVER DELEGATES AN IDEA (KIT-154, option A)
   The dispatcher routes a delegated ticket by its DESCRIPTION before its team: a
@@ -138,6 +159,12 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # The planner job's own schema and defaults, imported rather than copied: this installer
 # writes that job's config, and a second spelling of a key is a config nobody validates.
 import pipeline_plan_poller as poller  # noqa: E402
+# The review installer reads the dispatcher's config already, and reads it as FACTS
+# rather than as a file (it holds tracker tokens). Its reader, its repository-identity
+# rule and its tag-ambiguity check are IMPORTED, never copied: two spellings of "which
+# entry manages this repository" is one spelling that drifts.
+from pipeline_stage_e_setup import (  # noqa: E402
+    MCP_SERVER_NAME_RE, _read_dispatcher_facts_py, _repo_slug, _tag_ambiguity)
 
 # --------------------------------------------------------------------------- #
 # Exit codes
@@ -186,9 +213,10 @@ MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
 # SDK adds later. Such a tool reaches the planner until someone adds it below.
 #
 # `Task` and `Agent` are here because the planning procedure's rubric panel is
-# five passes in fresh contexts, and collapsing them into one context is a quality
-# change, not a security one — see the docstring's "not proven" note on whether a
-# subagent inherits this fence. `Write` is NOT here: see the docstring.
+# passes in fresh contexts, and collapsing them into one context is a quality
+# change, not a security one. A helper inherits this fence — the docstring cites
+# where the runner's source says so, and the live probe confirms it. `Write` is
+# NOT here: see the docstring.
 PLANNER_KEEP_TOOLS = (
     "Read", "Grep", "Glob", "Task", "Agent", "LSP", "ToolSearch",
     "TaskOutput", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TodoWrite",
@@ -221,9 +249,29 @@ DISALLOWED_BUILTINS = [
 PLANNING_DISALLOWED_TOOLS = DISALLOWED_BUILTINS + [
     rule for server in PLANNER_FENCE_SERVERS for rule in _server_rules(server)]
 
-# A label no ticket carries, so the Planning entry is NEVER label-routed — its job
-# kind comes from the team it maps to, not from text a ticket could hold (KIT-41).
+# A label no ticket carries, so the Planning entry is NEVER label-routed — its job kind
+# comes from the team it maps to, not from text a ticket could hold (KIT-41).
 PLANNING_ENTRY_NEVER_LABEL = "stage-a-planning-entry-never-label-routed"
+
+# THE PROMPT TYPES, AND WHY THE ENTRY DEFINES EVERY ONE OF THEM (KIT-154, route 2).
+#
+# A session's tool list is resolved in this order (ToolPermissionResolver,
+# `buildDisallowedToolsForRepo`, 0.2.69): the ENTRY's `labelPrompts[type]`, then the
+# global `promptDefaults[type]`, and only then the entry's own `disallowedTools`. The
+# type comes from the ticket's LABELS, and `orchestrator` selects a type on every entry
+# whether or not any `labelPrompts` exists at all (`PromptBuilder`, hardcoded).
+#
+# So a label on a planning ticket could select a type whose global list REPLACES this
+# fence. The planner job writes planning tickets with no labels, which closes that at
+# the source — but a label added to one by hand afterwards would still select a type.
+# Defining every type IN THE ENTRY, each with the same fence, closes it in the entry
+# too: whichever type a label selects, the list that wins is this one.
+#
+# `graphite-orchestrator` resolves to `orchestrator` for tools, so the four below are
+# every type this dispatcher version can select. A type a LATER version adds would not
+# be covered, which is why the installer refuses to compose an entry while the
+# dispatcher's `promptDefaults` names a type outside this set.
+PLANNING_PROMPT_TYPES = ("debugger", "builder", "scoper", "orchestrator")
 
 # The planning brief the entry delivers. It is the whole of what a planning session
 # is told about its lane, so it must be true of the lane (KIT-163): KIT-98 shipped the
@@ -268,8 +316,10 @@ PLANNING_BRIEF = (
     "(each effort label honest; split anything larger). Apply what they find, at most "
     "two rounds.\n\n"
     "WHAT YOU SKIP, because your tools are gone. The census and config preflight: no "
-    "shell; the executor reads the config. The duplicate-check pass: no tracker. Do not "
-    "claim the plan was checked against existing tickets. The Definition-of-Ready "
+    "shell; the executor reads the config. The duplicate-check pass: no tracker. The "
+    "executor compares your children's titles with the work team's recent tickets and "
+    "lists what looks alike for the owner, so do not claim the check yourself. The "
+    "Definition-of-Ready "
     "gate: no shell; the executor runs it on every child and rejects the whole tree if "
     "one fails. So write each child to pass it: all five sections, acceptance criteria "
     "a machine can check (name the command, path or endpoint in backticks), a test "
@@ -394,6 +444,9 @@ CONF_KEYS = {
                        "job delegates every planning ticket to it",
     "JOB_LABEL": "the launchd label for the planner job (reverse-DNS, and a deployment's "
                  "own: this repository never names one)",
+    "DISPATCHER_ACCOUNT": "the local account the dispatcher runs as — its config is read "
+                          "for the fields a loadable entry needs, and never written",
+    "DISPATCHER_CONFIG": "the absolute path of the dispatcher's own config file",
 }
 # Read when present, defaulted when absent.
 OPTIONAL_CONF_KEYS = {
@@ -450,6 +503,15 @@ def validate_conf(conf):
     if url and not url.startswith("https://"):
         errors.append("KIT_REPO_URL must be https:// (got %r) — the role account has no "
                       "keys, so ssh cannot clone" % url)
+    path = conf.get("DISPATCHER_CONFIG", "")
+    if path and not path.startswith("/"):
+        errors.append("DISPATCHER_CONFIG must be an absolute path (got %r) — the "
+                      "dispatcher resolves a relative one against a working directory "
+                      "nothing here can see" % path)
+    if conf.get("DISPATCHER_ACCOUNT") and conf.get("DISPATCHER_ACCOUNT") == conf.get("ROLE_ACCOUNT"):
+        errors.append("DISPATCHER_ACCOUNT and ROLE_ACCOUNT are the same account. The "
+                      "executor's key must live where a coding session cannot read it, "
+                      "and every session can read what the dispatcher's account can")
     label = conf.get("JOB_LABEL", "")
     if label and not JOB_LABEL_RE.match(label):
         errors.append("JOB_LABEL must be reverse-DNS with at least two parts, e.g. "
@@ -501,26 +563,199 @@ def load_conf(path):
 # --------------------------------------------------------------------------- #
 # The Planning dispatcher entry — composed here, applied by a person
 # --------------------------------------------------------------------------- #
-def planning_entry(conf):
-    """The dispatcher repository-entry that makes a delegated idea a PLANNING
-    session. Composed here; a person applies it to the dispatcher's own config
-    (this installer never writes that config — see the docstring).
+def planning_entry(conf, facts=None):
+    """The dispatcher repository-entry that makes a delegated planning ticket a PLANNING
+    session. Composed here; a person applies it to the dispatcher's own config (this
+    installer never writes that config — see the docstring).
 
     NO `allowedTools` KEY. The dispatcher's permission callback allows every tool
-    whatever an `allowedTools` list says, so the key narrows nothing — and an
-    entry that carries one gets a DIFFERENT set of injected MCP servers than one
-    that does not. A key that reads as a control and is not one is the defect
-    this entry was rebuilt to remove, so it is absent, exactly as it is on a
-    review entry. What the planner keeps is whatever `disallowedTools` leaves,
-    and `PLANNER_KEEP_TOOLS` is the allowlist a person probes that against."""
-    return {
-        "name": "stage-a-planning-%s" % conf["PLANNING_TEAM_KEY"].lower(),
+    whatever an `allowedTools` list says, so the key narrows nothing — and an entry
+    that carries one gets a DIFFERENT set of injected MCP servers than one that does
+    not. A key that reads as a control and is not one is the defect this entry was
+    rebuilt to remove, so it is absent, exactly as it is on a review entry. What the
+    planner keeps is whatever `disallowedTools` leaves, and `PLANNER_KEEP_TOOLS` is the
+    allowlist a person probes that against.
+
+    WITH `facts` (the dispatcher's own config, read by the review installer's reader)
+    the entry also carries what makes it LOADABLE: the clone it reads code in and that
+    clone's base branch, both from the entry that already manages the planned
+    repository; the workspace directory and workspace id the dispatcher uses; the owner
+    as the only user who may start a session in it; and an `id` equal to its `name`.
+    Without those a planning session has no checkout, no worktree location, and anyone
+    in the workspace could start a paid run (KIT-155)."""
+    entry = {
+        "id": planning_entry_name(conf),
+        "name": planning_entry_name(conf),
         "teamKeys": [conf["PLANNING_TEAM_KEY"]],
         "routingLabels": [PLANNING_ENTRY_NEVER_LABEL],
         "isActive": True,
         "disallowedTools": list(PLANNING_DISALLOWED_TOOLS),
         "appendInstruction": PLANNING_BRIEF,
     }
+    if facts is None:
+        return entry
+    entry["repositoryPath"] = facts["repositoryPath"]
+    entry["baseBranch"] = facts["baseBranch"]
+    entry["workspaceBaseDir"] = facts["workspaceBaseDir"]
+    entry["linearWorkspaceId"] = facts["linearWorkspaceId"]
+    entry["userAccessControl"] = {"allowedUsers": [conf["OWNER_USER_ID"]]}
+    entry["disallowedTools"] = list(facts["fence"])
+    # Every prompt type, each carrying the SAME fence and a label no ticket holds: a
+    # label can still select a type, and the list it selects is this one (KIT-154).
+    entry["labelPrompts"] = dict(
+        (kind, {"labels": [PLANNING_ENTRY_NEVER_LABEL],
+                "disallowedTools": list(facts["fence"])})
+        for kind in PLANNING_PROMPT_TYPES)
+    return entry
+
+
+def planning_entry_name(conf):
+    return "stage-a-planning-%s" % conf["PLANNING_TEAM_KEY"].lower()
+
+
+# Every key a loadable entry must carry, with what each one is for. A key this
+# installer writes but never CHECKS is a key a hand edit can quietly win.
+LOADABLE_KEYS = {
+    "id": "the id the dispatcher stores the entry under",
+    "name": "the name a routing tag matches",
+    "repositoryPath": "the clone the planner reads code in",
+    "baseBranch": "the branch that clone's worktrees are cut from",
+    "workspaceBaseDir": "where the dispatcher puts this session's worktree",
+    "linearWorkspaceId": "the tracker workspace this entry answers for",
+}
+
+
+def dispatcher_facts(ctx):
+    """What the Planning entry needs from the dispatcher's own config, or a refusal.
+
+    Read as FACTS, never as a file: that config holds the dispatcher's tracker tokens,
+    and this installer must never move them. The reader is the review installer's."""
+    conf = ctx.conf
+    account, path = conf["DISPATCHER_ACCOUNT"], conf["DISPATCHER_CONFIG"]
+    code, out = ctx.host.run_python(account, _read_dispatcher_facts_py(path))
+    if code is None:
+        raise Unknown("could not read the dispatcher's config as %s (%s)" % (account, out),
+                      "run this from a terminal as yourself, after `sudo -v`")
+    if code != 0:
+        raise SetupError("could not read %s as %s: %s" % (path, account, (out or "")[:200]))
+    try:
+        facts = json.loads(out)
+    except ValueError:
+        raise SetupError("the dispatcher's config at %s did not read back as facts" % path)
+
+    bases = facts.get("workspace_base_dirs") or []
+    spaces = facts.get("workspace_ids") or []
+    if len(bases) > 1:
+        raise SetupError("the dispatcher's entries disagree about workspaceBaseDir (%s). "
+                         "Worktree deletion is hardcoded to that path, so guessing leaves "
+                         "worktrees nothing removes." % ", ".join(bases))
+    if len(spaces) > 1:
+        raise SetupError("the dispatcher's entries name %d different workspace ids — "
+                         "refusing to guess which one the Planning entry belongs to"
+                         % len(spaces))
+    if not bases or not spaces:
+        raise SetupError("the dispatcher's config names no workspaceBaseDir or no workspace "
+                         "id to copy. Finish the dispatcher install first.")
+
+    # WHICH ENTRY MANAGES THE PLANNED REPOSITORY. Identity is the clone's `origin`
+    # remote, with the entry's own githubUrl as a second authority — both of which NAME
+    # the repository. A path basename is not evidence of identity.
+    #
+    # `origin` is asked FIRST because it is MEASURED from the clone on disk, while
+    # githubUrl is a field the entry declares about itself. Where both answer and they
+    # disagree about the planned repository, the entry describes a checkout it does not
+    # have: refuse rather than pick a side, because picking wrong points the planner at
+    # the wrong code — and a planner reads code for a living.
+    wanted = conf["PLANNED_REPO"].lower()
+    model = None
+    for other in facts.get("entries") or []:
+        measured = ctx.origin_slug(other.get("repositoryPath"))
+        declared = _repo_slug(other.get("githubUrl"))
+        if measured and declared and measured != declared and wanted in (measured, declared):
+            raise SetupError(
+                "the dispatcher entry %s says its repository is %s, but the clone it "
+                "points at (%s) has origin %s. One of those is wrong and this installer "
+                "will not guess which — fix the entry or the clone, then run this again."
+                % (other.get("name") or other.get("id") or "?", declared,
+                   other.get("repositoryPath"), measured))
+        slug = measured or declared
+        if slug == wanted and other.get("repositoryPath"):
+            model = other
+            break
+    if model is None:
+        raise SetupError(
+            "the dispatcher manages no clone whose origin is %s, so a planning session "
+            "would have no checkout to read the code in — which is most of what a planner "
+            "does. Give the dispatcher an entry for that repository first."
+            % conf["PLANNED_REPO"])
+
+    ours = {"id": planning_entry_name(conf), "name": planning_entry_name(conf)}
+    clashes = _tag_ambiguity(facts.get("entries") or [], [ours])
+    if clashes:
+        raise SetupError(
+            "a routing tag naming the Planning entry would ALSO match another entry, so a "
+            "planning ticket could start a session there too:\n%s"
+            % "\n".join("  - " + c for c in clashes))
+
+    unknown = [t for t in (facts.get("prompt_types_disallowing") or [])
+               if t not in PLANNING_PROMPT_TYPES]
+    if unknown:
+        raise SetupError(
+            "the dispatcher's promptDefaults set a tool list for the prompt type(s) %s, "
+            "which this installer does not know how to cover in the Planning entry. A "
+            "label selecting one of them would replace the planner's fence with that "
+            "list. Remove the default, or teach this installer the type."
+            % ", ".join(sorted(unknown)))
+
+    claim = [e for e in (facts.get("entries") or [])
+             if conf["PLANNING_TEAM_KEY"] in (e.get("teamKeys") or [])
+             and e.get("id") != ours["id"]]
+    if claim:
+        raise SetupError(
+            "the entry %r already claims the team key %s. Team routing takes the FIRST "
+            "entry claiming a key, so which one ran a planning ticket would depend on file "
+            "order." % (claim[0].get("id") or claim[0].get("name"), conf["PLANNING_TEAM_KEY"]))
+
+    return {"repositoryPath": model["repositoryPath"],
+            "baseBranch": model.get("baseBranch") or "main",
+            "workspaceBaseDir": bases[0], "linearWorkspaceId": spaces[0],
+            "fence": planner_fence(ctx, facts),
+            "prompt_types": list(facts.get("prompt_types_disallowing") or [])}
+
+
+def planner_fence(ctx, facts):
+    """The planner's `disallowedTools` ON THIS MACHINE: the built-in list, plus both
+    rule forms for every extra MCP server this machine injects.
+
+    Two sources beyond the four every machine has: the files the dispatcher config's
+    `linearMcpConfigs` names, and the planned repository's own committed `.mcp.json`,
+    which the runner loads from the session's working directory. A server this cannot
+    NAME is a refusal, never a smaller fence: an entry written without it would claim a
+    closed fence over a server nothing named."""
+    problems, extra = [], []
+    for row in facts.get("linear_mcp_configs") or []:
+        where = row.get("path") or "?"
+        if row.get("error") or not isinstance(row.get("servers"), list):
+            problems.append("%s: %s" % (where, row.get("error") or "no server list"))
+            continue
+        for server in row["servers"]:
+            if not (isinstance(server, str) and MCP_SERVER_NAME_RE.match(server)):
+                problems.append("%s: the server %r is not a name a rule can fence"
+                                % (where, str(server)[:60]))
+            elif server not in PLANNER_FENCE_SERVERS and server not in extra:
+                extra.append(server)
+    for server, why in ctx.repo_mcp_servers():
+        if why:
+            problems.append(why)
+        elif server not in PLANNER_FENCE_SERVERS and server not in extra:
+            extra.append(server)
+    if problems:
+        raise SetupError(
+            "refusing to compose the Planning entry: these MCP servers reach a planning "
+            "session and could not be fenced:\n%s\nFix or remove each one, then run this "
+            "again." % "\n".join("  - " + p for p in problems))
+    return list(PLANNING_DISALLOWED_TOOLS) + [
+        rule for server in sorted(extra) for rule in _server_rules(server)]
 
 
 def entry_problems(entry):
@@ -563,6 +798,30 @@ def entry_problems(entry):
     if entry.get("routingLabels") != [PLANNING_ENTRY_NEVER_LABEL]:
         problems.append("the entry is label-routable — its job kind must come from "
                         "the team, never a ticket's text (KIT-41)")
+    for key, why in sorted(LOADABLE_KEYS.items()):
+        if not entry.get(key):
+            problems.append("the entry has no %s — %s (KIT-155)" % (key, why))
+    if entry.get("id") != entry.get("name"):
+        problems.append("the entry's id and name differ; a routing tag matches either, so "
+                        "two spellings are two things a tag can name")
+    prompts = entry.get("labelPrompts")
+    if entry.get("repositoryPath") and not isinstance(prompts, dict):
+        problems.append("the entry defines no labelPrompts — a ticket label could select "
+                        "a prompt type whose own list replaces this fence (KIT-154)")
+    elif isinstance(prompts, dict):
+        for kind in ("debugger", "builder", "scoper", "orchestrator"):
+            got = prompts.get(kind)
+            if not isinstance(got, dict) or got.get("disallowedTools") != disallowed:
+                problems.append("the entry's %r prompt type does not carry this exact "
+                                "fence, so a label selecting it would replace the fence"
+                                % kind)
+            elif got.get("labels") != [PLANNING_ENTRY_NEVER_LABEL]:
+                problems.append("the entry's %r prompt type is selectable by a label a "
+                                "ticket could carry" % kind)
+    allowed = ((entry.get("userAccessControl") or {}).get("allowedUsers")) or []
+    if len(allowed) != 1 or not allowed[0]:
+        problems.append("the entry does not name exactly one allowed user — without it "
+                        "anyone in the workspace can start a paid planning session")
     return problems
 
 
@@ -734,11 +993,12 @@ CARDS = {
                "  1. no name beginning `mcp__` appears at all;",
                "  2. no name outside the planner's keep-set appears (the keep-set is",
                "     printed by `status`).",
-               "Then ask it to start ONE subagent and have THAT subagent list its own",
-               "tools by exact name. Check the same two things.",
-               "The second check is the one nobody remembers: whether a subagent",
-               "inherits its parent's fence is not known (KIT-140), and if it does",
-               "not, one subagent call reopens everything the fence closed."],
+               "Then ask it to start ONE helper session and have THAT helper list its",
+               "own tools by exact name. Check the same two things.",
+               "The runner's source says a helper inherits the same deny rules, so the",
+               "two lists should match. This step is where that is seen rather than",
+               "assumed: if the helper's list holds anything the session's does not,",
+               "stop and do not switch the gate on."],
         "good": "both lists hold no `mcp__` name and nothing outside the keep-set",
     },
     "CA-EXECUTOR": {
@@ -1076,6 +1336,21 @@ class Host(object):
             return None
         return code == 0
 
+    def run_python(self, account, program):
+        """(exit code, output) for one field-picking program run as `account`. The
+        program is a module constant, never input, and it prints FACTS — never the
+        file it reads, which holds the dispatcher's tracker tokens."""
+        import shlex as _shlex
+        return self._sudo(account, "/usr/bin/python3 -c " + _shlex.quote(program))
+
+    def origin_of(self, account, path):
+        """The `origin` remote of the clone at `path`, or "". Asked of git, because a
+        path's basename is not evidence of which repository a clone IS."""
+        import shlex as _shlex
+        code, out = self._sudo(account, "git -C %s remote get-url origin 2>/dev/null"
+                               % _shlex.quote(path))
+        return (out or "").strip().splitlines()[0] if (code == 0 and out) else ""
+
     def home_of(self, account):
         """The role account's own home, from the directory service. A plist names it
         literally: a system daemon inherits no login environment, so `~` means nothing
@@ -1294,7 +1569,7 @@ def poller_config(ctx):
         "plan_it_state": conf_value(conf, "PLAN_IT_STATE"),
         "owner_user_id": conf["OWNER_USER_ID"],
         "agent_user_name": conf["AGENT_USER_NAME"],
-        "planning_entry_name": planning_entry(conf)["name"],
+        "planning_entry_name": planning_entry_name(conf),
         "planned_repo": conf["PLANNED_REPO"],
         "linear_key_env": conf["LINEAR_KEY_ENV"],
         "github_token_env": conf_value(conf, "GITHUB_TOKEN_ENV"),
@@ -1479,6 +1754,55 @@ class GitHubReader(object):
         if code != 0:
             return None, (out if code is None else "the repository %s was not found" % repo)
         return out.strip() == "true", None
+
+    def repo_mcp_servers(self, repo):
+        """Every MCP server the repository's own files would add to a session, as
+        (name, None), plus (None, why) for anything unreadable or unnameable."""
+        import base64
+        out = []
+        code, raw = self._gh(["repos/%s" % repo, "--jq", ".default_branch"])
+        if code != 0:
+            return [(None, "could not read %s's default branch (%s)" % (repo, raw))]
+        branch = raw.strip()
+        code, raw = self._gh(["repos/%s/contents/.mcp.json?ref=%s" % (repo, branch),
+                              "--jq", ".content"])
+        if code == 0:
+            try:
+                doc = json.loads(base64.b64decode(raw.strip()).decode("utf-8"))
+                servers = doc.get("mcpServers") if isinstance(doc, dict) else None
+                if not isinstance(servers, (dict, type(None))):
+                    out.append((None, "%s's .mcp.json holds no mcpServers object" % repo))
+                for name in sorted(servers or {}):
+                    out.append((name, None))
+            except (ValueError, TypeError) as exc:
+                out.append((None, "%s's .mcp.json could not be read (%s)" % (repo, exc)))
+        elif code != 404:
+            out.append((None, "could not read %s's .mcp.json (%s)" % (repo, raw)))
+        # An agent definition can carry `mcpServers` in its own front matter, and those
+        # servers reach a HELPER session, where the entry's deny list still applies by
+        # NAME. This installer cannot parse a name it has not been given, so a definition
+        # that names any is refused rather than fenced over.
+        code, raw = self._gh(["repos/%s/contents/.claude/agents?ref=%s" % (repo, branch),
+                              "--jq", ".[].path"])
+        if code == 0:
+            for path in [p for p in (raw or "").split() if p.endswith(".md")][:20]:
+                code2, body = self._gh(["repos/%s/contents/%s?ref=%s" % (repo, path, branch),
+                                        "--jq", ".content"])
+                if code2 != 0:
+                    out.append((None, "could not read %s in %s" % (path, repo)))
+                    continue
+                try:
+                    text = base64.b64decode(body.strip()).decode("utf-8", "replace")
+                except (ValueError, TypeError):
+                    out.append((None, "could not decode %s in %s" % (path, repo)))
+                    continue
+                if re.search(r"(?m)^\s*mcpServers\s*:", text):
+                    out.append((None, "%s in %s names MCP servers of its own; a helper "
+                                      "session would hold them, and this installer cannot "
+                                      "name them to fence them" % (path, repo)))
+        elif code not in (404,):
+            out.append((None, "could not list %s's .claude/agents (%s)" % (repo, raw)))
+        return out
 
     def delivery_config(self, repo):
         """(doc, branch, None) / (None, branch, "absent") / (None, None, reason)."""
@@ -1690,12 +2014,29 @@ def step_executor_job(ctx, apply_it):
 def step_dispatcher_entry(ctx, apply_it):
     """Compose the Planning entry and HAND IT OFF. This installer never writes
     the dispatcher's config, even for the operator."""
-    entry = planning_entry(ctx.conf)
+    facts = dispatcher_facts(ctx)
+    entry = planning_entry(ctx.conf, facts)
+    notes = []
+    if facts["prompt_types"]:
+        # A prompt type's own list REPLACES an entry's `disallowedTools`, and a ticket's
+        # labels choose the type. The planning ticket the job writes carries no labels,
+        # so nothing selects one — but a label added by hand afterwards would, so the
+        # machine's types are named here rather than left to be discovered.
+        notes.append("the dispatcher's promptDefaults set a tool list for the prompt "
+                     "type(s) %s. Neither reaches a planning session: the planning ticket "
+                     "the job writes carries no labels, and this entry defines every "
+                     "prompt type with its own fence, which the dispatcher reads before "
+                     "any default. Named here for the record."
+                     % ", ".join(facts["prompt_types"]))
     problems = entry_problems(entry)
     if problems:
         raise SetupError("composed a broken Planning entry — refusing to print it:\n"
                          + "\n".join("  - " + p for p in problems))
     if not ctx.state.attested("CA-ENTRY"):
+        for note in notes:
+            ctx.say("")
+            for i, line in enumerate(_wrap(note)):
+                ctx.say(("  note: " if i == 0 else "  ") + line)
         if getattr(ctx, "failed_before", False) or not getattr(ctx, "job_ready", False):
             ctx.say("")
             ctx.say("(the Planning entry is withheld: the planner job is not in place yet,")
@@ -1705,7 +2046,7 @@ def step_dispatcher_entry(ctx, apply_it):
             ctx.say("----- the Planning entry, for you to apply -----")
             ctx.say(json.dumps(entry, indent=2))
         raise Blocked("CA-ENTRY")
-    return True, "Planning entry applied (signed %s)" % _signed_at(ctx, "CA-ENTRY"), []
+    return True, "Planning entry applied (signed %s)" % _signed_at(ctx, "CA-ENTRY"), notes
 
 
 def step_probe(ctx, apply_it):
@@ -1805,12 +2146,36 @@ class Ctx(object):
         self.conf = conf
         self.role_home = None
         self.job_ready = False
+        self._origins = {}
+        self._repo_servers = None
         self.github = github
         self.runner = runner
         self.tracker = tracker
         self.host = host
         self.state = state
         self._out = out if out is not None else []
+
+    def origin_slug(self, path):
+        """OWNER/NAME for the clone at `path`, lower-cased, or None. Cached: it is a
+        `sudo` round trip and the answer cannot change mid-run."""
+        if not path:
+            return None
+        if path not in self._origins:
+            url = self.host.origin_of(self.conf.get("DISPATCHER_ACCOUNT", ""), path)
+            self._origins[path] = _repo_slug(url)
+        return self._origins[path]
+
+    def repo_mcp_servers(self):
+        """[(server name, None)] for every MCP server the PLANNED repository ships, and
+        [(None, why)] for anything that could not be named.
+
+        A repository's committed `.mcp.json` is loaded from the session's working
+        directory, and an agent definition under `.claude/agents/` can name servers of
+        its own that a helper session then holds. Both reach a planning session, so both
+        are fenced — or refused."""
+        if self._repo_servers is None:
+            self._repo_servers = self.github.repo_mcp_servers(self.conf["PLANNED_REPO"])
+        return self._repo_servers
 
     def say(self, msg):
         self._out.append(msg)
@@ -2187,6 +2552,7 @@ class FakeHost(object):
         self.placed = []           # every url this fake was asked to clone
         self.plists = {}           # label -> the installed body
         self.loaded = set()        # labels a PERSON loaded; this installer never does
+        self.origins = {}          # clone path -> its `origin` url
 
     def account_exists(self, account):
         return None if self.locked else self._exists
@@ -2232,6 +2598,20 @@ class FakeHost(object):
     def job_loaded(self, label):
         return None if self.locked else (label in self.loaded)
 
+    def run_python(self, account, program):
+        """RUNS the field-picking program, here, over whatever config file the case
+        wrote. The point is that the program is the review installer's real one: a fake
+        that answered with a hand-made dict would pass while the reader's keys drifted."""
+        if self.locked:
+            return None, "sudo needs a password (synthetic)"
+        import subprocess
+        proc = subprocess.run([sys.executable, "-c", program], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=60)
+        return proc.returncode, (proc.stdout or proc.stderr).decode("utf-8", "replace").strip()
+
+    def origin_of(self, account, path):
+        return self.origins.get(path, "")
+
     def secret_present(self, account, env_name):
         if self.locked:
             return None, "sudo needs a password (synthetic)"
@@ -2270,9 +2650,14 @@ READY_DELIVERY = {
 
 
 class FakeGitHub(object):
-    def __init__(self, doc=READY_DELIVERY, why=None, private=False, visibility_why=None):
+    def __init__(self, doc=READY_DELIVERY, why=None, private=False, visibility_why=None,
+                 mcp_servers=()):
         self.doc, self.why = doc, why
         self.private, self.visibility_why = private, visibility_why
+        self.mcp = list(mcp_servers)      # [(server, None)] / [(None, why)]
+
+    def repo_mcp_servers(self, repo):
+        return list(self.mcp)
 
     def is_private(self, repo):
         if self.visibility_why:
@@ -2284,8 +2669,33 @@ class FakeGitHub(object):
             return None, ("main" if self.why == "absent" else None), self.why
         return json.loads(json.dumps(self.doc)), "main", None
 
+# What `dispatcher_facts` hands the composer, for the cases that are about the fence
+# rather than about reading a dispatcher config.
+GOOD_FACTS = {"repositoryPath": "/clones/product", "baseBranch": "main",
+              "workspaceBaseDir": "/work", "linearWorkspaceId": "ws-1",
+              "fence": list(PLANNING_DISALLOWED_TOOLS), "prompt_types": []}
+
+DISPATCHER_ENTRY = {
+    "id": "product", "name": "product", "repositoryPath": "/clones/product",
+    "baseBranch": "main", "githubUrl": "https://github.com/example-org/product",
+    "teamKeys": ["PROD"], "workspaceBaseDir": "/work", "linearWorkspaceId": "ws-1",
+}
+
+
+def _dispatcher_config(tmp, entries=None, extra=None):
+    """A dispatcher config on disk, for the real reader program to read."""
+    doc = {"repositories": entries if entries is not None else [dict(DISPATCHER_ENTRY)]}
+    doc.update(extra or {})
+    path = os.path.join(tmp, "dispatcher-%d.json" % abs(hash(json.dumps(doc, sort_keys=True))))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    return path
+
+
 GOOD_CONF = {
     "ROLE_ACCOUNT": "_planclaw",
+    "DISPATCHER_ACCOUNT": "_exdispatch",
+    "DISPATCHER_CONFIG": "/opt/example-dispatch/config.json",
     "AGENT_USER_NAME": "Dispatcher Agent",
     "JOB_LABEL": "com.example.stage-a-planner",  # _LABEL_EXAMPLE
     "PLANNING_TEAM_KEY": "PLAN",
@@ -2298,9 +2708,19 @@ GOOD_CONF = {
 
 
 def _ctx(state_root, conf=None, tracker=None, host=None, secret="k" * 40, github=None):
-    ctx = Ctx(dict(GOOD_CONF if conf is None else conf), Runner(apply_it=False),
+    host = FakeHost() if host is None else host
+    host.origins.setdefault(DISPATCHER_ENTRY["repositoryPath"],
+                            "ssh://git@example.com/example-org/product.git")
+    conf = dict(GOOD_CONF if conf is None else conf)
+    if conf.get("DISPATCHER_CONFIG") == GOOD_CONF["DISPATCHER_CONFIG"]:
+        # The synthetic path in GOOD_CONF is not a file, and the reader program is real:
+        # every case that reaches the entry step needs a config it can actually read.
+        root = os.path.dirname(os.path.abspath(state_root))
+        os.makedirs(root, exist_ok=True)
+        conf["DISPATCHER_CONFIG"] = _dispatcher_config(root)
+    ctx = Ctx(conf, Runner(apply_it=False),
               FakeLinear() if tracker is None else tracker,
-              FakeHost() if host is None else host, State(state_root),
+              host, State(state_root),
               github=FakeGitHub() if github is None else github)
     ctx.prompt_secret = lambda name, what="": secret
     return ctx
@@ -2324,7 +2744,7 @@ def selftest():
     #    that breaks it is caught. The servers are pinned as LITERALS, not read
     #    back out of the constant that builds the fence — a check that loops over
     #    PLANNER_FENCE_SERVERS stays green when someone empties it.
-    good = planning_entry(GOOD_CONF)
+    good = planning_entry(GOOD_CONF, GOOD_FACTS)
     check("fence-good-clean", entry_problems(good), [])
     check("fence-servers-pinned", PLANNER_FENCE_SERVERS,
           ("linear", "cyrus-tools", "cyrus-docs", "slack"))
@@ -2782,8 +3202,21 @@ def selftest():
         check("conf-flags-bad-planned-repo",
               any("PLANNED_REPO" in e for e in validate_conf(dict(GOOD_CONF, PLANNED_REPO="nope"))),
               True)
-        check("probe-card-checks-subagent",
-              "subagent" in " ".join(CARDS["CA-PROBE"]["do"]), True)
+        check("probe-card-checks-a-helper",
+              "helper session" in " ".join(CARDS["CA-PROBE"]["do"]), True)
+        # The helper-fence evidence is PINNED: a later edit that drops the citation
+        # drops the only reason Task and Agent are still in the keep set (KIT-140).
+        # Search the module docstring ONLY. `src` is this file, so every phrase below
+        # would match the tuple it is written in, and the check could never fail.
+        # Whitespace is flattened because the docstring wraps these phrases over lines.
+        evidence = " ".join((__doc__ or "").split())
+        for phrase in ("2.1.245", "deny rules", "never the deny rules",
+                       "front-matter `mcpServers`"):
+            check("helper-evidence:%s" % phrase, phrase in evidence, True)
+        # ...and that scoping is itself asserted: this line is in `src`, never in `evidence`.
+        check("helper-evidence-is-scoped", "for phrase in (" in evidence, False)
+        check("helper-tools-still-kept",
+              [t for t in ("Task", "Agent") if t in PLANNER_KEEP_TOOLS], ["Task", "Agent"])
         check("placeholder-unsignable", INITIALS_PLACEHOLDER.lower() in INITIALS_PLACEHOLDERS, True)
 
         # 17. THE PLANNER JOB (KIT-150). The installer places the code, writes the
@@ -2927,6 +3360,174 @@ def selftest():
         cmd_run(cctx2, dry_run=False)
         check("clone-level-left-alone", (cctx2.state.outcome("kit-clone"), cctx2.host.placed),
               (ALREADY_DONE, []))
+
+        # 21. THE ENTRY IS LOADABLE (KIT-155). Composed from the dispatcher's own
+        #     config, read by the review installer's real reader program.
+        def entry_ctx(name, entries=None, extra=None, conf=None, github=None, origins=None):
+            path = _dispatcher_config(tmp, entries, extra)
+            host = FakeHost()
+            host.origins.update(origins or {DISPATCHER_ENTRY["repositoryPath"]:
+                                            "https://github.com/example-org/product.git"})
+            c = _ctx(os.path.join(tmp, name), host=host, github=github,
+                     conf=dict(conf or GOOD_CONF, DISPATCHER_CONFIG=path),
+                     tracker=FakeLinear(teams={"PLAN": "t"}, labels=ALL_LABELS,
+                                        states=PLAN_STATES))
+            c.host.origins.clear()
+            c.host.origins.update(
+                {DISPATCHER_ENTRY["repositoryPath"]:
+                 "https://github.com/example-org/product.git"} if origins is None else origins)
+            c._out = []
+            return c
+
+        ectx = entry_ctx("entry")
+        facts = dispatcher_facts(ectx)
+        entry = planning_entry(ectx.conf, facts)
+        check("entry-no-problems", entry_problems(entry), [])
+        check("entry-clone-and-branch-from-one-entry",
+              (entry["repositoryPath"], entry["baseBranch"]), ("/clones/product", "main"))
+        check("entry-workspace-copied",
+              (entry["workspaceBaseDir"], entry["linearWorkspaceId"]), ("/work", "ws-1"))
+        check("entry-owner-is-the-only-allowed-user",
+              entry["userAccessControl"]["allowedUsers"], [GOOD_CONF["OWNER_USER_ID"]])
+        check("entry-id-equals-name", entry["id"] == entry["name"], True)
+        # The review installer's lookup of "which entry manages this repository" skips
+        # entries named with this prefix. Both spellings are asserted here, so neither
+        # can be renamed without the other (KIT-155).
+        from pipeline_stage_e_setup import PLANNING_ENTRY_PREFIX, _is_planning_entry
+        check("entry-name-is-skipped-by-the-review-installer",
+              (entry["name"].startswith(PLANNING_ENTRY_PREFIX), _is_planning_entry(entry)),
+              (True, True))
+        check("entry-name-is-the-jobs-tag", entry["name"],
+              json.loads(poller_config(ectx))["planning_entry_name"])
+        # Each loadable key dropped is a problem NAMED, so a later edit cannot quietly
+        # ship an entry that will not load.
+        for key in sorted(LOADABLE_KEYS):
+            mutant = dict(entry)
+            del mutant[key]
+            check("entry-mutant-drops:%s" % key,
+                  any(key in p for p in entry_problems(mutant)), True)
+        mutant = dict(entry, userAccessControl={"allowedUsers": []})
+        check("entry-mutant-opens-to-everyone", bool(entry_problems(mutant)), True)
+        mutant = dict(entry, id=entry["name"] + "-2")
+        check("entry-mutant-id-differs-from-name", bool(entry_problems(mutant)), True)
+
+        # Route 2 (KIT-154): every prompt type is defined IN the entry, with the same
+        # fence and a label no ticket carries, so whichever type a label selects, the
+        # list that wins is this one.
+        for kind in PLANNING_PROMPT_TYPES:
+            got = entry["labelPrompts"][kind]
+            check("prompt-type-carries-the-fence:%s" % kind,
+                  (got["disallowedTools"] == entry["disallowedTools"],
+                   got["labels"] == [PLANNING_ENTRY_NEVER_LABEL]), (True, True))
+        check("prompt-types-are-every-selectable-one", sorted(PLANNING_PROMPT_TYPES),
+              ["builder", "debugger", "orchestrator", "scoper"])
+        for kind in PLANNING_PROMPT_TYPES:
+            mutant = json.loads(json.dumps(entry))
+            del mutant["labelPrompts"][kind]
+            check("entry-mutant-drops-prompt-type:%s" % kind,
+                  bool(entry_problems(mutant)), True)
+        mutant = json.loads(json.dumps(entry))
+        mutant["labelPrompts"]["orchestrator"]["disallowedTools"] = ["Bash"]
+        check("entry-mutant-weakens-a-prompt-type", bool(entry_problems(mutant)), True)
+        mutant = json.loads(json.dumps(entry))
+        mutant["labelPrompts"]["builder"]["labels"] = ["builder"]
+        check("entry-mutant-makes-a-prompt-type-selectable", bool(entry_problems(mutant)), True)
+        mutant = json.loads(json.dumps(entry))
+        del mutant["labelPrompts"]
+        check("entry-mutant-drops-label-prompts", bool(entry_problems(mutant)), True)
+        # …and the refusals: no clone of the planned repository, two workspace bases,
+        # another entry claiming the team key, and a tag that would match twice.
+        def refusal(name, **kw):
+            try:
+                dispatcher_facts(entry_ctx(name, **kw))
+                return "no-refusal"
+            except SetupError as exc:
+                return str(exc).splitlines()[0]
+
+        check("entry-refuses-without-a-clone",
+              "manages no clone" in refusal(
+                  "no-clone", entries=[dict(DISPATCHER_ENTRY, githubUrl=None)],
+                  origins={}), True)
+        # An entry that NAMES a repository it does not have is refused, rather than
+        # silently believing the field over the clone.
+        check("entry-refuses-a-githubUrl-that-contradicts-the-clone",
+              "will not guess which" in refusal(
+                  "lying-url",
+                  entries=[dict(DISPATCHER_ENTRY,
+                                githubUrl="https://github.com/example-org/other")]),
+              True)
+        # ...and the agreeing case is still accepted, so the check is not just a wall.
+        check("entry-accepts-an-agreeing-githubUrl",
+              planning_entry(GOOD_CONF, dispatcher_facts(entry_ctx("agreeing")))
+              ["repositoryPath"], DISPATCHER_ENTRY["repositoryPath"])
+        check("entry-refuses-two-workspace-bases",
+              "workspaceBaseDir" in refusal("two-bases", entries=[
+                  dict(DISPATCHER_ENTRY),
+                  dict(DISPATCHER_ENTRY, id="other", name="other", workspaceBaseDir="/elsewhere",
+                       githubUrl="https://github.com/example-org/other")]), True)
+        check("entry-refuses-a-second-claim-on-the-team-key",
+              "already claims the team key" in refusal("claimed", entries=[
+                  dict(DISPATCHER_ENTRY),
+                  dict(DISPATCHER_ENTRY, id="coder", name="coder", teamKeys=["PLAN"],
+                       githubUrl="https://github.com/example-org/other")]), True)
+        # A prompt type this installer cannot cover is a refusal, not a note: a label
+        # selecting it would replace the planner's fence with that type's list.
+        check("unknown-prompt-type-refused",
+              "does not know how to cover" in refusal(
+                  "unknown-type",
+                  extra={"promptDefaults": {"reviewer": {"disallowedTools": ["Bash"]}}}), True)
+        check("known-prompt-type-is-only-a-note",
+              "no-refusal" == refusal("known-type", extra={
+                  "promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}}), True)
+        check("entry-refuses-an-ambiguous-tag",
+              "ALSO match" in refusal("ambiguous", entries=[
+                  dict(DISPATCHER_ENTRY),
+                  dict(DISPATCHER_ENTRY, id="x", name=planning_entry_name(GOOD_CONF),
+                       githubUrl="https://github.com/example-org/other")]), True)
+
+        # 22. THE FENCE COVERS WHAT THIS MACHINE INJECTS. Extra servers from the
+        #     dispatcher's linearMcpConfigs and from the planned repository's own
+        #     .mcp.json are fenced in BOTH rule forms; one that cannot be named is a
+        #     refusal, never a smaller fence.
+        extra_cfg = os.path.join(tmp, "extra-mcp.json")
+        with open(extra_cfg, "w", encoding="utf-8") as fh:
+            json.dump({"mcpServers": {"house-tools": {"url": "http://x"}}}, fh)
+        mctx = entry_ctx("mcp", extra={"linearMcpConfigs": [extra_cfg]},
+                         github=FakeGitHub(mcp_servers=[("repo-tools", None)]))
+        fence = dispatcher_facts(mctx)["fence"]
+        for rule in ("mcp__house-tools", "mcp__house-tools__*", "mcp__repo-tools",
+                     "mcp__repo-tools__*"):
+            check("fence-covers:%s" % rule, rule in fence, True)
+        check("fence-still-covers-the-four", "mcp__linear__*" in fence, True)
+        check("fence-refuses-an-unreadable-file",
+              "could not be fenced" in refusal("mcp-bad2",
+                                               extra={"linearMcpConfigs": ["/nope/missing.json"]}),
+              True)
+        check("fence-refuses-an-agent-that-names-servers",
+              "could not be fenced" in refusal(
+                  "mcp-agent", github=FakeGitHub(
+                      mcp_servers=[(None, ".claude/agents/x.md in example-org/product names "
+                                          "MCP servers of its own")])), True)
+
+        # 23. A PROMPT TYPE'S LIST IS NAMED, because a label added to a planning ticket
+        #     by hand would select it and replace this fence.
+        pctx2 = entry_ctx("prompt-types",
+                          extra={"promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}})
+        pctx2.state.attest("CA-ENTRY", "BC", "applied")
+        pctx2.job_ready = True
+        ok, _detail, notes = step_dispatcher_entry(pctx2, False)
+        check("prompt-type-named", any("orchestrator" in n for n in notes), True)
+        # The label is the only thing marking these lines as notes where they print,
+        # directly above the entry JSON.
+        pctx3 = entry_ctx("prompt-types-printed",
+                          extra={"promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}})
+        pctx3.job_ready = True
+        try:
+            step_dispatcher_entry(pctx3, False)   # prints, then blocks on the sign-off
+        except Blocked:
+            pass
+        check("prompt-type-note-is-labelled",
+              any(line.startswith("  note: ") for line in pctx3._out), True)
 
         # 15. NOTHING SECRET IS AN ARGUMENT. The live host passes payloads on
         #     stdin; its command text never interpolates a body.
