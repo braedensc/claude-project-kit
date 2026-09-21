@@ -99,9 +99,9 @@ that text before executing it, and the two never see the same thing.* 10 of 11 t
 open-source coding agents fell. Claude Code was not in the tested set — which is not a
 passing grade, so the kit measured itself.
 
-The battery is `.claude/hooks/test_guard_bypass.py` (`npm run test:bypass`): 76 probes
+The battery is `.claude/hooks/test_guard_bypass.py` (`npm run test:bypass`): 95 probes
 across the seven Bash pattern guards (the seventh, `stacked-branch`, added and measured
-2026-09-20), using the published primitive classes (quote
+2026-09-20 in a realistic repo), using the published primitive classes (quote
 collapsing, `$IFS` field splitting, command substitution, variable expansion, `printf`
 octal + `eval`, glob expansion, line continuation). Every probe recorded as getting
 through is then **executed in a sandbox whose PATH contains only inert shims**, so the
@@ -119,10 +119,13 @@ updated in the same PR.
 | never-merge (`gh pr merge`) | 7 | 1 | 5 | **advisory** |
 | self-approval (`gh pr review --approve`) | 12 | 7 | 4 | **advisory** |
 | protected-label (`hooks-change`, `agent:*`, …) | 11 | 3 | 7 | **advisory** |
+| stacked-branch (`checkout -b` off a feature branch, feature→feature `merge`, `--base <feature>`, …) | 28 | 19 | 8 | **advisory** |
 
-**All six are advisory against a motivated caller. None is robust.** Roughly a quarter
-of the probes bounced; the rest went through, and 40 of them were shell-verified to
-build the exact argv the guard was looking for.
+**All seven are advisory against a motivated caller. None is robust.** The first six
+held about a quarter of their probes; the stacked-branch guard holds two thirds of its
+own, for a structural reason given below — and one bypass is still one bypass. Of the
+probes that got through, 48 were shell-verified to build the exact argv the guard was
+looking for.
 
 **Threat model, stated plainly.** These guards still work against the case they were
 written for: a cooperating agent that mistypes, or reaches for a dangerous command
@@ -138,16 +141,26 @@ Three findings worth carrying into any future hardening:
   unresolved `$H` is simply not on the list. Its *exfil-shape denylist* does not hold: a
   secret in a request header or a URL path is not one of the enumerated shapes. Same
   file, same author, opposite outcomes, and the difference is the direction of the list.
-- **Failing closed beats matching harder.** The self-approval guard is the best-behaved
-  of the six, and not because its regexes are better: because a `gh pr review` with no
+- **Failing closed beats matching harder.** The self-approval guard held best of the
+  first six, and not because its regexes are better: because a `gh pr review` with no
   readable event is *refused*, mangling the flag (`--appro""ve`) or splitting the line
   buys nothing. The spellings that get past it are the ones that never reach the
   fail-closed branch — mangling the command word, or moving to `curl`.
+- **Parsing like the shell beats matching text.** The stacked-branch guard reads the RAW
+  command through its own quote-aware lexer (comments, redirections, heredocs and line
+  continuations dropped; `$(…)`, subshells, `sh -c` and literal `eval` followed) and
+  tests each ref against an allow-list plus a content check, so a ref it cannot see
+  fails closed. Quote-collapse, continuation and command substitution all bounce. What
+  still pays is defeating the lexer itself (`${IFS}`, a variable command word, `eval
+  "$var"`) or leaving `git`/`gh` behind (curl to the REST API, hub, xargs, an alias, an
+  interpreter).
 - **One root cause crosses every guard.** `_strip_prose` blanks the quoted value of
   `-m`/`--message`/`--title`/`--body`/`-t`/`-b` before any Bash guard sees it, so
   guards do not false-positive on commit prose. But bash still *evaluates command
   substitution inside that value*: `gh pr create --title "$(rm -rf build)"` is invisible
-  to every matcher and runs anyway. One probe per guard confirms it.
+  to every matcher and runs anyway. One probe per guard confirms it — except the
+  stacked-branch guard, which reads the raw command and so catches its own version
+  (probe `stack-12`).
 
 So which layer actually carries which guarantee:
 
@@ -160,12 +173,13 @@ So which layer actually carries which guarantee:
 | Claude never merges | `gh pr merge` matcher | **branch protection + the platform merge gate**, in repository settings, outside the repo tree |
 | An approval means a human read it | `gh pr review` matcher | a **branch-protection rule that does not count a review from the PR's own author** — ⚠️ **a team's layer, deliberately off on a single-maintainer repository; see below** |
 | A guard change is acknowledged by a person | protected-label matcher | **`scripts/check_grader_paths.py`**, which checks *who* applied the label, server-side |
+| A PR targets the base branch, not another feature branch | stacked-branch matcher | the **Stop hook** (`baseRefName` from GitHub's record, where `gh` works) and the **`PR base` workflow** (the `pull_request` event) — ⚠️ **red, not unmergeable**: branch protection covers the default branch only. Neither sees a branch *cut* from a feature branch whose PR targets `main`; only the matcher does |
 
 Every row's right-hand column is unreachable from a session. That is the design the
 measurement argues for, and it is why the second column was never the whole story — the
 never-merge, self-approval and protected-label guards were each already documented in
 `pre-tool-use.py` as "a first line over command shapes, not an exhaustive denylist".
-What the measurement adds is the same honesty for the other three, and numbers behind
+What the measurement adds is the same honesty for the other four, and numbers behind
 all seven.
 
 **One row's durable layer needs a second maintainer to mean anything, and a solo

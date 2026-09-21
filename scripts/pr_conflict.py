@@ -90,9 +90,16 @@ THE BASE BRANCH IS GITHUB'S, NEVER ASSUMED
 
   Every recipe, headline and fix prompt names the PR's own `baseRefName` — the branch
   GitHub computed `mergeable` against — and falls back to the repository's default
-  branch, read once per run and cached on `Gh`. A stacked PR, or a repository whose
-  default is `trunk`, gets a command that runs. The bounce driver picks its base the
-  same way, so the two lanes hand a session the same command.
+  branch, read once per run and cached on `Gh`. A repository whose default is `trunk`
+  gets a command that runs. The bounce driver picks its base the same way, so the two
+  lanes hand a session the same command.
+
+  A STACKED PR — based on a branch that is neither the default branch nor main/master
+  — is not sent a fix request at all. Its recipe would be `git merge origin/<feature>`,
+  which the PreToolUse stacked-branch guard refuses (feature-to-feature merges are not
+  allowed; docs/COLLABORATION.md § Never stack a PR). It is PAGED instead, with
+  reason=stacked and a retarget recipe, so no session is started on a step it cannot
+  run.
 
 WHO A PAGE REACHES
 
@@ -109,7 +116,7 @@ MARKERS (the whole producer/consumer contract)
   The FIRST LINE of a comment, exactly:
 
     <!-- pr-conflict:request episode=N -->                      github-actions[bot]
-    <!-- pr-conflict:page episode=N reason=budget|fork -->      github-actions[bot]
+    <!-- pr-conflict:page episode=N reason=budget|fork|stacked -->  github-actions[bot]
     <!-- pr-conflict:escalated episode=N -->                    github-actions[bot]
     <!-- pr-conflict:ack episode=N -->                          OWNER/MEMBER/COLLABORATOR
     <!-- pr-conflict:result episode=N outcome=O -->             OWNER/MEMBER/COLLABORATOR
@@ -429,6 +436,15 @@ def base_of(pr, gh):
     return pr.get("baseRefName") or gh.default_branch
 
 
+def is_stacked(pr, gh):
+    """True when the PR is based on a branch that is not a base branch — not the
+    default branch, and not main/master (the base set every layer shares). Asks for
+    the default branch only when the base is something else, so a main-based PR
+    costs nothing."""
+    base = pr.get("baseRefName")
+    return bool(base) and base not in ("main", "master") and base != gh.default_branch
+
+
 def page_recipients(pr, gh, page_to=()):
     """(logins, whose) — who a page @mentions, and the words that say why them. An empty
     list means nobody a mention would notify: the caller says so and fails the run."""
@@ -491,7 +507,20 @@ def request_body(pr, episode, attempt, base, budget=None):
     ])
 
 
-def page_body(pr, episode, reason, base, page, budget=None):
+def _retarget_recipe(pr, base, default):
+    return "\n".join([
+        "```", f"gh pr edit {pr['number']} --base {default}",
+        "# then read the diff. If this branch was also CUT from that feature branch,",
+        f"# its commits are still in this PR — move your own commits onto {default}:",
+        f"git rebase --onto origin/{default} origin/{base}",
+        "git push --force-with-lease", f"gh pr checks {pr['number']} --watch", "```",
+        "",
+        f"(Retarget, not merge: merging `{base}` in is the feature-to-feature merge the kit "
+        "forbids, and the stacked-branch guard refuses it.)",
+    ])
+
+
+def page_body(pr, episode, reason, base, page, budget=None, default=None):
     budget = MAX_FIX_REQUESTS if budget is None else budget
     why = {
         "budget": (f"this PR has already had {budget} automated fix attempts — a PR that "
@@ -501,10 +530,14 @@ def page_body(pr, episode, reason, base, page, budget=None):
         ("nothing in this repository answers an automated fix request — it is configured "
          "to page a person at the first conflict instead"),
         "fork": "it comes from a fork, and the waker only acts on branches in this repository",
+        "stacked": (f"its base `{base}` is not the default branch — it is STACKED on another "
+                    "branch, and a stacked PR is retargeted, not merged into "
+                    "(docs/COLLABORATION.md § Never stack a PR)"),
     }[reason]
+    recipe = _retarget_recipe(pr, base, default) if reason == "stacked" else _recipe(pr, base)
     return "\n".join([
         marker("page", episode, reason=reason), _headline(pr, base), "",
-        f"**No automated fix requested:** {why}.", "", _recipe(pr, base), "",
+        f"**No automated fix requested:** {why}.", "", recipe, "",
         _page_line(page),
     ])
 
@@ -582,10 +615,12 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
         if not labeled:
             episode = state["opened"] + 1
             add_label(n)  # the dedupe key first: a mid-step failure re-alerts, never double-posts
-            if pr["isCrossRepository"] or state["requests"] >= budget:
-                reason = "fork" if pr["isCrossRepository"] else "budget"
+            stacked = not pr["isCrossRepository"] and is_stacked(pr, gh)
+            if pr["isCrossRepository"] or stacked or state["requests"] >= budget:
+                reason = "fork" if pr["isCrossRepository"] else ("stacked" if stacked else "budget")
                 recipients = page_recipients(pr, gh, page_to)
-                comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget))
+                comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget,
+                                     default=gh.default_branch if stacked else None))
                 page(n, recipients)
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
@@ -1155,14 +1190,30 @@ def selftest():
     #     names its own base; a PR carrying none falls back to the repository's default.
     def first_comment(gh):
         return [w[2] for w in gh.writes if w[0] == "comment"][0]
-    for pr, want in ((_pr(28, base="trunk"), "trunk"), (_pr(28, base="feat/parent"), "feat/parent"),
-                     (_pr(28, base=None), "trunk")):
+    for pr, want in ((_pr(28, base="trunk"), "trunk"), (_pr(28, base=None), "trunk")):
         gh = FakeGh([pr], default_branch="trunk")
         run_monitor(gh)
         body = first_comment(gh)
         expect(f"git fetch origin {want} && git merge origin/{want}" in body and f"with `{want}`" in body
                and f"merges `{want}`" in body and "origin/main" not in body and "`main`" not in body,
                f"base {pr['baseRefName']!r} must be named as {want!r}: {body[:400]}")
+
+    # 28b. a STACKED PR is paged with a retarget recipe — never sent a fix request whose
+    #      `git merge origin/<feature>` the stacked-branch guard refuses, and never a
+    #      session started on it. main is a base even when the default is trunk.
+    gh = FakeGh([_pr(28, base="feat/parent")], default_branch="trunk")
+    run_monitor(gh)
+    body = first_comment(gh)
+    expect(body.startswith(marker("page", 1, reason="stacked"))
+           and "gh pr edit 28 --base trunk" in body
+           and "git rebase --onto origin/trunk origin/feat/parent" in body
+           and "git merge origin/feat/parent" not in body
+           and not body.startswith(marker("request", 1)),
+           f"a stacked PR must be paged with a retarget recipe: {body[:400]}")
+    gh = FakeGh([_pr(28, base="main")], default_branch="trunk")
+    run_monitor(gh)
+    expect(first_comment(gh).startswith(marker("request", 1)),
+           "a PR into main is not stacked, even on a trunk-default repository")
 
     # 29. WHO A PAGE REACHES. An organization's @mention notifies nobody, so: the PR's author;
     #     else a person who owns the repo; else say NOBODY was paged and fail the run. A

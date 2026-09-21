@@ -110,8 +110,10 @@ human-only steps at the end.
 >    must stay in CI. Move the other `templates/workflows/*.yml` (deploy-on-green,
 >    pipeline-failure-alert, backup-cron, keepalive, …) the same way; adapt their
 >    fenced stack sections; DELETE any that don't apply (no DB → no backup-cron;
->    nothing pauses → no keepalive). **Decide the parallel-session pair with me, not
->    by the glob:** `pr-conflict-monitor.yml` (a PR that goes `CONFLICTING` gets a fix
+>    nothing pauses → no keepalive). Leave `.github/workflows/pr-base.yml` exactly where
+>    it is: it fails any PR not based on my default branch (no stacked PRs) and reads
+>    that branch from the event, so it needs no adaptation. **Decide the
+>    parallel-session pair with me, not by the glob:** `pr-conflict-monitor.yml` (a PR that goes `CONFLICTING` gets a fix
 >    request, then a page) and `pr-union-check.yml` (green alone, red together) — keep
 >    both unless I will only ever run one session at a time. Adapt the union check's
 >    fenced battery step to my stack; if my default branch is not `main`, change both

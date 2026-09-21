@@ -117,22 +117,24 @@ branch. GitHub had not retargeted the stacked PR, so it merged into that dead br
 Nothing went red: the PR showed MERGED and its CI had been green. The fix never reached
 `main` and had to be re-landed.
 
-**The one merge that stays required.** Merging `main` *into* your branch is the opposite
-move and is the documented way to resolve a conflict — never rebase:
+**The move that stays allowed.** Bringing `main` *into* your branch is the opposite of
+stacking, and it is what the conflict loop (`scripts/pr_conflict.py`, run by
+`.github/workflows/pr-conflict-monitor.yml`) and the Stage E bounce driver ask a session
+to run when `main` moves under a PR:
 
 ```bash
-git fetch origin && git merge origin/main
+git fetch origin main && git merge origin/main
 ```
 
-Nothing here blocks that; the conflict loop in `.github/workflows/pr-conflict-monitor.yml`
-depends on it.
+Rebasing onto `origin/main` is allowed too, and so is syncing your branch from its own
+remote copy (`git pull`, `git merge @{u}`). None of these is blocked.
 
 **If you need work that only exists on another branch:** wait for that branch to merge,
 then cut from the updated `main`. If you genuinely cannot wait, say so and stop — that
 is a call for the repo owner, not a workaround.
 
-**Recovering a PR that is already stacked.** Retarget first, then check what the diff
-actually contains:
+**Recovering a PR that is already stacked.** Retarget first — the `PR base` check
+re-runs by itself — then check what the diff actually contains:
 
 ```bash
 gh pr edit <n> --base main
@@ -140,11 +142,17 @@ gh pr view <n> --json baseRefName,mergedAt
 ```
 
 Retargeting fixes the *target*; it does not fix the *content*. If the branch was also
-**cut from** the other feature branch, its commits are still in this PR — re-cut from
-`origin/main`, cherry-pick or re-apply your own work, and open a fresh PR. Re-land from
-a **new** branch (the merged-PR guard blocks committing on the old one, which is the
-guard doing its job), and confirm the change landed by looking at `origin/main`, not at
-the badge:
+**cut from** the other feature branch, its commits are still in this PR. Move your own
+commits off it and onto `main` — this is allowed, because the new base is `main`:
+
+```bash
+git fetch origin && git rebase --onto origin/main <the-other-branch>
+git push --force-with-lease
+```
+
+If that PR already merged, re-land from a **new** branch instead (the merged-PR guard
+blocks committing on the old one, which is the guard doing its job), and confirm the
+change landed by looking at `origin/main`, not at the badge:
 
 ```bash
 git fetch origin && git log origin/main --oneline -5
@@ -154,9 +162,10 @@ git fetch origin && git log origin/main --oneline -5
 
 | Layer | Catches | Reach |
 |---|---|---|
-| PreToolUse hook | `checkout -b`/`switch -c`/`branch`/`worktree add -b` off a non-base start point, `merge`/`pull` of a feature ref, `gh pr create\|edit --base <feature>` | **Advisory** — matches command text, so a respelling gets past it (docs/SECURITY.md) |
-| Stop hook | ending a turn while an open PR's `baseRefName` is not the base branch — including a PR with green CI | Reads GitHub's own record, so it does not care how the PR was created |
-| CI, `scripts/check_pr_base.py` | a PR whose `pull_request` event base is not the repo's default branch | Unforgeable, but it makes such a PR **red, not unmergeable** — branch protection covers the default branch only |
+| PreToolUse hook | cutting a branch whose start carries unmerged work (checked by content), bringing another feature branch in (`merge`/`pull`/`rebase`/`push HEAD:<other>`), and basing a PR on a non-base branch (`gh pr create\|edit --base`, `gh api`, `gh_fallback.py`, `gh-merge-base`) | **Advisory** — reads command text; 19 of 28 adversarial spellings held (docs/SECURITY.md). The **only** layer that sees a branch *cut* from a feature branch whose PR targets `main` |
+| Stop hook | ending a turn while an open PR's `baseRefName` is not a base branch — including a PR with green CI; a PR *merged* into a feature branch gets a notice | Reads GitHub's own record, so it does not care how the PR was created. Needs `gh` — silent where `gh` cannot reach GitHub (the dispatcher sandbox) |
+| `PR base` workflow (`scripts/check_pr_base.py`) | a PR whose `pull_request` base is not the default branch or `main`/`master`; re-runs on `edited`, so a retarget clears it | Unforgeable, but it makes such a PR **red, not unmergeable** — branch protection covers the default branch only |
+| The conflict loop | a CONFLICTING stacked PR is paged with a retarget recipe, never sent a fix request | So no session is started on a merge the guard would refuse |
 
 ---
 
@@ -391,7 +400,7 @@ Stop hook between them:
    > is unbypassable; the **Bash** guards below are regular expressions over raw command
    > text that bash rewrites before it runs — quote collapsing, `$IFS`, command
    > substitution. Measured 2026-08-26 against the GuardFall research, re-run with the
-   > stacked-branch guard on 2026-09-20: **76 probes, all seven Bash pattern guards
+   > stacked-branch guard on 2026-09-20: **95 probes, all seven Bash pattern guards
    > classified advisory, none robust** (`npm run test:bypass`,
    > full results and the layer-by-layer breakdown in docs/SECURITY.md §
    > *What the pattern guards actually carry*). A cooperating agent that mistypes is
@@ -415,20 +424,28 @@ Stop hook between them:
    - Blocks the same on a branch **not matching** `<type>/<short-kebab-desc>`, so an
      auto-generated `claude/<codename>` worktree branch is renamed before any work
      (one landed unrenamed in a real PR).
-   - **Stacked branches** — blocks cutting a branch from a non-base start point
-     (`git checkout -b`/`switch -c`/`git branch`/`git worktree add -b`, *including*
-     the implicit case where no start point is named and HEAD is already on a feature
-     branch — which is how the 2026-09-20 six-deep stack actually grew), merging or
-     pulling a feature ref, and `gh pr create|edit --base <feature>`. **Merging the
-     base INTO a feature branch stays allowed** — `git merge origin/main` is the
-     conflict-resolution move and what `pr-conflict-monitor.yml` asks a session to
-     run, so blocking it would break the conflict loop; the base set is an allow-list
-     every arm consults, and anything unparseable fails **open** for that reason. The
-     base branch is `main`/`master` plus `github.defaultBranch` from the **committed**
-     `delivery.json` when a project configured the pipeline — read from the default
-     branch, never the worktree, and **widening only**, so an unreadable config makes
-     the guard stricter rather than looser. Advisory, like every Bash guard here; the
-     Stop hook and the CI check below are the layers that do not read command text.
+   - **Stacked branches** — blocks cutting a branch whose start point carries commits no
+     base branch has (`checkout -b`, `switch -c`, `git branch`, `worktree add`, including
+     the *implicit* start — branching again where you stand, which is how the 2026-09-20
+     six-deep stack actually grew), bringing another feature branch's work in (`merge`,
+     `pull`, `rebase` onto it, `push HEAD:<other>`), and basing a PR on a non-base branch
+     (`gh pr create|edit --base`, `gh api` to `/pulls`, `gh_fallback.py pr-create`, the
+     `gh-merge-base` config). "Cut from the base" is judged **by content** (`git rev-list
+     <start> --not <base tips>` is empty), so a fresh `claude/<codename>` worktree branch,
+     a tag on main or a detached HEAD on main pass, and a branch with one commit of its
+     own does not, whatever it is called. **Bringing the base in stays allowed** — `git
+     fetch origin main && git merge origin/main` is what `pr-conflict-monitor.yml` and
+     the bounce driver ask for — as do rebasing onto the base, `rebase --onto origin/main
+     <old-base>`, and syncing a branch from its own remote copy. The command is read by a
+     quote-aware lexer (comments, redirections, heredocs and continuations dropped;
+     `$(…)`, subshells, `sh -c` and literal `eval` followed). **Fail direction:** a ref the
+     hook cannot see (`$VAR`, `$(…)` output, `FETCH_HEAD`, `-`, `@{-N}`) fails *closed*
+     with a message naming the literal ref to use; a checkout with no base branch to
+     measure against, and any git failure while measuring, fail *open*. The base branch is
+     `main`/`master` plus `github.defaultBranch` from a **committed** `delivery.json` and
+     the remote's recorded default (`origin/HEAD`, which the config anchor now protects)
+     — widening only, never read from the worktree copy. Advisory like every Bash guard;
+     the Stop hook and the `PR base` workflow are the layers that do not read command text.
    - Blocks `Edit`/`Write` whose path is in a **different worktree** than the acting
      session's (resolved via `git worktree list`) — a write into another checkout
      (classically the main checkout on `main`, reached via a stray `cd`) otherwise
@@ -468,7 +485,7 @@ Stop hook between them:
      and `--request-changes` stay allowed (neither manufactures a human signal), as
      do reading reviews and `--add-reviewer` — *asking* for a review is not giving
      one. The bare form and an `--input`-hidden event fail **closed** — and that
-     fail-closed default is why this guard held best of the six under measurement:
+     fail-closed default is why this guard held well under measurement:
      mangling the *flag* leaves nothing recognizable, which reads as the interactive
      form and is refused. What still gets through is mangling the *command word*,
      respelling the API event value, or a `curl` whose event lives in a file. The
@@ -530,11 +547,15 @@ Stop hook between them:
    conflicted PR look green). The base check reads `baseRefName` out of GitHub's own
    record rather than any command text, so it fires however the PR was created — a
    respelled command, the web UI, an automation — and it deliberately fires on a
-   **green** PR, because a stacked PR looks fine until its base merges. It is asked
-   before the CI verdict: once a stacked PR goes conflicting, "no checks" is a
-   symptom the CI verdict cannot name. Its message points at `gh pr edit <n> --base
-   <base>` and, unlike the CI-failure messages, deliberately does **not** point at
-   `/fix-ci` — a wrong base is not something reading a job log will fix.
+   **green** PR, because a stacked PR looks fine until its base merges. Before blocking
+   it asks GitHub for the default branch (`gh repo view`), so a `trunk`- or
+   `develop`-default repo is not mistaken for a stacked one, and if gh cannot say it
+   says nothing. It is said **once per commit**, then steps aside so the DIRTY and
+   failing-CI triage and the fix budget still apply to a stacked PR that is also red.
+   Its message points at `gh pr edit <n> --base <base>` and `rebase --onto`, and —
+   unlike the CI-failure messages — deliberately not at `/fix-ci`. A PR that was
+   **merged** into a feature branch (so the work never reached the base) gets a
+   non-blocking notice.
    Dedups per (branch, reason, commit) so it can't loop;
    fails open like the PreToolUse guards. It samples **at turn-end only**: a PR that
    goes `DIRTY` after its session ends is the conflict monitor's (below).
@@ -565,13 +586,15 @@ Stop hook between them:
 3. **Git pre-commit hook** — blocks human/CLI commits on `main`. Bypassable with
    `--no-verify`, but…
 4. **CI + branch protection** — the unbypassable gate. All changes land via PR with
-   passing checks; no direct or force-push to `main`. A step inside **Kit checks**
-   (`scripts/check_pr_base.py`) fails any PR whose base is not the repo's default
-   branch, read off the `pull_request` event — the one input no command spelling
-   reaches. State its limit plainly: it makes a stacked PR **red, not unmergeable**.
-   Branch protection guards the default branch only, so a PR whose base is a feature
-   branch has no required context gating it at all; what this buys is that stacking
-   can no longer happen quietly. The **Hooks change guard** job
+   passing checks; no direct or force-push to `main`. The **PR base** workflow
+   (`.github/workflows/pr-base.yml`, running `scripts/check_pr_base.py`) fails any PR
+   whose base is not the default branch or `main`/`master`, read off the `pull_request`
+   event — the one input no command spelling reaches. It is its own workflow so that a
+   retarget (`edited`) re-runs it and so a stacked PR still gets every Kit-checks step.
+   State its limit plainly: it makes a stacked PR **red, not unmergeable**. Branch
+   protection guards the default branch only, so a PR whose base is a feature branch has
+   no required context gating it at all; what this buys is that stacking can no longer
+   happen quietly. The **Hooks change guard** job
    is the server-side twin of self-protection and grader-path protection: a PR that
    touches a grader path — `.claude/hooks/**`, `.claude/settings*.json`,
    `.github/workflows/**`, `scripts/check_*.py`, the dispatch path those graders

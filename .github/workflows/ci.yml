@@ -13,11 +13,9 @@ name: CI
 on:
   push:
     branches: [main]
-  # Run on every PR regardless of base branch — so a stacked PR (base != the
-  # default branch) is gated too, not just PRs that target it directly. That
-  # matters more now than it did: the "PR base is the default branch" step below
-  # FAILS such a PR, and it can only do that on a run that happened.
-  # `labeled`/`unlabeled`
+  # Run on every PR regardless of base branch — so a PR whose base is not main is
+  # still checked (it also fails the "PR base" workflow: stacked PRs are not
+  # allowed, docs/COLLABORATION.md). `labeled`/`unlabeled`
   # are included so "Hooks change guard" re-evaluates the moment a
   # `hooks-change` label is added or removed (the default PR activity types —
   # opened/synchronize/reopened — don't cover labels).
@@ -45,22 +43,9 @@ jobs:
       - name: GuardFall bypass battery (recorded results still hold)
         run: python3 .claude/hooks/test_guard_bypass.py
 
-      # Every PR branches off the default branch and merges back into it — never
-      # off, or into, another feature branch (docs/COLLABORATION.md). This reads
-      # the base off the `pull_request` event, the one place no command spelling
-      # reaches, so it holds where the PreToolUse stacked-branch guard is only
-      # advisory. What it does NOT do is make a stacked PR unmergeable: branch
-      # protection guards the default branch only, so a PR based on a feature
-      # branch has no required context at all. It makes such a PR loudly RED.
-      # The selftest runs beside it because this job is the only thing that would
-      # catch the check silently passing on every input.
-      - name: PR base is the default branch (no stacked PRs)
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_REF: ${{ github.base_ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: python3 scripts/check_pr_base.py
-
+      # The PR-base gate itself runs as its own workflow (pr-base.yml — so a
+      # retarget re-runs it, and a stacked PR still gets every step here). Its
+      # decision function is proven here too, so a push to main checks it.
       - name: PR base check selftest
         run: python3 scripts/check_pr_base.py --selftest
 
