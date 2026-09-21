@@ -804,6 +804,26 @@ def main():
         '[{"number":7,"state":"OPEN"}]',
         '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"},'
         '{"name":"Hooks change guard","conclusion":"FAILURE"}]}')
+    # A PR whose CI is GREEN but whose base is another feature branch. The Stop
+    # hook reads `baseRefName` out of GitHub's own record, so unlike the
+    # PreToolUse guard it does not care how the PR was created — a respelled
+    # command, the web UI and an automation all arrive here identically. Green
+    # checks are exactly the case that needs catching: a stacked PR looks fine
+    # right up until its base merges and every descendant turns CONFLICTING.
+    stop_stacked_root, stop_stacked, stop_stacked_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":'
+        '[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    stop_baseok_root, stop_baseok, stop_baseok_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"main","statusCheckRollup":'
+        '[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    # Separate sandbox for the message assertion — the per-(branch, reason, sha)
+    # dedup means a sandbox only speaks once per commit.
+    stop_msgstack_root, stop_msgstack, stop_msgstack_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":'
+        '[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
     stop_dirty_root, stop_dirty, stop_dirty_env = make_stop_sandbox(
         '[{"number":7,"state":"OPEN"}]',
         '{"mergeStateStatus":"DIRTY","statusCheckRollup":[{"name":"CodeQL","conclusion":"SUCCESS"}]}')
@@ -873,6 +893,13 @@ def main():
     # matching must survive a config that resolves no label ID at all.
     pl_nolbl_root, pl_nolbl, pl_nolbl_pins = make_pipeline_sandbox(
         cfg_over={"linear": {"labels": {"ids": {}, "required": []}}})
+    # A project whose base branch is NOT `main`. The stacked-branch guard reads
+    # `github.defaultBranch` from the COMMITTED config on the default branch, so
+    # `develop` must become a legal base — and `main`/`master` must stay legal
+    # too, because the value only ever WIDENS the set (an unreadable config makes
+    # the guard stricter, never looser).
+    pl_dev_root, pl_dev, pl_dev_pins = make_pipeline_sandbox(
+        cfg_over={"github": {"defaultBranch": "develop"}})
     pl_noid_root, pl_noid, pl_noid_pins = make_pipeline_sandbox(pin={"ticket": None})
     pl_plan_root, pl_plan, pl_plan_pins = make_pipeline_sandbox(
         branch="feat/decompose-the-epic", pin={"session_mode": "planning", "ticket": None})
@@ -926,7 +953,7 @@ def main():
         pl_noeff_root, pl_noeff_pins, pl_noauto_root, pl_noauto_pins,
         pl_disarm_root, pl_disarm_pins, pl_expplan_root, pl_expplan_pins,
         pl_pinsin_root, pl_pinsin_pins, pl_pinsbad_root, pl_pinsbad_pins,
-        pl_nolbl_root, pl_nolbl_pins,
+        pl_nolbl_root, pl_nolbl_pins, pl_dev_root, pl_dev_pins,
     ]
 
     # (name, payload, expect_block, hook_path)
@@ -963,6 +990,118 @@ def main():
         # REAL repo's current branch having a merged PR (merged-PR guard is live)
         ("push feature branch allowed", bash("git push -u origin feat/kit"), ALLOW, feat_hook),
         ("--force-with-lease allowed", bash("git push --force-with-lease origin feat/kit"), ALLOW, feat_hook),
+
+        # ── universal: stacked branches (every PR is cut from, and merges into,
+        #    the base branch — six-deep stack, 2026-09-20) ────────────────────
+        # Branch-CREATING spellings with a feature-branch start point.
+        ("checkout -b off a feature branch blocked",
+         bash("git checkout -b feat/new feat/old"), BLOCK, feat_hook),
+        ("checkout -B off a feature branch blocked",
+         bash("git checkout -B feat/new origin/feat/old"), BLOCK, feat_hook),
+        ("switch -c off a feature branch blocked",
+         bash("git switch -c feat/new feat/old"), BLOCK, feat_hook),
+        ("switch --create off a refs/heads feature branch blocked",
+         bash("git switch --create feat/new refs/heads/feat/old"), BLOCK, feat_hook),
+        ("git branch <new> <feature start> blocked",
+         bash("git branch feat/new feat/old"), BLOCK, feat_hook),
+        ("worktree add -b off a feature branch blocked",
+         bash("git worktree add -b feat/new ../wt feat/old"), BLOCK, feat_hook),
+        ("chained checkout -b off a feature branch blocked (later segment)",
+         bash("git fetch origin && git checkout -b feat/new feat/old"), BLOCK, feat_hook),
+        ("git -C <dir> checkout -b off a feature branch blocked (global flag skipped)",
+         bash("git -C /tmp/x checkout -b feat/new feat/old"), BLOCK, feat_hook),
+        # No start point named: the command cuts from HEAD, so the CURRENT branch
+        # is the start point. This is how the 2026-09-20 stack actually happened —
+        # nobody typed a start point, they just branched again where they stood.
+        ("checkout -b with no start point blocked ON a feature branch",
+         bash("git checkout -b feat/new"), BLOCK, feat_hook),
+        ("checkout -b with no start point ALLOWED on main",
+         bash("git checkout -b feat/new"), ALLOW, main_hook),
+        # Feature → feature merges, the other direction of the same rule.
+        ("merge of a feature branch blocked", bash("git merge feat/other"), BLOCK, feat_hook),
+        ("merge --no-ff of a feature branch blocked",
+         bash("git merge --no-ff feat/other"), BLOCK, feat_hook),
+        ("merge of a remote feature branch blocked",
+         bash("git merge origin/feat/other"), BLOCK, feat_hook),
+        ("pull of a feature branch refspec blocked",
+         bash("git pull origin feat/other"), BLOCK, feat_hook),
+        # FETCH_HEAD names no ref the guard can see, so it fails CLOSED here (the
+        # message says to name the ref instead).
+        ("merge FETCH_HEAD blocked (the guard cannot see what was fetched)",
+         bash("git merge FETCH_HEAD"), BLOCK, feat_hook),
+        # A PR based on anything but the base branch.
+        ("gh pr create --base <feature> blocked",
+         bash("gh pr create --base feat/other --body-file /tmp/b.md"), BLOCK, feat_hook),
+        ("gh pr create -B <feature> blocked", bash("gh pr create -B feat/other"), BLOCK, feat_hook),
+        ("gh pr edit --base <feature> blocked",
+         bash("gh pr edit 7 --base feat/other"), BLOCK, feat_hook),
+
+        # THE ALLOW HALF, and the first two matter most: merging the BASE into a
+        # feature branch is the kit's documented conflict-resolution move
+        # (docs/LESSONS.md) and what .github/workflows/pr-conflict-monitor.yml
+        # asks a session to run. A guard that blocked it would break the conflict
+        # loop, so these are the cases that must never go red.
+        ("merge origin/main ALLOWED (the conflict-resolution move)",
+         bash("git merge origin/main"), ALLOW, feat_hook),
+        ("fetch && merge origin/main ALLOWED (the conflict loop's literal command)",
+         bash("git fetch origin && git merge origin/main"), ALLOW, feat_hook),
+        ("merge main allowed", bash("git merge main"), ALLOW, feat_hook),
+        ("merge origin/master allowed", bash("git merge origin/master"), ALLOW, feat_hook),
+        ("merge refs/remotes/origin/main allowed",
+         bash("git merge refs/remotes/origin/main"), ALLOW, feat_hook),
+        ("merge --no-edit origin/main allowed",
+         bash("git merge --no-edit origin/main"), ALLOW, feat_hook),
+        ("merge --abort allowed", bash("git merge --abort"), ALLOW, feat_hook),
+        ("merge --continue allowed", bash("git merge --continue"), ALLOW, feat_hook),
+        ("checkout -b off origin/main allowed",
+         bash("git checkout -b feat/new origin/main"), ALLOW, feat_hook),
+        ("checkout -b off main allowed", bash("git checkout -b feat/new main"), ALLOW, feat_hook),
+        ("switch -c off origin/main allowed",
+         bash("git switch -c feat/new origin/main"), ALLOW, feat_hook),
+        ("git branch <new> origin/main allowed",
+         bash("git branch feat/new origin/main"), ALLOW, feat_hook),
+        ("worktree add -b off origin/main allowed",
+         bash("git worktree add -b feat/new ../wt origin/main"), ALLOW, feat_hook),
+        ("gh pr create --base main allowed",
+         bash("gh pr create --base main --body-file /tmp/b.md"), ALLOW, feat_hook),
+        ("gh pr create with no --base allowed (defaults to the base branch)",
+         bash("gh pr create --body-file /tmp/b.md"), ALLOW, feat_hook),
+        ("gh pr edit --base main allowed (retargeting IS the remedy)",
+         bash("gh pr edit 7 --base main"), ALLOW, feat_hook),
+        ("bare git pull allowed (merges this branch's own upstream)",
+         bash("git pull"), ALLOW, feat_hook),
+        ("git pull origin allowed (no refspec named)", bash("git pull origin"), ALLOW, feat_hook),
+        ("git pull --ff-only origin main allowed",
+         bash("git pull --ff-only origin main"), ALLOW, feat_hook),
+        # Read-only and unrelated git that names a feature branch must not trip it.
+        ("git checkout <feature> allowed (switching is not branching)",
+         bash("git checkout feat/other"), ALLOW, feat_hook),
+        ("git branch -m allowed (renaming is not branching)",
+         bash("git branch -m feat/renamed"), ALLOW, feat_hook),
+        ("git branch --merged main allowed (a read, not a creation)",
+         bash("git branch --merged main"), ALLOW, feat_hook),
+        ("git log origin/main..HEAD allowed", bash("git log origin/main..HEAD --oneline"),
+         ALLOW, feat_hook),
+        ("git diff origin/main...HEAD allowed", bash("git diff origin/main...HEAD"),
+         ALLOW, feat_hook),
+
+        # The base branch is CONFIGURABLE — `github.defaultBranch` from the
+        # COMMITTED delivery.json on the default branch (contract §1), never from
+        # the worktree the session can edit.
+        ("configured base: merge origin/develop allowed",
+         bash("git merge origin/develop"), ALLOW, pl_dev),
+        ("configured base: checkout -b off origin/develop allowed",
+         bash("git checkout -b feat/eng-123-new origin/develop"), ALLOW, pl_dev),
+        ("configured base: gh pr create --base develop allowed",
+         bash("gh pr create --base develop"), ALLOW, pl_dev),
+        # Widening only: a configured `develop` must not REMOVE main/master.
+        ("configured base: merge origin/main still allowed (widening, not replacing)",
+         bash("git merge origin/main"), ALLOW, pl_dev),
+        # ...and a feature branch is still a feature branch.
+        ("configured base: merge of a feature branch still blocked",
+         bash("git merge feat/other"), BLOCK, pl_dev),
+        ("configured base: gh pr create --base <feature> still blocked",
+         bash("gh pr create --base feat/other"), BLOCK, pl_dev),
 
         # ── universal: secret reads (path-target guard) ──────────────────────
         ("cat .env blocked", bash("cat .env"), BLOCK, HOOK),
@@ -1700,6 +1839,10 @@ def main():
          {}, ALLOW, stop_pending, stop_pending_env),
         ("stop: a human-pending check does not mask a real failure beside it",
          {}, BLOCK, stop_mixed, stop_mixed_env),
+        ("stop: an open PR based on a feature branch blocks even with GREEN CI",
+         {}, BLOCK, stop_stacked, stop_stacked_env),
+        ("stop: an open PR based on the base branch is allowed",
+         {}, ALLOW, stop_baseok, stop_baseok_env),
     ]
 
     # What the not-green messages SAY. The Stop hook is the enforcement — a session
@@ -1716,6 +1859,14 @@ def main():
          stop_dirtyred, stop_dirtyred_env,
          ["rebase", "--force-with-lease", "/fix-ci", "triages the conflict"],
          ["has failing CI"]),
+        # A wrong base is not a CI failure, and telling the session to fix CI here
+        # would send it to read a log that says nothing. The message has to name
+        # the retarget command AND the case retargeting does not fix — a branch
+        # CUT from the other branch keeps its commits in the PR.
+        ("stop reason: a stacked PR names the retarget command, not the CI loop",
+         stop_msgstack, stop_msgstack_env,
+         ["--base main", "gh pr edit 7", "CUT from", "docs/COLLABORATION.md"],
+         ["/fix-ci"]),
     ]
 
     failures = 0
@@ -1826,6 +1977,16 @@ def main():
          bash("gh pr review 7 --approve"), "`--comment` review is still allowed", HOOK),
         ("stderr reason: the bare-review block names the event as the reason",
          bash("gh pr review 7"), "interactive prompt", HOOK),
+        # The stacked-branch blocks are only worth their friction if they hand
+        # back the correct command — a session that is told "no" and not "instead"
+        # improvises, which is how the 2026-09-20 stack grew one PR at a time.
+        ("stderr reason: a stacked branch is given the off-the-base command",
+         bash("git checkout -b feat/new feat/old"),
+         "git checkout -b feat/new origin/main", feat_hook),
+        ("stderr reason: a feature merge says merging the BASE in stays allowed",
+         bash("git merge feat/other"), "git merge origin/main", feat_hook),
+        ("stderr reason: a bad PR base points at the base branch",
+         bash("gh pr create --base feat/other"), "gh pr create --base main", feat_hook),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -1840,6 +2001,7 @@ def main():
               stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
               stop_dirtyred_root, stop_msgred_root, stop_budget_root, stop_clear_root,
               stop_prem_root, stop_shared_root, stop_status_root,
+              stop_stacked_root, stop_baseok_root, stop_msgstack_root,
               *pl_cleanup):
         shutil.rmtree(r, ignore_errors=True)
 

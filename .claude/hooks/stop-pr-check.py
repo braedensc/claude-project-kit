@@ -184,6 +184,34 @@ def _clear_budget(branch: str) -> None:
             pass
 
 
+# ── Base branches: which branch an open PR is allowed to target ───────────────
+# `main`/`master` always, plus `github.defaultBranch` from the COMMITTED
+# delivery.json on a trusted ref when a project configured the pipeline
+# (docs/PIPELINE-CONTRACT.md §1) — read from the default branch, never from the
+# worktree, for the same reason the PreToolUse hook reads it there: a session
+# that could name its own base branch could name a feature branch. Widening
+# only, so an absent or broken config makes this stricter, never looser.
+def _configured_default_branch() -> str:
+    try:
+        if not os.path.isfile(os.path.join(PROJECT_ROOT, "delivery.json")):
+            return ""
+        for ref in ("origin/main", "origin/master", "main", "master"):
+            code, out = _run(["git", "show", ref + ":delivery.json"])
+            if code != 0 or not out.strip():
+                continue
+            cfg = json.loads(out)
+            name = ((cfg.get("github") or {}).get("defaultBranch") or "")
+            name = name.strip() if isinstance(name, str) else ""
+            return "" if (not name or "{{" in name) else name
+    except Exception:
+        return ""
+    return ""
+
+
+def _base_branch_names() -> set:
+    return PROTECTED_BRANCHES | ({_configured_default_branch()} - {""})
+
+
 def _block(branch: str, reason: str, head_sha: str, msg: str) -> None:
     if _already_nagged(branch, reason, head_sha):
         sys.exit(0)
@@ -271,7 +299,8 @@ if pr.get("state") != "OPEN":
     sys.exit(0)  # merged or closed — nothing further to watch
 
 code, out = _run(
-    ["gh", "pr", "view", str(pr["number"]), "--json", "statusCheckRollup,mergeStateStatus"],
+    ["gh", "pr", "view", str(pr["number"]), "--json",
+     "baseRefName,statusCheckRollup,mergeStateStatus"],
     timeout=10,
 )
 if code != 0:
@@ -282,6 +311,35 @@ try:
 except Exception:
     sys.exit(0)
 raw_checks = info.get("statusCheckRollup", [])
+
+# ── Base branch: is this PR stacked on another feature branch? ───────────
+# Asked BEFORE the CI verdict, because a stacked PR's checks can be perfectly
+# green while the PR is still the wrong shape — and because once its base merges,
+# this PR turns CONFLICTING and GitHub stops running checks on it at all, so the
+# CI verdict below would report "no checks" for a cause it cannot name.
+# Unlike the PreToolUse guard, this reads `baseRefName` out of GitHub's OWN
+# record, so it does not care how the PR was created: a respelled `gh pr create`,
+# the web UI and an automation all land here. Fails open when the field is absent
+# (an older `gh` that does not return it) — never block on what cannot be read.
+_pr_base = info.get("baseRefName")
+if isinstance(_pr_base, str) and _pr_base and _pr_base not in _base_branch_names():
+    _suggest = _configured_default_branch() or base.split("/")[-1]
+    msg = (
+        "PR #" + str(pr["number"]) + " for `" + branch + "` is based on `"
+        + _pr_base + "`, not this repo's base branch ("
+        + ", ".join(sorted(_base_branch_names())) + "). Every PR branches off the "
+        "base and merges back into it. A stacked PR turns CONFLICTING the moment "
+        "its base is squash-merged, and GitHub runs NO checks on a conflicted PR "
+        "— so it reads as 'no checks reported', which looks like broken CI "
+        "(six-deep stack, 2026-09-20: five forced re-cascades). Retarget it now, "
+        "before the base moves:\n"
+        "  gh pr edit " + str(pr["number"]) + " --base " + _suggest + "\n"
+        "Then read the diff. If this branch was also CUT from that feature branch, "
+        "retargeting leaves the other branch's commits in this PR — re-cut from "
+        "the base instead (`git fetch origin && git checkout -b <type>/<desc> "
+        "origin/" + _suggest + "`) and open a fresh PR. (docs/COLLABORATION.md)"
+    )
+    _block(branch, "pr-base", head_sha, msg)
 
 
 # GitHub's legacy commit-status API reports as a `StatusContext`, which has no `name`

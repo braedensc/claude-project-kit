@@ -99,8 +99,9 @@ that text before executing it, and the two never see the same thing.* 10 of 11 t
 open-source coding agents fell. Claude Code was not in the tested set — which is not a
 passing grade, so the kit measured itself.
 
-The battery is `.claude/hooks/test_guard_bypass.py` (`npm run test:bypass`): 67 probes
-across the six Bash pattern guards, using the published primitive classes (quote
+The battery is `.claude/hooks/test_guard_bypass.py` (`npm run test:bypass`): 76 probes
+across the seven Bash pattern guards (the seventh, `stacked-branch`, added and measured
+2026-09-20), using the published primitive classes (quote
 collapsing, `$IFS` field splitting, command substitution, variable expansion, `printf`
 octal + `eval`, glob expansion, line continuation). Every probe recorded as getting
 through is then **executed in a sandbox whose PATH contains only inert shims**, so the
@@ -165,7 +166,7 @@ measurement argues for, and it is why the second column was never the whole stor
 never-merge, self-approval and protected-label guards were each already documented in
 `pre-tool-use.py` as "a first line over command shapes, not an exhaustive denylist".
 What the measurement adds is the same honesty for the other three, and numbers behind
-all six.
+all seven.
 
 **One row's durable layer needs a second maintainer to mean anything, and a solo
 repository has one. Measured 2026-09-04 and again 2026-09-17, unchanged.** The approval

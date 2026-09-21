@@ -45,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -709,6 +710,361 @@ def _in_git_store(path: str) -> bool:
         return True  # unresolvable path → fail CLOSED
     return ".git" in parts
 
+
+
+# ── Stacked-branch guard: cut from the base, merge back into the base ──────────
+# Added 2026-09-20, after six PRs shipped as a six-deep stack
+# (#153←#154←#155←#156←#157←#158), each branched off its predecessor. Every
+# squash-merge of a base REWRITES the base branch, which puts all remaining
+# descendants into CONFLICTING at once — and GitHub runs NO checks on a
+# conflicted PR, so five PRs read as "no checks reported", which looks like
+# broken CI rather than a conflict. Six stacked PRs meant five forced
+# re-cascades; it ended by merging the tip alone and closing the other four.
+# Independent branches off the base never do this.
+#
+# THE RULE: a feature branch is cut FROM the base branch and merges BACK INTO
+# it. Feature → feature is forbidden in both directions — creating a branch off
+# another feature branch, and merging one feature branch into another.
+#
+# THE ONE THING THIS MUST NOT BREAK: merging the BASE *into* a feature branch.
+# `git merge origin/main` is the kit's documented conflict-resolution move
+# (never rebase — docs/LESSONS.md), and it is what the automated conflict loop
+# in .github/workflows/pr-conflict-monitor.yml asks a session to run. So the
+# base set below is an ALLOW-list every arm consults, and _is_base_ref is
+# deliberately generous about the remote segment: a false NEGATIVE there would
+# block the conflict loop's only move, which is a far worse failure than a
+# stacked branch getting through. Everything unparseable fails OPEN for the
+# same reason.
+#
+# REACH, stated plainly. Like every Bash guard in this file it matches command
+# TEXT, so it is ADVISORY — measured in docs/SECURITY.md § *What the pattern
+# guards actually carry*; a respelling gets past it. It catches the cooperating
+# session that stacks out of habit, which is exactly how the 2026-09-20 incident
+# happened. The two layers that do NOT read command text are the Stop hook
+# (which reads the open PR's `baseRefName` out of GitHub's own record when a
+# turn ends) and the CI step `scripts/check_pr_base.py` (which reads the base
+# off the `pull_request` event). Neither can be respelled; docs/COLLABORATION.md
+# says which of the three carries what.
+_STACK_WHY = (
+    "Every branch is cut from the base branch and merges back into it — never "
+    "off, or into, another feature branch. A six-deep stack on 2026-09-20 cost "
+    "five forced re-cascades: squash-merging a base REWRITES the base branch, so "
+    "every descendant PR turns CONFLICTING at once, and GitHub runs NO checks on "
+    "a conflicted PR — they read as \"no checks reported\", which looks like "
+    "broken CI. (docs/COLLABORATION.md)"
+)
+STACK_CREATE_HELP = (
+    "🔒 Stacked branch blocked — this would cut `{new}` from {origin}, which is "
+    "not a base branch (base = {bases}).\n"
+    + _STACK_WHY + "\n"
+    "Branch off the base instead:\n"
+    "  git fetch origin && git checkout -b {new} origin/{base}\n"
+    "If you need work that only exists on another feature branch, wait for that "
+    "branch to merge and then cut from the updated base."
+)
+STACK_MERGE_HELP = (
+    "🔒 Feature-to-feature merge blocked — `{ref}` is not a base branch "
+    "(base = {bases}).\n"
+    + _STACK_WHY + "\n"
+    "Merging the BASE into your branch is the opposite case and stays ALLOWED — "
+    "it is this repo's conflict-resolution move:\n"
+    "  git fetch origin && git merge origin/{base}\n"
+    "(A bare `FETCH_HEAD` is refused for the same reason: the guard cannot see "
+    "which ref was fetched. Name the ref — `git merge origin/{base}`.)"
+)
+STACK_PR_BASE_HELP = (
+    "🔒 PR base blocked — `--base {ref}` targets a branch that is not a base "
+    "branch (base = {bases}).\n"
+    + _STACK_WHY + "\n"
+    "Open the PR against the base branch:\n"
+    "  gh pr create --base {base} --body-file <file>\n"
+    "Retargeting an existing PR back onto the base (`gh pr edit <n> --base "
+    "{base}`) is the remedy and stays allowed."
+)
+
+
+def _configured_default_branch() -> str:
+    """`github.defaultBranch` from the COMMITTED `delivery.json` on a trusted ref
+    (docs/PIPELINE-CONTRACT.md §1), or "" when the pipeline is off or the value is
+    unusable.
+
+    Read through `_read_delivery_config`, so the name comes from the DEFAULT
+    BRANCH rather than from the worktree — a session that could name its own base
+    branch could name a feature branch and stack freely, which is the whole point
+    of the config anchor above.
+
+    WIDENING ONLY: whatever this returns is *added* to `main`/`master`, never
+    substituted for them. So an absent, broken or placeholder config makes the
+    guard STRICTER (a visible false block a human can fix), never looser — the
+    fail direction a write-blocking guard is required to take. Gated on
+    `_pipeline_configured()`, so a project that never adopted the pipeline pays
+    one `stat` and no subprocess."""
+    try:
+        if not _pipeline_configured():
+            return ""
+        cfg, _source = _read_delivery_config()
+    except Exception:
+        return ""
+    if not isinstance(cfg, dict):
+        return ""
+    name = (cfg.get("github") or {}).get("defaultBranch")
+    if not isinstance(name, str):
+        return ""
+    name = name.strip()
+    if not name or "{{" in name or not re.match(r"^[\w][\w./-]*$", name):
+        return ""
+    return name
+
+
+def _base_branches() -> set:
+    """The branch names a feature branch may be cut FROM and merged INTO."""
+    return PROTECTED_BRANCHES | ({_configured_default_branch()} - {""})
+
+
+_PREFERRED_BASE_CACHE = None
+
+
+def _preferred_base() -> str:
+    """The base branch name to SUGGEST in a block message — the configured default
+    branch when there is one, else whichever of `main`/`master` this repo actually
+    has. Called ONLY once a block is already decided, so its `git rev-parse`
+    probes cost nothing on the allow path (which is every ordinary Bash call)."""
+    global _PREFERRED_BASE_CACHE
+    if _PREFERRED_BASE_CACHE is not None:
+        return _PREFERRED_BASE_CACHE
+    name = _configured_default_branch()
+    if not name:
+        name = "main"
+        for cand in ("main", "master"):
+            try:
+                r = subprocess.run(
+                    ["git", "-C", PROJECT_ROOT, "rev-parse", "--verify", "--quiet",
+                     "refs/heads/" + cand],
+                    capture_output=True, text=True, timeout=3,
+                )
+            except Exception:
+                break
+            if r.returncode == 0:
+                name = cand
+                break
+    _PREFERRED_BASE_CACHE = name
+    return name
+
+
+_REF_DECOR_RE = re.compile(r"(?:\^[0-9]*|~[0-9]*|@\{[^}]*\})+$")
+
+
+def _is_base_ref(ref: str, bases) -> bool:
+    """True when `ref` names one of `bases` under any spelling a command line
+    uses: `main`, `origin/main`, `refs/heads/main`, `refs/remotes/origin/main`,
+    and trailing `~`/`^`/`@{…}` decorations.
+
+    Deliberately generous about the remote segment (any `<x>/main` reads as
+    `main`) because a remote can be named anything and a false negative here
+    blocks `git merge origin/main` — the one move the conflict loop depends on.
+    The cost is that a feature branch literally named `<something>/main` reads as
+    a base; that is an accepted, documented looseness in an advisory guard."""
+    if not ref:
+        return False
+    r = _REF_DECOR_RE.sub("", ref.strip().strip("'\""))
+    if not r:
+        return False
+    if r.startswith("refs/heads/"):
+        r = r[len("refs/heads/"):]
+    elif r.startswith("refs/remotes/"):
+        r = r[len("refs/remotes/"):]
+        r = r.split("/", 1)[1] if "/" in r else r
+    elif "/" in r:
+        r = r.split("/", 1)[1]
+    return r in bases
+
+
+_SHELL_SEG_RE = re.compile(r"\|\||&&|[;&|\n]")
+_GIT_GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                           "--exec-path", "--super-prefix"}
+# The subcommands this guard reads, in both spellings git accepts.
+_GIT_SUBCOMMANDS = frozenset({"checkout", "switch", "branch", "merge", "pull",
+                              "worktree"})
+_GH_PR_BASE_CMD_RE = re.compile(r"\bgh\s+pr\s+(?:create|new|edit)\b([^#\n;&|]*)")
+_PR_BASE_FLAG_RE = re.compile(r"(?<![\w-])(?:--base|-B)(?:=|\s+)([^\s'\"]+)")
+_CREATE_FLAGS = {"-b", "-B", "-c", "-C", "--create", "--force-create"}
+_WORKTREE_CREATE_FLAGS = {"-b", "-B"}
+_MERGE_NOOP_FLAGS = {"--abort", "--continue", "--quit"}
+# Separated-form flags whose VALUE is not a ref. `-S` is deliberately absent: its
+# optional argument must be attached (`-Skeyid`), so treating it as separated
+# would swallow the ref that follows and read `git merge -S origin/main` as
+# naming nothing.
+_MERGE_VALUE_FLAGS = {"-s", "--strategy", "-X", "--strategy-option", "-m",
+                      "--message", "-F", "--file", "--into-name"}
+
+
+def _git_invocations(cmd: str):
+    """[(subcommand, tokens-after-it)] for every `git …` on the line.
+
+    Segment-scoped on `;`/`&&`/`||`/`|`/newline, so a later unrelated command is
+    never folded into one argv — the same per-command discipline the operator
+    guards above use. Falls back to a whitespace split when a segment has
+    unbalanced quotes, so a quoting trick degrades to a coarser parse rather than
+    to no parse at all."""
+    out = []
+    for seg in _SHELL_SEG_RE.split(cmd or ""):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except Exception:
+            toks = seg.split()
+        gi = next((i for i, t in enumerate(toks)
+                   if t == "git" or t.endswith("/git")), None)
+        if gi is None:
+            # `git-merge` / `git-checkout` / … — git's dashed plumbing names are
+            # real binaries that reach the same effect. Measured as a bypass of
+            # the first draft of this guard (test_guard_bypass.py, stack-*).
+            dashed = next(
+                ((i, t) for i, t in enumerate(toks)
+                 if t.rsplit("/", 1)[-1].startswith("git-")
+                 and t.rsplit("/", 1)[-1][4:] in _GIT_SUBCOMMANDS), None)
+            if dashed is None:
+                continue
+            di, dt = dashed
+            out.append((dt.rsplit("/", 1)[-1][4:], toks[di + 1:]))
+            continue
+        i = gi + 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 2 if toks[i] in _GIT_GLOBAL_VALUE_FLAGS else 1
+        if i < len(toks):
+            out.append((toks[i], toks[i + 1:]))
+    return out
+
+
+def _positionals(toks, value_flags):
+    """Non-flag arguments in order, skipping the value of any flag in
+    `value_flags` (separated form only — an `--opt=value` carries its own).
+    Empty tokens are dropped: `_strip_prose` rewrites a quoted message payload to
+    `''`, which must not be read as a ref."""
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            out.extend(x for x in toks[i + 1:] if x)
+            break
+        if t.startswith("-"):
+            i += 2 if (t in value_flags and i + 1 < len(toks)) else 1
+            continue
+        if t:
+            out.append(t)
+        i += 1
+    return out
+
+
+def _creation_start_point(toks, create_flags, skip_positionals=0):
+    """(new_branch, start_point) for a branch-CREATING git command, or None when
+    no create flag is present. `start_point` is "" when the command names none —
+    it then cuts from HEAD, and the caller resolves the current branch instead.
+    A create flag consumes the new branch name unless it carried one attached
+    (`--create=x`)."""
+    new, pos, i, saw = "", [], 0, False
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            pos.extend(x for x in toks[i + 1:] if x)
+            break
+        if t.startswith("-"):
+            head, _, attached = t.partition("=")
+            # A short create flag can carry its value ATTACHED (`-bfeat/new`),
+            # which is how git itself documents it. Split it before the
+            # membership test, or the whole token reads as an unknown flag and
+            # the command is not seen as a creation at all (measured bypass,
+            # test_guard_bypass.py stack-*).
+            if (not attached and len(head) > 2 and head[1] != "-"
+                    and head[:2] in create_flags):
+                head, attached = head[:2], head[2:]
+            if head in create_flags:
+                saw = True
+                if attached:
+                    new = new or attached
+                    i += 1
+                elif i + 1 < len(toks) and toks[i + 1] and not toks[i + 1].startswith("-"):
+                    new = new or toks[i + 1]
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if head == "--orphan":
+                i += 1 if attached else 2
+                continue
+            i += 1
+            continue
+        if t:
+            pos.append(t)
+        i += 1
+    if not saw:
+        return None
+    pos = pos[skip_positionals:]
+    return new, (pos[0] if pos else "")
+
+
+def _stacked_branch_block(cmd: str):
+    """(help_template, format-kwargs) for the first stacking violation on the
+    line, else None. The caller supplies `base=` — see _preferred_base."""
+    bases = _base_branches()
+    shown = ", ".join("`%s`" % b for b in sorted(bases))
+
+    for sub, toks in _git_invocations(cmd):
+        # ── cut a branch from a non-base start point ──────────────────────────
+        found = None
+        if sub in ("checkout", "switch"):
+            found = _creation_start_point(toks, _CREATE_FLAGS)
+        elif sub == "branch":
+            # Only the PLAIN creation spellings — `git branch <new> [<start>]`.
+            # Any flag at all (`-d`, `-m`, `--merged main`, `--contains`) means
+            # this is a delete/rename/list, which other guards own.
+            if toks and not any(t.startswith("-") for t in toks) and len(toks) <= 2:
+                found = (toks[0], toks[1] if len(toks) > 1 else "")
+        elif sub == "worktree" and toks[:1] == ["add"]:
+            # `git worktree add [-b <new>] <path> [<commit-ish>]` — the path is a
+            # positional that is NOT a ref, so skip it before reading the start.
+            found = _creation_start_point(toks[1:], _WORKTREE_CREATE_FLAGS,
+                                          skip_positionals=1)
+        if found:
+            new, start = found
+            if start:
+                if not _is_base_ref(start, bases):
+                    return STACK_CREATE_HELP, {
+                        "new": new or "<branch>", "origin": "`%s`" % start,
+                        "bases": shown}
+            else:
+                # No start point: the command cuts from HEAD. Resolve the branch
+                # HEAD is on. Fails OPEN on an empty answer (no git) and on a
+                # DETACHED head, where "HEAD" is not a branch name and blocking
+                # would trap a session mid-recovery.
+                cur = _current_branch()
+                if cur and cur != "HEAD" and cur not in bases:
+                    return STACK_CREATE_HELP, {
+                        "new": new or "<branch>",
+                        "origin": "the current branch `%s`" % cur,
+                        "bases": shown}
+
+        # ── merge a feature branch into this one ──────────────────────────────
+        refs = []
+        if sub == "merge":
+            if not any(t in _MERGE_NOOP_FLAGS for t in toks):
+                refs = _positionals(toks, _MERGE_VALUE_FLAGS)
+        elif sub == "pull":
+            # `git pull [<remote> [<refspec>…]]`. A bare `git pull` (or `git pull
+            # origin`) merges this branch's own upstream and is untouched.
+            refs = _positionals(toks, _MERGE_VALUE_FLAGS)[1:]
+        for r in refs:
+            if not _is_base_ref(r, bases):
+                return STACK_MERGE_HELP, {"ref": r, "bases": shown}
+
+    # ── open (or retarget) a PR against a non-base branch ─────────────────────
+    for m in _GH_PR_BASE_CMD_RE.finditer(cmd or ""):
+        for b in _PR_BASE_FLAG_RE.finditer(m.group(1)):
+            if not _is_base_ref(b.group(1), bases):
+                return STACK_PR_BASE_HELP, {"ref": b.group(1), "bases": shown}
+    return None
 
 # ── Secret-file target match (Bash) ─────────────────────────────────────────────
 # Hardened 2026-08-23. The old guard was a verb denylist (cat/less/
@@ -1747,6 +2103,18 @@ def _dispatch(data) -> None:
                 merged = _merged_pr_info(branch)
                 if merged:
                     block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
+
+        # Stacked branches are what the 2026-09-20 incident was made of: a branch
+        # cut from another feature branch, a merge between two of them, or a PR
+        # based on one. Merging the BASE into a feature branch is the opposite
+        # move and stays ALLOWED — the conflict loop depends on it. Runs after the
+        # push guard so a push violation still wins the message, and before the
+        # gh guards so `gh pr create --base <feature>` is named as stacking rather
+        # than as something else.
+        _stack = _stacked_branch_block(scan)
+        if _stack:
+            _stack_tpl, _stack_kw = _stack
+            block(_stack_tpl.format(base=_preferred_base(), **_stack_kw))
 
         # Merging a PR (with or without --auto) is the HUMAN's action only — Claude
         # opens PRs and stops there (near-miss 2026-07-03: `gh pr merge
