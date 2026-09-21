@@ -61,7 +61,31 @@ OPERATOR_KEY_ENV=LINEAR_API_KEY
 # The executor is started with `--key-env` set to this name.
 LINEAR_KEY_ENV=STAGE_A_LINEAR_API_KEY
 
-# OPTIONAL. The https clone URL the role account will run the executor out of. Not
-# read by anything yet: the job that runs the executor does not exist (KIT-150).
-# Not ssh — the role account has no keys.
+# The https clone URL the role account runs the planner job and the executor out of.
+# The installer places that clone under the role account and keeps it level with origin,
+# and the job execs from it on every pass. Not ssh — the role account has no keys.
 KIT_REPO_URL=https://github.com/example-org/claude-project-kit
+
+# The display name of the dispatcher's agent user in the tracker. The planner job
+# delegates every planning ticket to it, in the same call that creates the ticket, so a
+# session's own identity is never in the loop. It must be an app user, not a person.
+AGENT_USER_NAME=Dispatcher Agent
+
+# The launchd label for the planner job. A label belongs to a deployment, never to this
+# repository, so you type it: reverse-DNS, at least two parts. The job is installed at
+# /Library/LaunchDaemons/<this>.plist and is never loaded by the installer.
+JOB_LABEL=com.example.stage-a-planner
+
+# OPTIONAL. The Planning team state you move an idea into to start a planning run. The
+# installer creates it if it is absent, and refuses a state of this name that is a done
+# state — moving an idea there is how a run STARTS. Default: Plan it
+PLAN_IT_STATE=Plan it
+
+# OPTIONAL. How often the planner job runs, in seconds (60 to 3600). Default: 300
+POLL_INTERVAL_SECONDS=300
+
+# OPTIONAL, and only for a PRIVATE planned repository. The NAME — never the value — of
+# the variable holding a read-only code-host token, so the job can update its checkout
+# of the planned repository. The installer asks for the value at a hidden prompt and
+# stores it beside the tracker key. Leave empty for a public repository.
+GITHUB_TOKEN_ENV=

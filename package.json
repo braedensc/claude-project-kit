@@ -26,6 +26,7 @@
     "test:block": "python3 scripts/telemetry_block.py --selftest",
     "test:safe-outputs": "python3 scripts/pipeline_safe_outputs_probe.py --selftest",
     "test:plan-executor": "python3 scripts/pipeline_plan_executor.py --selftest",
+    "test:plan-poller": "python3 scripts/pipeline_plan_poller.py --selftest",
     "test:sync-user-skills": "python3 scripts/sync_user_skills.py --selftest",
     "test:lifecycle": "python3 scripts/telemetry_lifecycle.py --selftest",
     "test:dashboard": "python3 scripts/telemetry_dashboard.py --selftest",
