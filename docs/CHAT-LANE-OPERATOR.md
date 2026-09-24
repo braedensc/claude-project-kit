@@ -63,7 +63,9 @@ python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 The conf has seven values, and five optional ones: `DISPATCHER_SERVICE`,
 `FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN` and `FRONT_DOOR_MATCHER`. Leave
 one unset and every printed command that needs it says `not composed: set <KEY> in
-chat-lane.conf`, and a subcommand that needs it refuses. Nothing is guessed.
+chat-lane.conf`, and a subcommand that needs it refuses. Nothing is guessed. A conf with a
+problem (an unknown key, say) composes nothing: `card` lists the problems first, prints the
+card without its commands, and exits 2.
 
 | Command | What it does |
 |---|---|
@@ -296,7 +298,9 @@ sh -e pf-block.sh                     # stops at the first error
 ```
 
 It is safe to run again. If the boot job is already loaded, the script stops it and waits
-until launchd lets it go before it loads it again.
+until launchd lets it go before it loads it again. It waits 30 seconds at most. If it prints
+`STILL LOADED after 30 s` and then `Bootstrap failed: 5`, the old job had not let go yet. The
+rule already loaded stays in force: wait a minute and run the script again.
 
 - **The port** is `DISPATCHER_PORT` in your conf. It must be the port the dispatcher reads
   from `CYRUS_SERVER_PORT`, which is 3456 when unset (`WorkerService.js:190`;
@@ -443,7 +447,15 @@ longer finds it (a start before then fails with `Bootstrap failed: 5`), starts i
 shows the end of its log. The log's path comes from the plist's `StandardOutPath`.
 
 Good: the log shows a fresh start.
-Not that: `NOT RESTARTED`. Something is running. Wait, and paste it again.
+Not that: `NOT RESTARTED`. It answered busy: something is running. Wait, and paste it again.
+Not that either:
+- `NOT LOADED`: launchd did not hold the dispatcher, so nothing of it ran. The block started
+  it; read the log it shows.
+- `NOT ANSWERING`: launchd holds it, and nothing answered on its port. The block shows its
+  state and log. Read them first: a dispatcher that fails at start is restarted by launchd
+  again and again, and a restart does not fix that. When a restart is what it needs, the
+  card's second block restarts it without asking `/status`, and stops any session still
+  running.
 
 ### Step 8 — Confirm tickets still start sessions
 
@@ -505,7 +517,11 @@ dispatcher's own routes:
 | `/status` | idle or busy (`EdgeWorker.js:535`) |
 | `/slack-webhook` | the chat lane (`SlackEventTransport.js:85`) |
 
-A path it names is a wider door. It is not removed: find out what added it.
+A path it names is a wider door. It is not removed: find out what added it. One kind it
+refuses to add beside: a wildcard (any path with `*`), or a path under `/api/update/` or
+`/mcp/`. Those reach the dispatcher's config-update route or its tool server, whose auth
+check passes everything while `CYRUS_API_KEY` is unset. Take that path off the line by
+hand first. `--remove` still works beside one.
 
 With `--apply` it appends the path to the end of the line and changes nothing else. It
 backs the file up, validates it with `FRONT_DOOR_BIN validate --config … --adapter
@@ -521,7 +537,9 @@ forward one on purpose for monitoring.
 Not that, and each answer means a different layer: `404` on the Slack path means the path
 is not on the line or the door was not restarted; `530`, or the tunnel's own error page,
 means the tunnel in front of the door is down; `502` means the door forwarded it and the
-dispatcher is not listening.
+dispatcher is not listening. For a `502`, paste card CK-C5's block: it starts a dispatcher
+launchd does not hold, and says `NOT ANSWERING`, with the state and the log, for one it
+holds. Read the log before the card's forced restart.
 
 ### Step 11 — Point Slack at it
 
@@ -547,7 +565,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file and backups folder included |
-| `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
+| `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
 

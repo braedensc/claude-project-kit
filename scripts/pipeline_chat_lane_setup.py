@@ -520,13 +520,16 @@ def pf_plist():
 # because the boot job was still loaded from the first. Now a loaded job is booted out
 # first, and the script waits until launchd no longer lists it — `bootout` returns when
 # launchd has accepted the request, not when the job is gone (the Stage E installer's
-# restart notes). Bounded: 30 polls, one second apart. Each line stands alone, because a
-# person may paste them one at a time.
+# restart notes). Bounded: 30 polls, one second apart, and the bound says so when it runs
+# out — the bootstrap after it then fails with errno 5, and `sh -e` stops there (review of
+# KIT-197, finding 41). Each line stands alone, because a person may paste them one at a time.
 PF_RELOAD_IF_LOADED = (
     "if sudo launchctl print system/%(label)s >/dev/null 2>&1; then "
     "sudo launchctl bootout system/%(label)s; n=0; "
     "while sudo launchctl print system/%(label)s >/dev/null 2>&1; do "
-    "n=$((n+1)); [ $n -ge 30 ] && break; sleep 1; done; fi" % {"label": PF_DAEMON_LABEL})
+    "n=$((n+1)); [ $n -ge 30 ] && { echo 'STILL LOADED after 30 s: launchd has not let the "
+    "old boot job go. Wait a minute, then run this script again.' >&2; break; }; "
+    "sleep 1; done; fi" % {"label": PF_DAEMON_LABEL})
 
 
 def pf_install_commands(port):
@@ -745,6 +748,32 @@ EXPECTED_ROUTES = {
     "/status": "idle or busy, for a safe restart (edge-worker EdgeWorker.js:535)",
     SLACK_PATH: "the chat lane's Slack events (slack-event-transport SlackEventTransport.js:85)",
 }
+
+# The two dispatcher routes that must never be reachable through the door (review of
+# KIT-197, finding 46): the config-update routes (EdgeWorker.js:516-521) and the
+# dispatcher's own tool server (EdgeWorker.js:97), whose auth check passes everything while
+# CYRUS_API_KEY is unset (McpConfigService.js:166-170). A path with `*` in it is a pattern:
+# it forwards paths nobody listed, and may cover either. Compared without case, on the
+# safe side of however the door matches.
+TOOL_SERVER_PATH = "/mcp/cyrus-tools"
+
+
+def widening_reason(path):
+    """Why a path on the allowlist line forwards one of the dispatcher's control routes,
+    or None. A literal path that is not a dispatcher route is not this: it is named, not
+    judged, because it may be there on purpose."""
+    low = path.lower()
+    if "*" in path:
+        return ("a wildcard: it forwards paths nobody listed, and can cover the dispatcher's "
+                "config-update route (%s) or its tool server (%s)"
+                % (CONFIG_UPDATE_PATH, TOOL_SERVER_PATH))
+    if low.startswith("/api/update/"):
+        return "the dispatcher's config-update route (EdgeWorker.js:516-521)"
+    if low.startswith("/mcp/"):
+        return ("the dispatcher's tool server, whose auth check passes everything while "
+                "CYRUS_API_KEY is unset (McpConfigService.js:166-170)")
+    return None
+
 
 # One named-matcher line: the matcher, `path`, then one or more paths, then an optional
 # trailing comment (`#` starting a word) and trailing space. No line ending: callers split
@@ -1240,6 +1269,9 @@ def _compose_piece_4(conf):
          "and its last exit (sudo launchctl print system/%s | grep 'last exit'). Its one "
          "command is /sbin/pfctl -E -a %s -f \"%s\"; run that by hand with sudo to see the "
          "error." % (PF_DAEMON_LOG, PF_DAEMON_LABEL, PF_ANCHOR, PF_RULES_PATH))
+    para("Not that either: \"STILL LOADED after 30 s\", then \"Bootstrap failed: 5\". The "
+         "old boot job had not let go yet. The rule already loaded stays in force: wait a "
+         "minute and run the script again.")
     para("After piece 3's restart, card CK-C4 proves the rule from a second device on the "
          "same network. A test from this machine to its own network address proves "
          "nothing.")
@@ -1315,9 +1347,11 @@ def _compose_piece_7(conf):
          "the ONE `<matcher> path …` line of FRONT_DOOR_CONFIG, names every path on it that "
          "is not one of the dispatcher's own routes, and changes nothing;  front-door "
          "--apply  appends the path, backs the file up, validates it with FRONT_DOOR_BIN, and "
-         "puts the backup back if validation fails. It refuses on no such line, or on two. "
-         "It never restarts the front door: card CK-C2 has the restart and the three "
-         "probes." % _self_path())
+         "puts the backup back if validation fails. It refuses on no such line, or on two, "
+         "and will not add the path beside a wildcard or a path under /api/update/ or "
+         "/mcp/: those reach the dispatcher's config-update route or its tool server. It "
+         "never restarts the front door: card CK-C2 has the restart and the three probes."
+         % _self_path())
     say("")
 
 
@@ -1380,9 +1414,14 @@ def _group(needs, lines):
     return {"needs": tuple(needs), "lines": list(lines)}
 
 
-def card_lines(item, conf):
-    """The lines one `do` item prints under this conf (None: no conf was loaded)."""
+def card_lines(item, conf, broken=False):
+    """The lines one `do` item prints under this conf (None: no conf was loaded). `broken`:
+    a conf was read and has problems, so no command is composed from it, and "set <KEY>"
+    would be false for a key that is set (review of KIT-197, finding 39)."""
     if isinstance(item, dict):
+        if broken:
+            return ["    not composed: fix chat-lane.conf first (its problems are listed "
+                    "above)"]
         missing = [k for k in item["needs"] if not (conf or {}).get(k)]
         if missing:
             return ["    not composed: set %s in chat-lane.conf" % k for k in missing]
@@ -1409,22 +1448,44 @@ _WAIT_GONE = ("n=0; while sudo launchctl print system/%s >/dev/null 2>&1; do n=$
 # EdgeWorker.js:1784-1802, served at EdgeWorker.js:535), and a restart stops every running
 # session. The log's path is read out of the plist's StandardOutPath, as the Stage E
 # installer's `_dispatcher_log_path` does, so no key names it.
-IDLE_RESTART_LINES = [
-    "if curl -s -m 5 http://127.0.0.1:${DISPATCHER_PORT}/status | grep -q '\"idle\"'; then",
-    "  sudo launchctl bootout system/${DISPATCHER_SERVICE}",
-    "  " + _WAIT_GONE % "${DISPATCHER_SERVICE}",
-    "  sudo launchctl bootstrap system /Library/LaunchDaemons/${DISPATCHER_SERVICE}.plist",
-    "  sleep 10",
-    "  L=$(/usr/libexec/PlistBuddy -c 'Print :StandardOutPath' "
-    "/Library/LaunchDaemons/${DISPATCHER_SERVICE}.plist)",
-    "  sudo tail -n 40 \"$L\"",
-    "else",
-    "  echo 'NOT RESTARTED: the dispatcher did not answer idle. A webhook, a ticket session "
-    "or a chat session is running, or it is not answering. Paste this again later.'",
-    "fi",
-]
+#
+# NO ANSWER IS NOT "BUSY" (review of KIT-197, finding 31). Card CK-C2 sends a 502 here, and
+# a dispatcher that is not listening can never answer idle, so the block used to say "paste
+# again later" forever. Now: an answer that is not idle is busy; no answer, with launchd not
+# holding the job, means nothing runs and it is started; no answer while launchd holds it
+# prints its state and log, and the card's forced restart is the person's call.
+_LOG_TAIL = ["L=$(/usr/libexec/PlistBuddy -c 'Print :StandardOutPath' "
+             "/Library/LaunchDaemons/${DISPATCHER_SERVICE}.plist)",
+             "sudo tail -n 40 \"$L\""]
+_BOOTSTRAP = ["sudo launchctl bootstrap system /Library/LaunchDaemons/${DISPATCHER_SERVICE}.plist",
+              "sleep 10"]
+IDLE_RESTART_LINES = (
+    ["S=$(curl -s -m 5 http://127.0.0.1:${DISPATCHER_PORT}/status)",
+     "if printf '%s' \"$S\" | grep -q '\"idle\"'; then",
+     "  sudo launchctl bootout system/${DISPATCHER_SERVICE}",
+     "  " + _WAIT_GONE % "${DISPATCHER_SERVICE}"]
+    + ["  " + line for line in _BOOTSTRAP + _LOG_TAIL]
+    + ["elif [ -n \"$S\" ]; then",
+       "  echo 'NOT RESTARTED: the dispatcher answered, and not idle: a webhook, a ticket "
+       "session or a chat session is running. Paste this again later.'",
+       "elif ! sudo launchctl print system/${DISPATCHER_SERVICE} >/dev/null 2>&1; then",
+       "  echo 'NOT LOADED: launchd does not hold the dispatcher, so nothing of it runs. "
+       "Starting it:'"]
+    + ["  " + line for line in _BOOTSTRAP + _LOG_TAIL]
+    + ["else",
+       "  echo 'NOT ANSWERING: launchd holds the dispatcher and nothing answered on its port "
+       "in 5 s. Its state, and the end of its log:'",
+       "  sudo launchctl print system/${DISPATCHER_SERVICE} | grep -E 'state =|pid =|last "
+       "exit'"]
+    + ["  " + line for line in _LOG_TAIL]
+    + ["fi"])
 IDLE_RESTART = _group(("DISPATCHER_SERVICE", "DISPATCHER_PORT"),
                       ["    " + line for line in IDLE_RESTART_LINES])
+# After NOT ANSWERING, and only then: the same stop, wait, start, with no /status gate.
+FORCED_RESTART = _group(("DISPATCHER_SERVICE",), ["    " + line for line in (
+    ["echo 'FORCED RESTART: it stops any session still running.'",
+     "sudo launchctl bootout system/${DISPATCHER_SERVICE}",
+     _WAIT_GONE % "${DISPATCHER_SERVICE}"] + _BOOTSTRAP + _LOG_TAIL)])
 
 # The front door's restart: the same stop, wait, start. It stops no session; a tracker
 # webhook sent in those seconds fails, and the tracker retries it.
@@ -1512,8 +1573,10 @@ CARDS = {
                "      first: until then every ticket is turned away at the door.",
                "  530, or the tunnel's own error page: the tunnel in front of the door is",
                "      down, not the door. Read the tunnel service's state and its log.",
-               "  502: the door forwarded it and the dispatcher is not listening. Restart",
-               "      the dispatcher (card CK-C5), then probe again.",
+               "  502: the door forwarded it and the dispatcher is not listening. Paste card",
+               "      CK-C5's block: it starts a dispatcher launchd does not hold, and says",
+               "      NOT ANSWERING, with its state and log, for one launchd holds. Read the",
+               "      log before the card's forced restart; then probe again.",
                "(A status or version path is not the test: a front door may forward one on",
                "purpose for monitoring.)"],
         "good": ("401 on the Slack path and on the tracker path, and 404 (anything but 401) "
@@ -1629,12 +1692,21 @@ CARDS = {
                "It stops the dispatcher, waits until launchd has let it go, starts it, and",
                "shows the end of its log, whose path it reads from the dispatcher's plist:",
                IDLE_RESTART,
-               "NOT RESTARTED means busy or not answering: wait, and paste it again. Do not",
+               "NOT RESTARTED means it answered busy: wait, and paste it again. Do not",
                "force it while a session runs.",
+               "NOT LOADED means launchd did not hold it, so nothing of it was running: the",
+               "block started it. Read the log it showed.",
+               "NOT ANSWERING means launchd holds it and nothing answered on its port, so no",
+               "webhook reaches it either. Read the state and log the block showed first: a",
+               "dispatcher that fails at start is restarted by launchd again and again, and",
+               "a restart will not fix that. When a restart is what it needs, paste this",
+               "instead. It asks nothing first, and stops any session still running:",
+               FORCED_RESTART,
                "Then, first: delegate one throwaway tracker ticket (THE ORDER, step 6)."],
         "good": "the block showed the dispatcher's fresh start at the end of its log",
         "not": ("NOT RESTARTED for an hour or more — a session is stuck: find it before "
-                "forcing a restart"),
+                "forcing a restart; or NOT ANSWERING again after the forced restart — the "
+                "dispatcher fails at start: its log says why"),
     },
     "CK-C6": {
         "title": "Turn the chat lane off",
@@ -1682,7 +1754,9 @@ NEVER = [
 ]
 
 
-def print_card(cid, conf=None):
+def print_card(cid, conf=None, broken=False):
+    """`broken`: a chat-lane.conf was read, and its problems were printed above this card;
+    nothing is composed from it."""
     card = CARDS.get(cid)
     if not card:
         raise ConfError("no such checkpoint card: %s (have %s)"
@@ -1691,7 +1765,10 @@ def print_card(cid, conf=None):
     say("=" * 74)
     say(" %s — %s" % (cid, card["title"]))
     say("=" * 74)
-    if conf is None:
+    if broken:
+        say(" (chat-lane.conf has the problems listed above: ${NAMES} below are left as they")
+        say("  are, and no command that needs a conf value is composed until they are fixed)")
+    elif conf is None:
         say(" (no chat-lane.conf loaded: ${NAMES} below are yours to fill in, and a command")
         say("  that needs a conf value says so instead of printing)")
     say("")
@@ -1701,7 +1778,7 @@ def print_card(cid, conf=None):
     say("")
     say("WHAT TO DO")
     for item in card["do"]:
-        for line in card_lines(item, conf):
+        for line in card_lines(item, None if broken else conf, broken):
             say("  " + line)
     say("")
     say("GOOD: %s" % card["good"])
@@ -2349,7 +2426,9 @@ def check_user_settings(conf, us, env_facts):
 def check_front_door(conf, fd):
     """The front door's allowlist line, read as the role account (KIT-197). `fd` is
     `front_door_digest`'s answer. The Slack path and the tracker path on the one line is
-    done; a path that is not one of the dispatcher's own routes is named, not judged."""
+    done. A path that forwards the config-update route or the tool server, or a wildcard
+    that may, is drift (`widening_reason`); any other path that is not one of the
+    dispatcher's own routes is named, not judged."""
     unset = [k for k in FRONT_DOOR_READ_KEYS if not conf.get(k)]
     if unset:
         return _row("front-door", UNKNOWN,
@@ -2379,10 +2458,16 @@ def check_front_door(conf, fd):
         problems.append("the tracker path %s is not on line %s of %s, so no tracker webhook "
                         "reaches the dispatcher and no ticket starts a session"
                         % (TRACKER_PATH, fd.get("line"), path))
+    for p in paths:
+        why = widening_reason(p)
+        if why:
+            problems.append("line %s of %s forwards %s, %s. Take it off the line, restart "
+                            "the door (card CK-C2), and find out what added it"
+                            % (fd.get("line"), path, p, why))
     notes = ["note: the line also forwards %s, which is not one of the dispatcher's own "
              "routes (%s). It widens the door; find out what added it" % (p, ", ".join(
                  sorted(EXPECTED_ROUTES)))
-             for p in paths if p not in EXPECTED_ROUTES]
+             for p in paths if p not in EXPECTED_ROUTES and not widening_reason(p)]
     if problems:
         return _problem_row("front-door", BLOCKED, problems, notes)
     return _row("front-door", ALREADY_DONE,
@@ -3440,13 +3525,24 @@ def cmd_front_door(conf, runner, sudo, apply_it=False, remove=False):
     text = fd["text"]
     say("  line      %d" % fd["line"])
     say("  now       %s" % text.strip())
+    wide = []
     for p in fd["paths"]:
-        if p not in EXPECTED_ROUTES:
+        why = widening_reason(p)
+        if why:
+            wide.append(p)
+            say("  WIDENS    %s: %s." % (p, why))
+        elif p not in EXPECTED_ROUTES:
             say("  WARNING   %s is not one of the dispatcher's own routes: the door forwards a "
                 "path this kit cannot account for. Find out what added it." % p)
     say("  The dispatcher's own routes:")
     for route in sorted(EXPECTED_ROUTES):
         say("    %-16s %s" % (route, EXPECTED_ROUTES[route]))
+    if wide and not remove:
+        say("REFUSED: this line forwards %s. The chat path is not added to a door that "
+            "reaches the dispatcher's control routes: take %s off the line by hand, restart "
+            "the door, then run front-door again. Nothing was changed."
+            % (", ".join(wide), "it" if len(wide) == 1 else "them"))
+        return EX_BLOCKED
     new = front_line_edit(text, matcher, SLACK_PATH, remove)
     if new is None:
         say("REFUSED: taking %s off would leave the line with no path at all, and an empty "
@@ -3529,12 +3625,21 @@ def main(argv=None, runner=None, sudo=None):
             say(refusal_text(found, args.command))
             return EX_REFUSED
     if args.command == "card":
+        # No conf at all is fine: a card reads without one. A conf that was read and has
+        # problems is named, and nothing is composed from it (review of KIT-197, 39).
         conf, errors = load_conf(args.conf)
+        broken = conf is not None and bool(errors)
+        if broken:
+            say("Your conf has %d problem(s), so no command below is composed from it:"
+                % len(errors))
+            for e in errors:
+                say("  - " + e)
         try:
-            return print_card(args.target or "", conf if (conf and not errors) else None)
+            rc = print_card(args.target or "", None if (broken or not conf) else conf, broken)
         except ConfError as exc:
             say(str(exc))
             return EX_USAGE
+        return EX_USAGE if broken else rc
     conf, errors = load_conf(args.conf)
     if errors:
         say("Your conf has %d problem(s). Every one of them, in one pass:" % len(errors))
@@ -5024,6 +5129,15 @@ def _selftest_kit197(expect, conf):
                     expect("pf-rerun-waits-until-gone",
                            calls.find("launchctl bootout") < calls.rfind("launchctl print")
                            < calls.find("bootstrapped"), calls)
+            # the old job never lets go within the bound: the script says so before the
+            # bootstrap fails, and `sh -e` stops there (review 41)
+            env, log = _shims(tmp, loaded=True, linger=40)
+            ran = subprocess.run(["/bin/sh", "-e", "-c", launchd], env=env, capture_output=True,
+                                 text=True, timeout=60)
+            expect("pf-rerun-says-when-the-wait-ran-out", ran.returncode != 0
+                   and "STILL LOADED" in ran.stdout + ran.stderr
+                   and "Bootstrap failed" in ran.stderr, (ran.returncode, ran.stdout[-200:],
+                                                          ran.stderr[-200:]))
     group("pf-rerun", pf_rerun)
 
     # -- CK-C5: restart the dispatcher only when it says it is idle -------------------
@@ -5036,11 +5150,11 @@ def _selftest_kit197(expect, conf):
         expect("card-c5-log-path-from-the-plist",
                "/usr/libexec/PlistBuddy -c 'Print :StandardOutPath' "
                "/Library/LaunchDaemons/com.example.dispatcher.plist" in out, out)
-        block = _shell_block(out, "if curl", "fi")
+        block = _shell_block(out, "S=$(curl", "fi")
         expect("card-c5-gate-block-found", "127.0.0.1:3456/status" in block
                and "grep -q '\"idle\"'" in block, block)
         with tempfile.TemporaryDirectory() as tmp:
-            for says in ("idle", "busy", "down"):
+            for says in ("idle", "busy"):
                 env, log = _shims(tmp, curl_says=says, loaded=True, linger=2)
                 ran = _run_shell(block, env)
                 calls = _read(log)
@@ -5054,6 +5168,36 @@ def _selftest_kit197(expect, conf):
                     expect("card-c5-%s-does-not-restart" % says,
                            "launchctl bootout" not in calls and "bootstrapped" not in calls
                            and "NOT RESTARTED" in ran.stdout, (calls, ran.stdout))
+            # nothing answers: "busy" and "dead" are told apart, so CK-C2's 502 remedy is
+            # not a loop (review 31). Launchd holds it: its state and log, and no restart.
+            env, log = _shims(tmp, curl_says="down", loaded=True, linger=2)
+            ran = _run_shell(block, env)
+            calls = _read(log)
+            expect("card-c5-not-answering-shows-state-and-log",
+                   "NOT ANSWERING" in ran.stdout and "NOT RESTARTED" not in ran.stdout
+                   and "launchctl print system/com.example.dispatcher" in calls
+                   and "sudo tail -n 40" in calls and "launchctl bootout" not in calls
+                   and "bootstrapped" not in calls, (calls, ran.stdout[-300:]))
+            # launchd does not hold it: nothing runs, so nothing is lost by starting it
+            env, log = _shims(tmp, curl_says="down", loaded=False)
+            ran = _run_shell(block, env)
+            calls = _read(log)
+            expect("card-c5-not-loaded-starts-it", "NOT LOADED" in ran.stdout
+                   and "bootstrapped" in calls and "launchctl bootout" not in calls,
+                   (calls, ran.stdout[-300:]))
+            # the forced restart the card offers after NOT ANSWERING stops, waits, starts
+            forced = _shell_block(out, "echo 'FORCED RESTART", "sudo tail")
+            env, log = _shims(tmp, loaded=True, linger=2)
+            ran = _run_shell(forced, env)
+            calls = _read(log)
+            expect("card-c5-forced-restart-waits", forced and "curl" not in forced
+                   and calls.find("launchctl bootout") < calls.rfind("launchctl print")
+                   < calls.find("bootstrapped") and "Bootstrap failed" not in ran.stderr,
+                   (forced, calls))
+        flat = " ".join(out.split())
+        expect("card-c5-reads-not-answering-apart-from-busy",
+               "NOT ANSWERING" in flat and "NOT LOADED" in flat
+               and "NOT ANSWERING" in CARDS["CK-C5"]["not"], flat[-900:])
         rc, out_min = _capture(print_card, "CK-C5", minimal)
         expect("card-c5-not-composed-without-the-key",
                "not composed: set DISPATCHER_SERVICE in chat-lane.conf" in out_min
@@ -5080,6 +5224,8 @@ def _selftest_kit197(expect, conf):
             calls = _read(log)
             expect("card-c2-restart-waits", "bootstrapped" in calls
                    and "Bootstrap failed" not in ran.stderr, (block, calls))
+        c2_502 = flat[flat.find("502:"):flat.find("502:") + 260]
+        expect("card-c2-502-names-not-answering", "NOT ANSWERING" in c2_502, c2_502)
         rc, out_min = _capture(print_card, "CK-C2", minimal)
         expect("card-c2-not-composed-without-the-keys",
                "not composed: set FRONT_DOOR_SERVICE in chat-lane.conf" in out_min
@@ -5091,7 +5237,7 @@ def _selftest_kit197(expect, conf):
     def card_c6():
         rc, out = _capture(print_card, "CK-C6", conf)
         flat = " ".join(out.split())
-        steps = ("Uninstall", "env-names --remove", "if curl", "front-door --remove --apply",
+        steps = ("Uninstall", "env-names --remove", "S=$(curl", "front-door --remove --apply",
                  "bootout system/com.example.front-door", "/slack-webhook",
                  "pfctl -a %s -s rules" % PF_ANCHOR)
         at = [flat.find(s) for s in steps]
@@ -5123,6 +5269,25 @@ def _selftest_kit197(expect, conf):
             refs = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)\}", json.dumps(card["do"])))
             expect("card-keys-known:" + cid, refs <= CONF_KEYS, refs - CONF_KEYS)
     group("cards-c1-c3", cards_c1_c3)
+
+    # -- a card under a conf with problems names them; it never says "set" a key that is
+    # set, nor "no chat-lane.conf loaded" when one was (review 39) ---------------------
+    def card_bad_conf():
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "chat-lane.conf")
+            _put(bad, GOOD_CONF_TEXT + "FRONT_DOOR_MATCHER2=@x\n")
+            rc, out = _capture(main, ["card", "CK-C5", "--conf", bad])
+            expect("card-bad-conf-names-the-problem", rc == EX_USAGE
+                   and "unknown key FRONT_DOOR_MATCHER2" in out
+                   and "set DISPATCHER_SERVICE" not in out and "set DISPATCHER_PORT" not in out
+                   and "no chat-lane.conf loaded" not in out and "fix chat-lane.conf" in out
+                   and "launchctl bootout" not in out, (rc, out[:900]))
+            rc, out = _capture(main, ["card", "CK-C5", "--conf",
+                                      os.path.join(tmp, "absent.conf")])
+            expect("card-without-a-conf-still-prints", rc == EX_OK
+                   and "no chat-lane.conf loaded" in out
+                   and "not composed: set DISPATCHER_SERVICE" in out, (rc, out[:400]))
+    group("card-bad-conf", card_bad_conf)
 
     # -- THE ORDER uses the subcommands ----------------------------------------------
     def order():
@@ -5181,6 +5346,13 @@ def _selftest_kit197(expect, conf):
         row = check_front_door(conf, dict(good, paths=good["paths"] + ["/extra-path"]))
         expect("verify-front-door-names-an-unknown-path", row["outcome"] == ALREADY_DONE
                and "/extra-path" in _row_text(row), row)
+        # a path that forwards the config-update route or the tool server, or a wildcard
+        # that may, is drift, not a note (review 46)
+        for wide in ("/*", "/api/*", "/mcp/*", "*", "/mcp/cyrus-tools", "/MCP/cyrus-tools",
+                     "/api/update/cyrus-config", "/api/update/other"):
+            row = check_front_door(conf, dict(good, paths=good["paths"] + [wide]))
+            expect("verify-front-door-blocks-a-widening-path:" + wide,
+                   row["outcome"] == BLOCKED and wide in _row_text(row), row)
         row = check_front_door(conf, dict(good, paths=["/linear-webhook", "/status"]))
         expect("verify-front-door-slack-missing", row["outcome"] == BLOCKED
                and "/slack-webhook" in _row_text(row), row)
@@ -5817,6 +5989,35 @@ def _selftest_kit197(expect, conf):
                 expect("front-door-two-lines-refused:%s" % apply_it, rc == EX_BLOCKED
                        and mach.writes == [] and _read(fd_path) == two and "found 2" in out,
                        (rc, out[-300:]))
+            # no line at all — the matcher line removed, or a matcher the conf misspells —
+            # is a clean refusal, never a traceback (review 51)
+            zero = FRONT_DOOR_FIXTURE.replace(
+                "\t@dispatcher path /linear-webhook /callback /status /extra-path\n", "")
+            for label, text, matcher in (("no-line", zero, "@dispatcher"),
+                                         ("other-matcher", FRONT_DOOR_FIXTURE, "@other")):
+                _put(fd_path, text)
+                for apply_it in (False, True):
+                    mach = _RoleMachine(home, _pf_answers())
+                    rc, out = _capture(cmd_front_door, dict(fconf, FRONT_DOOR_MATCHER=matcher),
+                                       mach, _FakeSudo(), apply_it, False)
+                    expect("front-door-zero-lines-refused:%s:%s" % (label, apply_it),
+                           rc == EX_BLOCKED and mach.writes == [] and _read(fd_path) == text
+                           and "found 0" in out, (rc, out[-300:]))
+            # a line that forwards the config-update route or the tool server: the chat
+            # path is not added to it; taking the chat path off still works (review 46)
+            wide = FRONT_DOOR_FIXTURE.replace("/extra-path", "/extra-path /api/*")
+            _put(fd_path, wide)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_front_door, fconf, mach, _FakeSudo(), True, False)
+            expect("front-door-refuses-to-add-beside-a-widening-path", rc == EX_BLOCKED
+                   and mach.writes == [] and _read(fd_path) == wide and "/api/*" in out,
+                   (rc, out[-300:]))
+            wide_on = wide.replace("/api/*", "/api/* /slack-webhook")
+            _put(fd_path, wide_on)
+            rc, out = _capture(cmd_front_door, fconf, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True, True)
+            expect("front-door-remove-beside-a-widening-path", rc == EX_OK
+                   and _read(fd_path) == wide and "/api/*" in out, (rc, out[-300:]))
 
             def moved():
                 _put(fd_path, FRONT_DOOR_FIXTURE + "# edited by hand\n")

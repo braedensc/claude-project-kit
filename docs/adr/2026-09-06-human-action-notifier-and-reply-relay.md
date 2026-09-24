@@ -513,8 +513,9 @@ and the block before the listen, on the port the dispatcher really listens on. I
 the chat token with every value in the role account's env file, where the notifier keeps
 its own, and writes nothing when it cannot read that file. **Restarts and the port block
 stay printed commands the owner runs**, as installers never load jobs: a new card restarts
-the dispatcher only when its own `/status` answers `idle`, and another turns the lane off in
-order. `verify` gains a row that reads the front door's allowlist line. The live-check card
+the dispatcher only when its own `/status` answers `idle`, starts one launchd does not
+hold, and shows the state and log of one that holds but does not answer; another turns
+the lane off in order. `verify` gains a row that reads the front door's allowlist line. The live-check card
 now tests calls, not the listing, and names KIT-196.
 
 The writers are guarded the way `verify` is: they need administrator access, asked for once,
