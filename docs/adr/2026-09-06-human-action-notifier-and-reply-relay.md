@@ -501,9 +501,9 @@ The three scripts' behaviour moved into it as subcommands a person runs:
 
 Each refuses under a model, before its conf is read. Each writes as the role account,
 through one program handed to that account's shell, with every value on standard input and
-none in an argument. `merge` and `front-door` re-read the file and refuse when it is not the
-file they planned from: the dispatcher rewrites its config when it refreshes a tracker
-token. `env-names` has no separate plan; it reads and replaces the env file in one pass, and
+none in an argument. `merge` and `front-door` re-read the file, as they start and again
+just before the write, and refuse when it is not the file they planned from: the
+dispatcher rewrites its config when it refreshes a tracker token. `env-names` has no separate plan; it reads and replaces the env file in one pass, and
 nothing else rewrites that file. Each writes nothing when nothing would change, and
 otherwise backs the file up first, under the role account's home, at mode 600; the
 user-level read denies now cover that folder and the role account's own env file. A dry run

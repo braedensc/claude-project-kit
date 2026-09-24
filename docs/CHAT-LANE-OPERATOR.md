@@ -92,9 +92,10 @@ line: a `REFUSED:` line can end in 10, 2 or 3.
 
 - **They run as the role account**, through `sudo -u`. Every value goes on standard input,
   never in an argument, so `ps` never shows it and nothing prints it.
-- **`merge` and `front-door` check the file is the one they planned from.** The
-  dispatcher rewrites its own config when it refreshes a tracker token. If the file changed
-  between the read and the write, the writer refuses and writes nothing. Run it again.
+- **`merge` and `front-door` check the file is the one they planned from**, as they start
+  and again just before the write. The dispatcher rewrites its own config when it
+  refreshes a tracker token. If the file changed, the writer refuses and writes nothing.
+  Run it again. The dispatcher honours no lock, so one read's worth of window remains.
   `env-names` has no separate plan: it reads and replaces the env file in one pass, and
   nothing else rewrites that file.
 - **They write nothing when nothing would change.** No backup, no new file, and no restart
@@ -148,9 +149,11 @@ With `--apply` it then reads everything again and prints the `grant`, `coding-fe
 `user-settings` rows as `verify` would.
 
 Good: those three rows say `ALREADY-DONE`, and a second `merge --apply` says `Nothing to
-write`.
-Not that: `REFUSED: … changed since it was read`. The dispatcher refreshed a token in
-between. Run it again.
+write: every piece this command merges is already in place`.
+Not that: `REFUSED: … changed since it was read`, or `… changed while it was being backed
+up`. The dispatcher refreshed a token in between. Run it again.
+Not that either: `Nothing this command can write`. A line above says `CANNOT`, `NOT
+MERGED` or `LEFT ALONE`: that piece is yours by hand, and the rows say what is left.
 
 ### Step 2 — Fence the Slack server off every other entry (piece 2)
 
@@ -187,7 +190,10 @@ Two more ways the fence can open. A session routed to several entries keeps only
 environment variable replaces `defaultDisallowedTools` at start (`WorkerService.js:164-165`).
 
 `verify` prints the exact list for each entry, ready to paste. `merge` writes exactly that
-list.
+list. **Except under `DISALLOWED_TOOLS`:** an entry that inherits then runs under that
+env list, which neither command reads. `verify` says so, `merge` writes nothing for that
+entry and prints `CANNOT`, and the fix is yours: give the entry its own list, the value of
+`DISALLOWED_TOOLS` plus both rules.
 
 ### Step 3 — Trim the chat grant (piece 1)
 
@@ -255,7 +261,9 @@ The rules go into that file's existing `deny` list. Every rule already there sta
 hooks.
 
 Don't: overwrite the file. The account may already have one, and its rules would be gone.
-`merge` backs an existing file up first and adds only what is missing.
+`merge` backs an existing file up first and adds only what is missing. A file it cannot
+extend — not a JSON object, or a `permissions` or `deny` of the wrong type — is reported
+`FAILED` and left alone; `merge` still writes the config, and you merge this piece by hand.
 
 **Why the rules start with `//**/` or `~/`.** The first twelve are this repository's own
 secret-file denies. Written relative, as the repository has them, a rule matches under the

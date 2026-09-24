@@ -41,7 +41,8 @@ and then run for real. The owner decided the composer itself gains those writers
     with every value on standard input and never in an argument; each backs the file up
     first, under the role account's own home, and writes nothing when there is nothing
     to change. `merge --apply` and `front-door --apply` also check the file is still the
-    one they planned from (a checksum). `env-names` has no separate plan: it reads and replaces the env file in one
+    one they planned from (a checksum), as they start and again just before the write.
+    `env-names` has no separate plan: it reads and replaces the env file in one
     pass, and nothing else rewrites that file. `compose`, `verify` and `card` still
     write nothing.
 
@@ -1092,7 +1093,9 @@ def _compose_piece_2(conf):
     para("compose reads no live config, so this is the rule. `verify` computes the exact "
          "list for each entry from the live file, and `merge` applies exactly that list, "
          "with piece 1 and piece 5, in one pass. It leaves a review entry alone and names "
-         "it if its fence is missing: the Stage E installer owns those entries.")
+         "it if its fence is missing: the Stage E installer owns those entries. With "
+         "DISALLOWED_TOOLS set, an entry that inherits runs under a list no file holds, so "
+         "`merge` composes nothing for it and says CANNOT: give it its own list by hand.")
     say("")
 
 
@@ -1855,11 +1858,17 @@ def user_settings():
         s = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         return {"path": path, "error": why(exc)}
-    perms = s.get("permissions") if isinstance(s, dict) else None
-    deny = perms.get("deny") if isinstance(perms, dict) else None
+    # The shape the merge writer can extend: an object, whose permissions (when present)
+    # is an object, whose deny (when present) is a list. Anything else is reported, never
+    # read as an empty list the writer would then refuse.
+    perms = s.get("permissions", {}) if isinstance(s, dict) else None
+    deny = perms.get("deny", []) if isinstance(perms, dict) else None
+    if not isinstance(deny, list):
+        return {"path": path, "sha256": digest(raw),
+                "error": "unparseable (not a settings object with a permissions.deny list)"}
     return {"path": path, "sha256": digest(raw),
-            "deny": [str(d)[:300] for d in deny] if isinstance(deny, list) else [],
-            "hasHooks": bool(isinstance(s, dict) and s.get("hooks"))}
+            "deny": [str(d)[:300] for d in deny],
+            "hasHooks": bool(s.get("hooks"))}
 
 def front_door(path, matcher):
     # Only the lines that START with the matcher: the caller decides which of them is the
@@ -2046,12 +2055,19 @@ def check_fence(cfg, env_facts):
             continue
         fenced_count += 1
         composed, missing, source = fence_entry(own, default)
+        env_override = own is None and "DISALLOWED_TOOLS" in env_names
         if missing:
             problems.append("%s (%s entry) lacks %s; its effective list comes from %s"
                             % (label, kind, ", ".join(missing), source))
-            lines.append("  paste into %s:  \"disallowedTools\": %s" % (label,
-                                                                        json.dumps(composed)))
-        if own is None and "DISALLOWED_TOOLS" in env_names:
+            if env_override:
+                # A list composed from the file would drop every deny the env list
+                # supplies (review of KIT-197, finding 29): no paste line for it.
+                lines.append("give %s its own list by hand: the value of DISALLOWED_TOOLS "
+                             "plus both Slack rules" % label)
+            else:
+                lines.append("  paste into %s:  \"disallowedTools\": %s"
+                             % (label, json.dumps(composed)))
+        if env_override:
             unknown.append("%s inherits defaultDisallowedTools, and the dispatcher env file "
                            "sets DISALLOWED_TOOLS, which replaces that list at start "
                            "(WorkerService.js:164-165); its live list is not in any file "
@@ -2067,8 +2083,10 @@ def check_fence(cfg, env_facts):
                             "Slack rules. Add both rules to that list rather than deleting "
                             "the key: %s" % (ptype, REMOVAL_NOTE))
     if problems:
+        # The caveats ride along: a row that is BLOCKED for one reason must still say what
+        # it could not measure (review of KIT-197, finding 29).
         return _problem_row("coding-fence", FAILED if any("not a list" in p for p in problems)
-                            else BLOCKED, problems, lines)
+                            else BLOCKED, problems, unknown + lines)
     if unknown:
         return _problem_row("coding-fence", UNKNOWN, unknown, lines)
     return _row("coding-fence", ALREADY_DONE,
@@ -2515,8 +2533,9 @@ def cmd_verify(conf, runner, sudo):
 #     never shows it, and the Runner records it as "<hidden>";
 #   * paths are arguments, never spliced into the program;
 #   * the merge and front-door programs re-read the file and refuse (exit 3, nothing
-#     written) when it is not the file the plan read — the dispatcher rewrites its own
-#     config when it refreshes a tracker token. The env program has no separate plan to compare with: it reads and
+#     written) when it is not the file the plan read, as they start and again just before
+#     the write — the dispatcher rewrites its own config when it refreshes a tracker
+#     token. The env program has no separate plan to compare with: it reads and
 #     replaces the env file in one pass, and the dispatcher never rewrites that file;
 #   * it writes nothing, and backs nothing up, when there is nothing to change;
 #   * it backs the file up first, under the role account's home, at mode 600, with a name
@@ -2530,7 +2549,9 @@ def cmd_verify(conf, runner, sudo):
 BACKUP_TAG = "pre-chat-lane"
 
 # Pieces 1, 2 and 5. Exit 0 wrote (or had nothing to write), 1 failed (a copy taken first
-# is put back), 2 a malformed patch, 3 refused: the file is not the one the plan read.
+# is put back, unless something else wrote the file too; or the settings file has a shape
+# it cannot extend), 2 a malformed patch, 3 refused: the file is not the one the plan read,
+# checked as it starts and again just before the config is written.
 MERGE_WRITER_PY = r'''
 import hashlib, json, os, sys, time
 
@@ -2667,30 +2688,45 @@ def main():
         new_cfg = render(cfg, raw.decode("utf-8")).encode("utf-8")
     s_raw = new_settings = None
     if deny_add:
+        # The settings checksum is not optional: a patch without it would switch the check
+        # off (review of KIT-197, finding 49). None means "there was no file".
+        if "settingsSha256" not in patch:
+            stop(2, "the patch adds deny rules and carries no settings checksum. Nothing was "
+                    "written.")
         exists = os.path.exists(s_path)
         s_raw = read(s_path) if exists else None
-        if "settingsSha256" in patch:
-            now = hashlib.sha256(s_raw).hexdigest() if exists else None
-            if now != patch["settingsSha256"]:
-                stop(3, "%s changed since it was read. Nothing was written. Run merge "
-                        "again." % s_path)
+        now = hashlib.sha256(s_raw).hexdigest() if exists else None
+        if now != patch["settingsSha256"]:
+            stop(3, "%s changed since it was read. Nothing was written. Run merge "
+                    "again." % s_path)
         settings, ok = loads(s_raw) if exists else ({}, True)
         perms = settings.setdefault("permissions", {}) if ok and isinstance(settings, dict) else None
         deny = perms.setdefault("deny", []) if isinstance(perms, dict) else None
         if not isinstance(deny, list):
-            stop(3, "%s is not a JSON object with a permissions.deny list. Nothing was "
+            stop(1, "%s is not a JSON object with a permissions.deny list. Nothing was "
                     "written: merge piece 5 into it by hand." % s_path)
         deny.extend([x for x in deny_add if x not in deny])
         new_settings = render(settings, s_raw.decode("utf-8") if exists else None).encode("utf-8")
 
-    # 2. The dispatcher config, in place, after a private copy.
+    # 2. The dispatcher config, in place, after a private copy. The checksum is taken
+    # again after the copy, just before the write: the dispatcher does not wait while the
+    # copy is made (review of KIT-197, finding 37). A window of one read remains; the
+    # dispatcher honours no lock.
     if new_cfg is not None:
         bk = backup_path(backups, "dispatcher-config.pre-chat-lane")
         private_copy(raw, bk)
         say("BACKUP      %s (it holds the tracker's tokens; mode 600)" % bk)
+        if read(path) != raw:
+            stop(3, "%s changed while it was being backed up: the dispatcher rewrites it "
+                    "when it refreshes a tracker token. Nothing was written. Run merge "
+                    "again." % path)
         in_place(path, new_cfg)
         _doc, ok = loads(read(path))
         if not ok:
+            if read(path) != new_cfg:
+                stop(1, "%s does not parse, and it no longer holds what this wrote: "
+                        "something else wrote it too, so it was not overwritten. Compare it "
+                        "with the copy taken first, %s, and restore by hand." % (path, bk))
             in_place(path, raw)
             stop(1, "%s did not parse after the write, so the copy taken first was put "
                     "back." % path)
@@ -2905,6 +2941,9 @@ def main():
                      os.path.basename(path) + ".pre-chat-lane")
     private_copy(raw, bk)
     say("BACKUP    %s" % bk)
+    if read(path) != raw:
+        stop(3, "%s changed while it was being backed up. Nothing was written. Run "
+                "front-door again." % path)
     in_place(path, b"\n".join(lines))
     say("WROTE     %s in place: line %d, and nothing else" % (path, i + 1))
     try:
@@ -2999,6 +3038,7 @@ def merge_plan(conf, facts):
     lines, ops = [], []
     default = cfg.get("defaultDisallowedTools")
     default_ok = default is None or isinstance(default, list)
+    env_names = set(env_facts.get("names") or []) | set(env_facts.get("empty") or [])
     fenced = 0
     for e in cfg.get("entries") or []:
         label, kind, own = _entry_label(e), entry_kind(e), e.get("disallowedTools")
@@ -3022,6 +3062,16 @@ def merge_plan(conf, facts):
                          "is composed for it" % (kind, label, "its disallowedTools"
                                                  if own == "not-a-list"
                                                  else "defaultDisallowedTools"))
+        elif own is None and "DISALLOWED_TOOLS" in env_names:
+            # The env list replaces defaultDisallowedTools at start (WorkerService.js:164-165),
+            # and this reads no env value. A list composed from the file would drop every
+            # deny that env list supplies, and verify would then pass (review of KIT-197,
+            # finding 29).
+            lines.append("CANNOT      %s entry %s inherits its list, and the dispatcher env "
+                         "file sets DISALLOWED_TOOLS, which replaces defaultDisallowedTools at "
+                         "start (WorkerService.js:164-165). Nothing is composed for it: give "
+                         "it its own list by hand, the value of DISALLOWED_TOOLS plus both "
+                         "Slack rules" % (kind, label))
         else:
             composed, missing, source = fence_entry(own, default)
             if missing:
@@ -3153,7 +3203,12 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
         _plan_line(line)
     say("")
     if not ops and not deny_add:
-        say("Nothing to write: every piece this command merges is already in place.")
+        # "Nothing to do" and "could not do it" must not read alike (contract §13).
+        held = [l for l in lines if l.startswith(("CANNOT", "NOT MERGED", "LEFT ALONE"))]
+        say("Nothing this command can write: %d line(s) above name a piece it did not merge "
+            "(CANNOT, NOT MERGED, LEFT ALONE), and the rows below say what is left." % len(held)
+            if held else
+            "Nothing to write: every piece this command merges is already in place.")
         rows = merge_rows(conf, facts)
         say("-- rows, as verify reads them --")
         print_rows(rows)
@@ -4809,6 +4864,30 @@ def _merge_fixture(review_fenced=True, first_mcp=False):
     }
 
 
+# Runs a writer program's REAL text with `os.fsync` wrapped: on its Nth call the wrapper
+# overwrites a file, as the dispatcher does when it stores a refreshed tracker token. The
+# writers fsync the backup first and the written file second, so N picks the moment.
+_FSYNC_HOOK = '''
+import os as _hook_os
+_hook_real = _hook_os.fsync
+_hook_calls = [0]
+def _hook_fsync(fd):
+    _hook_real(fd)
+    _hook_calls[0] += 1
+    act = _HOOKS.get(_hook_calls[0])
+    if act:
+        with open(act[0], "w", encoding="utf-8") as fh:
+            fh.write(act[1])
+_hook_os.fsync = _hook_fsync
+'''
+
+
+def _run_hooked(program, args, stdin, home, hooks):
+    return subprocess.run([sys.executable, "-c", "_HOOKS = %r\n" % hooks + _FSYNC_HOOK + program]
+                          + list(args), input=stdin, capture_output=True, text=True,
+                          timeout=60, cwd="/", env={"HOME": home, "PATH": "/usr/bin:/bin"})
+
+
 def _fenced_fixture():
     """`_merge_fixture` with piece 2 applied, as `merge --apply` leaves it: every non-review
     entry and every prompt type carries both Slack rules."""
@@ -5314,6 +5393,112 @@ def _selftest_kit197(expect, conf):
                    and "LEFT ALONE" not in out, review_lines)
     group("merge-hand", merge_hand)
 
+    # -- merge's edges: what it must not compose, and what it must not call "in place" --
+    def merge_edges():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            spath = os.path.join(home, ".claude", "settings.json")
+            mconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
+                         FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"))
+
+            # DISALLOWED_TOOLS in the env file replaces defaultDisallowedTools at start
+            # (WorkerService.js:164-165): an entry that inherits runs under a list no file
+            # holds, so merge composes nothing for it — a list built from the file would
+            # drop every deny the env list supplies, and verify would then pass (review 29)
+            doc = {"defaultDisallowedTools": ["Bash(rm -rf *)"],
+                   "repositories": [
+                       {"id": "coding-own", "name": "own", "repositoryPath": REPO_ONE,
+                        "disallowedTools": ["Edit"]},
+                       {"id": "coding-inherits", "name": "inherits",
+                        "repositoryPath": REPO_TWO}]}
+            _put(cfg_path, json.dumps(doc, indent=2) + "\n")
+            _put(env_path, "DISALLOWED_TOOLS=Bash(rm:*),WebFetch\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            repos = json.loads(_read(cfg_path))["repositories"]
+            expect("merge-env-override-composes-nothing-for-an-inheriting-entry",
+                   "disallowedTools" not in repos[1]
+                   and repos[0].get("disallowedTools") == ["Edit"] + list(SLACK_FENCE_RULES)
+                   and "CANNOT" in out and "DISALLOWED_TOOLS" in out and rc == EX_BLOCKED
+                   and not re.search(r"coding-fence\s+ALREADY-DONE", out),
+                   (rc, repos, out[-600:]))
+            probe_cfg = {"defaultDisallowedTools": ["Bash(rm -rf *)"], "entries": [
+                {"index": 0, "id": "coding-inherits", "name": "inherits",
+                 "disallowedTools": None, "labelPrompts": {}, "instructionHead": ""}]}
+            row = check_fence(probe_cfg, {"names": ["DISALLOWED_TOOLS"]})
+            expect("verify-fence-keeps-the-env-caveat-beside-a-problem",
+                   row["outcome"] == BLOCKED
+                   and "its live list is not in any file this reads" in _row_text(row)
+                   and "paste into coding-inherits" not in _row_text(row), row)
+
+            # the headline names "could not" apart from "nothing to do" (review 33)
+            done = _fenced_fixture()
+            done["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
+            full = json.dumps({"permissions": {"deny": user_deny_patterns(mconf)}}) + "\n"
+            _put(spath, full)
+            _put(env_path, "CLAUDE_CONFIG_DIR=/srv/elsewhere\n")
+            _put(cfg_path, json.dumps(done, indent=2) + "\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               False)
+            expect("merge-not-merged-is-not-already-in-place", rc == EX_UNKNOWN
+                   and "NOT MERGED" in out and "already in place" not in out, (rc, out[-500:]))
+            _put(env_path, "A=1\n")
+            broken = json.loads(json.dumps(done))
+            broken["repositories"][0]["labelPrompts"]["debugger"]["disallowedTools"] = "Write"
+            _put(cfg_path, json.dumps(broken, indent=2) + "\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               False)
+            expect("merge-cannot-is-not-already-in-place", rc == EX_BLOCKED
+                   and "CANNOT" in out and "already in place" not in out, (rc, out[-500:]))
+            _put(cfg_path, json.dumps(done, indent=2) + "\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               False)
+            expect("merge-in-place-says-so", rc == EX_OK and "already in place" in out,
+                   (rc, out[-300:]))
+
+            # a settings file of the wrong shape: the plan and the writer agree. The dry run
+            # plans no DENY, verify's row says FAILED, and --apply still writes the config
+            # and exits 1 — never 3, which is "refused for safety" (review 36)
+            for label, text in (("permissions-is-a-list", '{"permissions": []}'),
+                                ("deny-is-a-string", '{"permissions": {"deny": "Read(x)"}}'),
+                                ("deny-is-null", '{"permissions": {"deny": null}}'),
+                                ("top-level-is-a-list", "[]")):
+                _put(cfg_path, json.dumps(_merge_fixture(), indent=2) + "\n")
+                _put(spath, text)
+                rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()),
+                                   _FakeSudo(), False)
+                dry_ok = ("CANNOT" in out and not re.search(r"^\s*DENY\b", out, re.M)
+                          and rc == EX_BLOCKED)
+                facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), mconf)
+                us_row = check_user_settings(mconf, facts["userSettings"], facts["env"])
+                rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()),
+                                   _FakeSudo(), True)
+                repos = json.loads(_read(cfg_path))["repositories"]
+                expect("merge-settings-shape-plan-and-writer-agree:" + label, dry_ok
+                       and us_row["outcome"] == FAILED and rc == EX_FAILED
+                       and repos[0]["disallowedTools"][-2:] == list(SLACK_FENCE_RULES)
+                       and _read(spath) == text, (label, dry_ok, us_row, rc, out[-400:]))
+
+            # the settings file moved between the plan and the write: cmd_merge's own patch
+            # carries its checksum, so nothing is written, not even the config (review 49)
+            _put(cfg_path, json.dumps(_merge_fixture(), indent=2) + "\n")
+            _put(spath, json.dumps({"permissions": {"deny": []}}) + "\n")
+            cfg_before = _read(cfg_path)
+            moved = json.dumps({"permissions": {"deny": []}, "model": "someone-else"}) + "\n"
+
+            def edit_settings():
+                _put(spath, moved)
+            rc, out = _capture(cmd_merge, mconf,
+                               _RoleMachine(home, _pf_answers(), before_write=edit_settings),
+                               _FakeSudo(), True)
+            expect("merge-refuses-moved-settings-through-cmd-merge", rc == EX_REFUSED
+                   and "changed" in out and _read(cfg_path) == cfg_before
+                   and _read(spath) == moved, (rc, out[-400:]))
+    group("merge-edges", merge_edges)
+
     # -- env-names: the REAL role-account shell ---------------------------------------
     def env_names():
         with tempfile.TemporaryDirectory() as tmp:
@@ -5700,11 +5885,22 @@ def _selftest_kit197(expect, conf):
                    and _read_bytes(cfg_path) == raw
                    and _read(spath) == json.dumps({"permissions": {"deny": []}}),
                    (ran.returncode, ran.stdout[-200:]))
+            # a shape problem is FAILED (1), not REFUSED (3): nothing moved, it is broken
             _put(spath, json.dumps({"permissions": {"deny": "not a list"}}))
             ran = run(merge_writer_command(wconf), json.dumps({
-                "configSha256": sha, "config": [], "deny": [BACKUPS_DENY_RULE]}))
-            expect("merge-writer-refuses-a-deny-that-is-not-a-list", ran.returncode == 3
+                "configSha256": sha, "config": [], "deny": [BACKUPS_DENY_RULE],
+                "settingsSha256": hashlib.sha256(_read_bytes(spath)).hexdigest()}))
+            expect("merge-writer-fails-a-deny-that-is-not-a-list", ran.returncode == 1
                    and "by hand" in ran.stdout, (ran.returncode, ran.stdout[-200:]))
+            # a patch with deny rules and no settings checksum is malformed: the check can
+            # not be switched off by leaving the key out (review 49)
+            _put(spath, json.dumps({"permissions": {"deny": []}}))
+            ran = run(merge_writer_command(wconf), json.dumps({
+                "configSha256": sha, "config": [right], "deny": [BACKUPS_DENY_RULE]}))
+            expect("merge-writer-wants-the-settings-checksum", ran.returncode == 2
+                   and _read_bytes(cfg_path) == raw
+                   and _read(spath) == json.dumps({"permissions": {"deny": []}}),
+                   (ran.returncode, ran.stdout[-200:]))
             # the config is copied, privately, before it is written
             os.unlink(spath)
             ran = run(merge_writer_command(wconf), json.dumps({
@@ -5716,6 +5912,38 @@ def _selftest_kit197(expect, conf):
                    and len(copies) == 1 and _read_bytes(os.path.join(bdir, copies[0])) == raw
                    and _mode(os.path.join(bdir, copies[0])) == 0o600
                    and _mode(bdir) == 0o700, (ran.returncode, copies))
+
+            # INSIDE the writer: the dispatcher rewrites its config while the backup is
+            # being made. The writer checks again just before the write, and refuses; and a
+            # file that no longer holds what it wrote is never overwritten with the old
+            # bytes (review 37). The real program runs, with os.fsync wrapped.
+            _put(cfg_path, json.dumps(_merge_fixture(), indent=2) + "\n")
+            raw = _read_bytes(cfg_path)
+            sha = hashlib.sha256(raw).hexdigest()
+            refreshed = raw.decode("utf-8").replace(SENTINELS[3], SENTINELS[3] + "-refreshed")
+            patch = json.dumps({"configSha256": sha, "config": [right], "deny": []})
+            ran = _run_hooked(MERGE_WRITER_PY, [cfg_path], patch, home,
+                              {1: (cfg_path, refreshed)})
+            expect("merge-writer-rechecks-just-before-the-write", ran.returncode == 3
+                   and "changed" in ran.stdout and _read(cfg_path) == refreshed,
+                   (ran.returncode, ran.stdout[-300:]))
+            _put(cfg_path, raw.decode("utf-8"))
+            ran = _run_hooked(MERGE_WRITER_PY, [cfg_path], patch, home,
+                              {2: (cfg_path, "{ not json")})
+            expect("merge-writer-never-restores-over-another-write", ran.returncode == 1
+                   and _read(cfg_path) == "{ not json" and "by hand" in ran.stdout,
+                   (ran.returncode, ran.stdout[-300:]))
+            fd_file = os.path.join(tmp, "front", "Caddyfile.edge")
+            _put(fd_file, FRONT_DOOR_FIXTURE)
+            fraw = _read_bytes(fd_file)
+            edited = FRONT_DOOR_FIXTURE + "# edited by hand\n"
+            ran = _run_hooked(FRONT_WRITER_PY, [fd_file, "/bin/true"], json.dumps({
+                "sha256": hashlib.sha256(fraw).hexdigest(), "index": 1,
+                "old": FRONT_DOOR_FIXTURE.splitlines()[1],
+                "new": FRONT_DOOR_FIXTURE.splitlines()[1] + " /slack-webhook"}), home,
+                {1: (fd_file, edited)})
+            expect("front-writer-rechecks-just-before-the-write", ran.returncode == 3
+                   and _read(fd_file) == edited, (ran.returncode, ran.stdout[-300:]))
 
             # the env writer: someone else's file, a missing file, nothing on stdin, a
             # mode it does not know
