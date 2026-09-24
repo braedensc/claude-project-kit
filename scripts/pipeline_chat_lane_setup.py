@@ -697,7 +697,7 @@ def slack_manifest(conf):
     return {
         "display_information": {
             "name": CHAT_APP_NAME,
-            "description": "The dispatcher's chat lane. One-member workspace only.",
+            "description": "The dispatcher's chat lane. Fully trusted members only.",
         },
         "features": {"bot_user": {"display_name": CHAT_BOT_NAME, "always_online": False}},
         "oauth_config": {"scopes": {"bot": sorted(SCOPE_CITES)}},
@@ -984,14 +984,21 @@ def cmd_compose(conf, conf_path="chat-lane.conf", piece=None):
 
 
 def _compose_warning():
-    say("READ THIS FIRST — THE SLACK WORKSPACE MUST HAVE ONE MEMBER")
+    say("READ THIS FIRST — EVERY MEMBER OF THE SLACK WORKSPACE MUST BE FULLY TRUSTED")
     para("The chat lane has no user list and no channel list. Any member of the Slack "
          "workspace who can mention the bot in a channel it is in starts a session, as "
          "the dispatcher's account, with no sandbox. The access check runs only on tracker "
-         "webhooks (EdgeWorker.js:3083-3087, 3620-3624). So the gate is workspace "
-         "membership. Keep the workspace to one member: you. Turn this lane off before "
-         "anyone else joins. The private channel keeps the notifier's pings confidential; "
-         "it does not gate this lane.")
+         "webhooks (EdgeWorker.js:3083-3087, 3620-3624), so the tracker's allowedUsers "
+         "list does not apply here either. The gate is workspace membership.")
+    para("So every member can do everything you can: read every file and token the "
+         "dispatcher's account can read (your tracker key and code-host token among them), "
+         "steer any running session, write to the tracker, and run read-only shell "
+         "commands. Admit only people you would trust with that account itself. Full "
+         "members only: no guests and no shared-channel users. Require two-factor sign-in "
+         "for every member, because each member's Slack account is now part of this "
+         "boundary. Turn this lane off before anyone who does not meet that joins. The "
+         "private channel keeps the notifier's pings confidential; it does not gate this "
+         "lane.")
     say("")
 
 
@@ -1309,7 +1316,7 @@ def _compose_order(conf):
     me = "python3 %s" % _self_path()
     say("THE ORDER — the fence before the token, the port block before the listen")
     steps = (
-        "1. Confirm the Slack workspace has one member.",
+        "1. Confirm every member of the Slack workspace is fully trusted, a full member, and signs in with two-factor.",
         "2. Pieces 2, 1 and 5, in one command, as the role account:  %s merge  prints what "
         "it would change and changes nothing; then  %s merge --apply  writes the "
         "dispatcher config in place and the user settings, and prints verify's rows for "
@@ -1450,7 +1457,8 @@ CARDS = {
                 "secrets are shown only to that person. This command has no Slack access and "
                 "wants none. It is a SECOND app: the notifier keeps its own app and token, so "
                 "the token every dispatcher session can read is never the notifier's."),
-        "do": ["Check the workspace has exactly one member: you.",
+        "do": ["Check every workspace member is fully trusted, a full member (no guests),",
+               "and signs in with two-factor: each can do everything you can in this lane.",
                "Print the manifest (piece 6):",
                "    %s compose --piece 6" % ME,
                "In Slack's app settings: Create New App -> From a manifest -> choose the",
@@ -1649,7 +1657,7 @@ CARDS = {
 }
 
 NEVER = [
-    "Never let this lane stay on with a second member in the Slack workspace.",
+    "Never let this lane stay on while anyone not fully trusted is in the Slack workspace.",
     "Never put the notifier's token in the dispatcher's env file.",
     "Never paste a token into a chat, a ticket, a pull request or a repository.",
     "Never merge a pull request, and never give one your own sign-off.",
@@ -3628,11 +3636,23 @@ def _selftest_body():
         finally:
             globals()["OWNER_GRANT_BASE"] = real_base
 
-    # compose shape: one-member warning first, the appended servers right under the grant
+    # compose shape: the trusted-members warning first, the appended servers right under
+    # the grant. The owner replaced "one member" with "fully trusted members" on
+    # 2026-09-24 (KIT-117); the old rule must not come back by accident.
     flat = " ".join(out.split())
     first_piece = out.find("PIECE 1")
-    expect("compose-one-member-at-top",
-           0 <= out.find("ONE MEMBER") < first_piece, "the workspace warning is not first")
+    expect("compose-trusted-members-at-top",
+           0 <= out.find("MUST BE FULLY TRUSTED") < first_piece,
+           "the workspace warning is not first")
+    warning = " ".join(out[max(0, out.find("READ THIS FIRST")):max(0, first_piece)].split())
+    expect("compose-trusted-members-says-what-a-member-can-do",
+           all(w in warning for w in ("allowedUsers", "two-factor", "no guests",
+                                      "Full members only", "everything you can",
+                                      "every file and token", "steer any running")),
+           "the warning block does not say what a member can do, or what the rule asks")
+    expect("compose-no-one-member-rule",
+           "ONE MEMBER" not in out and "one member" not in flat.lower(),
+           "the replaced one-member rule is back in compose")
     grant_at = out.find('"slackAllowedTools":')
     piece2 = out.find("PIECE 2")
     expect("compose-appended-servers-under-grant",

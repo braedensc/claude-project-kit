@@ -516,3 +516,16 @@ The writers are guarded the way `verify` is: they need administrator access, ask
 and they refuse in an agent environment. The markers are environment variables a session
 could unset, so that refusal is tamper-evident, not tamper-proof, as for every other command
 here.
+
+**"One member" becomes "fully trusted members" (owner decision, 2026-09-24).** Decision 1
+kept the Slack workspace to one member, because workspace membership is the lane's only
+gate. The owner replaced that with a rule that admits more people on stated terms. Every
+member of the workspace must be someone the owner would trust with the role account itself.
+Nothing narrows what a member can do: the tracker's `allowedUsers` list does not apply to
+Slack, so every member can read every file and token the role account can read, steer any
+running session, write to the tracker, and run read-only shell commands. Members are full
+members only, never guests or shared-channel users, and every one signs in with two-factor,
+because each member's Slack account becomes part of the boundary. The lane is turned off
+before anyone who does not meet that joins. The composer's opening warning, its order, the
+app-creation card and its "never" list now say this rule, and a selftest keeps the old one
+from returning.

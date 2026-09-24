@@ -25,15 +25,30 @@ Every claim about the dispatcher cites its source at version 0.2.69 as `File.js:
 
 ---
 
-## Before anything: one member in the Slack workspace
+## Before anything: only fully trusted members in the Slack workspace
 
 The chat lane has **no user list and no channel list**. The dispatcher checks who is asking
 only on tracker webhooks (`EdgeWorker.js:3083-3087, 3620-3624`). So anyone in the Slack
-workspace who can mention the bot in a channel it is in starts a session.
+workspace who can mention the bot in a channel it is in starts a session. The tracker's
+`allowedUsers` list does not apply here either.
 
-The gate is **workspace membership**. Keep the workspace to one member: you. Turn this lane
-off before anyone else joins. The private channel keeps the notifier's pings private. It
-does not gate this lane.
+The gate is **workspace membership**, and every member can do everything you can:
+
+- read every file and token the dispatcher's account can read, your own tracker key and
+  code-host token included;
+- steer any running session, and write to the tracker;
+- run read-only shell commands (KIT-196).
+
+So the rule is:
+
+- **Admit only people you would trust with that account itself.** Wanting them to suggest
+  ideas or follow the work is not enough on its own. A tracker seat does that.
+- **Full members only.** No guests, no shared-channel users.
+- **Two-factor sign-in for every member.** Each member's Slack account is now part of this
+  boundary.
+- **Turn this lane off before anyone who does not meet that joins.**
+
+The private channel keeps the notifier's pings private. It does not gate this lane.
 
 ---
 
@@ -91,8 +106,10 @@ unguarded.
 
 Open the workspace's member list.
 
-Good: one member, you.
-Not that: anyone else. Stop here.
+Good: every member is someone you would trust with the dispatcher's account, is a full
+member, and signs in with two-factor.
+Not that: a guest, a shared-channel user, or anyone you would not trust with that account.
+Stop here.
 
 ### Steps 2 to 4 — one command: `merge`
 
