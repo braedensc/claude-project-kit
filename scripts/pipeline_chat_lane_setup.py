@@ -2406,10 +2406,14 @@ def check_user_settings(conf, us, env_facts):
         return _row("user-settings", UNKNOWN,
                     "the dispatcher env file sets CLAUDE_CONFIG_DIR, so sessions read user "
                     "settings from that directory, not %s" % path)
+    # The remedy is named on the row, so a deployment that was on before the rules grew
+    # is told what to run (review of KIT-197, findings 40 and 47).
+    remedy = ("run  merge , then  merge --apply : it adds only the missing rules and keeps "
+              "every other rule and key")
     err = us.get("error")
     if err == "missing":
         return _row("user-settings", BLOCKED, "no user settings file at %s" % path,
-                    ["compose piece 5 has the block to merge"])
+                    [remedy + " (a new file, mode 600)"])
     if err and err.startswith("unparseable"):
         return _row("user-settings", FAILED, "%s is %s" % (path, err))
     if err:
@@ -2418,7 +2422,7 @@ def check_user_settings(conf, us, env_facts):
     if missing:
         return _row("user-settings", BLOCKED,
                     "%d composed deny rule(s) missing from %s" % (len(missing), path),
-                    ["missing: " + m for m in missing])
+                    ["missing: " + m for m in missing] + [remedy])
     return _row("user-settings", ALREADY_DONE,
                 "%s carries every composed deny rule" % path)
 
@@ -5670,6 +5674,44 @@ def _selftest_kit197(expect, conf):
                    and "changed" in out and _read(cfg_path) == cfg_before
                    and _read(spath) == moved, (rc, out[-400:]))
     group("merge-edges", merge_edges)
+
+    # -- a lane that was on before this change: the documented upgrade path holds (review
+    # 40, 47). The old conf has none of the new keys; the settings carry the old fourteen
+    # rules plus the backups folder written by hand, in the absolute form. -------------
+    def upgrade():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            spath = os.path.join(home, ".claude", "settings.json")
+            old = dict(minimal, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path)
+            done = _fenced_fixture()
+            done["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
+            _put(cfg_path, json.dumps(done, indent=2) + "\n")
+            _put(env_path, "A=1\n")
+            hand = "Read(/%s/.stage-e/backups/**)" % home
+            old_rules = [r for r in user_deny_patterns(old)
+                         if r not in ("Read(~/.stage-e/env)", BACKUPS_DENY_RULE)] + [hand]
+            _put(spath, json.dumps({"permissions": {"deny": old_rules}}, indent=2) + "\n")
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), old)
+            rows = {r["check"]: r for r in evaluate(facts, old, pf_probe(
+                _RoleMachine(home, _pf_answers())))}
+            us, fd = rows["user-settings"], rows["front-door"]
+            expect("upgrade-front-door-not-measured-until-the-keys-are-set",
+                   fd["outcome"] == UNKNOWN and "NOT MEASURED" in fd["detail"]
+                   and "FRONT_DOOR_CONFIG" in fd["detail"], fd)
+            expect("upgrade-user-settings-names-merge-as-the-remedy",
+                   us["outcome"] == BLOCKED and "Read(~/.stage-e/env)" in _row_text(us)
+                   and BACKUPS_DENY_RULE in _row_text(us) and "merge --apply" in _row_text(us),
+                   us)
+            rc, out = _capture(cmd_merge, old, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            deny = json.loads(_read(spath))["permissions"]["deny"]
+            expect("upgrade-merge-adds-only-the-two-rules", rc == EX_OK
+                   and deny == old_rules + ["Read(~/.stage-e/env)", BACKUPS_DENY_RULE]
+                   and json.loads(_read(cfg_path)) == done, (rc, deny, out[-400:]))
+    group("upgrade", upgrade)
 
     # -- env-names: the REAL role-account shell ---------------------------------------
     def env_names():

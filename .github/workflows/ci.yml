@@ -301,15 +301,18 @@ jobs:
       - name: Stage A installer selftest (fence composition, agent-refused, human gates)
         run: python3 scripts/pipeline_stage_a_setup.py --selftest
 
-      # The chat-lane composer: prints every piece of the dispatcher's built-in Slack lane
-      # for a person to apply, and never writes the dispatcher's config. The grant is the
+      # The chat-lane composer: prints every piece of the dispatcher's built-in Slack lane.
+      # compose, verify and card write nothing; merge --apply, env-names and
+      # front-door --apply write pieces 1, 2, 3, 5 and 7 as the role account when a person
+      # runs them (KIT-197), and each is refused in an agent environment. The grant is the
       # owner's list — no wildcard, one literal git-pull pair per repository, and a mutant
       # holding Monitor or `Bash(git -C * pull)` turns it red. The Slack fence keeps every
-      # inherited default, the deny rules are pinned to .claude/settings.json, verify's nine
-      # checks (pf's loaded rules and the anchor point among them) run against stubs with no
-      # env value in any output, the printed pf commands parse as shell, the command verify
-      # sends to the role account is run for real, verify is refused in an agent environment
-      # and runs nothing but its reads, and the fakes tolerate a Runner that passes cwd.
+      # inherited default, the deny rules are pinned to .claude/settings.json, verify's ten
+      # checks (pf's loaded rules, the anchor point and the front door among them) run
+      # against stubs with no env value in any output, the printed pf commands and restarts
+      # run through /bin/sh against shims, the three writer programs run for real against
+      # temporary files, verify runs nothing but its reads, and the fakes tolerate a Runner
+      # that passes cwd.
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
 

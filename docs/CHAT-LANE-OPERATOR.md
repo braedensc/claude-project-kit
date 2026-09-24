@@ -107,6 +107,27 @@ line: a `REFUSED:` line can end in 10, 2 or 3.
   the chat lane's `Read` tool. Delete a copy once `verify` is clean.
 - **They never restart anything.** Each prints the restart for you to run.
 
+### Already on before this change?
+
+A lane switched on before the composer gained its writers (KIT-197) keeps running. Only
+`verify` changes. It gains a `front-door` row, and piece 5 gains two deny rules: the role
+account's env file (`ROLE_ENV_FILE`, by default `Read(~/.stage-e/env)`) and
+`Read(~/.stage-e/backups/**)`. Until they are in, the chat lane's `Read` tool can still open
+the role account's env file. So do this soon after you pull:
+
+1. Pull this checkout. Nothing else moves: the composer runs from here.
+2. Add the five new keys to `chat-lane.conf` (see `chat-lane.conf.example`):
+   `DISPATCHER_SERVICE`, `FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN` and
+   `FRONT_DOOR_MATCHER`. Add `ROLE_ENV_FILE` only if yours is not `~/.stage-e/env`.
+3. Run `verify`. Expect `user-settings` to say two rules are missing and to name `merge`:
+   exit 10. If `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` is still unset, `front-door`
+   says `NOT MEASURED`, names the key, and `verify` exits 4 instead.
+4. Run `merge`, then `merge --apply`. It adds only those two rules. A backups rule written
+   by hand in the absolute form, `Read(//Users/<role>/.stage-e/backups/**)`, stays; it is
+   redundant and harmless.
+5. Run `front-door`. Good: `/slack-webhook is already on the line. Nothing to change.`
+6. Run `verify` again. Good: exit 0.
+
 ---
 
 ## The steps, in order

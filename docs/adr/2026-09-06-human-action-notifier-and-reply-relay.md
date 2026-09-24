@@ -486,9 +486,10 @@ nothing. Calls were tested instead. Read-only commands **ran**, through Bash and
 write, a `touch`, a chained `echo …; touch …` and `Monitor` running `touch` were refused.
 A Bash read of a path under a user-level `Read` deny was refused. `log_failure_mode` was
 absent, as it is while `CYRUS_API_KEY` is unset. **The owner kept the lane on with a
-read-only shell as a named residual.** It adds to the accepted residuals of decision 1: the
-lane can read, through a shell as well as the `Read` tool, any file the role account can
-read that no deny rule covers.
+read-only shell as a named residual.** It adds to the accepted residuals under *1. The
+conversational lane runs on the dispatcher's own Slack transport*, in *Update 2026-09-17*:
+the lane can read, through a shell as well as the `Read` tool, any file the role account
+can read that no deny rule covers.
 
 **The composer now writes (owner decision, 2026-09-24).** It had been print-and-verify only.
 The three scripts' behaviour moved into it as subcommands a person runs:
@@ -501,29 +502,33 @@ The three scripts' behaviour moved into it as subcommands a person runs:
 
 Each refuses under a model, before its conf is read. Each writes as the role account,
 through one program handed to that account's shell, with every value on standard input and
-none in an argument. `merge` and `front-door` re-read the file, as they start and again
-just before the write, and refuse when it is not the file they planned from: the
-dispatcher rewrites its config when it refreshes a tracker token. `env-names` has no separate plan; it reads and replaces the env file in one pass, and
-nothing else rewrites that file. Each writes nothing when nothing would change, and
-otherwise backs the file up first, under the role account's home, at mode 600; the
-user-level read denies now cover that folder and the role account's own env file. A dry run
-is the default where there is one. `env-names` refuses without a terminal, and until
-`verify`'s fence and port-block rows both measure as applied: the fence before the token,
-and the block before the listen, on the port the dispatcher really listens on. It compares
-the chat token with every value in the role account's env file, where the notifier keeps
-its own, and writes nothing when it cannot read that file. **Restarts and the port block
-stay printed commands the owner runs**, as installers never load jobs: a new card restarts
-the dispatcher only when its own `/status` answers `idle`, starts one launchd does not
-hold, and shows the state and log of one that holds but does not answer; another turns
-the lane off in order. `verify` gains a row that reads the front door's allowlist line. The live-check card
-now tests calls, not the listing, and names KIT-196.
+none in an argument. `merge` and `front-door` re-read the file, as they start and again just
+before the write, and refuse when it is not the file they planned from: the dispatcher
+rewrites its config when it refreshes a tracker token. `env-names` has no separate plan; it
+reads and replaces the env file in one pass, and nothing else rewrites that file. Each
+writes nothing when nothing would change, and otherwise backs the file up first, under the
+role account's home, at mode 600; the user-level read denies now cover that folder and the
+role account's own env file. A dry run is the default where there is one. `env-names`
+refuses without a terminal, and until `verify`'s fence and port-block rows both measure as
+applied: the fence before the token, and the block before the listen, on the port the
+dispatcher really listens on. It compares the chat token with every value in the role
+account's env file, where the notifier keeps its own, and writes nothing when it cannot read
+that file. **Restarts and the port block stay printed commands the owner runs**, as
+installers never load jobs: a new card restarts the dispatcher only when its own `/status`
+answers `idle`, starts one launchd does not hold, and shows the state and log of one that
+holds but does not answer; another turns the lane off in order. `verify` gains a row that
+reads the front door's allowlist line. The live-check card now tests calls, not the listing,
+and names KIT-196. A deployment that was on before this change adds the new conf keys and
+runs `merge --apply` once, for the two new read denies; `docs/CHAT-LANE-OPERATOR.md`,
+*Already on before this change?*, has the steps.
 
 The writers are guarded the way `verify` is: they need administrator access, asked for once,
 and they refuse in an agent environment. The markers are environment variables a session
 could unset, so that refusal is tamper-evident, not tamper-proof, as for every other command
 here.
 
-**"One member" becomes "fully trusted members" (owner decision, 2026-09-24).** Decision 1
+**"One member" becomes "fully trusted members" (owner decision, 2026-09-24).** *1. The
+conversational lane runs on the dispatcher's own Slack transport*, in *Update 2026-09-17*,
 kept the Slack workspace to one member, because workspace membership is the lane's only
 gate. The owner replaced that with a rule that admits more people on stated terms. Every
 member of the workspace must be someone the owner would trust with the role account itself.
