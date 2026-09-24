@@ -190,7 +190,7 @@ What it does, in order:
      nothing is asked. With `LINEAR_KEY_FILE=.stage-a/env`, it asks once for a key of the
      planner's own.
    - **The job.** It clones the kit under the role account, writes the job's settings,
-     and installs the job. It does not start it yet.
+     and installs the job **disabled**, so not even a reboot starts it before you say so.
    - **The dispatcher's settings.** It composes one planning entry per repository and
      shows the change as a diff. It warns you which sessions a restart would cut off. After
      you type `yes`, it backs up the file, writes the entries, and restarts the dispatcher.
@@ -200,7 +200,8 @@ What it does, in order:
      session's answer. Then it asks you **one** question: is the team's agent guidance
      empty, or silent about planning and building? The API cannot read it. It records the
      sign-off and closes the tickets.
-   - **The job, started.** After a yes, it starts the job and reads its first heartbeat.
+   - **The job, started.** After a yes, it enables the job in launchd, starts it, and reads
+     its first heartbeat. Enabled, it starts again after a reboot.
    - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py
      drill`). It makes the dispatcher refuse one planning ticket and checks planning stops.
      Then it puts the setting back and probes again, which is what lets planning start.
@@ -226,6 +227,17 @@ Before you start, each repository in `PLANNED_REPOS` needs a committed `delivery
 **If the dispatcher's own setup tool rebuilds its settings file,** the planning entries are
 dropped with everything else it did not write. Run the one command again: it finds them
 missing and puts them back.
+
+**If you stop it with Ctrl-C,** the installer finishes what it was undoing first: the drill
+puts the planning setup back, and an interrupted restart prints the command that starts the
+dispatcher. The next run checks that the dispatcher is running before it does anything else.
+
+**Stage E's own cards do not hold up the idea gate.** When the review installer is waiting on
+a person but its jobs already run the current code, the one command says so and carries on.
+
+**To switch the job off for good,** disable it as well as stopping it, or the next boot
+starts it again: `sudo launchctl disable system/<label>`, then
+`sudo launchctl bootout system/<label>`.
 
 ## 6. Reading the job
 
@@ -261,6 +273,8 @@ wall clock.
 - **The installer's own new steps have not run live.** Writing the dispatcher's settings and
   restarting it reuse the review installer's code, which has. The pull request, the automatic
   probe, starting the job and the drill are proven only against synthetic fixtures.
+- **Installed disabled, enabled at your yes.** That the override launchd records outlives a
+  reboot is from its documentation, not yet seen on this kit's job.
 - **The session log's tool list is read from the SDK's start-up message.** That it lists the
   tools after the fence removed them is read from the runner's source, not yet seen live. A
   list that still held a fenced tool would fail the probe loudly, never pass it.

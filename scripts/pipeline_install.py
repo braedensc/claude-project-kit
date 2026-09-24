@@ -95,15 +95,40 @@ class Io(object):
 
     def run(self, argv, capture=False):
         """(exit code, output). Streams are inherited unless `capture`: an installer's
-        prompts and cards are for the person, not for this program."""
+        prompts and cards are for the person, not for this program.
+
+        CTRL-C BELONGS TO THE INSTALLER, NOT TO THIS WRAPPER. Ctrl-C reaches every process
+        on the terminal. Left alone, this wrapper would give the installer a quarter of a
+        second and then kill it — in the middle of the drill putting Cyrus's settings back,
+        or of a restart. So this process ignores it while an installer runs, the installer
+        gets it with the default handling restored, and its own clean-up runs to the end."""
+        import signal
         try:
             if capture:
                 proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       cwd=KIT, timeout=120)
                 return proc.returncode, proc.stdout.decode("utf-8", "replace")
-            return subprocess.run(argv, cwd=KIT).returncode, ""
+            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                child = subprocess.Popen(argv, cwd=KIT, preexec_fn=lambda: signal.signal(
+                    signal.SIGINT, signal.SIG_DFL))
+                return child.wait(), ""
+            finally:
+                signal.signal(signal.SIGINT, previous)
         except (OSError, subprocess.SubprocessError) as exc:
             return 127, str(exc)
+
+    def stage_e_steps(self):
+        """{step: outcome} from the review installer's own record, which its `verify`
+        rewrites on every pass — or None when it cannot be read."""
+        import json
+        path = os.path.expanduser("~/.stage-e-setup/state.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                steps = json.load(fh).get("steps") or {}
+            return dict((k, (v or {}).get("outcome")) for k, v in steps.items())
+        except (OSError, ValueError, AttributeError):
+            return None
 
     def ask(self, question):
         try:
@@ -221,21 +246,40 @@ def step_stage_e(io, conf, skip):
         return None
     if code in (3, 5):
         return stop(io, STAGE_E_MEANS[code], code)
-    io.say("")
-    io.say("Stage E is not up to date: the check above names what is outstanding.")
-    io.say("Updating it can restart the dispatcher, which cuts off any session it is running.")
-    io.say("Check Linear first: nothing the dispatcher works on should be In Progress.")
-    if not io.ask("Update Stage E now?"):
-        return stop(io, "nothing changed. Stage E comes first, because the same kit change "
-                        "teaches its jobs to leave planning tickets alone. Run this again "
-                        "when you are ready.", EX_BLOCKED)
-    code, _out = io.run([sys.executable, STAGE_E, "run", "--conf", conf])
-    if code != 0:
-        return stop(io, STAGE_E_MEANS.get(code, "the review installer stopped with exit %d. "
-                                                "Its FAILED lines above say why." % code), code)
-    io.say("")
-    io.say("Stage E is up to date.")
-    return None
+    # WHAT IS OUTSTANDING DECIDES WHAT HAPPENS. The check records every step it measured.
+    # A step `run` would change is work for the installer; a card is work for a person,
+    # and running the installer again cannot clear it. Only the first needs a run.
+    steps = io.stage_e_steps()
+    if steps is None or any(o == "WOULD-CHANGE" for o in steps.values()):
+        io.say("")
+        io.say("Stage E is not up to date: the check above names what is outstanding.")
+        io.say("Updating it can restart the dispatcher, which cuts off any session it is "
+               "running.")
+        io.say("Check Linear first: nothing the dispatcher works on should be In Progress.")
+        if not io.ask("Update Stage E now?"):
+            return stop(io, "nothing changed. Stage E comes first, because the same kit change "
+                            "teaches its jobs to leave planning tickets alone. Run this again "
+                            "when you are ready.", EX_BLOCKED)
+        code, _out = io.run([sys.executable, STAGE_E, "run", "--conf", conf])
+        if code == 0:
+            io.say("")
+            io.say("Stage E is up to date.")
+            return None
+        if code in (3, 5):
+            return stop(io, STAGE_E_MEANS[code], code)
+        steps = io.stage_e_steps()
+    # THE IDEA GATE NEEDS STAGE E'S CODE, NOT ITS SIGN-OFFS. Its jobs must run the code
+    # that leaves planning tickets alone; a Stage E card waiting on a person does not
+    # change that, and stopping here on one would keep the idea gate out of reach for as
+    # long as the card waits.
+    if steps and steps.get("code") in ("DONE", "ALREADY-DONE"):
+        io.say("")
+        io.say("Stage E's jobs run the current code. Stage E still has something for you,")
+        io.say("named above, which does not block the idea gate. Carrying on; come back to it.")
+        return None
+    return stop(io, STAGE_E_MEANS.get(code, "the review installer stopped with exit %d. Its "
+                                            "FAILED lines above say why." % code)
+                + " (To install the idea gate without touching Stage E: --skip-stage-e.)", code)
 
 
 def step_stage_a(io, conf, stage_e_conf):
@@ -300,7 +344,9 @@ class FakeIo(Io):
     """The outside world, scripted. `codes` answers each program by a key naming it; a
     program this case did not script is a failure of the case, never a silent pass."""
 
-    def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None):
+    def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
+                 steps=None):
+        self.steps = {"code": "WOULD-CHANGE"} if steps is None else steps
         self.codes = dict(codes or {})
         self.answers = list(answers)
         self.asked = []
@@ -339,6 +385,10 @@ class FakeIo(Io):
             raise AssertionError("an unscripted program ran: %r" % k)
         got = self.codes[k]
         return (got.pop(0) if isinstance(got, list) else got), ""
+
+    def stage_e_steps(self):
+        got = self.steps
+        return got.pop(0) if isinstance(got, list) else got
 
     def ask(self, question):
         self.asked.append(question)
@@ -452,6 +502,26 @@ def selftest():
           (code, "pipeline_stage_a_setup.py run" in io.ran), (1, False))
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 5})
     check("stage-e-no-password-stops", (code, io.asked), (5, []))
+    # A CARD IN STAGE E DOES NOT KEEP THE IDEA GATE OUT: its code is current, and running
+    # the review installer again could not clear a card anyway.
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10},
+                  steps={"code": "ALREADY-DONE", "handover": "BLOCKED-ON-HUMAN"})
+    check("stage-e-card-only-is-not-rerun-and-does-not-block",
+          ("pipeline_stage_e_setup.py run" in io.ran, "pipeline_stage_a_setup.py run" in io.ran,
+           io.asked, code), (False, True, [], EX_OK))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                         "pipeline_stage_e_setup.py run": 10}, answers=[True],
+                  steps=[{"code": "WOULD-CHANGE"}, {"code": "DONE", "handover": "BLOCKED-ON-HUMAN"}])
+    check("stage-e-run-then-card-carries-on",
+          ("pipeline_stage_a_setup.py run" in io.ran, code), (True, EX_OK))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                         "pipeline_stage_e_setup.py run": 10}, answers=[True],
+                  steps=[{"code": "WOULD-CHANGE"}, {"code": "WOULD-CHANGE"}])
+    check("stage-e-code-still-behind-stops",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (10, False))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 1}, steps={"code": "FAILED"})
+    check("stage-e-code-failed-stops-and-names-the-skip",
+          (code, any("--skip-stage-e" in line for line in io.lines)), (1, True))
     os.unlink(se_conf)
     code, io = go()
     check("no-stage-e-skips-to-the-idea-gate",
@@ -468,7 +538,28 @@ def selftest():
         check("stage-a-exit-%d-said" % rc, bool(io.lines and io.lines[-1]), True)
     check("waiting-says-run-again", "run this same command again" in STAGE_A_MEANS[10], True)
 
-    # 7. IT NEVER MERGES, APPROVES OR LABELS: none of those verbs is in this file.
+    # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
+    #    a terminal's Ctrl-C goes to the whole process group, and a wrapper that did not
+    #    step aside would kill the installer a quarter of a second in.
+    import signal
+    import time
+    mark = os.path.join(tmp, "cleanup-done")
+    child = ("import time,sys\ntry:\n    time.sleep(30)\nexcept KeyboardInterrupt:\n"
+             "    time.sleep(1.5)\n    open(%r,'w').write('ok')\n    sys.exit(10)\n" % mark)
+    driver = ("import sys; sys.path.insert(0, %r)\nimport pipeline_install as pi\n"
+              "code, _ = pi.Io().run([sys.executable, '-c', %r])\nsys.exit(0 if code == 10 else 1)\n"
+              % (HERE, child))
+    proc = subprocess.Popen([sys.executable, "-c", driver], start_new_session=True)
+    time.sleep(1.0)
+    os.killpg(proc.pid, signal.SIGINT)
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    check("ctrl-c-lets-the-installer-finish-its-clean-up",
+          (proc.returncode, os.path.exists(mark)), (0, True))
+
+    # 8. IT NEVER MERGES, APPROVES OR LABELS: none of those verbs is in this file.
     src = open(os.path.abspath(__file__)).read()
     for verb in ("pr " + "merge", "--" + "approve", "--add-" + "label", "auto-" + "merge"):
         check("no-verb:%s" % verb, verb in src, False)

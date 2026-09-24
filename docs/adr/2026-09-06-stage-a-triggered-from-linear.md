@@ -1057,7 +1057,10 @@ its date.
   by-hand `attest CA-PROBE --ticket …` path remains. The probe also leaves a harmless test file
   in the role account's home and reports whether the session's file tool returned it.
 - **"Never loads the job"** (`CA-EXECUTOR`). It starts the job after a yes and reads its first
-  heartbeat.
+  heartbeat. The old claim was also weaker than it read: launchd loads every job in
+  `/Library/LaunchDaemons` at boot, so "installed and never loaded" held only until a reboot.
+  The job is now installed with `Disabled`, and the yes enables it in launchd's override
+  record before starting it.
 - **The by-hand planning run** (`CA-HANDOVER`) is **optional**: it shows what a plan looks like
   and proves nothing about the fence or the job, so it no longer blocks.
 - **The routing drill** (live test 8) is automated as the optional `drill` command. It sets one
@@ -1069,6 +1072,16 @@ its date.
 - **The `delivery.json` block the person pasted** (`CA-DELIVERY`). The installer opens that pull
   request itself, as the person, through their own `gh`, and waits for the merge. It never
   merges, approves or labels.
+
+**Found in review, before hand-off.** Three read-only reviewers found two high defects, both
+fixed and pinned by tests: every program run as the dispatcher's account inherited the
+operator's working directory, which that account cannot enter, so each one would have died
+importing its first module (the review installer's KIT-112 fix, now applied here); and the one
+command killed the installer a quarter of a second after Ctrl-C, cutting off the drill's
+restore. Also fixed: a fork's pull request from the same branch name was taken for the
+installer's own; a branch left by an interrupted run blocked every retry; a merged pull request
+that no longer covered the gap was never replaced; a Stage E card blocked the idea gate for as
+long as it waited.
 
 **What did not change.** The fence, the planning brief, the routing check and circuit breaker,
 the version pin and the stop file. Every mutating command still refuses in an agent

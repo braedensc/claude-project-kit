@@ -1231,6 +1231,7 @@ CARDS = {
                 "exactly like one that is started and failing."),
         "do": ["Run the one command again, in a terminal, and answer yes to starting it.",
                "By hand instead:",
+               "    sudo launchctl enable system/<JOB_LABEL>",
                "    sudo launchctl bootstrap system /Library/LaunchDaemons/<JOB_LABEL>.plist",
                "If it reports the job ran and could not do its work, read its log under",
                "the role account's home before changing anything."],
@@ -1346,6 +1347,7 @@ class LinearTransport(object):
         self._auth = ("Bearer " + key) if key.startswith("lin_oauth_") else key
 
     def post(self, query, variables=None):
+        import http.client
         import urllib.error
         import urllib.request
         body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
@@ -1363,6 +1365,12 @@ class LinearTransport(object):
         except urllib.error.URLError as exc:
             raise Unknown("the tracker was unreachable (%s), so nothing on the work "
                           "teams could be measured" % str(exc.reason)[:120],
+                          "check the network and run the same command again")
+        except (OSError, http.client.HTTPException) as exc:
+            # A read that timed out or a connection dropped mid-answer is not wrapped in a
+            # URLError. Unwrapped, it escaped every step's handler — and the drill's
+            # clean-up — as a traceback.
+            raise Unknown("the tracker's answer was cut off (%s)" % type(exc).__name__,
                           "check the network and run the same command again")
         try:
             doc = json.loads(raw.decode("utf-8"))
@@ -1536,7 +1544,11 @@ class Host(object):
                 # reason, and that call is proven on a live machine.
                 ["sudo", "-n", "-H", "-u", account, "/bin/sh", "-c", script],
                 input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=30)
+                # THE CHILD STARTS AT `/` (KIT-112, the review installer's own fix). Run
+                # from a checkout under your home, which the role account cannot enter,
+                # every `python3 -c` it runs dies importing its first module: the
+                # interpreter puts the working directory on its path and cannot read it.
+                cwd="/", timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
             return None, str(exc)[:160]
         err = proc.stderr.decode("utf-8", "replace")
@@ -1545,7 +1557,12 @@ class Host(object):
             return None, "sudo needs a password, and this pass may not ask for one"
         if proc.returncode == 1 and "unknown user" in err:
             return 1, "unknown user"
-        return proc.returncode, proc.stdout.decode("utf-8", "replace").strip()
+        out = proc.stdout.decode("utf-8", "replace").strip()
+        if proc.returncode != 0 and not out:
+            # A failure that printed only to stderr says why there, and a refusal with
+            # nothing after its colon is a dead end.
+            out = err.strip()[-300:]
+        return proc.returncode, out
 
     def account_exists(self, account):
         code, out = self._sudo(account, "true")
@@ -1580,6 +1597,10 @@ class Host(object):
         Used for ONE thing: your own key, which the review jobs already store, read back
         for this pass the way the review installer reads its own (KIT-195). It lives in
         this process's memory for the run and is never printed, logged or written."""
+        # Checked HERE as well as in the conf: the first run reads this before any conf
+        # exists, from values taken out of another installer's settings file.
+        if not ENV_NAME_RE.match(env_name or "") or key_file_problem(relpath):
+            return None
         code, out = self._sudo(account, 'f="$HOME/%s"; [ -f "$f" ] || exit 9; '
                                         'sed -n "s/^%s=//p" "$f" | head -n 1'
                                % (relpath, env_name))
@@ -1616,7 +1637,12 @@ class Host(object):
         return proc.returncode == 0, said
 
     def start_job(self, label):
-        """Load the planner job — only after the person's yes (`step_enable`)."""
+        """Enable, then load, the planner job — only after the person's yes
+        (`step_enable`). The job is installed disabled (see `job_plist`); enabling it is
+        what makes it start again after a reboot."""
+        ok, said = self._launchctl(["enable", "system/" + label])
+        if not ok:
+            return ok, said
         return self._launchctl(["bootstrap", "system", _plist_path(label)])
 
     def kick_job(self, label):
@@ -1835,6 +1861,7 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
   </array>
   <key>StartInterval</key><integer>{interval}</integer>
   <key>RunAtLoad</key><true/>
+  <key>Disabled</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
@@ -1844,7 +1871,12 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 def job_plist(ctx):
     """The planner job, rendered. `$HOME` reaches the file LITERALLY and is resolved by
     /bin/sh at run time; HOME is also set above, because a system daemon inherits no
-    login environment."""
+    login environment.
+
+    INSTALLED DISABLED. launchd loads every job in /Library/LaunchDaemons at boot, so a job
+    installed and "not started" would start at the next reboot whatever the person said.
+    `Disabled` keeps it out until `start_job` enables it — after the person's yes — in
+    launchd's own override record, which outlives a reboot."""
     from xml.sax.saxutils import escape as _xml
     home = ctx.role_home
     return PLIST.format(
@@ -1918,9 +1950,10 @@ def poller_config(ctx):
 def _say_delivery_absent(ctx, repo, branch):
     ctx.say("")
     ctx.say("----- %s has no delivery.json on %s -----" % (repo, branch))
-    ctx.say("The repository is not set up for the pipeline at all. Set it up first (the")
-    ctx.say("board setup writes delivery.json), merge that, then run this again. Its")
-    ctx.say("`linear.teamKey` is the team its ideas are planned on.")
+    ctx.say("The repository is not set up for the pipeline at all. Either remove it from")
+    ctx.say("PLANNED_REPOS in your settings file, or set it up first (the board setup")
+    ctx.say("writes delivery.json), merge that, and run this again. Its `linear.teamKey`")
+    ctx.say("is the team its ideas are planned on.")
 
 
 def resolve_repos(ctx):
@@ -2406,6 +2439,9 @@ class GitHubWriter(object):
     person running this installer, through their own `gh`. It has no merge, no approve
     and no label path; --selftest asserts none of those verbs is in this file."""
 
+    def __init__(self):
+        self._login = None
+
     def _run(self, argv, stdin=None):
         import subprocess
         try:
@@ -2415,6 +2451,17 @@ class GitHubWriter(object):
             return None, "", "gh could not run (%s)" % str(exc)[:120]
         return (proc.returncode, proc.stdout.decode("utf-8", "replace"),
                 proc.stderr.decode("utf-8", "replace"))
+
+    def login(self):
+        """The GitHub login `gh` acts as — the only author whose pull request this
+        installer treats as its own."""
+        if self._login is None:
+            code, out, err = self._run(["api", "user", "--jq", ".login"])
+            if code != 0 or not out.strip():
+                raise Unknown("could not ask gh who it is logged in as (%s)" % err.strip()[:120],
+                              "check `gh auth status`, then run the same command again")
+            self._login = out.strip()
+        return self._login
 
     def delivery_text(self, repo, branch):
         """(text, blob sha) of delivery.json on `branch`, or raises SetupError."""
@@ -2437,32 +2484,43 @@ class GitHubWriter(object):
         raise SetupError("could not read %s's branch %s: %s" % (repo, branch, err.strip()[:160]))
 
     def open_pr(self, repo, base, head, text, blob_sha):
-        """Cut `head` from `base`, commit the new file to it, open the pull request, and
-        answer with its URL."""
+        """Cut `head` from `base` (or pick up the branch an interrupted run left), commit
+        the new file to it unless it already holds it, open the pull request, and answer
+        with its URL."""
         import base64
-        sha = self.branch_head(repo, base)
-        if not sha:
-            raise SetupError("%s has no branch %s to cut from" % (repo, base))
-        code, _out, err = self._run(["api", "-X", "POST", "repos/%s/git/refs" % repo,
-                                     "-f", "ref=refs/heads/%s" % head, "-f", "sha=%s" % sha])
-        if code != 0:
-            raise SetupError("could not create the branch %s on %s: %s"
-                             % (head, repo, err.strip()[:160]))
-        code, _out, err = self._run([
-            "api", "-X", "PUT", "repos/%s/contents/delivery.json" % repo,
-            "-f", "message=%s" % DELIVERY_PR_TITLE, "-f", "branch=%s" % head,
-            "-f", "sha=%s" % blob_sha,
-            "-f", "content=%s" % base64.b64encode(text.encode("utf-8")).decode("ascii")])
-        if code != 0:
-            raise SetupError("could not commit delivery.json to %s on %s: %s"
-                             % (head, repo, err.strip()[:160]))
+        existing = self.branch_head(repo, head)
+        if existing is None:
+            sha = self.branch_head(repo, base)
+            if not sha:
+                raise SetupError("%s has no branch %s to cut from" % (repo, base))
+            code, _out, err = self._run(["api", "-X", "POST", "repos/%s/git/refs" % repo,
+                                         "-f", "ref=refs/heads/%s" % head, "-f", "sha=%s" % sha])
+            if code != 0:
+                raise SetupError("could not create the branch %s on %s: %s"
+                                 % (head, repo, err.strip()[:160]))
+        else:
+            # AN EARLIER RUN STOPPED HALF WAY: the branch exists and no pull request does.
+            # Commit on top of what it holds, and only if it does not hold this already.
+            have, blob_sha = self.delivery_text(repo, head)
+            if have == text:
+                blob_sha = None
+        if blob_sha is not None:
+            code, _out, err = self._run([
+                "api", "-X", "PUT", "repos/%s/contents/delivery.json" % repo,
+                "-f", "message=%s" % DELIVERY_PR_TITLE, "-f", "branch=%s" % head,
+                "-f", "sha=%s" % blob_sha,
+                "-f", "content=%s" % base64.b64encode(text.encode("utf-8")).decode("ascii")])
+            if code != 0:
+                raise SetupError("could not commit delivery.json to %s on %s: %s. Run the "
+                                 "same command again: it picks up the branch."
+                                 % (head, repo, err.strip()[:160]))
         code, out, err = self._run(["pr", "create", "--repo", repo, "--base", base,
                                     "--head", head, "--title", DELIVERY_PR_TITLE,
                                     "--body-file", "-"], stdin=DELIVERY_PR_BODY.encode("utf-8"))
         url = (out.strip().splitlines() or [""])[-1]
         if code != 0 or "/pull/" not in url:
-            raise SetupError("could not open the pull request on %s: %s"
-                             % (repo, (err or out).strip()[:200]))
+            raise SetupError("could not open the pull request on %s: %s. Run the same command "
+                             "again: it picks up the branch." % (repo, (err or out).strip()[:200]))
         return url
 
     def pr_state(self, url):
@@ -2471,42 +2529,69 @@ class GitHubWriter(object):
         return out.strip() if code == 0 and out.strip() else None
 
     def find_pr(self, repo, head):
-        """(url, state) of the newest pull request from `head`, or (None, None)."""
-        code, out, _err = self._run(["pr", "list", "--repo", repo, "--head", head,
-                                     "--state", "all", "--json", "url,state", "--limit", "1"])
+        """(url, state) of the newest pull request THIS installer's person opened from
+        `head` in `repo` itself, or (None, None).
+
+        Same repository and same author, both: `--head` matches a branch NAME, the name is
+        in public source, and anyone can open a pull request from a fork branch of that
+        name. A pull request that could not be looked for is not one that does not exist."""
+        code, out, err = self._run(["pr", "list", "--repo", repo, "--head", head,
+                                    "--state", "all", "--limit", "20",
+                                    "--json", "url,state,isCrossRepository,author"])
+        if code != 0:
+            raise Unknown("could not list %s's pull requests (%s)" % (repo, err.strip()[:120]),
+                          "check `gh auth status`, then run the same command again")
         try:
-            rows = json.loads(out) if code == 0 else []
+            rows = json.loads(out or "[]")
         except ValueError:
-            rows = []
-        return (rows[0]["url"], rows[0]["state"]) if rows else (None, None)
+            raise Unknown("gh's list of %s's pull requests did not read back" % repo,
+                          "run the same command again")
+        me = self.login()
+        for row in rows:
+            if not row.get("isCrossRepository") and ((row.get("author") or {}).get("login")) == me:
+                return row.get("url"), row.get("state")
+        return None, None
 
 
 def _branch_for(ctx, repo):
     """This installer's branch in `repo`: the fixed name, or a numbered one once an earlier
-    pull request from it was closed unmerged (a branch name is not reused for new work)."""
+    pull request from it was closed, or merged without switching plans on for good (a
+    branch name is not reused for new work)."""
     used = ((ctx.state.data.get("notes") or {}).get("delivery_closed") or {}).get(repo) or 0
     return DELIVERY_BRANCH if not used else "%s-%d" % (DELIVERY_BRANCH, used + 1)
 
 
 def delivery_pr(ctx, repo, base, patch):
-    """The URL of this installer's open or merged pull request for `repo` — found, or
-    opened after the person's yes. None when they said no."""
+    """The URL of this installer's open pull request for `repo` — found, or opened after
+    the person's yes. None when they said no. Called only while the repository's
+    committed file still does not switch plans on."""
     prs = ctx.state.data["notes"].setdefault("delivery_prs", {})
     head = _branch_for(ctx, repo)
     url, state = ctx.github_writer.find_pr(repo, head)
-    if url and state in ("OPEN", "MERGED"):
+    if url and state == "OPEN":
         prs[repo] = url
         return url
-    if url and state == "CLOSED":
+    if url and state == "MERGED":
+        # Just merged, and this pass's first read of the default branch came before the
+        # merge landed: read it again before calling the pull request spent.
+        fresh, _blob = ctx.github_writer.delivery_text(repo, base)
+        if not delivery_gaps(json.loads(fresh), ctx.conf.get("OWNER_USER_ID")):
+            prs[repo] = url
+            return url
+    if url and state in ("CLOSED", "MERGED"):
+        # CLOSED: nobody merged it. MERGED: it merged, and the default branch STILL does
+        # not switch plans on — reverted, edited since, or a gap it never carried. Either
+        # way that branch is spent, and a fresh one carries the change as it is needed now.
         closed = ctx.state.data["notes"].setdefault("delivery_closed", {})
         closed[repo] = int(closed.get(repo) or 0) + 1
-        ctx.say("  The last pull request for %s (%s) was closed without merging, so a new"
-                % (repo, url))
-        ctx.say("  one is opened from a fresh branch.")
+        ctx.say("  The last pull request for %s (%s) was %s, and the file still does not "
+                "switch plans on, so a new one is opened from a fresh branch."
+                % (repo, url, "merged" if state == "MERGED" else "closed without merging"))
         head = _branch_for(ctx, repo)
-    doc, _branch, _why = ctx.delivery_doc(repo)
     text, blob = ctx.github_writer.delivery_text(repo, base)
-    new, how = patch_delivery_text(text, doc, patch)
+    # The document patched is the one just READ, not the one this pass cached earlier: a
+    # change that landed in between must not be written back over.
+    new, how = patch_delivery_text(text, json.loads(text), patch)
     import difflib
     ctx.say("")
     ctx.say("----- the change to %s's delivery.json -----" % repo)
@@ -2530,12 +2615,16 @@ def delivery_pr(ctx, repo, base, patch):
 
 MERGE_POLL_SECONDS = 15
 DEFAULT_MERGE_WAIT_SECONDS = 1800
+# How many polls in a row may fail to read a pull request's state before the wait says
+# it could not look, rather than going on reading "not merged yet" into silence.
+MERGE_UNREAD_LIMIT = 4
 
 
 def wait_for_merges(ctx, urls):
     """True once every pull request is MERGED; False when the wait ran out or the person
     stopped it (a re-run finds the same pull requests and carries on waiting). A pull
-    request closed without merging is a failure that says so."""
+    request closed without merging is a failure that says so, and one whose state cannot
+    be read is UNKNOWN, never "still waiting"."""
     ctx.say("")
     ctx.say("Waiting for you to merge:")
     for url in urls:
@@ -2544,10 +2633,19 @@ def wait_for_merges(ctx, urls):
     ctx.say("Leave this window open: it notices the merge within %d seconds. Or press" %
             MERGE_POLL_SECONDS)
     ctx.say("Ctrl-C, merge whenever you like, and run the same command again.")
-    waited, told = 0, 0
+    waited, told, unread = 0, 0, 0
     try:
         while True:
             states = dict((u, ctx.github_writer.pr_state(u)) for u in urls)
+            if any(s is None for s in states.values()):
+                unread += 1
+                if unread >= MERGE_UNREAD_LIMIT:
+                    raise Unknown("could not read the state of %s, %d times in a row"
+                                  % (", ".join(u for u, s in states.items() if s is None),
+                                     unread),
+                                  "check `gh auth status`, then run the same command again")
+            else:
+                unread = 0
             closed = [u for u, s in states.items() if s == "CLOSED"]
             if closed:
                 raise SetupError("%s was closed without merging. Run the same command again "
@@ -2769,6 +2867,31 @@ def entry_diff(have, want):
     return list(difflib.unified_diff(old, new, "now", "after", lineterm="", n=1))
 
 
+# A ledger note: a restart this installer began and did not see finish.
+RESTART_PENDING = "dispatcher-restart-pending"
+
+
+def check_pending_restart(ctx):
+    """Refuse to go on while a restart this installer began may have left the dispatcher
+    stopped — or clear the note once launchd holds it again."""
+    pending = (ctx.state.data.get("notes") or {}).get(RESTART_PENDING)
+    if not pending:
+        return
+    loaded = ctx.host.job_loaded(ctx.conf["DISPATCHER_SERVICE"])
+    if loaded is None:
+        raise Unknown("a dispatcher restart this installer began on %s was not seen to finish, "
+                      "and launchd could not be asked whether it is running" % pending.get("at"),
+                      "run `sudo -v` in your terminal, then run this again")
+    if not loaded:
+        raise SetupError(
+            "a dispatcher restart this installer began on %s did not finish: the dispatcher "
+            "is NOT running. Start it with:\n    sudo launchctl bootstrap system "
+            "/Library/LaunchDaemons/%s.plist\nthen run this again. The config from before "
+            "that change is at %s." % (pending.get("at"), ctx.conf["DISPATCHER_SERVICE"],
+                                       pending.get("backup")))
+    ctx.state.data["notes"].pop(RESTART_PENDING, None)
+
+
 # How many backups of the dispatcher's config to keep under the dispatcher account's home.
 # Each one holds its tracker tokens, so they are pruned, as the review installer's are.
 CONFIG_BACKUPS_KEPT = 5
@@ -2789,6 +2912,7 @@ def restart_dispatcher_live(conf, backup):
         conf={"DISPATCHER_SERVICE": conf["DISPATCHER_SERVICE"],
               "DISPATCHER_CONFIG": conf["DISPATCHER_CONFIG"]},
         state=types.SimpleNamespace(data={"notes": {}}), dispatcher_down=None)
+    plist = "/Library/LaunchDaemons/%s.plist" % conf["DISPATCHER_SERVICE"]
     try:
         stage_e._restart_dispatcher(shim, backup)
     except stage_e.SetupError as exc:
@@ -2798,8 +2922,15 @@ def restart_dispatcher_live(conf, backup):
             "    sudo launchctl bootstrap system %s\n"
             "The config as it was before this change is at %s, readable as %s."
             % (exc, (down.get("state") or "not running").upper(),
-               down.get("plist") or "/Library/LaunchDaemons/%s.plist"
-               % conf["DISPATCHER_SERVICE"], backup, conf["DISPATCHER_ACCOUNT"]))
+               down.get("plist") or plist, backup, conf["DISPATCHER_ACCOUNT"]))
+    except KeyboardInterrupt:
+        # STOPPED MID-RESTART: the old process may be gone and the new one not started.
+        # Said here, with the command, because the next thing on screen is a prompt.
+        raise SetupError(
+            "the restart was interrupted, so the dispatcher may be STOPPED. Start it with:\n"
+            "    sudo launchctl bootstrap system %s\n"
+            "The config as it was before this change is at %s, readable as %s."
+            % (plist, backup, conf["DISPATCHER_ACCOUNT"]))
 
 
 def running_sessions(ctx):
@@ -2849,7 +2980,14 @@ def apply_planning_entries(ctx, entries, remove, why):
         return "the dispatcher's config already held them; nothing restarted"
     ctx.say("  backup: %s (as %s)" % (backup, account))
     ctx.say("  restarting the dispatcher so it loads the change...")
+    # RECORDED BEFORE THE RESTART, cleared after it: a pass killed in between leaves the
+    # file written and the dispatcher possibly stopped, and the next pass would find the
+    # entries matching and look no further. This note makes it look.
+    ctx.state.data["notes"][RESTART_PENDING] = {"at": now_iso(), "backup": backup}
+    ctx.state.save()
     ctx.restart_dispatcher(backup)
+    ctx.state.data["notes"].pop(RESTART_PENDING, None)
+    ctx.state.save()
     ctx.say("  the dispatcher is running again.")
     return "wrote them (backup %s) and restarted the dispatcher" % backup
 
@@ -2871,6 +3009,7 @@ def step_dispatcher_entry(ctx, apply_it):
     re-runs, which drops every entry the kit added; the next pass finds it missing and
     puts it back."""
     rows = resolve_repos(ctx)
+    check_pending_restart(ctx)
     entries, notes = [], []
     types = []
     for row in rows:
@@ -3048,6 +3187,14 @@ def step_probe(ctx, apply_it):
         return True, "probe signed %s on dispatcher %s, which is still running" % (
             _signed_at(ctx, "CA-PROBE"),
             ((ctx.state.data.get("ids") or {}).get("probe") or {}).get("dispatcher_version")), []
+    if apply_it and ctx.interactive and ctx.tracker is not None and \
+            ctx.version_reader(version_url(ctx.conf)) is None:
+        # NO TICKET AGAINST A DISPATCHER THAT IS NOT ANSWERING: each would wait minutes for
+        # a routing note that cannot come, and fail without naming why.
+        raise Unknown("the dispatcher is not answering at %s, so no probe ticket was filed"
+                      % version_url(ctx.conf),
+                      "start it:  sudo launchctl bootstrap system /Library/LaunchDaemons/"
+                      "%s.plist\nthen run this again" % ctx.conf["DISPATCHER_SERVICE"])
     if not (apply_it and ctx.interactive and ctx.tracker is not None):
         _say_probe_tickets(ctx, rows)
         if hard:
@@ -3106,10 +3253,22 @@ mutation StageAMoveOwn($id: String!, $input: IssueUpdateInput!) {
         self.ctx.state.save()
         return issue
 
+    Q_OWN_ISSUE = """
+query StageAOwnIssue($id: String!) {
+  issue(id: $id) { id identifier title creator { id } }
+}"""
+
     def move(self, issue_id, state_id):
         if issue_id not in self.book:
             raise SetupError("refusing to move %s: this installer moves only tickets it "
                              "filed itself" % issue_id)
+        # THE BOOK IS A FILE IN YOUR HOME, which any process running as you could edit. So
+        # the ticket itself is asked too: one of this installer's own titles, filed by you.
+        issue = (self.ctx.tracker.post(self.Q_OWN_ISSUE, {"id": issue_id}).get("issue")) or {}
+        if (issue.get("title") not in (PROBE_TITLE_TOOLS, PROBE_TITLE_LABEL, DRILL_TITLE)
+                or ((issue.get("creator") or {}).get("id")) != self.ctx.conf.get("OWNER_USER_ID")):
+            raise SetupError("refusing to move %s: its title or its creator is not one this "
+                             "installer's own tickets have" % (issue.get("identifier") or issue_id))
         data = self.ctx.tracker.post(self.M_MOVE_OWN, {"id": issue_id,
                                                        "input": {"stateId": state_id}})
         if not (data.get("issueUpdate") or {}).get("success"):
@@ -3541,7 +3700,8 @@ def step_lane(ctx, apply_it):
     if ctx.state.attested("CA-LANE"):
         return True, "the lane proved out (signed %s)" % _signed_at(ctx, "CA-LANE"), []
     drill = (ctx.state.data.get("ids") or {}).get("drill")
-    if not drill and apply_it and ctx.interactive:
+    declined = (ctx.state.data.get("notes") or {}).get("drill_declined")
+    if not drill and apply_it and ctx.interactive and not declined:
         ctx.say("")
         ctx.say("The idea gate is installed and running. What is left is proving it.")
         ctx.say("The routing drill is automatic: it makes the dispatcher refuse one planning")
@@ -3549,6 +3709,13 @@ def step_lane(ctx, apply_it):
         ctx.say("again. About ten minutes; it restarts the dispatcher twice.")
         if ctx.confirm("Run the routing drill now?"):
             run_drill(ctx)
+        else:
+            # Asked once. A "no" is remembered, so every later run does not ask again.
+            ctx.state.data["notes"]["drill_declined"] = now_iso()
+    if not drill and declined:
+        ctx.say("")
+        ctx.say("The routing drill has not run. Run it when you have ten minutes:")
+        ctx.say("    python3 %s drill" % _self_path())
     raise Blocked("CA-LANE")
 
 
@@ -3644,18 +3811,29 @@ def run_drill(ctx):
                      lambda: _stop_since(ctx, started), limit, every=10)
     finally:
         # ON EVERY PATH: the idea out of Plan it (so nothing plans it later), then the
-        # entry back. A restore that fails is said louder than whatever failed first,
-        # because a planning setup that lets nobody in is one nobody notices.
+        # entry back. Neither may stop the other: a close that fails — a dropped
+        # connection, a second Ctrl-C — is said and passed over, and the restore runs
+        # anyway. A restore that fails is said louder than whatever failed first, because
+        # a planning setup that lets nobody in is one nobody notices.
         if idea is not None:
-            own.close(idea["id"])
+            try:
+                if not own.close(idea["id"]):
+                    ctx.say("  THE DRILL'S IDEA %s IS STILL IN %s: move it out by hand, or "
+                            "the planner job will plan it." % (idea.get("identifier"),
+                                                               conf_value(conf, "PLAN_IT_STATE")))
+            except BaseException as exc:          # the restore below must still run
+                ctx.say("  could not close the drill's idea %s (%s): move it out of %s by "
+                        "hand." % (idea.get("identifier"), type(exc).__name__,
+                                   conf_value(conf, "PLAN_IT_STATE")))
         try:
             apply_planning_entries(ctx, entries, [], "the drill: the planning setup put back")
             notes.pop("drill_in_progress", None)
-        except (SetupError, Unknown) as exc:
+        except BaseException as exc:
             ctx.state.save()
-            raise SetupError("THE DRILL COULD NOT PUT THE PLANNING SETUP BACK: %s\nRun the "
-                             "one command again: its dispatcher-entry step writes the setup "
-                             "as composed." % (getattr(exc, "what", None) or exc))
+            raise SetupError("THE DRILL COULD NOT PUT THE PLANNING SETUP BACK (%s): %s\nRun "
+                             "the one command again: its dispatcher-entry step writes the "
+                             "setup as composed." % (type(exc).__name__,
+                                                     getattr(exc, "what", None) or exc))
         ctx.state.save()
     if stop is None:
         raise SetupError("the drill FAILED: the planner job did not stop planning when the "
@@ -3989,7 +4167,8 @@ def cmd_run(ctx, dry_run):
 def cmd_verify(ctx):
     ctx.runner.apply_it = False
     ctx.say("Stage A verify — read-only. Every step is re-measured against the live")
-    ctx.say("machine, nothing stops early, and no credential is ever asked for.")
+    ctx.say("machine, nothing stops early, and no Linear key is ever asked for. (Your Mac")
+    ctx.say("password may be: the checks read files as the role account.)")
     code, rows = run_steps(ctx, apply_it=False, keep_going=True)
     if ctx.runner.writes:
         ctx.say("")
@@ -4390,6 +4569,11 @@ class FakeLinear(object):
                         self.replies[ident] = got[1]
             return {"issueCreate": {"success": True, "issue": {"id": iid, "identifier": ident,
                                                                 "url": "u"}}}
+        if "StageAOwnIssue" in query:
+            rec = self.issues.get(v["id"])
+            return {"issue": None if rec is None else {
+                "id": v["id"], "identifier": rec["identifier"], "title": rec["input"]["title"],
+                "creator": {"id": self.viewer}}}
         if "StageAMoveOwn" in query:
             self.moves.append((v["id"], v["input"]["stateId"]))
             return {"issueUpdate": {"success": True}}
@@ -5260,10 +5444,10 @@ def _wizard_and_key_cases(check, tmp):
     import io
     import subprocess
     import tempfile
-    check("https-url-from-ssh", https_url("git@github.com:example-org/kit.git"),
-          "https://github.com/example-org/kit")
-    check("https-url-from-ssh-scheme", https_url("ssh://git@github.com/example-org/kit.git"),
-          "https://github.com/example-org/kit")
+    check("https-url-from-ssh", https_url("git@example.com:example-org/kit.git"),
+          "https://example.com/example-org/kit")
+    check("https-url-from-ssh-scheme", https_url("ssh://git@example.com/example-org/kit.git"),
+          "https://example.com/example-org/kit")
     check("https-url-kept", https_url("https://github.com/example-org/kit.git"),
           "https://github.com/example-org/kit")
     stage_e = {"ROLE_ACCOUNT": "_exdispatch", "DISPATCHER_CONFIG": "/opt/x/config.json",
@@ -5382,6 +5566,330 @@ def _wizard_and_key_cases(check, tmp):
     check("canary-three-answers",
           (judge_canary("x tok y", {}, "tok"), judge_canary("x", {"file read": "denied"}, "tok"),
            judge_canary("x", {}, "tok")), ("READ", "NOT-RETURNED", "NO-ANSWER"))
+
+
+def _selftest_review_fixes(check, tmp):
+    """KIT-195's review round: each finding, pinned."""
+    src = open(os.path.abspath(__file__)).read()
+
+    # 1. EVERY ROLE-ACCOUNT COMMAND STARTS AT `/` (a checkout under your home is one the
+    #    role account cannot enter, and its interpreter dies importing its first module).
+    host_src = src[src.index("class Host(object):"):src.index("    def account_exists(self, account):")]
+    check("sudo-child-starts-at-root", 'cwd="/"' in host_src, True)
+
+    # 2. A TRACKER ANSWER CUT OFF MID-READ IS "COULD NOT LOOK", never a traceback.
+    lt = LinearTransport("k" * 40)
+
+    class _Cut(object):
+        def open(self, req, timeout=30):
+            raise TimeoutError("read timed out")
+    lt._opener = _Cut()
+    try:
+        lt.post("query { viewer { id } }")
+        got = "no error"
+    except Unknown:
+        got = "unknown"
+    except Exception as exc:                  # the defect: an unwrapped error
+        got = type(exc).__name__
+    check("tracker-cut-off-is-unknown", got, "unknown")
+
+    # 3. ONLY YOUR OWN SAME-REPOSITORY PULL REQUEST IS THIS INSTALLER'S.
+    gw = GitHubWriter()
+    gw._login = "me"
+    rows = [{"url": "u/fork", "state": "OPEN", "isCrossRepository": True,
+             "author": {"login": "me"}},
+            {"url": "u/other", "state": "OPEN", "isCrossRepository": False,
+             "author": {"login": "someone"}},
+            {"url": "u/mine", "state": "OPEN", "isCrossRepository": False,
+             "author": {"login": "me"}}]
+    gw._run = lambda argv, stdin=None: (0, json.dumps(rows), "")
+    check("pr-find-skips-forks-and-other-authors", gw.find_pr("o/r", DELIVERY_BRANCH),
+          ("u/mine", "OPEN"))
+    gw._run = lambda argv, stdin=None: (0, json.dumps(rows[:2]), "")
+    check("pr-find-a-lookalike-is-not-ours", gw.find_pr("o/r", DELIVERY_BRANCH), (None, None))
+    gw._run = lambda argv, stdin=None: (1, "", "HTTP 502")
+    try:
+        gw.find_pr("o/r", DELIVERY_BRANCH)
+        got = "no error"
+    except Unknown:
+        got = "unknown"
+    check("pr-find-that-could-not-look-is-unknown", got, "unknown")
+
+    # 4. A BRANCH AN INTERRUPTED RUN LEFT IS PICKED UP, not a 422 forever.
+    import base64 as _b64
+
+    def scripted(branch_exists, branch_text):
+        calls = []
+
+        def run(argv, stdin=None):
+            calls.append(argv)
+            if argv[:2] == ["api", "repos/o/r/git/ref/heads/%s" % DELIVERY_BRANCH]:
+                return (0, "abc\n", "") if branch_exists else (1, "", "HTTP 404 Not Found")
+            if argv[:2] == ["api", "repos/o/r/git/ref/heads/main"]:
+                return 0, "def\n", ""
+            if argv[0] == "api" and "contents/delivery.json?ref=" in argv[1]:
+                return 0, json.dumps({"content": _b64.b64encode(branch_text.encode()).decode(),
+                                      "sha": "blob-branch"}), ""
+            if argv[:1] == ["api"]:
+                return 0, "{}", ""
+            if argv[:2] == ["pr", "create"]:
+                return 0, "https://github.com/o/r/pull/9\n", ""
+            raise AssertionError(argv)
+        w = GitHubWriter()
+        w._run = run
+        return w, calls
+
+    w, calls = scripted(True, "NEW")
+    url = w.open_pr("o/r", "main", DELIVERY_BRANCH, "NEW", "blob-main")
+    check("pr-leftover-branch-already-holding-it-is-reused",
+          (url.endswith("/pull/9"), any("git/refs" in " ".join(c) for c in calls),
+           any("-X" in c and "PUT" in c for c in calls)), (True, False, False))
+    w, calls = scripted(True, "OLD")
+    w.open_pr("o/r", "main", DELIVERY_BRANCH, "NEW", "blob-main")
+    puts = [c for c in calls if "PUT" in c]
+    check("pr-leftover-branch-gets-the-commit-on-its-own-sha",
+          (len(puts), "sha=blob-branch" in (puts[0] if puts else [])), (1, True))
+    w, calls = scripted(False, "")
+    w.open_pr("o/r", "main", DELIVERY_BRANCH, "NEW", "blob-main")
+    check("pr-fresh-branch-is-cut-then-committed",
+          (any("git/refs" in " ".join(c) for c in calls), len([c for c in calls if "PUT" in c])),
+          (True, 1))
+
+    # 5. A STATE THAT CANNOT BE READ IS "COULD NOT LOOK", not thirty quiet minutes.
+    class _Blind(object):
+        def pr_state(self, url):
+            return None
+    bc = _ctx(os.path.join(tmp, "pr-blind"))
+    bc._out = []
+    bc.sleep = lambda s: None
+    bc.github_writer = _Blind()
+    try:
+        wait_for_merges(bc, ["u/1"])
+        got = "no error"
+    except Unknown:
+        got = "unknown"
+    check("pr-state-unreadable-is-unknown", got, "unknown")
+
+    # 6. A PULL REQUEST MERGED EARLIER THAT NO LONGER COVERS THE GAP IS SPENT.
+    off = json.loads(json.dumps(READY_DELIVERY))
+    del off["linear"]["findingTicket"]
+
+    class _W(object):
+        def __init__(self, fresh):
+            self.fresh, self.opened = fresh, []
+
+        def find_pr(self, repo, head):
+            return ("u/old", "MERGED") if head == DELIVERY_BRANCH else (None, None)
+
+        def delivery_text(self, repo, branch):
+            return json.dumps(self.fresh, indent=2) + "\n", "b"
+
+        def open_pr(self, repo, base, head, text, blob):
+            self.opened.append(head)
+            return "u/new"
+    mc = _ctx(os.path.join(tmp, "pr-merged-spent"), tracker=_ready_tracker())
+    mc._out = []
+    step_tracker(mc, True)
+    _scripted(mc, ["y"])
+    mc.github_writer = _W(off)
+    got = delivery_pr(mc, "example-org/product", "main", delivery_patch(mc))
+    check("pr-merged-but-still-off-opens-a-fresh-branch",
+          (got, mc.github_writer.opened), ("u/new", [DELIVERY_BRANCH + "-2"]))
+    mr = _ctx(os.path.join(tmp, "pr-merged-lagging"), tracker=_ready_tracker())
+    mr._out = []
+    step_tracker(mr, True)
+    _scripted(mr, ["y"])
+    mr.github_writer = _W(READY_DELIVERY)
+    check("pr-just-merged-is-not-reopened",
+          (delivery_pr(mr, "example-org/product", "main", delivery_patch(mr)),
+           mr.github_writer.opened), ("u/old", []))
+
+    # 7. A DRILL WHOSE IDEA CANNOT BE CLOSED STILL PUTS THE SETUP BACK.
+    dc, _a = _probe_world(tmp, "drill-close-fails", answers=("y", "y", "bc", "yes", "y"))
+    step_probe(dc, True)
+    fresh = json.dumps({"result": "ok", "ended_at": now_iso(), "exit_code": 0})
+    dc.host.files[ROLE_HEARTBEAT] = fresh
+    dc.host.loaded.add(GOOD_CONF["JOB_LABEL"])
+    dc.restart_dispatcher = lambda backup: None
+    fails = [1]
+    real_states = dc.tracker.team_states
+
+    def flaky(team_id):
+        if fails[0] and any(r["input"]["title"] == DRILL_TITLE for r in dc.tracker.issues.values()):
+            fails[0] -= 1
+            raise TimeoutError("synthetic: the connection dropped")
+        return real_states(team_id)
+    dc.tracker.team_states = flaky
+
+    def trip(host):
+        host.files[ROLE_STATE_DIR + "/stop.json"] = json.dumps(
+            {"schema": poller.STOP_SCHEMA, "at": now_iso(), "reason": "synthetic"})
+    dc.host.on_kick = trip
+    try:
+        run_drill(dc)
+    except (SetupError, Unknown, TimeoutError):
+        pass
+    with open(dc.conf["DISPATCHER_CONFIG"], encoding="utf-8") as fh:
+        live = dict((r.get("id"), r) for r in json.load(fh)["repositories"])
+    check("drill-close-failure-still-restores",
+          (live[ENTRY]["userAccessControl"]["allowedUsers"],
+           any("drill's idea" in line for line in dc._out)),
+          ([GOOD_CONF["OWNER_USER_ID"]], True))
+
+    # 8. A RESTART THAT DID NOT FINISH IS LOOKED AT ON THE NEXT PASS.
+    pc = _ctx(os.path.join(tmp, "restart-pending"), tracker=_ready_tracker())
+    pc._out = []
+    pc.state.data["notes"][RESTART_PENDING] = {"at": "2026-09-24T00:00:00Z", "backup": "/b"}
+    try:
+        check_pending_restart(pc)
+        got = "passed"
+    except SetupError as exc:
+        got = str(exc)
+    check("restart-pending-and-dispatcher-down-says-how-to-start-it",
+          "launchctl bootstrap system /Library/LaunchDaemons/%s.plist"
+          % GOOD_CONF["DISPATCHER_SERVICE"] in got, True)
+    pc.host.loaded.add(GOOD_CONF["DISPATCHER_SERVICE"])
+    check_pending_restart(pc)
+    check("restart-pending-cleared-once-it-runs",
+          RESTART_PENDING in pc.state.data["notes"], False)
+    sc = _ctx(os.path.join(tmp, "restart-pending-step"), tracker=_ready_tracker())
+    sc._out = []
+    sc.job_ready = True
+    sc.state.data["notes"][RESTART_PENDING] = {"at": "2026-09-24T00:00:00Z", "backup": "/b"}
+    try:
+        step_dispatcher_entry(sc, False)
+        got = "passed"
+    except SetupError as exc:
+        got = str(exc)
+    check("restart-pending-is-checked-by-the-entry-step", "did not finish" in got, True)
+    rc = _ctx(os.path.join(tmp, "restart-note"), tracker=_ready_tracker())
+    rc._out = []
+    step_preflight(rc, True)
+    step_tracker(rc, True)
+
+    def dies(backup):
+        raise SetupError("THE DISPATCHER IS STOPPED (synthetic)")
+    rc.restart_dispatcher = dies
+    try:
+        apply_planning_entries(rc, compose_entries(rc, resolve_repos(rc)), [], "selftest")
+    except SetupError:
+        pass
+    check("restart-failure-leaves-the-note", RESTART_PENDING in rc.state.data["notes"], True)
+
+    # 9. NO PROBE TICKET AGAINST A DISPATCHER THAT IS NOT ANSWERING.
+    nd, _a = _probe_world(tmp, "probe-dispatcher-down")
+    nd.version_reader = lambda url: None
+    try:
+        step_probe(nd, True)
+        got = "passed"
+    except Unknown:
+        got = "unknown"
+    check("probe-refuses-a-silent-dispatcher-before-filing", (got, nd.tracker.issues),
+          ("unknown", {}))
+
+    # 10. THE JOB IS INSTALLED DISABLED, and only the yes enables it (a reboot would
+    #     otherwise start a job the person said no to).
+    jc = _ctx(os.path.join(tmp, "plist-disabled"), tracker=_ready_tracker())
+    jc._out = []
+    step_preflight(jc, True)
+    check("job-installed-disabled", "<key>Disabled</key><true/>" in job_plist(jc), True)
+    seen = []
+    h = Host()
+    h._launchctl = lambda argv: (seen.append(argv), (True, ""))[1]
+    h.start_job("com.example.planner")  # _LABEL_EXAMPLE
+    check("start-enables-then-loads",
+          [a[0] for a in seen], ["enable", "bootstrap"])
+
+    # 11. THE BOOK OF OWN TICKETS IS CHECKED AGAINST THE TICKET ITSELF.
+    fc = _ctx(os.path.join(tmp, "own-forged"), tracker=_ready_tracker())
+    fc.tracker.issues["iss-PROD-7"] = {"identifier": "PROD-7", "team": "PROD",
+                                       "input": {"title": "A real piece of work"}}
+    own = OwnTickets(fc)
+    own.book["iss-PROD-7"] = {"identifier": "PROD-7", "why": "probe", "team_id": "team-prod"}
+    try:
+        own.move("iss-PROD-7", "s-done")
+        got = "moved"
+    except SetupError:
+        got = "refused"
+    check("own-tickets-a-forged-book-entry-is-refused", (got, fc.tracker.moves), ("refused", []))
+
+    # A lookalike the tracker would pass — the right title, filed by you — is still refused
+    # when this installer did not file it: the book and the ticket are two separate checks.
+    fc.tracker.issues["iss-PROD-8"] = {"identifier": "PROD-8", "team": "PROD",
+                                       "input": {"title": PROBE_TITLE_LABEL}}
+    try:
+        OwnTickets(fc).move("iss-PROD-8", "s-done")
+        got = "moved"
+    except SetupError:
+        got = "refused"
+    check("own-tickets-refuse-an-unbooked-lookalike", (got, fc.tracker.moves), ("refused", []))
+
+    # 12. A NAME READ OUT OF ANOTHER INSTALLER'S SETTINGS NEVER REACHES A SHELL UNCHECKED.
+    hv = Host()
+
+    def never(*a, **k):
+        raise AssertionError("a shell ran with an unchecked name")
+    hv._sudo = never
+    check("secret-read-refuses-a-bad-name",
+          (hv.read_secret_value("_x", "X$(id)", ".stage-e/env"),
+           hv.read_secret_value("_x", "GOOD_NAME", "../env")), (None, None))
+
+    # 13. THE WIZARD: two key names, re-asks what fails, and suggests only plannable repos.
+    values, _s = derive_conf({"ROLE_ACCOUNT": "_exdispatch", "LINEAR_KEY_ENV": "LINEAR_API_KEY",
+                              "DISPATCHER_CONFIG": "/opt/x/config.json",
+                              "DISPATCHER_SERVICE": "com.example.dispatcher",  # _LABEL_EXAMPLE
+                              "AGENT_DISPLAY_NAME": "a", "REVIEW_REPOS": "o/r",
+                              "KIT_REPO_URL": "https://example.com/o/kit"}, "", "owner-1")
+    check("wizard-never-one-name-for-two-keys",
+          (values["OPERATOR_KEY_ENV"] != values["LINEAR_KEY_ENV"],
+           validate_conf(parse_conf(render_conf(values))[0])), (True, []))
+    se = os.path.join(tmp, "stage-e-bad.conf")
+    with open(se, "w", encoding="utf-8") as fh:
+        fh.write("ROLE_ACCOUNT=_exdispatch\nDISPATCHER_CONFIG=/opt/x/config.json\n"
+                 "DISPATCHER_SERVICE=not a label\nAGENT_DISPLAY_NAME=a\n"
+                 "REVIEW_REPOS=o/kit,o/product\nKIT_REPO_URL=https://example.com/o/kit\n"
+                 "LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY\n")
+    wz = _ctx(os.path.join(tmp, "wizard-reask"))
+    wz._out = []
+    answers = {"Which repositories": "", "The dispatcher's launchd label": "com.example.dispatcher",  # _LABEL_EXAMPLE
+               "Write these settings": "y"}
+
+    def ask(prompt):
+        for start, value in answers.items():
+            if prompt.startswith(start):
+                return value
+        return ""
+    _scripted(wz, [])
+    wz._ask = ask
+    out = os.path.join(tmp, "wizard-reask.conf")
+    got = run_wizard(wz, out, se, tmp, "owner-1", has_delivery=lambda r: r == "o/product")
+    check("wizard-reasks-a-failing-value-and-writes",
+          (bool(got), load_conf(out)[1] if got else None), (True, []))
+    check("wizard-suggests-only-repos-with-a-delivery-config",
+          (got or {}).get("PLANNED_REPOS"), "o/product")
+
+    # 14. THE DRILL IS OFFERED ONCE; A NO IS REMEMBERED.
+    lc = _ctx(os.path.join(tmp, "lane-once"), tracker=_ready_tracker())
+    lc._out = []
+    asked = _scripted(lc, ["n"])
+    for _ in range(2):
+        try:
+            step_lane(lc, True)
+        except Blocked:
+            pass
+    check("lane-asks-the-drill-once",
+          (len([q for q in asked if "drill" in q]),
+           any("python3" in line and " drill" in line for line in lc._out)), (1, True))
+
+    # 15. A REPOSITORY WITH NO DELIVERY CONFIG NAMES THE WAY OUT.
+    ac = _ctx(os.path.join(tmp, "absent-way-out"), github=FakeGitHub(why="absent"))
+    ac._out = []
+    try:
+        resolve_repos(ac)
+    except Blocked:
+        pass
+    check("delivery-absent-says-remove-it-from-the-list",
+          any("PLANNED_REPOS" in line for line in ac._out), True)
 
 
 def selftest():
@@ -6368,6 +6876,7 @@ def selftest():
               bool(re.search(r"[\"']com\.[a-z0-9-]+\.stage-a", "\n".join(
                   ln for ln in src.splitlines() if "_LABEL_EXAMPLE" not in ln))), False)
         _selftest_one_command(check, tmp)
+        _selftest_review_fixes(check, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -6455,9 +6964,13 @@ def derive_conf(stage_e, origin, viewer_id):
         put("JOB_LABEL", service.rsplit(".", 1)[0] + ".stage-a-planner",
             "beside the dispatcher's own label")
     put("OWNER_USER_ID", viewer_id, "your Linear key")
-    put("OPERATOR_KEY_ENV", "LINEAR_API_KEY", "the usual name")
     values.setdefault("LINEAR_KEY_ENV", "STAGE_A_LINEAR_API_KEY")
     sources.setdefault("LINEAR_KEY_ENV", "the usual name")
+    # Two names, never one: the conf refuses a single name for both keys, and a stored
+    # key named LINEAR_API_KEY is allowed in the review installer's settings.
+    operator = "LINEAR_API_KEY" if values["LINEAR_KEY_ENV"] != "LINEAR_API_KEY" \
+        else "OPERATOR_LINEAR_API_KEY"
+    put("OPERATOR_KEY_ENV", operator, "the usual name")
     return values, sources
 
 
@@ -6488,9 +7001,11 @@ def render_conf(values):
     return "\n".join(lines) + "\n"
 
 
-def run_wizard(ctx, conf_path, stage_e_path, kit_root, viewer_id):
+def run_wizard(ctx, conf_path, stage_e_path, kit_root, viewer_id, has_delivery=None):
     """Write the settings file from what can be worked out plus the person's answers.
-    Returns the conf, or None when nothing was written."""
+    Returns the conf, or None when nothing was written. `has_delivery(repo)` says whether
+    a repository has a committed delivery.json: the reviewed repositories are only a
+    suggestion for the planned ones, and a repository with none can never be planned."""
     stage_e = {}
     if os.path.exists(stage_e_path):
         with open(stage_e_path, encoding="utf-8") as fh:
@@ -6503,6 +7018,16 @@ def run_wizard(ctx, conf_path, stage_e_path, kit_root, viewer_id):
     except (OSError, subprocess.SubprocessError):
         origin = ""
     values, sources = derive_conf(stage_e, origin, viewer_id)
+    if has_delivery and values.get("PLANNED_REPOS"):
+        kept = [r for r in planned_repos(values) if has_delivery(r)]
+        dropped = [r for r in planned_repos(values) if r not in kept]
+        if dropped:
+            ctx.say("Left out of the suggestion, with no delivery.json to plan from: %s"
+                    % ", ".join(dropped))
+        if kept:
+            values["PLANNED_REPOS"] = ",".join(kept)
+        else:
+            values.pop("PLANNED_REPOS", None)
     ctx.say("")
     ctx.say("----- the idea gate's settings: %s does not exist yet -----" % conf_path)
     ctx.say("Worked out for you:" if values else "Nothing could be worked out.")
@@ -6519,12 +7044,35 @@ def run_wizard(ctx, conf_path, stage_e_path, kit_root, viewer_id):
                 values[key] = got
                 break
     errors = validate_conf(values)
-    if errors:
+    for _round in range(2):
+        # RE-ASKED, NOT RE-DERIVED: a value that fails the check is asked again, with the
+        # reason beside it. Deriving it again would only fail the same way.
+        bad = [k for k in list(CONF_KEYS) + list(OPTIONAL_CONF_KEYS)
+               if any(k in e for e in errors)]
+        if not bad:
+            break
         ctx.say("")
-        ctx.say("Not written — these values do not hold:")
+        ctx.say("These values do not hold yet:")
         for e in errors:
             ctx.say("  - " + e)
-        ctx.say("Run the same command again to answer them afresh.")
+        for key in bad:
+            if key == "JOB_LABEL" and JOB_LABEL_RE.match(values.get("DISPATCHER_SERVICE") or ""):
+                continue                   # derived below from the corrected service label
+            got = ctx._ask("%s [%s]: " % (WIZARD_QUESTIONS.get(key, key),
+                                          values.get(key, ""))).strip()
+            if got:
+                values[key] = got
+        service = values.get("DISPATCHER_SERVICE") or ""
+        if not values.get("JOB_LABEL") and JOB_LABEL_RE.match(service):
+            values["JOB_LABEL"] = service.rsplit(".", 1)[0] + ".stage-a-planner"
+        errors = validate_conf(values)
+    if errors:
+        ctx.say("")
+        ctx.say("Not written — these values still do not hold:")
+        for e in errors:
+            ctx.say("  - " + e)
+        ctx.say("Run the same command again to answer them afresh, or copy "
+                "stage-a.conf.example to %s and fill it in." % conf_path)
         return None
     if not ctx.confirm("Write these settings to %s?" % conf_path):
         return None
@@ -6672,11 +7220,22 @@ def main(argv=None):
             with open(args.stage_e_conf, encoding="utf-8") as fh:
                 stage_e = parse_conf(fh.read())[0]
         seed = derive_conf(stage_e, "", None)[0]
+        # The seed comes out of ANOTHER installer's settings file, before any conf exists
+        # to validate: only the values this path uses, and only in their checked shapes.
+        if not (re.fullmatch(r"_?[A-Za-z][A-Za-z0-9_.-]{0,31}", seed.get("ROLE_ACCOUNT") or "")
+                and ENV_NAME_RE.match(seed.get("LINEAR_KEY_ENV") or "")):
+            seed = dict((k, v) for k, v in seed.items()
+                        if k not in ("ROLE_ACCOUNT", "LINEAR_KEY_FILE"))
         key, _source = operator_key(seed, Host(), True, True, print)
         probe_ctx = _live_ctx(seed, args.state_home, interactive=True, key=key)
         viewer = viewer_id_of(probe_ctx.tracker) if probe_ctx.tracker else None
         kit_root = os.path.dirname(HERE)
-        if run_wizard(probe_ctx, args.conf, args.stage_e_conf, kit_root, viewer) is None:
+        reader = GitHubReader()
+
+        def has_delivery(repo):
+            return reader.delivery_config(repo)[0] is not None
+        if run_wizard(probe_ctx, args.conf, args.stage_e_conf, kit_root, viewer,
+                      has_delivery=has_delivery) is None:
             return EX_USAGE
 
     conf, errors = load_conf(args.conf)
@@ -6701,8 +7260,8 @@ def main(argv=None):
         print(str(exc), file=sys.stderr)
         return EX_REFUSED
     except KeyboardInterrupt:
-        print("\nStopped. Nothing half-done is left: run the same command again to carry on.",
-              file=sys.stderr)
+        print("\nStopped. Run the same command again: it measures every step afresh and "
+              "carries on from what it finds.", file=sys.stderr)
         return EX_BLOCKED
 
 
