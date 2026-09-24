@@ -13,8 +13,9 @@ name: CI
 on:
   push:
     branches: [main]
-  # Run on every PR regardless of base branch — so stacked PRs (base != main)
-  # are gated too, not just PRs that target main directly. `labeled`/`unlabeled`
+  # Run on every PR regardless of base branch — so a PR whose base is not main is
+  # still checked (it also fails the "PR base" workflow: stacked PRs are not
+  # allowed, docs/COLLABORATION.md). `labeled`/`unlabeled`
   # are included so "Hooks change guard" re-evaluates the moment a
   # `hooks-change` label is added or removed (the default PR activity types —
   # opened/synchronize/reopened — don't cover labels).
@@ -41,6 +42,12 @@ jobs:
       # docstring and docs/SECURITY.md.
       - name: GuardFall bypass battery (recorded results still hold)
         run: python3 .claude/hooks/test_guard_bypass.py
+
+      # The PR-base gate itself runs as its own workflow (pr-base.yml — so a
+      # retarget re-runs it, and a stacked PR still gets every step here). Its
+      # decision function is proven here too, so a push to main checks it.
+      - name: PR base check selftest
+        run: python3 scripts/check_pr_base.py --selftest
 
       - name: Validate all tracked JSON/YAML
         run: |

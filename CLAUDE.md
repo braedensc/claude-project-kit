@@ -43,16 +43,40 @@ The PreToolUse hook (`.claude/hooks/pre-tool-use.py`) **blocks** these in real t
 the model cannot skip the hook. A block is the system working — **branch/fix and retry,
 never work around it.** Full reference: `.claude/hooks/README.md`.
 
-One honest qualification, measured 2026-08-26 (`npm run test:bypass`, docs/SECURITY.md
-§ *What the pattern guards actually carry*): the **Bash** guards below match raw command
-text that bash rewrites before running it, and all six classify as **advisory** — a
-respelling gets past them. That is a fact about the threat model, **not a licence**.
+One honest qualification, measured 2026-08-26 and extended 2026-09-20 (`npm run
+test:bypass`, docs/SECURITY.md § *What the pattern guards actually carry*): the **Bash**
+guards below read raw command text that bash rewrites before running it, and all seven
+classify as **advisory** — a respelling gets past them. That is a fact about the threat
+model, **not a licence**.
 Working around a block is exactly the behaviour the guard exists to make visible, and
 the durable layers (branch protection, CI, `permissions.deny`, the sandbox) will catch
 it anyway. If a guard is in your way, say so and stop — never respell the command.
 
 - **Branch guard** — no `Edit`/`Write`/`git commit` on `main`/`master`. Branch first:
   `git checkout -b <type>/<short-kebab-desc>` (type ∈ feat|fix|chore|refactor|docs).
+- **Stacked-branch guard — never stack a PR.** **Every branch is cut from the base
+  branch and merges back into it.** A feature branch is never branched off another
+  feature branch, and two feature branches are never merged into each other. "Cut from
+  the base" is judged **by content**: the start point must carry no commits that are
+  not already on a base branch — so a fresh `claude/<codename>` worktree branch, a tag
+  on main or a detached HEAD on main are fine, and a branch with one commit of its own
+  is not, whatever it is called. Blocked: creating a branch from such a start point
+  (`checkout -b`, `switch -c`, `git branch`, `worktree add`, including the *implicit*
+  start — branching again while you stand on a feature branch), bringing another
+  feature branch's work in (`merge`, `pull`, `rebase` onto it, `push HEAD:<other>`),
+  and basing a PR on a non-base branch (`gh pr create|edit --base`, `gh api` to
+  `/pulls`, `scripts/gh_fallback.py pr-create --base`, the `gh-merge-base` config).
+  **Bringing the base INTO your branch stays allowed** — `git fetch origin main && git
+  merge origin/main` is what the conflict loop (`scripts/pr_conflict.py`) asks a session
+  to run, and rebasing onto the base, `rebase --onto origin/main <old-base>` (the way off
+  a stack) and syncing your branch from its own remote copy are allowed too. The base
+  branch is `main`/`master` plus `github.defaultBranch` from a **committed**
+  `delivery.json`, plus the remote's recorded default (`origin/HEAD`) — widening only.
+  Why: on 2026-09-20 six PRs shipped as a six-deep stack (#153←#154←#155←#156←#157←#158);
+  each squash-merge rewrote `main` and turned every descendant CONFLICTING, and GitHub
+  runs **no checks at all** on a conflicted PR, so they read as "no checks reported" —
+  which looks like broken CI. Five forced re-cascades; it ended by merging the tip alone
+  and closing four PRs.
 - **Branch-naming guard** — the branch must match `<type>/<short-kebab-desc>`. Rename
   an auto-generated `claude/<codename>` worktree branch before working
   (`git branch -m <type>/<desc>`).
@@ -104,7 +128,13 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   matched on domain boundaries — lookalikes like `evil-github.com` don't pass.
 
 **Stop hook** (`.claude/hooks/stop-pr-check.py`) blocks *ending a turn* on a pushed
-branch that has **no PR**, a PR with **failing CI**, or a **DIRTY** (conflict) PR. So:
+branch that has **no PR**, a PR **based on a branch other than the base branch**, a PR
+with **failing CI**, or a **DIRTY** (conflict) PR. The base check reads `baseRefName`
+out of GitHub's own record, so it fires however the PR was created — a respelled
+command, the web UI, an automation — and it fires on a GREEN PR, because a stacked PR
+looks fine right up until its base merges. It asks GitHub for the default branch before
+blocking, says it once per commit and then steps aside for the CI/DIRTY triage, and —
+like every check in this hook — does nothing where `gh` cannot reach GitHub. So:
 open the PR, then watch CI to green (`gh pr checks <n> --watch`) before calling a task
 done. A DIRTY PR is *not* green — GitHub skips the required CI, so side checks alone can
 look passing; rebase, resolve, force-push.
@@ -202,6 +232,8 @@ npm run test:conflict        # conflict loop: fix request, bounded escalation, u
 npm run test:conflict-waker-setup  # the waker's installer: a user LaunchAgent, signed-off
                              #   dry run, stale heartbeat = NOT RUNNING, no sudo path
 npm run test:union           # union check: green alone + red together, bisected, report-only
+npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
+                             #   event or missing value FAILS, main() itself is exercised
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over all tracked files
@@ -226,11 +258,15 @@ deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
 `docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`.
 
 CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
-validation, the reusable-workflow call-contract check, the alert-page check, the forbidden-paths gate,
+validation, the reusable-workflow call-contract check, the PR-base selftest, the alert-page check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
 and weekly-review selftests, and secretlint on every PR. `main` is protected: **three** contexts are required —
 **Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
+A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
+based on a base branch and re-runs on a retarget. It is deliberately not required:
+every PR into `main` passes it, and branch protection never covers a PR based on a
+feature branch — so it makes a stacked PR red, not unmergeable.
 
 **A component that can do nothing must say which nothing it did.** *Nothing to do* and
 *could not do it* have opposite meanings and identical symptoms — no output, no error,

@@ -221,6 +221,41 @@ files in `origin/main`, not the log. Now **hook-enforced**: the PreToolUse guard
 blocks commit/push on a MERGED-PR branch outright, failing open when `gh`/network
 can't verify.
 
+**Never stack a PR — a six-deep stack cost five forced re-cascades.** On 2026-09-20 one
+session shipped six PRs as a chain: #153←#154←#155←#156←#157←#158, each branched off its
+predecessor. Every squash-merge of a base **rewrites `main`**, which put all remaining
+descendants into CONFLICTING at once — and **GitHub runs no checks at all on a
+conflicted PR**, so five PRs read as "no checks reported", which looks like broken CI
+rather than a conflict. Each merge therefore forced a manual re-cascade of everything
+below it. It ended by merging the tip alone (#158, which provably contained the rest)
+and closing the other four. Independent PRs off `main` never do this. The rule is now
+**every branch is cut from `main` and merges back into `main`**, enforced at three
+depths: a PreToolUse guard (advisory — it reads command text), the Stop hook reading the
+open PR's `baseRefName` out of GitHub's own record, and the `PR base` workflow reading
+the `pull_request` event. Be precise about the last one: it makes a stacked PR **red,
+not unmergeable** — branch protection covers `main` only, so a PR based on a feature
+branch has no required context gating it. **The move that stays allowed is the opposite
+direction**: bringing `origin/main` *into* your branch, which is what the conflict loop
+asks a session to run. A guard that blocked it would break that loop.
+
+**A guard over shell text must parse like the shell — and "stacked" is a property of
+content, not of a name.** The first version of that guard shipped with 402/402 green
+and was then reviewed adversarially (six lenses, every finding reproduced): 56
+findings, including one that broke the invariant it existed to protect. It split the
+command on `&` and `|` *before* reading quotes, so `git merge origin/main 2>&1` read `2>`
+as the ref and blocked the conflict loop's own move; a trailing `# comment`, a read-only
+`grep` for a git command, and a heredoc mentioning one were all blocked the same way.
+And it judged start points by NAME, so every Claude Code worktree session — which starts
+on `claude/<codename>`, a branch with no commits of its own — was refused `git checkout
+-b`, while a feature branch literally named `feat/main` passed as a base. The battery was
+green because its sandboxes had no `main` to measure against. The rewrite reads the raw
+command through a small quote-aware lexer and asks git the real question — does this
+start point carry commits no base branch has (`git rev-list <start> --not <base
+tips>`)? Two things generalize: **a battery is only as strong as the repo shape its
+sandboxes have** (build the history the guard reasons about), and **mutation-test each
+sub-behaviour, not just the whole guard** — three single-line mutants of the first
+version passed the full battery unchanged.
+
 **Claude never merges — opening the PR is the end of its involvement.** A real
 near-miss (2026-07-03): `gh pr merge --auto` was used on agent-opened PRs —
 auto-merge still means the agent caused the merge, and the owner corrected it

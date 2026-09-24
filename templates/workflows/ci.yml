@@ -31,8 +31,10 @@ name: CI
 on:
   push:
     branches: [main]
-  # Run on every PR regardless of base branch — so stacked PRs (base != main)
-  # are gated too, not just PRs that target main directly. `labeled`/`unlabeled`
+  # Run on every PR regardless of base branch — so a PR whose base is not the
+  # default branch is still checked (it also fails the "PR base" workflow, which
+  # ships active at .github/workflows/pr-base.yml: stacked PRs are not allowed,
+  # docs/COLLABORATION.md). `labeled`/`unlabeled`
   # are included so the label-driven gates re-evaluate the moment their label is
   # added or removed — `hooks-change` for "Hooks change guard", `no-ticket` for
   # "Ticket link" (the default PR activity types — opened/synchronize/reopened —

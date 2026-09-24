@@ -82,6 +82,7 @@ You cannot, ever:
 | **Apply or remove** `hooks-change`, `agent:*`, `blocked:*`, `provenance:*` | Those labels mean *a person decided*. Ask for one; never apply it. |
 | **Move a ticket** to ready, Done or Canceled | Ready starts sessions. Done deletes worktrees. Both are a person's call. |
 | **Create a ticket** yourself | Report the finding. Where a filer is configured, *request* one. |
+| **Stack a branch or a PR** — branch off another feature branch, merge two of them, or open a PR based on one | Squash-merging a base rewrites the base branch, so every PR stacked on it conflicts at once — and GitHub runs **no checks at all** on a conflicted PR, so it reads as broken CI. Cut from the base branch. Merging the base **into** your branch (`git merge origin/main`) is the opposite move and is how you resolve a conflict. |
 | **Edit a hook, a guard, a settings file, or `delivery.json`** | A guard you can edit is theater. Write a scratch copy; hand a person the command. |
 | **Re-spell a command a guard blocked** | Working around a block is the failure the guard exists to show. Say it blocked you and stop. |
 | **Widen the network allowlist, weaken the sandbox, or touch certificate trust** | Human-only, with a recorded reason. |
