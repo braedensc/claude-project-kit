@@ -3037,6 +3037,12 @@ def _selftest_body():
         old_root = tempfile.mkdtemp(prefix="pre-kit156.", dir=tmp_root)
         old_home = os.path.join(old_root, "role-home")
         shutil.copytree(home, old_home, symlinks=True)
+        # A fixture that keeps "this checkout" beside the role home (so a preflight can compare
+        # the clone with it) needs that folder copied too, or the old install reads as a
+        # checkout it cannot hash. Absent, there is nothing to copy.
+        here_checkout = os.path.join(os.path.dirname(home), "checkout")
+        if os.path.isdir(here_checkout):
+            shutil.copytree(here_checkout, os.path.join(old_root, "checkout"), symlinks=True)
         old_ledger = os.path.join(old_root, "ledger")
         shutil.copytree(ledger, old_ledger)
         old_state = State(old_ledger)
