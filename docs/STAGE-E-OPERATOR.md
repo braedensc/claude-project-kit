@@ -458,7 +458,7 @@ poller would.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats and one tracker key. Posts one comment per incident on one ticket, and nothing else. Not a session. |
+| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
@@ -1472,20 +1472,24 @@ Input/output error` and leaves you with nothing loaded. Poll
   (`run_timeout_seconds`, or `--timeout`); the poller exits 4 when it is cut off, the
   driver exits 2 and calls the pass partial.
 
-**Monitor the heartbeats, not the log — there are three.**
+**Monitor the heartbeats, not the log — there are three, and a fourth once the notifier is
+installed** (`state/notifier-heartbeat.json`, `docs/NOTIFIER-OPERATOR.md`).
 `state/heartbeat.json`, `state/bounce-heartbeat.json` and `finding/heartbeat.json` carry a
 timestamp and a result on every terminal path, including a failed one. A stale heartbeat
 means *not running*. A fresh one with a result outside that job's good list means *ran and
 could not do it* — the good lists differ per job, and `docs/HEARTBEAT-MONITOR.md` has them:
 the review poller's `declined`, and the bounce driver's `idle`, `declined` and `paused`,
-are healthy.
-**Count them**: two fresh heartbeats out of three is one whole daemon that is not running,
-and nothing else on the machine will say so. They live under the **role account's** home,
-not yours, so reading them takes `sudo -u`:
+are healthy. The notifier's file is shaped differently: `at` and an integer `exit`, and only
+exit `0` is good.
+**Count them** against the jobs you run — three, or four with the notifier: one fresh
+heartbeat fewer than that is one whole daemon that is not running, and nothing else on the
+machine will say so. They live under the **role account's** home, not yours, so reading
+them takes `sudo -u`:
 
 > **Something can read them for you.** `scripts/pipeline_heartbeat_monitor.py` is a fourth
-> one-shot job, run by the same role account on a longer interval, that judges all three
-> heartbeats and posts **one** comment on a ticket when the verdict changes — once per
+> one-shot job, run by the same role account on a longer interval, that judges the three
+> daemons' heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it — and posts
+> **one** comment on a ticket when the verdict changes — once per
 > incident, not once per pass, and one more when it clears. Under the installer it is off
 > only by name (`HEARTBEAT_MONITOR_TICKET=off`); left empty, `run` stops at card `CK-9`. Run
 > by hand with no ticket configured, a problem it cannot report is exit 3 rather than a clean
@@ -1493,9 +1497,21 @@ not yours, so reading them takes `sudo -u`:
 > cannot report the machine asleep or off, or its own death (KIT-45). **The installer
 > installs it** at its `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
 > `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the install steps.
+>
+> **It watches up to four jobs, and its comments reach your chat channel** (KIT-156). Each
+> comment carries a mark on its first line that the human-action notifier pings on, once,
+> with no label (`docs/NOTIFIER-OPERATOR.md`, *The daemon-health page*). Set
+> `NOTIFIER_JOB_LABEL` in `stage-e.conf` to the notifier's `JOB_LABEL` and the monitor
+> watches the notifier's heartbeat too, at the interval launchd holds for it plus one pass.
+> A notifier you paused (unloaded, its plist still installed) is left unwatched on that run,
+> and a note under the steps table says so; the step does not fail. A label with no job and no plist behind it is
+> refused, and the `code` step asks before it stops anything, so a refusal leaves every job
+> loaded. Left empty, the note says the notifier is not watched. A stopped notifier still
+> pings nobody: the comment lands and says so.
 
 ```sh
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
+sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/notifier-heartbeat.json'   # once the notifier is installed, at its default STATE_DIR
 ```
 
 The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours.

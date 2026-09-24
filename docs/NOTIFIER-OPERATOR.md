@@ -42,10 +42,23 @@ One pass every few minutes, as the role account:
 | `planning-rejected` | the plan executor | a plan was refused | none |
 | `agent:blocked` | a stopped session | a session needs a decision | `agent:blocked` |
 | `agent:needs-human` | a stopped session | a session is terminal until you act | `agent:needs-human` |
+| `daemon-health-incident` | the heartbeat monitor | a watched Stage E daemon needs a look | none |
+| `daemon-health-recovered` | the heartbeat monitor | the watched daemons are reporting again | none |
 
 **The four planning marks count only from the executor's author ids** (`EXECUTOR_ACTOR_IDS`).
 A session that can comment could otherwise forge one. A planning mark from anyone else is
 skipped, never paged.
+
+**The two daemon-health marks count only from the monitor's author ids**
+(`MONITOR_ACTOR_IDS`, KIT-156). They are the heartbeat monitor's page
+(`docs/HEARTBEAT-MONITOR.md`, *How the comment reaches you*). A health mark from anyone else
+is skipped, and the pass **names it** in its summary: ticket, comment, author. That changes
+no exit code, so one forged comment cannot turn every pass into exit 3 while it stays in the
+window. The key is optional in the notifier's config. Absent, the marks count from nobody,
+and every pass says `daemon-health marks: OFF` — so a config written before the key existed
+keeps loading. A mark seen while the key is absent is **deferred, not dropped**: it is not
+recorded as seen, so once the key is set, every health comment still among the newest the
+notifier reads pings, oldest first.
 
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
@@ -157,13 +170,13 @@ Not set, the labels row says **NOT MEASURED** and prints those three lines.
 | `preflight` | reads the conf, finds the role account's home, checks the notifier is in that account's clone, and runs the notifier's own selftest | any problem, all listed at once |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private | card `CK-N1` |
 | `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer |
-| `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
-| `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it | a composition the notifier would refuse fails here, before anything is written |
+| `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS` and `MONITOR_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
+| `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it, and after the notifier in the role account's clone is seen to know every key in it | a composition the notifier would refuse fails here, before anything is written. So does a key the clone's older notifier does not know |
 | `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
 | `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
-| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id | — |
+| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on | — |
 
 **Two sign-offs are bound to what they signed.** `A-PRIVATE-CHANNEL` records the channel
 id. Change the channel and `CK-N1` comes back. `A-FIRST-PING` records the config the job
@@ -283,6 +296,72 @@ Still nothing? Read `~/.stage-e/notifier.log` as the role account, and its heart
 `~/.stage-e/state/notifier-heartbeat.json`. A stale `at` means NOT RUNNING. A fresh one with
 a non-zero `exit` means RAN AND COULD NOT, and its `summary` says why.
 
+## The daemon-health page — two ends (KIT-156)
+
+A stopped Stage E daemon becomes a comment by the heartbeat monitor, and that comment
+becomes a ping here. Two installers own the two ends, and neither writes the other's file.
+
+**This end: `MONITOR_ACTOR_IDS` in `notifier.conf`.** The default, `self`, is the user the
+tracker key belongs to. That is the monitor's author when the monitor comments with the
+same key — which the `handover` row checks. Name ids instead when it does not. `off` stands
+alone: the notifier then pages on the health marks from nobody, and says so every pass.
+
+**The other end: `stage-e.conf`.** `HEARTBEAT_MONITOR_TICKET` names the ticket the monitor
+comments on. `NOTIFIER_JOB_LABEL` set to this notifier's `JOB_LABEL` makes the monitor watch
+this notifier's heartbeat too. Run the Stage E installer after this one: it asks launchd
+what it holds under that label, so the notifier must be loaded first.
+
+**The `handover` row says ON only when every one of these holds:**
+
+| It checks | OFF when |
+|---|---|
+| the monitor's config exists, as the role account reads it | it does not, or it is not JSON |
+| the monitor comments on a ticket of a team in `TEAM_KEYS` | the notifier never reads that team's comments |
+| with the same key `self` resolves | `MONITOR_ACTOR_IDS=self` and the monitor uses another key |
+| the monitor **runs**: its own heartbeat is a real pass, recent, with a good result | it has written none, or its last one is older than two of its intervals plus a pass and two minutes. A rehearsal, a bad result or a file it cannot judge is NOT PROVEN |
+| this notifier's own config — the file the job reads, not `notifier.conf` — names `monitor_actor_ids`, and every id `MONITOR_ACTOR_IDS` names | the file names none: the job pages on the marks from nobody. Run `run` with the tracker key in your shell |
+| the monitor watches this notifier, with its current state directory and interval | it does not, or it measured an older notifier: run the Stage E installer again |
+
+The monitor's config alone is not a running monitor. `HEARTBEAT_MONITOR_TICKET=off`
+unloads the monitor and leaves its config behind, and so does a Stage E run that stopped
+before loading it. For up to that heartbeat limit after a monitor stops (about 64 minutes on
+the defaults), its last heartbeat is still fresh, so the row can still say ON until then.
+
+**Adding the key to an installed notifier changes its config.** The `config` step rewrites
+the file, and `CK-N4` comes back, because the first-ping sign-off is bound to the config.
+The role account's clone must carry this change first. An older notifier would refuse the
+new key on every pass, so the `config` step asks the clone's notifier which keys it knows
+and writes nothing it does not know. It fails instead, naming the key and the Stage E
+installer's `code` step, which moves the clone.
+
+**A `verify` without the key cannot add it.** On a notifier installed before KIT-156, the
+ledger holds no monitor ids. So the `config` row says it waits on the labels step, and the
+`handover` says the page is OFF, naming `monitor_actor_ids`. That is the page's true state
+until a `run` with the key writes the config.
+
+**Turning the page on after the merge that brings it:**
+
+1. Pull this checkout, then run the Stage E installer's `run`. It moves the role account's
+   clone.
+2. Run this installer's `run` with `$STAGE_E_LINEAR_API_KEY` set in your shell. It resolves
+   `MONITOR_ACTOR_IDS` and rewrites the config. After the job's next pass, `CK-N4` comes back.
+3. Set `NOTIFIER_JOB_LABEL` in `stage-e.conf` to this notifier's `JOB_LABEL`, and run the
+   Stage E installer again. It watches this notifier from then on.
+
+Do steps 1 and 2 in one sitting. Between them the monitor already marks its comments and this
+notifier does not page on them yet. Any it posts in that gap ping late, when step 2 lands,
+oldest first. The same goes for switching `MONITOR_ACTOR_IDS` from `off` to on later.
+
+**Pausing this notifier while the monitor watches it.** Unload it as usual. The Stage E
+installer's `heartbeat-monitor` row then says `notifier paused: not watched; load it, then
+run this again`, and the step does not fail. A monitor already watching it reports it stale.
+Load it again, and run the Stage E installer to watch it again if a Stage E run happened
+during the pause.
+
+**A notifier that refuses its own config writes no heartbeat.** It exits 2 before a pass
+starts. So the monitor's row for it shows its last good beat until that ages out, then
+`stale`, not `failing`. The reason is in `~/.stage-e/notifier.log`.
+
 ---
 
 ## Status and verify
@@ -303,17 +382,34 @@ row you can act on, and none of them is green:
 | older than two intervals plus a pass | NOT MEASURED: loaded and NOT RUNNING |
 | no heartbeat at all | NOT MEASURED: the job has never finished a pass |
 
-That is the only place a dead notifier shows up, and only when you run it.
+A dead notifier shows up in two places: here, when you run `verify`, and — with
+`NOTIFIER_JOB_LABEL` set in `stage-e.conf` — in a comment by the heartbeat monitor on its
+ticket. Neither pings you. The notifier is the job that sends pings.
 
 ---
 
 ## What is not proven
 
-- **Nothing watches the notifier's own heartbeat.** A notifier that stops is silent. `verify`
-  reads the heartbeat only when a person runs it. (KIT-156)
-- **A stopped Stage E daemon pages nobody.** The heartbeat monitor comments with Stage E's
-  tracker key, usually your own, and the tracker does not notify you of your own comment. The daemon-health page
-  through this channel is not built. (KIT-156)
+- **A dead notifier cannot page about itself.** The heartbeat monitor can watch its
+  heartbeat (KIT-156), and a stopped notifier then becomes a comment on the monitor's ticket
+  that says it pinged nobody. No ping goes out. Only a check off this machine closes that.
+  (KIT-45)
+- **"Only the monitor's author" means "anything holding that key".** The monitor comments
+  with Stage E's tracker key, usually your own. So `MONITOR_ACTOR_IDS=self` accepts a
+  daemon-health mark from anything holding that key: the other Stage E daemons, the plan
+  executor, you typing by hand, and a session using your own tracker connector. Where a
+  dispatcher's tools can read the role account's env file, a dispatched session can too
+  (KIT-162). A dispatched session commenting in the ordinary way writes as the dispatcher's
+  own account, so it cannot forge the mark. A forged mark applies no label: it costs one
+  ping. The `agent:*` marks are already accepted from anyone. (KIT-156)
+- **Whether every comment posted with that key starts with its writer's own text.** The
+  monitor defuses `<!--` in everything it embeds. The bounce driver copies reviewer and
+  session text into its comments and does not defuse `<!--`, and that its first line is
+  always its own text is not verified. (KIT-156)
+- **Whether a monitor comment keeps its `<!--` through the tracker's API.** The monitor
+  posts through `commentCreate`, the same path as the throwaway test's fallback above. The
+  selftest proves the notifier reads the monitor's comment, not that the tracker stores it
+  unchanged. The first real incident is its test. (KIT-156)
 - **What a session can reach with the dispatcher's own Slack token.** If the dispatcher's
   Slack lane is turned on, its token is in every session's environment. The notifier's
   separate app keeps that token from posting as the notifier. Nothing stops a session with a
