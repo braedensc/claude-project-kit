@@ -646,8 +646,13 @@ def user_deny_patterns(conf):
             if rule not in out:
                 out.append(rule)
     role_env = (conf or {}).get("ROLE_ENV_FILE") or DEFAULT_ROLE_ENV_FILE
-    for rule in ([_path_rule(role_env)] if role_env.startswith(("/", "~/")) else []) + [
-            BACKUPS_DENY_RULE]:
+    # The env file's own temp copies sit beside it while a writer runs, and a write killed
+    # outright can leave one behind until that writer's next run sweeps it: the Stage E
+    # installer's `env.stage-e-setup.<pid>` and the notifier installer's
+    # `env.notifier-setup.<pid>`. Each is a whole copy of the file, so it is denied too.
+    role_rules = ([_path_rule(role_env), _path_rule(role_env + ".*")]
+                  if role_env.startswith(("/", "~/")) else [])
+    for rule in role_rules + [BACKUPS_DENY_RULE]:
         if rule not in out:
             out.append(rule)
     return out
@@ -5082,9 +5087,16 @@ def _selftest_kit197(expect, conf):
         rules = user_deny_patterns(conf)
         expect("deny-backups-rule", "Read(~/.stage-e/backups/**)" in rules, rules)
         expect("deny-role-env-rule-default", "Read(~/.stage-e/env)" in rules, rules)
+        expect("deny-role-env-temp-copies", "Read(~/.stage-e/env.*)" in rules, rules)
         other = user_deny_patterns(dict(conf, ROLE_ENV_FILE="/srv/role/env"))
         expect("deny-role-env-rule-absolute", "Read(//srv/role/env)" in other
+               and "Read(//srv/role/env.*)" in other
                and "Read(~/.stage-e/env)" not in other, other)
+        us_tmp = {"path": "/h/.claude/settings.json",
+                  "deny": [r for r in rules if r != "Read(~/.stage-e/env.*)"]}
+        row_tmp = check_user_settings(conf, us_tmp, {"names": []})
+        expect("verify-user-settings-wants-temp-copies-rule", row_tmp["outcome"] == BLOCKED
+               and "Read(~/.stage-e/env.*)" in _row_text(row_tmp), row_tmp)
         us = {"path": "/h/.claude/settings.json",
               "deny": [r for r in rules if r != "Read(~/.stage-e/backups/**)"]}
         row = check_user_settings(conf, us, {"names": []})
