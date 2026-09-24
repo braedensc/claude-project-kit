@@ -108,8 +108,8 @@ checks rules 2 and 3 against real paths. Left empty, it says in preflight that i
 check them.
 
 **The Stage E installer shares this file and keeps this line.** When it stores or replaces
-one of its own two credentials, it changes only its own two lines. Every other line stays,
-this token included (KIT-171). A Stage E installer from before that fix rewrote the whole
+one of its own two credentials, it changes only its own lines. Every other line stays, this
+token included (KIT-171). A Stage E installer from before that fix rewrote the whole
 file and dropped this token. If one of those changed Stage E's credentials, run this
 installer again.
 
