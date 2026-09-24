@@ -302,13 +302,13 @@ conf value:
   `~/.stage-e/notifier.json` as the role account.
 
 It adds `notifier` to `watch`, with an interval of launchd's interval plus one pass (300 +
-240 = 540 s on the defaults). Empty, the step's row says the notifier is not watched, by
-name. What else the step does depends on what launchd says:
+240 = 540 s on the defaults). Empty, the step's note says the notifier is not watched, by
+name. The note prints whole under the steps table, where a row's text is cut short. What else the step does depends on what launchd says:
 
 | What it finds | What the step does |
 |---|---|
 | launchd holds the label, running the notifier on that config | watches it |
-| launchd does not hold the label, and `/Library/LaunchDaemons/<label>.plist` is there | **paused**: not watched on this pass, and the row says `notifier paused: not watched; load it, then run this again`. The step does not fail, and the monitor is loaded for the other three |
+| launchd does not hold the label, and `/Library/LaunchDaemons/<label>.plist` is there | **paused**: not watched on this pass, and the step's note says `notifier paused: not watched; load it, then run this again`. The step does not fail, and the monitor is loaded for the other three |
 | launchd does not hold the label, and no plist is there | refused, by name: an absent heartbeat would page on every pass |
 | the label runs something else, or the notifier on another `--config` | refused, by name. This step reads only `~/.stage-e/notifier.json`, so keep the notifier installer's `NOTIFIER_CONFIG` at its default |
 | `~/.stage-e/notifier.json` is absent | refused, by name |

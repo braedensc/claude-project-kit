@@ -1504,9 +1504,9 @@ them takes `sudo -u`:
 > `NOTIFIER_JOB_LABEL` in `stage-e.conf` to the notifier's `JOB_LABEL` and the monitor
 > watches the notifier's heartbeat too, at the interval launchd holds for it plus one pass.
 > A notifier you paused (unloaded, its plist still installed) is left unwatched on that run,
-> and the row says so; the step does not fail. A label with no job and no plist behind it is
+> and a note under the steps table says so; the step does not fail. A label with no job and no plist behind it is
 > refused, and the `code` step asks before it stops anything, so a refusal leaves every job
-> loaded. Left empty, its row says the notifier is not watched. A stopped notifier still
+> loaded. Left empty, the note says the notifier is not watched. A stopped notifier still
 > pings nobody: the comment lands and says so.
 
 ```sh

@@ -5099,6 +5099,9 @@ def step_heartbeat_monitor(ctx, apply_it):
     # refusal: it is left out of `watch` on this pass and the row says so.
     notifier = measure_notifier(ctx)
     watch_note = _notifier_watch_note(notifier)
+    # The row is cut at 96 characters when printed, and this clause sits at its end, so it is
+    # ALSO returned as a note, which prints whole — watched, paused, or not configured.
+    watch_notes = [watch_note]
     want_conf, want_plist = monitor_config(conf, notifier), _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
@@ -5126,7 +5129,7 @@ def step_heartbeat_monitor(ctx, apply_it):
                              "ended `%s` — %s" % (doc.get("result"),
                                                   str(doc.get("detail") or "")[:300]))
         return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`; %s"
-                      % (ticket, int(age), doc.get("result"), watch_note)), []
+                      % (ticket, int(age), doc.get("result"), watch_note)), list(watch_notes)
 
     if not apply_it:
         todo = (["write ~/.stage-e/%s" % MONITOR_CONFIG] if conf_stale else []) \
@@ -5135,7 +5138,7 @@ def step_heartbeat_monitor(ctx, apply_it):
             + ["%s it and wait for a heartbeat (%s)"
                % ("reload" if loaded else "load",
                   why_not or ("the last one was a dry run" if not real else "stale"))]
-        return False, "would " + ", then ".join(todo) + "; " + watch_note, []
+        return False, "would " + ", then ".join(todo) + "; " + watch_note, list(watch_notes)
 
     if conf_stale:
         body = json.dumps(want_conf, indent=2, sort_keys=True) + "\n"
@@ -5227,7 +5230,7 @@ def step_heartbeat_monitor(ctx, apply_it):
                                  % (doc.get("result"), str(doc.get("detail") or "")[:300]))
             return False, ("loaded; its first pass wrote a heartbeat (`%s`), and it comments "
                            "on %s once per incident; %s" % (doc.get("result"), ticket,
-                                                            watch_note)), []
+                                                            watch_note)), list(watch_notes)
         if n < MONITOR_HEARTBEAT_POLLS - 1:
             _pause(MONITOR_HEARTBEAT_POLL_SECONDS)
     raise Unknown("the heartbeat monitor was loaded and wrote no heartbeat within %d s"
@@ -10552,6 +10555,12 @@ def _selftest_body():
         try:
             (okNP, detailNP, _x), _o = _quiet(lambda: step_heartbeat_monitor(ctxNP, apply_it=True))
             _bodyNP = [w["stdin"] for w in fakeNP.writes if "write " in w["why"]]
+            # The row prints cut at 96 characters, so the clause must also come back as a
+            # note, which `_print_rows` prints whole.
+            expect("notifier-watch-paused-note-prints-whole",
+                   any("notifier paused: not watched; load it, then run this again" in n
+                       and "its plist is installed" in n for n in (_x or [])),
+                   "the paused clause was not returned as a note: %r" % (_x,))
             expect("notifier-watch-paused",
                    "notifier paused: not watched; load it, then run this again" in detailNP
                    and _bodyNP and json.loads(_bodyNP[0]) == monitor_config(_conf_n)
@@ -10572,7 +10581,8 @@ def _selftest_body():
                 okNV, detailNV, _x = step_heartbeat_monitor(ctxNV, apply_it=False)
                 expect("notifier-watch-paused-verify",
                        okNV is want_ok and "notifier paused: not watched" in detailNV
-                       and not fakeNV.writes, "%s: %r" % (name, detailNV))
+                       and any("notifier paused: not watched" in n for n in (_x or []))
+                       and not fakeNV.writes, "%s: %r %r" % (name, detailNV, _x))
             except (SetupError, Unknown, Blocked) as exc:
                 failures.append("notifier-watch-paused-verify (%s): %s" % (name, exc))
 
