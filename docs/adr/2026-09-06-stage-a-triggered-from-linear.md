@@ -987,6 +987,27 @@ support: every ticket routed to its own repository's planning entry, and both ro
   "takes precedence" wording. Linear's public API does not expose it (it exists only in webhook
   payloads), so the probe card asks a person to read it and record it in the sign-off.
 
+**What the pre-merge review changed.** An adversarial review of the build found seven real
+defects, all fixed before merge:
+
+- **A routing read that failed ended the pass**, so later passes filed new planning tickets
+  before re-checking the old one. Now every open routing check is finished first, and no
+  new run starts while any route is unknown.
+- **One substitution in the sanitizer could fold an idea's text into a directive**, and the
+  refusal ended the whole pass. The sanitizer now runs until nothing changes, and an idea it
+  still cannot clean is refused on its own.
+- **The Stage E skips read marks a coding session can write.** A session could put the
+  planning label on its own ticket and take itself out of review. The review poller's
+  discovery and the criteria snapshot now skip a ticket only when the dispatcher's own
+  routing note confirms a planning session. The finding poller and the duplicate check still
+  skip by the marks alone: a session that skips them only hides its own reports.
+- **A repository added after the sign-offs** was planned under the old probe, and its entry
+  was never printed. Both sign-offs now re-open until they cover every planned repository.
+- **A re-sign read the same probe tickets again.** It now needs tickets handed over after the
+  last sign-off, because a re-sign is what clears a stop.
+- Executor runs the pass's clock killed were never counted, and a closing note that failed
+  once was lost. Both are retried and bounded now.
+
 **KIT-182's criterion "each fenced entry keeps its team key" does not hold for a planning
 entry**, by this decision. It still holds for the review entry, which keeps its team.
 
@@ -994,4 +1015,6 @@ entry**, by this decision. It still holds for the review entry, which keeps its 
 delegation; whether the tracker escapes it; `Issue.history`'s page order; whether `Team.labels`
 returns every team label a pass needs; that the installed dispatcher matches the 0.2.69 source
 this was read from. The probe measures the first three on a real dispatcher before the gate is
-switched on.
+switched on. One residual is known and not closed: if the dispatcher's own note fails to post
+AND the ticket falls to the coding entry, a later thought the model writes could imitate the
+note and be read as it.

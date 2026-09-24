@@ -25,6 +25,15 @@ WHAT A PLANNING TICKET IS
   Never the title. A title is whatever a person typed, and "Plan the release" is a coding
   ticket.
 
+  BOTH MARKS ARE WRITABLE BY A CODING SESSION. A session holds the tracker's tools, so it can
+  put the label on its own ticket or edit its own first line. That is harmless where a skip
+  only spares a job some work (the finding poller, the executor's duplicate list). It is not
+  harmless where the skip would take a ticket out of REVIEW: a session could switch off its
+  own review. So the review poller's discovery and the criteria snapshot skip a ticket only
+  when `routed_to_planning` also confirms, from the dispatcher's own routing note, that the
+  session really ran in a planning entry. A session cannot forge that note: the dispatcher
+  posts it before the session's model runs.
+
 THE ROUTING NOTE
 
   When the dispatcher (Cyrus 0.2.69) starts a session it posts a thought:
@@ -145,6 +154,41 @@ def earliest_routing_thought(activities):
     return sorted(thoughts, key=lambda a: str(a.get("createdAt") or ""))[0]
 
 
+# The session's thoughts, oldest first as asked. `routed_to_planning` refuses to confirm
+# anything from a list it could not read whole, so the unknown page order can only make it
+# say "not confirmed" — the safe answer, which leaves the ticket in review.
+Q_SESSION_THOUGHTS = """
+query SessionRoutingThoughts($id: String!) {
+  agentSession(id: $id) {
+    activities(first: 50, orderBy: createdAt, filter: { type: { in: ["thought"] } }) {
+      nodes { createdAt content { __typename ... on AgentActivityThoughtContent { body } } }
+      pageInfo { hasNextPage }
+    }
+  }
+}"""
+
+
+def routed_to_planning(data):
+    """True only when the dispatcher's own routing note, read from a `SessionRoutingThoughts`
+    answer, says the session ran in a planning entry — and only that one.
+
+    The note is the earliest routing-shaped thought, and it must name exactly one entry,
+    starting with the planning prefix. Its route may be the tag, the label, or none (a
+    later session on a ticket already routed reuses the cached route and names no method).
+    A list read partly, no note, or anything else is NOT confirmed."""
+    conn = (((data or {}).get("agentSession") or {}).get("activities")) or {}
+    if (conn.get("pageInfo") or {}).get("hasNextPage"):
+        return False
+    note = earliest_routing_thought(conn.get("nodes") or [])
+    if note is None:
+        return False
+    parsed = parse_routing_note((note.get("content") or {}).get("body"))
+    if not parsed or parsed.get("unparsed"):
+        return False
+    names = parsed["entries"]
+    return len(names) == 1 and names[0].startswith(PLANNING_PREFIX)
+
+
 def routing_verdict(note_body, want_entry):
     """(ok, reason). ok only when the note names exactly one entry, that entry is
     `want_entry`, and the route was the tag or the label. None is a failure: the note is
@@ -248,6 +292,22 @@ def selftest():
     check("earliest-is-the-wrong-one", routing_verdict(
         first["content"]["body"], "stage-a-planning-x")[0], False)
     check("no-thought-no-note", earliest_routing_thought(acts[3:]), None)
+
+    # Confirmation for a skip that would take a ticket out of review: the dispatcher's own
+    # earliest note must name a planning entry, from a list read whole.
+    def thoughts(*bodies, more=False):
+        return {"agentSession": {"activities": {"nodes": [
+            {"createdAt": "2026-01-01T00:00:%02dZ" % i,
+             "content": {"__typename": "AgentActivityThoughtContent", "body": b}}
+            for i, b in enumerate(bodies)], "pageInfo": {"hasNextPage": more}}}}
+    check("confirmed-by-tag", routed_to_planning(thoughts("On it.", tag_note)), True)
+    check("confirmed-by-cached-route", routed_to_planning(
+        thoughts("**Routing**\n- **stage-a-planning-x** → `main` (default)")), True)
+    check("coding-note-not-confirmed", routed_to_planning(thoughts(team_note, tag_note)), False)
+    check("no-note-not-confirmed", routed_to_planning(thoughts("On it.")), False)
+    check("partial-list-not-confirmed", routed_to_planning(thoughts(tag_note, more=True)), False)
+    check("merged-not-confirmed", routed_to_planning(thoughts(merged)), False)
+    check("nothing-not-confirmed", routed_to_planning(None), False)
 
     if failures:
         print("FAIL: pipeline_machine_tickets selftest")

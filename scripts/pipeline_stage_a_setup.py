@@ -833,7 +833,7 @@ def dispatcher_facts(ctx, row, rows=None):
                 "matching one ticket make ONE session whose fence is only what both deny, "
                 "so the planner's fence would be emptied. Remove it from that entry."
                 % (name, label))
-        if label in (other.get("labelPromptLabels") or []):
+        if label.lower() in set(str(x).lower() for x in (other.get("labelPromptLabels") or [])):
             raise SetupError(
                 "the dispatcher entry %r reads the label %r as a prompt type. Remove it "
                 "from that entry's labelPrompts." % (name, label))
@@ -919,8 +919,11 @@ def entry_problems(entry):
                 problems.append("the fence does not remove %s — a server the dispatcher "
                                 "injects into every session" % rule)
     for rule in (r for r in disallowed if r.startswith("mcp__")):
+        # Anchored to ONE named server, whole or by wildcard — the four every machine has,
+        # or one this machine or the repository adds, which `planner_fence` names. A
+        # per-tool rule (`mcp__linear__save_issue`) has `__` in its "server" and is refused.
         match = MCP_FENCE_RULE_RE.match(rule)
-        if not (match and match.group(1) in PLANNER_FENCE_SERVERS):
+        if not (match and MCP_SERVER_NAME_RE.match(match.group(1))):
             problems.append("%r is not a rule anchored to one fenced server; an "
                             "unanchored or per-tool rule is skipped by the runtime with "
                             "no error" % rule)
@@ -1767,6 +1770,14 @@ def job_plist(ctx):
         log=home + "/" + ROLE_LOG)
 
 
+def probe_uncovered(probe, rows):
+    """The planned repositories a recorded probe does not cover by both routes."""
+    seen = {}
+    for ev in (probe.get("tickets") or {}).values():
+        seen.setdefault(ev.get("entry"), set()).add(ev.get("method"))
+    return [r for r in rows if not set(machine.PLANNING_METHODS) <= seen.get(r["entry"], set())]
+
+
 def version_url(conf):
     """The dispatcher's own `/version` route, on this machine."""
     return "http://127.0.0.1:%s/version" % conf_value(conf, "DISPATCHER_PORT")
@@ -1800,7 +1811,11 @@ def poller_config(ctx):
         "dispatcher_version_url": version_url(conf),
     }
     probe = (ctx.state.data.get("ids") or {}).get("probe") or {}
-    if ctx.state.attested("CA-PROBE") and probe.get("dispatcher_version"):
+    if (ctx.state.attested("CA-PROBE") and probe.get("dispatcher_version")
+            and not probe_uncovered(probe, rows)):
+        # Only a probe that covers EVERY planned repository, by both routes, lets the job
+        # plan. A repository added after the sign-off leaves the job planning nothing until
+        # the probe is signed again for all of them.
         doc["probe"] = {"signed_at": probe["signed_at"],
                         "dispatcher_version": probe["dispatcher_version"]}
     problems = poller.validate_config(doc)
@@ -2354,6 +2369,16 @@ def step_dispatcher_entry(ctx, apply_it):
             ctx.say("----- the planning entries, one per repository, for you to apply -----")
             ctx.say(json.dumps(entries, indent=2))
         raise Blocked("CA-ENTRY")
+    # A sign-off covers the entries that existed when it was made. One composed since —
+    # a repository added to PLANNED_REPOS, or an older installer's ledger — must be in the
+    # dispatcher's own config before this step holds again. Measured, not remembered.
+    applied = set(e.get("id") for e in (read_dispatcher(ctx).get("entries") or []))
+    missing = [e for e in entries if e["id"] not in applied]
+    if missing:
+        ctx.say("")
+        ctx.say("----- planning entries not yet in the dispatcher's config -----")
+        ctx.say(json.dumps(missing, indent=2))
+        raise Blocked("CA-ENTRY")
     return True, "%d planning entr%s applied (signed %s)" % (
         len(entries), "y" if len(entries) == 1 else "ies", _signed_at(ctx, "CA-ENTRY")), notes
 
@@ -2397,6 +2422,18 @@ def step_probe(ctx, apply_it):
             ctx.say("    label:                          %s" % row["entry"])
         raise Blocked("CA-PROBE")
     probe = (ctx.state.data.get("ids") or {}).get("probe") or {}
+    uncovered = probe_uncovered(probe, resolve_repos(ctx)) if probe.get("dispatcher_version") else []
+    if uncovered:
+        ctx.say("")
+        ctx.say("----- the probe does not cover every planned repository -----")
+        ctx.say("A repository was added after the probe was signed. Probe EVERY repository")
+        ctx.say("again with new tickets, and sign once with all their ids. Until then the")
+        ctx.say("planner job plans nothing.")
+        for row in uncovered:
+            ctx.say("  %s, on the work team %s:" % (row["repo"], row["team_key"]))
+            ctx.say("    first line of the description:  [repo=%s]" % row["entry"])
+            ctx.say("    label:                          %s" % row["entry"])
+        raise Blocked("CA-PROBE")
     if not probe.get("dispatcher_version"):
         raise SetupError("CA-PROBE is signed, but no routing evidence or dispatcher version "
                          "was recorded with it — it was signed by an older installer. Run the "
@@ -2872,7 +2909,7 @@ def read_probe_ticket(tracker, identifier):
             "note_at": note.get("createdAt"), "session_at": sessions[0].get("createdAt")}
 
 
-def verify_probe_tickets(ctx, rows, tickets):
+def verify_probe_tickets(ctx, rows, tickets, after=None):
     """(evidence, problems). Every probe ticket must have been routed to its own
     repository's planning entry, and every planned repository must show BOTH routes: a
     ticket reached by its tag, and one reached by its label alone."""
@@ -2887,6 +2924,13 @@ def verify_probe_tickets(ctx, rows, tickets):
         got = read_probe_ticket(ctx.tracker, ident)
         if got.get("reason"):
             problems.append("%s %s" % (ident, got["reason"]))
+            continue
+        if after and not str(got.get("session_at") or "") > after:
+            # A re-sign is what clears a planning stop and pins a new dispatcher version, so
+            # it needs routing evidence from AFTER the last sign-off, not the install-day
+            # tickets read again.
+            problems.append("%s was handed to the agent before the last probe sign-off (%s). "
+                            "File a new probe ticket and sign with its id" % (ident, after))
             continue
         ok, why = machine.routing_verdict(got["note"], row["entry"])
         if ok and not got["whole"]:
@@ -2944,7 +2988,8 @@ def cmd_attest(ctx, aid, initials, note, tickets=()):
             return EX_USAGE
         try:
             rows = resolve_repos(ctx)
-            evidence, problems = verify_probe_tickets(ctx, rows, tickets)
+            before = ((ctx.state.data.get("ids") or {}).get("probe") or {}).get("signed_at")
+            evidence, problems = verify_probe_tickets(ctx, rows, tickets, after=before)
             version = ctx.version_reader(version_url(ctx.conf))
             router = router_fingerprint(ctx) if not problems else None
         except (SetupError, Unknown, Blocked) as exc:
@@ -3692,9 +3737,13 @@ def selftest():
             # 13b. THE PROBE PROVES WHICH ENTRY ANSWERED. The installer reads the
             #      dispatcher's own routing notes on the probe tickets, needs both routes
             #      for every repository, and records the dispatcher's version.
+            with_planning = _dispatcher_config(tmp, [dict(DISPATCHER_ENTRY), {
+                "id": ENTRY, "name": ENTRY, "routingLabels": [ENTRY]}])
+
             def probe_ctx(name, probe, version="0.2.69", conf=None):
                 c = _ctx(os.path.join(tmp, name), tracker=_ready_tracker(probe=probe),
-                         version=version, conf=conf)
+                         version=version,
+                         conf=dict(conf or GOOD_CONF, DISPATCHER_CONFIG=with_planning))
                 c._out = []
                 return c
 
@@ -3727,6 +3776,12 @@ def selftest():
                       (code, bad.state.attested("CA-PROBE"),
                        any(needle in line for line in bad._out)), (EX_FAILED, False, True))
 
+            # A re-sign needs NEW probe tickets: the same ones read again prove nothing about
+            # routing since the last sign-off, and a re-sign is what clears a planning stop.
+            check("probe-stale-tickets-refused",
+                  (cmd_attest(pc, "CA-PROBE", "BC", "again", ["PROD-1", "PROD-2"]),
+                   any("before the last probe sign-off" in line for line in pc._out)),
+                  (EX_FAILED, True))
             # The sign-off reaches the job, and the step re-measures the live version.
             pc.tracker = _ready_tracker(probe=good_probe)
             pc.state.attest("CA-ENTRY", "BC", "applied")
@@ -3744,6 +3799,22 @@ def selftest():
                 vc._out = []
                 cmd_verify(vc)
                 check("probe-%s" % label, vc.state.outcome("probe"), want)
+            # A repository added after the sign-off: the job plans nothing, and the step asks
+            # for a probe of every repository.
+            added = dict(pc.conf, PLANNED_REPOS="example-org/product,example-org/web")
+            web_doc = json.loads(json.dumps(READY_DELIVERY))
+            web_doc["linear"]["teamKey"] = "WEB"
+            ac = Ctx(added, Runner(apply_it=False), pc.tracker, pc.host, State(pc.state.root),
+                     github=FakeGitHub(docs={"example-org/web": web_doc}),
+                     version_reader=lambda url: "0.2.69")
+            ac._out = []
+            raised = None
+            try:
+                step_probe(ac, False)
+            except Blocked as exc:
+                raised = str(exc)
+            check("added-repo-reopens-the-probe",
+                  (raised, "probe" in json.loads(poller_config(ac))), ("CA-PROBE", False))
             old = _ctx(os.path.join(tmp, "probe-old"), tracker=_ready_tracker())
             old.state.attest("CA-ENTRY", "BC", "x")
             old.state.attest("CA-PROBE", "BC", "signed before the probe read routing")
@@ -4194,12 +4265,43 @@ def selftest():
                                           "MCP servers of its own")])), True)
 
         # 23. A PROMPT TYPE'S LIST IS NAMED.
-        pctx2 = entry_ctx("prompt-types",
+        applied = {"id": ENTRY, "name": ENTRY, "routingLabels": [ENTRY]}
+        pctx2 = entry_ctx("prompt-types", entries=[dict(DISPATCHER_ENTRY), applied],
                           extra={"promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}})
         pctx2.state.attest("CA-ENTRY", "BC", "applied")
         pctx2.job_ready = True
         ok, _detail, notes = step_dispatcher_entry(pctx2, False)
         check("prompt-type-named", any("orchestrator" in n for n in notes), True)
+        # A sign-off covers the entries that existed when it was made: an entry composed
+        # since — a repository added, or an older installer's ledger — re-opens it.
+        gone = entry_ctx("entry-missing")
+        gone.state.attest("CA-ENTRY", "BC", "applied")
+        gone.job_ready = True
+        raised = None
+        try:
+            step_dispatcher_entry(gone, False)
+        except Blocked as exc:
+            raised = str(exc)
+        check("signed-entry-missing-from-dispatcher-reopens", (raised,
+              any('"name": "%s"' % ENTRY in line for line in gone._out)), ("CA-ENTRY", True))
+        # A fence rule for a server this machine or the repository adds is anchored, and the
+        # entry that carries it is printed — not refused as broken (a new user's dead end).
+        xctx = entry_ctx("extra-server", github=FakeGitHub(mcp_servers=[("repo-tools", None)]))
+        xctx.job_ready = True
+        try:
+            step_dispatcher_entry(xctx, False)
+        except Blocked:
+            pass
+        check("extra-server-entry-printed",
+              any('"mcp__repo-tools__*"' in line for line in xctx._out), True)
+        check("per-tool-rule-still-refused", bool(entry_problems(dict(
+            planning_entry(GOOD_CONF, ROW, GOOD_FACTS),
+            disallowedTools=list(PLANNING_DISALLOWED_TOOLS) + ["mcp__repo-tools__run"]))), True)
+        # A label another entry reads as a prompt type is refused in either config form, in
+        # any case: the dispatcher accepts a plain list, and matches without case.
+        check("prompt-label-list-form-any-case-refused",
+              "as a prompt type" in refusal("prompt-label-list", entries=[
+                  dict(DISPATCHER_ENTRY, labelPrompts={"builder": [ENTRY.upper()]})]), True)
         pctx3 = entry_ctx("prompt-types-printed",
                           extra={"promptDefaults": {"orchestrator": {"disallowedTools": ["Bash"]}}})
         pctx3.job_ready = True

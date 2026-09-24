@@ -262,12 +262,6 @@ def choose_sessions(nodes, team_keys, app_user_id=""):
             continue
         if managed and str(((issue.get("team") or {}).get("key")) or "").upper() not in managed:
             continue
-        if machine.issue_is_planning_ticket(issue):
-            # An idea-gate planning ticket (KIT-184): it sits on a work team now, and a
-            # person's delegation starts its session, but no review reads its criteria. It
-            # must not spend one of the pass's reads. The listing carries its labels; its
-            # opening tag is checked again once the description is read.
-            continue
         if not ((node.get("creator") or {}).get("id")):
             continue
         if app_user_id and str((node.get("appUser") or {}).get("id") or "") != app_user_id:
@@ -638,7 +632,24 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
     owed.sort(key=lambda t: (t[0] != "first", str(t[2].get("createdAt") or ""), t[1]))
     rechecks.sort(key=lambda t: (str(t[2].get("updatedAt") or ""), t[1]), reverse=True)
 
+    def planning_confirmed(session):
+        """An idea-gate planning ticket (KIT-184) sits on a work team now, and no review
+        reads its criteria, so it is skipped — but only when the dispatcher's own routing
+        note confirms the session ran in a planning entry. Its label and opening tag are
+        both things a coding session can write on its own ticket, and a skip on those alone
+        would let a session keep its criteria out of the snapshot a review is judged by."""
+        try:
+            return machine.routed_to_planning(
+                call(machine.Q_SESSION_THOUGHTS, {"id": session.get("id")}))
+        except SnapshotError:
+            return False
+
     for kind, ident, session, existing in owed + rechecks:
+        if (machine.issue_is_planning_ticket(session.get("issue"))
+                and planning_confirmed(session)):
+            result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
+                                    "routing note — no snapshot" % ident)
+            continue
         cut = ("the pass deadline" if deadline is not None and time.monotonic() >= deadline
                else "the read cap of %d" % max_reads if result["reads"] >= max_reads else "")
         if cut:
@@ -661,9 +672,9 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
         if not issue:
             result["problems"].append("%s: the tracker returned no issue" % ident)
             continue
-        if machine.is_planning_ticket(issue.get("description")):
-            result["detail"].append("%s: a planning ticket (its description opens with the "
-                                    "planning tag) — no snapshot" % ident)
+        if machine.is_planning_ticket(issue.get("description")) and planning_confirmed(session):
+            result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
+                                    "routing note — no snapshot" % ident)
             continue
         taken_at = clock()
         hist = issue.get("history") or {}
@@ -822,10 +833,6 @@ def selftest():
     foreign = nodes + [session("s-foreign", created="2026-09-16T12:00:00Z", app_user="app-other")]
     check("with the dispatcher's app user configured, another app's session is never considered",
           choose_sessions(foreign, ["KIT"], app)["KIT-7"]["id"], "s-human")
-    planning = session("s-plan", ident="KIT-9", issue_id="iss-9")
-    planning["issue"]["labels"] = {"nodes": [{"name": "stage-a-planning-kit"}]}
-    check("a planning ticket, by its routing label, is never chosen (KIT-184)",
-          sorted(choose_sessions(nodes + [planning], ["KIT"])), ["KIT-7"])
     check("…nor is a session that records no app user",
           choose_sessions([session("s-noapp", app_user=None)], ["KIT"], app), {})
     check("the app user is read in the driver's spelling and the poller's",
@@ -986,6 +993,7 @@ def selftest():
     class Fake:
         def __init__(self, sessions, issues, fail=(), more_sessions=False):
             self.sessions, self.issues, self.fail, self.calls = sessions, issues, set(fail), []
+            self.thoughts = {}
             self.more_sessions = more_sessions
 
         def __call__(self, query, variables):
@@ -999,6 +1007,10 @@ def selftest():
                                                        "endCursor": "c"}}}
             if op == "CriteriaSnapshotIssue":
                 return {"issue": self.issues.get(variables["id"])}
+            if op == "SessionRoutingThoughts":
+                return {"agentSession": {"activities": {
+                    "nodes": list(self.thoughts.get(variables["id"]) or []),
+                    "pageInfo": {"hasNextPage": False}}}}
             return {"commentCreate": {"success": True}}
 
     def ops(fake, name):
@@ -1019,12 +1031,30 @@ def selftest():
         mode = os.stat(os.path.join(store, "KIT-7.json")).st_mode & 0o777
         check("the snapshot file is mode 600 in the role account's state dir", mode, 0o600)
 
+        # A PLANNING TICKET (KIT-184) takes no snapshot — but only when the dispatcher's own
+        # routing note confirms it. Its label and tag are writable by a coding session.
+        def routed(entry, method="[repo=...] tag"):
+            return [{"createdAt": "2026-09-16T10:00:01Z", "content": {
+                "__typename": "AgentActivityThoughtContent",
+                "body": "**Routing** (%s)\n- **%s** → `main` (default)" % (method, entry)}}]
         plan_issue = {"id": "iss-8", "identifier": "KIT-8", "history": no_history(),
                       "description": "[repo=stage-a-planning-kit]\n\n" + desc}
-        pfake = Fake([session("s-plan-8", ident="KIT-8", issue_id="iss-8")], {"iss-8": plan_issue})
+        labelled = session("s-plan-9", ident="KIT-9", issue_id="iss-9")
+        labelled["issue"]["labels"] = {"nodes": [{"name": "stage-a-planning-kit"}]}
+        pfake = Fake([session("s-plan-8", ident="KIT-8", issue_id="iss-8"), labelled],
+                     {"iss-8": plan_issue, "iss-9": dict(plan_issue, id="iss-9", identifier="KIT-9")})
+        pfake.thoughts = {"s-plan-8": routed("stage-a-planning-kit"),
+                          "s-plan-9": routed("stage-a-planning-kit", "Label routing")}
         r = snapshot_pass(cfg, state, pfake, clock=at("2026-09-16T10:05:00Z"))
-        check("a planning ticket found only by its opening tag takes no snapshot (KIT-184)",
-              (r["taken"], read_snapshot(store, "KIT-8")), ([], None))
+        check("a confirmed planning ticket takes no snapshot, by its tag or its label (KIT-184)",
+              (r["taken"], read_snapshot(store, "KIT-8"), read_snapshot(store, "KIT-9")),
+              ([], None, None))
+        check("…and the labelled one spends no read", len(ops(pfake, "CriteriaSnapshotIssue")), 1)
+        cfake = Fake([labelled], {"iss-9": dict(plan_issue, id="iss-9", identifier="KIT-9")})
+        cfake.thoughts = {"s-plan-9": routed("kit", "Team routing")}
+        r = snapshot_pass(cfg, state, cfake, clock=at("2026-09-16T10:06:00Z"))
+        check("a coding ticket that labelled itself a planning ticket still takes its snapshot",
+              r["taken"], ["KIT-9"])
 
         r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:10:00Z"))
         check("an unedited ticket: one read, nothing said", (r["unchanged"], r["notices"],

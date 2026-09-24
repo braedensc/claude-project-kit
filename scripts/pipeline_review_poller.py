@@ -2009,7 +2009,7 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
     """
     reviews_team = cfg.get("reviews_team_id")
     found, seen_issues, unattached = {}, {}, []
-    after, pages, sessions, more, attached, planning = None, 0, 0, False, 0, 0
+    after, pages, sessions, more, attached, planning, unconfirmed = None, 0, 0, False, 0, 0, 0
     for _ in range(DISCOVERY_MAX_PAGES):
         data = linear_graphql(DISCOVER_SESSIONS,
                               {"first": DISCOVERY_PAGE_SIZE, "after": after,
@@ -2025,11 +2025,25 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
             if reviews_team and ((issue.get("team") or {}).get("id")) == reviews_team:
                 continue                      # our own review tickets
             if machine.issue_is_planning_ticket(issue):
-                # An idea-gate planning ticket (KIT-184). It sits on a work team now, beside
-                # the work this reads, and it is never coding work: a PR attached to one, or
-                # a plan that names one, is not a PR to review against its criteria.
-                planning += 1
-                continue
+                # An idea-gate planning ticket (KIT-184) sits on a work team now, beside the
+                # work this reads, and a plan is never a PR to review. But the label and the
+                # tag are both things a coding session can write on its OWN ticket, so the
+                # skip also needs the dispatcher's routing note — posted before the session's
+                # model runs — to confirm the session ran in a planning entry. Unconfirmed,
+                # the ticket stays in discovery: a missed review is the worse mistake.
+                try:
+                    confirmed = machine.routed_to_planning(linear_graphql(
+                        machine.Q_SESSION_THOUGHTS, {"id": node.get("id")}, api_key))
+                except PollerError as exc:
+                    confirmed = False
+                    log("NOTE: could not read %s's routing note (%s)" % (ident, exc))
+                if confirmed:
+                    planning += 1
+                    continue
+                unconfirmed += 1
+                log("WARNING: %s carries the planning label or tag, but the dispatcher's own "
+                    "routing note does not show a planning session — it is treated as coding "
+                    "work and stays in review" % ident)
             seen_issues[iid] = ident
             parsed = prs_from_attachments(dict(issue, identifier=ident))
             if parsed:
@@ -2086,7 +2100,7 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
             found.setdefault(owner_repo, {}).setdefault(number, row["issue"])
 
     stats = {"pages": pages, "sessions": sessions, "issues": len(seen_issues),
-             "planning": planning,
+             "planning": planning, "planning_unconfirmed": unconfirmed,
              "attached": attached, "unattached": len(unattached), "probed": probed,
              "probed_hits": probed_hits, "ambiguous": ambiguous, "off_repo": off_repo,
              "unprobed": max(0, len(unattached) - probed), "more_pages": more}
@@ -3230,6 +3244,7 @@ class _FakeLinear:
                        "displayName": "Dispatcher Agent", "active": True}]
         self.labels = [{"id": "label-1", "name": "haiku", "team": None}]
         self.discovery = []           # agentSessions nodes, newest first
+        self.thoughts = {}            # session id -> thought activities (routing notes)
 
     def __call__(self, query, variables, api_key):
         op = re.search(r"^\s*(?:mutation|query)\s+(\w+)", query, re.MULTILINE).group(1)
@@ -3255,6 +3270,10 @@ class _FakeLinear:
         if op == "FindModelLabel":
             want = ((variables["filter"].get("name") or {}).get("eq"))
             return {"issueLabels": {"nodes": [x for x in self.labels if x["name"] == want]}}
+        if op == "SessionRoutingThoughts":
+            return {"agentSession": {"activities": {
+                "nodes": list(self.thoughts.get(variables["id"]) or []),
+                "pageInfo": {"hasNextPage": False}}}}
         if op == "DiscoverSessions":
             return {"agentSessions": {"nodes": list(self.discovery),
                                       "pageInfo": {"hasNextPage": False, "endCursor": None}}}
@@ -5036,9 +5055,24 @@ def selftest():
         fake.sessions["issue-KIT-41"] = [{"id": "sp2", "status": "complete",
                                           "createdAt": "2026-09-06T00:00:00Z",
                                           "updatedAt": "2026-09-06T00:05:00Z", "endedAt": None}]
+        note = ("**Routing** ([repo=...] tag)\n- **stage-a-planning-kit** → `main` (default)")
+        fake.thoughts = dict((sid, [{"createdAt": "2026-09-06T00:00:01Z", "content": {
+            "__typename": "AgentActivityThoughtContent", "body": note}}]) for sid in ("sp1", "sp2"))
         p_found, p_stats = discover_pipeline_prs(dcfg, "x")
         check("discovery skips a planning ticket by its label and by its opening tag, never "
               "by title", (p_found.get("o/r"), p_stats["planning"]), ({42: "KIT-42"}, 2))
+        # …but only when the DISPATCHER'S note confirms it. A coding session can put the
+        # label on its own ticket; its note names its coding entry, so it stays in review.
+        fake.thoughts["sp1"] = [{"createdAt": "2026-09-06T00:00:01Z", "content": {
+            "__typename": "AgentActivityThoughtContent",
+            "body": "**Routing** (Team routing)\n- **kit** → `main` (default)"}}]
+        u_found, u_stats = discover_pipeline_prs(dcfg, "x")
+        check("a coding ticket that labelled itself a planning ticket is still discovered",
+              ((u_found.get("o/r") or {}).get(40), u_stats["planning_unconfirmed"]), ("KIT-40", 1))
+        fake.thoughts.pop("sp1")
+        n_found, _ = discover_pipeline_prs(dcfg, "x")
+        check("…and so is one with no routing note at all",
+              (n_found.get("o/r") or {}).get(40), "KIT-40")
 
         with tempfile.TemporaryDirectory() as tmp:
             fake.__init__()

@@ -25,6 +25,8 @@ beside its real work. The gate is four parts and one gesture:
 | The **planning session** | A sandboxed session the dispatcher starts from that ticket, in the repository's **planning entry**: no tracker tool, no shell, no way to write a file. | the dispatcher |
 | The **executor** (`scripts/pipeline_plan_executor.py`) | The one party holding a tracker credential. It checks the proposal, runs the readiness gate on every child, and files the tree in the backlog. | the planner job |
 
+The **dispatcher** is the program that turns a ticket handed to its agent user into a sandboxed session; "delegate to the agent" means hand a ticket to that user.
+
 **The gesture: you move an idea to Plan it.** Two gestures, two meanings, on a work team:
 
 - Move a ticket to **Plan it** to plan it.
@@ -83,8 +85,11 @@ but it is the case this design is built to catch:
   4. the idea gets a note;
   5. **all planning stops**, on every team.
 
-  The stop survives restarts. Only signing the probe again, then running the installer,
-  clears it. The job never reuses a planning ticket.
+  The stop survives restarts. Only signing the probe again, with new probe tickets, then
+  running the installer, clears it. The job never reuses a planning ticket.
+- **Nothing new starts while a route is unknown.** A routing check a pass could not finish
+  — a read that failed, a pass that ran out of time — is finished first on the next pass,
+  before any new planning ticket is filed.
 
 **The dispatcher's version is pinned.** An upgrade could change how tags and labels route.
 The job reads the dispatcher's version from its own `/version` route on every pass, and
@@ -127,8 +132,10 @@ and it cannot merge.
 - Lists children whose titles look like recent tickets, leaving out the idea and every
   planning ticket.
 
-**Other jobs on the same team** — the review poller's discovery, the criteria snapshot and
-the finding poller — skip planning tickets, by their label or their opening tag.
+**Other jobs on the same team** skip planning tickets. The finding poller skips one by its
+label or its opening tag. The review poller's discovery and the criteria snapshot also need
+the dispatcher's own routing note to confirm it: a coding session can write the label or
+the tag on its own ticket, and must not be able to take itself out of review.
 
 **The installer** (`scripts/pipeline_stage_a_setup.py`)
 - Refuses to run its mutating commands in an agent environment.
@@ -162,7 +169,7 @@ What you supply, and why it is yours:
 |---|---|
 | `CA-DELIVERY` | Turn the plan kind on in each planned repository's committed `delivery.json`, by a pull request you merge. |
 | `CA-ENTRY` | Paste the composed planning entries into the dispatcher's config and restart it. Check each: every tracker server named twice (`mcp__<server>` and `mcp__<server>__*`), `Bash`, `Write` and `Edit` denied, one routing label equal to its own name, no `teamKeys`, no `allowedTools`, and you as the only allowed user. |
-| `CA-PROBE` | For each repository, hand the agent one probe ticket with the tag and the label, and one with the label only. Read both sessions' tool lists and a helper's. Read the work team's agent guidance: the API cannot. Sign with `--ticket` for each probe ticket; the installer reads the routing notes itself, and records the dispatcher's version. |
+| `CA-PROBE` | For each repository, hand the agent one probe ticket with the tag and the label, and one with the label only. Read both sessions' tool lists and a helper's. Read the work team's agent guidance: the API cannot. Sign with `--ticket` for each probe ticket; the installer reads the routing notes itself, and records the dispatcher's version. Signing again — after an upgrade, a stop, or a new repository — needs new probe tickets for every repository. |
 | `CA-HANDOVER` | Run the planning procedure by hand once, before anything is automatic. |
 | `CA-EXECUTOR` | Load the job. The next run measures it. |
 | `CA-LANE` | Plan one idea carrying a routing tag and one carrying a prompt-type label. Run the routing drill: make the dispatcher refuse a planning session, and see planning stop until you sign the probe again. Then plan one real idea end to end. |
