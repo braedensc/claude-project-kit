@@ -21,7 +21,7 @@ beside its real work. The gate is four parts and one gesture:
 | Part | What it is | Who runs it |
 |---|---|---|
 | **Plan it** | A to-do state on each work team. Moving an idea into it is the only thing that starts planning. | you |
-| The **planner job** (`scripts/pipeline_plan_poller.py`) | A scheduled program under the executor's own account. It turns your move into a clean planning ticket, checks where the dispatcher sent it, and reads the answer back. | a system daemon |
+| The **planner job** (`scripts/pipeline_plan_poller.py`) | A scheduled program under a role account — usually the dispatcher's own, as the review jobs use. It turns your move into a clean planning ticket, checks where the dispatcher sent it, and reads the answer back. | a system daemon |
 | The **planning session** | A sandboxed session the dispatcher starts from that ticket, in the repository's **planning entry**: no tracker tool, no shell, no way to write a file. | the dispatcher |
 | The **executor** (`scripts/pipeline_plan_executor.py`) | The one party holding a tracker credential. It checks the proposal, runs the readiness gate on every child, and files the tree in the backlog. | the planner job |
 
@@ -137,46 +137,99 @@ label or its opening tag. The review poller's discovery and the criteria snapsho
 the dispatcher's own routing note to confirm it: a coding session can write the label or
 the tag on its own ticket, and must not be able to take itself out of review.
 
-**The installer** (`scripts/pipeline_stage_a_setup.py`)
-- Refuses to run its mutating commands in an agent environment.
+**The installer** (`scripts/pipeline_stage_a_setup.py`, run by `scripts/pipeline_install.py`)
+- Refuses to run its mutating commands in an agent environment, and reads no key there.
 - Refuses two repositories whose `delivery.json` name one team.
-- Never creates a team, and never writes the dispatcher's config: it composes the planning
-  entries and prints them.
-- Never loads the job.
+- Asks before every change a person should see, and only when a person is at the terminal.
+  Writing the dispatcher's settings and running the drill need the word `yes`, typed.
+- Never creates a team or an account. Never merges, approves or labels.
+- Moves only tickets it filed itself: the probe tickets and the drill's idea.
 
 ## 5. Installing it
 
-One command, run repeatedly by a person in a terminal, until it stops asking:
+**One command, typed in a terminal, as yourself:**
 
 ```bash
-python3 scripts/pipeline_stage_a_setup.py run
+python3 scripts/pipeline_install.py
 ```
 
-It reads `stage-a.conf` (copy `stage-a.conf.example`), reports every bad value in one pass,
-and stops at the first row that needs you. `status` replays what earlier passes recorded;
-`verify` re-measures everything, including the dispatcher's version, and changes nothing;
-`card <id>` prints one checkpoint.
+Run it from the kit checkout you install from. It does everything a machine can do, and
+stops only for what a person must do. Run it again after any stop: it carries on from there.
+
+**Where to type it.** The macOS Terminal app works, and so does the Claude desktop app's
+Terminal tab: neither sets the markers the installers refuse on (measured 2026-09-24). The
+`!` prefix inside a Claude Code session does **not** work. That shell belongs to the
+session, and the installers refuse it on purpose.
+
+**Why it refuses a Claude session.** The idea gate stores a Linear key and places a
+background job that files tickets. A session that could run the installer could install
+its own supervisor. So the installer refuses whenever an agent marker is set, and there is
+no override.
+
+What it does, in order:
+
+1. **The kit checkout.** On its default branch, with no uncommitted changes. It
+   fast-forwards it, and starts itself again when that moved the code.
+2. **The skills in your home folder.** If they differ from the kit's, it asks, then
+   replaces them.
+3. **Stage E**, when the machine has it (`stage-e.conf`). It runs the review installer's
+   read-only check first. Only when something is outstanding does it warn you, ask, and run
+   the review installer. That can restart the dispatcher.
+4. **The idea gate:**
+   - **Settings.** On a first run it writes `stage-a.conf` for you. It takes the
+     dispatcher's account, settings file and service, the agent's name, the kit's URL and
+     the reviewed repositories from `stage-e.conf`. Your user id comes from your key. It
+     asks only for the rest.
+   - **The board.** On each work team it creates **Plan it** (a to-do state) and the
+     repository's **routing label**. It reports which started state a running ticket
+     lands in.
+   - **The plan kind.** If a planned repository's `delivery.json` does not switch plans on,
+     it shows the change, opens the pull request **as you**, and waits for you to merge
+     it. If the repository's checks ask for the guard-change label, you add it.
+   - **The key.** By default the planner reuses the key the review jobs already store, so
+     nothing is asked. With `LINEAR_KEY_FILE=.stage-a/env`, it asks once for a key of the
+     planner's own.
+   - **The job.** It clones the kit under the role account, writes the job's settings,
+     and installs the job. It does not start it yet.
+   - **The dispatcher's settings.** It composes one planning entry per repository and
+     shows the change as a diff. It warns you which sessions a restart would cut off. After
+     you type `yes`, it backs up the file, writes the entries, and restarts the dispatcher.
+   - **The probe.** After a yes, it files two test tickets per repository, as you, and hands
+     them to the agent. It reads where the dispatcher sent them. It reads the tool list the
+     session was given from the dispatcher's own session log, and a helper's from the
+     session's answer. Then it asks you **one** question: is the team's agent guidance
+     empty, or silent about planning and building? The API cannot read it. It records the
+     sign-off and closes the tickets.
+   - **The job, started.** After a yes, it starts the job and reads its first heartbeat.
+   - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py
+     drill`). It makes the dispatcher refuse one planning ticket and checks planning stops.
+     Then it puts the setting back and probes again, which is what lets planning start.
+
+What is still yours, at most:
+
+| When | What you do |
+|---|---|
+| Once | Type your Mac password. |
+| First run, if the key is not stored yet | Paste your Linear key at a hidden prompt. |
+| Each planned repository | Merge the pull request it opened (and add the guard-change label if the checks ask). |
+| Before each change | Type `y`, or `yes` where it asks for the word. |
+| The probe | Answer the agent-guidance question. |
+| At the end | Plan two test ideas and one real idea, then sign `CA-LANE` (the card lists them). |
+
+Each checkpoint card (`card <id>`) is what you see only when you answered no, or ran the
+installer where it cannot ask. `status` replays what earlier passes recorded; `verify`
+re-measures everything and changes nothing.
 
 Before you start, each repository in `PLANNED_REPOS` needs a committed `delivery.json` whose
 `linear.teamKey` names its work team, and the dispatcher needs a coding entry for it.
 
-What the installer builds on each work team: a **Plan it** state (to-do type) and the
-repository's **routing label**. It reports which started state a running ticket lands in.
-
-What you supply, and why it is yours:
-
-| Checkpoint | What you do |
-|---|---|
-| `CA-DELIVERY` | Turn the plan kind on in each planned repository's committed `delivery.json`, by a pull request you merge. |
-| `CA-ENTRY` | Paste the composed planning entries into the dispatcher's config and restart it. Check each: every tracker server named twice (`mcp__<server>` and `mcp__<server>__*`), `Bash`, `Write` and `Edit` denied, one routing label equal to its own name, no `teamKeys`, no `allowedTools`, and you as the only allowed user. |
-| `CA-PROBE` | For each repository, hand the agent one probe ticket with the tag and the label, and one with the label only. Read both sessions' tool lists and a helper's. Read the work team's agent guidance: the API cannot. Sign with `--ticket` for each probe ticket; the installer reads the routing notes itself, and records the dispatcher's version. Signing again — after an upgrade, a stop, or a new repository — needs new probe tickets for every repository. |
-| `CA-HANDOVER` | Run the planning procedure by hand once, before anything is automatic. |
-| `CA-EXECUTOR` | Load the job. The next run measures it. |
-| `CA-LANE` | Plan one idea carrying a routing tag and one carrying a prompt-type label. Run the routing drill: make the dispatcher refuse a planning session, and see planning stop until you sign the probe again. Then plan one real idea end to end. |
+**If the dispatcher's own setup tool rebuilds its settings file,** the planning entries are
+dropped with everything else it did not write. Run the one command again: it finds them
+missing and puts them back.
 
 ## 6. Reading the job
 
-Everything the job owns sits under the executor account's home:
+Everything the job owns sits under the role account's home:
 
 | File | What it tells you |
 |---|---|
@@ -205,3 +258,12 @@ wall clock.
   person sees the helper's own tool list.
 - **The duplicate check compares titles, not intent.**
 - **Nothing watches the job's heartbeat automatically** unless the heartbeat monitor is set up.
+- **The installer's own new steps have not run live.** Writing the dispatcher's settings and
+  restarting it reuse the review installer's code, which has. The pull request, the automatic
+  probe, starting the job and the drill are proven only against synthetic fixtures.
+- **The session log's tool list is read from the SDK's start-up message.** That it lists the
+  tools after the fence removed them is read from the runner's source, not yet seen live. A
+  list that still held a fenced tool would fail the probe loudly, never pass it.
+- **A planning session could read files in the role account's home**, if its file-reading
+  tool reaches there. The probe leaves a harmless test file beside the planner's own files,
+  asks the session to read it, and reports what came back. Tracked as KIT-162.

@@ -294,12 +294,18 @@ jobs:
       - name: Stage E installer selftest (idempotent, agent-refused, §13 exit codes)
         run: python3 scripts/pipeline_stage_e_setup.py --selftest
 
-      # The Stage A (idea-gate) installer: the fallback-(b) tool-fence composition
-      # (no Linear MCP attached; Write kept), agent-env refusal, conf-all-errors,
-      # and no move/approve/merge verb in its own source. Composes-and-hands-off
-      # the dispatcher entry; never turns the gate on.
+      # The Stage A (idea-gate) installer: the planning fence (every injected tool server
+      # named twice, no Write), agent-env refusal, conf-all-errors, no merge/approve/label
+      # verb, and a ticket move only in the one class that refuses tickets it did not
+      # file. Since KIT-195 it writes the planning entries after a typed yes, opens the
+      # delivery pull request, runs the probe, starts the job and runs the drill — each
+      # asked first, each with a refusal case, and the whole suite mutation-tested.
       - name: Stage A installer selftest (fence composition, agent-refused, human gates)
         run: python3 scripts/pipeline_stage_a_setup.py --selftest
+      # The one command (KIT-195): levels the skills, brings Stage E up to date after a
+      # yes, then runs the Stage A installer. Refused under a model before it reads anything.
+      - name: One-command installer selftest (order, agent-refused, never merges)
+        run: python3 scripts/pipeline_install.py --selftest
 
       # The chat-lane composer: prints every piece of the dispatcher's built-in Slack lane
       # for a person to apply, and never writes the dispatcher's config. The grant is the
