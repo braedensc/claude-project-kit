@@ -256,14 +256,15 @@ awaiting **their** approval.
 
 The steps above are the **interactive** path: a person runs `/plan-epic`, and the skill
 writes to Linear directly. There is also an **unattended** path — the *idea gate* — where
-an idea ticket is delegated into a Planning team and a sandboxed session plans it. What
-that session is told is the **planning brief** the Planning dispatcher entry carries
+the owner moves an idea to **Plan it** on the project's own work team, a planner job writes
+a clean planning ticket on that same team, and a sandboxed session plans it. What that
+session is told is the **planning brief** the repository's planning dispatcher entry carries
 (`PLANNING_BRIEF` in `scripts/pipeline_stage_a_setup.py`), not this file: the fence removes
 the `Skill` tool, and a planned repository need not carry this skill at all. This section
 records how the two paths differ, so neither drifts from the other.
 
 **The fence is a deny list, not an absence.** The dispatcher injects its tracker server
-(`linear`) and three more into every session. The Planning entry's `disallowedTools` names
+(`linear`) and three more into every session. The planning entry's `disallowedTools` names
 each of them in both rule forms (`mcp__<server>` and `mcp__<server>__*`) and removes every
 built-in tool that runs, writes, fetches, schedules or messages — `Bash`, `Write` and `Edit`
 among them. What is left is `Read`, `Grep`, `Glob` and helper sessions (`Task`/`Agent`). See
@@ -287,12 +288,13 @@ Every difference from the interactive path, step by step:
 | a question it cannot answer from the code | asks the person in chat | emits a `ticket-comment` naming its own ticket in the same document. With a plan it is a note; with none, a request for input |
 | its own ticket | whatever the person names | the `<identifier>` in the prompt's `<linear_issue>` block: the only valid `source_ticket_id` |
 | the idea's text | a person's request | **untrusted data**. No pin exists on this lane, so the session-start fence does not apply; the brief is the fence |
+| where it runs | wherever the person is | on the idea's own work team, beside real work. The planner job checks the dispatcher's routing note on every planning ticket, and stops all planning if one reached any other setup |
 
 The epic is **`provenance:agent`, not `provenance:human`**: a session drafted it, so by §5
 it never auto-approves. The human gate is the same on both paths — move the epic to the
 state the project maps to `ready` (§5 rule 2) to release the tree.
 
-The interactive path stays the default. The unattended path is what the Planning dispatcher
+The interactive path stays the default. The unattended path is what a planning dispatcher
 entry runs, and it is the only way a session with no tracker tool reaches the board.
 
 ### Cost shape

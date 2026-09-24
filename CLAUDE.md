@@ -164,8 +164,9 @@ npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
 npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13)
-npm run test:plan-poller     # the planner job: the owner's move is the trigger, the
-                             #   delegated ticket is a clean copy, the plan read back
+npm run test:plan-poller     # the planner job: the owner's move on a work team is the
+                             #   trigger, the delegated ticket is a clean copy, its routing
+                             #   is checked (a miss stops planning), the plan read back
 npm run test:sync-user-skills  # user-scope skill drift: check is read-only; --apply
                              #   refuses in an agent env (machine-local ~/.claude/skills)
 npm run test:emit       # generation-side gate: every producer REFUSES to write a malformed doc
@@ -193,8 +194,9 @@ npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one c
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
                              #   agent-refused, §13 exit codes, no secret in any output
-npm run test:stage-a-setup   # Stage A (idea-gate) installer: fallback-(b) fence composition
-                             #   (no Linear MCP), agent-refused, conf-all-errors, human gates
+npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built into each work
+                             #   team (Plan it + routing label, entries with no team key),
+                             #   the fence, the probe read back, agent-refused, conf-all-errors
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,

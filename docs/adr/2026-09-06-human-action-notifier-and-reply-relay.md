@@ -360,6 +360,7 @@ lane write the rest:
 | `planning-rejected` | plan executor (idea gate) | a plan was refused; re-plan | no — unlike no-output, a rejection is a loud, self-explaining comment naming what failed; the owner already has their cue, so no `agent:blocked` is needed to make it visible |
 | `agent:blocked` (marker) | a stopped working session (`/work` step 5) | a session is blocked on a decision | yes (this is the case §6 already names) |
 | `agent:needs-human` | bounce driver | the bounce budget is spent | yes |
+| `agent:needs-human` | planner job (idea gate), on the cancelled planning ticket | a planning ticket's routing could not be confirmed; all planning is stopped until the probe is signed again (KIT-184) | yes — the label lands on that dead planning ticket, never on the idea |
 | review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision |
 
 New producer marks are added to this table in the same PR that ships them, so a mark the

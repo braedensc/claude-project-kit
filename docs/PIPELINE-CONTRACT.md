@@ -863,8 +863,9 @@ MCP session) must still never create a ticket itself; that path is closed by the
 
 ### Filing a plan — the tree shape of `ticket-create`
 
-A **planning session** (the idea-gate: an idea ticket delegated into a Planning team, run
-sandboxed by the dispatcher) does not file findings — it proposes a whole **epic tree**.
+A **planning session** (the idea gate: the owner moves an idea to Plan it on the project's
+own work team, and a planner job files a clean planning ticket on that team and delegates it;
+the dispatcher runs it sandboxed) does not file findings — it proposes a whole **epic tree**.
 It holds no tracker tool and no tool that writes a file — its entry's deny list removes
 both — so it cannot write to the board or to its own supervision; its only output is a
 proposed tree, in its final message, which a credential-holding executor validates and
@@ -938,9 +939,11 @@ backlog — and the tree shape adds these:
   planning batch is set aside and never delivered as a question.
 - **Where its inputs come from.** The executor's only config is the **planned repository's
   committed `delivery.json`**: the work team the tree is filed into (`linear.teamKey`), that
-  team's state and label ids, and `linear.findingTicket`. It resolves the **idea ticket in its
-  own team** — the prefix of the pinned id — which is normally a separate Planning team, and
-  files the tree into the work team. The pinned id comes from whatever started the session,
+  team's state and label ids, and `linear.findingTicket`. It resolves the pinned ticket **in its
+  own team** — the prefix of the pinned id — and **refuses when that is not the work team the
+  config names**: a plan is filed on the team its idea is on (KIT-184). Its duplicate check
+  leaves out the pinned ticket, the idea a planning run was made from (`--idea`), and every
+  planning ticket. The pinned id comes from whatever started the session,
   never from the tree: a run that can write refuses without it, because a pin defaulted from
   `source_ticket_id` would compare the session's claim with itself. The **planner job**
   (`scripts/pipeline_plan_poller.py`) supplies it: it writes the planning ticket the session is

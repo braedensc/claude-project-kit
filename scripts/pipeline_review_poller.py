@@ -200,6 +200,10 @@ LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
     it saw and whether more pages existed, so an operator can tell "not started yet"
     from "outside the window". If the live schema has grown `Issue.agentSessions`,
     `find_sessions_for_issue` is the one place to switch.
+  - Discovery also reads each session's issue description and first ten labels, only to
+    skip the idea gate's planning tickets (KIT-184), which now sit on the work teams. That
+    made the query larger per page; if Linear ever refuses it as too complex, those two
+    fields are the first suspect, and the description alone is enough to recognise one.
   - `AgentActivity.content` is a union; the response/error bodies are read through inline
     fragments on `AgentActivityResponseContent` / `AgentActivityErrorContent`. The
     typings confirm the type names and the `body` field. The activities connection is
@@ -335,6 +339,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gh_fallback  # noqa: E402  (try_gh / api / token — the TLS-safe GitHub transport)
+import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 
 try:
     import pipeline_review_local as prl  # noqa: E402  (classify / render_comment / post_comment)
@@ -1745,8 +1750,9 @@ query DiscoverSessions($first: Int!, $after: String, $attachments: Int!) {
     nodes {
       id status createdAt updatedAt
       issue {
-        id identifier
+        id identifier description
         team { id key }
+        labels(first: 10) { nodes { name } }
         attachments(first: $attachments) { nodes { url sourceType title } }
       }
     }
@@ -2003,7 +2009,7 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
     """
     reviews_team = cfg.get("reviews_team_id")
     found, seen_issues, unattached = {}, {}, []
-    after, pages, sessions, more, attached = None, 0, 0, False, 0
+    after, pages, sessions, more, attached, planning = None, 0, 0, False, 0, 0
     for _ in range(DISCOVERY_MAX_PAGES):
         data = linear_graphql(DISCOVER_SESSIONS,
                               {"first": DISCOVERY_PAGE_SIZE, "after": after,
@@ -2018,6 +2024,12 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
                 continue
             if reviews_team and ((issue.get("team") or {}).get("id")) == reviews_team:
                 continue                      # our own review tickets
+            if machine.issue_is_planning_ticket(issue):
+                # An idea-gate planning ticket (KIT-184). It sits on a work team now, beside
+                # the work this reads, and it is never coding work: a PR attached to one, or
+                # a plan that names one, is not a PR to review against its criteria.
+                planning += 1
+                continue
             seen_issues[iid] = ident
             parsed = prs_from_attachments(dict(issue, identifier=ident))
             if parsed:
@@ -2074,9 +2086,11 @@ def discover_pipeline_prs(cfg, api_key, probe_max=DISCOVERY_PROBE_MAX):
             found.setdefault(owner_repo, {}).setdefault(number, row["issue"])
 
     stats = {"pages": pages, "sessions": sessions, "issues": len(seen_issues),
+             "planning": planning,
              "attached": attached, "unattached": len(unattached), "probed": probed,
              "probed_hits": probed_hits, "ambiguous": ambiguous, "off_repo": off_repo,
              "unprobed": max(0, len(unattached) - probed), "more_pages": more}
+    log("discovery: %d planning ticket(s) skipped" % stats["planning"])
     log("discovery: %d session(s) over %d page(s) → %d issue(s); %d PR(s) from attachments, "
         "%d unattached (%d probed, %d found, %d ambiguous, %d on an unworked repo, %d left "
         "unprobed at the %d cap); more history beyond the window: %s"
@@ -5005,6 +5019,26 @@ def selftest():
         except PollerError:
             pass
         fake.fail_all = False
+        # A PLANNING TICKET (KIT-184) lives on a work team now, beside the work discovery
+        # reads. It is skipped by its routing label or its opening tag, never its title: a
+        # PR attached to one, or a plan that names one, is not a PR to review against it.
+        fake.__init__()
+        by_label = _sess("sp1", "KIT-40", "kit-team", [GH % 40])
+        by_label["issue"]["labels"] = {"nodes": [{"name": "stage-a-planning-kit"}]}
+        by_tag = _sess("sp2", "KIT-41", "kit-team", [])
+        by_tag["issue"]["description"] = "\\[repo=stage-a-planning-kit\\]\n\nPlanning run"
+        titled = _sess("sp3", "KIT-42", "kit-team", [GH % 42])
+        titled["issue"]["description"] = "Plan the release notes"
+        fake.discovery = [by_label, by_tag, titled]
+        fake.activities["sp2"] = [{"id": "a2", "createdAt": "2026-09-06T00:04:00Z",
+                                   "content": {"__typename": "AgentActivityResponseContent",
+                                               "body": "The plan touches %s" % (GH % 41)}}]
+        fake.sessions["issue-KIT-41"] = [{"id": "sp2", "status": "complete",
+                                          "createdAt": "2026-09-06T00:00:00Z",
+                                          "updatedAt": "2026-09-06T00:05:00Z", "endedAt": None}]
+        p_found, p_stats = discover_pipeline_prs(dcfg, "x")
+        check("discovery skips a planning ticket by its label and by its opening tag, never "
+              "by title", (p_found.get("o/r"), p_stats["planning"]), ({42: "KIT-42"}, 2))
 
         with tempfile.TemporaryDirectory() as tmp:
             fake.__init__()

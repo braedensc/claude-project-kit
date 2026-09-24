@@ -127,6 +127,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from check_ticket_dor import pin_fields  # noqa: E402  (ONE description parser, contract §3)
+import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -155,7 +156,7 @@ query CriteriaSnapshotSessions($first: Int!, $after: String) {
       id createdAt updatedAt
       creator { id }
       appUser { id }
-      issue { id identifier team { key } state { type } }
+      issue { id identifier team { key } state { type } labels(first: 20) { nodes { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -260,6 +261,12 @@ def choose_sessions(nodes, team_keys, app_user_id=""):
         if not IDENTIFIER_RE.match(ident):
             continue
         if managed and str(((issue.get("team") or {}).get("key")) or "").upper() not in managed:
+            continue
+        if machine.issue_is_planning_ticket(issue):
+            # An idea-gate planning ticket (KIT-184): it sits on a work team now, and a
+            # person's delegation starts its session, but no review reads its criteria. It
+            # must not spend one of the pass's reads. The listing carries its labels; its
+            # opening tag is checked again once the description is read.
             continue
         if not ((node.get("creator") or {}).get("id")):
             continue
@@ -654,6 +661,10 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
         if not issue:
             result["problems"].append("%s: the tracker returned no issue" % ident)
             continue
+        if machine.is_planning_ticket(issue.get("description")):
+            result["detail"].append("%s: a planning ticket (its description opens with the "
+                                    "planning tag) — no snapshot" % ident)
+            continue
         taken_at = clock()
         hist = issue.get("history") or {}
         hist_nodes = hist.get("nodes") if "nodes" in hist else None
@@ -811,6 +822,10 @@ def selftest():
     foreign = nodes + [session("s-foreign", created="2026-09-16T12:00:00Z", app_user="app-other")]
     check("with the dispatcher's app user configured, another app's session is never considered",
           choose_sessions(foreign, ["KIT"], app)["KIT-7"]["id"], "s-human")
+    planning = session("s-plan", ident="KIT-9", issue_id="iss-9")
+    planning["issue"]["labels"] = {"nodes": [{"name": "stage-a-planning-kit"}]}
+    check("a planning ticket, by its routing label, is never chosen (KIT-184)",
+          sorted(choose_sessions(nodes + [planning], ["KIT"])), ["KIT-7"])
     check("…nor is a session that records no app user",
           choose_sessions([session("s-noapp", app_user=None)], ["KIT"], app), {})
     check("the app user is read in the driver's spelling and the poller's",
@@ -1003,6 +1018,13 @@ def selftest():
               (["KIT-7"], ["do the thing", "test it"]))
         mode = os.stat(os.path.join(store, "KIT-7.json")).st_mode & 0o777
         check("the snapshot file is mode 600 in the role account's state dir", mode, 0o600)
+
+        plan_issue = {"id": "iss-8", "identifier": "KIT-8", "history": no_history(),
+                      "description": "[repo=stage-a-planning-kit]\n\n" + desc}
+        pfake = Fake([session("s-plan-8", ident="KIT-8", issue_id="iss-8")], {"iss-8": plan_issue})
+        r = snapshot_pass(cfg, state, pfake, clock=at("2026-09-16T10:05:00Z"))
+        check("a planning ticket found only by its opening tag takes no snapshot (KIT-184)",
+              (r["taken"], read_snapshot(store, "KIT-8")), ([], None))
 
         r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:10:00Z"))
         check("an unedited ticket: one read, nothing said", (r["unchanged"], r["notices"],

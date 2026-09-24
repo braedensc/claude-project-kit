@@ -26,6 +26,8 @@ WHAT THIS IS
   | planning-rejected        | plan executor         | a plan was refused; re-plan       | no             |
   | agent:blocked            | a stopped session     | blocked on a decision             | yes            |
   | agent:needs-human        | a stopped session     | terminal until a person acts      | needs-human    |
+  |                          | or the planner job,   | (the planner job: a misrouted     |                |
+  |                          | on its planning ticket| planning ticket; planning stopped)|                |
 
   The review lane's "NOT reviewed" verdict is deliberately NOT paged on: it is a CI-visible
   verdict, not a person's decision (ADR, same table).

@@ -3,9 +3,10 @@
 
 The direct analog of the review publisher (docs/PIPELINE-CONTRACT.md §14,
 scripts/pipeline_review_local.py), pointed at planning instead of review. A
-planning session — a clean planning ticket the planner job writes and delegates
-into a Planning team, run sandboxed by the dispatcher — holds no tracker tool and no tool that writes a file: the
-Planning entry's deny list removes every tracker server the dispatcher injects,
+planning session — a clean planning ticket the planner job writes on the idea's own
+work team and delegates, run sandboxed by the dispatcher (KIT-184) — holds no tracker
+tool and no tool that writes a file: the planning entry's deny list removes every
+tracker server the dispatcher injects,
 and Write with them (docs/adr/2026-09-06-stage-a-triggered-from-linear.md, its
 2026-09-17 update). Its whole deliverable is one `pipeline-safe-outputs/1`
 document carrying a tree-shaped `ticket-create` (§8 "Filing a plan"), in its final
@@ -91,13 +92,18 @@ Usage:
     pipeline_plan_executor.py --requests F --pinned TEAM-123
                               --config <planned repo>/delivery.json
                               --repo-root <planned repo checkout>
-                              [--key-env NAME] [--dry-run]
+                              [--idea TEAM-122] [--key-env NAME] [--dry-run]
     pipeline_plan_executor.py --selftest
 
   WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
-    --pinned     the delegated idea ticket, from whatever started the session —
-                 never the tree's own source_ticket_id. A run that can write
-                 refuses without it. The idea is resolved in ITS OWN team.
+    --pinned     the delegated ticket, from whatever started the session — never
+                 the tree's own source_ticket_id. A run that can write refuses
+                 without it. It is resolved in ITS OWN team, and that team must
+                 be the one --config names: a plan is filed on the team its idea
+                 is on (KIT-184), so a pinned ticket on any other team is refused.
+    --idea       the idea a planning run was made from, when it is not the pinned
+                 ticket itself (the planner job's lane). The duplicate check leaves
+                 it out, with the pinned ticket and every planning ticket.
     --config     the PLANNED repository's committed delivery.json. It names the
                  work team the tree is filed into, that team's state and label
                  ids, and `linear.findingTicket`, which turns plans on.
@@ -131,6 +137,8 @@ import check_schemas  # noqa: E402  document_problems: the one definition of "co
 # The publisher's credential scan, imported rather than copied (KIT-170): the same
 # shapes that keep a secret off a pull request keep it out of a filed ticket.
 import pipeline_review_local as _publisher  # noqa: E402
+# The one definition of a planning ticket, shared with the planner job and the Stage E jobs.
+import pipeline_machine_tickets as _machine  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -358,6 +366,17 @@ def looks_like(a, b):
         return 0, 0.0
     shared = wa & wb
     return len(shared), len(shared) / float(min(len(wa), len(wb)))
+
+
+def dedupe_skips(row, pinned, idea=None):
+    """Whether the duplicate check leaves this ticket out: the pinned ticket, the idea a
+    planning run was made from, and every planning ticket. Planning lives on the work
+    team now (KIT-184), so its own tickets sit in the window the check reads — and an
+    idea's title is often a child's."""
+    ident = (row or {}).get("identifier")
+    if ident and ident in (pinned, idea):
+        return True
+    return _machine.issue_is_planning_ticket(row)
 
 
 def duplicate_matches(children, existing):
@@ -895,12 +914,13 @@ class LinearClient:
             "query($teamKey: String!, $number: Float!) {"
             "  issues(filter: { team: { key: { eq: $teamKey } }, "
             "number: { eq: $number } }, first: 1) {"
-            "    nodes { id identifier } } }",
+            "    nodes { id identifier team { key } } } }",
             {"teamKey": key, "number": float(number)})
         nodes = data["issues"]["nodes"]
         if not nodes or nodes[0].get("identifier") != pinned_id:
             raise ExecutorError("idea ticket %s not found" % pinned_id)
-        return {"id": nodes[0]["id"], "identifier": nodes[0]["identifier"]}
+        return {"id": nodes[0]["id"], "identifier": nodes[0]["identifier"],
+                "team_key": ((nodes[0].get("team") or {}).get("key")) or key}
 
     def resolve_team(self, team_key):
         """The WORK team the tree is filed into — the one whose state and label
@@ -916,11 +936,12 @@ class LinearClient:
 
     def recent_issues(self, team_id, limit):
         """The work team's most recently updated tickets, open and closed, for the
-        duplicate check. Titles and identifiers only: nothing else is compared."""
+        duplicate check. Titles are what is compared; the description and labels are read
+        only to leave planning tickets out (KIT-184)."""
         data = self._gql(
             "query($filter: IssueFilter!, $first: Int!) { issues(filter: $filter, "
             "first: $first, orderBy: updatedAt) { nodes { identifier title url "
-            "state { type } } } }",
+            "description labels(first: 20) { nodes { name } } state { type } } } }",
             {"filter": {"team": {"id": {"eq": team_id}}}, "first": min(int(limit), 250)})
         return ((data.get("issues") or {}).get("nodes")) or []
 
@@ -1091,9 +1112,20 @@ def materialise(args, client=None):
         return EXIT_ERRORED
     if args.pinned:
         try:
-            split_ticket_id(args.pinned)
+            pinned_team = split_ticket_id(args.pinned)[0]
         except ExecutorError as exc:
             print("::error:: --pinned %s" % exc, file=sys.stderr)
+            return EXIT_ERRORED
+        if pinned_team != team_key:
+            # A plan is filed on the team its idea is on (KIT-184). A pinned ticket on
+            # another team means the planner job's settings and this repository's
+            # delivery.json disagree about which team plans it, and filing would put the
+            # tree away from its idea. Nothing is reported on either ticket: this run
+            # cannot tell which of the two is wrong.
+            print("::error:: --pinned %s is on the team %s, but %s names the team %s. A plan "
+                  "is filed on the team its idea is on, so this run refuses rather than file "
+                  "the tree somewhere else. Nothing was created."
+                  % (args.pinned, pinned_team, config_path, team_key), file=sys.stderr)
             return EXIT_ERRORED
     pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
     plan, comments = scrub_plan(plan, comments)
@@ -1171,7 +1203,8 @@ def materialise(args, client=None):
               file=sys.stderr)
         return EXIT_ERRORED
 
-    return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments)
+    return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments,
+                   idea=getattr(args, "idea", None))
 
 
 def _landing_state_or_placeholder(cfg, finding_cfg):
@@ -1277,7 +1310,8 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
     return EXIT_REJECTED
 
 
-def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None):
+def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None,
+            idea=None):
     """The only path that mutates. Any failure here is `errored`, never
     `rejected` — the tree was accepted; the tracker is what failed, and it may be
     partly written (§8, §13).
@@ -1307,9 +1341,14 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
     digest = plan_digest(pinned, plan)
     receipt = plan_receipt(pinned, digest)
     try:
-        # The idea is on the Planning team; the tree lands in the WORK team the
-        # project config names, whose state and label ids `forced` carries.
+        # The pinned ticket, resolved by its own id, must be on the WORK team the project
+        # config names — whose state and label ids `forced` carries — because a plan is
+        # filed on the team its idea is on. Measured here as well as read from the id.
         src = client.resolve_idea(pinned)
+        if src.get("team_key") and src["team_key"] != team_key:
+            print("::error:: %s is on the team %s, not %s. Nothing was created."
+                  % (pinned, src["team_key"], team_key), file=sys.stderr)
+            return EXIT_ERRORED
         src_id[0] = src["id"]
         team_id = client.resolve_team(team_key)
 
@@ -1350,7 +1389,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         # owner reads when approving. A lookup that fails is SAID, never skipped.
         scanned, existing, dedupe_failure = 0, [], None
         try:
-            existing = client.recent_issues(team_id, DEDUPE_SCAN_LIMIT)
+            existing = [row for row in client.recent_issues(team_id, DEDUPE_SCAN_LIMIT)
+                        if not dedupe_skips(row, pinned, idea)]
             scanned = len(existing)
         except ExecutorError as exc:
             dedupe_failure = exc
@@ -1450,7 +1490,8 @@ class FakeLinear:
     def resolve_idea(self, pinned_id):
         split_ticket_id(pinned_id)  # the live client refuses a malformed id; so does this
         self.resolved_ideas.append(pinned_id)
-        return {"id": "idea-%s" % pinned_id, "identifier": pinned_id}
+        return {"id": "idea-%s" % pinned_id, "identifier": pinned_id,
+                "team_key": getattr(self, "idea_team", None) or pinned_id.split("-")[0]}
 
     def resolve_team(self, team_key):
         self.team_ids[team_key] = "team-%s" % team_key
@@ -1833,10 +1874,10 @@ def selftest():
               _marker(ESC_AWAITING_APPROVAL) in summary, True)
 
         # ── The config seam (KIT-136) ────────────────────────────────────────
-        # 30. AN IDEA ON A PLANNING TEAM, A TREE IN THE WORK TEAM. The idea is
-        #     resolved by ITS OWN id; the tree is created in the work team the
-        #     config names; the summary lands on the idea. The old code looked
-        #     `PLAN-7`'s number up in the work team and commented on `KIT-7`.
+        # 30. A PLAN IS FILED ON THE TEAM ITS IDEA IS ON (KIT-184). A pinned ticket on
+        #     any other team than the config's is refused before anything is resolved,
+        #     created or reported — a dry run included — and so is one the tracker says
+        #     is on another team, whatever its id reads.
         fakeX = FakeLinear()
         cross = _tree()
         cross["requests"][0]["source_ticket_id"] = "PLAN-7"
@@ -1844,23 +1885,34 @@ def selftest():
         json.dump(cross, open(req, "w"))
         argsX = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
                                    dry_run=False, pinned="PLAN-7")
-        check("cross-team-ok", materialise(argsX, client=fakeX), EXIT_OK)
-        check("cross-team-idea-resolved-by-own-id", fakeX.resolved_ideas, ["PLAN-7"])
-        check("cross-team-summary-on-the-idea",
-              [c[0] for c in fakeX.comments], ["idea-PLAN-7"])
-        check("cross-team-tree-in-work-team",
-              sorted(set(i["team_id"] for i in fakeX.issues)), ["team-KIT"])
+        check("cross-team-refused", materialise(argsX, client=fakeX), EXIT_ERRORED)
+        check("cross-team-nothing-touched",
+              (fakeX.resolved_ideas, fakeX.issues, fakeX.comments), ([], [], []))
+        argsXd = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                    dry_run=True, pinned="PLAN-7")
+        check("cross-team-refused-in-dry-run", materialise(argsXd, client=FakeLinear()),
+              EXIT_ERRORED)
+        fakeXm = FakeLinear()
+        fakeXm.idea_team = "OTHER"
+        json.dump(_tree(), open(req, "w"))
+        argsXm = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                    dry_run=False, pinned="KIT-777")
+        check("measured-team-refused", (materialise(argsXm, client=fakeXm), fakeXm.issues),
+              (EXIT_ERRORED, []))
 
-        # 31. A rejection and a question land on the idea too, never on
-        #     <work team>-<number>.
+        # 31. The idea is still resolved by ITS OWN id, and a rejection lands on it,
+        #     never on some other ticket with the same number.
         fakeY = FakeLinear()
         bad = _tree()
-        bad["requests"][0]["source_ticket_id"] = "PLAN-7"
+        bad["requests"][0]["source_ticket_id"] = "KIT-7"
         bad["requests"][0]["children"][0]["depends_on"] = [9]
         json.dump(bad, open(req, "w"))
-        check("cross-team-reject", materialise(argsX, client=fakeY), EXIT_REJECTED)
-        check("cross-team-rejection-on-the-idea",
-              [c[0] for c in fakeY.comments], ["idea-PLAN-7"])
+        argsY = argparse.Namespace(requests=req, config=cfg_path, repo_root=tmp,
+                                   dry_run=False, pinned="KIT-7")
+        check("own-team-reject", materialise(argsY, client=fakeY), EXIT_REJECTED)
+        check("own-team-rejection-on-the-idea",
+              [c[0] for c in fakeY.comments], ["idea-KIT-7"])
+        check("own-team-idea-resolved-by-own-id", fakeY.resolved_ideas, ["KIT-7"])
 
         # 32. NO PIN, NO WRITE. A run that can write, with no --pinned, is refused
         #     before anything is resolved or created; a dry run may still measure.
@@ -2141,6 +2193,31 @@ def selftest():
                                 [{"identifier": "T-2", "title": "Add the migration",
                                   "url": ""}]), {})
         check("dedupe-scan-limit-is-a-cap", DEDUPE_SCAN_LIMIT <= 250, True)
+        # 55. PLANNING LIVES ON THE WORK TEAM (KIT-184), so the check leaves out the
+        #     pinned ticket, the idea a planning run was made from, and every planning
+        #     ticket — by its opening tag or its routing label, never by its title.
+        fakeD5 = FakeLinear()
+        alike = "Add the ticket-create tree kind to the schema"
+        fakeD5.existing = [
+            {"identifier": "KIT-777", "title": alike, "url": "u1"},
+            {"identifier": "KIT-776", "title": alike, "url": "u2"},
+            {"identifier": "KIT-800", "title": alike, "url": "u3",
+             "description": "[repo=stage-a-planning-kit]\n\nPlanning run"},
+            {"identifier": "KIT-801", "title": alike, "url": "u4", "description": "x",
+             "labels": {"nodes": [{"name": "stage-a-planning-kit"}]}},
+            {"identifier": "KIT-802", "title": alike, "url": "u5",
+             "description": "Plan the schema work [repo=stage-a-planning-kit] later"}]
+        req55 = os.path.join(tmp, "dedupe55.json")
+        json.dump(_tree(), open(req55, "w"))
+        args55 = argparse.Namespace(requests=req55, config=cfg_path, repo_root=tmp,
+                                    dry_run=False, pinned="KIT-777", idea="KIT-776")
+        check("dedupe-planning-files", materialise(args55, client=fakeD5), EXIT_OK)
+        summary5 = fakeD5.comments[0][1]
+        check("dedupe-skips-the-idea-and-planning-tickets",
+              [k for k in ("KIT-777", "KIT-776", "KIT-800", "KIT-801", "KIT-802")
+               if "[%s]" % k in summary5], ["KIT-802"])
+        check("dedupe-counts-what-it-compared",
+              "against the 1 most recently updated" in summary5, True)
 
         # 40. A CHILD THAT CHANGES A GUARD IS NAMED FOR THE OWNER (KIT-163). The
         #     session cannot request the guard-change label and this executor never
@@ -2201,6 +2278,8 @@ def main(argv=None):
     ap.add_argument("--pinned", help="the delegated ticket id, from whatever started the "
                                      "session. Required for any run that can write; a "
                                      "dry run may omit it")
+    ap.add_argument("--idea", help="the idea a planning run was made from, when it is not "
+                                   "the pinned ticket; the duplicate check leaves it out")
     ap.add_argument("--key-env", default=DEFAULT_KEY_ENV,
                     help="the NAME of the environment variable holding the tracker key "
                          "(default %s)" % DEFAULT_KEY_ENV)

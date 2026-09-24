@@ -418,7 +418,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
-                    "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py")
+                    "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
+                    "pipeline_machine_tickets.py")
 
 # The entry points of those four jobs — the roots the closure is walked from.
 DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
@@ -2176,7 +2177,12 @@ def _read_dispatcher_facts_py(path):
     `prompt_types_disallowing`, and `labelPromptsDisallowing` on each entry, name the
     prompt types whose config sets `disallowedTools`: in the global `promptDefaults`, and
     in that entry's `labelPrompts`. Type names only. A session of such a type runs under
-    that list instead of its entry's `disallowedTools`."""
+    that list instead of its entry's `disallowedTools`.
+
+    `labelPromptLabels` is every label an entry's `labelPrompts` reads as a prompt type,
+    and `gitlabUrl`/`projectKeys` are the other two things the router matches an entry
+    by. The idea gate's installer refuses a routing label or tag any of them would also
+    answer (KIT-184)."""
     return (
         "import json,os,sys\n"
         "c=json.load(open(%r))\n"
@@ -2216,8 +2222,13 @@ def _read_dispatcher_facts_py(path):
         "               'repositoryPath': r.get('repositoryPath'),\n"
         "               'baseBranch': r.get('baseBranch'),\n"
         "               'githubUrl': r.get('githubUrl'),\n"
+        "               'gitlabUrl': r.get('gitlabUrl'),\n"
         "               'teamKeys': r.get('teamKeys'),\n"
+        "               'projectKeys': r.get('projectKeys'),\n"
         "               'routingLabels': r.get('routingLabels'),\n"
+        "               'labelPromptLabels': sorted({str(l)[:80] for v in "
+        "(r.get('labelPrompts') or {}).values() if isinstance(v,dict) "
+        "for l in (v.get('labels') or []) if isinstance(v.get('labels'),list)}),\n"
         "               'disallowedTools': r.get('disallowedTools'),\n"
         "               'labelPromptsDisallowing': pt(r.get('labelPrompts')),\n"
         "               'allowedUsers': (r.get('userAccessControl') or {})"
@@ -3126,7 +3137,7 @@ def _origin_slug(ctx, path):
     return ctx.origin_slugs[path]
 
 
-# The idea gate's Planning entry (scripts/pipeline_stage_a_setup.py) carries a
+# An idea-gate planning entry (scripts/pipeline_stage_a_setup.py) carries a
 # `repositoryPath` — a clone of the planned repository, which it reads code in — so it
 # answers "which entry manages this repository?" as truthfully as a coding entry does,
 # and in file order it can answer FIRST. It must not: the entry this lookup returns is
@@ -3329,11 +3340,12 @@ def _entry_matches(have, want):
 def _tag_ambiguity(entries, wanted, dead=()):
     """Every way an entry OTHER than the intended one could answer to a review tag.
 
-    The router matches `[repo=x]` against an entry's githubUrl tail, its name
-    (case-insensitively) and its id — and starts a session in EVERY entry that matches.
-    One extra match is a review session running in an entry that has Bash and Write, so
-    this is a refusal rather than a warning. `dead` names entries this pass is about to
-    remove; they cannot match anything afterwards."""
+    The router matches `[repo=x]` against an entry's githubUrl or gitlabUrl tail, its
+    name (case-insensitively) and its id — and every entry that matches joins ONE session,
+    whose disallowed tools are only those EVERY matched entry denies
+    (ToolPermissionResolver, 0.2.69). One extra match with an entry that has Bash and
+    Write empties the fence, so this is a refusal rather than a warning. `dead` names
+    entries this pass is about to remove; they cannot match anything afterwards."""
     problems = []
     ours = {w["id"] for w in wanted} | set(dead)
     for want in wanted:
@@ -3342,9 +3354,10 @@ def _tag_ambiguity(entries, wanted, dead=()):
             if entry.get("id") in ours:
                 continue
             hits = []
-            url = entry.get("githubUrl") or ""
-            if url.endswith("/" + tag) or url.endswith("/" + tag + ".git"):
-                hits.append("its githubUrl %s" % url)
+            for field in ("githubUrl", "gitlabUrl"):
+                url = entry.get(field) or ""
+                if url.endswith("/" + tag) or url.endswith("/" + tag + ".git"):
+                    hits.append("its %s %s" % (field, url))
             if (entry.get("name") or "").lower() == tag.lower():
                 hits.append("its name")
             if entry.get("id") == tag:
@@ -6978,12 +6991,14 @@ def _selftest_body():
                "%s is not <prefix><repository name>" % name)
     trap = list(ctx14.dispatcher["entries"]) + [
         {"id": "other", "name": "reviews-kit", "repositoryPath": "/x/other"},
-        {"id": "byurl", "name": "byurl", "githubUrl": "https://example.com/x/reviews-app"}]
+        {"id": "byurl", "name": "byurl", "githubUrl": "https://example.com/x/reviews-app"},
+        {"id": "bylab", "name": "bylab", "gitlabUrl": "https://example.com/x/reviews-kit.git"}]
     caught = _tag_ambiguity(trap, multi)
-    expect("tag-unambiguous", len(caught) == 2 and any("its name" in c for c in caught)
-           and any("githubUrl" in c for c in caught),
+    expect("tag-unambiguous", len(caught) == 3 and any("its name" in c for c in caught)
+           and any("githubUrl" in c for c in caught) and any("gitlabUrl" in c for c in caught),
            "an entry that could answer to a review tag was not caught: %s" % caught)
-    expect("tag-unambiguous", not _tag_ambiguity(trap, multi, dead=["other", "byurl"]),
+    expect("tag-unambiguous", not _tag_ambiguity(trap, multi,
+                                                 dead=["other", "byurl", "bylab"]),
            "entries this pass is about to REMOVE were still counted as matches")
     # NO REVIEW ENTRY IS THE WORKSPACE CATCH-ALL. The router's last resort is
     # the first entry with no teamKeys, no routingLabels and no projectKeys —
