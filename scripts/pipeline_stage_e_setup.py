@@ -2730,22 +2730,93 @@ ENV_VALUE_SH = (
 )
 
 
+# THE WRITE, AND IT IS A MERGE (KIT-171). The file is SHARED: the notifier keeps
+# its own token in it, and a person may keep a comment or a name of their own
+# there. This drops only the lines for the names it owns, in any spelling `.`
+# reads as that name (plain, indented, or after `export`), keeps every other
+# line as it was and in order, appends the fresh values from stdin, and swaps
+# the result in by a rename inside the same directory, so a daemon sourcing the
+# file mid-write reads the old file or the new one and never half of either.
+# The old spelling was `cat >`, which deleted every foreign line on every
+# store: the notifier's token went with them, and its next pass exited 2 and
+# paged nobody.
+#
+# Exit 5 is "the file was not replaced": the original is untouched and the temp
+# file is gone. It covers a read that failed (grep's exit 2 — carrying on would
+# replace every foreign line with nothing), a write that failed, and a DIRECTORY
+# at the file's path, which `mv` would otherwise fill and call a success.
+#
+# Exit 6 is "interrupted": a signal the shell can catch (the terminal closed,
+# Ctrl-C, a TERM) arrived mid-write. The temp file is removed before the shell
+# exits, because it holds EVERYTHING: both credentials and the notifier's
+# token. Whether the rename had already happened is not known, so exit 6 says
+# only that the file is the old one or the new one whole. A KILL cannot be
+# caught, so each write first sweeps this writer's own stale temps: a single
+# installer writes at a time, and a sweep that catches a second one mid-write
+# makes that one exit 5, never half a file. The notifier's temps are not ours
+# to touch.
+#
+# `-a` because one NUL byte makes grep print "Binary file … matches" in place of
+# every line and exit 0, and that sentence would become the file. `%(names)s` is
+# the owned names joined by `|`; each is validated as [A-Z][A-Z0-9_]*, so it is
+# safe inside the pattern and the shell text. The values travel on stdin only,
+# straight to `cat`: never a shell variable, never an argument. Owned lines move
+# to the end of the file; under `.` the last definition wins in any case. No
+# single quote anywhere, so the offline battery's needles survive shell-quoting.
+ENV_WRITE_SH = (
+    "umask 077; d=%(home)s; "
+    "mkdir -p \"$d/state\" && chmod 700 \"$d\" \"$d/state\" || exit 5; "
+    "f=\"$d/env\"; [ -d \"$f\" ] && exit 5; rm -f \"$d\"/env.stage-e-setup.*; "
+    "t=\"$d/env.stage-e-setup.$$\"; trap \"rm -f \\\"\\$t\\\"; exit 6\" HUP INT TERM; "
+    "( if [ -f \"$f\" ]; then grep -a -v -E "
+    "\"^[[:space:]]*(export[[:space:]]+)?(%(names)s)=\" \"$f\"; "
+    "[ $? -le 1 ] || exit 5; fi; cat ) > \"$t\" || { rm -f \"$t\"; exit 5; }; "
+    "chmod 600 \"$t\" && mv -f \"$t\" \"$f\" || { rm -f \"$t\"; exit 5; }"
+)
+
+# The code-host token has TWO names, in the order `gh` and scripts/gh_fallback.py
+# read them. The credentials step owns both: it writes the one the conf names
+# and drops a line under the other, because a GH_TOKEN line kept beside a
+# configured GITHUB_TOKEN is the token every daemon would post with.
+CODE_HOST_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
+
+_PROBE_NAME_RE = re.compile(r"name=(.*) len=(\d*)$")
+
+
 def parse_env_probe(text):
-    """(names->length, mode, owner) out of ENV_PROBE_SH's output."""
+    """(names->length, mode, owner) out of ENV_PROBE_SH's output.
+
+    A name is everything the probe printed before ` len=`, so `export GH_TOKEN`
+    and `  GH_TOKEN` are keyed as written, never as a bare `export` or an empty
+    string. They are still not the plain name ENV_VALUE_SH reads: an owned name
+    in either spelling counts as missing, and the store drops it."""
     seen, mode, owner = {}, "", ""
     for line in (text or "").splitlines():
-        parts = dict(p.split("=", 1) for p in line.split() if "=" in p)
         if line.startswith("mode="):
+            parts = dict(p.split("=", 1) for p in line.split() if "=" in p)
             mode, owner = parts.get("mode", ""), parts.get("owner", "")
-        elif line.startswith("name="):
-            seen[parts.get("name", "")] = int(parts.get("len", "0") or 0)
+            continue
+        m = _PROBE_NAME_RE.match(line)
+        if m:
+            seen[m.group(1)] = int(m.group(2) or 0)
     return seen, mode, owner
 
 
+def _probe_len(seen, name):
+    """The longest value the probe saw under `name`, in any spelling `.` reads
+    as that name: plain, indented, or after `export`."""
+    pat = re.compile(r"[ \t]*(export[ \t]+)?%s$" % re.escape(name))
+    return max([n for k, n in seen.items() if pat.match(k)] or [0])
+
+
 def step_credentials(ctx, apply_it):
-    """The role account's own env file, mode 600, under its own home."""
+    """The role account's own env file, mode 600, under its own home. This step
+    owns the tracker key's line and the code-host token's, under either of the
+    token's two names, and no others (KIT-171)."""
     r, conf = ctx.runner, ctx.conf
     names = [conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"]]
+    # The token's other name: never written, dropped whenever the file is.
+    other = [n for n in CODE_HOST_TOKEN_NAMES if n not in names]
 
     _refuse_bad_credential_home(ctx)
 
@@ -2762,7 +2833,35 @@ def step_credentials(ctx, apply_it):
                       "written: an unreadable env file is not an absent one.")
     seen, mode, owner = parse_env_probe(probe.out if probe.ok else "")
 
+    # A FILE ANOTHER ACCOUNT OWNS IS REFUSED FIRST, missing names or not. The
+    # write replaces the file by a rename, and the role account owns the
+    # directory, so it CAN replace a file another account owns; `cat >` could
+    # not, which is why this used to be asked only of a complete file. It is
+    # asked before this step sends the stored token to the code host or asks a
+    # person for anything: a refusal after the prompt throws away what was
+    # typed. It cannot undo the tracker step, which runs first and has already
+    # read the tracker key out of this same file to measure the tracker.
+    if probe.ok and owner != ctx.account:
+        raise SetupError(
+            "the env file at %s/env is owned by %r, not by %r. A chmod does not fix an "
+            "owner, and rewriting someone else's credential file is not this installer's "
+            "to do. Move or remove it as that owner, then run this again."
+            % (ctx.stage_home, owner, ctx.account))
+
     missing = [n for n in names if seen.get(n, 0) < 20]
+
+    # A GH_TOKEN LINE BESIDE A CONFIGURED GITHUB_TOKEN IS THE TOKEN IN USE.
+    # `gh` and the comment transport read GH_TOKEN first, so every daemon would
+    # post with it while this step proves GITHUB_TOKEN and calls it live: a
+    # check that measured a different token from the one in use (§13). Any
+    # spelling `.` reads counts; an empty one sets nothing the transport uses.
+    # The other way round (GITHUB_TOKEN beside a configured GH_TOKEN) loses to
+    # the configured name, so it is not drift; the next write drops it anyway.
+    rank = (CODE_HOST_TOKEN_NAMES.index(conf["GITHUB_TOKEN_ENV"])
+            if conf["GITHUB_TOKEN_ENV"] in CODE_HOST_TOKEN_NAMES
+            else len(CODE_HOST_TOKEN_NAMES))
+    shadow = [n for n in other
+              if CODE_HOST_TOKEN_NAMES.index(n) < rank and _probe_len(seen, n) > 0]
 
     # THE STORED CODE-HOST TOKEN IS PROVED HERE, AND NOWHERE ELSE.
     #
@@ -2787,18 +2886,12 @@ def step_credentials(ctx, apply_it):
     # rejected. Trusting the probe here would keep the bad value and make the
     # next run ask for a replacement all over again.
     replaced = [n for n in names if n in ctx.replaced]
-    if probe.ok and not missing and not replaced and mode == "600" and owner == ctx.account:
+    if probe.ok and not missing and not replaced and not shadow and mode == "600" \
+            and owner == ctx.account:
         return True, "env file present, mode 600, owned by %s, both names set (%s)" % (
             ctx.account, ", ".join("%s=%d chars" % (n, seen[n]) for n in names)), []
 
-    if probe.ok and not missing and owner != ctx.account:
-        raise SetupError(
-            "the env file at %s/env is owned by %r, not by %r. A chmod does not fix an "
-            "owner, and rewriting someone else's credential file is not this installer's "
-            "to do. Move or remove it as that owner, then run this again."
-            % (ctx.stage_home, owner, ctx.account))
-
-    if probe.ok and not missing and not replaced and mode != "600":
+    if probe.ok and not missing and not replaced and not shadow and mode != "600":
         if not apply_it:
             return False, "env file is mode %s, want 600" % mode, []
         res = r.as_role(ctx.account, "chmod 600 %s/env" % ctx.stage_home,
@@ -2808,10 +2901,18 @@ def step_credentials(ctx, apply_it):
                              % (ctx.stage_home, (res.err or "").strip()[:200]))
         return False, "env file re-tightened to mode 600", []
 
+    shadow_note = ("%s is in %s/env beside the configured %s, and `gh` and the comment "
+                   "transport read %s first, so the daemons would post with a token this "
+                   "step never proved" % (" and ".join(shadow), ctx.stage_home,
+                                          conf["GITHUB_TOKEN_ENV"], shadow[0])
+                   if shadow else "")
     if not apply_it:
         if replaced:
-            return False, ("would rewrite %s/env with the replacement %s"
-                           % (ctx.stage_home, ", ".join(replaced))), []
+            return False, ("would store the replacement %s in %s/env, keeping every "
+                           "other line" % (", ".join(replaced), ctx.stage_home)), []
+        if shadow and not missing:
+            return False, ("%s. `run` removes that line and keeps every other."
+                           % shadow_note), []
         return False, "env file missing or incomplete (want %s)" % ", ".join(names), []
     if not ctx.tty:
         raise Blocked("CK-2")
@@ -2822,6 +2923,12 @@ def step_credentials(ctx, apply_it):
     say("  role account's home. Never into the dispatcher's own env file, which is copied")
     say("  unscrubbed into every session; never under its state root, which the sessions")
     say("  the ledger counts can reach. Nothing is echoed, logged or kept here.")
+    say("  Only these two lines change, and a line under the token's other name")
+    say("  (%s) goes if there is one. Every other line in that file, the"
+        % " or ".join(other))
+    say("  notifier's token included, is kept as it is.")
+    if shadow:
+        say("  " + shadow_note + ". That line goes.")
     say("  A value this run has ALREADY resolved is reused, not asked for again — so a")
     say("  key the tracker step needed a moment ago is not typed a second time.")
     say("")
@@ -2842,19 +2949,40 @@ def step_credentials(ctx, apply_it):
     ctx.github()
     lines = ["%s=%s" % (n, ctx.secret(n, "")[0]) for n in names]
     body = "\n".join(lines) + "\n"
+    # A MERGE, NOT A REWRITE (KIT-171): ENV_WRITE_SH keeps every line it does
+    # not own. The notifier's token lives in this file too. It drops the
+    # token's other name as well as the two it writes (17f-x).
     res = r.as_role(ctx.account,
-                    "umask 077; mkdir -p %s/state && chmod 700 %s %s/state && "
-                    "cat > %s/env && chmod 600 %s/env"
-                    % (ctx.stage_home, ctx.stage_home, ctx.stage_home, ctx.stage_home,
-                       ctx.stage_home),
-                    stdin=body, why="write the role account's env file (mode 600)",
+                    ENV_WRITE_SH % {"home": ctx.stage_home,
+                                    "names": "|".join(names + other)},
+                    stdin=body,
+                    why="store %s in the role account's env file (mode 600), keeping "
+                        "every other line" % " and ".join(names),
                     secret_stdin=True)
     del body, lines
     if res.skipped:
-        return False, "would write %s/env with %s" % (ctx.stage_home, ", ".join(names)), []
+        return False, ("would store %s in %s/env, keeping every other line"
+                       % (", ".join(names), ctx.stage_home)), []
+    if res.rc == 5:
+        raise SetupError(
+            "the env file at %s/env was not replaced (exit 5): it holds exactly what it "
+            "held before, and neither value was stored. The write keeps every line it "
+            "does not own, so it stops rather than lose one: a file %s cannot read, a "
+            "directory at that path, a home it cannot close to mode 700, or a write "
+            "that failed. %s"
+            % (ctx.stage_home, ctx.account, (res.err or "").strip()[:200]))
+    if res.rc == 6:
+        raise SetupError(
+            "the write to %s/env was interrupted by a signal (exit 6). Its temporary "
+            "copy was removed. The file is either what it was or the new one whole, "
+            "never half of either. Run this again: it measures the file and finishes "
+            "the store if one is still needed." % ctx.stage_home)
     if not res.ok:
         raise SetupError("could not write the env file: %s" % (res.err or "").strip()[:200])
-    return False, "env file written, mode 600, with %s" % ", ".join(names), []
+    return False, ("env file updated, mode 600: %s stored, every other line kept%s"
+                   % (", ".join(names),
+                      "; the %s line that would have won was removed" % " and ".join(shadow)
+                      if shadow else "")), []
 
 
 def credential_home_problem(role_home, dispatcher_config, workspace_base_dirs):
@@ -8545,7 +8673,7 @@ def _selftest_body():
     # again to write the env file. Two steps, one keystroke.
     cases += 1
     ctxM, fakeM, _apiM = _healthy_ctx(conf, stored_env=False)
-    fakeM.answers = list(fakeM.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeM.answers = list(fakeM.answers) + [("env.stage-e-setup.", 0, "")]
     askedM = _counted(ctxM)
     _quiet(lambda: run_steps(ctxM, apply_it=True, keep_going=True))
     expect("secret-asked-once", askedM.count(conf["LINEAR_KEY_ENV"]) == 1,
@@ -8562,7 +8690,7 @@ def _selftest_body():
     # mutant: a process that forgets a secret between steps must ask twice.
     cases += 1
     ctxN, fakeN, _apiN = _healthy_ctx(conf, stored_env=False)
-    fakeN.answers = list(fakeN.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeN.answers = list(fakeN.answers) + [("env.stage-e-setup.", 0, "")]
     askedN = _counted(ctxN)
     _quiet(lambda: step_tracker(ctxN, apply_it=True))
     ctxN._secrets, ctxN._sources = {}, {}          # the forgetting
@@ -8981,7 +9109,7 @@ def _selftest_body():
     # bad key and make the NEXT run ask for a replacement all over again.
     cases += 1
     ctxW, fakeW, _apiW = _healthy_ctx(conf)
-    fakeW.answers = list(fakeW.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeW.answers = list(fakeW.answers) + [("env.stage-e-setup.", 0, "")]
     askedW = _counted(ctxW)
     ctxW.replaced.add(conf["LINEAR_KEY_ENV"])       # as ctx.linear() marks it
     ok, detailW, _x = _quiet(lambda: step_credentials(ctxW, apply_it=True))[0]
@@ -8993,6 +9121,15 @@ def _selftest_body():
            "the rewrite asked for a value it already held: %s" % askedW)
     expect("replacement-reaches-the-file", wroteW and wroteW[0]["stdin"] == "<hidden>",
            "the rewrite recorded the credential in the ledger")
+    # …through the merge, byte for byte: the script 17f runs for real is the
+    # script this step sends (KIT-171), and the names it drops are its own two
+    # plus the code-host token's other name (17f-x).
+    expect("replacement-reaches-the-file", wroteW and wroteW[0]["argv"][-1] == (
+        "cd / && " + ENV_WRITE_SH % {"home": ctxW.stage_home, "names": "%s|%s|%s" % (
+            conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"],
+            {"GH_TOKEN": "GITHUB_TOKEN"}.get(conf["GITHUB_TOKEN_ENV"], "GH_TOKEN"))}),
+           "the credentials step did not send ENV_WRITE_SH: %s"
+           % (wroteW and wroteW[0]["argv"][-1][:160]))
     # …and a dry run names the rewrite without making it.
     cases += 1
     ctxX, fakeX, _apiX = _healthy_ctx(conf)
@@ -9023,7 +9160,7 @@ def _selftest_body():
     # -- 17e-i. `run`: rejected, asking allowed -> one replacement, written --
     cases += 1
     ctxG1, fakeG1, _apiG1 = _healthy_ctx(conf)
-    fakeG1.answers = list(fakeG1.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeG1.answers = list(fakeG1.answers) + [("env.stage-e-setup.", 0, "")]
     builtG1 = []
     deadG1, liveG1 = FakeGitHub(GH_REJECTED), FakeGitHub(GH_LIVE)
     ctxG1.github_factory = lambda t: (builtG1.append(t),
@@ -9165,6 +9302,617 @@ def _selftest_body():
            "without the probe the same dead token did NOT measure as already-done "
            "(%r, %d write(s)) — something else is catching it and the checks above "
            "prove less than they claim" % (okG5, len(fakeG5.writes)))
+
+    # ------------------------------------------------------------------ #
+    # 17f. THE ENV FILE IS SHARED, SO STORING A CREDENTIAL KEEPS EVERY OTHER
+    # LINE IN IT (KIT-171).
+    #
+    # The notifier keeps its own token in this same file. The credentials step
+    # used to write it with `cat >`, so every first store and every replacement
+    # deleted each line it did not own, the notifier's token with them, and
+    # nothing here said so: the notifier's next pass exited 2 and paged nobody.
+    # Most of these cases run the REAL write script through a real /bin/sh
+    # against a real file, reaching it through the step. Between them they
+    # cover every shape the script branches on: no file at all, an empty one,
+    # one holding only the owned lines, one another writer shares, one it
+    # cannot read, a directory at its path, a state path it cannot create, a
+    # stale temp copy beside it, a rename that fails, and a write interrupted
+    # halfway. The owner refusal (17f-v) runs on a scripted
+    # probe, because a real file owned by another account needs a second
+    # account and root.
+    # ------------------------------------------------------------------ #
+    import pwd as _pwd
+    import signal as _signal
+
+    class _RoleShell(FakeRunner):
+        """The role account, emulated. A `sudo -u <role> -H /bin/sh -c …`
+        script runs through a REAL /bin/sh with HOME at a temporary role home,
+        unless the scripted table answers it first. The battery owns the files
+        it creates, where a real `sudo -u` would show the role account, so the
+        probe's `owner=` field is translated, and nothing else is."""
+
+        def __init__(self, home, role, answers=None):
+            FakeRunner.__init__(self, answers)
+            self.home, self.role = home, role
+            self.me = _pwd.getpwuid(os.geteuid()).pw_name
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            line = _fmt(argv)
+            scripted = any(needle in line for needle, _rc, _out in self.answers)
+            if scripted or list(argv[:2]) != ["sudo", "-u"] \
+                    or list(argv[3:6]) != ["-H", "/bin/sh", "-c"]:
+                return FakeRunner._exec(self, argv, stdin, timeout, cwd)
+            p = subprocess.run(["/bin/sh", "-c", argv[6]], input=stdin,
+                               capture_output=True, text=True, timeout=timeout,
+                               env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
+            out = re.sub(r"(?m)^(mode=\S* owner=)%s$" % re.escape(self.me),
+                         lambda m: m.group(1) + self.role, p.stdout)
+            return Result(p.returncode, out, p.stderr)
+
+    LKEY, GKEY = conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"]
+    # The code-host token's OTHER name. The transport reads GH_TOKEN and then
+    # GITHUB_TOKEN, so the step owns both and writes the configured one.
+    OTHER_GKEY = {"GH_TOKEN": "GITHUB_TOKEN", "GITHUB_TOKEN": "GH_TOKEN"}[GKEY]
+    OWNED_NAMES = "%s|%s|%s" % (LKEY, GKEY, OTHER_GKEY)
+    # Fake values, assembled so no credential-shaped literal sits in the file.
+    SLACK_FAKE = "xoxb-" + "FAKE" * 12
+    STALE_TOKEN = "ghp_" + "OLDSTALE" * 4
+    STALE_KEY = "lin_" + "api_" + "OLDINDENTED" * 3
+    STALE_OTHER = "ghp_" + "OTHERNAME" * 4
+    NEW_TOKEN = "ghp_" + "REPLACEMENT" + "NOTREAL" * 4
+    STALE_VALUES = (STALE_TOKEN, STALE_KEY, STALE_OTHER)
+    ALL_VALUES = (STORED_KEY, STORED_TOKEN, NEW_TOKEN, SLACK_FAKE) + STALE_VALUES
+    # What another writer left in the file: a comment, a blank line, the
+    # notifier's token in the `export` spelling, an unrelated name, and two
+    # names that merely END or START with an owned one.
+    FOREIGN = ["# kept: the owner's own note", "",
+               "export NOTIFIER_SLACK_BOT_TOKEN=" + SLACK_FAKE,
+               "OTHER=kept", "NOT_" + GKEY + "=kept", GKEY + "_EXTRA=kept"]
+    # …plus three STALE owned lines, each of which must go: the token in the
+    # `export` spelling, the key INDENTED (`.` reads that as an assignment
+    # too), and the token under its other name. And a last line with no
+    # newline: adding that one byte is the only change the merge makes to a
+    # line it keeps.
+    SEED = "\n".join(FOREIGN[:4] + ["export %s=%s" % (GKEY, STALE_TOKEN),
+                                    "  %s=%s" % (LKEY, STALE_KEY),
+                                    "%s=%s" % (OTHER_GKEY, STALE_OTHER)]
+                     + FOREIGN[4:]).encode("utf-8")
+    STORED_PROBE = ("mode=600 owner=%s\nname=%s len=%d\nname=%s len=%d\n"
+                    % (conf["ROLE_ACCOUNT"], LKEY, len(STORED_KEY), GKEY,
+                       len(STORED_TOKEN)))
+
+    def _owned(line):
+        return re.match(r"\s*(export\s+)?(%s)=" % OWNED_NAMES, line) is not None
+
+    def _role_home(seed):
+        """A temporary role home whose env file holds `seed` (bytes), mode 600.
+        The home itself starts at 755, so a store is SEEN to close it to 700."""
+        home = tempfile.mkdtemp(prefix="stage-e-kit171.")
+        os.mkdir(os.path.join(home, ".stage-e"))
+        os.chmod(os.path.join(home, ".stage-e"), 0o755)
+        path = os.path.join(home, ".stage-e", "env")
+        with open(path, "wb") as fh:
+            fh.write(seed)
+        os.chmod(path, 0o600)
+        return home, path
+
+    def _shell_ctx(home, answers=None, cfg=None):
+        cfg = cfg or conf
+        ctx, _f = _settled_ctx(cfg)
+        ctx.runner = _RoleShell(home, cfg["ROLE_ACCOUNT"], answers)
+        return ctx, ctx.runner
+
+    def _file_problems(path, want, foreign_want=None):
+        """What is wrong with the env file after a store. Names and counts only:
+        a failure message never carries a value, fake or not."""
+        foreign_want = FOREIGN if foreign_want is None else foreign_want
+        bad = []
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8", "replace")
+        lines = text.split("\n")[:-1] if text.endswith("\n") else text.split("\n")
+        foreign = [ln for ln in lines if not _owned(ln)]
+        if foreign != foreign_want:
+            bad.append("the lines this step does not own were not kept in order: "
+                       "%d kept of %d, names %s"
+                       % (len(foreign), len(foreign_want),
+                          [ln.split("=", 1)[0] for ln in foreign]))
+        for name, value in sorted(want.items()):
+            mine = [ln for ln in lines if re.match(r"\s*(export\s+)?%s=" % name, ln)]
+            if mine != ["%s=%s" % (name, value)]:
+                bad.append("%s is in the file %d time(s), not once, plainly, with the "
+                           "value this run settled on" % (name, len(mine)))
+        if len(lines) != len(foreign_want) + len(want):
+            bad.append("the file has %d line(s), want %d"
+                       % (len(lines), len(foreign_want) + len(want)))
+        # WHERE the owned lines go is part of the contract, not a detail: under
+        # `.` the last definition wins, so the fresh values go LAST, in the
+        # order the step writes them.
+        if lines[len(foreign_want):] != ["%s=%s" % (n, v) for n, v in want.items()]:
+            bad.append("the owned lines are not the last lines of the file, in order")
+        if not raw.endswith(b"\n"):
+            bad.append("the file does not end with a newline")
+        for label, stale in zip(("the stale token", "the indented key",
+                                 "the token under its other name"), STALE_VALUES):
+            if stale in text:
+                bad.append("a stale owned line survived: %s" % label)
+        mode = os.stat(path).st_mode & 0o777
+        if mode != 0o600:
+            bad.append("the file is mode %o, not 600" % mode)
+        home_mode = os.stat(os.path.dirname(path)).st_mode & 0o777
+        if home_mode != 0o700:
+            bad.append("the home is mode %o after a store, not 700" % home_mode)
+        left = sorted(os.listdir(os.path.dirname(path)))
+        if left != ["env", "state"]:
+            bad.append("the home holds %s, not just env and state: a temp file was "
+                       "left behind" % left)
+        return bad
+
+    def _leaks(run, printed):
+        """Any value, fake or not, in any command line or any printed line."""
+        argvs = [_fmt(a) for a in run.reads] + [_fmt(w["argv"]) for w in run.writes]
+        bad = []
+        if any(v in a for v in ALL_VALUES for a in argvs):
+            bad.append("a credential value reached a command line")
+        if any(v in printed for v in ALL_VALUES):
+            bad.append("a credential value was printed")
+        return bad
+
+    def _store_and_replace():
+        """KIT-171 start to finish: a FIRST store into a file another writer
+        already uses, then a REPLACEMENT of the code-host token. Returns every
+        problem found, so the mutant below can run the same thing."""
+        home, path = _role_home(SEED)
+        ctx, run = _shell_ctx(home)
+        asked = _counted(ctx)
+        bad = []
+        try:
+            (ok1, _d1, _x1), out1 = _quiet(lambda: step_credentials(ctx, apply_it=True))
+        except Exception as exc:
+            return ["the first store raised %s: %s" % (type(exc).__name__, exc)]
+        bad += ["first store: " + p
+                for p in _file_problems(path, {LKEY: STORED_KEY, GKEY: STORED_TOKEN})]
+        if asked != [LKEY, GKEY]:
+            bad.append("the first store asked for %s, want one of each" % asked)
+        ctx.replaced.add(GKEY)               # as ctx.github() marks a refused token
+        ctx._secrets[GKEY], ctx._sources[GKEY] = NEW_TOKEN, "typed at a hidden prompt"
+        try:
+            (ok2, _d2, _x2), out2 = _quiet(lambda: step_credentials(ctx, apply_it=True))
+        except Exception as exc:
+            return bad + ["the replacement raised %s: %s" % (type(exc).__name__, exc)]
+        bad += ["replacement: " + p
+                for p in _file_problems(path, {LKEY: STORED_KEY, GKEY: NEW_TOKEN})]
+        with open(path, "rb") as fh:
+            if STORED_TOKEN.encode("utf-8") in fh.read():
+                bad.append("replacement: the refused token is still in the file")
+        wrote = [w for w in run.writes if "env file" in w["why"]]
+        if len(wrote) != 2 or any(w["stdin"] != "<hidden>" for w in wrote):
+            bad.append("the env file was not written twice with a hidden body: %d "
+                       "write(s)" % len(wrote))
+        if ok1 is not False or ok2 is not False:
+            bad.append("a store reported the step already done (%r, %r)" % (ok1, ok2))
+        return bad + _leaks(run, out1 + out2)
+
+    # -- 17f-i. a first store, then a replacement, keep the foreign lines ---
+    cases += 1
+    for problem in _store_and_replace():
+        failures.append("env-merge-keeps-foreign-lines: " + problem)
+
+    # mutant: the old whole-file write, in the new constant's clothes. The
+    # scenario must go red under it, or it cannot see KIT-171 at all.
+    cases += 1
+    OLD_WRITE_SH = ("umask 077; mkdir -p %(home)s/state && chmod 700 %(home)s "
+                    "%(home)s/state && cat > %(home)s/env && chmod 600 %(home)s/env")
+    saved_write_sh = globals().get("ENV_WRITE_SH")
+    globals()["ENV_WRITE_SH"] = OLD_WRITE_SH
+    try:
+        survived = not _store_and_replace()
+    finally:
+        globals()["ENV_WRITE_SH"] = saved_write_sh
+    expect("env-merge-mutant", not survived,
+           "the whole-file write kept every foreign line too, so 17f-i cannot see a "
+           "store that deletes the notifier's token")
+
+    # -- 17f-ii. a file it cannot read is a file it does not replace --------
+    # The write reads the file to keep its lines. A read that fails must stop
+    # the write; carrying on would replace every foreign line with nothing.
+    # Root reads a mode-000 file anyway, so there is nothing to prove as root.
+    cases += 1
+    if os.geteuid() != 0:
+        homeU, pathU = _role_home(SEED)
+        ctxU, runU = _shell_ctx(homeU, answers=[
+            ("stat -f", 0, STORED_PROBE),
+            ("n=" + LKEY, 0, STORED_KEY), ("n=" + GKEY, 0, STORED_TOKEN)])
+        _counted(ctxU)
+        ctxU.replaced.add(GKEY)
+        os.chmod(pathU, 0)
+        try:
+            _quiet(lambda: step_credentials(ctxU, apply_it=True))
+            failures.append("env-merge-unreadable: a write over a file it could not "
+                            "read was reported as done")
+        except SetupError as exc:
+            expect("env-merge-unreadable", "not replaced" in str(exc),
+                   "the refusal did not say the file was left as it was: %s" % exc)
+        finally:
+            modeU = os.stat(pathU).st_mode & 0o777
+            os.chmod(pathU, 0o600)
+        with open(pathU, "rb") as fh:
+            expect("env-merge-unreadable", fh.read() == SEED and modeU == 0,
+                   "the unreadable file was changed (mode now %o)" % modeU)
+        leftU = sorted(os.listdir(os.path.dirname(pathU)))
+        expect("env-merge-unreadable", leftU == ["env", "state"],
+               "a failed write left %s behind" % leftU)
+
+    # -- 17f-iii. a DIRECTORY where the file goes is refused, not filled ----
+    # `mv` onto a directory moves the file INTO it and exits 0: a store that
+    # reports success and stores nothing anyone reads.
+    cases += 1
+    homeD = tempfile.mkdtemp(prefix="stage-e-kit171.")
+    os.makedirs(os.path.join(homeD, ".stage-e", "env"), 0o700)
+    ctxD, runD = _shell_ctx(homeD)
+    _counted(ctxD)
+    try:
+        _quiet(lambda: step_credentials(ctxD, apply_it=True))
+        failures.append("env-merge-directory: a directory at the env file's path was "
+                        "reported as a stored env file")
+    except SetupError as exc:
+        expect("env-merge-directory", "not replaced" in str(exc),
+               "the refusal did not say the file was left as it was: %s" % exc)
+    expect("env-merge-directory", os.listdir(os.path.join(homeD, ".stage-e", "env")) == [],
+           "the credentials were moved into a directory nobody reads")
+
+    # -- 17f-iv. a line grep calls BINARY is still a line it keeps ----------
+    # Without `-a`, one NUL byte makes grep print "Binary file … matches" in
+    # place of every line, exit 0, and the merge would install that sentence
+    # as the whole file.
+    cases += 1
+    homeB, pathB = _role_home(SEED + b"\nBLOB=a\x00b\n")
+    ctxB, runB = _shell_ctx(homeB, answers=[
+        ("stat -f", 0, STORED_PROBE),
+        ("n=" + LKEY, 0, STORED_KEY), ("n=" + GKEY, 0, STORED_TOKEN)])
+    _counted(ctxB)
+    ctxB.replaced.add(GKEY)
+    try:
+        _quiet(lambda: step_credentials(ctxB, apply_it=True))
+    except Exception as exc:
+        failures.append("env-merge-binary: the store raised %s: %s"
+                        % (type(exc).__name__, exc))
+    with open(pathB, "rb") as fh:
+        rawB = fh.read()
+    expect("env-merge-binary", b"\nBLOB=a\x00b\n" in rawB
+           and b"\nOTHER=kept\n" in rawB and b"Binary file" not in rawB,
+           "a foreign line holding a NUL byte cost the file its foreign lines")
+
+    # -- 17f-v. a file someone ELSE owns is refused, missing names or not ----
+    # `mv` replaces a file the role account does not own, as long as it owns
+    # the directory. `cat >` could not, so this refusal used to be free; now
+    # it has to be asked for. It is asked before this step sends the stored
+    # token to the code host or asks a person for anything, whatever the file
+    # holds. Three shapes: names missing; complete, with a stored token the
+    # code host refuses (the order is what is under test: a refusal after the
+    # prompt throws away what was typed); and complete, readable, live, with
+    # nothing replaced, where a narrower guard would chmod or write it.
+    def _foreign_owner_case(label, probe, values, verdict):
+        ctxO, fakeO = _settled_ctx(conf)
+        fakeO.answers = [("stat -f", 0, probe)] + [
+            ("n=" + n, 0 if v else 8, v or "") for n, v in values]
+        built = []
+        ctxO.github_factory = lambda token: (built.append(1), FakeGitHub(verdict))[1]
+        askedO = _counted(ctxO)
+        try:
+            _quiet(lambda: step_credentials(ctxO, apply_it=True))
+            failures.append("env-merge-foreign-owner (%s): a file owned by another "
+                            "account was reported stored" % label)
+        except SetupError as exc:
+            expect("env-merge-foreign-owner", "someone-else" in str(exc),
+                   "(%s) the refusal did not name the owner: %s" % (label, exc))
+        except (Unknown, Blocked) as exc:
+            failures.append("env-merge-foreign-owner (%s): raised %s, not the owner "
+                            "refusal: %s" % (label, type(exc).__name__, exc))
+        expect("env-merge-foreign-owner", not fakeO.writes and askedO == [] and not built,
+               "(%s) a file owned by another account was written (%d), a value was asked "
+               "for (%s), or its stored token was sent to the code host (%d)"
+               % (label, len(fakeO.writes), askedO, len(built)))
+
+    cases += 3
+    _foreign_owner_case("names missing", "mode=600 owner=someone-else\n",
+                        [(LKEY, None), (GKEY, None)], GH_LIVE)
+    _foreign_owner_case(
+        "complete, dead stored token",
+        "mode=600 owner=someone-else\nname=%s len=%d\nname=%s len=%d\n"
+        % (LKEY, len(STORED_KEY), GKEY, len(STORED_TOKEN)),
+        [(LKEY, STORED_KEY), (GKEY, STORED_TOKEN)], GH_REJECTED)
+    _foreign_owner_case(
+        "complete, readable, live, nothing replaced",
+        "mode=644 owner=someone-else\nname=%s len=%d\nname=%s len=%d\n"
+        % (LKEY, len(STORED_KEY), GKEY, len(STORED_TOKEN)),
+        [(LKEY, STORED_KEY), (GKEY, STORED_TOKEN)], GH_LIVE)
+
+    # -- 17f-vi. a state directory it cannot create gets no credential ------
+    # `state` is a FILE here, so `mkdir -p` fails before any chmod runs.
+    # Carrying on would store both values in a home this step could not set
+    # up. (That a store CLOSES the home to 700 is checked on every successful
+    # store instead: `_role_home` starts it at 755 and `_file_problems` wants
+    # 700.)
+    cases += 1
+    homeH, pathH = _role_home(SEED)
+    with open(os.path.join(homeH, ".stage-e", "state"), "w") as fh:
+        fh.write("not a directory\n")
+    ctxH, runH = _shell_ctx(homeH, answers=[
+        ("stat -f", 0, STORED_PROBE),
+        ("n=" + LKEY, 0, STORED_KEY), ("n=" + GKEY, 0, STORED_TOKEN)])
+    _counted(ctxH)
+    ctxH.replaced.add(GKEY)
+    try:
+        _quiet(lambda: step_credentials(ctxH, apply_it=True))
+        failures.append("env-merge-home: a home that could not be made 700 was given "
+                        "the credentials")
+    except SetupError as exc:
+        expect("env-merge-home", "not replaced" in str(exc),
+               "the refusal did not say the file was left as it was: %s" % exc)
+    with open(pathH, "rb") as fh:
+        expect("env-merge-home", fh.read() == SEED,
+               "the env file changed under a home that could not be locked down")
+
+    # -- 17f-vii. no moment at which another account can read a value -------
+    # Two layers, each invisible in the finished file, so each is caught in
+    # the act. The temp file is watched WHILE the write waits on stdin, under
+    # a caller whose own umask is 022: it must already be 600 before a single
+    # value arrives. And a leftover temp at the same name and a wider mode (a
+    # killed earlier run whose pid came round again) must not hand its mode to
+    # the env file: `>` keeps an existing file's mode. The write sweeps such
+    # leftovers first (17f-xi), so this one is left there by an `rm` that
+    # removes nothing, which is what a sweep that failed looks like: the
+    # `chmod 600` is the layer under the sweep, and it is still asked for.
+    cases += 1
+    write_sh = "cd / && " + ENV_WRITE_SH % {"home": "$HOME/.stage-e",
+                                            "names": OWNED_NAMES}
+    body = "%s=%s\n%s=%s\n" % (LKEY, STORED_KEY, GKEY, STORED_TOKEN)
+    no_rm_dir = tempfile.mkdtemp(prefix="stage-e-kit171-norm.")
+    with open(os.path.join(no_rm_dir, "rm"), "w") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(os.path.join(no_rm_dir, "rm"), 0o755)
+    homeT, pathT = _role_home(SEED)
+    proc = subprocess.Popen(["/bin/sh", "-c", 'umask 022; eval "$1"', "sh", write_sh],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            env={"HOME": homeT, "PATH": "/usr/bin:/bin"})
+    tmp_modes, deadline = [], time.time() + 10
+    while not tmp_modes and time.time() < deadline and proc.poll() is None:
+        for name in os.listdir(os.path.dirname(pathT)):
+            if name.startswith("env.stage-e-setup."):
+                tmp_modes.append(os.stat(os.path.join(os.path.dirname(pathT), name))
+                                 .st_mode & 0o777)
+        time.sleep(0.01)
+    _out, _err = proc.communicate(body, timeout=30)
+    expect("env-merge-never-readable", tmp_modes == [0o600],
+           "the temp file that receives the values was mode %s mid-write, under a "
+           "caller with umask 022" % ["%o" % m for m in tmp_modes])
+    expect("env-merge-never-readable", proc.returncode == 0
+           and not _file_problems(pathT, {LKEY: STORED_KEY, GKEY: STORED_TOKEN}),
+           "the watched write did not complete cleanly: rc %s" % proc.returncode)
+    homeT2, pathT2 = _role_home(SEED)
+    pre = ('t="$HOME/.stage-e/env.stage-e-setup.$$"; : > "$t"; chmod 644 "$t"; '
+           'eval "$1"')
+    left = subprocess.run(["/bin/sh", "-c", pre, "sh", write_sh], input=body,
+                          capture_output=True, text=True, timeout=30,
+                          env={"HOME": homeT2, "PATH": no_rm_dir + ":/usr/bin:/bin"})
+    expect("env-merge-never-readable", left.returncode == 0
+           and os.stat(pathT2).st_mode & 0o777 == 0o600,
+           "a leftover temp file at mode 644 handed its mode to the env file: rc %s, "
+           "mode %o" % (left.returncode, os.stat(pathT2).st_mode & 0o777))
+
+    # -- 17f-viii. a rename that fails leaves the old file and no temp ------
+    # Nothing on an ordinary disk makes a same-directory rename fail, so the
+    # failure is injected: an `mv` first on PATH that refuses. The last branch
+    # of the script is otherwise one nobody has run.
+    cases += 1
+    stub_dir = tempfile.mkdtemp(prefix="stage-e-kit171-stub.")
+    with open(os.path.join(stub_dir, "mv"), "w") as fh:
+        fh.write("#!/bin/sh\nexit 1\n")
+    os.chmod(os.path.join(stub_dir, "mv"), 0o755)
+    homeR, pathR = _role_home(SEED)
+    renamed = subprocess.run(["/bin/sh", "-c", write_sh], input=body, capture_output=True,
+                             text=True, timeout=30,
+                             env={"HOME": homeR, "PATH": stub_dir + ":/usr/bin:/bin"})
+    with open(pathR, "rb") as fh:
+        keptR = fh.read() == SEED
+    leftR = sorted(os.listdir(os.path.dirname(pathR)))
+    expect("env-merge-rename-fails", renamed.returncode == 5 and keptR
+           and leftR == ["env", "state"],
+           "a refused rename: rc %s (want 5), file unchanged %s, home holds %s"
+           % (renamed.returncode, keptR, leftR))
+
+    # -- 17f-ix. the two commonest shapes: no file yet, and the old two lines
+    # A first install has no env file, and grep must not be run on one. Every
+    # install the old writer touched holds exactly the two owned lines, so grep
+    # selects NOTHING and exits 1, which is not a failure. An empty file is
+    # the same exit. Each goes through the real step and a real /bin/sh.
+    def _plain_store(label, home, path, prepare=None, want=None):
+        ctxP, runP = _shell_ctx(home)
+        askedP = _counted(ctxP)
+        if prepare:
+            prepare(ctxP)
+        try:
+            (_okP, _dP, _xP), outP = _quiet(lambda: step_credentials(ctxP, apply_it=True))
+        except Exception as exc:
+            failures.append("env-merge-%s: the store raised %s: %s"
+                            % (label, type(exc).__name__, exc))
+            return
+        for problem in (_file_problems(path, want or {LKEY: STORED_KEY, GKEY: STORED_TOKEN},
+                                       foreign_want=[])
+                        + _leaks(runP, outP)):
+            failures.append("env-merge-%s: %s" % (label, problem))
+        return askedP
+
+    cases += 3
+    homeA = tempfile.mkdtemp(prefix="stage-e-kit171.")
+    askedA = _plain_store("absent", homeA, os.path.join(homeA, ".stage-e", "env"))
+    expect("env-merge-absent", askedA == [LKEY, GKEY],
+           "a first install asked for %s, want one of each" % askedA)
+
+    def _replace_token(c):
+        c.replaced.add(GKEY)
+        c._secrets[GKEY], c._sources[GKEY] = NEW_TOKEN, "typed at a hidden prompt"
+
+    homeW, pathW = _role_home(("%s=%s\n%s=%s\n" % (LKEY, STORED_KEY, GKEY, STALE_TOKEN))
+                              .encode("utf-8"))
+    askedW2 = _plain_store("owned-only", homeW, pathW, prepare=_replace_token,
+                           want={LKEY: STORED_KEY, GKEY: NEW_TOKEN})
+    expect("env-merge-owned-only", askedW2 == [],
+           "a replacement over the old two-line file asked for %s" % askedW2)
+    homeE, pathE = _role_home(b"")
+    _plain_store("empty", homeE, pathE)
+
+    # -- 17f-x. the code-host token has TWO names, and the one read FIRST wins
+    # `gh` and scripts/gh_fallback.py read GH_TOKEN, then GITHUB_TOKEN. With
+    # GITHUB_TOKEN_ENV=GITHUB_TOKEN, a GH_TOKEN line kept in the same file is
+    # what every daemon posts with, while this step proves GITHUB_TOKEN and
+    # reports it live: a check that measured a different token from the one in
+    # use. So a GH_TOKEN line in any spelling `.` reads is drift even when
+    # nothing else is, `verify` says so, and `run` removes it. A GITHUB_TOKEN
+    # line beside a configured GH_TOKEN loses to it, so it is not drift (it is
+    # still dropped whenever the file is written, as 17f-i shows).
+    conf_gt = dict(conf, GITHUB_TOKEN_ENV="GITHUB_TOKEN")
+    NOTE, KEPT = "# kept: the owner's own note", "OTHER=kept"
+    # The last shape is the same line in a file that is ALSO at the wrong
+    # mode: a chmod alone would fix the mode and keep the line.
+    for spelling, env_mode in (("GH_TOKEN=", 0o600), ("export GH_TOKEN=", 0o600),
+                               ("  GH_TOKEN=", 0o600), ("GH_TOKEN=", 0o644)):
+        cases += 1
+        seedX = "\n".join([NOTE, "%s=%s" % (LKEY, STORED_KEY), spelling + STALE_TOKEN,
+                           KEPT, "GITHUB_TOKEN=" + STORED_TOKEN]) + "\n"
+        homeX, pathX = _role_home(seedX.encode("utf-8"))
+        os.chmod(pathX, env_mode)
+        spelling = "%s (mode %o)" % (spelling, env_mode)
+        ctxV, runV = _shell_ctx(homeX, cfg=conf_gt)
+        ctxV.may_prompt = False
+        try:
+            (okV, detailV, _xV), _pV = _quiet(lambda: step_credentials(ctxV, apply_it=False))
+        except Exception as exc:
+            okV, detailV = None, "raised %s: %s" % (type(exc).__name__, exc)
+        expect("gh-token-shadow", okV is False and "GH_TOKEN" in detailV
+               and not runV.writes,
+               "(%r) verify called a file whose GH_TOKEN line wins over the configured "
+               "GITHUB_TOKEN %r, and wrote %d" % (spelling, detailV, len(runV.writes)))
+        ctxR, runR = _shell_ctx(homeX, cfg=conf_gt)
+        askedR = _counted(ctxR)
+        try:
+            (okR, _dR, _xR), outR = _quiet(lambda: step_credentials(ctxR, apply_it=True))
+        except Exception as exc:
+            failures.append("gh-token-shadow (%r): run raised %s: %s"
+                            % (spelling, type(exc).__name__, exc))
+            continue
+        expect("gh-token-shadow", okR is False and askedR == [],
+               "(%r) run did not rewrite the file without asking (%r, asked %s)"
+               % (spelling, okR, askedR))
+        for problem in (_file_problems(pathX, {LKEY: STORED_KEY, "GITHUB_TOKEN": STORED_TOKEN},
+                                       foreign_want=[NOTE, KEPT])
+                        + _leaks(runR, outR)):
+            failures.append("gh-token-shadow (%r): %s" % (spelling, problem))
+        # …and what the daemons read, sourced the way DAEMON_EXEC sources it.
+        # The expected value travels in the environment, never in argv, and
+        # only a verdict comes back.
+        src = subprocess.run(
+            ["/bin/sh", "-c", 'set -a; . "$HOME/.stage-e/env"; set +a; '
+             'if [ -z "${GH_TOKEN:-}" ] && [ "$GITHUB_TOKEN" = "$WANT" ]; '
+             'then echo one-token; else echo two-tokens; fi'],
+            capture_output=True, text=True, timeout=30,
+            env={"HOME": homeX, "PATH": "/usr/bin:/bin", "WANT": STORED_TOKEN})
+        expect("gh-token-shadow", src.stdout.strip() == "one-token",
+               "(%r) after `run`, sourcing the file still sets GH_TOKEN or a different "
+               "GITHUB_TOKEN: %s" % (spelling, src.stdout.strip() or src.stderr[:120]))
+    # Not drift: an EMPTY GH_TOKEN line (`.` sets it empty; the transport skips
+    # an empty one), and a GITHUB_TOKEN line beside a configured GH_TOKEN.
+    cases += 1
+    for label, cfgN, seedN in (
+            ("an empty GH_TOKEN line", conf_gt,
+             "%s=%s\nGH_TOKEN=\nGITHUB_TOKEN=%s\n" % (LKEY, STORED_KEY, STORED_TOKEN)),
+            ("a GITHUB_TOKEN line beside GH_TOKEN", conf,
+             "%s=%s\nGITHUB_TOKEN=%s\nGH_TOKEN=%s\n"
+             % (LKEY, STORED_KEY, STALE_OTHER, STORED_TOKEN))):
+        homeN, _pathN = _role_home(seedN.encode("utf-8"))
+        ctxN, runN = _shell_ctx(homeN, cfg=cfgN)
+        ctxN.may_prompt = False
+        try:
+            (okN, detailN, _xN), _pN = _quiet(lambda: step_credentials(ctxN, apply_it=False))
+        except Exception as exc:
+            okN, detailN = None, "raised %s: %s" % (type(exc).__name__, exc)
+        expect("gh-token-shadow-not-drift", okN is True and not runN.writes,
+               "%s was called drift: %r" % (label, detailN))
+
+    # -- 17f-xi. an interrupted write leaves no copy of the file behind ------
+    # The temp file holds EVERYTHING: both credentials and the notifier's
+    # token. A signal the shell can catch (the tab closed, Ctrl-C, a TERM)
+    # removes it before the shell exits, and the env file is as it was. One it
+    # cannot catch (KILL) leaves it, so the next store sweeps this writer's
+    # own stale temps first, and nobody else's.
+    for sig in (_signal.SIGTERM, _signal.SIGHUP, _signal.SIGINT):
+        cases += 1
+        homeK, pathK = _role_home(SEED)
+        dirK = os.path.dirname(pathK)
+        procK = subprocess.Popen(
+            ["/bin/sh", "-c", write_sh], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True,
+            # Signals ignored when a non-interactive shell starts cannot be
+            # trapped, and a battery run under nohup or `&` would inherit that.
+            preexec_fn=lambda: [_signal.signal(s, _signal.SIG_DFL)
+                                for s in (_signal.SIGTERM, _signal.SIGHUP, _signal.SIGINT)],
+            env={"HOME": homeK, "PATH": "/usr/bin:/bin"})
+        deadline, seen_tmp = time.time() + 10, False
+        while not seen_tmp and time.time() < deadline and procK.poll() is None:
+            seen_tmp = any(n.startswith("env.stage-e-setup.") for n in os.listdir(dirK))
+            if not seen_tmp:
+                time.sleep(0.01)
+        if seen_tmp:
+            time.sleep(0.05)           # let the shell reach its wait on `cat`
+            os.killpg(procK.pid, sig)
+        try:
+            procK.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            procK.kill()
+            procK.communicate()
+        leftK = sorted(os.listdir(dirK))
+        with open(pathK, "rb") as fh:
+            keptK = fh.read() == SEED
+        # Exit 6, not 5: the trap is what cleaned up, and the step reads 6 as
+        # "interrupted", not as "not replaced".
+        expect("env-merge-interrupted", seen_tmp and procK.returncode == 6
+               and keptK and leftK == ["env", "state"],
+               "%s mid-write: temp seen %s, rc %s (want 6), env unchanged %s, home "
+               "holds %s" % (sig.name, seen_tmp, procK.returncode, keptK, leftK))
+    cases += 1
+    homeS, pathS = _role_home(SEED)
+    dirS = os.path.dirname(pathS)
+    for name in ("env.stage-e-setup.4242", "env.notifier-setup.4242"):
+        with open(os.path.join(dirS, name), "w") as fh:
+            fh.write("a copy a killed writer left\n")
+        os.chmod(os.path.join(dirS, name), 0o600)
+    swept = subprocess.run(["/bin/sh", "-c", write_sh], input=body, capture_output=True,
+                           text=True, timeout=30,
+                           env={"HOME": homeS, "PATH": "/usr/bin:/bin"})
+    leftS = sorted(os.listdir(dirS))
+    expect("env-merge-sweeps-stale-temp", swept.returncode == 0
+           and leftS == ["env", "env.notifier-setup.4242", "state"],
+           "a store beside a killed run's temp copy: rc %s, home holds %s (want the "
+           "stale Stage E copy gone and the notifier's left alone)"
+           % (swept.returncode, leftS))
+    # …and the step reads exit 6 as what it is. "Not replaced" would be a
+    # claim the script cannot make once the rename may have happened.
+    cases += 1
+    ctxI, fakeI = _settled_ctx(conf)
+    fakeI.answers = [("stat -f", 0, STORED_PROBE), ("n=" + LKEY, 0, STORED_KEY),
+                     ("n=" + GKEY, 0, STORED_TOKEN), ("env.stage-e-setup.", 6, "")]
+    _counted(ctxI)
+    ctxI.replaced.add(GKEY)
+    try:
+        _quiet(lambda: step_credentials(ctxI, apply_it=True))
+        failures.append("env-merge-interrupted-exit: an interrupted write was reported "
+                        "as a store")
+    except SetupError as exc:
+        expect("env-merge-interrupted-exit", "interrupted" in str(exc)
+               and "not replaced" not in str(exc),
+               "exit 6 was reported as %r" % str(exc)[:160])
 
     # -- 17. `status` names what is next and exits on the worst row ---------
     cases += 1
