@@ -293,8 +293,9 @@ extend — not a JSON object, or a `permissions` or `deny` of the wrong type —
 secret-file denies. Written relative, as the repository has them, a rule matches under the
 session's current directory only. For a chat session that is an empty folder. Anchored at
 the root, each matches the file name anywhere. The next two name this deployment's
-dispatcher config and env file. The last two are the role account's own: its env file
-(`ROLE_ENV_FILE`, by default `~/.stage-e/env`, which holds the other installers' keys) and
+dispatcher config and env file. The last three are the role account's own: its env file
+(`ROLE_ENV_FILE`, by default `~/.stage-e/env`, which holds the other installers' keys), the
+temp copies an installer writes beside that file while it runs (`~/.stage-e/env.*`), and
 `~/.stage-e/backups`, where the three writers copy a file before changing it. A `~/` rule
 matches under the home of the account the session runs as.
 
