@@ -1588,18 +1588,45 @@ def clone_lacks_keys(ctx, doc):
     return [l.split(" ", 1)[1] for l in res.out.splitlines() if l.startswith("missing ")]
 
 
+def monitor_ids_unresolved(conf, ids):
+    """Why the ledger's monitor author ids cannot be composed for this conf, or "".
+
+    THE LEDGER IS WHAT THE LAST LABELS STEP RESOLVED, and `verify` never asks for the key, so
+    its labels row keeps the ledger's ids unchecked. A ledger from before KIT-156 has no
+    monitor ids at all; composing from it would drop `monitor_actor_ids`, reproduce the old
+    file byte for byte, and call the page's own end current while the notifier pages on the
+    health marks from nobody. `off` needs no lookup, so it is never unresolved; and a named id
+    the ledger does not hold is a conf that moved since the labels step."""
+    monitors = split_list(conf.get("MONITOR_ACTOR_IDS", EXECUTOR_SELF))
+    if monitors == [MONITOR_OFF]:
+        return ""
+    have = ids.get("monitor_actor_ids") or []
+    if not have:
+        return "the heartbeat-monitor author ids (MONITOR_ACTOR_IDS)"
+    named = [m for m in monitors if m != EXECUTOR_SELF and m not in have]
+    if named:
+        return "the heartbeat-monitor author ids (MONITOR_ACTOR_IDS now names %s)" % ", ".join(named)
+    return ""
+
+
 def step_config(ctx, apply_it):
     conf = ctx.conf
     label_ids = ctx.ids.get("label_ids") or {}
     actors = ctx.ids.get("executor_actor_ids") or []
     missing = [k for k in LABEL_KEYS if not label_ids.get(k)] + ([] if actors else ["the executor ids"])
+    unresolved = monitor_ids_unresolved(conf, ctx.ids)
+    if unresolved:
+        missing.append(unresolved)
     if missing:
         what = "waits on the labels step: %s not resolved yet" % ", ".join(missing)
         if apply_it:
             raise Unknown(what, "clear the labels row first")
         return False, what, []
-    body = validate_composed(compose_config(conf, label_ids, actors,
-                                            ctx.ids.get("monitor_actor_ids") or []),
+    # `off` composes no monitor ids whatever the ledger holds: it needs no lookup, and a ledger
+    # from a run when it was on would otherwise keep paging while the conf says off.
+    monitor_ids = ([] if split_list(conf.get("MONITOR_ACTOR_IDS", EXECUTOR_SELF)) == [MONITOR_OFF]
+                   else ctx.ids.get("monitor_actor_ids") or [])
+    body = validate_composed(compose_config(conf, label_ids, actors, monitor_ids),
                              ctx.role_home)
     unknown_keys = clone_lacks_keys(ctx, json.loads(body))
     if unknown_keys:
@@ -1970,6 +1997,111 @@ def read_monitor_config(ctx):
     return (doc, None) if isinstance(doc, dict) else (None, "not a JSON object")
 
 
+def monitor_running(ctx, doc):
+    """Whether the heartbeat monitor whose config is `doc` is running, by ITS OWN heartbeat,
+    read as the role account: (True, how), (False, why) or (None, why).
+
+    THE CONFIG IS NOT THE MONITOR. `HEARTBEAT_MONITOR_TICKET=off` unloads the monitor and
+    leaves its config behind — deliberately, because under `off` a person may run the monitor
+    by hand from that very file — and so does a Stage E run that stopped before loading it.
+    Read alone, the file says ON with nothing running. So:
+
+      True   a real pass, recent, with a good result;
+      False  no heartbeat at all, or one older than two of its intervals plus one pass and
+             two minutes — the line the Stage E installer calls NOT RUNNING;
+      None   what cannot be told: an unreadable or unjudgeable file, a config naming no
+             interval, a last beat that was a rehearsal, or a last pass that ended badly.
+
+    For up to that limit after a monitor stops, its last heartbeat is still fresh, so this
+    reads it as running for that long: said in docs/NOTIFIER-OPERATOR.md."""
+    sdir = str(doc.get("monitor_state_dir") or doc.get("state_dir") or MONITOR_DEFAULT_STATE_DIR)
+    path = sdir.rstrip("/") + "/" + os.path.basename(se.MONITOR_HEARTBEAT)
+    interval = doc.get("run_interval_seconds")
+    timeout = doc.get("run_timeout_seconds", se.MONITOR_RUN_TIMEOUT_SECONDS)
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0
+               for v in (interval, timeout)):
+        return None, ("its config names no usable run_interval_seconds or run_timeout_seconds, "
+                      "so how old its heartbeat may get is not known")
+    try:
+        res = ctx.as_role(MONITOR_READ_SH.replace("@F@", _q(path)),
+                          what="reading the heartbeat monitor's own heartbeat %s" % path)
+    except Unknown as exc:
+        return None, exc.what
+    if res.rc == 9:
+        return False, "it has written no heartbeat at %s" % path
+    if not res.ok:
+        return None, "its heartbeat %s could not be read as %s (exit %d): %s" % (
+            path, ctx.account, res.rc, ctx.scrub((res.err or "").strip())[:120])
+    try:
+        beat = json.loads(res.out)
+    except ValueError:
+        return None, "its heartbeat %s is not JSON" % path
+    if not isinstance(beat, dict) or beat.get("schema") != se.MONITOR_HEARTBEAT_SCHEMA:
+        return None, "its heartbeat %s carries a schema this installer does not know" % path
+    stamp = se._heartbeat_epoch(beat)
+    if stamp is None:
+        return None, "its heartbeat %s carries no time that can be read" % path
+    age = int(ctx.clock() - stamp)
+    limit = se.MONITOR_STALE_MULTIPLIER * interval + timeout + 120
+    if age > limit:
+        return False, ("its last heartbeat at %s is %d s old, past the %d s two of its passes "
+                       "may take" % (path, age, limit))
+    if beat.get("dry_run"):
+        return None, ("its last heartbeat at %s is a rehearsal (--dry-run), which says nothing "
+                      "about a loaded job" % path)
+    if beat.get("result") not in se.MONITOR_GOOD_RESULTS:
+        return None, "its last pass, %d s ago, ended `%s`" % (age, beat.get("result"))
+    return True, "its last pass was %d s ago" % age
+
+
+def notifier_end(ctx, monitors):
+    """This notifier's end of the daemon-health page: (True, ids), (False, why) or (None, why).
+
+    THIS END IS THE FILE THE JOB READS, NOT THE CONF. The job reads its config on every pass,
+    so what it pages on is what that file names. When the `config` row composed this pass and
+    found the file identical, the composition IS the file. Otherwise the file is read as the
+    role account: a pass that composed nothing (the labels row NOT MEASURED, say) over a file
+    an older installer wrote is a notifier that pages on the health marks from nobody — and
+    reading ON off the conf's default there is exactly the lie this replaces."""
+    conf = ctx.conf
+    named = [m for m in monitors if m != EXECUTOR_SELF]
+    remedy = ("Run this installer's `run` with $%s set in your shell: its labels step resolves "
+              "MONITOR_ACTOR_IDS and its config step writes them" % conf["LINEAR_KEY_ENV"])
+    if ctx.config_current and ctx.composed:
+        ids = json.loads(ctx.composed["body"]).get("monitor_actor_ids") or []
+    else:
+        try:
+            have, _mode = _read_config_file(ctx)
+        except Unknown as exc:
+            return None, ("the notifier's config %s was not composed on this pass and could not "
+                          "be read: %s (KIT-156)" % (conf["NOTIFIER_CONFIG"], exc.what))
+        if have is None:
+            return False, ("the notifier's config %s is absent, so no notifier job pages on "
+                           "anything. %s (KIT-156)" % (conf["NOTIFIER_CONFIG"], remedy))
+        try:
+            installed = json.loads(have)
+        except ValueError:
+            installed = None
+        if not isinstance(installed, dict):
+            return None, "the notifier's config %s is not a JSON object (KIT-156)" \
+                % conf["NOTIFIER_CONFIG"]
+        ids = installed.get("monitor_actor_ids") or []
+        if ids:
+            return None, ("the notifier's config %s names monitor author id(s), and it is not the "
+                          "config this pass composed (see the `config` row), so whether they are "
+                          "the monitor's author is not proven on this pass (KIT-156)"
+                          % conf["NOTIFIER_CONFIG"])
+    if not ids:
+        return False, ("the notifier's config %s carries no monitor_actor_ids, so the job pages on "
+                       "the heartbeat monitor's marks from nobody and says `daemon-health marks: "
+                       "OFF` on every pass. %s (KIT-156)" % (conf["NOTIFIER_CONFIG"], remedy))
+    missing = [m for m in named if m not in ids]
+    if missing:
+        return None, ("MONITOR_ACTOR_IDS names %s, which the notifier's config %s does not hold. "
+                      "%s (KIT-156)" % (", ".join(missing), conf["NOTIFIER_CONFIG"], remedy))
+    return True, ids
+
+
 def daemon_health_lines(ctx):
     """(on, off, unproven) for the heartbeat monitor's page through this notifier (KIT-156).
 
@@ -1977,7 +2109,9 @@ def daemon_health_lines(ctx):
     monitor's end is its own config, read as the role account: which ticket it comments on
     (a team TEAM_KEYS does not scan is a comment the notifier never reads) and with which key
     (`self` is the notifier key's user, which is the monitor's author only when the two keys
-    are one). Whether the monitor watches THIS notifier is a separate line: a page can work
+    are one) — and its own heartbeat, because a config is not a running monitor
+    (`monitor_running`). This end is the config the notifier job reads (`notifier_end`), not
+    the conf. Whether the monitor watches THIS notifier is a separate line: a page can work
     while nothing watches the job that sends it."""
     conf = ctx.conf
     on, off, unproven = [], [], []
@@ -1995,6 +2129,8 @@ def daemon_health_lines(ctx):
         unproven.append(what)
         return on, off, unproven
 
+    # Whether a monitor RUNS on this config: both lines below rest on it.
+    running, how = monitor_running(ctx, doc) if doc is not None else (None, "")
     if monitors == [MONITOR_OFF]:
         off.append("the daemon-health page: MONITOR_ACTOR_IDS=off, so this notifier pages on the "
                    "heartbeat monitor's marks from nobody and says `daemon-health marks: OFF` on "
@@ -2011,9 +2147,10 @@ def daemon_health_lines(ctx):
         key_env = str(doc.get("linear_key_env") or MONITOR_DEFAULT_KEY_ENV)
         named = [m for m in monitors if m != EXECUTOR_SELF]
         if not ticket:
-            off.append("the daemon-health page: the heartbeat monitor comments on no ticket "
-                       "(HEARTBEAT_MONITOR_TICKET=off in stage-e.conf), so it writes no mark "
-                       "(KIT-156)")
+            off.append("the daemon-health page: the heartbeat monitor's config names no ticket "
+                       "(`notify_ticket_id` is empty), so it writes no mark. The Stage E "
+                       "installer never writes that: it names one from HEARTBEAT_MONITOR_TICKET, "
+                       "and under `off` it unloads the monitor instead (KIT-156)")
         elif team not in teams:
             off.append("the daemon-health page: the heartbeat monitor comments on %s, and "
                        "TEAM_KEYS (%s) does not scan team %s, so this notifier never reads those "
@@ -2025,18 +2162,34 @@ def daemon_health_lines(ctx):
                        "its marks would be skipped as another author's. Name the monitor's "
                        "author id in MONITOR_ACTOR_IDS, or give both jobs one key (KIT-156)"
                        % (conf["LINEAR_KEY_ENV"], key_env))
+        elif running is False:
+            off.append("the daemon-health page: the heartbeat monitor's config names %s, and the "
+                       "monitor is not running — %s. Nothing writes the marks this notifier pages "
+                       "on. The Stage E installer's `heartbeat-monitor` step loads it; "
+                       "HEARTBEAT_MONITOR_TICKET=off unloads it and leaves this config behind "
+                       "(KIT-156)" % (ticket, how))
+        elif running is None:
+            unproven.append("the daemon-health page: the heartbeat monitor's config names %s, "
+                            "and whether the monitor runs is not proven on this pass — %s "
+                            "(KIT-156)" % (ticket, how))
         else:
-            on.append("the daemon-health page: the heartbeat monitor's comments on %s carry a "
-                      "mark this notifier pings on — an incident and a recovery, one ping each, "
-                      "no label — accepted only from %s (KIT-156)"
-                      % (ticket, "the user of $%s, which the monitor comments with" % key_env
-                         if not named else "the id(s) MONITOR_ACTOR_IDS names%s"
-                         % (" and the user of $%s" % conf["LINEAR_KEY_ENV"]
-                            if EXECUTOR_SELF in monitors else "")))
-            unproven.append("that only the heartbeat monitor writes the daemon-health mark: "
-                            "anything holding $%s can — the other Stage E daemons, a person, "
-                            "and a session handed that key. The mark applies no label, so a "
-                            "forged one costs a ping (KIT-156)" % key_env)
+            end, end_why = notifier_end(ctx, monitors)
+            if end is False:
+                off.append("the daemon-health page: " + end_why)
+            elif end is None:
+                unproven.append("the daemon-health page: " + end_why)
+            else:
+                on.append("the daemon-health page: the heartbeat monitor's comments on %s carry "
+                          "a mark this notifier pings on — an incident and a recovery, one ping "
+                          "each, no label — accepted only from %s (KIT-156)"
+                          % (ticket, "the user of $%s, which the monitor comments with" % key_env
+                             if not named else "the id(s) MONITOR_ACTOR_IDS names%s"
+                             % (" and the user of $%s" % conf["LINEAR_KEY_ENV"]
+                                if EXECUTOR_SELF in monitors else "")))
+                unproven.append("that only the heartbeat monitor writes the daemon-health mark: "
+                                "anything holding $%s can — the other Stage E daemons, a person, "
+                                "and a session handed that key. The mark applies no label, so a "
+                                "forged one costs a ping (KIT-156)" % key_env)
 
     if doc is not None:
         watched = [str(j) for j in doc.get("watch") or [] if isinstance(j, str)]
@@ -2045,6 +2198,13 @@ def daemon_health_lines(ctx):
                        "NOTIFIER_JOB_LABEL=%s in stage-e.conf and run the Stage E installer: its "
                        "`heartbeat-monitor` step measures this job and watches it (KIT-156)"
                        % conf["JOB_LABEL"])
+        elif running is False:
+            off.append("nothing watches this notifier's heartbeat: the heartbeat monitor's config "
+                       "names it in `watch`, and the monitor is not running — %s (KIT-156)" % how)
+        elif running is None:
+            unproven.append("whether the heartbeat monitor watches this notifier: its config names "
+                            "it in `watch`, and whether the monitor runs is not proven on this "
+                            "pass — %s (KIT-156)" % how)
         else:
             home = ctx.role_home or ROLE_HOME_SENTINEL
             reads = str(doc.get("notifier_state_dir") or doc.get("state_dir")
@@ -2681,6 +2841,21 @@ def _selftest_body():
                        "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "dry": dry, "exit": exit_code,
                        "summary": summary}, fh)
 
+    import pipeline_heartbeat_monitor as hbm
+
+    def monitor_beat(home, ago=30, result="ok", dry=False):
+        """The heartbeat MONITOR's own heartbeat, written by its own writer, `ago` seconds old,
+        where the Stage E installer's config puts it (`state_dir`, ~/.stage-e/state)."""
+        sdir = os.path.join(home, ".stage-e", "state")
+        os.makedirs(sdir, exist_ok=True)
+        saved_now = hbm._now
+        hbm._now = lambda: time.time() - ago
+        try:
+            hbm.write_heartbeat({"monitor_state_dir": sdir}, result=result, dry_run=dry,
+                                detail="selftest")
+        finally:
+            hbm._now = saved_now
+
     def new_home(root, with_token=True, with_key=True, extra_lines=()):
         home = os.path.join(root, "role-home")
         scripts = os.path.join(home, ".stage-e", "kit", "scripts")
@@ -2751,8 +2926,10 @@ def _selftest_body():
         with open(monitor_file, "w", encoding="utf-8") as fh:
             json.dump({"notify_ticket_id": "KIT-7", "linear_key_env": "STAGE_E_LINEAR_API_KEY",
                        "watch": ["review-poller", "bounce-driver", "finding-poller", "notifier"],
-                       "intervals": {"notifier": 300 + 240}}, fh)
+                       "intervals": {"notifier": 300 + 240}, "run_interval_seconds": 1800}, fh)
         monitor_before = snapshot(os.path.dirname(monitor_file))[monitor_file]
+        # …and running: its own heartbeat is fresh, as a loaded monitor leaves it.
+        monitor_beat(home)
         ctx, fake = machine_ctx(root, home=home)
         code, out = quiet(lambda: cmd_run(ctx, dry_run=False))
         captured.append(out)
@@ -2848,6 +3025,83 @@ def _selftest_body():
             composed_doc = json.load(fh)
         ok("config: MONITOR_ACTOR_IDS=self (the default) composes the key's own user",
            composed_doc.get("monitor_actor_ids") == ["viewer-uuid-0001"], composed_doc)
+
+        # ── 3b. AN INSTALL FROM BEFORE KIT-156, verified without the key ───────────────
+        # Its ledger has no monitor ids and its notifier.json no monitor_actor_ids, so the
+        # running notifier pages on the health marks from nobody. `verify` asks for no key, so
+        # the labels row is NOT MEASURED and the ledger's old ids stand. Composing from those
+        # would reproduce the old file byte for byte and call it current, and the handover
+        # would read ON off the conf's default. Neither may happen: the config row waits on
+        # the labels step, and the handover says OFF, naming the key the file lacks. A copy of
+        # the settled machine, so the sections below keep theirs.
+        old_root = tempfile.mkdtemp(prefix="pre-kit156.", dir=tmp_root)
+        old_home = os.path.join(old_root, "role-home")
+        shutil.copytree(home, old_home, symlinks=True)
+        old_ledger = os.path.join(old_root, "ledger")
+        shutil.copytree(ledger, old_ledger)
+        old_state = State(old_ledger)
+        old_ids = dict(old_state.data.get("ids") or {})
+        old_ids.pop("monitor_actor_ids", None)
+        old_state.data["ids"] = old_ids
+        old_body = validate_composed(compose_config(good_conf(), old_ids["label_ids"],
+                                                    old_ids["executor_actor_ids"]), old_home)
+        # Everything that install signed and recorded was bound to ITS config, as it would be.
+        old_state.data["notes"][NOTE_CONFIG] = _sha(old_body)
+        old_state.data["notes"][NOTE_DRY_RUN]["config_sha256"] = _sha(old_body)
+        old_state.data["attestations"][A_FIRST_PING]["config_sha256"] = _sha(old_body)
+        old_state.save()
+        old_cfg = os.path.join(old_home, ".stage-e", "notifier.json")
+        with open(old_cfg, "w", encoding="utf-8") as fh:
+            fh.write(old_body)
+        os.chmod(old_cfg, 0o600)
+
+        def old_machine(env):
+            c, f = machine_ctx(old_root, home=old_home, state=State(old_ledger), env=env)
+            f.plists = dict(plists)
+            f.bootstrap(plist_file)
+            return c, f
+
+        c_old, f_old = old_machine({})
+        code_old, out_old = quiet(lambda: cmd_verify(c_old))
+        captured.append(out_old)
+        rows_old = rows_of(run_steps_rows(c_old))
+        ok("verify, an install from before KIT-156, no key: the config row is NOT current — it "
+           "waits on the labels step for the monitor ids",
+           rows_old.get("labels") == UNKNOWN and rows_old.get("config") not in (ALREADY_DONE, DONE)
+           and "heartbeat-monitor author ids" in out_old, "%s\n%s" % (rows_old, out_old[-1500:]))
+        ok("…and the handover says the daemon-health page is OFF, naming the key the notifier's "
+           "config lacks — never ON",
+           "ON: the daemon-health page" not in out_old
+           and "OFF: the daemon-health page" in out_old and "monitor_actor_ids" in out_old,
+           out_old[-1500:])
+        # With the key, `verify` resolves the ids: the config row names the rewrite, and until
+        # `run` writes it the page is still OFF — the job reads the file, not the ledger.
+        c_old2, f_old2 = old_machine({"STAGE_E_LINEAR_API_KEY": key})
+        code_old2, out_old2 = quiet(lambda: cmd_verify(c_old2))
+        captured.append(out_old2)
+        rows_old2 = rows_of(run_steps_rows(c_old2))
+        ok("verify WITH the key: the config would change, and the page stays OFF until it does",
+           rows_old2.get("config") == WOULD_CHANGE and "ON: the daemon-health page" not in out_old2
+           and "OFF: the daemon-health page" in out_old2 and not f_old2.writes,
+           "%s\n%s" % (rows_old2, out_old2[-1500:]))
+        c_old3, f_old3 = old_machine({"STAGE_E_LINEAR_API_KEY": key})
+        code_old3, out_old3 = quiet(lambda: cmd_run(c_old3, dry_run=False))
+        captured.append(out_old3)
+        with open(old_cfg, encoding="utf-8") as fh:
+            upgraded = json.load(fh)
+        ok("run WITH the key writes monitor_actor_ids into the notifier's config",
+           upgraded.get("monitor_actor_ids") == ["viewer-uuid-0001"]
+           and rows_of(run_steps_rows(c_old3)).get("config") == DONE and code_old3 != EX_OK,
+           "%s %s\n%s" % (upgraded, code_old3, out_old3[-900:]))
+        # …and once the loaded job has run on it, the first-ping sign-off made on the old config
+        # no longer holds: card CK-N4 comes back, as NOTIFIER-OPERATOR.md says it does.
+        real_pass(old_home)
+        c_old4, f_old4 = old_machine({"STAGE_E_LINEAR_API_KEY": key})
+        code_old4, out_old4 = quiet(lambda: cmd_run(c_old4, dry_run=False))
+        captured.append(out_old4)
+        ok("…and after the job's next real pass, card CK-N4 comes back",
+           code_old4 == EX_BLOCKED and rows_of(run_steps_rows(c_old4)).get("first-ping") == BLOCKED
+           and "CK-N4" in out_old4, "%s\n%s" % (code_old4, out_old4[-900:]))
 
         def settled(**kw):
             """A machine on which every row holds: loaded, running this plist, passing."""
@@ -3173,7 +3427,8 @@ def _selftest_body():
         root11 = os.path.join(tmp_root, "broken")
         os.makedirs(root11)
         ctx, fake11 = machine_ctx(root11)
-        ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"]}
+        ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                   "monitor_actor_ids": ["viewer-uuid-0001"]}
         saved_compose = globals()["compose_config"]
 
         def dropping(conf, label_ids, actor_ids, *rest):
@@ -3278,8 +3533,9 @@ def _selftest_body():
             with open(os.path.join(h13, ".fake-exit"), "w") as fh:
                 fh.write(str(rc))
             ctx, _f = machine_ctx(r13, home=h13)
-            ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"]}
-            steps13 = tuple((s, t, f) for s, t, f in STEPS if s in ("preflight", "config", "job", "dry-run"))
+            ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                       "monitor_actor_ids": ["viewer-uuid-0001"]}
+            steps13 =tuple((s, t, f) for s, t, f in STEPS if s in ("preflight", "config", "job", "dry-run"))
             (code, rows), out = quiet(lambda: run_steps(ctx, True, keep_going=True, steps=steps13))
             got = rows_of(rows).get("dry-run")
             want = DONE if rc in (0, 3) else FAILED
@@ -3353,13 +3609,56 @@ def _selftest_body():
            and ctx14b.ids.get("monitor_actor_ids") == [] and "MONITOR_ACTOR_IDS=off" in out14,
            "%s\n%s" % (written, out14[-600:]))
 
+        # ── 14b'. the ledger's monitor ids are composed only when they answer this conf ──
+        # A ledger from before KIT-156 holds none; `verify` keeps the ledger's ids unchecked.
+        # Composing those would reproduce the old file and call it current (see 3b). `off`
+        # needs no lookup; a named id the ledger does not hold is a conf that moved since.
+        for extra_x, ids_x, want_x in (
+                ("MONITOR_ACTOR_IDS=off\n", {}, ""),
+                ("", {}, "MONITOR_ACTOR_IDS"),
+                ("", {"monitor_actor_ids": []}, "MONITOR_ACTOR_IDS"),
+                ("", {"monitor_actor_ids": ["viewer-uuid-0001"]}, ""),
+                ("MONITOR_ACTOR_IDS=monitor-actor-0009\n",
+                 {"monitor_actor_ids": ["viewer-uuid-0001"]}, "monitor-actor-0009"),
+                ("MONITOR_ACTOR_IDS=monitor-actor-0009,self\n",
+                 {"monitor_actor_ids": ["monitor-actor-0009", "viewer-uuid-0001"]}, "")):
+            got_x = monitor_ids_unresolved(good_conf(extra_x), ids_x)
+            ok("config: %s against a ledger holding %s — %s"
+               % (extra_x.strip() or "MONITOR_ACTOR_IDS=self", ids_x.get("monitor_actor_ids"),
+                  "waits on the labels step" if want_x else "composable"),
+               (want_x in got_x and got_x) if want_x else got_x == "", got_x)
+        # `off` composes NO monitor ids whatever the ledger holds: a ledger from a pass when it
+        # was on must not keep the page on under a conf that says off.
+        r14o = tempfile.mkdtemp(prefix="monitor-off-ledger.", dir=tmp_root)
+        c14o = good_conf("MONITOR_ACTOR_IDS=off\n")
+        ctx14o, f14o = machine_ctx(r14o, conf=c14o)
+        ctx14o.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                      "monitor_actor_ids": ["viewer-uuid-0001"]}
+        (_c14o, rows14o), out14o = quiet(lambda: run_steps(ctx14o, True,
+                                                           steps=(("config", "", step_config),)))
+        try:
+            with open(os.path.join(f14o.home, ".stage-e", "notifier.json"), encoding="utf-8") as fh:
+                written14o = json.load(fh)
+        except (OSError, ValueError):
+            written14o = None
+        ok("config: MONITOR_ACTOR_IDS=off composes no monitor ids, even over a ledger that "
+           "holds some",
+           rows14o[0][1] == DONE and written14o is not None
+           and "monitor_actor_ids" not in written14o, "%s\n%s" % (rows14o, out14o[-400:]))
+
         # ── 14c. the handover measures BOTH ends of the daemon-health page ──────────────
         mon_doc = {"notify_ticket_id": "KIT-7", "linear_key_env": "STAGE_E_LINEAR_API_KEY",
                    "watch": ["review-poller", "bounce-driver", "finding-poller", "notifier"],
-                   "intervals": {"notifier": 300 + 240}}
+                   "intervals": {"notifier": 300 + 240}, "run_interval_seconds": 1800}
         handover_writes, handover_reads = [], []
 
-        def handover_with(monitor_doc, extra="", ids_m=("viewer-uuid-0001",), env=None):
+        def handover_with(monitor_doc, extra="", ids_m=("viewer-uuid-0001",), env=None,
+                          beat=30, beat_result="ok", beat_dry=False, notifier_end="current"):
+            """The handover's daemon-health lines over one machine. `beat` is the age of the
+            MONITOR's own heartbeat in seconds (None: it has written none; "garbage": not
+            JSON). `notifier_end` is this end: "current" is a config row that composed and
+            matched the file, with `ids_m` as its monitor ids; "pre-kit156" is a pass that
+            composed nothing, over the file an older installer wrote."""
             r = os.path.join(tmp_root, "handover-%d" % len(checks))
             os.makedirs(r)
             values, _e = parse_conf(good_text + extra)
@@ -3368,11 +3667,28 @@ def _selftest_body():
             ctx, f = machine_ctx(r, conf=c, env=env)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
                        "monitor_actor_ids": list(ids_m)}
+            if notifier_end == "current":
+                body_h = validate_composed(compose_config(c, ids, ["actor-0001"], list(ids_m)),
+                                           f.home)
+                ctx.composed = {"body": body_h, "sha256": _sha(body_h)}
+                ctx.config_current = True
+            else:
+                body_h = validate_composed(compose_config(c, ids, ["actor-0001"]), f.home)
+            with open(os.path.join(f.home, ".stage-e", "notifier.json"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(body_h)
             if monitor_doc is not None:
                 with open(os.path.join(f.home, ".stage-e", "monitor.json"), "w",
                           encoding="utf-8") as fh:
                     fh.write(monitor_doc if isinstance(monitor_doc, str)
                              else json.dumps(monitor_doc))
+            if beat == "garbage":
+                os.makedirs(os.path.join(f.home, ".stage-e", "state"), exist_ok=True)
+                with open(os.path.join(f.home, ".stage-e", "state", "monitor-heartbeat.json"),
+                          "w", encoding="utf-8") as fh:
+                    fh.write("{not json")
+            elif beat is not None:
+                monitor_beat(f.home, ago=beat, result=beat_result, dry=beat_dry)
             on, off, unproven = handover_lines(ctx)
             handover_writes.extend(f.writes)
             handover_reads.extend(s for s in f.role_scripts if "monitor.json" in s)
@@ -3447,6 +3763,57 @@ def _selftest_body():
         ok("handover: under a model the monitor's config is NOT MEASURED, never guessed",
            "NOT PROVEN: the daemon-health page" in text and "not measured" in text
            and "ON: the daemon-health page" not in text, text)
+
+        # THE MONITOR'S CONFIG IS NOT THE MONITOR. `HEARTBEAT_MONITOR_TICKET=off` unloads it and
+        # leaves its config behind, and so does a Stage E run that stopped before loading it:
+        # the file alone would read ON with nothing running. Its own heartbeat is what says a
+        # monitor runs — fresh, a real pass, a good result — so both ON lines rest on it.
+        for name, kw in (("has written no heartbeat", {"beat": None}),
+                         ("wrote its last heartbeat long ago", {"beat": 10 ** 5})):
+            text = handover_with(mon_doc, **kw)
+            ok("handover: a monitor config left behind by a monitor that %s — OFF, both lines, "
+               "saying it is not running and naming the Stage E step" % name,
+               "OFF: the daemon-health page" in text and "not running" in text
+               and "heartbeat-monitor" in text
+               and "ON: the daemon-health page" not in text
+               and "ON: the heartbeat monitor watches" not in text
+               and "OFF: nothing watches this notifier's heartbeat" in text, text)
+        # A rehearsal says nothing about a loaded job, and neither does a file that cannot be
+        # judged: what cannot be told is said as such, never as ON and never as a guessed OFF.
+        for name, kw in (("a heartbeat that is not JSON", {"beat": "garbage"}),
+                         ("a last pass that ended `error`", {"beat_result": "error"}),
+                         ("a last heartbeat that was a rehearsal", {"beat_dry": True})):
+            text = handover_with(mon_doc, **kw)
+            ok("handover: a monitor with %s — NOT PROVEN, never ON" % name,
+               "NOT PROVEN: the daemon-health page" in text
+               and "ON: the daemon-health page" not in text
+               and "ON: the heartbeat monitor watches" not in text, text)
+
+        # THIS END IS THE CONFIG THE JOB READS, not the conf. A pass that composed nothing,
+        # over a file an older installer wrote, is a notifier that pages on the marks from
+        # nobody — and says `daemon-health marks: OFF` every pass.
+        text = handover_with(mon_doc, notifier_end="pre-kit156")
+        ok("handover: the notifier's own config carries no monitor_actor_ids — OFF, naming the "
+           "key and the `run` that writes it, never ON",
+           "OFF: the daemon-health page" in text and "monitor_actor_ids" in text
+           and "STAGE_E_LINEAR_API_KEY" in text and "ON: the daemon-health page" not in text,
+           text)
+        text = handover_with(mon_doc, extra="MONITOR_ACTOR_IDS=monitor-actor-0009\n",
+                             ids_m=("viewer-uuid-0001",))
+        ok("handover: a config composed without an id MONITOR_ACTOR_IDS names — NOT PROVEN, "
+           "never ON",
+           "NOT PROVEN: the daemon-health page" in text and "monitor-actor-0009" in text
+           and "ON: the daemon-health page" not in text, text)
+
+        # PINNED (the KIT-178 review round, 2026-09-24): the monitor calls the notifier stale
+        # LATER than this installer's own `verify` does, so `verify` is the first to go red.
+        conf_d = good_conf()
+        ok("the monitor's staleness line for the notifier (2 x (interval + pass)) is looser "
+           "than this installer's own (2 x interval + pass + 120 s)",
+           stale_after_seconds(conf_d)
+           < hbm.stale_after(int(conf_d["INTERVAL_SECONDS"]) + int(conf_d["RUN_TIMEOUT_SECONDS"]),
+                             se.MONITOR_STALE_MULTIPLIER),
+           (stale_after_seconds(conf_d), hbm.stale_after(540, se.MONITOR_STALE_MULTIPLIER)))
 
         # ── 15. the real transport: real requests, and a redirect refused ────────────────
         import http.server

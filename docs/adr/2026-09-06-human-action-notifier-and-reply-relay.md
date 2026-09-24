@@ -472,12 +472,14 @@ Recorded under the marks table.
 
 ## Update 2026-09-24 — the daemon-health page is built (KIT-156)
 
-Decision 3 of the update above is built as decided: two marks, no label on either, accepted
-only from the monitor's author, and the notifier watched as a fourth job. The owner settled
-four open points on 2026-09-24:
+Decision 3 of *Update 2026-09-17 — the conversational lane, the front door, paging and the
+relay* (its section *3. Heartbeat-monitor incidents page through the notifier*) is built as
+decided: two marks, no label on either, accepted only from the monitor's author, and the
+notifier watched as a fourth job. The owner settled four open points on 2026-09-24:
 
-- **A notifier exit 3 is failing** for the monitor. For the notifier it means a ping or a
-  label did not land. The review poller's exit 3 stays good: that is the poller doing its job.
+- **A notifier exit 3 is failing** for the monitor. The notifier declined something it found:
+  a ping or a label did not land, or a per-pass cap held events back. The review poller's
+  exit 3 stays good: that is the poller doing its job.
 - **Recovery comments ping too.** At the flap rate measured on the monitor's ticket, that is
   about ten pings a week.
 - **`monitor_actor_ids` is optional.** Absent, the marks are accepted from nobody and every
@@ -496,12 +498,23 @@ What was built, beyond the decision:
   still only counted.
 - **The monitor reads the notifier's integer exit** through the exit table the Stage E jobs
   share. A dry-run heartbeat is judged by its time and named a rehearsal.
-- **A comment that names the notifier says it pinged nobody.**
+- **A comment that names a stopped notifier says it pinged nobody.** One whose last pass
+  exited 3 is running, reads the comment on its next pass, and the comment says that instead.
+- **Pings for one ticket go out oldest first**, by each comment's time, so an incident and its
+  recovery found in one pass end on the current state. A health mark seen while
+  `monitor_actor_ids` is absent is deferred, not dropped: switched on later, every one still
+  in the window pings then.
 - **The Stage E installer decides whether the notifier is watched** (`NOTIFIER_JOB_LABEL`),
-  from what launchd holds and from the notifier's own config. It refuses a label launchd does
-  not hold. The notifier's installer never writes the monitor's config. The Stage E step owns
-  that file whole and would revert anything written into it (the KIT-171 defect class). The
-  notifier's installer reads it for its handover, which is ON only when both ends agree.
+  from what launchd holds and from the notifier's own config, which it reads only at
+  `~/.stage-e/notifier.json` and only when launchd runs the notifier on that file. A notifier
+  unloaded with its plist still installed is **paused**: not watched on that run, said by
+  name, and no failure. A label with no job and no plist is refused, and the `code` step asks
+  before it stops anything, so a refusal never leaves the monitor unloaded. The monitor
+  refuses a watched job's heartbeat directory inside a git working tree. The notifier's
+  installer never writes the monitor's config. The Stage E step owns that file whole and
+  would revert anything written into it (the KIT-171 defect class). The notifier's installer
+  reads it for its handover, and says ON only when the monitor's config, the monitor's own
+  heartbeat and the notifier's own config file all agree — never from `notifier.conf` alone.
 - **The notifier's installer asks the role account's clone which config keys its notifier
   knows** before it writes a config. A clone older than this change would refuse
   `monitor_actor_ids` on every pass.

@@ -305,7 +305,14 @@ MONITOR_INTERVAL_SECONDS=1800
 # Set, the `heartbeat-monitor` step asks launchd what it runs under that label
 # and how often, reads the notifier's pass time and state directory from
 # ~/.stage-e/notifier.json as the role account, and watches it at that interval
-# plus one pass.  A label launchd does not hold is refused, not watched.
+# plus one pass.  The notifier must run with that config file: one started on
+# another --config is refused, by name.
+#
+# A PAUSED notifier (unloaded, its plist still in /Library/LaunchDaemons) is
+# left unwatched on that run, and the row says so; the step does not fail.
+# Load it, then run this installer again to watch it.  A label with no loaded
+# job and no plist is refused, and the `code` step asks before it stops any
+# job, so a refusal leaves everything loaded.
 #
 # A dead notifier still cannot page about itself.  The monitor's comment lands
 # on its ticket and says it pinged nobody; only an off-box check covers that

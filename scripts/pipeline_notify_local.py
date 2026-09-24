@@ -39,7 +39,9 @@ WHAT THIS IS
   comment, so without these its incidents reached nobody. They carry no label (daemon health
   is not a ticket's lifecycle) and are accepted only from `monitor_actor_ids`. That key is
   optional: unset, the marks are accepted from nobody and every pass says
-  `daemon-health marks: OFF`, so a config written before it existed keeps loading. A health
+  `daemon-health marks: OFF`, so a config written before it existed keeps loading. A mark seen
+  while it is unset is DEFERRED, not dropped: it is not recorded as seen, so the first pass
+  with the key set pages every one still in the window, oldest first. A health
   mark from any other author is skipped and NAMED in the pass summary — ticket, comment,
   author — without changing the exit code. A dead notifier cannot page about itself: the
   monitor's comment still lands, and says it pinged nobody (KIT-45 is the off-box answer).
@@ -980,6 +982,13 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
     `labelled_keys` is the seen-set's second half. None means "treat every sent key as
     settled" and yields no settle events — the right answer for the callers that only want
     to know what a fresh read would page on.
+
+    EACH TICKET'S COMMENTS ARE TAKEN OLDEST FIRST, by their `created_at`, whatever order the
+    tracker returned them in (it returns the window newest first). One pass can find several
+    unpaged marks on one ticket — the heartbeat monitor's incident and its recovery, after
+    the notifier was down or its monitor key was off — and the last ping in the channel must
+    be the current state, not "needs a look" about an incident that is over. The sort is
+    stable, so comments that carry no time keep the order they came in.
     """
     events, settle, skipped = [], [], []
     emitted = set()
@@ -1000,7 +1009,8 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                             "on this ticket were not examined; raise lookback_comments"
                             % (SATURATED_SKIP, cfg.get("lookback_comments") or 0)))
 
-        for comment in ticket.get("comments") or []:
+        for comment in sorted(ticket.get("comments") or [],
+                              key=lambda c: str(c.get("created_at") or "")):
             cid = comment.get("id")
             body = comment.get("body") or ""
             first = body.split("\n", 1)[0]
@@ -1485,8 +1495,8 @@ class TrackerClient:
         query = ("query($t:String!,$n:Int!,$c:Int!){issues(filter:{team:{key:{eq:$t}}},"
                  "first:$n,orderBy:updatedAt){nodes{id identifier title "
                  "labels{nodes{id}} "
-                 "comments(first:$c,orderBy:createdAt){nodes{id body parent{id} user{id} "
-                 "botActor{id}}}}}}")
+                 "comments(first:$c,orderBy:createdAt){nodes{id body createdAt parent{id} "
+                 "user{id} botActor{id}}}}}}")
         doc = self._gql(query, {"t": team_key, "n": 50, "c": int(limit)})
         nodes = (((doc.get("data") or {}).get("issues") or {}).get("nodes")) or []
         out = []
@@ -1497,7 +1507,8 @@ class TrackerClient:
                           or (c.get("botActor") or {}).get("id"))
                 comments.append({"id": c.get("id"), "body": c.get("body"),
                                  "author_id": author,
-                                 "parent_id": (c.get("parent") or {}).get("id")})
+                                 "parent_id": (c.get("parent") or {}).get("id"),
+                                 "created_at": c.get("createdAt")})
             out.append({
                 "id": n.get("identifier"),
                 "uuid": n.get("id"),
@@ -2067,8 +2078,12 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         summary += (" | daemon-health marks: ON, from %d monitor author id(s)"
                     % len(cfg["monitor_actor_ids"]))
     else:
-        summary += (" | daemon-health marks: OFF (monitor_actor_ids is unset) — %d seen, none "
-                    "paged" % len(health_off))
+        # DEFERRED, NOT DROPPED: a mark seen while OFF is not recorded as seen, so the first
+        # pass with the key set pages every one still in the window, oldest first. Said here,
+        # so "none paged" never reads as "none owed".
+        summary += (" | daemon-health marks: OFF (monitor_actor_ids is unset) — %d seen, not "
+                    "paged yet: each pages once monitor_actor_ids is set, if it is still among "
+                    "the newest comments read" % len(health_off))
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -2524,6 +2539,59 @@ def selftest():
         res_quiet = run_once(cfg_off, _FakeTracker([]), _FakeChat(), False, out=buf)
         ok("…and says OFF on a pass that saw none, too",
            "daemon-health marks: OFF" in res_quiet["summary"], res_quiet["summary"])
+
+        # The gate is two-way: the monitor's author is not an executor. Distinct ids, so a
+        # gate that let the monitor's id through for a planning mark cannot hide.
+        planning = (ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_REJECTED, ESC_NO_OUTPUT)
+        ok("the monitor's author may write none of the four planning marks; the executor's may",
+           MONITOR != EXEC
+           and not any(is_authorised(m, MONITOR, cfg_on) for m in planning)
+           and all(is_authorised(m, EXEC, cfg_on) for m in planning),
+           [(m, is_authorised(m, MONITOR, cfg_on)) for m in planning])
+
+        # OFF, THEN ON, over ONE state dir. A mark seen while the key is unset is not recorded
+        # as seen: it is DEFERRED, not dropped, and the OFF summary says so. The first pass
+        # with the key set pages every one still in the window — oldest first, whatever order
+        # the tracker returned them in, so the last ping in the channel is the current state
+        # and never a "needs a look" about an incident that is over. The tracker returns the
+        # window NEWEST first, which is the order these comments are handed over in.
+        pair = [{"id": "KIT-23", "uuid": "u-KIT-23", "title": "Stage E daemon health",
+                 "label_ids": [], "comments": [
+                     {"id": "h-rec", "body": marker(HEALTH_OK) + "\nreporting again",
+                      "author_id": MONITOR, "created_at": "2026-09-12T12:30:00.000Z"},
+                     {"id": "h-inc", "body": marker(HEALTH_IN) + "\nneeds a look",
+                      "author_id": MONITOR, "created_at": "2026-09-12T12:00:00.000Z"}]}]
+        res_p_off = run_once(cfg_off, _FakeTracker(pair), _FakeChat(), False, out=buf)
+        ok("a health mark seen while OFF is said to be DEFERRED — not 'none paged'",
+           "2 seen, not paged yet" in res_p_off["summary"]
+           and "none paged" not in res_p_off["summary"], res_p_off["summary"])
+        chat_p_on = _FakeChat()
+        res_p_on = run_once(cfg_on, _FakeTracker(pair), chat_p_on, False, out=buf)
+        ok("…and the first pass with the key set pages both, the incident BEFORE its recovery",
+           len(chat_p_on.posts) == 2 and "needs a look" in chat_p_on.posts[0]
+           and "reporting again" in chat_p_on.posts[1] and res_p_on["exit"] == EXIT_OK,
+           (chat_p_on.posts, res_p_on["summary"]))
+
+        # The REAL tracker read asks for each comment's time and keeps it, so that order is
+        # the tracker's own and not a fixture's.
+        class _GqlStub(TrackerClient):
+            asked = []
+
+            def _gql(self, query, variables):
+                self.asked.append(query)
+                return {"data": {"issues": {"nodes": [{
+                    "id": "u-9", "identifier": "KIT-9", "title": "t", "labels": {"nodes": []},
+                    "comments": {"nodes": [
+                        {"id": "c-new", "body": "b", "parent": None, "user": {"id": "a"},
+                         "createdAt": "2026-09-12T12:30:00.000Z"},
+                        {"id": "c-old", "body": "b", "parent": None, "user": {"id": "a"},
+                         "createdAt": "2026-09-12T12:00:00.000Z"}]}}]}}}
+        read_t = _GqlStub(cfg, "not-a-real-key").recent_tickets("KIT", 20)
+        ok("the tracker read asks for each comment's createdAt, and carries it",
+           "createdAt" in _GqlStub.asked[0].split("comments(", 1)[-1].split("{nodes{", 1)[-1]
+           and [c.get("created_at") for c in read_t[0]["comments"]]
+           == ["2026-09-12T12:30:00.000Z", "2026-09-12T12:00:00.000Z"],
+           (_GqlStub.asked[:1], read_t))
 
         # ── §7d. A hostile ticket title cannot control the chat client ───────────
         nasty = [tkt("KIT-5", ESC_BLOCKED, "c5", title="<!channel> <http://x|click>",

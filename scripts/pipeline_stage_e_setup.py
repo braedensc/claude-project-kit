@@ -2420,6 +2420,14 @@ def step_code(ctx, apply_it):
     # machine never loaded is not one to report as switched off.
     if r.as_root(["launchctl", "print", "system/" + monitor_label(conf)]).ok:
         stop_labels = stop_labels + (monitor_label(conf),)
+        # THE NOTIFIER IS MEASURED BEFORE ANYTHING STOPS, when the monitor stopped here is
+        # going to watch it. The `heartbeat-monitor` step refuses a notifier label it cannot
+        # watch (never installed, another job, another config, no interval), and that step
+        # runs after this one has stopped the monitor: a refusal there would leave the
+        # monitor — and so all three daemons' watch — unloaded. Asked here, the same refusal
+        # stops the run with every job still loaded. A PAUSED notifier is no refusal.
+        if monitor_ticket(conf) not in ("off", "") and notifier_label(conf):
+            measure_notifier(ctx)
     for label in stop_labels:
         # Unload before touching the code every job execs out of — the finding
         # poller runs from the same clone as review and bounce. `bootout` on a
@@ -4796,7 +4804,9 @@ def monitor_config(conf, notifier=None):
 
     `notifier` is what `measure_notifier` read, or None: with it, the notifier is a fourth
     watched job, by the same rule — the interval launchd holds for it, plus its own pass
-    clock — and its heartbeat is read from its own state directory."""
+    clock — and its heartbeat is read from its own state directory. A PAUSED notifier is
+    not watched on this pass: the config is the one written with no notifier at all."""
+    notifier = _notifier_watched(notifier)
     doc = {
         "state_dir": "~/.stage-e/state",
         "finding_state_dir": "~/.stage-e/finding",
@@ -4821,19 +4831,55 @@ def notifier_label(conf):
     return (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
 
 
+def _notifier_config_read_sh(ctx):
+    """Read the notifier's config as the role account. Exit 9 is ABSENT; any other failure is
+    a read that could not be made, which is a different fact and never reported as absent."""
+    return 'f="%s/%s"; [ -e "$f" ] || exit 9; cat "$f"' % (ctx.stage_home, NOTIFIER_CONFIG_FILE)
+
+
+# The one `--config` argument a notifier job may run with for this step to watch it: the file
+# read above, in any of the spellings the notifier installer and a person write it in.
+_NOTIFIER_CONFIG_ARG_RE = re.compile(r"""\brun\s+--config[ =]("([^"]*)"|'([^']*)'|(\S+))""")
+
+
+def _notifier_config_arg(text):
+    """The `--config` path launchd's print shows the notifier running with, or None."""
+    found = _NOTIFIER_CONFIG_ARG_RE.search(text or "")
+    if not found:
+        return None
+    return next(g for g in found.groups()[1:] if g is not None)
+
+
+def _is_read_config(ctx, path):
+    """True when `path` is ~/.stage-e/notifier.json, however it is spelled."""
+    tail = "/.stage-e/" + NOTIFIER_CONFIG_FILE
+    spellings = {"$HOME" + tail, "${HOME}" + tail, "~" + tail}
+    if ctx.role_home:
+        spellings.add(ctx.role_home.rstrip("/") + tail)
+    return path in spellings
+
+
 def measure_notifier(ctx):
     """What the monitor needs to watch the notifier, measured — or None when
-    NOTIFIER_JOB_LABEL is empty.
+    NOTIFIER_JOB_LABEL is empty, or {"label", "paused": True} when it is paused.
 
     THREE MEASUREMENTS, AND NONE OF THEM IS A CONF VALUE. launchd is asked whether it holds
     the label, what it runs there and how often; the notifier's own config is read as the
     role account for its pass clock and its state directory. The interval is launchd's
     because launchd keeps what it was given: a changed notifier conf moves the file on disk
-    and not the running job.
+    and not the running job. The config read is the one launchd runs the job with: a job
+    started on another `--config` is refused by name, because the file read here would then
+    say nothing about it.
 
-    A label launchd does not hold is REFUSED, never watched: its heartbeat would be missing
-    or stale on every pass, and the monitor would page about a job nobody meant to run. A
-    label holding something that is not the notifier is refused for the same reason."""
+    PAUSED IS NOT REFUSED (the KIT-178 review round, 2026-09-24). A label launchd does not
+    hold whose plist is still in /Library/LaunchDaemons is the notifier's documented pause
+    (`bootout`). It is not watched on this pass — the row says so by name — and the step goes
+    on: a pause of one job must never stop the installer or leave the monitor unloaded.
+
+    A label launchd does not hold and that has NO plist is REFUSED, never watched: its
+    heartbeat would be missing or stale on every pass, and the monitor would page about a job
+    nobody meant to run. A label holding something that is not the notifier is refused for the
+    same reason."""
     label = notifier_label(ctx.conf)
     if not label:
         return None
@@ -4842,11 +4888,15 @@ def measure_notifier(ctx):
     text = (res.out or "") + (res.err or "")
     if not res.ok:
         if res.rc == 113 or "Could not find service" in text:
+            plist = _dispatcher_plist(label)
+            if r.read(["test", "-f", plist]).ok:
+                return {"label": label, "paused": True, "plist": plist}
             raise SetupError(
-                "NOTIFIER_JOB_LABEL=%s names a job launchd does not hold, so the heartbeat "
-                "monitor would page about its heartbeat on every pass. Load the notifier "
-                "(the notifier installer's card CK-N3), or empty NOTIFIER_JOB_LABEL to leave "
-                "it unwatched." % label)
+                "NOTIFIER_JOB_LABEL=%s names a job launchd does not hold, and there is no plist "
+                "at %s, so it is not a paused notifier either: the heartbeat monitor would page "
+                "about its heartbeat on every pass. Install and load the notifier (the notifier "
+                "installer's `run`, then its card CK-N3), correct the label, or empty "
+                "NOTIFIER_JOB_LABEL to leave it unwatched." % (label, plist))
         raise Unknown("could not ask launchd about system/%s (exit %d): %s"
                       % (label, res.rc, text.strip()[:160]), "run the same command again")
     if NOTIFIER_SCRIPT_NAME not in text:
@@ -4861,32 +4911,60 @@ def measure_notifier(ctx):
             "system/%s is loaded, and launchd's own print gave no run interval, so how old "
             "the notifier's heartbeat may get cannot be worked out." % label,
             "read it yourself: sudo launchctl print system/%s" % label)
-    got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, NOTIFIER_CONFIG_FILE))
+    runs = _notifier_config_arg(text)
+    if runs is None or not _is_read_config(ctx, runs):
+        raise SetupError(
+            "system/%s runs the notifier with --config %s, and this step reads only "
+            "~/.stage-e/%s as %s. A notifier configured elsewhere cannot be watched from here: "
+            "its pass clock and state directory would be read from the wrong file. Keep the "
+            "notifier installer's NOTIFIER_CONFIG at its default, or empty NOTIFIER_JOB_LABEL."
+            % (label, runs or "(none that launchd's print names)", NOTIFIER_CONFIG_FILE,
+               ctx.account))
+    got = r.as_role(ctx.account, _notifier_config_read_sh(ctx))
+    if got.rc == 9:
+        raise SetupError(
+            "system/%s is loaded, and ~/.stage-e/%s is missing as %s, so the notifier's pass "
+            "clock and state directory are not known. The notifier installer writes that file."
+            % (label, NOTIFIER_CONFIG_FILE, ctx.account))
+    if not got.ok:
+        raise Unknown("could not read ~/.stage-e/%s as %s (exit %d): %s"
+                      % (NOTIFIER_CONFIG_FILE, ctx.account, got.rc,
+                         (got.err or got.out or "").strip()[:160]),
+                      "run the same command again")
     try:
-        doc = json.loads(got.out) if got.ok and got.out.strip() else None
+        doc = json.loads(got.out)
     except ValueError:
         doc = None
     if not isinstance(doc, dict):
         raise SetupError(
-            "system/%s is loaded, and ~/.stage-e/%s is %s as %s, so the notifier's pass clock "
-            "and state directory are not known. The notifier installer writes that file; a "
-            "notifier configured elsewhere cannot be watched from here."
-            % (label, NOTIFIER_CONFIG_FILE, "missing" if not (got.ok and got.out.strip())
-               else "not a JSON object", ctx.account))
+            "system/%s is loaded, and ~/.stage-e/%s is not a JSON object as %s, so the "
+            "notifier's pass clock and state directory are not known."
+            % (label, NOTIFIER_CONFIG_FILE, ctx.account))
     timeout = doc.get("run_timeout_seconds") or NOTIFIER_DEFAULT_RUN_TIMEOUT
     state_dir = doc.get("state_dir") or NOTIFIER_DEFAULT_STATE_DIR
     if (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
             or not isinstance(state_dir, str)):
-        raise SetupError("~/.stage-e/%s carries a run_timeout_seconds or state_dir the notifier "
-                         "itself would refuse (%r, %r)" % (NOTIFIER_CONFIG_FILE, timeout, state_dir))
+        # Only the SHAPE is judged here. Whether that state dir is inside a git working tree
+        # is the monitor's own `check` to refuse, below, before the job is loaded.
+        raise SetupError("~/.stage-e/%s carries a run_timeout_seconds that is not a whole "
+                         "number of seconds, or a state_dir that is not a path (%r, %r)"
+                         % (NOTIFIER_CONFIG_FILE, timeout, state_dir))
     return {"label": label, "interval": int(found.group(1)), "run_timeout": timeout,
             "state_dir": state_dir}
+
+
+def _notifier_watched(notifier):
+    """The measurement when the monitor is to watch the notifier on this pass, or None."""
+    return notifier if notifier and not notifier.get("paused") else None
 
 
 def _notifier_watch_note(notifier):
     """One clause for the step's row: whether the notifier is watched, and by what gap."""
     if not notifier:
         return "the notifier is not watched (NOTIFIER_JOB_LABEL is empty)"
+    if notifier.get("paused"):
+        return ("notifier paused: not watched; load it, then run this again (launchd does not "
+                "hold system/%s, and its plist is installed)" % notifier["label"])
     return ("it watches the notifier system/%s: every %d + %d s pass = %d s"
             % (notifier["label"], notifier["interval"], notifier["run_timeout"],
                notifier["interval"] + notifier["run_timeout"]))
@@ -4984,8 +5062,10 @@ def step_heartbeat_monitor(ctx, apply_it):
     is NOT RUNNING, never installed.
 
     The notifier is the one job it may also watch, and only as launchd holds it: see
-    `measure_notifier`. Its row says either way. This step writes the monitor's config
-    whole; the notifier installer never writes it, or this step would revert it."""
+    `measure_notifier`. Its row says either way, and says PAUSED when the notifier is
+    unloaded with its plist still installed; a paused notifier is left unwatched and never
+    fails this step. This step writes the monitor's config whole; the notifier installer
+    never writes it, or this step would revert it."""
     r, conf = ctx.runner, ctx.conf
     ticket = monitor_ticket(conf)
     if ticket == "off":
@@ -5013,7 +5093,10 @@ def step_heartbeat_monitor(ctx, apply_it):
                          "exists, or set it to off." % ticket)
 
     # The notifier, as a fourth watched job — or said, by name, not to be (KIT-156). Measured
-    # before anything is written, so a label launchd does not hold stops the step here.
+    # before anything is written, so a label that is refused stops the step here. On a `run`
+    # that moved the clone, `code` already measured it before it stopped the monitor, so a
+    # refusal never reaches this line with the monitor unloaded. A PAUSED notifier is no
+    # refusal: it is left out of `watch` on this pass and the row says so.
     notifier = measure_notifier(ctx)
     watch_note = _notifier_watch_note(notifier)
     want_conf, want_plist = monitor_config(conf, notifier), _monitor_plist(ctx)
@@ -10323,12 +10406,21 @@ def _selftest_body():
             want["notifier_state_dir"] = state_dir
             return want
 
-        def _notifier_ctx(printed=(0, _nprint), nconf=_nconf_doc, have=None, **kw):
+        def _notifier_ctx(printed=(0, _nprint), nconf=_nconf_doc, have=None,
+                          plist_present=True, nconf_rc=0, **kw):
+            """`plist_present` answers whether the notifier's plist is installed — what tells
+            a PAUSED notifier (unloaded, still installed) from one that was never loaded.
+            `nconf` None is a notifier.json that is ABSENT (the read's exit 9); `nconf_rc`
+            any other exit is a read that failed, which is not the same fact."""
             ctx_n, fake_n = _monitor_ctx(**kw)
             ctx_n.conf = dict(ctx_n.conf, NOTIFIER_JOB_LABEL=_nlabel)
-            lead = [("launchctl print system/" + _nlabel, printed[0], printed[1])]
-            if nconf is not None:
-                lead.append(("cat $HOME/.stage-e/notifier.json", 0, json.dumps(nconf)))
+            lead = [("launchctl print system/" + _nlabel, printed[0], printed[1]),
+                    ("test -f " + _dispatcher_plist(_nlabel), 0 if plist_present else 1, "")]
+            if nconf is None:
+                lead.append((".stage-e/" + NOTIFIER_CONFIG_FILE, 9, ""))
+            else:
+                lead.append((".stage-e/" + NOTIFIER_CONFIG_FILE, nconf_rc,
+                             json.dumps(nconf) if nconf_rc == 0 else ""))
             if have is not None:
                 lead.append(("cat $HOME/.stage-e/" + MONITOR_CONFIG, 0, json.dumps(have)))
             fake_n.answers = lead + fake_n.answers
@@ -10391,19 +10483,27 @@ def _selftest_body():
         expect("notifier-watch-install", _bodyNA and json.loads(_bodyNA[0]) == _want_n,
                "the monitor config written was %s" % (_bodyNA[:1],))
 
-        # Refusals: launchd does not hold it; it holds something that is not the notifier;
-        # it gives no interval to judge by; the notifier's config cannot be read. Each is
-        # said by name and writes nothing.
+        # Refusals: launchd does not hold it and nothing is installed under that label; it
+        # holds something that is not the notifier; it gives no interval to judge by; it runs
+        # the notifier on another config than the one read here; the notifier's config is
+        # absent. Each is said by name and writes nothing. A config that is THERE and could
+        # not be read is not "missing": that is NOT MEASURED.
+        _v2print = _nprint.replace("$HOME/.stage-e/notifier.json", "$HOME/.stage-e/notifier-v2.json")
         for name, kw, exc_type, needles in (
-                ("not loaded", {"printed": (113, "Could not find service")}, SetupError,
-                 (_nlabel, "NOTIFIER_JOB_LABEL", "does not hold")),
+                ("not loaded, and no plist", {"printed": (113, "Could not find service"),
+                                              "plist_present": False}, SetupError,
+                 (_nlabel, "NOTIFIER_JOB_LABEL", "does not hold", "no plist")),
                 ("another job", {"printed": (0, _nprint.replace("pipeline_notify_local.py",
                                                                 "pipeline_review_poller.py"))},
                  SetupError, (_nlabel, "pipeline_notify_local.py")),
                 ("no interval", {"printed": (0, _nprint.replace("\trun interval = 300 seconds\n",
                                                                 ""))},
                  Unknown, (_nlabel, "interval")),
-                ("no config", {"nconf": None}, SetupError, ("notifier.json",)),
+                ("another config than the one read here", {"printed": (0, _v2print)}, SetupError,
+                 (_nlabel, "notifier-v2.json", "~/.stage-e/notifier.json")),
+                ("no config", {"nconf": None}, SetupError, ("notifier.json", "missing")),
+                ("a config that could not be read", {"nconf_rc": 1}, Unknown,
+                 ("notifier.json", "could not read", "exit 1")),
                 ("a pass clock the notifier would refuse",
                  {"nconf": dict(_nconf_doc, run_timeout_seconds="240")}, SetupError,
                  ("run_timeout_seconds", "'240'")),
@@ -10416,11 +10516,101 @@ def _selftest_body():
                 failures.append("notifier-watch-refused (%s): the step went on" % name)
             except exc_type as exc:
                 expect("notifier-watch-refused", all(n in str(exc) for n in needles)
+                       and "itself would refuse" not in str(exc)
                        and not fakeNR.writes,
                        "%s: %s; writes %s" % (name, exc, [w["why"] for w in fakeNR.writes]))
             except (SetupError, Unknown, Blocked) as exc:
                 failures.append("notifier-watch-refused (%s): %s, not %s: %s"
                                 % (name, type(exc).__name__, exc_type.__name__, exc))
+        # The spellings of the one config that IS read here are all accepted: `$HOME/…` (what
+        # the notifier installer writes), `~/…`, and the role account's home spelled out.
+        for spelled in ('"~/.stage-e/notifier.json"',
+                        '"/Users/<role-account>/.stage-e/notifier.json"'):
+            ctxNS2, fakeNS2 = _notifier_ctx(
+                printed=(0, _nprint.replace('"$HOME/.stage-e/notifier.json"', spelled)),
+                have=_want_n)
+            try:
+                okNS2, detailNS2, _x = step_heartbeat_monitor(ctxNS2, apply_it=False)
+                expect("notifier-watch-config-spellings", okNS2 is True and "500" in detailNS2,
+                       "%s read %r" % (spelled, detailNS2))
+            except (SetupError, Unknown, Blocked) as exc:
+                failures.append("notifier-watch-config-spellings: %s refused: %s" % (spelled, exc))
+
+        cases += 1
+        # PAUSED (the KIT-178 review round, 2026-09-24): launchd does not hold the label, and
+        # its plist is still installed — the notifier's own documented pause, `bootout`. It is
+        # not watched on this pass, the row says so by name, and the step does NOT fail: the
+        # monitor is written without it and loaded for the other three, even after `code`
+        # stopped it.
+        ctxNP, fakeNP = _notifier_ctx(printed=(113, "Could not find service"), config=False,
+                                      plist=False, loaded=False, beat_age=-5)
+        fakeNP.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                          (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
+                          ("install -o root", 0, ""), (_rearm_cmd, 0, ""),
+                          ("launchctl bootstrap system", 0, "")] + fakeNP.answers
+        ctxNP.unloaded = [mlabel]
+        try:
+            (okNP, detailNP, _x), _o = _quiet(lambda: step_heartbeat_monitor(ctxNP, apply_it=True))
+            _bodyNP = [w["stdin"] for w in fakeNP.writes if "write " in w["why"]]
+            expect("notifier-watch-paused",
+                   "notifier paused: not watched; load it, then run this again" in detailNP
+                   and _bodyNP and json.loads(_bodyNP[0]) == monitor_config(_conf_n)
+                   and any("launchctl bootstrap system" in _fmt(w["argv"]) for w in fakeNP.writes)
+                   and mlabel not in ctxNP.unloaded,
+                   "a paused notifier read %r, wrote %s, left unloaded %s"
+                   % (detailNP, _bodyNP[:1], ctxNP.unloaded))
+        except (SetupError, Unknown, Blocked) as exc:
+            failures.append("notifier-watch-paused: a paused notifier failed the step and left "
+                            "the monitor %s: %s" % ("unloaded" if mlabel in ctxNP.unloaded
+                                                     else "as it was", exc))
+        # …and `verify` over a settled monitor that already leaves it out holds, saying so;
+        # over one still watching it, it names the change and fails nothing.
+        for name, have, want_ok in (("already unwatched", monitor_config(_conf_n), True),
+                                    ("still watched", _want_n, False)):
+            ctxNV, fakeNV = _notifier_ctx(printed=(113, "Could not find service"), have=have)
+            try:
+                okNV, detailNV, _x = step_heartbeat_monitor(ctxNV, apply_it=False)
+                expect("notifier-watch-paused-verify",
+                       okNV is want_ok and "notifier paused: not watched" in detailNV
+                       and not fakeNV.writes, "%s: %r" % (name, detailNV))
+            except (SetupError, Unknown, Blocked) as exc:
+                failures.append("notifier-watch-paused-verify (%s): %s" % (name, exc))
+
+        cases += 1
+        # `code` MEASURES THE NOTIFIER BEFORE IT STOPS ANYTHING, when the monitor it would stop
+        # is going to watch it. A refusal then stops the run with every job still loaded, not
+        # after the monitor was stopped with nothing left to load it again.
+        def _code_ctx(**kw):
+            ctx_c, fake_c = _notifier_ctx(**kw)
+            fake_c.answers = [("ls $HOME/.stage-e/kit/scripts", 0, "\n"),
+                              ("rev-parse --short HEAD", 1, ""),
+                              ("git clone --quiet", 0, "")] + fake_c.answers
+            return ctx_c, fake_c
+        ctxKC, fakeKC = _code_ctx(printed=(113, "Could not find service"), plist_present=False)
+        try:
+            _quiet(lambda: step_code(ctxKC, apply_it=True))
+            failures.append("notifier-watch-before-code: code went on past a refused notifier")
+        except SetupError as exc:
+            expect("notifier-watch-before-code",
+                   _nlabel in str(exc) and not any("bootout" in _fmt(w["argv"])
+                                                   for w in fakeKC.writes)
+                   and ctxKC.unloaded == [],
+                   "%s; writes %s; unloaded %s" % (exc, [_fmt(w["argv"]) for w in fakeKC.writes],
+                                                   ctxKC.unloaded))
+        except (Blocked, Unknown) as exc:
+            failures.append("notifier-watch-before-code: %s, not a refusal before any "
+                            "unload: %s; unloaded %s" % (type(exc).__name__, exc, ctxKC.unloaded))
+        # …and a PAUSED notifier is no reason to stop: `code` goes on and stops the monitor.
+        ctxKP, fakeKP = _code_ctx(printed=(113, "Could not find service"))
+        try:
+            _quiet(lambda: step_code(ctxKP, apply_it=True))
+        except Blocked:
+            pass
+        except (SetupError, Unknown) as exc:
+            failures.append("notifier-watch-before-code: a paused notifier stopped `code`: %s"
+                            % exc)
+        expect("notifier-watch-before-code", mlabel in ctxKP.unloaded,
+               "a paused notifier: code recorded %s" % ctxKP.unloaded)
     finally:
         globals()["_pause"] = _saved_pause_m
     order = [s for s, _t, _f in STEPS]

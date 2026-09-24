@@ -56,7 +56,9 @@ is skipped, and the pass **names it** in its summary: ticket, comment, author. T
 no exit code, so one forged comment cannot turn every pass into exit 3 while it stays in the
 window. The key is optional in the notifier's config. Absent, the marks count from nobody,
 and every pass says `daemon-health marks: OFF` — so a config written before the key existed
-keeps loading.
+keeps loading. A mark seen while the key is absent is **deferred, not dropped**: it is not
+recorded as seen, so once the key is set, every health comment still among the newest the
+notifier reads pings, oldest first.
 
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
@@ -174,7 +176,7 @@ Not set, the labels row says **NOT MEASURED** and prints those three lines.
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
 | `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
-| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config as the role account, and **never writes it**, to say whether the daemon-health page is on | — |
+| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on | — |
 
 **Two sign-offs are bound to what they signed.** `A-PRIVATE-CHANNEL` records the channel
 id. Change the channel and `CK-N1` comes back. `A-FIRST-PING` records the config the job
@@ -309,14 +311,21 @@ comments on. `NOTIFIER_JOB_LABEL` set to this notifier's `JOB_LABEL` makes the m
 this notifier's heartbeat too. Run the Stage E installer after this one: it asks launchd
 what it holds under that label, so the notifier must be loaded first.
 
-**The `handover` row says ON only when both ends agree:**
+**The `handover` row says ON only when every one of these holds:**
 
 | It checks | OFF when |
 |---|---|
 | the monitor's config exists, as the role account reads it | it does not, or it is not JSON |
 | the monitor comments on a ticket of a team in `TEAM_KEYS` | the notifier never reads that team's comments |
 | with the same key `self` resolves | `MONITOR_ACTOR_IDS=self` and the monitor uses another key |
+| the monitor **runs**: its own heartbeat is a real pass, recent, with a good result | it has written none, or its last one is older than two of its intervals plus a pass and two minutes. A rehearsal, a bad result or a file it cannot judge is NOT PROVEN |
+| this notifier's own config — the file the job reads, not `notifier.conf` — names `monitor_actor_ids`, and every id `MONITOR_ACTOR_IDS` names | the file names none: the job pages on the marks from nobody. Run `run` with the tracker key in your shell |
 | the monitor watches this notifier, with its current state directory and interval | it does not, or it measured an older notifier: run the Stage E installer again |
+
+The monitor's config alone is not a running monitor. `HEARTBEAT_MONITOR_TICKET=off`
+unloads the monitor and leaves its config behind, and so does a Stage E run that stopped
+before loading it. For up to that heartbeat limit after a monitor stops (about 64 minutes on
+the defaults), its last heartbeat is still fresh, so the row can still say ON until then.
 
 **Adding the key to an installed notifier changes its config.** The `config` step rewrites
 the file, and `CK-N4` comes back, because the first-ping sign-off is bound to the config.
@@ -324,6 +333,34 @@ The role account's clone must carry this change first. An older notifier would r
 new key on every pass, so the `config` step asks the clone's notifier which keys it knows
 and writes nothing it does not know. It fails instead, naming the key and the Stage E
 installer's `code` step, which moves the clone.
+
+**A `verify` without the key cannot add it.** On a notifier installed before KIT-156, the
+ledger holds no monitor ids. So the `config` row says it waits on the labels step, and the
+`handover` says the page is OFF, naming `monitor_actor_ids`. That is the page's true state
+until a `run` with the key writes the config.
+
+**Turning the page on after the merge that brings it:**
+
+1. Pull this checkout, then run the Stage E installer's `run`. It moves the role account's
+   clone.
+2. Run this installer's `run` with `$STAGE_E_LINEAR_API_KEY` set in your shell. It resolves
+   `MONITOR_ACTOR_IDS` and rewrites the config. After the job's next pass, `CK-N4` comes back.
+3. Set `NOTIFIER_JOB_LABEL` in `stage-e.conf` to this notifier's `JOB_LABEL`, and run the
+   Stage E installer again. It watches this notifier from then on.
+
+Do steps 1 and 2 in one sitting. Between them the monitor already marks its comments and this
+notifier does not page on them yet. Any it posts in that gap ping late, when step 2 lands,
+oldest first. The same goes for switching `MONITOR_ACTOR_IDS` from `off` to on later.
+
+**Pausing this notifier while the monitor watches it.** Unload it as usual. The Stage E
+installer's `heartbeat-monitor` row then says `notifier paused: not watched; load it, then
+run this again`, and the step does not fail. A monitor already watching it reports it stale.
+Load it again, and run the Stage E installer to watch it again if a Stage E run happened
+during the pause.
+
+**A notifier that refuses its own config writes no heartbeat.** It exits 2 before a pass
+starts. So the monitor's row for it shows its last good beat until that ages out, then
+`stale`, not `failing`. The reason is in `~/.stage-e/notifier.log`.
 
 ---
 

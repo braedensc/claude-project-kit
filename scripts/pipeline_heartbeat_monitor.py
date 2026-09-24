@@ -24,8 +24,8 @@ HOW THE COMMENT REACHES A PERSON (KIT-156)
   So the comment alone reached nobody. It now carries a mark alone on its FIRST line,
   `<!-- pipeline-escalation: daemon-health-incident -->` on an incident and
   `…daemon-health-recovered -->` on a recovery, and the human-action notifier pings the
-  private chat channel on it. This job holds no chat token: the notifier stays the only
-  thing that sends a ping. The notifier accepts these two marks only from the author ids
+  private chat channel on it. This job's code reads no chat token: the notifier stays the
+  only thing that sends a ping. The notifier accepts these two marks only from the author ids
   its own config names (`monitor_actor_ids`), applies no label for either, and pings once
   per comment.
 
@@ -34,9 +34,12 @@ HOW THE COMMENT REACHES A PERSON (KIT-156)
   before it is embedded (the plan executor's rule), so a daemon — or anything that can write
   its state directory — cannot put a second mark into the comment.
 
-  When the notifier is itself one of the problems, the comment says in its own text that it
-  probably pinged nobody. A dead notifier cannot page about itself; the comment still lands
-  on the ticket, and an off-box check is the only real answer (KIT-45).
+  When the notifier is itself one of the problems, the comment says in its own text what that
+  means for the ping. A notifier that is not running, or failing some other way, probably
+  pinged nobody, and the comment says so: a dead notifier cannot page about itself; the
+  comment still lands on the ticket, and an off-box check is the only real answer (KIT-45).
+  A notifier whose last pass exited 3 is running and declined something it found; it reads
+  the comment on its next pass, and the comment says that instead.
 
 WHAT IT CANNOT CATCH, STATED FIRST BECAUSE IT IS THE POINT
 
@@ -74,7 +77,8 @@ WHAT IT WATCHES, AND WHY THE FOUR SHAPES ARE NOT UNIFIED HERE
   the shapes stay where they are and the differences live in the WATCHERS table below — one
   row per job, declaring the schema string, the timestamp fields in priority order, and what
   counts as a good result. The notifier's exit is read by way of this file's own exit table,
-  and only exit 0 is good: its exit 3 is a ping or a label that did not land.
+  and only exit 0 is good: its exit 3 is a pass that declined something it found — a ping or
+  a label did not land, or a per-pass cap held events back — and it stays failing.
 
   A shape this table does not recognize is `unreadable`, which is a verdict about THIS
   MONITOR ("I could not judge") and never about the daemon ("it is down"). Those two are
@@ -145,8 +149,11 @@ WHAT IT NEVER DOES (asserted in --selftest against this file's own source)
   label, moves no ticket state, creates no ticket, touches no pull request, approves and
   merges nothing, and launches no session. The one `pipeline-escalation` mark it writes is
   one of its two daemon-health marks, on line 1 of its own comment, and neither mark carries
-  a label in the notifier's table: a lifecycle label is not this job's to cause. It sends no
-  chat message and holds no chat token.
+  a label in the notifier's table: a lifecycle label is not this job's to cause. Its code
+  sends no chat message and reads no chat token: no chat API, no token name, and no URL but
+  the tracker's. That is a claim about this code, not about the process: the role account's
+  env file it is started with may hold the notifier's token, and no source scan can say what
+  an environment holds.
 
 Usage:
   pipeline_heartbeat_monitor.py run   --config FILE [--dry-run] [--timeout N]
@@ -310,8 +317,9 @@ WATCHERS = {
     },
     # The human-action notifier (KIT-156): the job that turns this monitor's mark into a
     # ping. Its heartbeat carries an integer `exit` and no result string. Only exit 0 is
-    # good: its exit 3 is a ping or a label that did not land (owner decision, 2026-09-24),
-    # unlike the review poller's, which is that poller doing its job.
+    # good: its exit 3 is the notifier declining something it found — a ping or a label did
+    # not land, or a per-pass cap held events back — and it stays failing (owner decision,
+    # 2026-09-24), unlike the review poller's, which is that poller doing its job.
     NOTIFIER_JOB: {
         "label": "notifier",
         "writer": "scripts/pipeline_notify_local.py",
@@ -725,14 +733,26 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     for v in sorted(report["verdicts"], key=lambda v: v["job"]):
         lines.append("| %s | `%s` | %s |" % (v["label"], v["verdict"], defuse(v["detail"])))
     lines.append("")
-    if not recovery and any(v["job"] == NOTIFIER_JOB for v in report["problems"]):
+    notifier_row = next((v for v in report["problems"] if v["job"] == NOTIFIER_JOB), None)
+    if not recovery and notifier_row is not None:
         # The notifier is the job that turns this comment's mark into a ping. Named here as
-        # a problem, it probably cannot: say so where the reader is, rather than let the
-        # absence of a ping read as the absence of a problem.
-        lines.append("**This comment has probably pinged nobody.** The notifier is one of "
-                     "the jobs named above, and it is the job that turns this comment into a "
-                     "chat ping. A ping comes late, if at all: only once the notifier works "
-                     "again while this comment is still among the newest it reads.")
+        # a problem, it may not: say so where the reader is, rather than let the absence of
+        # a ping read as the absence of a problem. Which sentence depends on WHY it is a
+        # problem. Its exit 3 is a pass that ran and declined something it found — it reads
+        # this comment on its next pass and pings it — so claiming nobody was pinged would be
+        # false. Anything else (not running, wedged, unjudgeable, another failing exit) keeps
+        # the warning: claiming a ping that never went out is the worse of the two lies.
+        if notifier_row["verdict"] == "failing" and notifier_row.get("result") == "declined":
+            lines.append("**The notifier is running, and its last pass declined something it "
+                         "found:** a ping or a label did not land, or a per-pass cap held "
+                         "events back. It reads this comment on its next pass, so this comment "
+                         "is probably pinged then. Its heartbeat's `summary` names what it "
+                         "declined.")
+        else:
+            lines.append("**This comment has probably pinged nobody.** The notifier is one of "
+                         "the jobs named above, and it is the job that turns this comment into "
+                         "a chat ping. A ping comes late, if at all: only once the notifier "
+                         "works again while this comment is still among the newest it reads.")
     if report["unwatched"]:
         lines.append("Not watched on this machine, so not judged: %s."
                      % ", ".join(report["unwatched"]))
@@ -891,6 +911,16 @@ def load_config(path):
         problems.append("'monitor_state_dir' (%s) is inside a git working tree. A session "
                         "can write a worktree, and this file decides whether a page about "
                         "that session's PR is sent" % monitor_dir)
+    # Every WATCHED job's heartbeat directory, too. A session that can write it can write a
+    # fresh `ok` beat there, and a job that is down then reads as healthy. The notifier refuses
+    # a state dir inside a worktree and then writes no heartbeat at all, so a beat found in
+    # one is by construction not the notifier's. A directory only an unwatched job would use
+    # is never read, so it is not judged.
+    for key in sorted(set(WATCHERS[job]["dir_key"] for job in watch)):
+        if dirs[key] != monitor_dir and _inside_git_worktree(dirs[key]):
+            problems.append("'%s' (%s) is inside a git working tree. A session can write a "
+                            "worktree, and a heartbeat written there would make a job that is "
+                            "down read as healthy" % (key, dirs[key]))
 
     if problems:
         raise MonitorError("this config cannot be used:\n  - %s" % "\n  - ".join(problems),
@@ -1568,6 +1598,43 @@ def selftest():
        "pinged nobody" in notifier_down and "pinged nobody" not in body
        and "pinged nobody" not in part_body and "pinged nobody" not in notifier_back,
        notifier_down)
+    # …and not one where the notifier is WATCHED AND HEALTHY while another job is down: the
+    # sentence is about the notifier being a problem, not about it being watched.
+    notifier_fine = build_comment(report_of([("review-poller", "stale"), ("notifier", "ok")]),
+                                  None, 0, False, {"review-poller": 300, "notifier": 540})
+    ok("an incident on a machine whose notifier is watched and healthy does not say it "
+       "pinged nobody, nor that the notifier declined anything",
+       "pinged nobody" not in notifier_fine and "declined something" not in notifier_fine,
+       notifier_fine)
+
+    # A NOTIFIER THAT RAN AND DECLINED is not a stopped one. Its exit 3 is still `failing`
+    # (owner decision, 2026-09-24), but it is running: it reads this comment on its next pass
+    # and pings it. So the comment says what its exit 3 means instead, and never that nobody
+    # was pinged. Every verdict that means it is NOT running — and a failing exit other than
+    # 3, or one this monitor cannot read as a number — keeps the "pinged nobody" sentence:
+    # claiming a ping that never went out is the worse lie of the two.
+    def with_notifier(verdict, result=None):
+        rows = [{"job": "review-poller", "label": "review-poller", "verdict": "stale",
+                 "detail": "d", "result": None},
+                {"job": "notifier", "label": "notifier", "verdict": verdict, "detail": "d",
+                 "result": result}]
+        return build_comment(build_report(rows, set(), False, None), None, 0, False,
+                             {"review-poller": 300, "notifier": 540})
+    declining = with_notifier("failing", "declined")
+    ok("an incident naming a notifier that RAN and declined (exit 3) does not say it pinged "
+       "nobody — it says what exit 3 means, and that this comment is read on its next pass",
+       "pinged nobody" not in declining and "declined something it found" in declining
+       and "a per-pass cap held events back" in declining and "next pass" in declining,
+       declining)
+    for verdict_x, result_x in (("stale", None), ("missing", None), ("wedged", None),
+                                ("unreadable", None), ("failing", "error"),
+                                ("failing", "usage"), ("failing", "timeout"),
+                                ("failing", "exit-7"), ("failing", None)):
+        ok("…while a notifier that is %s%s still says this comment probably pinged nobody"
+           % (verdict_x, " (%s)" % result_x if result_x else ""),
+           "pinged nobody" in with_notifier(verdict_x, result_x)
+           and "declined something it found" not in with_notifier(verdict_x, result_x),
+           with_notifier(verdict_x, result_x))
 
     # A MARK FORGED IN A HEARTBEAT reaches no line but the first. Every value this comment
     # takes from a heartbeat is text some daemon wrote — a result string, a pause time, a
@@ -1683,6 +1750,27 @@ def selftest():
                            notifier_state_dir=os.path.join(tmp, "nstate"))))
         ok("a state dir inside a git working tree is refused (a session could write it)",
            "inside a git working tree" in errors_for(dict(good, monitor_state_dir=HERE)))
+        # A WATCHED JOB'S HEARTBEAT DIRECTORY is the same kind of file: a session that can
+        # write it can write a fresh `ok` beat there, and a job that is down reads as healthy.
+        # The notifier refuses a state dir inside a worktree and then writes no heartbeat at
+        # all, so a beat found there is by construction not the notifier's.
+        wt = os.path.join(tmp, "a-worktree")
+        os.makedirs(os.path.join(wt, ".git"))
+        with_notifier_dir = dict(good, watch=["review-poller", "notifier"],
+                                 intervals={"review-poller": 300, "notifier": 540},
+                                 notifier_state_dir=os.path.join(wt, "nstate"))
+        msg = errors_for(with_notifier_dir)
+        ok("a watched job's heartbeat directory inside a git working tree is refused "
+           "(notifier_state_dir)",
+           "'notifier_state_dir'" in msg and "inside a git working tree" in msg, msg)
+        msg = errors_for(dict(good, state_dir=os.path.join(wt, "s"),
+                              monitor_state_dir=os.path.join(tmp, "m")))
+        ok("…and the daemons' own (state_dir), with the monitor's state kept outside",
+           "'state_dir'" in msg and "inside a git working tree" in msg
+           and "'monitor_state_dir'" not in msg, msg)
+        ok("…but a directory only an UNWATCHED job would use is not judged",
+           errors_for(dict(good, notifier_state_dir=os.path.join(wt, "nstate"))) == "",
+           errors_for(dict(good, notifier_state_dir=os.path.join(wt, "nstate"))))
         ok("an unreadable --config is exit 2, before anything is read",
            errors_for("not-a-dict") or True)
         try:
@@ -2004,6 +2092,20 @@ def selftest():
               "assigneeId", "commentUpdate", "issueDelete")
     for token in banned:
         ok("never constructs %r" % token, token not in body_only)
+    # NO CHAT SEND, NO CHAT TOKEN — the notifier is the only job that pings (owner decision,
+    # KIT-156). The bare word "chat" is not banned: the prose here uses it to say exactly this.
+    # A claim about the CODE: the env file the role account sources may hold the notifier's
+    # token, and no source scan can say what a process's environment holds.
+    for token in ("slack", "postmessage", "xoxb", "chat_token", "bot_token"):
+        ok("its code reads no chat token and sends no chat message (%r)" % token,
+           token not in body_only.lower())
+    named_urls = sorted(set(re.findall(r"https?://[^\s\"'<>)]+", body_only)))
+    ok("…the only URL its code names is the tracker's", named_urls == [LINEAR_API], named_urls)
+    ok("…it opens exactly one kind of connection, the tracker's",
+       body_only.count("urlopen(") == 1, body_only.count("urlopen("))
+    ok("…and it reads exactly one environment variable: the tracker key's, by the name its "
+       "config gives", body_only.count("os.environ") == 1
+       and "os.environ.get(name" in body_only, body_only.count("os.environ"))
     ok("this file declares exactly ONE tracker mutation", body_only.count("mutation(") == 1)
     ok("…and that mutation is commentCreate", "commentCreate" in COMMENT_MUTATION)
     ok("it launches no session and runs no model",
@@ -2096,6 +2198,16 @@ def selftest():
         ok("…and from EVERYONE while no monitor author is configured (OFF)",
            not any(pnl.is_authorised(m, "monitor-actor-1", {"executor_actor_ids": ["x"]})
                    for m in (inc, rec)))
+        # The gate is two-way: the monitor's author is not an executor. The four planning
+        # marks, from the monitor's id, are refused — and accepted from the executor's, so the
+        # refusal is the gate and not a dead fixture.
+        planning = (pnl.ESC_AWAITING_APPROVAL, pnl.ESC_NEEDS_INPUT, pnl.ESC_REJECTED,
+                    pnl.ESC_NO_OUTPUT)
+        ok("…and the monitor's author may write none of the four planning marks, which the "
+           "executor's may",
+           not any(pnl.is_authorised(m, "monitor-actor-1", gate) for m in planning)
+           and all(pnl.is_authorised(m, "exec-actor-1", gate) for m in planning),
+           [(m, pnl.is_authorised(m, "monitor-actor-1", gate)) for m in planning])
 
         # End to end through the notifier's own selection: the monitor's incident and
         # recovery comments on its ticket are two events with no label; from any other
@@ -2121,6 +2233,20 @@ def selftest():
         ok("a comment carrying a mark forged in a heartbeat pages as ONE incident, and the "
            "forged mark is not even seen as a mark below line 1",
            [e["mark"] for e in events] == [inc] and not skipped, (events, skipped))
+        # ORDER. The tracker hands the comment window back NEWEST first; an incident and its
+        # recovery found in one pass (a notifier back from an outage, the key switched on)
+        # must still ping incident first, or the last ping in the channel says "needs a look"
+        # about an incident that is over.
+        newest_first = [{"id": "KIT-7", "uuid": "u-7", "title": "daemon health", "label_ids": [],
+                         "comments": [
+                             {"id": "c-rec", "body": recovery_body, "author_id": "monitor-actor-1",
+                              "created_at": "2026-09-12T12:30:00.000Z"},
+                             {"id": "c-inc", "body": body, "author_id": "monitor-actor-1",
+                              "created_at": "2026-09-12T12:00:00.000Z"}]}]
+        events, skipped, _cap = pnl.select_events(newest_first, set(), sel_cfg)
+        ok("an incident and its recovery found in ONE pass are selected oldest first, whatever "
+           "order the tracker returned them in",
+           [e["mark"] for e in events] == [inc, rec], [e["mark"] for e in events])
 
         # The fourth watcher row IS the notifier's heartbeat: its schema, its filename, and
         # the directory the notifier writes it in by default.
@@ -2140,9 +2266,10 @@ def selftest():
         ok("the exit vocabulary agrees with the notifier's, name for name",
            all(globals()[n] == getattr(pnl, n, None) for n in
                ("EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "EXIT_DECLINED", "EXIT_TIMEOUT")))
-        # THE NOTIFIER'S OWN WRITER, at each exit it can leave. Exit 3 is a ping or a label
-        # that did not land, so it is FAILING here (owner decision, 2026-09-24): unlike the
-        # review poller's exit 3, nothing about it is the job doing its job.
+        # THE NOTIFIER'S OWN WRITER, at each exit it can leave. Exit 3 is the notifier
+        # declining something it found — a ping or a label did not land, or a per-pass cap
+        # held events back — so it is FAILING here (owner decision, 2026-09-24): unlike the
+        # review poller's exit 3, something it found went unsaid on that pass.
         with tempfile.TemporaryDirectory() as nd:
             ncfg = {"state_dir": nd}
             for code, want in ((0, "ok"), (1, "failing"), (2, "failing"), (3, "failing"),
@@ -2173,6 +2300,40 @@ def selftest():
            judged_exit(0)["verdict"] == "ok"
            and all(r["verdict"] == "failing" and r["result"] is None for r in odd_rows.values()),
            dict((k, (r["verdict"], r["result"])) for k, r in odd_rows.items()))
+        seven = judged_exit(7)
+        ok("an integer exit no sibling uses is its own word, `exit-7`, in no good list",
+           seven["verdict"] == "failing" and seven["result"] == "exit-7",
+           (seven["verdict"], seven["result"]))
+
+        # A NOTIFIER THAT REFUSES ITS OWN CONFIG leaves no heartbeat: it exits 2 before a pass
+        # starts, and the directory it would write in is named by the config it refused. So
+        # the monitor reads its LAST beat until that ages past the limit, and then `stale` —
+        # never `failing`. A pin on what docs/HEARTBEAT-MONITOR.md says; the notifier's log
+        # and launchd's last exit code are where the reason is.
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as rd:
+            sd = os.path.join(rd, "state")
+            os.makedirs(sd)
+            ncfg2 = {"state_dir": sd}
+            pnl.write_heartbeat(ncfg2, {"exit": 0, "summary": "s"}, _iso(time.time() - 2000))
+            with open(pnl.heartbeat_path(ncfg2), encoding="utf-8") as fh:
+                beat_before = fh.read()
+            refused_path = os.path.join(rd, "notifier.json")
+            with open(refused_path, "w", encoding="utf-8") as fh:
+                json.dump(dict(pnl.EXAMPLE_CONFIG, state_dir=sd,
+                               a_key_this_notifier_does_not_know=1), fh)
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                refused_rc = pnl.main(["run", "--config", refused_path])
+            with open(pnl.heartbeat_path(ncfg2), encoding="utf-8") as fh:
+                beat_after = fh.read()
+            aged = judge_one("notifier", spec_n, read_beat(pnl.heartbeat_path(ncfg2)),
+                             time.time(), stale_after(540, DEFAULT_STALE_MULTIPLIER), False)
+            ok("a notifier that refuses its own config exits 2 and writes no heartbeat, so the "
+               "monitor reads it `stale` once its last beat ages out — not `failing`",
+               refused_rc == EXIT_USAGE and beat_after == beat_before
+               and aged["verdict"] == "stale", (refused_rc, aged["verdict"]))
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))
