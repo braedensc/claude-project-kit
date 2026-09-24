@@ -45,7 +45,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -715,356 +714,1034 @@ def _in_git_store(path: str) -> bool:
 # ── Stacked-branch guard: cut from the base, merge back into the base ──────────
 # Added 2026-09-20, after six PRs shipped as a six-deep stack
 # (#153←#154←#155←#156←#157←#158), each branched off its predecessor. Every
-# squash-merge of a base REWRITES the base branch, which puts all remaining
+# squash-merge of a base REWRITES the base branch, which put all remaining
 # descendants into CONFLICTING at once — and GitHub runs NO checks on a
 # conflicted PR, so five PRs read as "no checks reported", which looks like
-# broken CI rather than a conflict. Six stacked PRs meant five forced
-# re-cascades; it ended by merging the tip alone and closing the other four.
-# Independent branches off the base never do this.
+# broken CI rather than a conflict. Five forced re-cascades; it ended by merging
+# the tip alone and closing the other four. Independent branches never do this.
 #
 # THE RULE: a feature branch is cut FROM the base branch and merges BACK INTO
-# it. Feature → feature is forbidden in both directions — creating a branch off
-# another feature branch, and merging one feature branch into another.
+# it. Feature → feature is forbidden in both directions: cutting a branch whose
+# start commit carries another branch's unmerged work, and bringing another
+# feature branch's work into this one (merge, pull, rebase onto it, push into it).
 #
-# THE ONE THING THIS MUST NOT BREAK: merging the BASE *into* a feature branch.
-# `git merge origin/main` is the kit's documented conflict-resolution move
-# (never rebase — docs/LESSONS.md), and it is what the automated conflict loop
-# in .github/workflows/pr-conflict-monitor.yml asks a session to run. So the
-# base set below is an ALLOW-list every arm consults, and _is_base_ref is
-# deliberately generous about the remote segment: a false NEGATIVE there would
-# block the conflict loop's only move, which is a far worse failure than a
-# stacked branch getting through. Everything unparseable fails OPEN for the
-# same reason.
+# WHAT "CUT FROM THE BASE" MEANS HERE — BY CONTENT, NOT BY NAME. A start point is
+# fine when every commit it carries is already on a base branch's history
+# (`git rev-list <start> --not <base tips>` is empty). So a tag or a SHA on main
+# passes, a fresh `claude/<codename>` worktree branch with no commits of its own
+# passes, a detached HEAD on main passes — and a branch with one commit of its own
+# does not, whatever it is called. Names are only the fast path: a start point
+# that NAMES a base branch is allowed without asking git anything.
 #
-# REACH, stated plainly. Like every Bash guard in this file it matches command
-# TEXT, so it is ADVISORY — measured in docs/SECURITY.md § *What the pattern
-# guards actually carry*; a respelling gets past it. It catches the cooperating
-# session that stacks out of habit, which is exactly how the 2026-09-20 incident
-# happened. The two layers that do NOT read command text are the Stop hook
-# (which reads the open PR's `baseRefName` out of GitHub's own record when a
-# turn ends) and the CI step `scripts/check_pr_base.py` (which reads the base
-# off the `pull_request` event). Neither can be respelled; docs/COLLABORATION.md
-# says which of the three carries what.
+# THE ONE MOVE THIS MUST NEVER BREAK: bringing the BASE into a feature branch.
+# `git fetch origin main && git merge origin/main` is what the conflict loop
+# (scripts/pr_conflict.py, pr-conflict-monitor.yml) and the Stage E bounce driver
+# ask a session to run; rebasing onto the base is the other documented spelling.
+# Both name a base branch, so both take the fast path. Syncing a branch from its
+# OWN remote copy (`git pull origin <this-branch>`, `git merge @{u}`) is not
+# stacking either, and is allowed.
+#
+# HOW THE COMMAND IS READ. `_shell_commands` is a small quote-aware shell lexer:
+# it drops comments, redirections (and their targets), heredoc bodies and line
+# continuations, splits on `;` `&&` `||` `|` `&` `(` `)` and newlines only OUTSIDE
+# quotes, and descends into `$(…)`, backticks, `sh -c '…'` and `eval`. It is total
+# (never raises) and linear in the command's length.
+#
+# FAIL DIRECTION, stated once and precisely:
+#   * a ref the hook cannot see at hook time — `$VAR`, `$(…)` output, FETCH_HEAD,
+#     `-`, `@{-N}` — fails CLOSED, and the message says to name the ref;
+#   * a ref that names no base branch and does not resolve in this checkout fails
+#     CLOSED (git would refuse it anyway);
+#   * a checkout where NO base branch exists at all (nothing to measure against),
+#     and any git failure while measuring, fail OPEN.
+#
+# REACH, stated plainly. This reads command TEXT, so it is ADVISORY — measured in
+# test_guard_bypass.py and docs/SECURITY.md § *What the pattern guards actually
+# carry*; a spelling the lexer cannot follow gets past it (`${IFS}` as a word
+# separator is the recorded example). The layers that do NOT read command text
+# are the Stop hook (the open PR's `baseRefName`, read from GitHub's own record)
+# and .github/workflows/pr-base.yml (the `pull_request` event). Neither sees a
+# branch CUT from a feature branch whose PR targets main — only this guard does.
 _STACK_WHY = (
     "Every branch is cut from the base branch and merges back into it — never "
     "off, or into, another feature branch. A six-deep stack on 2026-09-20 cost "
     "five forced re-cascades: squash-merging a base REWRITES the base branch, so "
-    "every descendant PR turns CONFLICTING at once, and GitHub runs NO checks on "
+    "every PR stacked on it turns CONFLICTING at once, and GitHub runs NO checks on "
     "a conflicted PR — they read as \"no checks reported\", which looks like "
-    "broken CI. (docs/COLLABORATION.md)"
+    "broken CI. (docs/COLLABORATION.md § Never stack a PR)"
 )
 STACK_CREATE_HELP = (
-    "🔒 Stacked branch blocked — this would cut `{new}` from {origin}, which is "
-    "not a base branch (base = {bases}).\n"
+    "🔒 Stacked branch blocked — this would cut `{new}` from {origin}, which carries "
+    "commits that are not on a base branch (base = {bases}).\n"
     + _STACK_WHY + "\n"
-    "Branch off the base instead:\n"
-    "  git fetch origin && git checkout -b {new} origin/{base}\n"
-    "If you need work that only exists on another feature branch, wait for that "
-    "branch to merge and then cut from the updated base."
+    "Cut it from the base instead (`--no-track`, so the new branch does not adopt "
+    "the base as its upstream):\n"
+    "  git fetch origin && git switch --no-track -c {new} origin/{base}\n"
+    "If the work you need is only on another feature branch, wait for that branch "
+    "to merge, then cut from the updated base. To continue an EXISTING PR branch, "
+    "check it out by name instead: git switch <its-name>"
 )
 STACK_MERGE_HELP = (
-    "🔒 Feature-to-feature merge blocked — `{ref}` is not a base branch "
-    "(base = {bases}).\n"
+    "🔒 Feature-to-feature {verb} blocked — `{ref}` carries commits that are not on "
+    "a base branch (base = {bases}).\n"
     + _STACK_WHY + "\n"
-    "Merging the BASE into your branch is the opposite case and stays ALLOWED — "
-    "it is this repo's conflict-resolution move:\n"
-    "  git fetch origin && git merge origin/{base}\n"
-    "(A bare `FETCH_HEAD` is refused for the same reason: the guard cannot see "
-    "which ref was fetched. Name the ref — `git merge origin/{base}`.)"
+    "Bringing the BASE into your branch is the opposite case and stays ALLOWED — it "
+    "is what the conflict loop asks for:\n"
+    "  git fetch origin {base} && git merge origin/{base}\n"
+    "Syncing your branch from its own remote copy (`git pull`, `git merge @{{u}}`) "
+    "is allowed too."
+)
+STACK_UNSEEN_HELP = (
+    "🔒 Branch guard cannot see what `{ref}` points at when the command runs "
+    "({why}), so it cannot tell whether this {verb} brings another feature "
+    "branch's work in.\n"
+    + _STACK_WHY + "\n"
+    "Name the ref literally instead — for the base branch:\n"
+    "  git fetch origin {base} && git merge origin/{base}"
 )
 STACK_PR_BASE_HELP = (
-    "🔒 PR base blocked — `--base {ref}` targets a branch that is not a base "
-    "branch (base = {bases}).\n"
+    "🔒 PR base blocked — this would base a pull request on `{ref}`, which is not a "
+    "base branch (base = {bases}).\n"
     + _STACK_WHY + "\n"
     "Open the PR against the base branch:\n"
     "  gh pr create --base {base} --body-file <file>\n"
     "Retargeting an existing PR back onto the base (`gh pr edit <n> --base "
     "{base}`) is the remedy and stays allowed."
 )
+STACK_PUSH_HELP = (
+    "🔒 Push blocked — this would push `{src}` into `{dst}`, another feature "
+    "branch. Pushing one feature branch's commits into another is a feature-to-"
+    "feature merge done on the remote.\n"
+    + _STACK_WHY + "\n"
+    "Push your branch to its own name: git push -u origin HEAD"
+)
+
+
+# ── the lexer ─────────────────────────────────────────────────────────────────
+_LEX_MAX_DEPTH = 4          # nesting of $(…) / `…` / sh -c / eval followed
+_LEX_SEPARATORS = ";&|()"
+_WORD_BREAK = " \t\n" + _LEX_SEPARATORS + "<>"
+
+
+def _read_until(cmd, i, close):
+    """Index just past the `close` that ends a `$(`/`${` group opened before i,
+    honouring nesting and quotes. Returns len(cmd) when unterminated."""
+    opener = "(" if close == ")" else "{"
+    depth, n = 1, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = cmd.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and cmd[i] != '"':
+                i += 2 if cmd[i] == "\\" else 1
+            i += 1
+            continue
+        if c == opener:
+            depth += 1
+        elif c == close:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _shell_commands(cmd, depth=0):
+    """Every simple command on the line as a list of words; each word is
+    (text, dynamic) — its text after quote removal, and whether it contained a
+    `$` or backtick expansion whose value the hook cannot know. Total and linear:
+    an unterminated quote swallows the rest of the line as that word."""
+    out, cmds, words = [], [], []
+    word, dyn, started, digits_only = [], False, False, True
+    pending_heredocs = []            # [(delimiter, strip_tabs)]
+    skip_redirect_target = False
+    n, i = len(cmd), 0
+    subs = []                         # command-substitution bodies to descend into
+
+    def end_word():
+        nonlocal word, dyn, started, digits_only, skip_redirect_target
+        if started:
+            if skip_redirect_target:
+                skip_redirect_target = False
+            else:
+                words.append(("".join(word), dyn))
+        word, dyn, started, digits_only = [], False, False, True
+
+    def end_cmd():
+        nonlocal words, skip_redirect_target
+        end_word()
+        skip_redirect_target = False
+        if words:
+            cmds.append(words)
+        words = []
+
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            if i + 1 < n and cmd[i + 1] == "\n":       # line continuation
+                i += 2
+                continue
+            if i + 1 < n:
+                word.append(cmd[i + 1])
+                started, digits_only = True, False
+            i += 2
+            continue
+        if c == "'":
+            j = cmd.find("'", i + 1)
+            j = n if j < 0 else j
+            word.append(cmd[i + 1:j])
+            started, digits_only = True, False
+            i = j + 1
+            continue
+        if c == '"':
+            i += 1
+            started, digits_only = True, False
+            while i < n and cmd[i] != '"':
+                ch = cmd[i]
+                if ch == "\\" and i + 1 < n:
+                    nxt = cmd[i + 1]
+                    if nxt == "\n":
+                        i += 2
+                        continue
+                    word.append(nxt if nxt in '$`"\\' else ch + nxt)
+                    i += 2
+                    continue
+                if ch == "`":
+                    j = cmd.find("`", i + 1)
+                    j = n if j < 0 else j
+                    subs.append(cmd[i + 1:j])
+                    dyn = True
+                    word.append(cmd[i:j + 1])
+                    i = j + 1
+                    continue
+                if ch == "$":
+                    dyn = True
+                    if cmd.startswith("$(", i):
+                        j = _read_until(cmd, i + 2, ")")
+                        subs.append(cmd[i + 2:j - 1])
+                        word.append(cmd[i:j])
+                        i = j
+                        continue
+                word.append(ch)
+                i += 1
+            i += 1
+            continue
+        if c == "`":
+            j = cmd.find("`", i + 1)
+            j = n if j < 0 else j
+            subs.append(cmd[i + 1:j])
+            word.append(cmd[i:j + 1])
+            dyn, started, digits_only = True, True, False
+            i = j + 1
+            continue
+        if c == "$":
+            if cmd.startswith("$(", i):
+                j = _read_until(cmd, i + 2, ")")
+                subs.append(cmd[i + 2:j - 1])
+                word.append(cmd[i:j])
+            elif cmd.startswith("${", i):
+                j = _read_until(cmd, i + 2, "}")
+                word.append(cmd[i:j])
+            else:
+                j = i + 1
+                word.append("$")
+            dyn, started, digits_only = True, True, False
+            i = j
+            continue
+        if c == "#" and not started:                   # comment to end of line
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c in " \t":
+            end_word()
+            i += 1
+            continue
+        if c == "\n":
+            end_cmd()
+            i += 1
+            # A heredoc body starts on the line after its operator: skip to the
+            # delimiter line, for each heredoc opened on the line just ended.
+            while pending_heredocs:
+                delim, strip = pending_heredocs.pop(0)
+                while i < n:
+                    j = cmd.find("\n", i)
+                    line = cmd[i:(n if j < 0 else j)]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+            continue
+        if c in "<>" or (c == "&" and cmd.startswith("&>", i)):
+            # A redirection. A word of bare digits right before it is its fd.
+            if started and digits_only and word:
+                word, dyn, started, digits_only = [], False, False, True
+            end_word()
+            if c == "&":
+                i += 2
+                if i < n and cmd[i] == ">":
+                    i += 1
+            elif cmd.startswith("<<<", i):
+                i += 3
+            elif cmd.startswith("<<", i):
+                strip = cmd.startswith("<<-", i)
+                i += 3 if strip else 2
+                while i < n and cmd[i] in " \t":
+                    i += 1
+                j = i
+                while j < n and cmd[j] not in _WORD_BREAK:
+                    j += 1
+                delim = cmd[i:j].replace("'", "").replace('"', "").replace("\\", "")
+                if delim:
+                    pending_heredocs.append((delim, strip))
+                i = j
+                continue
+            else:
+                i += 1
+                if i < n and cmd[i] in ">&|":
+                    i += 1
+                if i < n and cmd[i] == "(" and cmd[i - 1] in "<>":   # process substitution
+                    j = _read_until(cmd, i + 1, ")")
+                    subs.append(cmd[i + 1:j - 1])
+                    i = j
+                    continue
+            skip_redirect_target = True
+            continue
+        if c in _LEX_SEPARATORS:
+            end_cmd()
+            i += 1
+            continue
+        word.append(c)
+        started = True
+        if not c.isdigit():
+            digits_only = False
+        i += 1
+    end_cmd()
+
+    out.extend(cmds)
+    if depth < _LEX_MAX_DEPTH:
+        for body in subs:
+            out.extend(_shell_commands(body, depth + 1))
+        # `sh -c '<script>'` and `eval <words>` run their argument as shell.
+        for words_ in cmds:
+            texts = [w[0] for w in words_]
+            k = _command_word_index(texts)
+            if k is None:
+                continue
+            head = texts[k].rsplit("/", 1)[-1]
+            if head in ("sh", "bash", "zsh", "dash", "ksh"):
+                for m in range(k + 1, len(texts) - 1):
+                    if texts[m] == "-c" or (texts[m].startswith("-") and not texts[m].startswith("--")
+                                            and "c" in texts[m][1:]):
+                        out.extend(_shell_commands(texts[m + 1], depth + 1))
+                        break
+            elif head == "eval":
+                out.extend(_shell_commands(" ".join(texts[k + 1:]), depth + 1))
+    return out
+
+
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_PREFIX_WORDS = frozenset({"command", "builtin", "exec", "nohup", "time", "env", "sudo",
+                           "!", "{", "}", "if", "then", "else", "elif", "do", "while",
+                           "until", "xargs"})
+
+
+def _command_word_index(texts):
+    """Index of the word a simple command actually runs, past `VAR=x` assignments
+    and wrapper words (`env`, `command`, `sudo`, `time`, …), or None."""
+    k = 0
+    while k < len(texts):
+        t = texts[k]
+        if _ASSIGNMENT_RE.match(t):
+            k += 1
+            continue
+        if t in _PREFIX_WORDS:
+            k += 1
+            # a wrapper's own flags (`env -i`, `sudo -u x`) are not the command
+            while k < len(texts) and texts[k].startswith("-"):
+                k += 2 if texts[k] in ("-u", "-g", "-C") else 1
+            continue
+        return k
+    return None
+
+
+# ── reading git, cheaply and never raising ────────────────────────────────────
+def _git_in(dirpath, *args, timeout=3):
+    """stdout of a READ-ONLY git command run in `dirpath`, or None on any failure."""
+    try:
+        r = subprocess.run(["git", "-C", dirpath, *args], capture_output=True,
+                           text=True, timeout=timeout)
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+_STACK_CACHE = {}
+
+
+def _cached(key, fn):
+    if key not in _STACK_CACHE:
+        try:
+            _STACK_CACHE[key] = fn()
+        except Exception:
+            _STACK_CACHE[key] = None
+    return _STACK_CACHE[key]
 
 
 def _configured_default_branch() -> str:
-    """`github.defaultBranch` from the COMMITTED `delivery.json` on a trusted ref
-    (docs/PIPELINE-CONTRACT.md §1), or "" when the pipeline is off or the value is
-    unusable.
-
-    Read through `_read_delivery_config`, so the name comes from the DEFAULT
-    BRANCH rather than from the worktree — a session that could name its own base
-    branch could name a feature branch and stack freely, which is the whole point
-    of the config anchor above.
-
-    WIDENING ONLY: whatever this returns is *added* to `main`/`master`, never
-    substituted for them. So an absent, broken or placeholder config makes the
-    guard STRICTER (a visible false block a human can fix), never looser — the
-    fail direction a write-blocking guard is required to take. Gated on
-    `_pipeline_configured()`, so a project that never adopted the pipeline pays
-    one `stat` and no subprocess."""
+    """`github.defaultBranch` from the COMMITTED `delivery.json` (contract §1), or
+    "" when the pipeline is off, the value is unusable, or the only copy found is
+    the WORKING TREE one. `_read_delivery_config` falls back to the working tree
+    for the adoption PR; this guard does not accept that fallback, because a
+    session that could name its own base branch could name a feature branch."""
     try:
         if not _pipeline_configured():
             return ""
-        cfg, _source = _read_delivery_config()
+        cfg, source = _read_delivery_config()
+        if not isinstance(cfg, dict) or not source or "working tree" in source:
+            return ""
+        gh_cfg = cfg.get("github")
+        name = gh_cfg.get("defaultBranch") if isinstance(gh_cfg, dict) else None
+        if not isinstance(name, str):
+            return ""
+        name = name.strip()
+        if not name or "{{" in name or not re.match(r"^[\w][\w./-]*$", name):
+            return ""
+        return name
     except Exception:
         return ""
-    if not isinstance(cfg, dict):
-        return ""
-    name = (cfg.get("github") or {}).get("defaultBranch")
-    if not isinstance(name, str):
-        return ""
-    name = name.strip()
-    if not name or "{{" in name or not re.match(r"^[\w][\w./-]*$", name):
-        return ""
-    return name
 
 
-def _base_branches() -> set:
-    """The branch names a feature branch may be cut FROM and merged INTO."""
-    return PROTECTED_BRANCHES | ({_configured_default_branch()} - {""})
+def _origin_head(dirpath) -> str:
+    """The branch `refs/remotes/origin/HEAD` names — the remote's default branch as
+    `git clone` recorded it — or "". Trusted like origin/main: the config-anchor
+    guard refuses the session's ways of repointing it (`git remote set-head`,
+    `git symbolic-ref … origin/HEAD <ref>`, writes under `.git/`)."""
+    def read():
+        out = _git_in(dirpath, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+        return out[len("origin/"):] if out and out.startswith("origin/") else ""
+    return _cached(("origin-head", dirpath), read) or ""
+
+
+def _base_branches(dirpath=None) -> set:
+    """The branch names a feature branch may be cut FROM and merged INTO: `main`
+    and `master`, plus the configured default and the remote's recorded default.
+    WIDENING ONLY — an unreadable source adds nothing and removes nothing, so a
+    stale or absent one can never take `main` away from the conflict loop."""
+    names = set(PROTECTED_BRANCHES)
+    for extra in (_configured_default_branch(), _origin_head(dirpath or PROJECT_ROOT)):
+        if extra:
+            names.add(extra)
+    return names
+
+
+def _remotes(dirpath):
+    out = _cached(("remotes", dirpath), lambda: _git_in(dirpath, "remote"))
+    return set(out.split()) if out else {"origin", "upstream"}
+
+
+def _base_tips(dirpath, bases):
+    """Commit ids of every base branch that exists here, local or remote-tracking."""
+    def read():
+        pats = []
+        for b in sorted(bases):
+            pats += ["refs/heads/" + b, "refs/remotes/*/" + b]
+        out = _git_in(dirpath, "for-each-ref", "--format=%(objectname)", *pats)
+        return sorted(set(out.split())) if out else []
+    return _cached(("tips", dirpath, tuple(sorted(bases))), read) or []
+
+
+def _strip_decor(ref):
+    """`origin/main~2` → `origin/main`. Everything from the first `~`, `^` or `@{`
+    on is decoration — check-ref-format forbids all three in a name. Linear."""
+    return re.split(r"[~^]|@\{", ref, maxsplit=1)[0]
+
+
+def _is_base_name(name, dirpath):
+    """Exact membership in the base set, asking git only when `name` is not
+    `main`/`master`/the configured default — so the common case costs nothing."""
+    if name in PROTECTED_BRANCHES:
+        return True
+    cfgd = _configured_default_branch()
+    if cfgd and name == cfgd:
+        return True
+    oh = _origin_head(dirpath)
+    return bool(oh) and name == oh
+
+
+def _is_remote(name, dirpath):
+    return name == "origin" or name in _remotes(dirpath)
+
+
+def _names_base(ref, dirpath):
+    """True when `ref` literally NAMES a base branch: `main`, `refs/heads/main`,
+    `refs/remotes/<any>/main`, or `<remote>/main` for a remote this checkout has.
+    The remote segment is only stripped when it IS a remote, so a feature branch
+    called `feat/main` is not mistaken for a base."""
+    r = _strip_decor(ref)
+    if not r:
+        return False
+    if _is_base_name(r, dirpath):
+        return True
+    if r.startswith("refs/heads/"):
+        return _is_base_name(r[len("refs/heads/"):], dirpath)
+    if r.startswith("refs/remotes/"):
+        rest = r[len("refs/remotes/"):]
+        return "/" in rest and _is_base_name(rest.split("/", 1)[1], dirpath)
+    if "/" in r:
+        remote, name = r.split("/", 1)
+        return _is_base_name(name, dirpath) and _is_remote(remote, dirpath)
+    return False
+
+
+def _branch_part(ref, dirpath):
+    """The branch a ref names with any `refs/heads/`, `refs/remotes/<r>/` or
+    `<remote>/` prefix removed (the last only for a real remote)."""
+    r = _strip_decor(ref)
+    if r.startswith("refs/heads/"):
+        return r[len("refs/heads/"):]
+    if r.startswith("refs/remotes/"):
+        rest = r[len("refs/remotes/"):]
+        return rest.split("/", 1)[1] if "/" in rest else rest
+    if "/" in r and _is_remote(r.split("/", 1)[0], dirpath):
+        return r.split("/", 1)[1]
+    return r
+
+
+def _unseen(ref):
+    """Why the hook cannot know what `ref` will point at when the command runs, or
+    None when it can."""
+    if ref == "-" or re.match(r"^@\{-\d+\}", ref):
+        return "the previously checked-out branch is decided when the command runs"
+    if _strip_decor(ref) in ("FETCH_HEAD", "MERGE_HEAD", "ORIG_HEAD"):
+        return "it is whatever the most recent fetch left behind"
+    return None
+
+
+def _ahead_of_base(dirpath, commitish, bases):
+    """True: `commitish` carries commits no base branch has. False: every commit it
+    carries is already on a base. None: cannot tell (unresolvable, no base branch
+    exists here, or git failed) — callers decide the direction."""
+    tips = _base_tips(dirpath, bases)
+    if not tips:
+        return None
+    sha = _git_in(dirpath, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                  commitish + "^{commit}")
+    if not sha:
+        return None
+    out = _git_in(dirpath, "rev-list", "-n", "1", sha, "--not", *tips)
+    if out is None:
+        return None
+    return bool(out)
+
+
+def _no_base_here(dirpath, bases):
+    return not _base_tips(dirpath, bases)
+
+
+# ── per-command parsing ───────────────────────────────────────────────────────
+_GIT_GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                           "--super-prefix", "--config-env", "--exec-path"}
+_GIT_SUBCOMMANDS = frozenset({"checkout", "switch", "branch", "merge", "pull", "worktree",
+                              "rebase", "push", "config"})
+
+
+def _split_cluster(tok, value_letters):
+    """A short-flag cluster (`-qb`, `-dBfeat/x`) as [(letter, attached_value)]:
+    letters up to the first one in `value_letters`, which takes the rest of the
+    cluster (or "" if nothing is attached, meaning the next word)."""
+    out = []
+    body = tok[1:]
+    for k, ch in enumerate(body):
+        if ch in value_letters:
+            out.append((ch, body[k + 1:]))
+            return out
+        out.append((ch, None))
+    return out
+
+
+def _walk_args(toks, value_long, value_short, bool_short=""):
+    """Walk a subcommand's arguments. Returns (flags, positionals), where flags is a
+    list of (name, value) — name like `--base` or `-b`, value the attached or next
+    word for a value-taking flag, else None. `--` ends option parsing."""
+    flags, pos, i = [], [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t == "--":
+            pos.extend(toks[i + 1:])
+            break
+        if t.startswith("--") and len(t) > 2:
+            name, eq, val = t.partition("=")
+            if name in value_long and not eq:
+                flags.append((name, toks[i + 1] if i + 1 < len(toks) else ""))
+                i += 2
+                continue
+            flags.append((name, val if eq else None))
+            i += 1
+            continue
+        if t.startswith("-") and len(t) > 1:
+            consumed_next = False
+            for letter, attached in _split_cluster(t, value_short):
+                if letter in value_short:
+                    if attached:
+                        flags.append(("-" + letter, attached))
+                    else:
+                        flags.append(("-" + letter, toks[i + 1] if i + 1 < len(toks) else ""))
+                        consumed_next = True
+                else:
+                    flags.append(("-" + letter, None))
+            i += 2 if consumed_next else 1
+            continue
+        pos.append(t)
+        i += 1
+    return flags, pos
+
+
+def _git_invocation(words, line_dir):
+    """(subcommand, argument words, directory git acts in) for a git command, or
+    None. `git -C a -C b` composes like git does; `git-merge` (the dashed plumbing
+    name) counts."""
+    texts = [w[0] for w in words]
+    k = _command_word_index(texts)
+    if k is None:
+        return None
+    head = texts[k].rsplit("/", 1)[-1]
+    if head.startswith("git-") and head[4:] in _GIT_SUBCOMMANDS:
+        return head[4:], words[k + 1:], line_dir
+    if head != "git":
+        return None
+    d, i = line_dir, k + 1
+    while i < len(words) and texts[i].startswith("-"):
+        t = texts[i]
+        if t == "-C" and i + 1 < len(words):
+            val, dyn = words[i + 1]
+            if dyn or val.startswith("~") and val != "~" and not val.startswith("~/"):
+                d = None                               # cannot resolve it: fall back
+            elif d is not None:
+                d = os.path.join(d, os.path.expanduser(val))
+            i += 2
+            continue
+        i += 2 if t in _GIT_GLOBAL_VALUE_FLAGS else 1
+    if i >= len(words):
+        return None
+    return texts[i], words[i + 1:], d
+
+
+def _stack_verdict(cmd):
+    """(help_template, kwargs) for the first stacking move on the line, else None.
+    The caller adds `base=`. Reads the RAW command (not the prose-stripped one):
+    the lexer keeps a quoted message as one inert word, and prose-stripping would
+    erase a quoted start point (`-t "origin/feat/y"`)."""
+    if not cmd or not re.search(r"git|gh", cmd):
+        return None
+    try:
+        line_dir = os.getcwd()
+    except Exception:
+        line_dir = PROJECT_ROOT
+    heads = {}                       # dir -> ("ref", name) | ("detached", ref) | ("unknown", why)
+
+    def resolve_dir(d):
+        return os.path.realpath(d) if d else PROJECT_ROOT
+
+    def current(d):
+        """(kind, value) for the HEAD git will act on in `d`."""
+        if d in heads:
+            return heads[d]
+        b = _git_in(d, "rev-parse", "--abbrev-ref", "HEAD")
+        if not b:
+            return ("none", "")
+        return ("detached", "HEAD") if b == "HEAD" else ("ref", b)
+
+    def shown(bases):
+        return ", ".join("`%s`" % b for b in sorted(bases))
+
+    def start_blocks(d, bases, start, new=""):
+        """(template, kwargs) when cutting a branch from `start` would stack."""
+        text, dyn = start
+        if dyn:
+            return STACK_UNSEEN_HELP, {"ref": text, "why": "it is expanded by the shell",
+                                       "verb": "branch", "bases": shown(bases)}
+        why = _unseen(text)
+        if why:
+            return STACK_UNSEEN_HELP, {"ref": text, "why": why, "verb": "branch",
+                                       "bases": shown(bases)}
+        if _names_base(text, d):
+            return None
+        if new and _branch_part(text, d) == new and _strip_decor(text) != new:
+            return None                                # its own remote copy
+        ahead = _ahead_of_base(d, text, bases)
+        if ahead is False or (ahead is None and _no_base_here(d, bases)):
+            return None
+        return STACK_CREATE_HELP, {"new": new or "<branch>", "origin": "`%s`" % text,
+                                   "bases": shown(bases)}
+
+    def implicit_blocks(d, bases, new):
+        kind, val = current(d)
+        if kind == "none":
+            return None                                # not a repo / no commits: git decides
+        if kind == "unknown":
+            return STACK_UNSEEN_HELP, {"ref": "HEAD", "why": val, "verb": "branch",
+                                       "bases": shown(bases)}
+        if kind == "ref" and _is_base_name(val, d):
+            return None
+        ahead = _ahead_of_base(d, val if kind in ("ref", "detached") else "HEAD", bases)
+        if ahead is False or ahead is None:
+            return None                                # on the base, or nothing to measure
+        where = ("the current branch `%s`" % val) if kind == "ref" and val != "HEAD" \
+            else ("`%s`" % val if val != "HEAD" else "a detached HEAD")
+        return STACK_CREATE_HELP, {"new": new or "<branch>", "origin": where,
+                                   "bases": shown(bases)}
+
+    def merge_blocks(d, bases, ref, verb):
+        text, dyn = ref
+        if dyn:
+            return STACK_UNSEEN_HELP, {"ref": text, "why": "it is expanded by the shell",
+                                       "verb": verb, "bases": shown(bases)}
+        if re.match(r"^(?:HEAD)?@\{(?:u|upstream|push)\}$", text, re.I) or text == "HEAD":
+            return None                                # this branch's own upstream
+        why = _unseen(text)
+        if why:
+            return STACK_UNSEEN_HELP, {"ref": text, "why": why, "verb": verb,
+                                       "bases": shown(bases)}
+        if _names_base(text, d):
+            return None
+        kind, cur = current(d)
+        if kind == "ref" and _branch_part(text, d) == cur:
+            return None                                # syncing from its own remote copy
+        if verb == "merge" and kind == "detached":
+            return None                                # a scratch merge on a detached HEAD
+        ahead = _ahead_of_base(d, text, bases)
+        if ahead is False or (ahead is None and _no_base_here(d, bases)):
+            return None
+        return STACK_MERGE_HELP, {"ref": text, "verb": verb, "bases": shown(bases)}
+
+    for words in _shell_commands(cmd):
+        texts = [w[0] for w in words]
+        k = _command_word_index(texts)
+        if k is None:
+            continue
+        head = texts[k].rsplit("/", 1)[-1]
+
+        # `cd <dir>` moves where every later git on the line acts.
+        if head == "cd":
+            arg = words[k + 1] if len(words) > k + 1 else ("~", False)
+            if arg[1] or arg[0] == "-":
+                line_dir = None
+            elif line_dir is not None:
+                line_dir = os.path.join(line_dir, os.path.expanduser(arg[0]))
+            continue
+
+        # ── gh: `gh pr create|new|edit --base`, `gh pr checkout`, `gh api` ─────
+        if head == "gh":
+            j = k + 1
+            while j < len(texts) and texts[j].startswith("-"):
+                j += 1 if ("=" in texts[j] or (texts[j].startswith("-R") and len(texts[j]) > 2)) else 2
+            rest = words[j:]
+            rt = [w[0] for w in rest]
+            gdir_ = resolve_dir(line_dir)
+            bases = _base_branches(gdir_)
+            if rt[:1] == ["pr"] and len(rt) > 1 and rt[1] in ("create", "new", "edit"):
+                flags, _ = _walk_args(rt[2:], {"--base", "--title", "--body", "--body-file",
+                                               "--head", "--assignee", "--label", "--milestone",
+                                               "--project", "--reviewer", "--template", "--repo",
+                                               "--add-label", "--remove-label", "--add-assignee",
+                                               "--remove-assignee", "--add-reviewer",
+                                               "--remove-reviewer", "--add-project",
+                                               "--remove-project", "--recover"},
+                                      "BtbFHalmprTR")
+                for name, val in flags:
+                    if name in ("--base", "-B") and val is not None:
+                        if "$" in val or "`" in val:
+                            return STACK_UNSEEN_HELP, {"ref": val, "why": "it is expanded by the shell",
+                                                       "verb": "PR base", "bases": shown(bases)}
+                        if not _is_base_name(val, gdir_):
+                            return STACK_PR_BASE_HELP, {"ref": val, "bases": shown(bases)}
+            elif rt[:1] == ["pr"] and len(rt) > 1 and rt[1] in ("checkout", "co"):
+                heads[resolve_dir(line_dir)] = ("unknown-feature", "a pull request's branch")
+            elif rt[:1] == ["api"]:
+                path = next((t for t in rt[1:] if re.match(r"^/?repos/[^/\s]+/[^/\s]+/pulls(?:/\d+)?/?$", t)), "")
+                fields, _ = _walk_args(rt[1:], {"--field", "--raw-field", "--method", "--input",
+                                                "--jq", "--template", "--header", "--hostname",
+                                                "--preview", "--cache"}, "fFXqtHp")
+                for name, val in fields:
+                    if name not in ("-f", "-F", "--field", "--raw-field") or not val:
+                        continue
+                    key, _, v = val.partition("=")
+                    if (path and key == "base") or key == "baseRefName":
+                        if v and not _is_base_name(v, gdir_):
+                            return STACK_PR_BASE_HELP, {"ref": v, "bases": shown(bases)}
+                    if key == "query":
+                        for m in re.finditer(r'baseRefName\s*:\s*\\?"([^"\\]+)', v):
+                            if not _is_base_name(m.group(1), gdir_):
+                                return STACK_PR_BASE_HELP, {"ref": m.group(1), "bases": shown(bases)}
+            continue
+
+        # ── the kit's own REST fallback: python3 scripts/gh_fallback.py pr-create ─
+        if head.startswith("python") and len(texts) > k + 2 and texts[k + 1].endswith("gh_fallback.py") \
+                and texts[k + 2] == "pr-create":
+            gdir_ = resolve_dir(line_dir)
+            bases = _base_branches(gdir_)
+            flags, _ = _walk_args(texts[k + 3:], {"--base", "--title", "--body-file", "--head",
+                                                  "--repo"}, "")
+            for name, val in flags:
+                if name == "--base" and val and not _is_base_name(val, gdir_):
+                    return STACK_PR_BASE_HELP, {"ref": val, "bases": shown(bases)}
+            continue
+
+        inv = _git_invocation(words, line_dir)
+        if not inv:
+            continue
+        sub, args, gdir = inv
+        d = resolve_dir(gdir)
+        bases = _base_branches(d)
+        at = [w[0] for w in args]
+        dyn_of = {}
+        for w in args:
+            dyn_of.setdefault(w[0], w[1])
+
+        def W(t):
+            return (t, dyn_of.get(t, False) or "$" in t or "`" in t)
+
+        # ── checkout / switch: create, or move HEAD ───────────────────────────
+        if sub in ("checkout", "switch"):
+            create = "bBcC" if sub == "switch" else "bB"
+            flags, pos = _walk_args(at, {"--orphan", "--conflict", "--pathspec-from-file",
+                                         "--create", "--force-create"}, create)
+            fnames = {f[0] for f in flags}
+            new = next((v for f, v in flags if f in ("-b", "-B", "-c", "-C", "--create",
+                                                     "--force-create") and v is not None), None)
+            if "--orphan" in fnames:
+                heads[d] = ("unknown", "an orphan branch has no start commit")
+                continue
+            if new is not None:
+                if pos:
+                    hit = start_blocks(d, bases, W(pos[0]), new)
+                    after = ("ref", pos[0])
+                else:
+                    hit = implicit_blocks(d, bases, new)
+                    after = heads.get(d)
+                if hit:
+                    return hit
+                if after:
+                    heads[d] = after
+                continue
+            # a plain checkout/switch moves HEAD — only when it names one ref
+            detach = "--detach" in fnames or (sub == "switch" and "-d" in fnames)
+            if pos and pos[0] == "-":
+                heads[d] = ("unknown", "`-` is decided when the command runs")
+            elif len(pos) == 1 and "--" not in at and not (
+                    sub == "checkout" and os.path.exists(os.path.join(d, pos[0]))):
+                heads[d] = ("detached" if detach else "ref", pos[0])
+            continue
+
+        # ── branch: create (plain, --track, -f, copy) ─────────────────────────
+        if sub == "branch":
+            flags, pos = _walk_args(at, {"--set-upstream-to", "--contains", "--no-contains",
+                                         "--merged", "--no-merged", "--points-at", "--sort",
+                                         "--format", "--column", "--color", "--abbrev"}, "u")
+            names = [f for f, _ in flags]
+            creating_mods = {"-f", "--force", "-t", "--track", "--no-track", "-q", "--quiet",
+                             "--create-reflog", "--no-create-reflog", "--recurse-submodules",
+                             "--no-recurse-submodules"}
+            copy = any(f in ("-c", "-C", "--copy") for f in names)
+            if any(f not in creating_mods and f not in ("-c", "-C", "--copy") for f in names):
+                continue                               # delete/rename/list/upstream: not a creation
+            if copy:
+                if len(pos) == 2:
+                    hit = start_blocks(d, bases, W(pos[0]), pos[1])
+                elif len(pos) == 1:
+                    hit = implicit_blocks(d, bases, pos[0])
+                else:
+                    continue
+            elif len(pos) == 2:
+                hit = start_blocks(d, bases, W(pos[1]), pos[0])
+            elif len(pos) == 1:
+                hit = implicit_blocks(d, bases, pos[0])
+            else:
+                continue
+            if hit:
+                return hit
+            continue
+
+        # ── worktree add ──────────────────────────────────────────────────────
+        if sub == "worktree":
+            if not at or at[0] != "add":
+                continue
+            flags, pos = _walk_args(at[1:], {"--reason"}, "bB")
+            fnames = {f for f, _ in flags}
+            new = next((v for f, v in flags if f in ("-b", "-B") and v is not None), None)
+            if not pos or "--orphan" in fnames:
+                continue
+            wt_dir = os.path.realpath(os.path.join(d, os.path.expanduser(pos[0])))
+            if "--detach" in fnames or "-d" in fnames:
+                heads[wt_dir] = ("detached", pos[1] if len(pos) > 1 else "HEAD")
+                continue
+            if new is None and len(pos) > 1:
+                # `git worktree add <path> <branch>` checks out an existing branch
+                # (or detaches at a commit): it creates nothing new.
+                heads[wt_dir] = ("ref", pos[1])
+                continue
+            if new is None:
+                auto = os.path.basename(pos[0].rstrip("/"))
+                if _git_in(d, "rev-parse", "--verify", "--quiet", "refs/heads/" + auto) is not None:
+                    heads[wt_dir] = ("ref", auto)      # checks out the existing branch
+                    continue
+                new = auto
+            hit = start_blocks(d, bases, W(pos[1]), new) if len(pos) > 1 \
+                else implicit_blocks(d, bases, new)
+            if hit:
+                return hit
+            heads[wt_dir] = ("ref", new)
+            continue
+
+        # ── merge / pull / rebase: bring another branch's work in ─────────────
+        if sub == "merge":
+            if any(t in ("--abort", "--continue", "--quit") for t in at):
+                continue
+            _, pos = _walk_args(at, {"--strategy", "--strategy-option", "--message", "--file",
+                                     "--into-name", "--cleanup"}, "sXmF")
+            for r in pos:
+                hit = merge_blocks(d, bases, W(r), "merge")
+                if hit:
+                    return hit
+            continue
+        if sub == "pull":
+            _, pos = _walk_args(at, {"--strategy", "--strategy-option", "--depth", "--deepen",
+                                     "--shallow-since", "--shallow-exclude", "--jobs",
+                                     "--upload-pack", "--server-option", "--negotiation-tip",
+                                     "--cleanup"},
+                                "sXjo")
+            for spec in pos[1:]:
+                src = spec.lstrip("+").split(":", 1)[0]
+                if not src:
+                    continue
+                remote = pos[0]
+                local = ("refs/remotes/%s/%s" % (remote, src)) if not src.startswith("refs/") else src
+                ref = W(src)
+                if not ref[1] and not _names_base(src, d) and \
+                        _git_in(d, "rev-parse", "--verify", "--quiet", local) is not None:
+                    ref = (local, False)
+                hit = merge_blocks(d, bases, ref, "pull")
+                if hit:
+                    return hit
+            continue
+        if sub == "rebase":
+            if any(t in ("--continue", "--abort", "--skip", "--quit", "--edit-todo",
+                         "--show-current-patch", "--root") for t in at):
+                continue
+            flags, pos = _walk_args(at, {"--onto", "--strategy", "--strategy-option", "--exec",
+                                         "--empty", "--whitespace"}, "sXx")
+            onto = [v for f, v in flags if f == "--onto" and v]
+            targets = onto if onto else pos[:1]
+            for t in targets:
+                tw = W(t)
+                if not tw[1] and _unseen(t) is None and \
+                        _git_in(d, "merge-base", "--is-ancestor", "--end-of-options", t, "HEAD") is not None:
+                    continue                           # reworking its own history (`-i HEAD~3`)
+                hit = merge_blocks(d, bases, tw, "rebase")
+                if hit:
+                    return hit
+            continue
+
+        # ── push <remote> <src>:<dst> into ANOTHER feature branch ─────────────
+        if sub == "push":
+            if any(t in ("-d", "--delete", "--mirror", "--tags", "--all") for t in at):
+                continue
+            _, pos = _walk_args(at, {"--repo", "--receive-pack", "--exec", "--push-option"}, "o")
+            kind, cur = current(d)
+            if kind != "ref":
+                continue
+            for spec in pos[1:]:
+                if ":" not in spec:
+                    continue
+                src, dst = spec.lstrip("+").split(":", 1)
+                dst = dst[len("refs/heads/"):] if dst.startswith("refs/heads/") else dst
+                if not src or not dst or _is_base_name(dst, d):
+                    continue                           # a delete, or the push guard's business
+                src_name = cur if src == "HEAD" and kind == "ref" else _branch_part(src, d)
+                if dst != src_name and not (kind == "ref" and dst == cur):
+                    return STACK_PUSH_HELP, {"src": src, "dst": dst}
+            continue
+
+        # ── gh's own default-base config: branch.<b>.gh-merge-base ────────────
+        if sub == "config":
+            if any(t.startswith("--unset") or t in ("--get", "--get-all", "--list", "-l",
+                                                    "--remove-section") for t in at):
+                continue
+            _, pos = _walk_args(at, {"--file", "--blob", "--type", "--default", "--comment"}, "f")
+            if len(pos) >= 2 and re.match(r"^branch\..+\.gh-merge-base$", pos[0]):
+                if not _is_base_name(pos[1], d):
+                    return STACK_PR_BASE_HELP, {"ref": pos[1], "bases": shown(bases)}
+            continue
+    return None
+
+
+def _stacked_branch_block(cmd):
+    """Entry point for `_dispatch`. Resets the per-invocation cache so a batteried
+    hook process never reuses a stale answer."""
+    _STACK_CACHE.clear()
+    return _stack_verdict(cmd)
 
 
 _PREFERRED_BASE_CACHE = None
 
 
 def _preferred_base() -> str:
-    """The base branch name to SUGGEST in a block message — the configured default
-    branch when there is one, else whichever of `main`/`master` this repo actually
-    has. Called ONLY once a block is already decided, so its `git rev-parse`
-    probes cost nothing on the allow path (which is every ordinary Bash call)."""
+    """The base branch to SUGGEST in a block message: the configured default, else
+    the remote's recorded default (origin/HEAD), else whichever of `main`/`master`
+    this repo actually has. Only called once a block is decided."""
     global _PREFERRED_BASE_CACHE
     if _PREFERRED_BASE_CACHE is not None:
         return _PREFERRED_BASE_CACHE
-    name = _configured_default_branch()
+    name = _configured_default_branch() or _origin_head(PROJECT_ROOT)
     if not name:
         name = "main"
         for cand in ("main", "master"):
-            try:
-                r = subprocess.run(
-                    ["git", "-C", PROJECT_ROOT, "rev-parse", "--verify", "--quiet",
-                     "refs/heads/" + cand],
-                    capture_output=True, text=True, timeout=3,
-                )
-            except Exception:
-                break
-            if r.returncode == 0:
+            if _git_in(PROJECT_ROOT, "rev-parse", "--verify", "--quiet", "refs/heads/" + cand) is not None \
+                    or _git_in(PROJECT_ROOT, "rev-parse", "--verify", "--quiet",
+                               "refs/remotes/origin/" + cand) is not None:
                 name = cand
                 break
     _PREFERRED_BASE_CACHE = name
     return name
 
 
-_REF_DECOR_RE = re.compile(r"(?:\^[0-9]*|~[0-9]*|@\{[^}]*\})+$")
-
-
-def _is_base_ref(ref: str, bases) -> bool:
-    """True when `ref` names one of `bases` under any spelling a command line
-    uses: `main`, `origin/main`, `refs/heads/main`, `refs/remotes/origin/main`,
-    and trailing `~`/`^`/`@{…}` decorations.
-
-    Deliberately generous about the remote segment (any `<x>/main` reads as
-    `main`) because a remote can be named anything and a false negative here
-    blocks `git merge origin/main` — the one move the conflict loop depends on.
-    The cost is that a feature branch literally named `<something>/main` reads as
-    a base; that is an accepted, documented looseness in an advisory guard."""
-    if not ref:
+def _origin_head_write(cmd):
+    """True when the command would repoint `refs/remotes/origin/HEAD`, which the
+    stacked-branch guard trusts as the remote's default branch. Part of the config
+    anchor (CONFIG_ANCHOR_HELP): the `set-head` spelling is refused by the regexes
+    above; this catches the symbolic-ref spelling (with or without a `refs/`
+    target, and with `-m <reason>`) and a fetch/pull refspec whose destination is
+    origin/HEAD — which, while it is a symref, writes THROUGH it to the branch it
+    names. Reading it (one operand) and deleting it (`-d`, which only NARROWS the
+    base set) stay allowed. Parsed with the lexer, not a regex."""
+    if not cmd or "HEAD" not in cmd:
         return False
-    r = _REF_DECOR_RE.sub("", ref.strip().strip("'\""))
-    if not r:
-        return False
-    if r.startswith("refs/heads/"):
-        r = r[len("refs/heads/"):]
-    elif r.startswith("refs/remotes/"):
-        r = r[len("refs/remotes/"):]
-        r = r.split("/", 1)[1] if "/" in r else r
-    elif "/" in r:
-        r = r.split("/", 1)[1]
-    return r in bases
-
-
-_SHELL_SEG_RE = re.compile(r"\|\||&&|[;&|\n]")
-_GIT_GLOBAL_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
-                           "--exec-path", "--super-prefix"}
-# The subcommands this guard reads, in both spellings git accepts.
-_GIT_SUBCOMMANDS = frozenset({"checkout", "switch", "branch", "merge", "pull",
-                              "worktree"})
-_GH_PR_BASE_CMD_RE = re.compile(r"\bgh\s+pr\s+(?:create|new|edit)\b([^#\n;&|]*)")
-_PR_BASE_FLAG_RE = re.compile(r"(?<![\w-])(?:--base|-B)(?:=|\s+)([^\s'\"]+)")
-_CREATE_FLAGS = {"-b", "-B", "-c", "-C", "--create", "--force-create"}
-_WORKTREE_CREATE_FLAGS = {"-b", "-B"}
-_MERGE_NOOP_FLAGS = {"--abort", "--continue", "--quit"}
-# Separated-form flags whose VALUE is not a ref. `-S` is deliberately absent: its
-# optional argument must be attached (`-Skeyid`), so treating it as separated
-# would swallow the ref that follows and read `git merge -S origin/main` as
-# naming nothing.
-_MERGE_VALUE_FLAGS = {"-s", "--strategy", "-X", "--strategy-option", "-m",
-                      "--message", "-F", "--file", "--into-name"}
-
-
-def _git_invocations(cmd: str):
-    """[(subcommand, tokens-after-it)] for every `git …` on the line.
-
-    Segment-scoped on `;`/`&&`/`||`/`|`/newline, so a later unrelated command is
-    never folded into one argv — the same per-command discipline the operator
-    guards above use. Falls back to a whitespace split when a segment has
-    unbalanced quotes, so a quoting trick degrades to a coarser parse rather than
-    to no parse at all."""
-    out = []
-    for seg in _SHELL_SEG_RE.split(cmd or ""):
-        seg = seg.strip()
-        if not seg:
+    targets = ("refs/remotes/origin/HEAD", "origin/HEAD")
+    for words in _shell_commands(cmd):
+        inv = _git_invocation(words, None)
+        if not inv:
             continue
-        try:
-            toks = shlex.split(seg)
-        except Exception:
-            toks = seg.split()
-        gi = next((i for i, t in enumerate(toks)
-                   if t == "git" or t.endswith("/git")), None)
-        if gi is None:
-            # `git-merge` / `git-checkout` / … — git's dashed plumbing names are
-            # real binaries that reach the same effect. Measured as a bypass of
-            # the first draft of this guard (test_guard_bypass.py, stack-*).
-            dashed = next(
-                ((i, t) for i, t in enumerate(toks)
-                 if t.rsplit("/", 1)[-1].startswith("git-")
-                 and t.rsplit("/", 1)[-1][4:] in _GIT_SUBCOMMANDS), None)
-            if dashed is None:
+        sub, args, _d = inv
+        at = [w[0] for w in args]
+        if sub == "symbolic-ref":
+            flags, pos = _walk_args(at, set(), "m")
+            if any(f in ("-d", "--delete") for f, _ in flags):
                 continue
-            di, dt = dashed
-            out.append((dt.rsplit("/", 1)[-1][4:], toks[di + 1:]))
-            continue
-        i = gi + 1
-        while i < len(toks) and toks[i].startswith("-"):
-            i += 2 if toks[i] in _GIT_GLOBAL_VALUE_FLAGS else 1
-        if i < len(toks):
-            out.append((toks[i], toks[i + 1:]))
-    return out
+            if len(pos) >= 2 and pos[0] in targets:
+                return True
+        elif sub in ("fetch", "pull"):
+            for spec in at:
+                if ":" in spec and not spec.startswith("-"):
+                    if spec.lstrip("+").split(":", 1)[1] in targets:
+                        return True
+    return False
 
-
-def _positionals(toks, value_flags):
-    """Non-flag arguments in order, skipping the value of any flag in
-    `value_flags` (separated form only — an `--opt=value` carries its own).
-    Empty tokens are dropped: `_strip_prose` rewrites a quoted message payload to
-    `''`, which must not be read as a ref."""
-    out, i = [], 0
-    while i < len(toks):
-        t = toks[i]
-        if t == "--":
-            out.extend(x for x in toks[i + 1:] if x)
-            break
-        if t.startswith("-"):
-            i += 2 if (t in value_flags and i + 1 < len(toks)) else 1
-            continue
-        if t:
-            out.append(t)
-        i += 1
-    return out
-
-
-def _creation_start_point(toks, create_flags, skip_positionals=0):
-    """(new_branch, start_point) for a branch-CREATING git command, or None when
-    no create flag is present. `start_point` is "" when the command names none —
-    it then cuts from HEAD, and the caller resolves the current branch instead.
-    A create flag consumes the new branch name unless it carried one attached
-    (`--create=x`)."""
-    new, pos, i, saw = "", [], 0, False
-    while i < len(toks):
-        t = toks[i]
-        if t == "--":
-            pos.extend(x for x in toks[i + 1:] if x)
-            break
-        if t.startswith("-"):
-            head, _, attached = t.partition("=")
-            # A short create flag can carry its value ATTACHED (`-bfeat/new`),
-            # which is how git itself documents it. Split it before the
-            # membership test, or the whole token reads as an unknown flag and
-            # the command is not seen as a creation at all (measured bypass,
-            # test_guard_bypass.py stack-*).
-            if (not attached and len(head) > 2 and head[1] != "-"
-                    and head[:2] in create_flags):
-                head, attached = head[:2], head[2:]
-            if head in create_flags:
-                saw = True
-                if attached:
-                    new = new or attached
-                    i += 1
-                elif i + 1 < len(toks) and toks[i + 1] and not toks[i + 1].startswith("-"):
-                    new = new or toks[i + 1]
-                    i += 2
-                else:
-                    i += 1
-                continue
-            if head == "--orphan":
-                i += 1 if attached else 2
-                continue
-            i += 1
-            continue
-        if t:
-            pos.append(t)
-        i += 1
-    if not saw:
-        return None
-    pos = pos[skip_positionals:]
-    return new, (pos[0] if pos else "")
-
-
-def _stacked_branch_block(cmd: str):
-    """(help_template, format-kwargs) for the first stacking violation on the
-    line, else None. The caller supplies `base=` — see _preferred_base."""
-    bases = _base_branches()
-    shown = ", ".join("`%s`" % b for b in sorted(bases))
-
-    for sub, toks in _git_invocations(cmd):
-        # ── cut a branch from a non-base start point ──────────────────────────
-        found = None
-        if sub in ("checkout", "switch"):
-            found = _creation_start_point(toks, _CREATE_FLAGS)
-        elif sub == "branch":
-            # Only the PLAIN creation spellings — `git branch <new> [<start>]`.
-            # Any flag at all (`-d`, `-m`, `--merged main`, `--contains`) means
-            # this is a delete/rename/list, which other guards own.
-            if toks and not any(t.startswith("-") for t in toks) and len(toks) <= 2:
-                found = (toks[0], toks[1] if len(toks) > 1 else "")
-        elif sub == "worktree" and toks[:1] == ["add"]:
-            # `git worktree add [-b <new>] <path> [<commit-ish>]` — the path is a
-            # positional that is NOT a ref, so skip it before reading the start.
-            found = _creation_start_point(toks[1:], _WORKTREE_CREATE_FLAGS,
-                                          skip_positionals=1)
-        if found:
-            new, start = found
-            if start:
-                if not _is_base_ref(start, bases):
-                    return STACK_CREATE_HELP, {
-                        "new": new or "<branch>", "origin": "`%s`" % start,
-                        "bases": shown}
-            else:
-                # No start point: the command cuts from HEAD. Resolve the branch
-                # HEAD is on. Fails OPEN on an empty answer (no git) and on a
-                # DETACHED head, where "HEAD" is not a branch name and blocking
-                # would trap a session mid-recovery.
-                cur = _current_branch()
-                if cur and cur != "HEAD" and cur not in bases:
-                    return STACK_CREATE_HELP, {
-                        "new": new or "<branch>",
-                        "origin": "the current branch `%s`" % cur,
-                        "bases": shown}
-
-        # ── merge a feature branch into this one ──────────────────────────────
-        refs = []
-        if sub == "merge":
-            if not any(t in _MERGE_NOOP_FLAGS for t in toks):
-                refs = _positionals(toks, _MERGE_VALUE_FLAGS)
-        elif sub == "pull":
-            # `git pull [<remote> [<refspec>…]]`. A bare `git pull` (or `git pull
-            # origin`) merges this branch's own upstream and is untouched.
-            refs = _positionals(toks, _MERGE_VALUE_FLAGS)[1:]
-        for r in refs:
-            if not _is_base_ref(r, bases):
-                return STACK_MERGE_HELP, {"ref": r, "bases": shown}
-
-    # ── open (or retarget) a PR against a non-base branch ─────────────────────
-    for m in _GH_PR_BASE_CMD_RE.finditer(cmd or ""):
-        for b in _PR_BASE_FLAG_RE.finditer(m.group(1)):
-            if not _is_base_ref(b.group(1), bases):
-                return STACK_PR_BASE_HELP, {"ref": b.group(1), "bases": shown}
-    return None
 
 # ── Secret-file target match (Bash) ─────────────────────────────────────────────
 # Hardened 2026-08-23. The old guard was a verb denylist (cat/less/
@@ -2044,6 +2721,10 @@ def _dispatch(data) -> None:
                 or (_GIT_CONFIG_REMOTE_RE.search(scan)
                     and not _GIT_CONFIG_READ_RE.search(scan))):
             block(CONFIG_ANCHOR_HELP)
+        # …and the remote's recorded default, which the stacked-branch guard trusts
+        # as a base branch (see _origin_head_write). Reads the RAW command.
+        if _origin_head_write(cmd):
+            block(CONFIG_ANCHOR_HELP)
 
         # Block rm -rf / rm -fr / rm --recursive.
         # The short-flag run must START an argument token — (?:^|[\s'"]) before the
@@ -2104,14 +2785,13 @@ def _dispatch(data) -> None:
                 if merged:
                     block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
 
-        # Stacked branches are what the 2026-09-20 incident was made of: a branch
-        # cut from another feature branch, a merge between two of them, or a PR
-        # based on one. Merging the BASE into a feature branch is the opposite
-        # move and stays ALLOWED — the conflict loop depends on it. Runs after the
-        # push guard so a push violation still wins the message, and before the
-        # gh guards so `gh pr create --base <feature>` is named as stacking rather
-        # than as something else.
-        _stack = _stacked_branch_block(scan)
+        # Stacked branches (see the guard's block comment): cutting a branch whose
+        # start carries another feature branch's unmerged work, bringing such work
+        # in (merge / pull / rebase onto it / push into it), or basing a PR on a
+        # non-base branch. Bringing the BASE in stays allowed — the conflict loop
+        # depends on it. Reads the RAW command: the guard has its own quote-aware
+        # lexer, and prose-stripping would erase a quoted start point.
+        _stack = _stacked_branch_block(cmd)
         if _stack:
             _stack_tpl, _stack_kw = _stack
             block(_stack_tpl.format(base=_preferred_base(), **_stack_kw))
