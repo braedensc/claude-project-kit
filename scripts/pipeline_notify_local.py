@@ -28,9 +28,21 @@ WHAT THIS IS
   | agent:needs-human        | a stopped session     | terminal until a person acts      | needs-human    |
   |                          | or the planner job,   | (the planner job: a misrouted     |                |
   |                          | on its planning ticket| planning ticket; planning stopped)|                |
+  | daemon-health-incident   | heartbeat monitor     | a watched daemon needs a look     | no             |
+  | daemon-health-recovered  | heartbeat monitor     | the watched daemons report again  | no             |
 
   The review lane's "NOT reviewed" verdict is deliberately NOT paged on: it is a CI-visible
   verdict, not a person's decision (ADR, same table).
+
+  THE TWO DAEMON-HEALTH MARKS (KIT-156) are the heartbeat monitor's page. That job comments
+  under the owner's own tracker key, and the tracker does not notify anyone of their own
+  comment, so without these its incidents reached nobody. They carry no label (daemon health
+  is not a ticket's lifecycle) and are accepted only from `monitor_actor_ids`. That key is
+  optional: unset, the marks are accepted from nobody and every pass says
+  `daemon-health marks: OFF`, so a config written before it existed keeps loading. A health
+  mark from any other author is skipped and NAMED in the pass summary — ticket, comment,
+  author — without changing the exit code. A dead notifier cannot page about itself: the
+  monitor's comment still lands, and says it pinged nobody (KIT-45 is the off-box answer).
 
   NOT IN THIS BUILD: the pull-request human moment (ADR decision 5, "opened" until the review
   lane is live and "reviewed and green" after). It needs the code host, which this pass does
@@ -107,6 +119,8 @@ THE REPLY RELAY — OFF BY DEFAULT (KIT-118)
       session the budget stopped — off-budget, by a side door.
     * The four planning marks have never run, and their answer is an approval or a re-plan in
       the tracker, not a message to a session.
+    * The two daemon-health marks are about a daemon, not a session: no session asked, so
+      there is no one to answer.
 
   EACH PASS, for each recorded message younger than seven days, the thread's replies are read
   with `conversations.replies`. The channel is private, so this needs the `groups:history`
@@ -280,6 +294,10 @@ ESC_REJECTED = "planning-rejected"
 ESC_NO_OUTPUT = "planning-no-output"
 ESC_BLOCKED = "agent:blocked"
 ESC_NEEDS_HUMAN = "agent:needs-human"
+# The heartbeat monitor's page (KIT-156). Accepted only from `monitor_actor_ids`.
+ESC_HEALTH_INCIDENT = "daemon-health-incident"
+ESC_HEALTH_RECOVERED = "daemon-health-recovered"
+HEALTH_MARKS = (ESC_HEALTH_INCIDENT, ESC_HEALTH_RECOVERED)
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -312,12 +330,22 @@ MARKS = {
         "label": "agent:needs-human",
         "why_no_label": None,
     },
+    ESC_HEALTH_INCIDENT: {
+        "moment": "A watched daemon needs a look",
+        "label": None,
+        "why_no_label": "daemon health is not a ticket's lifecycle",
+    },
+    ESC_HEALTH_RECOVERED: {
+        "moment": "The watched daemons are reporting again",
+        "label": None,
+        "why_no_label": "daemon health is not a ticket's lifecycle",
+    },
 }
 
 # The mark as every producer writes it, matched on a body's FIRST line only.
-# The alternation is widened to all six marks: the only pre-existing consumer regex, in the
-# inert GitHub-Actions lane, matches the session half alone and would silently see none of
-# the four planning marks.
+# The alternation is built from every mark in the table: the only pre-existing consumer
+# regex, in the inert GitHub-Actions lane, matches the session half alone and would
+# silently see none of the four planning marks or the two daemon-health marks.
 MARK_RE = re.compile(
     r"^\s*<!--\s*pipeline-escalation:\s*(%s)\s*-->" % "|".join(re.escape(k) for k in MARKS)
 )
@@ -325,7 +353,8 @@ MARK_RE = re.compile(
 # needs-human WINS over blocked when a body somehow carries both — the precedence the
 # GitHub-Actions lane already publishes, kept so the two lanes never disagree.
 MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_BLOCKED, ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
-                   ESC_REJECTED, ESC_AWAITING_APPROVAL]
+                   ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
+                   ESC_HEALTH_RECOVERED]
 
 # Deliberately NOT a mark. The plan executor writes it on informational notes; paging on it
 # would turn every filed plan's footnote into a notification.
@@ -344,6 +373,10 @@ CONFIG_KEYS = {
     "label_ids": "map of label key -> label id, resolved by KEY never by display text (§6)",
     "executor_actor_ids": "actor ids allowed to author the planning marks; a session that "
                           "can comment could otherwise forge them",
+    "monitor_actor_ids": "actor ids allowed to author the two daemon-health marks (the "
+                         "heartbeat monitor's tracker author). Optional: unset, those marks "
+                         "are accepted from nobody and every pass says "
+                         "'daemon-health marks: OFF'",
     "max_events_per_pass": "flood guard; above it the pass sends one summary and declines",
     "lookback_comments": "how many recent comments per ticket to examine",
     "run_timeout_seconds": "wall clock for one pass; exceeding it is exit 4, not exit 1",
@@ -383,6 +416,7 @@ EXAMPLE_CONFIG = {
     "ticket_url_template": "https://linear.app/example/issue/{id}",
     "label_ids": {"agent:blocked": "<uuid>", "agent:needs-human": "<uuid>"},
     "executor_actor_ids": ["<plan-executor actor uuid>"],
+    "monitor_actor_ids": ["<heartbeat-monitor author uuid>"],
     "max_events_per_pass": 25,
     "lookback_comments": 20,
     "run_timeout_seconds": 240,
@@ -448,6 +482,9 @@ def load_config(path):
         "ticket_url_template": (raw.get("ticket_url_template") or "").strip(),
         "label_ids": raw.get("label_ids") or {},
         "executor_actor_ids": raw.get("executor_actor_ids") or [],
+        # `raw.get(key, default)`, like the relay keys: a string here must be a named error,
+        # never quietly read as one author id per character.
+        "monitor_actor_ids": raw.get("monitor_actor_ids", []),
         "max_events_per_pass": raw.get("max_events_per_pass") or 25,
         "lookback_comments": raw.get("lookback_comments") or 20,
         "run_timeout_seconds": raw.get("run_timeout_seconds") or 240,
@@ -498,6 +535,17 @@ def load_config(path):
             "config needs 'executor_actor_ids' — the actor id(s) allowed to author the "
             "planning marks. Without it a session that can comment could forge one; the "
             "job refuses to guess.")
+
+    # OPTIONAL, unlike the executor ids: a config written before the daemon-health marks
+    # existed must keep loading. Absent or empty is OFF, said on every pass; anything that is
+    # not a list of non-empty strings is refused by name.
+    monitors = cfg["monitor_actor_ids"]
+    if not isinstance(monitors, list) or not all(isinstance(a, str) and a.strip()
+                                                 for a in monitors):
+        errors.append(
+            "config 'monitor_actor_ids' must be a list of the heartbeat monitor's tracker "
+            "author id(s), or absent to leave the daemon-health marks OFF, got %r"
+            % (monitors,))
 
     # The relay switch is a real boolean or it is refused: the string "false" is truthy, and
     # reading it as ON would start relaying on a config that says off.
@@ -884,14 +932,27 @@ def is_authorised(mark, author_id, cfg):
     so they are accepted from any author. What they can do is bounded by the label mapping:
     a session can already request its own supervision label, and §6's invariant is that it
     never applies one itself — which is still true here, because this job applies it.
+
+    The two daemon-health marks are the heartbeat monitor's, so they are accepted only from
+    `monitor_actor_ids` — never from the executor, and from nobody while that key is unset.
+    That author is the tracker key the monitor comments with, so "only the monitor" really
+    means "anything holding that key" (docs/NOTIFIER-OPERATOR.md, What is not proven).
     """
     if mark in (ESC_BLOCKED, ESC_NEEDS_HUMAN):
         return True
-    allowed = cfg.get("executor_actor_ids") or []
+    if mark in HEALTH_MARKS:
+        allowed = cfg.get("monitor_actor_ids") or []
+    else:
+        allowed = cfg.get("executor_actor_ids") or []
     return bool(author_id) and author_id in allowed
 
 
 SATURATED_SKIP = "comment window saturated"
+# The two ways a daemon-health mark goes unpaged. The first is named in the pass summary
+# with its ticket, comment and author, because something other than the configured monitor
+# wrote the monitor's mark; the second is counted in the summary's OFF clause.
+HEALTH_UNAUTHORISED_SKIP = "daemon-health mark from an author not in monitor_actor_ids"
+HEALTH_OFF_SKIP = "daemon-health mark while monitor_actor_ids is unset (OFF)"
 
 
 def select_events(tickets, sent_keys, cfg, labelled_keys=None):
@@ -962,9 +1023,16 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 continue
 
             if not is_authorised(mark, comment.get("author_id"), cfg):
-                skipped.append((tid, cid,
-                                "mark %s from an unauthorised author — only the configured "
-                                "executor may produce it" % mark))
+                if mark in HEALTH_MARKS and not cfg.get("monitor_actor_ids"):
+                    skipped.append((tid, cid, "%s — not paged" % HEALTH_OFF_SKIP))
+                elif mark in HEALTH_MARKS:
+                    skipped.append((tid, cid, "%s: mark %s from author %s — not paged"
+                                    % (HEALTH_UNAUTHORISED_SKIP, mark,
+                                       comment.get("author_id") or "(none)")))
+                else:
+                    skipped.append((tid, cid,
+                                    "mark %s from an unauthorised author — only the configured "
+                                    "executor may produce it" % mark))
                 continue
 
             key = event_id(cid)
@@ -1031,7 +1099,8 @@ def is_relayable_mark(mark):
     """Only an agent:blocked ping ever records a relay target.
 
     needs-human means the bounce budget is spent — a relay there would re-prompt the session
-    the budget stopped. The four planning marks have never run.
+    the budget stopped. The four planning marks have never run. The two daemon-health marks
+    are the heartbeat monitor's, and no session is waiting on them.
     """
     return mark == RELAY_MARK
 
@@ -1805,6 +1874,16 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
             "could sit outside it and would never be paged; raise lookback_comments"
             % (len(saturated), ", ".join(str(s[0]) for s in saturated)))
 
+    # The heartbeat monitor's mark from an author that is not the monitor: something else
+    # wrote it. NAMED every pass it stays in the window, and counted as nothing else — it
+    # changes no exit code, or one forged comment would make every pass exit 3 until it aged
+    # out, and a real decline would read like more of the same.
+    health_forged = [s for s in skipped if (s[2] or "").startswith(HEALTH_UNAUTHORISED_SKIP)]
+    if health_forged:
+        problems.append("%d daemon-health mark(s) NOT paged — %s" % (
+            len(health_forged), "; ".join("%s comment %s: %s" % s for s in health_forged)))
+    health_off = [s for s in skipped if (s[2] or "").startswith(HEALTH_OFF_SKIP)]
+
     for event in events:
         try:
             if event.get("settle"):
@@ -1983,6 +2062,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
             code = EXIT_ERROR
             summary = ("FAIL: the reply relay could not do what it was asked: %s — this is "
                        "NOT 'no replies' | %s" % ("; ".join(relay["failures"]), summary))
+    # …and so do the daemon-health marks: on from which authors, or OFF and how many unpaged.
+    if cfg.get("monitor_actor_ids"):
+        summary += (" | daemon-health marks: ON, from %d monitor author id(s)"
+                    % len(cfg["monitor_actor_ids"]))
+    else:
+        summary += (" | daemon-health marks: OFF (monitor_actor_ids is unset) — %d seen, none "
+                    "paged" % len(health_off))
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -2128,9 +2214,12 @@ def selftest():
         return "<!-- pipeline-escalation: %s -->" % label
 
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
-    ok("all six ADR marks are known", set(MARKS) == {
+    # Spelled as the ADR spells them, not through the constants: a renamed constant must not
+    # carry the contract string along with it.
+    ok("all eight ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
-        ESC_BLOCKED, ESC_NEEDS_HUMAN})
+        ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered"},
+       sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
            find_mark(marker(mark) + "\nbody") == mark)
@@ -2179,6 +2268,14 @@ def selftest():
     ok("a session's blocked mark applies blocked", label_for(ESC_BLOCKED) == "agent:blocked")
     ok("a session's needs-human mark applies needs-human",
        label_for(ESC_NEEDS_HUMAN) == "agent:needs-human")
+    for _health in ("daemon-health-incident", "daemon-health-recovered"):
+        ok("the heartbeat monitor's %s mark is known and applies NO label" % _health,
+           _health in MARKS and label_for(_health) is None)
+        ok("…and is never a reply-relay target (%s)" % _health,
+           _health in MARKS and not is_relayable_mark(_health))
+        ok("…and comes after every lifecycle mark in precedence (%s)" % _health,
+           _health in MARK_PRECEDENCE
+           and MARK_PRECEDENCE.index(_health) > MARK_PRECEDENCE.index(ESC_AWAITING_APPROVAL))
 
     # ── §6. Config: all errors at once, env NAMES only, state dir outside a worktree ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -2356,6 +2453,77 @@ def selftest():
         chat_s = _FakeChat()
         run_once(cfg, _FakeTracker(sess), chat_s, False, out=buf)
         ok("a session's OWN agent:blocked mark is still honoured", len(chat_s.posts) == 1)
+
+        # ── §7h. The heartbeat monitor's two marks (KIT-156) ──────────────────────
+        # Accepted only from `monitor_actor_ids`; unset, from nobody, and the pass says OFF.
+        # A mark from any other author is a skip NAMED in the summary — ticket, comment,
+        # author — and it changes no exit code: a forged comment stays in the window for
+        # many passes, and an exit 3 on each would bury the real ones.
+        HEALTH_IN, HEALTH_OK = "daemon-health-incident", "daemon-health-recovered"
+        MONITOR = "monitor-actor-1"
+        try:
+            cfg_on = load_config_from(dict(good, monitor_actor_ids=[MONITOR]), tmp)
+            ok("monitor_actor_ids is a config key the loader accepts", True)
+        except NotifierError as exc:
+            cfg_on = cfg
+            ok("monitor_actor_ids is a config key the loader accepts", False, str(exc))
+        cfg_off = load_config_from(dict((k, v) for k, v in good.items()
+                                        if k != "monitor_actor_ids"), tmp)
+        ok("health marks come from the configured monitor author only",
+           is_authorised(HEALTH_IN, MONITOR, cfg_on) and is_authorised(HEALTH_OK, MONITOR, cfg_on)
+           and not is_authorised(HEALTH_IN, EXEC, cfg_on)
+           and not is_authorised(HEALTH_IN, "a-session", cfg_on))
+        try:
+            load_config_from(dict(good, monitor_actor_ids="self"), tmp)
+            ok("a monitor_actor_ids that is not a list is refused by name", False)
+        except NotifierError as exc:
+            ok("a monitor_actor_ids that is not a list is refused by name",
+               "'monitor_actor_ids' must be a list" in str(exc), str(exc))
+
+        # One incident comment: one ping across two passes, and no label, ever.
+        h1 = [tkt("KIT-20", HEALTH_IN, "h1", title="Stage E daemon health", author=MONITOR)]
+        chat_h1, tracker_h1 = _FakeChat(), _FakeTracker(h1)
+        res_h1 = run_once(cfg_on, tracker_h1, chat_h1, False, out=buf)
+        chat_h2, tracker_h2 = _FakeChat(), _FakeTracker(h1)
+        res_h2 = run_once(cfg_on, tracker_h2, chat_h2, False, out=buf)
+        ok("a monitor incident pings once, and says what it is",
+           len(chat_h1.posts) == 1 and "needs a look" in chat_h1.posts[0]
+           and "KIT-20" in chat_h1.posts[0] and res_h1["exit"] == EXIT_OK,
+           (chat_h1.posts, res_h1["summary"]))
+        ok("…and not again on the next pass",
+           len(chat_h1.posts) == 1 and chat_h2.posts == [] and res_h2["exit"] == EXIT_OK,
+           res_h2["summary"])
+        ok("…and applies no label on either pass",
+           len(chat_h1.posts) == 1 and tracker_h1.labels == [] and tracker_h2.labels == [],
+           (tracker_h1.labels, tracker_h2.labels))
+        ok("…and the pass says the health marks are on",
+           "daemon-health marks: ON" in res_h1["summary"], res_h1["summary"])
+
+        # A health mark from anyone else: not paged, not labelled, NAMED, exit unchanged.
+        forged_h = [tkt("KIT-21", HEALTH_IN, "h2", author="a-session")]
+        chat_fh, tracker_fh = _FakeChat(), _FakeTracker(forged_h)
+        res_fh = run_once(cfg_on, tracker_fh, chat_fh, False, out=buf)
+        named = all(t in res_fh["summary"] for t in ("KIT-21", "h2", "a-session"))
+        ok("a forged health mark is NAMED in the summary: ticket, comment and author",
+           named, res_fh["summary"])
+        ok("…and pages nobody and labels nothing",
+           named and chat_fh.posts == [] and tracker_fh.labels == [])
+        ok("…without changing the exit code", named and res_fh["exit"] == EXIT_OK, res_fh["exit"])
+
+        # OFF: accepted from nobody, including the monitor's own author, and said every pass.
+        off_h = [tkt("KIT-22", HEALTH_IN, "h3", author=MONITOR)]
+        chat_oh, tracker_oh = _FakeChat(), _FakeTracker(off_h)
+        res_oh = run_once(cfg_off, tracker_oh, chat_oh, False, out=buf)
+        said_off = ("daemon-health marks: OFF" in res_oh["summary"]
+                    and "1 seen" in res_oh["summary"])
+        ok("with monitor_actor_ids unset, the pass says daemon-health marks are OFF, and that "
+           "it saw one", said_off, res_oh["summary"])
+        ok("…and that one pages nobody, labels nothing, and changes no exit code",
+           said_off and chat_oh.posts == [] and tracker_oh.labels == []
+           and res_oh["exit"] == EXIT_OK)
+        res_quiet = run_once(cfg_off, _FakeTracker([]), _FakeChat(), False, out=buf)
+        ok("…and says OFF on a pass that saw none, too",
+           "daemon-health marks: OFF" in res_quiet["summary"], res_quiet["summary"])
 
         # ── §7d. A hostile ticket title cannot control the chat client ───────────
         nasty = [tkt("KIT-5", ESC_BLOCKED, "c5", title="<!channel> <http://x|click>",

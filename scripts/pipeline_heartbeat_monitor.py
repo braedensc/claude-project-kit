@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Heartbeat monitor — the one Stage E job that READS the other three's heartbeats.
+"""Heartbeat monitor — the one Stage E job that READS the other daemons' heartbeats.
 
 WHAT THIS IS
 
@@ -7,14 +7,36 @@ WHAT THIS IS
   job is dead" and "the job ran and had nothing to do" stop looking identical (§13). Until
   this file existed, **nothing read them.** The three heartbeats were a signal with no
   consumer: a daemon could stop for a week and the only thing that would notice was an
-  operator remembering to `cat` three files under another account's home.
+  operator remembering to `cat` three files under another account's home. The human-action
+  notifier writes one too, and it is the fourth job this monitor can watch (KIT-156).
 
   This is that consumer, and nothing more. One scheduled, one-shot pass, run by the SAME
-  role account as the daemons it watches, on a LONGER interval. It reads the three files,
-  judges each one, and when the verdict CHANGES it posts ONE comment on a configured
-  tracker ticket. It is deterministic code — no model, no prompt, no tokens — so there is
-  nothing here for an injection to steer, and a page cannot be produced by anything except
-  a heartbeat a daemon actually wrote (or failed to).
+  role account as the daemons it watches, on a LONGER interval. It reads the files of the
+  jobs named in `watch`, judges each one, and when the verdict CHANGES it posts ONE comment
+  on a configured tracker ticket. It is deterministic code — no model, no prompt, no
+  tokens — so there is nothing here for an injection to steer, and a page cannot be
+  produced by anything except a heartbeat a daemon actually wrote (or failed to).
+
+HOW THE COMMENT REACHES A PERSON (KIT-156)
+
+  The comment is posted with the tracker key named by `linear_key_env`, which on a normal
+  install is the owner's own — and the tracker does not notify anyone of their own comment.
+  So the comment alone reached nobody. It now carries a mark alone on its FIRST line,
+  `<!-- pipeline-escalation: daemon-health-incident -->` on an incident and
+  `…daemon-health-recovered -->` on a recovery, and the human-action notifier pings the
+  private chat channel on it. This job holds no chat token: the notifier stays the only
+  thing that sends a ping. The notifier accepts these two marks only from the author ids
+  its own config names (`monitor_actor_ids`), applies no label for either, and pings once
+  per comment.
+
+  Line 1 is the only line the notifier reads a mark on, and it is the only line that can
+  hold one: every value this job takes from a heartbeat has its `<!--` and `-->` defused
+  before it is embedded (the plan executor's rule), so a daemon — or anything that can write
+  its state directory — cannot put a second mark into the comment.
+
+  When the notifier is itself one of the problems, the comment says in its own text that it
+  probably pinged nobody. A dead notifier cannot page about itself; the comment still lands
+  on the ticket, and an off-box check is the only real answer (KIT-45).
 
 WHAT IT CANNOT CATCH, STATED FIRST BECAUSE IT IS THE POINT
 
@@ -42,15 +64,17 @@ WHAT IT CANNOT CATCH, STATED FIRST BECAUSE IT IS THE POINT
   attempted here: a half-built dead-man's switch that silently stops pinging is worse than
   none.
 
-WHAT IT WATCHES, AND WHY THE THREE SHAPES ARE NOT UNIFIED HERE
+WHAT IT WATCHES, AND WHY THE FOUR SHAPES ARE NOT UNIFIED HERE
 
-  The three daemons were written at different times and their heartbeats do not agree on
-  field names: the review poller ends with `result`/`ended_at`, the bounce driver writes
-  `result`/`at`/`finished_at` and also writes a `running` beat at the START of a pass, and
-  the finding poller writes a boolean `ok` with `at`. Rewriting them to one shape would
-  touch three daemons for this one reader's convenience, so the shapes stay where they are
-  and the differences live in the WATCHERS table below — one row per job, declaring the
-  schema string, the timestamp fields in priority order, and what counts as a good result.
+  The jobs were written at different times and their heartbeats do not agree on field
+  names: the review poller and the finding poller end with `result`/`ended_at`, the bounce
+  driver writes `result`/`at`/`finished_at` and also writes a `running` beat at the START of
+  a pass, and the notifier writes an integer `exit` with `at` and no result string at all.
+  Rewriting them to one shape would touch four jobs for this one reader's convenience, so
+  the shapes stay where they are and the differences live in the WATCHERS table below — one
+  row per job, declaring the schema string, the timestamp fields in priority order, and what
+  counts as a good result. The notifier's exit is read by way of this file's own exit table,
+  and only exit 0 is good: its exit 3 is a ping or a label that did not land.
 
   A shape this table does not recognize is `unreadable`, which is a verdict about THIS
   MONITOR ("I could not judge") and never about the daemon ("it is down"). Those two are
@@ -68,7 +92,7 @@ WHAT "STALE" MEANS, AND THE ONE FALSE PAGE IT WOULD OTHERWISE GUARANTEE
 
   A sleeping laptop would otherwise make this useless. launchd runs the missed interval on
   wake, so for one interval after a wake EVERY heartbeat is legitimately old and a naive
-  monitor pages on all three. So the monitor reads its OWN last-run timestamp first: if it
+  monitor pages on all of them. So the monitor reads its OWN last-run timestamp first: if it
   missed its own schedule by more than `stale_multiplier` intervals, the machine was not
   running, staleness is NOT judged this pass, and the report says so in those words.
   `missing`, `failing` and `unreadable` are still judged — none of them depends on the
@@ -119,10 +143,10 @@ WHAT IT NEVER DOES (asserted in --selftest against this file's own source)
 
   Its ONLY tracker write is `commentCreate` on the one configured ticket. It applies no
   label, moves no ticket state, creates no ticket, touches no pull request, approves and
-  merges nothing, and launches no session. It deliberately writes NO `pipeline-escalation`
-  mark: a mark would make the human-action notifier apply a lifecycle label, and a label is
-  not this job's to write. When the chat notifier is activated, adding a mark for daemon
-  health is a change to THAT job's table, not a widening of this one.
+  merges nothing, and launches no session. The one `pipeline-escalation` mark it writes is
+  one of its two daemon-health marks, on line 1 of its own comment, and neither mark carries
+  a label in the notifier's table: a lifecycle label is not this job's to cause. It sends no
+  chat message and holds no chat token.
 
 Usage:
   pipeline_heartbeat_monitor.py run   --config FILE [--dry-run] [--timeout N]
@@ -182,6 +206,30 @@ RESULT_BY_CODE = {EXIT_OK: "ok", EXIT_ERROR: "error", EXIT_USAGE: "usage",
 HEARTBEAT_SCHEMA = "pipeline-heartbeat-monitor-heartbeat/1"
 STATE_SCHEMA = "pipeline-heartbeat-monitor-state/1"
 
+# ── The page: the two marks the notifier pings on (KIT-156) ────────────────────────────
+# Redeclared rather than imported, for the reason the exit codes are: --selftest asserts the
+# notifier finds exactly these on this file's comments, applies no label, and accepts them
+# only from its configured monitor author.
+HEALTH_INCIDENT = "daemon-health-incident"
+HEALTH_RECOVERED = "daemon-health-recovered"
+NOTIFIER_JOB = "notifier"
+
+
+def mark_line(mark):
+    """The mark, alone, as the first line of a comment."""
+    return "<!-- pipeline-escalation: %s -->" % mark
+
+
+def defuse(text):
+    """Heartbeat-derived text, made unable to carry a mark: the plan executor's rule.
+
+    A heartbeat is a file a daemon wrote, and so is anything a process that can write that
+    daemon's state directory put there. With `<!--` and `-->` neutralised, nothing embedded
+    below line 1 can open or close an HTML comment, so line 1 is the only line that can hold
+    a mark — by construction, not by a scan that could miss a spelling. The text stays
+    readable; it only stops being markup."""
+    return str(text).replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
 LINEAR_API = "https://api.linear.app/graphql"
 TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([0-9]+)$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -193,7 +241,7 @@ DEFAULT_COOLDOWN_SECONDS = 900
 DEFAULT_RUN_TIMEOUT_SECONDS = 120
 MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot page on jitter
 
-# ── The three jobs, and how each one's heartbeat is shaped ─────────────────────────────
+# ── The four jobs, and how each one's heartbeat is shaped ──────────────────────────────
 #
 # `dir_key`      which config directory the file sits in (the finding poller has its own,
 #                so its heartbeat.json cannot collide with the review poller's).
@@ -202,6 +250,12 @@ MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot p
 #                is rewritten by the mid-pass `running` beat.
 # `bool_field`   a heartbeat that reports a boolean instead of a result string. No
 #                watcher uses it today: the finding poller did until its /2 heartbeat.
+# `exit_field`   a heartbeat that reports its integer exit instead of a result string (the
+#                notifier). The number is read by way of RESULT_BY_CODE, the vocabulary every
+#                sibling shares, so one word reaches the verdict table.
+# `dry_field`    a boolean that marks a rehearsal (`--dry-run`). Judged by its time like any
+#                other beat, and NAMED as a rehearsal, so a loaded job's first real pass is
+#                not mistaken for having happened.
 # `good`         results that mean the last pass was fine. That is the daemon's own reading
 #                of its exit, not "nothing was declined": the review poller's `declined`
 #                (exit 3) is a pass that settled a NOT-reviewed verdict and said so on the
@@ -254,6 +308,24 @@ WATCHERS = {
         "good": ("ok",),
         "running": (),
     },
+    # The human-action notifier (KIT-156): the job that turns this monitor's mark into a
+    # ping. Its heartbeat carries an integer `exit` and no result string. Only exit 0 is
+    # good: its exit 3 is a ping or a label that did not land (owner decision, 2026-09-24),
+    # unlike the review poller's, which is that poller doing its job.
+    NOTIFIER_JOB: {
+        "label": "notifier",
+        "writer": "scripts/pipeline_notify_local.py",
+        "dir_key": "notifier_state_dir",
+        "filename": "notifier-heartbeat.json",
+        "schema": "pipeline-notifier-heartbeat/1",
+        "ts_fields": ("at",),
+        "result_field": None,
+        "bool_field": None,
+        "exit_field": "exit",
+        "dry_field": "dry",
+        "good": ("ok",),
+        "running": (),
+    },
 }
 
 # Verdicts that mean a person should look. `unreadable` is in here on purpose: a monitor
@@ -288,6 +360,9 @@ VERDICT_SENTENCE = {
 CONFIG_KEYS = {
     "state_dir": "where the review poller's and bounce driver's heartbeats live",
     "finding_state_dir": "where the finding poller's heartbeat lives (its own directory)",
+    "notifier_state_dir": "where the notifier's heartbeat lives: its config's `state_dir`. "
+                          "Defaults to state_dir, which is where the notifier writes it by "
+                          "default",
     "monitor_state_dir": "where THIS job's state file and heartbeat live; defaults to "
                          "state_dir; must be outside every git working tree",
     "watch": "which jobs this machine actually runs: any of %s. Required — an "
@@ -381,13 +456,20 @@ def parse_iso(value):
 def result_of(doc, spec):
     """The last pass's result as one lower-case word, or None if the file does not say.
 
-    The finding poller's boolean becomes `ok`/`error` here so one vocabulary reaches the
-    verdict table; the translation lives in this one function rather than at each use.
+    A boolean becomes `ok`/`error`, and the notifier's integer exit becomes its word in
+    RESULT_BY_CODE, so one vocabulary reaches the verdict table; the translation lives in
+    this one function rather than at each use. An exit no sibling uses is `exit-N`, which is
+    in no job's good list.
     """
     if spec.get("bool_field"):
         raw = doc.get(spec["bool_field"])
         if isinstance(raw, bool):
             return "ok" if raw else "error"
+        return None
+    if spec.get("exit_field"):
+        raw = doc.get(spec["exit_field"])
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return RESULT_BY_CODE.get(raw, "exit-%d" % raw)
         return None
     raw = doc.get(spec.get("result_field") or "result")
     if isinstance(raw, str) and raw.strip():
@@ -408,7 +490,21 @@ def judge_one(job, spec, raw, now, limit, blind):
     `blind` is the sleep blind spot: staleness is not judgeable this pass. It suppresses
     ONLY the two clock-derived verdicts. A missing, failing or unjudgeable heartbeat does
     not become healthy because the machine was asleep.
+
+    A beat its job marks as a rehearsal is judged by its time like any other — the job did
+    run — and its row says it was a rehearsal, so it is never read as a pass of the loaded
+    job.
     """
+    out = _judge_beat(job, spec, raw, now, limit, blind)
+    doc = raw.get("doc")
+    if (spec.get("dry_field") and isinstance(doc, dict) and doc.get(spec["dry_field"]) is True
+            and out["verdict"] not in ("missing", "unreadable")):
+        out["detail"] += " — a rehearsal (--dry-run), not a pass of the loaded job"
+    return out
+
+
+def _judge_beat(job, spec, raw, now, limit, blind):
+    """judge_one's verdict, before a rehearsal is named."""
     out = {"job": job, "label": spec["label"], "path": raw.get("path", ""),
            "result": None, "age_seconds": None, "beat_at": None, "detail": ""}
     if not raw.get("exists"):
@@ -600,10 +696,15 @@ def decide_post(report, state, now, cooldown, target=None):
 
 
 def build_comment(report, state_note, carried, recovery, watched_intervals):
-    """The comment body. Short, plain, and self-limiting: it says what it saw, what it
-    could not see, and it carries NO escalation mark (a mark would make the chat notifier
-    apply a lifecycle label, which is not this job's to write)."""
-    lines = []
+    """The comment body. Short, plain, and self-limiting: it says what it saw and what it
+    could not see.
+
+    Line 1 is ONE mark, alone: the recovery mark on a recovery and the incident mark on
+    every other comment — a carried change, a changed ticket and a partly-judged pass
+    included, because none of those is a recovery. The notifier pings on it and applies no
+    label (KIT-156). Every heartbeat-derived value below it is defused, so no other line can
+    carry a mark."""
+    lines = [mark_line(HEALTH_RECOVERED if recovery else HEALTH_INCIDENT)]
     if recovery:
         lines.append("**Stage E daemons are reporting again.** Every watched job has a "
                      "fresh heartbeat with a good result.")
@@ -622,8 +723,16 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     lines.append("| Job | Verdict | What that means |")
     lines.append("| --- | --- | --- |")
     for v in sorted(report["verdicts"], key=lambda v: v["job"]):
-        lines.append("| %s | `%s` | %s |" % (v["label"], v["verdict"], v["detail"]))
+        lines.append("| %s | `%s` | %s |" % (v["label"], v["verdict"], defuse(v["detail"])))
     lines.append("")
+    if not recovery and any(v["job"] == NOTIFIER_JOB for v in report["problems"]):
+        # The notifier is the job that turns this comment's mark into a ping. Named here as
+        # a problem, it probably cannot: say so where the reader is, rather than let the
+        # absence of a ping read as the absence of a problem.
+        lines.append("**This comment has probably pinged nobody.** The notifier is one of "
+                     "the jobs named above, and it is the job that turns this comment into a "
+                     "chat ping. A ping comes late, if at all: only once the notifier works "
+                     "again while this comment is still among the newest it reads.")
     if report["unwatched"]:
         lines.append("Not watched on this machine, so not judged: %s."
                      % ", ".join(report["unwatched"]))
@@ -639,7 +748,7 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
         lines.append("%d earlier change(s) were held back by the comment cooldown and are "
                      "included in the state above." % carried)
     if state_note:
-        lines.append(state_note)
+        lines.append(defuse(state_note))
     lines.append("")
     lines.append("Longest healthy gap between two heartbeats, per job: %s. Read the "
                  "heartbeat files themselves and the daemon logs as the role account "
@@ -773,7 +882,8 @@ def load_config(path):
 
     dirs = {}
     for key, default in (("state_dir", DEFAULT_STATE_DIR),
-                         ("finding_state_dir", DEFAULT_FINDING_DIR)):
+                         ("finding_state_dir", DEFAULT_FINDING_DIR),
+                         ("notifier_state_dir", raw.get("state_dir") or DEFAULT_STATE_DIR)):
         dirs[key] = os.path.realpath(os.path.expanduser(raw.get(key) or default))
     monitor_dir = os.path.realpath(os.path.expanduser(
         raw.get("monitor_state_dir") or raw.get("state_dir") or DEFAULT_STATE_DIR))
@@ -789,6 +899,7 @@ def load_config(path):
     return {
         "state_dir": dirs["state_dir"],
         "finding_state_dir": dirs["finding_state_dir"],
+        "notifier_state_dir": dirs["notifier_state_dir"],
         "monitor_state_dir": monitor_dir,
         "watch": watch,
         "intervals": intervals,
@@ -1390,15 +1501,32 @@ def selftest():
     ok("a recovery is exempt from the cooldown",
        decide_post(healthy, hot, NOW, 900)[0] is True)
 
-    # ── 8. The comment says what it saw, what it did not, and carries no mark ────────
+    # ── 8. The comment says what it saw, what it did not, and carries ONE mark ───────
+    # The mark is the page (KIT-156): the notifier pings on it, and on nothing else here.
+    # It sits alone on line 1, because that is the only line the notifier reads a mark on,
+    # and the header a person reads comes straight after it.
+    incident_line = "<!-- pipeline-escalation: daemon-health-incident -->"
+    recovered_line = "<!-- pipeline-escalation: daemon-health-recovered -->"
+
+    def headline(text):
+        """The first line a person reads: the one after the mark."""
+        rest = text.splitlines()
+        return rest[1] if rest and rest[0].startswith("<!--") and len(rest) > 1 else rest[0]
+
+    def marked_lines(text):
+        return [i for i, line in enumerate(text.splitlines()) if "pipeline-escalation" in line]
+
     body = build_comment(worse, None, 2, False, {"review-poller": 300})
     ok("the comment names every problem job",
        "review-poller" in body and "bounce-driver" in body)
     ok("the comment names the carried count", "2 earlier change(s)" in body)
     ok("the comment states the blind spot this monitor cannot cover",
        "asleep" in body and "silence here is not health" in body)
-    ok("the comment carries NO escalation mark (it must not trigger a label)",
-       "pipeline-escalation" not in body)
+    ok("an incident comment's FIRST line is the incident mark, alone",
+       body.splitlines()[0] == incident_line, body.splitlines()[0])
+    ok("…and no other line carries a mark", marked_lines(body) == [0], marked_lines(body))
+    ok("…and the header a person reads comes straight after it, on line 2",
+       body.splitlines()[1].startswith("**Stage E daemon health: 2 of 2"), body.splitlines()[:2])
     unwatched_body = build_comment(report_of([("review-poller", "stale")],
                                              unwatched=("finding-poller",)),
                                   None, 0, False, {"review-poller": 300})
@@ -1406,6 +1534,9 @@ def selftest():
        "Not watched on this machine" in unwatched_body and "finding-poller" in unwatched_body)
     recovery_body = build_comment(healthy, None, 0, True, {"review-poller": 300})
     ok("a recovery comment says so plainly", "reporting again" in recovery_body)
+    ok("a recovery comment's first line is the RECOVERY mark, and only that line is marked",
+       recovery_body.splitlines()[0] == recovered_line and marked_lines(recovery_body) == [0],
+       recovery_body.splitlines()[:2])
     note_body = build_comment(broken, "state file was unreadable", 0, False, {"review-poller": 300})
     ok("a lost state file is disclosed in the comment it may duplicate",
        "state file was unreadable" in note_body)
@@ -1414,8 +1545,60 @@ def selftest():
                               None, 0, False, {"review-poller": 300, "finding-poller": 300})
     ok("a comment from an unjudged pass names the job it did not judge in its first line, so "
        "that job never reads as recovered",
-       "not judged this pass" in part_body.splitlines()[0]
-       and "review-poller" in part_body.splitlines()[0], part_body.splitlines()[0])
+       "not judged this pass" in headline(part_body)
+       and "review-poller" in headline(part_body), headline(part_body))
+    # Every incident shape carries the INCIDENT mark: a carried change, a lost state file
+    # (a duplicate), and a pass that judged only part of the picture. None of them is a
+    # recovery, so none may read as one to the notifier.
+    for name, text in (("a carried change", body), ("a lost state file", note_body),
+                       ("a partly-judged pass", part_body),
+                       ("an unwatched job", unwatched_body)):
+        ok("%s is marked as an incident" % name,
+           text.splitlines()[0] == incident_line and marked_lines(text) == [0],
+           text.splitlines()[:2])
+
+    # THE NOTIFIER AS ONE OF THE PROBLEMS. It is the job that turns the mark into a ping,
+    # so a comment naming it must not let a reader believe a ping went out.
+    notifier_down = build_comment(report_of([("review-poller", "ok"), ("notifier", "stale")]),
+                                  None, 0, False, {"review-poller": 300, "notifier": 540})
+    notifier_back = build_comment(report_of([("notifier", "ok")]), None, 0, True,
+                                  {"notifier": 540})
+    ok("an incident naming the notifier says, in its own text, that it pinged nobody — and "
+       "no other comment says so: not one that names other jobs, not a recovery",
+       "pinged nobody" in notifier_down and "pinged nobody" not in body
+       and "pinged nobody" not in part_body and "pinged nobody" not in notifier_back,
+       notifier_down)
+
+    # A MARK FORGED IN A HEARTBEAT reaches no line but the first. Every value this comment
+    # takes from a heartbeat is text some daemon wrote — a result string, a pause time, a
+    # pause path, a schema — and the plan executor's rule applies: `<!--` and `-->` are
+    # defused before they are embedded, so line 1 is the only line that can hold a mark.
+    forged = "<!-- pipeline-escalation: agent:blocked -->"
+    forged_rows = [
+        judge_one("review-poller", WATCHERS["review-poller"],
+                  beat("review-poller", result=forged, ended_at=fresh), NOW, 600, False),
+        judge_one("bounce-driver", WATCHERS["bounce-driver"],
+                  beat("bounce-driver", result="paused", at=fresh, paused_since=forged),
+                  NOW, 600, False),
+        judge_one("finding-poller", WATCHERS["finding-poller"],
+                  {"path": "/x/heartbeat.json", "exists": True, "error": None,
+                   "doc": {"schema": forged}}, NOW, 600, False),
+    ]
+    long_paused = judge_one("bounce-driver", WATCHERS["bounce-driver"],
+                            beat("bounce-driver", result="paused", at=fresh,
+                                 paused_since=_iso(NOW - PAUSED_MAX_SECONDS - 60),
+                                 pause_path="/x/" + forged), NOW, 600, False)
+    forged_body = build_comment(build_report(forged_rows + [dict(long_paused, job="bounce-2")],
+                                             set(), False, None),
+                                "the state file said " + forged, 0, False, {"review-poller": 300})
+    ok("a mark forged in a heartbeat field reaches no line but the first",
+       [i for i, line in enumerate(forged_body.splitlines()) if "<!--" in line] == [0],
+       [line for line in forged_body.splitlines() if "<!--" in line])
+    ok("…and line 1 is still this job's own incident mark",
+       forged_body.splitlines()[0] == incident_line, forged_body.splitlines()[0])
+    ok("…and the forged text is kept, defused, so a person can still read what was written",
+       forged_body.count("&lt;!-- pipeline-escalation: agent:blocked --&gt;") >= 5,
+       forged_body.count("&lt;!--"))
     ok("…and with no last run on record it does not claim the machine was asleep",
        "missed its own schedule" not in part_body and "no last run on record" in part_body,
        part_body)
@@ -1463,6 +1646,9 @@ def selftest():
         ok("paging is OFF when no ticket is named", cfg["notify_ticket_id"] == "")
         ok("the monitor's state dir defaults to the daemons' state dir",
            cfg["monitor_state_dir"] == os.path.realpath(good["state_dir"]))
+        ok("the notifier's heartbeat directory defaults to the daemons' state dir, where the "
+           "notifier writes it by default",
+           cfg.get("notifier_state_dir") == os.path.realpath(good["state_dir"]), cfg)
 
         def errors_for(doc):
             try:
@@ -1488,6 +1674,13 @@ def selftest():
                                                intervals={"review-poller": 300})))
         ok("an unknown config key is refused",
            "unknown config key" in errors_for(dict(good, surprise=1)))
+        ok("the notifier can be watched: `notifier` in 'watch', and its own directory key",
+           errors_for(dict(good, watch=["review-poller", "notifier"],
+                           intervals={"review-poller": 300, "notifier": 540},
+                           notifier_state_dir=os.path.join(tmp, "nstate"))) == "",
+           errors_for(dict(good, watch=["review-poller", "notifier"],
+                           intervals={"review-poller": 300, "notifier": 540},
+                           notifier_state_dir=os.path.join(tmp, "nstate"))))
         ok("a state dir inside a git working tree is refused (a session could write it)",
            "inside a git working tree" in errors_for(dict(good, monitor_state_dir=HERE)))
         ok("an unreadable --config is exit 2, before anything is read",
@@ -1871,6 +2064,115 @@ def selftest():
                    % (code, want), real["verdict"] == want, real.get("detail"))
     except ImportError:
         ok("the finding poller is importable for the cross-check", False)
+
+    # ── 15. The page, read by the notifier's OWN code (KIT-156) ──────────────────────
+    # This job writes a mark; the notifier is the only thing that turns it into a ping. Two
+    # files, one contract, so it is asserted here against the notifier's own functions and
+    # its own heartbeat writer — the drift is caught where it would bite, not in prose.
+    try:
+        import pipeline_notify_local as pnl
+    except ImportError as exc:
+        pnl = None
+        ok("the notifier is importable for the cross-check", False, exc)
+    if pnl is not None:
+        inc, rec = "daemon-health-incident", "daemon-health-recovered"
+        for name, text, want in (("an incident", body, inc), ("a recovery", recovery_body, rec),
+                                 ("a partly-judged incident", part_body, inc),
+                                 ("an incident on a lost state file", note_body, inc),
+                                 ("an incident naming the notifier", notifier_down, inc)):
+            ok("the notifier finds exactly the %s mark on %s comment" % (want, name),
+               pnl.find_mark(text) == want, (pnl.find_mark(text), text.splitlines()[:1]))
+        for mark in (inc, rec):
+            ok("the notifier knows %s and applies NO label for it" % mark,
+               mark in pnl.MARKS and pnl.label_for(mark) is None, pnl.MARKS.get(mark))
+            ok("%s is never a reply-relay target" % mark,
+               mark in pnl.MARKS and not pnl.is_relayable_mark(mark))
+        gate = {"executor_actor_ids": ["exec-actor-1"], "monitor_actor_ids": ["monitor-actor-1"]}
+        ok("the notifier accepts both marks from the configured monitor author",
+           all(pnl.is_authorised(m, "monitor-actor-1", gate) for m in (inc, rec)))
+        ok("…and refuses them from anyone else, the plan executor included",
+           not any(pnl.is_authorised(m, who, gate) for m in (inc, rec)
+                   for who in ("someone-else", "exec-actor-1", None, "")))
+        ok("…and from EVERYONE while no monitor author is configured (OFF)",
+           not any(pnl.is_authorised(m, "monitor-actor-1", {"executor_actor_ids": ["x"]})
+                   for m in (inc, rec)))
+
+        # End to end through the notifier's own selection: the monitor's incident and
+        # recovery comments on its ticket are two events with no label; from any other
+        # author they are two NAMED skips and no event at all.
+        sel_cfg = dict(pnl.EXAMPLE_CONFIG, ticket_url_template="https://x/{id}", **gate)
+
+        def on_ticket(author, *texts):
+            return [{"id": "KIT-7", "uuid": "u-7", "title": "daemon health", "label_ids": [],
+                     "comments": [{"id": "c%d" % i, "body": t, "author_id": author}
+                                  for i, t in enumerate(texts)]}]
+        events, skipped, _cap = pnl.select_events(on_ticket("monitor-actor-1", body, recovery_body),
+                                                  set(), sel_cfg)
+        ok("the notifier selects one event per monitor comment, with no label on either",
+           sorted(e["mark"] for e in events) == sorted([inc, rec])
+           and all(e["label"] is None for e in events) and not skipped, (events, skipped))
+        events, skipped, _cap = pnl.select_events(on_ticket("exec-actor-1", body, recovery_body),
+                                                  set(), sel_cfg)
+        ok("…and from another author, none — each one a skip that names that author",
+           events == [] and len(skipped) == 2
+           and all("exec-actor-1" in (s[2] or "") for s in skipped), skipped)
+        events, skipped, _cap = pnl.select_events(on_ticket("monitor-actor-1", forged_body),
+                                                  set(), sel_cfg)
+        ok("a comment carrying a mark forged in a heartbeat pages as ONE incident, and the "
+           "forged mark is not even seen as a mark below line 1",
+           [e["mark"] for e in events] == [inc] and not skipped, (events, skipped))
+
+        # The fourth watcher row IS the notifier's heartbeat: its schema, its filename, and
+        # the directory the notifier writes it in by default.
+        spec_n = WATCHERS.get("notifier")
+        ok("the notifier is a watched job", spec_n is not None, sorted(WATCHERS))
+        spec_n = spec_n or {"label": "notifier", "schema": None, "filename": None,
+                            "ts_fields": ("at",), "good": (), "running": ()}
+        ok("the watched schema string is the one the notifier writes",
+           spec_n["schema"] == pnl.HEARTBEAT_SCHEMA, spec_n["schema"])
+        ok("the watched filename is where the notifier writes it, in the directory it writes "
+           "it by default",
+           spec_n["filename"] == os.path.basename(pnl.heartbeat_path({"state_dir": "/d"}))
+           and spec_n.get("dir_key") == "notifier_state_dir"
+           and pnl.DEFAULT_STATE_DIR == DEFAULT_STATE_DIR, (spec_n, pnl.DEFAULT_STATE_DIR))
+        # A pin, not a regression test: it holds today and goes red the day either file
+        # renumbers an exit, which would silently change what `failing` means here.
+        ok("the exit vocabulary agrees with the notifier's, name for name",
+           all(globals()[n] == getattr(pnl, n, None) for n in
+               ("EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "EXIT_DECLINED", "EXIT_TIMEOUT")))
+        # THE NOTIFIER'S OWN WRITER, at each exit it can leave. Exit 3 is a ping or a label
+        # that did not land, so it is FAILING here (owner decision, 2026-09-24): unlike the
+        # review poller's exit 3, nothing about it is the job doing its job.
+        with tempfile.TemporaryDirectory() as nd:
+            ncfg = {"state_dir": nd}
+            for code, want in ((0, "ok"), (1, "failing"), (2, "failing"), (3, "failing"),
+                               (4, "failing")):
+                pnl.write_heartbeat(ncfg, {"exit": code, "summary": "s"}, pnl._now_iso())
+                real = judge_one("notifier", spec_n, read_beat(pnl.heartbeat_path(ncfg)),
+                                 time.time(), 600, False)
+                ok("a heartbeat the notifier REALLY writes (exit %d) is judged %s" % (code, want),
+                   real["verdict"] == want
+                   and (want == "ok" or repr(RESULT_BY_CODE[code]) in real["detail"]),
+                   (real["verdict"], real.get("detail")))
+            pnl.write_heartbeat(ncfg, {"exit": 0, "dry": True, "summary": "s"}, pnl._now_iso())
+            real = judge_one("notifier", spec_n, read_beat(pnl.heartbeat_path(ncfg)),
+                             time.time(), 600, False)
+            ok("a notifier rehearsal (--dry-run) is judged by its time, and named a rehearsal",
+               real["verdict"] == "ok" and "rehearsal" in real["detail"], real.get("detail"))
+        # The exit is read only when it is an integer. A boolean is not a number here —
+        # `False == 0` in Python, so it would otherwise read as exit 0 — and a string or a
+        # missing exit says nothing either. Exit 0 beside them is the control: the watcher
+        # really does read the exit, so the odd ones fail for their shape, not for nothing.
+        def judged_exit(value):
+            raw_x = {"path": "/x/notifier-heartbeat.json", "exists": True, "error": None,
+                     "doc": {"schema": spec_n["schema"], "at": _iso(NOW - 60), "exit": value}}
+            return judge_one("notifier", spec_n, raw_x, NOW, 600, False)
+        odd_rows = dict((repr(o), judged_exit(o)) for o in (False, True, "0", None))
+        ok("a notifier exit is read only as an integer: 0 is ok, and False, True, '0' and "
+           "None are never ok",
+           judged_exit(0)["verdict"] == "ok"
+           and all(r["verdict"] == "failing" and r["result"] is None for r in odd_rows.values()),
+           dict((k, (r["verdict"], r["result"])) for k, r in odd_rows.items()))
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))

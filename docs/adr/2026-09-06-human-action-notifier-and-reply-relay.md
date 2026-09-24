@@ -362,6 +362,8 @@ lane write the rest:
 | `agent:needs-human` | bounce driver | the bounce budget is spent | yes |
 | `agent:needs-human` | planner job (idea gate), on the cancelled planning ticket | a planning ticket's routing could not be confirmed; all planning is stopped until the probe is signed again (KIT-184) | yes — the label lands on that dead planning ticket, never on the idea |
 | review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision |
+| `daemon-health-incident` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | a watched Stage E daemon, or the notifier, needs a look | no — daemon health is not a ticket's lifecycle |
+| `daemon-health-recovered` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | the watched daemons are reporting again | no — daemon health is not a ticket's lifecycle |
 
 New producer marks are added to this table in the same PR that ships them, so a mark the
 notifier cannot page on never exists silently.
@@ -467,3 +469,43 @@ what review checks. That half is open (KIT-118).
 ### 5. The needs-human label stands
 
 Recorded under the marks table.
+
+## Update 2026-09-24 — the daemon-health page is built (KIT-156)
+
+Decision 3 of the update above is built as decided: two marks, no label on either, accepted
+only from the monitor's author, and the notifier watched as a fourth job. The owner settled
+four open points on 2026-09-24:
+
+- **A notifier exit 3 is failing** for the monitor. For the notifier it means a ping or a
+  label did not land. The review poller's exit 3 stays good: that is the poller doing its job.
+- **Recovery comments ping too.** At the flap rate measured on the monitor's ticket, that is
+  about ten pings a week.
+- **`monitor_actor_ids` is optional.** Absent, the marks are accepted from nobody and every
+  pass says `daemon-health marks: OFF`, so a config written before the key existed keeps
+  loading. The installer composes it from `MONITOR_ACTOR_IDS` (default `self`, or `off`).
+- **The comment window is left as it is.** The notifier names the monitor's ticket as
+  saturated once it carries more comments than one pass reads. That warning is accepted.
+
+What was built, beyond the decision:
+
+- **Line 1 is the only line that can carry a mark.** The monitor defuses `<!--` and `-->` in
+  every value it takes from a heartbeat, by the plan executor's rule. A mark forged in a
+  heartbeat field cannot reach line 1.
+- **A health mark from any other author is named**, with its ticket, comment and author, in
+  the pass summary, and changes no exit code. The planning marks' unauthorised skips are
+  still only counted.
+- **The monitor reads the notifier's integer exit** through the exit table the Stage E jobs
+  share. A dry-run heartbeat is judged by its time and named a rehearsal.
+- **A comment that names the notifier says it pinged nobody.**
+- **The Stage E installer decides whether the notifier is watched** (`NOTIFIER_JOB_LABEL`),
+  from what launchd holds and from the notifier's own config. It refuses a label launchd does
+  not hold. The notifier's installer never writes the monitor's config. The Stage E step owns
+  that file whole and would revert anything written into it (the KIT-171 defect class). The
+  notifier's installer reads it for its handover, which is ON only when both ends agree.
+- **The notifier's installer asks the role account's clone which config keys its notifier
+  knows** before it writes a config. A clone older than this change would refuse
+  `monitor_actor_ids` on every pass.
+
+Still open: the notifier's own death (KIT-45). Who can really write the mark is anything
+holding the monitor's tracker key, as for the planning marks (`docs/NOTIFIER-OPERATOR.md`,
+*What is not proven*).

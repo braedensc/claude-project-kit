@@ -297,6 +297,24 @@ CONFLICT_WAKER_CONF=conflict-waker.conf
 # RULE: a positive integer.
 MONITOR_INTERVAL_SECONDS=1800
 
+# The human-action notifier's launchd label, so the heartbeat monitor watches
+# the notifier too — the job that turns the monitor's comments into chat pings
+# (docs/NOTIFIER-OPERATOR.md).  Set it to the notifier's own JOB_LABEL once the
+# notifier is loaded.
+#
+# Set, the `heartbeat-monitor` step asks launchd what it runs under that label
+# and how often, reads the notifier's pass time and state directory from
+# ~/.stage-e/notifier.json as the role account, and watches it at that interval
+# plus one pass.  A label launchd does not hold is refused, not watched.
+#
+# A dead notifier still cannot page about itself.  The monitor's comment lands
+# on its ticket and says it pinged nobody; only an off-box check covers that
+# (KIT-45).
+#
+# RULE: a reverse-DNS launchd label, or EMPTY, which leaves the notifier
+# unwatched and says so by name on every run.
+NOTIFIER_JOB_LABEL=
+
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from
 # each repository's own `delivery.json` on its committed default branch.  Keep

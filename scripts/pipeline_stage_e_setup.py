@@ -18,7 +18,10 @@ passes — review poller, bounce driver, finding poller.
 A fourth system LaunchDaemon reads those three's heartbeats: the heartbeat
 monitor (scripts/pipeline_heartbeat_monitor.py, KIT-127). It comments on ONE
 ticket when their health changes, so the `heartbeat-monitor` step stops on a card
-until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name.
+until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name. With
+NOTIFIER_JOB_LABEL set it watches the human-action notifier's heartbeat too, at the
+interval launchd holds for that job plus the notifier's own pass clock (KIT-156);
+empty, the step says the notifier is not watched.
 
 And one thing that is NOT the role account's: the `conflict-waker` step installs
 the local half of the conflict loop for the PERSON running this command — a user
@@ -603,6 +606,10 @@ CONF_DEFAULTS = {
     # `off` leaves the three heartbeats unread, BY NAME.
     "HEARTBEAT_MONITOR_TICKET": "",
     "MONITOR_INTERVAL_SECONDS": "1800",
+    # The human-action notifier's launchd label, for the monitor to watch its heartbeat too
+    # (KIT-156). Empty leaves it unwatched, and the `heartbeat-monitor` step says so by name.
+    # Set, launchd must hold that job: its interval is read from launchd, not from here.
+    "NOTIFIER_JOB_LABEL": "",
 }
 # The kit's own grader-path guard, by name — the one check a session can never turn
 # green, because it is red exactly until a person applies the label it demands. It is
@@ -752,6 +759,10 @@ def validate_conf(values):
     if monitor_value and monitor_value.lower() != "off" and not _TICKET_ID_RE.match(monitor_value):
         errors.append("HEARTBEAT_MONITOR_TICKET must be a ticket id like KIT-123, or `off` "
                       "(got %r)" % monitor_value)
+    nlabel = (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
+    if nlabel and not _RDNS_RE.match(nlabel):
+        errors.append("NOTIFIER_JOB_LABEL %r is not a reverse-DNS launchd label — the "
+                      "notifier's JOB_LABEL, or empty to leave it unwatched" % nlabel)
     if conf.get("SEVERITY_THRESHOLD") not in ("low", "medium", "high", "critical"):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
@@ -4763,17 +4774,30 @@ MONITOR_DAEMON_PASS_SECONDS = 900
 MONITOR_GOOD_RESULTS = ("ok", "declined")
 MONITOR_HEARTBEAT_POLLS = 18
 MONITOR_HEARTBEAT_POLL_SECONDS = 5
+# The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
+# installer's default path, as the role account; what the notifier's own loader assumes
+# when a key is absent is held here, and the battery asserts it against that loader.
+NOTIFIER_WATCH_JOB = "notifier"
+NOTIFIER_SCRIPT_NAME = "pipeline_notify_local.py"
+NOTIFIER_CONFIG_FILE = "notifier.json"
+NOTIFIER_DEFAULT_RUN_TIMEOUT = 240
+NOTIFIER_DEFAULT_STATE_DIR = "~/.stage-e/state"
+_RUN_INTERVAL_RE = re.compile(r"^\s*run interval = (\d+) seconds?\s*$", re.MULTILINE)
 
 
-def monitor_config(conf):
+def monitor_config(conf, notifier=None):
     """The monitor's config, from the same conf values the three daemons are scheduled
     by — so its idea of "stale" follows the interval launchd really uses.
 
     Each job's interval is launchd's PLUS one pass's wall clock: the longest a healthy job
     can go between two heartbeats. The review poller writes only when a pass ends, and the
     bounce driver's `running` beat stands until its pass ends, so launchd's interval alone
-    reads a long pass inside its own deadline as `stale` or `wedged`."""
-    return {
+    reads a long pass inside its own deadline as `stale` or `wedged`.
+
+    `notifier` is what `measure_notifier` read, or None: with it, the notifier is a fourth
+    watched job, by the same rule — the interval launchd holds for it, plus its own pass
+    clock — and its heartbeat is read from its own state directory."""
+    doc = {
         "state_dir": "~/.stage-e/state",
         "finding_state_dir": "~/.stage-e/finding",
         "watch": [job for job, _key in MONITOR_JOBS],
@@ -4785,6 +4809,87 @@ def monitor_config(conf):
         "notify_ticket_id": monitor_ticket(conf),
         "linear_key_env": conf["LINEAR_KEY_ENV"],
     }
+    if notifier:
+        doc["watch"].append(NOTIFIER_WATCH_JOB)
+        doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
+        doc["notifier_state_dir"] = notifier["state_dir"]
+    return doc
+
+
+def notifier_label(conf):
+    """The notifier's launchd label, or "" while it is left unwatched."""
+    return (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
+
+
+def measure_notifier(ctx):
+    """What the monitor needs to watch the notifier, measured — or None when
+    NOTIFIER_JOB_LABEL is empty.
+
+    THREE MEASUREMENTS, AND NONE OF THEM IS A CONF VALUE. launchd is asked whether it holds
+    the label, what it runs there and how often; the notifier's own config is read as the
+    role account for its pass clock and its state directory. The interval is launchd's
+    because launchd keeps what it was given: a changed notifier conf moves the file on disk
+    and not the running job.
+
+    A label launchd does not hold is REFUSED, never watched: its heartbeat would be missing
+    or stale on every pass, and the monitor would page about a job nobody meant to run. A
+    label holding something that is not the notifier is refused for the same reason."""
+    label = notifier_label(ctx.conf)
+    if not label:
+        return None
+    r = ctx.runner
+    res = r.as_root(["launchctl", "print", "system/" + label])
+    text = (res.out or "") + (res.err or "")
+    if not res.ok:
+        if res.rc == 113 or "Could not find service" in text:
+            raise SetupError(
+                "NOTIFIER_JOB_LABEL=%s names a job launchd does not hold, so the heartbeat "
+                "monitor would page about its heartbeat on every pass. Load the notifier "
+                "(the notifier installer's card CK-N3), or empty NOTIFIER_JOB_LABEL to leave "
+                "it unwatched." % label)
+        raise Unknown("could not ask launchd about system/%s (exit %d): %s"
+                      % (label, res.rc, text.strip()[:160]), "run the same command again")
+    if NOTIFIER_SCRIPT_NAME not in text:
+        raise SetupError(
+            "NOTIFIER_JOB_LABEL=%s names a job launchd holds, and it does not run %s. That "
+            "label is some other job's; watching it as the notifier would judge the wrong "
+            "heartbeat. Set NOTIFIER_JOB_LABEL to the notifier's own JOB_LABEL."
+            % (label, NOTIFIER_SCRIPT_NAME))
+    found = _RUN_INTERVAL_RE.search(text)
+    if not found:
+        raise Unknown(
+            "system/%s is loaded, and launchd's own print gave no run interval, so how old "
+            "the notifier's heartbeat may get cannot be worked out." % label,
+            "read it yourself: sudo launchctl print system/%s" % label)
+    got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, NOTIFIER_CONFIG_FILE))
+    try:
+        doc = json.loads(got.out) if got.ok and got.out.strip() else None
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        raise SetupError(
+            "system/%s is loaded, and ~/.stage-e/%s is %s as %s, so the notifier's pass clock "
+            "and state directory are not known. The notifier installer writes that file; a "
+            "notifier configured elsewhere cannot be watched from here."
+            % (label, NOTIFIER_CONFIG_FILE, "missing" if not (got.ok and got.out.strip())
+               else "not a JSON object", ctx.account))
+    timeout = doc.get("run_timeout_seconds") or NOTIFIER_DEFAULT_RUN_TIMEOUT
+    state_dir = doc.get("state_dir") or NOTIFIER_DEFAULT_STATE_DIR
+    if (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
+            or not isinstance(state_dir, str)):
+        raise SetupError("~/.stage-e/%s carries a run_timeout_seconds or state_dir the notifier "
+                         "itself would refuse (%r, %r)" % (NOTIFIER_CONFIG_FILE, timeout, state_dir))
+    return {"label": label, "interval": int(found.group(1)), "run_timeout": timeout,
+            "state_dir": state_dir}
+
+
+def _notifier_watch_note(notifier):
+    """One clause for the step's row: whether the notifier is watched, and by what gap."""
+    if not notifier:
+        return "the notifier is not watched (NOTIFIER_JOB_LABEL is empty)"
+    return ("it watches the notifier system/%s: every %d + %d s pass = %d s"
+            % (notifier["label"], notifier["interval"], notifier["run_timeout"],
+               notifier["interval"] + notifier["run_timeout"]))
 
 
 def _monitor_plist(ctx):
@@ -4876,7 +4981,11 @@ def step_heartbeat_monitor(ctx, apply_it):
     Which ticket, or none, is a person's call, so an unnamed ticket is card CK-9 and
     `off` is said by name on every run. Before it is loaded the ticket is proved to
     exist and the monitor's own `check` runs; a loaded monitor whose heartbeat is stale
-    is NOT RUNNING, never installed."""
+    is NOT RUNNING, never installed.
+
+    The notifier is the one job it may also watch, and only as launchd holds it: see
+    `measure_notifier`. Its row says either way. This step writes the monitor's config
+    whole; the notifier installer never writes it, or this step would revert it."""
     r, conf = ctx.runner, ctx.conf
     ticket = monitor_ticket(conf)
     if ticket == "off":
@@ -4903,7 +5012,11 @@ def step_heartbeat_monitor(ctx, apply_it):
                          "read, so every comment the monitor owes would fail. Name one that "
                          "exists, or set it to off." % ticket)
 
-    want_conf, want_plist = monitor_config(conf), _monitor_plist(ctx)
+    # The notifier, as a fourth watched job — or said, by name, not to be (KIT-156). Measured
+    # before anything is written, so a label launchd does not hold stops the step here.
+    notifier = measure_notifier(ctx)
+    watch_note = _notifier_watch_note(notifier)
+    want_conf, want_plist = monitor_config(conf, notifier), _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
         have_conf = json.loads(got.out) if got.ok and got.out.strip() else None
@@ -4929,8 +5042,8 @@ def step_heartbeat_monitor(ctx, apply_it):
             raise SetupError("the heartbeat monitor runs and could not do its job: its last pass "
                              "ended `%s` — %s" % (doc.get("result"),
                                                   str(doc.get("detail") or "")[:300]))
-        return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`"
-                      % (ticket, int(age), doc.get("result"))), []
+        return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`; %s"
+                      % (ticket, int(age), doc.get("result"), watch_note)), []
 
     if not apply_it:
         todo = (["write ~/.stage-e/%s" % MONITOR_CONFIG] if conf_stale else []) \
@@ -4939,7 +5052,7 @@ def step_heartbeat_monitor(ctx, apply_it):
             + ["%s it and wait for a heartbeat (%s)"
                % ("reload" if loaded else "load",
                   why_not or ("the last one was a dry run" if not real else "stale"))]
-        return False, "would " + ", then ".join(todo), []
+        return False, "would " + ", then ".join(todo) + "; " + watch_note, []
 
     if conf_stale:
         body = json.dumps(want_conf, indent=2, sort_keys=True) + "\n"
@@ -5030,7 +5143,8 @@ def step_heartbeat_monitor(ctx, apply_it):
                 raise SetupError("the heartbeat monitor loaded and its first pass ended `%s` — %s"
                                  % (doc.get("result"), str(doc.get("detail") or "")[:300]))
             return False, ("loaded; its first pass wrote a heartbeat (`%s`), and it comments "
-                           "on %s once per incident" % (doc.get("result"), ticket)), []
+                           "on %s once per incident; %s" % (doc.get("result"), ticket,
+                                                            watch_note)), []
         if n < MONITOR_HEARTBEAT_POLLS - 1:
             _pause(MONITOR_HEARTBEAT_POLL_SECONDS)
     raise Unknown("the heartbeat monitor was loaded and wrote no heartbeat within %d s"
@@ -9785,7 +9899,8 @@ def _selftest_body():
     try:
         _mcfg = hbm.load_config(_mpath)
         expect("monitor-config-accepted",
-               set(_mcfg["watch"]) == set(hbm.WATCHERS) and _mcfg["notify_ticket_id"] == "KIT-7"
+               set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier"}
+               and _mcfg["notify_ticket_id"] == "KIT-7"
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
                                           "finding-poller": 300 + 900}
                and _mcfg["run_interval_seconds"] == 1800,
@@ -10175,6 +10290,137 @@ def _selftest_body():
         _x, outOffM = _quiet(lambda: _unloaded_notice(ctxOff))
         expect("unloaded-notice", "THE STAGE E DAEMONS ARE UNLOADED" not in outOffM
                and "bootstrap system" not in outOffM, outOffM)
+
+        # -- THE NOTIFIER, WATCHED (KIT-156) ----------------------------------------------
+        # NOTIFIER_JOB_LABEL empty: not watched, and said by name. Set: launchd is asked
+        # what it holds under that label and how often it runs it, the notifier's own
+        # config is read as the role account, and the monitor watches `notifier` with the
+        # run interval plus one pass. A notifier launchd does not hold is refused: its
+        # absent heartbeat would otherwise page for ever.
+        cases += 1
+        _nlabel = "com.example.notifier"
+        expect("notifier-watch-conf", CONF_DEFAULTS.get("NOTIFIER_JOB_LABEL") == ""
+               and "NOTIFIER_JOB_LABEL" in CONF_KEYS,
+               "NOTIFIER_JOB_LABEL must be a conf key whose default is empty (not watched)")
+        _nerrs = validate_conf(parse_conf(GOOD_CONF + "NOTIFIER_JOB_LABEL=nodots\n")[0])[1] \
+            + parse_conf(GOOD_CONF + "NOTIFIER_JOB_LABEL=nodots\n")[1]
+        expect("notifier-watch-conf", any("NOTIFIER_JOB_LABEL" in e and "reverse-DNS" in e
+                                          for e in _nerrs), "a malformed label read %s" % _nerrs)
+        _nprint = ("system/%s = {\n\tstate = not running\n\tprogram = /bin/sh\n\targuments = {\n"
+                   "\t\t/bin/sh\n\t\t-c\n\t\tset -a; . \"$HOME/.stage-e/env\"; set +a; exec "
+                   "/usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_notify_local.py\" run "
+                   "--config \"$HOME/.stage-e/notifier.json\"\n\t}\n\trun interval = 300 seconds\n}\n"
+                   % _nlabel)
+        _nconf_doc = {"state_dir": "~/.stage-e/notifier-state", "run_timeout_seconds": 200,
+                      "linear_key_env": "STAGE_E_LINEAR_API_KEY", "team_keys": ["KIT"]}
+
+        def _watching(conf_x, interval, state_dir):
+            """The monitor config the step must want when it watches the notifier, spelled
+            out here rather than asked of `monitor_config`: what is pinned is the shape."""
+            want = dict(monitor_config(conf_x))
+            want["watch"] = list(want["watch"]) + ["notifier"]
+            want["intervals"] = dict(want["intervals"], notifier=interval)
+            want["notifier_state_dir"] = state_dir
+            return want
+
+        def _notifier_ctx(printed=(0, _nprint), nconf=_nconf_doc, have=None, **kw):
+            ctx_n, fake_n = _monitor_ctx(**kw)
+            ctx_n.conf = dict(ctx_n.conf, NOTIFIER_JOB_LABEL=_nlabel)
+            lead = [("launchctl print system/" + _nlabel, printed[0], printed[1])]
+            if nconf is not None:
+                lead.append(("cat $HOME/.stage-e/notifier.json", 0, json.dumps(nconf)))
+            if have is not None:
+                lead.append(("cat $HOME/.stage-e/" + MONITOR_CONFIG, 0, json.dumps(have)))
+            fake_n.answers = lead + fake_n.answers
+            return ctx_n, fake_n
+
+        # Unwatched: the settled row says so, by name.
+        okNU, detailNU, _x = step_heartbeat_monitor(_monitor_ctx()[0], apply_it=False)
+        expect("notifier-watch-off", okNU is True and "notifier" in detailNU
+               and "NOTIFIER_JOB_LABEL" in detailNU and "not watched" in detailNU,
+               "an unwatched notifier must be named as such: %r" % detailNU)
+
+        # Watched and settled: the monitor already watches it, with launchd's interval plus
+        # the notifier's own pass clock, and its own state dir. Nothing is written.
+        _conf_n = _monitor_conf("KIT-7")[0]
+        _want_n = _watching(_conf_n, 300 + 200, "~/.stage-e/notifier-state")
+        ctxNS, fakeNS = _notifier_ctx(have=_want_n)
+        okNS, detailNS, _x = step_heartbeat_monitor(ctxNS, apply_it=False)
+        expect("notifier-watch-settled", okNS is True and _nlabel in detailNS
+               and "500" in detailNS and not fakeNS.writes,
+               "a settled monitor that watches the notifier read %r, wrote %s"
+               % (detailNS, fakeNS.writes))
+        # …and the monitor's OWN loader takes that config, watching all four jobs.
+        _npath = os.path.join(_mdir, "monitor-notifier.json")
+        with open(_npath, "w", encoding="utf-8") as fh:
+            json.dump(dict(_want_n, state_dir=os.path.join(_mdir, "s"),
+                           finding_state_dir=os.path.join(_mdir, "f"),
+                           notifier_state_dir=os.path.join(_mdir, "n")), fh)
+        try:
+            _ncfg = hbm.load_config(_npath)
+            expect("notifier-watch-accepted", set(_ncfg["watch"]) == set(hbm.WATCHERS)
+                   and _ncfg["intervals"].get("notifier") == 500,
+                   "the monitor read back %s" % _ncfg)
+        except hbm.MonitorError as exc:
+            failures.append("notifier-watch-accepted: the monitor refused it: %s" % exc)
+
+        # The notifier's config names neither key: the notifier's OWN defaults apply, and
+        # the defaults assumed here are asserted against its loader.
+        import pipeline_notify_local as _pnl_m
+        _probe_dir = tempfile.mkdtemp(prefix="notifier-defaults.", dir=_mdir)
+        _pdefault_timeout = _pnl_m.load_config_from(dict(
+            [(k, v) for k, v in _pnl_m.EXAMPLE_CONFIG.items() if k != "run_timeout_seconds"],
+            state_dir=os.path.join(_probe_dir, "state")), _probe_dir)["run_timeout_seconds"]
+        ctxND, fakeND = _notifier_ctx(nconf={}, have=_watching(
+            _conf_n, 300 + _pdefault_timeout, _pnl_m.DEFAULT_STATE_DIR))
+        okND, detailND, _x = step_heartbeat_monitor(ctxND, apply_it=False)
+        expect("notifier-watch-defaults",
+               okND is True and "300 + %d" % _pdefault_timeout in detailND and not fakeND.writes,
+               "a notifier config naming neither key read %r (the notifier's defaults: %s s, %s)"
+               % (detailND, _pdefault_timeout, _pnl_m.DEFAULT_STATE_DIR))
+
+        # A run writes exactly that config.
+        ctxNA, fakeNA = _notifier_ctx(config=False, plist=False, loaded=False, beat_age=-5)
+        fakeNA.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                          (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
+                          ("install -o root", 0, ""), (_rearm_cmd, 0, ""),
+                          ("launchctl bootstrap system", 0, "")] + fakeNA.answers
+        ctxNA.unloaded = [mlabel]
+        _quiet(lambda: step_heartbeat_monitor(ctxNA, apply_it=True))
+        _bodyNA = [w["stdin"] for w in fakeNA.writes if "write " in w["why"]]
+        expect("notifier-watch-install", _bodyNA and json.loads(_bodyNA[0]) == _want_n,
+               "the monitor config written was %s" % (_bodyNA[:1],))
+
+        # Refusals: launchd does not hold it; it holds something that is not the notifier;
+        # it gives no interval to judge by; the notifier's config cannot be read. Each is
+        # said by name and writes nothing.
+        for name, kw, exc_type, needles in (
+                ("not loaded", {"printed": (113, "Could not find service")}, SetupError,
+                 (_nlabel, "NOTIFIER_JOB_LABEL", "does not hold")),
+                ("another job", {"printed": (0, _nprint.replace("pipeline_notify_local.py",
+                                                                "pipeline_review_poller.py"))},
+                 SetupError, (_nlabel, "pipeline_notify_local.py")),
+                ("no interval", {"printed": (0, _nprint.replace("\trun interval = 300 seconds\n",
+                                                                ""))},
+                 Unknown, (_nlabel, "interval")),
+                ("no config", {"nconf": None}, SetupError, ("notifier.json",)),
+                ("a pass clock the notifier would refuse",
+                 {"nconf": dict(_nconf_doc, run_timeout_seconds="240")}, SetupError,
+                 ("run_timeout_seconds", "'240'")),
+                ("a state dir the notifier would refuse",
+                 {"nconf": dict(_nconf_doc, state_dir=7)}, SetupError, ("state_dir",))):
+            ctxNR, fakeNR = _notifier_ctx(config=False, plist=False, loaded=False,
+                                          beat_age=None, **kw)
+            try:
+                step_heartbeat_monitor(ctxNR, apply_it=True)
+                failures.append("notifier-watch-refused (%s): the step went on" % name)
+            except exc_type as exc:
+                expect("notifier-watch-refused", all(n in str(exc) for n in needles)
+                       and not fakeNR.writes,
+                       "%s: %s; writes %s" % (name, exc, [w["why"] for w in fakeNR.writes]))
+            except (SetupError, Unknown, Blocked) as exc:
+                failures.append("notifier-watch-refused (%s): %s, not %s: %s"
+                                % (name, type(exc).__name__, exc_type.__name__, exc))
     finally:
         globals()["_pause"] = _saved_pause_m
     order = [s for s, _t, _f in STEPS]
