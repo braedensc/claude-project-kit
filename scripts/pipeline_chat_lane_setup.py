@@ -38,9 +38,12 @@ and then run for real. The owner decided the composer itself gains those writers
     `merge --apply`, `env-names` and `front-door --apply` WRITE. Each is a subcommand a
     PERSON runs; each refuses in an agent environment, before the conf is read; each
     writes AS THE ROLE ACCOUNT, through one program handed to `sudo -u <role> /bin/sh`,
-    with every value on standard input and never in an argument; each checks the file
-    is still the one it read (a checksum) and backs it up first, under the role
-    account's own home. `compose`, `verify` and `card` still write nothing.
+    with every value on standard input and never in an argument; each backs the file up
+    first, under the role account's own home, and writes nothing when there is nothing
+    to change. `merge --apply` and `front-door --apply` also check the file is still the
+    one they planned from (a checksum). `env-names` has no separate plan: it reads and replaces the env file in one
+    pass, and nothing else rewrites that file. `compose`, `verify` and `card` still
+    write nothing.
 
 WHAT IT NEVER DOES.  It never restarts anything and never loads a job: the restarts and
 the port block stay PRINTED commands a person runs (installers never load jobs). It never
@@ -49,19 +52,25 @@ approve, label or ticket-state path anywhere in this file, and `--selftest` scan
 source: outside the three writer programs and the one function that runs them, the
 source may hold no write at all.
 
-EXIT CODES — the Stage E installer's, contract §13:
+EXIT CODES — the Stage E installer's, contract §13. The word on a line (REFUSED, NOT
+MEASURED) says what happened; the exit code says which kind of nothing it was:
     0   compose printed / verify measured every check as applied / a writer wrote, or
         found nothing to write, and its rows measure as applied
     1   FAILED — a check found something broken, or a write failed (a writer that fails
         after writing puts its backup back)
-    2   USAGE or CONFIG — nothing was attempted (a subcommand missing a conf key it
-        needs; a secret of the wrong shape)
-    3   REFUSED — an agent environment; or the file changed between the read and the
-        write, so nothing was written; or the token offered is the notifier's
-    4   UNKNOWN — a check could not measure itself. Not a pass.
+    2   USAGE or CONFIG — nothing was attempted: a conf error, a conf key the subcommand
+        needs is unset, or a secret of the wrong shape
+    3   REFUSED for safety — an agent environment; or, for merge and front-door, the
+        file changed between the read and the write; or the token offered is the
+        notifier's. Nothing was written.
+    4   UNKNOWN — a check could not measure itself, or env-names could not compare the
+        token with the notifier's. Not a pass.
     5   NO ADMINISTRATOR ACCESS — `sudo` absent or declined; nothing was read
-    10  BLOCKED-ON-HUMAN — drift: a piece is not applied, or not as composed. A writer's
-        dry run that found something to write exits 10: it did nothing, on purpose
+    10  BLOCKED-ON-HUMAN — drift: a piece is not applied, or not as composed; or a step
+        must come first (env-names before the fence or the port block, or without a
+        terminal; a file a writer will not touch — missing, a symbolic link, another
+        account's; not exactly one allowlist line). A writer's dry run that found
+        something to write exits 10: it did nothing, on purpose
 
 `verify` REFUSES IN AN AGENT ENVIRONMENT, and that is stricter than the Stage E
 installer's `verify` on purpose. That one still runs under a model with its credential
@@ -1094,10 +1103,13 @@ def _compose_piece_3(conf):
          "(Application.js:52-78). Nobody types a secret into this file by hand:  python3 %s "
          "env-names  asks for the two secret values at hidden prompts, hands them to the "
          "role account's shell on standard input — never in an argument, never on this "
-         "screen — and writes all four names together. It refuses until the port block "
-         "(piece 4) measures as loaded, and refuses the notifier's token. It backs the "
-         "file up first; that backup holds the secrets, so delete it once verify is "
-         "clean. It never restarts the dispatcher: card CK-C5 does, only when it is idle."
+         "screen — and writes all four names together. It refuses until verify's "
+         "coding-fence row (piece 2) and port-block row (piece 4, on the port the "
+         "dispatcher listens on) both measure as applied. It refuses a token found "
+         "anywhere in ROLE_ENV_FILE, where the notifier keeps its own, and will not guess "
+         "when that file cannot be read. It backs the file up first; that backup holds "
+         "the secrets, so delete it once verify is clean. It never restarts the "
+         "dispatcher: card CK-C5 does, only when it is idle."
          % (conf["DISPATCHER_ENV_FILE"], _self_path()))
     say("")
     say("    SLACK_BOT_TOKEN        the CHAT app's bot token (Slack: OAuth & Permissions)")
@@ -1330,7 +1342,8 @@ def _compose_order(conf):
         "stay in Slack until the next step asks for them.",
         "5. Piece 3, all four names together:  %s env-names  asks for the chat app's token "
         "and signing secret at hidden prompts and writes all four names. It refuses until "
-        "the port block measures as loaded. Then restart the dispatcher with card CK-C5, "
+        "the fence and the port block measure as applied, as verify's rows read them. "
+        "Then restart the dispatcher with card CK-C5, "
         "which restarts it only when it answers idle. slackAllowedTools reloads live "
         "(ConfigManager.js:51-62, 181), but the listening address and address checks are "
         "read at start only, and a removed env name stays set until a restart "
@@ -2501,9 +2514,11 @@ def cmd_verify(conf, runner, sudo):
 #   * every value goes on STANDARD INPUT — a secret never reaches an argument, so `ps`
 #     never shows it, and the Runner records it as "<hidden>";
 #   * paths are arguments, never spliced into the program;
-#   * the program re-reads the file and refuses (exit 3, nothing written) when it is not
-#     the file the plan read — the dispatcher rewrites its own config when it refreshes a
-#     tracker token;
+#   * the merge and front-door programs re-read the file and refuse (exit 3, nothing
+#     written) when it is not the file the plan read — the dispatcher rewrites its own
+#     config when it refreshes a tracker token. The env program has no separate plan to compare with: it reads and
+#     replaces the env file in one pass, and the dispatcher never rewrites that file;
+#   * it writes nothing, and backs nothing up, when there is nothing to change;
 #   * it backs the file up first, under the role account's home, at mode 600, with a name
 #     the Stage E installer's backup pruning never matches;
 #   * it prints names, lengths, paths and tool lists, never a value.
@@ -2711,9 +2726,20 @@ except OSError as exc:
 
 # Piece 3. Arguments: set|remove, the dispatcher's env file, the role account's own env
 # file (`~/` = that account's home), and the notifier token's NAME. `set` reads the token
-# and the signing secret from standard input, one per line. Exit 0 wrote, 5 could not (the
-# original untouched), 6 refused the notifier's token, 7 nothing on standard input, 2 a
-# bad argument. Portable to both stats: GNU's `-c` is tried first, BSD's `-f` after.
+# and the signing secret from standard input, one per line. Exit 0 wrote; 9 had nothing to
+# change (nothing written, nothing backed up); 4 refused the file (missing, a symbolic
+# link, or another account's); 5 could not (the original untouched); 6 refused the
+# notifier's token; 7 nothing on standard input; 8 could not compare the token with the
+# notifier's (the role account's env file is absent or unreadable); 2 a bad argument.
+# Portable to both stats: GNU's `-c` is tried first, BSD's `-f` after.
+#
+# THE NOTIFIER'S TOKEN (review of KIT-197, 30/43/48). The offered token is compared with
+# EVERY value in the role account's env file, not only the one under NOTIFIER_TOKEN_ENV:
+# a notifier conf that names its token differently, or a stale line above the live one
+# (a shell that sources the file keeps the last), would otherwise pass. A file that cannot
+# be read is exit 8, never a pass; a file with no line for the name says so. The secrets,
+# and every line and value read from that file, meet only shell builtins: `ps` never
+# shows a value (the selftest scans for it).
 ENV_WRITER_SH = r'''
 cd / || exit 5
 mode=$1; f=$2; renv=$3; nname=$4
@@ -2722,36 +2748,56 @@ case $nname in ''|*[!A-Z0-9_]*) echo "FAILED: bad notifier name. Nothing was cha
 case $renv in "~/"*) renv="$HOME/${renv#??}";; esac
 names='SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET|CYRUS_HOST_EXTERNAL|WEBHOOK_IP_VALIDATION'
 pat="^[[:space:]]*(export[[:space:]]+)?($names)[[:space:]]*(=|:[[:space:]])"
-[ -f "$f" ] || { echo "REFUSED: $f does not exist. Nothing was changed."; exit 5; }
+[ -L "$f" ] && { echo "REFUSED: $f is a symbolic link. Replacing it would leave a plain file at the link's own mode where the link was. Point DISPATCHER_ENV_FILE at the file itself. Nothing was changed."; exit 4; }
+[ -f "$f" ] || { echo "REFUSED: $f does not exist. Nothing was changed."; exit 4; }
 me=$(id -un)
 owner=$(stat -c %U "$f" 2>/dev/null || stat -f %Su "$f" 2>/dev/null)
-[ "$owner" = "$me" ] || { echo "REFUSED: $f is owned by ${owner:-an unknown account}, not $me. Nothing was changed."; exit 5; }
+[ "$owner" = "$me" ] || { echo "REFUSED: $f is owned by ${owner:-an unknown account}, not $me. Nothing was changed."; exit 4; }
 if [ "$mode" = set ]; then
     IFS= read -r T || T=
     IFS= read -r S || S=
     [ -n "$T" ] && [ -n "$S" ] || { T=; S=; echo "FAILED: two values did not arrive on standard input. Nothing was changed."; exit 7; }
-    n=
-    if [ -f "$renv" ]; then
-        n=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$nname[[:space:]]*=[[:space:]]*//p" "$renv" | head -n 1)
-        case $n in
-            \"*) n=${n#\"}; n=${n%%\"*};;
-            \'*) n=${n#\'}; n=${n%%\'*};;
-            *) n=${n%%[[:space:]#]*};;
-        esac
+    if [ ! -e "$renv" ]; then why="does not exist"
+    elif [ ! -f "$renv" ] || [ ! -r "$renv" ]; then why="cannot be read"
+    else why=; fi
+    if [ -n "$why" ]; then
+        T=; S=
+        echo "NOT CHECKED: $renv $why, so the token could not be compared with the notifier's. Point ROLE_ENV_FILE in chat-lane.conf at the file the notifier keeps its token in (notifier.conf's ENV_FILE). Nothing was changed."
+        exit 8
     fi
-    if [ -n "$n" ] && [ "$n" = "$T" ]; then
-        n=; T=; S=
-        echo "REFUSED: that token is the NOTIFIER's ($nname in the role account's env file). The chat lane needs the chat app's own token: two apps, two tokens. Nothing was changed."
+    hit=; seen=
+    while IFS= read -r l || [ -n "$l" ]; do
+        l=${l#"${l%%[![:space:]]*}"}
+        case $l in export[[:space:]]*) l=${l#export}; l=${l#"${l%%[![:space:]]*}"};; esac
+        case $l in *=*) ;; *) continue;; esac
+        k=${l%%=*}; k=${k%"${k##*[![:space:]]}"}
+        case $k in ''|*[!A-Za-z0-9_]*) continue;; esac
+        v=${l#*=}; v=${v#"${v%%[![:space:]]*}"}
+        case $v in
+            \"*) v=${v#\"}; v=${v%%\"*};;
+            \'*) v=${v#\'}; v=${v%%\'*};;
+            *) v=${v%%[[:space:]#]*};;
+        esac
+        [ "$k" = "$nname" ] && seen=1
+        [ -n "$v" ] && [ "$v" = "$T" ] && hit=$k
+    done < "$renv"
+    l=; v=
+    if [ -n "$hit" ]; then
+        T=; S=
+        if [ "$hit" = "$nname" ]; then
+            echo "REFUSED: that token is the NOTIFIER's ($nname in the role account's env file). The chat lane needs the chat app's own token: two apps, two tokens. Nothing was changed."
+        else
+            echo "REFUSED: that token is already in the role account's env file, as $hit, so it is not the chat app's own: two apps, two tokens. If $hit is the notifier's token under another name, set NOTIFIER_TOKEN_ENV=$hit in chat-lane.conf. Nothing was changed."
+        fi
         exit 6
     fi
-    n=
+    if [ -n "$seen" ]; then
+        echo "CHECKED     the token is not the notifier's: it matches no value in $renv, $nname among them."
+    else
+        echo "NOTE        $renv has no $nname line, so the notifier may keep its token elsewhere. The token was compared with every value in that file and matched none. Make ROLE_ENV_FILE and NOTIFIER_TOKEN_ENV match notifier.conf's ENV_FILE and CHAT_TOKEN_ENV."
+    fi
 fi
 umask 077
-d="$HOME/.stage-e/backups"
-mkdir -p "$d" && chmod 700 "$d" || { T=; S=; echo "REFUSED: could not make $d. Nothing was changed."; exit 5; }
-b="$d/dispatcher-env.pre-chat-lane.$(date +%Y-%m-%d-%H%M%S)"
-[ -e "$b" ] && b="$b.$$"
-cp -p "$f" "$b" && chmod 600 "$b" || { T=; S=; echo "REFUSED: could not back up $f. Nothing was changed."; exit 5; }
 t="$f.chat-lane.$$"
 grep -v -E "$pat" "$f" > "$t"
 [ $? -le 1 ] || { T=; S=; rm -f "$t"; echo "FAILED: could not read $f. The original is untouched."; exit 5; }
@@ -2759,6 +2805,20 @@ if [ "$mode" = set ]; then
     printf 'SLACK_BOT_TOKEN=%s\nSLACK_SIGNING_SECRET=%s\nCYRUS_HOST_EXTERNAL=true\nWEBHOOK_IP_VALIDATION=false\n' "$T" "$S" >> "$t" || { T=; S=; rm -f "$t"; echo "FAILED: could not write the new copy. The original is untouched."; exit 5; }
 fi
 T=; S=
+if cmp -s "$t" "$f"; then
+    rm -f "$t"
+    if [ "$mode" = set ]; then
+        echo "UNCHANGED $f already ends with these four lines. Nothing was written, and nothing was backed up."
+    else
+        echo "UNCHANGED $f names none of the four. Nothing was written, and nothing was backed up."
+    fi
+    exit 9
+fi
+d="$HOME/.stage-e/backups"
+mkdir -p "$d" && chmod 700 "$d" || { rm -f "$t"; echo "FAILED: could not make $d. Nothing was changed."; exit 5; }
+b="$d/dispatcher-env.pre-chat-lane.$(date +%Y-%m-%d-%H%M%S)"
+[ -e "$b" ] && b="$b.$$"
+cp -p "$f" "$b" && chmod 600 "$b" || { rm -f "$t"; echo "FAILED: could not back up $f. Nothing was changed."; exit 5; }
 m=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)
 chmod "$m" "$t" && mv -f "$t" "$f" || { rm -f "$t"; echo "FAILED: could not replace $f. The original is untouched."; exit 5; }
 echo "WROTE $f (mode $m, owner $me): $(grep -c . "$b") non-empty line(s) before, $(grep -c . "$f") after. Every other line kept, in order."
@@ -2768,7 +2828,7 @@ else
     echo "  lines naming any of the four left in it: $(grep -c -E "$pat" "$f")"
 fi
 echo "BACKUP $b"
-echo "  It holds the two secrets as they were. Delete it once verify is clean:"
+echo "  It holds the whole env file as it was, the dispatcher's other secrets included. Delete it once verify is clean:"
 echo "      sudo -u $me rm -f '$b'"
 dir=$(dirname "$f")
 for s in "$dir"/.*.sw? "$dir"/*.sw?; do
@@ -3156,9 +3216,21 @@ def secret_shape_problem(token, secret):
 
 
 def _env_done(conf, res):
+    """The env writer's exit, as this file's exit (contract §13: each nothing named). The
+    writer's own line, relayed first, says which case it was; none of these adds a second
+    cause to it."""
     _relay(res)
-    if res.rc == 6:
+    if res.rc == 6:              # the notifier's token: refused, nothing changed
         return EX_REFUSED
+    if res.rc == 4:              # not a file it writes: missing, a link, another account's
+        return EX_BLOCKED
+    if res.rc == 8:              # the notifier's token could not be compared: not a pass
+        return EX_UNKNOWN
+    if res.rc == 9:              # nothing to change: nothing written, nothing backed up
+        para("Nothing changed, so this run needs no restart. If the dispatcher was not "
+             "restarted since these names last changed, restart it now, only when it is "
+             "idle: card CK-C5.", "")
+        return EX_OK
     if not res.ok:
         say("FAILED: the role account's shell exited %d%s." % (res.rc, {
             5: ": the file could not be read or replaced, and the original is untouched",
@@ -3170,6 +3242,58 @@ def _env_done(conf, res):
          "when it is idle — card CK-C5:", "")
     print_card("CK-C5", conf)
     return EX_OK
+
+
+def _env_names_gate(conf, runner):
+    """None when `env-names` may ask for the secrets; otherwise its exit code, after saying
+    why. THE ORDER's two rules, each measured exactly as `verify` measures it: the fence
+    before the token (the coding-fence row) and the port block before the listen (the
+    port-block row, including CYRUS_SERVER_PORT against DISPATCHER_PORT). Review of KIT-197,
+    findings 32, 35, 44 and 45: the gate used to read pf alone."""
+    account, envfile = conf["ROLE_ACCOUNT"], conf["DISPATCHER_ENV_FILE"]
+    facts, why_not = probe_facts(runner, conf)
+    if facts is None:
+        say("NOT MEASURED: the read-only probe as %s did not run (%s). Nothing was asked for "
+            "or changed." % (account, why_not))
+        return EX_UNKNOWN
+    env_facts = facts.get("env") or {"error": "missing"}
+    if env_facts.get("error"):
+        missing = env_facts["error"] == "missing"
+        say("%s: the dispatcher's env file %s is %s, so the port it listens on could not be "
+            "compared with DISPATCHER_PORT. Nothing was asked for or changed."
+            % ("REFUSED" if missing else "NOT MEASURED", envfile, env_facts["error"]))
+        return EX_BLOCKED if missing else EX_UNKNOWN
+    cfg = facts.get("config") or {"error": "missing"}
+    rows = [_config_unmeasured(cfg, ("coding-fence",))[0] if cfg.get("error")
+            else check_fence(cfg, env_facts),
+            check_port_block(conf, pf_probe(runner), env_facts)]
+    remedy = {
+        "coding-fence": "The order is the fence before the token: once SLACK_BOT_TOKEN is in "
+                        "the dispatcher's environment, every session it starts gets a working "
+                        "Slack server, and an unfenced entry keeps it. Run  python3 %s merge  "
+                        "and then  merge --apply  first." % _self_path(),
+        "port-block": "The order is the port block before the listen, and the block must "
+                      "refuse the port the dispatcher listens on. Fix what the row names "
+                      "(piece 4:  python3 %s compose --piece 4 ), then run env-names again."
+                      % _self_path(),
+    }
+    for row in rows:
+        if row["outcome"] == ALREADY_DONE:
+            continue
+        unmeasured = row["outcome"] == UNKNOWN
+        say("%s: the %s row does not measure as applied (%s): %s"
+            % ("NOT MEASURED" if unmeasured else "REFUSED", row["check"], row["outcome"],
+               row["detail"]))
+        for line in row["lines"]:
+            if line.startswith("  paste"):
+                say("  " + line.strip())       # never wrapped: it is pasted as JSON
+            else:
+                para(line, "  ")
+        para(("It could not be measured, so nothing is asked for until it is. Fix the read "
+              "above, then run env-names again." if unmeasured else remedy[row["check"]])
+             + " Nothing was asked for or changed.", "")
+        return _VERIFY_EXIT[row["outcome"]]
+    return None
 
 
 def cmd_env_names(conf, runner, sudo, remove=False, tty=False, reader=None):
@@ -3192,19 +3316,16 @@ def cmd_env_names(conf, runner, sudo, remove=False, tty=False, reader=None):
             "or changed. Run it yourself, in a terminal:  python3 %s env-names" % _self_path())
         return EX_BLOCKED
     say("Chat-lane env-names — the four names into %s, as %s." % (envfile, account))
-    say("  First pf is asked, as root, whether the port block is loaded: CYRUS_HOST_EXTERNAL")
-    say("  makes the dispatcher listen on every interface, so the block comes first.")
-    sudo.acquire("`env-names` asks pf, as root, which rules it holds, then writes %s as the "
-                 "%s role account" % (envfile, account), _resume("env-names"))
-    row = check_port_block(conf, pf_probe(runner), None)
-    if row["outcome"] != ALREADY_DONE:
-        say("REFUSED: the port block does not measure as loaded (%s): %s"
-            % (row["outcome"], row["detail"]))
-        for line in row["lines"]:
-            para(line, "  ")
-        para("The order is the port block before the listen. Load piece 4 first:  python3 %s "
-             "compose --piece 4 . Nothing was asked for or changed." % _self_path(), "")
-        return EX_BLOCKED
+    say("  First the order is measured, as verify measures it: the Slack fence before the")
+    say("  token, and the port block — on the port the dispatcher listens on — before")
+    say("  CYRUS_HOST_EXTERNAL makes it listen on every interface.")
+    sudo.acquire("`env-names` reads the dispatcher's config and env file as the %s role "
+                 "account (names and tool lists only) and asks pf, as root, which rules it "
+                 "holds; then it writes %s as that account" % (account, envfile),
+                 _resume("env-names"))
+    refused = _env_names_gate(conf, runner)
+    if refused is not None:
+        return refused
     ask = reader or getpass.getpass
     token = (ask("  Paste the CHAT app's Bot User OAuth Token (Slack: OAuth & Permissions; "
                  "xoxb-...), then Enter. Hidden: ") or "").strip()
@@ -4688,6 +4809,42 @@ def _merge_fixture(review_fenced=True, first_mcp=False):
     }
 
 
+def _fenced_fixture():
+    """`_merge_fixture` with piece 2 applied, as `merge --apply` leaves it: every non-review
+    entry and every prompt type carries both Slack rules."""
+    doc = _merge_fixture()
+    fence = list(SLACK_FENCE_RULES)
+    first, second, _review, planning = doc["repositories"]
+    first["disallowedTools"] = first["disallowedTools"] + fence
+    first["labelPrompts"]["debugger"]["disallowedTools"] += fence
+    second["disallowedTools"] = doc["defaultDisallowedTools"] + fence
+    planning["disallowedTools"] = planning["disallowedTools"] + fence
+    doc["promptDefaults"]["scoper"]["disallowedTools"] += fence
+    return doc
+
+
+# The words a secret-carrying variable may follow in the env writer: shell builtins, and a
+# plain assignment. `echo` is left out on purpose: it would print the value.
+_BUILTIN_WORDS = ("printf", "[", "case", "read", "assign")
+_SECRET_VAR = re.compile(r"\$\{?(?:T|S|l|v)(?![A-Za-z0-9_])")
+
+
+def _value_commands(script):
+    """The command word of every shell segment that mentions a secret-carrying variable
+    ("assign" for a segment that only assigns). The notifier installer's check, with `${`
+    kept whole so `"${T}"` is still seen."""
+    words = []
+    for seg in re.split(r";|&&|\|\||\||\(|\)|(?<!\$)\{|\}|\n|\bthen\b|\bdo\b|\belse\b|\bif\b",
+                        script):
+        if not _SECRET_VAR.search(seg):
+            continue
+        parts = [w for w in seg.split() if w not in ("if", "!", "while", "elif")]
+        while parts and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", parts[0]):
+            parts = parts[1:] if len(parts) > 1 else ["assign"]
+        words.append(parts[0] if parts else "")
+    return words
+
+
 def _selftest_kit197(expect, conf):
     """The owner-run writers (merge, env-names, front-door), the printed commands filled from
     the conf, and verify's front-door row. Each group records a crash as a failed case rather
@@ -5200,12 +5357,45 @@ def _selftest_kit197(expect, conf):
                                reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
             expect("env-names-needs-a-terminal", rc == EX_BLOCKED and not asked
                    and not mach.argvs and "terminal" in out, (rc, out[-300:]))
+            # THE ORDER's first rule, measured before anything is asked: the fence before
+            # the token. The fixture's coding entries lack the Slack rules (review 45).
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-refuses-without-the-fence", rc == EX_BLOCKED and not asked
+                   and mach.writes == [] and _read(env_path) == original
+                   and "fence" in out and "merge --apply" in out, (rc, out[-400:]))
+            _put(cfg_path, json.dumps(_fenced_fixture(), indent=2) + "\n")
             mach = _RoleMachine(home, _pf_answers(rules=(0, "", "")))
             rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
                                reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
             expect("env-names-refuses-without-the-port-block", rc == EX_BLOCKED and not asked
                    and mach.writes == [] and _read(env_path) == original
                    and "port block" in out, (rc, out[-400:]))
+            # the block must guard the port the dispatcher LISTENS on, as verify's row
+            # measures it: CYRUS_SERVER_PORT compared with DISPATCHER_PORT (review 32, 44)
+            _put(env_path, original + "\nCYRUS_SERVER_PORT=4000\n")
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-refuses-a-port-mismatch", rc == EX_BLOCKED and not asked
+                   and mach.writes == [] and "CYRUS_SERVER_PORT" in out, (rc, out[-400:]))
+            _put(env_path, original)
+            os.chmod(env_path, 0o640)
+            # a port block that could not be measured is exit 4, and its remedy is not
+            # "load piece 4" (review 35)
+            mach = _RoleMachine(home, _pf_answers(rules=(1, "", "sudo: a password is required")))
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-unmeasured-port-block-exits-4", rc == EX_UNKNOWN and not asked
+                   and mach.writes == [] and "piece 4" not in out, (rc, out[-400:]))
+            # no env file at all: refused before either secret is asked for
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, dict(econf, DISPATCHER_ENV_FILE=env_path + "-gone"),
+                               mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-refuses-a-missing-env-file-before-asking", rc == EX_BLOCKED
+                   and not asked and mach.writes == [], (rc, out[-300:]))
             for label, tok, sec in (
                     ("not-xoxb", "xoxp-" + "FAKE" * 12, FAKE_SIGNING_SECRET),
                     ("short", "xoxb-FAKE", FAKE_SIGNING_SECRET),
@@ -5243,8 +5433,10 @@ def _selftest_kit197(expect, conf):
                    and _read(os.path.join(bdir, got[0])) == original
                    and _mode(os.path.join(bdir, got[0])) == 0o600, got)
             flat = " ".join(out.split())
-            expect("env-names-says-the-backup-holds-secrets", "holds the two secrets" in flat
+            expect("env-names-says-the-backup-holds-secrets", "holds the whole env file" in flat
                    and "once verify is clean" in flat, flat[-500:])
+            expect("env-names-says-it-checked-the-notifier-token",
+                   "CHECKED" in out and "NOTIFIER_SLACK_BOT_TOKEN" in out, out[-600:])
             expect("env-names-prints-the-restart-card", "CK-C5" in out
                    and "launchctl bootout system/com.example.dispatcher" in out)
             expect("env-names-never-restarts",
@@ -5261,15 +5453,63 @@ def _selftest_kit197(expect, conf):
                                                                                      "set"),
                    [w["stdin"] for w in mach.writes])
 
-            # the notifier's own token is refused, and nothing is touched
-            _put(role_env, "export NOTIFIER_SLACK_BOT_TOKEN=\"%s\"\n" % FAKE_BOT_TOKEN)
-            snap, count = _read(env_path), len(backups())
+            # the same values again: nothing to change, so no backup, no rename, no restart
+            # card — "nothing to do" is told apart from "did it" (review 34)
+            snap, count, inode = _read(env_path), len(backups()), os.stat(env_path).st_ino
             mach = _RoleMachine(home, _pf_answers())
             rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
                                reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
-            expect("env-names-refuses-the-notifier-token", rc == EX_REFUSED
+            expect("env-names-same-values-change-nothing", rc == EX_OK
                    and _read(env_path) == snap and len(backups()) == count
-                   and "notifier" in out.lower() and FAKE_BOT_TOKEN not in out, (rc, out[-400:]))
+                   and os.stat(env_path).st_ino == inode and "UNCHANGED" in out
+                   and "launchctl bootout" not in out, (rc, out[-400:]))
+
+            # the notifier's own token is refused, and nothing is touched — under its own
+            # name, under another name, and as the LAST of two definitions, which is the
+            # one a shell that sources the file keeps (review 30, 43, 48)
+            for label, role_text in (
+                    ("its-name", "export NOTIFIER_SLACK_BOT_TOKEN=\"%s\"\n" % FAKE_BOT_TOKEN),
+                    ("another-name", "CHAT_BOT_TOKEN=%s\n" % FAKE_BOT_TOKEN),
+                    ("stale-line-first", "NOTIFIER_SLACK_BOT_TOKEN=%s\n"
+                                         "NOTIFIER_SLACK_BOT_TOKEN='%s'\n"
+                                         % (FAKE_NOTIFIER_TOKEN, FAKE_BOT_TOKEN))):
+                _put(role_env, role_text)
+                mach = _RoleMachine(home, _pf_answers())
+                rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                                   reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+                expect("env-names-refuses-the-notifier-token:" + label, rc == EX_REFUSED
+                       and _read(env_path) == snap and len(backups()) == count
+                       and "notifier" in out.lower() and FAKE_BOT_TOKEN not in out,
+                       (rc, out[-400:]))
+            # the file it compares with cannot be read: NOT CHECKED, exit 4, nothing
+            # written and nothing backed up — never a silent pass
+            os.unlink(role_env)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-no-role-env-file-is-not-a-pass", rc == EX_UNKNOWN
+                   and "NOT CHECKED" in out and "does not exist" in out
+                   and _read(env_path) == snap and len(backups()) == count, (rc, out[-400:]))
+            if os.geteuid() != 0:
+                _put(role_env, "NOTIFIER_SLACK_BOT_TOKEN=%s\n" % FAKE_NOTIFIER_TOKEN)
+                os.chmod(role_env, 0)
+                mach = _RoleMachine(home, _pf_answers())
+                rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                                   reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+                os.chmod(role_env, 0o600)
+                expect("env-names-unreadable-role-env-file-is-not-a-pass", rc == EX_UNKNOWN
+                       and "NOT CHECKED" in out and "cannot be read" in out
+                       and _read(env_path) == snap and len(backups()) == count,
+                       (rc, out[-400:]))
+            # a file with no line for the name: every value is still compared, and the
+            # output says the name was not there
+            _put(role_env, "STAGE_E_LINEAR_API_KEY=%s\n" % SENTINELS[4])
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-says-the-notifier-name-is-absent", rc == EX_OK
+                   and "NOTE" in out and "no NOTIFIER_SLACK_BOT_TOKEN line" in out
+                   and SENTINELS[4] not in out, (rc, out[-400:]))
             _put(role_env, "NOTIFIER_SLACK_BOT_TOKEN=%s\n" % FAKE_NOTIFIER_TOKEN)
 
             # --remove: no terminal, no port block needed; the four go, the rest stay
@@ -5282,6 +5522,26 @@ def _selftest_kit197(expect, conf):
                    and _read(env_path).splitlines() == want[:4], (rc, out[-400:]))
             expect("env-names-remove-backs-up-first", len(backups()) == count + 1)
             expect("env-names-remove-keeps-the-mode", _mode(env_path) == 0o640)
+            # a second --remove has nothing to remove, and says so
+            snap, count, inode = _read(env_path), len(backups()), os.stat(env_path).st_ino
+            rc, out = _capture(cmd_env_names, econf, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True, False, reader_of())
+            expect("env-names-remove-twice-changes-nothing", rc == EX_OK
+                   and _read(env_path) == snap and len(backups()) == count
+                   and os.stat(env_path).st_ino == inode and "UNCHANGED" in out
+                   and "launchctl bootout" not in out, (rc, out[-400:]))
+            # a symbolic link is refused, and the refusal is not reported as a failure
+            real = os.path.join(envdir, "real-env")
+            _put(real, "KEEP=1\n")
+            os.chmod(real, 0o600)
+            link = os.path.join(envdir, "env-link")
+            os.symlink(real, link)
+            rc, out = _capture(cmd_env_names, dict(econf, DISPATCHER_ENV_FILE=link),
+                               _RoleMachine(home, _pf_answers()), _FakeSudo(), True, False,
+                               reader_of())
+            expect("env-names-refuses-a-symlink-as-blocked", rc == EX_BLOCKED
+                   and os.path.islink(link) and "symbolic link" in out and "FAILED" not in out,
+                   (rc, out[-300:]))
     group("env-names", env_names)
 
     # -- front-door: the REAL writer, a stand-in proxy binary -------------------------
@@ -5466,15 +5726,31 @@ def _selftest_kit197(expect, conf):
             os.chmod(os.path.join(fakebin, "id"), 0o755)
             ran = run(env_writer_command(wconf, "set"), "%s\n%s\n" % (
                 FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET), path_first=fakebin)
-            expect("env-writer-refuses-a-file-it-does-not-own", ran.returncode == 5
+            expect("env-writer-refuses-a-file-it-does-not-own", ran.returncode == 4
                    and "owned by" in ran.stdout and _read(env_path) == "KEEP=1\n"
                    and FAKE_BOT_TOKEN not in ran.stdout + ran.stderr, ran.stdout[-200:])
             ran = run(env_writer_command(dict(wconf, DISPATCHER_ENV_FILE=env_path + "-gone"),
                                          "set"), "%s\n%s\n" % (FAKE_BOT_TOKEN,
                                                                FAKE_SIGNING_SECRET))
-            expect("env-writer-refuses-a-missing-file", ran.returncode == 5
+            expect("env-writer-refuses-a-missing-file", ran.returncode == 4
                    and "does not exist" in ran.stdout
                    and not os.path.exists(env_path + "-gone"), ran.stdout[-200:])
+            # a symbolic link: `mv` would replace the LINK with a plain file at the link's
+            # own mode (755 on macOS, 777 under GNU stat), holding every secret (review 42)
+            real = os.path.join(tmp, "dispatcher", "real-env")
+            _put(real, "KEEP=1\n")
+            os.chmod(real, 0o600)
+            link = os.path.join(tmp, "dispatcher", "env-link")
+            os.symlink(real, link)
+            for mode in ("set", "remove"):
+                ran = run(env_writer_command(dict(wconf, DISPATCHER_ENV_FILE=link), mode),
+                          "%s\n%s\n" % (FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET)
+                          if mode == "set" else "")
+                expect("env-writer-refuses-a-symlink:" + mode, ran.returncode == 4
+                       and os.path.islink(link) and _read(real) == "KEEP=1\n"
+                       and _mode(real) == 0o600 and "symbolic link" in ran.stdout
+                       and FAKE_BOT_TOKEN not in ran.stdout + ran.stderr,
+                       (ran.returncode, ran.stdout[-200:]))
             ran = run(env_writer_command(wconf, "set"), "")
             expect("env-writer-wants-both-values", ran.returncode == 7
                    and _read(env_path) == "KEEP=1\n", ran.stdout[-200:])
@@ -5493,6 +5769,20 @@ def _selftest_kit197(expect, conf):
             expect("front-writer-refuses-a-different-line", ran.returncode == 3
                    and _read_bytes(fd_path) == fraw, (ran.returncode, ran.stdout[-200:]))
     group("writer-guards", writer_guards)
+
+    # -- the env writer's secrets meet only shell builtins, never an external command,
+    # whose argv `ps` would show: the chat token and signing secret ($T, $S), and every
+    # line and value it reads from the role account's env file ($l, $v) (review 50) ----
+    def env_builtins():
+        used = _value_commands(ENV_WRITER_SH)
+        expect("env-writer-values-meet-only-builtins",
+               used and all(w in _BUILTIN_WORDS for w in used), used)
+        for mutant in ("/usr/bin/printf 'x%s' \"$T\"", "/bin/test \"$v\" = \"$T\"",
+                       "echo \"${S}\" | /usr/bin/wc -c"):
+            got = _value_commands(ENV_WRITER_SH + "\n" + mutant + "\n")
+            expect("env-writer-builtins-scan-flags:" + mutant.split()[0],
+                   any(w not in _BUILTIN_WORDS for w in got), got)
+    group("env-builtins", env_builtins)
 
     # -- each shape refusal says which shape, by length or kind, and never the value -----
     def shapes():

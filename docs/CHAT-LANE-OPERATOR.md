@@ -71,23 +71,34 @@ chat-lane.conf`, and a subcommand that needs it refuses. Nothing is guessed.
 | `compose --piece N` | Prints one piece alone. `--piece 4` prints only the port-block script, so you can save it to a file. |
 | `verify` | Reads the dispatcher's config, its env file, the role account's user settings and the front door's config **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value. Changes nothing. Refuses to run under a model. |
 | `merge` | Pieces 1, 2 and 5. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
-| `env-names` | Piece 3. Asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
+| `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
 | `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off. |
 
-Every command exits like the Stage E installer's: **0** done, or nothing left to do,
-**10** something is not applied yet (a writer's dry run that found work also exits 10),
-**4** a check could not measure, **1** something is broken or a write failed, **5** no
-administrator password, **3** refused: under a model, or the file changed between the read
-and the write, or the token offered is the notifier's.
+Every command exits like the Stage E installer's. Read the exit code, not the word on the
+line: a `REFUSED:` line can end in 10, 2 or 3.
+
+| Exit | Means |
+|---|---|
+| **0** | Done, or nothing left to do. |
+| **10** | Something is not applied yet, or a step must come first. A writer's dry run that found work. `env-names` before the fence or the port block, or with no terminal. A file a writer will not touch: missing, a symbolic link, or owned by another account. A front-door file without exactly one allowlist line, or a removal that would empty it. |
+| **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, or a pasted secret has the wrong shape. |
+| **4** | A check could not measure. `env-names` also exits 4 when it cannot read the file it compares the token with. Not a pass. |
+| **1** | Something is broken, or a write failed. |
+| **5** | No administrator password. |
+| **3** | Refused for safety, and nothing was written: under a model; `merge` or `front-door` found the file changed between the read and the write; or the token offered is the notifier's. |
 
 ### What the three writers promise
 
 - **They run as the role account**, through `sudo -u`. Every value goes on standard input,
   never in an argument, so `ps` never shows it and nothing prints it.
-- **They check the file is the one they read.** The dispatcher rewrites its own config
-  when it refreshes a tracker token. If the file changed between the read and the write,
-  the writer refuses and writes nothing. Run it again.
+- **`merge` and `front-door` check the file is the one they planned from.** The
+  dispatcher rewrites its own config when it refreshes a tracker token. If the file changed
+  between the read and the write, the writer refuses and writes nothing. Run it again.
+  `env-names` has no separate plan: it reads and replaces the env file in one pass, and
+  nothing else rewrites that file.
+- **They write nothing when nothing would change.** No backup, no new file, and no restart
+  to do for it. The output says `Nothing to write`, `ok`, or `UNCHANGED`.
 - **They back the file up first**, into `~/.stage-e/backups` in the role account's home, at
   mode 600. Those copies hold the same secrets as the files. Piece 5 denies that folder to
   the chat lane's `Read` tool. Delete a copy once `verify` is clean.
@@ -302,7 +313,8 @@ lines, one `inet` and one `inet6`, for your port. `sudo pfctl -s info | grep Sta
 Not that: no rules, or `Status: Disabled`. Stop. Do not go on to Step 7 until both are
 right. Read the boot job's log, `/var/log/pipeline-dispatcher-port.log`, and its last exit
 (`sudo launchctl print system/local.pipeline-dispatcher-port | grep 'last exit'`). Step 7's
-`env-names` refuses until `verify`'s port-block reading says the block is loaded.
+`env-names` refuses until `verify`'s port-block reading says the block is loaded, on the
+port the dispatcher really listens on.
 
 ### Step 6 — Create the chat app (card CK-C1, piece 6)
 
@@ -347,19 +359,33 @@ All four go in together, before the restart. Run this yourself, in a terminal:
 python3 scripts/pipeline_chat_lane_setup.py env-names
 ```
 
-- It refuses until pf says the port block is loaded: the block before the listen.
+- It measures the order first, exactly as `verify` does, and asks for nothing until both
+  hold. The `coding-fence` row must say the Slack fence is in place (Steps 2 to 4): the
+  fence before the token. The `port-block` row must say the block is loaded, on the port
+  the dispatcher listens on (`CYRUS_SERVER_PORT` against `DISPATCHER_PORT`): the block
+  before the listen. A row it could not measure exits 4, not 10.
 - It asks for the token and the secret at two hidden prompts, and checks their shape:
   `xoxb-` and at least 40 characters for the token, exactly 32 lower-case hex for the
   secret.
-- It hands them to the role account's shell on standard input. That shell refuses the
-  notifier's own token, read from `ROLE_ENV_FILE`.
-- It backs the env file up, drops any old line for the four names (with or without
-  `export`), adds the four, and keeps every other line in order and the file's mode.
+- It hands them to the role account's shell on standard input. That shell compares the
+  token with **every** value in `ROLE_ENV_FILE`, where the notifier keeps its own, and
+  refuses a match under any name. It needs that file:
+  - Missing or unreadable: `NOT CHECKED`, exit 4, and nothing is written. Point
+    `ROLE_ENV_FILE` at the notifier's env file.
+  - No line for `NOTIFIER_TOKEN_ENV` in it: it still compares every value, and prints a
+    `NOTE`. Make `ROLE_ENV_FILE` and `NOTIFIER_TOKEN_ENV` match notifier.conf's `ENV_FILE`
+    and `CHAT_TOKEN_ENV`.
+  - Otherwise it prints `CHECKED`.
+- It refuses an env file that is a symbolic link, or that the role account does not own.
+  Point `DISPATCHER_ENV_FILE` at the file itself.
+- It drops any old line for the four names (with or without `export`), adds the four, and
+  keeps every other line in order and the file's mode. If that changes nothing, it says
+  `UNCHANGED` and writes and backs up nothing. Otherwise it backs the file up first.
 - It prints each name with its value's **length**, never a value, and warns if a `vi` swap
   file sits beside the env file.
 
-The backup holds the two secrets. Delete it once `verify` is clean; the output prints the
-command.
+The backup holds the whole env file, the two secrets and the dispatcher's other secrets
+too. Delete it once `verify` is clean; the output prints the command.
 
 **`WEBHOOK_IP_VALIDATION=false` is not optional. Without it, tickets stop starting sessions.**
 `CYRUS_HOST_EXTERNAL=true` turns on webhook source-address checks unless this name is exactly
@@ -590,7 +616,7 @@ read.
 |---|---|
 | Set `slackAllowedTools` | Live, for chat sessions started or resumed after the file changes (`ConfigManager.js:51-62, 181`; `EdgeWorker.js:362-381`; `ChatSessionHandler.js:139, 279`). A session still running keeps its old list (`ChatSessionHandler.js:70-77`). |
 | Remove `slackAllowedTools` | At restart only: a reload keeps the old value (`ConfigManager.js:181`). |
-| Add or change a name in the env file | Live (`Application.js:52-78`), except the listening address and address checks, which are read at start. |
+| Add or change a name in the env file | Live (`Application.js:52-78`), except the listening address and address checks, which are read at start. `env-names` replaces the file with a rename, which the watcher may not count as a change (see *What is not proven*), so count on the restart. |
 | Remove a name from the env file | At restart only: a reload sets names and never unsets one (`Application.js:54`). |
 | **Delete** `promptDefaults`, `slackMcpConfigs` or any other config key | At restart only, and worse: the merge keeps the old value (`ConfigManager.js:176-183`), so the reloaded config equals the old one and nothing is re-applied at all — while the log still prints the reload line. Set the key to an empty value instead, or restart. `verify` reads the file, so both rows go green either way. |
 | The port block | Now, when the LaunchDaemon is bootstrapped, and again at every boot. |
@@ -679,7 +705,9 @@ These came out of reading the dispatcher's source for this build.
   exact string, so `git -C <path> pull origin main` is refused by design; only the two
   composed forms are allowed (KIT-174).
 - Whether the config watcher sees an edit from an editor that replaces the file instead of
-  changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174).
+  changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174). The same
+  question holds for the env file's watcher (`Application.js:52-78`), and `env-names`
+  itself replaces that file with a rename.
 - Whether Slack creates an app from a manifest whose request URL does not answer yet
   (KIT-174).
 - Whether the Slack tool server's tools the lane uses need scopes the chat app lacks. None

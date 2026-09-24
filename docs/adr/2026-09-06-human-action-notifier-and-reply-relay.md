@@ -501,16 +501,21 @@ The three scripts' behaviour moved into it as subcommands a person runs:
 
 Each refuses under a model, before its conf is read. Each writes as the role account,
 through one program handed to that account's shell, with every value on standard input and
-none in an argument. Each re-reads the file and refuses when it is not the file it planned
-from: the dispatcher rewrites its config when it refreshes a tracker token. Each backs the
-file up first, under the role account's home, at mode 600, and the user-level read denies
-now cover that folder and the role account's own env file. A dry run is the default where
-there is one; `env-names` refuses without a terminal, and until the port block measures as
-loaded. **Restarts and the port block stay printed commands the owner runs**, as installers
-never load jobs: a new card restarts the dispatcher only when its own `/status` answers
-`idle`, and another turns the lane off in order. `verify` gains a row that reads the front
-door's allowlist line. The live-check card now tests calls, not the listing, and names
-KIT-196.
+none in an argument. `merge` and `front-door` re-read the file and refuse when it is not the
+file they planned from: the dispatcher rewrites its config when it refreshes a tracker
+token. `env-names` has no separate plan; it reads and replaces the env file in one pass, and
+nothing else rewrites that file. Each writes nothing when nothing would change, and
+otherwise backs the file up first, under the role account's home, at mode 600; the
+user-level read denies now cover that folder and the role account's own env file. A dry run
+is the default where there is one. `env-names` refuses without a terminal, and until
+`verify`'s fence and port-block rows both measure as applied: the fence before the token,
+and the block before the listen, on the port the dispatcher really listens on. It compares
+the chat token with every value in the role account's env file, where the notifier keeps
+its own, and writes nothing when it cannot read that file. **Restarts and the port block
+stay printed commands the owner runs**, as installers never load jobs: a new card restarts
+the dispatcher only when its own `/status` answers `idle`, and another turns the lane off in
+order. `verify` gains a row that reads the front door's allowlist line. The live-check card
+now tests calls, not the listing, and names KIT-196.
 
 The writers are guarded the way `verify` is: they need administrator access, asked for once,
 and they refuse in an agent environment. The markers are environment variables a session

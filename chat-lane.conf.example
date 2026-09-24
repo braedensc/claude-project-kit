@@ -56,17 +56,19 @@ FRONT_DOOR_HOST=chat.example.com
 # two without reading the value.
 DISPATCHER_PORT=3456
 
-# The NAME of the notifier's own token variable. `verify` checks that this name
-# is NOT in the dispatcher's env file: every dispatcher session inherits that
-# file, and the notifier's token must never reach one. `env-names` refuses a
-# chat token equal to this one's value in ROLE_ENV_FILE. Leave the default unless
-# your notifier uses a different name.
+# The NAME of the notifier's own token variable: notifier.conf's CHAT_TOKEN_ENV.
+# `verify` checks that this name is NOT in the dispatcher's env file: every
+# dispatcher session inherits that file, and the notifier's token must never
+# reach one. Leave the default unless your notifier uses a different name.
 NOTIFIER_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
 
 # The role account's OWN env file: the one the Stage E installer and the notifier
-# keep their keys in. `env-names` reads the notifier's token from it, only to
-# refuse that token as the chat app's. Piece 5 denies it to the chat lane's Read
-# tool. `~/` means the ROLE account's home, not yours.
+# keep their keys in (notifier.conf's ENV_FILE). `env-names` compares the chat
+# token with every value in it, only to refuse the notifier's token as the chat
+# app's. It will not guess: when this file is missing or unreadable, env-names
+# writes nothing and exits 4; when it has no NOTIFIER_TOKEN_ENV line, it says so.
+# Piece 5 denies it to the chat lane's Read tool. `~/` means the ROLE account's
+# home, not yours.
 #
 # RULE: an absolute path, or one starting `~/`. The default is the one both
 # installers use.
