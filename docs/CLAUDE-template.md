@@ -164,11 +164,29 @@ git checkout -b <type>/<short-kebab-desc>
   A hook *enforces* this — rename an auto-generated `claude/<codename>` worktree branch
   before working (`git branch -m <type>/<desc>`).
 - **One task = one branch = one PR.** Small and short-lived.
+- **Never stack a PR. Every branch is cut from the base branch and merges back into
+  it.** Never branch off another feature branch, and never merge two feature branches
+  into each other. If the work you need is only on another branch, wait for that branch
+  to merge and cut from the updated base. **Bringing the base INTO your branch is the
+  opposite move and stays allowed** when `main` moves under you —
+  `git fetch origin main && git merge origin/main` is what the conflict loop asks for.
+  Already stacked? `gh pr edit <n> --base main`, then move your own commits off the
+  other branch: `git rebase --onto origin/main <that-branch>`.
+  *Why:* squash-merging a base **rewrites** the base branch, so every PR stacked on it
+  turns CONFLICTING at once — and GitHub runs **no checks at all** on a conflicted PR,
+  so they read as "no checks reported", which looks like broken CI. A six-deep stack in
+  the kit's own repo (2026-09-20) cost five forced re-cascades and ended with four PRs
+  closed. Independent branches off the base never do this.
 - **The hooks enforce this:** `Edit`/`Write`/`git commit` are *blocked* on `main` or a
-  mis-named branch; writes into a *different worktree* are blocked; so are
+  mis-named branch; cutting a branch whose start carries another branch's unmerged
+  commits, merging/rebasing/pushing one feature branch into another, and basing a PR on a
+  non-base branch are blocked; writes into a *different worktree* are blocked; so are
   `git commit`/`git push` on a branch whose PR already **merged**, and `gh pr merge` in
   any form. A block isn't a bug — branch fresh (or fix the path) and retry; never work
-  around it.
+  around it. The base branch is `main`/`master`, the remote's recorded default
+  (`origin/HEAD`), and `github.defaultBranch` from a committed `delivery.json` if this
+  project configured the delivery pipeline. The `PR base` workflow checks every PR's base
+  in CI and re-runs on a retarget.
 - **Ordered/generated files are serialized** (migrations etc.): pull latest main
   immediately before generating one; never two generating branches in parallel.
 - **Open a PR when the task is done** (`gh pr create`) — and stop there. **Merging is
@@ -179,7 +197,10 @@ git checkout -b <type>/<short-kebab-desc>
   red PR. Local checks passing is necessary, not sufficient; the PR's CI status is
   the source of truth. **A `DIRTY` (conflicted) PR is not green** — GitHub skips the
   required CI entirely, so only side checks report; rebase, resolve, force-push. (A
-  Stop hook also blocks ending a turn with no PR, a failing check, or a DIRTY PR.)
+  Stop hook also blocks ending a turn with no PR, a PR based on a branch other than
+  the base branch, a failing check, or a DIRTY PR. The base check reads GitHub's own
+  record, so it fires however the PR was created — and fires on a green PR, because a
+  stacked PR looks fine right up until its base merges.)
 - **Before a follow-up commit to an open PR, confirm it's still open**
   (`gh pr view <n> --json state`) — a commit pushed to a merged PR's branch is
   silently orphaned. If merged, branch fresh off updated `main`. (Also enforced by
@@ -206,7 +227,9 @@ These apply every session without exception:
    never appear in any frontend file or client bundle.
 
 5. **No direct or force push to `main`.** All changes via PR. CI is the unbypassable
-   gate.
+   gate. **And every PR branches off `main` and merges back into `main`** — never a PR
+   based on another PR's branch (see *Branch Workflow* for why, and for the move that
+   stays allowed: bringing `origin/main` into your own branch).
 
 6. **On a hard environment block, explain the fix and HALT.** If every path is blocked
    (broken hook, permission wall, dead auth), surface what's wrong + the exact fix

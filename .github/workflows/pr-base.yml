@@ -1,0 +1,49 @@
+name: PR base
+
+# Every PR branches off the base branch and merges back into it — never off, or
+# into, another feature branch (docs/COLLABORATION.md § Never stack a PR). A
+# six-deep stack on 2026-09-20 cost five forced re-cascades: each squash-merge of a
+# base rewrote main and turned every PR stacked on it CONFLICTING, and GitHub runs
+# no checks on a conflicted PR, so they read as "no checks reported".
+#
+# WHY ITS OWN WORKFLOW, not a step in "Kit checks":
+#   - `edited` is in the trigger list, so retargeting a PR (`gh pr edit --base`)
+#     re-runs this by itself. A re-run of an old run reuses the old event, so it
+#     would still compare against the old base; only a fresh event helps.
+#   - A failing step would skip every later step in its job — a stacked PR would
+#     go unscanned by secretlint and the forbidden-paths gate until retargeted.
+#
+# REACH, stated plainly. This reads the base off the `pull_request` event, which
+# only GitHub writes, so no command spelling reaches it — the durable counterpart to
+# the PreToolUse stacked-branch guard, which is advisory. It is NOT a merge gate:
+# branch protection covers the default branch only, so a PR whose base is a
+# feature branch has no required context at all. It makes such a PR loudly red.
+# It also cannot see a branch CUT from a feature branch whose PR targets the base.
+# "PR base" does not need to be a required context: every PR into the base passes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-base:
+    name: PR base
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The check is only as good as its decision function, so the selftest runs
+      # first; if it fails, the check below is not trusted and the job is red.
+      - name: PR base check selftest
+        run: python3 scripts/check_pr_base.py --selftest
+
+      - name: PR base is a base branch (no stacked PRs)
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 scripts/check_pr_base.py

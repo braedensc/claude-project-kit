@@ -39,6 +39,14 @@ IT CANNOT MERGE
     asserts it stays that way. Merging is the human's action; a tool the kit ships must
     not be able to do it, for the same reason the PreToolUse guard blocks it.
 
+IT CANNOT STACK
+    `pr-create --base B` refuses any B that is not main, master or the repository's own
+    default branch, on BOTH paths — every PR branches off the base branch and merges
+    back into it (docs/COLLABORATION.md § Never stack a PR). When B is not main/master
+    and the default branch cannot be read, it refuses rather than guess. This matters
+    most exactly where this script is used: inside the sandbox, gh cannot reach GitHub,
+    so the Stop hook's base check never runs there either.
+
 Usage:
     gh_fallback.py pr-create  --title T --body-file F --base B [--head H] [--repo O/R] [--draft]
     gh_fallback.py pr-checks  NUMBER [--repo O/R]
@@ -60,10 +68,12 @@ import urllib.request
 API = "https://api.github.com"
 
 # The complete set of API paths this script will ever construct. --selftest asserts
-# this mapping is exactly these three, so a merge endpoint cannot be added without a
-# test failing and a human noticing.
+# this mapping is exactly these five (two reads of a PR's state, one of the repo's
+# default branch, one create, one comment), so a merge endpoint cannot be added
+# without a test failing and a human noticing.
 ENDPOINTS = {
     "pr-create": ("POST", "/repos/{owner}/{repo}/pulls"),
+    "repo-read": ("GET", "/repos/{owner}/{repo}"),
     "pr-read": ("GET", "/repos/{owner}/{repo}/pulls/{number}"),
     "pr-checks": ("GET", "/repos/{owner}/{repo}/commits/{ref}/check-runs"),
     "pr-comment": ("POST", "/repos/{owner}/{repo}/issues/{number}/comments"),
@@ -215,8 +225,42 @@ def read_body_file(path):
         raise Failure(f"could not read --body-file {path!r}: {e}", 2)
 
 
+ALWAYS_BASE = ("main", "master")
+
+
+def base_refusal(base, default):
+    """None when `base` is a base branch, else why the PR is refused. Pure, so the
+    selftest exercises the real decision."""
+    if base in ALWAYS_BASE or (default and base == default):
+        return None
+    if not default:
+        return (f"refusing --base {base}: it is not main or master, and the repository's "
+                "default branch could not be read to confirm it is the base. Every PR "
+                "branches off the base branch (docs/COLLABORATION.md § Never stack a PR).")
+    return (f"refusing --base {base}: this repository's base branch is {default}. Every PR "
+            "branches off the base branch and merges back into it — never onto another "
+            "feature branch (docs/COLLABORATION.md § Never stack a PR).")
+
+
+def repo_default_branch(owner, repo):
+    """The repository's default branch — gh first, REST second — or "" if neither can say."""
+    ok, out, _ = try_gh(["repo", "view", f"{owner}/{repo}", "--json", "defaultBranchRef",
+                         "--jq", ".defaultBranchRef.name"])
+    if ok and out.strip():
+        return out.strip()
+    try:
+        _, tmpl = ENDPOINTS["repo-read"]
+        return (api("GET", tmpl.format(owner=owner, repo=repo)) or {}).get("default_branch") or ""
+    except Failure:
+        return ""
+
+
 def cmd_pr_create(args):
     owner, repo = resolve_repo(args.repo)
+    default = "" if args.base in ALWAYS_BASE else repo_default_branch(owner, repo)
+    refusal = base_refusal(args.base, default)
+    if refusal:
+        raise Failure(refusal)
     head = args.head or current_branch()
     body = read_body_file(args.body_file)
 
@@ -329,7 +373,22 @@ def selftest():
 
     # The endpoint set is the merge guard. If a merge path is ever added, this fails.
     check("endpoint names", sorted(ENDPOINTS),
-          ["pr-checks", "pr-comment", "pr-create", "pr-read"])
+          ["pr-checks", "pr-comment", "pr-create", "pr-read", "repo-read"])
+
+    # It cannot stack either: a non-base --base is refused on both paths, and an
+    # unconfirmable one is refused rather than guessed.
+    for base, default, refused, needle in [
+        ("main", "", False, ""),
+        ("master", "develop", False, ""),
+        ("develop", "develop", False, ""),
+        ("feat/x", "main", True, "base branch is main"),
+        ("feat/x", "", True, "could not be read"),
+        ("develop", "", True, "could not be read"),
+        ("main-v2", "main", True, "base branch is main"),
+    ]:
+        why = base_refusal(base, default)
+        if bool(why) != refused or (needle and needle not in (why or "")):
+            failures.append(f"base_refusal({base!r}, {default!r}) = {why!r}")
     for name, (method, path) in ENDPOINTS.items():
         if path.rstrip("/").endswith("/merge"):
             failures.append(f"{name} targets a merge endpoint; this script must not merge")

@@ -15,6 +15,12 @@ waker for local sessions (`scripts/pipeline_conflict_waker_setup.py` installs it
 dispatcher's sessions. Both scripts, and what `pr_conflict.py` imports, live in `scripts/`,
 so `git rm -r templates/` never takes them.
 
+**One more that needs no template:** `.github/workflows/pr-base.yml` fails any PR whose base
+is not the repository's default branch (or `main`/`master`) — no stacked PRs
+(docs/COLLABORATION.md § Never stack a PR). It is generic — the default branch comes from
+the event, not from config — so the kit's own active copy is the one every project
+inherits from the template, and bootstrap leaves it where it is.
+
 | Template | Activates to | What it is |
 |---|---|---|
 | `workflows/ci.yml` | `.github/workflows/ci.yml` (replacing the kit's own) | App CI: secret-scan + forbidden paths, lint, typecheck, test, non-required e2e smoke |
@@ -22,7 +28,7 @@ so `git rm -r templates/` never takes them.
 | `workflows/pipeline-failure-alert.yml` | `.github/workflows/pipeline-failure-alert.yml` | `workflow_run` failure on main → one deduped issue, @mention+assign a person (email + phone push; see *Who an alert pages* below); post-merge failures are otherwise silent |
 | `workflows/backup-cron.yml` | `.github/workflows/backup-cron.yml` | Daily encrypted `pg_dump` → artifact, with the IPv6/pooler/role gotchas inline |
 | `workflows/keepalive.yml` | `.github/workflows/keepalive.yml` | Free-tier anti-pause ping (401-is-healthy pattern) |
-| `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | A PR that goes CONFLICTING (it skips required CI and can look green) gets a bounded fix request, answered by the conflict waker or the bounce driver; unanswered, it pages the PR's author (or the `PR_CONFLICT_PAGE_TO` variable). Names each PR's real base branch |
+| `workflows/pr-conflict-monitor.yml` | `.github/workflows/pr-conflict-monitor.yml` | A PR that goes CONFLICTING (it skips required CI and can look green) gets a bounded fix request, answered by the conflict waker or the bounce driver; unanswered, it pages the PR's author (or the `PR_CONFLICT_PAGE_TO` variable). Names each PR's real base branch; a STACKED PR is paged with a retarget recipe instead of a fix request |
 | `workflows/pr-union-check.yml` | `.github/workflows/pr-union-check.yml` | Green alone, red together: runs the battery on the union of the open PRs and comments on the PR whose arrival turned it red. Report-only. Adapt its fenced battery step to your stack |
 | `workflows/frontend-uptime.yml` | `.github/workflows/frontend-uptime.yml` | Synthetic probe of the user-facing app (status + app-shell marker, blip-tolerant) for surfaces deployed outside the pipeline |
 | `workflows/migration-drift.yml` | `.github/workflows/migration-drift.yml` | Daily read-only declared-vs-applied compare against prod → issue; catches drift however it arises |

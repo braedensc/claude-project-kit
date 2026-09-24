@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -552,18 +553,39 @@ def make_worktree_sandbox():
     return root, hook_copy, sibling, codename
 
 
-def make_stop_sandbox(list_json, view_json):
+def make_stop_sandbox(list_json, view_json, repo_default="main", committed_cfg=None,
+                      worktree_cfg=None, origin_head=None):
     """Sandbox for the Stop hook: main + a pushed feature branch one commit AHEAD
-    of main, with a mocked `gh` answering both `pr list` and `pr view`."""
+    of main, with a mocked `gh` answering `pr list`, `pr view` and `repo view`.
+
+    The last three shape the base-branch check: `repo_default` is what `gh repo view`
+    reports as GitHub's default branch (None = that call FAILS); `committed_cfg` is
+    a delivery.json committed on `main` before branching, `worktree_cfg` one written
+    into the worktree afterwards (the forging attempt); `origin_head` makes
+    `refs/remotes/origin/HEAD` a symref to `origin/<name>`."""
     root, _ = make_sandbox("main")
+    if committed_cfg is not None:
+        with open(os.path.join(root, "delivery.json"), "w") as fh:
+            json.dump(committed_cfg, fh)
+        _git(root, "add", "delivery.json")
+        _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+             "commit", "-q", "-m", "config")
     _git(root, "checkout", "-q", "-b", "feat/battery")
     _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
          "commit", "--allow-empty", "-q", "-m", "ahead")
     _wire_upstream(root, "feat/battery")
+    if worktree_cfg is not None:
+        with open(os.path.join(root, "delivery.json"), "w") as fh:
+            json.dump(worktree_cfg, fh)
+    if origin_head:
+        _git(root, "update-ref", f"refs/remotes/origin/{origin_head}", "main")
+        _git(root, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{origin_head}")
+    repo_answer = f"echo '{repo_default}'" if repo_default is not None else "exit 1"
     body = (
-        'case "$2" in\n'
-        f"  list) echo '{list_json}' ;;\n"
-        f"  view) echo '{view_json}' ;;\n"
+        'case "$1 $2" in\n'
+        f"  'pr list') echo '{list_json}' ;;\n"
+        f"  'pr view') echo '{view_json}' ;;\n"
+        f"  'repo view') {repo_answer} ;;\n"
         "esac"
     )
     env = _fake_gh(root, body)
@@ -622,6 +644,337 @@ def make_stale_main_sandbox():
     env = _fake_gh(root, "echo '[]'")                     # no PR
     stop_copy = os.path.join(root, ".claude", "hooks", "stop-pr-check.py")
     return root, stop_copy, env
+
+
+# ── stacked-branch sandboxes ─────────────────────────────────────────────────
+# The stacked-branch guard judges a start point BY CONTENT — does it carry commits
+# no base branch has? — so its cases need real history: a bare `origin` whose
+# default branch `git clone` records as origin/HEAD, and feature branches WITH
+# commits of their own. (`make_sandbox`'s one-commit repos have no `main` to
+# measure against, so there the guard can only fail open — which is why the first
+# draft of these cases, written against them, proved less than it claimed.)
+_STACK_TMP = []
+
+
+def _commit(root, msg):
+    _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "--allow-empty", "-q", "-m", msg)
+
+
+def _stack_remote(default, extra=()):
+    """A bare remote whose default branch is `default`, carrying tag v1.0 on it and
+    each (branch, start, n_commits) in `extra`."""
+    seed = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-seed-"))
+    parent = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-origin-"))
+    _STACK_TMP.extend([seed, parent])
+    bare = os.path.join(parent, "o.git")
+    _git(seed, "init", "-q", "-b", default)
+    _commit(seed, "base")
+    _git(seed, "tag", "v1.0")
+    for branch, start, n in extra:
+        _git(seed, "checkout", "-q", "-b", branch, start)
+        for k in range(n):
+            _commit(seed, f"{branch} work {k}")
+    _git(seed, "checkout", "-q", default)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", default, bare], check=True,
+                   capture_output=True, env=_git_env())
+    _git(seed, "push", "-q", "--all", bare)
+    _git(seed, "push", "-q", "--tags", bare)
+    return bare
+
+
+def _stack_checkout(bare=None):
+    parent = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-stack-"))
+    _STACK_TMP.append(parent)
+    root = os.path.join(parent, "repo")
+    if bare:
+        subprocess.run(["git", "clone", "-q", bare, root], check=True, capture_output=True,
+                       env=_git_env())
+    else:
+        os.makedirs(root)
+    return root
+
+
+def _stack_install(root):
+    hooks = os.path.join(root, ".claude", "hooks")
+    os.makedirs(hooks)
+    hook_copy = os.path.join(hooks, "pre-tool-use.py")
+    shutil.copy(HOOK, hook_copy)
+    shutil.copy(STOP_HOOK, os.path.join(hooks, "stop-pr-check.py"))
+    return hook_copy
+
+
+def make_stack_repo(kind):
+    """One realistic checkout for the stacked-branch cases; returns its hook copy.
+
+      feat         HEAD on feat/probe, one commit of its own; feat/other has one too
+                   (local and pushed); claude/codename-ab12 sits on main; feat/main is
+                   a FEATURE branch that merely ends in /main; tag v1.0 is on main
+      main         the same repo, HEAD on main
+      codename     HEAD on claude/codename-ab12 — a fresh worktree branch, 0 commits
+      det-main     HEAD detached on origin/main
+      det-feat     HEAD detached at origin/feat/other
+      trunk        GitHub default `trunk`; no main/master anywhere; no delivery.json
+      trunk-nohead as trunk, but init+fetch, so there is NO origin/HEAD at all
+      gitflow      default `develop` (two commits ahead of main); HEAD cut from it
+      wt-config    feat, plus an UNCOMMITTED delivery.json naming feat/other the base
+      bad-config   feat, plus a COMMITTED delivery.json whose `github` is a string"""
+    if kind in ("feat", "main", "codename", "det-main", "det-feat", "wt-config", "bad-config"):
+        root = _stack_checkout(_stack_remote("main", [("feat/other", "main", 1)]))
+        if kind == "bad-config":
+            with open(os.path.join(root, "delivery.json"), "w") as fh:
+                json.dump({"version": 1, "github": "acme/app"}, fh)
+            _git(root, "add", "delivery.json")
+            _commit(root, "config")
+            _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        _git(root, "checkout", "-q", "-b", "feat/probe", "origin/main")
+        _commit(root, "probe work")
+        _git(root, "branch", "-q", "feat/other", "origin/feat/other")
+        _git(root, "branch", "-q", "claude/codename-ab12", "origin/main")
+        _git(root, "branch", "-q", "feat/main", "feat/other")
+        if kind == "main":
+            _git(root, "checkout", "-q", "main")
+        elif kind == "codename":
+            _git(root, "checkout", "-q", "claude/codename-ab12")
+        elif kind == "det-main":
+            _git(root, "checkout", "-q", "--detach", "origin/main")
+        elif kind == "det-feat":
+            _git(root, "checkout", "-q", "--detach", "origin/feat/other")
+        elif kind == "wt-config":
+            with open(os.path.join(root, "delivery.json"), "w") as fh:
+                json.dump({"version": 1, "github": {"owner": "acme", "repo": "app",
+                                                    "defaultBranch": "feat/other"}}, fh)
+    elif kind == "trunk":
+        root = _stack_checkout(_stack_remote("trunk", [("feat/other", "trunk", 1)]))
+        _git(root, "checkout", "-q", "-b", "feat/t", "origin/trunk")
+        _commit(root, "t work")
+    elif kind == "trunk-nohead":
+        bare = _stack_remote("trunk", [("feat/other", "trunk", 1)])
+        root = _stack_checkout()
+        _git(root, "init", "-q", "-b", "scratch")
+        _git(root, "remote", "add", "origin", bare)
+        # git >= 2.48 makes `fetch` CREATE origin/HEAD (remote.<name>.followRemoteHEAD
+        # defaults to "create") — first seen on CI's newer git, where this scenario
+        # silently stopped being the one it names. Turn that off, and delete it in
+        # case an older git ignored the setting, so the premise holds on every git.
+        _git(root, "config", "remote.origin.followRemoteHEAD", "never")
+        _git(root, "fetch", "-q", "origin")
+        subprocess.run(["git", "-C", root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+                       capture_output=True, env=_git_env())
+        _git(root, "checkout", "-q", "-b", "feat/t", "origin/trunk")
+        _commit(root, "t work")
+    elif kind == "gitflow":
+        bare = _stack_remote("main", [("develop", "main", 2), ("feat/other", "main", 1)])
+        subprocess.run(["git", "--git-dir", bare, "symbolic-ref", "HEAD", "refs/heads/develop"],
+                       check=True, capture_output=True, env=_git_env())
+        root = _stack_checkout(bare)
+        _git(root, "checkout", "-q", "-b", "feat/g", "origin/develop")
+        _commit(root, "g work")
+    else:
+        raise ValueError(kind)
+    return _stack_install(root)
+
+
+# (scenario, command, expect_block). THE FIRST GROUP IS THE ONE THAT MUST NEVER GO
+# RED: bringing the base into a feature branch is what the conflict loop
+# (scripts/pr_conflict.py, pr-conflict-monitor.yml) and the Stage E bounce driver ask
+# a session to run — the literal is `git fetch origin <base> && git merge
+# origin/<base>` — and sessions add redirections, pipes and comments to everything.
+STACK_CASES = [
+    # ── bringing the BASE in, in every spelling a session uses ────────────────
+    ("feat", "git fetch origin main && git merge origin/main", ALLOW),
+    ("feat", "git merge origin/main", ALLOW),
+    ("feat", "git fetch origin && git merge origin/main", ALLOW),
+    ("feat", "git merge origin/main 2>&1", ALLOW),
+    ("feat", "git merge origin/main 2>&1 | tail -20", ALLOW),
+    ("feat", "git merge --no-edit origin/main >/dev/null", ALLOW),
+    ("feat", "git merge origin/main 2>/dev/null", ALLOW),
+    ("feat", "git merge origin/main > /tmp/merge.log 2>&1", ALLOW),
+    ("feat", "git merge origin/main </dev/null", ALLOW),
+    ("feat", "git merge origin/main &>/dev/null", ALLOW),
+    ("feat", "git merge origin/main  # resolve the conflict", ALLOW),
+    ("feat", "# bring main in\ngit fetch origin && git merge origin/main", ALLOW),
+    ("feat", "git merge --no-edit \\\n  origin/main", ALLOW),
+    ("feat", "GIT_EDITOR=true git merge origin/main", ALLOW),
+    ("feat", "command git merge origin/main", ALLOW),
+    ("feat", "git merge -m 'bring main in' origin/main", ALLOW),
+    ("feat", "git merge --cleanup scissors origin/main", ALLOW),
+    ("feat", "git merge --no-ff origin/master", ALLOW),
+    ("feat", "git merge refs/remotes/origin/main", ALLOW),
+    ("feat", "git merge origin/main~1", ALLOW),
+    ("feat", "git merge v1.0", ALLOW),
+    ("feat", "git merge --abort", ALLOW),
+    ("feat", "git merge --continue", ALLOW),
+    ("feat", "git pull origin main 2>&1", ALLOW),
+    ("feat", "git pull --depth 1 origin main", ALLOW),
+    ("feat", "git pull --rebase origin main", ALLOW),
+    ("feat", "git pull --ff-only  # start from latest (skip if offline / no remote yet)", ALLOW),
+    ("feat", "git rebase origin/main", ALLOW),
+    ("trunk", "git fetch origin trunk && git merge origin/trunk", ALLOW),
+    ("trunk-nohead", "git fetch origin trunk && git merge origin/trunk", ALLOW),
+    ("gitflow", "git fetch origin develop && git merge origin/develop", ALLOW),
+    ("gitflow", "git merge origin/main", ALLOW),
+    # ── syncing your OWN branch is not stacking ───────────────────────────────
+    ("feat", "git pull", ALLOW),
+    ("feat", "git pull origin", ALLOW),
+    ("feat", "git pull origin feat/probe", ALLOW),
+    ("feat", "git merge origin/feat/probe", ALLOW),
+    ("feat", "git merge @{u}", ALLOW),
+    ("feat", "git merge @{upstream}", ALLOW),
+    ("feat", "git checkout -b feat/other origin/feat/other", ALLOW),
+    ("feat", "git checkout -B feat/other origin/feat/other", ALLOW),
+    ("feat", "git worktree add -b feat/other ../wt2 origin/feat/other", ALLOW),
+    # ── cutting from the base, or from something already on it ────────────────
+    ("main", "git checkout -b feat/new", ALLOW),
+    ("main", "git checkout -b feat/new 2>&1", ALLOW),
+    ("main", "git switch -c feat/new >/dev/null", ALLOW),
+    ("main", "git branch feat/new", ALLOW),
+    ("feat", "git checkout -b feat/new origin/main", ALLOW),
+    ("feat", "git switch --no-track -c feat/new origin/main", ALLOW),
+    ("feat", "git checkout --no-track -b feat/new origin/main", ALLOW),
+    ("feat", "git checkout -b feat/new main", ALLOW),
+    ("feat", "git checkout -b feat/new v1.0", ALLOW),
+    ("feat", "git branch feat/new origin/main", ALLOW),
+    ("feat", "git worktree add -b feat/new ../wt origin/main", ALLOW),
+    ("feat", "git checkout main && git pull --ff-only && git checkout -b feat/new", ALLOW),
+    ("codename", "git checkout -b feat/new", ALLOW),
+    ("codename", "git checkout -b chore/sync-kit-2026-09-20", ALLOW),
+    ("det-main", "git checkout -b feat/new", ALLOW),
+    ("trunk", "git checkout -b feat/new origin/trunk", ALLOW),
+    ("trunk-nohead", "git checkout -b feat/new origin/trunk", ALLOW),
+    ("gitflow", "git checkout -b feat/new origin/develop", ALLOW),
+    ("gitflow", "gh pr create --base develop --body-file /tmp/b.md", ALLOW),
+    ("trunk", "gh pr create --base trunk --body-file /tmp/b.md", ALLOW),
+    # ── ordinary git, and text that merely MENTIONS stacking ──────────────────
+    ("feat", "git checkout feat/other", ALLOW),
+    ("feat", "git switch feat/other", ALLOW),
+    ("feat", "git checkout -- README.md", ALLOW),
+    ("feat", "git branch -m feat/renamed", ALLOW),
+    ("feat", "git branch -D feat/other", ALLOW),
+    ("feat", "git branch --merged main", ALLOW),
+    ("feat", "git branch -a", ALLOW),
+    ("feat", "git branch -u origin/feat/probe", ALLOW),
+    ("feat", "git log origin/main..HEAD --oneline", ALLOW),
+    ("feat", "git diff origin/main...HEAD", ALLOW),
+    ("feat", "git rebase -i HEAD~1", ALLOW),
+    ("feat", "git rebase --continue", ALLOW),
+    ("feat", "git rebase --onto origin/main feat/other", ALLOW),
+    ("feat", "git push -u origin HEAD", ALLOW),
+    ("feat", "git push origin HEAD:feat/probe", ALLOW),
+    ("feat", "git push origin --delete feat/old", ALLOW),
+    ("feat", "git worktree add ../wt3 feat/other", ALLOW),
+    ("feat", "git worktree add -f --detach /tmp/hook-battery-union origin/main", ALLOW),
+    # docs/LESSONS.md's union check: several PR branches merged onto a DETACHED scratch
+    # worktree. Nothing is stacked — no branch moves — so the merge arm stands aside.
+    ("feat", "git worktree add -f --detach /tmp/hook-battery-union2 origin/main && "
+             "git -C /tmp/hook-battery-union2 merge --no-edit feat/other feat/main", ALLOW),
+    ("feat", "gh pr create --body-file /tmp/b.md", ALLOW),
+    ("feat", "gh pr create --base main --body-file /tmp/b.md", ALLOW),
+    ("feat", "gh pr create -B main", ALLOW),
+    ("feat", "gh pr edit 7 --base main", ALLOW),
+    ("feat", "gh pr view 7 --json baseRefName", ALLOW),
+    ("feat", "gh api repos/o/r/pulls -f base=main -f head=feat/probe", ALLOW),
+    ("feat", "python3 scripts/gh_fallback.py pr-create --title T --body-file /tmp/b.md --base main", ALLOW),
+    ("feat", "grep -rnE \"git rebase origin/main|git merge feat/other\" docs .claude/skills", ALLOW),
+    ("feat", "grep -n 'git checkout -b\\|git switch -c' docs/COLLABORATION.md", ALLOW),
+    ("feat", "echo 'gh pr create --base feat/x' > /tmp/note.txt", ALLOW),
+    ("feat", "git commit -m 'explain: never git merge feat/other'", ALLOW),
+    ("feat", "cat <<'EOF' > /tmp/x.sh\ngit merge feat/other\ngit checkout -b feat/y feat/z\nEOF", ALLOW),
+    ("feat", "echo \"a; git merge feat/other\"", ALLOW),
+    # ── the fail-OPEN edge, recorded rather than implied: with no main/master, no
+    #    origin/HEAD and no configured default, there is no base to measure against.
+    #    Failing closed here would block that repo's own `git merge origin/trunk`.
+    ("trunk-nohead", "git merge origin/feat/other", ALLOW),
+    # ── cutting a branch from a feature branch ────────────────────────────────
+    ("feat", "git checkout -b feat/new", BLOCK),          # the 2026-09-20 incident's shape
+    ("feat", "git checkout -b feat/new feat/other", BLOCK),
+    ("feat", "git checkout -B feat/new origin/feat/other", BLOCK),
+    ("feat", "git switch -c feat/new feat/other", BLOCK),
+    ("feat", "git switch --create feat/new refs/heads/feat/other", BLOCK),
+    ("feat", "git checkout -qb feat/new feat/other", BLOCK),
+    ("main", "git checkout -qb feat/new feat/other", BLOCK),
+    ("feat", "git checkout -bfeat/new feat/other", BLOCK),
+    ("main", "git checkout -b x -t \"origin/feat/other\"", BLOCK),
+    ("main", "git switch -c x --track origin/feat/other", BLOCK),
+    ("feat", "git branch feat/new feat/other", BLOCK),
+    ("feat", "git branch -f feat/new feat/other", BLOCK),
+    ("feat", "git branch -t feat/new origin/feat/other", BLOCK),
+    ("feat", "git branch --no-track feat/new feat/other 2>/dev/null", BLOCK),
+    ("feat", "git branch -c feat/other feat/new", BLOCK),
+    ("feat", "git branch feat/new", BLOCK),
+    ("feat", "git worktree add -b feat/new ../wt feat/other", BLOCK),
+    ("feat", "git worktree add ../feat-new", BLOCK),
+    ("feat", "git fetch origin && git checkout -b feat/new feat/other", BLOCK),
+    ("feat", "git -C . checkout -b feat/new feat/other", BLOCK),
+    ("feat", "(git checkout -b feat/new feat/other)", BLOCK),
+    ("feat", "bash -c 'git checkout -b feat/new feat/other'", BLOCK),
+    ("feat", "x=$(git checkout -b feat/new feat/other)", BLOCK),
+    ("feat", "git checkout -b feat/new feat/main", BLOCK),  # ends in /main, still a feature
+    ("main", "git checkout feat/other && git checkout -b feat/new", BLOCK),
+    ("main", "git switch feat/other && git switch -c feat/new", BLOCK),
+    ("det-feat", "git checkout -b feat/new", BLOCK),
+    ("trunk", "git checkout -b feat/new", BLOCK),
+    ("gitflow", "git checkout -b feat/new", BLOCK),
+    ("gitflow", "git checkout -b feat/new origin/feat/other", BLOCK),
+    # ── bringing another feature branch's work in ─────────────────────────────
+    ("feat", "git merge feat/other", BLOCK),
+    ("feat", "git merge --no-ff feat/other", BLOCK),
+    ("feat", "git merge origin/feat/other", BLOCK),
+    ("feat", "git merge --squash feat/other", BLOCK),
+    ("feat", "git merge origin/main feat/other", BLOCK),
+    ("feat", "git merge feat/other 2>&1 | tail -5", BLOCK),
+    ("feat", "git merge feat/other  # note", BLOCK),
+    ("feat", "git pull origin feat/other", BLOCK),
+    ("feat", "git pull --rebase origin feat/other", BLOCK),
+    ("feat", "git rebase feat/other", BLOCK),
+    ("feat", "git rebase origin/feat/other", BLOCK),
+    ("feat", "git-merge feat/other", BLOCK),
+    ("feat", "GIT_EDITOR=true git merge feat/other", BLOCK),
+    ("feat", "eval 'git merge feat/other'", BLOCK),
+    ("feat", "git merge FETCH_HEAD", BLOCK),
+    ("feat", "git merge -", BLOCK),
+    ("feat", "git merge @{-1}", BLOCK),
+    ("feat", "git merge $BRANCH", BLOCK),
+    ("feat", "git merge \"$(git rev-parse --abbrev-ref @{-1})\"", BLOCK),
+    ("feat", "git push origin HEAD:feat/other", BLOCK),
+    ("feat", "git push origin +HEAD:refs/heads/feat/other", BLOCK),
+    ("trunk", "git merge origin/feat/other", BLOCK),
+    ("gitflow", "git merge origin/feat/other", BLOCK),
+    # ── basing a PR on a non-base branch ──────────────────────────────────────
+    ("feat", "gh pr create --base feat/other --body-file /tmp/b.md", BLOCK),
+    ("feat", "gh pr create --base \"feat/other\"", BLOCK),
+    ("feat", "gh pr create --base 'feat/other'", BLOCK),
+    ("feat", "gh pr create --base=\"feat/other\"", BLOCK),
+    ("feat", "gh pr create -B feat/other", BLOCK),
+    ("feat", "gh pr create -Bfeat/other", BLOCK),
+    ("feat", "gh pr create -dB feat/other", BLOCK),
+    ("feat", "gh -R o/r pr create --base feat/other", BLOCK),
+    ("feat", "gh --repo o/r pr create --base feat/other", BLOCK),
+    ("feat", "gh pr create --title T \\\n  --base feat/other", BLOCK),
+    ("feat", "gh pr edit 7 --base feat/other", BLOCK),
+    ("feat", "gh pr create --base feat/main", BLOCK),
+    ("feat", "gh pr create --base \"$B\"", BLOCK),
+    ("feat", "gh api repos/o/r/pulls -f base=feat/other -f head=feat/probe", BLOCK),
+    ("feat", "gh api -X PATCH repos/o/r/pulls/7 -f base=feat/other", BLOCK),
+    ("feat", "python3 scripts/gh_fallback.py pr-create --title T --body-file /tmp/b.md --base feat/other", BLOCK),
+    ("feat", "git config branch.feat/probe.gh-merge-base feat/other", BLOCK),
+    # ── the config anchor now also covers origin/HEAD, which the guard trusts ─
+    ("feat", "git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat/other", BLOCK),
+    ("feat", "git symbolic-ref -m why refs/remotes/origin/HEAD refs/remotes/origin/feat/other", BLOCK),
+    ("feat", "git symbolic-ref refs/remotes/origin/HEAD origin/feat/other", BLOCK),
+    ("feat", "git fetch origin feat/other:refs/remotes/origin/HEAD", BLOCK),
+    ("feat", "git symbolic-ref refs/remotes/origin/HEAD", ALLOW),
+    ("feat", "git symbolic-ref --short refs/remotes/origin/HEAD", ALLOW),
+    ("feat", "git symbolic-ref -d refs/remotes/origin/HEAD", ALLOW),
+    # ── config: only a COMMITTED delivery.json can widen the base set, and a
+    #    malformed one must not take every Bash call down with it ──────────────
+    ("wt-config", "git merge feat/other", BLOCK),
+    ("wt-config", "git merge origin/main", ALLOW),
+    ("bad-config", "ls", ALLOW),
+    ("bad-config", "git merge origin/main", ALLOW),
+    ("bad-config", "git checkout -b feat/new feat/other", BLOCK),
+]
+STACK_SCENARIOS = sorted({s for s, _, _ in STACK_CASES})
 
 
 # ── pipeline sandboxes (docs/PIPELINE-CONTRACT.md) ───────────────────────────
@@ -804,6 +1157,61 @@ def main():
         '[{"number":7,"state":"OPEN"}]',
         '{"statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"},'
         '{"name":"Hooks change guard","conclusion":"FAILURE"}]}')
+    # A PR whose CI is GREEN but whose base is another feature branch. The Stop
+    # hook reads `baseRefName` out of GitHub's own record, so unlike the
+    # PreToolUse guard it does not care how the PR was created — a respelled
+    # command, the web UI and an automation all arrive here identically. Green
+    # checks are exactly the case that needs catching: a stacked PR looks fine
+    # right up until its base merges and every descendant turns CONFLICTING.
+    stop_stacked_root, stop_stacked, stop_stacked_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":'
+        '[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    stop_baseok_root, stop_baseok, stop_baseok_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"main","statusCheckRollup":'
+        '[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    # Separate sandbox for the message assertion — the per-(branch, reason, sha)
+    # dedup means a sandbox only speaks once per commit.
+    stop_msgstack_root, stop_msgstack, stop_msgstack_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":'
+        '[{"name":"Kit checks","conclusion":"SUCCESS"}]}')
+    # A repo whose GitHub default is `trunk` and which has no delivery.json: a PR
+    # into trunk is correctly based, and the hook must ask GitHub before blocking.
+    stop_trunk_root, stop_trunk, stop_trunk_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"trunk","statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}',
+        repo_default="trunk")
+    # gh cannot say what the default is: never block on what cannot be read.
+    stop_nogh_root, stop_nogh, stop_nogh_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}',
+        repo_default=None)
+    # The configured base, COMMITTED — honoured without asking GitHub (which here
+    # would say `main`, so only the config path can allow it)…
+    stop_cfg_root, stop_cfg, stop_cfg_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"develop","statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}',
+        committed_cfg={"version": 1, "github": {"owner": "a", "repo": "b", "defaultBranch": "develop"}})
+    # …and the same name written only into the WORKTREE copy, which must not count.
+    stop_wtcfg_root, stop_wtcfg, stop_wtcfg_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}',
+        committed_cfg={"version": 1, "github": {"owner": "a", "repo": "b", "defaultBranch": "main"}},
+        worktree_cfg={"version": 1, "github": {"owner": "a", "repo": "b", "defaultBranch": "feat/other"}})
+    # origin/HEAD names the remote's recorded default — a base without asking GitHub.
+    stop_ohead_root, stop_ohead, stop_ohead_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"develop","statusCheckRollup":[{"name":"Kit checks","conclusion":"SUCCESS"}]}',
+        origin_head="develop")
+    # Stacked AND red: the base message must not hide the CI verdict on the next turn.
+    stop_stackred_root, stop_stackred, stop_stackred_env = make_stop_sandbox(
+        '[{"number":7,"state":"OPEN"}]',
+        '{"baseRefName":"feat/other","statusCheckRollup":[{"name":"Kit checks","conclusion":"FAILURE"}]}')
+    # MERGED into a feature branch: the work never reached the base, and nothing is red.
+    stop_offbase_root, stop_offbase, stop_offbase_env = make_stop_sandbox(
+        '[{"number":7,"state":"MERGED","baseRefName":"feat/other"}]', '{}')
     stop_dirty_root, stop_dirty, stop_dirty_env = make_stop_sandbox(
         '[{"number":7,"state":"OPEN"}]',
         '{"mergeStateStatus":"DIRTY","statusCheckRollup":[{"name":"CodeQL","conclusion":"SUCCESS"}]}')
@@ -873,6 +1281,13 @@ def main():
     # matching must survive a config that resolves no label ID at all.
     pl_nolbl_root, pl_nolbl, pl_nolbl_pins = make_pipeline_sandbox(
         cfg_over={"linear": {"labels": {"ids": {}, "required": []}}})
+    # A project whose base branch is NOT `main`. The stacked-branch guard reads
+    # `github.defaultBranch` from the COMMITTED config on the default branch, so
+    # `develop` must become a legal base — and `main`/`master` must stay legal
+    # too, because the value only ever WIDENS the set (an unreadable config makes
+    # the guard stricter, never looser).
+    pl_dev_root, pl_dev, pl_dev_pins = make_pipeline_sandbox(
+        cfg_over={"github": {"defaultBranch": "develop"}})
     pl_noid_root, pl_noid, pl_noid_pins = make_pipeline_sandbox(pin={"ticket": None})
     pl_plan_root, pl_plan, pl_plan_pins = make_pipeline_sandbox(
         branch="feat/decompose-the-epic", pin={"session_mode": "planning", "ticket": None})
@@ -926,8 +1341,10 @@ def main():
         pl_noeff_root, pl_noeff_pins, pl_noauto_root, pl_noauto_pins,
         pl_disarm_root, pl_disarm_pins, pl_expplan_root, pl_expplan_pins,
         pl_pinsin_root, pl_pinsin_pins, pl_pinsbad_root, pl_pinsbad_pins,
-        pl_nolbl_root, pl_nolbl_pins,
+        pl_nolbl_root, pl_nolbl_pins, pl_dev_root, pl_dev_pins,
     ]
+
+    stack_hooks = {s: make_stack_repo(s) for s in STACK_SCENARIOS}
 
     # (name, payload, expect_block, hook_path)
     cases = [
@@ -963,6 +1380,26 @@ def main():
         # REAL repo's current branch having a merged PR (merged-PR guard is live)
         ("push feature branch allowed", bash("git push -u origin feat/kit"), ALLOW, feat_hook),
         ("--force-with-lease allowed", bash("git push --force-with-lease origin feat/kit"), ALLOW, feat_hook),
+
+        # The base branch is CONFIGURABLE — `github.defaultBranch` from the
+        # COMMITTED delivery.json on the default branch (contract §1), never from
+        # the worktree the session can edit (the `wt-config` scenario in
+        # STACK_CASES is the forging attempt). The realistic cases live in
+        # STACK_CASES; these pin the configured-name path on the pipeline sandbox.
+        ("configured base: merge origin/develop allowed",
+         bash("git merge origin/develop"), ALLOW, pl_dev),
+        ("configured base: checkout -b off origin/develop allowed",
+         bash("git checkout -b feat/eng-123-new origin/develop"), ALLOW, pl_dev),
+        ("configured base: gh pr create --base develop allowed",
+         bash("gh pr create --base develop"), ALLOW, pl_dev),
+        # Widening only: a configured `develop` must not REMOVE main/master.
+        ("configured base: merge origin/main still allowed (widening, not replacing)",
+         bash("git merge origin/main"), ALLOW, pl_dev),
+        # ...and a feature branch is still a feature branch.
+        ("configured base: merge of a feature branch still blocked",
+         bash("git merge feat/other"), BLOCK, pl_dev),
+        ("configured base: gh pr create --base <feature> still blocked",
+         bash("gh pr create --base feat/other"), BLOCK, pl_dev),
 
         # ── universal: secret reads (path-target guard) ──────────────────────
         ("cat .env blocked", bash("cat .env"), BLOCK, HOOK),
@@ -1677,6 +2114,11 @@ def main():
 
     # Stop hook: different protocol (exit 0 + JSON decision on stdout).
     # (name, payload_or_None(raw), expect_block, hook_path, env)
+    cases += [
+        (f"stack[{scen}] {'BLOCK' if want else 'ALLOW'}: {cmd!r}", bash(cmd), want, stack_hooks[scen])
+        for scen, cmd, want in STACK_CASES
+    ]
+
     stop_cases = [
         ("stop: stop_hook_active short-circuits",
          {"stop_hook_active": True}, ALLOW, STOP_HOOK, None),
@@ -1700,6 +2142,20 @@ def main():
          {}, ALLOW, stop_pending, stop_pending_env),
         ("stop: a human-pending check does not mask a real failure beside it",
          {}, BLOCK, stop_mixed, stop_mixed_env),
+        ("stop: an open PR based on a feature branch blocks even with GREEN CI",
+         {}, BLOCK, stop_stacked, stop_stacked_env),
+        ("stop: an open PR based on the base branch is allowed",
+         {}, ALLOW, stop_baseok, stop_baseok_env),
+        ("stop: a PR into a trunk default (no delivery.json) is allowed — GitHub is asked",
+         {}, ALLOW, stop_trunk, stop_trunk_env),
+        ("stop: gh cannot name the default branch — the base check says nothing",
+         {}, ALLOW, stop_nogh, stop_nogh_env),
+        ("stop: a COMMITTED configured base is honoured without GitHub",
+         {}, ALLOW, stop_cfg, stop_cfg_env),
+        ("stop: a WORKTREE-only delivery.json cannot make a feature branch a base",
+         {}, BLOCK, stop_wtcfg, stop_wtcfg_env),
+        ("stop: origin/HEAD's branch is a base without asking GitHub",
+         {}, ALLOW, stop_ohead, stop_ohead_env),
     ]
 
     # What the not-green messages SAY. The Stop hook is the enforcement — a session
@@ -1716,9 +2172,19 @@ def main():
          stop_dirtyred, stop_dirtyred_env,
          ["rebase", "--force-with-lease", "/fix-ci", "triages the conflict"],
          ["has failing CI"]),
+        # A wrong base is not a CI failure, and telling the session to fix CI here
+        # would send it to read a log that says nothing. The message has to name
+        # the retarget command AND the case retargeting does not fix — a branch
+        # CUT from the other branch keeps its commits in the PR.
+        ("stop reason: a stacked PR names the retarget command, not the CI loop",
+         stop_msgstack, stop_msgstack_env,
+         ["gh pr edit 7 --base main", "CUT from", "git rebase --onto origin/main feat/other",
+          "--no-track", "re-runs by itself", "docs/COLLABORATION.md"],
+         ["/fix-ci"]),
     ]
 
     failures = 0
+    seq_ran = 0
     for name, payload, expect_block, hook_path, *rest in cases:
         env = rest[0] if rest else None          # rest = (env,) or (env, cwd)
         cwd = rest[1] if len(rest) > 1 else None
@@ -1754,9 +2220,44 @@ def main():
     for name, hook_path, env, needles, absent in stop_reason_cases:
         failures += check_stop_reason(name, hook_path, env, needles, absent)
 
-    # These two run a SEQUENCE of turns rather than one, so they report how many
+    # A stacked PR that is ALSO red: turn 1 names the base; turn 2 on the SAME commit
+    # must reach the CI verdict and charge the fix budget, or the base message would
+    # hide a red PR for as long as it stays stacked.
+    seq_ran += 1
+    t1 = run_stop_hook_json({}, stop_stackred, env=stop_stackred_env)
+    t2 = run_stop_hook_json({}, stop_stackred, env=stop_stackred_env)
+    ok = ("is based on `feat/other`" in t1.get("reason", "")
+          and t2.get("decision") == "block" and "has failing CI" in t2.get("reason", "")
+          and "attempt 1 of 3" in t2.get("reason", ""))
+    print(f"[{'PASS' if ok else 'FAIL'}] stop: stacked+red — base on turn 1, the CI verdict "
+          f"and budget on turn 2 of the same commit")
+    failures += 0 if ok else 1
+
+    # Merged into a feature branch: a NON-blocking notice (§13 — "could not" must not
+    # render as "nothing to do"), never a block.
+    seq_ran += 1
+    off = run_stop_hook_json({}, stop_offbase, env=stop_offbase_env)
+    ok = off.get("decision") != "block" and "MERGED into `feat/other`" in off.get("systemMessage", "")
+    print(f"[{'PASS' if ok else 'FAIL'}] stop: a PR merged into a feature branch gets a "
+          f"non-blocking 'never reached the base' notice")
+    failures += 0 if ok else 1
+
+    # The lexer is linear: a 50,000-character decoration run once took the first
+    # draft past the hook's 10 s timeout — and a timed-out PreToolUse hook does not
+    # block, so every later guard was switched off for that call. The never-merge
+    # guard after it must still fire, and fast.
+    seq_ran += 1
+    t0 = time.time()
+    slow_blocked = run_hook(bash("git merge " + "~" * 50000 + "x; gh pr merge 1 --auto"),
+                            hook_path=stack_hooks["feat"])
+    took = time.time() - t0
+    ok = slow_blocked and took < 5
+    print(f"[{'PASS' if ok else 'FAIL'}] stacked guard is linear: 50k-char token + a later "
+          f"gh pr merge still BLOCKS, in {took:.2f}s (limit 5s)")
+    failures += 0 if ok else 1
+
+    # These run a SEQUENCE of turns rather than one, so they report how many
     # assertions they made — the total below has to count them all (see its comment).
-    seq_ran = 0
     for ran, failed in (
         check_fix_budget(
             stop_budget_root, stop_budget, stop_budget_env, stop_budget_view),
@@ -1826,6 +2327,25 @@ def main():
          bash("gh pr review 7 --approve"), "`--comment` review is still allowed", HOOK),
         ("stderr reason: the bare-review block names the event as the reason",
          bash("gh pr review 7"), "interactive prompt", HOOK),
+        # The stacked-branch blocks are only worth their friction if they hand
+        # back the correct command — a session that is told "no" and not "instead"
+        # improvises, which is how the 2026-09-20 stack grew one PR at a time.
+        ("stderr reason: a stacked branch is given the off-the-base command",
+         bash("git checkout -b feat/new feat/other"),
+         "git switch --no-track -c feat/new origin/main", stack_hooks["feat"]),
+        ("stderr reason: a feature merge says bringing the BASE in stays allowed",
+         bash("git merge feat/other"), "git fetch origin main && git merge origin/main",
+         stack_hooks["feat"]),
+        ("stderr reason: a bad PR base points at the base branch",
+         bash("gh pr create --base feat/other"), "gh pr create --base main", stack_hooks["feat"]),
+        ("stderr reason: an unseen ref says to name it",
+         bash("git merge FETCH_HEAD"), "Name the ref literally", stack_hooks["feat"]),
+        ("stderr reason: a push into another feature branch is named as a merge",
+         bash("git push origin HEAD:feat/other"), "feature-to-feature merge done on the remote",
+         stack_hooks["feat"]),
+        ("stderr reason: repointing origin/HEAD is the config anchor's",
+         bash("git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat/other"),
+         "rewrite a git ref", stack_hooks["feat"]),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -1840,6 +2360,9 @@ def main():
               stop_dirty_root, stop_pending_root, stop_mixed_root, stale_root,
               stop_dirtyred_root, stop_msgred_root, stop_budget_root, stop_clear_root,
               stop_prem_root, stop_shared_root, stop_status_root,
+              stop_stacked_root, stop_baseok_root, stop_msgstack_root, stop_trunk_root,
+              stop_nogh_root, stop_cfg_root, stop_wtcfg_root, stop_ohead_root,
+              stop_stackred_root, stop_offbase_root, *_STACK_TMP,
               *pl_cleanup):
         shutil.rmtree(r, ignore_errors=True)
 

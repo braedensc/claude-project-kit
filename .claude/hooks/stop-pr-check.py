@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Stop hook: nudges Claude before ending a turn on a pushed branch that either
-(a) has no PR yet, or (b) has an open PR with failing CI that Claude could
-actually fix. CLAUDE.md may say
+Stop hook: nudges Claude before ending a turn on a pushed branch that
+(a) has no PR yet, (b) has an open PR based on a branch other than the base
+branch (a stacked PR — asked first, and asked even when its CI is green),
+(c) has an open PR that is DIRTY (conflicted), or (d) has an open PR with failing
+CI that Claude could actually fix. A PR that was MERGED into a non-base branch —
+work that never reached the base — gets a non-blocking notice. CLAUDE.md may say
 "open a PR when the task is done" and "watch CI to green," but written rules
 aren't reliably followed across parallel worktree sessions — this makes both
 a hard-to-miss reminder instead.
@@ -184,6 +187,53 @@ def _clear_budget(branch: str) -> None:
             pass
 
 
+# ── Base branches: which branch an open PR is allowed to target ───────────────
+# The same definition the PreToolUse stacked-branch guard uses: `main`/`master`,
+# plus `github.defaultBranch` from a COMMITTED delivery.json, plus the remote's
+# recorded default (`refs/remotes/origin/HEAD`). Widening only. Never read from
+# the worktree copy of delivery.json: a session that could name its own base
+# branch could name a feature branch. When a PR's base is still outside that set,
+# the hook asks GitHub itself (`gh repo view`) before blocking — the same value
+# the PR-base workflow compares against — and says nothing if it cannot ask.
+def _origin_head_branch() -> str:
+    code, out = _run(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    return out[len("origin/"):] if code == 0 and out.startswith("origin/") else ""
+
+
+def _configured_default_branch() -> str:
+    try:
+        if not os.path.isfile(os.path.join(PROJECT_ROOT, "delivery.json")):
+            return ""
+        refs = ["origin/main", "origin/master", "main", "master"]
+        oh = _origin_head_branch()
+        if oh:
+            refs.insert(0, "origin/" + oh)
+        for ref in refs:
+            code, out = _run(["git", "show", ref + ":delivery.json"])
+            if code != 0 or not out.strip():
+                continue
+            cfg = json.loads(out)
+            gh_cfg = cfg.get("github") if isinstance(cfg, dict) else None
+            name = gh_cfg.get("defaultBranch") if isinstance(gh_cfg, dict) else None
+            name = name.strip() if isinstance(name, str) else ""
+            return "" if (not name or "{{" in name) else name
+    except Exception:
+        return ""
+    return ""
+
+
+def _base_branch_names() -> set:
+    return PROTECTED_BRANCHES | ({_configured_default_branch(), _origin_head_branch()} - {""})
+
+
+def _github_default_branch() -> str:
+    """GitHub's own default branch, or "" if gh cannot say. Asked only when a PR's
+    base is outside the local base set, so the common case makes no extra call."""
+    code, out = _run(["gh", "repo", "view", "--json", "defaultBranchRef",
+                      "--jq", ".defaultBranchRef.name"], timeout=10)
+    return out.strip() if code == 0 else ""
+
+
 def _block(branch: str, reason: str, head_sha: str, msg: str) -> None:
     if _already_nagged(branch, reason, head_sha):
         sys.exit(0)
@@ -245,7 +295,8 @@ if not shutil.which("gh"):
 # --state all: a merged/closed PR means the "open a PR" task was already done
 # (and there's nothing further to watch), even if local main hasn't caught up.
 code, out = _run(
-    ["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state"],
+    ["gh", "pr", "list", "--head", branch, "--state", "all", "--json",
+     "number,state,baseRefName"],
     timeout=10,
 )
 if code != 0:
@@ -267,11 +318,28 @@ if not prs:
     sys.exit(0)
 
 pr = prs[0]
+if pr.get("state") == "MERGED":
+    # The second way a stack goes wrong: merged into a feature branch, so the work
+    # never reached the base, and nothing goes red. Said once, never blocking —
+    # there is nothing left for this session to fix on this branch (§13: "could
+    # not" must not read like "nothing to do").
+    _merged_base = pr.get("baseRefName")
+    if isinstance(_merged_base, str) and _merged_base and _merged_base not in _base_branch_names() \
+            and _merged_base != _github_default_branch() \
+            and not _already_nagged(branch, "merged-off-base", head_sha):
+        _record_nag(branch, "merged-off-base", head_sha)
+        _notice(
+            f"PR #{pr['number']} for `{branch}` was MERGED into `{_merged_base}`, which is not "
+            "a base branch — so this work has NOT reached the base branch, and nothing will go "
+            "red about it. Tell the user, and re-land it from a fresh branch cut from the base "
+            "(docs/COLLABORATION.md § Never stack a PR)."
+        )
 if pr.get("state") != "OPEN":
     sys.exit(0)  # merged or closed — nothing further to watch
 
 code, out = _run(
-    ["gh", "pr", "view", str(pr["number"]), "--json", "statusCheckRollup,mergeStateStatus"],
+    ["gh", "pr", "view", str(pr["number"]), "--json",
+     "baseRefName,statusCheckRollup,mergeStateStatus"],
     timeout=10,
 )
 if code != 0:
@@ -282,6 +350,39 @@ try:
 except Exception:
     sys.exit(0)
 raw_checks = info.get("statusCheckRollup", [])
+
+# ── Base branch: is this PR stacked on another feature branch? ────────────────
+# Asked BEFORE the conflict and CI verdicts, and asked on a GREEN PR: a stacked
+# PR's checks can pass right up until its base is squash-merged, and then it turns
+# CONFLICTING and GitHub stops running checks on it at all. This reads
+# `baseRefName` from GitHub's own record, so it does not care how the PR was
+# created. It needs `gh` to answer: where gh cannot reach GitHub this hook has
+# already exited above, silently, as every check here does.
+# Said ONCE per commit, then out of the way: a later turn-end on the same commit
+# falls through to the DIRTY / failing-CI triage and the fix budget below, so a
+# stacked PR that is ALSO red is never hidden behind this message.
+_pr_base = info.get("baseRefName")
+if isinstance(_pr_base, str) and _pr_base and _pr_base not in _base_branch_names() \
+        and not _already_nagged(branch, "pr-base", head_sha):
+    _gh_default = _github_default_branch()
+    if _gh_default and _pr_base != _gh_default:
+        _suggest = _gh_default
+        msg = (
+            f"PR #{pr['number']} for `{branch}` is based on `{_pr_base}`, not this repo's "
+            f"base branch (`{_suggest}`). Every PR branches off the base and merges back "
+            "into it. A stacked PR turns CONFLICTING the moment its base is squash-merged, "
+            "and GitHub runs NO checks on a conflicted PR — so it reads as 'no checks "
+            "reported', which looks like broken CI (six-deep stack, 2026-09-20: five forced "
+            "re-cascades). Retarget it now, before the base moves:\n"
+            f"  gh pr edit {pr['number']} --base {_suggest}\n"
+            "The PR-base check re-runs by itself on the retarget. Then read the diff: if this "
+            "branch was also CUT from that feature branch, retargeting leaves the other "
+            "branch's commits in this PR — move your own commits onto the base instead "
+            f"(`git rebase --onto origin/{_suggest} {_pr_base}`), or re-cut with "
+            f"`git switch --no-track -c <type>/<desc> origin/{_suggest}` and open a fresh PR. "
+            "(docs/COLLABORATION.md § Never stack a PR)"
+        )
+        _block(branch, "pr-base", head_sha, msg)
 
 
 # GitHub's legacy commit-status API reports as a `StatusContext`, which has no `name`
