@@ -25,8 +25,10 @@ tracker key. It creates none of them.
 
 THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabulary
 
-    preflight    the conf, the role account's home, the notifier in its clone, and the
-                 notifier's own --selftest run from THIS checkout
+    preflight    the conf, the role account's home, the notifier's own --selftest run from
+                 THIS checkout, and the notifier in the role account's clone: every file the
+                 job runs, byte for byte this checkout's (sha256, read as that account). The
+                 clone's HEAD may differ; the files the notifier runs may not
     slack-app    CK-N1: a Slack app for the notifier alone, and a PRIVATE channel
     credentials  the Slack token in the role account's env file — its shape measured in that
                  account's shell, its value never read into this process
@@ -52,7 +54,9 @@ SUBCOMMANDS
     status              replays the ledger from disk. It probes nothing
     verify              re-measures EVERY step, never stops early, changes nothing, writes
                         nothing (not even the ledger), asks for no credential, and never raises
-    card <CK-id>        print a checkpoint card, at any time, with or without a conf
+    card <CK-id>        print a checkpoint card, at any time, with or without a conf.
+                        `card CK-N5` is printed ONLY this way — no step raises it, nothing is
+                        signed on it: is the job alive, and how to pause and resume it
     attest <A-id> --initials YOUR-INITIALS --note "..."
                         record something no computer can check. YOUR-INITIALS is a placeholder
                         and is refused as typed
@@ -584,6 +588,13 @@ def log_path(conf, home):
     return os.path.dirname(resolve_path(conf["NOTIFIER_CONFIG"].rstrip("/"), home)) + "/" + LOG_NAME
 
 
+def log_file(conf):
+    """The same log as the role account's own shell spells it, `~` kept for its `$HOME` to
+    expand: what card CK-N5 prints. `log_path` is that file resolved for the plist, which
+    launchd reads and which expands nothing; the selftest holds the two to one file."""
+    return os.path.dirname(conf["NOTIFIER_CONFIG"].rstrip("/")).rstrip("/") + "/" + LOG_NAME
+
+
 def render_plist(conf, home):
     """The Stage E installer's own PLIST template, filled in. launchd expands nothing, so the
     home and the log are absolute; `$HOME` inside the command is /bin/sh's, at run time."""
@@ -907,6 +918,55 @@ CARDS = {
         "good": "one ping in the private channel, its link opens the ticket, and the label landed",
         "attest": A_FIRST_PING,
     },
+    # Printed only by `card CK-N5`. No step raises it and nothing is signed on it: it is the
+    # set of commands for looking at a loaded job yourself, and for stopping and starting it.
+    "CK-N5": {
+        "title": "Is the notifier alive, and how to pause it",
+        "why": ("A notifier that stops says nothing: no ping is exactly what a quiet week looks "
+                "like. `verify` reads its heartbeat, but only when a person runs it. These are "
+                "the commands to look for yourself, and to stop and start the job. No step waits "
+                "on this card and nothing is signed on it: it is printed when you ask for it."),
+        "do": ["1. Its last pass, and the log's last lines, read as the role account:",
+               "    sudo -u ${ROLE_ACCOUNT} -H /bin/sh -c 'cd / && cat ${HEARTBEAT}; tail -20 ${LOG}'",
+               "   Good: `at` is under ${STALE_SECONDS} s old and `exit` is 0. Older than that",
+               "   is NOT RUNNING: the line `verify` draws, two intervals plus the longest a",
+               "   pass may take plus two minutes (2 x ${INTERVAL_SECONDS} + ${RUN_TIMEOUT_SECONDS} + 120 s).",
+               "   `exit` 3 with `capped` equal to `declined`: the per-pass cap held events",
+               "   back, and they go on the next pass. Any other non-zero `exit`: its",
+               "   `summary` says why.",
+               "2. Every step re-measured, changing nothing:",
+               "    python3 scripts/pipeline_notifier_setup.py verify",
+               "3. What launchd holds, and the job's last exit:",
+               "    sudo launchctl print system/${JOB_LABEL}",
+               "4. Whether the role account's clone runs this checkout's notifier, file by file",
+               "   (the comparison `verify` makes in its preflight row):",
+               "    ( cd scripts && shasum -a 256 ${REQUIRED_SCRIPTS} ) \\",
+               "      | sudo -u ${ROLE_ACCOUNT} -H /bin/sh -c 'cd ${CLONE_SCRIPTS} && shasum -a 256 -c -'",
+               "   Good: every line ends `OK`. A `FAILED` line is a file the two do not share:",
+               "   pull this checkout, or let the Stage E installer's `run` move the clone.",
+               "",
+               "PAUSE: unload it.",
+               "    sudo launchctl bootout system/${JOB_LABEL}",
+               "Paused looks like this:",
+               "  - `sudo launchctl print system/${JOB_LABEL}` answers",
+               "    `Could not find service`;",
+               "  - a later `run` does not load it again: this installer never loads it;",
+               "  - `verify` reports the `enable` step BLOCKED on CK-N3, so it cannot say",
+               "    `No drift` until you resume.",
+               "A bootout lasts until the machine restarts: at boot, launchd loads every",
+               "plist in /Library/LaunchDaemons again, this one included. To keep it paused",
+               "through a restart, disable it as well:",
+               "    sudo launchctl disable system/${JOB_LABEL}",
+               "",
+               "RESUME: load it again, the line from card CK-N3. If you disabled it, enable",
+               "it first:",
+               "    sudo launchctl enable system/${JOB_LABEL}",
+               "    sudo launchctl bootstrap system ${PLIST}",
+               "Then, once it has had a pass:",
+               "    python3 scripts/pipeline_notifier_setup.py verify"],
+        "good": "a heartbeat under ${STALE_SECONDS} s old with exit 0, and every clone file OK",
+        "attest": None,
+    },
 }
 
 ATTESTATIONS = {
@@ -927,7 +987,21 @@ NEVER = [
 def _card_values(conf):
     values = dict(CARD_EXAMPLE if conf is None else conf)
     values["PLIST"] = plist_path(values)
+    # CK-N5's values are DERIVED, never conf keys of their own: the heartbeat `enable` reads,
+    # the log the plist names, the files preflight compares, and the threshold `enable` uses.
+    values["HEARTBEAT"] = _q(heartbeat_file(values))
+    values["LOG"] = _q(log_file(values))
+    values["CLONE_SCRIPTS"] = _q(values["ROLE_KIT_CLONE"].rstrip("/") + "/scripts")
+    values["REQUIRED_SCRIPTS"] = " ".join(REQUIRED_SCRIPTS)
+    values["STALE_SECONDS"] = str(stale_after_seconds(values))
     return values
+
+
+def _fill(line, values):
+    for key, val in values.items():
+        if isinstance(val, str):
+            line = line.replace("${%s}" % key, val)
+    return line
 
 
 def print_card(cid, conf=None):
@@ -948,12 +1022,9 @@ def print_card(cid, conf=None):
     say("")
     say("WHAT TO DO")
     for line in card["do"]:
-        for key, val in values.items():
-            if isinstance(val, str):
-                line = line.replace("${%s}" % key, val)
-        say("  " + line)
+        say("  " + _fill(line, values))
     say("")
-    say("GOOD: %s" % card["good"].replace("${JOB_LABEL}", values["JOB_LABEL"]))
+    say("GOOD: %s" % _fill(card["good"], values))
     if card["attest"]:
         say("SIGN-OFF: %s — %s" % (card["attest"], ATTESTATIONS[card["attest"]]))
     say("")
@@ -1111,6 +1182,11 @@ class Ctx(object):
         # it is looking at rather than leaving the operator to guess.
         self.rehearsed = False
         self.clock = time.time
+        # The command the operator typed, so a printed remedy repeats THAT one: a key hand-off
+        # that says `run` to someone reading a dry run would have them change the machine.
+        self.command = "run"
+        # This checkout's scripts, which preflight holds the role account's clone to.
+        self.checkout_scripts = HERE
 
     @property
     def account(self):
@@ -1147,6 +1223,48 @@ def _last_line(text):
 # Steps. Each returns (ok, detail, notes) or raises Blocked / Unknown / SetupError.
 # ok=True is ALREADY-DONE; ok=False is DONE under `run` and WOULD-CHANGE otherwise.
 # --------------------------------------------------------------------------- #
+# The clone's copy of each script the job runs, hashed in the role account's shell: one line
+# per script, `sha256 <digest> <name>`, `missing <name>`, `unreadable <name>`, or `nohash
+# <name>` when no digest came back. That last one is its own word so a missing tool reads as
+# NOT MEASURED, never as a mismatch. BSD `shasum` or GNU `sha256sum`, branched on `uname`
+# like the `stat` calls below, because the selftest runs this text through /bin/sh where CI
+# runs. It reads code, never a credential.
+CLONE_HASH_SH = (
+    'c=@DIR@; case "$(uname)" in Darwin) h="shasum -a 256";; *) h=sha256sum;; esac; '
+    'for s in @FILES@; do f="$c/$s"; '
+    'if [ ! -f "$f" ]; then echo "missing $s"; '
+    'elif [ ! -r "$f" ]; then echo "unreadable $s"; '
+    'else d=$($h < "$f" 2>/dev/null | cut -c1-64); '
+    'if [ ${#d} -eq 64 ]; then echo "sha256 $d $s"; else echo "nohash $s"; fi; fi; done')
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def parse_clone_hashes(text):
+    """{script: (verdict, digest or None)} from CLONE_HASH_SH's lines. A line of any other
+    shape is ignored, so a script it names nothing about stays unmeasured."""
+    found = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[0] == "sha256" and _SHA256_RE.match(parts[1]):
+            found[parts[2]] = ("sha256", parts[1])
+        elif len(parts) == 2 and parts[0] in ("missing", "unreadable", "nohash"):
+            found[parts[1]] = (parts[0], None)
+    return found
+
+
+def checkout_hashes(root):
+    """{script: sha256 hex, or None when it cannot be read} for REQUIRED_SCRIPTS under `root`,
+    this checkout's `scripts/` directory."""
+    out = {}
+    for name in REQUIRED_SCRIPTS:
+        try:
+            with open(os.path.join(root, name), "rb") as fh:
+                out[name] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            out[name] = None
+    return out
+
+
 def step_preflight(ctx, apply_it):
     conf, r = ctx.conf, ctx.runner
     problems, measured, unmeasured, notes = [], ["conf valid"], [], []
@@ -1185,26 +1303,58 @@ def step_preflight(ctx, apply_it):
 
     clone = conf["ROLE_KIT_CLONE"].rstrip("/")
     if ctx.agent:
-        unmeasured.append("whether %s/scripts carries %s, and whether %s can run /usr/bin/python3 "
-                          "— both need `sudo -u %s`"
+        unmeasured.append("whether %s/scripts carries %s, byte for byte as this checkout does, and "
+                          "whether %s can run /usr/bin/python3 — both need `sudo -u %s`"
                           % (clone, ", ".join(REQUIRED_SCRIPTS), ctx.account, ctx.account))
     else:
-        script = ('c=%s; for s in %s; do if [ -f "$c/$s" ]; then echo "have $s"; '
-                  'else echo "missing $s"; fi; done'
-                  % (_q(clone + "/scripts"), " ".join(REQUIRED_SCRIPTS)))
-        res = r.as_role(ctx.account, script)
+        res = r.as_role(ctx.account, CLONE_HASH_SH.replace("@DIR@", _q(clone + "/scripts"))
+                        .replace("@FILES@", " ".join(REQUIRED_SCRIPTS)))
         if not res.ok:
             unmeasured.append("the clone could not be read as %s (exit %d): %s"
                               % (ctx.account, res.rc, (res.err or res.out).strip()[:160]))
         else:
-            missing = [l.split(" ", 1)[1] for l in res.out.splitlines() if l.startswith("missing ")]
+            theirs = parse_clone_hashes(res.out)
+            mine = checkout_hashes(ctx.checkout_scripts)
+            verdict = dict((s, (theirs.get(s) or ("nohash", None))) for s in REQUIRED_SCRIPTS)
+            missing = [s for s in REQUIRED_SCRIPTS if verdict[s][0] == "missing"]
+            unreadable = [s for s in REQUIRED_SCRIPTS if verdict[s][0] == "unreadable"]
+            unhashed = [s for s in REQUIRED_SCRIPTS if verdict[s][0] == "nohash"]
+            unread_here = [s for s in REQUIRED_SCRIPTS if not mine.get(s)]
+            differ = [s for s in REQUIRED_SCRIPTS if verdict[s][0] == "sha256" and mine.get(s)
+                      and verdict[s][1] != mine[s]]
             if missing:
                 problems.append("the role account's clone at %s lacks scripts/%s. The change that "
                                 "ships the notifier is not in that clone yet: merge it, then let "
                                 "the Stage E installer's `run` move the clone (its `code` step)"
                                 % (clone, ", scripts/".join(missing)))
-            else:
-                measured.append("the clone carries the notifier and what it imports")
+            if unreadable:
+                problems.append("the role account's clone at %s holds scripts/%s, which %s cannot "
+                                "read — and the job runs as that account"
+                                % (clone, ", scripts/".join(unreadable), ctx.account))
+            # PRESENCE IS NOT ENOUGH. The selftest above ran from THIS checkout; a clone that is
+            # behind it, or ahead, runs code that battery never passed. Only the files the job
+            # runs are compared, so a merge that touches none of them never blocks.
+            if differ:
+                problems.append("the role account's clone at %s holds a different scripts/%s from "
+                                "this checkout's (sha256, read as %s). The notifier's selftest "
+                                "passed HERE, so the job would run code it never passed. Bring "
+                                "the two level: this checkout at the commit you mean to run, and "
+                                "the clone moved by the Stage E installer's `run` (its `code` "
+                                "step). Only the %d files the notifier runs are compared"
+                                % (clone, ", scripts/".join(differ), ctx.account,
+                                   len(REQUIRED_SCRIPTS)))
+            if unhashed or unread_here:
+                unmeasured.append("could not hash %s, so whether the clone runs this checkout's "
+                                  "notifier is NOT MEASURED"
+                                  % "; ".join(filter(None, (
+                                      "scripts/%s in the clone as %s (no digest from `shasum` or "
+                                      "`sha256sum`)" % (", scripts/".join(unhashed), ctx.account)
+                                      if unhashed else "",
+                                      "scripts/%s in this checkout" % ", scripts/".join(unread_here)
+                                      if unread_here else ""))))
+            if not (missing or unreadable or differ or unhashed or unread_here):
+                measured.append("the clone's %d notifier files are byte for byte this checkout's "
+                                "(sha256, read as %s)" % (len(REQUIRED_SCRIPTS), ctx.account))
         py = r.as_role(ctx.account, "/usr/bin/python3 -V")
         if not py.ok:
             problems.append("%s cannot run /usr/bin/python3 (exit %d): %s — the job's command uses "
@@ -1405,7 +1555,7 @@ def step_labels(ctx, apply_it):
         raise Unknown(
             "NOT MEASURED — $%s is not set in your shell. This step reads the tracker key from YOUR "
             "environment, for this one command; it never reads the role account's file." % name,
-            key_hand_off(name))
+            key_hand_off(name, ctx.command))
     ctx.held.append(key)
     api = ctx.transport_factory(key)
     try:
@@ -1716,6 +1866,11 @@ def stale_after_seconds(conf):
     return 2 * int(conf["INTERVAL_SECONDS"]) + int(conf["RUN_TIMEOUT_SECONDS"]) + 120
 
 
+def _is_count(value):
+    """A heartbeat count: an int, and not a JSON `true`, which Python counts as the int 1."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def heartbeat_age(ctx, beat):
     """Seconds since the heartbeat was written, or None when its stamp cannot be read."""
     stamp = str((beat or {}).get("at") or "")
@@ -1783,8 +1938,9 @@ def step_enable(ctx, apply_it):
                 "system/%s is loaded and has written NO heartbeat, so no pass of it has ever "
                 "finished. The plist runs it at load, so this is not a job waiting for its first "
                 "interval." % label,
-                "read %s as %s — a pass that cannot start writes nothing to its heartbeat"
-                % (log_path(conf, ctx.role_home or "~"), ctx.account))
+                "read %s as %s — a pass that cannot start writes nothing to its heartbeat\n"
+                "the commands, filled in:  python3 %s card CK-N5"
+                % (log_path(conf, ctx.role_home or "~"), ctx.account, _self_path()))
         raise Unknown("system/%s is loaded and its heartbeat is %s" % (label, why_not),
                       "run the same command again")
     age = heartbeat_age(ctx, beat)
@@ -1804,14 +1960,33 @@ def step_enable(ctx, apply_it):
         raise Unknown(
             "system/%s is loaded and NOT RUNNING: its last pass was %d s ago, past the %d s a "
             "pass may take" % (label, int(age), stale),
-            "read %s as %s, and `sudo launchctl print system/%s` for its last exit"
-            % (log_path(conf, ctx.role_home or "~"), ctx.account, label))
+            "read %s as %s, and `sudo launchctl print system/%s` for its last exit\n"
+            "the commands, filled in:  python3 %s card CK-N5"
+            % (log_path(conf, ctx.role_home or "~"), ctx.account, label, _self_path()))
     exit_code = beat.get("exit")
     if exit_code == notify.EXIT_DECLINED:
         # A REAL pass's exit 3 is not the rehearsal's. The rehearsal cannot post, so its
         # declines are withheld titles and the per-pass cap; a real pass declines when the chat
         # refused the ping or the label did not apply — an escalation nobody was told about.
         # Reading the two the same way is how a revoked token reads as "no drift".
+        #
+        # ONE EXCEPTION IN THE WORDS, NONE IN THE GRADE: when the heartbeat says every decline
+        # was the per-pass cap (`capped`, KIT-187), the found events are waiting for the next
+        # pass and nothing failed to land, so saying "a ping or a label did not land" would
+        # send the operator after a token that is fine. It stays FAILED: pings a person is
+        # owed did not go out this pass. A heartbeat with no `capped` — an older notifier's —
+        # keeps the old words, because it cannot say which it was.
+        capped, declined = beat.get("capped"), beat.get("declined")
+        if _is_count(capped) and capped > 0 and _is_count(declined) and declined == capped:
+            raise SetupError(
+                "system/%s ran %d s ago and exited 3: %d %s over the per-pass cap %s not sent "
+                "this pass; %s on the next. Nothing else was declined: %s\n"
+                "  Still a failure: a person is owed those pings and this pass did not send "
+                "them. If it repeats, more is waiting than MAX_EVENTS_PER_PASS (%s) lets out "
+                "in one pass."
+                % ((label, int(age), capped)
+                   + (("event", "was", "it goes") if capped == 1 else ("events", "were", "they go"))
+                   + (ctx.scrub(str(beat.get("summary")))[:400], conf["MAX_EVENTS_PER_PASS"])))
         raise SetupError(
             "system/%s ran %s ago and DECLINED what it found (exit 3): %s\n"
             "  On a real pass that means a ping or a label did not land — a revoked token, a bot "
@@ -1872,6 +2047,9 @@ def step_handover(ctx, apply_it):
     on, off, unproven = handover_lines(ctx)
     notes = (["ON: " + l for l in on] + ["OFF: " + l for l in off]
              + ["NOT PROVEN: " + l for l in unproven])
+    # `verify` reaches this row on every pass, so this is where the health card is named.
+    notes.append("CHECK IT YOURSELF with card CK-N5: is it alive, and how to pause and resume "
+                 "it, filled in from your conf. python3 %s card CK-N5" % _self_path())
     return True, "%d on, %d off, %d not proven — each named below" % (
         len(on), len(off), len(unproven)), notes
 
@@ -2014,6 +2192,7 @@ def _banner(ctx, title):
 def cmd_run(ctx, dry_run):
     if not dry_run:
         refuse_if_agent("run", ctx.env)
+    ctx.command = "run --dry-run" if dry_run else "run"
     if dry_run:
         ctx.may_prompt = False
     _banner(ctx, "Notifier installer — %s" % ("DRY RUN: nothing will be changed" if dry_run
@@ -2055,6 +2234,7 @@ def cmd_verify(ctx):
     """Re-measures EVERY step, never stops early, changes nothing, records nothing, and never
     raises: an escaped exception becomes exit 1 with its name, not a traceback."""
     try:
+        ctx.command = "verify"
         ctx.may_prompt = False
         ctx.record = False
         ctx.runner.dry_run = True
@@ -2340,6 +2520,8 @@ def _selftest_body():
             self.selftest_rc = 0
             self.role_scripts = []
             self.sudo_argv = []
+            # The role account's PATH. A case empties it to take the hashing tools away.
+            self.shell_path = "/usr/bin:/bin"
 
         def bootstrap(self, path):
             """What a person does at CK-N3: launchd takes a COPY of the file as it is now."""
@@ -2371,7 +2553,7 @@ def _selftest_body():
                 self.role_scripts.append(argv[6])
                 p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True,
                                    text=True, timeout=timeout,
-                                   env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
+                                   env={"HOME": self.home, "PATH": self.shell_path})
                 out = p.stdout.replace("owner=%s " % real_user, "owner=%s " % self.role)
                 return se.Result(p.returncode, out, p.stderr)
             if argv[:1] == ["dscl"]:
@@ -2433,25 +2615,37 @@ def _selftest_body():
 
     FakeTracker.teams = ("KIT", "TOD")
 
-    def real_pass(home, exit_code=0, dry=False, ago=30, summary="sent 1, labelled 1, declined 0"):
-        """What the LOADED job leaves behind, which is not what the rehearsal leaves behind."""
+    def real_pass(home, exit_code=0, dry=False, ago=30, summary="sent 1, labelled 1, declined 0",
+                  **counts):
+        """What the LOADED job leaves behind, which is not what the rehearsal leaves behind.
+        `counts` are heartbeat fields a case needs (`declined`, `capped`); an older notifier
+        wrote no `capped`, so none is written unless a case asks."""
         state = os.path.join(home, ".stage-e", "state")
         if not os.path.isdir(state):
             os.makedirs(state)
         when = datetime.fromtimestamp(time.time() - ago, timezone.utc)
+        doc = {"schema": notify.HEARTBEAT_SCHEMA, "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "dry": dry, "exit": exit_code, "summary": summary}
+        doc.update(counts)
         with open(os.path.join(state, "notifier-heartbeat.json"), "w", encoding="utf-8") as fh:
-            json.dump({"schema": notify.HEARTBEAT_SCHEMA,
-                       "at": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "dry": dry, "exit": exit_code,
-                       "summary": summary}, fh)
+            json.dump(doc, fh)
+
+    def checkout_of(home):
+        """THIS CHECKOUT's scripts, as preflight compares the clone with them: beside the fake
+        role home, holding the same bytes the clone does, so a fresh fixture is level and a
+        case that wants drift edits one side."""
+        return os.path.join(os.path.dirname(home), "checkout", "scripts")
 
     def new_home(root, with_token=True, with_key=True, extra_lines=()):
         home = os.path.join(root, "role-home")
         scripts = os.path.join(home, ".stage-e", "kit", "scripts")
         os.makedirs(scripts)
+        os.makedirs(checkout_of(home), exist_ok=True)
         os.chmod(os.path.join(home, ".stage-e"), 0o700)
         for name in REQUIRED_SCRIPTS:
-            with open(os.path.join(scripts, name), "w", encoding="utf-8") as fh:
-                fh.write(fake_notifier if name == NOTIFIER_SCRIPT else "# fake\n")
+            for where in (scripts, checkout_of(home)):
+                with open(os.path.join(where, name), "w", encoding="utf-8") as fh:
+                    fh.write(fake_notifier if name == NOTIFIER_SCRIPT else "# fake\n")
         lines = list(extra_lines)
         if with_key:
             lines.append("STAGE_E_LINEAR_API_KEY=" + key)
@@ -2473,6 +2667,7 @@ def _selftest_body():
         ctx = Ctx(conf, fake, st,
                   env={"STAGE_E_LINEAR_API_KEY": key} if env is None else env, tty=tty,
                   transport_factory=tracker or FakeTracker(), token_reader=reader)
+        ctx.checkout_scripts = checkout_of(home)
         return ctx, fake
 
     def with_env(extra, fn):
@@ -3279,6 +3474,233 @@ def _selftest_body():
         ok("conf: the CHAT_TOKEN_ENV refusal does not claim the two VALUES are compared",
            not any("same value" in e for e in validate_conf(
                parse_conf(good_text + "CHAT_TOKEN_ENV=SLACK_BOT_TOKEN\n")[0], person)[1]))
+
+        # ── 16g. KIT-198: the health card, printed only when asked for ─────────────────
+        def attempt(fn):
+            """(value, exception) — so a case against a missing name fails by NAME."""
+            try:
+                return fn(), None
+            except Exception as exc:                              # noqa: BLE001
+                return None, exc
+
+        health_conf = os.path.join(tmp_root, "health.conf")
+        with open(health_conf, "w", encoding="utf-8") as fh:
+            fh.write(good_text + "INTERVAL_SECONDS=600\nRUN_TIMEOUT_SECONDS=300\n")
+        code, out = quiet(lambda: main(["card", "CK-N5", "--conf", health_conf]))
+        captured.append(out)
+        wanted = [
+            "sudo -u _exnotify -H /bin/sh -c 'cd / && cat "
+            "\"$HOME/.stage-e/state/notifier-heartbeat.json\"; tail -20 \"$HOME/.stage-e/notifier.log\"'",
+            "python3 scripts/pipeline_notifier_setup.py verify",
+            "sudo launchctl print system/com.example.notifier",
+            "sudo launchctl bootout system/com.example.notifier",
+            "sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.notifier.plist",
+            "Could not find service",
+            # 2 x 600 + 300 + 120, from THIS conf: the threshold `enable` uses, not a round number
+            "1620 s"]
+        ok("card CK-N5: filled from the conf — heartbeat and log as the role account, verify, "
+           "launchd, pause, resume, and the stale threshold `enable` really uses",
+           code == EX_OK and not [w for w in wanted if w not in out] and "${" not in out
+           and "ten minutes" not in out,
+           "missing %r\n%s" % ([w for w in wanted if w not in out], out[-2000:]))
+        ok("card CK-N5: what paused looks like — `run` never reloads it, `verify` blocks on "
+           "CK-N3 meanwhile, and a restart loads it unless it is disabled",
+           "does not load it again" in out and "BLOCKED on CK-N3" in out and "restart" in out
+           and "sudo launchctl disable system/com.example.notifier" in out
+           and "sudo launchctl enable system/com.example.notifier" in out, out[-2000:])
+        clone_check = [l for l in out.splitlines() if "shasum -a 256" in l]
+        ok("card CK-N5: prints the command that compares the clone's notifier files with this "
+           "checkout's, as the role account",
+           len(clone_check) == 2 and all(name in clone_check[0] for name in REQUIRED_SCRIPTS)
+           and "sudo -u _exnotify -H /bin/sh -c 'cd \"$HOME/.stage-e/kit/scripts\" && "
+               "shasum -a 256 -c -'" in clone_check[1], repr(clone_check))
+        with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+            own = fh.read().partition("\ndef selftest():")[0]
+        ok("card CK-N5: nothing is signed on it and no step raises it",
+           (CARDS.get("CK-N5") or {"attest": "missing"})["attest"] is None
+           and ('Blocked("CK-' + 'N5"') not in own and "SIGN-OFF" not in out, out[-400:])
+        # The paths it prints are the files the steps read, for every spelling of the conf.
+        spellings = (good_conf(), good_conf("NOTIFIER_CONFIG=~/notifier.json\n"),
+                     good_conf("NOTIFIER_CONFIG=/var/example role/n.json\n"
+                               "STATE_DIR=/var/example role/state\n"))
+        pairs, exc = attempt(lambda: [
+            (resolve_path(log_file(c), "/private/var/_exnotify"),
+             log_path(c, "/private/var/_exnotify"),
+             _card_values(c)["HEARTBEAT"], _q(heartbeat_file(c))) for c in spellings])
+        ok("card CK-N5: its log is the plist's log and its heartbeat the one `enable` reads, "
+           "however the conf spells the paths",
+           exc is None and all(a == b and h == g for a, b, h, g in pairs), repr(exc or pairs))
+        abs_res, exc = attempt(lambda: quiet(lambda: print_card("CK-N5", spellings[2])))
+        abs_out = abs_res[1] if abs_res else repr(exc)
+        ok("card CK-N5: an absolute path is printed quoted, never with a `$HOME` in front",
+           'cat "/var/example role/state/notifier-heartbeat.json"; tail -20 '
+           '"/var/example role/notifier.log"' in abs_out, abs_out[-1500:])
+        real_pass(home)
+        c, f = settled()
+        code, out = quiet(lambda: cmd_verify(c))
+        captured.append(out)
+        # Notes are word-wrapped, so the note names the card in its first words, where no
+        # cwd-long path in front of it can push `CK-N5` onto the next line.
+        ok("handover: `verify` names card CK-N5 on a settled machine",
+           code == EX_OK and "with card CK-N5" in out, out[-900:])
+        c, f = settled()
+        f.loaded = False
+        code, out = quiet(lambda: cmd_verify(c))
+        captured.append(out)
+        ok("handover: …and while the job is paused, where `enable` waits on CK-N3",
+           code == EX_BLOCKED and rows_of(run_steps_rows(c)).get("enable") == BLOCKED
+           and "with card CK-N5" in out, out[-900:])
+
+        # ── 16h. KIT-187a: the key hand-off repeats the command you actually ran ─────────
+        ho_root = os.path.join(tmp_root, "hand-off")
+        signed = State(os.path.join(ho_root, "ledger"))
+        signed.attest(A_PRIVATE, "pq", "n", channel_id="C0SYNTHETIC1")
+        for command, fn in (("run --dry-run", lambda c: cmd_run(c, dry_run=True)),
+                            ("verify", cmd_verify),
+                            ("run", lambda c: cmd_run(c, dry_run=False))):
+            c, f = machine_ctx(os.path.join(ho_root, command.replace(" ", "").replace("-", "")),
+                               env={}, dry_run=command != "run", state=signed)
+            code, out = quiet(lambda: fn(c))
+            spelled = '"$STAGE_E_LINEAR_API_KEY" python3 %s %s\n' % (_self_path(), command)
+            ok("labels: with no key in your shell, the hand-off repeats `%s`" % command,
+               spelled in out and rows_of(run_steps_rows(c)).get("labels") == UNKNOWN,
+               "%r not in:\n%s" % (spelled, out[-900:]))
+
+        # ── 16i. KIT-187b: preflight compares the clone's notifier with THIS checkout's ──
+        drift_root = os.path.join(tmp_root, "clone-drift")
+        drift_home = new_home(drift_root)
+        with open(os.path.join(drift_home, ".stage-e", "kit", "scripts",
+                               "pipeline_review_local.py"), "a", encoding="utf-8") as fh:
+            fh.write("# a line this checkout does not have\n")
+        c, f = machine_ctx(drift_root, home=drift_home)
+        _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        ok("preflight: a clone holding every file, one of them different from this checkout's, "
+           "FAILS — naming that file and the Stage E installer's `run`",
+           isinstance(exc, SetupError) and "scripts/pipeline_review_local.py" in str(exc)
+           and "scripts/gh_fallback.py" not in str(exc)
+           and "Stage E installer's `run`" in str(exc)
+           and "byte for byte" not in str(exc), repr(exc))
+        ok("preflight: the comparison runs as the role account",
+           [s for s in f.role_scripts if "sha256" in s and "$HOME/.stage-e/kit/scripts" in s],
+           repr(f.role_scripts))
+        ok("preflight: outside the battery, the clone is held to the scripts beside this file",
+           getattr(Ctx(c.conf, f, c.state), "checkout_scripts", None)
+           == os.path.dirname(os.path.abspath(__file__)))
+        level_root = os.path.join(tmp_root, "clone-docs-only")
+        level_home = new_home(level_root)
+        for extra_file, text in (("README.md", "a doc-only merge\n"),
+                                 ("scripts/unrelated_tool.py", "# not the notifier's\n")):
+            with open(os.path.join(level_home, ".stage-e", "kit", extra_file), "w",
+                      encoding="utf-8") as fh:
+                fh.write(text)
+        c, f = machine_ctx(level_root, home=level_home)
+        res, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        ok("preflight: files the notifier does not run may differ — a doc-only merge never blocks",
+           exc is None and res[0][0] is True and "byte" in res[0][1], repr(exc or res))
+        if os.geteuid() != 0:                     # root reads a mode-000 file regardless
+            locked_root = os.path.join(tmp_root, "clone-unreadable")
+            locked_home = new_home(locked_root)
+            locked = os.path.join(locked_home, ".stage-e", "kit", "scripts", "pr_conflict.py")
+            os.chmod(locked, 0)
+            c, f = machine_ctx(locked_root, home=locked_home)
+            try:
+                _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+            finally:
+                os.chmod(locked, 0o644)
+            ok("preflight: a clone file the role account cannot read FAILS, naming it — the job "
+               "could not import it either",
+               isinstance(exc, SetupError) and "scripts/pr_conflict.py" in str(exc)
+               and "cannot read" in str(exc), repr(exc))
+        absent_root = os.path.join(tmp_root, "clone-missing-file")
+        absent_home = new_home(absent_root)
+        os.remove(os.path.join(absent_home, ".stage-e", "kit", "scripts", "pipeline_labels.py"))
+        c, f = machine_ctx(absent_root, home=absent_home)
+        _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        ok("preflight: a clone missing a file the notifier runs still FAILS, naming it",
+           isinstance(exc, SetupError) and "lacks scripts/pipeline_labels.py" in str(exc)
+           and "byte for byte" not in str(exc), repr(exc))
+        tools_root = os.path.join(tmp_root, "clone-no-hasher")
+        tools_home = new_home(tools_root)
+        c, f = machine_ctx(tools_root, home=tools_home)
+        f.shell_path = os.path.join(tools_root, "empty-path")
+        os.makedirs(f.shell_path)
+        _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        ok("preflight: a clone it could not hash is NOT MEASURED — never passed, never a mismatch",
+           isinstance(exc, Unknown) and "could not hash" in exc.what
+           and "differ" not in exc.what, repr(exc))
+
+        # ── 16j. KIT-187c: a pass the cap held back is named as the cap, still FAILED ──
+        cap_many = "2 events over the per-pass cap were not sent this pass; they go on the next"
+        cap_one = "1 event over the per-pass cap was not sent this pass; it goes on the next"
+        land_words = "a ping or a label did not land"
+        for name, counts, cap_words in (
+                ("only the cap held events back", {"capped": 2, "declined": 2}, cap_many),
+                ("only the cap held one event back", {"capped": 1, "declined": 1}, cap_one),
+                ("the cap AND a failed send", {"capped": 2, "declined": 3}, None),
+                ("an older notifier's heartbeat, with no `capped`", {"declined": 2}, None),
+                ("a `capped` that is not a count", {"capped": True, "declined": 1}, None),
+                ("counts that name nothing", {"capped": 0, "declined": 0}, None)):
+            real_pass(home, exit_code=3, summary="sent 25, labelled 25, declined %d"
+                      % counts["declined"], **counts)
+            c, f = settled()
+            code, out = quiet(lambda: cmd_verify(c))
+            captured.append(out)
+            ok("enable: a real exit 3 — %s — stays FAILED, %s" % (
+                name, "and names the cap" if cap_words else "and says a ping or label did not land"),
+               rows_of(run_steps_rows(c)).get("enable") == FAILED and code == EX_FAILED
+               and (cap_words in out if cap_words else "over the per-pass cap" not in out)
+               and (land_words in out) == (not cap_words),
+               out[-900:])
+
+        # ── 16k. the rows that send a person to look for themselves name card CK-N5 ─────
+        for name, prepare in (("a stale heartbeat", lambda: real_pass(home, ago=10 ** 6)),
+                              ("no heartbeat at all", lambda: os.remove(beat_file))):
+            prepare()
+            c, f = settled()
+            code, out = quiet(lambda: cmd_verify(c))
+            captured.append(out)
+            ok("enable: %s — the remedy names card CK-N5, filled in" % name,
+               rows_of(run_steps_rows(c)).get("enable") == UNKNOWN
+               and "the commands, filled in:  python3 %s card CK-N5" % _self_path() in out,
+               out[-900:])
+        real_pass(home)
+
+        # ── 16l. the clone's hashes: a digest that is not one is NOT MEASURED, twice over ──
+        hashed, exc = attempt(lambda: parse_clone_hashes(
+            "sha256 %s a.py\nsha256 %s b.py\nsha256 c.py\nmissing d.py\nnohash e.py\n"
+            "unreadable f.py\nwhatever g.py" % ("0" * 64, "short")))
+        ok("clone hashes: only a 64-hex digest counts; any other line leaves the file unmeasured",
+           hashed == {"a.py": ("sha256", "0" * 64), "d.py": ("missing", None),
+                      "e.py": ("nohash", None), "f.py": ("unreadable", None)}, repr(exc or hashed))
+        # A hashing tool that answers with something that is not a digest: the shell says
+        # `nohash` itself, before the parser ever sees the line.
+        liar = os.path.join(tmp_root, "lying-hasher")
+        os.makedirs(liar)
+        for tool in ("shasum", "sha256sum"):
+            with open(os.path.join(liar, tool), "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\necho 'abc  -'\n")
+            os.chmod(os.path.join(liar, tool), 0o755)
+        for tool in ("uname", "cut"):
+            found = shutil.which(tool)
+            if found:
+                os.symlink(found, os.path.join(liar, tool))
+        lied, exc = attempt(lambda: subprocess.run(
+            ["/bin/sh", "-c", CLONE_HASH_SH.replace("@DIR@", _q(os.path.join(home, ".stage-e",
+                                                                        "kit", "scripts")))
+             .replace("@FILES@", " ".join(REQUIRED_SCRIPTS))],
+            capture_output=True, text=True, timeout=60, env={"PATH": liar}))
+        ok("clone hashes: a tool that prints no 64-character digest reads `nohash` in the shell",
+           lied is not None
+           and lied.stdout.split("\n")[:-1] == ["nohash " + s for s in REQUIRED_SCRIPTS],
+           repr(exc or (lied.stdout, lied.stderr)))
+        gone_root = os.path.join(tmp_root, "checkout-missing-file")
+        gone_home = new_home(gone_root)
+        os.remove(os.path.join(checkout_of(gone_home), "gh_fallback.py"))
+        c, f = machine_ctx(gone_root, home=gone_home)
+        _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        ok("preflight: a file THIS checkout cannot read leaves the comparison NOT MEASURED",
+           isinstance(exc, Unknown) and "scripts/gh_fallback.py in this checkout" in exc.what,
+           repr(exc))
 
         # ── 17. what this file can never do, read from its own source ──────────────────
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:
