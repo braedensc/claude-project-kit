@@ -753,7 +753,14 @@ def make_stack_repo(kind):
         root = _stack_checkout()
         _git(root, "init", "-q", "-b", "scratch")
         _git(root, "remote", "add", "origin", bare)
+        # git >= 2.48 makes `fetch` CREATE origin/HEAD (remote.<name>.followRemoteHEAD
+        # defaults to "create") — first seen on CI's newer git, where this scenario
+        # silently stopped being the one it names. Turn that off, and delete it in
+        # case an older git ignored the setting, so the premise holds on every git.
+        _git(root, "config", "remote.origin.followRemoteHEAD", "never")
         _git(root, "fetch", "-q", "origin")
+        subprocess.run(["git", "-C", root, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+                       capture_output=True, env=_git_env())
         _git(root, "checkout", "-q", "-b", "feat/t", "origin/trunk")
         _commit(root, "t work")
     elif kind == "gitflow":
