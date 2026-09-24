@@ -1,37 +1,67 @@
 #!/usr/bin/env python3
 """Chat-lane composer — the dispatcher's built-in Slack lane, composed for a person to apply.
 
-    python3 scripts/pipeline_chat_lane_setup.py compose [--conf chat-lane.conf]
+    python3 scripts/pipeline_chat_lane_setup.py compose [--piece N] [--conf chat-lane.conf]
     python3 scripts/pipeline_chat_lane_setup.py verify  [--conf chat-lane.conf]
+    python3 scripts/pipeline_chat_lane_setup.py merge [--apply]
+    python3 scripts/pipeline_chat_lane_setup.py env-names [--remove]
+    python3 scripts/pipeline_chat_lane_setup.py front-door [--apply] [--remove]
     python3 scripts/pipeline_chat_lane_setup.py card CK-C1
     python3 scripts/pipeline_chat_lane_setup.py --selftest
 
 WHAT IT IS.  The dispatcher ships a Slack transport: mention its bot in a channel and it
 starts a session for that thread. That session gets no sandbox. This file COMPOSES every
 piece a deployment needs to turn that lane on under the owner's conditions (KIT-117,
-decision and correction of 2026-09-17), and VERIFIES the live result. A person applies
-each piece by hand.
+decision and correction of 2026-09-17), and VERIFIES the live result.
 
-    compose   prints every piece. Reads no live file, needs no role-account access, runs
-              anywhere. Exit 0, or 2 on a conf error.
-    verify    read-only live measurement: three files as the role account, and pf's
+    compose   prints every piece, or one (`--piece N`; piece 4 alone is only its script).
+              Reads no live file, needs no role-account access, runs anywhere. Exit 0, or
+              2 on a conf error.
+    verify    read-only live measurement: four files as the role account, and pf's
               loaded rules as root. One outcome per check.
+    merge     pieces 1, 2 and 5 into the dispatcher config and the role account's user
+              settings. Dry run by default; `--apply` writes.
+    env-names piece 3: asks for the chat app's two secrets at hidden prompts and writes
+              the four names into the dispatcher's env file. `--remove` takes them out.
+    front-door piece 7: adds the Slack path to the front door's one allowlist line.
+              Dry run by default; `--apply` writes; `--remove` takes the path off.
     card      prints a checkpoint card: CK-C1 (create the chat app), CK-C2 (the front
               door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
-              from a second device).
+              from a second device), CK-C5 (restart the dispatcher, only when it is
+              idle), CK-C6 (turn the lane off).
 
-WHAT IT NEVER DOES.  It never writes the dispatcher's config, its env file, or any
-settings file. `compose` prints; `verify` reads. There is no merge, approve, label or
-ticket-state path anywhere in this file, and `--selftest` scans its own source for one.
+WHAT CHANGED ON 2026-09-24 (owner decision, KIT-197).  This file used to print and read
+only. The chat lane was then switched on by hand on a deployment, and three live-file
+edits it only described were done with three small scripts instead, tested on fixtures
+and then run for real. The owner decided the composer itself gains those writers. So:
+
+    `merge --apply`, `env-names` and `front-door --apply` WRITE. Each is a subcommand a
+    PERSON runs; each refuses in an agent environment, before the conf is read; each
+    writes AS THE ROLE ACCOUNT, through one program handed to `sudo -u <role> /bin/sh`,
+    with every value on standard input and never in an argument; each checks the file
+    is still the one it read (a checksum) and backs it up first, under the role
+    account's own home. `compose`, `verify` and `card` still write nothing.
+
+WHAT IT NEVER DOES.  It never restarts anything and never loads a job: the restarts and
+the port block stay PRINTED commands a person runs (installers never load jobs). It never
+prints a value from the env file, the config or the settings file. There is no merge,
+approve, label or ticket-state path anywhere in this file, and `--selftest` scans its own
+source: outside the three writer programs and the one function that runs them, the
+source may hold no write at all.
 
 EXIT CODES — the Stage E installer's, contract §13:
-    0   compose printed / verify measured every check as applied
-    1   FAILED — a check found something broken (an unparseable config, say)
-    2   USAGE or CONFIG — nothing was attempted
-    3   REFUSED — `verify` in an agent environment
+    0   compose printed / verify measured every check as applied / a writer wrote, or
+        found nothing to write, and its rows measure as applied
+    1   FAILED — a check found something broken, or a write failed (a writer that fails
+        after writing puts its backup back)
+    2   USAGE or CONFIG — nothing was attempted (a subcommand missing a conf key it
+        needs; a secret of the wrong shape)
+    3   REFUSED — an agent environment; or the file changed between the read and the
+        write, so nothing was written; or the token offered is the notifier's
     4   UNKNOWN — a check could not measure itself. Not a pass.
     5   NO ADMINISTRATOR ACCESS — `sudo` absent or declined; nothing was read
-    10  BLOCKED-ON-HUMAN — drift: a piece is not applied, or not as composed
+    10  BLOCKED-ON-HUMAN — drift: a piece is not applied, or not as composed. A writer's
+        dry run that found something to write exits 10: it did nothing, on purpose
 
 `verify` REFUSES IN AN AGENT ENVIRONMENT, and that is stricter than the Stage E
 installer's `verify` on purpose. That one still runs under a model with its credential
@@ -110,6 +140,7 @@ THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
 """
 import argparse
 import contextlib
+import getpass
 import inspect
 import io
 import json
@@ -133,7 +164,7 @@ from pipeline_stage_e_setup import (  # noqa: E402
     ALREADY_DONE, BLOCKED, FAILED, UNKNOWN,
     EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED,
     REVIEW_BRIEF_FINGERPRINT, TRACKER_FENCE_SERVERS,
-    _ACCOUNT_RE, _BLOB_RE, _CRED_PREFIXES, _ENV_NAME_RE,
+    _ACCOUNT_RE, _BLOB_RE, _CRED_PREFIXES, _ENV_NAME_RE, _RDNS_RE,
     NoPrivilege, Runner, SudoSession,
     _fill, _owns_review_entry, _server_rules, _wrap,
 )
@@ -475,6 +506,19 @@ def pf_plist():
            "</plist>"]) + "\n"
 
 
+# RE-RUNNABLE (KIT-197). A second run used to stop at `launchctl bootstrap` with errno 5,
+# because the boot job was still loaded from the first. Now a loaded job is booted out
+# first, and the script waits until launchd no longer lists it — `bootout` returns when
+# launchd has accepted the request, not when the job is gone (the Stage E installer's
+# restart notes). Bounded: 30 polls, one second apart. Each line stands alone, because a
+# person may paste them one at a time.
+PF_RELOAD_IF_LOADED = (
+    "if sudo launchctl print system/%(label)s >/dev/null 2>&1; then "
+    "sudo launchctl bootout system/%(label)s; n=0; "
+    "while sudo launchctl print system/%(label)s >/dev/null 2>&1; do "
+    "n=$((n+1)); [ $n -ge 30 ] && break; sleep 1; done; fi" % {"label": PF_DAEMON_LABEL})
+
+
 def pf_install_commands(port):
     """The exact commands a person runs, in order, to install, check, load and confirm."""
     rules, plist = '"%s"' % PF_RULES_PATH, PF_DAEMON_PLIST
@@ -494,6 +538,7 @@ def pf_install_commands(port):
                "sudo chown root:wheel %s %s" % (rules, plist),
                "sudo chmod 644 %s %s" % (rules, plist),
                "plutil -lint %s" % plist,
+               PF_RELOAD_IF_LOADED,
                "sudo launchctl bootstrap system %s" % plist,
                "sudo /sbin/pfctl -a %s -s rules" % PF_ANCHOR,
                "sudo /sbin/pfctl -s info | grep Status",
@@ -557,16 +602,40 @@ def anchored(pattern):
     return "Read(//**/%s)" % inner.lstrip("/")
 
 
+# The role account's own files the chat lane must not read either (KIT-197). Its env file
+# holds the Stage E key, the notifier's token and more, and the backups folder is where the
+# writers below copy the dispatcher's env file, its config and the user settings before
+# changing them — so it holds the chat app's secrets and the tracker's tokens too. A `~/`
+# rule is the permissions page's "Path from home directory", and a chat session runs as the
+# role account, so `~/` is that account's home wherever the session stands.
+DEFAULT_ROLE_ENV_FILE = "~/.stage-e/env"
+ROLE_BACKUPS = "~/.stage-e/backups"
+BACKUPS_DENY_RULE = "Read(%s/**)" % ROLE_BACKUPS
+
+
+def _path_rule(path):
+    """`Read(//abs/path)` for an absolute path, `Read(~/rel)` for one under the home."""
+    if path.startswith("~/"):
+        return "Read(%s)" % path
+    return "Read(/%s)" % path
+
+
 def user_deny_patterns(conf):
     """The composed deny list: the repository's patterns anchored, then this deployment's
-    two credential files by absolute path."""
+    two credential files by absolute path, then the role account's own env file and the
+    backups folder under its home."""
     out = [anchored(p) for p in REPO_DENY_PATTERNS]
     for key in ("DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE"):
         path = (conf or {}).get(key) or ""
         if path.startswith("/"):
-            rule = "Read(/%s)" % path
+            rule = _path_rule(path)
             if rule not in out:
                 out.append(rule)
+    role_env = (conf or {}).get("ROLE_ENV_FILE") or DEFAULT_ROLE_ENV_FILE
+    for rule in ([_path_rule(role_env)] if role_env.startswith(("/", "~/")) else []) + [
+            BACKUPS_DENY_RULE]:
+        if rule not in out:
+            out.append(rule)
     return out
 
 
@@ -645,6 +714,83 @@ def slack_manifest(conf):
 
 
 # --------------------------------------------------------------------------- #
+# Piece 7 — the front door's path allowlist (KIT-197).
+#
+# The front door is a Caddy-style reverse proxy whose allowlist is ONE named-matcher line,
+# `<matcher> path /a /b …` in FRONT_DOOR_CONFIG. The chat lane appends one path to it. A
+# path on that line that is not one of the dispatcher's own routes is a wider door than
+# the kit can account for, so it is named — never removed: it may be there on purpose.
+#
+# The dispatcher's own routes behind the door, each where 0.2.69 registers it:
+# --------------------------------------------------------------------------- #
+SLACK_PATH = "/slack-webhook"
+TRACKER_PATH = "/linear-webhook"
+# The config-update route: only the dispatcher answers it 401, so it is the probe that
+# proves the door forwards no more than its paths (EdgeWorker.js:516-521).
+CONFIG_UPDATE_PATH = "/api/update/cyrus-config"
+EXPECTED_ROUTES = {
+    TRACKER_PATH: "the tracker's webhooks (linear-event-transport LinearEventTransport.js:68)",
+    "/callback": ("the tracker sign-in's redirect, served by the self-auth command's own "
+                  "listener (cli SelfAuthCommand.js:113)"),
+    "/status": "idle or busy, for a safe restart (edge-worker EdgeWorker.js:535)",
+    SLACK_PATH: "the chat lane's Slack events (slack-event-transport SlackEventTransport.js:85)",
+}
+
+# One named-matcher line: the matcher, `path`, then one or more paths, then an optional
+# trailing comment (`#` starting a word) and trailing space. No line ending: callers split
+# on "\n" and hand one line's text in.
+_PATH_WORD = r"[^\s#]\S*"
+
+
+def front_line_parts(line, matcher):
+    """(head, paths, tail) whose concatenation is `line`, or None when `line` is not this
+    matcher's single-line `path` form. `paths.split()` is the path list."""
+    m = re.match(r"^(\s*%s\s+path\s+)(%s(?:\s+%s)*)((?:\s+#.*)?\s*)$"
+                 % (re.escape(matcher), _PATH_WORD, _PATH_WORD), line)
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def front_line_edit(line, matcher, path, remove=False):
+    """The line with `path` appended to its paths (or, with `remove`, taken out of them).
+    The line itself when there is nothing to change. None when `line` is not the
+    matcher's line, or when removing would leave it with no path — an empty allowlist line
+    is a broken door, not a closed one."""
+    parts = front_line_parts(line, matcher)
+    if parts is None:
+        return None
+    head, paths, tail = parts
+    words = paths.split()
+    if remove:
+        if path not in words:
+            return line
+        kept = [w for w in words if w != path]
+        return head + " ".join(kept) + tail if kept else None
+    if path in words:
+        return line
+    return head + paths + " " + path + tail
+
+
+def front_door_digest(fd, matcher):
+    """The probe's front-door answer, reduced by `front_line_parts`: how many lines are the
+    matcher's `path` line, and — when exactly one — which, its text and its paths."""
+    if fd is None or fd.get("error"):
+        return fd
+    hits = []
+    for cand in fd.get("candidates") or []:
+        parts = front_line_parts(cand.get("text") or "", matcher)
+        if parts is not None:
+            hits.append((cand.get("index"), cand.get("text"), parts[1].split()))
+    out = {"path": fd.get("path"), "sha256": fd.get("sha256"), "count": len(hits),
+           "lines": [i + 1 for i, _t, _p in hits]}
+    if len(hits) == 1:
+        index, text, paths = hits[0]
+        out.update({"index": index, "line": index + 1, "text": text, "paths": paths})
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
 def say(msg=""):
@@ -681,9 +827,19 @@ class ConfError(Exception):
 # --------------------------------------------------------------------------- #
 CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE", "FRONT_DOOR_HOST")
 CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
-                 "DISPATCHER_PORT": DEFAULT_DISPATCHER_PORT}
-CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
+                 "DISPATCHER_PORT": DEFAULT_DISPATCHER_PORT,
+                 "ROLE_ENV_FILE": DEFAULT_ROLE_ENV_FILE}
+# Optional, and empty when unset (KIT-197). A printed command that needs one says
+# "not composed: set <KEY> in chat-lane.conf" instead of printing a placeholder; a
+# subcommand that needs one refuses, naming it.
+CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
+                 "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
+CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
+# What `front-door` needs, and what verify's front-door row needs.
+FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
+FRONT_DOOR_READ_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_MATCHER")
 _HOST_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
+_MATCHER_RE = re.compile(r"^@[A-Za-z0-9_-]+$")
 _EXTRA_CRED_PREFIXES = ("xoxp-", "xoxa-", "xoxe", "xapp-")
 
 
@@ -758,6 +914,25 @@ def validate_conf(values):
         errors.append("NOTIFIER_TOKEN_ENV is %s, a name the dispatcher itself reads. Two "
                       "apps means two names: the notifier's token never enters the "
                       "dispatcher's env file" % name)
+    for key in CONF_OPTIONAL:
+        conf.setdefault(key, "")
+    for key in ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE"):
+        if conf[key] and not _RDNS_RE.match(conf[key]):
+            errors.append("%s %r is not a reverse-DNS launchd label: the name `launchctl "
+                          "print system/<label>` finds, such as com.example.dispatcher"
+                          % (key, conf[key]))
+    if conf["DISPATCHER_SERVICE"] and conf["DISPATCHER_SERVICE"] == conf["FRONT_DOOR_SERVICE"]:
+        errors.append("DISPATCHER_SERVICE and FRONT_DOOR_SERVICE name the same service")
+    for key in ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN"):
+        if conf[key] and not conf[key].startswith("/"):
+            errors.append("%s must be an absolute path (got %r)" % (key, conf[key]))
+    if conf["FRONT_DOOR_MATCHER"] and not _MATCHER_RE.match(conf["FRONT_DOOR_MATCHER"]):
+        errors.append("FRONT_DOOR_MATCHER %r is not a named matcher: @ and then letters, "
+                      "digits, _ or -" % conf["FRONT_DOOR_MATCHER"])
+    role_env = conf.get("ROLE_ENV_FILE") or ""
+    if not role_env.startswith(("/", "~/")) or role_env in ("/", "~/"):
+        errors.append("ROLE_ENV_FILE must be an absolute path, or start with ~/ for the role "
+                      "account's own home (got %r)" % role_env)
     return conf, errors
 
 
@@ -776,20 +951,39 @@ def load_conf(path):
 # --------------------------------------------------------------------------- #
 # compose
 # --------------------------------------------------------------------------- #
-def cmd_compose(conf, conf_path="chat-lane.conf"):
+def cmd_compose(conf, conf_path="chat-lane.conf", piece=None):
+    """Every piece and THE ORDER; or one piece alone. Piece 4 alone is only its script, so
+    `compose --piece 4 > pf-block.sh` is the file a person reads and then runs."""
     problems = grant_problems(owner_grant())
     if problems:
         # The approved list is a constant; a broken one is a defect in this file.
         say("BUG: the composed grant breaks the owner's decision: " + "; ".join(problems))
         return EX_FAILED
+    if piece == 4:
+        for line in pf_install_commands(conf["DISPATCHER_PORT"]):
+            say(line)
+        return EX_OK
+    if piece:
+        COMPOSE_PIECES[piece](conf)
+        return EX_OK
     rule = "=" * 76
     say(rule)
-    say(" Chat lane — every piece, composed for you to apply by hand")
+    say(" Chat lane — every piece, composed for you to apply")
     say(rule)
     say(" conf: %s    dispatcher source read: %s" % (conf_path, SOURCE_VERSION))
-    para("This command read no live file and changed nothing. Apply each piece yourself, "
-         "in THE ORDER at the end, then run:  python3 %s verify" % _self_path(), " ")
+    para("This command read no live file and changed nothing. Three subcommands write pieces "
+         "1, 2, 3, 5 and 7 for you, as the role account, when you run them: merge, env-names "
+         "and front-door. The rest is yours by hand. Apply everything in the order at the "
+         "end, then run:  python3 %s verify" % _self_path(), " ")
     say("")
+    _compose_warning()
+    for n in sorted(COMPOSE_PIECES):
+        COMPOSE_PIECES[n](conf)
+    _compose_order(conf)
+    return EX_OK
+
+
+def _compose_warning():
     say("READ THIS FIRST — THE SLACK WORKSPACE MUST HAVE ONE MEMBER")
     para("The chat lane has no user list and no channel list. Any member of the Slack "
          "workspace who can mention the bot in a channel it is in starts a session, as "
@@ -800,7 +994,9 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "it does not gate this lane.")
     say("")
 
-    # -- Piece 1 -------------------------------------------------------------
+
+# -- Piece 1 -----------------------------------------------------------------
+def _compose_piece_1(conf):
     say("PIECE 1 — THE TRIMMED CHAT GRANT")
     para("Where: the top level of %s. MERGE this one key; never replace the file, because "
          "the dispatcher rewrites it itself to store refreshed tracker tokens "
@@ -842,9 +1038,16 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "dispatcher skips entries with isActive false (EdgeWorker.js:274-290), so "
          "retiring one promotes the next. Keep every entry's allowedTools free of mcp__ "
          "names; `verify` checks the live order.")
+    para("merge writes this key for you, with the pull rules filled in from the live "
+         "repository paths — the list verify's paste line carries:  python3 %s merge  shows "
+         "it and changes nothing;  merge --apply  writes it. It never edits an entry's "
+         "allowedTools: an mcp__ name there is a warning for you to remove by hand."
+         % _self_path())
     say("")
 
-    # -- Piece 2 -------------------------------------------------------------
+
+# -- Piece 2 -----------------------------------------------------------------
+def _compose_piece_2(conf):
     say("PIECE 2 — FENCE THE SLACK SERVER OFF EVERY OTHER ENTRY")
     para("Why: once SLACK_BOT_TOKEN is in the dispatcher's environment, every session gets "
          "a working Slack server (McpConfigService.js:87-99), and the ticket lane approves "
@@ -871,14 +1074,24 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "DISALLOWED_TOOLS environment variable replaces defaultDisallowedTools at start "
          "(cli WorkerService.js:164-165).")
     para("compose reads no live config, so this is the rule. `verify` computes the exact "
-         "list for each entry from the live file, ready to paste.")
+         "list for each entry from the live file, and `merge` applies exactly that list, "
+         "with piece 1 and piece 5, in one pass. It leaves a review entry alone and names "
+         "it if its fence is missing: the Stage E installer owns those entries.")
     say("")
 
-    # -- Piece 3 -------------------------------------------------------------
+
+# -- Piece 3 -----------------------------------------------------------------
+def _compose_piece_3(conf):
     say("PIECE 3 — THE DISPATCHER'S ENV FILE: FOUR NAMES")
     para("Where: %s. The dispatcher loads it at start and re-applies it when it changes "
-         "(Application.js:52-78). Names only: type the two secret values in yourself."
-         % conf["DISPATCHER_ENV_FILE"])
+         "(Application.js:52-78). Nobody types a secret into this file by hand:  python3 %s "
+         "env-names  asks for the two secret values at hidden prompts, hands them to the "
+         "role account's shell on standard input — never in an argument, never on this "
+         "screen — and writes all four names together. It refuses until the port block "
+         "(piece 4) measures as loaded, and refuses the notifier's token. It backs the "
+         "file up first; that backup holds the secrets, so delete it once verify is "
+         "clean. It never restarts the dispatcher: card CK-C5 does, only when it is idle."
+         % (conf["DISPATCHER_ENV_FILE"], _self_path()))
     say("")
     say("    SLACK_BOT_TOKEN        the CHAT app's bot token (Slack: OAuth & Permissions)")
     say("    SLACK_SIGNING_SECRET   the CHAT app's signing secret (Slack: Basic Information)")
@@ -935,7 +1148,7 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
         "then reachable from the local network without the front door: the config-update "
         "routes, the tool server at /mcp/cyrus-tools, whose auth check passes everything "
         "while CYRUS_API_KEY is unset (McpConfigService.js:166-170), /status and every "
-        "webhook. Read at start only. CLOSED BY PIECE 4 once it is loaded and card CK-C4 "
+        "webhook. Read at start only. CLOSED BY piece 4 once it is loaded and card CK-C4 "
         "passes; open until then.",
         "3. Webhook source-address checks turn on (EdgeWorker.js:241-252), and the "
         "dispatcher fetches GitHub's address list from api.github.com at start "
@@ -956,7 +1169,11 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
         para(effect, "    ")
     say("")
 
-    # -- Piece 4 -------------------------------------------------------------
+
+# -- Piece 4 -----------------------------------------------------------------
+def _compose_piece_4(conf):
+    """The whole piece, as `compose` prints it. `compose --piece 4` prints only the
+    script, which `cmd_compose` handles before it would get here."""
     port = conf["DISPATCHER_PORT"]
     say("PIECE 4 — BLOCK THE DISPATCHER'S PORT FROM THE NETWORK (load it BEFORE piece 3)")
     para("Why: CYRUS_HOST_EXTERNAL=true makes the dispatcher listen on every network "
@@ -982,7 +1199,11 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
     say("")
     para("Run these in order in a terminal on this machine, and stop at the first error. "
          "They are printed flush left on purpose: a heredoc's closing word must start its "
-         "line, and a plist may not start with a space.")
+         "line, and a plist may not start with a space. The same lines, and nothing else, "
+         "come from  python3 %s compose --piece 4 > pf-block.sh ; read that file, then run "
+         "it with  sh -e pf-block.sh , which stops at the first error. It is safe to run "
+         "again: a boot job that is already loaded is stopped, and waited for, before it is "
+         "loaded again." % _self_path())
     say("")
     say(PF_COPY_START)
     for line in pf_install_commands(port):
@@ -993,13 +1214,18 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "%s; the info command prints \"Status: Enabled\"; the curl on 127.0.0.1 answers "
          "with a JSON status." % port)
     para("Not that: no rules, or \"Status: Disabled\". Stop there, and do NOT set "
-         "CYRUS_HOST_EXTERNAL in piece 3 until both are right.")
+         "CYRUS_HOST_EXTERNAL in piece 3 until both are right. Read the boot job's log, %s, "
+         "and its last exit (sudo launchctl print system/%s | grep 'last exit'). Its one "
+         "command is /sbin/pfctl -E -a %s -f \"%s\"; run that by hand with sudo to see the "
+         "error." % (PF_DAEMON_LOG, PF_DAEMON_LABEL, PF_ANCHOR, PF_RULES_PATH))
     para("After piece 3's restart, card CK-C4 proves the rule from a second device on the "
          "same network. A test from this machine to its own network address proves "
          "nothing.")
     say("")
 
-    # -- Piece 5 -------------------------------------------------------------
+
+# -- Piece 5 -----------------------------------------------------------------
+def _compose_piece_5(conf):
     say("PIECE 5 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES ONLY")
     para("Where: ~/.claude/settings.json in %s's home. A chat session loads user, project "
          "and local settings (ClaudeRunner.js:499), and its folder is not a project "
@@ -1012,11 +1238,18 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
     for line in block.splitlines():
         say("    " + line)
     say("")
-    para("Why every rule starts with //**/: the first twelve are this repository's own "
+    para("Why the rules start with //**/ or ~/: the first twelve are this repository's own "
          "denies, which are relative, and a relative rule matches under the session's "
          "current directory only. A chat session's is a fresh, empty folder. Anchored, each "
-         "matches that file name anywhere. The last two are this deployment's dispatcher "
-         "config and env file.")
+         "matches that file name anywhere. The next two are this deployment's dispatcher "
+         "config and env file. The last two are the role account's own: its env file "
+         "(ROLE_ENV_FILE), and the backups folder where merge, env-names and front-door copy "
+         "a file before changing it — those copies hold the same secrets. A rule starting "
+         "~/ matches under the home of the account the session runs as, which is the role "
+         "account.")
+    para("merge writes this for you: it adds only the rules missing from the file, keeps "
+         "every rule and every other key already there, backs an existing file up first, "
+         "and leaves it at mode 600:  python3 %s merge , then  merge --apply ." % _self_path())
     para("WHAT THESE DO NOT STOP. They block the Read tool. They do not stop the upload "
          "tool in mcp__cyrus-tools, which reads the file inside the dispatcher's own "
          "process, outside the session (cyrus-tools/index.js:107). And they apply to every "
@@ -1024,7 +1257,9 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "loads user settings (ClaudeRunner.js:499).")
     say("")
 
-    # -- Piece 6 -------------------------------------------------------------
+
+# -- Piece 6 -----------------------------------------------------------------
+def _compose_piece_6(conf):
     say("PIECE 6 — THE CHAT APP'S SLACK MANIFEST (a SECOND app; the notifier keeps its own)")
     para("Slack: Create New App -> From a manifest -> paste this. Card CK-C1 walks it.")
     say("")
@@ -1048,44 +1283,166 @@ def cmd_compose(conf, conf_path="chat-lane.conf"):
          "the app.")
     say("")
 
-    # -- Piece 7 -------------------------------------------------------------
+
+# -- Piece 7 -----------------------------------------------------------------
+def _compose_piece_7(conf):
     say("PIECE 7 — THE FRONT DOOR")
     para("The reverse proxy's path allowlist gains /slack-webhook, and nothing else. "
-         "Slack's request URL is then https://%s/slack-webhook. Card CK-C2 walks it."
-         % conf["FRONT_DOOR_HOST"])
+         "Slack's request URL is then https://%s/slack-webhook." % conf["FRONT_DOOR_HOST"])
+    para("front-door writes it for you, as the role account:  python3 %s front-door  prints "
+         "the ONE `<matcher> path …` line of FRONT_DOOR_CONFIG, names every path on it that "
+         "is not one of the dispatcher's own routes, and changes nothing;  front-door "
+         "--apply  appends the path, backs the file up, validates it with FRONT_DOOR_BIN, and "
+         "puts the backup back if validation fails. It refuses on no such line, or on two. "
+         "It never restarts the front door: card CK-C2 has the restart and the three "
+         "probes." % _self_path())
     say("")
 
-    # -- Order ---------------------------------------------------------------
+
+COMPOSE_PIECES = {1: _compose_piece_1, 2: _compose_piece_2, 3: _compose_piece_3,
+                  4: _compose_piece_4, 5: _compose_piece_5, 6: _compose_piece_6,
+                  7: _compose_piece_7}
+
+
+# -- Order -------------------------------------------------------------------
+def _compose_order(conf):
+    me = "python3 %s" % _self_path()
     say("THE ORDER — the fence before the token, the port block before the listen")
     steps = (
         "1. Confirm the Slack workspace has one member.",
-        "2. Piece 2, then piece 1, in the dispatcher config.",
-        "3. Piece 5, in the role account's user settings.",
-        "4. Piece 4: install and load the port block. Go on only when pfctl shows both "
-        "rules and \"Status: Enabled\" — the next restart makes the dispatcher listen on "
-        "every interface.",
-        "5. Card CK-C1: create the chat app from piece 6 and install it.",
-        "6. Piece 3, all four names together, then restart the dispatcher when no session "
-        "is in flight. slackAllowedTools reloads live (ConfigManager.js:51-62, 181), but the "
-        "listening address and address checks are read at start only, and a removed env "
-        "name stays set until a restart (Application.js:54). Restart on purpose, now, not at "
-        "the next reboot.",
-        "7. %s" % TICKET_CHECK_STEP,
-        "8. Card CK-C4, from a second device: the port refuses the network.",
-        "9. Piece 7 and card CK-C2: the front door.",
-        "10. In the Slack app, retry the request URL under Event Subscriptions. Make a "
+        "2. Pieces 2, 1 and 5, in one command, as the role account:  %s merge  prints what "
+        "it would change and changes nothing; then  %s merge --apply  writes the "
+        "dispatcher config in place and the user settings, and prints verify's rows for "
+        "them. If the dispatcher rewrote its config in between, it refuses and writes "
+        "nothing: run it again." % (me, me),
+        "3. Piece 4: install and load the port block:  %s compose --piece 4 > pf-block.sh "
+        "; read it; then  sh -e pf-block.sh . Go on only when pfctl shows both rules and "
+        "\"Status: Enabled\" — the next restart makes the dispatcher listen on every "
+        "interface. It is safe to run again." % me,
+        "4. Card CK-C1: create the chat app from piece 6 and install it. Its two secrets "
+        "stay in Slack until the next step asks for them.",
+        "5. Piece 3, all four names together:  %s env-names  asks for the chat app's token "
+        "and signing secret at hidden prompts and writes all four names. It refuses until "
+        "the port block measures as loaded. Then restart the dispatcher with card CK-C5, "
+        "which restarts it only when it answers idle. slackAllowedTools reloads live "
+        "(ConfigManager.js:51-62, 181), but the listening address and address checks are "
+        "read at start only, and a removed env name stays set until a restart "
+        "(Application.js:54). Restart on purpose, now, not at the next reboot." % me,
+        "6. %s" % TICKET_CHECK_STEP,
+        "7. Card CK-C4, from a second device: the port refuses the network.",
+        "8. Piece 7 and card CK-C2: the front door.  %s front-door , then  front-door "
+        "--apply ; the card has the front door's restart and the three probes." % me,
+        "9. In the Slack app, retry the request URL under Event Subscriptions. Make a "
         "private channel and invite the bot.",
-        "11. python3 %s verify" % _self_path(),
-        "12. Card CK-C3: the live check, in the channel.",
+        "10. %s verify" % me,
+        "11. Card CK-C3: the live check, in the channel.",
+        "To turn the lane off later: card CK-C6.",
     )
     for step in steps:
         para(step, "  ")
-    return EX_OK
 
 
 # --------------------------------------------------------------------------- #
 # Cards — the Stage E installer's card format.
+#
+# A `do` item is a line of text, or a COMMAND GROUP made by `_group`: lines that print only
+# when every conf key they need has a value. Otherwise the group prints
+# `not composed: set <KEY> in chat-lane.conf`, one line per missing key, and never a
+# placeholder command a person could paste by mistake (KIT-197).
 # --------------------------------------------------------------------------- #
+ME = "python3 scripts/pipeline_chat_lane_setup.py"
+
+
+def _group(needs, lines):
+    return {"needs": tuple(needs), "lines": list(lines)}
+
+
+def card_lines(item, conf):
+    """The lines one `do` item prints under this conf (None: no conf was loaded)."""
+    if isinstance(item, dict):
+        missing = [k for k in item["needs"] if not (conf or {}).get(k)]
+        if missing:
+            return ["    not composed: set %s in chat-lane.conf" % k for k in missing]
+        return [_fill(line, conf) for line in item["lines"]]
+    return [_fill(item, conf)]
+
+
+def say_group(group, conf):
+    for line in card_lines(group, conf):
+        say("  " + line)
+
+
+# How long a printed restart waits for launchd to let the old job go before it starts the
+# new one: the Stage E installer's bound (an ExitTimeOut of 120 s plus 30 s of headroom,
+# polled every two seconds). `bootout` returns when launchd has accepted the request, not
+# when the job is gone, and a bootstrap into a domain that still holds it fails with
+# `Bootstrap failed: 5` (the Stage E installer's restart notes).
+_WAIT_GONE = ("n=0; while sudo launchctl print system/%s >/dev/null 2>&1; do n=$((n+1)); "
+              "[ $n -ge 75 ] && { echo 'STILL LOADED after 150 s: run the bootstrap line "
+              "again in a minute'; break; }; sleep 2; done")
+
+# CK-C5's block. The dispatcher's own "can it be safely restarted" answer gates it: /status
+# says busy while a webhook, a ticket session or a chat session runs (cyrus-edge-worker
+# EdgeWorker.js:1784-1802, served at EdgeWorker.js:535), and a restart stops every running
+# session. The log's path is read out of the plist's StandardOutPath, as the Stage E
+# installer's `_dispatcher_log_path` does, so no key names it.
+IDLE_RESTART_LINES = [
+    "if curl -s -m 5 http://127.0.0.1:${DISPATCHER_PORT}/status | grep -q '\"idle\"'; then",
+    "  sudo launchctl bootout system/${DISPATCHER_SERVICE}",
+    "  " + _WAIT_GONE % "${DISPATCHER_SERVICE}",
+    "  sudo launchctl bootstrap system /Library/LaunchDaemons/${DISPATCHER_SERVICE}.plist",
+    "  sleep 10",
+    "  L=$(/usr/libexec/PlistBuddy -c 'Print :StandardOutPath' "
+    "/Library/LaunchDaemons/${DISPATCHER_SERVICE}.plist)",
+    "  sudo tail -n 40 \"$L\"",
+    "else",
+    "  echo 'NOT RESTARTED: the dispatcher did not answer idle. A webhook, a ticket session "
+    "or a chat session is running, or it is not answering. Paste this again later.'",
+    "fi",
+]
+IDLE_RESTART = _group(("DISPATCHER_SERVICE", "DISPATCHER_PORT"),
+                      ["    " + line for line in IDLE_RESTART_LINES])
+
+# The front door's restart: the same stop, wait, start. It stops no session; a tracker
+# webhook sent in those seconds fails, and the tracker retries it.
+FRONT_RESTART = _group(("FRONT_DOOR_SERVICE",), [
+    "    sudo launchctl bootout system/${FRONT_DOOR_SERVICE}",
+    "    " + _WAIT_GONE % "${FRONT_DOOR_SERVICE}",
+    "    sudo launchctl bootstrap system /Library/LaunchDaemons/${FRONT_DOOR_SERVICE}.plist",
+])
+
+FRONT_DOOR_SUBCOMMAND = _group(FRONT_DOOR_KEYS, ["    %s front-door" % ME,
+                                                 "    %s front-door --apply" % ME])
+FRONT_DOOR_REMOVE = _group(FRONT_DOOR_KEYS, ["    %s front-door --remove" % ME,
+                                             "    %s front-door --remove --apply" % ME])
+
+
+def _probe_line(path):
+    return ("    curl -sS -m 10 -o /dev/null -w '%{http_code}\\n' -X POST "
+            "https://${FRONT_DOOR_HOST}" + path)
+
+
+# The three probes, each with no signature. Only the dispatcher answers 401 on its routes
+# (the Slack transport and the tracker transport both refuse an unsigned request), so a
+# 401 means "the door forwarded it" and anything else means it did not.
+PROBES_ON = _group(("FRONT_DOOR_HOST",), [
+    _probe_line(SLACK_PATH),
+    "Good: 401 — the door forwarded it, and the dispatcher asked for a signature.",
+    _probe_line(TRACKER_PATH),
+    "Good: 401 — the tracker's webhooks still reach the dispatcher.",
+    _probe_line(CONFIG_UPDATE_PATH),
+    "Good: 404 — the door's own answer for a path it does not forward. A 403 or a",
+    "connection error is as safe: only the dispatcher answers this route 401.",
+    "Not that: 401 on this last one. That is the dispatcher's config-update route",
+    "answering, so the allowlist lets more than its paths through. Fix the door first.",
+])
+PROBES_OFF = _group(("FRONT_DOOR_HOST",), [
+    _probe_line(SLACK_PATH),
+    "Good: 404 — the door no longer forwards the chat path.",
+    _probe_line(TRACKER_PATH),
+    "Good: 401 — tickets still reach the dispatcher.",
+])
+
 CARDS = {
     "CK-C1": {
         "title": "Create the chat app from the manifest",
@@ -1095,42 +1452,50 @@ CARDS = {
                 "the token every dispatcher session can read is never the notifier's."),
         "do": ["Check the workspace has exactly one member: you.",
                "Print the manifest (piece 6):",
-               "    python3 scripts/pipeline_chat_lane_setup.py compose",
+               "    %s compose --piece 6" % ME,
                "In Slack's app settings: Create New App -> From a manifest -> choose the",
                "workspace -> paste the JSON. The request URL is",
                "    https://${FRONT_DOOR_HOST}/slack-webhook",
                "If Slack says the URL did not verify, carry on: the door is not open yet.",
-               "Install the app to the workspace. Then put two values into",
-               "${DISPATCHER_ENV_FILE}, by typing them, under the names piece 3 gives:",
-               "    SLACK_BOT_TOKEN       <- OAuth & Permissions: Bot User OAuth Token",
-               "    SLACK_SIGNING_SECRET  <- Basic Information: Signing Secret",
-               "Never paste either into a chat, a ticket, a pull request or a repository."],
-        "good": ("an app with exactly the four bot scopes of piece 6, no user scopes, and "
-                 "the two names in the dispatcher's env file"),
-        "not": "the notifier's token under SLACK_BOT_TOKEN — every session could read it",
+               "Install the app to the workspace. Its bot token and signing secret stay in",
+               "Slack for now. Copy them nowhere: the env-names step of THE ORDER asks for",
+               "both at hidden prompts, once the port block is loaded, and writes them",
+               "itself. Never paste either into a chat, a ticket, a pull request or a",
+               "repository."],
+        "good": ("an app with exactly the four bot scopes of piece 6, no user scopes, "
+                 "installed, and its two secrets still only in Slack"),
+        "not": "the notifier's app or token used for this — two apps, two tokens",
     },
     "CK-C2": {
         "title": "Open the front door for one path",
-        "why": ("The reverse proxy lives outside this repository, so nothing here can measure "
-                "its path allowlist. The port behind it is card CK-C4's: do that one first."),
-        "do": ["Add /slack-webhook to the proxy's path allowlist. Nothing else.",
-               "From anywhere, ask the door for the new path with no signature:",
-               "    curl -s -o /dev/null -w '%{http_code}\\n' -X POST \\",
-               "      https://${FRONT_DOOR_HOST}/slack-webhook",
-               "Good: 401 — the door forwarded it and the dispatcher asked for a",
-               "signature. Not that: 404 or a timeout — the path is not reaching it.",
-               "Now a route that must NEVER be reachable. The dispatcher answers it 401,",
-               "and nothing else does, so a 401 here means the door forwards it:",
-               "    curl -sS -m 5 -o /dev/null -w '%{http_code}\\n' -X POST \\",
-               "      https://${FRONT_DOOR_HOST}/api/update/cyrus-config",
-               "Good: anything but 401 — 403 or 404 from the proxy, or a connection error.",
-               "Not that: 401. That is the dispatcher's config-update route answering, so",
-               "the allowlist is letting more than /slack-webhook through. Fix the door",
-               "before going on.",
+        "why": ("The reverse proxy lives outside this repository, and only it can say what it "
+                "forwards. The port behind it is card CK-C4's: do that one first."),
+        "do": ["Dry run first. It prints the ONE allowlist line, names any path on it that is",
+               "not one of the dispatcher's own routes, and changes nothing. Then apply:",
+               FRONT_DOOR_SUBCOMMAND,
+               "--apply appends /slack-webhook to that line and changes nothing else. It",
+               "backs the file up, validates it with the proxy's own binary, and puts the",
+               "backup back if validation fails. It never restarts the door.",
+               "Restart the front door: stop it, wait until launchd has let it go, start it.",
+               "It stops no session; a tracker webhook sent in those seconds is retried.",
+               FRONT_RESTART,
+               "Then three probes, from anywhere, each with no signature:",
+               PROBES_ON,
+               "If a probe answers otherwise, each answer means a different layer:",
+               "  404 on the Slack path: the door answered, and the path is not on its",
+               "      line, or the door was not restarted. Run front-door again; restart.",
+               "  404 on the tracker path: the tracker path left the line. Put it back",
+               "      first: until then every ticket is turned away at the door.",
+               "  530, or the tunnel's own error page: the tunnel in front of the door is",
+               "      down, not the door. Read the tunnel service's state and its log.",
+               "  502: the door forwarded it and the dispatcher is not listening. Restart",
+               "      the dispatcher (card CK-C5), then probe again.",
                "(A status or version path is not the test: a front door may forward one on",
                "purpose for monitoring.)"],
-        "good": "401 on /slack-webhook, and anything but 401 on the config-update route",
-        "not": "401 on the config-update route — the door forwards more than one path",
+        "good": ("401 on the Slack path and on the tracker path, and 404 (anything but 401) "
+                 "on the config-update route"),
+        "not": ("401 on the config-update route — the door forwards more than its paths; or "
+                "404 on the tracker path — tickets no longer reach the dispatcher"),
     },
     "CK-C4": {
         "title": "Prove the dispatcher's port is closed, from a second device",
@@ -1174,24 +1539,112 @@ CARDS = {
         "not": ("a JSON status on the second device — the port is open; or a timeout, "
                 "which proves nothing either way"),
     },
+    # CK-C3 TESTS CALLS, NOT THE LISTING (KIT-196). A chat session is SHOWN every built-in
+    # tool: the chat runner passes allowedTools and no tools restriction, and the grant is
+    # enforced when a tool is CALLED. So "list your tools" proves nothing — and the
+    # dispatcher's chat prompt names log_failure_mode even when that tool is absent.
+    # Measured on a deployment, 2026-09-24: Bash `echo` and Monitor `echo` RAN (read-only
+    # commands are auto-approved by the SDK's default permission handling); Write, `touch`,
+    # a chained `echo; touch` and Monitor `touch` were refused; a Bash read of a path under
+    # a user-level Read deny was refused; ToolSearch found no log_failure_mode.
     "CK-C3": {
-        "title": "Ask the bot, in the private channel, what it holds",
-        "why": ("Only a live session shows the tool list the dispatcher really built. The "
-                "source says what should be there; this is the measurement. No computer "
-                "here can mention a bot as you."),
-        "do": ["In the private channel, mention the bot:",
-               "    @pipeline-chat list the name of every tool you can call, one per line",
-               "Confirm these are ABSENT: Monitor, Task, ScheduleWakeup (and Agent, Write,",
-               "Edit, Skill).",
-               "Confirm tools beginning mcp__cyrus-tools ARE present. That is expected and",
-               "accepted: the trim cannot remove that server.",
-               "Ask a read question:",
-               "    @pipeline-chat what is waiting on me in the tracker?",
-               "Good: an answer drawn from the tracker.",
-               "Record the tool list and the date in your private runbook."],
-        "good": ("no Monitor, Task or ScheduleWakeup; mcp__cyrus-tools present, as expected; "
-                 "a read question answered"),
-        "not": "Monitor or Task in the list — the grant did not load; restart and ask again",
+        "title": "Test the bot's calls, in the private channel",
+        "why": ("Only a live session shows what the dispatcher really built, and a listing "
+                "shows the wrong thing: the session is SHOWN every built-in tool, Monitor, "
+                "Task and ScheduleWakeup included, because the grant is enforced when a tool "
+                "is CALLED. So this card makes calls. No computer here can mention a bot as "
+                "you."),
+        "do": ["First, on this machine, make a harmless decoy that a read deny covers (a",
+               "*.pem name; it holds no key):",
+               "    printf 'decoy, not a key\\n' > /tmp/chat-lane-decoy.pem",
+               "In the private channel, send each of these as its own mention:",
+               "    @%s run this with Bash and show me the output: echo chat-lane-check"
+               % CHAT_BOT_NAME,
+               "    @%s run this with Bash: touch /tmp/chat-lane-touch" % CHAT_BOT_NAME,
+               "    @%s run this with Bash: echo one; touch /tmp/chat-lane-touch"
+               % CHAT_BOT_NAME,
+               "    @%s use the Write tool to create /tmp/chat-lane-write.txt" % CHAT_BOT_NAME,
+               "    @%s use Monitor to run: echo chat-lane-monitor" % CHAT_BOT_NAME,
+               "    @%s use Monitor to run: touch /tmp/chat-lane-monitor" % CHAT_BOT_NAME,
+               "    @%s run this with Bash: wc -c /tmp/chat-lane-decoy.pem" % CHAT_BOT_NAME,
+               "    @%s use ToolSearch to look for log_failure_mode" % CHAT_BOT_NAME,
+               "    @%s what is waiting on me in the tracker?" % CHAT_BOT_NAME,
+               "Good, as measured on a deployment on 2026-09-24:",
+               "  - Bash with echo RAN, and Monitor with echo RAN. Read-only commands are",
+               "    auto-approved by the SDK's default permission handling, so this lane",
+               "    has a read-only shell. That is the open residual, KIT-196.",
+               "  - Write, touch, the chained echo; touch, and Monitor with touch were all",
+               "    refused.",
+               "  - The wc -c of the decoy was refused: a user-level Read deny covers a",
+               "    Bash read of that path too.",
+               "  - ToolSearch found no log_failure_mode. It is registered only when",
+               "    CYRUS_API_KEY is set, and that stays unset.",
+               "  - The tracker question was answered.",
+               "Then check that nothing was made, and remove the decoy:",
+               "    ls -l /tmp/chat-lane-touch /tmp/chat-lane-write.txt /tmp/chat-lane-monitor",
+               "    rm -f /tmp/chat-lane-decoy.pem",
+               "Good: ls finds none of the three.",
+               "Tools beginning mcp__cyrus-tools are there, as expected: the trim cannot",
+               "remove that server. Record the answers and the date in your private runbook."],
+        "good": ("echo RAN through Bash and Monitor; Write, touch, the chained touch and "
+                 "Monitor's touch refused; the decoy read refused; no log_failure_mode; a "
+                 "tracker question answered"),
+        "not": ("a Write or a touch that RAN — the grant did not load: restart the dispatcher "
+                "(card CK-C5) and test again; or log_failure_mode found — CYRUS_API_KEY is "
+                "set"),
+    },
+    "CK-C5": {
+        "title": "Restart the dispatcher, only when it is idle",
+        "why": ("A restart stops every running session (docs/STAGE-E-OPERATOR.md). The "
+                "dispatcher says itself when that is safe: /status answers idle only while "
+                "no webhook, ticket session or chat session is running (cyrus-edge-worker "
+                "EdgeWorker.js:1784-1802). The listening address, the address checks and a "
+                "removed env name are read at start only, so the chat lane's env change "
+                "needs this restart. Nothing in this file restarts it for you."),
+        "do": ["Paste this block whole. It restarts only when the dispatcher answers idle.",
+               "It stops the dispatcher, waits until launchd has let it go, starts it, and",
+               "shows the end of its log, whose path it reads from the dispatcher's plist:",
+               IDLE_RESTART,
+               "NOT RESTARTED means busy or not answering: wait, and paste it again. Do not",
+               "force it while a session runs.",
+               "Then, first: delegate one throwaway tracker ticket (THE ORDER, step 6)."],
+        "good": "the block showed the dispatcher's fresh start at the end of its log",
+        "not": ("NOT RESTARTED for an hour or more — a session is stuck: find it before "
+                "forcing a restart"),
+    },
+    "CK-C6": {
+        "title": "Turn the chat lane off",
+        "why": ("Turning the lane off starts in Slack, which nothing here can reach: until "
+                "the app is gone, a copied token keeps working. Then the four names leave "
+                "the dispatcher's env file, the dispatcher restarts so it listens on this "
+                "machine only, and the front door stops forwarding the chat path."),
+        "do": ["1. In Slack, open the chat app's settings and Uninstall it from the",
+               "   workspace. That revokes its token: it is the step that really ends the",
+               "   lane.",
+               "2. Take the four names out of the dispatcher's env file (it backs the file",
+               "   up first; no terminal prompt is needed):",
+               "    %s env-names --remove" % ME,
+               "3. Restart the dispatcher, only when it is idle (card CK-C5's block). A",
+               "   reload never unsets a name (Application.js:54); only a restart does:",
+               IDLE_RESTART,
+               "4. Take the chat path off the front door, then restart the door:",
+               FRONT_DOOR_REMOVE,
+               FRONT_RESTART,
+               "5. Probe the door:",
+               PROBES_OFF,
+               "6. The port block stays loaded. It costs nothing while the dispatcher",
+               "   listens on this machine only. Check it is still there:",
+               "    sudo /sbin/pfctl -a %s -s rules" % PF_ANCHOR,
+               "Keep the fences, the grant and the port block. Removing slackAllowedTools",
+               "would bring back the built-in chat list, Monitor and Task included, at the",
+               "next restart; the fences and the port block cost nothing while the lane is",
+               "off.",
+               "Then run verify. The env and front-door rows now say the lane's pieces are",
+               "not applied: that is what off looks like."],
+        "good": ("the app uninstalled; 404 on the chat path and 401 on the tracker path; "
+                 "the port block still loaded"),
+        "not": ("401 on the chat path — the door still forwards it; or no 401 on the "
+                "tracker path — tickets no longer arrive"),
     },
 }
 
@@ -1215,15 +1668,17 @@ def print_card(cid, conf=None):
     say(" %s — %s" % (cid, card["title"]))
     say("=" * 74)
     if conf is None:
-        say(" (no chat-lane.conf loaded: ${NAMES} below are yours to fill in)")
+        say(" (no chat-lane.conf loaded: ${NAMES} below are yours to fill in, and a command")
+        say("  that needs a conf value says so instead of printing)")
     say("")
     say("WHY THIS IS YOURS")
     for line in _wrap(card["why"]):
         say("  " + line)
     say("")
     say("WHAT TO DO")
-    for line in card["do"]:
-        say("  " + _fill(line, conf))
+    for item in card["do"]:
+        for line in card_lines(item, conf):
+            say("  " + line)
     say("")
     say("GOOD: %s" % card["good"])
     say("NOT THAT: %s" % card["not"])
@@ -1244,8 +1699,14 @@ def print_card(cid, conf=None):
 # file). Every `open` in it takes one argument: read mode.
 # --------------------------------------------------------------------------- #
 FACTS_PY = r'''
-import json, os, re, sys
+import hashlib, json, os, pathlib, re, sys
 QUOTES = "\"'`"
+
+def raw_of(path):
+    return pathlib.Path(path).read_bytes()
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
 LINE = re.compile(r"^\s*(?:export\s+)?([\w.-]+)\s*(?:=|:\s)(.*)$")
 
 def why(exc):
@@ -1295,8 +1756,8 @@ def mcp_rows(paths):
 
 def config(path):
     try:
-        with open(path) as fh:
-            c = json.load(fh)
+        raw = raw_of(path)
+        c = json.loads(raw.decode("utf-8"))
         if not isinstance(c, dict):
             raise ValueError("not an object")
     except Exception as exc:
@@ -1324,7 +1785,8 @@ def config(path):
             "slackMcpConfigs": mcp_rows(c.get("slackMcpConfigs")),
             "defaultDisallowedTools": tools(c.get("defaultDisallowedTools")),
             "promptDefaults": prompt_lists(c.get("promptDefaults")),
-            "entries": entries}
+            "entries": entries,
+            "sha256": digest(raw)}
 
 def present(raw):
     raw = raw.strip()
@@ -1368,27 +1830,45 @@ def env(path):
 def user_settings():
     path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
-        with open(path) as fh:
-            s = json.load(fh)
+        raw = raw_of(path)
+        s = json.loads(raw.decode("utf-8"))
     except Exception as exc:
         return {"path": path, "error": why(exc)}
     perms = s.get("permissions") if isinstance(s, dict) else None
     deny = perms.get("deny") if isinstance(perms, dict) else None
-    return {"path": path,
+    return {"path": path, "sha256": digest(raw),
             "deny": [str(d)[:300] for d in deny] if isinstance(deny, list) else [],
             "hasHooks": bool(isinstance(s, dict) and s.get("hooks"))}
 
-print(json.dumps({"config": config(sys.argv[1]), "env": env(sys.argv[2]),
-                  "userSettings": user_settings()}))
+def front_door(path, matcher):
+    # Only the lines that START with the matcher: the caller decides which of them is the
+    # `path` line. The file holds no secret; these lines are an allowlist.
+    try:
+        raw = raw_of(path)
+        text = raw.decode("utf-8")
+    except Exception as exc:
+        return {"path": path, "error": why(exc)}
+    head = re.compile(r"^\s*" + re.escape(matcher) + r"\s")
+    found = [{"index": i, "text": line[:1000]}
+             for i, line in enumerate(text.split("\n")) if head.match(line)]
+    return {"path": path, "sha256": digest(raw), "candidates": found[:50]}
+
+out = {"config": config(sys.argv[1]), "env": env(sys.argv[2]),
+       "userSettings": user_settings()}
+if len(sys.argv) > 5:
+    out["frontDoor"] = front_door(sys.argv[4], sys.argv[5])
+print(json.dumps(out))
 '''.replace("[:HEAD]", "[:%d]" % INSTRUCTION_HEAD_CHARS)
 
 
 def facts_command(conf):
-    """The /bin/sh script `as_role` runs. Paths are arguments, never spliced into code."""
-    return "/usr/bin/python3 -c %s %s %s %s" % (shlex.quote(FACTS_PY),
-                                                shlex.quote(conf["DISPATCHER_CONFIG"]),
-                                                shlex.quote(conf["DISPATCHER_ENV_FILE"]),
-                                                shlex.quote(conf["DISPATCHER_PORT"]))
+    """The /bin/sh script `as_role` runs. Paths are arguments, never spliced into code. The
+    front door's file and matcher go last, and only when both are set."""
+    args = [conf["DISPATCHER_CONFIG"], conf["DISPATCHER_ENV_FILE"], conf["DISPATCHER_PORT"]]
+    if all(conf.get(k) for k in FRONT_DOOR_READ_KEYS):
+        args += [conf["FRONT_DOOR_CONFIG"], conf["FRONT_DOOR_MATCHER"]]
+    return "/usr/bin/python3 -c %s %s" % (shlex.quote(FACTS_PY),
+                                          " ".join(shlex.quote(a) for a in args))
 
 
 # The root reads `verify` makes for the port block — the Stage E installer's `as_root`
@@ -1827,8 +2307,54 @@ def check_user_settings(conf, us, env_facts):
                 "%s carries every composed deny rule" % path)
 
 
+def check_front_door(conf, fd):
+    """The front door's allowlist line, read as the role account (KIT-197). `fd` is
+    `front_door_digest`'s answer. The Slack path and the tracker path on the one line is
+    done; a path that is not one of the dispatcher's own routes is named, not judged."""
+    unset = [k for k in FRONT_DOOR_READ_KEYS if not conf.get(k)]
+    if unset:
+        return _row("front-door", UNKNOWN,
+                    "NOT MEASURED: set %s in chat-lane.conf, and this row reads the front "
+                    "door's path allowlist as the role account" % " and ".join(unset))
+    path, matcher = conf["FRONT_DOOR_CONFIG"], conf["FRONT_DOOR_MATCHER"]
+    if fd is None:
+        return _row("front-door", UNKNOWN, "the read-only probe did not read %s" % path)
+    err = fd.get("error")
+    if err == "missing":
+        return _row("front-door", BLOCKED, "no file at %s (FRONT_DOOR_CONFIG)" % path)
+    if err:
+        return _row("front-door", UNKNOWN, "%s is %s" % (path, err))
+    count = fd.get("count")
+    if count != 1:
+        return _row("front-door", BLOCKED,
+                    "%s has %s `%s path …` lines, and the allowlist is exactly one: found %s"
+                    % (path, count, matcher, count),
+                    ["line %d" % n for n in fd.get("lines") or []])
+    paths = fd.get("paths") or []
+    problems = []
+    if SLACK_PATH not in paths:
+        problems.append("%s is not on line %s of %s, so Slack's requests never reach the "
+                        "dispatcher: run front-door --apply, then restart the door (card "
+                        "CK-C2)" % (SLACK_PATH, fd.get("line"), path))
+    if TRACKER_PATH not in paths:
+        problems.append("the tracker path %s is not on line %s of %s, so no tracker webhook "
+                        "reaches the dispatcher and no ticket starts a session"
+                        % (TRACKER_PATH, fd.get("line"), path))
+    notes = ["note: the line also forwards %s, which is not one of the dispatcher's own "
+             "routes (%s). It widens the door; find out what added it" % (p, ", ".join(
+                 sorted(EXPECTED_ROUTES)))
+             for p in paths if p not in EXPECTED_ROUTES]
+    if problems:
+        return _problem_row("front-door", BLOCKED, problems, notes)
+    return _row("front-door", ALREADY_DONE,
+                "line %s of %s carries %s and the tracker path %s. Card CK-C2's probes are "
+                "the proof from outside" % (fd.get("line"), path, SLACK_PATH, TRACKER_PATH),
+                notes)
+
+
 CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env", "ip-validation-off",
-          "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings")
+          "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings",
+          "front-door")
 
 
 def evaluate(facts, conf, pf=None):
@@ -1854,6 +2380,8 @@ def evaluate(facts, conf, pf=None):
         rows.append(check_notifier_absent(conf, env_facts))
         rows.append(check_hosted_keys_absent(env_facts))
         rows.append(check_user_settings(conf, us, env_facts))
+        rows.append(check_front_door(conf, front_door_digest(facts.get("frontDoor"),
+                                                             conf.get("FRONT_DOOR_MATCHER"))))
     rows.append(check_port_block(conf, pf, env_facts) if pf is not None else
                 _row("port-block", UNKNOWN, "the root reads of pf were not made"))
     order = {c: i for i, c in enumerate(CHECKS)}
@@ -1872,44 +2400,37 @@ def worst_exit(rows):
     return EX_OK
 
 
-def refusal_text(found):
-    return ("REFUSED: `verify` reads the dispatcher's config and env file as the role account,\n"
+_REFUSAL_WHAT = {
+    "verify": "reads the dispatcher's config and env file as the role account",
+    "merge": "reads the dispatcher's config as the role account and writes it",
+    "env-names": "writes the chat app's secrets into the dispatcher's env file",
+    "front-door": "reads and writes the front door's config as the role account",
+}
+
+
+def refusal_text(found, command="verify"):
+    return ("REFUSED: `%s` %s,\n"
             "  and this is an agent environment (%s set). The config holds the tracker's\n"
-            "  tokens and the env file holds the chat bot's. The probe prints names only,\n"
+            "  tokens and the env file holds the chat bot's. Nothing here prints a value,\n"
             "  but a session has no business running it. There is no override flag.\n"
-            "  A PERSON runs this, in a terminal:  python3 %s verify\n"
-            "  Read-only meanwhile:  compose | card <CK-id>" % (", ".join(found), _self_path()))
+            "  A PERSON runs this, in a terminal:  python3 %s %s\n"
+            "  Read-only meanwhile:  compose | card <CK-id>"
+            % (command, _REFUSAL_WHAT.get(command, _REFUSAL_WHAT["verify"]),
+               ", ".join(found), _self_path(), command))
 
 
-def cmd_verify(conf, runner, sudo):
-    found = agent_env_markers_present()
-    if found:
-        say(refusal_text(found))
-        return EX_REFUSED
-    runner.dry_run = True
-    account = conf["ROLE_ACCOUNT"]
-    say("Chat lane verify — read-only. It reads the dispatcher config, its env file and the")
-    say("user settings as %s, through one program that prints names and tool lists and" % account)
-    say("never a value, and asks pf, as root, what it has loaded. Your login password may be")
-    say("asked for, once.")
-    sudo.acquire("`verify` reads three files as the %s role account and asks pf, as root, "
-                 "which rules it holds. It changes nothing." % account, "verify")
-    res = runner.as_role(account, facts_command(conf))
-    facts = None
-    if res.ok:
-        try:
-            facts = json.loads(res.out)
-        except ValueError:
-            facts = None
-    rows = evaluate(facts, conf, pf_probe(runner))
-    if facts is None:
-        why = ("exit %d: %s" % (res.rc, (res.err or "").strip()[:160]) if not res.ok
-               else "its output was not JSON")
-        for r in rows:
-            if r["outcome"] == UNKNOWN and r["check"] != "port-block":
-                r["detail"] = "the read-only probe as %s did not run (%s)" % (account, why)
-    say("")
-    say("-- checks --")
+def probe_facts(runner, conf):
+    """(facts, why-not). The read-only probe, as the role account."""
+    res = runner.as_role(conf["ROLE_ACCOUNT"], facts_command(conf))
+    if not res.ok:
+        return None, "exit %d: %s" % (res.rc, (res.err or "").strip()[:160])
+    try:
+        return json.loads(res.out), None
+    except ValueError:
+        return None, "its output was not JSON"
+
+
+def print_rows(rows):
     for r in rows:
         head = "  %-22s %-17s " % (r["check"], r["outcome"])
         wrapped = _wrap(r["detail"], 104 - len(head)) or [""]
@@ -1921,6 +2442,31 @@ def cmd_verify(conf, runner, sudo):
                 say("      " + line.strip())     # never wrapped: it is pasted as JSON
             else:
                 para(line, "      ", 104)
+
+
+def cmd_verify(conf, runner, sudo):
+    found = agent_env_markers_present()
+    if found:
+        say(refusal_text(found))
+        return EX_REFUSED
+    runner.dry_run = True
+    account = conf["ROLE_ACCOUNT"]
+    say("Chat lane verify — read-only. It reads the dispatcher config, its env file, the")
+    say("user settings and the front door's config as %s, through one program that prints"
+        % account)
+    say("names, tool lists and allowlist paths and never a value, and asks pf, as root, what")
+    say("it has loaded. Your login password may be asked for, once.")
+    sudo.acquire("`verify` reads four files as the %s role account and asks pf, as root, "
+                 "which rules it holds. It changes nothing." % account, "verify")
+    facts, why = probe_facts(runner, conf)
+    rows = evaluate(facts, conf, pf_probe(runner))
+    if facts is None:
+        for r in rows:
+            if r["outcome"] == UNKNOWN and r["check"] != "port-block":
+                r["detail"] = "the read-only probe as %s did not run (%s)" % (account, why)
+    say("")
+    say("-- checks --")
+    print_rows(rows)
     if runner.writes:
         say("")
         say("BUG: verify recorded %d write(s); that is a defect in this file."
@@ -1930,22 +2476,852 @@ def cmd_verify(conf, runner, sudo):
     say("")
     say("No drift: every check measures as applied." if code == EX_OK else
         "Not clean (exit %d). Apply what the rows name, then run verify again." % code)
-    say("Not measured from here, so they are cards: the Slack app (CK-C1), the front door "
-        "(CK-C2), the live session (CK-C3) and the port from a second device (CK-C4).")
+    say("Not measured from here, so they are cards: the Slack app (CK-C1), the front door's "
+        "answers from outside (CK-C2), the live session (CK-C3) and the port from a second "
+        "device (CK-C4).")
     return code
+
+
+# --------------------------------------------------------------------------- #
+# The writers — owner decision of 2026-09-24 (KIT-197).
+#
+# Three live-file edits this file used to only describe were done on a deployment by three
+# small scripts, tested on fixtures and then run for real. These are those scripts'
+# behaviour, owned here. Each is a PROGRAM handed to the role account's /bin/sh through
+# `_role_write`, the one place in this file that asks the runner to write:
+#
+#   * every value goes on STANDARD INPUT — a secret never reaches an argument, so `ps`
+#     never shows it, and the Runner records it as "<hidden>";
+#   * paths are arguments, never spliced into the program;
+#   * the program re-reads the file and refuses (exit 3, nothing written) when it is not
+#     the file the plan read — the dispatcher rewrites its own config when it refreshes a
+#     tracker token;
+#   * it backs the file up first, under the role account's home, at mode 600, with a name
+#     the Stage E installer's backup pruning never matches;
+#   * it prints names, lengths, paths and tool lists, never a value.
+#
+# `--selftest` RUNS each program through a real /bin/sh against temporary files; a shell
+# fragment nobody has executed is a guess about a shell (the Stage E installer, 15b). The
+# exact text of the three programs, and of `_role_write`, is all the write scan exempts.
+# --------------------------------------------------------------------------- #
+BACKUP_TAG = "pre-chat-lane"
+
+# Pieces 1, 2 and 5. Exit 0 wrote (or had nothing to write), 1 failed (a copy taken first
+# is put back), 2 a malformed patch, 3 refused: the file is not the one the plan read.
+MERGE_WRITER_PY = r'''
+import hashlib, json, os, sys, time
+
+def say(msg):
+    print(msg)
+    sys.stdout.flush()
+
+def stop(code, msg):
+    say(("REFUSED: " if code == 3 else "FAILED: ") + msg)
+    sys.exit(code)
+
+def indent_of(text):
+    for line in text.split("\n")[1:]:
+        body = line.lstrip(" \t")
+        if body and len(body) < len(line):
+            return "\t" if line.startswith("\t") else len(line) - len(body)
+    return 2
+
+def render(doc, like):
+    if like is None:
+        return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+    text = json.dumps(doc, indent=indent_of(like), ensure_ascii=False)
+    return text + "\n" if like.endswith("\n") else text
+
+def read(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+def loads(raw):
+    try:
+        return json.loads(raw.decode("utf-8")), True
+    except ValueError:
+        return None, False
+
+def backup_path(folder, name):
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    path = os.path.join(folder, "%s.%s" % (name, time.strftime("%Y-%m-%d-%H%M%S")))
+    return path + ".%d" % os.getpid() if os.path.exists(path) else path
+
+def private_copy(raw, path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(path, 0o600)
+
+def in_place(path, data):
+    # The SAME file, not a rename: the dispatcher watches it and reloads on a change.
+    with open(path, "r+b") as fh:
+        fh.seek(0)
+        fh.write(data)
+        fh.truncate()
+        fh.flush()
+        os.fsync(fh.fileno())
+
+def entry_at(cfg, op):
+    repos = cfg.get("repositories")
+    i = op.get("index")
+    if (not isinstance(repos, list) or type(i) is not int or not 0 <= i < len(repos)
+            or not isinstance(repos[i], dict)):
+        stop(3, "entry #%s is not where the plan found it. Nothing was written. Run merge "
+                "again." % i)
+    r = repos[i]
+    if (str(r.get("id") or "")[:80] != op.get("id")
+            or str(r.get("name") or "")[:80] != op.get("name")):
+        stop(3, "entry #%d is not the entry the plan named (%s). Nothing was written. Run "
+                "merge again." % (i, op.get("id") or op.get("name")))
+    return r
+
+def plus(lst, add):
+    return lst + [x for x in add if x not in lst]
+
+def apply_op(cfg, op):
+    kind, add = op.get("op"), list(op.get("add") or [])
+    if kind == "fence-entry":
+        r = entry_at(cfg, op)
+        own, default, src = r.get("disallowedTools"), cfg.get("defaultDisallowedTools"), op.get("from")
+        if src == "own" and isinstance(own, list):
+            r["disallowedTools"] = plus(own, add)
+        elif src == "default" and own is None and isinstance(default, list):
+            r["disallowedTools"] = plus(list(default), add)
+        elif src == "none" and own is None and default is None:
+            r["disallowedTools"] = add
+        else:
+            stop(3, "entry #%d's disallowedTools is not what the plan read. Nothing was "
+                    "written. Run merge again." % op.get("index"))
+    elif kind == "fence-prompt":
+        if op.get("scope") == "labelPrompts":
+            holder = entry_at(cfg, op).get("labelPrompts")
+        elif op.get("scope") == "promptDefaults":
+            holder = cfg.get("promptDefaults")
+        else:
+            stop(2, "the patch names an unknown scope. Nothing was written.")
+        v = holder.get(op.get("type")) if isinstance(holder, dict) else None
+        if not isinstance(v, dict) or not isinstance(v.get("disallowedTools"), list):
+            stop(3, "%s.%s.disallowedTools is not what the plan read. Nothing was written. "
+                    "Run merge again." % (op.get("scope"), op.get("type")))
+        v["disallowedTools"] = plus(v["disallowedTools"], add)
+    elif kind == "grant":
+        grant = op.get("set")
+        if not isinstance(grant, list) or not all(isinstance(t, str) for t in grant):
+            stop(2, "the patch's grant is not a list of tool names. Nothing was written.")
+        cfg["slackAllowedTools"] = grant
+    else:
+        stop(2, "the patch names an unknown operation. Nothing was written.")
+
+def main():
+    path = sys.argv[1]
+    try:
+        patch = json.loads(sys.stdin.read())
+    except ValueError:
+        patch = None
+    if not isinstance(patch, dict):
+        stop(2, "the patch on standard input is not a JSON object. Nothing was written.")
+    ops, deny_add = patch.get("config") or [], patch.get("deny") or []
+    home = os.path.expanduser("~")
+    backups = os.path.join(home, ".stage-e", "backups")
+    s_path = os.path.join(home, ".claude", "settings.json")
+
+    # 1. Every check, before anything is written.
+    raw = new_cfg = None
+    if ops:
+        raw = read(path)
+        if hashlib.sha256(raw).hexdigest() != patch.get("configSha256"):
+            stop(3, "%s changed since it was read: the dispatcher rewrites it when it "
+                    "refreshes a tracker token. Nothing was written. Run merge again." % path)
+        cfg, ok = loads(raw)
+        if not ok or not isinstance(cfg, dict):
+            stop(1, "%s is not a JSON object. Nothing was written." % path)
+        for op in ops:
+            apply_op(cfg, op)
+        new_cfg = render(cfg, raw.decode("utf-8")).encode("utf-8")
+    s_raw = new_settings = None
+    if deny_add:
+        exists = os.path.exists(s_path)
+        s_raw = read(s_path) if exists else None
+        if "settingsSha256" in patch:
+            now = hashlib.sha256(s_raw).hexdigest() if exists else None
+            if now != patch["settingsSha256"]:
+                stop(3, "%s changed since it was read. Nothing was written. Run merge "
+                        "again." % s_path)
+        settings, ok = loads(s_raw) if exists else ({}, True)
+        perms = settings.setdefault("permissions", {}) if ok and isinstance(settings, dict) else None
+        deny = perms.setdefault("deny", []) if isinstance(perms, dict) else None
+        if not isinstance(deny, list):
+            stop(3, "%s is not a JSON object with a permissions.deny list. Nothing was "
+                    "written: merge piece 5 into it by hand." % s_path)
+        deny.extend([x for x in deny_add if x not in deny])
+        new_settings = render(settings, s_raw.decode("utf-8") if exists else None).encode("utf-8")
+
+    # 2. The dispatcher config, in place, after a private copy.
+    if new_cfg is not None:
+        bk = backup_path(backups, "dispatcher-config.pre-chat-lane")
+        private_copy(raw, bk)
+        say("BACKUP      %s (it holds the tracker's tokens; mode 600)" % bk)
+        in_place(path, new_cfg)
+        _doc, ok = loads(read(path))
+        if not ok:
+            in_place(path, raw)
+            stop(1, "%s did not parse after the write, so the copy taken first was put "
+                    "back." % path)
+        say("WROTE       %s in place (the same file, so the dispatcher reloads it), and it "
+            "parses" % path)
+
+    # 3. The user settings: a private temporary file, then a rename, at mode 600.
+    if new_settings is not None:
+        folder = os.path.dirname(s_path)
+        if not os.path.isdir(folder):
+            os.makedirs(folder, mode=0o700)
+            os.chmod(folder, 0o700)
+        if s_raw is not None:
+            bk = backup_path(backups, "user-settings.json")
+            private_copy(s_raw, bk)
+            say("BACKUP      %s" % bk)
+        tmp = "%s.chat-lane.%d" % (s_path, os.getpid())
+        private_copy(new_settings, tmp)
+        os.replace(tmp, s_path)
+        _doc, ok = loads(read(s_path))
+        if not ok:
+            stop(1, "%s did not parse after the write." % s_path)
+        say("WROTE       %s, mode 600, and it parses" % s_path)
+    if new_cfg is None and new_settings is None:
+        say("Nothing to write: the patch changes nothing.")
+    sys.exit(0)
+
+try:
+    main()
+except OSError as exc:
+    stop(1, "%s: %s. Nothing more was written." % (exc.strerror, exc.filename))
+'''
+
+# Piece 3. Arguments: set|remove, the dispatcher's env file, the role account's own env
+# file (`~/` = that account's home), and the notifier token's NAME. `set` reads the token
+# and the signing secret from standard input, one per line. Exit 0 wrote, 5 could not (the
+# original untouched), 6 refused the notifier's token, 7 nothing on standard input, 2 a
+# bad argument. Portable to both stats: GNU's `-c` is tried first, BSD's `-f` after.
+ENV_WRITER_SH = r'''
+cd / || exit 5
+mode=$1; f=$2; renv=$3; nname=$4
+case $mode in set|remove) ;; *) echo "FAILED: unknown mode. Nothing was changed."; exit 2;; esac
+case $nname in ''|*[!A-Z0-9_]*) echo "FAILED: bad notifier name. Nothing was changed."; exit 2;; esac
+case $renv in "~/"*) renv="$HOME/${renv#??}";; esac
+names='SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET|CYRUS_HOST_EXTERNAL|WEBHOOK_IP_VALIDATION'
+pat="^[[:space:]]*(export[[:space:]]+)?($names)[[:space:]]*(=|:[[:space:]])"
+[ -f "$f" ] || { echo "REFUSED: $f does not exist. Nothing was changed."; exit 5; }
+me=$(id -un)
+owner=$(stat -c %U "$f" 2>/dev/null || stat -f %Su "$f" 2>/dev/null)
+[ "$owner" = "$me" ] || { echo "REFUSED: $f is owned by ${owner:-an unknown account}, not $me. Nothing was changed."; exit 5; }
+if [ "$mode" = set ]; then
+    IFS= read -r T || T=
+    IFS= read -r S || S=
+    [ -n "$T" ] && [ -n "$S" ] || { T=; S=; echo "FAILED: two values did not arrive on standard input. Nothing was changed."; exit 7; }
+    n=
+    if [ -f "$renv" ]; then
+        n=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$nname[[:space:]]*=[[:space:]]*//p" "$renv" | head -n 1)
+        case $n in
+            \"*) n=${n#\"}; n=${n%%\"*};;
+            \'*) n=${n#\'}; n=${n%%\'*};;
+            *) n=${n%%[[:space:]#]*};;
+        esac
+    fi
+    if [ -n "$n" ] && [ "$n" = "$T" ]; then
+        n=; T=; S=
+        echo "REFUSED: that token is the NOTIFIER's ($nname in the role account's env file). The chat lane needs the chat app's own token: two apps, two tokens. Nothing was changed."
+        exit 6
+    fi
+    n=
+fi
+umask 077
+d="$HOME/.stage-e/backups"
+mkdir -p "$d" && chmod 700 "$d" || { T=; S=; echo "REFUSED: could not make $d. Nothing was changed."; exit 5; }
+b="$d/dispatcher-env.pre-chat-lane.$(date +%Y-%m-%d-%H%M%S)"
+[ -e "$b" ] && b="$b.$$"
+cp -p "$f" "$b" && chmod 600 "$b" || { T=; S=; echo "REFUSED: could not back up $f. Nothing was changed."; exit 5; }
+t="$f.chat-lane.$$"
+grep -v -E "$pat" "$f" > "$t"
+[ $? -le 1 ] || { T=; S=; rm -f "$t"; echo "FAILED: could not read $f. The original is untouched."; exit 5; }
+if [ "$mode" = set ]; then
+    printf 'SLACK_BOT_TOKEN=%s\nSLACK_SIGNING_SECRET=%s\nCYRUS_HOST_EXTERNAL=true\nWEBHOOK_IP_VALIDATION=false\n' "$T" "$S" >> "$t" || { T=; S=; rm -f "$t"; echo "FAILED: could not write the new copy. The original is untouched."; exit 5; }
+fi
+T=; S=
+m=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null)
+chmod "$m" "$t" && mv -f "$t" "$f" || { rm -f "$t"; echo "FAILED: could not replace $f. The original is untouched."; exit 5; }
+echo "WROTE $f (mode $m, owner $me): $(grep -c . "$b") non-empty line(s) before, $(grep -c . "$f") after. Every other line kept, in order."
+if [ "$mode" = set ]; then
+    awk -F= '/^(SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET|CYRUS_HOST_EXTERNAL|WEBHOOK_IP_VALIDATION)=/ {print "  " $1, length($0) - length($1) - 1}' "$f"
+else
+    echo "  lines naming any of the four left in it: $(grep -c -E "$pat" "$f")"
+fi
+echo "BACKUP $b"
+echo "  It holds the two secrets as they were. Delete it once verify is clean:"
+echo "      sudo -u $me rm -f '$b'"
+dir=$(dirname "$f")
+for s in "$dir"/.*.sw? "$dir"/*.sw?; do
+    [ -e "$s" ] && echo "WARNING: a vi swap file is still beside the env file: $s. It can hold the secrets. Quit every vi on that file, then delete it."
+done
+exit 0
+'''
+
+# Piece 7. Arguments: the front door's config and its binary. The patch names the line
+# (index, old text, new text) and the file's checksum. Exit 0 wrote and validated, 3
+# refused (not the file or not the line the plan read), 4 validation failed and the
+# backup was put back byte for byte, 1 failed, 2 a malformed patch.
+#
+# `--adapter caddyfile`: the matcher line is Caddyfile syntax, and Caddy picks that adapter
+# by itself only for a file whose name starts "Caddyfile"; a front door built with another
+# file name would otherwise fail validation every time.
+FRONT_WRITER_PY = r'''
+import hashlib, json, os, subprocess, sys, time
+
+def say(msg):
+    print(msg)
+    sys.stdout.flush()
+
+def stop(code, msg):
+    say(("REFUSED: " if code == 3 else "FAILED: ") + msg)
+    sys.exit(code)
+
+def read(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+def backup_path(folder, name):
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    path = os.path.join(folder, "%s.%s" % (name, time.strftime("%Y-%m-%d-%H%M%S")))
+    return path + ".%d" % os.getpid() if os.path.exists(path) else path
+
+def private_copy(raw, path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(raw)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(path, 0o600)
+
+def in_place(path, data):
+    with open(path, "r+b") as fh:
+        fh.seek(0)
+        fh.write(data)
+        fh.truncate()
+        fh.flush()
+        os.fsync(fh.fileno())
+
+def main():
+    path, binary = sys.argv[1], sys.argv[2]
+    try:
+        patch = json.loads(sys.stdin.read())
+    except ValueError:
+        patch = None
+    if not isinstance(patch, dict) or not isinstance(patch.get("new"), str):
+        stop(2, "the patch on standard input is not what this program takes. Nothing was "
+                "written.")
+    raw = read(path)
+    if hashlib.sha256(raw).hexdigest() != patch.get("sha256"):
+        stop(3, "%s changed since it was read. Nothing was written. Run front-door again."
+             % path)
+    lines = raw.split(b"\n")
+    i = patch.get("index")
+    if (type(i) is not int or not 0 <= i < len(lines)
+            or lines[i] != str(patch.get("old")).encode("utf-8")):
+        stop(3, "that line of %s is not the line the plan read. Nothing was written." % path)
+    lines[i] = patch["new"].encode("utf-8")
+    bk = backup_path(os.path.join(os.path.expanduser("~"), ".stage-e", "backups"),
+                     os.path.basename(path) + ".pre-chat-lane")
+    private_copy(raw, bk)
+    say("BACKUP    %s" % bk)
+    in_place(path, b"\n".join(lines))
+    say("WROTE     %s in place: line %d, and nothing else" % (path, i + 1))
+    try:
+        ran = subprocess.run([binary, "validate", "--config", path, "--adapter", "caddyfile"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True, timeout=120)
+        rc, out = ran.returncode, ran.stdout or ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        rc, out = 127, "%s could not be run (%s)" % (binary, type(exc).__name__)
+    tail = [l for l in out.splitlines() if l.strip()][-3:]
+    if rc != 0:
+        in_place(path, raw)
+        if read(path) == raw:
+            said = "the backup was put back byte for byte. The front door still runs the old file"
+        else:
+            said = "THE RESTORE DID NOT READ BACK: copy %s over %s by hand" % (bk, path)
+        say("VALIDATE FAILED (exit %d), so %s." % (rc, said))
+        for l in tail:
+            say("    " + l[:300])
+        sys.exit(4)
+    say("VALIDATE  ok: %s" % (tail[-1][:300] if tail else "exit 0"))
+    sys.exit(0)
+
+try:
+    main()
+except OSError as exc:
+    stop(1, "%s: %s. Nothing more was written." % (exc.strerror, exc.filename))
+'''
+
+# The programs the write scan exempts, by exact text.
+WRITER_PROGRAMS = (MERGE_WRITER_PY, ENV_WRITER_SH, FRONT_WRITER_PY)
+
+
+def merge_writer_command(conf):
+    return "/usr/bin/python3 -c %s %s" % (shlex.quote(MERGE_WRITER_PY),
+                                          shlex.quote(conf["DISPATCHER_CONFIG"]))
+
+
+def env_writer_command(conf, mode):
+    return "/bin/sh -c %s env-names %s %s %s %s" % (
+        shlex.quote(ENV_WRITER_SH), shlex.quote(mode), shlex.quote(conf["DISPATCHER_ENV_FILE"]),
+        shlex.quote(conf["ROLE_ENV_FILE"]), shlex.quote(conf["NOTIFIER_TOKEN_ENV"]))
+
+
+def front_door_writer_command(conf):
+    return "/usr/bin/python3 -c %s %s %s" % (shlex.quote(FRONT_WRITER_PY),
+                                             shlex.quote(conf["FRONT_DOOR_CONFIG"]),
+                                             shlex.quote(conf["FRONT_DOOR_BIN"]))
+
+
+def _role_write(runner, account, script, stdin, what, secret=False):
+    """THE ONE WRITE SEAM. Every write this file makes is one of the three writer programs,
+    run as the role account, reached only from `merge --apply`, `env-names` and
+    `front-door --apply` — subcommands a person runs, each of which has already refused an
+    agent environment. `--selftest` checks nothing else in the file asks for a write."""
+    runner.dry_run = False
+    return runner.as_role(account, script, stdin=stdin, why=what, secret_stdin=secret)
+
+
+def _relay(res):
+    """The writer's own lines. They carry names, lengths and paths, never a value."""
+    for line in (res.out or "").splitlines():
+        say("  " + line)
+    for line in (res.err or "").strip().splitlines()[-5:]:
+        say("  (stderr) " + line[:300])
+
+
+def _resume(command, apply_it=False, remove=False):
+    """The command line a declined sudo tells a person to run again."""
+    return command + (" --remove" if remove else "") + (" --apply" if apply_it else "")
+
+
+def _plan_line(line):
+    """A plan line: a 12-character tag, then text wrapped under itself."""
+    tag, rest = line[:12], line[12:]
+    wrapped = _wrap(rest, 90) or [""]
+    say("  " + tag + wrapped[0])
+    for more in wrapped[1:]:
+        say(" " * 14 + more)
+
+
+# --------------------------------------------------------------------------- #
+# merge — pieces 1, 2 and 5.
+# --------------------------------------------------------------------------- #
+def merge_plan(conf, facts):
+    """(lines, config operations, deny rules to add), from the probe's facts, with the SAME
+    functions `verify` uses: owner_grant, fence_entry, prompt_type_gaps, user_deny_patterns
+    and entry_kind. It reads nothing itself, and its lines hold no value."""
+    cfg = facts.get("config") or {}
+    env_facts = facts.get("env") or {}
+    us = facts.get("userSettings") or {}
+    lines, ops = [], []
+    default = cfg.get("defaultDisallowedTools")
+    default_ok = default is None or isinstance(default, list)
+    fenced = 0
+    for e in cfg.get("entries") or []:
+        label, kind, own = _entry_label(e), entry_kind(e), e.get("disallowedTools")
+        ident = {"index": e.get("index"), "id": e.get("id") or "", "name": e.get("name") or ""}
+        if kind == "review":
+            # Judged exactly as verify's coding-fence row judges it: an entry with no list
+            # of its own inherits defaultDisallowedTools.
+            _c, missing, _s = fence_entry(own if own != "not-a-list" else [],
+                                          default if default_ok else None)
+            if missing or own == "not-a-list":
+                lines.append("LEFT ALONE  review entry %s lacks %s. It is the Stage E "
+                             "installer's: run the Stage E installer, whose entries these are"
+                             % (label, ", ".join(missing or SLACK_FENCE_RULES)))
+            else:
+                lines.append("ok          review entry %s already denies both Slack rules"
+                             % label)
+            continue
+        fenced += 1
+        if own == "not-a-list" or (own is None and not default_ok):
+            lines.append("CANNOT      %s entry %s: %s is not a list. Fix it by hand; nothing "
+                         "is composed for it" % (kind, label, "its disallowedTools"
+                                                 if own == "not-a-list"
+                                                 else "defaultDisallowedTools"))
+        else:
+            composed, missing, source = fence_entry(own, default)
+            if missing:
+                op = dict(ident)
+                op.update({"op": "fence-entry", "add": missing,
+                           "from": "own" if own is not None else
+                                   "default" if default is not None else "none"})
+                ops.append(op)
+                lines.append("FENCE       %s entry %s: disallowedTools = %s (was: %s)"
+                             % (kind, label, json.dumps(composed), source))
+            else:
+                lines.append("ok          %s entry %s already denies both Slack rules"
+                             % (kind, label))
+        prompts = e.get("labelPrompts") or {}
+        for ptype in prompt_type_gaps(prompts):
+            if not isinstance(prompts.get(ptype), list):
+                lines.append("CANNOT      %s labelPrompts.%s.disallowedTools is not a list. Fix "
+                             "it by hand" % (label, ptype))
+                continue
+            add = [r for r in SLACK_FENCE_RULES if r not in prompts[ptype]]
+            op = dict(ident)
+            op.update({"op": "fence-prompt", "scope": "labelPrompts", "type": ptype,
+                       "add": add})
+            ops.append(op)
+            lines.append("FENCE       %s labelPrompts.%s.disallowedTools += %s"
+                         % (label, ptype, json.dumps(add)))
+    if fenced:
+        defaults = cfg.get("promptDefaults") or {}
+        for ptype in prompt_type_gaps(defaults):
+            if not isinstance(defaults.get(ptype), list):
+                lines.append("CANNOT      promptDefaults.%s.disallowedTools is not a list. Fix "
+                             "it by hand" % ptype)
+                continue
+            add = [r for r in SLACK_FENCE_RULES if r not in defaults[ptype]]
+            ops.append({"op": "fence-prompt", "scope": "promptDefaults", "type": ptype,
+                        "add": add})
+            lines.append("FENCE       promptDefaults.%s.disallowedTools += %s"
+                         % (ptype, json.dumps(add)))
+
+    # Piece 1: the approved list, with a pull-rule pair per ACTIVE repository path.
+    active = active_entries(cfg)
+    paths = []
+    for e in active:
+        if e.get("repositoryPath") and e["repositoryPath"] not in paths:
+            paths.append(e["repositoryPath"])
+    wanted = owner_grant(paths)
+    live = cfg.get("slackAllowedTools")
+    unsafe = grant_problems(wanted)
+    if unsafe:
+        lines.append("CANNOT      the grant composed from the live repository paths is unsafe: "
+                     "%s. Nothing is composed for slackAllowedTools" % "; ".join(unsafe))
+    elif isinstance(live, list) and sorted(live) == sorted(wanted):
+        lines.append("ok          slackAllowedTools is already the approved list")
+    else:
+        extra = [t for t in live if t not in wanted] if isinstance(live, list) else []
+        if extra:
+            lines.append("DROP        slackAllowedTools holds what the owner did not approve: %s"
+                         % ", ".join(extra))
+        ops.append({"op": "grant", "set": wanted})
+        lines.append("GRANT       slackAllowedTools = %s" % json.dumps(wanted))
+    if active and active[0].get("mcpAllowedTools"):
+        lines.append("WARNING     the first active entry %s lists %s in allowedTools, and the "
+                     "dispatcher adds those to the chat grant (RunnerConfigBuilder.js:63-66). "
+                     "Not changed here: remove them by hand"
+                     % (_entry_label(active[0]), ", ".join(active[0]["mcpAllowedTools"])))
+
+    # Piece 5: the read denies, merged into the role account's user settings.
+    names = set(env_facts.get("names") or []) | set(env_facts.get("empty") or [])
+    s_path = us.get("path") or "~/.claude/settings.json"
+    deny_add = []
+    if "CLAUDE_CONFIG_DIR" in names:
+        lines.append("NOT MERGED  the dispatcher env file sets CLAUDE_CONFIG_DIR, so sessions "
+                     "read user settings from that directory, not %s. Merge piece 5 there by "
+                     "hand" % s_path)
+    elif us.get("error") and us.get("error") != "missing":
+        lines.append("CANNOT      %s is %s: the read denies are not merged" % (s_path,
+                                                                                us["error"]))
+    else:
+        have = us.get("deny") or []
+        deny_add = [r for r in user_deny_patterns(conf) if r not in have]
+        if deny_add:
+            lines.append("DENY        %s%s: add %d rule(s): %s"
+                         % (s_path, " (a new file, mode 600)" if us.get("error") else "",
+                            len(deny_add), ", ".join(deny_add)))
+        else:
+            lines.append("ok          %s already carries every composed read deny" % s_path)
+    return lines, ops, deny_add
+
+
+def merge_rows(conf, facts):
+    """The grant, coding-fence and user-settings rows, as `verify` prints them."""
+    cfg = facts.get("config") or {"error": "missing"}
+    env_facts = facts.get("env") or {"error": "missing"}
+    us = facts.get("userSettings") or {"error": "missing"}
+    rows = (_config_unmeasured(cfg, ("grant", "coding-fence")) if cfg.get("error") else
+            [check_grant(cfg), check_fence(cfg, env_facts)])
+    return rows + [check_user_settings(conf, us, env_facts)]
+
+
+def cmd_merge(conf, runner, sudo, apply_it=False):
+    found = agent_env_markers_present()
+    if found:
+        say(refusal_text(found, "merge"))
+        return EX_REFUSED
+    account = conf["ROLE_ACCOUNT"]
+    say("Chat-lane merge — %s" % ("APPLY" if apply_it else "DRY RUN: nothing will be changed"))
+    say("  Pieces 1, 2 and 5, planned from what verify's probe reads as %s. It prints entry"
+        % account)
+    say("  names, key names and tool lists, never a value.")
+    sudo.acquire("`merge` reads the dispatcher config and the user settings as the %s role "
+                 "account%s." % (account, ", and writes them as that account" if apply_it
+                                 else ", and changes nothing"), _resume("merge", apply_it))
+    facts, why_not = probe_facts(runner, conf)
+    if facts is None:
+        say("NOT MEASURED: the read-only probe as %s did not run (%s). Nothing was changed."
+            % (account, why_not))
+        return EX_UNKNOWN
+    cfg = facts.get("config") or {"error": "missing"}
+    if cfg.get("error"):
+        broken = cfg["error"].startswith("unparseable")
+        say("%s: the dispatcher config %s is %s. Nothing was changed."
+            % ("FAILED" if broken else "NOT MEASURED", conf["DISPATCHER_CONFIG"], cfg["error"]))
+        return EX_FAILED if broken else EX_UNKNOWN
+    lines, ops, deny_add = merge_plan(conf, facts)
+    us = facts.get("userSettings") or {}
+    say("  config    %s" % conf["DISPATCHER_CONFIG"])
+    say("  settings  %s" % (us.get("path") or "~/.claude/settings.json"))
+    for line in lines:
+        _plan_line(line)
+    say("")
+    if not ops and not deny_add:
+        say("Nothing to write: every piece this command merges is already in place.")
+        rows = merge_rows(conf, facts)
+        say("-- rows, as verify reads them --")
+        print_rows(rows)
+        return worst_exit(rows)
+    if not apply_it:
+        say("DRY RUN: nothing was changed. Run it again with --apply to write this, as %s."
+            % account)
+        return EX_BLOCKED
+    patch = {"configSha256": cfg.get("sha256"), "config": ops,
+             "settingsSha256": us.get("sha256"), "deny": deny_add}
+    res = _role_write(runner, account, merge_writer_command(conf), json.dumps(patch),
+                      "merge pieces 1, 2 and 5 into %s and the user settings, as %s"
+                      % (conf["DISPATCHER_CONFIG"], account))
+    _relay(res)
+    if res.rc == 3:
+        return EX_REFUSED
+    if not res.ok:
+        say("FAILED: the writer exited %d." % res.rc)
+        return EX_FAILED
+    again, why_not = probe_facts(runner, conf)
+    if again is None:
+        say("NOT MEASURED after the write: the probe as %s did not run (%s)." % (account,
+                                                                                 why_not))
+        return EX_UNKNOWN
+    rows = merge_rows(conf, again)
+    say("")
+    say("-- rows, read again as verify reads them --")
+    print_rows(rows)
+    say("")
+    para("The dispatcher reloads its config on a change (ConfigManager.js:51-62): its log "
+         "says \"Config file changed, reloading...\". Nothing was restarted.", "")
+    return worst_exit(rows)
+
+
+# --------------------------------------------------------------------------- #
+# env-names — piece 3.
+# --------------------------------------------------------------------------- #
+CHAT_TOKEN_PREFIX = "xoxb-"
+CHAT_TOKEN_MIN_LEN = 40
+_CHAT_TOKEN_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_SIGNING_SECRET_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def secret_shape_problem(token, secret):
+    """Why these two values cannot be the chat app's bot token and signing secret, or None.
+    Never quotes either value."""
+    if not token.startswith(CHAT_TOKEN_PREFIX):
+        return ("the token does not start %s: it may be the signing secret, or a user token."
+                % CHAT_TOKEN_PREFIX)
+    if len(token) < CHAT_TOKEN_MIN_LEN:
+        return "the token is only %d characters: the paste was cut short." % len(token)
+    if not _CHAT_TOKEN_RE.match(token):
+        return ("the token holds a character a Slack bot token never does (a space, or a "
+                "stray quote).")
+    if len(secret) != 32:
+        return "the signing secret is %d characters; Slack's is 32." % len(secret)
+    if not _SIGNING_SECRET_RE.match(secret):
+        return "the signing secret is not lower-case hex."
+    return None
+
+
+def _env_done(conf, res):
+    _relay(res)
+    if res.rc == 6:
+        return EX_REFUSED
+    if not res.ok:
+        say("FAILED: the role account's shell exited %d%s." % (res.rc, {
+            5: ": the file could not be read or replaced, and the original is untouched",
+            7: ": no value arrived on its standard input"}.get(res.rc, "")))
+        return EX_FAILED
+    say("")
+    para("It restarted nothing. The listening address, the address checks and a removed "
+         "name are read at start only (Application.js:54): restart the dispatcher now, only "
+         "when it is idle — card CK-C5:", "")
+    print_card("CK-C5", conf)
+    return EX_OK
+
+
+def cmd_env_names(conf, runner, sudo, remove=False, tty=False, reader=None):
+    found = agent_env_markers_present()
+    if found:
+        say(refusal_text(found, "env-names"))
+        return EX_REFUSED
+    account, envfile = conf["ROLE_ACCOUNT"], conf["DISPATCHER_ENV_FILE"]
+    if remove:
+        say("Chat-lane env-names --remove — the four names leave %s, as %s. Every other line "
+            "stays." % (envfile, account))
+        sudo.acquire("`env-names --remove` rewrites %s as the %s role account, keeping every "
+                     "other line" % (envfile, account), _resume("env-names", remove=True))
+        res = _role_write(runner, account, env_writer_command(conf, "remove"), "",
+                          "remove the four chat-lane names from %s" % envfile)
+        return _env_done(conf, res)
+    if not tty:
+        say("NEEDS A TERMINAL: env-names asks for the chat app's bot token and signing secret "
+            "at two hidden prompts, and this run has no terminal to ask at. Nothing was read "
+            "or changed. Run it yourself, in a terminal:  python3 %s env-names" % _self_path())
+        return EX_BLOCKED
+    say("Chat-lane env-names — the four names into %s, as %s." % (envfile, account))
+    say("  First pf is asked, as root, whether the port block is loaded: CYRUS_HOST_EXTERNAL")
+    say("  makes the dispatcher listen on every interface, so the block comes first.")
+    sudo.acquire("`env-names` asks pf, as root, which rules it holds, then writes %s as the "
+                 "%s role account" % (envfile, account), _resume("env-names"))
+    row = check_port_block(conf, pf_probe(runner), None)
+    if row["outcome"] != ALREADY_DONE:
+        say("REFUSED: the port block does not measure as loaded (%s): %s"
+            % (row["outcome"], row["detail"]))
+        for line in row["lines"]:
+            para(line, "  ")
+        para("The order is the port block before the listen. Load piece 4 first:  python3 %s "
+             "compose --piece 4 . Nothing was asked for or changed." % _self_path(), "")
+        return EX_BLOCKED
+    ask = reader or getpass.getpass
+    token = (ask("  Paste the CHAT app's Bot User OAuth Token (Slack: OAuth & Permissions; "
+                 "xoxb-...), then Enter. Hidden: ") or "").strip()
+    secret = (ask("  Paste the CHAT app's Signing Secret (Slack: Basic Information), then "
+                  "Enter. Hidden: ") or "").strip()
+    problem = secret_shape_problem(token, secret)
+    if problem:
+        token = secret = None
+        say("REFUSED: %s Nothing was changed. (No value is shown.)" % problem)
+        return EX_USAGE
+    say("  token: %d characters, starts %s; signing secret: 32 lower-case hex characters."
+        % (len(token), CHAT_TOKEN_PREFIX))
+    res = _role_write(runner, account, env_writer_command(conf, "set"),
+                      "%s\n%s\n" % (token, secret),
+                      "write the four chat-lane names into %s" % envfile, secret=True)
+    token = secret = None
+    return _env_done(conf, res)
+
+
+# --------------------------------------------------------------------------- #
+# front-door — piece 7.
+# --------------------------------------------------------------------------- #
+def cmd_front_door(conf, runner, sudo, apply_it=False, remove=False):
+    found = agent_env_markers_present()
+    if found:
+        say(refusal_text(found, "front-door"))
+        return EX_REFUSED
+    unset = [k for k in FRONT_DOOR_KEYS if not conf.get(k)]
+    if unset:
+        say("REFUSED: front-door needs %s in chat-lane.conf. Nothing was read or changed."
+            % " and ".join(unset))
+        return EX_USAGE
+    account, path = conf["ROLE_ACCOUNT"], conf["FRONT_DOOR_CONFIG"]
+    matcher = conf["FRONT_DOOR_MATCHER"]
+    say("Front door allowlist — %s%s" % ("APPLY" if apply_it else "DRY RUN: nothing will be "
+                                          "changed", ", REMOVING the chat path" if remove else ""))
+    sudo.acquire("`front-door` reads %s as the %s role account%s." % (
+        path, account, ", and writes and validates it as that account" if apply_it
+        else ", and changes nothing"), _resume("front-door", apply_it, remove))
+    facts, why_not = probe_facts(runner, conf)
+    fd = front_door_digest((facts or {}).get("frontDoor"), matcher)
+    if fd is None:
+        say("NOT MEASURED: the read-only probe as %s did not read %s (%s). Nothing was "
+            "changed." % (account, path, why_not or "no answer for the front door"))
+        return EX_UNKNOWN
+    if fd.get("error"):
+        say("%s: %s is %s. Nothing was changed." % (
+            "REFUSED" if fd["error"] == "missing" else "NOT MEASURED", path, fd["error"]))
+        return EX_BLOCKED if fd["error"] == "missing" else EX_UNKNOWN
+    say("  file      %s" % path)
+    if fd["count"] != 1:
+        say("REFUSED: expected exactly one `%s path ...` line in %s, found %d%s. Nothing was "
+            "changed: the allowlist is one line, and this will not guess which."
+            % (matcher, path, fd["count"], " (lines %s)" % ", ".join(
+                str(n) for n in fd["lines"]) if fd["lines"] else ""))
+        return EX_BLOCKED
+    text = fd["text"]
+    say("  line      %d" % fd["line"])
+    say("  now       %s" % text.strip())
+    for p in fd["paths"]:
+        if p not in EXPECTED_ROUTES:
+            say("  WARNING   %s is not one of the dispatcher's own routes: the door forwards a "
+                "path this kit cannot account for. Find out what added it." % p)
+    say("  The dispatcher's own routes:")
+    for route in sorted(EXPECTED_ROUTES):
+        say("    %-16s %s" % (route, EXPECTED_ROUTES[route]))
+    new = front_line_edit(text, matcher, SLACK_PATH, remove)
+    if new is None:
+        say("REFUSED: taking %s off would leave the line with no path at all, and an empty "
+            "allowlist line is a broken door, not a closed one. Edit it by hand. Nothing was "
+            "changed." % SLACK_PATH)
+        return EX_BLOCKED
+    if new == text:
+        say("  ok        %s is already %s the line. Nothing to change." % (
+            SLACK_PATH, "off" if remove else "on"))
+        para("If the door was not restarted since that line last changed, restart it now "
+             "(card %s)." % ("CK-C6" if remove else "CK-C2"), "  ")
+        return EX_OK
+    say("  becomes   %s" % new.strip())
+    if not apply_it:
+        say("DRY RUN: nothing was changed. Run it again with --apply to write this, as %s."
+            % account)
+        return EX_BLOCKED
+    patch = {"sha256": fd["sha256"], "index": fd["index"], "old": text, "new": new}
+    res = _role_write(runner, account, front_door_writer_command(conf), json.dumps(patch),
+                      "%s %s on line %d of %s, then validate it, as %s" % (
+                          "remove" if remove else "add", SLACK_PATH, fd["line"], path,
+                          account))
+    _relay(res)
+    if res.rc == 3:
+        return EX_REFUSED
+    if not res.ok:
+        say("FAILED: the writer exited %d." % res.rc)
+        return EX_FAILED
+    say("")
+    say("It restarted nothing. Restart the front door, then probe it:")
+    say_group(FRONT_RESTART, conf)
+    say_group(PROBES_OFF if remove else PROBES_ON, conf)
+    return EX_OK
 
 
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+WRITING_COMMANDS = ("merge", "env-names", "front-door")
+# The flags each command takes. Anything else is a usage error, so `merge --remove` cannot
+# be read as a command that removed something.
+_FLAGS = {"compose": (), "verify": (), "card": (), "merge": ("apply",),
+          "env-names": ("remove",), "front-door": ("apply", "remove")}
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pipeline_chat_lane_setup.py",
-        description="Compose the dispatcher's built-in Slack lane for a person to apply, "
-                    "and verify it read-only.")
-    p.add_argument("command", nargs="?", choices=["compose", "verify", "card"])
+        description="Compose the dispatcher's built-in Slack lane, apply the pieces a "
+                    "person asks it to, and verify it read-only.")
+    p.add_argument("command", nargs="?", choices=["compose", "verify", "card"]
+                   + list(WRITING_COMMANDS))
     p.add_argument("target", nargs="?", help="a CK-id for `card`")
     p.add_argument("--conf", default="chat-lane.conf")
+    p.add_argument("--piece", type=int, help="compose: print one piece (1 to 7) alone")
+    p.add_argument("--apply", action="store_true",
+                   help="merge, front-door: write (the default is a dry run)")
+    p.add_argument("--remove", action="store_true",
+                   help="env-names, front-door: take the chat lane's names, or path, out")
     p.add_argument("--selftest", action="store_true")
     return p
 
@@ -1957,11 +3333,16 @@ def main(argv=None, runner=None, sudo=None):
     if not args.command:
         build_parser().print_usage()
         return EX_USAGE
+    wrong = [f for f in ("apply", "remove") if getattr(args, f)
+             and f not in _FLAGS[args.command]]
+    if wrong:
+        say("`%s` takes no --%s. Nothing was attempted." % (args.command, wrong[0]))
+        return EX_USAGE
     # BEFORE the conf is read: a refusal that happens after the first read already ran.
-    if args.command == "verify":
+    if args.command == "verify" or args.command in WRITING_COMMANDS:
         found = agent_env_markers_present()
         if found:
-            say(refusal_text(found))
+            say(refusal_text(found, args.command))
             return EX_REFUSED
     if args.command == "card":
         conf, errors = load_conf(args.conf)
@@ -1977,16 +3358,29 @@ def main(argv=None, runner=None, sudo=None):
             say("  - " + e)
         return EX_USAGE
     if args.command == "compose":
-        return cmd_compose(conf, args.conf)
+        if args.piece is not None and args.piece not in COMPOSE_PIECES:
+            say("no such piece: %d (have 1 to %d)" % (args.piece, max(COMPOSE_PIECES)))
+            return EX_USAGE
+        return cmd_compose(conf, args.conf, args.piece)
+    runner = runner or Runner(dry_run=True)
+    sudo = sudo or SudoSession()
+    resume = _resume(args.command, args.apply, args.remove)
     try:
-        return cmd_verify(conf, runner or Runner(dry_run=True), sudo or SudoSession())
+        if args.command == "verify":
+            return cmd_verify(conf, runner, sudo)
+        if args.command == "merge":
+            return cmd_merge(conf, runner, sudo, args.apply)
+        if args.command == "env-names":
+            return cmd_env_names(conf, runner, sudo, args.remove,
+                                 sys.stdin.isatty() and sys.stdout.isatty())
+        return cmd_front_door(conf, runner, sudo, args.apply, args.remove)
     except NoPrivilege as exc:
         # The text comes from the Stage E installer's SudoSession, so its "run the same
         # command again" line names THAT script and drops the --conf this run was given.
-        # Following it would run a different installer's verify and leave the chat lane
-        # unmeasured (review of PR #147, finding 8).
-        mine = "python3 %s verify --conf %s" % (_self_path(), args.conf)
-        say(str(exc).replace("python3 %s verify" % _stage_e_self_path(), mine))
+        # Following it would run a different installer's command and leave the chat lane
+        # untouched (review of PR #147, finding 8).
+        mine = "python3 %s %s --conf %s" % (_self_path(), resume, args.conf)
+        say(str(exc).replace("python3 %s %s" % (_stage_e_self_path(), resume), mine))
         say("")
         say("The command to run again is this one:  %s" % mine)
         return EX_NOPRIV
@@ -2096,11 +3490,20 @@ def _put(path, text):
         fh.write(text)
 
 
-GOOD_CONF_TEXT = """
+MINIMAL_CONF_TEXT = """
 ROLE_ACCOUNT=_exdispatch
 DISPATCHER_CONFIG=/opt/example-dispatcher/config.json
 DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env
 FRONT_DOOR_HOST=chat.example.com
+"""
+
+# The four required keys, and the five optional ones the printed commands and the
+# front-door subcommand need (KIT-197). ROLE_ENV_FILE keeps its default.
+GOOD_CONF_TEXT = MINIMAL_CONF_TEXT + """DISPATCHER_SERVICE=com.example.dispatcher
+FRONT_DOOR_SERVICE=com.example.front-door
+FRONT_DOOR_CONFIG=/opt/example-dispatcher/Caddyfile
+FRONT_DOOR_BIN=/opt/homebrew/bin/caddy
+FRONT_DOOR_MATCHER=@dispatcher
 """
 
 # The repository paths the fake dispatcher config serves, and therefore the paths the
@@ -2373,7 +3776,11 @@ def _selftest_body():
         drifted["permissions"]["deny"] = drifted["permissions"]["deny"][1:-1]
         expect("deny-drift-removed-red", repo_deny_drift(drifted) != [])
     anchored_all = user_deny_patterns(conf)
-    expect("deny-anchored", all(p.startswith("Read(//") for p in anchored_all), anchored_all)
+    # Every rule is anchored at the root, or at the role account's own home (`~/`), which a
+    # rule written from there matches wherever the session stands (KIT-197).
+    expect("deny-anchored", all(p.startswith("Read(//") or p.startswith("Read(~/")
+                                for p in anchored_all)
+           and all(anchored(p) in anchored_all for p in REPO_DENY_PATTERNS), anchored_all)
     expect("deny-anchor-shape", anchored("Read(**/id_rsa)") == "Read(//**/id_rsa)"
            and anchored("Read(.env)") == "Read(//**/.env)", anchored("Read(**/id_rsa)"))
     expect("deny-conf-files", "Read(//opt/example-dispatcher/config.json)" in anchored_all
@@ -2445,7 +3852,10 @@ def _selftest_body():
         home = os.path.join(tmp, "home")
         cfg_path = os.path.join(tmp, "dispatcher", "config.json")
         env_path = os.path.join(tmp, "dispatcher", ".env")
-        vconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path)
+        front_path = os.path.join(tmp, "front", "Caddyfile")
+        vconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
+                     FRONT_DOOR_CONFIG=front_path)
+        _put(front_path, FRONT_DOOR_FIXTURE.replace("/extra-path", "/slack-webhook"))
         review_brief = REVIEW_BRIEF_FINGERPRINT + ". More."
         planning_brief = PLANNING_BRIEF_FINGERPRINT + ". More."
 
@@ -2489,7 +3899,8 @@ def _selftest_body():
             else:
                 _put(spath, settings_text)
             ran = subprocess.run([sys.executable, "-c", FACTS_PY, cfg_path, env_path,
-                                  vconf["DISPATCHER_PORT"]],
+                                  vconf["DISPATCHER_PORT"], front_path,
+                                  vconf.get("FRONT_DOOR_MATCHER") or "@dispatcher"],
                                  capture_output=True, text=True,
                                  env=dict(os.environ, HOME=home))
             # EVERY probe's whole output is kept for the no-value scan at the end.
@@ -3017,10 +4428,11 @@ def _selftest_body():
     flat_c2 = " ".join(c2.split())
     expect("card-c2-filled", "https://chat.example.com/slack-webhook" in c2)
     # CK-C2 must test a route that must ALWAYS be refused, not /status, which a front door
-    # may forward on purpose (review of PR #147, finding 3).
+    # may forward on purpose (review of PR #147, finding 3). Since KIT-197 the card names
+    # the door's own 404 as the expected answer, and a 401 as the failure.
     expect("card-c2-checks-a-never-route",
            "/api/update/cyrus-config" in flat_c2
-           and "Good: anything but 401" in flat_c2
+           and "Good: 404" in flat_c2 and "Not that: 401 on this last one" in flat_c2
            and "may forward one on purpose" in flat_c2, c2)
     expect("card-c2-no-status-assumption",
            "curl -s -m 5 https://chat.example.com/status" not in flat_c2,
@@ -3032,8 +4444,29 @@ def _selftest_body():
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
         src = fh.read()
     above = src.split(SELFTEST_SENTINEL, 1)[0]
-    above_scan = "\n".join(l for l in above.splitlines() if _BANNED_MARK not in l)
+    # The owner's decision of 2026-09-24 (KIT-197): three writer PROGRAMS, run as the role
+    # account, through ONE seam. Exactly their text, and the seam's, is exempt from the
+    # write scan; every other line above the sentinel is still scanned. A program that is
+    # not found verbatim (a post-processed string, say) exempts nothing and is reported.
+    exempt = above
+    for n, prog in enumerate(WRITER_PROGRAMS):
+        expect("writer-program-verbatim-in-source:%d" % n, prog in exempt)
+        exempt = exempt.replace(prog, "")
+    seam = inspect.getsource(_role_write)
+    expect("write-seam-verbatim-in-source", seam in exempt and "why=" in seam)
+    exempt = exempt.replace(seam, "")
+    above_scan = "\n".join(l for l in exempt.splitlines() if _BANNED_MARK not in l)
     whole_scan = "\n".join(l for l in src.splitlines() if _BANNED_MARK not in l)
+    # …and the seam is reached from the three writing subcommands and from nowhere else:
+    # once from merge and front-door, twice from env-names (its set and its --remove).
+    callers = {fn.__name__: inspect.getsource(fn).count("_role_write(")
+               for fn in (cmd_merge, cmd_env_names, cmd_front_door)}
+    expect("write-seam-callers", above_scan.count("_role_write(") == 4
+           and callers == {"cmd_merge": 1, "cmd_env_names": 2, "cmd_front_door": 1},
+           (above_scan.count("_role_write("), callers))
+    expect("write-seam-callers-refuse-agents", all(
+        "agent_env_markers_present()" in inspect.getsource(fn)
+        for fn in (cmd_merge, cmd_env_names, cmd_front_door)))
     for tok in WRITE_TOKENS:
         expect("no-write-token:" + tok, tok not in above_scan,
                "the non-test source holds %r" % tok)
@@ -3045,6 +4478,9 @@ def _selftest_body():
     injected = whole_scan + "\n    run(['gh', '" + FORBIDDEN_TOKENS[0] + "'])\n"
     expect("forbidden-scan-mutant", any(tok in injected for tok in FORBIDDEN_TOKENS))
     expect("sentinel-present", SELFTEST_SENTINEL in src and len(above) < len(src))
+
+    # -- KIT-197: the owner-run writers, the printed commands, the front-door row -----
+    _selftest_kit197(expect, conf)
 
     if failures:
         for f in failures:
@@ -3060,6 +4496,1045 @@ def _capture_verify_fail(vconf):
     fake = _FakeRunner([], default=(1, "", "sudo: a password is required"))
     rc_v, printed = _capture(cmd_verify, vconf, fake, _FakeSudo())
     return rc_v, printed, fake, None
+
+
+# --------------------------------------------------------------------------- #
+# KIT-197 — the three owner-run writers, the printed commands, the front-door row.
+#
+# Every writer here is RUN, not matched: `_RoleMachine` hands `sudo -u <role> -H /bin/sh -c`
+# to a real /bin/sh with HOME set to a temporary role home, so the program a person's machine
+# runs is the program this battery runs. Only pf and `sudo` itself are stood in for.
+# --------------------------------------------------------------------------- #
+# Obviously fake, assembled at run time: no literal of a credential's shape in the source.
+FAKE_BOT_TOKEN = "xoxb-" + "FAKE" * 12
+FAKE_SIGNING_SECRET = "deadbeef" * 4
+FAKE_NOTIFIER_TOKEN = "xoxb-" + "NOTIFIERFAKE" * 4
+
+FRONT_DOOR_FIXTURE = (
+    "chat.example.com {\n"
+    "\t@dispatcher path /linear-webhook /callback /status /extra-path\n"
+    "\thandle @dispatcher {\n"
+    "\t\treverse_proxy 127.0.0.1:3456\n"
+    "\t}\n"
+    "\trespond 404\n"
+    "}\n")
+
+# A stand-in for the front door's binary: logs its arguments, and fails validation while a
+# flag file exists.
+FAKE_PROXY_BIN = """#!/bin/sh
+echo "$*" >> '%(log)s'
+if [ -e '%(flag)s' ]; then echo "Error: adapting config: unrecognized directive"; exit 1; fi
+echo "Valid configuration"
+exit 0
+"""
+
+# launchd, curl and sleep, for running the PRINTED restart commands for real. `print` keeps
+# answering "loaded" for SHIM_LINGER polls after a bootout, as launchd does for a job still
+# inside its exit timeout, and a bootstrap into a domain that still holds the job fails with
+# the errno 5 the Stage E installer met in production.
+SUDO_SHIM = """#!/bin/sh
+echo "sudo $*" >> "$SHIM_LOG"
+[ "$1" = launchctl ] || exit 0
+case "$2" in
+print)
+    [ -e "$SHIM_STATE/loaded" ] || exit 113
+    if [ -e "$SHIM_STATE/linger" ]; then
+        n=$(cat "$SHIM_STATE/linger")
+        if [ "$n" -le 0 ]; then rm -f "$SHIM_STATE/loaded" "$SHIM_STATE/linger"; exit 113; fi
+        echo $((n - 1)) > "$SHIM_STATE/linger"
+    fi
+    exit 0;;
+bootout)
+    [ -e "$SHIM_STATE/loaded" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
+    echo "$SHIM_LINGER" > "$SHIM_STATE/linger"
+    exit 0;;
+bootstrap)
+    if [ -e "$SHIM_STATE/loaded" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
+    : > "$SHIM_STATE/loaded"
+    echo "bootstrapped" >> "$SHIM_LOG"
+    exit 0;;
+esac
+exit 0
+"""
+CURL_SHIM = """#!/bin/sh
+echo "curl $*" >> "$SHIM_LOG"
+[ "$SHIM_CURL" = down ] && exit 7
+printf '{"status":"%s"}' "$SHIM_CURL"
+"""
+SLEEP_SHIM = """#!/bin/sh
+echo "sleep $*" >> "$SHIM_LOG"
+"""
+
+
+def _read(path):
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+def _shims(tmp, curl_says="idle", loaded=True, linger=2):
+    bindir = os.path.join(tmp, "shim-bin")
+    state = os.path.join(tmp, "shim-state-%d" % len(os.listdir(tmp)))
+    log = os.path.join(state, "calls.log")
+    os.makedirs(bindir, exist_ok=True)
+    os.makedirs(state)
+    if loaded:
+        _put(os.path.join(state, "loaded"), "")
+    _put(log, "")
+    for name, body in (("sudo", SUDO_SHIM), ("curl", CURL_SHIM), ("sleep", SLEEP_SHIM)):
+        path = os.path.join(bindir, name)
+        _put(path, body)
+        os.chmod(path, 0o755)
+    env = {"PATH": bindir + ":/usr/bin:/bin", "SHIM_LOG": log, "SHIM_STATE": state,
+           "SHIM_LINGER": str(linger), "SHIM_CURL": curl_says, "HOME": tmp}
+    return env, log
+
+
+def _run_shell(script, env):
+    return subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True,
+                          timeout=60)
+
+
+def _shell_block(text, first, last):
+    """The printed lines from the one that starts `first` to the one that starts `last`,
+    inclusive, with the card's indentation taken off."""
+    lines = [l.strip() for l in text.splitlines()]
+    try:
+        i = next(n for n, l in enumerate(lines) if l.startswith(first))
+        j = next(n for n, l in enumerate(lines) if n > i and l.startswith(last))
+    except StopIteration:
+        return ""
+    return "\n".join(lines[i:j + 1]) + "\n"
+
+
+class _RoleMachine(_FakeRunner):
+    """`sudo -u <role> -H /bin/sh -c <script>` runs through a REAL /bin/sh as this user, with
+    HOME a temporary role home and /usr/bin/python3 swapped for this interpreter. pf's reads
+    answer from the table. `before_write` runs just before each write reaches the machine:
+    the moment the dispatcher might rewrite its own config."""
+
+    def __init__(self, home, answers=(), before_write=None):
+        _FakeRunner.__init__(self, answers)
+        self.home = home
+        self.before_write = before_write
+        self.role_runs = []
+
+    def write(self, why, argv, stdin=None, timeout=300, secret_stdin=False, cwd=None):
+        if self.before_write is not None:
+            self.before_write()
+        return _FakeRunner.write(self, why, argv, stdin, timeout, secret_stdin, cwd)
+
+    def _exec(self, argv, stdin, timeout, cwd=None, **kwargs):
+        from pipeline_stage_e_setup import Result
+        argv = list(argv)
+        if argv[:2] == ["sudo", "-u"] and argv[3:6] == ["-H", "/bin/sh", "-c"] and len(argv) == 7:
+            self.argvs.append(argv)
+            script = argv[6].replace("/usr/bin/python3", shlex.quote(sys.executable))
+            p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True,
+                               text=True, timeout=timeout,
+                               env={"HOME": self.home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
+            self.role_runs.append({"rc": p.returncode, "out": p.stdout, "err": p.stderr})
+            return Result(p.returncode, p.stdout, p.stderr)
+        return _FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd, **kwargs)
+
+
+def _merge_fixture(review_fenced=True, first_mcp=False):
+    review_brief = REVIEW_BRIEF_FINGERPRINT + ". More."
+    planning_brief = PLANNING_BRIEF_FINGERPRINT + ". More."
+    first = {"id": "coding-a", "name": "a", "repositoryPath": REPO_ONE,
+             "allowedTools": ["Read"] + (["mcp__github"] if first_mcp else []),
+             "disallowedTools": ["Edit"],
+             "labelPrompts": {"debugger": {"labels": ["Bug"], "disallowedTools": ["Write"]}}}
+    return {
+        "linearWorkspaces": {"ws": {"linearToken": SENTINELS[3]}},
+        "defaultDisallowedTools": ["Bash(rm -rf *)"],
+        "repositories": [
+            first,
+            {"id": "coding-b", "name": "b", "repositoryPath": REPO_TWO},
+            {"id": "reviews-a", "name": "reviews-a", "appendInstruction": review_brief,
+             "disallowedTools": ["Bash"] + (list(SLACK_FENCE_RULES) if review_fenced else [])},
+            {"name": "stage-a-planning-plan", "appendInstruction": planning_brief,
+             "disallowedTools": ["Edit"]},
+        ],
+        "promptDefaults": {"scoper": {"disallowedTools": ["Write"]}},
+    }
+
+
+def _selftest_kit197(expect, conf):
+    """The owner-run writers (merge, env-names, front-door), the printed commands filled from
+    the conf, and verify's front-door row. Each group records a crash as a failed case rather
+    than stopping the battery, so a missing piece is counted, not hidden."""
+    def group(name, fn):
+        try:
+            fn()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
+            expect("crashed:" + name, False, "%s: %s" % (type(exc).__name__, str(exc)[:400]))
+
+    minimal = validate_conf(parse_conf(MINIMAL_CONF_TEXT)[0])[0]
+
+    # -- the conf: six new keys, each validated, all optional -------------------------
+    def conf_keys():
+        values, perrs = parse_conf(GOOD_CONF_TEXT)
+        full, verrs = validate_conf(values)
+        expect("conf-new-keys-accepted", not perrs and not verrs
+               and full.get("DISPATCHER_SERVICE") == "com.example.dispatcher"
+               and full.get("FRONT_DOOR_MATCHER") == "@dispatcher"
+               and full.get("FRONT_DOOR_BIN") == "/opt/homebrew/bin/caddy", perrs + verrs)
+        expect("conf-role-env-file-default", full.get("ROLE_ENV_FILE") == "~/.stage-e/env",
+               full.get("ROLE_ENV_FILE"))
+        _m, merrs = validate_conf(parse_conf(MINIMAL_CONF_TEXT)[0])
+        expect("conf-new-keys-optional", not merrs and not _m.get("FRONT_DOOR_CONFIG"), merrs)
+        bad = ("DISPATCHER_SERVICE=not a label\n"
+               "FRONT_DOOR_SERVICE=frontdoor\n"
+               "FRONT_DOOR_CONFIG=relative/Caddyfile\n"
+               "FRONT_DOOR_BIN=caddy\n"
+               "FRONT_DOOR_MATCHER=dispatcher\n"
+               "ROLE_ENV_FILE=.stage-e/env\n")
+        values, perrs = parse_conf(MINIMAL_CONF_TEXT + bad)
+        allerrs = perrs + validate_conf(values)[1]
+        for needle in ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE",
+                       "FRONT_DOOR_CONFIG must be an absolute path",
+                       "FRONT_DOOR_BIN must be an absolute path", "FRONT_DOOR_MATCHER",
+                       "ROLE_ENV_FILE"):
+            expect("conf-new-key-error:" + needle, any(needle in e for e in allerrs), allerrs)
+        values, _p = parse_conf(MINIMAL_CONF_TEXT + "DISPATCHER_SERVICE=com.example.same\n"
+                                "FRONT_DOOR_SERVICE=com.example.same\n")
+        errs = validate_conf(values)[1]
+        expect("conf-two-services-differ", any("the same service" in e for e in errs), errs)
+    group("conf", conf_keys)
+
+    # -- piece 5: the backups folder and the role account's own env file are denied too ----
+    def deny_rules():
+        rules = user_deny_patterns(conf)
+        expect("deny-backups-rule", "Read(~/.stage-e/backups/**)" in rules, rules)
+        expect("deny-role-env-rule-default", "Read(~/.stage-e/env)" in rules, rules)
+        other = user_deny_patterns(dict(conf, ROLE_ENV_FILE="/srv/role/env"))
+        expect("deny-role-env-rule-absolute", "Read(//srv/role/env)" in other
+               and "Read(~/.stage-e/env)" not in other, other)
+        us = {"path": "/h/.claude/settings.json",
+              "deny": [r for r in rules if r != "Read(~/.stage-e/backups/**)"]}
+        row = check_user_settings(conf, us, {"names": []})
+        expect("verify-user-settings-wants-backups-rule", row["outcome"] == BLOCKED
+               and "Read(~/.stage-e/backups/**)" in _row_text(row), row)
+    group("deny", deny_rules)
+
+    # -- compose --piece N, and piece 4 as a script alone ------------------------------
+    def pieces():
+        with tempfile.TemporaryDirectory() as tmp:
+            cpath = os.path.join(tmp, "chat-lane.conf")
+            _put(cpath, GOOD_CONF_TEXT)
+            for n in range(1, 8):
+                rc, out = _capture(main, ["compose", "--piece", str(n), "--conf", cpath])
+                others = [m for m in range(1, 8) if m != n and ("PIECE %d " % m) in out]
+                if n == 4:
+                    expect("compose-piece-4-is-only-the-script",
+                           rc == EX_OK and out == "\n".join(pf_install_commands("3456")) + "\n"
+                           and PF_COPY_START not in out, out[:200])
+                else:
+                    expect("compose-piece-%d-alone" % n,
+                           rc == EX_OK and ("PIECE %d " % n) in out and not others
+                           and "THE ORDER" not in out, (rc, others, out[:120]))
+            rc, _o = _capture(main, ["compose", "--piece", "9", "--conf", cpath])
+            expect("compose-piece-out-of-range", rc == EX_USAGE, rc)
+            rc, out4 = _capture(main, ["compose", "--piece", "4", "--conf", cpath])
+            check = subprocess.run(["/bin/bash", "-n"], input=out4, capture_output=True,
+                                   text=True, timeout=10)
+            expect("compose-piece-4-parses-as-shell", rc == EX_OK and check.returncode == 0,
+                   check.stderr[-200:])
+    group("pieces", pieces)
+
+    # -- piece 4 is re-runnable: a loaded job is booted out and waited for -------------
+    def pf_rerun():
+        launchd = "\n".join(l for l in pf_install_commands("3456") if "launchctl" in l) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            for loaded in (True, False):
+                env, log = _shims(tmp, loaded=loaded, linger=2)
+                ran = _run_shell(launchd, env)
+                calls = _read(log)
+                label = "loaded" if loaded else "not-loaded"
+                booted_out = "launchctl bootout system/%s" % PF_DAEMON_LABEL in calls
+                expect("pf-rerun-%s-bootstraps" % label, "bootstrapped" in calls
+                       and "Bootstrap failed" not in ran.stderr, (calls, ran.stderr[-200:]))
+                expect("pf-rerun-%s-bootout" % label, booted_out == loaded, calls)
+                if loaded:
+                    expect("pf-rerun-waits-until-gone",
+                           calls.find("launchctl bootout") < calls.rfind("launchctl print")
+                           < calls.find("bootstrapped"), calls)
+    group("pf-rerun", pf_rerun)
+
+    # -- CK-C5: restart the dispatcher only when it says it is idle -------------------
+    def card_c5():
+        rc, out = _capture(print_card, "CK-C5", conf)
+        flat = " ".join(out.split())
+        expect("card-c5-exists", rc == EX_OK and "WHY THIS IS YOURS" in out and "${" not in out,
+               out[:200])
+        expect("card-c5-cites-the-idle-answer", "EdgeWorker.js:1784-1802" in flat, flat[:300])
+        expect("card-c5-log-path-from-the-plist",
+               "/usr/libexec/PlistBuddy -c 'Print :StandardOutPath' "
+               "/Library/LaunchDaemons/com.example.dispatcher.plist" in out, out)
+        block = _shell_block(out, "if curl", "fi")
+        expect("card-c5-gate-block-found", "127.0.0.1:3456/status" in block
+               and "grep -q '\"idle\"'" in block, block)
+        with tempfile.TemporaryDirectory() as tmp:
+            for says in ("idle", "busy", "down"):
+                env, log = _shims(tmp, curl_says=says, loaded=True, linger=2)
+                ran = _run_shell(block, env)
+                calls = _read(log)
+                if says == "idle":
+                    expect("card-c5-idle-restarts",
+                           "launchctl bootout system/com.example.dispatcher" in calls
+                           and "bootstrapped" in calls and "Bootstrap failed" not in ran.stderr
+                           and calls.find("launchctl bootout") < calls.rfind("launchctl print")
+                           < calls.find("bootstrapped"), (calls, ran.stderr[-200:]))
+                else:
+                    expect("card-c5-%s-does-not-restart" % says,
+                           "launchctl bootout" not in calls and "bootstrapped" not in calls
+                           and "NOT RESTARTED" in ran.stdout, (calls, ran.stdout))
+        rc, out_min = _capture(print_card, "CK-C5", minimal)
+        expect("card-c5-not-composed-without-the-key",
+               "not composed: set DISPATCHER_SERVICE in chat-lane.conf" in out_min
+               and "launchctl bootout" not in out_min and "${" not in out_min, out_min)
+    group("card-c5", card_c5)
+
+    # -- CK-C2: the subcommand, the front door's restart, three probes ----------------
+    def card_c2():
+        rc, out = _capture(print_card, "CK-C2", conf)
+        flat = " ".join(out.split())
+        for needle in ("front-door --apply",
+                       "sudo launchctl bootout system/com.example.front-door",
+                       "sudo launchctl bootstrap system "
+                       "/Library/LaunchDaemons/com.example.front-door.plist",
+                       "curl -sS -m 10", "https://chat.example.com/slack-webhook",
+                       "https://chat.example.com/linear-webhook",
+                       "https://chat.example.com/api/update/cyrus-config",
+                       "Good: 401", "Good: 404", "530", "502"):
+            expect("card-c2-has:" + needle, needle in flat, needle)
+        block = _shell_block(out, "sudo launchctl bootout", "sudo launchctl bootstrap")
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = _shims(tmp, loaded=True, linger=3)
+            ran = _run_shell(block, env)
+            calls = _read(log)
+            expect("card-c2-restart-waits", "bootstrapped" in calls
+                   and "Bootstrap failed" not in ran.stderr, (block, calls))
+        rc, out_min = _capture(print_card, "CK-C2", minimal)
+        expect("card-c2-not-composed-without-the-keys",
+               "not composed: set FRONT_DOOR_SERVICE in chat-lane.conf" in out_min
+               and "launchctl bootout" not in out_min and "${" not in out_min
+               and "https://chat.example.com/slack-webhook" in out_min, out_min)
+    group("card-c2", card_c2)
+
+    # -- CK-C6: turning the lane off, in order ----------------------------------------
+    def card_c6():
+        rc, out = _capture(print_card, "CK-C6", conf)
+        flat = " ".join(out.split())
+        steps = ("Uninstall", "env-names --remove", "if curl", "front-door --remove --apply",
+                 "bootout system/com.example.front-door", "/slack-webhook",
+                 "pfctl -a %s -s rules" % PF_ANCHOR)
+        at = [flat.find(s) for s in steps]
+        expect("card-c6-in-order", rc == EX_OK and all(a >= 0 for a in at) and at == sorted(at),
+               list(zip(steps, at)))
+        expect("card-c6-keeps-the-fences", "Keep the fences, the grant and the port block"
+               in flat, flat[-600:])
+        expect("card-c6-probes-say-404-then-401", "Good: 404" in flat and "Good: 401" in flat)
+    group("card-c6", card_c6)
+
+    # -- CK-C1 leaves the secrets in Slack; CK-C3 tests calls, not the listing ---------
+    def cards_c1_c3():
+        _rc, c1 = _capture(print_card, "CK-C1", conf)
+        flat1 = " ".join(c1.split())
+        expect("card-c1-no-env-edit-at-creation", "SLACK_BOT_TOKEN <-" not in flat1
+               and "env-names" in flat1 and "stay in Slack" in flat1, flat1)
+        _rc, c3 = _capture(print_card, "CK-C3", conf)
+        flat3 = " ".join(c3.split())
+        for needle in ("KIT-196", "Monitor", "Write", "touch", "RAN", "refused",
+                       "log_failure_mode", "CYRUS_API_KEY", "echo"):
+            expect("card-c3-says:" + needle, needle in flat3, needle)
+        expect("card-c3-tests-calls-not-the-listing",
+               "list the name of every tool" not in flat3, flat3[:300])
+        do3 = "\n".join(CARDS["CK-C3"]["do"])
+        expect("card-c3-reads-no-credential-file",
+               not re.search(r"\.stage-e/env|DISPATCHER_ENV_FILE|DISPATCHER_CONFIG|\.env\b"
+                             r"|config\.json", do3), do3)
+        for cid, card in CARDS.items():
+            refs = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)\}", json.dumps(card["do"])))
+            expect("card-keys-known:" + cid, refs <= CONF_KEYS, refs - CONF_KEYS)
+    group("cards-c1-c3", cards_c1_c3)
+
+    # -- THE ORDER uses the subcommands ----------------------------------------------
+    def order():
+        _rc, out = _capture(cmd_compose, conf)
+        tail = " ".join(out[out.find("THE ORDER"):].split())
+        for needle in ("merge --apply", "compose --piece 4", "env-names", "card CK-C5",
+                       "front-door --apply", "card CK-C6"):
+            expect("order-uses:" + needle, needle in tail, needle)
+        at = [tail.find(s) for s in ("merge --apply", "compose --piece 4", "env-names",
+                                     "card CK-C5")]
+        expect("order-merge-pf-env-restart", all(a >= 0 for a in at) and at == sorted(at), at)
+    group("order", order)
+
+    # -- the allowlist line: one function edits it, byte for byte ---------------------
+    def front_lines():
+        m = "@dispatcher"
+        for text, remove, want in (
+                ("\t@dispatcher path /linear-webhook /status", False,
+                 "\t@dispatcher path /linear-webhook /status /slack-webhook"),
+                ("  @dispatcher path /a /b  # keep this", False,
+                 "  @dispatcher path /a /b /slack-webhook  # keep this"),
+                ("@dispatcher path /a /slack-webhook", False, "@dispatcher path /a /slack-webhook"),
+                ("@dispatcher path /a /slack-webhook /b", True, "@dispatcher path /a /b"),
+                ("@dispatcher path /slack-webhook /a", True, "@dispatcher path /a"),
+                ("@dispatcher path /a /slack-webhook-old", True,
+                 "@dispatcher path /a /slack-webhook-old")):
+            got = front_line_edit(text, m, SLACK_PATH, remove)
+            expect("front-line-edit:%r" % text[:40] + (":remove" if remove else ""), got == want,
+                   got)
+        expect("front-line-remove-last-path-refused",
+               front_line_edit("@dispatcher path /slack-webhook", m, SLACK_PATH, True) is None)
+        expect("front-line-only-the-named-matcher",
+               front_line_parts("@other path /a", m) is None
+               and front_line_parts("@dispatcher path_regexp x", m) is None
+               and front_line_parts("# @dispatcher path /a", m) is None
+               and front_line_parts("@dispatcherx path /a", m) is None)
+        parts = front_line_parts("  @dispatcher path /a /b  # c", m)
+        expect("front-line-parts-rejoin", parts and "".join(parts) == "  @dispatcher path /a /b  # c"
+               and parts[1].split() == ["/a", "/b"], parts)
+        expect("front-routes-cited", set(EXPECTED_ROUTES) == {"/linear-webhook", "/callback",
+                                                              "/status", "/slack-webhook"}
+               and all(".js:" in v for v in EXPECTED_ROUTES.values()), EXPECTED_ROUTES)
+    group("front-lines", front_lines)
+
+    # -- verify's front-door row ------------------------------------------------------
+    def verify_row():
+        row = check_front_door(minimal, None)
+        expect("verify-front-door-unset-keys", row["outcome"] == UNKNOWN
+               and "NOT MEASURED" in row["detail"] and "FRONT_DOOR_CONFIG" in row["detail"]
+               and "FRONT_DOOR_MATCHER" in row["detail"], row)
+        good = {"count": 1, "line": 2, "sha256": "0" * 64,
+                "text": "@dispatcher path /linear-webhook /slack-webhook",
+                "paths": ["/linear-webhook", "/callback", "/status", "/slack-webhook"]}
+        row = check_front_door(conf, good)
+        expect("verify-front-door-done", row["outcome"] == ALREADY_DONE, row)
+        row = check_front_door(conf, dict(good, paths=good["paths"] + ["/extra-path"]))
+        expect("verify-front-door-names-an-unknown-path", row["outcome"] == ALREADY_DONE
+               and "/extra-path" in _row_text(row), row)
+        row = check_front_door(conf, dict(good, paths=["/linear-webhook", "/status"]))
+        expect("verify-front-door-slack-missing", row["outcome"] == BLOCKED
+               and "/slack-webhook" in _row_text(row), row)
+        row = check_front_door(conf, dict(good, paths=["/slack-webhook"]))
+        expect("verify-front-door-tracker-missing", row["outcome"] == BLOCKED
+               and "/linear-webhook" in _row_text(row), row)
+        for n in (0, 2):
+            row = check_front_door(conf, {"count": n, "sha256": "0" * 64})
+            expect("verify-front-door-%d-lines" % n, row["outcome"] == BLOCKED
+                   and str(n) in row["detail"], row)
+        expect("verify-front-door-missing-file",
+               check_front_door(conf, {"error": "missing"})["outcome"] == BLOCKED)
+        expect("verify-front-door-unreadable",
+               check_front_door(conf, {"error": "unreadable"})["outcome"] == UNKNOWN)
+        expect("verify-checks-include-front-door", "front-door" in CHECKS, CHECKS)
+    group("verify-row", verify_row)
+
+    # -- merge: the plan, through the REAL probe, and the REAL writer -----------------
+    def merge_real():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            mconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
+                         FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"))
+            fixture = _merge_fixture(review_fenced=True)
+            before = json.dumps(fixture, indent=2) + "\n"
+            _put(cfg_path, before)
+            _put(env_path, "CYRUS_HOST_EXTERNAL=true\n")
+            spath = os.path.join(home, ".claude", "settings.json")
+            old_settings = json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
+                                       "permissions": {"deny": ["Read(~/.ssh/**)"]}},
+                                      indent=4) + "\n"
+            _put(spath, old_settings)
+            inode = os.stat(cfg_path).st_ino
+
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, mconf, mach, _FakeSudo(), False)
+            expect("merge-dry-run-exit-10", rc == EX_BLOCKED, (rc, out[-400:]))
+            expect("merge-dry-run-writes-nothing", mach.writes == []
+                   and _read(cfg_path) == before and _read(spath) == old_settings)
+            for needle in ("coding-a", "coding-b", "stage-a-planning-plan", "slackAllowedTools",
+                           "debugger", "scoper", "Read(~/.stage-e/backups/**)"):
+                expect("merge-dry-run-names:" + needle, needle in out, needle)
+            expect("merge-dry-run-no-value", SENTINELS[3] not in out)
+
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, mconf, mach, _FakeSudo(), True)
+            after = json.loads(_read(cfg_path))
+            repos = after.get("repositories") or [{}, {}, {}, {}]
+            expect("merge-apply-exit-0", rc == EX_OK, out[-800:])
+            expect("merge-apply-in-place", os.stat(cfg_path).st_ino == inode)
+            expect("merge-apply-fences-coding", repos[0].get("disallowedTools")
+                   == ["Edit", "mcp__slack", "mcp__slack__*"], repos[0])
+            expect("merge-apply-keeps-inherited-default", repos[1].get("disallowedTools")
+                   == ["Bash(rm -rf *)", "mcp__slack", "mcp__slack__*"], repos[1])
+            expect("merge-apply-review-entry-untouched", repos[2] == fixture["repositories"][2],
+                   repos[2])
+            expect("merge-apply-fences-planning", repos[3].get("disallowedTools")
+                   == ["Edit", "mcp__slack", "mcp__slack__*"], repos[3])
+            expect("merge-apply-prompt-types",
+                   repos[0].get("labelPrompts", {}).get("debugger", {}).get("disallowedTools")
+                   == ["Write", "mcp__slack", "mcp__slack__*"]
+                   and after.get("promptDefaults", {}).get("scoper", {}).get("disallowedTools")
+                   == ["Write", "mcp__slack", "mcp__slack__*"], after.get("promptDefaults"))
+            expect("merge-apply-grant-is-verifys",
+                   after.get("slackAllowedTools") == owner_grant([REPO_ONE, REPO_TWO]),
+                   after.get("slackAllowedTools"))
+            expect("merge-apply-keeps-the-token", after.get("linearWorkspaces")
+                   == fixture["linearWorkspaces"])
+            text = _read(cfg_path)
+            expect("merge-apply-indent-and-newline", text.endswith("}\n")
+                   and text.splitlines()[1].startswith('  "')
+                   and not text.splitlines()[1].startswith('   '), text[:80])
+            settings = json.loads(_read(spath))
+            deny = settings.get("permissions", {}).get("deny", [])
+            expect("merge-apply-settings-merged", settings.get("env") == {"SECRET_THING":
+                                                                           SENTINELS[3]}
+                   and deny[:1] == ["Read(~/.ssh/**)"]
+                   and all(r in deny for r in user_deny_patterns(mconf)), deny)
+            expect("merge-apply-settings-keeps-indent",
+                   _read(spath).splitlines()[1].startswith('    "'), _read(spath)[:60])
+            expect("merge-apply-settings-mode-600", _mode(spath) == 0o600, oct(_mode(spath)))
+            bdir = os.path.join(home, ".stage-e", "backups")
+            bks = [b for b in (os.listdir(bdir) if os.path.isdir(bdir) else [])
+                   if b.startswith("user-settings.json.")]
+            expect("merge-apply-settings-backed-up", len(bks) == 1
+                   and _read(os.path.join(bdir, bks[0])) == old_settings
+                   and _mode(os.path.join(bdir, bks[0])) == 0o600, bks)
+            expect("merge-apply-prints-verify-rows",
+                   re.search(r"grant\s+ALREADY-DONE", out)
+                   and re.search(r"coding-fence\s+ALREADY-DONE", out)
+                   and re.search(r"user-settings\s+ALREADY-DONE", out), out[-800:])
+            expect("merge-apply-one-write-the-writer", len(mach.writes) == 1
+                   and mach.writes[0]["argv"][:6] == ["sudo", "-u", "_exdispatch", "-H",
+                                                       "/bin/sh", "-c"]
+                   and mach.writes[0]["argv"][6] == "cd / && " + merge_writer_command(mconf),
+                   [w["argv"][:6] for w in mach.writes])
+            expect("merge-apply-no-value", SENTINELS[3] not in out)
+
+            cfg_snap, set_snap = _read(cfg_path), _read(spath)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, mconf, mach, _FakeSudo(), True)
+            expect("merge-idempotent", rc == EX_OK and mach.writes == []
+                   and _read(cfg_path) == cfg_snap and _read(spath) == set_snap
+                   and "Nothing to write" in out, (rc, out[-300:]))
+
+            # a fresh home with no settings file: made at 600, in a folder made at 700
+            home2 = os.path.join(tmp, "role-home-2")
+            os.makedirs(home2)
+            _put(cfg_path, before)
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home2, _pf_answers()),
+                               _FakeSudo(), True)
+            spath2 = os.path.join(home2, ".claude", "settings.json")
+            expect("merge-creates-settings-600-in-700", rc == EX_OK and os.path.exists(spath2)
+                   and _mode(spath2) == 0o600 and _mode(os.path.dirname(spath2)) == 0o700,
+                   (rc, out[-300:]))
+    group("merge-real", merge_real)
+
+    def merge_moved():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            mconf = dict(conf, DISPATCHER_CONFIG=cfg_path,
+                         DISPATCHER_ENV_FILE=os.path.join(tmp, "dispatcher", ".env"),
+                         FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"))
+            _put(cfg_path, json.dumps(_merge_fixture(), indent=2) + "\n")
+
+            def refresh():
+                # What the dispatcher does between the read and the write: it rewrites its
+                # own config to store a refreshed tracker token.
+                doc = json.loads(_read(cfg_path))
+                doc["linearWorkspaces"]["ws"]["linearToken"] = SENTINELS[3] + "-refreshed"
+                _put(cfg_path, json.dumps(doc, indent=2) + "\n")
+            mach = _RoleMachine(home, _pf_answers(), before_write=refresh)
+            rc, out = _capture(cmd_merge, mconf, mach, _FakeSudo(), True)
+            moved = json.loads(_read(cfg_path))
+            expect("merge-sha-mismatch-refused", rc == EX_REFUSED and "changed" in out,
+                   (rc, out[-400:]))
+            expect("merge-sha-mismatch-wrote-nothing",
+                   moved["repositories"][0]["disallowedTools"] == ["Edit"]
+                   and moved["linearWorkspaces"]["ws"]["linearToken"].endswith("-refreshed")
+                   and not os.path.exists(os.path.join(home, ".claude", "settings.json")),
+                   moved["repositories"][0])
+            expect("merge-sha-mismatch-no-value", SENTINELS[3] not in out)
+
+            # The writer checks each entry's index AND id, whatever the checksum says.
+            raw = _read_bytes(cfg_path)
+            import hashlib
+            sha = hashlib.sha256(raw).hexdigest()
+            script = merge_writer_command(mconf).replace("/usr/bin/python3",
+                                                         shlex.quote(sys.executable))
+            for label, op, want_rc in (
+                    ("wrong-id", {"op": "fence-entry", "index": 0, "id": "someone-else",
+                                  "name": "a", "from": "own", "add": list(SLACK_FENCE_RULES)}, 3),
+                    ("wrong-index", {"op": "fence-entry", "index": 9, "id": "coding-a",
+                                     "name": "a", "from": "own",
+                                     "add": list(SLACK_FENCE_RULES)}, 3),
+                    ("right", {"op": "fence-entry", "index": 0, "id": "coding-a", "name": "a",
+                               "from": "own", "add": list(SLACK_FENCE_RULES)}, 0)):
+                ran = subprocess.run(["/bin/sh", "-c", "cd / && " + script],
+                                     input=json.dumps({"configSha256": sha, "config": [op],
+                                                       "deny": []}),
+                                     capture_output=True, text=True, timeout=60,
+                                     env={"HOME": home, "PATH": "/usr/bin:/bin"})
+                changed = _read_bytes(cfg_path) != raw
+                expect("merge-writer-entry-identity:" + label, ran.returncode == want_rc
+                       and changed == (want_rc == 0), (ran.returncode, ran.stdout[-300:],
+                                                       ran.stderr[-300:]))
+    group("merge-moved", merge_moved)
+
+    def merge_hand():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            mconf = dict(conf, DISPATCHER_CONFIG=cfg_path,
+                         DISPATCHER_ENV_FILE=os.path.join(tmp, "dispatcher", ".env"),
+                         FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"))
+            fixture = _merge_fixture(review_fenced=False, first_mcp=True)
+            _put(cfg_path, json.dumps(fixture, indent=2) + "\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               False)
+            review_lines = [l.strip() for l in out.splitlines() if "reviews-a" in l]
+            expect("merge-names-the-unfenced-review-entry",
+                   review_lines and not any(l.startswith("FENCE") for l in review_lines)
+                   and "run the Stage E installer" in " ".join(out.split()), review_lines)
+            expect("merge-warns-first-entry-mcp", "WARNING" in out and "mcp__github" in out,
+                   out[-500:])
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            after = json.loads(_read(cfg_path))
+            expect("merge-leaves-review-and-mcp-alone",
+                   after["repositories"][2] == fixture["repositories"][2]
+                   and "mcp__github" in after["repositories"][0]["allowedTools"]
+                   and rc == EX_BLOCKED, (rc, out[-500:]))
+            # a review entry with no list of its own is fenced by an inherited default that
+            # carries both rules: merge agrees with verify and does not name it
+            inheriting = _merge_fixture()
+            del inheriting["repositories"][2]["disallowedTools"]
+            inheriting["defaultDisallowedTools"] = ["Bash(rm -rf *)"] + list(SLACK_FENCE_RULES)
+            _put(cfg_path, json.dumps(inheriting, indent=2) + "\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               False)
+            review_lines = [l.strip() for l in out.splitlines() if "reviews-a" in l]
+            expect("merge-review-entry-inheriting-the-fence-is-ok",
+                   review_lines and review_lines[0].startswith("ok")
+                   and "LEFT ALONE" not in out, review_lines)
+    group("merge-hand", merge_hand)
+
+    # -- env-names: the REAL role-account shell ---------------------------------------
+    def env_names():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            envdir = os.path.join(tmp, "dispatcher")
+            env_path = os.path.join(envdir, ".env")
+            cfg_path = os.path.join(envdir, "config.json")
+            _put(cfg_path, json.dumps(_merge_fixture(), indent=2) + "\n")
+            econf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
+                         FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"))
+            original = ("# dispatcher env\n"
+                        "LINEAR_CLIENT_ID=%s\n"
+                        "export SLACK_BOT_TOKEN=%s\n"
+                        "CYRUS_HOST_EXTERNAL=false\n"
+                        "OTHER_SETTING=1\n"
+                        "  export WEBHOOK_IP_VALIDATION = true\n"
+                        "LAST_LINE=kept" % (SENTINELS[3], SENTINELS[0]))
+            _put(env_path, original)
+            os.chmod(env_path, 0o640)
+            role_env = os.path.join(home, ".stage-e", "env")
+            _put(role_env, "NOTIFIER_SLACK_BOT_TOKEN=%s\nSTAGE_E_LINEAR_API_KEY=%s\n"
+                 % (FAKE_NOTIFIER_TOKEN, SENTINELS[4]))
+            asked = []
+
+            def reader_of(*values):
+                queue = list(values)
+
+                def read(prompt):
+                    asked.append(prompt)
+                    return queue.pop(0)
+                return read
+            bdir = os.path.join(home, ".stage-e", "backups")
+
+            def backups():
+                return sorted(b for b in (os.listdir(bdir) if os.path.isdir(bdir) else [])
+                              if b.startswith("dispatcher-env.pre-chat-lane."))
+
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, False,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-needs-a-terminal", rc == EX_BLOCKED and not asked
+                   and not mach.argvs and "terminal" in out, (rc, out[-300:]))
+            mach = _RoleMachine(home, _pf_answers(rules=(0, "", "")))
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-refuses-without-the-port-block", rc == EX_BLOCKED and not asked
+                   and mach.writes == [] and _read(env_path) == original
+                   and "port block" in out, (rc, out[-400:]))
+            for label, tok, sec in (
+                    ("not-xoxb", "xoxp-" + "FAKE" * 12, FAKE_SIGNING_SECRET),
+                    ("short", "xoxb-FAKE", FAKE_SIGNING_SECRET),
+                    ("bad-char", "xoxb-" + "FAKE" * 10 + " '", FAKE_SIGNING_SECRET),
+                    ("secret-length", FAKE_BOT_TOKEN, "deadbeef" * 3),
+                    ("secret-upper-case", FAKE_BOT_TOKEN, "DEADBEEF" * 4)):
+                del asked[:]
+                mach = _RoleMachine(home, _pf_answers())
+                rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                                   reader_of(tok, sec))
+                expect("env-names-shape:" + label, rc == EX_USAGE and len(asked) == 2
+                       and mach.writes == [] and _read(env_path) == original
+                       and tok not in out and sec not in out, (rc, out[-300:]))
+
+            _put(os.path.join(envdir, ".env.swp"), "swap")
+            del asked[:]
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            want = ["# dispatcher env", "LINEAR_CLIENT_ID=%s" % SENTINELS[3], "OTHER_SETTING=1",
+                    "LAST_LINE=kept", "SLACK_BOT_TOKEN=" + FAKE_BOT_TOKEN,
+                    "SLACK_SIGNING_SECRET=" + FAKE_SIGNING_SECRET, "CYRUS_HOST_EXTERNAL=true",
+                    "WEBHOOK_IP_VALIDATION=false"]
+            expect("env-names-writes-the-four-keeps-the-rest-in-order",
+                   rc == EX_OK and _read(env_path).splitlines() == want, (rc, out[-600:]))
+            expect("env-names-keeps-the-mode", _mode(env_path) == 0o640, oct(_mode(env_path)))
+            expect("env-names-prints-lengths", all(
+                ("%s %d" % (n, size)) in out for n, size in (
+                    ("SLACK_BOT_TOKEN", len(FAKE_BOT_TOKEN)), ("SLACK_SIGNING_SECRET", 32),
+                    ("CYRUS_HOST_EXTERNAL", 4), ("WEBHOOK_IP_VALIDATION", 5))), out[-600:])
+            expect("env-names-swap-file-warning", "swap file" in out and ".env.swp" in out,
+                   out[-400:])
+            got = backups()
+            expect("env-names-backed-up-first", len(got) == 1
+                   and _read(os.path.join(bdir, got[0])) == original
+                   and _mode(os.path.join(bdir, got[0])) == 0o600, got)
+            flat = " ".join(out.split())
+            expect("env-names-says-the-backup-holds-secrets", "holds the two secrets" in flat
+                   and "once verify is clean" in flat, flat[-500:])
+            expect("env-names-prints-the-restart-card", "CK-C5" in out
+                   and "launchctl bootout system/com.example.dispatcher" in out)
+            expect("env-names-never-restarts",
+                   not any("launchctl" in " ".join(a) for a in mach.argvs))
+            argv_text = "\n".join(" ".join(a) for a in mach.argvs)
+            expect("env-names-no-value-in-argv", FAKE_BOT_TOKEN not in argv_text
+                   and FAKE_SIGNING_SECRET not in argv_text)
+            expect("env-names-no-value-in-output", all(v not in out for v in (
+                FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET, SENTINELS[0], SENTINELS[3],
+                SENTINELS[4], FAKE_NOTIFIER_TOKEN)))
+            expect("env-names-stdin-hidden", len(mach.writes) == 1
+                   and mach.writes[0]["stdin"] == "<hidden>"
+                   and mach.writes[0]["argv"][6] == "cd / && " + env_writer_command(econf,
+                                                                                     "set"),
+                   [w["stdin"] for w in mach.writes])
+
+            # the notifier's own token is refused, and nothing is touched
+            _put(role_env, "export NOTIFIER_SLACK_BOT_TOKEN=\"%s\"\n" % FAKE_BOT_TOKEN)
+            snap, count = _read(env_path), len(backups())
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), False, True,
+                               reader_of(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET))
+            expect("env-names-refuses-the-notifier-token", rc == EX_REFUSED
+                   and _read(env_path) == snap and len(backups()) == count
+                   and "notifier" in out.lower() and FAKE_BOT_TOKEN not in out, (rc, out[-400:]))
+            _put(role_env, "NOTIFIER_SLACK_BOT_TOKEN=%s\n" % FAKE_NOTIFIER_TOKEN)
+
+            # --remove: no terminal, no port block needed; the four go, the rest stay
+            del asked[:]
+            count = len(backups())
+            mach = _RoleMachine(home, _pf_answers(rules=(0, "", "")))
+            rc, out = _capture(cmd_env_names, econf, mach, _FakeSudo(), True, False,
+                               reader_of())
+            expect("env-names-remove", rc == EX_OK and not asked
+                   and _read(env_path).splitlines() == want[:4], (rc, out[-400:]))
+            expect("env-names-remove-backs-up-first", len(backups()) == count + 1)
+            expect("env-names-remove-keeps-the-mode", _mode(env_path) == 0o640)
+    group("env-names", env_names)
+
+    # -- front-door: the REAL writer, a stand-in proxy binary -------------------------
+    def front_door():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            fd_path = os.path.join(tmp, "front", "Caddyfile")
+            fbin = os.path.join(tmp, "bin", "fake-proxy")
+            vlog = os.path.join(tmp, "validate.log")
+            flag = os.path.join(tmp, "validate-fails")
+            _put(fbin, FAKE_PROXY_BIN % {"log": vlog, "flag": flag})
+            os.chmod(fbin, 0o755)
+            _put(vlog, "")
+            fconf = dict(conf, DISPATCHER_CONFIG=os.path.join(tmp, "d", "config.json"),
+                         DISPATCHER_ENV_FILE=os.path.join(tmp, "d", ".env"),
+                         FRONT_DOOR_CONFIG=fd_path, FRONT_DOOR_BIN=fbin)
+            _put(fd_path, FRONT_DOOR_FIXTURE)
+            original = _read_bytes(fd_path)
+            inode = os.stat(fd_path).st_ino
+            bdir = os.path.join(home, ".stage-e", "backups")
+
+            for key in ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER"):
+                mach = _RoleMachine(home, _pf_answers())
+                rc, out = _capture(cmd_front_door, dict(fconf, **{key: ""}), mach, _FakeSudo(),
+                                   True, False)
+                expect("front-door-needs:" + key, rc == EX_USAGE and key in out
+                       and not mach.argvs, (rc, out[-200:]))
+
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_front_door, fconf, mach, _FakeSudo(), False, False)
+            expect("front-door-dry-run", rc == EX_BLOCKED and mach.writes == []
+                   and _read_bytes(fd_path) == original
+                   and "@dispatcher path /linear-webhook /callback /status /extra-path" in out
+                   and "/extra-path /slack-webhook" in out, (rc, out[-500:]))
+            warned = [l for l in out.splitlines() if "WARNING" in l]
+            expect("front-door-names-the-unknown-path", any("/extra-path" in l for l in warned)
+                   and not any("/callback" in l for l in warned), warned)
+            expect("front-door-cites-each-route", all(c in " ".join(out.split()) for c in (
+                "LinearEventTransport.js:68", "SlackEventTransport.js:85")), out[-600:])
+
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_front_door, fconf, mach, _FakeSudo(), True, False)
+            after = _read_bytes(fd_path).splitlines(True)
+            before_lines = original.splitlines(True)
+            diff = [i for i, (a, b) in enumerate(zip(before_lines, after)) if a != b]
+            expect("front-door-apply-changes-one-line", rc == EX_OK
+                   and len(after) == len(before_lines) and diff == [1]
+                   and after[1] == b"\t@dispatcher path /linear-webhook /callback /status "
+                                   b"/extra-path /slack-webhook\n", (rc, diff, out[-500:]))
+            expect("front-door-apply-in-place", os.stat(fd_path).st_ino == inode)
+            expect("front-door-validated", ("validate --config " + fd_path) in _read(vlog),
+                   _read(vlog))
+            bks = sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []
+            expect("front-door-backed-up", len(bks) == 1
+                   and bks[0].startswith("Caddyfile.pre-chat-lane.")
+                   and _read_bytes(os.path.join(bdir, bks[0])) == original
+                   and _mode(os.path.join(bdir, bks[0])) == 0o600, bks)
+            expect("front-door-prints-restart-and-probes",
+                   "launchctl bootout system/com.example.front-door" in out
+                   and "/api/update/cyrus-config" in out, out[-600:])
+            expect("front-door-never-restarts",
+                   not any("launchctl" in " ".join(a) for a in mach.argvs))
+            expect("front-door-apply-the-writer", len(mach.writes) == 1
+                   and mach.writes[0]["argv"][6] == "cd / && " + front_door_writer_command(fconf))
+
+            applied = _read_bytes(fd_path)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_front_door, fconf, mach, _FakeSudo(), True, False)
+            expect("front-door-idempotent", rc == EX_OK and mach.writes == []
+                   and _read_bytes(fd_path) == applied and "already" in out, (rc, out[-300:]))
+
+            _put(fd_path, FRONT_DOOR_FIXTURE)
+            _put(flag, "")
+            rc, out = _capture(cmd_front_door, fconf, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True, False)
+            expect("front-door-validate-failure-restores-byte-for-byte", rc == EX_FAILED
+                   and _read_bytes(fd_path) == original and "VALIDATE" in out.upper(),
+                   (rc, out[-400:]))
+            os.unlink(flag)
+
+            two = FRONT_DOOR_FIXTURE.replace("\trespond 404\n",
+                                             "\t@dispatcher path /other\n\trespond 404\n")
+            _put(fd_path, two)
+            for apply_it in (False, True):
+                mach = _RoleMachine(home, _pf_answers())
+                rc, out = _capture(cmd_front_door, fconf, mach, _FakeSudo(), apply_it, False)
+                expect("front-door-two-lines-refused:%s" % apply_it, rc == EX_BLOCKED
+                       and mach.writes == [] and _read(fd_path) == two and "found 2" in out,
+                       (rc, out[-300:]))
+
+            def moved():
+                _put(fd_path, FRONT_DOOR_FIXTURE + "# edited by hand\n")
+            _put(fd_path, FRONT_DOOR_FIXTURE)
+            rc, out = _capture(cmd_front_door, fconf,
+                               _RoleMachine(home, _pf_answers(), before_write=moved),
+                               _FakeSudo(), True, False)
+            expect("front-door-sha-mismatch-refused", rc == EX_REFUSED
+                   and _read(fd_path) == FRONT_DOOR_FIXTURE + "# edited by hand\n",
+                   (rc, out[-300:]))
+
+            _put(fd_path, FRONT_DOOR_FIXTURE.replace("/extra-path", "/extra-path /slack-webhook"))
+            rc, out = _capture(cmd_front_door, fconf, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True, True)
+            expect("front-door-remove", rc == EX_OK and _read(fd_path) == FRONT_DOOR_FIXTURE,
+                   (rc, out[-400:]))
+            _put(fd_path, "@dispatcher path /slack-webhook\n")
+            rc, out = _capture(cmd_front_door, fconf, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True, True)
+            expect("front-door-remove-last-path-refused", rc == EX_BLOCKED
+                   and _read(fd_path) == "@dispatcher path /slack-webhook\n", (rc, out[-300:]))
+    group("front-door", front_door)
+
+    # -- each writer's own guards, run directly: the checks the subcommands never reach
+    # because their plan is right (a wrong name, a wrong `from`, a moved settings file, a
+    # file owned by someone else, a line that is not the one read) -------------------
+    def writer_guards():
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            wconf = dict(conf, DISPATCHER_CONFIG=cfg_path,
+                         DISPATCHER_ENV_FILE=os.path.join(tmp, "dispatcher", ".env"))
+            _put(cfg_path, json.dumps(_merge_fixture(), indent=2) + "\n")
+            raw = _read_bytes(cfg_path)
+            sha = hashlib.sha256(raw).hexdigest()
+            py = shlex.quote(sys.executable)
+
+            def run(script, stdin, path_first=None):
+                path = "/usr/bin:/bin" if path_first is None else path_first + ":/usr/bin:/bin"
+                return subprocess.run(["/bin/sh", "-c", "cd / && " + script.replace(
+                    "/usr/bin/python3", py)], input=stdin, capture_output=True, text=True,
+                    timeout=60, env={"HOME": home, "PATH": path})
+
+            right = {"op": "fence-entry", "index": 0, "id": "coding-a", "name": "a",
+                     "from": "own", "add": list(SLACK_FENCE_RULES)}
+            for label, op in (("wrong-name", dict(right, name="someone-else")),
+                              ("wrong-from", dict(right, **{"from": "default"})),
+                              ("prompt-type-gone", {"op": "fence-prompt", "scope": "labelPrompts",
+                                                    "index": 0, "id": "coding-a", "name": "a",
+                                                    "type": "no-such-type",
+                                                    "add": list(SLACK_FENCE_RULES)})):
+                ran = run(merge_writer_command(wconf),
+                          json.dumps({"configSha256": sha, "config": [op], "deny": []}))
+                expect("merge-writer-refuses:" + label, ran.returncode == 3
+                       and _read_bytes(cfg_path) == raw, (ran.returncode, ran.stdout[-200:]))
+            # the settings file moved between the read and the write: nothing is written,
+            # not even the config
+            spath = os.path.join(home, ".claude", "settings.json")
+            _put(spath, json.dumps({"permissions": {"deny": []}}))
+            ran = run(merge_writer_command(wconf), json.dumps({
+                "configSha256": sha, "config": [right], "settingsSha256": "0" * 64,
+                "deny": [BACKUPS_DENY_RULE]}))
+            expect("merge-writer-refuses-moved-settings", ran.returncode == 3
+                   and _read_bytes(cfg_path) == raw
+                   and _read(spath) == json.dumps({"permissions": {"deny": []}}),
+                   (ran.returncode, ran.stdout[-200:]))
+            _put(spath, json.dumps({"permissions": {"deny": "not a list"}}))
+            ran = run(merge_writer_command(wconf), json.dumps({
+                "configSha256": sha, "config": [], "deny": [BACKUPS_DENY_RULE]}))
+            expect("merge-writer-refuses-a-deny-that-is-not-a-list", ran.returncode == 3
+                   and "by hand" in ran.stdout, (ran.returncode, ran.stdout[-200:]))
+            # the config is copied, privately, before it is written
+            os.unlink(spath)
+            ran = run(merge_writer_command(wconf), json.dumps({
+                "configSha256": sha, "config": [right], "deny": []}))
+            bdir = os.path.join(home, ".stage-e", "backups")
+            copies = [b for b in (os.listdir(bdir) if os.path.isdir(bdir) else [])
+                      if b.startswith("dispatcher-config.%s." % BACKUP_TAG)]
+            expect("merge-writer-backs-the-config-up-first", ran.returncode == 0
+                   and len(copies) == 1 and _read_bytes(os.path.join(bdir, copies[0])) == raw
+                   and _mode(os.path.join(bdir, copies[0])) == 0o600
+                   and _mode(bdir) == 0o700, (ran.returncode, copies))
+
+            # the env writer: someone else's file, a missing file, nothing on stdin, a
+            # mode it does not know
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            _put(env_path, "KEEP=1\n")
+            fakebin = os.path.join(tmp, "fake-id-bin")
+            _put(os.path.join(fakebin, "id"), "#!/bin/sh\necho someone-else\n")
+            os.chmod(os.path.join(fakebin, "id"), 0o755)
+            ran = run(env_writer_command(wconf, "set"), "%s\n%s\n" % (
+                FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET), path_first=fakebin)
+            expect("env-writer-refuses-a-file-it-does-not-own", ran.returncode == 5
+                   and "owned by" in ran.stdout and _read(env_path) == "KEEP=1\n"
+                   and FAKE_BOT_TOKEN not in ran.stdout + ran.stderr, ran.stdout[-200:])
+            ran = run(env_writer_command(dict(wconf, DISPATCHER_ENV_FILE=env_path + "-gone"),
+                                         "set"), "%s\n%s\n" % (FAKE_BOT_TOKEN,
+                                                               FAKE_SIGNING_SECRET))
+            expect("env-writer-refuses-a-missing-file", ran.returncode == 5
+                   and "does not exist" in ran.stdout
+                   and not os.path.exists(env_path + "-gone"), ran.stdout[-200:])
+            ran = run(env_writer_command(wconf, "set"), "")
+            expect("env-writer-wants-both-values", ran.returncode == 7
+                   and _read(env_path) == "KEEP=1\n", ran.stdout[-200:])
+            ran = run(env_writer_command(wconf, "bogus"), "")
+            expect("env-writer-refuses-an-unknown-mode", ran.returncode == 2
+                   and _read(env_path) == "KEEP=1\n", ran.stdout[-200:])
+
+            # the front-door writer: the right checksum, but not the line the plan read
+            fd_path = os.path.join(tmp, "front", "Caddyfile")
+            _put(fd_path, FRONT_DOOR_FIXTURE)
+            fraw = _read_bytes(fd_path)
+            fconf = dict(wconf, FRONT_DOOR_CONFIG=fd_path, FRONT_DOOR_BIN="/bin/true")
+            ran = run(front_door_writer_command(fconf), json.dumps({
+                "sha256": hashlib.sha256(fraw).hexdigest(), "index": 1,
+                "old": "\t@dispatcher path /somewhere-else", "new": "\t@dispatcher path /x"}))
+            expect("front-writer-refuses-a-different-line", ran.returncode == 3
+                   and _read_bytes(fd_path) == fraw, (ran.returncode, ran.stdout[-200:]))
+    group("writer-guards", writer_guards)
+
+    # -- each shape refusal says which shape, by length or kind, and never the value -----
+    def shapes():
+        for tok, sec, said in (
+                ("xoxp-" + "FAKE" * 12, FAKE_SIGNING_SECRET, "does not start xoxb-"),
+                ("xoxb-FAKE", FAKE_SIGNING_SECRET, "only 9 characters"),
+                ("xoxb-" + "FAKE" * 10 + " '", FAKE_SIGNING_SECRET, "never does"),
+                (FAKE_BOT_TOKEN, "deadbeef" * 3, "is 24 characters"),
+                (FAKE_BOT_TOKEN, "DEADBEEF" * 4, "not lower-case hex")):
+            got = secret_shape_problem(tok, sec) or ""
+            expect("shape-says:" + said, said in got and tok not in got and sec not in got,
+                   got)
+        expect("shape-accepts-the-real-shape",
+               secret_shape_problem(FAKE_BOT_TOKEN, FAKE_SIGNING_SECRET) is None)
+    group("shapes", shapes)
+
+    # -- a flag a command does not take is a usage error, before anything is read -----
+    def flags():
+        for argv in (["merge", "--remove"], ["env-names", "--apply"], ["verify", "--apply"],
+                     ["compose", "--remove"]):
+            fake = _FakeRunner([("", 0, "{}", "")])
+            rc, out = _capture(main, argv + ["--conf", "/nonexistent/chat-lane.conf"],
+                               fake, _FakeSudo())
+            expect("flag-refused:" + " ".join(argv), rc == EX_USAGE and "takes no" in out
+                   and not fake.argvs, (rc, out[-200:]))
+    group("flags", flags)
+
+    # -- a declined sudo names THIS script, the subcommand and its flags, and the conf --
+    def no_sudo_writers():
+        class _Declining(object):
+            def acquire(self, why, resume):
+                raise NoPrivilege("NO ADMINISTRATOR ACCESS — nothing was attempted.\n"
+                                  "  Fix that and run the same command again:\n"
+                                  "      python3 %s %s" % (_stage_e_self_path(), resume))
+        with tempfile.TemporaryDirectory() as tmp:
+            cpath = os.path.join(tmp, "chat-lane.conf")
+            _put(cpath, GOOD_CONF_TEXT)
+            for argv in (["merge", "--apply"], ["front-door", "--remove", "--apply"],
+                         ["env-names", "--remove"]):
+                rc, out = _capture(main, argv + ["--conf", cpath],
+                                   _FakeRunner([("", 0, "{}", "")]), _Declining())
+                want = "pipeline_chat_lane_setup.py %s --conf %s" % (" ".join(argv), cpath)
+                expect("no-sudo-names-the-writer:" + argv[0], rc == EX_NOPRIV and want in out
+                       and "pipeline_stage_e_setup.py" not in out, out[-300:])
+    group("no-sudo-writers", no_sudo_writers)
+
+    # -- every writing subcommand refuses in an agent environment, before the conf ----
+    def agent_refused():
+        marker = AGENT_ENV_MARKERS[0]
+        try:
+            os.environ[marker] = ""
+            for argv in (["merge", "--apply"], ["env-names"], ["env-names", "--remove"],
+                         ["front-door", "--apply"]):
+                fake = _FakeRunner([("", 0, "{}", "")])
+                rc, out = _capture(main, argv + ["--conf", "/nonexistent/chat-lane.conf"],
+                                   fake, _FakeSudo())
+                expect("agent-refused:" + " ".join(argv), rc == EX_REFUSED
+                       and "REFUSED" in out and not fake.argvs and "could not read" not in out,
+                       (rc, out[-300:]))
+        finally:
+            os.environ.pop(marker, None)
+    group("agent-refused", agent_refused)
 
 
 if __name__ == "__main__":

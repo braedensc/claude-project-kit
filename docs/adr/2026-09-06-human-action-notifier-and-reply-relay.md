@@ -467,3 +467,52 @@ what review checks. That half is open (KIT-118).
 ### 5. The needs-human label stands
 
 Recorded under the marks table.
+
+## Update 2026-09-24 — the chat lane is on, and the composer writes (KIT-197, KIT-196)
+
+**The lane was switched on, and kept on.** A deployment turned the conversational lane on on
+2026-09-24, in the order the composer prints. Three live-file edits the composer only
+described were made with three small scripts instead, tested on fixtures first: the grant,
+fences and read denies merged into the dispatcher's config and the role account's user
+settings; the four names written into the dispatcher's env file from hidden prompts; and one
+path appended to the front door's allowlist line. `verify` then measured every row as
+applied, and the door answered `401` on the Slack path, `401` on the tracker path and `404`
+on the config-update route.
+
+The live check found one thing the source reading had not (KIT-196). A chat session is
+shown every built-in tool, and the grant is enforced at call time, so a tool listing proves
+nothing. Calls were tested instead. Read-only commands **ran**, through Bash and through
+`Monitor`: the SDK's default permission handling approves them whatever the grant says. A
+write, a `touch`, a chained `echo …; touch …` and `Monitor` running `touch` were refused.
+A Bash read of a path under a user-level `Read` deny was refused. `log_failure_mode` was
+absent, as it is while `CYRUS_API_KEY` is unset. **The owner kept the lane on with a
+read-only shell as a named residual.** It adds to the accepted residuals of decision 1: the
+lane can read, through a shell as well as the `Read` tool, any file the role account can
+read that no deny rule covers.
+
+**The composer now writes (owner decision, 2026-09-24).** It had been print-and-verify only.
+The three scripts' behaviour moved into it as subcommands a person runs:
+
+| Subcommand | Piece | What it writes |
+| --- | --- | --- |
+| `merge [--apply]` | 1, 2, 5 | the grant and fences into the dispatcher's config, in place; the read denies into the role account's user settings |
+| `env-names [--remove]` | 3 | the four names into the dispatcher's env file, from two hidden prompts |
+| `front-door [--apply] [--remove]` | 7 | one path on the front door's one allowlist line, then the door's own validation |
+
+Each refuses under a model, before its conf is read. Each writes as the role account,
+through one program handed to that account's shell, with every value on standard input and
+none in an argument. Each re-reads the file and refuses when it is not the file it planned
+from: the dispatcher rewrites its config when it refreshes a tracker token. Each backs the
+file up first, under the role account's home, at mode 600, and the user-level read denies
+now cover that folder and the role account's own env file. A dry run is the default where
+there is one; `env-names` refuses without a terminal, and until the port block measures as
+loaded. **Restarts and the port block stay printed commands the owner runs**, as installers
+never load jobs: a new card restarts the dispatcher only when its own `/status` answers
+`idle`, and another turns the lane off in order. `verify` gains a row that reads the front
+door's allowlist line. The live-check card now tests calls, not the listing, and names
+KIT-196.
+
+The writers are guarded the way `verify` is: they need administrator access, asked for once,
+and they refuse in an agent environment. The markers are environment variables a session
+could unset, so that refusal is tamper-evident, not tamper-proof, as for every other command
+here.
