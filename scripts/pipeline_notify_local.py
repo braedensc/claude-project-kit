@@ -210,11 +210,14 @@ Exit:
      a relay thread read that failed — including a chat token missing `groups:history`).
   2  usage/config/import error — nothing was touched.
   3  ran, and at least one event was DECLINED this pass (seen but not sendable) — including a
-     relayed reply that was dropped, or a relay left pending and so unconfirmed.
+     relayed reply that was dropped, or a relay left pending and so unconfirmed. Events over
+     max_events_per_pass count here too; the heartbeat's `capped` says how many of the
+     declined were only that, left for the next pass.
   4  hit the wall-clock --timeout. Distinct from 1 so a scheduler log tells hung from failed.
 
   A heartbeat is left on every path above. The two cases that leave none are an unreadable
-  --config (exit 2, before the state dir is known) and a SIGTERM/KeyboardInterrupt.
+  --config (exit 2, before the state dir is known) and a SIGTERM/KeyboardInterrupt. On a pass
+  that ended before it counted (1 after its reads, 2 or 4), `capped` is null — not known.
 """
 
 import argparse
@@ -692,6 +695,17 @@ def write_heartbeat(cfg, result, now):
     """
     # `dry` is load-bearing: without it a rehearsal writes a heartbeat claiming messages
     # were sent, and a monitor reading the record cannot tell a dry run from a real pass.
+    #
+    # `capped` is the part of `declined` that the per-pass cap held back: events found and
+    # left for the next pass, not a ping or a label that failed. Both exit 3, so without it a
+    # reader cannot say which happened (KIT-187). ADDED WITHOUT A SCHEMA BUMP: the field is
+    # new and optional, nothing is renamed or removed, and every reader matches the schema id
+    # exactly, so a `/2` would make each of them refuse every heartbeat this writes. A reader
+    # treats an absent `capped` — an older notifier's heartbeat — as "not known", never 0, and
+    # this writer says "not known" the same way: `capped` is null when the pass ended before
+    # it counted (a deadline, an error), because a 0 there would claim nothing was held back.
+    # The other counts on those paths are 0 placeholders, older than this field: read any
+    # count only on exit 0 or 3.
     dry = bool(result.get("dry"))
     doc = {
         "schema": HEARTBEAT_SCHEMA,
@@ -702,6 +716,7 @@ def write_heartbeat(cfg, result, now):
         "sent": 0 if dry else result.get("sent", 0),
         "would_send": result.get("sent", 0) if dry else 0,
         "declined": result.get("declined", 0),
+        "capped": result.get("capped"),
         "labelled": 0 if dry else result.get("labelled", 0),
         "settled": 0 if dry else result.get("settled", 0),
         "would_settle": result.get("settled", 0) if dry else 0,
@@ -1767,7 +1782,9 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         if relay_on:
             summary += " (the reply relay did not run either)"
         out.write(summary + "\n")
-        return {"exit": EXIT_ERROR, "examined": 0, "sent": 0, "declined": 0,
+        # `capped` 0 is TRUE here: the pass stopped before it chose any event, so the cap
+        # held nothing back. A pass that ends later, uncounted, leaves it null.
+        return {"exit": EXIT_ERROR, "examined": 0, "sent": 0, "declined": 0, "capped": 0,
                 "labelled": 0, "dry": bool(dry_run), "summary": summary}
 
     events, skipped, capped = select_events(tickets, sent_keys, cfg, labelled_keys)
@@ -1990,7 +2007,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
 
     out.write(summary + "\n")
     return {"exit": code, "examined": len(tickets), "sent": sent,
-            "declined": declined, "labelled": labelled, "settled": settled,
+            "declined": declined, "capped": capped, "labelled": labelled, "settled": settled,
             "relayed": relay["relayed"] if relay else 0,
             "dry": bool(dry_run), "summary": summary}
 
@@ -2448,6 +2465,81 @@ def selftest():
         ev, _, capped = select_events(many, set(), cfg)
         ok("the per-pass cap holds", len(ev) == cfg["max_events_per_pass"] and capped == 5)
 
+        # A REAL pass the cap held back exits 3 like a failed send, so its heartbeat has to
+        # say which it was: the installer's `enable` row reads `capped` to name the cap
+        # instead of "a ping or a label did not land" (KIT-187). Its own state dir, so the
+        # seen-set this pass saves cannot reach the dry-run checks below.
+        cfg_cap = dict(cfg, state_dir=os.path.join(tmp, "cap-state"))
+        over = [tkt("KIT-%d" % i, ESC_BLOCKED, "cr%d" % i, author="s")
+                for i in range(cfg["max_events_per_pass"] + 2)]
+        res_cap = run_once(cfg_cap, _FakeTracker(over), _FakeChat(), False, out=io.StringIO())
+        write_heartbeat(cfg_cap, res_cap, _now_iso())
+        with open(heartbeat_path(cfg_cap), encoding="utf-8") as fh:
+            hb_cap = json.load(fh)
+        ok("a capped real pass exits 3 and its heartbeat counts what the cap held back",
+           res_cap["exit"] == EXIT_DECLINED and res_cap.get("capped") == 2
+           and hb_cap.get("capped") == 2 and hb_cap.get("declined") == 2
+           and hb_cap.get("sent") == cfg["max_events_per_pass"], repr(hb_cap))
+        res_uncapped = run_once(cfg_cap, _FakeTracker(over[:1]), _FakeChat(), False,
+                                out=io.StringIO())
+        write_heartbeat(cfg_cap, res_uncapped, _now_iso())
+        with open(heartbeat_path(cfg_cap), encoding="utf-8") as fh:
+            hb_uncapped = json.load(fh)
+        ok("a pass the cap did not touch records capped 0, not a missing field",
+           hb_uncapped.get("capped") == 0, repr(hb_uncapped))
+
+        # A refused send is declined and NOT capped. Every case above has capped equal to
+        # declined (all of it the cap, or both 0), so a writer that copied `declined` into
+        # `capped` passed them all — and the installer would then word a revoked token as
+        # events "held back by the cap" (KIT-187 review, finding 66).
+        cfg_ref = dict(cfg, state_dir=os.path.join(tmp, "refused-state"))
+        res_ref = run_once(cfg_ref, _FakeTracker([tkt("KIT-2", ESC_BLOCKED, "c2r", author="s1")]),
+                           _FakeChat(ok=False, error="channel_not_found"), False,
+                           out=io.StringIO())
+        write_heartbeat(cfg_ref, res_ref, _now_iso())
+        with open(heartbeat_path(cfg_ref), encoding="utf-8") as fh:
+            hb_ref = json.load(fh)
+        ok("a refused send under the cap is declined, never counted as capped",
+           res_ref["exit"] == EXIT_DECLINED and hb_ref.get("declined") == 1
+           and hb_ref.get("capped") == 0, repr(hb_ref))
+
+        class _RefuseFirst(_FakeChat):
+            """The chat refuses the first ping and takes every one after it."""
+
+            def post_message(self, text):
+                if not self.posts:
+                    self.posts.append(text)
+                    return {"ok": False, "error": "channel_not_found"}
+                return _FakeChat.post_message(self, text)
+
+        cfg_mix = dict(cfg, state_dir=os.path.join(tmp, "mixed-state"))
+        res_mix = run_once(cfg_mix, _FakeTracker(over), _RefuseFirst(), False, out=io.StringIO())
+        write_heartbeat(cfg_mix, res_mix, _now_iso())
+        with open(heartbeat_path(cfg_mix), encoding="utf-8") as fh:
+            hb_mix = json.load(fh)
+        ok("the cap AND a refused send: `capped` is only the cap's part of `declined`",
+           res_mix["exit"] == EXIT_DECLINED and hb_mix.get("capped") == 2
+           and hb_mix.get("declined") == 3
+           and hb_mix.get("sent") == cfg["max_events_per_pass"] - 1, repr(hb_mix))
+
+        # A pass that ENDED before it could count — the deadline struck in the send loop,
+        # after the cap was applied — cannot say what the cap held back. Its heartbeat says
+        # so with a null, never with a 0 that claims nothing was held back (finding 59).
+        class _DeadlineOnSecondPost(_FakeChat):
+            def post_message(self, text):
+                if self.posts:
+                    raise Deadline()
+                return _FakeChat.post_message(self, text)
+
+        cfg_dl = dict(cfg, state_dir=os.path.join(tmp, "deadline-state"))
+        rc_dl = run_command(cfg_dl, False, 60, tracker=_FakeTracker(over),
+                            chat=_DeadlineOnSecondPost(), out=io.StringIO())
+        with open(heartbeat_path(cfg_dl), encoding="utf-8") as fh:
+            hb_dl = json.load(fh)
+        ok("a pass the deadline ended records `capped` as null (not known), never a false 0",
+           rc_dl == EXIT_TIMEOUT and hb_dl.get("exit") == EXIT_TIMEOUT and "capped" in hb_dl
+           and hb_dl["capped"] is None, repr(hb_dl))
+
         # ── §9. Dry run sends nothing, writes no state, and says it was a rehearsal ──
         chat3, tracker3 = _FakeChat(), _FakeTracker([tkt("KIT-8", ESC_BLOCKED, "c8",
                                                          author="s")])
@@ -2469,6 +2561,8 @@ def selftest():
             hb = json.load(fh)
         ok("the heartbeat records the failing pass",
            hb["schema"] == HEARTBEAT_SCHEMA and hb["exit"] == EXIT_ERROR)
+        ok("…and a pass that failed before it chose any event records capped 0, not no field",
+           hb.get("capped") == 0, repr(hb))
 
         # ── a credential value never reaches an output ───────────────────────────
         fake_secret = "xoxb-" + "9876543210zyxwvutsrq"

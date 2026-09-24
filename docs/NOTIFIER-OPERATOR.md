@@ -97,6 +97,8 @@ will be sent to — read that line before you load the job.
 ## Where the token lives
 
 In the role account's own env file, `~/.stage-e/env`, at mode 600, beside the tracker key.
+Storing the token keeps every other line of that file, a line holding a NUL byte included.
+A store that lost the tracker key's line fails; it never reports itself done.
 The same three rules the notifier states when the token is missing:
 
 1. **In the notifier's own env file**, under the role account's home, mode 600.
@@ -128,7 +130,8 @@ It checks your work and carries on.
 | `run --dry-run` | the same pass with nothing applied. Names what would change. Asks for nothing |
 | `status` | replays the ledger. Probes nothing |
 | `verify` | re-measures every step. Changes nothing, records nothing, asks for no credential |
-| `card CK-N1` | print a card, at any time |
+| `card CK-N1` | print a card, at any time. Without a conf that loaded, it shows the example values, and its header says why: not found, or found and rejected, with the first problem |
+| `card CK-N5` | is it alive, and how to pause and resume it. Printed only when you ask: no step stops on it, nothing is signed on it |
 | `attest A-PRIVATE-CHANNEL --initials YOUR-INITIALS --note "..."` | record something no computer can check. `YOUR-INITIALS` is refused as typed |
 
 **The labels step reads the tracker key from YOUR shell,** for that one command. It never
@@ -145,7 +148,14 @@ start from that shell inherits it — a `claude` session among them, whose every
 then hold your tracker key. That is the incident this kit's own installers are shaped
 against.
 
-Not set, the labels row says **NOT MEASURED** and prints those three lines.
+Not set, the labels row says **NOT MEASURED** and prints those three lines, naming the
+command you ran: `run --dry-run`, `run` or `verify`, with the `--conf` and `--state` you
+gave it.
+
+**When the installer prints one of its own commands for you to run next, it repeats those
+two options.** That covers a card's lines, a remedy, and the command to run again. Each
+names the installer by the path that reaches it from where you stand. The defaults add
+nothing.
 
 **Your login password is asked for once,** at the start of `run`, `run --dry-run` and
 `verify`. Declined, the command stops at exit 5 having done nothing.
@@ -154,7 +164,7 @@ Not set, the labels row says **NOT MEASURED** and prints those three lines.
 
 | Step | What it does | What stops it |
 |---|---|---|
-| `preflight` | reads the conf, finds the role account's home, checks the notifier is in that account's clone, and runs the notifier's own selftest | any problem, all listed at once |
+| `preflight` | reads the conf, finds the role account's home, runs the notifier's own selftest from this checkout, and checks that account's clone holds every file the notifier runs **byte for byte as this checkout does** (sha256, read as that account) | any problem, all listed at once. A clone file that is missing, unreadable, or different is named |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private | card `CK-N1` |
 | `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer |
 | `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
@@ -164,6 +174,14 @@ Not set, the labels row says **NOT MEASURED** and prints those three lines.
 | `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
 | `handover` | prints what is on, what is off, and what is not proven, each with a ticket id | — |
+
+**The clone must run the code this checkout tested.** Preflight runs the notifier's
+selftest here. Then it hashes, as the role account, each file the notifier runs in that
+account's clone, and compares each with this checkout's. Being there is not enough: a
+different file fails preflight, named. Bring the two level: this checkout at the commit you
+mean to run, and the clone moved by the Stage E installer's `run` (its `code` step). Only
+those files count. The clone's HEAD may differ, so a merge that touches none of them never
+blocks. A clone file it could not hash is **NOT MEASURED**, not a pass.
 
 **Two sign-offs are bound to what they signed.** `A-PRIVATE-CHANNEL` records the channel
 id. Change the channel and `CK-N1` comes back. `A-FIRST-PING` records the config the job
@@ -213,6 +231,14 @@ declines when the chat refused the ping or the label did not apply — an escala
 was told about. The `enable` row reads the loaded job's heartbeat, and treats a real pass's
 exit 3 as a failure with the notifier's own summary, never as done.
 
+A real pass also exits 3 when it found more than `MAX_EVENTS_PER_PASS` events. The ones
+over the cap are not sent that pass; they go on the next. The heartbeat counts them in
+`capped`, a part of `declined`. When the cap was the whole of it (`capped` equals
+`declined`), the `enable` row says so, not "a ping or a label did not land". It is still
+FAILED: a person is owed those pings. A heartbeat from an older notifier has no `capped`,
+and keeps the old words. A pass that ended before it could count, at a deadline or an
+error, writes `capped` as null: not known, never a 0 that says nothing was held back.
+
 A `run` that already passed the rehearsal does not repeat it, so a loaded job's real
 heartbeat is not replaced by a rehearsal's — including when that heartbeat is the one
 reporting a failure.
@@ -222,21 +248,83 @@ reporting a failure.
 The installer never loads the job. You do:
 
 ```sh
+sudo launchctl enable system/<JOB_LABEL>
 sudo launchctl bootstrap system /Library/LaunchDaemons/<JOB_LABEL>.plist
 sudo launchctl print system/<JOB_LABEL>
 python3 scripts/pipeline_notifier_setup.py run
 ```
 
+**The enable line comes before every load.** It does nothing to a job that was never
+disabled. A job paused with `disable` (card `CK-N5`) will not load without it, not even
+after a restart. The installer does not read launchd's disabled flag: a job unloaded and
+disabled, and one only unloaded, both read as not loaded, BLOCKED on `CK-N3`. The card's
+lines load either.
+
 Changed the plist while it was loaded? Unload it first:
 `sudo launchctl bootout system/<JOB_LABEL>`. Wait a few seconds before loading again. A load
-straight after an unload can answer `Input/output error`; wait and repeat it.
+straight after an unload can answer `Input/output error`; wait and repeat it. The same error
+can also mean a job paused with `disable`. Waiting never clears that one; the enable line
+does.
 
 **launchd keeps what it was given.** Change `INTERVAL_SECONDS`, or a path the job's command
 names, and the file on disk moves on while the running job does not. The installer asks
 launchd what it is actually running and compares it with the plist, on every run — so this
 card keeps coming back until you reload it, not just on the run that rewrote the file.
 
-To pause the notifier, unload it. A later `run` does not load it again.
+To pause the notifier, unload it. A later `run` does not load it again. Card `CK-N5`
+says what paused looks like, and how to resume.
+
+## Is it alive? Pause and resume — card CK-N5
+
+```sh
+python3 scripts/pipeline_notifier_setup.py card CK-N5
+```
+
+Printed only when you ask. No step stops on it and nothing is signed on it. Its commands
+come filled in from your `notifier.conf`:
+
+- **The heartbeat and the log's last lines,** read as the role account:
+  `sudo -u <role-account> -H /bin/sh -c 'cd / && cat "$HOME/.stage-e/state/notifier-heartbeat.json"; tail -20 "$HOME/.stage-e/notifier.log"'`
+- **`verify`**, and **`sudo launchctl print system/<JOB_LABEL>`**.
+- **Whether the clone runs this checkout's notifier:** the same comparison preflight makes,
+  one `shasum` line per file, each `OK` or `FAILED`. It hashes the installer's own
+  `scripts/` by full path, so it compares the checkout preflight compares, wherever you
+  paste it.
+- **Pause:** `sudo launchctl bootout system/<JOB_LABEL>`. **Resume:** CK-N3's two lines,
+  `sudo launchctl enable system/<JOB_LABEL>`, then
+  `sudo launchctl bootstrap system /Library/LaunchDaemons/<JOB_LABEL>.plist`.
+
+**What alive looks like:** `dry` is false, `exit` is 0, and `at` is recent and not in the
+future.
+
+- **`dry: true` is a rehearsal,** from the installer's dry-run step or a dry run typed by
+  hand. It is not a pass of the loaded job, and says nothing about whether the job is
+  alive. Read the heartbeat again after one interval. The `enable` row grades it the same
+  way.
+- **A heartbeat is stale after 2 × `INTERVAL_SECONDS` + `RUN_TIMEOUT_SECONDS` + 120 s.**
+  With the defaults that is 960 s, 16 minutes. It is the line the `enable` row draws, and
+  the card prints it from your own values.
+- **An `at` more than 120 s in the future says nothing either:** a clock that moved back,
+  or a stamp the job did not write. The `enable` row calls it NOT MEASURED.
+
+**What paused looks like:**
+
+- `sudo launchctl print system/<JOB_LABEL>` answers `Could not find service`.
+- A later `run` does not load it again. The installer never loads the job.
+- `verify` reports the `enable` step BLOCKED on `CK-N3` for as long as it is paused. It
+  cannot say "No drift" until you resume.
+- If your Stage E install watches the notifier (`NOTIFIER_JOB_LABEL` in `stage-e.conf`),
+  its heartbeat monitor reports the paused notifier as stopped once two of its passes have
+  gone by. That comment pings when you resume. A Stage E run made during the pause leaves
+  the notifier unwatched and says so in a note. After you resume, run the Stage E installer
+  again, so the monitor watches it again.
+
+**A bootout lasts until the machine restarts.** At boot, launchd loads every plist in
+`/Library/LaunchDaemons` again, this one included. To keep it paused through a restart,
+also `sudo launchctl disable system/<JOB_LABEL>`. Resuming is the same two lines either
+way: CK-N3 enables before it loads.
+
+`verify`'s last row, `handover`, names this card on every pass.
 
 ## The throwaway live test — card CK-N4
 
@@ -280,8 +368,11 @@ unset STAGE_E_LINEAR_API_KEY
 ```
 
 Still nothing? Read `~/.stage-e/notifier.log` as the role account, and its heartbeat,
-`~/.stage-e/state/notifier-heartbeat.json`. A stale `at` means NOT RUNNING. A fresh one with
-a non-zero `exit` means RAN AND COULD NOT, and its `summary` says why.
+`~/.stage-e/state/notifier-heartbeat.json`. Card `CK-N5` prints that command with your
+paths. `dry: true` is a rehearsal, not a pass of the loaded job. A stale `at` means NOT
+RUNNING. A fresh one with a non-zero `exit` means RAN AND COULD NOT, and its `summary` says
+why. The one exception: `exit` 3 with `capped` equal to `declined` means the per-pass cap
+held events back for the next pass.
 
 ---
 
@@ -298,12 +389,29 @@ row you can act on, and none of them is green:
 |---|---|
 | a real pass, exit 0, recent | done |
 | a real pass that declined (exit 3) | FAILED, with the summary: a ping or a label did not land |
+| a real pass that declined only because of the per-pass cap (exit 3, `capped` equal to `declined`) | FAILED, with the summary: N events over the cap were not sent this pass; they go on the next |
 | a real pass that exited 1, 2 or 4 | FAILED, with the summary |
 | only the installer's own rehearsal | NOT MEASURED: the loaded job has finished no pass |
-| older than two intervals plus a pass | NOT MEASURED: loaded and NOT RUNNING |
+| older than 2 × `INTERVAL_SECONDS` + `RUN_TIMEOUT_SECONDS` + 120 s (960 s with the defaults) | NOT MEASURED: loaded and NOT RUNNING |
+| dated more than 120 s in the future | NOT MEASURED: a clock that moved back, or a stamp the job did not write |
 | no heartbeat at all | NOT MEASURED: the job has never finished a pass |
 
 That is the only place a dead notifier shows up, and only when you run it.
+
+A paused job has no heartbeat row to read: `enable` stops at "not loaded", BLOCKED on
+`CK-N3`. Card `CK-N5` prints the commands to look for yourself.
+
+`verify`'s preflight also compares the clone's notifier files with this checkout's.
+
+**After a merge that changes the notifier,** in this order:
+
+1. Pull this checkout, then run the Stage E installer's `run`. Its `code` step moves the
+   role account's clone.
+2. Run this installer's `run`. Preflight compares the two again. If the merge changed the
+   notifier's config, card `CK-N4` comes back: watch one ping again and sign it.
+
+Run this installer first and preflight is FAILED, naming each file the clone does not
+share. It stops there, before it changes anything: run the two again in the order above.
 
 ---
 
