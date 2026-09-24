@@ -12,24 +12,43 @@ way round: *you* start a session, by typing. It uses a **second** Slack app, and
 requests come in through your front door.
 
 **Mechanism** ships in this kit as `scripts/pipeline_chat_lane_setup.py`, tested in CI.
-**Activation** is yours, by hand: two edits to the dispatcher's config, one to its env file,
-a packet-filter rule, one settings file, one Slack app and one front-door path. **No session
-writes the dispatcher's config.** This file is generic on purpose: no hostnames, account
-names or ids from a real deployment. Keep the filled-in copy in your private runbook.
+**Activation** is yours: two edits to the dispatcher's config, one to its env file, a
+packet-filter rule, one settings file, one Slack app and one front-door path. Three
+subcommands make the file edits for you, as the role account, when **you** run them:
+`merge`, `env-names` and `front-door` (owner decision, 2026-09-24; KIT-197). Each refuses
+to run under a model, so **no session writes the dispatcher's config.** The restarts and
+the port block stay printed commands that you run. This file is generic on purpose: no
+hostnames, account names or ids from a real deployment. Keep the filled-in copy in your
+private runbook.
 
 Every claim about the dispatcher cites its source at version 0.2.69 as `File.js:line`.
 
 ---
 
-## Before anything: one member in the Slack workspace
+## Before anything: only fully trusted members in the Slack workspace
 
 The chat lane has **no user list and no channel list**. The dispatcher checks who is asking
 only on tracker webhooks (`EdgeWorker.js:3083-3087, 3620-3624`). So anyone in the Slack
-workspace who can mention the bot in a channel it is in starts a session.
+workspace who can mention the bot in a channel it is in starts a session. The tracker's
+`allowedUsers` list does not apply here either.
 
-The gate is **workspace membership**. Keep the workspace to one member: you. Turn this lane
-off before anyone else joins. The private channel keeps the notifier's pings private. It
-does not gate this lane.
+The gate is **workspace membership**, and every member can do everything you can:
+
+- read every file and token the dispatcher's account can read, your own tracker key and
+  code-host token included;
+- steer any running session, and write to the tracker;
+- run read-only shell commands (KIT-196).
+
+So the rule is:
+
+- **Admit only people you would trust with that account itself.** Wanting them to suggest
+  ideas or follow the work is not enough on its own. A tracker seat does that.
+- **Full members only.** No guests, no shared-channel users.
+- **Two-factor sign-in for every member.** Each member's Slack account is now part of this
+  boundary.
+- **Turn this lane off before anyone who does not meet that joins.**
+
+The private channel keeps the notifier's pings private. It does not gate this lane.
 
 ---
 
@@ -37,19 +56,78 @@ does not gate this lane.
 
 ```sh
 cp chat-lane.conf.example chat-lane.conf && chmod 600 chat-lane.conf
-$EDITOR chat-lane.conf                                      # six values, none secret
+$EDITOR chat-lane.conf                                      # none of them secret
 python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 ```
+
+The conf has seven values, and five optional ones: `DISPATCHER_SERVICE`,
+`FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN` and `FRONT_DOOR_MATCHER`. Leave
+one unset and every printed command that needs it says `not composed: set <KEY> in
+chat-lane.conf`, and a subcommand that needs it refuses. Nothing is guessed. A conf with a
+problem (an unknown key, say) composes nothing: `card` lists the problems first, prints the
+card without its commands, and exits 2.
 
 | Command | What it does |
 |---|---|
 | `compose` | Prints all seven pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
-| `verify` | Reads the dispatcher's config, its env file and the role account's user settings **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names and tool lists, never a value. Changes nothing. Refuses to run under a model. |
-| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device. |
+| `compose --piece N` | Prints one piece alone. `--piece 4` prints only the port-block script, so you can save it to a file. |
+| `verify` | Reads the dispatcher's config, its env file, the role account's user settings and the front door's config **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value. Changes nothing. Refuses to run under a model. |
+| `merge` | Pieces 1, 2 and 5. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
+| `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
+| `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
+| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off. |
 
-`verify` exits like the Stage E installer's: **0** every check applied, **10** something is
-not applied yet, **4** a check could not measure, **1** something is broken, **5** no
-administrator password, **3** refused under a model.
+Every command exits like the Stage E installer's. Read the exit code, not the word on the
+line: a `REFUSED:` line can end in 10, 2 or 3.
+
+| Exit | Means |
+|---|---|
+| **0** | Done, or nothing left to do. |
+| **10** | Something is not applied yet, or a step must come first. A writer's dry run that found work. `env-names` before the fence or the port block, or with no terminal. A file a writer will not touch: missing, a symbolic link, or owned by another account. A front-door file without exactly one allowlist line, a line that reaches the dispatcher's control routes, or a removal that would empty it. |
+| **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, or a pasted secret has the wrong shape. |
+| **4** | A check could not measure. `env-names` also exits 4 when it cannot read the file it compares the token with. Not a pass. |
+| **1** | Something is broken, or a write failed. |
+| **5** | No administrator password. |
+| **3** | Refused for safety, and nothing was written: under a model; `merge` or `front-door` found the file changed between the read and the write; or the token offered is the notifier's. |
+
+### What the three writers promise
+
+- **They run as the role account**, through `sudo -u`. Every value goes on standard input,
+  never in an argument, so `ps` never shows it and nothing prints it.
+- **`merge` and `front-door` check the file is the one they planned from**, as they start
+  and again just before the write. The dispatcher rewrites its own config when it
+  refreshes a tracker token. If the file changed, the writer refuses and writes nothing.
+  Run it again. The dispatcher honours no lock, so one read's worth of window remains.
+  `env-names` has no separate plan: it reads and replaces the env file in one pass, and
+  nothing else rewrites that file.
+- **They write nothing when nothing would change.** No backup, no new file, and no restart
+  to do for it. The output says `Nothing to write`, `ok`, or `UNCHANGED`.
+- **They back the file up first**, into `~/.stage-e/backups` in the role account's home, at
+  mode 600. Those copies hold the same secrets as the files. Piece 5 denies that folder to
+  the chat lane's `Read` tool. Delete a copy once `verify` is clean.
+- **They never restart anything.** Each prints the restart for you to run.
+
+### Already on before this change?
+
+A lane switched on before the composer gained its writers (KIT-197) keeps running. Only
+`verify` changes. It gains a `front-door` row, and piece 5 gains three deny rules: the role
+account's env file (`ROLE_ENV_FILE`, by default `Read(~/.stage-e/env)`), the temp copies an
+installer writes beside it while it runs (`Read(~/.stage-e/env.*)`), and
+`Read(~/.stage-e/backups/**)`. Until they are in, the chat lane's `Read` tool can still open
+the role account's env file. So do this soon after you pull:
+
+1. Pull this checkout. Nothing else moves: the composer runs from here.
+2. Add the five new keys to `chat-lane.conf` (see `chat-lane.conf.example`):
+   `DISPATCHER_SERVICE`, `FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN` and
+   `FRONT_DOOR_MATCHER`. Add `ROLE_ENV_FILE` only if yours is not `~/.stage-e/env`.
+3. Run `verify`. Expect `user-settings` to say three rules are missing and to name `merge`:
+   exit 10. If `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` is still unset, `front-door`
+   says `NOT MEASURED`, names the key, and `verify` exits 4 instead.
+4. Run `merge`, then `merge --apply`. It adds only those three rules. A backups rule written
+   by hand in the absolute form, `Read(//Users/<role>/.stage-e/backups/**)`, stays; it is
+   redundant and harmless.
+5. Run `front-door`. Good: `/slack-webhook is already on the line. Nothing to change.`
+6. Run `verify` again. Good: exit 0.
 
 ---
 
@@ -64,8 +142,42 @@ unguarded.
 
 Open the workspace's member list.
 
-Good: one member, you.
-Not that: anyone else. Stop here.
+Good: every member is someone you would trust with the dispatcher's account, is a full
+member, and signs in with two-factor.
+Not that: a guest, a shared-channel user, or anyone you would not trust with that account.
+Stop here.
+
+### Steps 2 to 4 — one command: `merge`
+
+Steps 2, 3 and 4 below are one command. Read what each step does first; then:
+
+```sh
+python3 scripts/pipeline_chat_lane_setup.py merge            # what it would change
+python3 scripts/pipeline_chat_lane_setup.py merge --apply    # writes it
+```
+
+`merge` reads the live config and user settings the way `verify` does, and plans with
+the same functions. It prints entry names, key names and tool lists only.
+
+- It writes the dispatcher's config **in place**: the same file, so the dispatcher's
+  watcher reloads it (`ConfigManager.js:51-62`). It keeps the file's indent and its last
+  newline.
+- It leaves a review entry alone. If a review entry lacks the Slack rules, it names it:
+  run the Stage E installer, whose entries these are.
+- It never edits an entry's `allowedTools`. An `mcp__` name in the first active entry is a
+  warning for you to remove by hand.
+- It adds only the missing deny rules to the user settings, and keeps every other rule
+  and key. A new file is made at mode 600.
+
+With `--apply` it then reads everything again and prints the `grant`, `coding-fence` and
+`user-settings` rows as `verify` would.
+
+Good: those three rows say `ALREADY-DONE`, and a second `merge --apply` says `Nothing to
+write: every piece this command merges is already in place`.
+Not that: `REFUSED: … changed since it was read`, or `… changed while it was being backed
+up`. The dispatcher refreshed a token in between. Run it again.
+Not that either: `Nothing this command can write`. A line above says `CANNOT`, `NOT
+MERGED` or `LEFT ALONE`: that piece is yours by hand, and the rows say what is left.
 
 ### Step 2 — Fence the Slack server off every other entry (piece 2)
 
@@ -101,12 +213,16 @@ Two more ways the fence can open. A session routed to several entries keeps only
 **every** one of them denies (`ToolPermissionResolver.js:181-189`). And a `DISALLOWED_TOOLS`
 environment variable replaces `defaultDisallowedTools` at start (`WorkerService.js:164-165`).
 
-`verify` prints the exact list for each entry, ready to paste.
+`verify` prints the exact list for each entry, ready to paste. `merge` writes exactly that
+list. **Except under `DISALLOWED_TOOLS`:** an entry that inherits then runs under that
+env list, which neither command reads. `verify` says so, `merge` writes nothing for that
+entry and prints `CANNOT`, and the fix is yours: give the entry its own list, the value of
+`DISALLOWED_TOOLS` plus both rules.
 
 ### Step 3 — Trim the chat grant (piece 1)
 
-Merge this one key into the top level of the dispatcher's config. `compose` prints it
-filled in; the shape is:
+This one key goes into the top level of the dispatcher's config. `merge` writes it with
+the pull rules filled in from the live repository paths. The shape is:
 
 ```json
 "slackAllowedTools": ["Read", "WebFetch", "WebSearch", "SendMessage", "ToolSearch", "mcp__slack", "mcp__linear", "Bash(git -C /ABSOLUTE/PATH/TO/REPOSITORY pull)", "Bash(git -C /ABSOLUTE/PATH/TO/REPOSITORY pull --ff-only)"]
@@ -162,18 +278,26 @@ next. Keep every entry free of them; `verify` checks the live order.
 
 A chat session's folder is a fresh directory, not a project (`ChatSessionHandler.js:427-432`).
 So the only settings file it loads is the role account's own `~/.claude/settings.json`
-(`ClaudeRunner.js:499`). `compose` prints a `permissions.deny` block for it.
+(`ClaudeRunner.js:499`). `compose` prints a `permissions.deny` block for it, and `merge`
+merges it.
 
-Merge the rules into that file's existing `deny` list. Keep every rule already there. No
+The rules go into that file's existing `deny` list. Every rule already there stays. No
 hooks.
 
 Don't: overwrite the file. The account may already have one, and its rules would be gone.
+`merge` backs an existing file up first and adds only what is missing. A file it cannot
+extend — not a JSON object, or a `permissions` or `deny` of the wrong type — is reported
+`FAILED` and left alone; `merge` still writes the config, and you merge this piece by hand.
 
-**Why the rules start with `//**/`.** They are this repository's own secret-file denies.
-Written relative, as the repository has them, a rule matches under the session's current
-directory only. For a chat session that is an empty folder. Anchored at the root, each
-matches the file name anywhere. The last two rules name this deployment's dispatcher config
-and env file.
+**Why the rules start with `//**/` or `~/`.** The first twelve are this repository's own
+secret-file denies. Written relative, as the repository has them, a rule matches under the
+session's current directory only. For a chat session that is an empty folder. Anchored at
+the root, each matches the file name anywhere. The next two name this deployment's
+dispatcher config and env file. The last three are the role account's own: its env file
+(`ROLE_ENV_FILE`, by default `~/.stage-e/env`, which holds the other installers' keys), the
+temp copies an installer writes beside that file while it runs (`~/.stage-e/env.*`), and
+`~/.stage-e/backups`, where the three writers copy a file before changing it. A `~/` rule
+matches under the home of the account the session runs as.
 
 **What they do not stop.** They block the `Read` tool. They do **not** stop the upload tool
 in `mcp__cyrus-tools`, which opens the file inside the dispatcher's own process
@@ -188,8 +312,18 @@ rule first. It refuses the dispatcher's port on every interface except loopback,
 and IPv6. The front door still works, because it connects locally.
 
 `compose` prints three things for this step: the rules file, a root LaunchDaemon, and the
-commands that install, check, load and confirm them. Run those commands in a terminal, in
-order, and stop at the first error.
+commands that install, check, load and confirm them. Save them, read them, then run them:
+
+```sh
+python3 scripts/pipeline_chat_lane_setup.py compose --piece 4 > pf-block.sh
+less pf-block.sh
+sh -e pf-block.sh                     # stops at the first error
+```
+
+It is safe to run again. If the boot job is already loaded, the script stops it and waits
+until launchd lets it go before it loads it again. It waits 30 seconds at most. If it prints
+`STILL LOADED after 30 s` and then `Bootstrap failed: 5`, the old job had not let go yet. The
+rule already loaded stays in force: wait a minute and run the script again.
 
 - **The port** is `DISPATCHER_PORT` in your conf. It must be the port the dispatcher reads
   from `CYRUS_SERVER_PORT`, which is 3456 when unset (`WorkerService.js:190`;
@@ -212,7 +346,10 @@ lines, one `inet` and one `inet6`, for your port. `sudo pfctl -s info | grep Sta
 `Status: Enabled`. The dispatcher still answers `curl -s -m 5 http://127.0.0.1:<port>/status`.
 
 Not that: no rules, or `Status: Disabled`. Stop. Do not go on to Step 7 until both are
-right.
+right. Read the boot job's log, `/var/log/pipeline-dispatcher-port.log`, and its last exit
+(`sudo launchctl print system/local.pipeline-dispatcher-port | grep 'last exit'`). Step 7's
+`env-names` refuses until `verify`'s port-block reading says the block is loaded, on the
+port the dispatcher really listens on.
 
 ### Step 6 — Create the chat app (card CK-C1, piece 6)
 
@@ -237,18 +374,53 @@ starts (`McpConfigService.js:91-98`) may want more scopes for some tools. None i
 
 If Slack says the request URL did not verify, carry on. Step 11 retries it.
 
+Install the app. Its bot token and signing secret **stay in Slack** until Step 7 asks for
+them. Copy them nowhere.
+
 Good: an app with exactly those four bot scopes and no user scopes.
 
 ### Step 7 — Four names in the dispatcher's env file, then restart (piece 3)
 
 | Name | Value |
 |---|---|
-| `SLACK_BOT_TOKEN` | the **chat** app's bot token, typed by you |
-| `SLACK_SIGNING_SECRET` | the chat app's signing secret, typed by you |
+| `SLACK_BOT_TOKEN` | the **chat** app's bot token |
+| `SLACK_SIGNING_SECRET` | the chat app's signing secret |
 | `CYRUS_HOST_EXTERNAL` | `true` |
 | `WEBHOOK_IP_VALIDATION` | `false` |
 
-Add all four together, before the restart.
+All four go in together, before the restart. Run this yourself, in a terminal:
+
+```sh
+python3 scripts/pipeline_chat_lane_setup.py env-names
+```
+
+- It measures the order first, exactly as `verify` does, and asks for nothing until both
+  hold. The `coding-fence` row must say the Slack fence is in place (Steps 2 to 4): the
+  fence before the token. The `port-block` row must say the block is loaded, on the port
+  the dispatcher listens on (`CYRUS_SERVER_PORT` against `DISPATCHER_PORT`): the block
+  before the listen. A row it could not measure exits 4, not 10.
+- It asks for the token and the secret at two hidden prompts, and checks their shape:
+  `xoxb-` and at least 40 characters for the token, exactly 32 lower-case hex for the
+  secret.
+- It hands them to the role account's shell on standard input. That shell compares the
+  token with **every** value in `ROLE_ENV_FILE`, where the notifier keeps its own, and
+  refuses a match under any name. It needs that file:
+  - Missing or unreadable: `NOT CHECKED`, exit 4, and nothing is written. Point
+    `ROLE_ENV_FILE` at the notifier's env file.
+  - No line for `NOTIFIER_TOKEN_ENV` in it: it still compares every value, and prints a
+    `NOTE`. Make `ROLE_ENV_FILE` and `NOTIFIER_TOKEN_ENV` match notifier.conf's `ENV_FILE`
+    and `CHAT_TOKEN_ENV`.
+  - Otherwise it prints `CHECKED`.
+- It refuses an env file that is a symbolic link, or that the role account does not own.
+  Point `DISPATCHER_ENV_FILE` at the file itself.
+- It drops any old line for the four names (with or without `export`), adds the four, and
+  keeps every other line in order and the file's mode. If that changes nothing, it says
+  `UNCHANGED` and writes and backs up nothing. Otherwise it backs the file up first.
+- It prints each name with its value's **length**, never a value, and warns if a `vi` swap
+  file sits beside the env file.
+
+The backup holds the whole env file, the two secrets and the dispatcher's other secrets
+too. Delete it once `verify` is clean; the output prints the command.
 
 **`WEBHOOK_IP_VALIDATION=false` is not optional. Without it, tickets stop starting sessions.**
 `CYRUS_HOST_EXTERNAL=true` turns on webhook source-address checks unless this name is exactly
@@ -283,9 +455,30 @@ dispatcher's own unsandboxed process. The only opt-out is leaving the key unset.
 `CYRUS_TEAM_ID` as well, whole session transcripts go there too (`EdgeWorker.js:152-173`).
 `CYRUS_APP_URL` only changes where they go.
 
-Then **restart the dispatcher** when no session is in flight. A restart stops every running
-session (`docs/STAGE-E-OPERATOR.md`). Some of this reloads live, but not all of it (see
-*When a change takes effect*).
+Then **restart the dispatcher**, only when it is idle. A restart stops every running session
+(`docs/STAGE-E-OPERATOR.md`). Some of this reloads live, but not all of it (see *When a
+change takes effect*). `env-names` prints card CK-C5 when it finishes:
+
+```sh
+python3 scripts/pipeline_chat_lane_setup.py card CK-C5
+```
+
+Paste its block whole. It restarts only when the dispatcher's own `/status` answers `idle`:
+busy means a webhook, a ticket session or a chat session is running
+(`EdgeWorker.js:1784-1802`). It stops the dispatcher, waits until `launchctl print` no
+longer finds it (a start before then fails with `Bootstrap failed: 5`), starts it, and
+shows the end of its log. The log's path comes from the plist's `StandardOutPath`.
+
+Good: the log shows a fresh start.
+Not that: `NOT RESTARTED`. It answered busy: something is running. Wait, and paste it again.
+Not that either:
+- `NOT LOADED`: launchd did not hold the dispatcher, so nothing of it ran. The block started
+  it; read the log it shows.
+- `NOT ANSWERING`: launchd holds it, and nothing answered on its port. The block shows its
+  state and log. Read them first: a dispatcher that fails at start is restarted by launchd
+  again and again, and a restart does not fix that. When a restart is what it needs, the
+  card's second block restarts it without asking `/status`, and stops any session still
+  running.
 
 ### Step 8 — Confirm tickets still start sessions
 
@@ -296,7 +489,7 @@ Delegate one throwaway tracker ticket to the dispatcher.
 Good: a session starts on it within five minutes.
 
 Not that: no session. Roll back now. Remove `CYRUS_HOST_EXTERNAL` from the dispatcher's env
-file and restart the dispatcher. Then read the dispatcher's log for
+file and restart the dispatcher (card CK-C5). Then read the dispatcher's log for
 `Rejected Linear webhook from unauthorized IP` (`LinearEventTransport.js:93`).
 
 ### Step 9 — Prove the port is closed, from a second device (card CK-C4)
@@ -326,16 +519,50 @@ After the next reboot, run the card again: the rule is loaded at boot.
 
 ### Step 10 — Open the front door for one path (card CK-C2, piece 7)
 
-The reverse proxy's path allowlist gains `/slack-webhook`, and nothing else.
+The reverse proxy's path allowlist gains `/slack-webhook`, and nothing else. The allowlist
+is the one `FRONT_DOOR_MATCHER path …` line in `FRONT_DOOR_CONFIG` (a Caddyfile named
+matcher such as `@dispatcher path /linear-webhook /callback /status`).
 
 ```sh
-python3 scripts/pipeline_chat_lane_setup.py card CK-C2
+python3 scripts/pipeline_chat_lane_setup.py front-door            # what it would change
+python3 scripts/pipeline_chat_lane_setup.py front-door --apply    # writes it
+python3 scripts/pipeline_chat_lane_setup.py card CK-C2            # the restart and probes
 ```
 
-Good: the door answers `401` on `/slack-webhook` with no signature — the dispatcher asking
-for one — and anything **but** `401` on the dispatcher's config-update route, which must
-never be reachable. A status or version path is not the test: a front door may forward one
-on purpose for monitoring.
+`front-door` works as the role account. It finds exactly one such line; no line, or two,
+and it refuses. It prints the line, and names every path on it that is not one of the
+dispatcher's own routes:
+
+| Route | Where the dispatcher registers it |
+|---|---|
+| `/linear-webhook` | the tracker's webhooks (`LinearEventTransport.js:68`) |
+| `/callback` | the tracker sign-in's redirect, on the self-auth command's own listener (`SelfAuthCommand.js:113`) |
+| `/status` | idle or busy (`EdgeWorker.js:535`) |
+| `/slack-webhook` | the chat lane (`SlackEventTransport.js:85`) |
+
+A path it names is a wider door. It is not removed: find out what added it. One kind it
+refuses to add beside: a wildcard (any path with `*`), or a path under `/api/update/` or
+`/mcp/`. Those reach the dispatcher's config-update route or its tool server, whose auth
+check passes everything while `CYRUS_API_KEY` is unset. Take that path off the line by
+hand first. `--remove` still works beside one.
+
+With `--apply` it appends the path to the end of the line and changes nothing else. It
+backs the file up, validates it with `FRONT_DOOR_BIN validate --config … --adapter
+caddyfile`, and puts the backup back byte for byte if validation fails. It never restarts
+the door: card CK-C2 prints the restart and three probes.
+
+Good: `401` on `/slack-webhook` with no signature — the dispatcher asking for one — and
+`401` on `/linear-webhook`, so tickets still reach it. `404` on the dispatcher's
+config-update route, `/api/update/cyrus-config`, which must never be reachable: only the
+dispatcher answers it `401`. A status or version path is not the test: a front door may
+forward one on purpose for monitoring.
+
+Not that, and each answer means a different layer: `404` on the Slack path means the path
+is not on the line or the door was not restarted; `530`, or the tunnel's own error page,
+means the tunnel in front of the door is down; `502` means the door forwarded it and the
+dispatcher is not listening. For a `502`, paste card CK-C5's block: it starts a dispatcher
+launchd does not hold, and says `NOT ANSWERING`, with the state and the log, for one it
+holds. Read the log before the card's forced restart.
 
 ### Step 11 — Point Slack at it
 
@@ -360,12 +587,14 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `notifier-token-absent` | the notifier's token name is **not** in the dispatcher's env file |
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
-| `user-settings` | the role account's settings file exists and carries every composed deny rule |
+| `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file and backups folder included |
+| `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
 
 `verify` cannot see the network from outside. `port-block` says the rule is loaded; card
-`CK-C4` is the proof that it works.
+`CK-C4` is the proof that it works. `front-door` says the line is right; card `CK-C2`'s
+probes are the proof that the running door serves it.
 
 ### Step 13 — The live check (card CK-C3)
 
@@ -373,10 +602,32 @@ Good: `No drift: every check measures as applied.` and exit 0.
 python3 scripts/pipeline_chat_lane_setup.py card CK-C3
 ```
 
-In the channel, ask the bot to list its tool names. Then ask it what is waiting for you in
-the tracker.
+**Test calls, not the list.** A chat session is *shown* every built-in tool, `Monitor`,
+`Task` and `ScheduleWakeup` included. The chat runner passes `allowedTools` and no `tools`
+restriction, and the grant is enforced when a tool is **called**. So a listing proves
+nothing. The dispatcher's chat prompt even names `log_failure_mode` when that tool is
+absent.
 
-Good: no `Monitor`, `Task` or `ScheduleWakeup`; an answer from the tracker.
+The card has you make a harmless decoy file, `/tmp/chat-lane-decoy.pem`, then mention the
+bot once per call. This is what a deployment measured on 2026-09-24 (KIT-196), and what
+Good looks like:
+
+| Call | Result |
+|---|---|
+| Bash `echo` | **ran** |
+| `Monitor` with `echo` | **ran** |
+| `Write`, Bash `touch`, a chained `echo …; touch …`, `Monitor` with `touch` | refused |
+| Bash `wc -c` of the decoy, which a user-level `Read` deny covers | refused |
+| `ToolSearch` for `log_failure_mode` | nothing found: it exists only with `CYRUS_API_KEY`, which stays unset |
+| a tracker question | answered |
+
+**The open residual, KIT-196: this lane has a read-only shell.** Read-only commands are
+auto-approved by the SDK's default permission handling, through Bash and through
+`Monitor`, whatever the grant says. They can read any file the role account can read that
+no `Read` deny covers. The owner kept the lane on with this named.
+
+Not that: a `Write` or a `touch` that ran. The grant did not load: restart the dispatcher
+(card CK-C5) and test again.
 Expected, and accepted: tools named `mcp__cyrus-tools__…` appear. The trim cannot remove
 that server.
 
@@ -414,7 +665,7 @@ read.
 |---|---|
 | Set `slackAllowedTools` | Live, for chat sessions started or resumed after the file changes (`ConfigManager.js:51-62, 181`; `EdgeWorker.js:362-381`; `ChatSessionHandler.js:139, 279`). A session still running keeps its old list (`ChatSessionHandler.js:70-77`). |
 | Remove `slackAllowedTools` | At restart only: a reload keeps the old value (`ConfigManager.js:181`). |
-| Add or change a name in the env file | Live (`Application.js:52-78`), except the listening address and address checks, which are read at start. |
+| Add or change a name in the env file | Live (`Application.js:52-78`), except the listening address and address checks, which are read at start. `env-names` replaces the file with a rename, which the watcher may not count as a change (see *What is not proven*), so count on the restart. |
 | Remove a name from the env file | At restart only: a reload sets names and never unsets one (`Application.js:54`). |
 | **Delete** `promptDefaults`, `slackMcpConfigs` or any other config key | At restart only, and worse: the merge keeps the old value (`ConfigManager.js:176-183`), so the reloaded config equals the old one and nothing is re-applied at all — while the log still prints the reload line. Set the key to an empty value instead, or restart. `verify` reads the file, so both rows go green either way. |
 | The port block | Now, when the LaunchDaemon is bootstrapped, and again at every boot. |
@@ -436,7 +687,9 @@ deployment accepts the same list.
 - **No identity check beyond Slack workspace membership.**
 - **It can steer any running session**, through the tool server's feedback tool.
 - **It can read any file the role account can read and upload it**, public if asked. A web
-  page it fetches could talk it into sending a credential to a public link, with no shell.
+  page it fetches could talk it into sending a credential to a public link.
+- **It has a read-only shell.** Read-only commands run through Bash and `Monitor` without
+  the grant naming them (KIT-196, measured 2026-09-24). The owner kept the lane on.
 - **Every coding session can read the chat bot's token.**
 - **A process already running on this machine can call the dispatcher's tool server.** Its
   auth check passes everything while no key is set, and a call needs a live session's id
@@ -467,7 +720,9 @@ These came out of reading the dispatcher's source for this build.
 
 ## What is not proven
 
-- That a live chat session holds the trimmed list. Card `CK-C3` measures it once (KIT-117).
+- That a live chat session is fenced as measured, beyond the calls card `CK-C3` makes. It
+  was measured once, on 2026-09-24 (KIT-196). Which read-only commands the SDK approves is
+  the SDK's rule, not this kit's, and it can change with the SDK.
 - Whether the chat grant can name single tools of a server instead of the whole server
   (KIT-117).
 - Whether a sandboxed coding session can actually reach Slack with the chat token, through
@@ -499,7 +754,9 @@ These came out of reading the dispatcher's source for this build.
   exact string, so `git -C <path> pull origin main` is refused by design; only the two
   composed forms are allowed (KIT-174).
 - Whether the config watcher sees an edit from an editor that replaces the file instead of
-  changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174).
+  changing it. Only a `change` event reloads (`ConfigManager.js:59`) (KIT-174). The same
+  question holds for the env file's watcher (`Application.js:52-78`), and `env-names`
+  itself replaces that file with a rename.
 - Whether Slack creates an app from a manifest whose request URL does not answer yet
   (KIT-174).
 - Whether the Slack tool server's tools the lane uses need scopes the chat app lacks. None
@@ -515,11 +772,25 @@ These came out of reading the dispatcher's source for this build.
 
 ## Turning it off
 
+```sh
+python3 scripts/pipeline_chat_lane_setup.py card CK-C6
+```
+
+The card walks these, with every command filled in from your conf:
+
 1. **Uninstall the chat app in Slack.** That revokes its token, and it is the step that
    really ends the lane: a copied token works until then.
-2. Remove the four names from the dispatcher's env file, then restart. A reload does not
+2. Remove the four names from the dispatcher's env file:
+   `python3 scripts/pipeline_chat_lane_setup.py env-names --remove`. It backs the file up
+   first and needs no prompt.
+3. Restart the dispatcher, only when it is idle (card CK-C5's block). A reload does not
    unset a name (`Application.js:54`). The dispatcher then listens on this machine only.
-3. Remove `/slack-webhook` from the front door.
-4. Leave `slackAllowedTools`, the entry fences and the port block in place. Removing the
-   grant key restores the built-in list, `Monitor` and `Task` included, at the next restart.
-   The port block costs nothing while the dispatcher listens on this machine only.
+4. Take `/slack-webhook` off the front door: `front-door --remove`, then
+   `front-door --remove --apply`. Restart the door.
+5. Probe the door. Good: `404` on `/slack-webhook`, `401` on `/linear-webhook`.
+6. Check the port block is still loaded: `sudo pfctl -a com.apple/250.pipeline-dispatcher-port -s rules`.
+
+Keep the fences, the grant and the port block. Removing the grant key restores the
+built-in list, `Monitor` and `Task` included, at the next restart. The port block costs
+nothing while the dispatcher listens on this machine only. Afterwards `verify` reports the
+env and front-door rows as not applied: that is what off looks like.

@@ -1,4 +1,4 @@
-# chat-lane.conf.example — the six values the chat-lane composer asks you for.
+# chat-lane.conf.example — the values the chat-lane composer asks you for.
 #
 # ---------------------------------------------------------------------------
 # HOW TO USE THIS FILE
@@ -8,9 +8,11 @@
 #   python3 scripts/pipeline_chat_lane_setup.py compose       # prints every piece
 #   python3 scripts/pipeline_chat_lane_setup.py verify        # after you apply them
 #
-# Both commands check this file first and report EVERY bad value in one pass.
-# Neither one writes anything: `compose` prints, `verify` reads. You apply each
-# piece by hand. The steps are in docs/CHAT-LANE-OPERATOR.md.
+# Every command checks this file first and reports EVERY bad value in one pass.
+# `compose` prints and `verify` reads. Three subcommands write, as the role
+# account, only when you run them: `merge --apply`, `env-names` and
+# `front-door --apply`. None of them restarts anything. The steps are in
+# docs/CHAT-LANE-OPERATOR.md.
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
@@ -20,7 +22,8 @@
 #
 #   NO KEY HERE EVER HOLDS A CREDENTIAL.  The loader refuses a value with a
 #   credential shape and names the KEY only.  The chat app's token and signing
-#   secret go into the dispatcher's env file, typed by you, and nowhere else.
+#   secret go into the dispatcher's env file through `env-names`, which asks for
+#   them at hidden prompts, and nowhere else.
 #
 #   MODE 600.  It holds no secret, but it holds the shape of your deployment.
 #   `chat-lane.conf` is gitignored; this example is committed.  Every value
@@ -28,16 +31,18 @@
 # ---------------------------------------------------------------------------
 
 
-# The local account the dispatcher runs as. `verify` reads three files as this
-# account, through `sudo -u`. Never your own login.
+# The local account the dispatcher runs as. `verify` reads four files as this
+# account, through `sudo -u`, and the three writing subcommands write as it.
+# Never your own login.
 ROLE_ACCOUNT=_exdispatch
 
 # The dispatcher's config file, as an absolute path. The chat grant and the
-# Slack fence go in here. The composer never writes it.
+# Slack fence go in here. `merge --apply` writes them, in place.
 DISPATCHER_CONFIG=/opt/example-dispatcher/config.json
 
 # The env file the dispatcher loads, as an absolute path. By default that is
-# `.env` in the dispatcher's home. The three chat-lane names go in here.
+# `.env` in the dispatcher's home. The four chat-lane names go in here, through
+# `env-names`.
 DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env
 
 # The public host name of your front door (the reverse proxy). Host name only:
@@ -51,8 +56,58 @@ FRONT_DOOR_HOST=chat.example.com
 # two without reading the value.
 DISPATCHER_PORT=3456
 
-# The NAME of the notifier's own token variable. `verify` checks that this name
-# is NOT in the dispatcher's env file: every dispatcher session inherits that
-# file, and the notifier's token must never reach one. Leave the default unless
-# your notifier uses a different name.
+# The NAME of the notifier's own token variable: notifier.conf's CHAT_TOKEN_ENV.
+# `verify` checks that this name is NOT in the dispatcher's env file: every
+# dispatcher session inherits that file, and the notifier's token must never
+# reach one. Leave the default unless your notifier uses a different name.
 NOTIFIER_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
+
+# The role account's OWN env file: the one the Stage E installer and the notifier
+# keep their keys in (notifier.conf's ENV_FILE). `env-names` compares the chat
+# token with every value in it, only to refuse the notifier's token as the chat
+# app's. It will not guess: when this file is missing or unreadable, env-names
+# writes nothing and exits 4; when it has no NOTIFIER_TOKEN_ENV line, it says so.
+# Piece 5 denies it to the chat lane's Read tool. `~/` means the ROLE account's
+# home, not yours.
+#
+# RULE: an absolute path, or one starting `~/`. The default is the one both
+# installers use.
+ROLE_ENV_FILE=~/.stage-e/env
+
+# ---------------------------------------------------------------------------
+# OPTIONAL — the printed restarts and the front-door subcommand need these.
+# Leave one unset and every command that needs it prints
+# `not composed: set <KEY> in chat-lane.conf`, and a subcommand that needs it
+# refuses, naming it. Nothing is guessed.
+# ---------------------------------------------------------------------------
+
+# The launchd label of the dispatcher's own system daemon: the name
+# `launchctl print system/<label>` finds. Card CK-C5 restarts it (only when it
+# answers idle), and reads its log's path from the plist's StandardOutPath.
+# The same key, and the same value, as stage-e.conf.
+#
+# RULE: reverse-DNS, at least two dot-separated segments.
+DISPATCHER_SERVICE=com.example.dispatcher
+
+# The launchd label of the front door's system daemon. Card CK-C2 restarts it
+# after `front-door --apply`.
+#
+# RULE: reverse-DNS, and not the same as DISPATCHER_SERVICE.
+FRONT_DOOR_SERVICE=com.example.front-door
+
+# The front door's config file, as an absolute path: the one holding its path
+# allowlist line (below). `front-door` reads and writes it as ROLE_ACCOUNT, so
+# that account must own it. `verify` reads it for the front-door row.
+FRONT_DOOR_CONFIG=/opt/example-dispatcher/Caddyfile
+
+# The front door's own binary, as an absolute path. `front-door --apply` runs
+# `<this> validate --config <FRONT_DOOR_CONFIG> --adapter caddyfile` after its
+# edit, and puts the backup back if that fails.
+FRONT_DOOR_BIN=/opt/homebrew/bin/caddy
+
+# The named matcher whose ONE line is the allowlist, as it is written in
+# FRONT_DOOR_CONFIG: `<matcher> path /one /two ...`. `front-door` refuses when it
+# finds no such line, or two.
+#
+# RULE: `@` and then letters, digits, `_` or `-`.
+FRONT_DOOR_MATCHER=@dispatcher
