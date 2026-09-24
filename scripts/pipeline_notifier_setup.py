@@ -972,8 +972,11 @@ CARDS = {
                "  - `verify` reports the `enable` step BLOCKED on CK-N3, so it cannot say",
                "    `No drift` until you resume;",
                "  - if your Stage E install watches the notifier (NOTIFIER_JOB_LABEL in",
-               "    stage-e.conf), its heartbeat-monitor row shows it as paused, not watched.",
-               "    Resuming the notifier needs no Stage E run.",
+               "    stage-e.conf): its heartbeat monitor reports the paused notifier as",
+               "    stopped once two of its passes have gone by, and that comment pings",
+               "    when you resume. A Stage E run made during the pause leaves it",
+               "    unwatched and says so in a note; after you resume, run the Stage E",
+               "    installer again so the monitor watches it again.",
                "A bootout lasts until the machine restarts: at boot, launchd loads every",
                "plist in /Library/LaunchDaemons again, this one included. To keep it paused",
                "through a restart, disable it as well:",
@@ -3851,10 +3854,13 @@ def _selftest_body():
            outx[-1800:])
         # Decision 1 of the round: a pause, seen from a Stage E install that watches the
         # notifier, and said without claiming that watch exists on every install (finding 65).
-        ok("card CK-N5: a pause, if your Stage E install watches the notifier, shows there as "
-           "paused, not watched, and resuming the notifier needs no Stage E run",
+        ok("card CK-N5: a pause, if your Stage E install watches the notifier, is reported "
+           "there as stopped, a Stage E run during it leaves it unwatched, and resuming "
+           "ends with a Stage E run",
            "if your Stage E install watches the notifier" in out5
-           and "paused, not watched" in out5 and "needs no Stage E run" in out5, out5[-2500:])
+           and "reports the paused notifier as" in out5 and "unwatched" in out5
+           and "run the Stage E" in out5 and "installer again" in out5
+           and "needs no Stage E run" not in out5, out5[-2500:])
 
         # CK-N3 is the card `run` and `verify` send a paused job to. A job paused with
         # `disable` will not load until it is enabled, and waiting does not change that

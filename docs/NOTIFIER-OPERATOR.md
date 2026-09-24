@@ -314,8 +314,10 @@ future.
 - `verify` reports the `enable` step BLOCKED on `CK-N3` for as long as it is paused. It
   cannot say "No drift" until you resume.
 - If your Stage E install watches the notifier (`NOTIFIER_JOB_LABEL` in `stage-e.conf`),
-  its heartbeat-monitor row shows it as paused, not watched. Resuming the notifier needs no
-  Stage E run.
+  its heartbeat monitor reports the paused notifier as stopped once two of its passes have
+  gone by. That comment pings when you resume. A Stage E run made during the pause leaves
+  the notifier unwatched and says so in a note. After you resume, run the Stage E installer
+  again, so the monitor watches it again.
 
 **A bootout lasts until the machine restarts.** At boot, launchd loads every plist in
 `/Library/LaunchDaemons` again, this one included. To keep it paused through a restart,
