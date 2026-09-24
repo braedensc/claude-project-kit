@@ -107,6 +107,12 @@ Set `DISPATCHER_ENV_FILE` and `DISPATCHER_STATE_ROOT` in `notifier.conf`, and th
 checks rules 2 and 3 against real paths. Left empty, it says in preflight that it did not
 check them.
 
+**The Stage E installer shares this file and keeps this line.** When it stores or replaces
+one of its own two credentials, it changes only its own two lines. Every other line stays,
+this token included (KIT-171). A Stage E installer from before that fix rewrote the whole
+file and dropped this token. If one of those changed Stage E's credentials, run this
+installer again.
+
 ---
 
 ## The installer: one command, repeated
@@ -325,10 +331,6 @@ That is the only place a dead notifier shows up, and only when you run it.
   this env file included — is readable by a session through a tool server the dispatcher
   provides, whatever the sandbox denies. Moving the file does not help: every daemon runs as
   the same account. (KIT-162)
-- **The Stage E installer rewrites the env file whole** when it stores or replaces a
-  credential. That drops the notifier's token line. Every notifier pass then exits 2, and only
-  `verify` here shows it. Re-run this installer after any Stage E credential change.
-  (KIT-171)
 - **Whether `chat:write` alone posts to a private channel** the bot was invited to. The
   notifier is built for that one scope. The throwaway test settles it. (KIT-173)
 - **Whether the tracker's editor keeps `<!--` intact** on a comment's first line. The API

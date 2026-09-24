@@ -177,12 +177,22 @@ role account's own env file at mode 600, and from then on **read back out of tha
 so a second `run`, a `run --dry-run` and `verify` ask you for nothing at all. Nothing prints
 a value; what you see back is the name, the length and the class.
 
+**The installer changes only its own two lines of that file.** Other things live there too:
+the notifier keeps its token in it, and you may keep a comment or a name of your own. A store
+or a replacement drops the old lines for the two names it owns and adds the new ones at the
+end. Every other line stays as it was, in order, and the file stays at mode 600. The new file
+replaces the old one in a single step, so a daemon starting mid-write reads one or the other,
+never half. If the installer cannot read the file, it stops and changes nothing. A file
+owned by any account but the role account is refused, not replaced. (KIT-171: before this
+fix it rewrote the whole file, and the notifier's token went with it.)
+
 The exception is real and worth knowing before it happens: **if the tracker refuses a key
 that was read out of that file**, that is a *rejected* key, not a missing one — the file is
 there and its contents are not accepted — and `run` asks you for a replacement and writes it
-back over the old one. Revoke a key, let one expire, or point the installer at another
-workspace and you will type that one secret a second time. `verify` and `run --dry-run`
-never ask; they report the rejection and name `run` as the command that can fix it.
+over the old line, leaving every other line alone. Revoke a key, let one expire, or point
+the installer at another workspace and you will type that one secret a second time.
+`verify` and `run --dry-run` never ask; they report the rejection and name `run` as the
+command that can fix it.
 
 **Both credentials are asked about, not just counted.** The installer probes the env file
 for *names and lengths*, which cannot tell a live credential from a dead one. So the tracker
@@ -1051,6 +1061,10 @@ EOF
 chmod 600 ~/.stage-e/env
 ```
 
+**This recipe is for a first setup only.** `cat >` overwrites the whole file. If the file
+already holds anything, such as the notifier's token, edit it instead, or let `run` store the
+two values: it keeps every other line.
+
 The Linear key must be a **personal key on the owner's account**. A delegation made with
 an app token arrives with no creator and the dispatcher blocks it, so only the owner's
 identity can start a reviewer. That is why this key exists at all, and why the three rules
@@ -1109,8 +1123,9 @@ That is the whole procedure. **Do not restart the daemons.** Each pass re-reads 
 when it starts, so the next scheduled pass picks up the new value on its own; a restart buys
 nothing and stops whatever was mid-flight. The alternative is `python3
 scripts/pipeline_stage_e_setup.py run`, which asks for a replacement at a hidden prompt and
-writes the file for you — take that one if you would rather not edit a credential file by
-hand.
+writes the file for you. It replaces only its own two lines and keeps every other line,
+the notifier's token included. Take that one if you would rather not edit a credential file
+by hand.
 
 The scripts read the values from the environment variables their config **names**.
 
