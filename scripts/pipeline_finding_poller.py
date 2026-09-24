@@ -127,6 +127,9 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 from datetime import datetime, timedelta, timezone
 
 SCHEMA = "pipeline-finding/1"
@@ -666,7 +669,7 @@ query($teamId: ID!, $since: DateTimeOrDuration!, $after: String) {
     nodes {
       id body createdAt
       user { id name }
-      issue { id identifier }
+      issue { id identifier description labels(first: 20) { nodes { name } } }
     }
   }
 }""" % DEFAULT_COMMENT_PAGE
@@ -729,6 +732,10 @@ def scan_team(cfg, key, api_key, since):
             issue = c.get("issue") or {}
             if not issue.get("id"):
                 continue                      # a document/project comment, not a ticket
+            if machine.issue_is_planning_ticket(issue):
+                # An idea-gate planning ticket (KIT-184). It sits on a work team now, and a
+                # plan's text is the planner's, answering an idea — never a finding to file.
+                continue
             user = c.get("user") or {}
             if agent_id:
                 if user.get("id") != agent_id:
@@ -977,7 +984,9 @@ def selftest():
     ok("query: bounded by the comment's own createdAt", "createdAt: {gt: $since}" in _Q_COMMENTS)
     ok("query: nothing in the scan is keyed on updatedAt", "updatedAt" not in _Q_COMMENTS)
     ok("query: the comment's createdAt is read back (the watermark needs it)",
-       "createdAt" in _Q_COMMENTS and "issue { id identifier }" in _Q_COMMENTS)
+       "createdAt" in _Q_COMMENTS and "issue { id identifier" in _Q_COMMENTS)
+    ok("query: the comment's issue carries what marks a planning ticket (KIT-184)",
+       "description labels(first: 20) { nodes { name } }" in _Q_COMMENTS)
 
     now = datetime(2026, 9, 13, 12, 0, 0, tzinfo=timezone.utc)
     ok("since: no watermark → the cold-start window",
@@ -1073,6 +1082,14 @@ def selftest():
         # the agent's own ordinary comment, and a malformed block: neither is a candidate
         dict(finding_comment, id="cmt-3", body="just a plan comment"),
         dict(finding_comment, id="cmt-4", body="```json\n{\"schema\": \"%s\", oops\n```" % SCHEMA),
+        # a well-formed finding by the agent on a PLANNING ticket (KIT-184), recognised by
+        # its routing label and by its opening tag: a plan's text is never a finding
+        dict(finding_comment, id="cmt-5", issue={
+            "id": "iss-8", "identifier": "KIT-8", "description": "x",
+            "labels": {"nodes": [{"name": "stage-a-planning-kit"}]}}),
+        dict(finding_comment, id="cmt-6", issue={
+            "id": "iss-9", "identifier": "KIT-9",
+            "description": "[repo=stage-a-planning-kit]\n\nPlanning run"}),
     ]
 
     class _FakeLinear:
@@ -1128,6 +1145,9 @@ def selftest():
         rc = _pass(fake, cfg_path)
         ok("pass: a finding on a month-old ticket is FILED (the window is the comment's)",
            rc == EXIT_OK and len(fake.created) == 1)
+        ok("pass: a finding on a planning ticket, by its label or its tag, is never filed "
+           "(KIT-184)", not any(("KIT-8" in json.dumps(i) or "KIT-9" in json.dumps(i))
+                                for i in fake.created) and len(fake.created) == 1)
         ok("pass: the scan never asked the issues endpoint about updated tickets",
            not any("issues(" in q for q, _v in fake.asked))
         ok("pass: it asked for comments created after a real instant",

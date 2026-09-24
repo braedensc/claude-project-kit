@@ -881,3 +881,140 @@ definition naming servers the installer cannot name is refused outright.
 
 The live probe stays, and its card now says what to expect: the two tool lists should match.
 Source is what the runtime should do; the probe is what it did.
+
+## Update 2026-09-23 — planning built into each work team (KIT-184)
+
+**The decision.** The owner decided on 2026-09-21, and approved the design on 2026-09-23,
+that there is **no Planning team**: Linear caps teams, and each extra team is more setup per
+project. Planning now lives inside each project's own work team. The as-built lane (the
+2026-09-19 block) was never installed, so nothing is migrated.
+
+**What this block supersedes.** Every passage below stays as written; read each as a record
+of its date, not of now.
+
+- **The Planning-team trigger** — decision 1, "delegation into a dedicated Planning team", as
+  already narrowed by the 2026-09-19 block's "the owner moves an idea into the Plan it state on
+  the Planning team". The owner still moves an idea into **Plan it**, but on the project's own
+  work team. The team the idea is on says which repository it is for.
+- **Option A's Planning team** — the 2026-09-19 block "The idea is never the ticket the
+  dispatcher sees", where the planning ticket carries "no labels" and "exactly one routing tag
+  … naming the Planning entry". The planning ticket is now filed on the idea's own team and
+  carries its tag **and** one routing label.
+- **The routing decision** — decision 2, "routing by the dispatcher entry the ticket was
+  delegated into", which relied on the Planning team's entry, and the 2026-09-19 KIT-155 refusal
+  "another entry already claiming the Planning team key". A planning entry now claims **no team
+  key** at all.
+- The 2026-09-19 route-2 and route-3 paragraphs, where they say the planning ticket "carries no
+  labels". It carries one: its routing label, which names no prompt type, runner or model.
+
+**The planning entry deliberately has no team key.** The team key is the **only fetch-free
+routing input** the dispatcher has (Cyrus 0.2.69, `RepositoryRouter`): the `[repo=…]` tag, the
+routing label and the project are each read by a separate fetch, and a fetch that fails counts
+silently as "none". The team is read from the webhook itself. On a dedicated team, a routing
+failure landed in a fenced entry. On a work team it lands in the **coding** entry, which claims
+that team's key. A planning entry that claimed the key too would compete with the coding entry
+for every ticket on the team. So it claims none, and three things replace the net the team used
+to be:
+
+1. **A routing label unique to the repository** (`stage-a-planning-<repository name>`, team-scoped,
+   exact case). It catches a tag that failed to fetch or match, and a one-off blip. It cannot
+   catch a failure that hits both fetches, which share one client and one key. It must be the
+   only entry's label: several matching entries make **one** session whose disallowed tools are
+   only what every matched entry denies (`ToolPermissionResolver`), so a shared label would empty
+   the fence. The installer refuses a label another entry routes on or reads as a prompt type.
+2. **The routing check, in the same pass.** The dispatcher posts a `**Routing**` thought naming
+   the entry that answered, after the worktree exists and **before the runner starts**. Seconds
+   after filing, the planner job reads the session's **earliest** routing-shaped thought (a model
+   could imitate a later one). A note naming any other entry, a route other than the tag or the
+   label, or **no note** within the wait is a failure: the note is best-effort, so absence proves
+   nothing. The wait defaults to 120 seconds and stretches to 330 while a repository setup hook
+   runs, because the note comes after the hook.
+3. **A circuit breaker.** On a failure the job writes the evidence first — the session id, the
+   note, the times — to a stop file and its own record, because cancelling deletes the session's
+   worktree. Then it cancels the ticket, pages the owner with an `agent:needs-human` mark on the
+   dead planning ticket (a mark the notifier already reads), and notes the idea. **All planning
+   stops** until a person signs the probe again; the stop survives restarts, an unreadable stop
+   counts as stopped, and only a probe signed after it clears it. A planning ticket is never
+   reused, because the dispatcher caches a ticket's first route for good.
+
+**The residual.** A planning ticket whose tag and label fetches both fail runs in the coding
+entry for the seconds between the routing note and the cancel. It works from the clean copy of
+the idea, not the idea itself; cancelling deletes its working copy; it cannot merge. This is the
+accepted price of no Planning team.
+
+**A dispatcher upgrade is the larger risk, and it is pinned.** One upgrade that changed tag or
+label routing would send every planning ticket to the coding entry. The executor's account
+cannot read the dispatcher's install directory (it is mode 700 under the dispatcher's account,
+measured), but the dispatcher serves its own version on `GET /version` with no key
+(`EdgeWorker.registerVersionEndpoint`), and every `cyrus-*` package pins its siblings exactly, so
+that version fixes the routing code. **The job reads it over loopback on every pass** and starts
+no run when it differs from the version recorded at the probe, or cannot be read. The installer
+records the version at the probe sign-off; when `DISPATCHER_ROUTER_FILE` names the routing code,
+it also records its fingerprint, read as the dispatcher's account, and `verify` re-checks both.
+The runbook's upgrade step is: upgrade, re-probe, sign.
+
+**The probe proves which entry answered.** For every planned repository, a person files one
+probe ticket with the tag and the label, and one with the label alone. `attest CA-PROBE
+--ticket …` reads the dispatcher's routing notes back and refuses a sign-off they do not
+support: every ticket routed to its own repository's planning entry, and both routes seen.
+
+**Everything else the design page found.**
+
+- **Live work dragged into Plan it is refused**, with one note and no run: a ticket with a
+  delegate, an agent session, a `provenance:*` or `agent:*` label, a parent or children, or a
+  pull request attached. A daily cap across every team (default 10) bounds a bulk move.
+- **Plan it must be unstarted**, created so by the installer, which refuses an existing state of
+  that name of any other type; the job re-checks the type every pass (KIT-183). A started Plan it
+  would catch every coding ticket, since the dispatcher moves each session's ticket to the
+  lowest-position started state. The installer reports which state that is, per team.
+- **The trigger reads the whole history**, paged and bounded (KIT-183). Linear's history takes an
+  order field but no direction, and the direction is not documented.
+- **The direct-delegation warning** watches only ideas in Plan it, and only sessions created after
+  the move, plus sessions on the job's own tickets that it did not start. It never fires on the
+  team's real work. And the read-back reads the session whose routing was checked, never a later
+  one.
+- **Other jobs skip planning tickets**, by their routing label or their opening tag and never by
+  title, through one shared definition (`scripts/pipeline_machine_tickets.py`): the review
+  poller's discovery, the criteria snapshot, the finding poller, and the executor's duplicate
+  check, which also leaves out the idea itself.
+- **The executor refuses a plan whose pinned ticket is on another team** than the repository's
+  `delivery.json` names, and the job gives up on such a run at once, with a note, rather than
+  retrying it.
+- **Two repositories naming one team are refused**: the dispatcher routes a team key to one
+  repository, so one team plans one repository. The settings are a list, `PLANNED_REPOS`; each
+  repository's team is read from its own committed `delivery.json`.
+- **Team agent guidance reaches every session on the team**, planners included, with
+  "takes precedence" wording. Linear's public API does not expose it (it exists only in webhook
+  payloads), so the probe card asks a person to read it and record it in the sign-off.
+
+**What the pre-merge review changed.** An adversarial review of the build found seven real
+defects, all fixed before merge:
+
+- **A routing read that failed ended the pass**, so later passes filed new planning tickets
+  before re-checking the old one. Now every open routing check is finished first, and no
+  new run starts while any route is unknown.
+- **One substitution in the sanitizer could fold an idea's text into a directive**, and the
+  refusal ended the whole pass. The sanitizer now runs until nothing changes, and an idea it
+  still cannot clean is refused on its own.
+- **The Stage E skips read marks a coding session can write.** A session could put the
+  planning label on its own ticket and take itself out of review. The review poller's
+  discovery and the criteria snapshot now skip a ticket only when the dispatcher's own
+  routing note confirms a planning session. The finding poller and the duplicate check still
+  skip by the marks alone: a session that skips them only hides its own reports.
+- **A repository added after the sign-offs** was planned under the old probe, and its entry
+  was never printed. Both sign-offs now re-open until they cover every planned repository.
+- **A re-sign read the same probe tickets again.** It now needs tickets handed over after the
+  last sign-off, because a re-sign is what clears a stop.
+- Executor runs the pass's clock killed were never counted, and a closing note that failed
+  once was lost. Both are retried and bounded now.
+
+**KIT-182's criterion "each fenced entry keeps its team key" does not hold for a planning
+entry**, by this decision. It still holds for the review entry, which keeps its team.
+
+**Not proven — nothing here has run live.** The routing note's rendered shape and its delay after
+delegation; whether the tracker escapes it; `Issue.history`'s page order; whether `Team.labels`
+returns every team label a pass needs; that the installed dispatcher matches the 0.2.69 source
+this was read from. The probe measures the first three on a real dispatcher before the gate is
+switched on. One residual is known and not closed: if the dispatcher's own note fails to post
+AND the ticket falls to the coding entry, a later thought the model writes could imitate the
+note and be read as it.

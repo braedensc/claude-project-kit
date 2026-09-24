@@ -127,6 +127,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from check_ticket_dor import pin_fields  # noqa: E402  (ONE description parser, contract §3)
+import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -155,7 +156,7 @@ query CriteriaSnapshotSessions($first: Int!, $after: String) {
       id createdAt updatedAt
       creator { id }
       appUser { id }
-      issue { id identifier team { key } state { type } }
+      issue { id identifier team { key } state { type } labels(first: 20) { nodes { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -631,7 +632,24 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
     owed.sort(key=lambda t: (t[0] != "first", str(t[2].get("createdAt") or ""), t[1]))
     rechecks.sort(key=lambda t: (str(t[2].get("updatedAt") or ""), t[1]), reverse=True)
 
+    def planning_confirmed(session):
+        """An idea-gate planning ticket (KIT-184) sits on a work team now, and no review
+        reads its criteria, so it is skipped — but only when the dispatcher's own routing
+        note confirms the session ran in a planning entry. Its label and opening tag are
+        both things a coding session can write on its own ticket, and a skip on those alone
+        would let a session keep its criteria out of the snapshot a review is judged by."""
+        try:
+            return machine.routed_to_planning(
+                call(machine.Q_SESSION_THOUGHTS, {"id": session.get("id")}))
+        except SnapshotError:
+            return False
+
     for kind, ident, session, existing in owed + rechecks:
+        if (machine.issue_is_planning_ticket(session.get("issue"))
+                and planning_confirmed(session)):
+            result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
+                                    "routing note — no snapshot" % ident)
+            continue
         cut = ("the pass deadline" if deadline is not None and time.monotonic() >= deadline
                else "the read cap of %d" % max_reads if result["reads"] >= max_reads else "")
         if cut:
@@ -653,6 +671,10 @@ def snapshot_pass(cfg, state_dir, call, dry_run=False, deadline=None, clock=None
         issue = (data or {}).get("issue") or {}
         if not issue:
             result["problems"].append("%s: the tracker returned no issue" % ident)
+            continue
+        if machine.is_planning_ticket(issue.get("description")) and planning_confirmed(session):
+            result["detail"].append("%s: a planning ticket, confirmed by the dispatcher's "
+                                    "routing note — no snapshot" % ident)
             continue
         taken_at = clock()
         hist = issue.get("history") or {}
@@ -971,6 +993,7 @@ def selftest():
     class Fake:
         def __init__(self, sessions, issues, fail=(), more_sessions=False):
             self.sessions, self.issues, self.fail, self.calls = sessions, issues, set(fail), []
+            self.thoughts = {}
             self.more_sessions = more_sessions
 
         def __call__(self, query, variables):
@@ -984,6 +1007,10 @@ def selftest():
                                                        "endCursor": "c"}}}
             if op == "CriteriaSnapshotIssue":
                 return {"issue": self.issues.get(variables["id"])}
+            if op == "SessionRoutingThoughts":
+                return {"agentSession": {"activities": {
+                    "nodes": list(self.thoughts.get(variables["id"]) or []),
+                    "pageInfo": {"hasNextPage": False}}}}
             return {"commentCreate": {"success": True}}
 
     def ops(fake, name):
@@ -1003,6 +1030,31 @@ def selftest():
               (["KIT-7"], ["do the thing", "test it"]))
         mode = os.stat(os.path.join(store, "KIT-7.json")).st_mode & 0o777
         check("the snapshot file is mode 600 in the role account's state dir", mode, 0o600)
+
+        # A PLANNING TICKET (KIT-184) takes no snapshot — but only when the dispatcher's own
+        # routing note confirms it. Its label and tag are writable by a coding session.
+        def routed(entry, method="[repo=...] tag"):
+            return [{"createdAt": "2026-09-16T10:00:01Z", "content": {
+                "__typename": "AgentActivityThoughtContent",
+                "body": "**Routing** (%s)\n- **%s** → `main` (default)" % (method, entry)}}]
+        plan_issue = {"id": "iss-8", "identifier": "KIT-8", "history": no_history(),
+                      "description": "[repo=stage-a-planning-kit]\n\n" + desc}
+        labelled = session("s-plan-9", ident="KIT-9", issue_id="iss-9")
+        labelled["issue"]["labels"] = {"nodes": [{"name": "stage-a-planning-kit"}]}
+        pfake = Fake([session("s-plan-8", ident="KIT-8", issue_id="iss-8"), labelled],
+                     {"iss-8": plan_issue, "iss-9": dict(plan_issue, id="iss-9", identifier="KIT-9")})
+        pfake.thoughts = {"s-plan-8": routed("stage-a-planning-kit"),
+                          "s-plan-9": routed("stage-a-planning-kit", "Label routing")}
+        r = snapshot_pass(cfg, state, pfake, clock=at("2026-09-16T10:05:00Z"))
+        check("a confirmed planning ticket takes no snapshot, by its tag or its label (KIT-184)",
+              (r["taken"], read_snapshot(store, "KIT-8"), read_snapshot(store, "KIT-9")),
+              ([], None, None))
+        check("…and the labelled one spends no read", len(ops(pfake, "CriteriaSnapshotIssue")), 1)
+        cfake = Fake([labelled], {"iss-9": dict(plan_issue, id="iss-9", identifier="KIT-9")})
+        cfake.thoughts = {"s-plan-9": routed("kit", "Team routing")}
+        r = snapshot_pass(cfg, state, cfake, clock=at("2026-09-16T10:06:00Z"))
+        check("a coding ticket that labelled itself a planning ticket still takes its snapshot",
+              r["taken"], ["KIT-9"])
 
         r = snapshot_pass(cfg, state, fake, clock=at("2026-09-16T10:10:00Z"))
         check("an unedited ticket: one read, nothing said", (r["unchanged"], r["notices"],

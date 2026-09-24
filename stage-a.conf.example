@@ -4,7 +4,7 @@
 # HOW TO USE THIS FILE
 #
 #   cp stage-a.conf.example stage-a.conf && chmod 600 stage-a.conf
-#   $EDITOR stage-a.conf                              # six values, none of them secret
+#   $EDITOR stage-a.conf                              # none of these values is secret
 #   python3 scripts/pipeline_stage_a_setup.py run     # the only command you type
 #
 # `run` validates this file before it touches anything, and reports EVERY bad
@@ -23,6 +23,10 @@
 #   MODE 600.  It holds no secret, but it holds the shape of your deployment.
 #   `stage-a.conf` is gitignored; this example is committed.  Every value below
 #   is synthetic (`example.com`, the namespaced `_planclaw`); edit them all.
+#
+#   THERE IS NO PLANNING TEAM.  Planning happens on each repository's own work
+#   team: you move an idea to "Plan it" on that team.  Which team a repository
+#   plans on is read from its own delivery.json, never typed here.
 # ---------------------------------------------------------------------------
 
 
@@ -31,28 +35,26 @@
 # the dispatcher kept starting planning sessions. The installer never creates it.
 ROLE_ACCOUNT=_planclaw
 
-# The Linear team key you delegate idea tickets into. Being on this team routes an
-# idea to the Planning entry — UNLESS the idea's own description carries a routing
-# tag, or a label selects a prompt type, either of which outranks the team (KIT-154).
-# Until that closes, write ideas yourself; never paste idea text from elsewhere.
-# Must not be the planned repository's work team.
-PLANNING_TEAM_KEY=PLAN
+# The repositories whose ideas are planned, as owner/repo, separated by commas.
+# Each one's COMMITTED delivery.json, on its default branch, says which work team
+# its ideas sit on (`linear.teamKey`) and is the executor's only config for it: the
+# team the tree lands in, that team's state and label ids, and the
+# `linear.findingTicket` block that turns plans on. The installer reads that file and
+# never writes it.
+#
+# RULE: one team plans one repository. The dispatcher sends a team's tickets to
+# exactly one repository, so two repositories whose delivery.json name the same team
+# are refused.
+PLANNED_REPOS=example-org/product
 
 # Your own Linear USER ID — the person notified on every filed plan and named as
 # the subscriber on each epic. A plan nobody is notified about dies in the
 # backlog. This is the user id, not an email.
 OWNER_USER_ID=REPLACE_WITH_YOUR_LINEAR_USER_ID
 
-# The planned repository, as owner/repo. Its COMMITTED delivery.json, on its default
-# branch, is the executor's only config: the work team the tree lands in, its state
-# and label ids, and the `linear.findingTicket` block that turns plans on. The
-# installer reads that file and never writes it; when it is not ready, it prints the
-# exact block for you to add in a pull request of your own.
-PLANNED_REPO=example-org/product
-
 # The NAME — never the value — of the variable holding YOUR tracker key, in the
-# terminal you run the installer from. It provisions the Planning team and the
-# labels. It is read, never stored.
+# terminal you run the installer from. It creates the Plan it state and the routing
+# label on each work team, and reads the probe tickets back. It is read, never stored.
 OPERATOR_KEY_ENV=LINEAR_API_KEY
 
 # The NAME — never the value — of the variable the EXECUTOR's key is stored under,
@@ -76,23 +78,44 @@ AGENT_USER_NAME=Dispatcher Agent
 # /Library/LaunchDaemons/<this>.plist and is never loaded by the installer.
 JOB_LABEL=com.example.stage-a-planner
 
-# OPTIONAL. The Planning team state you move an idea into to start a planning run. The
-# installer creates it if it is absent, and refuses a state of this name that is a done
-# state — moving an idea there is how a run STARTS. Default: Plan it
+# OPTIONAL. The state, on each work team, you move an idea into to start a planning
+# run. The installer creates it as a to-do (unstarted) state if it is absent, and
+# refuses one of this name of any other type. Default: Plan it
 PLAN_IT_STATE=Plan it
 
 # OPTIONAL. How often the planner job runs, in seconds (60 to 3600). Default: 300
 POLL_INTERVAL_SECONDS=300
 
-# OPTIONAL, and only for a PRIVATE planned repository. The NAME — never the value — of
+# OPTIONAL. How many planning runs may start in one day (UTC), across every team
+# (1 to 100). A limit on what a mis-drag or a bulk status change can cost. Default: 10
+MAX_RUNS_PER_DAY=10
+
+# OPTIONAL. How long, in seconds, the planner job waits for the dispatcher's routing
+# note after filing a planning ticket (30 to 300). No note in time counts as a routing
+# failure, which cancels the ticket and stops planning. The wait stretches by itself
+# while a repository setup script runs. Default: 120
+ROUTING_WAIT_SECONDS=120
+
+# OPTIONAL. The port the dispatcher listens on, on this machine. The planner job reads
+# the dispatcher's version from it on every pass, and refuses to plan on a version the
+# probe was not signed on. Default: 3456
+DISPATCHER_PORT=3456
+
+# OPTIONAL. The absolute path of the dispatcher's installed routing code
+# (RepositoryRouter.js inside its cyrus-edge-worker package). When set, the probe
+# records its fingerprint, read as the dispatcher's account, and `verify` checks it has
+# not changed. Leave empty to rely on the version alone.
+DISPATCHER_ROUTER_FILE=
+
+# OPTIONAL, and only for PRIVATE planned repositories. The NAME — never the value — of
 # the variable holding a read-only code-host token, so the job can update its checkout
-# of the planned repository. The installer asks for the value at a hidden prompt and
-# stores it beside the tracker key. Leave empty for a public repository.
+# of each planned repository. The installer asks for the value at a hidden prompt and
+# stores it beside the tracker key. Leave empty when every one is public.
 GITHUB_TOKEN_ENV=
 
 # The local account the dispatcher itself runs as. The installer reads that account's
 # copy of the dispatcher config — as FACTS, never as a file, because it holds the
-# dispatcher's tracker tokens — for the fields a loadable Planning entry needs: the
+# dispatcher's tracker tokens — for the fields a loadable planning entry needs: the
 # clone the planner reads code in, that clone's base branch, the workspace directory
 # and the workspace id. It never writes that config.
 #
