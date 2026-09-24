@@ -216,7 +216,8 @@ Exit:
   4  hit the wall-clock --timeout. Distinct from 1 so a scheduler log tells hung from failed.
 
   A heartbeat is left on every path above. The two cases that leave none are an unreadable
-  --config (exit 2, before the state dir is known) and a SIGTERM/KeyboardInterrupt.
+  --config (exit 2, before the state dir is known) and a SIGTERM/KeyboardInterrupt. On a pass
+  that ended before it counted (1 after its reads, 2 or 4), `capped` is null — not known.
 """
 
 import argparse
@@ -700,7 +701,11 @@ def write_heartbeat(cfg, result, now):
     # reader cannot say which happened (KIT-187). ADDED WITHOUT A SCHEMA BUMP: the field is
     # new and optional, nothing is renamed or removed, and every reader matches the schema id
     # exactly, so a `/2` would make each of them refuse every heartbeat this writes. A reader
-    # treats an absent `capped` — an older notifier's heartbeat — as "not known", never 0.
+    # treats an absent `capped` — an older notifier's heartbeat — as "not known", never 0, and
+    # this writer says "not known" the same way: `capped` is null when the pass ended before
+    # it counted (a deadline, an error), because a 0 there would claim nothing was held back.
+    # The other counts on those paths are 0 placeholders, older than this field: read any
+    # count only on exit 0 or 3.
     dry = bool(result.get("dry"))
     doc = {
         "schema": HEARTBEAT_SCHEMA,
@@ -711,7 +716,7 @@ def write_heartbeat(cfg, result, now):
         "sent": 0 if dry else result.get("sent", 0),
         "would_send": result.get("sent", 0) if dry else 0,
         "declined": result.get("declined", 0),
-        "capped": result.get("capped", 0),
+        "capped": result.get("capped"),
         "labelled": 0 if dry else result.get("labelled", 0),
         "settled": 0 if dry else result.get("settled", 0),
         "would_settle": result.get("settled", 0) if dry else 0,
@@ -1777,7 +1782,9 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         if relay_on:
             summary += " (the reply relay did not run either)"
         out.write(summary + "\n")
-        return {"exit": EXIT_ERROR, "examined": 0, "sent": 0, "declined": 0,
+        # `capped` 0 is TRUE here: the pass stopped before it chose any event, so the cap
+        # held nothing back. A pass that ends later, uncounted, leaves it null.
+        return {"exit": EXIT_ERROR, "examined": 0, "sent": 0, "declined": 0, "capped": 0,
                 "labelled": 0, "dry": bool(dry_run), "summary": summary}
 
     events, skipped, capped = select_events(tickets, sent_keys, cfg, labelled_keys)
@@ -2480,6 +2487,58 @@ def selftest():
             hb_uncapped = json.load(fh)
         ok("a pass the cap did not touch records capped 0, not a missing field",
            hb_uncapped.get("capped") == 0, repr(hb_uncapped))
+
+        # A refused send is declined and NOT capped. Every case above has capped equal to
+        # declined (all of it the cap, or both 0), so a writer that copied `declined` into
+        # `capped` passed them all — and the installer would then word a revoked token as
+        # events "held back by the cap" (KIT-187 review, finding 66).
+        cfg_ref = dict(cfg, state_dir=os.path.join(tmp, "refused-state"))
+        res_ref = run_once(cfg_ref, _FakeTracker([tkt("KIT-2", ESC_BLOCKED, "c2r", author="s1")]),
+                           _FakeChat(ok=False, error="channel_not_found"), False,
+                           out=io.StringIO())
+        write_heartbeat(cfg_ref, res_ref, _now_iso())
+        with open(heartbeat_path(cfg_ref), encoding="utf-8") as fh:
+            hb_ref = json.load(fh)
+        ok("a refused send under the cap is declined, never counted as capped",
+           res_ref["exit"] == EXIT_DECLINED and hb_ref.get("declined") == 1
+           and hb_ref.get("capped") == 0, repr(hb_ref))
+
+        class _RefuseFirst(_FakeChat):
+            """The chat refuses the first ping and takes every one after it."""
+
+            def post_message(self, text):
+                if not self.posts:
+                    self.posts.append(text)
+                    return {"ok": False, "error": "channel_not_found"}
+                return _FakeChat.post_message(self, text)
+
+        cfg_mix = dict(cfg, state_dir=os.path.join(tmp, "mixed-state"))
+        res_mix = run_once(cfg_mix, _FakeTracker(over), _RefuseFirst(), False, out=io.StringIO())
+        write_heartbeat(cfg_mix, res_mix, _now_iso())
+        with open(heartbeat_path(cfg_mix), encoding="utf-8") as fh:
+            hb_mix = json.load(fh)
+        ok("the cap AND a refused send: `capped` is only the cap's part of `declined`",
+           res_mix["exit"] == EXIT_DECLINED and hb_mix.get("capped") == 2
+           and hb_mix.get("declined") == 3
+           and hb_mix.get("sent") == cfg["max_events_per_pass"] - 1, repr(hb_mix))
+
+        # A pass that ENDED before it could count — the deadline struck in the send loop,
+        # after the cap was applied — cannot say what the cap held back. Its heartbeat says
+        # so with a null, never with a 0 that claims nothing was held back (finding 59).
+        class _DeadlineOnSecondPost(_FakeChat):
+            def post_message(self, text):
+                if self.posts:
+                    raise Deadline()
+                return _FakeChat.post_message(self, text)
+
+        cfg_dl = dict(cfg, state_dir=os.path.join(tmp, "deadline-state"))
+        rc_dl = run_command(cfg_dl, False, 60, tracker=_FakeTracker(over),
+                            chat=_DeadlineOnSecondPost(), out=io.StringIO())
+        with open(heartbeat_path(cfg_dl), encoding="utf-8") as fh:
+            hb_dl = json.load(fh)
+        ok("a pass the deadline ended records `capped` as null (not known), never a false 0",
+           rc_dl == EXIT_TIMEOUT and hb_dl.get("exit") == EXIT_TIMEOUT and "capped" in hb_dl
+           and hb_dl["capped"] is None, repr(hb_dl))
 
         # ── §9. Dry run sends nothing, writes no state, and says it was a rehearsal ──
         chat3, tracker3 = _FakeChat(), _FakeTracker([tkt("KIT-8", ESC_BLOCKED, "c8",

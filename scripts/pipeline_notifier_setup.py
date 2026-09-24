@@ -13,7 +13,8 @@ same command again: it checks your work and carries on.
 WHAT IT BUILDS, AS THE DISPATCHER'S ROLE ACCOUNT, BESIDE AN EXISTING STAGE E INSTALL
 
     <ENV_FILE>          one line added or replaced: <CHAT_TOKEN_ENV>=xoxb-…, mode 600.
-                        Every other line in the file is kept.
+                        Every other line in the file is kept, one holding a NUL byte
+                        included; a store that lost the tracker key's line fails.
     <NOTIFIER_CONFIG>   the notifier's JSON config, mode 600. Env var NAMES and ids only.
     /Library/LaunchDaemons/<JOB_LABEL>.plist
                         one system LaunchDaemon running `pipeline_notify_local.py run
@@ -54,13 +55,19 @@ SUBCOMMANDS
     status              replays the ledger from disk. It probes nothing
     verify              re-measures EVERY step, never stops early, changes nothing, writes
                         nothing (not even the ledger), asks for no credential, and never raises
-    card <CK-id>        print a checkpoint card, at any time, with or without a conf.
+    card <CK-id>        print a checkpoint card, at any time, with or without a conf. Without
+                        one that loaded, it shows the example values and its header says why:
+                        not found, or found and rejected, with the first problem.
                         `card CK-N5` is printed ONLY this way — no step raises it, nothing is
                         signed on it: is the job alive, and how to pause and resume it
     attest <A-id> --initials YOUR-INITIALS --note "..."
                         record something no computer can check. YOUR-INITIALS is a placeholder
                         and is refused as typed
     --selftest          offline battery; every transport stubbed
+
+  The commands they print for you to run next — a card's lines, a key hand-off, a remedy, the
+  command to run again — name this file as you reached it and repeat the --conf and --state
+  you gave.
 
 EXIT CODES — the Stage E installer's own numbers (contract §13)
 
@@ -130,6 +137,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -837,7 +845,7 @@ CARDS = {
                "7. From a SECOND Slack account in the same workspace, search for the channel.",
                "   Good: it does not appear, and it cannot be joined.",
                "8. Sign it off, then run the installer again:",
-               "       python3 scripts/pipeline_notifier_setup.py attest A-PRIVATE-CHANNEL \\",
+               "       python3 ${SELF} attest A-PRIVATE-CHANNEL${FLAGS} \\",
                "         --initials " + INITIALS_PLACEHOLDER + " --note \"private; a second "
                "account could not join\"",
                "   (YOUR initials, 2-4 letters. The placeholder is refused as typed.)",
@@ -853,7 +861,7 @@ CARDS = {
                 "It is never an argument (argv is visible to every process), never a file in this "
                 "repository, and never echoed. That needs a terminal, and this run has none."),
         "do": ["Run the installer again from a real terminal:",
-               "    python3 scripts/pipeline_notifier_setup.py run",
+               "    python3 ${SELF} run${FLAGS}",
                "It asks for ${CHAT_TOKEN_ENV} by name and shows back only its length.",
                "",
                "Or add the one line by hand, as the role account:",
@@ -869,19 +877,24 @@ CARDS = {
         "why": ("Loading is the moment real pings start and real labels land on real tickets. The "
                 "dry run above is what you read first; turning it on is yours. This installer "
                 "measures whether the job is loaded and never loads it."),
-        "do": ["Read the dry-run row above. Then load the job:",
+        "do": ["Read the dry-run row above. Then load the job. The enable line comes first: it",
+               "does nothing to a job that was never disabled, and a job paused with `disable`",
+               "(card CK-N5) will not load without it, not even after a restart.",
+               "    sudo launchctl enable system/${JOB_LABEL}",
                "    sudo launchctl bootstrap system ${PLIST}",
                "If it was already loaded and the plist changed, unload it FIRST — launchd keeps",
                "what it was given until it is told again, and the installer compares the two on",
                "every run, so this card comes back until you do. Wait a few seconds between",
                "them: a load straight after an unload can answer `Input/output error`; wait and",
-               "run the load again.",
+               "run the load again. The same error can also mean a job paused with",
+               "`disable`, and waiting never clears that one: the enable line does.",
                "    sudo launchctl bootout system/${JOB_LABEL}",
+               "    sudo launchctl enable system/${JOB_LABEL}",
                "    sudo launchctl bootstrap system ${PLIST}",
                "Check it, then run the installer again — the job takes its first pass at load,",
                "so give it a moment:",
                "    sudo launchctl print system/${JOB_LABEL}",
-               "    python3 scripts/pipeline_notifier_setup.py run"],
+               "    python3 ${SELF} run${FLAGS}"],
         "good": ("`sudo launchctl print system/${JOB_LABEL}` shows this plist's own command, and "
                  "the job's next pass writes a heartbeat"),
         "attest": None,
@@ -909,7 +922,7 @@ CARDS = {
                "exercise them. The first real planning run is their test.",
                "",
                "Then sign it off:",
-               "    python3 scripts/pipeline_notifier_setup.py attest A-FIRST-PING \\",
+               "    python3 ${SELF} attest A-FIRST-PING${FLAGS} \\",
                "      --initials " + INITIALS_PLACEHOLDER + " --note \"<ticket id>: pinged, link "
                "opened, label landed\"",
                "(YOUR initials, 2-4 letters. The placeholder is refused as typed.)",
@@ -928,19 +941,24 @@ CARDS = {
                 "on this card and nothing is signed on it: it is printed when you ask for it."),
         "do": ["1. Its last pass, and the log's last lines, read as the role account:",
                "    sudo -u ${ROLE_ACCOUNT} -H /bin/sh -c 'cd / && cat ${HEARTBEAT}; tail -20 ${LOG}'",
-               "   Good: `at` is under ${STALE_SECONDS} s old and `exit` is 0. Older than that",
-               "   is NOT RUNNING: the line `verify` draws, two intervals plus the longest a",
-               "   pass may take plus two minutes (2 x ${INTERVAL_SECONDS} + ${RUN_TIMEOUT_SECONDS} + 120 s).",
+               "   Good: `dry` is false, `exit` is 0, and `at` is under ${STALE_SECONDS} s old and",
+               "   not in the future. `dry` true is a rehearsal — the installer's dry-run step,",
+               "   or a dry run typed by hand — and not a pass of the loaded job: it says nothing",
+               "   about whether the job is alive. Read it again after one interval (${INTERVAL_SECONDS} s).",
+               "   Older than ${STALE_SECONDS} s is NOT RUNNING: the line `verify` draws, two intervals",
+               "   plus the longest a pass may take plus two minutes",
+               "   (2 x ${INTERVAL_SECONDS} + ${RUN_TIMEOUT_SECONDS} + 120 s). An `at` in the future says nothing",
+               "   either: a clock that moved back, or a stamp the job did not write.",
                "   `exit` 3 with `capped` equal to `declined`: the per-pass cap held events",
                "   back, and they go on the next pass. Any other non-zero `exit`: its",
                "   `summary` says why.",
                "2. Every step re-measured, changing nothing:",
-               "    python3 scripts/pipeline_notifier_setup.py verify",
+               "    python3 ${SELF} verify${FLAGS}",
                "3. What launchd holds, and the job's last exit:",
                "    sudo launchctl print system/${JOB_LABEL}",
                "4. Whether the role account's clone runs this checkout's notifier, file by file",
                "   (the comparison `verify` makes in its preflight row):",
-               "    ( cd scripts && shasum -a 256 ${REQUIRED_SCRIPTS} ) \\",
+               "    ( cd ${CHECKOUT_SCRIPTS} && shasum -a 256 ${REQUIRED_SCRIPTS} ) \\",
                "      | sudo -u ${ROLE_ACCOUNT} -H /bin/sh -c 'cd ${CLONE_SCRIPTS} && shasum -a 256 -c -'",
                "   Good: every line ends `OK`. A `FAILED` line is a file the two do not share:",
                "   pull this checkout, or let the Stage E installer's `run` move the clone.",
@@ -952,19 +970,23 @@ CARDS = {
                "    `Could not find service`;",
                "  - a later `run` does not load it again: this installer never loads it;",
                "  - `verify` reports the `enable` step BLOCKED on CK-N3, so it cannot say",
-               "    `No drift` until you resume.",
+               "    `No drift` until you resume;",
+               "  - if your Stage E install watches the notifier (NOTIFIER_JOB_LABEL in",
+               "    stage-e.conf), its heartbeat-monitor row shows it as paused, not watched.",
+               "    Resuming the notifier needs no Stage E run.",
                "A bootout lasts until the machine restarts: at boot, launchd loads every",
                "plist in /Library/LaunchDaemons again, this one included. To keep it paused",
                "through a restart, disable it as well:",
                "    sudo launchctl disable system/${JOB_LABEL}",
                "",
-               "RESUME: load it again, the line from card CK-N3. If you disabled it, enable",
-               "it first:",
+               "RESUME: CK-N3's two lines. The enable line does nothing to a job you never",
+               "disabled, and one you did will not load without it:",
                "    sudo launchctl enable system/${JOB_LABEL}",
                "    sudo launchctl bootstrap system ${PLIST}",
                "Then, once it has had a pass:",
-               "    python3 scripts/pipeline_notifier_setup.py verify"],
-        "good": "a heartbeat under ${STALE_SECONDS} s old with exit 0, and every clone file OK",
+               "    python3 ${SELF} verify${FLAGS}"],
+        "good": ("a heartbeat with `dry` false and exit 0, under ${STALE_SECONDS} s old and not in "
+                 "the future, and every clone file OK"),
         "attest": None,
     },
 }
@@ -984,7 +1006,7 @@ NEVER = [
 ]
 
 
-def _card_values(conf):
+def _card_values(conf, flags=""):
     values = dict(CARD_EXAMPLE if conf is None else conf)
     values["PLIST"] = plist_path(values)
     # CK-N5's values are DERIVED, never conf keys of their own: the heartbeat `enable` reads,
@@ -994,6 +1016,12 @@ def _card_values(conf):
     values["CLONE_SCRIPTS"] = _q(values["ROLE_KIT_CLONE"].rstrip("/") + "/scripts")
     values["REQUIRED_SCRIPTS"] = " ".join(REQUIRED_SCRIPTS)
     values["STALE_SECONDS"] = str(stale_after_seconds(values))
+    # Where the person stands does not decide what a card's commands run: this installer as it
+    # was reached, with the options it was given, and the checkout preflight compares (HERE,
+    # by full path) — not `./scripts` in whatever directory the card is pasted in.
+    values["SELF"] = _self_path()
+    values["FLAGS"] = flags
+    values["CHECKOUT_SCRIPTS"] = shlex.quote(HERE)
     return values
 
 
@@ -1004,16 +1032,22 @@ def _fill(line, values):
     return line
 
 
-def print_card(cid, conf=None):
+def print_card(cid, conf=None, problem=None, flags=""):
+    """`problem` is why the conf is not in use. A conf that loaded and was REJECTED is not an
+    absent one: the header says which, so the example values below are never read as yours."""
     card = CARDS.get(cid)
     if not card:
         raise SetupError("no such checkpoint card: %r (have %s)" % (cid, ", ".join(sorted(CARDS))))
-    values = _card_values(conf)
+    values = _card_values(conf, flags)
     say("")
     say("=" * 74)
     say(" %s — %s" % (cid, card["title"]))
     say("=" * 74)
-    if conf is None:
+    if conf is None and problem:
+        for line in se._wrap("(your conf did NOT load — %s. The values below are the EXAMPLE "
+                             "ones, not yours: `verify` lists every problem.)" % problem):
+            say(" " + line)
+    elif conf is None:
         say(" (no notifier.conf loaded: the values below are the example ones)")
     say("")
     say("WHY THIS IS YOURS")
@@ -1048,6 +1082,24 @@ def _self_path():
         return os.path.relpath(os.path.abspath(__file__), os.getcwd())
     except ValueError:
         return os.path.abspath(__file__)
+
+
+def invocation_flags(conf_path, state_home):
+    """The options this run was given, as every command it prints must repeat them: ` --conf X`
+    and ` --state Y`, each only when it is not the default. A printed command that dropped them
+    would run against notifier.conf and the default ledger — a key hand-off among them, which a
+    person pastes with the tracker key in hand (KIT-187)."""
+    flags = ""
+    if conf_path != DEFAULT_CONF:
+        flags += " --conf " + shlex.quote(conf_path)
+    if state_home != DEFAULT_STATE_HOME:
+        flags += " --state " + shlex.quote(state_home)
+    return flags
+
+
+def invoke(sub, flags=""):
+    """This installer's command line, as a person types it from where they stand now."""
+    return "python3 %s %s%s" % (_self_path(), sub, flags)
 
 
 def refuse_if_agent(action, env=None):
@@ -1147,7 +1199,7 @@ def acquire_privilege(ctx, command, dry_run):
     else:
         why = ("`run` writes the token and the config as the %s role account, and installs one "
                "system LaunchDaemon. It never loads it.")
-    ctx.sudo.acquire(why % ctx.account, command + (" --dry-run" if dry_run else ""))
+    ctx.sudo.acquire(why % ctx.account, command + (" --dry-run" if dry_run else "") + ctx.flags)
     return True
 
 
@@ -1182,6 +1234,9 @@ class Ctx(object):
         # it is looking at rather than leaving the operator to guess.
         self.rehearsed = False
         self.clock = time.time
+        # The --conf and --state this run was given (`invocation_flags`), repeated by every
+        # command it prints. `main` sets them; empty means the defaults.
+        self.flags = ""
         # The command the operator typed, so a printed remedy repeats THAT one: a key hand-off
         # that says `run` to someone reading a dry run would have them change the machine.
         self.command = "run"
@@ -1414,14 +1469,20 @@ CRED_PROBE_SH = (
 # The token, written by the role account's shell from STDIN. Every other line of the file is
 # kept; every line for this name is replaced by one. `printf` and `read` are shell builtins, so
 # the value is never in any process's argv. Exit 6 is a value the shell itself refused, 7 is no
-# value on stdin, 5 is a file it could not write.
+# value on stdin, 5 is a file it could not write — or a DIRECTORY at the file's path, which `mv`
+# would otherwise fill and call a success.
+#
+# The file is SHARED with the Stage E installer's two credentials, so keeping every other line
+# is the contract, and the Stage E installer's own writer keeps it the same way (KIT-171).
+# `-a` because one NUL byte makes grep print "Binary file … matches" in place of every line and
+# exit 0: that sentence, then the token, would become the whole file.
 CRED_WRITE_SH = (
     'umask 077; f=@ENV@; d=$(dirname "$f"); '
-    '[ -d "$d" ] || mkdir -p -m 700 "$d" || exit 5; '
+    '[ -d "$d" ] || mkdir -p -m 700 "$d" || exit 5; [ -d "$f" ] && exit 5; '
     'IFS= read -r v || [ -n "$v" ] || exit 7; '
     'case "$v" in xoxb-*) ;; *) exit 6;; esac; [ ${#v} -ge @MIN@ ] || exit 6; '
     't="$f.notifier-setup.$$"; '
-    '( if [ -f "$f" ]; then grep -v -E "^(export[[:space:]]+)?@CHAT@=" "$f"; '
+    '( if [ -f "$f" ]; then grep -a -v -E "^(export[[:space:]]+)?@CHAT@=" "$f"; '
     '[ $? -le 1 ] || exit 5; fi; printf "%s=%s\\n" "@CHAT@" "$v" ) > "$t" '
     '|| { rm -f "$t"; exit 5; }; '
     'chmod 600 "$t" && mv -f "$t" "$f" || { rm -f "$t"; exit 5; }'
@@ -1533,6 +1594,14 @@ def step_credentials(ctx, apply_it):
     if again.get("chat") != "ok" or again.get("mode") != "600":
         raise SetupError("%s was written, and reading it back as %s says %s, mode %s"
                          % (chat_env, ctx.account, again.get("chat"), again.get("mode")))
+    # The one line this store must keep that the probe can see: a write that lost the tracker
+    # key lost the Stage E installer's lines with it, and is not "every other line kept".
+    if again.get("key") != "ok":
+        raise SetupError("%s was written, and reading %s back as %s: %s %s. The store did not "
+                         "keep the file's other lines; the Stage E installer's `run` stores that "
+                         "key again"
+                         % (chat_env, conf["ENV_FILE"], ctx.account, key_env,
+                            _VERDICT.get(again.get("key"), "not usable")))
     return False, "%s written into %s, mode 600; every other line kept" % (chat_env, conf["ENV_FILE"]), []
 
 
@@ -1866,6 +1935,11 @@ def stale_after_seconds(conf):
     return 2 * int(conf["INTERVAL_SECONDS"]) + int(conf["RUN_TIMEOUT_SECONDS"]) + 120
 
 
+# How far ahead of this machine's clock a heartbeat's stamp may be and still count: ordinary
+# skew. Further ahead is not a fresh pass, it is a stamp that says nothing (`enable`).
+CLOCK_SKEW_SECONDS = 120
+
+
 def _is_count(value):
     """A heartbeat count: an int, and not a JSON `true`, which Python counts as the int 1."""
     return isinstance(value, int) and not isinstance(value, bool)
@@ -1907,7 +1981,12 @@ def step_enable(ctx, apply_it):
                       % (label, res.rc, text.strip()[:160]), "run the same command again")
     ctx.loaded = loaded
     if not loaded:
-        raise Blocked("CK-N3", "system/%s is not loaded; this installer never loads it" % label)
+        # launchd's print answers the same for a job only booted out and one also DISABLED (a
+        # CK-N5 pause kept through a restart), and this step does not ask which. It does not
+        # need to: CK-N3 enables before it loads, which does nothing to a job never disabled.
+        raise Blocked("CK-N3", "system/%s is not loaded; this installer never loads it. A job "
+                               "paused with `disable` reads the same: CK-N3 enables it, then "
+                               "loads it" % label)
 
     # WHAT IS LOADED, not what is on disk.
     want = plistlib.loads(render_plist(conf, ctx.role_home).encode("utf-8")) if ctx.role_home else {}
@@ -1939,8 +2018,9 @@ def step_enable(ctx, apply_it):
                 "finished. The plist runs it at load, so this is not a job waiting for its first "
                 "interval." % label,
                 "read %s as %s — a pass that cannot start writes nothing to its heartbeat\n"
-                "the commands, filled in:  python3 %s card CK-N5"
-                % (log_path(conf, ctx.role_home or "~"), ctx.account, _self_path()))
+                "the commands, filled in:  %s"
+                % (log_path(conf, ctx.role_home or "~"), ctx.account,
+                   invoke("card CK-N5", ctx.flags)))
         raise Unknown("system/%s is loaded and its heartbeat is %s" % (label, why_not),
                       "run the same command again")
     age = heartbeat_age(ctx, beat)
@@ -1951,18 +2031,29 @@ def step_enable(ctx, apply_it):
             "loaded job%s. Nothing here has seen that job complete a pass."
             % (label, str(beat.get("at"))[:16],
                " — this run's own, a moment ago" if ctx.rehearsed else ""),
-            "wait one interval (%s s) for its next pass, then:\n    python3 %s verify"
-            % (conf["INTERVAL_SECONDS"], _self_path()))
+            "wait one interval (%s s) for its next pass, then:\n    %s"
+            % (conf["INTERVAL_SECONDS"], invoke("verify", ctx.flags)))
     if age is None:
         raise Unknown("system/%s is loaded and its heartbeat carries no readable time (%r)"
                       % (label, str(beat.get("at"))[:40]), "run the same command again")
+    if age < -CLOCK_SKEW_SECONDS:
+        # `age > stale` alone is one-sided: a stamp from the future is "fresh" forever, so one
+        # heartbeat dated ahead would keep a job that never runs again reading as done.
+        raise Unknown(
+            "system/%s is loaded and its heartbeat is dated %d s IN THE FUTURE (%s): a clock that "
+            "moved back, or a stamp the job did not write. It says nothing about whether the job "
+            "runs now" % (label, int(-age), str(beat.get("at"))[:40]),
+            "wait one interval (%s s): a running job's next pass writes the time as this "
+            "machine's clock has it. Still ahead after that? Read the heartbeat and the log "
+            "yourself:\n    %s" % (conf["INTERVAL_SECONDS"], invoke("card CK-N5", ctx.flags)))
     if age > stale:
         raise Unknown(
             "system/%s is loaded and NOT RUNNING: its last pass was %d s ago, past the %d s a "
             "pass may take" % (label, int(age), stale),
             "read %s as %s, and `sudo launchctl print system/%s` for its last exit\n"
-            "the commands, filled in:  python3 %s card CK-N5"
-            % (log_path(conf, ctx.role_home or "~"), ctx.account, label, _self_path()))
+            "the commands, filled in:  %s"
+            % (log_path(conf, ctx.role_home or "~"), ctx.account, label,
+               invoke("card CK-N5", ctx.flags)))
     exit_code = beat.get("exit")
     if exit_code == notify.EXIT_DECLINED:
         # A REAL pass's exit 3 is not the rehearsal's. The rehearsal cannot post, so its
@@ -2047,9 +2138,10 @@ def step_handover(ctx, apply_it):
     on, off, unproven = handover_lines(ctx)
     notes = (["ON: " + l for l in on] + ["OFF: " + l for l in off]
              + ["NOT PROVEN: " + l for l in unproven])
-    # `verify` reaches this row on every pass, so this is where the health card is named.
+    # `verify` reaches this row on every pass, so this is where the health card is named. The
+    # command is its own line: `_print_rows` prints a command line whole, never wrapped.
     notes.append("CHECK IT YOURSELF with card CK-N5: is it alive, and how to pause and resume "
-                 "it, filled in from your conf. python3 %s card CK-N5" % _self_path())
+                 "it, filled in from your conf:\n%s" % invoke("card CK-N5", ctx.flags))
     return True, "%d on, %d off, %d not proven — each named below" % (
         len(on), len(off), len(unproven)), notes
 
@@ -2097,8 +2189,13 @@ def _print_rows(rows, notes=()):
     for sid, note in notes:
         say("")
         say("  note from `%s`:" % sid)
-        for line in se._wrap(note):
-            say("    " + line)
+        # Each line of a note is its own paragraph. A command line is printed whole: wrapped,
+        # `python3` ended one line and its path began the next, so a paste ran a bare
+        # interpreter and then a file that is not executable.
+        for para in note.split("\n"):
+            for line in ([para.strip()] if para.strip().startswith(("python3 ", "sudo "))
+                         else se._wrap(para)):
+                say("    " + line)
 
 
 def run_steps(ctx, apply_it, keep_going=False, resume="run", steps=None):
@@ -2119,9 +2216,9 @@ def run_steps(ctx, apply_it, keep_going=False, resume="run", steps=None):
                 continue
             _finish(ctx, resume)
             _print_rows(rows, row_notes)
-            print_card(exc.card_id, ctx.conf)
+            print_card(exc.card_id, ctx.conf, flags=ctx.flags)
             say("Do that, then run the same command again — it checks your work and carries on:")
-            say("    python3 %s %s" % (_self_path(), resume))
+            say("    " + invoke(resume, ctx.flags))
             return EX_BLOCKED, rows
         except Unknown as exc:
             what = ctx.scrub(exc.what)
@@ -2161,7 +2258,7 @@ def run_steps(ctx, apply_it, keep_going=False, resume="run", steps=None):
         say("")
         if kind == "card":
             say("  step `%s` waits on checkpoint %s — read it with:" % (sid, payload))
-            say("      python3 %s card %s" % (_self_path(), payload))
+            say("      " + invoke("card %s" % payload, ctx.flags))
         elif kind == "unknown":
             se._print_unknown(sid, payload)
         else:
@@ -2192,7 +2289,7 @@ def _banner(ctx, title):
 def cmd_run(ctx, dry_run):
     if not dry_run:
         refuse_if_agent("run", ctx.env)
-    ctx.command = "run --dry-run" if dry_run else "run"
+    ctx.command = ("run --dry-run" if dry_run else "run") + ctx.flags
     if dry_run:
         ctx.may_prompt = False
     _banner(ctx, "Notifier installer — %s" % ("DRY RUN: nothing will be changed" if dry_run
@@ -2222,7 +2319,7 @@ def cmd_run(ctx, dry_run):
         if not ctx.record:
             say("Nothing was recorded: an agent environment writes no ledger.")
         say("Nothing here asked for a credential. Run the same command again after clearing a row:")
-        say("    python3 %s run --dry-run" % _self_path())
+        say("    " + invoke("run --dry-run", ctx.flags))
         return code
     if code == EX_OK:
         say("")
@@ -2234,7 +2331,7 @@ def cmd_verify(ctx):
     """Re-measures EVERY step, never stops early, changes nothing, records nothing, and never
     raises: an escaped exception becomes exit 1 with its name, not a traceback."""
     try:
-        ctx.command = "verify"
+        ctx.command = "verify" + ctx.flags
         ctx.may_prompt = False
         ctx.record = False
         ctx.runner.dry_run = True
@@ -2253,15 +2350,16 @@ def cmd_verify(ctx):
                 counts[outcome] = counts.get(outcome, 0) + 1
             say("Outstanding: " + ", ".join("%d %s" % (n, o) for o, n in sorted(counts.items())
                                             if o not in (DONE, ALREADY_DONE, SKIPPED)))
-            say("The one command that moves it forward:  python3 %s run" % _self_path())
+            say("The one command that moves it forward:  " + invoke("run", ctx.flags))
         return code
     except Exception as exc:                                      # noqa: BLE001
         say("BUG: verify raised %s: %s" % (type(exc).__name__, scrub(str(exc), ctx.held)))
         return EX_FAILED
 
 
-def cmd_status(state):
-    """Replays the ledger. It probes nothing."""
+def cmd_status(state, flags=""):
+    """Replays the ledger. It probes nothing. `flags` are the --conf and --state it was given,
+    repeated in the commands it prints."""
     say("")
     say("=" * 74)
     say(" Notifier install status        %s" % se.now_iso())
@@ -2302,7 +2400,7 @@ def cmd_status(state):
     say("")
     if not blocking:
         say("Every recorded step holds. Re-measure against the live machine with:")
-        say("    python3 %s verify" % _self_path())
+        say("    " + invoke("verify", flags))
         return EX_OK
     sid, outcome, row = blocking[0]
     say("%s at `%s`." % ({BLOCKED: "BLOCKED ON A PERSON", FAILED: "FAILED", UNKNOWN: "COULD NOT MEASURE",
@@ -2311,13 +2409,13 @@ def cmd_status(state):
         say("  %s" % CARDS[row["card"]]["title"])
         say("")
         say("THE ONE COMMAND THAT CLEARS IT:")
-        say("    python3 %s card %s" % (_self_path(), row["card"]))
+        say("    " + invoke("card %s" % row["card"], flags))
     else:
         for line in se._wrap(str(row.get("detail") or "nothing recorded yet")):
             say("  " + line)
         say("")
         say("THE ONE COMMAND THAT MOVES IT:")
-        say("    python3 %s run" % _self_path())
+        say("    " + invoke("run", flags))
     worst = next((s for s in _SEVERITY if any(o == s for _s, o, _r in blocking)), WOULD_CHANGE)
     return _EXIT.get(worst, EX_BLOCKED)
 
@@ -2522,6 +2620,9 @@ def _selftest_body():
             self.sudo_argv = []
             # The role account's PATH. A case empties it to take the hashing tools away.
             self.shell_path = "/usr/bin:/bin"
+            # (script, stdout) -> stdout: a case that needs the role shell to say LESS than it
+            # did edits its answer here, after the real /bin/sh ran.
+            self.stdout_filter = None
 
         def bootstrap(self, path):
             """What a person does at CK-N3: launchd takes a COPY of the file as it is now."""
@@ -2555,6 +2656,8 @@ def _selftest_body():
                                    text=True, timeout=timeout,
                                    env={"HOME": self.home, "PATH": self.shell_path})
                 out = p.stdout.replace("owner=%s " % real_user, "owner=%s " % self.role)
+                if self.stdout_filter is not None:
+                    out = self.stdout_filter(argv[6], out)
                 return se.Result(p.returncode, out, p.stderr)
             if argv[:1] == ["dscl"]:
                 return se.Result(0, "NFSHomeDirectory: %s\n" % self.home)
@@ -3491,7 +3594,8 @@ def _selftest_body():
         wanted = [
             "sudo -u _exnotify -H /bin/sh -c 'cd / && cat "
             "\"$HOME/.stage-e/state/notifier-heartbeat.json\"; tail -20 \"$HOME/.stage-e/notifier.log\"'",
-            "python3 scripts/pipeline_notifier_setup.py verify",
+            # this installer as it was reached, and the --conf it was given (findings 58, 63)
+            "python3 %s verify --conf %s" % (_self_path(), shlex.quote(health_conf)),
             "sudo launchctl print system/com.example.notifier",
             "sudo launchctl bootout system/com.example.notifier",
             "sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.notifier.plist",
@@ -3543,6 +3647,11 @@ def _selftest_body():
         # cwd-long path in front of it can push `CK-N5` onto the next line.
         ok("handover: `verify` names card CK-N5 on a settled machine",
            code == EX_OK and "with card CK-N5" in out, out[-900:])
+        # …and the command itself whole, on a line of its own: wrapped, `python3` ended one
+        # line and its path began the next, so a paste ran a bare interpreter (findings 60, 69).
+        ok("handover: the CK-N5 command is printed whole on one line, never wrapped",
+           ("python3 %s card CK-N5" % _self_path()) in [l.strip() for l in out.splitlines()],
+           out[-900:])
         c, f = settled()
         f.loaded = False
         code, out = quiet(lambda: cmd_verify(c))
@@ -3698,9 +3807,264 @@ def _selftest_body():
         os.remove(os.path.join(checkout_of(gone_home), "gh_fallback.py"))
         c, f = machine_ctx(gone_root, home=gone_home)
         _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        # …and never ALSO claims the byte-for-byte match it could not make (finding 70, a2).
         ok("preflight: a file THIS checkout cannot read leaves the comparison NOT MEASURED",
-           isinstance(exc, Unknown) and "scripts/gh_fallback.py in this checkout" in exc.what,
+           isinstance(exc, Unknown) and "scripts/gh_fallback.py in this checkout" in exc.what
+           and "byte for byte" not in exc.what, repr(exc))
+
+        # ── 16m. the KIT-198 review round: each finding it closes, pinned ────────────────
+        me = _self_path()
+        code, out5 = quiet(lambda: main(["card", "CK-N5", "--conf", health_conf]))
+        captured.append(out5)
+        good5 = [l for l in out5.splitlines() if l.startswith("GOOD:")]
+        # A rehearsal writes the same heartbeat file, fresh and exit 0. `enable` grades it NOT
+        # MEASURED; a card that read only `at` and `exit` called it alive (finding 56).
+        ok("card CK-N5: its Good lines require `dry` false, as `enable` does — a rehearsal is "
+           "not a pass of the loaded job",
+           "Good: `dry` is false" in out5 and "rehearsal" in out5
+           and good5 and "`dry` false" in good5[0], out5[-2500:])
+        # A stamp from the future is fresh forever by an `under N s old` test (finding 64).
+        ok("card CK-N5: …and a heartbeat dated in the future is not fresh",
+           "not in the future" in out5.partition("Good: `dry`")[2].partition("2. ")[0]
+           and good5 and "not in the future" in good5[0], out5[-2500:])
+        # The clone check hashes the checkout preflight compares — this installer's own
+        # scripts, by full path — not `./scripts` wherever the person stands (finding 63).
+        clone5 = [l for l in out5.splitlines() if "shasum -a 256" in l]
+        ok("card CK-N5: the clone check hashes THIS installer's checkout, by full path",
+           clone5 and ("( cd %s && shasum -a 256 " % shlex.quote(HERE)) in clone5[0],
+           repr(clone5))
+        # …and its `verify` is this installer as reached from where the card was printed,
+        # which from anywhere but the checkout root is not `scripts/…`.
+        elsewhere_dir = os.path.join(tmp_root, "somewhere-else")
+        os.makedirs(elsewhere_dir)
+        here_before = os.getcwd()
+        os.chdir(elsewhere_dir)
+        try:
+            far = _self_path()
+            code, outx = quiet(lambda: main(["card", "CK-N5", "--conf", health_conf]))
+        finally:
+            os.chdir(here_before)
+        ok("card CK-N5: printed from another directory, its commands run this installer by the "
+           "path that reaches it from there",
+           far != "scripts/pipeline_notifier_setup.py"
+           and ("python3 %s verify --conf %s" % (far, shlex.quote(health_conf))) in outx,
+           outx[-1800:])
+        # Decision 1 of the round: a pause, seen from a Stage E install that watches the
+        # notifier, and said without claiming that watch exists on every install (finding 65).
+        ok("card CK-N5: a pause, if your Stage E install watches the notifier, shows there as "
+           "paused, not watched, and resuming the notifier needs no Stage E run",
+           "if your Stage E install watches the notifier" in out5
+           and "paused, not watched" in out5 and "needs no Stage E run" in out5, out5[-2500:])
+
+        # CK-N3 is the card `run` and `verify` send a paused job to. A job paused with
+        # `disable` will not load until it is enabled, and waiting does not change that
+        # (findings 57, 61, 68).
+        code, out3 = quiet(lambda: main(["card", "CK-N3", "--conf", health_conf]))
+        captured.append(out3)
+        lines3 = [l.strip() for l in out3.splitlines()]
+        loads3 = [i for i, l in enumerate(lines3) if l.startswith("sudo launchctl bootstrap ")]
+        ok("card CK-N3: every load is preceded by the enable line — harmless on a job never "
+           "disabled, and the only thing that loads one paused with `disable`",
+           code == EX_OK and len(loads3) == 2
+           and all(lines3[i - 1] == "sudo launchctl enable system/com.example.notifier"
+                   for i in loads3), out3[-2000:])
+        io_advice = out3.partition("Input/output error")[2].partition("launchctl bootout")[0]
+        ok("card CK-N3: `Input/output error` is not only timing — a job paused with `disable` "
+           "is named as its other cause, in the advice itself",
+           "paused with" in io_advice and "`disable`" in io_advice, out3[-2000:])
+        c, f = settled()
+        f.loaded = False
+        _v, exc = attempt(lambda: quiet(lambda: step_enable(c, False)))
+        ok("enable: a job that is not loaded says a `disable` pause reads the same, and that "
+           "CK-N3 loads either",
+           isinstance(exc, Blocked) and exc.card_id == "CK-N3" and "disable" in (exc.extra or ""),
            repr(exc))
+
+        # A heartbeat dated in the future (finding 64). A minute ahead is clock skew.
+        real_pass(home, ago=-10 ** 6)
+        c, f = settled()
+        code, outf = quiet(lambda: cmd_verify(c))
+        captured.append(outf)
+        ok("enable: a heartbeat dated in the future is NOT MEASURED, never a fresh pass",
+           rows_of(run_steps_rows(c)).get("enable") == UNKNOWN and "IN THE FUTURE" in outf
+           and "No drift" not in outf, outf[-900:])
+        real_pass(home, ago=-60)
+        c, f = settled()
+        code, outf = quiet(lambda: cmd_verify(c))
+        ok("enable: …but a stamp a minute ahead, inside the clock-skew allowance, is a pass",
+           rows_of(run_steps_rows(c)).get("enable") == ALREADY_DONE, outf[-900:])
+        real_pass(home)
+
+        # A conf that LOADED and was rejected is not an absent one (finding 58).
+        rejected_conf = os.path.join(tmp_root, "rejected.conf")
+        with open(rejected_conf, "w", encoding="utf-8") as fh:
+            fh.write(good_text + "INTERVAL_SECONDS=30\n")
+        code, outr = quiet(lambda: main(["card", "CK-N5", "--conf", rejected_conf]))
+        ok("card: a conf that loaded and was rejected is named as rejected, with its problem — "
+           "never 'no notifier.conf loaded' over the example values",
+           "no notifier.conf loaded" not in outr and "RUN_TIMEOUT_SECONDS" in outr
+           and "EXAMPLE" in outr, outr[:1200])
+
+        # Every command it prints repeats the --conf and --state this run was given: a remedy
+        # that drops them runs against notifier.conf and the default ledger (findings 58, 62).
+        FL = " --conf 'alt dir/n.conf' --state /tmp/alt-state"
+        flags_v, exc = attempt(lambda: (invocation_flags(DEFAULT_CONF, DEFAULT_STATE_HOME),
+                                        invocation_flags("alt dir/n.conf", "/tmp/alt-state")))
+        ok("flags: a non-default --conf and --state are repeated, quoted; the defaults add nothing",
+           flags_v == ("", FL), repr(exc or flags_v))
+        made, exc = attempt(lambda: make_ctx(
+            build_parser().parse_args(["verify", "--conf", "alt dir/n.conf",
+                                       "--state", "/tmp/alt-state"]),
+            good_conf(), State(os.path.join(tmp_root, "made-ledger"))))
+        ok("flags: the context `main` builds carries them",
+           exc is None and getattr(made, "flags", None) == FL, repr(exc or made))
+        c, f = settled(env={})
+        c.flags = FL
+        code, outv = quiet(lambda: cmd_verify(c))
+        captured.append(outv)
+        ok("flags: verify's key hand-off repeats them",
+           '"$STAGE_E_LINEAR_API_KEY" python3 %s verify%s\n' % (me, FL) in outv, outv[-1500:])
+        ok("flags: the handover's CK-N5 command repeats them",
+           ("python3 %s card CK-N5%s" % (me, FL)) in [l.strip() for l in outv.splitlines()],
+           outv[-1500:])
+        ok("flags: verify's closing command repeats them",
+           "moves it forward:  python3 %s run%s" % (me, FL) in outv, outv[-600:])
+        flag_ledger = State(os.path.join(tmp_root, "flags-ledger"))
+        flag_ledger.attest(A_PRIVATE, "pq", "n", channel_id="C0SYNTHETIC1")
+        c, f = machine_ctx(os.path.join(tmp_root, "flags-dry"), env={}, dry_run=True,
+                           state=flag_ledger)
+        c.flags = FL
+        code, outd = quiet(lambda: cmd_run(c, dry_run=True))
+        captured.append(outd)
+        ok("flags: a dry run's key hand-off repeats them",
+           '"$STAGE_E_LINEAR_API_KEY" python3 %s run --dry-run%s\n' % (me, FL) in outd,
+           outd[-1500:])
+        ok("flags: a dry run's closing command repeats them",
+           ("    python3 %s run --dry-run%s" % (me, FL)) in outd.splitlines(), outd[-600:])
+        run_root = os.path.join(tmp_root, "flags-run")
+        c, f = machine_ctx(run_root)
+        c.flags = FL
+        code, outb = quiet(lambda: cmd_run(c, dry_run=False))
+        captured.append(outb)
+        ok("flags: `run`'s resume line repeats them",
+           code == EX_BLOCKED and ("    python3 %s run%s" % (me, FL)) in outb.splitlines(),
+           outb[-900:])
+        ok("flags: …and so does the sign-off command on the card it stops at",
+           "python3 %s attest A-PRIVATE-CHANNEL%s" % (me, FL) in outb, outb[-1800:])
+        code, outs = quiet(lambda: main(["status", "--state", os.path.join(run_root, "ledger")]))
+        ok("flags: `status` repeats the --state it was given in the command it prints",
+           "python3 %s card CK-N1 --state %s" % (me, shlex.quote(os.path.join(run_root, "ledger")))
+           in outs, outs[-600:])
+        c, f = settled()
+        f.loaded = False
+        c.flags = FL
+        code, outp = quiet(lambda: cmd_verify(c))
+        ok("flags: verify's pointer to the card a step waits on repeats them",
+           ("python3 %s card CK-N3%s" % (me, FL)) in [l.strip() for l in outp.splitlines()],
+           outp[-900:])
+        for name, prepare, needle in (
+                ("a stale heartbeat", lambda: real_pass(home, ago=10 ** 6),
+                 "the commands, filled in:  python3 %s card CK-N5%s" % (me, FL)),
+                ("no heartbeat at all", lambda: os.remove(beat_file),
+                 "the commands, filled in:  python3 %s card CK-N5%s" % (me, FL)),
+                ("a rehearsal's heartbeat", lambda: real_pass(home, dry=True),
+                 "    python3 %s verify%s" % (me, FL))):
+            prepare()
+            c, f = settled()
+            c.flags = FL
+            code, outn = quiet(lambda: cmd_verify(c))
+            ok("flags: the remedy for %s repeats them" % name, needle in outn, outn[-900:])
+        real_pass(home)
+        resumes = []
+
+        class _ResumeSudo(object):
+            held = False
+
+            def acquire(self, why, resume):
+                resumes.append(resume)
+                return True
+
+        c, f = machine_ctx(os.path.join(tmp_root, "flags-sudo"))
+        c.sudo, c.flags = _ResumeSudo(), FL
+        acquire_privilege(c, "run", True)
+        ok("flags: the password prompt's own retry line repeats them",
+           resumes == ["run --dry-run" + FL], repr(resumes))
+
+        # The scrub in each exit-3 branch is the step's OWN, before its 400-character cut:
+        # run_steps scrubs again, but a caller that did not would print a held value whole
+        # (finding 70, a3 and a5). Called directly, so only the step's scrub stands.
+        held_value = "held-" + "Q7" * 20
+        for name, counts, words in (("the cap's words", {"capped": 2, "declined": 2},
+                                     "over the per-pass cap"),
+                                    ("a failed send's words", {"declined": 2}, "did not land")):
+            real_pass(home, exit_code=3, summary="sent 25, labelled 25, declined 2 | "
+                      + held_value, **counts)
+            c, f = settled()
+            c.held.append(held_value)
+            _v, exc = attempt(lambda: quiet(lambda: step_enable(c, False)))
+            ok("enable: %s scrub a held value out of the summary themselves" % name,
+               isinstance(exc, SetupError) and held_value[:12] not in str(exc)
+               and words in str(exc), scrub(repr(exc), (held_value,))[:600])
+        real_pass(home)
+
+        # The role shell said NOTHING about one file: unmeasured, never a missing file (a1).
+        silent_root = os.path.join(tmp_root, "clone-silent-file")
+        silent_home = new_home(silent_root)
+        c, f = machine_ctx(silent_root, home=silent_home)
+        f.stdout_filter = lambda script, text: (
+            "".join(l for l in text.splitlines(True) if not l.rstrip("\n").endswith(" pr_conflict.py"))
+            if "sha256" in script else text)
+        _v, exc = attempt(lambda: quiet(lambda: step_preflight(c, False)))
+        ok("preflight: a clone file the role shell said nothing about is NOT MEASURED, never "
+           "a missing file",
+           isinstance(exc, Unknown) and "could not hash" in exc.what
+           and "pr_conflict.py" in exc.what and "lacks" not in exc.what, repr(exc))
+
+        # The env file is shared. A line grep calls BINARY is still a line, and the notifier's
+        # store keeps it, like the Stage E installer's (index 7, KIT-171's twin).
+        nul_root = os.path.join(tmp_root, "typed-nul")
+        os.makedirs(nul_root)
+        nul_home = new_home(nul_root, with_token=False, extra_lines=("OTHER_NAME=kept",))
+        env_nul = os.path.join(nul_home, ".stage-e", "env")
+        with open(env_nul, "ab") as fh:
+            fh.write(b"BLOB=a\x00b\n")
+        c, f = machine_ctx(nul_root, home=nul_home, tty=True, reader=lambda _p: token)
+        _v, exc = attempt(lambda: quiet(lambda: step_credentials(c, True)))
+        with open(env_nul, "rb") as fh:
+            raw_nul = fh.read()
+        ok("credentials: storing the token keeps a line holding a NUL byte and every other "
+           "line — grep's 'Binary file … matches' never becomes the file",
+           exc is None and b"Binary file" not in raw_nul and b"\nBLOB=a\x00b\n" in raw_nul
+           and ("STAGE_E_LINEAR_API_KEY=" + key).encode() in raw_nul
+           and ("GH_TOKEN=" + gh).encode() in raw_nul and b"OTHER_NAME=kept\n" in raw_nul
+           and raw_nul.count(b"NOTIFIER_SLACK_BOT_TOKEN=") == 1,
+           scrub("%r %s" % (exc, raw_nul.decode("utf-8", "replace")), (token, key, gh))[:600])
+        dir_home = os.path.join(tmp_root, "env-is-a-directory")
+        os.makedirs(os.path.join(dir_home, ".stage-e", "env"))
+        wrote, exc = attempt(lambda: subprocess.run(
+            ["/bin/sh", "-c", _cred_script(CRED_WRITE_SH, good_conf())], input=token + "\n",
+            capture_output=True, text=True, timeout=60,
+            env={"HOME": dir_home, "PATH": "/usr/bin:/bin"}))
+        ok("credentials: a DIRECTORY at the env file's path is refused (exit 5) and left empty — "
+           "`mv` would file the token inside it and call that stored",
+           wrote is not None and wrote.returncode == 5
+           and os.listdir(os.path.join(dir_home, ".stage-e", "env")) == [],
+           repr(exc or (wrote.returncode, os.listdir(os.path.join(dir_home, ".stage-e", "env")))))
+        saved_write = globals()["CRED_WRITE_SH"]
+        globals()["CRED_WRITE_SH"] = ('umask 077; f=@ENV@; IFS= read -r v || exit 7; '
+                                      'printf "%s=%s\\n" "@CHAT@" "$v" > "$f"; chmod 600 "$f"')
+        try:
+            wipe_root = os.path.join(tmp_root, "typed-wipe")
+            os.makedirs(wipe_root)
+            c, f = machine_ctx(wipe_root, home=new_home(wipe_root, with_token=False), tty=True,
+                               reader=lambda _p: token)
+            _v, exc = attempt(lambda: quiet(lambda: step_credentials(c, True)))
+        finally:
+            globals()["CRED_WRITE_SH"] = saved_write
+        ok("credentials: a store that lost the tracker key's line is a failure, never "
+           "'every other line kept'",
+           isinstance(exc, SetupError) and "STAGE_E_LINEAR_API_KEY" in str(exc)
+           and "every other line kept" not in str(exc), repr(exc))
 
         # ── 17. what this file can never do, read from its own source ──────────────────
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:
@@ -3766,6 +4130,14 @@ def build_parser():
     return p
 
 
+def make_ctx(args, conf, state):
+    """The context `run` and `verify` are handed, carrying the options this run was given."""
+    ctx = Ctx(conf, se.Runner(dry_run=args.dry_run or args.command == "verify"), state,
+              tty=sys.stdin.isatty() and sys.stdout.isatty())
+    ctx.flags = invocation_flags(args.conf, args.state)
+    return ctx
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
@@ -3780,8 +4152,9 @@ def main(argv=None):
         return EX_REFUSED
     try:
         state = State(args.state)
+        flags = invocation_flags(args.conf, args.state)
         if args.command == "status":
-            return cmd_status(state)
+            return cmd_status(state, flags)
         conf, errors, problem = None, [], None
         try:
             conf, errors = load_conf(args.conf, invoking_user())
@@ -3792,7 +4165,11 @@ def main(argv=None):
         if errors:
             problem = "%d problem(s), the first: %s" % (len(errors), errors[0])
         if args.command == "card":
-            print_card(args.target or "", conf if conf is not None and not errors else None)
+            # A conf that did not load, or loaded and was rejected, prints the example values
+            # under a header that says which, and why. It stays exit 0: a card is readable
+            # with or without a conf, and `verify` is where every problem is listed.
+            print_card(args.target or "", conf if conf is not None and not errors else None,
+                       problem=problem, flags=flags)
             return EX_OK
         if args.command == "attest":
             return cmd_attest(state, args.target or "", args.initials, args.note,
@@ -3805,8 +4182,7 @@ def main(argv=None):
             say("")
             say("Fix them all, then run the same command again.")
             return EX_USAGE
-        ctx = Ctx(conf, se.Runner(dry_run=args.dry_run or args.command == "verify"), state,
-                  tty=sys.stdin.isatty() and sys.stdout.isatty())
+        ctx = make_ctx(args, conf, state)
         acquire_privilege(ctx, args.command, args.dry_run)
         if args.command == "verify":
             return cmd_verify(ctx)
