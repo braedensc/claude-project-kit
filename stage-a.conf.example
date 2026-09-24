@@ -1,14 +1,22 @@
-# stage-a.conf.example — every value the Stage A (idea-gate) installer asks you for.
+# stage-a.conf.example — every value the Stage A (idea-gate) installer reads.
 #
 # ---------------------------------------------------------------------------
 # HOW TO USE THIS FILE
 #
-#   cp stage-a.conf.example stage-a.conf && chmod 600 stage-a.conf
-#   $EDITOR stage-a.conf                              # none of these values is secret
-#   python3 scripts/pipeline_stage_a_setup.py run     # the only command you type
+#   You usually never edit it. On a first run the installer writes stage-a.conf
+#   for you: it works out most values from the review installer's own settings
+#   (stage-e.conf), from this checkout and from your Linear key, and asks only
+#   for the rest. The one command that does it, typed in a terminal:
 #
-# `run` validates this file before it touches anything, and reports EVERY bad
-# value in one pass — not the first one it meets. Fix them all, run it again.
+#     python3 scripts/pipeline_install.py
+#
+#   To fill it by hand instead:
+#
+#     cp stage-a.conf.example stage-a.conf && chmod 600 stage-a.conf
+#     $EDITOR stage-a.conf                              # none of these values is secret
+#
+# The installer validates the file before it touches anything, and reports EVERY
+# bad value in one pass — not the first one it meets.
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
@@ -16,13 +24,11 @@
 #   FORMAT.  `KEY=value`, one per line.  `#` starts a comment ONLY at the start
 #   of a line.  It is PARSED, never SOURCED — no `$(…)`, no backticks, no export.
 #
-#   NO KEY HERE EVER HOLDS A CREDENTIAL.  The executor's Linear key is named
-#   here, never valued: the installer writes the value into the role account's
-#   own env file at mode 600, and this file records only the env-var NAME.
+#   NO KEY HERE EVER HOLDS A CREDENTIAL.  Keys are named here, never valued.
 #
 #   MODE 600.  It holds no secret, but it holds the shape of your deployment.
 #   `stage-a.conf` is gitignored; this example is committed.  Every value below
-#   is synthetic (`example.com`, the namespaced `_planclaw`); edit them all.
+#   is synthetic (`example.com`, `example-org`); edit them all.
 #
 #   THERE IS NO PLANNING TEAM.  Planning happens on each repository's own work
 #   team: you move an idea to "Plan it" on that team.  Which team a repository
@@ -30,53 +36,75 @@
 # ---------------------------------------------------------------------------
 
 
-# The non-admin local account the executor runs as — NOT your login. A job under
-# your login stops when you log out; the executor would then file no plans while
-# the dispatcher kept starting planning sessions. The installer never creates it.
-ROLE_ACCOUNT=_planclaw
+# The local account the planner job runs as — NOT your login. A job under your login
+# could be read by every Claude session you run, and stops when you log out. The usual
+# choice is the dispatcher's own account, which the review jobs already run as: the
+# first run fills it in from stage-e.conf. The installer never creates accounts.
+ROLE_ACCOUNT=_exdispatch
 
 # The repositories whose ideas are planned, as owner/repo, separated by commas.
 # Each one's COMMITTED delivery.json, on its default branch, says which work team
-# its ideas sit on (`linear.teamKey`) and is the executor's only config for it: the
-# team the tree lands in, that team's state and label ids, and the
-# `linear.findingTicket` block that turns plans on. The installer reads that file and
-# never writes it.
+# its ideas sit on (`linear.teamKey`) and is the executor's only config for it. When
+# that file does not switch plans on yet, the installer shows the change, opens the
+# pull request AS YOU, and waits for you to merge it. It never merges.
 #
 # RULE: one team plans one repository. The dispatcher sends a team's tickets to
 # exactly one repository, so two repositories whose delivery.json name the same team
-# are refused.
+# are refused. The first run suggests the repositories the review jobs watch.
 PLANNED_REPOS=example-org/product
 
-# Your own Linear USER ID — the person notified on every filed plan and named as
-# the subscriber on each epic. A plan nobody is notified about dies in the
-# backlog. This is the user id, not an email.
+# Your own Linear USER ID — the person notified on every filed plan, and the only
+# person the planning entries let start a session. The first run reads it from your key.
 OWNER_USER_ID=REPLACE_WITH_YOUR_LINEAR_USER_ID
 
-# The NAME — never the value — of the variable holding YOUR tracker key, in the
-# terminal you run the installer from. It creates the Plan it state and the routing
-# label on each work team, and reads the probe tickets back. It is read, never stored.
+# The NAME — never the value — of the variable holding YOUR tracker key in the terminal
+# you run the installer from. It creates the Plan it state and the routing label, and
+# files and reads the probe tickets as you. It is never stored. When it is not set, and
+# the planner reuses the review jobs' key (LINEAR_KEY_FILE below), the installer reads
+# that stored key instead; otherwise it asks at a hidden prompt.
 OPERATOR_KEY_ENV=LINEAR_API_KEY
 
-# The NAME — never the value — of the variable the EXECUTOR's key is stored under,
-# in the role account's own env file (mode 600). A different key from yours, and a
-# different name: one name for both is how your key ends up in the executor's file.
-# The executor is started with `--key-env` set to this name.
-LINEAR_KEY_ENV=STAGE_A_LINEAR_API_KEY
+# The NAME — never the value — of the variable the planner job's key is stored under.
+# It must be a PERSONAL key of yours: the planning entries let only you start a session,
+# and the dispatcher checks who handed the ticket over.
+LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
 
-# The https clone URL the role account runs the planner job and the executor out of.
-# The installer places that clone under the role account and keeps it level with origin,
-# and the job execs from it on every pass. Not ssh — the role account has no keys.
+# OPTIONAL. The env file, under ROLE_ACCOUNT's home, that holds that key.
+#   .stage-e/env  — reuse the key the review jobs already store (the first run's
+#                   choice when stage-e.conf exists). Nothing is asked for; the review
+#                   installer owns that file, and revoking that key stops both.
+#   .stage-a/env  — a key of the planner's own, asked for once at a hidden prompt.
+# Default: .stage-a/env
+LINEAR_KEY_FILE=.stage-e/env
+
+# The https clone URL the role account runs the planner job out of. The installer places
+# that clone under the role account and keeps it level with origin. Not ssh — the role
+# account has no keys. The first run takes it from stage-e.conf or this checkout.
 KIT_REPO_URL=https://github.com/example-org/claude-project-kit
 
 # The display name of the dispatcher's agent user in the tracker. The planner job
-# delegates every planning ticket to it, in the same call that creates the ticket, so a
-# session's own identity is never in the loop. It must be an app user, not a person.
+# delegates every planning ticket to it. It must be an app user, not a person. The first
+# run takes it from stage-e.conf (AGENT_DISPLAY_NAME).
 AGENT_USER_NAME=Dispatcher Agent
 
-# The launchd label for the planner job. A label belongs to a deployment, never to this
-# repository, so you type it: reverse-DNS, at least two parts. The job is installed at
-# /Library/LaunchDaemons/<this>.plist and is never loaded by the installer.
+# The launchd label for the planner job: reverse-DNS, at least two parts. The job is
+# installed at /Library/LaunchDaemons/<this>.plist and started only after your yes. The
+# first run puts it beside the dispatcher's own label.
 JOB_LABEL=com.example.stage-a-planner
+
+# The local account the dispatcher itself runs as. The installer reads the dispatcher's
+# config as that account — as FACTS, because it holds the dispatcher's tracker tokens —
+# and writes the planning entries into it as that account, after a backup and your typed
+# yes.
+DISPATCHER_ACCOUNT=_exdispatch
+
+# The dispatcher's own config file, by absolute path.
+DISPATCHER_CONFIG=/opt/example-dispatch/config.json
+
+# The dispatcher's launchd label. After writing the planning entries the installer
+# restarts it (stop, wait until launchd lets go, start) so it loads them — and warns you
+# first, because a restart cuts off any session it is running.
+DISPATCHER_SERVICE=com.example.dispatcher
 
 # OPTIONAL. The state, on each work team, you move an idea into to start a planning
 # run. The installer creates it as a to-do (unstarted) state if it is absent, and
@@ -92,8 +120,7 @@ MAX_RUNS_PER_DAY=10
 
 # OPTIONAL. How long, in seconds, the planner job waits for the dispatcher's routing
 # note after filing a planning ticket (30 to 300). No note in time counts as a routing
-# failure, which cancels the ticket and stops planning. The wait stretches by itself
-# while a repository setup script runs. Default: 120
+# failure, which cancels the ticket and stops planning. Default: 120
 ROUTING_WAIT_SECONDS=120
 
 # OPTIONAL. The port the dispatcher listens on, on this machine. The planner job reads
@@ -103,26 +130,12 @@ DISPATCHER_PORT=3456
 
 # OPTIONAL. The absolute path of the dispatcher's installed routing code
 # (RepositoryRouter.js inside its cyrus-edge-worker package). When set, the probe
-# records its fingerprint, read as the dispatcher's account, and `verify` checks it has
-# not changed. Leave empty to rely on the version alone.
+# records its fingerprint and `verify` checks it has not changed. Leave empty to rely on
+# the version alone.
 DISPATCHER_ROUTER_FILE=
 
 # OPTIONAL, and only for PRIVATE planned repositories. The NAME — never the value — of
 # the variable holding a read-only code-host token, so the job can update its checkout
-# of each planned repository. The installer asks for the value at a hidden prompt and
-# stores it beside the tracker key. Leave empty when every one is public.
+# of each planned repository. Asked for at a hidden prompt and stored in
+# ~/.stage-a/env under the role account. Leave empty when every one is public.
 GITHUB_TOKEN_ENV=
-
-# The local account the dispatcher itself runs as. The installer reads that account's
-# copy of the dispatcher config — as FACTS, never as a file, because it holds the
-# dispatcher's tracker tokens — for the fields a loadable planning entry needs: the
-# clone the planner reads code in, that clone's base branch, the workspace directory
-# and the workspace id. It never writes that config.
-#
-# RULE: not the same account as ROLE_ACCOUNT. Every session can read what the
-# dispatcher's account can read, and the executor's key must be out of that reach.
-DISPATCHER_ACCOUNT=_exdispatch
-
-# The dispatcher's own config file, by absolute path. A relative path is resolved
-# against a working directory nothing here can see.
-DISPATCHER_CONFIG=/opt/example-dispatch/config.json
