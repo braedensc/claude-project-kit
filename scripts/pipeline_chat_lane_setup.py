@@ -70,8 +70,9 @@ MEASURED) says what happened; the exit code says which kind of nothing it was:
     10  BLOCKED-ON-HUMAN — drift: a piece is not applied, or not as composed; or a step
         must come first (env-names before the fence or the port block, or without a
         terminal; a file a writer will not touch — missing, a symbolic link, another
-        account's; not exactly one allowlist line). A writer's dry run that found
-        something to write exits 10: it did nothing, on purpose
+        account's; not exactly one allowlist line, or one that reaches the
+        dispatcher's control routes). A writer's dry run that found something to
+        write exits 10: it did nothing, on purpose
 
 `verify` REFUSES IN AN AGENT ENVIRONMENT, and that is stricter than the Stage E
 installer's `verify` on purpose. That one still runs under a model with its credential

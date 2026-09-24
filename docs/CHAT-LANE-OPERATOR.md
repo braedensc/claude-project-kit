@@ -83,7 +83,7 @@ line: a `REFUSED:` line can end in 10, 2 or 3.
 | Exit | Means |
 |---|---|
 | **0** | Done, or nothing left to do. |
-| **10** | Something is not applied yet, or a step must come first. A writer's dry run that found work. `env-names` before the fence or the port block, or with no terminal. A file a writer will not touch: missing, a symbolic link, or owned by another account. A front-door file without exactly one allowlist line, or a removal that would empty it. |
+| **10** | Something is not applied yet, or a step must come first. A writer's dry run that found work. `env-names` before the fence or the port block, or with no terminal. A file a writer will not touch: missing, a symbolic link, or owned by another account. A front-door file without exactly one allowlist line, a line that reaches the dispatcher's control routes, or a removal that would empty it. |
 | **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, or a pasted secret has the wrong shape. |
 | **4** | A check could not measure. `env-names` also exits 4 when it cannot read the file it compares the token with. Not a pass. |
 | **1** | Something is broken, or a write failed. |
