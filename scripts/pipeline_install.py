@@ -74,6 +74,12 @@ STAGE_E_MEANS = {
     2: "the review installer's settings (stage-e.conf) have a problem; every bad value is "
        "listed above.",
 }
+# Said with every Stage E stop that is not the person's to clear by running again.
+STAGE_E_SKIP_HINT = " (To install the idea gate without touching Stage E: --skip-stage-e.)"
+# Said when a person pressed Ctrl-C: the installer it reached finished its own clean-up,
+# and nothing after it runs.
+INTERRUPTED = ("interrupted. %s finished its own clean-up and stopped; the lines above say "
+               "where. Nothing after it ran. Run this same command again to carry on.")
 STAGE_A_MEANS = {
     0: "The idea gate is installed, running and proven.",
     10: "The idea gate is waiting on you. What for is printed just above. Do it, then run "
@@ -93,6 +99,15 @@ class Io(object):
     """Everything this command does to the outside world, in one seam, so --selftest can
     walk every path with no machine: running a program, asking a person, restarting."""
 
+    # Set when the person pressed Ctrl-C while an installer ran: that installer finished
+    # its own clean-up, and nothing after it may start.
+    interrupted = False
+
+    def now(self):
+        """UTC now, to the second, in the form the installers stamp their records with."""
+        import datetime
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def run(self, argv, capture=False):
         """(exit code, output). Streams are inherited unless `capture`: an installer's
         prompts and cards are for the person, not for this program.
@@ -100,15 +115,19 @@ class Io(object):
         CTRL-C BELONGS TO THE INSTALLER, NOT TO THIS WRAPPER. Ctrl-C reaches every process
         on the terminal. Left alone, this wrapper would give the installer a quarter of a
         second and then kill it — in the middle of the drill putting Cyrus's settings back,
-        or of a restart. So this process ignores it while an installer runs, the installer
-        gets it with the default handling restored, and its own clean-up runs to the end."""
+        or of a restart. So this process only NOTES it while an installer runs, the
+        installer gets it with the default handling restored, and its own clean-up runs to
+        the end. Noted, not ignored: an installer that stopped on a Ctrl-C must not be
+        followed by the next one, as if the person had asked for that."""
         import signal
         try:
             if capture:
                 proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       cwd=KIT, timeout=120)
                 return proc.returncode, proc.stdout.decode("utf-8", "replace")
-            previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            def noted(_signum, _frame):
+                self.interrupted = True
+            previous = signal.signal(signal.SIGINT, noted)
             try:
                 child = subprocess.Popen(argv, cwd=KIT, preexec_fn=lambda: signal.signal(
                     signal.SIGINT, signal.SIG_DFL))
@@ -118,17 +137,20 @@ class Io(object):
         except (OSError, subprocess.SubprocessError) as exc:
             return 127, str(exc)
 
-    def stage_e_steps(self):
-        """{step: outcome} from the review installer's own record, which its `verify`
-        rewrites on every pass — or None when it cannot be read."""
+    def stage_e_steps(self, since):
+        """{step: outcome} for the steps the review installer's own record says were
+        measured at or after `since` — or None when it cannot be read, or when its `code`
+        step was not measured then. An older pass's row says nothing about now."""
         import json
         path = os.path.expanduser("~/.stage-e-setup/state.json")
         try:
             with open(path, encoding="utf-8") as fh:
                 steps = json.load(fh).get("steps") or {}
-            return dict((k, (v or {}).get("outcome")) for k, v in steps.items())
+            fresh = dict((k, (v or {}).get("outcome")) for k, v in steps.items()
+                         if str((v or {}).get("at") or "") >= since)
         except (OSError, ValueError, AttributeError):
             return None
+        return fresh if "code" in fresh else None
 
     def ask(self, question):
         try:
@@ -211,6 +233,8 @@ def step_checkout(io, argv, no_pull):
 def step_skills(io):
     heading(io, "2. The skills in your home folder")
     code, _out = io.run([sys.executable, SKILLS])
+    if io.interrupted:
+        return stop(io, INTERRUPTED % "The skills check", code or EX_BLOCKED)
     if code == 0:
         return None
     if code == 3:
@@ -224,6 +248,8 @@ def step_skills(io):
         io.say("Left as they are. Planning sessions may load an older procedure until you do.")
         return None
     code, _out = io.run([sys.executable, SKILLS, "--apply"])
+    if io.interrupted:
+        return stop(io, INTERRUPTED % "Replacing the skills", code or EX_BLOCKED)
     if code != 0:
         return stop(io, "the skills could not all be replaced (exit %d)." % code, code)
     return None
@@ -239,17 +265,26 @@ def step_stage_e(io, conf, skip):
                "to date." % os.path.relpath(conf, KIT))
         io.say("The idea gate asks for the dispatcher's details itself.")
         return None
+    started = io.now()
     code, _out = io.run([sys.executable, STAGE_E, "verify", "--conf", conf])
+    if io.interrupted:
+        return stop(io, INTERRUPTED % "Stage E's check", code or EX_BLOCKED)
     if code == 0:
         io.say("")
         io.say("Stage E is up to date. Nothing to do.")
         return None
-    if code in (3, 5):
-        return stop(io, STAGE_E_MEANS[code], code)
-    # WHAT IS OUTSTANDING DECIDES WHAT HAPPENS. The check records every step it measured.
-    # A step `run` would change is work for the installer; a card is work for a person,
-    # and running the installer again cannot clear it. Only the first needs a run.
-    steps = io.stage_e_steps()
+    if code != 10:
+        # NOT "WORK OUTSTANDING": a step that FAILED (1), one that could not be measured
+        # (4), a settings problem (2), a refusal (3) or no password (5). None of those is a
+        # card a person signs, and none is something to carry on past.
+        return stop(io, STAGE_E_MEANS.get(code, "Stage E's check stopped with exit %d. The "
+                                                "lines above say why." % code)
+                    + STAGE_E_SKIP_HINT, code)
+    # WHAT IS OUTSTANDING DECIDES WHAT HAPPENS. The check records every step it measured,
+    # and only rows THIS check wrote are read: an older pass's record says nothing about
+    # now. A step `run` would change is work for the installer; a card is work for a
+    # person, and running the installer again cannot clear it.
+    steps = io.stage_e_steps(started)
     if steps is None or any(o == "WOULD-CHANGE" for o in steps.values()):
         io.say("")
         io.say("Stage E is not up to date: the check above names what is outstanding.")
@@ -261,25 +296,31 @@ def step_stage_e(io, conf, skip):
                             "teaches its jobs to leave planning tickets alone. Run this again "
                             "when you are ready.", EX_BLOCKED)
         code, _out = io.run([sys.executable, STAGE_E, "run", "--conf", conf])
+        if io.interrupted:
+            return stop(io, INTERRUPTED % "Stage E's installer", code or EX_BLOCKED)
         if code == 0:
             io.say("")
             io.say("Stage E is up to date.")
             return None
-        if code in (3, 5):
-            return stop(io, STAGE_E_MEANS[code], code)
-        steps = io.stage_e_steps()
-    # THE IDEA GATE NEEDS STAGE E'S CODE, NOT ITS SIGN-OFFS. Its jobs must run the code
-    # that leaves planning tickets alone; a Stage E card waiting on a person does not
-    # change that, and stopping here on one would keep the idea gate out of reach for as
-    # long as the card waits.
-    if steps and steps.get("code") in ("DONE", "ALREADY-DONE"):
+        # A RUN THAT STOPPED PART WAY IS NEVER CARRIED PAST. It may have moved the code and
+        # stopped before reloading the review jobs, so "the code is current" says nothing
+        # about whether they are running. The next pass's check tells the two apart: if
+        # all that is left then is a card, it carries on.
+        return stop(io, STAGE_E_MEANS.get(code, "Stage E's installer stopped part way "
+                                                "(exit %d). The lines above say where." % code)
+                    + " If it said its jobs are unloaded, review, bounce and findings stay off "
+                      "until it finishes. Clear what it names, then run this command again.",
+                    code)
+    # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's
+    # code (its jobs leave planning tickets alone), not its sign-offs; stopping here on a
+    # card would keep the idea gate out of reach for as long as the card waits.
+    if steps.get("code") in ("DONE", "ALREADY-DONE"):
         io.say("")
         io.say("Stage E's jobs run the current code. Stage E still has something for you,")
         io.say("named above, which does not block the idea gate. Carrying on; come back to it.")
         return None
-    return stop(io, STAGE_E_MEANS.get(code, "the review installer stopped with exit %d. Its "
-                                            "FAILED lines above say why." % code)
-                + " (To install the idea gate without touching Stage E: --skip-stage-e.)", code)
+    return stop(io, "Stage E's check says its code is not current, and nothing `run` could "
+                    "change was named." + STAGE_E_SKIP_HINT, code)
 
 
 def step_stage_a(io, conf, stage_e_conf):
@@ -347,6 +388,8 @@ class FakeIo(Io):
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
                  steps=None):
         self.steps = {"code": "WOULD-CHANGE"} if steps is None else steps
+        self.since = []
+        self.interrupt_on = set()          # program keys whose run the person Ctrl-C'd
         self.codes = dict(codes or {})
         self.answers = list(answers)
         self.asked = []
@@ -383,12 +426,18 @@ class FakeIo(Io):
             return got
         if k not in self.codes:
             raise AssertionError("an unscripted program ran: %r" % k)
+        if k in self.interrupt_on:
+            self.interrupted = True
         got = self.codes[k]
         return (got.pop(0) if isinstance(got, list) else got), ""
 
-    def stage_e_steps(self):
+    def stage_e_steps(self, since):
+        self.since.append(since)
         got = self.steps
         return got.pop(0) if isinstance(got, list) else got
+
+    def now(self):
+        return "2026-10-03T00:00:00Z"
 
     def ask(self, question):
         self.asked.append(question)
@@ -509,11 +558,76 @@ def selftest():
     check("stage-e-card-only-is-not-rerun-and-does-not-block",
           ("pipeline_stage_e_setup.py run" in io.ran, "pipeline_stage_a_setup.py run" in io.ran,
            io.asked, code), (False, True, [], EX_OK))
+    # A RUN THAT STOPPED PART WAY IS NEVER CARRIED PAST — even with its code moved, it may
+    # have stopped before reloading the review jobs (the review round's high finding).
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
                          "pipeline_stage_e_setup.py run": 10}, answers=[True],
-                  steps=[{"code": "WOULD-CHANGE"}, {"code": "DONE", "handover": "BLOCKED-ON-HUMAN"}])
-    check("stage-e-run-then-card-carries-on",
-          ("pipeline_stage_a_setup.py run" in io.ran, code), (True, EX_OK))
+                  steps=[{"code": "WOULD-CHANGE"}, {"code": "DONE", "daemons": "FAILED"}])
+    check("stage-e-run-that-stopped-part-way-stops",
+          (code, "pipeline_stage_a_setup.py run" in io.ran,
+           any("unloaded" in line for line in io.lines)), (10, False, True))
+    for rc in (1, 4):
+        code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                             "pipeline_stage_e_setup.py run": rc}, answers=[True],
+                      steps=[{"code": "WOULD-CHANGE"}, {"code": "DONE"}])
+        check("stage-e-run-exit-%d-stops" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran), (rc, False))
+    # A CHECK THAT FAILED OR COULD NOT MEASURE IS NOT WORK OUTSTANDING: it stops, whatever
+    # an older record says, and names the way to install without Stage E.
+    for rc in (1, 2, 4):
+        code, io = go(codes={"pipeline_stage_e_setup.py verify": rc},
+                      steps={"code": "ALREADY-DONE"})
+        check("stage-e-check-exit-%d-stops-without-running-anything" % rc,
+              (code, "pipeline_stage_e_setup.py run" in io.ran,
+               "pipeline_stage_a_setup.py run" in io.ran, io.asked), (rc, False, False, []))
+    check("stage-e-check-failure-names-the-skip",
+          any("--skip-stage-e" in line for line in io.lines), True)
+    # ONLY THIS CHECK'S OWN ROWS ARE READ.
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10},
+                  steps={"code": "ALREADY-DONE", "handover": "BLOCKED-ON-HUMAN"})
+    check("stage-e-record-read-since-the-check-began", io.since, ["2026-10-03T00:00:00Z"])
+    # CTRL-C: the installer it reached finishes its clean-up, and nothing after it runs.
+    for prog in ("pipeline_stage_e_setup.py verify", "pipeline_stage_e_setup.py run"):
+        io = FakeIo(codes=dict(healthy, **{"pipeline_stage_e_setup.py verify": 10,
+                                           "pipeline_stage_e_setup.py run": 10}),
+                    answers=[True], steps={"code": "WOULD-CHANGE"})
+        io.interrupt_on.add(prog)
+        code = main(base, io=io)
+        check("ctrl-c-in-%s-stops-everything-after-it" % prog.split()[-1],
+              ("pipeline_stage_a_setup.py run" in io.ran,
+               any("interrupted" in line for line in io.lines), code != EX_OK),
+              (False, True, True))
+        if prog.endswith("verify"):
+            # Stopped AT the check: nothing asked, and Stage E's installer never started.
+            check("ctrl-c-in-the-check-asks-nothing-and-runs-nothing",
+                  (io.asked, "pipeline_stage_e_setup.py run" in io.ran), ([], False))
+    io = FakeIo(codes=dict(healthy, **{"sync_user_skills.py": 0}))
+    io.interrupt_on.add("sync_user_skills.py")
+    main(base, io=io)
+    check("ctrl-c-in-the-skills-check-stops-everything-after-it",
+          ("pipeline_stage_e_setup.py verify" in io.ran, "pipeline_stage_a_setup.py run" in io.ran),
+          (False, False))
+    # THE REAL RECORD READER keeps only rows stamped at or after the check began, and says
+    # nothing at all when the `code` row is older.
+    import json as _json
+    home = os.path.join(tmp, "home")
+    os.makedirs(os.path.join(home, ".stage-e-setup"))
+    with open(os.path.join(home, ".stage-e-setup", "state.json"), "w") as fh:
+        _json.dump({"steps": {"code": {"outcome": "ALREADY-DONE", "at": "2026-10-03T10:00:05Z"},
+                              "old": {"outcome": "WOULD-CHANGE", "at": "2026-10-01T00:00:00Z"}}},
+                   fh)
+    saved_home = os.environ.get("HOME")
+    os.environ["HOME"] = home
+    try:
+        check("record-reader-keeps-only-fresh-rows",
+              Io().stage_e_steps("2026-10-03T10:00:00Z"), {"code": "ALREADY-DONE"})
+        check("record-reader-refuses-a-stale-code-row",
+              Io().stage_e_steps("2026-10-03T11:00:00Z"), None)
+    finally:
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
                          "pipeline_stage_e_setup.py run": 10}, answers=[True],
                   steps=[{"code": "WOULD-CHANGE"}, {"code": "WOULD-CHANGE"}])
@@ -547,7 +661,8 @@ def selftest():
     child = ("import time,sys\ntry:\n    time.sleep(30)\nexcept KeyboardInterrupt:\n"
              "    time.sleep(1.5)\n    open(%r,'w').write('ok')\n    sys.exit(10)\n" % mark)
     driver = ("import sys; sys.path.insert(0, %r)\nimport pipeline_install as pi\n"
-              "code, _ = pi.Io().run([sys.executable, '-c', %r])\nsys.exit(0 if code == 10 else 1)\n"
+              "io = pi.Io()\ncode, _ = io.run([sys.executable, '-c', %r])\n"
+              "sys.exit(0 if (code == 10 and io.interrupted) else 1)\n"
               % (HERE, child))
     proc = subprocess.Popen([sys.executable, "-c", driver], start_new_session=True)
     time.sleep(1.0)

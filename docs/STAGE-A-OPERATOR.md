@@ -81,7 +81,9 @@ but it is the case this design is built to catch:
 - **The circuit breaker.** A wrong note, or none, trips it:
   1. the evidence is written first, because cancelling deletes the session's working copy;
   2. the ticket is cancelled;
-  3. you are paged: the planning ticket gets an `agent:needs-human` mark the notifier reads;
+  3. you are paged: the planning ticket gets an `agent:needs-human` mark the notifier reads
+     (the notifier scans only the teams in its `TEAM_KEYS`, so each planned repository's
+     team must be listed there);
   4. the idea gets a note;
   5. **all planning stops**, on every team.
 
@@ -232,8 +234,11 @@ missing and puts them back.
 puts the planning setup back, and an interrupted restart prints the command that starts the
 dispatcher. The next run checks that the dispatcher is running before it does anything else.
 
-**Stage E's own cards do not hold up the idea gate.** When the review installer is waiting on
-a person but its jobs already run the current code, the one command says so and carries on.
+**Stage E's own cards do not hold up the idea gate.** When the review installer's check finds
+nothing left but a card for a person, and its jobs already run the current code, the one
+command says so and carries on. Anything else from Stage E stops it: a check that failed or
+could not measure, an update that stopped part way (it may have left the review jobs
+unloaded), or a Ctrl-C. Run the one command again once that is cleared.
 
 **To switch the job off for good,** disable it as well as stopping it, or the next boot
 starts it again: `sudo launchctl disable system/<label>`, then
@@ -269,7 +274,11 @@ wall clock.
 - **A helper session inherits the fence, per the runner's source.** The probe is where a
   person sees the helper's own tool list.
 - **The duplicate check compares titles, not intent.**
-- **Nothing watches the job's heartbeat automatically** unless the heartbeat monitor is set up.
+- **Nothing watches the job's heartbeat automatically.** The heartbeat monitor does not know
+  this job yet (KIT-192); `verify` is what reads it.
+- **The planner's key is the review jobs' variable, by name.** Rename `LINEAR_KEY_ENV` in the
+  review installer's settings and the planner goes on reading the old name: change it in
+  `stage-a.conf` too.
 - **The installer's own new steps have not run live.** Writing the dispatcher's settings and
   restarting it reuse the review installer's code, which has. The pull request, the automatic
   probe, starting the job and the drill are proven only against synthetic fixtures.

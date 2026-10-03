@@ -1514,6 +1514,9 @@ def _plist_path(label):
 # The shell the role-account methods run. Module constants so --selftest can execute
 # them against real directories: a shell fragment nobody has run is a guess about a
 # shell.
+# Whether ONE variable is set in an env file, and how long its value is — never the value.
+SECRET_PRESENT_SH = ('f="$HOME/%s"; [ -f "$f" ] || exit 9; [ -r "$f" ] || exit 8; '
+                     'v=$(sed -n "s/^%s=//p" "$f" | head -n 1); printf %%s "$v" | wc -c')
 CLONE_READ_SH = 'd="$HOME/%s"; [ -d "$d/.git" ] || exit 9; printf "LOCAL %%s\\n" "$(git -C "$d" rev-parse HEAD 2>/dev/null)"; printf "REMOTE %%s\\n" "$(git -C "$d" ls-remote origin HEAD 2>/dev/null | head -1 | cut -f1)"'
 CLONE_WRITE_SH = 'set -e; umask 077; d="$HOME/%s"; mkdir -p "$(dirname "$d")"; chmod 700 "$(dirname "$d")"; if [ -d "$d/.git" ]; then git -C "$d" fetch --quiet --no-tags origin && git -C "$d" merge --ff-only FETCH_HEAD >/dev/null; else git clone --quiet %s "$d"; fi; git -C "$d" rev-parse HEAD'
 SECRET_WRITE_SH = 'set -e; umask 077; t="$HOME/%s"; mkdir -p "$(dirname "$t")"; chmod 700 "$(dirname "$t")"; v=$(cat); { [ -f "$t" ] && grep -v "^%s=" "$t" || true; } > "$t.tmp"; printf "%s=%%s\\n" "$v" >> "$t.tmp"; chmod 600 "$t.tmp"; mv "$t.tmp" "$t"'
@@ -1577,11 +1580,13 @@ class Host(object):
         length does."""
         code, out = self._sudo(
             account,
-            'f="$HOME/%s"; [ -f "$f" ] || exit 9; '
-            'v=$(sed -n "s/^%s=//p" "$f" | head -n 1); '
-            'printf %%s "$v" | wc -c' % (relpath, env_name))
+            SECRET_PRESENT_SH % (relpath, env_name))
         if code is None:
             return None, out
+        if code == 8:
+            # A pipeline's status is its LAST command's — wc's — so an unreadable file
+            # would read as "present, 0 chars" without this test first.
+            return None, "the env file ~%s/%s exists and cannot be read" % (account, relpath)
         if code == 9:
             return False, 0
         if code != 0:
@@ -1838,10 +1843,15 @@ def daemon_exec(conf):
     key_file = conf_value(conf, "LINEAR_KEY_FILE")
     if key_file != own:
         name = conf["LINEAR_KEY_ENV"]
-        parts.append('%s="$(sed -n "s/^%s=//p" "$HOME/%s" | head -n 1)"'
+        # `tr -d '\r'`: every review-job reader strips the line it reads, and a key with
+        # a carriage return on it would fail every pass — and appear in the job's log in
+        # the error the HTTP library raises.
+        parts.append('%s="$(sed -n "s/^%s=//p" "$HOME/%s" | head -n 1 | tr -d \'\\r\')"'
                      % (name, name, key_file))
     parts.append("set +a")
     return "; ".join(parts) + "; exec /usr/bin/python3 "
+
+
 PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
 "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2889,6 +2899,13 @@ def check_pending_restart(ctx):
             "/Library/LaunchDaemons/%s.plist\nthen run this again. The config from before "
             "that change is at %s." % (pending.get("at"), ctx.conf["DISPATCHER_SERVICE"],
                                        pending.get("backup")))
+    if ctx.version_reader(version_url(ctx.conf)) is None:
+        raise Unknown(
+            "a dispatcher restart this installer began on %s was not seen to finish, and the "
+            "dispatcher is held by launchd but does not answer at %s"
+            % (pending.get("at"), version_url(ctx.conf)),
+            dispatcher_recovery(ctx.conf["DISPATCHER_SERVICE"], "/Library/LaunchDaemons/%s.plist"
+                                % ctx.conf["DISPATCHER_SERVICE"]) + "then run this again")
     ctx.state.data["notes"].pop(RESTART_PENDING, None)
 
 
@@ -2912,25 +2929,39 @@ def restart_dispatcher_live(conf, backup):
         conf={"DISPATCHER_SERVICE": conf["DISPATCHER_SERVICE"],
               "DISPATCHER_CONFIG": conf["DISPATCHER_CONFIG"]},
         state=types.SimpleNamespace(data={"notes": {}}), dispatcher_down=None)
-    plist = "/Library/LaunchDaemons/%s.plist" % conf["DISPATCHER_SERVICE"]
+    label = conf["DISPATCHER_SERVICE"]
+    plist = "/Library/LaunchDaemons/%s.plist" % label
+    tail = ("The config as it was before this change is at %s, readable as %s."
+            % (backup, conf["DISPATCHER_ACCOUNT"]))
     try:
         stage_e._restart_dispatcher(shim, backup)
     except stage_e.SetupError as exc:
         down = shim.dispatcher_down or {}
-        raise SetupError(
-            "%s\nTHE DISPATCHER IS %s. Start it again with:\n"
-            "    sudo launchctl bootstrap system %s\n"
-            "The config as it was before this change is at %s, readable as %s."
-            % (exc, (down.get("state") or "not running").upper(),
-               down.get("plist") or plist, backup, conf["DISPATCHER_ACCOUNT"]))
+        if down.get("state") == "stopped":
+            # launchd let go of it and would not start it again: start is the remedy.
+            raise SetupError("%s\nTHE DISPATCHER IS STOPPED. Start it again with:\n"
+                             "    sudo launchctl bootstrap system %s\n%s"
+                             % (exc, down.get("plist") or plist, tail))
+        # STUCK: launchd still holds it. A bootstrap now would only answer EIO, so the
+        # first command is the one that says which case this is.
+        raise SetupError("%s\n%s%s" % (exc, dispatcher_recovery(label, plist), tail))
     except KeyboardInterrupt:
-        # STOPPED MID-RESTART: the old process may be gone and the new one not started.
-        # Said here, with the command, because the next thing on screen is a prompt.
-        raise SetupError(
-            "the restart was interrupted, so the dispatcher may be STOPPED. Start it with:\n"
-            "    sudo launchctl bootstrap system %s\n"
-            "The config as it was before this change is at %s, readable as %s."
-            % (plist, backup, conf["DISPATCHER_ACCOUNT"]))
+        # STOPPED MID-RESTART: it may be running, stopping, or gone. Said here, with the
+        # commands, because the next thing on screen is a prompt.
+        raise SetupError("the restart was interrupted, so the dispatcher may not be running.\n"
+                         "%s%s" % (dispatcher_recovery(label, plist), tail))
+
+
+def dispatcher_recovery(label, plist):
+    """What to type when whether the dispatcher is running is unknown — in the order that
+    works whichever state it is in."""
+    return ("WHETHER THE DISPATCHER IS RUNNING IS UNKNOWN. Look first:\n"
+            "    sudo launchctl print system/%s\n"
+            "  - it prints the service, running: nothing to do;\n"
+            "  - it could not find the service:  sudo launchctl bootstrap system %s\n"
+            "  - it prints the service, not running:  sudo launchctl bootout system/%s\n"
+            "    then, once `print` no longer finds it, the bootstrap above.\n"
+            % (label, plist, label))
 
 
 def running_sessions(ctx):
@@ -2954,6 +2985,12 @@ def apply_planning_entries(ctx, entries, remove, why):
     import shlex as _shlex
     conf = ctx.conf
     account, path = conf["DISPATCHER_ACCOUNT"], conf["DISPATCHER_CONFIG"]
+    # THE BACKUP HOLDS THE DISPATCHER'S TOKENS, so where it goes answers to the same rule as
+    # the key's: never beside the dispatcher's own config, never under its state root.
+    where_problem = credential_home_problem(
+        ctx.host.home_of(account), path, read_dispatcher(ctx).get("workspace_base_dirs"))
+    if where_problem:
+        raise SetupError("refusing to back up the dispatcher's config there: %s" % where_problem)
     stamp = now_iso().replace("-", "").replace(":", "")
     code, out = ctx.host.run_sh(account, CONFIG_BACKUP_SH % (
         BACKUP_HOME, _shlex.quote(os.path.basename(path)), _shlex.quote(stamp),
@@ -5892,6 +5929,111 @@ def _selftest_review_fixes(check, tmp):
           any("PLANNED_REPOS" in line for line in ac._out), True)
 
 
+def _selftest_union_fixes(check, tmp):
+    """The second review round (PR #161 against the three PRs merged to main after it)."""
+    import subprocess
+    import tempfile
+    import pipeline_stage_e_setup as stage_e
+
+    # 1. A CARRIAGE RETURN ON THE STORED LINE NEVER REACHES THE PLANNER'S KEY.
+    shared = dict(GOOD_CONF, LINEAR_KEY_ENV="STAGE_E_LINEAR_API_KEY",
+                  LINEAR_KEY_FILE=".stage-e/env")
+    home = tempfile.mkdtemp(prefix="stage-a-cr-", dir=tmp)
+    os.makedirs(os.path.join(home, ".stage-e"))
+    with open(os.path.join(home, ".stage-e", "env"), "wb") as fh:
+        fh.write(b"STAGE_E_LINEAR_API_KEY=lin_api_example\r\nGH_TOKEN=gh\n")
+    prefix = daemon_exec(shared).replace("exec /usr/bin/python3 ", "")
+    proc = subprocess.run(["/bin/sh", "-c", prefix + 'printf "[%s]" "$STAGE_E_LINEAR_API_KEY"'],
+                          env={"HOME": home, "PATH": "/usr/bin:/bin"}, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=30)
+    check("daemon-strips-a-carriage-return", proc.stdout.decode(), "[lin_api_example]")
+
+    # 2. AN ENV FILE THAT EXISTS AND CANNOT BE READ IS "COULD NOT LOOK", not "0 chars".
+    def present(file_body, mode=0o600):
+        h = tempfile.mkdtemp(prefix="stage-a-sp-", dir=tmp)
+        if file_body is not None:
+            os.makedirs(os.path.join(h, ".stage-e"))
+            f = os.path.join(h, ".stage-e", "env")
+            with open(f, "w") as fh:
+                fh.write(file_body)
+            os.chmod(f, mode)
+        r = subprocess.run(["/bin/sh", "-c", SECRET_PRESENT_SH % (".stage-e/env", "KEY")],
+                           env={"HOME": h, "PATH": "/usr/bin:/bin"}, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=30)
+        return r.returncode, r.stdout.decode().strip()
+    check("secret-present-length", present("KEY=%s\n" % ("k" * 30)), (0, "30"))
+    check("secret-present-absent-file", present(None)[0], 9)
+    if os.geteuid() != 0:                     # root reads anything; the case needs a person
+        check("secret-present-unreadable-file", present("KEY=x\n", 0o000)[0], 8)
+    hs = Host()
+    hs._sudo = lambda account, script, stdin=None: (8, "")
+    got = hs.secret_present("_x", "KEY", ".stage-e/env")
+    check("secret-present-unreadable-is-unknown", (got[0], "cannot be read" in got[1]),
+          (None, True))
+
+    # 3. A RESTART LEFT STUCK, OR INTERRUPTED: look first, then the command that fits.
+    real = stage_e._restart_dispatcher
+
+    def stuck(shim, backup):
+        shim.dispatcher_down = {"state": "stuck", "plist": "/L/x.plist"}
+        raise stage_e.SetupError("launchd still holds it")
+
+    def stopped(shim, backup):
+        shim.dispatcher_down = {"state": "stopped", "plist": "/L/x.plist"}
+        raise stage_e.SetupError("it did not come back")
+
+    def interrupted(shim, backup):
+        raise KeyboardInterrupt()
+
+    def message(fake):
+        stage_e._restart_dispatcher = fake
+        try:
+            restart_dispatcher_live(dict(GOOD_CONF), "/b/config.json.1")
+            return ""
+        except SetupError as exc:
+            return str(exc)
+        finally:
+            stage_e._restart_dispatcher = real
+    for name, fake in (("stuck", stuck), ("interrupted", interrupted)):
+        msg = message(fake)
+        check("restart-%s-looks-before-it-starts" % name,
+              ("launchctl print system/" in msg and "bootout" in msg
+               and msg.index("launchctl print") < msg.index("bootstrap")), True)
+    msg = message(stopped)
+    check("restart-stopped-says-start-it", "THE DISPATCHER IS STOPPED" in msg
+          and "launchctl bootstrap system /L/x.plist" in msg, True)
+
+    # 4. A PENDING RESTART IS CLEARED ONLY ONCE THE DISPATCHER ANSWERS.
+    pc = _ctx(os.path.join(tmp, "pending-answer"), tracker=_ready_tracker(), version=None)
+    pc._out = []
+    pc.host.loaded.add(GOOD_CONF["DISPATCHER_SERVICE"])
+    pc.state.data["notes"][RESTART_PENDING] = {"at": "2026-10-03T00:00:00Z", "backup": "/b"}
+    try:
+        check_pending_restart(pc)
+        got = "cleared"
+    except Unknown:
+        got = "unknown"
+    check("restart-pending-held-but-silent-is-unknown",
+          (got, RESTART_PENDING in pc.state.data["notes"]), ("unknown", True))
+
+    # 5. THE BACKUP'S HOME ANSWERS TO THE SAME RULE AS THE KEY'S.
+    bc = _ctx(os.path.join(tmp, "backup-home"), tracker=_ready_tracker())
+    bc._out = []
+    bc.host.home = os.path.dirname(bc.conf["DISPATCHER_CONFIG"])   # beside the config
+    try:
+        apply_planning_entries(bc, [], [], "selftest")
+        got = "written"
+    except SetupError as exc:
+        got = str(exc)
+    check("backup-beside-the-dispatcher-config-refused", "refusing to back up" in got, True)
+
+    # 6. STAGE E'S KEY NAME HAS A DEFAULT; THE REUSE DOES NOT NEED IT SPELLED OUT.
+    values, _s = derive_conf({"ROLE_ACCOUNT": "_exdispatch"}, "", None)
+    check("derive-reuses-stage-e-key-under-its-default-name",
+          (values.get("LINEAR_KEY_ENV"), values.get("LINEAR_KEY_FILE")),
+          ("STAGE_E_LINEAR_API_KEY", ".stage-e/env"))
+
+
 def selftest():
     failures, cases = [], [0]
 
@@ -6877,6 +7019,7 @@ def selftest():
                   ln for ln in src.splitlines() if "_LABEL_EXAMPLE" not in ln))), False)
         _selftest_one_command(check, tmp)
         _selftest_review_fixes(check, tmp)
+        _selftest_union_fixes(check, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -6933,6 +7076,10 @@ def https_url(origin):
     return ""
 
 
+# The review installer's default for its own key's variable (CONF_DEFAULTS there).
+STAGE_E_DEFAULT_KEY_ENV = "STAGE_E_LINEAR_API_KEY"
+
+
 def derive_conf(stage_e, origin, viewer_id):
     """(values, sources): every setting this installer can work out without asking, and
     where each came from. The review installer's settings carry most of it — the
@@ -6955,9 +7102,11 @@ def derive_conf(stage_e, origin, viewer_id):
     put("PLANNED_REPOS", stage_e.get("REVIEW_REPOS"), "the repositories reviewed here")
     put("KIT_REPO_URL", https_url(stage_e.get("KIT_REPO_URL")) or https_url(origin),
         "the review installer's settings" if stage_e.get("KIT_REPO_URL") else "this checkout")
-    if stage_e.get("ROLE_ACCOUNT") and stage_e.get("LINEAR_KEY_ENV"):
-        # The owner's choice (KIT-195): the planner reuses the key the review jobs store.
-        put("LINEAR_KEY_ENV", stage_e.get("LINEAR_KEY_ENV"), "the review jobs' stored key")
+    if stage_e.get("ROLE_ACCOUNT"):
+        # The owner's choice (KIT-195): the planner reuses the key the review jobs store,
+        # under the name the review installer gives it — its own default when unset.
+        put("LINEAR_KEY_ENV", stage_e.get("LINEAR_KEY_ENV") or STAGE_E_DEFAULT_KEY_ENV,
+            "the review jobs' stored key")
         put("LINEAR_KEY_FILE", ".stage-e/env", "the review jobs' stored key")
     service = stage_e.get("DISPATCHER_SERVICE") or ""
     if JOB_LABEL_RE.match(service):

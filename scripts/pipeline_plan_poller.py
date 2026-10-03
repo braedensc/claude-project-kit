@@ -387,7 +387,10 @@ def load_config(path):
 
 def credential(cfg, env=None):
     env = os.environ if env is None else env
-    value = env.get(cfg["linear_key_env"]) or ""
+    # Stripped, as every review-job reader strips the line it reads: a key carrying a
+    # carriage return or a space fails every call, and the HTTP library's error for a bad
+    # header value quotes the value — into this job's log.
+    value = (env.get(cfg["linear_key_env"]) or "").strip()
     if len(value) < 20:
         raise ConfigError("%s is empty or too short in this process's environment — the "
                           "job holds the only tracker credential, so nothing can be read "
@@ -2172,6 +2175,10 @@ def selftest():
 
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body_src = src[:src.index("# Selftest — every tracker call")]
+    # 0. The key is read stripped: a stored line ending in a carriage return must not reach
+    #    an Authorization header (KIT-195 review).
+    check("credential-stripped", credential({"linear_key_env": "K"},
+                                            env={"K": "k" * 40 + "\r\n"}), "k" * 40)
     # 1. Exactly three mutations, and nothing that approves, merges, adds a label to an
     #    existing ticket or sets a parent. The only issueUpdate moves a planning ticket this
     #    job created, and the only label is the routing label, set once, at create.
