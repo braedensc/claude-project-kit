@@ -317,7 +317,9 @@ SEVERITY_THRESHOLD=medium
 # the shared comment transport reads `GH_TOKEN` and `GITHUB_TOKEN` and nothing
 # else, and the bounce driver does not mirror a renamed variable — rename it
 # and its reads keep working while every comment it posts fails, weeks later,
-# at exhaustion time.
+# at exhaustion time.  If you set it to `GITHUB_TOKEN`, keep no `GH_TOKEN` line
+# in that env file: `gh` and the transport read `GH_TOKEN` first, so that line
+# would be the token in use.  `verify` reports one, and `run` removes it.
 #
 # RULE: an environment variable NAME (`[A-Z][A-Z0-9_]*`).  A value with a
 # credential shape here is refused, by key name.
