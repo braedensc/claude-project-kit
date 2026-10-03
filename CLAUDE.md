@@ -226,7 +226,10 @@ npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idemp
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built into each work
                              #   team (Plan it + routing label, entries with no team key),
-                             #   the fence, the probe read back, agent-refused, conf-all-errors
+                             #   the fence, the probe run and read back, the entry written after
+                             #   a typed yes, the delivery PR opened, the drill, agent-refused
+npm run test:install         # the one command (scripts/pipeline_install.py): skills, then
+                             #   Stage E after a yes, then Stage A; refused under a model
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,

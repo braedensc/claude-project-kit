@@ -87,12 +87,14 @@ WHO CAN START A RUN, AND ON WHAT
 
 WHERE IT RUNS
 
-  As the EXECUTOR's role account — a macOS account of its own, never the dispatcher's.
-  Every coding session can read any file the dispatcher's account can read, through the
-  dispatcher's own tool server (KIT-162). The key this job holds files tickets carrying
-  provenance labels, so it lives in `~/.stage-a/env` under the executor's account, mode 600.
+  As the installer's ROLE_ACCOUNT. Since KIT-195 the usual choice is the dispatcher's own
+  account, as the review jobs use, with the key they already store: the owner chose that
+  over a third account. It carries the exposure KIT-162 describes — a coding session can
+  read files that account can read, through the dispatcher's own tool server — which is
+  tracked there, not settled here. A deployment can still give this job an account of its
+  own; its key then lives in `~/.stage-a/env` under that account, mode 600.
 
-  The key must be the OWNER's (a second personal key). Each planning entry lets only the
+  The key must be the OWNER's (a personal key). Each planning entry lets only the
   owner start sessions, and the dispatcher checks the DELEGATOR — the key that created the
   planning ticket. A key belonging to anyone else would have every planning ticket refused
   in silence, so a pass whose key is not the owner's stops with exit 2.
@@ -385,7 +387,10 @@ def load_config(path):
 
 def credential(cfg, env=None):
     env = os.environ if env is None else env
-    value = env.get(cfg["linear_key_env"]) or ""
+    # Stripped, as every review-job reader strips the line it reads: a key carrying a
+    # carriage return or a space fails every call, and the HTTP library's error for a bad
+    # header value quotes the value — into this job's log.
+    value = (env.get(cfg["linear_key_env"]) or "").strip()
     if len(value) < 20:
         raise ConfigError("%s is empty or too short in this process's environment — the "
                           "job holds the only tracker credential, so nothing can be read "
@@ -429,9 +434,9 @@ def read_dispatcher_version(url):
     """The dispatcher's own version, from its `/version` route on this machine, or None.
 
     The route answers `{cyrus_cli_version}` without a key (EdgeWorker.registerVersionEndpoint,
-    0.2.69). The executor's account cannot read the dispatcher's install directory, and
-    every `cyrus-*` package pins its siblings exactly, so this version names the routing
-    code the planning lane relies on. No answer is not a match."""
+    0.2.69). It needs no file: a job on an account of its own cannot read the dispatcher's
+    install directory, and every `cyrus-*` package pins its siblings exactly, so this
+    version names the routing code the planning lane relies on. No answer is not a match."""
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             doc = json.load(resp)
@@ -707,7 +712,7 @@ def load_stop(state_dir):
         at = "9999-12-31T23:59:59Z"
     return {"schema": STOP_SCHEMA, "at": at, "unreadable": True,
             "reason": "the planning stop at %s could not be read, so it counts as stopped. "
-                      "Read it as the executor account, then sign the probe again" % path}
+                      "Read it as the job's role account, then sign the probe again" % path}
 
 
 def write_stop(state_dir, doc, dry_run):
@@ -2170,6 +2175,10 @@ def selftest():
 
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     body_src = src[:src.index("# Selftest — every tracker call")]
+    # 0. The key is read stripped: a stored line ending in a carriage return must not reach
+    #    an Authorization header (KIT-195 review).
+    check("credential-stripped", credential({"linear_key_env": "K"},
+                                            env={"K": "k" * 40 + "\r\n"}), "k" * 40)
     # 1. Exactly three mutations, and nothing that approves, merges, adds a label to an
     #    existing ticket or sets a parent. The only issueUpdate moves a planning ticket this
     #    job created, and the only label is the routing label, set once, at create.

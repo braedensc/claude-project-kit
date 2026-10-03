@@ -1018,3 +1018,82 @@ this was read from. The probe measures the first three on a real dispatcher befo
 switched on. One residual is known and not closed: if the dispatcher's own note fails to post
 AND the ticket falls to the coding entry, a later thought the model writes could imitate the
 note and be read as it.
+
+## Update 2026-09-24 — one command to install, stopping only for a person (KIT-195)
+
+**The decision.** The owner found the install too long to follow: about twenty separate
+actions across a twelve-step runbook, for code that was already built. The owner asked for one
+command, "easily installable anytime anywhere", that does what a machine can do and stops only
+for what a person must, and decided each fork below on 2026-09-24. `scripts/pipeline_install.py`
+is the one command: it levels the skills, brings Stage E up to date after a yes, and runs this
+installer. This installer now does the steps a person used to do by hand.
+
+**What this block supersedes.** Every passage below stays as written; read each as a record of
+its date.
+
+- **"The installer never writes the dispatcher config"** — the security argument's supervision
+  paragraph and the installer's old refusal list. It now writes the planning entries itself,
+  with the review installer's own backup, reconcile and restart, after showing the diff and
+  receiving a **typed `yes`**. What keeps the entry a person's decision is unchanged: the
+  person sees exactly what will be written and says so. The review installer has written its
+  own entries this way since Stage E. `CA-ENTRY` is now a measured step, not a sign-off: an
+  entry is applied when the dispatcher's config holds exactly what the conf composes. That
+  matters because the dispatcher's own setup tool rebuilds its repository list when its
+  tracker phase re-runs, and drops every entry the kit added; the next pass puts them back.
+- **"A separate local account for the executor", and the conf rule refusing the dispatcher's
+  own account** (the 2026-09-19 block, and the conf validator). **The owner chose the review
+  jobs' shape:** the planner job may run as the dispatcher's own account, and by default
+  reuses the personal key the review jobs already store (`LINEAR_KEY_FILE=.stage-e/env`), so
+  there is no second key to make. The exposure accepted is the one KIT-162 already tracks: a
+  coding session can read files that account can read through the dispatcher's own tool
+  server. It is recorded there as a trade-off, **not decided** there. A deployment may still
+  give the planner an account of its own.
+- **The by-hand probe** (`CA-PROBE`). The installer now files the two probe tickets per
+  repository itself, with the owner's own key, so the tracker records the owner as creator and
+  delegator. It reads the routing notes as before. It reads the session's tool list from the
+  **dispatcher's own session log** (the SDK's start-up message), not from the session's reply,
+  and uses the reply only for the helper session. It asks the person the one thing the API
+  cannot answer, the team's agent guidance, records the sign-off, and closes the tickets. The
+  by-hand `attest CA-PROBE --ticket …` path remains. The probe also leaves a harmless test file
+  in the role account's home and reports whether the session's file tool returned it.
+- **"Never loads the job"** (`CA-EXECUTOR`). It starts the job after a yes and reads its first
+  heartbeat. The old claim was also weaker than it read: launchd loads every job in
+  `/Library/LaunchDaemons` at boot, so "installed and never loaded" held only until a reboot.
+  The job is now installed with `Disabled`, and the yes enables it in launchd's override
+  record before starting it.
+- **The by-hand planning run** (`CA-HANDOVER`) is **optional**: it shows what a plan looks like
+  and proves nothing about the fence or the job, so it no longer blocks.
+- **The routing drill** (live test 8) is automated as the optional `drill` command. It sets one
+  planning entry's allowed user to nobody, moves a harmless idea into Plan it, checks the job
+  stops planning, and on every path puts the entry back and closes the idea, then probes again.
+- **"Moves no ticket"** (the installer's banned verbs). It moves only tickets it filed itself —
+  the probe tickets and the drill's idea — through one class that refuses any other id; the
+  selftest asserts the verb appears nowhere else in the file.
+- **The `delivery.json` block the person pasted** (`CA-DELIVERY`). The installer opens that pull
+  request itself, as the person, through their own `gh`, and waits for the merge. It never
+  merges, approves or labels.
+
+**Found in review, before hand-off.** Three read-only reviewers found two high defects, both
+fixed and pinned by tests: every program run as the dispatcher's account inherited the
+operator's working directory, which that account cannot enter, so each one would have died
+importing its first module (the review installer's KIT-112 fix, now applied here); and the one
+command killed the installer a quarter of a second after Ctrl-C, cutting off the drill's
+restore. Also fixed: a fork's pull request from the same branch name was taken for the
+installer's own; a branch left by an interrupted run blocked every retry; a merged pull request
+that no longer covered the gap was never replaced; a Stage E card blocked the idea gate for as
+long as it waited.
+
+**What did not change.** The fence, the planning brief, the routing check and circuit breaker,
+the version pin and the stop file. Every mutating command still refuses in an agent
+environment, and under a model no key is read. Every step that changes something a person
+should see asks first, and only when a person is at a terminal; a pass that cannot ask says
+no. The installer still never creates a team or an account.
+
+**Where it runs.** The macOS Terminal app, or the Claude desktop app's Terminal tab: measured
+2026-09-24, that tab sets none of the four agent markers. Not the `!` prefix inside a Claude
+Code session, which is the session's own shell.
+
+**Not proven.** None of the new steps has run live. The session log's tool list is the pool
+after the fence per the runner's source; a list still holding a fenced tool would fail the
+probe loudly. The drill's premise — that the dispatcher posts no routing note for a delegator
+it refuses — is read from source; a drill that does not trip fails, and says so.

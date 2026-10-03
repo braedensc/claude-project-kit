@@ -92,6 +92,11 @@ $EDITOR stage-e.conf                                  # twelve values to fill in
 python3 scripts/pipeline_stage_e_setup.py run         # the only command that changes this machine
 ```
 
+**Keeping it up to date later, together with the idea gate:** `python3
+scripts/pipeline_install.py` pulls the kit, levels the skills, runs this installer's
+read-only `verify`, and runs `run` only when something is outstanding and you say yes
+(`docs/STAGE-A-OPERATOR.md` § 5).
+
 **Run the first pass when no coding session is in flight.** Writing the review entries
 restarts the dispatcher, and a restart kills every session mid-work. It restarts only when
 the entries actually change, so later re-runs are usually free — and `run --dry-run` tells
