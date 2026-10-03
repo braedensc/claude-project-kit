@@ -18,7 +18,10 @@ passes — review poller, bounce driver, finding poller.
 A fourth system LaunchDaemon reads those three's heartbeats: the heartbeat
 monitor (scripts/pipeline_heartbeat_monitor.py, KIT-127). It comments on ONE
 ticket when their health changes, so the `heartbeat-monitor` step stops on a card
-until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name.
+until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name. With
+NOTIFIER_JOB_LABEL set it watches the human-action notifier's heartbeat too, at the
+interval launchd holds for that job plus the notifier's own pass clock (KIT-156);
+empty, the step says the notifier is not watched.
 
 And one thing that is NOT the role account's: the `conflict-waker` step installs
 the local half of the conflict loop for the PERSON running this command — a user
@@ -603,6 +606,10 @@ CONF_DEFAULTS = {
     # `off` leaves the three heartbeats unread, BY NAME.
     "HEARTBEAT_MONITOR_TICKET": "",
     "MONITOR_INTERVAL_SECONDS": "1800",
+    # The human-action notifier's launchd label, for the monitor to watch its heartbeat too
+    # (KIT-156). Empty leaves it unwatched, and the `heartbeat-monitor` step says so by name.
+    # Set, launchd must hold that job: its interval is read from launchd, not from here.
+    "NOTIFIER_JOB_LABEL": "",
 }
 # The kit's own grader-path guard, by name — the one check a session can never turn
 # green, because it is red exactly until a person applies the label it demands. It is
@@ -752,6 +759,10 @@ def validate_conf(values):
     if monitor_value and monitor_value.lower() != "off" and not _TICKET_ID_RE.match(monitor_value):
         errors.append("HEARTBEAT_MONITOR_TICKET must be a ticket id like KIT-123, or `off` "
                       "(got %r)" % monitor_value)
+    nlabel = (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
+    if nlabel and not _RDNS_RE.match(nlabel):
+        errors.append("NOTIFIER_JOB_LABEL %r is not a reverse-DNS launchd label — the "
+                      "notifier's JOB_LABEL, or empty to leave it unwatched" % nlabel)
     if conf.get("SEVERITY_THRESHOLD") not in ("low", "medium", "high", "critical"):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
@@ -2409,6 +2420,14 @@ def step_code(ctx, apply_it):
     # machine never loaded is not one to report as switched off.
     if r.as_root(["launchctl", "print", "system/" + monitor_label(conf)]).ok:
         stop_labels = stop_labels + (monitor_label(conf),)
+        # THE NOTIFIER IS MEASURED BEFORE ANYTHING STOPS, when the monitor stopped here is
+        # going to watch it. The `heartbeat-monitor` step refuses a notifier label it cannot
+        # watch (never installed, another job, another config, no interval), and that step
+        # runs after this one has stopped the monitor: a refusal there would leave the
+        # monitor — and so all three daemons' watch — unloaded. Asked here, the same refusal
+        # stops the run with every job still loaded. A PAUSED notifier is no refusal.
+        if monitor_ticket(conf) not in ("off", "") and notifier_label(conf):
+            measure_notifier(ctx)
     for label in stop_labels:
         # Unload before touching the code every job execs out of — the finding
         # poller runs from the same clone as review and bounce. `bootout` on a
@@ -2730,22 +2749,93 @@ ENV_VALUE_SH = (
 )
 
 
+# THE WRITE, AND IT IS A MERGE (KIT-171). The file is SHARED: the notifier keeps
+# its own token in it, and a person may keep a comment or a name of their own
+# there. This drops only the lines for the names it owns, in any spelling `.`
+# reads as that name (plain, indented, or after `export`), keeps every other
+# line as it was and in order, appends the fresh values from stdin, and swaps
+# the result in by a rename inside the same directory, so a daemon sourcing the
+# file mid-write reads the old file or the new one and never half of either.
+# The old spelling was `cat >`, which deleted every foreign line on every
+# store: the notifier's token went with them, and its next pass exited 2 and
+# paged nobody.
+#
+# Exit 5 is "the file was not replaced": the original is untouched and the temp
+# file is gone. It covers a read that failed (grep's exit 2 — carrying on would
+# replace every foreign line with nothing), a write that failed, and a DIRECTORY
+# at the file's path, which `mv` would otherwise fill and call a success.
+#
+# Exit 6 is "interrupted": a signal the shell can catch (the terminal closed,
+# Ctrl-C, a TERM) arrived mid-write. The temp file is removed before the shell
+# exits, because it holds EVERYTHING: both credentials and the notifier's
+# token. Whether the rename had already happened is not known, so exit 6 says
+# only that the file is the old one or the new one whole. A KILL cannot be
+# caught, so each write first sweeps this writer's own stale temps: a single
+# installer writes at a time, and a sweep that catches a second one mid-write
+# makes that one exit 5, never half a file. The notifier's temps are not ours
+# to touch.
+#
+# `-a` because one NUL byte makes grep print "Binary file … matches" in place of
+# every line and exit 0, and that sentence would become the file. `%(names)s` is
+# the owned names joined by `|`; each is validated as [A-Z][A-Z0-9_]*, so it is
+# safe inside the pattern and the shell text. The values travel on stdin only,
+# straight to `cat`: never a shell variable, never an argument. Owned lines move
+# to the end of the file; under `.` the last definition wins in any case. No
+# single quote anywhere, so the offline battery's needles survive shell-quoting.
+ENV_WRITE_SH = (
+    "umask 077; d=%(home)s; "
+    "mkdir -p \"$d/state\" && chmod 700 \"$d\" \"$d/state\" || exit 5; "
+    "f=\"$d/env\"; [ -d \"$f\" ] && exit 5; rm -f \"$d\"/env.stage-e-setup.*; "
+    "t=\"$d/env.stage-e-setup.$$\"; trap \"rm -f \\\"\\$t\\\"; exit 6\" HUP INT TERM; "
+    "( if [ -f \"$f\" ]; then grep -a -v -E "
+    "\"^[[:space:]]*(export[[:space:]]+)?(%(names)s)=\" \"$f\"; "
+    "[ $? -le 1 ] || exit 5; fi; cat ) > \"$t\" || { rm -f \"$t\"; exit 5; }; "
+    "chmod 600 \"$t\" && mv -f \"$t\" \"$f\" || { rm -f \"$t\"; exit 5; }"
+)
+
+# The code-host token has TWO names, in the order `gh` and scripts/gh_fallback.py
+# read them. The credentials step owns both: it writes the one the conf names
+# and drops a line under the other, because a GH_TOKEN line kept beside a
+# configured GITHUB_TOKEN is the token every daemon would post with.
+CODE_HOST_TOKEN_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
+
+_PROBE_NAME_RE = re.compile(r"name=(.*) len=(\d*)$")
+
+
 def parse_env_probe(text):
-    """(names->length, mode, owner) out of ENV_PROBE_SH's output."""
+    """(names->length, mode, owner) out of ENV_PROBE_SH's output.
+
+    A name is everything the probe printed before ` len=`, so `export GH_TOKEN`
+    and `  GH_TOKEN` are keyed as written, never as a bare `export` or an empty
+    string. They are still not the plain name ENV_VALUE_SH reads: an owned name
+    in either spelling counts as missing, and the store drops it."""
     seen, mode, owner = {}, "", ""
     for line in (text or "").splitlines():
-        parts = dict(p.split("=", 1) for p in line.split() if "=" in p)
         if line.startswith("mode="):
+            parts = dict(p.split("=", 1) for p in line.split() if "=" in p)
             mode, owner = parts.get("mode", ""), parts.get("owner", "")
-        elif line.startswith("name="):
-            seen[parts.get("name", "")] = int(parts.get("len", "0") or 0)
+            continue
+        m = _PROBE_NAME_RE.match(line)
+        if m:
+            seen[m.group(1)] = int(m.group(2) or 0)
     return seen, mode, owner
 
 
+def _probe_len(seen, name):
+    """The longest value the probe saw under `name`, in any spelling `.` reads
+    as that name: plain, indented, or after `export`."""
+    pat = re.compile(r"[ \t]*(export[ \t]+)?%s$" % re.escape(name))
+    return max([n for k, n in seen.items() if pat.match(k)] or [0])
+
+
 def step_credentials(ctx, apply_it):
-    """The role account's own env file, mode 600, under its own home."""
+    """The role account's own env file, mode 600, under its own home. This step
+    owns the tracker key's line and the code-host token's, under either of the
+    token's two names, and no others (KIT-171)."""
     r, conf = ctx.runner, ctx.conf
     names = [conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"]]
+    # The token's other name: never written, dropped whenever the file is.
+    other = [n for n in CODE_HOST_TOKEN_NAMES if n not in names]
 
     _refuse_bad_credential_home(ctx)
 
@@ -2762,7 +2852,35 @@ def step_credentials(ctx, apply_it):
                       "written: an unreadable env file is not an absent one.")
     seen, mode, owner = parse_env_probe(probe.out if probe.ok else "")
 
+    # A FILE ANOTHER ACCOUNT OWNS IS REFUSED FIRST, missing names or not. The
+    # write replaces the file by a rename, and the role account owns the
+    # directory, so it CAN replace a file another account owns; `cat >` could
+    # not, which is why this used to be asked only of a complete file. It is
+    # asked before this step sends the stored token to the code host or asks a
+    # person for anything: a refusal after the prompt throws away what was
+    # typed. It cannot undo the tracker step, which runs first and has already
+    # read the tracker key out of this same file to measure the tracker.
+    if probe.ok and owner != ctx.account:
+        raise SetupError(
+            "the env file at %s/env is owned by %r, not by %r. A chmod does not fix an "
+            "owner, and rewriting someone else's credential file is not this installer's "
+            "to do. Move or remove it as that owner, then run this again."
+            % (ctx.stage_home, owner, ctx.account))
+
     missing = [n for n in names if seen.get(n, 0) < 20]
+
+    # A GH_TOKEN LINE BESIDE A CONFIGURED GITHUB_TOKEN IS THE TOKEN IN USE.
+    # `gh` and the comment transport read GH_TOKEN first, so every daemon would
+    # post with it while this step proves GITHUB_TOKEN and calls it live: a
+    # check that measured a different token from the one in use (§13). Any
+    # spelling `.` reads counts; an empty one sets nothing the transport uses.
+    # The other way round (GITHUB_TOKEN beside a configured GH_TOKEN) loses to
+    # the configured name, so it is not drift; the next write drops it anyway.
+    rank = (CODE_HOST_TOKEN_NAMES.index(conf["GITHUB_TOKEN_ENV"])
+            if conf["GITHUB_TOKEN_ENV"] in CODE_HOST_TOKEN_NAMES
+            else len(CODE_HOST_TOKEN_NAMES))
+    shadow = [n for n in other
+              if CODE_HOST_TOKEN_NAMES.index(n) < rank and _probe_len(seen, n) > 0]
 
     # THE STORED CODE-HOST TOKEN IS PROVED HERE, AND NOWHERE ELSE.
     #
@@ -2787,18 +2905,12 @@ def step_credentials(ctx, apply_it):
     # rejected. Trusting the probe here would keep the bad value and make the
     # next run ask for a replacement all over again.
     replaced = [n for n in names if n in ctx.replaced]
-    if probe.ok and not missing and not replaced and mode == "600" and owner == ctx.account:
+    if probe.ok and not missing and not replaced and not shadow and mode == "600" \
+            and owner == ctx.account:
         return True, "env file present, mode 600, owned by %s, both names set (%s)" % (
             ctx.account, ", ".join("%s=%d chars" % (n, seen[n]) for n in names)), []
 
-    if probe.ok and not missing and owner != ctx.account:
-        raise SetupError(
-            "the env file at %s/env is owned by %r, not by %r. A chmod does not fix an "
-            "owner, and rewriting someone else's credential file is not this installer's "
-            "to do. Move or remove it as that owner, then run this again."
-            % (ctx.stage_home, owner, ctx.account))
-
-    if probe.ok and not missing and not replaced and mode != "600":
+    if probe.ok and not missing and not replaced and not shadow and mode != "600":
         if not apply_it:
             return False, "env file is mode %s, want 600" % mode, []
         res = r.as_role(ctx.account, "chmod 600 %s/env" % ctx.stage_home,
@@ -2808,10 +2920,18 @@ def step_credentials(ctx, apply_it):
                              % (ctx.stage_home, (res.err or "").strip()[:200]))
         return False, "env file re-tightened to mode 600", []
 
+    shadow_note = ("%s is in %s/env beside the configured %s, and `gh` and the comment "
+                   "transport read %s first, so the daemons would post with a token this "
+                   "step never proved" % (" and ".join(shadow), ctx.stage_home,
+                                          conf["GITHUB_TOKEN_ENV"], shadow[0])
+                   if shadow else "")
     if not apply_it:
         if replaced:
-            return False, ("would rewrite %s/env with the replacement %s"
-                           % (ctx.stage_home, ", ".join(replaced))), []
+            return False, ("would store the replacement %s in %s/env, keeping every "
+                           "other line" % (", ".join(replaced), ctx.stage_home)), []
+        if shadow and not missing:
+            return False, ("%s. `run` removes that line and keeps every other."
+                           % shadow_note), []
         return False, "env file missing or incomplete (want %s)" % ", ".join(names), []
     if not ctx.tty:
         raise Blocked("CK-2")
@@ -2822,6 +2942,12 @@ def step_credentials(ctx, apply_it):
     say("  role account's home. Never into the dispatcher's own env file, which is copied")
     say("  unscrubbed into every session; never under its state root, which the sessions")
     say("  the ledger counts can reach. Nothing is echoed, logged or kept here.")
+    say("  Only these two lines change, and a line under the token's other name")
+    say("  (%s) goes if there is one. Every other line in that file, the"
+        % " or ".join(other))
+    say("  notifier's token included, is kept as it is.")
+    if shadow:
+        say("  " + shadow_note + ". That line goes.")
     say("  A value this run has ALREADY resolved is reused, not asked for again — so a")
     say("  key the tracker step needed a moment ago is not typed a second time.")
     say("")
@@ -2842,19 +2968,40 @@ def step_credentials(ctx, apply_it):
     ctx.github()
     lines = ["%s=%s" % (n, ctx.secret(n, "")[0]) for n in names]
     body = "\n".join(lines) + "\n"
+    # A MERGE, NOT A REWRITE (KIT-171): ENV_WRITE_SH keeps every line it does
+    # not own. The notifier's token lives in this file too. It drops the
+    # token's other name as well as the two it writes (17f-x).
     res = r.as_role(ctx.account,
-                    "umask 077; mkdir -p %s/state && chmod 700 %s %s/state && "
-                    "cat > %s/env && chmod 600 %s/env"
-                    % (ctx.stage_home, ctx.stage_home, ctx.stage_home, ctx.stage_home,
-                       ctx.stage_home),
-                    stdin=body, why="write the role account's env file (mode 600)",
+                    ENV_WRITE_SH % {"home": ctx.stage_home,
+                                    "names": "|".join(names + other)},
+                    stdin=body,
+                    why="store %s in the role account's env file (mode 600), keeping "
+                        "every other line" % " and ".join(names),
                     secret_stdin=True)
     del body, lines
     if res.skipped:
-        return False, "would write %s/env with %s" % (ctx.stage_home, ", ".join(names)), []
+        return False, ("would store %s in %s/env, keeping every other line"
+                       % (", ".join(names), ctx.stage_home)), []
+    if res.rc == 5:
+        raise SetupError(
+            "the env file at %s/env was not replaced (exit 5): it holds exactly what it "
+            "held before, and neither value was stored. The write keeps every line it "
+            "does not own, so it stops rather than lose one: a file %s cannot read, a "
+            "directory at that path, a home it cannot close to mode 700, or a write "
+            "that failed. %s"
+            % (ctx.stage_home, ctx.account, (res.err or "").strip()[:200]))
+    if res.rc == 6:
+        raise SetupError(
+            "the write to %s/env was interrupted by a signal (exit 6). Its temporary "
+            "copy was removed. The file is either what it was or the new one whole, "
+            "never half of either. Run this again: it measures the file and finishes "
+            "the store if one is still needed." % ctx.stage_home)
     if not res.ok:
         raise SetupError("could not write the env file: %s" % (res.err or "").strip()[:200])
-    return False, "env file written, mode 600, with %s" % ", ".join(names), []
+    return False, ("env file updated, mode 600: %s stored, every other line kept%s"
+                   % (", ".join(names),
+                      "; the %s line that would have won was removed" % " and ".join(shadow)
+                      if shadow else "")), []
 
 
 def credential_home_problem(role_home, dispatcher_config, workspace_base_dirs):
@@ -4763,17 +4910,32 @@ MONITOR_DAEMON_PASS_SECONDS = 900
 MONITOR_GOOD_RESULTS = ("ok", "declined")
 MONITOR_HEARTBEAT_POLLS = 18
 MONITOR_HEARTBEAT_POLL_SECONDS = 5
+# The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
+# installer's default path, as the role account; what the notifier's own loader assumes
+# when a key is absent is held here, and the battery asserts it against that loader.
+NOTIFIER_WATCH_JOB = "notifier"
+NOTIFIER_SCRIPT_NAME = "pipeline_notify_local.py"
+NOTIFIER_CONFIG_FILE = "notifier.json"
+NOTIFIER_DEFAULT_RUN_TIMEOUT = 240
+NOTIFIER_DEFAULT_STATE_DIR = "~/.stage-e/state"
+_RUN_INTERVAL_RE = re.compile(r"^\s*run interval = (\d+) seconds?\s*$", re.MULTILINE)
 
 
-def monitor_config(conf):
+def monitor_config(conf, notifier=None):
     """The monitor's config, from the same conf values the three daemons are scheduled
     by — so its idea of "stale" follows the interval launchd really uses.
 
     Each job's interval is launchd's PLUS one pass's wall clock: the longest a healthy job
     can go between two heartbeats. The review poller writes only when a pass ends, and the
     bounce driver's `running` beat stands until its pass ends, so launchd's interval alone
-    reads a long pass inside its own deadline as `stale` or `wedged`."""
-    return {
+    reads a long pass inside its own deadline as `stale` or `wedged`.
+
+    `notifier` is what `measure_notifier` read, or None: with it, the notifier is a fourth
+    watched job, by the same rule — the interval launchd holds for it, plus its own pass
+    clock — and its heartbeat is read from its own state directory. A PAUSED notifier is
+    not watched on this pass: the config is the one written with no notifier at all."""
+    notifier = _notifier_watched(notifier)
+    doc = {
         "state_dir": "~/.stage-e/state",
         "finding_state_dir": "~/.stage-e/finding",
         "watch": [job for job, _key in MONITOR_JOBS],
@@ -4785,6 +4947,155 @@ def monitor_config(conf):
         "notify_ticket_id": monitor_ticket(conf),
         "linear_key_env": conf["LINEAR_KEY_ENV"],
     }
+    if notifier:
+        doc["watch"].append(NOTIFIER_WATCH_JOB)
+        doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
+        doc["notifier_state_dir"] = notifier["state_dir"]
+    return doc
+
+
+def notifier_label(conf):
+    """The notifier's launchd label, or "" while it is left unwatched."""
+    return (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
+
+
+def _notifier_config_read_sh(ctx):
+    """Read the notifier's config as the role account. Exit 9 is ABSENT; any other failure is
+    a read that could not be made, which is a different fact and never reported as absent."""
+    return 'f="%s/%s"; [ -e "$f" ] || exit 9; cat "$f"' % (ctx.stage_home, NOTIFIER_CONFIG_FILE)
+
+
+# The one `--config` argument a notifier job may run with for this step to watch it: the file
+# read above, in any of the spellings the notifier installer and a person write it in.
+_NOTIFIER_CONFIG_ARG_RE = re.compile(r"""\brun\s+--config[ =]("([^"]*)"|'([^']*)'|(\S+))""")
+
+
+def _notifier_config_arg(text):
+    """The `--config` path launchd's print shows the notifier running with, or None."""
+    found = _NOTIFIER_CONFIG_ARG_RE.search(text or "")
+    if not found:
+        return None
+    return next(g for g in found.groups()[1:] if g is not None)
+
+
+def _is_read_config(ctx, path):
+    """True when `path` is ~/.stage-e/notifier.json, however it is spelled."""
+    tail = "/.stage-e/" + NOTIFIER_CONFIG_FILE
+    spellings = {"$HOME" + tail, "${HOME}" + tail, "~" + tail}
+    if ctx.role_home:
+        spellings.add(ctx.role_home.rstrip("/") + tail)
+    return path in spellings
+
+
+def measure_notifier(ctx):
+    """What the monitor needs to watch the notifier, measured — or None when
+    NOTIFIER_JOB_LABEL is empty, or {"label", "paused": True} when it is paused.
+
+    THREE MEASUREMENTS, AND NONE OF THEM IS A CONF VALUE. launchd is asked whether it holds
+    the label, what it runs there and how often; the notifier's own config is read as the
+    role account for its pass clock and its state directory. The interval is launchd's
+    because launchd keeps what it was given: a changed notifier conf moves the file on disk
+    and not the running job. The config read is the one launchd runs the job with: a job
+    started on another `--config` is refused by name, because the file read here would then
+    say nothing about it.
+
+    PAUSED IS NOT REFUSED (the KIT-178 review round, 2026-09-24). A label launchd does not
+    hold whose plist is still in /Library/LaunchDaemons is the notifier's documented pause
+    (`bootout`). It is not watched on this pass — the row says so by name — and the step goes
+    on: a pause of one job must never stop the installer or leave the monitor unloaded.
+
+    A label launchd does not hold and that has NO plist is REFUSED, never watched: its
+    heartbeat would be missing or stale on every pass, and the monitor would page about a job
+    nobody meant to run. A label holding something that is not the notifier is refused for the
+    same reason."""
+    label = notifier_label(ctx.conf)
+    if not label:
+        return None
+    r = ctx.runner
+    res = r.as_root(["launchctl", "print", "system/" + label])
+    text = (res.out or "") + (res.err or "")
+    if not res.ok:
+        if res.rc == 113 or "Could not find service" in text:
+            plist = _dispatcher_plist(label)
+            if r.read(["test", "-f", plist]).ok:
+                return {"label": label, "paused": True, "plist": plist}
+            raise SetupError(
+                "NOTIFIER_JOB_LABEL=%s names a job launchd does not hold, and there is no plist "
+                "at %s, so it is not a paused notifier either: the heartbeat monitor would page "
+                "about its heartbeat on every pass. Install and load the notifier (the notifier "
+                "installer's `run`, then its card CK-N3), correct the label, or empty "
+                "NOTIFIER_JOB_LABEL to leave it unwatched." % (label, plist))
+        raise Unknown("could not ask launchd about system/%s (exit %d): %s"
+                      % (label, res.rc, text.strip()[:160]), "run the same command again")
+    if NOTIFIER_SCRIPT_NAME not in text:
+        raise SetupError(
+            "NOTIFIER_JOB_LABEL=%s names a job launchd holds, and it does not run %s. That "
+            "label is some other job's; watching it as the notifier would judge the wrong "
+            "heartbeat. Set NOTIFIER_JOB_LABEL to the notifier's own JOB_LABEL."
+            % (label, NOTIFIER_SCRIPT_NAME))
+    found = _RUN_INTERVAL_RE.search(text)
+    if not found:
+        raise Unknown(
+            "system/%s is loaded, and launchd's own print gave no run interval, so how old "
+            "the notifier's heartbeat may get cannot be worked out." % label,
+            "read it yourself: sudo launchctl print system/%s" % label)
+    runs = _notifier_config_arg(text)
+    if runs is None or not _is_read_config(ctx, runs):
+        raise SetupError(
+            "system/%s runs the notifier with --config %s, and this step reads only "
+            "~/.stage-e/%s as %s. A notifier configured elsewhere cannot be watched from here: "
+            "its pass clock and state directory would be read from the wrong file. Keep the "
+            "notifier installer's NOTIFIER_CONFIG at its default, or empty NOTIFIER_JOB_LABEL."
+            % (label, runs or "(none that launchd's print names)", NOTIFIER_CONFIG_FILE,
+               ctx.account))
+    got = r.as_role(ctx.account, _notifier_config_read_sh(ctx))
+    if got.rc == 9:
+        raise SetupError(
+            "system/%s is loaded, and ~/.stage-e/%s is missing as %s, so the notifier's pass "
+            "clock and state directory are not known. The notifier installer writes that file."
+            % (label, NOTIFIER_CONFIG_FILE, ctx.account))
+    if not got.ok:
+        raise Unknown("could not read ~/.stage-e/%s as %s (exit %d): %s"
+                      % (NOTIFIER_CONFIG_FILE, ctx.account, got.rc,
+                         (got.err or got.out or "").strip()[:160]),
+                      "run the same command again")
+    try:
+        doc = json.loads(got.out)
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        raise SetupError(
+            "system/%s is loaded, and ~/.stage-e/%s is not a JSON object as %s, so the "
+            "notifier's pass clock and state directory are not known."
+            % (label, NOTIFIER_CONFIG_FILE, ctx.account))
+    timeout = doc.get("run_timeout_seconds") or NOTIFIER_DEFAULT_RUN_TIMEOUT
+    state_dir = doc.get("state_dir") or NOTIFIER_DEFAULT_STATE_DIR
+    if (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1
+            or not isinstance(state_dir, str)):
+        # Only the SHAPE is judged here. Whether that state dir is inside a git working tree
+        # is the monitor's own `check` to refuse, below, before the job is loaded.
+        raise SetupError("~/.stage-e/%s carries a run_timeout_seconds that is not a whole "
+                         "number of seconds, or a state_dir that is not a path (%r, %r)"
+                         % (NOTIFIER_CONFIG_FILE, timeout, state_dir))
+    return {"label": label, "interval": int(found.group(1)), "run_timeout": timeout,
+            "state_dir": state_dir}
+
+
+def _notifier_watched(notifier):
+    """The measurement when the monitor is to watch the notifier on this pass, or None."""
+    return notifier if notifier and not notifier.get("paused") else None
+
+
+def _notifier_watch_note(notifier):
+    """One clause for the step's row: whether the notifier is watched, and by what gap."""
+    if not notifier:
+        return "the notifier is not watched (NOTIFIER_JOB_LABEL is empty)"
+    if notifier.get("paused"):
+        return ("notifier paused: not watched; load it, then run this again (launchd does not "
+                "hold system/%s, and its plist is installed)" % notifier["label"])
+    return ("it watches the notifier system/%s: every %d + %d s pass = %d s"
+            % (notifier["label"], notifier["interval"], notifier["run_timeout"],
+               notifier["interval"] + notifier["run_timeout"]))
 
 
 def _monitor_plist(ctx):
@@ -4876,7 +5187,13 @@ def step_heartbeat_monitor(ctx, apply_it):
     Which ticket, or none, is a person's call, so an unnamed ticket is card CK-9 and
     `off` is said by name on every run. Before it is loaded the ticket is proved to
     exist and the monitor's own `check` runs; a loaded monitor whose heartbeat is stale
-    is NOT RUNNING, never installed."""
+    is NOT RUNNING, never installed.
+
+    The notifier is the one job it may also watch, and only as launchd holds it: see
+    `measure_notifier`. Its row says either way, and says PAUSED when the notifier is
+    unloaded with its plist still installed; a paused notifier is left unwatched and never
+    fails this step. This step writes the monitor's config whole; the notifier installer
+    never writes it, or this step would revert it."""
     r, conf = ctx.runner, ctx.conf
     ticket = monitor_ticket(conf)
     if ticket == "off":
@@ -4903,7 +5220,17 @@ def step_heartbeat_monitor(ctx, apply_it):
                          "read, so every comment the monitor owes would fail. Name one that "
                          "exists, or set it to off." % ticket)
 
-    want_conf, want_plist = monitor_config(conf), _monitor_plist(ctx)
+    # The notifier, as a fourth watched job — or said, by name, not to be (KIT-156). Measured
+    # before anything is written, so a label that is refused stops the step here. On a `run`
+    # that moved the clone, `code` already measured it before it stopped the monitor, so a
+    # refusal never reaches this line with the monitor unloaded. A PAUSED notifier is no
+    # refusal: it is left out of `watch` on this pass and the row says so.
+    notifier = measure_notifier(ctx)
+    watch_note = _notifier_watch_note(notifier)
+    # The row is cut at 96 characters when printed, and this clause sits at its end, so it is
+    # ALSO returned as a note, which prints whole — watched, paused, or not configured.
+    watch_notes = [watch_note]
+    want_conf, want_plist = monitor_config(conf, notifier), _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
         have_conf = json.loads(got.out) if got.ok and got.out.strip() else None
@@ -4929,8 +5256,8 @@ def step_heartbeat_monitor(ctx, apply_it):
             raise SetupError("the heartbeat monitor runs and could not do its job: its last pass "
                              "ended `%s` — %s" % (doc.get("result"),
                                                   str(doc.get("detail") or "")[:300]))
-        return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`"
-                      % (ticket, int(age), doc.get("result"))), []
+        return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`; %s"
+                      % (ticket, int(age), doc.get("result"), watch_note)), list(watch_notes)
 
     if not apply_it:
         todo = (["write ~/.stage-e/%s" % MONITOR_CONFIG] if conf_stale else []) \
@@ -4939,7 +5266,7 @@ def step_heartbeat_monitor(ctx, apply_it):
             + ["%s it and wait for a heartbeat (%s)"
                % ("reload" if loaded else "load",
                   why_not or ("the last one was a dry run" if not real else "stale"))]
-        return False, "would " + ", then ".join(todo), []
+        return False, "would " + ", then ".join(todo) + "; " + watch_note, list(watch_notes)
 
     if conf_stale:
         body = json.dumps(want_conf, indent=2, sort_keys=True) + "\n"
@@ -5030,7 +5357,8 @@ def step_heartbeat_monitor(ctx, apply_it):
                 raise SetupError("the heartbeat monitor loaded and its first pass ended `%s` — %s"
                                  % (doc.get("result"), str(doc.get("detail") or "")[:300]))
             return False, ("loaded; its first pass wrote a heartbeat (`%s`), and it comments "
-                           "on %s once per incident" % (doc.get("result"), ticket)), []
+                           "on %s once per incident; %s" % (doc.get("result"), ticket,
+                                                            watch_note)), list(watch_notes)
         if n < MONITOR_HEARTBEAT_POLLS - 1:
             _pause(MONITOR_HEARTBEAT_POLL_SECONDS)
     raise Unknown("the heartbeat monitor was loaded and wrote no heartbeat within %d s"
@@ -8545,7 +8873,7 @@ def _selftest_body():
     # again to write the env file. Two steps, one keystroke.
     cases += 1
     ctxM, fakeM, _apiM = _healthy_ctx(conf, stored_env=False)
-    fakeM.answers = list(fakeM.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeM.answers = list(fakeM.answers) + [("env.stage-e-setup.", 0, "")]
     askedM = _counted(ctxM)
     _quiet(lambda: run_steps(ctxM, apply_it=True, keep_going=True))
     expect("secret-asked-once", askedM.count(conf["LINEAR_KEY_ENV"]) == 1,
@@ -8562,7 +8890,7 @@ def _selftest_body():
     # mutant: a process that forgets a secret between steps must ask twice.
     cases += 1
     ctxN, fakeN, _apiN = _healthy_ctx(conf, stored_env=False)
-    fakeN.answers = list(fakeN.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeN.answers = list(fakeN.answers) + [("env.stage-e-setup.", 0, "")]
     askedN = _counted(ctxN)
     _quiet(lambda: step_tracker(ctxN, apply_it=True))
     ctxN._secrets, ctxN._sources = {}, {}          # the forgetting
@@ -8981,7 +9309,7 @@ def _selftest_body():
     # bad key and make the NEXT run ask for a replacement all over again.
     cases += 1
     ctxW, fakeW, _apiW = _healthy_ctx(conf)
-    fakeW.answers = list(fakeW.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeW.answers = list(fakeW.answers) + [("env.stage-e-setup.", 0, "")]
     askedW = _counted(ctxW)
     ctxW.replaced.add(conf["LINEAR_KEY_ENV"])       # as ctx.linear() marks it
     ok, detailW, _x = _quiet(lambda: step_credentials(ctxW, apply_it=True))[0]
@@ -8993,6 +9321,15 @@ def _selftest_body():
            "the rewrite asked for a value it already held: %s" % askedW)
     expect("replacement-reaches-the-file", wroteW and wroteW[0]["stdin"] == "<hidden>",
            "the rewrite recorded the credential in the ledger")
+    # …through the merge, byte for byte: the script 17f runs for real is the
+    # script this step sends (KIT-171), and the names it drops are its own two
+    # plus the code-host token's other name (17f-x).
+    expect("replacement-reaches-the-file", wroteW and wroteW[0]["argv"][-1] == (
+        "cd / && " + ENV_WRITE_SH % {"home": ctxW.stage_home, "names": "%s|%s|%s" % (
+            conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"],
+            {"GH_TOKEN": "GITHUB_TOKEN"}.get(conf["GITHUB_TOKEN_ENV"], "GH_TOKEN"))}),
+           "the credentials step did not send ENV_WRITE_SH: %s"
+           % (wroteW and wroteW[0]["argv"][-1][:160]))
     # …and a dry run names the rewrite without making it.
     cases += 1
     ctxX, fakeX, _apiX = _healthy_ctx(conf)
@@ -9023,7 +9360,7 @@ def _selftest_body():
     # -- 17e-i. `run`: rejected, asking allowed -> one replacement, written --
     cases += 1
     ctxG1, fakeG1, _apiG1 = _healthy_ctx(conf)
-    fakeG1.answers = list(fakeG1.answers) + [("cat > $HOME/.stage-e/env", 0, "")]
+    fakeG1.answers = list(fakeG1.answers) + [("env.stage-e-setup.", 0, "")]
     builtG1 = []
     deadG1, liveG1 = FakeGitHub(GH_REJECTED), FakeGitHub(GH_LIVE)
     ctxG1.github_factory = lambda t: (builtG1.append(t),
@@ -9165,6 +9502,617 @@ def _selftest_body():
            "without the probe the same dead token did NOT measure as already-done "
            "(%r, %d write(s)) — something else is catching it and the checks above "
            "prove less than they claim" % (okG5, len(fakeG5.writes)))
+
+    # ------------------------------------------------------------------ #
+    # 17f. THE ENV FILE IS SHARED, SO STORING A CREDENTIAL KEEPS EVERY OTHER
+    # LINE IN IT (KIT-171).
+    #
+    # The notifier keeps its own token in this same file. The credentials step
+    # used to write it with `cat >`, so every first store and every replacement
+    # deleted each line it did not own, the notifier's token with them, and
+    # nothing here said so: the notifier's next pass exited 2 and paged nobody.
+    # Most of these cases run the REAL write script through a real /bin/sh
+    # against a real file, reaching it through the step. Between them they
+    # cover every shape the script branches on: no file at all, an empty one,
+    # one holding only the owned lines, one another writer shares, one it
+    # cannot read, a directory at its path, a state path it cannot create, a
+    # stale temp copy beside it, a rename that fails, and a write interrupted
+    # halfway. The owner refusal (17f-v) runs on a scripted
+    # probe, because a real file owned by another account needs a second
+    # account and root.
+    # ------------------------------------------------------------------ #
+    import pwd as _pwd
+    import signal as _signal
+
+    class _RoleShell(FakeRunner):
+        """The role account, emulated. A `sudo -u <role> -H /bin/sh -c …`
+        script runs through a REAL /bin/sh with HOME at a temporary role home,
+        unless the scripted table answers it first. The battery owns the files
+        it creates, where a real `sudo -u` would show the role account, so the
+        probe's `owner=` field is translated, and nothing else is."""
+
+        def __init__(self, home, role, answers=None):
+            FakeRunner.__init__(self, answers)
+            self.home, self.role = home, role
+            self.me = _pwd.getpwuid(os.geteuid()).pw_name
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            line = _fmt(argv)
+            scripted = any(needle in line for needle, _rc, _out in self.answers)
+            if scripted or list(argv[:2]) != ["sudo", "-u"] \
+                    or list(argv[3:6]) != ["-H", "/bin/sh", "-c"]:
+                return FakeRunner._exec(self, argv, stdin, timeout, cwd)
+            p = subprocess.run(["/bin/sh", "-c", argv[6]], input=stdin,
+                               capture_output=True, text=True, timeout=timeout,
+                               env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
+            out = re.sub(r"(?m)^(mode=\S* owner=)%s$" % re.escape(self.me),
+                         lambda m: m.group(1) + self.role, p.stdout)
+            return Result(p.returncode, out, p.stderr)
+
+    LKEY, GKEY = conf["LINEAR_KEY_ENV"], conf["GITHUB_TOKEN_ENV"]
+    # The code-host token's OTHER name. The transport reads GH_TOKEN and then
+    # GITHUB_TOKEN, so the step owns both and writes the configured one.
+    OTHER_GKEY = {"GH_TOKEN": "GITHUB_TOKEN", "GITHUB_TOKEN": "GH_TOKEN"}[GKEY]
+    OWNED_NAMES = "%s|%s|%s" % (LKEY, GKEY, OTHER_GKEY)
+    # Fake values, assembled so no credential-shaped literal sits in the file.
+    SLACK_FAKE = "xoxb-" + "FAKE" * 12
+    STALE_TOKEN = "ghp_" + "OLDSTALE" * 4
+    STALE_KEY = "lin_" + "api_" + "OLDINDENTED" * 3
+    STALE_OTHER = "ghp_" + "OTHERNAME" * 4
+    NEW_TOKEN = "ghp_" + "REPLACEMENT" + "NOTREAL" * 4
+    STALE_VALUES = (STALE_TOKEN, STALE_KEY, STALE_OTHER)
+    ALL_VALUES = (STORED_KEY, STORED_TOKEN, NEW_TOKEN, SLACK_FAKE) + STALE_VALUES
+    # What another writer left in the file: a comment, a blank line, the
+    # notifier's token in the `export` spelling, an unrelated name, and two
+    # names that merely END or START with an owned one.
+    FOREIGN = ["# kept: the owner's own note", "",
+               "export NOTIFIER_SLACK_BOT_TOKEN=" + SLACK_FAKE,
+               "OTHER=kept", "NOT_" + GKEY + "=kept", GKEY + "_EXTRA=kept"]
+    # …plus three STALE owned lines, each of which must go: the token in the
+    # `export` spelling, the key INDENTED (`.` reads that as an assignment
+    # too), and the token under its other name. And a last line with no
+    # newline: adding that one byte is the only change the merge makes to a
+    # line it keeps.
+    SEED = "\n".join(FOREIGN[:4] + ["export %s=%s" % (GKEY, STALE_TOKEN),
+                                    "  %s=%s" % (LKEY, STALE_KEY),
+                                    "%s=%s" % (OTHER_GKEY, STALE_OTHER)]
+                     + FOREIGN[4:]).encode("utf-8")
+    STORED_PROBE = ("mode=600 owner=%s\nname=%s len=%d\nname=%s len=%d\n"
+                    % (conf["ROLE_ACCOUNT"], LKEY, len(STORED_KEY), GKEY,
+                       len(STORED_TOKEN)))
+
+    def _owned(line):
+        return re.match(r"\s*(export\s+)?(%s)=" % OWNED_NAMES, line) is not None
+
+    def _role_home(seed):
+        """A temporary role home whose env file holds `seed` (bytes), mode 600.
+        The home itself starts at 755, so a store is SEEN to close it to 700."""
+        home = tempfile.mkdtemp(prefix="stage-e-kit171.")
+        os.mkdir(os.path.join(home, ".stage-e"))
+        os.chmod(os.path.join(home, ".stage-e"), 0o755)
+        path = os.path.join(home, ".stage-e", "env")
+        with open(path, "wb") as fh:
+            fh.write(seed)
+        os.chmod(path, 0o600)
+        return home, path
+
+    def _shell_ctx(home, answers=None, cfg=None):
+        cfg = cfg or conf
+        ctx, _f = _settled_ctx(cfg)
+        ctx.runner = _RoleShell(home, cfg["ROLE_ACCOUNT"], answers)
+        return ctx, ctx.runner
+
+    def _file_problems(path, want, foreign_want=None):
+        """What is wrong with the env file after a store. Names and counts only:
+        a failure message never carries a value, fake or not."""
+        foreign_want = FOREIGN if foreign_want is None else foreign_want
+        bad = []
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        text = raw.decode("utf-8", "replace")
+        lines = text.split("\n")[:-1] if text.endswith("\n") else text.split("\n")
+        foreign = [ln for ln in lines if not _owned(ln)]
+        if foreign != foreign_want:
+            bad.append("the lines this step does not own were not kept in order: "
+                       "%d kept of %d, names %s"
+                       % (len(foreign), len(foreign_want),
+                          [ln.split("=", 1)[0] for ln in foreign]))
+        for name, value in sorted(want.items()):
+            mine = [ln for ln in lines if re.match(r"\s*(export\s+)?%s=" % name, ln)]
+            if mine != ["%s=%s" % (name, value)]:
+                bad.append("%s is in the file %d time(s), not once, plainly, with the "
+                           "value this run settled on" % (name, len(mine)))
+        if len(lines) != len(foreign_want) + len(want):
+            bad.append("the file has %d line(s), want %d"
+                       % (len(lines), len(foreign_want) + len(want)))
+        # WHERE the owned lines go is part of the contract, not a detail: under
+        # `.` the last definition wins, so the fresh values go LAST, in the
+        # order the step writes them.
+        if lines[len(foreign_want):] != ["%s=%s" % (n, v) for n, v in want.items()]:
+            bad.append("the owned lines are not the last lines of the file, in order")
+        if not raw.endswith(b"\n"):
+            bad.append("the file does not end with a newline")
+        for label, stale in zip(("the stale token", "the indented key",
+                                 "the token under its other name"), STALE_VALUES):
+            if stale in text:
+                bad.append("a stale owned line survived: %s" % label)
+        mode = os.stat(path).st_mode & 0o777
+        if mode != 0o600:
+            bad.append("the file is mode %o, not 600" % mode)
+        home_mode = os.stat(os.path.dirname(path)).st_mode & 0o777
+        if home_mode != 0o700:
+            bad.append("the home is mode %o after a store, not 700" % home_mode)
+        left = sorted(os.listdir(os.path.dirname(path)))
+        if left != ["env", "state"]:
+            bad.append("the home holds %s, not just env and state: a temp file was "
+                       "left behind" % left)
+        return bad
+
+    def _leaks(run, printed):
+        """Any value, fake or not, in any command line or any printed line."""
+        argvs = [_fmt(a) for a in run.reads] + [_fmt(w["argv"]) for w in run.writes]
+        bad = []
+        if any(v in a for v in ALL_VALUES for a in argvs):
+            bad.append("a credential value reached a command line")
+        if any(v in printed for v in ALL_VALUES):
+            bad.append("a credential value was printed")
+        return bad
+
+    def _store_and_replace():
+        """KIT-171 start to finish: a FIRST store into a file another writer
+        already uses, then a REPLACEMENT of the code-host token. Returns every
+        problem found, so the mutant below can run the same thing."""
+        home, path = _role_home(SEED)
+        ctx, run = _shell_ctx(home)
+        asked = _counted(ctx)
+        bad = []
+        try:
+            (ok1, _d1, _x1), out1 = _quiet(lambda: step_credentials(ctx, apply_it=True))
+        except Exception as exc:
+            return ["the first store raised %s: %s" % (type(exc).__name__, exc)]
+        bad += ["first store: " + p
+                for p in _file_problems(path, {LKEY: STORED_KEY, GKEY: STORED_TOKEN})]
+        if asked != [LKEY, GKEY]:
+            bad.append("the first store asked for %s, want one of each" % asked)
+        ctx.replaced.add(GKEY)               # as ctx.github() marks a refused token
+        ctx._secrets[GKEY], ctx._sources[GKEY] = NEW_TOKEN, "typed at a hidden prompt"
+        try:
+            (ok2, _d2, _x2), out2 = _quiet(lambda: step_credentials(ctx, apply_it=True))
+        except Exception as exc:
+            return bad + ["the replacement raised %s: %s" % (type(exc).__name__, exc)]
+        bad += ["replacement: " + p
+                for p in _file_problems(path, {LKEY: STORED_KEY, GKEY: NEW_TOKEN})]
+        with open(path, "rb") as fh:
+            if STORED_TOKEN.encode("utf-8") in fh.read():
+                bad.append("replacement: the refused token is still in the file")
+        wrote = [w for w in run.writes if "env file" in w["why"]]
+        if len(wrote) != 2 or any(w["stdin"] != "<hidden>" for w in wrote):
+            bad.append("the env file was not written twice with a hidden body: %d "
+                       "write(s)" % len(wrote))
+        if ok1 is not False or ok2 is not False:
+            bad.append("a store reported the step already done (%r, %r)" % (ok1, ok2))
+        return bad + _leaks(run, out1 + out2)
+
+    # -- 17f-i. a first store, then a replacement, keep the foreign lines ---
+    cases += 1
+    for problem in _store_and_replace():
+        failures.append("env-merge-keeps-foreign-lines: " + problem)
+
+    # mutant: the old whole-file write, in the new constant's clothes. The
+    # scenario must go red under it, or it cannot see KIT-171 at all.
+    cases += 1
+    OLD_WRITE_SH = ("umask 077; mkdir -p %(home)s/state && chmod 700 %(home)s "
+                    "%(home)s/state && cat > %(home)s/env && chmod 600 %(home)s/env")
+    saved_write_sh = globals().get("ENV_WRITE_SH")
+    globals()["ENV_WRITE_SH"] = OLD_WRITE_SH
+    try:
+        survived = not _store_and_replace()
+    finally:
+        globals()["ENV_WRITE_SH"] = saved_write_sh
+    expect("env-merge-mutant", not survived,
+           "the whole-file write kept every foreign line too, so 17f-i cannot see a "
+           "store that deletes the notifier's token")
+
+    # -- 17f-ii. a file it cannot read is a file it does not replace --------
+    # The write reads the file to keep its lines. A read that fails must stop
+    # the write; carrying on would replace every foreign line with nothing.
+    # Root reads a mode-000 file anyway, so there is nothing to prove as root.
+    cases += 1
+    if os.geteuid() != 0:
+        homeU, pathU = _role_home(SEED)
+        ctxU, runU = _shell_ctx(homeU, answers=[
+            ("stat -f", 0, STORED_PROBE),
+            ("n=" + LKEY, 0, STORED_KEY), ("n=" + GKEY, 0, STORED_TOKEN)])
+        _counted(ctxU)
+        ctxU.replaced.add(GKEY)
+        os.chmod(pathU, 0)
+        try:
+            _quiet(lambda: step_credentials(ctxU, apply_it=True))
+            failures.append("env-merge-unreadable: a write over a file it could not "
+                            "read was reported as done")
+        except SetupError as exc:
+            expect("env-merge-unreadable", "not replaced" in str(exc),
+                   "the refusal did not say the file was left as it was: %s" % exc)
+        finally:
+            modeU = os.stat(pathU).st_mode & 0o777
+            os.chmod(pathU, 0o600)
+        with open(pathU, "rb") as fh:
+            expect("env-merge-unreadable", fh.read() == SEED and modeU == 0,
+                   "the unreadable file was changed (mode now %o)" % modeU)
+        leftU = sorted(os.listdir(os.path.dirname(pathU)))
+        expect("env-merge-unreadable", leftU == ["env", "state"],
+               "a failed write left %s behind" % leftU)
+
+    # -- 17f-iii. a DIRECTORY where the file goes is refused, not filled ----
+    # `mv` onto a directory moves the file INTO it and exits 0: a store that
+    # reports success and stores nothing anyone reads.
+    cases += 1
+    homeD = tempfile.mkdtemp(prefix="stage-e-kit171.")
+    os.makedirs(os.path.join(homeD, ".stage-e", "env"), 0o700)
+    ctxD, runD = _shell_ctx(homeD)
+    _counted(ctxD)
+    try:
+        _quiet(lambda: step_credentials(ctxD, apply_it=True))
+        failures.append("env-merge-directory: a directory at the env file's path was "
+                        "reported as a stored env file")
+    except SetupError as exc:
+        expect("env-merge-directory", "not replaced" in str(exc),
+               "the refusal did not say the file was left as it was: %s" % exc)
+    expect("env-merge-directory", os.listdir(os.path.join(homeD, ".stage-e", "env")) == [],
+           "the credentials were moved into a directory nobody reads")
+
+    # -- 17f-iv. a line grep calls BINARY is still a line it keeps ----------
+    # Without `-a`, one NUL byte makes grep print "Binary file … matches" in
+    # place of every line, exit 0, and the merge would install that sentence
+    # as the whole file.
+    cases += 1
+    homeB, pathB = _role_home(SEED + b"\nBLOB=a\x00b\n")
+    ctxB, runB = _shell_ctx(homeB, answers=[
+        ("stat -f", 0, STORED_PROBE),
+        ("n=" + LKEY, 0, STORED_KEY), ("n=" + GKEY, 0, STORED_TOKEN)])
+    _counted(ctxB)
+    ctxB.replaced.add(GKEY)
+    try:
+        _quiet(lambda: step_credentials(ctxB, apply_it=True))
+    except Exception as exc:
+        failures.append("env-merge-binary: the store raised %s: %s"
+                        % (type(exc).__name__, exc))
+    with open(pathB, "rb") as fh:
+        rawB = fh.read()
+    expect("env-merge-binary", b"\nBLOB=a\x00b\n" in rawB
+           and b"\nOTHER=kept\n" in rawB and b"Binary file" not in rawB,
+           "a foreign line holding a NUL byte cost the file its foreign lines")
+
+    # -- 17f-v. a file someone ELSE owns is refused, missing names or not ----
+    # `mv` replaces a file the role account does not own, as long as it owns
+    # the directory. `cat >` could not, so this refusal used to be free; now
+    # it has to be asked for. It is asked before this step sends the stored
+    # token to the code host or asks a person for anything, whatever the file
+    # holds. Three shapes: names missing; complete, with a stored token the
+    # code host refuses (the order is what is under test: a refusal after the
+    # prompt throws away what was typed); and complete, readable, live, with
+    # nothing replaced, where a narrower guard would chmod or write it.
+    def _foreign_owner_case(label, probe, values, verdict):
+        ctxO, fakeO = _settled_ctx(conf)
+        fakeO.answers = [("stat -f", 0, probe)] + [
+            ("n=" + n, 0 if v else 8, v or "") for n, v in values]
+        built = []
+        ctxO.github_factory = lambda token: (built.append(1), FakeGitHub(verdict))[1]
+        askedO = _counted(ctxO)
+        try:
+            _quiet(lambda: step_credentials(ctxO, apply_it=True))
+            failures.append("env-merge-foreign-owner (%s): a file owned by another "
+                            "account was reported stored" % label)
+        except SetupError as exc:
+            expect("env-merge-foreign-owner", "someone-else" in str(exc),
+                   "(%s) the refusal did not name the owner: %s" % (label, exc))
+        except (Unknown, Blocked) as exc:
+            failures.append("env-merge-foreign-owner (%s): raised %s, not the owner "
+                            "refusal: %s" % (label, type(exc).__name__, exc))
+        expect("env-merge-foreign-owner", not fakeO.writes and askedO == [] and not built,
+               "(%s) a file owned by another account was written (%d), a value was asked "
+               "for (%s), or its stored token was sent to the code host (%d)"
+               % (label, len(fakeO.writes), askedO, len(built)))
+
+    cases += 3
+    _foreign_owner_case("names missing", "mode=600 owner=someone-else\n",
+                        [(LKEY, None), (GKEY, None)], GH_LIVE)
+    _foreign_owner_case(
+        "complete, dead stored token",
+        "mode=600 owner=someone-else\nname=%s len=%d\nname=%s len=%d\n"
+        % (LKEY, len(STORED_KEY), GKEY, len(STORED_TOKEN)),
+        [(LKEY, STORED_KEY), (GKEY, STORED_TOKEN)], GH_REJECTED)
+    _foreign_owner_case(
+        "complete, readable, live, nothing replaced",
+        "mode=644 owner=someone-else\nname=%s len=%d\nname=%s len=%d\n"
+        % (LKEY, len(STORED_KEY), GKEY, len(STORED_TOKEN)),
+        [(LKEY, STORED_KEY), (GKEY, STORED_TOKEN)], GH_LIVE)
+
+    # -- 17f-vi. a state directory it cannot create gets no credential ------
+    # `state` is a FILE here, so `mkdir -p` fails before any chmod runs.
+    # Carrying on would store both values in a home this step could not set
+    # up. (That a store CLOSES the home to 700 is checked on every successful
+    # store instead: `_role_home` starts it at 755 and `_file_problems` wants
+    # 700.)
+    cases += 1
+    homeH, pathH = _role_home(SEED)
+    with open(os.path.join(homeH, ".stage-e", "state"), "w") as fh:
+        fh.write("not a directory\n")
+    ctxH, runH = _shell_ctx(homeH, answers=[
+        ("stat -f", 0, STORED_PROBE),
+        ("n=" + LKEY, 0, STORED_KEY), ("n=" + GKEY, 0, STORED_TOKEN)])
+    _counted(ctxH)
+    ctxH.replaced.add(GKEY)
+    try:
+        _quiet(lambda: step_credentials(ctxH, apply_it=True))
+        failures.append("env-merge-home: a home that could not be made 700 was given "
+                        "the credentials")
+    except SetupError as exc:
+        expect("env-merge-home", "not replaced" in str(exc),
+               "the refusal did not say the file was left as it was: %s" % exc)
+    with open(pathH, "rb") as fh:
+        expect("env-merge-home", fh.read() == SEED,
+               "the env file changed under a home that could not be locked down")
+
+    # -- 17f-vii. no moment at which another account can read a value -------
+    # Two layers, each invisible in the finished file, so each is caught in
+    # the act. The temp file is watched WHILE the write waits on stdin, under
+    # a caller whose own umask is 022: it must already be 600 before a single
+    # value arrives. And a leftover temp at the same name and a wider mode (a
+    # killed earlier run whose pid came round again) must not hand its mode to
+    # the env file: `>` keeps an existing file's mode. The write sweeps such
+    # leftovers first (17f-xi), so this one is left there by an `rm` that
+    # removes nothing, which is what a sweep that failed looks like: the
+    # `chmod 600` is the layer under the sweep, and it is still asked for.
+    cases += 1
+    write_sh = "cd / && " + ENV_WRITE_SH % {"home": "$HOME/.stage-e",
+                                            "names": OWNED_NAMES}
+    body = "%s=%s\n%s=%s\n" % (LKEY, STORED_KEY, GKEY, STORED_TOKEN)
+    no_rm_dir = tempfile.mkdtemp(prefix="stage-e-kit171-norm.")
+    with open(os.path.join(no_rm_dir, "rm"), "w") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(os.path.join(no_rm_dir, "rm"), 0o755)
+    homeT, pathT = _role_home(SEED)
+    proc = subprocess.Popen(["/bin/sh", "-c", 'umask 022; eval "$1"', "sh", write_sh],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            env={"HOME": homeT, "PATH": "/usr/bin:/bin"})
+    tmp_modes, deadline = [], time.time() + 10
+    while not tmp_modes and time.time() < deadline and proc.poll() is None:
+        for name in os.listdir(os.path.dirname(pathT)):
+            if name.startswith("env.stage-e-setup."):
+                tmp_modes.append(os.stat(os.path.join(os.path.dirname(pathT), name))
+                                 .st_mode & 0o777)
+        time.sleep(0.01)
+    _out, _err = proc.communicate(body, timeout=30)
+    expect("env-merge-never-readable", tmp_modes == [0o600],
+           "the temp file that receives the values was mode %s mid-write, under a "
+           "caller with umask 022" % ["%o" % m for m in tmp_modes])
+    expect("env-merge-never-readable", proc.returncode == 0
+           and not _file_problems(pathT, {LKEY: STORED_KEY, GKEY: STORED_TOKEN}),
+           "the watched write did not complete cleanly: rc %s" % proc.returncode)
+    homeT2, pathT2 = _role_home(SEED)
+    pre = ('t="$HOME/.stage-e/env.stage-e-setup.$$"; : > "$t"; chmod 644 "$t"; '
+           'eval "$1"')
+    left = subprocess.run(["/bin/sh", "-c", pre, "sh", write_sh], input=body,
+                          capture_output=True, text=True, timeout=30,
+                          env={"HOME": homeT2, "PATH": no_rm_dir + ":/usr/bin:/bin"})
+    expect("env-merge-never-readable", left.returncode == 0
+           and os.stat(pathT2).st_mode & 0o777 == 0o600,
+           "a leftover temp file at mode 644 handed its mode to the env file: rc %s, "
+           "mode %o" % (left.returncode, os.stat(pathT2).st_mode & 0o777))
+
+    # -- 17f-viii. a rename that fails leaves the old file and no temp ------
+    # Nothing on an ordinary disk makes a same-directory rename fail, so the
+    # failure is injected: an `mv` first on PATH that refuses. The last branch
+    # of the script is otherwise one nobody has run.
+    cases += 1
+    stub_dir = tempfile.mkdtemp(prefix="stage-e-kit171-stub.")
+    with open(os.path.join(stub_dir, "mv"), "w") as fh:
+        fh.write("#!/bin/sh\nexit 1\n")
+    os.chmod(os.path.join(stub_dir, "mv"), 0o755)
+    homeR, pathR = _role_home(SEED)
+    renamed = subprocess.run(["/bin/sh", "-c", write_sh], input=body, capture_output=True,
+                             text=True, timeout=30,
+                             env={"HOME": homeR, "PATH": stub_dir + ":/usr/bin:/bin"})
+    with open(pathR, "rb") as fh:
+        keptR = fh.read() == SEED
+    leftR = sorted(os.listdir(os.path.dirname(pathR)))
+    expect("env-merge-rename-fails", renamed.returncode == 5 and keptR
+           and leftR == ["env", "state"],
+           "a refused rename: rc %s (want 5), file unchanged %s, home holds %s"
+           % (renamed.returncode, keptR, leftR))
+
+    # -- 17f-ix. the two commonest shapes: no file yet, and the old two lines
+    # A first install has no env file, and grep must not be run on one. Every
+    # install the old writer touched holds exactly the two owned lines, so grep
+    # selects NOTHING and exits 1, which is not a failure. An empty file is
+    # the same exit. Each goes through the real step and a real /bin/sh.
+    def _plain_store(label, home, path, prepare=None, want=None):
+        ctxP, runP = _shell_ctx(home)
+        askedP = _counted(ctxP)
+        if prepare:
+            prepare(ctxP)
+        try:
+            (_okP, _dP, _xP), outP = _quiet(lambda: step_credentials(ctxP, apply_it=True))
+        except Exception as exc:
+            failures.append("env-merge-%s: the store raised %s: %s"
+                            % (label, type(exc).__name__, exc))
+            return
+        for problem in (_file_problems(path, want or {LKEY: STORED_KEY, GKEY: STORED_TOKEN},
+                                       foreign_want=[])
+                        + _leaks(runP, outP)):
+            failures.append("env-merge-%s: %s" % (label, problem))
+        return askedP
+
+    cases += 3
+    homeA = tempfile.mkdtemp(prefix="stage-e-kit171.")
+    askedA = _plain_store("absent", homeA, os.path.join(homeA, ".stage-e", "env"))
+    expect("env-merge-absent", askedA == [LKEY, GKEY],
+           "a first install asked for %s, want one of each" % askedA)
+
+    def _replace_token(c):
+        c.replaced.add(GKEY)
+        c._secrets[GKEY], c._sources[GKEY] = NEW_TOKEN, "typed at a hidden prompt"
+
+    homeW, pathW = _role_home(("%s=%s\n%s=%s\n" % (LKEY, STORED_KEY, GKEY, STALE_TOKEN))
+                              .encode("utf-8"))
+    askedW2 = _plain_store("owned-only", homeW, pathW, prepare=_replace_token,
+                           want={LKEY: STORED_KEY, GKEY: NEW_TOKEN})
+    expect("env-merge-owned-only", askedW2 == [],
+           "a replacement over the old two-line file asked for %s" % askedW2)
+    homeE, pathE = _role_home(b"")
+    _plain_store("empty", homeE, pathE)
+
+    # -- 17f-x. the code-host token has TWO names, and the one read FIRST wins
+    # `gh` and scripts/gh_fallback.py read GH_TOKEN, then GITHUB_TOKEN. With
+    # GITHUB_TOKEN_ENV=GITHUB_TOKEN, a GH_TOKEN line kept in the same file is
+    # what every daemon posts with, while this step proves GITHUB_TOKEN and
+    # reports it live: a check that measured a different token from the one in
+    # use. So a GH_TOKEN line in any spelling `.` reads is drift even when
+    # nothing else is, `verify` says so, and `run` removes it. A GITHUB_TOKEN
+    # line beside a configured GH_TOKEN loses to it, so it is not drift (it is
+    # still dropped whenever the file is written, as 17f-i shows).
+    conf_gt = dict(conf, GITHUB_TOKEN_ENV="GITHUB_TOKEN")
+    NOTE, KEPT = "# kept: the owner's own note", "OTHER=kept"
+    # The last shape is the same line in a file that is ALSO at the wrong
+    # mode: a chmod alone would fix the mode and keep the line.
+    for spelling, env_mode in (("GH_TOKEN=", 0o600), ("export GH_TOKEN=", 0o600),
+                               ("  GH_TOKEN=", 0o600), ("GH_TOKEN=", 0o644)):
+        cases += 1
+        seedX = "\n".join([NOTE, "%s=%s" % (LKEY, STORED_KEY), spelling + STALE_TOKEN,
+                           KEPT, "GITHUB_TOKEN=" + STORED_TOKEN]) + "\n"
+        homeX, pathX = _role_home(seedX.encode("utf-8"))
+        os.chmod(pathX, env_mode)
+        spelling = "%s (mode %o)" % (spelling, env_mode)
+        ctxV, runV = _shell_ctx(homeX, cfg=conf_gt)
+        ctxV.may_prompt = False
+        try:
+            (okV, detailV, _xV), _pV = _quiet(lambda: step_credentials(ctxV, apply_it=False))
+        except Exception as exc:
+            okV, detailV = None, "raised %s: %s" % (type(exc).__name__, exc)
+        expect("gh-token-shadow", okV is False and "GH_TOKEN" in detailV
+               and not runV.writes,
+               "(%r) verify called a file whose GH_TOKEN line wins over the configured "
+               "GITHUB_TOKEN %r, and wrote %d" % (spelling, detailV, len(runV.writes)))
+        ctxR, runR = _shell_ctx(homeX, cfg=conf_gt)
+        askedR = _counted(ctxR)
+        try:
+            (okR, _dR, _xR), outR = _quiet(lambda: step_credentials(ctxR, apply_it=True))
+        except Exception as exc:
+            failures.append("gh-token-shadow (%r): run raised %s: %s"
+                            % (spelling, type(exc).__name__, exc))
+            continue
+        expect("gh-token-shadow", okR is False and askedR == [],
+               "(%r) run did not rewrite the file without asking (%r, asked %s)"
+               % (spelling, okR, askedR))
+        for problem in (_file_problems(pathX, {LKEY: STORED_KEY, "GITHUB_TOKEN": STORED_TOKEN},
+                                       foreign_want=[NOTE, KEPT])
+                        + _leaks(runR, outR)):
+            failures.append("gh-token-shadow (%r): %s" % (spelling, problem))
+        # …and what the daemons read, sourced the way DAEMON_EXEC sources it.
+        # The expected value travels in the environment, never in argv, and
+        # only a verdict comes back.
+        src = subprocess.run(
+            ["/bin/sh", "-c", 'set -a; . "$HOME/.stage-e/env"; set +a; '
+             'if [ -z "${GH_TOKEN:-}" ] && [ "$GITHUB_TOKEN" = "$WANT" ]; '
+             'then echo one-token; else echo two-tokens; fi'],
+            capture_output=True, text=True, timeout=30,
+            env={"HOME": homeX, "PATH": "/usr/bin:/bin", "WANT": STORED_TOKEN})
+        expect("gh-token-shadow", src.stdout.strip() == "one-token",
+               "(%r) after `run`, sourcing the file still sets GH_TOKEN or a different "
+               "GITHUB_TOKEN: %s" % (spelling, src.stdout.strip() or src.stderr[:120]))
+    # Not drift: an EMPTY GH_TOKEN line (`.` sets it empty; the transport skips
+    # an empty one), and a GITHUB_TOKEN line beside a configured GH_TOKEN.
+    cases += 1
+    for label, cfgN, seedN in (
+            ("an empty GH_TOKEN line", conf_gt,
+             "%s=%s\nGH_TOKEN=\nGITHUB_TOKEN=%s\n" % (LKEY, STORED_KEY, STORED_TOKEN)),
+            ("a GITHUB_TOKEN line beside GH_TOKEN", conf,
+             "%s=%s\nGITHUB_TOKEN=%s\nGH_TOKEN=%s\n"
+             % (LKEY, STORED_KEY, STALE_OTHER, STORED_TOKEN))):
+        homeN, _pathN = _role_home(seedN.encode("utf-8"))
+        ctxN, runN = _shell_ctx(homeN, cfg=cfgN)
+        ctxN.may_prompt = False
+        try:
+            (okN, detailN, _xN), _pN = _quiet(lambda: step_credentials(ctxN, apply_it=False))
+        except Exception as exc:
+            okN, detailN = None, "raised %s: %s" % (type(exc).__name__, exc)
+        expect("gh-token-shadow-not-drift", okN is True and not runN.writes,
+               "%s was called drift: %r" % (label, detailN))
+
+    # -- 17f-xi. an interrupted write leaves no copy of the file behind ------
+    # The temp file holds EVERYTHING: both credentials and the notifier's
+    # token. A signal the shell can catch (the tab closed, Ctrl-C, a TERM)
+    # removes it before the shell exits, and the env file is as it was. One it
+    # cannot catch (KILL) leaves it, so the next store sweeps this writer's
+    # own stale temps first, and nobody else's.
+    for sig in (_signal.SIGTERM, _signal.SIGHUP, _signal.SIGINT):
+        cases += 1
+        homeK, pathK = _role_home(SEED)
+        dirK = os.path.dirname(pathK)
+        procK = subprocess.Popen(
+            ["/bin/sh", "-c", write_sh], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True,
+            # Signals ignored when a non-interactive shell starts cannot be
+            # trapped, and a battery run under nohup or `&` would inherit that.
+            preexec_fn=lambda: [_signal.signal(s, _signal.SIG_DFL)
+                                for s in (_signal.SIGTERM, _signal.SIGHUP, _signal.SIGINT)],
+            env={"HOME": homeK, "PATH": "/usr/bin:/bin"})
+        deadline, seen_tmp = time.time() + 10, False
+        while not seen_tmp and time.time() < deadline and procK.poll() is None:
+            seen_tmp = any(n.startswith("env.stage-e-setup.") for n in os.listdir(dirK))
+            if not seen_tmp:
+                time.sleep(0.01)
+        if seen_tmp:
+            time.sleep(0.05)           # let the shell reach its wait on `cat`
+            os.killpg(procK.pid, sig)
+        try:
+            procK.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            procK.kill()
+            procK.communicate()
+        leftK = sorted(os.listdir(dirK))
+        with open(pathK, "rb") as fh:
+            keptK = fh.read() == SEED
+        # Exit 6, not 5: the trap is what cleaned up, and the step reads 6 as
+        # "interrupted", not as "not replaced".
+        expect("env-merge-interrupted", seen_tmp and procK.returncode == 6
+               and keptK and leftK == ["env", "state"],
+               "%s mid-write: temp seen %s, rc %s (want 6), env unchanged %s, home "
+               "holds %s" % (sig.name, seen_tmp, procK.returncode, keptK, leftK))
+    cases += 1
+    homeS, pathS = _role_home(SEED)
+    dirS = os.path.dirname(pathS)
+    for name in ("env.stage-e-setup.4242", "env.notifier-setup.4242"):
+        with open(os.path.join(dirS, name), "w") as fh:
+            fh.write("a copy a killed writer left\n")
+        os.chmod(os.path.join(dirS, name), 0o600)
+    swept = subprocess.run(["/bin/sh", "-c", write_sh], input=body, capture_output=True,
+                           text=True, timeout=30,
+                           env={"HOME": homeS, "PATH": "/usr/bin:/bin"})
+    leftS = sorted(os.listdir(dirS))
+    expect("env-merge-sweeps-stale-temp", swept.returncode == 0
+           and leftS == ["env", "env.notifier-setup.4242", "state"],
+           "a store beside a killed run's temp copy: rc %s, home holds %s (want the "
+           "stale Stage E copy gone and the notifier's left alone)"
+           % (swept.returncode, leftS))
+    # …and the step reads exit 6 as what it is. "Not replaced" would be a
+    # claim the script cannot make once the rename may have happened.
+    cases += 1
+    ctxI, fakeI = _settled_ctx(conf)
+    fakeI.answers = [("stat -f", 0, STORED_PROBE), ("n=" + LKEY, 0, STORED_KEY),
+                     ("n=" + GKEY, 0, STORED_TOKEN), ("env.stage-e-setup.", 6, "")]
+    _counted(ctxI)
+    ctxI.replaced.add(GKEY)
+    try:
+        _quiet(lambda: step_credentials(ctxI, apply_it=True))
+        failures.append("env-merge-interrupted-exit: an interrupted write was reported "
+                        "as a store")
+    except SetupError as exc:
+        expect("env-merge-interrupted-exit", "interrupted" in str(exc)
+               and "not replaced" not in str(exc),
+               "exit 6 was reported as %r" % str(exc)[:160])
 
     # -- 17. `status` names what is next and exits on the worst row ---------
     cases += 1
@@ -9785,7 +10733,8 @@ def _selftest_body():
     try:
         _mcfg = hbm.load_config(_mpath)
         expect("monitor-config-accepted",
-               set(_mcfg["watch"]) == set(hbm.WATCHERS) and _mcfg["notify_ticket_id"] == "KIT-7"
+               set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier"}
+               and _mcfg["notify_ticket_id"] == "KIT-7"
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
                                           "finding-poller": 300 + 900}
                and _mcfg["run_interval_seconds"] == 1800,
@@ -10175,6 +11124,251 @@ def _selftest_body():
         _x, outOffM = _quiet(lambda: _unloaded_notice(ctxOff))
         expect("unloaded-notice", "THE STAGE E DAEMONS ARE UNLOADED" not in outOffM
                and "bootstrap system" not in outOffM, outOffM)
+
+        # -- THE NOTIFIER, WATCHED (KIT-156) ----------------------------------------------
+        # NOTIFIER_JOB_LABEL empty: not watched, and said by name. Set: launchd is asked
+        # what it holds under that label and how often it runs it, the notifier's own
+        # config is read as the role account, and the monitor watches `notifier` with the
+        # run interval plus one pass. A notifier launchd does not hold is refused: its
+        # absent heartbeat would otherwise page for ever.
+        cases += 1
+        _nlabel = "com.example.notifier"
+        expect("notifier-watch-conf", CONF_DEFAULTS.get("NOTIFIER_JOB_LABEL") == ""
+               and "NOTIFIER_JOB_LABEL" in CONF_KEYS,
+               "NOTIFIER_JOB_LABEL must be a conf key whose default is empty (not watched)")
+        _nerrs = validate_conf(parse_conf(GOOD_CONF + "NOTIFIER_JOB_LABEL=nodots\n")[0])[1] \
+            + parse_conf(GOOD_CONF + "NOTIFIER_JOB_LABEL=nodots\n")[1]
+        expect("notifier-watch-conf", any("NOTIFIER_JOB_LABEL" in e and "reverse-DNS" in e
+                                          for e in _nerrs), "a malformed label read %s" % _nerrs)
+        _nprint = ("system/%s = {\n\tstate = not running\n\tprogram = /bin/sh\n\targuments = {\n"
+                   "\t\t/bin/sh\n\t\t-c\n\t\tset -a; . \"$HOME/.stage-e/env\"; set +a; exec "
+                   "/usr/bin/python3 \"$HOME/.stage-e/kit/scripts/pipeline_notify_local.py\" run "
+                   "--config \"$HOME/.stage-e/notifier.json\"\n\t}\n\trun interval = 300 seconds\n}\n"
+                   % _nlabel)
+        _nconf_doc = {"state_dir": "~/.stage-e/notifier-state", "run_timeout_seconds": 200,
+                      "linear_key_env": "STAGE_E_LINEAR_API_KEY", "team_keys": ["KIT"]}
+
+        def _watching(conf_x, interval, state_dir):
+            """The monitor config the step must want when it watches the notifier, spelled
+            out here rather than asked of `monitor_config`: what is pinned is the shape."""
+            want = dict(monitor_config(conf_x))
+            want["watch"] = list(want["watch"]) + ["notifier"]
+            want["intervals"] = dict(want["intervals"], notifier=interval)
+            want["notifier_state_dir"] = state_dir
+            return want
+
+        def _notifier_ctx(printed=(0, _nprint), nconf=_nconf_doc, have=None,
+                          plist_present=True, nconf_rc=0, **kw):
+            """`plist_present` answers whether the notifier's plist is installed — what tells
+            a PAUSED notifier (unloaded, still installed) from one that was never loaded.
+            `nconf` None is a notifier.json that is ABSENT (the read's exit 9); `nconf_rc`
+            any other exit is a read that failed, which is not the same fact."""
+            ctx_n, fake_n = _monitor_ctx(**kw)
+            ctx_n.conf = dict(ctx_n.conf, NOTIFIER_JOB_LABEL=_nlabel)
+            lead = [("launchctl print system/" + _nlabel, printed[0], printed[1]),
+                    ("test -f " + _dispatcher_plist(_nlabel), 0 if plist_present else 1, "")]
+            if nconf is None:
+                lead.append((".stage-e/" + NOTIFIER_CONFIG_FILE, 9, ""))
+            else:
+                lead.append((".stage-e/" + NOTIFIER_CONFIG_FILE, nconf_rc,
+                             json.dumps(nconf) if nconf_rc == 0 else ""))
+            if have is not None:
+                lead.append(("cat $HOME/.stage-e/" + MONITOR_CONFIG, 0, json.dumps(have)))
+            fake_n.answers = lead + fake_n.answers
+            return ctx_n, fake_n
+
+        # Unwatched: the settled row says so, by name.
+        okNU, detailNU, _x = step_heartbeat_monitor(_monitor_ctx()[0], apply_it=False)
+        expect("notifier-watch-off", okNU is True and "notifier" in detailNU
+               and "NOTIFIER_JOB_LABEL" in detailNU and "not watched" in detailNU,
+               "an unwatched notifier must be named as such: %r" % detailNU)
+
+        # Watched and settled: the monitor already watches it, with launchd's interval plus
+        # the notifier's own pass clock, and its own state dir. Nothing is written.
+        _conf_n = _monitor_conf("KIT-7")[0]
+        _want_n = _watching(_conf_n, 300 + 200, "~/.stage-e/notifier-state")
+        ctxNS, fakeNS = _notifier_ctx(have=_want_n)
+        okNS, detailNS, _x = step_heartbeat_monitor(ctxNS, apply_it=False)
+        expect("notifier-watch-settled", okNS is True and _nlabel in detailNS
+               and "500" in detailNS and not fakeNS.writes,
+               "a settled monitor that watches the notifier read %r, wrote %s"
+               % (detailNS, fakeNS.writes))
+        # …and the monitor's OWN loader takes that config, watching all four jobs.
+        _npath = os.path.join(_mdir, "monitor-notifier.json")
+        with open(_npath, "w", encoding="utf-8") as fh:
+            json.dump(dict(_want_n, state_dir=os.path.join(_mdir, "s"),
+                           finding_state_dir=os.path.join(_mdir, "f"),
+                           notifier_state_dir=os.path.join(_mdir, "n")), fh)
+        try:
+            _ncfg = hbm.load_config(_npath)
+            expect("notifier-watch-accepted", set(_ncfg["watch"]) == set(hbm.WATCHERS)
+                   and _ncfg["intervals"].get("notifier") == 500,
+                   "the monitor read back %s" % _ncfg)
+        except hbm.MonitorError as exc:
+            failures.append("notifier-watch-accepted: the monitor refused it: %s" % exc)
+
+        # The notifier's config names neither key: the notifier's OWN defaults apply, and
+        # the defaults assumed here are asserted against its loader.
+        import pipeline_notify_local as _pnl_m
+        _probe_dir = tempfile.mkdtemp(prefix="notifier-defaults.", dir=_mdir)
+        _pdefault_timeout = _pnl_m.load_config_from(dict(
+            [(k, v) for k, v in _pnl_m.EXAMPLE_CONFIG.items() if k != "run_timeout_seconds"],
+            state_dir=os.path.join(_probe_dir, "state")), _probe_dir)["run_timeout_seconds"]
+        ctxND, fakeND = _notifier_ctx(nconf={}, have=_watching(
+            _conf_n, 300 + _pdefault_timeout, _pnl_m.DEFAULT_STATE_DIR))
+        okND, detailND, _x = step_heartbeat_monitor(ctxND, apply_it=False)
+        expect("notifier-watch-defaults",
+               okND is True and "300 + %d" % _pdefault_timeout in detailND and not fakeND.writes,
+               "a notifier config naming neither key read %r (the notifier's defaults: %s s, %s)"
+               % (detailND, _pdefault_timeout, _pnl_m.DEFAULT_STATE_DIR))
+
+        # A run writes exactly that config.
+        ctxNA, fakeNA = _notifier_ctx(config=False, plist=False, loaded=False, beat_age=-5)
+        fakeNA.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                          (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
+                          ("install -o root", 0, ""), (_rearm_cmd, 0, ""),
+                          ("launchctl bootstrap system", 0, "")] + fakeNA.answers
+        ctxNA.unloaded = [mlabel]
+        _quiet(lambda: step_heartbeat_monitor(ctxNA, apply_it=True))
+        _bodyNA = [w["stdin"] for w in fakeNA.writes if "write " in w["why"]]
+        expect("notifier-watch-install", _bodyNA and json.loads(_bodyNA[0]) == _want_n,
+               "the monitor config written was %s" % (_bodyNA[:1],))
+
+        # Refusals: launchd does not hold it and nothing is installed under that label; it
+        # holds something that is not the notifier; it gives no interval to judge by; it runs
+        # the notifier on another config than the one read here; the notifier's config is
+        # absent. Each is said by name and writes nothing. A config that is THERE and could
+        # not be read is not "missing": that is NOT MEASURED.
+        _v2print = _nprint.replace("$HOME/.stage-e/notifier.json", "$HOME/.stage-e/notifier-v2.json")
+        for name, kw, exc_type, needles in (
+                ("not loaded, and no plist", {"printed": (113, "Could not find service"),
+                                              "plist_present": False}, SetupError,
+                 (_nlabel, "NOTIFIER_JOB_LABEL", "does not hold", "no plist")),
+                ("another job", {"printed": (0, _nprint.replace("pipeline_notify_local.py",
+                                                                "pipeline_review_poller.py"))},
+                 SetupError, (_nlabel, "pipeline_notify_local.py")),
+                ("no interval", {"printed": (0, _nprint.replace("\trun interval = 300 seconds\n",
+                                                                ""))},
+                 Unknown, (_nlabel, "interval")),
+                ("another config than the one read here", {"printed": (0, _v2print)}, SetupError,
+                 (_nlabel, "notifier-v2.json", "~/.stage-e/notifier.json")),
+                ("no config", {"nconf": None}, SetupError, ("notifier.json", "missing")),
+                ("a config that could not be read", {"nconf_rc": 1}, Unknown,
+                 ("notifier.json", "could not read", "exit 1")),
+                ("a pass clock the notifier would refuse",
+                 {"nconf": dict(_nconf_doc, run_timeout_seconds="240")}, SetupError,
+                 ("run_timeout_seconds", "'240'")),
+                ("a state dir the notifier would refuse",
+                 {"nconf": dict(_nconf_doc, state_dir=7)}, SetupError, ("state_dir",))):
+            ctxNR, fakeNR = _notifier_ctx(config=False, plist=False, loaded=False,
+                                          beat_age=None, **kw)
+            try:
+                step_heartbeat_monitor(ctxNR, apply_it=True)
+                failures.append("notifier-watch-refused (%s): the step went on" % name)
+            except exc_type as exc:
+                expect("notifier-watch-refused", all(n in str(exc) for n in needles)
+                       and "itself would refuse" not in str(exc)
+                       and not fakeNR.writes,
+                       "%s: %s; writes %s" % (name, exc, [w["why"] for w in fakeNR.writes]))
+            except (SetupError, Unknown, Blocked) as exc:
+                failures.append("notifier-watch-refused (%s): %s, not %s: %s"
+                                % (name, type(exc).__name__, exc_type.__name__, exc))
+        # The spellings of the one config that IS read here are all accepted: `$HOME/…` (what
+        # the notifier installer writes), `~/…`, and the role account's home spelled out.
+        for spelled in ('"~/.stage-e/notifier.json"',
+                        '"/Users/<role-account>/.stage-e/notifier.json"'):
+            ctxNS2, fakeNS2 = _notifier_ctx(
+                printed=(0, _nprint.replace('"$HOME/.stage-e/notifier.json"', spelled)),
+                have=_want_n)
+            try:
+                okNS2, detailNS2, _x = step_heartbeat_monitor(ctxNS2, apply_it=False)
+                expect("notifier-watch-config-spellings", okNS2 is True and "500" in detailNS2,
+                       "%s read %r" % (spelled, detailNS2))
+            except (SetupError, Unknown, Blocked) as exc:
+                failures.append("notifier-watch-config-spellings: %s refused: %s" % (spelled, exc))
+
+        cases += 1
+        # PAUSED (the KIT-178 review round, 2026-09-24): launchd does not hold the label, and
+        # its plist is still installed — the notifier's own documented pause, `bootout`. It is
+        # not watched on this pass, the row says so by name, and the step does NOT fail: the
+        # monitor is written without it and loaded for the other three, even after `code`
+        # stopped it.
+        ctxNP, fakeNP = _notifier_ctx(printed=(113, "Could not find service"), config=False,
+                                      plist=False, loaded=False, beat_age=-5)
+        fakeNP.answers = [("cat > $HOME/.stage-e/" + MONITOR_CONFIG, 0, ""),
+                          (MONITOR_SCRIPT + " check --config", 0, ""), ("plutil -lint", 0, ""),
+                          ("install -o root", 0, ""), (_rearm_cmd, 0, ""),
+                          ("launchctl bootstrap system", 0, "")] + fakeNP.answers
+        ctxNP.unloaded = [mlabel]
+        try:
+            (okNP, detailNP, _x), _o = _quiet(lambda: step_heartbeat_monitor(ctxNP, apply_it=True))
+            _bodyNP = [w["stdin"] for w in fakeNP.writes if "write " in w["why"]]
+            # The row prints cut at 96 characters, so the clause must also come back as a
+            # note, which `_print_rows` prints whole.
+            expect("notifier-watch-paused-note-prints-whole",
+                   any("notifier paused: not watched; load it, then run this again" in n
+                       and "its plist is installed" in n for n in (_x or [])),
+                   "the paused clause was not returned as a note: %r" % (_x,))
+            expect("notifier-watch-paused",
+                   "notifier paused: not watched; load it, then run this again" in detailNP
+                   and _bodyNP and json.loads(_bodyNP[0]) == monitor_config(_conf_n)
+                   and any("launchctl bootstrap system" in _fmt(w["argv"]) for w in fakeNP.writes)
+                   and mlabel not in ctxNP.unloaded,
+                   "a paused notifier read %r, wrote %s, left unloaded %s"
+                   % (detailNP, _bodyNP[:1], ctxNP.unloaded))
+        except (SetupError, Unknown, Blocked) as exc:
+            failures.append("notifier-watch-paused: a paused notifier failed the step and left "
+                            "the monitor %s: %s" % ("unloaded" if mlabel in ctxNP.unloaded
+                                                     else "as it was", exc))
+        # …and `verify` over a settled monitor that already leaves it out holds, saying so;
+        # over one still watching it, it names the change and fails nothing.
+        for name, have, want_ok in (("already unwatched", monitor_config(_conf_n), True),
+                                    ("still watched", _want_n, False)):
+            ctxNV, fakeNV = _notifier_ctx(printed=(113, "Could not find service"), have=have)
+            try:
+                okNV, detailNV, _x = step_heartbeat_monitor(ctxNV, apply_it=False)
+                expect("notifier-watch-paused-verify",
+                       okNV is want_ok and "notifier paused: not watched" in detailNV
+                       and any("notifier paused: not watched" in n for n in (_x or []))
+                       and not fakeNV.writes, "%s: %r %r" % (name, detailNV, _x))
+            except (SetupError, Unknown, Blocked) as exc:
+                failures.append("notifier-watch-paused-verify (%s): %s" % (name, exc))
+
+        cases += 1
+        # `code` MEASURES THE NOTIFIER BEFORE IT STOPS ANYTHING, when the monitor it would stop
+        # is going to watch it. A refusal then stops the run with every job still loaded, not
+        # after the monitor was stopped with nothing left to load it again.
+        def _code_ctx(**kw):
+            ctx_c, fake_c = _notifier_ctx(**kw)
+            fake_c.answers = [("ls $HOME/.stage-e/kit/scripts", 0, "\n"),
+                              ("rev-parse --short HEAD", 1, ""),
+                              ("git clone --quiet", 0, "")] + fake_c.answers
+            return ctx_c, fake_c
+        ctxKC, fakeKC = _code_ctx(printed=(113, "Could not find service"), plist_present=False)
+        try:
+            _quiet(lambda: step_code(ctxKC, apply_it=True))
+            failures.append("notifier-watch-before-code: code went on past a refused notifier")
+        except SetupError as exc:
+            expect("notifier-watch-before-code",
+                   _nlabel in str(exc) and not any("bootout" in _fmt(w["argv"])
+                                                   for w in fakeKC.writes)
+                   and ctxKC.unloaded == [],
+                   "%s; writes %s; unloaded %s" % (exc, [_fmt(w["argv"]) for w in fakeKC.writes],
+                                                   ctxKC.unloaded))
+        except (Blocked, Unknown) as exc:
+            failures.append("notifier-watch-before-code: %s, not a refusal before any "
+                            "unload: %s; unloaded %s" % (type(exc).__name__, exc, ctxKC.unloaded))
+        # …and a PAUSED notifier is no reason to stop: `code` goes on and stops the monitor.
+        ctxKP, fakeKP = _code_ctx(printed=(113, "Could not find service"))
+        try:
+            _quiet(lambda: step_code(ctxKP, apply_it=True))
+        except Blocked:
+            pass
+        except (SetupError, Unknown) as exc:
+            failures.append("notifier-watch-before-code: a paused notifier stopped `code`: %s"
+                            % exc)
+        expect("notifier-watch-before-code", mlabel in ctxKP.unloaded,
+               "a paused notifier: code recorded %s" % ctxKP.unloaded)
     finally:
         globals()["_pause"] = _saved_pause_m
     order = [s for s, _t, _f in STEPS]

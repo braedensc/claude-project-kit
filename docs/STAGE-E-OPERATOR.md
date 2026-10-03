@@ -177,12 +177,31 @@ role account's own env file at mode 600, and from then on **read back out of tha
 so a second `run`, a `run --dry-run` and `verify` ask you for nothing at all. Nothing prints
 a value; what you see back is the name, the length and the class.
 
+**The installer changes only its own lines of that file.** Other things live there too:
+the notifier keeps its token in it, and you may keep a comment or a name of your own. A store
+or a replacement drops the old lines for the two names it owns, in any spelling the shell
+reads: plain, indented, or after `export`. It adds both new lines at the end. A comment you
+kept above one of them stays behind, where it was. It also drops a line under the GitHub
+token's other name (`GH_TOKEN` or `GITHUB_TOKEN`), so the file holds one GitHub token. Every
+other line stays as it was, in order, and the file stays at mode 600.
+
+The new file replaces the old one in a single step, so a daemon starting mid-write reads one
+or the other, never half. If the installer cannot read the file, it stops and changes
+nothing. A file owned by any account but the role account is refused, not replaced. The
+credentials step refuses it before it sends the stored GitHub token anywhere or asks you for
+anything. If a write is interrupted (Ctrl-C, a closed terminal), its temporary copy is
+removed. A copy left by a hard kill, `~/.stage-e/env.stage-e-setup.<number>`, holds every
+value in the file; the next store removes it. (KIT-171: before this fix it rewrote the whole
+file, and the notifier's token went with it.)
+
 The exception is real and worth knowing before it happens: **if the tracker refuses a key
 that was read out of that file**, that is a *rejected* key, not a missing one — the file is
-there and its contents are not accepted — and `run` asks you for a replacement and writes it
-back over the old one. Revoke a key, let one expire, or point the installer at another
-workspace and you will type that one secret a second time. `verify` and `run --dry-run`
-never ask; they report the rejection and name `run` as the command that can fix it.
+there and its contents are not accepted — and `run` asks you for a replacement and stores it
+the way it stores any value: the old line goes, both of the installer's lines move to the end
+of the file, and every other line stays as it was. Revoke a key, let one expire, or point
+the installer at another workspace and you will type that one secret a second time.
+`verify` and `run --dry-run` never ask; they report the rejection and name `run` as the
+command that can fix it.
 
 **Both credentials are asked about, not just counted.** The installer probes the env file
 for *names and lengths*, which cannot tell a live credential from a dead one. So the tracker
@@ -458,7 +477,7 @@ poller would.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats and one tracker key. Posts one comment per incident on one ticket, and nothing else. Not a session. |
+| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
@@ -1051,6 +1070,14 @@ EOF
 chmod 600 ~/.stage-e/env
 ```
 
+**This recipe is for a first setup only.** `cat >` overwrites the whole file. If the file
+already holds anything, such as the notifier's token, edit it instead, or let `run` store the
+two values: it keeps every other line.
+
+The recipe names the GitHub line `GH_TOKEN`, the default. If your conf sets
+`GITHUB_TOKEN_ENV=GITHUB_TOKEN`, name the line `GITHUB_TOKEN` and write no `GH_TOKEN` line.
+`gh` and the comment transport read `GH_TOKEN` first, so that line would be the token in use.
+
 The Linear key must be a **personal key on the owner's account**. A delegation made with
 an app token arrives with no creator and the dispatcher blocks it, so only the owner's
 identity can start a reviewer. That is why this key exists at all, and why the three rules
@@ -1109,7 +1136,8 @@ That is the whole procedure. **Do not restart the daemons.** Each pass re-reads 
 when it starts, so the next scheduled pass picks up the new value on its own; a restart buys
 nothing and stops whatever was mid-flight. The alternative is `python3
 scripts/pipeline_stage_e_setup.py run`, which asks for a replacement at a hidden prompt and
-writes the file for you — take that one if you would rather not edit a credential file by
+writes the file for you. It replaces only its own lines and keeps every other line, the
+notifier's token included. Take that one if you would rather not edit a credential file by
 hand.
 
 The scripts read the values from the environment variables their config **names**.
@@ -1119,7 +1147,9 @@ The scripts read the values from the environment variables their config **names*
 `GH_TOKEN`.** The shared comment transport `scripts/gh_fallback.py` reads `GH_TOKEN` and
 `GITHUB_TOKEN` and nothing else. The poller mirrors a renamed variable into `GH_TOKEN` for
 its own process; the bounce driver does not, so every comment the driver posts fails with
-*no GitHub token*.
+*no GitHub token*. If you choose `GITHUB_TOKEN`, a `GH_TOKEN` line left in the env file wins:
+`gh` and the transport both read it first. `verify` reports such a line as outstanding work,
+and `run` removes it.
 
 ### 3c. Three config files, not one
 
@@ -1472,20 +1502,24 @@ Input/output error` and leaves you with nothing loaded. Poll
   (`run_timeout_seconds`, or `--timeout`); the poller exits 4 when it is cut off, the
   driver exits 2 and calls the pass partial.
 
-**Monitor the heartbeats, not the log — there are three.**
+**Monitor the heartbeats, not the log — there are three, and a fourth once the notifier is
+installed** (`state/notifier-heartbeat.json`, `docs/NOTIFIER-OPERATOR.md`).
 `state/heartbeat.json`, `state/bounce-heartbeat.json` and `finding/heartbeat.json` carry a
 timestamp and a result on every terminal path, including a failed one. A stale heartbeat
 means *not running*. A fresh one with a result outside that job's good list means *ran and
 could not do it* — the good lists differ per job, and `docs/HEARTBEAT-MONITOR.md` has them:
 the review poller's `declined`, and the bounce driver's `idle`, `declined` and `paused`,
-are healthy.
-**Count them**: two fresh heartbeats out of three is one whole daemon that is not running,
-and nothing else on the machine will say so. They live under the **role account's** home,
-not yours, so reading them takes `sudo -u`:
+are healthy. The notifier's file is shaped differently: `at` and an integer `exit`, and only
+exit `0` is good.
+**Count them** against the jobs you run — three, or four with the notifier: one fresh
+heartbeat fewer than that is one whole daemon that is not running, and nothing else on the
+machine will say so. They live under the **role account's** home, not yours, so reading
+them takes `sudo -u`:
 
 > **Something can read them for you.** `scripts/pipeline_heartbeat_monitor.py` is a fourth
-> one-shot job, run by the same role account on a longer interval, that judges all three
-> heartbeats and posts **one** comment on a ticket when the verdict changes — once per
+> one-shot job, run by the same role account on a longer interval, that judges the three
+> daemons' heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it — and posts
+> **one** comment on a ticket when the verdict changes — once per
 > incident, not once per pass, and one more when it clears. Under the installer it is off
 > only by name (`HEARTBEAT_MONITOR_TICKET=off`); left empty, `run` stops at card `CK-9`. Run
 > by hand with no ticket configured, a problem it cannot report is exit 3 rather than a clean
@@ -1493,9 +1527,21 @@ not yours, so reading them takes `sudo -u`:
 > cannot report the machine asleep or off, or its own death (KIT-45). **The installer
 > installs it** at its `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
 > `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the install steps.
+>
+> **It watches up to four jobs, and its comments reach your chat channel** (KIT-156). Each
+> comment carries a mark on its first line that the human-action notifier pings on, once,
+> with no label (`docs/NOTIFIER-OPERATOR.md`, *The daemon-health page*). Set
+> `NOTIFIER_JOB_LABEL` in `stage-e.conf` to the notifier's `JOB_LABEL` and the monitor
+> watches the notifier's heartbeat too, at the interval launchd holds for it plus one pass.
+> A notifier you paused (unloaded, its plist still installed) is left unwatched on that run,
+> and a note under the steps table says so; the step does not fail. A label with no job and no plist behind it is
+> refused, and the `code` step asks before it stops anything, so a refusal leaves every job
+> loaded. Left empty, the note says the notifier is not watched. A stopped notifier still
+> pings nobody: the comment lands and says so.
 
 ```sh
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
+sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/notifier-heartbeat.json'   # once the notifier is installed, at its default STATE_DIR
 ```
 
 The `-H` is load-bearing — it is what makes `~` the role account's home rather than yours.
