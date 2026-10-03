@@ -115,3 +115,17 @@ CHAT_API_BASE=https://slack.com/api
 #   no notifier path may sit under DISPATCHER_STATE_ROOT.
 DISPATCHER_ENV_FILE=
 DISPATCHER_STATE_ROOT=
+
+# Who may author the heartbeat monitor's two daemon-health marks: the page a
+# stopped Stage E daemon sends through this notifier (docs/HEARTBEAT-MONITOR.md).
+# `self`, a comma list of tracker actor ids, or `off`, which stands alone.
+#   self  the user the tracker key belongs to.  That is the monitor's author
+#         when the monitor comments with the same key; the handover checks it.
+#   off   no author at all: the notifier pages on those marks from nobody, and
+#         says `daemon-health marks: OFF` on every pass.  Those marks are not
+#         dropped: switched on later, every one still among the newest comments
+#         the notifier reads pings then, oldest first.
+# The marks carry no label.  Anything holding that key can write one.
+# A change here takes a `run` with the tracker key in your shell: `verify`
+# never asks for the key, so it cannot resolve these ids.
+MONITOR_ACTOR_IDS=self
