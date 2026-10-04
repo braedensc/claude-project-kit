@@ -199,9 +199,15 @@ What it does, in order:
    - **The probe.** After a yes, it files two test tickets per repository, as you, and hands
      them to the agent. It reads where the dispatcher sent them. It reads the tool list the
      session was given from the dispatcher's own session log, and a helper's from the
-     session's answer. Then it asks you **one** question: is the team's agent guidance
+     session's answer. A tool outside the keep-set in any list it read stops the probe,
+     without asking. Then it asks you **one** question: is the team's agent guidance
      empty, or silent about planning and building? The API cannot read it. It records the
      sign-off and closes the tickets.
+
+     Two more questions come only when a list was not measured. If a list came back but
+     could not be read, it asks about that list alone. If no helper list came back, it
+     says the helper was not measured and asks whether to sign anyway. The record says
+     which lists were read, and how. A session list nothing measured is never signed.
    - **The job, started.** After a yes, it enables the job in launchd, starts it, and reads
      its first heartbeat. Enabled, it starts again after a reboot.
    - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py
@@ -216,7 +222,7 @@ What is still yours, at most:
 | First run, if the key is not stored yet | Paste your Linear key at a hidden prompt. |
 | Each planned repository | Merge the pull request it opened (and add the guard-change label if the checks ask). |
 | Before each change | Type `y`, or `yes` where it asks for the word. |
-| The probe | Answer the agent-guidance question. |
+| The probe | Answer the agent-guidance question, and any question about a tool list it could not measure. |
 | At the end | Plan two test ideas and one real idea, then sign `CA-LANE` (the card lists them). |
 
 Each checkpoint card (`card <id>`) is what you see only when you answered no, or ran the
@@ -271,8 +277,10 @@ wall clock.
   asks a person to check it, and nothing re-checks it later.
 - **The tracker's limit on a session's final message is unmeasured.** A twenty-child plan
   measures about 50,000 characters. An overlong one arrives as "no plan", never a partial one.
-- **A helper session inherits the fence, per the runner's source.** The probe is where a
-  person sees the helper's own tool list.
+- **A helper session inherits the fence, per the runner's source.** It is not measured
+  yet. The probe's questions sit in the ticket's text, and a planning session that follows
+  its brief refuses them, so it starts no helper (KIT-208). The probe's record then says
+  the helper was not measured.
 - **The duplicate check compares titles, not intent.**
 - **Nothing watches the job's heartbeat automatically.** The heartbeat monitor does not know
   this job yet (KIT-192); `verify` is what reads it.
