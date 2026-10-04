@@ -219,6 +219,10 @@ from pipeline_stage_e_setup import (  # noqa: E402
 # The one definition of a planning entry's name, a planning ticket, and a routing note:
 # the job, this installer and the Stage E jobs all read it.
 import pipeline_machine_tickets as machine  # noqa: E402
+# The kit's vendored schema validator, the one every repository instantiated from the kit
+# runs in its own CI: a planned repository's copy of the delivery schema is checked with
+# it before a pull request is opened against that copy (KIT-205).
+import jsonschema_mini as jsm  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Exit codes
@@ -1188,6 +1192,21 @@ CARDS = {
                "If a repository has no delivery.json at all, set it up for the pipeline",
                "first; that is not something this installer can do."],
         "good": "the next run reads the merged file and marks this step ALREADY-DONE",
+    },
+    "CA-SCHEMA": {
+        "title": "Bring a planned repository's own delivery schema up to the kit's",
+        "measured": True,
+        "why": ("A planned repository checks its delivery.json against its OWN copy of the "
+                "delivery schema, in its CI. A copy from an older kit does not know the "
+                "fields that switch plans on, so the pull request would fail that check and "
+                "could never be merged. So nothing is opened until the copy accepts it."),
+        "do": ["In that repository, bring `schemas/delivery.schema.json` and the section 1",
+               "rows of `docs/PIPELINE-CONTRACT.md` up to the kit's: `/sync-kit` there does it.",
+               "Or copy only the fields named above from the kit's two files: its CI checks",
+               "that they agree. Merge that, then run the one command again. Or put the",
+               "delivery.json change on that same pull request yourself."],
+        "good": ("the next run finds the repository's own schema accepts the change, and "
+                 "opens the pull request"),
     },
     "CA-ENTRY": {
         "title": "Say yes to the planning setup in the dispatcher's settings",
@@ -2287,6 +2306,21 @@ class GitHubReader(object):
             out.append((None, "could not list %s's .claude/agents (%s)" % (repo, raw)))
         return out
 
+    def repo_file(self, repo, path, branch):
+        """(text, None) for one file on `branch`, (None, "absent") when the repository has
+        none there, or (None, why) when it could not be read."""
+        import base64
+        code, out = self._gh(["repos/%s/contents/%s?ref=%s" % (repo, path, branch),
+                              "--jq", ".content"])
+        if code == 404:
+            return None, "absent"
+        if code != 0:
+            return None, out
+        try:
+            return base64.b64decode(out.strip()).decode("utf-8"), None
+        except (ValueError, TypeError) as exc:
+            return None, "%s on %s could not be decoded (%s)" % (path, branch, exc)
+
     def delivery_config(self, repo):
         """(doc, branch, None) / (None, branch, "absent") / (None, None, reason)."""
         import base64
@@ -2369,6 +2403,51 @@ def merged_delivery(doc, patch):
         if not ids.get(name):
             ids[name] = value
     return new
+
+
+# Where a repository instantiated from the kit keeps ITS OWN copy of the delivery schema,
+# which its CI validates delivery.json against (scripts/check_schemas.py). Nothing syncs
+# that copy with the kit's, so an older copy can reject a field the kit added since.
+REPO_DELIVERY_SCHEMA = "schemas/delivery.schema.json"
+
+
+def repo_schema_rejections(ctx, repo, branch, proposed):
+    """[problem] for each way the planned repository's OWN delivery schema, on its default
+    branch, rejects `proposed`; [] when that copy accepts it, or when the repository keeps
+    no copy at all (KIT-205).
+
+    Live, the installer opened a pull request adding `linear.findingTicket`, and the
+    repository's CI failed it: its copy of the schema predated the field. The kit's schema
+    had accepted it, and the kit's is not the copy the repository's CI reads. So the copy
+    is read and the proposal checked against it, with the same vendored validator, before
+    anything is opened. A copy that could not be read, or that this validator cannot check,
+    raises Unknown: could not look is not clean (§13)."""
+    text, why = ctx.github.repo_file(repo, REPO_DELIVERY_SCHEMA, branch)
+    if why == "absent":
+        return []
+    remedy = "check `gh auth status`, then run the same command again"
+    if text is None:
+        raise Unknown("could not read %s's own %s on %s (%s), so whether its CI would accept "
+                      "the change is not known" % (repo, REPO_DELIVERY_SCHEMA, branch, why),
+                      remedy)
+    try:
+        schema = json.loads(text)
+    except ValueError as exc:
+        raise Unknown("%s's own %s on %s is not JSON (%s), so whether its CI would accept the "
+                      "change is not known" % (repo, REPO_DELIVERY_SCHEMA, branch, exc), remedy)
+    unreadable = jsm.check_schema(schema) if isinstance(schema, dict) else ["not an object"]
+    if not unreadable:
+        try:
+            errors = jsm.validate(proposed, schema)
+        except jsm.SchemaError as exc:
+            unreadable = [str(exc)]
+    if unreadable:
+        raise Unknown("%s's own %s on %s could not be checked (%s), so whether its CI would "
+                      "accept the change is not known" % (repo, REPO_DELIVERY_SCHEMA, branch,
+                                                          unreadable[0]),
+                      "bring that repository's schema up to the kit's (`/sync-kit` there), then "
+                      "run the same command again")
+    return ["%s %s [%s]" % (e["path"] or "<root>", e["message"], e["keyword"]) for e in errors]
 
 
 _IDS_OPEN_RE = re.compile(r'^(\s*)"ids"\s*:\s*\{\s*$')
@@ -2714,6 +2793,36 @@ def step_delivery_config(ctx, apply_it):
         for gap in gaps:
             ctx.say("  - " + gap)
     unresolved = UNRESOLVED_LABEL_ID in json.dumps(patch)
+    if not unresolved:
+        # THE REPOSITORY'S OWN SCHEMA, for every repository, before any pull request is
+        # offered (KIT-205). The document checked is the one the pull request would commit:
+        # `patch_delivery_text` writes exactly `merged_delivery` of the file it reads.
+        rejected = {}
+        for repo, (branch, _gaps) in sorted(all_gaps.items()):
+            doc, _b, _why = ctx.delivery_doc(repo)
+            problems = repo_schema_rejections(ctx, repo, branch,
+                                              merged_delivery(doc, patch))
+            if problems:
+                rejected[repo] = (branch, problems)
+        for repo, (branch, problems) in sorted(rejected.items()):
+            ctx.say("")
+            ctx.say("----- %s's own delivery schema would reject the change -----" % repo)
+            for line in _wrap("Its CI checks delivery.json against its own %s on %s, and "
+                              "that copy rejects what this installer would propose:"
+                              % (REPO_DELIVERY_SCHEMA, branch)):
+                ctx.say("  " + line)
+            for problem in problems:
+                ctx.say("    - " + problem)
+            unknown = sorted(set(p.split(" ", 1)[0] for p in problems
+                                 if p.endswith("[additionalProperties]")))
+            if unknown:
+                ctx.say("  Fields that copy does not know: %s" % ", ".join(unknown))
+            ctx.say("  Nothing was opened.")
+        if rejected:
+            ctx.state.data["notes"]["delivery_schema_rejects"] = dict(
+                (repo, problems) for repo, (_b, problems) in rejected.items())
+            raise Blocked("CA-SCHEMA")
+        ctx.state.data["notes"].pop("delivery_schema_rejects", None)
     if unresolved or not apply_it or ctx.github_writer is None:
         ctx.say("")
         ctx.say("A real run shows the exact change and opens the pull request for you. By")
@@ -4811,12 +4920,23 @@ READY_DELIVERY = {
 
 class FakeGitHub(object):
     def __init__(self, doc=READY_DELIVERY, why=None, private=False, visibility_why=None,
-                 mcp_servers=(), docs=None):
+                 mcp_servers=(), docs=None, files=None, file_whys=None):
         self.doc, self.why = doc, why
         self.docs = dict(docs or {})      # repo -> doc, over `doc`
         self.private, self.visibility_why = private, visibility_why
         self.mcp = list(mcp_servers)      # [(server, None)] / [(None, why)]
         self.reads = []
+        self.files = dict(files or {})    # path -> text on the default branch
+        self.file_whys = dict(file_whys or {})   # path -> why it could not be read
+        self.file_reads = []
+
+    def repo_file(self, repo, path, branch):
+        self.file_reads.append((repo, path, branch))
+        if path in self.file_whys:
+            return None, self.file_whys[path]
+        if path in self.files:
+            return self.files[path], None
+        return None, "absent"
 
     def repo_mcp_servers(self, repo):
         return list(self.mcp)
@@ -5118,6 +5238,72 @@ def _selftest_one_command(check, tmp):
     outcome(again)
     check("pr-after-a-closed-one-uses-a-fresh-branch",
           [h for _r, _b, h, _t, _s in again.github_writer.opened], [DELIVERY_BRANCH + "-2"])
+
+    # C2. KIT-205. THE REPOSITORY'S OWN SCHEMA, before anything is opened. Live, a planned
+    #     repository's older copy of the schema had no `findingTicket`, and its CI failed
+    #     the pull request the installer opened.
+    check("delivery-schema-copy-read-on-the-default-branch",
+          ("example-org/product", REPO_DELIVERY_SCHEMA, "main") in good.github.file_reads, True)
+    kit_root = os.path.dirname(HERE)
+    with open(os.path.join(kit_root, REPO_DELIVERY_SCHEMA), encoding="utf-8") as fh:
+        kit_schema = json.load(fh)
+    old_schema = json.loads(json.dumps(kit_schema))
+    del old_schema["properties"]["linear"]["properties"]["findingTicket"]
+    with open(os.path.join(kit_root, "delivery.example.json"), encoding="utf-8") as fh:
+        planned = json.load(fh)
+    planned["linear"]["teamKey"] = "PROD"
+    del planned["linear"]["findingTicket"]
+
+    def schema_ctx(name, text=None, why=None, states=("OPEN",)):
+        gh = FakeGitHub(doc=planned,
+                        files={REPO_DELIVERY_SCHEMA: text} if text is not None else None,
+                        file_whys={REPO_DELIVERY_SCHEMA: why} if why else None)
+        c = _ctx(os.path.join(tmp, name), tracker=_ready_tracker(), github=gh)
+        c._out = []
+        step_tracker(c, True)
+        c.github_writer = Writer(list(states), gh, merged_doc=None)
+        c.merge_wait_seconds = 0
+        _scripted(c, ("y",))
+        return c
+
+    probe_c = schema_ctx("schema-fixture")
+    proposal = merged_delivery(planned, delivery_patch(probe_c))
+    check("delivery-schema-fixture-is-valid-for-the-kit",
+          (repo_schema_rejections(probe_c, "x/y", "main", proposal),
+           [e["path"] for e in jsm.validate(proposal, kit_schema)]), ([], []))
+    so = schema_ctx("schema-old", text=json.dumps(old_schema))
+    check("delivery-old-repo-schema-stops-before-any-pull-request",
+          (outcome(so), so.github_writer.opened,
+           any("Fields that copy does not know: linear.findingTicket" in ln for ln in so._out),
+           so.state.data["notes"].get("delivery_schema_rejects")),
+          (("blocked", "CA-SCHEMA"), [], True,
+           {"example-org/product": ["linear.findingTicket is not a defined property here "
+                                    "[additionalProperties]"]}))
+    sd = schema_ctx("schema-old-dry", text=json.dumps(old_schema))
+    sd.runner.apply_it = False
+    try:
+        step_delivery_config(sd, False)
+        got = "passed"
+    except Blocked as exc:
+        got = str(exc)
+    check("delivery-old-repo-schema-is-measured-in-a-dry-run-too", got, "CA-SCHEMA")
+    for name, kw in (("schema-unreadable", {"why": "gh api failed: HTTP 502"}),
+                     ("schema-not-json", {"text": "{not json"}),
+                     ("schema-unknown-keyword", {"text": json.dumps(
+                         dict(kit_schema, **{"if": {"type": "object"}}))})):
+        su = schema_ctx(name, **kw)
+        try:
+            step_delivery_config(su, True)
+            got = "passed"
+        except Unknown as exc:
+            got = "unknown:" + exc.what.split(" (", 1)[0][:40]
+        except (Blocked, SetupError) as exc:
+            got = "other:" + str(exc)[:40]
+        check("delivery-repo-schema-that-cannot-be-checked-is-could-not-look:%s" % name,
+              (got.startswith("unknown:"), su.github_writer.opened), (True, []))
+    sk = schema_ctx("schema-current", text=json.dumps(kit_schema))
+    check("delivery-current-repo-schema-lets-the-pull-request-open",
+          (outcome(sk), len(sk.github_writer.opened)), (("blocked", "CA-DELIVERY"), 1))
 
     # D. THE DISPATCHER'S SETTINGS: a typed yes, a real backup, one reconcile, a restart
     #    only when the file changed — and nothing at all without the yes.
