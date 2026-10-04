@@ -196,6 +196,9 @@ What it does, in order:
    - **The dispatcher's settings.** It composes one planning entry per repository and
      shows the change as a diff. It warns you which sessions a restart would cut off. After
      you type `yes`, it backs up the file, writes the entries, and restarts the dispatcher.
+     Then it waits up to a minute for the dispatcher to **answer**, not just to be running.
+     If it never answers, the step stops there and prints `sudo launchctl print
+     system/<label>` to look first.
    - **The probe.** After a yes, it files two test tickets per repository, as you, and hands
      them to the agent. It reads where the dispatcher sent them. It reads the tool list the
      session was given from the dispatcher's own session log, and a helper's from the
@@ -233,6 +236,11 @@ missing and puts them back.
 **If you stop it with Ctrl-C,** the installer finishes what it was undoing first: the drill
 puts the planning setup back, and an interrupted restart prints the command that starts the
 dispatcher. The next run checks that the dispatcher is running before it does anything else.
+
+**If it says the dispatcher is not answering,** it has already asked launchd. When launchd
+holds the dispatcher, it is still starting: wait a minute and run the one command again.
+Do not `bootstrap` it then; a loaded job answers `Bootstrap failed: 5: Input/output error`.
+Only when launchd does not hold it does the installer print the `bootstrap` command.
 
 **Stage E's own cards do not hold up the idea gate.** When the review installer's check finds
 nothing left but a card for a person, and its jobs already run the current code, the one

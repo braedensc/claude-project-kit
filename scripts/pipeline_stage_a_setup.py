@@ -2905,7 +2905,7 @@ def check_pending_restart(ctx):
             "dispatcher is held by launchd but does not answer at %s"
             % (pending.get("at"), version_url(ctx.conf)),
             dispatcher_recovery(ctx.conf["DISPATCHER_SERVICE"], "/Library/LaunchDaemons/%s.plist"
-                                % ctx.conf["DISPATCHER_SERVICE"]) + "then run this again")
+                                % ctx.conf["DISPATCHER_SERVICE"], held=True))
     ctx.state.data["notes"].pop(RESTART_PENDING, None)
 
 
@@ -2952,16 +2952,68 @@ def restart_dispatcher_live(conf, backup):
                          "%s%s" % (dispatcher_recovery(label, plist), tail))
 
 
-def dispatcher_recovery(label, plist):
-    """What to type when whether the dispatcher is running is unknown — in the order that
-    works whichever state it is in."""
+def dispatcher_recovery(label, plist, held=None):
+    """What to type when the dispatcher may not be running — in the order that works
+    whichever state it is in. `held` is what `launchctl print` said when this installer
+    asked it: True (launchd holds the job), False (it does not), None (not asked, or no
+    answer), and the remedy fits that state.
+
+    A JOB LAUNCHD HOLDS IS NEVER TOLD TO BOOTSTRAP. Bootstrapping a loaded job answers
+    `Bootstrap failed: 5: Input/output error`, which reads as a new fault. The common case
+    is a dispatcher launchd started seconds ago that is not listening yet, and its remedy
+    is to wait (KIT-206)."""
+    if held:
+        return ("launchd holds the dispatcher, so it is starting, or running and not "
+                "answering. It is loaded: do not start it again.\n"
+                "Wait a minute, then run the same command again.\n"
+                "If it still does not answer, look at it first:\n"
+                "    sudo launchctl print system/%s\n"
+                "and read the dispatcher's own log before changing anything.\n" % label)
+    if held is False:
+        return ("launchd does not hold the dispatcher: it is stopped. Start it:\n"
+                "    sudo launchctl bootstrap system %s\n"
+                "then run the same command again.\n" % plist)
     return ("WHETHER THE DISPATCHER IS RUNNING IS UNKNOWN. Look first:\n"
             "    sudo launchctl print system/%s\n"
-            "  - it prints the service, running: nothing to do;\n"
+            "  - it prints the service, running: do not start it. It may still be\n"
+            "    starting: wait a minute, then run the same command again;\n"
             "  - it could not find the service:  sudo launchctl bootstrap system %s\n"
             "  - it prints the service, not running:  sudo launchctl bootout system/%s\n"
             "    then, once `print` no longer finds it, the bootstrap above.\n"
             % (label, plist, label))
+
+
+# How long a restart waits for the dispatcher to ANSWER, not just to be held by launchd.
+# launchd says a job is running as soon as its process starts, and the dispatcher's HTTP
+# server listens some seconds later. Measured 2026-10-03: silent seconds after launchd
+# said running, answering about 30 seconds later (KIT-206). Bounded by a count of asks,
+# so the battery walks the same path without sleeping.
+DISPATCHER_ANSWER_WAIT_SECONDS = 60
+DISPATCHER_ANSWER_POLL_SECONDS = 5
+
+
+class DispatcherSilent(SetupError):
+    """launchd took the dispatcher back, and the dispatcher never answered."""
+
+
+def wait_for_dispatcher(ctx):
+    """The dispatcher's version once its `/version` route answers, or None when it has not
+    answered in about a minute. Says what it waits for, so a person watching knows it is
+    waiting and not stuck."""
+    url = version_url(ctx.conf)
+    waited = 0
+    while True:
+        got = ctx.version_reader(url)
+        if got is not None:
+            return got
+        if waited >= DISPATCHER_ANSWER_WAIT_SECONDS:
+            return None
+        if waited == 0:
+            ctx.say("  waiting for the dispatcher to answer at %s ..." % url)
+        elif waited % 20 == 0:
+            ctx.say("  still waiting for the dispatcher to answer (%d s)" % waited)
+        ctx.sleep(DISPATCHER_ANSWER_POLL_SECONDS)
+        waited += DISPATCHER_ANSWER_POLL_SECONDS
 
 
 def running_sessions(ctx):
@@ -3023,9 +3075,21 @@ def apply_planning_entries(ctx, entries, remove, why):
     ctx.state.data["notes"][RESTART_PENDING] = {"at": now_iso(), "backup": backup}
     ctx.state.save()
     ctx.restart_dispatcher(backup)
+    # "launchd holds it" IS NOT "it answers" (KIT-206). The restart is done when the
+    # dispatcher itself answers, and the pending note stays until then: a pass that stops
+    # here leaves the next one a restart to look at.
+    version = wait_for_dispatcher(ctx)
+    if version is None:
+        label = ctx.conf["DISPATCHER_SERVICE"]
+        raise DispatcherSilent(
+            "the dispatcher was restarted, and it has not answered at %s in %d seconds.\n"
+            "The restart did not finish. The new settings are written; the config from "
+            "before them is at %s, readable as %s.\n%sthen run the same command again."
+            % (version_url(ctx.conf), DISPATCHER_ANSWER_WAIT_SECONDS, backup, account,
+               dispatcher_recovery(label, "/Library/LaunchDaemons/%s.plist" % label)))
     ctx.state.data["notes"].pop(RESTART_PENDING, None)
     ctx.state.save()
-    ctx.say("  the dispatcher is running again.")
+    ctx.say("  the dispatcher is running again, and answering (version %s)." % version)
     return "wrote them (backup %s) and restarted the dispatcher" % backup
 
 
@@ -3227,11 +3291,14 @@ def step_probe(ctx, apply_it):
     if apply_it and ctx.interactive and ctx.tracker is not None and \
             ctx.version_reader(version_url(ctx.conf)) is None:
         # NO TICKET AGAINST A DISPATCHER THAT IS NOT ANSWERING: each would wait minutes for
-        # a routing note that cannot come, and fail without naming why.
+        # a routing note that cannot come, and fail without naming why. The remedy is
+        # chosen by asking launchd first: a job it holds is starting, not stopped, and
+        # telling a person to bootstrap it only earns an EIO (KIT-206).
+        label = ctx.conf["DISPATCHER_SERVICE"]
         raise Unknown("the dispatcher is not answering at %s, so no probe ticket was filed"
                       % version_url(ctx.conf),
-                      "start it:  sudo launchctl bootstrap system /Library/LaunchDaemons/"
-                      "%s.plist\nthen run this again" % ctx.conf["DISPATCHER_SERVICE"])
+                      dispatcher_recovery(label, "/Library/LaunchDaemons/%s.plist" % label,
+                                          held=ctx.host.job_loaded(label)))
     if not (apply_it and ctx.interactive and ctx.tracker is not None):
         _say_probe_tickets(ctx, rows)
         if hard:
@@ -3865,6 +3932,12 @@ def run_drill(ctx):
         try:
             apply_planning_entries(ctx, entries, [], "the drill: the planning setup put back")
             notes.pop("drill_in_progress", None)
+        except DispatcherSilent as exc:
+            # THE SETUP IS BACK; only the dispatcher's answer is missing. Said as that, not
+            # as a setup that could not be put back.
+            notes.pop("drill_in_progress", None)
+            ctx.state.save()
+            raise SetupError("the drill put the planning setup back, and %s" % exc)
         except BaseException as exc:
             ctx.state.save()
             raise SetupError("THE DRILL COULD NOT PUT THE PLANNING SETUP BACK (%s): %s\nRun "
@@ -5823,6 +5896,90 @@ def _selftest_review_fixes(check, tmp):
         got = "unknown"
     check("probe-refuses-a-silent-dispatcher-before-filing", (got, nd.tracker.issues),
           ("unknown", {}))
+
+    # 9b. A RESTART IS DONE WHEN THE DISPATCHER ANSWERS, not when launchd holds it again
+    #     (KIT-206). Live, `/version` was silent seconds after launchd said running, the
+    #     probe asked once, and it told the person to bootstrap a running job.
+    def restart_world(name, answers_on):
+        """A finished install up to the entry step, whose dispatcher answers `/version`
+        only on the `answers_on`th ask after the restart."""
+        c, _a = _probe_world(tmp, name, answers=("yes", "y", "y", "bc"))
+        path = c.conf["DISPATCHER_CONFIG"]
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        doc["repositories"] = [r for r in doc["repositories"] if r.get("id") != ENTRY]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        c._dispatcher = None
+        c.job_ready = True
+        asks = {"after_restart": None}
+
+        def restart(backup):
+            asks["after_restart"] = 0
+
+        def reader(url):
+            if asks["after_restart"] is None:
+                return "0.2.69"
+            asks["after_restart"] += 1
+            return "0.2.69" if asks["after_restart"] >= answers_on else None
+        c.restart_dispatcher = restart
+        c.version_reader = reader
+        return c, asks
+
+    sw, sw_asks = restart_world("restart-answers-third", 3)
+    step_dispatcher_entry(sw, True)
+    waited = (sw_asks["after_restart"], RESTART_PENDING in sw.state.data["notes"],
+              any("waiting for the dispatcher to answer" in ln for ln in sw._out))
+    try:
+        step_probe(sw, True)
+        got = "signed"
+    except (SetupError, Unknown) as exc:
+        got = str(getattr(exc, "what", None) or exc)[:80]
+    check("restart-waits-until-the-dispatcher-answers-then-the-probe-files",
+          (waited, got, len(sw.tracker.issues), sw.state.attested("CA-PROBE")),
+          ((3, False, True), "signed", 2, True))
+    nw, nw_asks = restart_world("restart-never-answers", 10 ** 6)
+    try:
+        step_dispatcher_entry(nw, True)
+        got = "passed"
+    except DispatcherSilent as exc:
+        got = str(exc)
+    check("restart-whose-dispatcher-never-answers-fails-the-restart-itself",
+          ("The restart did not finish" in got, "launchctl print system/" in got,
+           RESTART_PENDING in nw.state.data["notes"], nw.tracker.issues),
+          (True, True, True, {}))
+    check("restart-wait-is-bounded-by-asks",
+          nw_asks["after_restart"],
+          DISPATCHER_ANSWER_WAIT_SECONDS // DISPATCHER_ANSWER_POLL_SECONDS + 1)
+
+    def probe_remedy(name, held):
+        c, _a = _probe_world(tmp, name)
+        c.version_reader = lambda url: None
+        if held:
+            c.host.loaded.add(GOOD_CONF["DISPATCHER_SERVICE"])
+        try:
+            step_probe(c, True)
+            return "passed"
+        except Unknown as exc:
+            return exc.remedy
+    held = probe_remedy("probe-silent-held", True)
+    check("probe-silent-and-held-never-says-bootstrap",
+          ("bootstrap" in held, "Wait a minute" in held, "launchctl print system/" in held),
+          (False, True, True))
+    gone = probe_remedy("probe-silent-not-held", False)
+    check("probe-silent-and-not-held-says-start-it",
+          "launchctl bootstrap system /Library/LaunchDaemons/%s.plist"
+          % GOOD_CONF["DISPATCHER_SERVICE"] in gone, True)
+    hp = _ctx(os.path.join(tmp, "pending-held-remedy"), tracker=_ready_tracker(), version=None)
+    hp.host.loaded.add(GOOD_CONF["DISPATCHER_SERVICE"])
+    hp.state.data["notes"][RESTART_PENDING] = {"at": "2026-10-03T00:00:00Z", "backup": "/b"}
+    try:
+        check_pending_restart(hp)
+        got = "cleared"
+    except Unknown as exc:
+        got = exc.remedy
+    check("restart-pending-held-but-silent-never-says-bootstrap",
+          ("bootstrap" in got, "Wait a minute" in got), (False, True))
 
     # 10. THE JOB IS INSTALLED DISABLED, and only the yes enables it (a reboot would
     #     otherwise start a job the person said no to).
