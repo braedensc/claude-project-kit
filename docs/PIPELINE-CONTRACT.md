@@ -851,6 +851,10 @@ authority**:
   findings and report any others in its **summary comment**, where a person triages them.
   The cap is a flood guard, not a limit to raise: many findings at once is itself a signal
   a person should look, and the graceful path is the comment, never a fourth request.
+  **On a local-daemon backend the cap is per source ticket, across passes** (KIT-234):
+  `pipeline_finding_poller.py` counts what it already filed from a ticket, declines a
+  fourth request for good, and says so once on that ticket. It cannot fail a batch, since
+  each finding is its own comment.
 
 **The kind is off unless a project turns it on.** Absent `linear.findingTicket`, a
 `ticket-create` request is refused and a session reports findings as `ticket-comment`s as

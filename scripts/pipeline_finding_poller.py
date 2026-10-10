@@ -86,15 +86,21 @@ WHAT IT NEVER DOES (asserted in --selftest, the way every Stage E script asserts
   It never moves a ticket to ready/working/review/done; never sets provenance:human,
   hooks-change, agent:* or blocked:* on anything; never assigns a ticket to the agent;
   never touches the SOURCE ticket's state or labels; never approves, merges or comments on
-  a PR. Its ONLY Linear writes are `issueCreate` (the finding ticket) and `commentCreate`
-  (the receipt). It trusts a finding only from the configured agent user — a comment from
-  anyone else is ignored, so a finding cannot be injected by an outside commenter.
+  a PR. Its ONLY Linear writes are `issueCreate` (the finding ticket, in the source's
+  project), `issueRelationCreate` (one `related` link from it to the source, KIT-234) and
+  `commentCreate` (the receipt, and the one cap note below). It trusts a finding only from
+  the configured agent user — a comment from anyone else is ignored, so a finding cannot be
+  injected by an outside commenter.
 
 FLOOD GUARD
 
-  At most `max_per_source` findings filed from any one source ticket per run (default 3,
-  KIT-96's §8 cap), and at most `max_per_run` across the whole pass. Over either, the
-  extras are LEFT for the next pass and named in the log — never silently dropped (§13).
+  At most `max_per_source` findings filed from any one source ticket, EVER (default 3,
+  KIT-96's §8 cap). The count includes what earlier passes filed, read from the seen-set.
+  A request over it is DECLINED for good and recorded, so it never holds the window back,
+  and one note on the source ticket says so, once (KIT-234: before, the count restarted
+  every pass, so one session could have any number filed). At most `max_per_run` across a
+  whole pass; over that, the extras are LEFT for the next pass and named in the log —
+  never silently dropped (§13).
 
 ONE RUN IS ONE PASS THEN EXIT. A system LaunchDaemon with `StartInterval`, `RunAtLoad` and
 no `KeepAlive` starts a fresh process each interval; each does scan → exit under a
@@ -336,6 +342,10 @@ def fenced_json_blocks(text):
     return out
 
 
+# A request over the per-ticket cap: declined for good, never left for a later pass.
+OVER_TICKET_CAP = "over the per-ticket cap"
+
+
 def parse_finding(comment_body):
     """(title, body) from a `pipeline-finding/1` block in a comment, or None if there is
     no well-formed finding. A malformed block is None, not an exception — one bad comment
@@ -379,13 +389,15 @@ def clean_labels(requested):
     return out
 
 
-def build_finding_body(source_id, body):
+def build_finding_body(source_id, body, parent_id=None):
     """The description the executor writes: a forced provenance header the session cannot
-    fake, then the session's own text."""
+    fake, then the session's own text. The header names the source's epic when it has one
+    (KIT-234), read from the tracker, never from the session's text."""
+    epic = (" (a child of epic **%s**)" % parent_id) if parent_id else ""
     header = ("> Filed by the Stage E finding poller from an agent session working "
-              "**%s**. Origin: `provenance:agent` — a session requested this; it did not "
+              "**%s**%s. Origin: `provenance:agent` — a session requested this; it did not "
               "create it. Backlog, unreviewed, awaiting a person; it approves nothing and "
-              "starts no session.\n\n" % source_id)
+              "starts no session.\n\n" % (source_id, epic))
     return header + (body or "")
 
 
@@ -401,17 +413,22 @@ def select_to_file(candidates, seen, max_per_source, max_per_run):
     id could not work out how far the pass may safely advance, and would step over the very
     finding the cap promised to keep.
     """
-    to_file, skipped, per_source, total = [], [], {}, 0
+    # THE CAP IS PER TICKET, across passes (KIT-234): what earlier passes filed counts.
+    per_source = {}
+    for rec in seen.values():
+        if isinstance(rec, dict) and rec.get("filed") and rec.get("source"):
+            per_source[rec["source"]] = per_source.get(rec["source"], 0) + 1
+    to_file, skipped, total = [], [], 0
     for c in candidates:
         if c["comment_id"] in seen:
             skipped.append((c, "already-filed"))
             continue
         src = c["source_id"]
+        if per_source.get(src, 0) >= max_per_source:
+            skipped.append((c, OVER_TICKET_CAP))
+            continue
         if total >= max_per_run:
             skipped.append((c, "over max_per_run"))
-            continue
-        if per_source.get(src, 0) >= max_per_source:
-            skipped.append((c, "over max_per_source"))
             continue
         per_source[src] = per_source.get(src, 0) + 1
         total += 1
@@ -482,18 +499,20 @@ def advance_watermarks(watermarks, teams, complete, left_behind, scan_started):
 
 
 def creation_input(cfg, team_id, backlog_state_id, prov_label_id, extra_label_ids,
-                   title, body, source_id):
+                   title, body, source_id, project_id=None, parent_id=None):
     """The EXACT issueCreate input, built in one place so --selftest can assert its shape
     carries none of the authority a session must not hold."""
     label_ids = [prov_label_id] + [i for i in (extra_label_ids or []) if i != prov_label_id]
     inp = {
         "teamId": team_id,
         "title": title[:DEFAULT_TITLE_CAP],
-        "description": build_finding_body(source_id, body),
+        "description": build_finding_body(source_id, body, parent_id),
         "stateId": backlog_state_id,
         "labelIds": label_ids,
         "subscriberIds": [cfg["owner_user_id"]] if cfg.get("owner_user_id") else [],
     }
+    if project_id:
+        inp["projectId"] = project_id      # the source's project (KIT-234), never a parent
     # assigneeId is deliberately ABSENT — never the session's identity, and a finding is a
     # backlog item nobody is yet working.
     return inp
@@ -669,7 +688,8 @@ query($teamId: ID!, $since: DateTimeOrDuration!, $after: String) {
     nodes {
       id body createdAt
       user { id name }
-      issue { id identifier description labels(first: 20) { nodes { name } } }
+      issue { id identifier description labels(first: 20) { nodes { name } }
+              project { id } parent { identifier } }
     }
   }
 }""" % DEFAULT_COMMENT_PAGE
@@ -682,6 +702,11 @@ mutation($input: IssueCreateInput!) {
 _M_COMMENT = """
 mutation($issueId: String!, $body: String!) {
   commentCreate(input: {issueId: $issueId, body: $body}) { success }
+}"""
+
+_M_RELATE = """
+mutation($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) { success }
 }"""
 
 
@@ -750,6 +775,8 @@ def scan_team(cfg, key, api_key, since):
                 continue
             out.append({"comment_id": c["id"], "source_id": issue.get("identifier"),
                         "source_uuid": issue.get("id"), "team_id": team_id,
+                        "source_project_id": (issue.get("project") or {}).get("id"),
+                        "source_parent": (issue.get("parent") or {}).get("identifier"),
                         "team_key": key, "created_at": c.get("createdAt"),
                         "title": parsed[0], "body": parsed[1]})
         info = block.get("pageInfo") or {}
@@ -762,15 +789,35 @@ def scan_team(cfg, key, api_key, since):
 
 
 def file_finding(cfg, cand, api_key):
-    """issueCreate the backlog ticket, forcing the safe fields; return its identifier."""
+    """issueCreate the backlog ticket, forcing the safe fields; return (identifier, id)."""
     team_id, backlog, labels = resolve_team(cfg, cand["team_key"], api_key)
     prov = labels[cfg["provenance_agent_label"]]
     inp = creation_input(cfg, team_id, backlog, prov, [], cand["title"], cand["body"],
-                         cand["source_id"])
+                         cand["source_id"], cand.get("source_project_id"),
+                         cand.get("source_parent"))
     res = (linear_graphql(_M_CREATE, {"input": inp}, api_key).get("issueCreate")) or {}
     if not res.get("success") or not res.get("issue"):
         raise PollerError("issueCreate did not succeed for a finding from %s" % cand["source_id"])
-    return res["issue"]["identifier"]
+    return res["issue"]["identifier"], res["issue"].get("id")
+
+
+def link_finding(filed_uuid, source_uuid, api_key):
+    """ONE `related` link from the finding to its source (KIT-234). Related, never parent:
+    a finding must not read as part of an approved tree."""
+    res = (linear_graphql(_M_RELATE, {"input": {"issueId": filed_uuid,
+                                                "relatedIssueId": source_uuid,
+                                                "type": "related"}}, api_key)
+           .get("issueRelationCreate")) or {}
+    if not res.get("success"):
+        raise PollerError("issueRelationCreate did not succeed")
+
+
+def post_cap_note(source_uuid, source_id, cap, api_key):
+    """The one note a ticket gets when it asks for more findings than the cap."""
+    body = ("**%s has asked for more follow-up tickets than one ticket may.** %d were "
+            "filed, the most one ticket may ask for. Its later requests were not filed; a "
+            "person can file them by hand. This note is posted once." % (source_id, cap))
+    linear_graphql(_M_COMMENT, {"issueId": source_uuid, "body": body}, api_key)
 
 
 def post_receipt(source_uuid, filed_id, api_key):
@@ -834,6 +881,29 @@ def run_scan(cfg, api_key, dry_run, deadline):
         if why == "already-filed":
             already += 1
             continue
+        if why == OVER_TICKET_CAP:
+            # DECLINED FOR GOOD (KIT-234): recorded, so it never holds the window back, and
+            # said once on the ticket. A dry run records and says nothing.
+            already += 1
+            log("declined (%s): comment %s on %s" % (why, cand["comment_id"],
+                                                     cand["source_id"]))
+            if dry_run:
+                continue
+            seen[cand["comment_id"]] = {"declined": OVER_TICKET_CAP,
+                                        "source": cand["source_id"], "at": _now_iso()}
+            note_key = "cap-note:%s" % cand["source_id"]
+            if note_key not in seen:
+                seen[note_key] = {"noted": True, "source": cand["source_id"],
+                                  "at": _now_iso()}
+                save_seen(seen_path(state_dir), seen)
+                try:
+                    post_cap_note(cand["source_uuid"], cand["source_id"],
+                                  cfg["max_per_source"], api_key)
+                except PollerError as exc:
+                    log("NOTE: the cap note on %s could not be posted (%s)"
+                        % (cand["source_id"], exc))
+            save_seen(seen_path(state_dir), seen)
+            continue
         left_behind.append(cand)
         log("left for the next pass (%s): comment %s on %s"
             % (why, cand["comment_id"], cand["source_id"]))
@@ -849,7 +919,7 @@ def run_scan(cfg, api_key, dry_run, deadline):
             log("DRY-RUN would file: %r (from %s)" % (cand["title"][:80], cand["source_id"]))
             filed += 1
             continue
-        filed_id = file_finding(cfg, cand, api_key)
+        filed_id, filed_uuid = file_finding(cfg, cand, api_key)
         # THE SEEN-SET IS THE DEDUP AUTHORITY, so it is written through the moment the
         # ticket exists — BEFORE the receipt. The other order (receipt, then seen-set) put
         # a second failure between creating a ticket and remembering it, and a receipt that
@@ -859,6 +929,11 @@ def run_scan(cfg, api_key, dry_run, deadline):
         save_seen(seen_path(state_dir), seen)
         log("filed %s from %s" % (filed_id, cand["source_id"]))
         filed += 1
+        try:
+            link_finding(filed_uuid, cand["source_uuid"], api_key)
+        except PollerError as exc:
+            log("NOTE: %s was filed and recorded, but its link to %s could not be made "
+                "(%s). The receipt still names it." % (filed_id, cand["source_id"], exc))
         try:
             post_receipt(cand["source_uuid"], filed_id, api_key)
         except PollerError as exc:
@@ -968,11 +1043,21 @@ def selftest():
     tf, sk = select_to_file(cands, {"c0": {}}, max_per_source=3, max_per_run=20)
     ok("select: already-seen skipped", all(c["comment_id"] != "c0" for c in tf))
     ok("select: max_per_source caps one source at 3", len(tf) == 3)
-    ok("select: the rest are left, not dropped", len(sk) == 2)  # c0 seen + one over-cap
+    ok("select: the rest are named, not dropped", len(sk) == 2)  # c0 seen + one over-cap
     ok("select: a skip carries the CANDIDATE, so a cap can hold the watermark back",
        all(isinstance(c, dict) and "created_at" in c for c, _why in sk))
     ok("select: the two skip reasons are told apart",
-       sorted(why for _c, why in sk) == ["already-filed", "over max_per_source"])
+       sorted(why for _c, why in sk) == ["already-filed", OVER_TICKET_CAP])
+    # KIT-234 (B7): the cap is per TICKET, across passes. Two already filed from KIT-1 leave
+    # room for one more; the rest are declined, not left for a later pass to file.
+    filed_before = {"old1": {"filed": "KIT-901", "source": "KIT-1"},
+                    "old2": {"filed": "KIT-902", "source": "KIT-1"},
+                    "other": {"filed": "KIT-903", "source": "KIT-2"},
+                    "declined": {"declined": OVER_TICKET_CAP, "source": "KIT-1"}}
+    tf3, sk3 = select_to_file(cands[1:4], filed_before, max_per_source=3, max_per_run=20)
+    ok("select: the per-ticket cap counts findings filed on earlier passes",
+       [c["comment_id"] for c in tf3] == ["c1"]
+       and sorted(why for _c, why in sk3) == [OVER_TICKET_CAP, OVER_TICKET_CAP])
     many = [{"comment_id": "d%d" % i, "source_id": "KIT-%d" % i, "title": "t", "body": "b",
              "team_key": "KIT", "created_at": "2026-09-10T00:%02d:00Z" % i}
             for i in range(30)]
@@ -987,6 +1072,8 @@ def selftest():
        "createdAt" in _Q_COMMENTS and "issue { id identifier" in _Q_COMMENTS)
     ok("query: the comment's issue carries what marks a planning ticket (KIT-184)",
        "description labels(first: 20) { nodes { name } }" in _Q_COMMENTS)
+    ok("query: the source's project and parent epic are read (KIT-234)",
+       "project { id }" in _Q_COMMENTS and "parent { identifier }" in _Q_COMMENTS)
 
     now = datetime(2026, 9, 13, 12, 0, 0, tzinfo=timezone.utc)
     ok("since: no watermark → the cold-start window",
@@ -1071,6 +1158,7 @@ def selftest():
         # The ticket itself has not been touched in a month. It is carried here only so the
         # assertion below can say what the scan did NOT ask about.
         "issue": {"id": "iss-7", "identifier": "KIT-7",
+                  "project": {"id": "proj-7"}, "parent": {"identifier": "KIT-5"},
                   "updatedAt": _iso(datetime.now(timezone.utc)
                                     - timedelta(hours=stale_ticket_hours))},
         "body": "```json\n%s\n```" % json.dumps(
@@ -1097,6 +1185,7 @@ def selftest():
 
         def __init__(self, comments):
             self.comments, self.created, self.receipts, self.asked = comments, [], [], []
+            self.related = []
 
         def __call__(self, query, variables, api_key):
             self.asked.append((query, variables))
@@ -1120,6 +1209,9 @@ def selftest():
             if "commentCreate" in query:
                 self.receipts.append(variables)
                 return {"commentCreate": {"success": True}}
+            if "issueRelationCreate" in query:
+                self.related.append(variables["input"])
+                return {"issueRelationCreate": {"success": True}}
             raise AssertionError("the fake was asked an unexpected query: %r" % query[:80])
 
     def _pass(fake, config_path, argv_extra=()):
@@ -1159,6 +1251,13 @@ def selftest():
                inp["stateId"] == "st-backlog" and inp["labelIds"] == ["lbl-prov"]
                and inp["subscriberIds"] == ["u-owner"] and "assigneeId" not in inp)
             ok("pass: the source ticket travels in the body", "KIT-7" in inp["description"])
+            ok("pass: the finding lands in the source's project (KIT-234)",
+               inp.get("projectId") == "proj-7")
+            ok("pass: its opening line names the source's epic (KIT-234)",
+               "child of epic **KIT-5**" in inp["description"].split("\n\n", 1)[0])
+        ok("pass: the finding is linked to its source as related, once (KIT-234)",
+           fake.related == [{"issueId": "new-1", "relatedIssueId": "iss-7",
+                             "type": "related"}])
         ok("pass: a finding from anyone but the agent user is never filed",
            len(fake.created) == 1)
         ok("pass: the receipt is posted on the SOURCE ticket",
@@ -1212,6 +1311,38 @@ def selftest():
            "still files it",
            open(watermark_path(state), encoding="utf-8").read() == marks_before
            and open(seen_path(state), encoding="utf-8").read() == seen_before)
+
+    # 3b. THE PER-TICKET CAP, through a real pass (KIT-234, B7). Four requests from one
+    #     ticket: three filed, the fourth declined and recorded, ONE note on the ticket, and
+    #     the watermark moves past it. A fifth on a later pass is declined with no second note.
+    with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
+        cfg_path = os.path.join(d, "poller.json")
+        json.dump({"teams": ["KIT"], "owner_user_id": "u-owner", "agent_user_id": "u-agent",
+                   "linear_key_env": key_env, "state_dir": state}, open(cfg_path, "w"))
+        recent = datetime.now(timezone.utc) - timedelta(minutes=30)
+        burst = [dict(finding_comment, id="b%d" % i,
+                      createdAt=_iso(recent + timedelta(seconds=i)))
+                 for i in range(4)]
+        fake_c = _FakeLinear(burst)
+        os.environ[key_env] = "not-a-real-key"
+        rc_c = _pass(fake_c, cfg_path)
+        seen_c = load_seen(seen_path(state))
+        notes = [r for r in fake_c.receipts if "most one ticket may ask for" in r["body"]]
+        ok("cap: three filed, the fourth declined and recorded",
+           rc_c == EXIT_OK and len(fake_c.created) == 3
+           and (seen_c.get("b3") or {}).get("declined") == OVER_TICKET_CAP)
+        ok("cap: one note on the source ticket says so", len(notes) == 1
+           and notes[0]["issueId"] == "iss-7")
+        mark_c = load_watermarks(watermark_path(state)).get("KIT")
+        ok("cap: a declined request never holds the window back",
+           bool(mark_c) and _parse_iso(mark_c) > recent)
+        late = dict(finding_comment, id="b9", createdAt=_iso(datetime.now(timezone.utc)))
+        fake_d = _FakeLinear([late])
+        _pass(fake_d, cfg_path)
+        ok("cap: a later request from the same ticket is declined with no second note",
+           fake_d.created == [] and fake_d.receipts == []
+           and (load_seen(seen_path(state)).get("b9") or {}).get("declined") == OVER_TICKET_CAP)
 
     # 4. THE ERROR HEARTBEAT. A config or credential failure used to exit before the
     #    heartbeat was written, leaving a stale timestamp — the symptom of a daemon that
