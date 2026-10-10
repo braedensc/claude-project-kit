@@ -1424,7 +1424,10 @@ The pipeline's own health watch posts it, not a person. When someone asks about 
 
 1. Read the status file %(status)s. It holds each finding, and no credential.
 2. Explain each finding in plain words: what is wrong, what it affects, and what the
-   owner should run.
+   owner should run. A finding in the `unknown` state means it could not be checked, not
+   that something is down: say "could not check".
+   If the file's `written_at` is more than about two hours old, the watch itself has
+   stopped. Say that first, and do not trust the rest of the file.
 3. Print any fix that needs sudo, launchctl or an installer as a command line for the
    owner. Never run it, and never say you did.
 
@@ -5336,7 +5339,8 @@ def _selftest_kit226_body(expect, conf):
                    "You never move a ticket", "Never say you did", "Orchestration Notes",
                    "nothing else"):
         expect("chat-rules-say:" + needle, needle in text, text[:300])
-    for needle in ("When a health alert fires", "Never run it", "pipeline_watch.py status"):
+    for needle in ("When a health alert fires", "Never run it", "pipeline_watch.py status",
+                   "could not check", "written_at"):
         expect("chat-rules-say:" + needle, needle in text, text[-600:])
     healthy = chat_rules_text(dict(conf, HEALTH_STATUS_FILE="/srv/health/status.json"))
     expect("chat-rules-name-the-status-file-when-set",
