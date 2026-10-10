@@ -199,7 +199,7 @@ nothing.
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
 | `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
-| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on | — |
+| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on. It reads the bounce driver's config the same way, to say whether the ready-to-merge page is on | — |
 
 **The clone must run the code this checkout tested.** Preflight runs the notifier's
 selftest here. Then it hashes, as the role account, each file the notifier runs in that
@@ -461,9 +461,18 @@ installer's `run`, which moves the clone. Then run this installer's `run` with
 `$STAGE_E_LINEAR_API_KEY` set in your shell. It resolves `BOUNCE_ACTOR_IDS` and rewrites
 the config. Until then the config step waits on the labels step and says so.
 
-Good: the next pass's summary says `ready-to-merge marks: ON`.
+The `handover` row checks this page too. It reads the bounce driver's config,
+`~/.stage-e/config.json`, as the role account, and never writes it. It says OFF when that
+file is missing, when the driver works in a team `TEAM_KEYS` does not scan, or when
+`BOUNCE_ACTOR_IDS=self` and the driver comments with another key. In that last case every
+real mark is skipped as another author's, yet the notifier's summary still says
+`ready-to-merge marks: ON`. Name the driver's author id in `BOUNCE_ACTOR_IDS`, or give both
+jobs one key.
+
+Good: the `handover` row says `ON: the ready-to-merge page`, and the next pass's summary
+says `ready-to-merge marks: ON`.
 Not that: `ready-to-merge marks: OFF (bounce_actor_ids is unset)`. The `run` with the key
-has not landed.
+has not landed. Nor `OFF: the ready-to-merge page`, which names what to fix.
 
 **Pausing this notifier while the monitor watches it.** Unload it as usual. The Stage E
 installer's `heartbeat-monitor` row then says `notifier paused: not watched; load it, then

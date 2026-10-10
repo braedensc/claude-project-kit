@@ -50,7 +50,8 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
     handover     what is on, what is off, and what is not proven — each with a ticket id.
                  The daemon-health page is measured at BOTH ends: this notifier's config, and
                  the heartbeat monitor's, which is READ as the role account and never
-                 written — the Stage E installer owns that file whole
+                 written — the Stage E installer owns that file whole. So is the
+                 ready-to-merge page (KIT-225), against the bounce driver's config
 
 SUBCOMMANDS
 
@@ -196,6 +197,13 @@ MONITOR_WATCH_JOB = se.NOTIFIER_WATCH_JOB
 # The monitor's own defaults for the two keys the handover reads when the file omits them.
 MONITOR_DEFAULT_KEY_ENV = "STAGE_E_LINEAR_API_KEY"
 MONITOR_DEFAULT_STATE_DIR = "~/.stage-e/state"
+# The bounce driver's config, where the Stage E installer's `config` step writes it, in the same
+# home. Read for the ready-to-merge handover line (KIT-225), never written, for the same reason.
+# The driver's own default for its key's name, and the poller's spelling of that key, which the
+# driver also reads. The selftest pins all three against the driver.
+BOUNCE_CONFIG_PATH = "~/.stage-e/config.json"
+BOUNCE_DEFAULT_KEY_ENV = "LINEAR_OWNER_API_KEY"
+BOUNCE_KEY_ENV_ALIAS = "linear_key_env"
 # The name the dispatcher's own Slack lane reads out of the dispatcher's environment — which is
 # copied into every session. The notifier's token may never live under it (owner, 2026-09-17).
 DISPATCHER_CHAT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -2307,8 +2315,12 @@ def read_monitor_config(ctx):
     """The heartbeat monitor's config as the role account holds it: (doc, None), or (None, why).
     READ ONLY — see MONITOR_CONFIG_PATH. Under a model this raises Unknown, like every other
     role-account read: what it would have said is not guessed."""
-    res = ctx.as_role(MONITOR_READ_SH.replace("@F@", _q(MONITOR_CONFIG_PATH)),
-                      what="reading the heartbeat monitor's config %s" % MONITOR_CONFIG_PATH)
+    return read_role_json(ctx, MONITOR_CONFIG_PATH, "the heartbeat monitor's config")
+
+
+def read_role_json(ctx, path, what):
+    """One JSON object the role account holds, read the same way: (doc, None), or (None, why)."""
+    res = ctx.as_role(MONITOR_READ_SH.replace("@F@", _q(path)), what="reading %s %s" % (what, path))
     if res.rc == 9:
         return None, "absent"
     if not res.ok:
@@ -2553,6 +2565,76 @@ def daemon_health_lines(ctx):
     return on, off, unproven
 
 
+def ready_to_merge_lines(ctx):
+    """(on, off, unproven) for the bounce driver's ready-to-merge page (KIT-225), on the pattern
+    of daemon_health_lines. The driver's end is its own config, read as the role account: which
+    teams its comments land in, and which key it comments with. `self` in BOUNCE_ACTOR_IDS is
+    the user of THIS notifier's key, so it is the driver's author only when the two keys are
+    one. When they differ, every real mark is skipped as another author's while the notifier
+    still says `ready-to-merge marks: ON`. This end is the config this pass composed."""
+    conf = ctx.conf
+    on, off, unproven = [], [], []
+    bouncers = split_list(conf.get("BOUNCE_ACTOR_IDS", EXECUTOR_SELF))
+    if bouncers == [MONITOR_OFF]:
+        off.append("the ready-to-merge page: BOUNCE_ACTOR_IDS=off, so this notifier pages on the "
+                   "bounce driver's ready-to-merge mark from nobody and says `ready-to-merge "
+                   "marks: OFF` on every pass (KIT-225)")
+        return on, off, unproven
+    try:
+        doc, why_not = read_role_json(ctx, BOUNCE_CONFIG_PATH, "the bounce driver's config")
+    except Unknown as exc:
+        unproven.append("the ready-to-merge page: not measured on this pass — %s (KIT-225)"
+                        % exc.what)
+        return on, off, unproven
+    named = [m for m in bouncers if m != EXECUTOR_SELF]
+    if doc is None:
+        off.append("the ready-to-merge page: the bounce driver's config %s is %s as %s, so nothing "
+                   "here can tell who writes the mark. The Stage E installer's `config` step "
+                   "writes it (KIT-225)" % (BOUNCE_CONFIG_PATH, why_not, ctx.account))
+        return on, off, unproven
+    key_env = str(doc.get("linear_api_key_env") or doc.get(BOUNCE_KEY_ENV_ALIAS)
+                  or BOUNCE_DEFAULT_KEY_ENV)
+    teams = [t.upper() for t in split_list(conf["TEAM_KEYS"])]
+    driver_teams = doc.get("team_keys") if isinstance(doc.get("team_keys"), list) else []
+    unscanned = [str(t) for t in driver_teams if str(t).upper() not in teams]
+    composed = (json.loads(ctx.composed["body"]).get("bounce_actor_ids") or []
+                if ctx.config_current and ctx.composed else None)
+    if unscanned:
+        off.append("the ready-to-merge page: the bounce driver comments on tickets in %s, and "
+                   "TEAM_KEYS (%s) does not scan %s, so this notifier never reads those comments. "
+                   "Add %s to TEAM_KEYS and run this installer again (KIT-225)"
+                   % (", ".join(unscanned), ", ".join(teams),
+                      "it" if len(unscanned) == 1 else "them", ", ".join(unscanned)))
+    elif not named and key_env != conf["LINEAR_KEY_ENV"]:
+        off.append("the ready-to-merge page: BOUNCE_ACTOR_IDS=self is the user of $%s, and the "
+                   "bounce driver comments with $%s, another key. Every real ready-to-merge mark "
+                   "is then skipped as another author's, while the notifier's summary still says "
+                   "`ready-to-merge marks: ON`. Name the bounce driver's author id in "
+                   "BOUNCE_ACTOR_IDS, or give both jobs one key (KIT-225)"
+                   % (conf["LINEAR_KEY_ENV"], key_env))
+    elif composed is None:
+        unproven.append("the ready-to-merge page: the notifier's config %s is not the one this "
+                        "pass composed (see the `config` row), so whether the job pages on the "
+                        "mark is not proven on this pass (KIT-225)" % conf["NOTIFIER_CONFIG"])
+    elif not composed or [m for m in named if m not in composed]:
+        unproven.append("the ready-to-merge page: the notifier's config %s does not hold every id "
+                        "BOUNCE_ACTOR_IDS names (%s). Run this installer's `run` with $%s set in "
+                        "your shell (KIT-225)" % (conf["NOTIFIER_CONFIG"],
+                                                 ", ".join(bouncers), conf["LINEAR_KEY_ENV"]))
+    else:
+        on.append("the ready-to-merge page: the bounce driver's comments carry a mark this "
+                  "notifier pings on, one ping with the pull request's link, no label, accepted "
+                  "only from %s (KIT-225)"
+                  % ("the user of $%s, which the bounce driver comments with" % key_env
+                     if not named else "the id(s) BOUNCE_ACTOR_IDS names%s"
+                     % (" and the user of $%s" % conf["LINEAR_KEY_ENV"]
+                        if EXECUTOR_SELF in bouncers else "")))
+        unproven.append("that only the bounce driver writes the ready-to-merge mark: anything "
+                        "holding $%s can. The mark applies no label, so a forged one costs a ping "
+                        "that links at most a pull request (KIT-225)" % key_env)
+    return on, off, unproven
+
+
 def handover_lines(ctx):
     conf = ctx.conf
     # The interval launchd reported, never the conf's: the conf says what the file asks for,
@@ -2570,7 +2652,8 @@ def handover_lines(ctx):
     unproven = ["what a session can reach with the dispatcher's own Slack token, and the "
                 "copy-it-out residual no fence closes (KIT-157)"]
     h_on, h_off, h_unproven = daemon_health_lines(ctx)
-    return on + h_on, h_off + off, h_unproven + unproven
+    r_on, r_off, r_unproven = ready_to_merge_lines(ctx)
+    return on + h_on + r_on, h_off + r_off + off, h_unproven + r_unproven + unproven
 
 
 def step_handover(ctx, apply_it):
@@ -3992,6 +4075,15 @@ def _selftest_body():
            written and "bounce_actor_ids" not in written
            and ctx14c.ids.get("bounce_actor_ids") == [] and "BOUNCE_ACTOR_IDS=off" in out14,
            "%s\n%s" % (written, out14[-600:]))
+        # `self` is looked up for the bounce driver alone: the executor names its id outright and
+        # the monitor is off, so BOUNCE_ACTOR_IDS is the only entry that asks for the user.
+        written, out14, ctx14c = monitor_ids_case(
+            "MONITOR_ACTOR_IDS=off\n",
+            text=good_text.replace("EXECUTOR_ACTOR_IDS=self", "EXECUTOR_ACTOR_IDS=actor-0000-explicit"))
+        ok("labels: BOUNCE_ACTOR_IDS=self is looked up when only the bounce driver asks for `self`",
+           written.get("bounce_actor_ids") == ["viewer-uuid-0001"]
+           and written.get("executor_actor_ids") == ["actor-0000-explicit"]
+           and "monitor_actor_ids" not in written, "%s\n%s" % (written, out14[-600:]))
         written, out14, ctx14c = monitor_ids_case("")
         ok("labels: BOUNCE_ACTOR_IDS defaults to `self`, the Stage E key's user",
            written.get("bounce_actor_ids") == ["viewer-uuid-0001"],
@@ -4065,15 +4157,19 @@ def _selftest_body():
         mon_doc = {"notify_ticket_id": "KIT-7", "linear_key_env": "STAGE_E_LINEAR_API_KEY",
                    "watch": ["review-poller", "bounce-driver", "finding-poller", "notifier"],
                    "intervals": {"notifier": 300 + 240}, "run_interval_seconds": 1800}
+        # The bounce driver's config as the Stage E installer writes it: the keys this reads.
+        bounce_cfg = {"linear_api_key_env": "STAGE_E_LINEAR_API_KEY", "team_keys": ["KIT"]}
         handover_writes, handover_reads = [], []
 
         def handover_with(monitor_doc, extra="", ids_m=("viewer-uuid-0001",), env=None,
-                          beat=30, beat_result="ok", beat_dry=False, notifier_end="current"):
+                          beat=30, beat_result="ok", beat_dry=False, notifier_end="current",
+                          bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",)):
             """The handover's daemon-health lines over one machine. `beat` is the age of the
             MONITOR's own heartbeat in seconds (None: it has written none; "garbage": not
             JSON). `notifier_end` is this end: "current" is a config row that composed and
-            matched the file, with `ids_m` as its monitor ids; "pre-kit156" is a pass that
-            composed nothing, over the file an older installer wrote."""
+            matched the file, with `ids_m` as its monitor ids and `ids_b` as its bounce-driver
+            ids; "pre-kit156" is a pass that composed nothing, over the file an older installer
+            wrote. `bounce_doc` is the bounce driver's config (None: absent)."""
             r = os.path.join(tmp_root, "handover-%d" % len(checks))
             os.makedirs(r)
             values, _e = parse_conf(good_text + extra)
@@ -4081,10 +4177,10 @@ def _selftest_body():
             c["__source__"] = "notifier.conf"
             ctx, f = machine_ctx(r, conf=c, env=env)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
-                       "monitor_actor_ids": list(ids_m)}
+                       "monitor_actor_ids": list(ids_m), "bounce_actor_ids": list(ids_b)}
             if notifier_end == "current":
-                body_h = validate_composed(compose_config(c, ids, ["actor-0001"], list(ids_m)),
-                                           f.home)
+                body_h = validate_composed(compose_config(c, ids, ["actor-0001"], list(ids_m),
+                                                          list(ids_b)), f.home)
                 ctx.composed = {"body": body_h, "sha256": _sha(body_h)}
                 ctx.config_current = True
             else:
@@ -4097,6 +4193,10 @@ def _selftest_body():
                           encoding="utf-8") as fh:
                     fh.write(monitor_doc if isinstance(monitor_doc, str)
                              else json.dumps(monitor_doc))
+            if bounce_doc is not None:
+                with open(os.path.join(f.home, ".stage-e", "config.json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump(bounce_doc, fh)
             if beat == "garbage":
                 os.makedirs(os.path.join(f.home, ".stage-e", "state"), exist_ok=True)
                 with open(os.path.join(f.home, ".stage-e", "state", "monitor-heartbeat.json"),
@@ -4106,7 +4206,8 @@ def _selftest_body():
                 monitor_beat(f.home, ago=beat, result=beat_result, dry=beat_dry)
             on, off, unproven = handover_lines(ctx)
             handover_writes.extend(f.writes)
-            handover_reads.extend(s for s in f.role_scripts if "monitor.json" in s)
+            handover_reads.extend(s for s in f.role_scripts
+                                  if "monitor.json" in s or "config.json" in s)
             return " || ".join(["ON: " + l for l in on] + ["OFF: " + l for l in off]
                                + ["NOT PROVEN: " + l for l in unproven])
 
@@ -4219,6 +4320,75 @@ def _selftest_body():
            "never ON",
            "NOT PROVEN: the daemon-health page" in text and "monitor-actor-0009" in text
            and "ON: the daemon-health page" not in text, text)
+
+        # ── 14d. the ready-to-merge page (KIT-225): both ends, on the daemon-health pattern ──
+        # `self` is the user of THIS notifier's key. The bounce driver writes the mark with the
+        # key its own config names. Two keys, and every real mark is skipped as a forgery while
+        # the notifier's summary still says `ready-to-merge marks: ON`.
+        text = handover_with(mon_doc)
+        ok("handover: one key for both jobs — the ready-to-merge page is ON, naming the key",
+           "ON: the ready-to-merge page" in text and "$STAGE_E_LINEAR_API_KEY" in text
+           and "OFF: the ready-to-merge page" not in text, text)
+        other_key = dict(bounce_cfg, linear_api_key_env="OTHER_TRACKER_KEY")
+        text = handover_with(mon_doc, bounce_doc=other_key)
+        ok("handover: `self` is another key's user than the bounce driver's — OFF, naming both "
+           "keys and the remedy, never ON",
+           "OFF: the ready-to-merge page" in text and "OTHER_TRACKER_KEY" in text
+           and "$STAGE_E_LINEAR_API_KEY" in text and "BOUNCE_ACTOR_IDS" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, bounce_doc=other_key, ids_b=("bounce-actor-0009",),
+                             extra="BOUNCE_ACTOR_IDS=bounce-actor-0009\n")
+        ok("handover: …but a named bounce-driver id needs no key match",
+           "ON: the ready-to-merge page" in text and "OFF: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, bounce_doc={"linear_key_env": "STAGE_E_LINEAR_API_KEY",
+                                                  "team_keys": ["KIT"]})
+        ok("handover: the driver's key read under the poller's spelling too, as the driver reads it",
+           "ON: the ready-to-merge page" in text and "OFF: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, bounce_doc={"team_keys": ["KIT"]})
+        ok("handover: a driver config naming no key is the driver's own default — another key, OFF",
+           "OFF: the ready-to-merge page" in text and "$LINEAR_OWNER_API_KEY" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, bounce_doc=dict(bounce_cfg, team_keys=["KIT", "REV"]))
+        ok("handover: the driver comments in a team TEAM_KEYS does not scan — OFF, by team",
+           "OFF: the ready-to-merge page" in text and "REV" in text and "TEAM_KEYS" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, bounce_doc=None)
+        ok("handover: no bounce driver config — OFF, naming the file and the Stage E step",
+           "OFF: the ready-to-merge page" in text and "config.json" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, extra="BOUNCE_ACTOR_IDS=off\n", ids_b=())
+        ok("handover: BOUNCE_ACTOR_IDS=off — the ready-to-merge page is OFF, by name",
+           "OFF: the ready-to-merge page" in text and "BOUNCE_ACTOR_IDS=off" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156")
+        ok("handover: a pass that composed no config — the ready-to-merge page NOT PROVEN, never ON",
+           "NOT PROVEN: the ready-to-merge page" in text and "not the one this pass composed" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, ids_b=())
+        ok("handover: a composed config with no bounce-driver ids — NOT PROVEN, never ON",
+           "NOT PROVEN: the ready-to-merge page" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, extra="BOUNCE_ACTOR_IDS=bounce-actor-0009\n",
+                             ids_b=("viewer-uuid-0001",))
+        ok("handover: a config composed without an id BOUNCE_ACTOR_IDS names — NOT PROVEN, never ON",
+           "NOT PROVEN: the ready-to-merge page" in text and "bounce-actor-0009" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        text = handover_with(mon_doc, env={"STAGE_E_LINEAR_API_KEY": key,
+                                           sorted(AGENT_ENV_MARKERS)[0]: "1"})
+        ok("handover: under a model the bounce driver's config is NOT MEASURED, never guessed",
+           "NOT PROVEN: the ready-to-merge page" in text and "not measured" in text
+           and "ON: the ready-to-merge page" not in text, text)
+        ok("handover: the bounce driver's config was READ as the role account, never written",
+           any("config.json" in s for s in handover_reads) and handover_writes == [],
+           (handover_reads[-1:], handover_writes))
+        import pipeline_bounce_local as _bounce
+        ok("handover: the bounce driver's config path, default key name and key alias are the "
+           "driver's own",
+           (BOUNCE_CONFIG_PATH, BOUNCE_DEFAULT_KEY_ENV,
+            _bounce.CONFIG_ALIASES.get(BOUNCE_KEY_ENV_ALIAS))
+           == (_bounce.DEFAULT_CONFIG_PATH, _bounce.CONFIG_DEFAULTS["linear_api_key_env"],
+               "linear_api_key_env"),
+           (BOUNCE_CONFIG_PATH, _bounce.DEFAULT_CONFIG_PATH))
 
         # PINNED (the KIT-178 review round, 2026-09-24): the monitor calls the notifier stale
         # LATER than this installer's own `verify` does, so `verify` is the first to go red.

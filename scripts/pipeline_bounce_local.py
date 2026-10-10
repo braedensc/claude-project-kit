@@ -41,8 +41,9 @@ WHAT HAPPENS WHEN NOTHING NEEDS BOUNCING (the conclusion)
   the BASIS (`clean` | `below-threshold` | `exhausted`), and the original coding ticket
   is moved once into the NEEDS-APPROVAL lane (`linear.stateIds.needsApproval`, contract
   §1). That state is the only one this file can write and that move is the only ticket
-  move it makes; nothing else about the conclusion changes anything — no comment, no
-  label, no approval, no merge. Exhaustion concludes the same way and additionally
+  move it makes. Before the move it leaves one comment on that ticket, the ready-to-merge
+  page (KIT-225); nothing else about the conclusion changes anything — no label, no
+  approval, no merge. Exhaustion concludes the same way and additionally
   applies `agent:needs-human`, which is what separates "we ran out of road" from
   "nothing needed fixing" on the board.
 
@@ -3246,7 +3247,10 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
     leaves the ready-to-merge comment, the owner's page that the PR is theirs, and records
     a `ready` row. It goes first, and a failure stops the conclusion here with nothing
     moved or recorded, so the next pass says it again: a page is the one thing a lane move
-    without it would lose. The `ready` row stops a retried move from saying it twice."""
+    without it would lose. That includes a comment the tracker saved but never answered for,
+    which is then said twice: a repeat, chosen over a lost page. The `ready` row, which names
+    its head, stops a retried move at that head from saying it twice; a later conclusion at a
+    new head says it again."""
     state_id = str(sit.get("needs_approval_state_id") or "")
     issue_id = str((sit.get("issue") or {}).get("id") or "")
     note, problems = "", []
@@ -3261,7 +3265,11 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
         problems.append("needs-approval move: no original ticket resolved for this PR")
     else:
         lane = "moved"
-    say_ready = (basis != EXHAUSTED_BASIS and bool(issue_id) and not sit.get("ready"))
+    # Once per HEAD, not once per pull request: a refused move leaves the conclusion owed, so
+    # the PR can be bounced again and conclude at a later head, and that is the one to page.
+    said = sit.get("ready") or {}
+    said_here = bool(said) and str(said.get("head_sha") or "") == str(sit.get("head_sha") or "")
+    say_ready = basis != EXHAUSTED_BASIS and bool(issue_id) and not said_here
     if dry_run:
         if say_ready:
             print("[dry-run] would leave the ready-to-merge comment on %s" % sit.get("ticket_id"))
@@ -3312,11 +3320,12 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     no merge, and `agent:needs-human` stays exactly what it was (a spent budget), so the
     two ways Stage E ends stay distinguishable on the board.
 
-    ONE COMMENT IS POSTED, and it is telemetry's. `record_conclusion` writes no comment at
-    all; `emit_telemetry` below hands the artifact to the §4 publisher, whose only Linear
-    mutation is a `commentCreate` on the pinned ticket. This docstring said "no comment"
-    for two releases while a comment landed on every conclusion — which is the reading a
-    person does when a comment appears and they go looking for the code that posts it."""
+    TWO COMMENTS ARE POSTED. `record_conclusion` leaves the ready-to-merge comment, the
+    owner's page (KIT-225), before it moves anything; `emit_telemetry` below hands the
+    artifact to the §4 publisher, whose only Linear mutation is a `commentCreate` on the
+    pinned ticket. This docstring said "no comment" for two releases while a comment landed
+    on every conclusion — which is the reading a person does when a comment appears and they
+    go looking for the code that posts it."""
     basis = verdict.get("basis") or "clean"
     # ONE ROW PER CONCLUSION, not one per pass that completes it (review of #140). A
     # needs-approval move that keeps failing brings this path back every pass, and each
@@ -5614,6 +5623,32 @@ def selftest():
                   (rc_r2, [c[0] for c in calls]), (EXIT_OK, ["ticketComment", "state", "telemetry"]))
             check("KIT-225 …one ready row, before the concluded row",
                   [r["outcome"] for r in read_ledger(ledger_path(tmp))], ["ready", "concluded"])
+
+        # KIT-225. THE READY COMMENT IS SAID ONCE PER HEAD, NOT ONCE PER PULL REQUEST. A refused
+        # move leaves the conclusion owed, so the PR can be bounced again and conclude clean at
+        # a later head. That later conclusion is the one the owner must hear about: a `ready`
+        # row from the earlier head must not silence it. A retry at the SAME head stays silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            def conclude_at(head):
+                sit_h = {"repo": "o/r", "pr": 41, "ticket_id": "ENG-41", "head_sha": head,
+                         "issue": {"id": "iss-uuid"}, "needs_approval_state_id": "st-na"}
+                sit_h.update(ledger_view(ledger_path(tmp), "o/r", 41))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return record_conclusion(sit_h, cfg, tmp, "clean", False)[0]
+            calls.clear()
+            world["state_fails"] = True
+            try:
+                moved_h = [conclude_at("aaaa"), conclude_at("aaaa")]
+            finally:
+                world["state_fails"] = False
+            moved_h.append(conclude_at("cccc"))
+            check("KIT-225 a refused move at head aaaa, retried there, then a clean conclusion at "
+                  "head cccc: one ready comment per head, and the retry at aaaa says nothing",
+                  (moved_h, [c[0] for c in calls],
+                   [(r["outcome"], r["head_sha"]) for r in read_ledger(ledger_path(tmp))]),
+                  ([False, False, True], ["ticketComment", "state", "state", "ticketComment", "state"],
+                   [("ready", "aaaa"), ("concluded", "aaaa"), ("concluded", "aaaa"),
+                    ("ready", "cccc"), ("concluded", "cccc")]))
 
         #       EVERY TERMINAL STATE REMAINS BANNED. The fixture names all six canonical
         #       states; the driver can reach exactly one of them. `done` is the one that

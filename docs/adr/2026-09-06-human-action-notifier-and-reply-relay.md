@@ -529,16 +529,20 @@ Decision 5's second half. When Stage E concludes a pull request clean or below t
 threshold, the bounce driver leaves one comment on the coding ticket, before it moves the
 ticket: the `ready-to-merge` mark on line 1 and the pull request alone on line 2. A failed
 comment stops the conclusion with nothing moved, so the next pass says it again; a `ready`
-ledger row keeps a retried move from saying it twice. The budget-spent comment now opens
-with `agent:needs-human`, so that moment pages too.
+ledger row, naming its head, keeps a retried move at that head from saying it twice. It is
+not once-only. A comment the tracker saved without answering counts as failed and is said
+again: a repeated page, chosen over a lost one, the same trade the notice path makes. A
+later conclusion at a new head, after a refused move and another bounce, says it again too.
+The budget-spent comment now opens with `agent:needs-human`, so that moment pages too.
 
 The notifier accepts `ready-to-merge` only from `bounce_actor_ids`, on the daemon-health
 pattern: optional, OFF and said while unset, deferred not dropped, a forgery named and
 skipped. It applies no label. Its ping links the pull request instead of the ticket, read
 from line 2 only for that author and only in the exact shape of one, so `build_message`
 still takes no comment text. The installer resolves `BOUNCE_ACTOR_IDS` (default `self`, the
-Stage E key's user) like the monitor's ids. The "opened" half is still not built: it needs
-the code host, which the notifier does not read.
+Stage E key's user) like the monitor's ids, and its handover says OFF when `self` and the
+driver's key differ, since every real mark would then be skipped. The "opened" half is still
+not built: it needs the code host, which the notifier does not read.
 
 ## Update 2026-09-24 — the chat lane is on, and the composer writes (KIT-197, KIT-196)
 
