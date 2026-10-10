@@ -1097,3 +1097,51 @@ Code session, which is the session's own shell.
 after the fence per the runner's source; a list still holding a fenced tool would fail the
 probe loudly. The drill's premise — that the dispatcher posts no routing note for a delegator
 it refuses — is read from source; a drill that does not trip fails, and says so.
+
+## Update 2026-10-10 — the owner's creation counts as the move (KIT-164)
+
+**What broke.** The planner job reads an idea's history for the move into Plan it, and
+checks the owner made it. On 2026-10-10 the routing drill could not test anything, and the
+reason reached past the drill. Read with the job's own query, about 25 minutes later:
+
+| Ticket | What happened | What the history holds |
+|---|---|---|
+| one | filed with the owner's key, moved to Plan it after 31 s, cancelled after 93 s | nothing at all |
+| two | filed with the owner's key, moved after 0.7 s, cancelled after 14 min | only the cancel |
+| three | filed with the owner's key, moved by the dispatcher after 2.7 s | both moves |
+| four | moved twice by the source-control integration | both moves |
+
+So the tracker does not record a state change the ticket's **creator** makes in its first
+minutes, and the change never appears later. Another actor's change is recorded at once.
+An idea written and moved quickly had no move to read, and was refused.
+
+**Decision (the owner's, 2026-10-10, option 1 of three).** An idea qualifies when the owner
+created it, it sits in Plan it, and its history holds **no state change at all**. Its
+creation then stands in for the move, and its creator for the mover. The trigger's id is
+`created-<idea id>`, so the planning ticket and the job's record name it as for a move.
+Any recorded state change voids this, and then only a recorded move into Plan it counts,
+checked against the owner as before. An idea the job already told it has no move keeps
+needing a real move. Its creation never counts later, so ideas the job refused before
+this change do not start on their own once it is installed; each gets the note once
+more. The drill files its idea straight into Plan it, and wakes the job once the idea
+reads back, through the job's own reader, as the owner's creation.
+
+**Why this trusts nothing new.** The owner-only rule already trusts the key that writes as
+the owner. A creation by that key is the same identity. Another actor's state change is
+recorded at once, so an idea someone else moved into Plan it carries that move, and is
+refused as not the owner's. An idea someone else created has a different creator, and is
+refused with its own note.
+
+**Also fixed: a refusal is said once.** The "no move" note was keyed on the idea's
+`updatedAt`, and a comment moves `updatedAt`. Had the tracker done that here, the note would
+have been posted again on every pass. It is now keyed on the history itself, so a new move
+gets a new answer and nothing else does. The "history too long" note is said once per idea.
+Either way the idea is then settled at its current `updatedAt`, so a later pass does not
+read its history again.
+
+**Rejected.** Waiting the window out (the drill files, waits about 15 minutes, then moves):
+slow, and it rests on a window that is bracketed, not measured. Measuring the window first:
+it would still leave a person waiting before each move.
+
+**Not proven.** The window was measured on tickets made through the API only. Whether a
+ticket made in the tracker's own app behaves the same is not known.

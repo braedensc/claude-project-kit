@@ -27,18 +27,22 @@ beside its real work. The gate is four parts and one gesture:
 
 The **dispatcher** is the program that turns a ticket handed to its agent user into a sandboxed session; "delegate to the agent" means hand a ticket to that user.
 
-**The gesture: you move an idea to Plan it.** Two gestures, two meanings, on a work team:
+**The gesture: you put an idea in Plan it**, by moving it there or by writing it there. Two
+gestures, two meanings, on a work team:
 
-- Move a ticket to **Plan it** to plan it.
+- Put a ticket in **Plan it** to plan it.
 - Delegate a ticket to the agent to **build** it.
 
 Never both on one ticket.
 
 ## 2. What happens, in order
 
-1. You write an idea on the project's work team and move it to **Plan it**.
+1. You write an idea on the project's work team, in **Plan it** or moved there.
 2. The planner job's next pass reads the ticket's history and checks that **you** made the
-   move. It also checks the ticket is a fresh idea, not live work (section 4).
+   move. When that history holds no state change at all, your creation of the ticket counts
+   as the move, and the job checks that **you** created it. The tracker never records a
+   change a ticket's creator makes in its first minutes, so a quick move leaves no trace
+   (KIT-164). The job also checks the ticket is a fresh idea, not live work (section 4).
 3. The job writes a **planning ticket on the same team**:
    - the first line is the repository's planning tag, `[repo=stage-a-planning-<repository>]`;
    - your idea is quoted inside `<untrusted-idea-data>` markers, with every routing
@@ -105,7 +109,14 @@ and it cannot merge.
 ## 4. What each part refuses
 
 **The planner job**
-- Starts nothing unless the owner made the move, read from the ticket's own history.
+- Starts nothing unless the owner made the move, read from the ticket's own history. When
+  that history holds no state change at all, the owner must have created the ticket instead.
+  Any recorded state change, by anyone, means only a recorded move into Plan it counts.
+- Says each refusal once per ticket, until the ticket's history changes. A new move gets a
+  new answer.
+- Never counts your creation of a ticket it already told has no move. That includes ideas
+  an older version refused; each gets the note once more. Move it out of Plan it and back
+  in.
 - Starts nothing on **live work**, with one note and no run: a ticket that is delegated, has
   an agent session, carries a `provenance:*` or `agent:*` label, has a parent or children, or
   has a pull request attached.
@@ -225,8 +236,9 @@ What it does, in order:
    - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py
      drill`). It makes the dispatcher refuse one planning ticket and checks planning stops.
      Then it puts the setting back and probes again, which is what lets planning start.
-     It files its idea in the backlog and moves it to Plan it. It wakes the job only once
-     the idea's history shows that move, because the job checks the history first.
+     It files its idea straight into Plan it, as you, so your creation counts as the move.
+     It wakes the job only once the idea reads back as your creation, the way the job
+     reads it.
 
      A drill has three endings. **Passed:** planning stopped. **Failed:** the job filed a
      planning ticket and planning did not stop. **Could not test** (exit 4): the job filed
@@ -312,6 +324,10 @@ wall clock.
 - **The planner's key is the review jobs' variable, by name.** Rename `LINEAR_KEY_ENV` in the
   review installer's settings and the planner goes on reading the old name: change it in
   `stage-a.conf` too.
+- **Your creation counts as the move only because of what the tracker leaves out.** On
+  2026-10-10, four tickets made through the API showed it: the creator's state change in
+  the first minutes left no history entry, and another actor's change was recorded at
+  once. Tickets made in the tracker's own app are not measured (KIT-164).
 - **The installer's own new steps have not run live.** Writing the dispatcher's settings and
   restarting it reuse the review installer's code, which has. The pull request, the automatic
   probe, starting the job and the drill are proven only against synthetic fixtures.
