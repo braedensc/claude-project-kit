@@ -60,21 +60,23 @@ $EDITOR chat-lane.conf                                      # none of them secre
 python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 ```
 
-The conf has seven values, and five optional ones: `DISPATCHER_SERVICE`,
-`FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN` and `FRONT_DOOR_MATCHER`. Leave
-one unset and every printed command that needs it says `not composed: set <KEY> in
-chat-lane.conf`, and a subcommand that needs it refuses. Nothing is guessed. A conf with a
-problem (an unknown key, say) composes nothing: `card` lists the problems first, prints the
-card without its commands, and exits 2.
+The conf has eight values, and seven optional ones: `DISPATCHER_SERVICE`,
+`FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN`, `FRONT_DOOR_MATCHER`, and
+`IDEA_TEAM_KEYS` and `HEALTH_STATUS_FILE` for piece 8. One of the eight, `CHAT_RULES`, stays
+`off` until Step 14. Leave an optional one unset and every printed command that needs it
+says `not composed: set <KEY> in chat-lane.conf`, and a subcommand that needs it refuses.
+Nothing is guessed. A conf with a problem (an unknown key, say) composes nothing: `card`
+lists the problems first, prints the card without its commands, and exits 2.
 
 | Command | What it does |
 |---|---|
-| `compose` | Prints all seven pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
+| `compose` | Prints all eight pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
 | `compose --piece N` | Prints one piece alone. `--piece 4` prints only the port-block script, so you can save it to a file. |
 | `verify` | Reads the dispatcher's config, its env file, the role account's user settings and the front door's config **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value. Changes nothing. Refuses to run under a model. |
 | `merge` | Pieces 1, 2 and 5. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
 | `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
+| `chat-rules` | Piece 8, once `CHAT_RULES=on` (Step 14). Says what it would write and changes nothing. `chat-rules --apply` writes the chat bot's rules, as the role account. While `CHAT_RULES=off` it refuses. |
 | `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off. |
 
 Every command exits like the Stage E installer's. Read the exit code, not the word on the
@@ -84,7 +86,7 @@ line: a `REFUSED:` line can end in 10, 2 or 3.
 |---|---|
 | **0** | Done, or nothing left to do. |
 | **10** | Something is not applied yet, or a step must come first. A writer's dry run that found work. `env-names` before the fence or the port block, or with no terminal. A file a writer will not touch: missing, a symbolic link, or owned by another account. A front-door file without exactly one allowlist line, a line that reaches the dispatcher's control routes, or a removal that would empty it. |
-| **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, or a pasted secret has the wrong shape. |
+| **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, `chat-rules` while `CHAT_RULES=off`, or a pasted secret has the wrong shape. |
 | **4** | A check could not measure. `env-names` also exits 4 when it cannot read the file it compares the token with. Not a pass. |
 | **1** | Something is broken, or a write failed. |
 | **5** | No administrator password. |
@@ -127,7 +129,8 @@ the role account's env file. So do this soon after you pull:
    by hand in the absolute form, `Read(//Users/<role>/.stage-e/backups/**)`, stays; it is
    redundant and harmless.
 5. Run `front-door`. Good: `/slack-webhook is already on the line. Nothing to change.`
-6. Run `verify` again. Good: exit 0.
+6. Run `verify` again. Good: exit 0. The `chat-rules` row says the rules are off; Step 14
+   turns them on.
 
 ---
 
@@ -588,7 +591,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file and backups folder included |
-| `chat-rules` | the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
+| `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
@@ -636,7 +639,13 @@ that server.
 
 Do this once the bridge runs (`docs/BRIDGE-OPERATOR.md`). The rules hand every request to it.
 
+First set `CHAT_RULES=on` in `chat-lane.conf`. Until then, `verify`'s `chat-rules` row says
+the rules are off, and `chat-rules` refuses. `compose --piece 8` prints the rules, so you
+can read them first.
+
 ```sh
+$EDITOR chat-lane.conf                                        # CHAT_RULES=on
+python3 scripts/pipeline_chat_lane_setup.py compose --piece 8   # read them
 python3 scripts/pipeline_chat_lane_setup.py chat-rules
 python3 scripts/pipeline_chat_lane_setup.py chat-rules --apply
 ```

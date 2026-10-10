@@ -27,6 +27,7 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
               Dry run by default; `--apply` writes; `--remove` takes the path off.
     chat-rules piece 8 (KIT-226): writes the chat bot's rules where every chat session
               reads them and nothing else does. Dry run by default; `--apply` writes.
+              Refuses until chat-lane.conf sets CHAT_RULES=on (Step 14).
     card      prints a checkpoint card: CK-C1 (create the chat app), CK-C2 (the front
               door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
               from a second device), CK-C5 (restart the dispatcher, only when it is
@@ -175,7 +176,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # the two installers cannot disagree on any of them.
 from pipeline_stage_e_setup import _self_path as _stage_e_self_path  # noqa: E402
 from pipeline_stage_e_setup import (  # noqa: E402
-    ALREADY_DONE, BLOCKED, FAILED, UNKNOWN,
+    ALREADY_DONE, BLOCKED, FAILED, UNKNOWN, SKIPPED,
     EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED,
     REVIEW_BRIEF_FINGERPRINT, TRACKER_FENCE_SERVERS,
     _ACCOUNT_RE, _BLOB_RE, _CRED_PREFIXES, _ENV_NAME_RE, _RDNS_RE,
@@ -876,7 +877,9 @@ class ConfError(Exception):
 CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE", "FRONT_DOOR_HOST")
 CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
                  "DISPATCHER_PORT": DEFAULT_DISPATCHER_PORT,
-                 "ROLE_ENV_FILE": DEFAULT_ROLE_ENV_FILE}
+                 "ROLE_ENV_FILE": DEFAULT_ROLE_ENV_FILE,
+                 # Piece 8, the chat bot's rules (KIT-226): off until Step 14 turns them on.
+                 "CHAT_RULES": "off"}
 # Optional, and empty when unset (KIT-197). A printed command that needs one says
 # "not composed: set <KEY> in chat-lane.conf" instead of printing a placeholder; a
 # subcommand that needs one refuses, naming it.
@@ -986,6 +989,9 @@ def validate_conf(values):
         errors.append("IDEA_TEAM_KEYS names %s, which %s not a team key: capitals and "
                       "digits, starting with a capital, like PROD"
                       % (", ".join(bad_teams), "is" if len(bad_teams) == 1 else "are"))
+    if conf.get("CHAT_RULES") not in ("off", "on"):
+        errors.append("CHAT_RULES is off or on: off until Step 14, once the bridge runs "
+                      "(got %r)" % conf.get("CHAT_RULES"))
     role_env = conf.get("ROLE_ENV_FILE") or ""
     if not role_env.startswith(("/", "~/")) or role_env in ("/", "~/"):
         errors.append("ROLE_ENV_FILE must be an absolute path, or start with ~/ for the role "
@@ -1028,10 +1034,10 @@ def cmd_compose(conf, conf_path="chat-lane.conf", piece=None):
     say(" Chat lane — every piece, composed for you to apply")
     say(rule)
     say(" conf: %s    dispatcher source read: %s" % (conf_path, SOURCE_VERSION))
-    para("This command read no live file and changed nothing. Three subcommands write pieces "
-         "1, 2, 3, 5 and 7 for you, as the role account, when you run them: merge, env-names "
-         "and front-door. The rest is yours by hand. Apply everything in the order at the "
-         "end, then run:  python3 %s verify" % _self_path(), " ")
+    para("This command read no live file and changed nothing. Four subcommands write pieces "
+         "1, 2, 3, 5, 7 and 8 for you, as the role account, when you run them: merge, "
+         "env-names, front-door and chat-rules. The rest is yours by hand. Apply everything "
+         "in the order at the end, then run:  python3 %s verify" % _self_path(), " ")
     say("")
     _compose_warning()
     for n in sorted(COMPOSE_PIECES):
@@ -1473,9 +1479,11 @@ def _compose_piece_8(conf):
     for line in chat_rules_text(conf).splitlines():
         say("    " + line)
     say("")
-    para("chat-rules writes it for you, as the role account, mode 600:  python3 %s "
-         "chat-rules , then  chat-rules --apply . verify's chat-rules row checks it byte for "
-         "byte." % _self_path())
+    para("Set CHAT_RULES=on in chat-lane.conf first. Until then verify's chat-rules row says "
+         "the rules are off and does not fail, and chat-rules refuses. Then chat-rules writes "
+         "it for you, as the role account, mode 600:  python3 %s chat-rules , then  "
+         "chat-rules --apply . From then on verify's chat-rules row checks it byte for byte."
+         % _self_path())
     para("WHAT THIS DOES NOT STOP. These are instructions, not a guard. The dispatcher starts "
          "work only when the owner delegates, and the bridge acts only on a member's yes to "
          "its own question; those are what hold. A chat session cannot rewrite this file: "
@@ -1486,7 +1494,7 @@ def _compose_piece_8(conf):
 
 COMPOSE_PIECES = {1: _compose_piece_1, 2: _compose_piece_2, 3: _compose_piece_3,
                   4: _compose_piece_4, 5: _compose_piece_5, 6: _compose_piece_6,
-                  7: _compose_piece_7}
+                  7: _compose_piece_7, 8: _compose_piece_8}
 
 
 # -- Order -------------------------------------------------------------------
@@ -1523,7 +1531,8 @@ def _compose_order(conf):
         "10. %s verify" % me,
         "11. Card CK-C3: the live check, in the channel.",
         "12. Once the bridge runs (docs/BRIDGE-OPERATOR.md), piece 8, the chat bot's rules: "
-        " %s chat-rules , then  chat-rules --apply ." % me,
+        "set CHAT_RULES=on in chat-lane.conf, then  %s chat-rules , then  chat-rules "
+        "--apply ." % me,
         "To turn the lane off later: card CK-C6.",
     )
     for step in steps:
@@ -2570,10 +2579,19 @@ def check_user_settings(conf, us, env_facts):
 
 
 def check_chat_rules(conf, cr):
-    """KIT-226: the chat bot's rules, byte for byte what this checkout composes."""
+    """KIT-226: the chat bot's rules, byte for byte what this checkout composes. Off until
+    Step 14 sets CHAT_RULES=on: the rules hand every request to the bridge, so they wait
+    for it, and a row that stayed BLOCKED until then would make BLOCKED the lane's normal
+    state and hide real drift behind it (review of KIT-226)."""
     path = cr.get("path") or chat_rules_path(conf)
     remedy = "run  chat-rules , then  chat-rules --apply  (once the bridge runs)"
     err = cr.get("error")
+    if conf.get("CHAT_RULES") != "on":
+        return _row("chat-rules", SKIPPED,
+                    "chat rules: off (CHAT_RULES=off); Step 14 turns them on",
+                    [] if err == "missing" else
+                    ["note: %s is there anyway. Every chat session reads it, and this row "
+                     "does not check it while CHAT_RULES=off" % path])
     if err == "missing":
         return _row("chat-rules", BLOCKED,
                     "no chat rules at %s, so chat sessions follow the dispatcher's own "
@@ -2685,9 +2703,9 @@ def evaluate(facts, conf, pf=None):
     return sorted(rows, key=lambda r: order.get(r["check"], len(CHECKS)))
 
 
-_SEVERITY = (FAILED, UNKNOWN, BLOCKED, ALREADY_DONE)
+_SEVERITY = (FAILED, UNKNOWN, BLOCKED, ALREADY_DONE, SKIPPED)
 _VERIFY_EXIT = {FAILED: EX_FAILED, UNKNOWN: EX_UNKNOWN, BLOCKED: EX_BLOCKED,
-                ALREADY_DONE: EX_OK}
+                ALREADY_DONE: EX_OK, SKIPPED: EX_OK}
 
 
 def worst_exit(rows):
@@ -3558,6 +3576,11 @@ def cmd_chat_rules(conf, runner, sudo, apply_it=False):
     if found:
         say(refusal_text(found, "chat-rules"))
         return EX_REFUSED
+    if conf.get("CHAT_RULES") != "on":
+        say("REFUSED: chat-rules needs CHAT_RULES=on in chat-lane.conf, and it is off. Step "
+            "14 turns it on, once the bridge runs. Nothing was read or changed. To read the "
+            "rules first:  python3 %s compose --piece 8" % _self_path())
+        return EX_USAGE
     account, path, text = conf["ROLE_ACCOUNT"], chat_rules_path(conf), chat_rules_text(conf)
     say("Chat-lane chat-rules — %s" % ("APPLY" if apply_it else
                                        "DRY RUN: nothing will be changed"))
@@ -4439,7 +4462,7 @@ def _selftest_body():
         env_path = os.path.join(tmp, "dispatcher", ".env")
         front_path = os.path.join(tmp, "front", "Caddyfile")
         vconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
-                     FRONT_DOOR_CONFIG=front_path)
+                     FRONT_DOOR_CONFIG=front_path, CHAT_RULES="on")
         _put(front_path, FRONT_DOOR_FIXTURE.replace("/extra-path", "/slack-webhook"))
         review_brief = REVIEW_BRIEF_FINGERPRINT + ". More."
         planning_brief = PLANNING_BRIEF_FINGERPRINT + ". More."
@@ -4473,13 +4496,17 @@ def _selftest_body():
             return json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
                                "permissions": {"deny": deny}})
 
-        def probe(config_obj, env_text, settings_text):
+        def probe(config_obj, env_text, settings_text, rules=True):
             _put(cfg_path, json.dumps(config_obj) if not isinstance(config_obj, str)
                  else config_obj)
             _put(env_path, env_text)
-            # The chat bot's rules (KIT-226), as chat-rules --apply leaves them.
-            _put(os.path.join(os.path.dirname(cfg_path), "slack-workspaces", "CLAUDE.md"),
-                 chat_rules_text(vconf))
+            # The chat bot's rules (KIT-226), as chat-rules --apply leaves them, or none.
+            rules_path = os.path.join(os.path.dirname(cfg_path), "slack-workspaces",
+                                      "CLAUDE.md")
+            if rules:
+                _put(rules_path, chat_rules_text(vconf))
+            elif os.path.exists(rules_path):
+                os.unlink(rules_path)
             spath = os.path.join(home, ".claude", "settings.json")
             if settings_text is None:
                 if os.path.exists(spath):
@@ -4505,12 +4532,12 @@ def _selftest_body():
                        "JSON line (%d bytes)" % len(ran.stdout))
                 return {}
 
-        def verify_with(ran, **pf):
+        def verify_with(ran, vc=None, **pf):
             fake = _FakeRunner([("/usr/bin/python3 -c", ran.returncode, ran.stdout,
                                  ran.stderr)] + _pf_answers(**pf))
             fakes.append(fake)
             sudo = _FakeSudo()
-            rc_v, printed = _capture(cmd_verify, vconf, fake, sudo)
+            rc_v, printed = _capture(cmd_verify, vc or vconf, fake, sudo)
             outputs.append(printed)
             return rc_v, printed, fake, sudo
 
@@ -4538,6 +4565,18 @@ def _selftest_body():
         expect("entry-kinds", kinds == {"coding-a": "coding", "coding-b": "coding",
                                         "reviews-a": "review",
                                         "stage-a-planning-plan": "planning"}, kinds)
+
+        # No rules file yet. CHAT_RULES=off, the default until Step 14, keeps verify clean
+        # and says so by name; on, the same lane is not clean (review of KIT-226).
+        ran = probe(good_config(), good_env(), good_settings, rules=False)
+        for value, want_rc, needle in (
+                ("off", EX_OK, "chat rules: off (CHAT_RULES=off); Step 14 turns them on"),
+                ("on", EX_BLOCKED, "no chat rules at")):
+            rc_v, printed, _f, _s = verify_with(ran, dict(vconf, CHAT_RULES=value))
+            flat_v = " ".join(printed.split())
+            expect("verify-chat-rules-%s-with-no-file" % value, rc_v == want_rc
+                   and needle in flat_v and ("No drift" in flat_v) == (value == "off"),
+                   (rc_v, printed[-900:]))
 
         # grant mismatch
         cfg_m = good_config()
@@ -5355,18 +5394,68 @@ def _selftest_kit226_body(expect, conf):
            "one of PROD, TOD." in teamed and "one of" not in text, teamed[:300])
     _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0], IDEA_TEAM_KEYS="prod,TOD"))
     expect("conf-IDEA_TEAM_KEYS-checked", any("IDEA_TEAM_KEYS" in e for e in errs), errs)
+    # CHAT_RULES: off until Step 14 turns the rules on (review of KIT-226).
+    expect("conf-CHAT_RULES-default-off", conf.get("CHAT_RULES") == "off",
+           conf.get("CHAT_RULES"))
+    _v, errs = parse_conf(GOOD_CONF_TEXT + "CHAT_RULES=on\n")
+    expect("conf-CHAT_RULES-known", not errs, errs)
+    _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0], CHAT_RULES="yes"))
+    expect("conf-CHAT_RULES-checked", any("CHAT_RULES" in e for e in errs), errs)
+    on, off = dict(conf, CHAT_RULES="on"), dict(conf, CHAT_RULES="off")
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     for name, facts, want in (("missing", {"path": path, "error": "missing"}, BLOCKED),
                               ("current", {"path": path, "sha256": sha}, ALREADY_DONE),
                               ("changed", {"path": path, "sha256": "0" * 64}, FAILED),
+                              ("link", {"path": path, "error": "a symbolic link"}, FAILED),
                               ("unreadable", {"path": path, "error": "unreadable"}, UNKNOWN)):
-        row = check_chat_rules(conf, facts)
+        row = check_chat_rules(on, facts)
         expect("chat-rules-row:" + name, row["outcome"] == want, row)
-    expect("chat-rules-is-a-verify-row", "chat-rules" in CHECKS and any(
-        r["check"] == "chat-rules" and r["outcome"] == BLOCKED
-        for r in evaluate({"config": {"error": "missing"}}, conf)))
+    for name, facts in (("missing", {"path": path, "error": "missing"}),
+                        ("present", {"path": path, "sha256": "0" * 64})):
+        row = check_chat_rules(off, facts)
+        expect("chat-rules-row-off:" + name, row["outcome"] == SKIPPED
+               and worst_exit([row]) == EX_OK
+               and row["detail"] == "chat rules: off (CHAT_RULES=off); Step 14 turns them on"
+               and bool(row["lines"]) == (name == "present")
+               and all(path in line for line in row["lines"]), row)
+    for c, want in ((on, BLOCKED), (off, SKIPPED)):
+        expect("chat-rules-is-a-verify-row:" + c["CHAT_RULES"], "chat-rules" in CHECKS and any(
+            r["check"] == "chat-rules" and r["outcome"] == want
+            for r in evaluate({"config": {"error": "missing"}}, c)))
+
+    # Piece 8 is composed like every other piece: `compose` prints it, rules and all.
+    rc, out = _capture(cmd_compose, conf)
+    p8 = out[out.find("PIECE 8 "):out.find("THE ORDER")]
+    flat8 = " ".join(p8.split())
+    expect("compose-prints-piece-8", rc == EX_OK and "PIECE 8 " in out
+           and "    # Rules for the tech lead in this Slack channel" in p8
+           and "WHAT THIS DOES NOT STOP" in p8 and "CHAT_RULES=on" in flat8, p8[:300])
+    order8 = " ".join(out[out.find("THE ORDER"):].split())
+    expect("compose-order-turns-chat-rules-on", "CHAT_RULES=on" in order8
+           and order8.find("CHAT_RULES=on") < order8.find("chat-rules --apply"), order8[-400:])
 
     with tempfile.TemporaryDirectory() as tmp:
+        # verify's probe never reads through a link: one to the right bytes is still a
+        # link, so whoever controls its target never controls the rules (review of KIT-226).
+        lhome = os.path.join(tmp, "probe-link")
+        lcfg = os.path.join(lhome, "config.json")
+        bait = os.path.join(tmp, "bait.md")
+        _put(bait, text)
+        lrules = chat_rules_path(dict(on, DISPATCHER_CONFIG=lcfg))
+        os.makedirs(os.path.dirname(lrules))
+        os.symlink(bait, lrules)
+        ran = subprocess.run([sys.executable, "-c", FACTS_PY, lcfg,
+                              os.path.join(lhome, "dispatcher.env"), "3456"],
+                             capture_output=True, text=True, env=dict(os.environ, HOME=lhome))
+        try:
+            cr = json.loads(ran.stdout).get("chatRules") or {"error": "missing"}
+        except ValueError:
+            cr = {"error": "the probe printed no JSON"}
+        row = check_chat_rules(on, cr)
+        expect("chat-rules-probe-refuses-a-link",
+               (cr.get("error"), "sha256" in cr, row["outcome"])
+               == ("a symbolic link", False, FAILED), (cr, row, ran.stderr[-300:]))
+
         def write(data, target):
             r = subprocess.run(["/usr/bin/python3", "-c", CHAT_RULES_WRITER_PY, target],
                                input=data.encode("utf-8"), stdout=subprocess.PIPE,
@@ -5402,10 +5491,17 @@ def _selftest_kit226_body(expect, conf):
         home = os.path.join(tmp, "role")
         os.makedirs(home)
         cyrus = os.path.join(home, "dispatcher-home")
-        rconf = dict(conf, DISPATCHER_CONFIG=os.path.join(cyrus, "config.json"),
+        rconf = dict(on, DISPATCHER_CONFIG=os.path.join(cyrus, "config.json"),
                      DISPATCHER_ENV_FILE=os.path.join(cyrus, "dispatcher.env"))
         rpath = chat_rules_path(rconf)
         mach = _RoleMachine(home, _pf_answers())
+        for apply_it in (False, True):
+            sudo = _FakeSudo()
+            rc, out = _capture(cmd_chat_rules, dict(rconf, CHAT_RULES="off"), mach, sudo,
+                               apply_it)
+            expect("chat-rules-refuses-while-off:%s" % ("apply" if apply_it else "dry-run"),
+                   (rc, os.path.exists(rpath), sudo.acquisitions, mach.role_runs)
+                   == (EX_USAGE, False, 0, []) and "CHAT_RULES=on" in out, out)
         rc, out = _capture(cmd_chat_rules, rconf, mach, _FakeSudo(), False)
         expect("chat-rules-dry-run-writes-nothing",
                (rc, os.path.exists(rpath), "DRY RUN" in out) == (EX_BLOCKED, False, True), out)
@@ -5422,6 +5518,15 @@ def _selftest_kit226_body(expect, conf):
         finally:
             os.environ.pop(AGENT_ENV_MARKERS[0], None)
         expect("chat-rules-refuses-an-agent", rc == EX_REFUSED, out)
+
+    # Could not check is exit 4, never "run --apply", and nothing is written (KIT-226).
+    for apply_it in (False, True):
+        fake = _FakeRunner([("/usr/bin/python3 -c", 0, json.dumps(
+            {"chatRules": {"path": path, "error": "unreadable"}}), "")])
+        rc, out = _capture(cmd_chat_rules, on, fake, _FakeSudo(), apply_it)
+        expect("chat-rules-could-not-check-is-exit-4:%s" % ("apply" if apply_it else "dry-run"),
+               (rc, fake.writes, "DRY RUN: nothing was changed" in out)
+               == (EX_UNKNOWN, [], False), out)
 
 
 def _selftest_kit197(expect, conf):
@@ -5494,9 +5599,9 @@ def _selftest_kit197(expect, conf):
         with tempfile.TemporaryDirectory() as tmp:
             cpath = os.path.join(tmp, "chat-lane.conf")
             _put(cpath, GOOD_CONF_TEXT)
-            for n in range(1, 8):
+            for n in range(1, 9):
                 rc, out = _capture(main, ["compose", "--piece", str(n), "--conf", cpath])
-                others = [m for m in range(1, 8) if m != n and ("PIECE %d " % m) in out]
+                others = [m for m in range(1, 9) if m != n and ("PIECE %d " % m) in out]
                 if n == 4:
                     expect("compose-piece-4-is-only-the-script",
                            rc == EX_OK and out == "\n".join(pf_install_commands("3456")) + "\n"

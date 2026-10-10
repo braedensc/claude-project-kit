@@ -9,10 +9,10 @@
 #   python3 scripts/pipeline_chat_lane_setup.py verify        # after you apply them
 #
 # Every command checks this file first and reports EVERY bad value in one pass.
-# `compose` prints and `verify` reads. Three subcommands write, as the role
-# account, only when you run them: `merge --apply`, `env-names` and
-# `front-door --apply`. None of them restarts anything. The steps are in
-# docs/CHAT-LANE-OPERATOR.md.
+# `compose` prints and `verify` reads. Four subcommands write, as the role
+# account, only when you run them: `merge --apply`, `env-names`,
+# `front-door --apply` and `chat-rules --apply`. None of them restarts
+# anything. The steps are in docs/CHAT-LANE-OPERATOR.md.
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
@@ -73,6 +73,15 @@ NOTIFIER_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
 # RULE: an absolute path, or one starting `~/`. The default is the one both
 # installers use.
 ROLE_ENV_FILE=~/.stage-e/env
+
+# Piece 8, the chat bot's rules (KIT-226). They hand every request to the
+# bridge, so leave this `off` until the bridge runs. While it is off, `verify`'s
+# chat-rules row says so and does not fail, and `chat-rules` refuses. Step 14
+# sets it to `on`. From then on a missing or changed rules file keeps `verify`
+# from passing, like any other piece.
+#
+# RULE: off or on. The default is off.
+CHAT_RULES=off
 
 # ---------------------------------------------------------------------------
 # OPTIONAL — the printed restarts and the front-door subcommand need these.
