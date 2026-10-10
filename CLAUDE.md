@@ -245,6 +245,7 @@ npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, els
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over all tracked files
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
+npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers
 npm install             # installs husky + secretlint, wires the pre-commit hook
 ```
 

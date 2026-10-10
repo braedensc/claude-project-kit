@@ -48,6 +48,7 @@
     "test:notifier-setup": "python3 scripts/pipeline_notifier_setup.py --selftest",
     "test:conflict": "python3 scripts/pr_conflict.py --selftest",
     "test:conflict-waker-setup": "python3 scripts/pipeline_conflict_waker_setup.py --selftest",
+    "test:session-brief": "python3 scripts/check_session_brief.py --selftest && python3 scripts/check_session_brief.py",
     "test:update": "python3 scripts/pipeline_update.py --selftest",
     "test:union": "python3 scripts/check_pr_union.py --selftest",
     "test:pr-base": "python3 scripts/check_pr_base.py --selftest",
