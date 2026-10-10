@@ -595,3 +595,45 @@ because each member's Slack account becomes part of the boundary. The lane is tu
 before anyone who does not meet that joins. The composer's opening warning, its order, the
 app-creation card and its "never" list now say this rule, and a selftest keeps the old one
 from returning.
+
+## Update 2026-10-10 — the tracker's merge and review tools are denied by name (KIT-212)
+
+**What was open.** The chat lane holds the tracker's whole tool server. Its hosted server
+carries six tools that act on a pull request: `merge_diff`, which merges one or queues it
+to merge; `submit_diff_review`, which records a review decision, an approval among them;
+and `update_diff`, `save_diff_comment`, `resolve_diff_thread` and `delete_diff_comment`.
+Nothing on the chat lane refused them. The kit's hooks do not run there, and the grant is
+the lane's only fence. So "never merge or approve" rested on the tracker's own permissions.
+
+**Why the grant cannot close it.** The dispatcher appends `mcp__<server>` for every server
+it built, whatever `slackAllowedTools` names (edge-worker `ToolPermissionResolver.js:72-77`),
+and the chat lane's `disallowedTools` is hard-coded empty (`RunnerConfigBuilder.js:78`).
+Naming single tracker tools in the grant would change nothing.
+
+**Decision.** Piece 5 gains six tool rules, `mcp__linear__<tool>` for each of the six, in
+the role account's user settings. That is the one settings file every session of that
+account loads (`ClaudeRunner.js:499`). The diff tools that only read stay, so the chat lane
+can still read a change to explain it. Every session the role account runs loses the six,
+coding, review and planning sessions too. That is intended: no part of the pipeline merges,
+approves or reviews a pull request through the tracker.
+
+**Measured 2026-10-10**, on the build the dispatcher runs (agent SDK 0.3.245, Claude Code
+2.1.245, checksum matching the SDK's manifest), with a stand-in server named like the
+tracker's and offering one write tool and one read tool. A deny rule naming the write tool
+took it out of the session's start-up tool list and left the read tool. It did so with no
+permission callback, the chat lane's shape, and with one that allows everything, the ticket
+lane's shape. The control run, with no rule, listed both. No model call was made, so a
+refused call itself was not observed.
+
+**`verify` gains `chat-tools`.** It reads the newest chat session's start-up line from that
+session's own log, by tool name only, and only in the folders the dispatcher names for chat
+sessions. It names any of the six the session holds. It also names any tracker tool the
+list does not cover whose name says it may merge, approve or act on a diff, so a tool the
+tracker adds later is seen, not missed.
+
+**What it does not close.** A session holding a GitHub token with write access can still
+merge through GitHub; the session's own grant and the repository's branch protection
+guard that path. And a session already running when the rules are merged keeps the six
+tools until it ends, so `merge` prints the idle-restart card after it adds them. The tool server's upload and steering residuals (KIT-162) are unchanged. The kit's
+PreToolUse hook lists five of the six as tracker writes, but it does not run on the chat
+lane, and on the dispatcher's lane it acts only where a pin exists.

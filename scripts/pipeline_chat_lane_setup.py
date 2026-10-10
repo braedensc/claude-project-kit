@@ -17,8 +17,9 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
     compose   prints every piece, or one (`--piece N`; piece 4 alone is only its script).
               Reads no live file, needs no role-account access, runs anywhere. Exit 0, or
               2 on a conf error.
-    verify    read-only live measurement: four files as the role account, and pf's
-              loaded rules as root. One outcome per check.
+    verify    read-only live measurement: four files, and the newest chat session's
+              start-up tool list (names only), as the role account, and pf's loaded
+              rules as root. One outcome per check.
     merge     pieces 1, 2 and 5 into the dispatcher config and the role account's user
               settings. Dry run by default; `--apply` writes.
     env-names piece 3: asks for the chat app's two secrets at hidden prompts and writes
@@ -582,7 +583,8 @@ def pf_missing_families(rules_text, port):
     return missing
 
 # --------------------------------------------------------------------------- #
-# Piece 5 — the role account's user-level settings: secret-file read denies, nothing else.
+# Piece 5 — the role account's user-level settings: secret-file read denies, and the
+# tracker's diff tools that write (KIT-212). Nothing else.
 #
 # REPO_DENY_PATTERNS is this repository's .claude/settings.json `permissions.deny`, read
 # 2026-09-17 and PINNED: the selftest fails the moment the two differ.
@@ -626,6 +628,35 @@ DEFAULT_ROLE_ENV_FILE = "~/.stage-e/env"
 ROLE_BACKUPS = "~/.stage-e/backups"
 BACKUPS_DENY_RULE = "Read(%s/**)" % ROLE_BACKUPS
 
+# THE TRACKER'S DIFF TOOLS THAT WRITE (KIT-212). The tracker's hosted tool server carries
+# tools that act on a pull request: merge it or queue it to merge, record a review decision
+# (an approval among them), edit it, comment on it, and resolve or delete its comments.
+# Merging and approving are a person's actions only, and no part of the pipeline reviews
+# through the tracker. The chat lane cannot be granted that server minus these tools: the
+# dispatcher appends `mcp__<server>` for every server it built, whatever the grant says
+# (edge-worker ToolPermissionResolver.js:72-77), and the chat lane's disallowedTools is
+# hard-coded empty (RunnerConfigBuilder.js:78). So a deny rule in a settings file the
+# session loads is the one fence left, and the role account's user settings are the one
+# file a chat session loads. Measured 2026-10-10 on the build the dispatcher runs (agent
+# SDK 0.3.245, Claude Code 2.1.245), with a stand-in server: a deny rule naming one tool
+# of a server the session is granted whole takes that tool out of the session's start-up
+# tool list, with and without a permission callback that allows everything, and leaves the
+# server's other tools in it. The same file reaches every session the role account runs,
+# so coding, review and planning sessions lose these tools too.
+TRACKER_SERVER = "linear"
+DIFF_WRITE_TOOLS = ("merge_diff", "submit_diff_review", "update_diff", "save_diff_comment",
+                    "resolve_diff_thread", "delete_diff_comment")
+# The diff tools that only read stay: the chat lane may read a change to explain it.
+DIFF_READ_TOOLS = ("get_diff", "list_diffs", "get_diff_threads")
+# A tracker tool the deny list does not name, whose name says it may act on a pull request.
+# `verify` names one it finds, so a tool the tracker adds later is seen, not missed.
+PR_SHAPED_TOOL = re.compile(r"merge|approv|diff|pull_?request", re.I)
+
+
+def diff_deny_rules():
+    """`mcp__<tracker>__<tool>` for each diff tool that writes."""
+    return ["mcp__%s__%s" % (TRACKER_SERVER, t) for t in DIFF_WRITE_TOOLS]
+
 
 def _path_rule(path):
     """`Read(//abs/path)` for an absolute path, `Read(~/rel)` for one under the home."""
@@ -637,7 +668,7 @@ def _path_rule(path):
 def user_deny_patterns(conf):
     """The composed deny list: the repository's patterns anchored, then this deployment's
     two credential files by absolute path, then the role account's own env file and the
-    backups folder under its home."""
+    backups folder under its home, then the tracker's six diff tools that write."""
     out = [anchored(p) for p in REPO_DENY_PATTERNS]
     for key in ("DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE"):
         path = (conf or {}).get(key) or ""
@@ -652,7 +683,7 @@ def user_deny_patterns(conf):
     # `env.notifier-setup.<pid>`. Each is a whole copy of the file, so it is denied too.
     role_rules = ([_path_rule(role_env), _path_rule(role_env + ".*")]
                   if role_env.startswith(("/", "~/")) else [])
-    for rule in role_rules + [BACKUPS_DENY_RULE]:
+    for rule in role_rules + [BACKUPS_DENY_RULE] + diff_deny_rules():
         if rule not in out:
             out.append(rule)
     return out
@@ -1286,7 +1317,8 @@ def _compose_piece_4(conf):
 
 # -- Piece 5 -----------------------------------------------------------------
 def _compose_piece_5(conf):
-    say("PIECE 5 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES ONLY")
+    say("PIECE 5 — THE ROLE ACCOUNT'S USER-LEVEL SETTINGS: SECRET-FILE READ DENIES, AND "
+        "THE TRACKER'S DIFF WRITES")
     para("Where: ~/.claude/settings.json in %s's home. A chat session loads user, project "
          "and local settings (ClaudeRunner.js:499), and its folder is not a project "
          "(ChatSessionHandler.js:427-432), so this is the only settings file it gets. "
@@ -1302,11 +1334,19 @@ def _compose_piece_5(conf):
          "denies, which are relative, and a relative rule matches under the session's "
          "current directory only. A chat session's is a fresh, empty folder. Anchored, each "
          "matches that file name anywhere. The next two are this deployment's dispatcher "
-         "config and env file. The last two are the role account's own: its env file "
-         "(ROLE_ENV_FILE), and the backups folder where merge, env-names and front-door copy "
+         "config and env file. The next three are the role account's own: its env file "
+         "(ROLE_ENV_FILE), the temp copies an installer writes beside it, and the backups "
+         "folder where merge, env-names and front-door copy "
          "a file before changing it — those copies hold the same secrets. A rule starting "
          "~/ matches under the home of the account the session runs as, which is the role "
          "account.")
+    para("The six mcp__%s__ rules at the end are not file rules. Each takes one of the "
+         "tracker's diff tools that write out of every session this account runs: merging "
+         "a pull request, recording a review decision such as an approval, editing one, "
+         "commenting on one, resolving or deleting its comments (KIT-212). The dispatcher "
+         "gives every chat session the whole tracker server whatever piece 1 says "
+         "(ToolPermissionResolver.js:72-77), so these rules are the only way to take the "
+         "tools away. The diff tools that only read stay." % TRACKER_SERVER)
     para("merge writes this for you: it adds only the rules missing from the file, keeps "
          "every rule and every other key already there, backs an existing file up first, "
          "and leaves it at mode 600:  python3 %s merge , then  merge --apply ." % _self_path())
@@ -1314,7 +1354,10 @@ def _compose_piece_5(conf):
          "tool in mcp__cyrus-tools, which reads the file inside the dispatcher's own "
          "process, outside the session (cyrus-tools/index.js:107). And they apply to every "
          "session this account runs, coding and review too, because every Claude session "
-         "loads user settings (ClaudeRunner.js:499).")
+         "loads user settings (ClaudeRunner.js:499). The six diff rules close the "
+         "tracker's path to a merge or an approval. A session holding a GitHub token with "
+         "write access has a second path, through GitHub itself; the session's own grant "
+         "and the repository's branch protection guard that one.")
     say("")
 
 
@@ -1953,6 +1996,51 @@ def user_settings():
             "deny": [str(d)[:300] for d in deny],
             "hasHooks": bool(s.get("hooks"))}
 
+def chat_tools(logs):
+    # The newest chat session's start-up tool list: the tracker's tool NAMES only, never
+    # a message. A chat session logs under logs/slack-<event id>/ (ChatSessionHandler.js
+    # 122-123, ClaudeRunner.js 996-1011), and its first SDK system/init line names every
+    # tool it was given. A coding session's log folder is never opened.
+    try:
+        dirs = [e.path for e in os.scandir(logs)
+                if e.name.startswith("slack-") and e.is_dir(follow_symlinks=False)]
+    except Exception as exc:
+        return {"error": why(exc)}
+    files = []
+    for d in dirs:
+        try:
+            for e in os.scandir(d):
+                if (e.name.startswith("session-") and e.name.endswith(".jsonl")
+                        and e.is_file(follow_symlinks=False)):
+                    files.append((e.stat(follow_symlinks=False).st_mtime, e.path))
+        except Exception:
+            continue
+    files.sort(reverse=True)
+    for _mtime, path in files[:20]:
+        try:
+            with pathlib.Path(path).open("rb") as fh:
+                for n, line in enumerate(fh):
+                    if n >= 200:
+                        break
+                    try:
+                        entry = json.loads(line.decode("utf-8", "replace"))
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    m = entry.get("message") if entry.get("type") == "sdk-message" else entry
+                    if (isinstance(m, dict) and m.get("type") == "system"
+                            and m.get("subtype") == "init" and isinstance(m.get("tools"), list)):
+                        at = entry.get("timestamp")
+                        return {"sessions": len(files),
+                                "startedAt": str(at)[:40] if at else None,
+                                "toolCount": len(m["tools"]),
+                                "tracker": sorted(str(t)[:80] for t in m["tools"]
+                                                  if str(t).startswith("mcp__linear__"))[:300]}
+        except Exception:
+            continue
+    return {"sessions": len(files), "none": True}
+
 def front_door(path, matcher):
     # Only the lines that START with the matcher: the caller decides which of them is the
     # `path` line. The file holds no secret; these lines are an allowlist.
@@ -1967,7 +2055,8 @@ def front_door(path, matcher):
     return {"path": path, "sha256": digest(raw), "candidates": found[:50]}
 
 out = {"config": config(sys.argv[1]), "env": env(sys.argv[2]),
-       "userSettings": user_settings()}
+       "userSettings": user_settings(),
+       "chatTools": chat_tools(os.path.join(os.path.dirname(sys.argv[1]), "logs"))}
 if len(sys.argv) > 5:
     out["frontDoor"] = front_door(sys.argv[4], sys.argv[5])
 print(json.dumps(out))
@@ -2433,6 +2522,50 @@ def check_user_settings(conf, us, env_facts):
                 "%s carries every composed deny rule" % path)
 
 
+def check_chat_tools(ct):
+    """The tracker tools the newest chat session was given, as its own start-up line
+    recorded them (KIT-212). A session gets its tool list when it starts or resumes, so a
+    deny rule merged later reaches only a session that starts after the merge."""
+    if not isinstance(ct, dict) or ct.get("error"):
+        return _row("chat-tools", UNKNOWN, "the chat session logs could not be read (%s)"
+                    % ((ct or {}).get("error") if isinstance(ct, dict) else "not measured"))
+    if ct.get("none") or not ct.get("sessions"):
+        return _row("chat-tools", UNKNOWN,
+                    "no chat session's start-up line was found, so the tools a chat session "
+                    "holds are not known",
+                    ["ask the bot one question in the channel, then run verify again"])
+    when = ct.get("startedAt") or "at an unknown time"
+    tracker = [t for t in ct.get("tracker") or [] if isinstance(t, str)]
+    if not tracker:
+        return _row("chat-tools", UNKNOWN,
+                    "the newest chat session (started %s) was given no tracker tools at "
+                    "all, so it says nothing about the deny rules" % when)
+    names = [t.split("__", 2)[-1] for t in tracker]
+    named = [n for n in names if n in DIFF_WRITE_TOOLS]
+    shaped = [n for n in names if n not in DIFF_WRITE_TOOLS and n not in DIFF_READ_TOOLS
+              and PR_SHAPED_TOOL.search(n)]
+    problems, notes = [], []
+    if named:
+        problems.append("the newest chat session (started %s) could call %s: the tracker's "
+                        "tools that merge, review or write a pull request"
+                        % (when, ", ".join(named)))
+        notes.append("run  merge , then  merge --apply : it adds the six deny rules to the "
+                     "role account's user settings. A session keeps the tools it started "
+                     "with, so restart the dispatcher when it is idle (card CK-C5), then ask "
+                     "the bot one question in a NEW thread, and run verify again")
+    if shaped:
+        problems.append("the newest chat session (started %s) holds %s, which the deny "
+                        "list does not name and whose name says it may act on a pull "
+                        "request. Read its description in the tracker's tool list: if it "
+                        "writes, add it to DIFF_WRITE_TOOLS in the kit; if it only reads, "
+                        "to DIFF_READ_TOOLS" % (when, ", ".join(shaped)))
+    if problems:
+        return _problem_row("chat-tools", BLOCKED, problems, notes)
+    return _row("chat-tools", ALREADY_DONE,
+                "the newest chat session (started %s) holds %d tracker tools, and none "
+                "merges, reviews or writes a pull request" % (when, len(tracker)))
+
+
 def check_front_door(conf, fd):
     """The front door's allowlist line, read as the role account (KIT-197). `fd` is
     `front_door_digest`'s answer. The Slack path and the tracker path on the one line is
@@ -2488,7 +2621,7 @@ def check_front_door(conf, fd):
 
 CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env", "ip-validation-off",
           "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings",
-          "front-door")
+          "chat-tools", "front-door")
 
 
 def evaluate(facts, conf, pf=None):
@@ -2514,6 +2647,7 @@ def evaluate(facts, conf, pf=None):
         rows.append(check_notifier_absent(conf, env_facts))
         rows.append(check_hosted_keys_absent(env_facts))
         rows.append(check_user_settings(conf, us, env_facts))
+        rows.append(check_chat_tools(facts.get("chatTools")))
         rows.append(check_front_door(conf, front_door_digest(facts.get("frontDoor"),
                                                              conf.get("FRONT_DOOR_MATCHER"))))
     rows.append(check_port_block(conf, pf, env_facts) if pf is not None else
@@ -2586,12 +2720,14 @@ def cmd_verify(conf, runner, sudo):
     runner.dry_run = True
     account = conf["ROLE_ACCOUNT"]
     say("Chat lane verify — read-only. It reads the dispatcher config, its env file, the")
-    say("user settings and the front door's config as %s, through one program that prints"
+    say("user settings, the front door's config and the newest chat session's log as %s,"
         % account)
-    say("names, tool lists and allowlist paths and never a value, and asks pf, as root, what")
-    say("it has loaded. Your login password may be asked for, once.")
-    sudo.acquire("`verify` reads four files as the %s role account and asks pf, as root, "
-                 "which rules it holds. It changes nothing." % account, "verify")
+    say("through one program that prints names, tool lists and allowlist paths and never a")
+    say("value or a message, and asks pf, as root, what it has loaded. Your login password")
+    say("may be asked for, once.")
+    sudo.acquire("`verify` reads four files and the newest chat session's start-up tool list "
+                 "as the %s role account, and asks pf, as root, which rules it holds. It "
+                 "changes nothing." % account, "verify")
     facts, why = probe_facts(runner, conf)
     rows = evaluate(facts, conf, pf_probe(runner))
     if facts is None:
@@ -3252,7 +3388,7 @@ def merge_plan(conf, facts):
                          % (s_path, " (a new file, mode 600)" if us.get("error") else "",
                             len(deny_add), ", ".join(deny_add)))
         else:
-            lines.append("ok          %s already carries every composed read deny" % s_path)
+            lines.append("ok          %s already carries every composed deny rule" % s_path)
     return lines, ops, deny_add
 
 
@@ -3335,6 +3471,12 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
     say("")
     para("The dispatcher reloads its config on a change (ConfigManager.js:51-62): its log "
          "says \"Config file changed, reloading...\". Nothing was restarted.", "")
+    if set(deny_add) & set(diff_deny_rules()):
+        para("The diff rules reach a session only when it starts. A session already running "
+             "keeps the tools it started with: a chat thread's session, a coding session "
+             "mid-run. Restart the dispatcher now, only when it is idle — card CK-C5. Then "
+             "ask the bot one question in a new thread, and run verify:", "")
+        print_card("CK-C5", conf)
     return worst_exit(rows)
 
 
@@ -4087,11 +4229,32 @@ def _selftest_body():
         drifted["permissions"]["deny"] = drifted["permissions"]["deny"][1:-1]
         expect("deny-drift-removed-red", repo_deny_drift(drifted) != [])
     anchored_all = user_deny_patterns(conf)
-    # Every rule is anchored at the root, or at the role account's own home (`~/`), which a
-    # rule written from there matches wherever the session stands (KIT-197).
+    read_rules = [p for p in anchored_all if p.startswith("Read(")]
+    # Every Read rule is anchored at the root, or at the role account's own home (`~/`),
+    # which a rule written from there matches wherever the session stands (KIT-197).
     expect("deny-anchored", all(p.startswith("Read(//") or p.startswith("Read(~/")
-                                for p in anchored_all)
+                                for p in read_rules)
            and all(anchored(p) in anchored_all for p in REPO_DENY_PATTERNS), anchored_all)
+    # KIT-212: the tracker's diff tools that write are denied BY NAME, the six of them,
+    # and nothing else that is not a Read rule. Written out, not read from the constant,
+    # so a tool dropped from the constant is red here.
+    kit212_writes = ["mcp__linear__" + t for t in (
+        "merge_diff", "submit_diff_review", "update_diff", "save_diff_comment",
+        "resolve_diff_thread", "delete_diff_comment")]
+    for rule in kit212_writes:
+        expect("deny-tracker-diff-write:" + rule, rule in anchored_all, anchored_all)
+    expect("deny-only-reads-and-the-diff-writes",
+           [p for p in anchored_all if not p.startswith("Read(")] == kit212_writes,
+           anchored_all)
+    for t in ("get_diff", "list_diffs", "get_diff_threads"):
+        expect("deny-keeps-diff-read:" + t, "mcp__linear__" + t not in anchored_all)
+    expect("deny-never-the-whole-tracker", "mcp__linear" not in anchored_all
+           and not any(p.startswith("mcp__") and "*" in p for p in anchored_all),
+           anchored_all)
+    expect("deny-diff-rules-in-every-conf", all(
+        r in user_deny_patterns(dict(conf, ROLE_ENV_FILE="/srv/role/env",
+                                     DISPATCHER_CONFIG="", DISPATCHER_ENV_FILE=""))
+        for r in kit212_writes))
     expect("deny-anchor-shape", anchored("Read(**/id_rsa)") == "Read(//**/id_rsa)"
            and anchored("Read(.env)") == "Read(//**/.env)", anchored("Read(**/id_rsa)"))
     expect("deny-conf-files", "Read(//opt/example-dispatcher/config.json)" in anchored_all
@@ -4242,6 +4405,35 @@ def _selftest_body():
 
         outputs, fakes = [], []
         good_settings = settings_with(user_deny_patterns(vconf) + ["Read(~/.ssh/**)"])
+
+        # KIT-212: the newest CHAT session's start-up tool list, read out of its own log
+        # under <dispatcher home>/logs/slack-<event id>/. A coding session's log is never
+        # read, a file with no start-up line yet is passed over, and no message in a log
+        # ever reaches the output (the sentinel below is scanned for at the end).
+        logs_root = os.path.join(tmp, "dispatcher", "logs")
+
+        def chat_log(dirname, name, tools, mtime, init=True):
+            lines = [json.dumps({"type": "session-metadata", "sessionId": name})]
+            if init:
+                lines.append(json.dumps({
+                    "type": "sdk-message", "timestamp": "2026-10-10T12:00:%02d.000Z" % (
+                        mtime % 60),
+                    "message": {"type": "system", "subtype": "init", "tools": tools}}))
+            lines.append(json.dumps({"type": "sdk-message", "message": {
+                "type": "user", "message": {"content": "say " + SENTINELS[2]}}}))
+            p = os.path.join(logs_root, dirname, "session-%s.jsonl" % name)
+            _put(p, "\n".join(lines) + "\n")
+            os.utime(p, (mtime, mtime))
+            return p
+
+        chat_reads = ["Read", "mcp__linear__get_issue", "mcp__linear__get_diff",
+                      "mcp__linear__list_diffs", "mcp__slack__post"]
+        chat_writes = chat_reads + ["mcp__linear__merge_diff",
+                                    "mcp__linear__submit_diff_review"]
+        chat_log("slack-old", "old", chat_writes, 1000)
+        chat_log("slack-new", "new", chat_reads, 3001)
+        chat_log("slack-new", "pending", [], 4000, init=False)
+        chat_log("PROD-7", "coding", chat_writes, 5000)
 
         ran = probe(good_config(), good_env(), good_settings)
         outputs.append(ran.stdout + ran.stderr)
@@ -4485,6 +4677,76 @@ def _selftest_body():
                [r for r in rows if r["check"] == "hosted-keys-absent"][0]["outcome"]
                == ALREADY_DONE and [r["check"] for r in rows] == list(CHECKS),
                [(r["check"], r["outcome"]) for r in rows])
+
+        # -- KIT-212: the chat-tools row, through the real probe ----------------------
+        ct = facts_of(probe(good_config(), good_env(), good_settings)).get("chatTools") or {}
+        expect("chat-tools-reads-the-newest-chat-session",
+               ct.get("tracker") == ["mcp__linear__get_diff", "mcp__linear__get_issue",
+                                     "mcp__linear__list_diffs"]
+               and ct.get("sessions") == 3 and ct.get("startedAt", "").endswith(":01.000Z")
+               and ct.get("toolCount") == len(chat_reads), ct)
+        newest = chat_log("slack-newest", "newest", chat_writes, 6000)
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
+        row = [r for r in rows if r["check"] == "chat-tools"][0]
+        expect("chat-tools-blocked-on-a-merge-tool", row["outcome"] == BLOCKED
+               and "merge_diff" in _row_text(row) and "submit_diff_review" in _row_text(row)
+               and "merge --apply" in _row_text(row) and "NEW thread" in _row_text(row), row)
+        os.unlink(newest)
+        os.rmdir(os.path.dirname(newest))
+        rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
+        expect("chat-tools-clean-after-the-newest-is-gone",
+               [r for r in rows if r["check"] == "chat-tools"][0]["outcome"] == ALREADY_DONE,
+               [r for r in rows if r["check"] == "chat-tools"])
+        # a line that is not UTF-8 never makes the reader skip the newest file
+        raw_path = os.path.join(logs_root, "slack-bytes", "session-bytes.jsonl")
+        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+        with open(raw_path, "wb") as fh:
+            fh.write(b'{"type": "session-metadata"}\n\xff\xfe not text\n' + json.dumps({
+                "type": "sdk-message", "timestamp": "2026-10-10T12:00:59.000Z",
+                "message": {"type": "system", "subtype": "init",
+                            "tools": chat_reads + ["mcp__linear__list_teams"]}}).encode() + b"\n")
+        os.utime(raw_path, (7000, 7000))
+        ct = facts_of(probe(good_config(), good_env(), good_settings)).get("chatTools") or {}
+        expect("chat-tools-reads-past-a-line-that-is-not-text",
+               "mcp__linear__list_teams" in (ct.get("tracker") or []), ct)
+        os.unlink(raw_path)
+        os.rmdir(os.path.dirname(raw_path))
+        # the row on its own, for every way the read can come back
+        for label, ct_in, want, needle in (
+                ("not-measured", None, UNKNOWN, "could not be read"),
+                ("unreadable", {"error": "unreadable"}, UNKNOWN, "unreadable"),
+                ("no-chat-session", {"sessions": 0, "none": True}, UNKNOWN,
+                 "ask the bot one question"),
+                ("no-tracker-tools", {"sessions": 2, "tracker": [], "toolCount": 9,
+                                      "startedAt": "T"}, UNKNOWN, "no tracker tools"),
+                ("reads-only", {"sessions": 2, "startedAt": "T", "toolCount": 9,
+                                "tracker": ["mcp__linear__get_issue",
+                                            "mcp__linear__get_diff_threads"]},
+                 ALREADY_DONE, "2 tracker tools"),
+                ("each-write", None, BLOCKED, "")):
+            if label == "each-write":
+                for t in ("merge_diff", "submit_diff_review", "update_diff",
+                          "save_diff_comment", "resolve_diff_thread", "delete_diff_comment"):
+                    r = check_chat_tools({"sessions": 1, "startedAt": "T", "toolCount": 3,
+                                          "tracker": ["mcp__linear__get_issue",
+                                                      "mcp__linear__" + t]})
+                    expect("chat-tools-blocked:" + t, r["outcome"] == BLOCKED
+                           and t in _row_text(r), r)
+                continue
+            r = check_chat_tools(ct_in)
+            expect("chat-tools-" + label, r["outcome"] == want and needle in _row_text(r), r)
+        # a tool the deny list does not name, whose name says it merges or approves
+        r = check_chat_tools({"sessions": 1, "startedAt": "T", "toolCount": 3,
+                              "tracker": ["mcp__linear__get_issue",
+                                          "mcp__linear__approve_pull_request"]})
+        expect("chat-tools-names-an-unknown-merge-shaped-tool", r["outcome"] == BLOCKED
+               and "approve_pull_request" in _row_text(r) and "DIFF_WRITE_TOOLS" in
+               _row_text(r) and "merge --apply" not in _row_text(r), r)
+        expect("chat-tools-probe-reads-tracker-names-only",
+               "mcp__linear__" in FACTS_PY and '"slack-"' in FACTS_PY)
+        expect("chat-tools-follows-user-settings",
+               "chat-tools" in CHECKS
+               and CHECKS.index("chat-tools") == CHECKS.index("user-settings") + 1, CHECKS)
 
         # the port block: healthy, then one mutant per way it can be wrong
         ran = probe(good_config(), good_env(), good_settings)
@@ -5725,6 +5987,46 @@ def _selftest_kit197(expect, conf):
                    and deny == old_rules + ["Read(~/.stage-e/env)", BACKUPS_DENY_RULE]
                    and json.loads(_read(cfg_path)) == done, (rc, deny, out[-400:]))
     group("upgrade", upgrade)
+
+    # -- KIT-212: a lane that was on before the diff rules. Its settings carry every
+    # composed rule but the six diff writes: verify names them, and merge adds exactly
+    # those six and keeps every other key. -----------------------------------------------
+    def upgrade_diff_denies():
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            spath = os.path.join(home, ".claude", "settings.json")
+            c = dict(minimal, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path)
+            done = _fenced_fixture()
+            done["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
+            _put(cfg_path, json.dumps(done, indent=2) + "\n")
+            _put(env_path, "A=1\n")
+            diff_rules = ["mcp__linear__" + t for t in (
+                "merge_diff", "submit_diff_review", "update_diff", "save_diff_comment",
+                "resolve_diff_thread", "delete_diff_comment")]
+            before = [r for r in user_deny_patterns(c) if r not in diff_rules]
+            _put(spath, json.dumps({"permissions": {"deny": before}, "model": "kept"},
+                                   indent=2) + "\n")
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+            us = check_user_settings(c, facts["userSettings"], facts["env"])
+            expect("kit212-upgrade-user-settings-names-the-six", us["outcome"] == BLOCKED
+                   and all(r in _row_text(us) for r in diff_rules)
+                   and "merge --apply" in _row_text(us), us)
+            rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            after = json.loads(_read(spath))
+            expect("kit212-upgrade-merge-adds-exactly-the-six", rc == EX_OK
+                   and after["permissions"]["deny"] == before + diff_rules
+                   and after.get("model") == "kept", (rc, after, out[-400:]))
+            expect("kit212-upgrade-merge-says-a-running-session-keeps-them",
+                   "keeps the tools it started with" in out and "CK-C5" in out, out[-900:])
+            rc2, out2 = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                                 True)
+            expect("kit212-merge-again-asks-no-restart", "CK-C5" not in out2
+                   and "keeps the tools it started with" not in out2, out2[-600:])
+    group("upgrade-kit-212", upgrade_diff_denies)
 
     # -- env-names: the REAL role-account shell ---------------------------------------
     def env_names():
