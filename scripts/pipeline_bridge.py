@@ -22,26 +22,31 @@ WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 
   A message's sender is the `user` field Slack's own history and replies calls return. It
   is then looked up with `users.info`, and refused unless the account is a human, not
-  deleted, not a guest (restricted or ultra-restricted), not an app user, and in the same
-  workspace as the bridge's own token. Bot posts, edits, file shares and every message with
-  a subtype (joins, broadcasts) are refused too. An optional `allowed_slack_users` list
+  deleted, not a guest (restricted or ultra-restricted), not an app user, and named by Slack
+  as in the same workspace as the bridge's own token: an account Slack names no workspace
+  for is refused, not passed. Bot posts, edits, file shares and every message with a
+  subtype (joins, broadcasts) are refused too. An optional `allowed_slack_users` list
   narrows it further; empty means any full member, which is the owner's decision of
   2026-10-10 (KIT-117): workspace membership is the access rule.
 
 THE BRIDGE ASKS, A MEMBER ANSWERS
 
   A request is one strict line, `plan <ticket id>`, from anyone in the channel, the chat
-  bot included: asking is harmless. The bridge reads the ticket from the tracker with the
-  owner's key and posts its OWN question in that thread, carrying only facts it read
-  itself. A question is answered by a reply `yes` or `no` in its thread, after it, from a
-  verified member. A `yes` binds to the question recorded in this job's state, never to a
-  ticket named in someone's text: with two questions open in one thread, a bare `yes` is
-  refused and `yes <ticket id>` is asked for. So is a bare `yes` when any bot posted in the
-  thread after the question, other than the bridge itself, because a look-alike question
-  could have changed what the person thought they were answering. A question edited after
-  it was posted is refused and closed. A question expires `question_ttl_hours` after it was
-  asked, judged by when the answer was SENT, so a yes sent while the Mac slept still
-  counts. A tricked chat bot can make the bridge ask; it cannot make it act.
+  bot included: asking is harmless. (`approve <ticket id>` is recognised too; this version
+  answers it once, saying approving from Slack is not built yet, and changes nothing.) The
+  bridge reads the ticket from the tracker with the owner's key and posts its OWN question
+  in that thread, carrying only facts it read itself. A question is answered by a reply
+  `yes` or `no` in its thread, after it, from a verified member. A `yes` binds to the
+  question recorded in this job's state, never to a ticket named in someone's text: with
+  two questions open in one thread, a bare `yes` is refused and `yes <ticket id>` is asked
+  for. So is a bare `yes` when anything other than the bridge or a verified member posted
+  in the thread after the question (a bot, an app, Slackbot, a guest), because a look-alike
+  question could have changed what the person thought they were answering. A question
+  edited after it was posted, or gone from its thread, is refused and closed. A question
+  expires `question_ttl_hours` after it was asked, judged by when the answer was SENT, so a
+  yes sent while the Mac slept still counts. A question's status changes only after the
+  bridge's reply saying so is posted. A tricked chat bot can make the bridge ask; it cannot
+  make it act.
 
   THE BRIDGE KNOWS ITS OWN BOT. `bot_user_id` in the config is the bridge app's bot user,
   and a token that answers to anyone else is refused before anything is read: a pasted
@@ -53,7 +58,13 @@ CATCHES UP AFTER SLEEP
   nothing redelivers it. So the bridge does not listen: every pass it reads the channel's
   history over `lookback_days`, the threads that changed, and the thread of every open
   question, and handles each message once (keyed on channel and timestamp). A "yes" sent
-  while the Mac slept is handled when it wakes, if its question has not expired.
+  while the Mac slept is handled when it wakes, if its question has not expired. A thread is
+  marked read only after every message taken from it is handled, so a pass that fails or
+  runs out of time reads it again next time.
+
+  A thread is found through its first message. So a new reply in a thread that started
+  before the window is not read, unless that thread holds an open question: ask in a new
+  message, or a newer thread, instead.
 
   The FIRST pass (no state file) records everything already in the window as seen and
   answers none of it. A state file that cannot be read is refused, never treated as a first
@@ -70,12 +81,17 @@ SAYS WHICH NOTHING IT DID (contract §13)
   as long as a question lives. A real pass writes a heartbeat; a dry run writes none, so a
   check that runs one never hides the job's own record.
 
+  Every request that reads the tracker counts against `max_questions_per_hour`, whether
+  the ticket is found or not: the key is the owner's, shared with Stage E. Past the limit a
+  request is refused without a read, and that is said at most once an hour per channel.
+
 WHAT IT NEVER DOES
 
   It writes nothing to the tracker in this version. It never posts outside its configured
   channels, never posts a message's own text back, and never prints a credential: both are
   read from env vars the config NAMES (the job's wrapper sources the role account's env
-  file), and every output line is redacted against them.
+  file), and every line it writes (the log, the state file, a Slack post) is redacted
+  against them. The state file is written mode 600.
 """
 import argparse
 import json
@@ -126,7 +142,8 @@ CONFIG_KEYS = {
                            "any full member of the workspace",
     "question_ttl_hours": "how long a question can be answered (default 24)",
     "lookback_days": "how far back each pass reads the channel (default 7)",
-    "max_questions_per_hour": "how many questions the bridge asks in an hour (default 20)",
+    "max_questions_per_hour": "how many requests the bridge looks up in the tracker in an "
+                              "hour, found or not (default 20)",
     "max_history_pages": "how many pages of channel history one pass may read (default 10)",
     "run_timeout_seconds": "wall clock for one pass (default 120)",
     "act": "whether the bridge acts; must be false in this version, which has no action",
@@ -154,7 +171,7 @@ SLACK_USER_RE = re.compile(r"^[UW][A-Z0-9]{8,}$")
 TEAM_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
 TICKET_RE = r"[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}"
 # The whole grammar. A request is one line and nothing else; so is an answer.
-REQUEST_RE = re.compile(r"^(plan)\s+(%s)$" % TICKET_RE, re.IGNORECASE)
+REQUEST_RE = re.compile(r"^(plan|approve)\s+(%s)$" % TICKET_RE, re.IGNORECASE)
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
@@ -285,6 +302,14 @@ def credential(cfg, key):
     return value
 
 
+def live_secrets(cfg):
+    """Every credential the config names that is set, so an output is redacted against it
+    even when a transport was handed in."""
+    values = [os.environ.get(cfg[k], "").strip() for k in ("slack_token_env",
+                                                            "linear_key_env")]
+    return [v for v in values if v]
+
+
 def state_path(cfg):
     return os.path.join(cfg["state_dir"], "bridge-state.json")
 
@@ -294,8 +319,10 @@ def heartbeat_path(cfg):
 
 
 def new_state():
+    # asked_at: when each tracker lookup for a request was made (the hourly limit).
+    # limit_said: per channel, when the bridge last said that limit was reached.
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
-            "asked_at": [], "posted": {}, "attempts": {}}
+            "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}}
 
 
 def load_state(cfg):
@@ -319,6 +346,7 @@ def load_state(cfg):
                           % (path, STATE_SCHEMA))
     doc.setdefault("posted", {})
     doc.setdefault("attempts", {})
+    doc.setdefault("limit_said", {})
     return doc, False
 
 
@@ -327,7 +355,13 @@ def lock_path(cfg):
 
 
 def save_state(cfg, state):
-    notify._atomic_write_json(state_path(cfg), state)
+    """Mode 600: the record says who answered what. The umask is set around the
+    notifier's atomic write, so the file is never readable by others, even briefly."""
+    old = os.umask(0o077)
+    try:
+        notify._atomic_write_json(state_path(cfg), state)
+    finally:
+        os.umask(old)
 
 
 def write_heartbeat(cfg, result, now_iso):
@@ -454,10 +488,14 @@ class TrackerClient(object):
                              {"query": query, "variables": variables})
         except urllib.error.HTTPError as exc:
             # The tracker answers an unknown id with an error STATUS and a GraphQL body.
-            # Read the body before giving up, or one mistyped request stops every pass.
+            # Read the body before giving up, or one mistyped request stops every pass. A
+            # body with no GraphQL errors in it (an outage, a proxy's 503, nothing at all)
+            # is "could not check", never "not found".
             try:
-                doc = json.loads(exc.read().decode("utf-8") or "{}")
-            except (OSError, ValueError):
+                doc = json.loads((exc.read() or b"").decode("utf-8") or "{}")
+            except (AttributeError, OSError, ValueError):
+                doc = None
+            if not (isinstance(doc, dict) and doc.get("errors")):
                 raise BridgeError("the tracker answered HTTP %s" % exc.code)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise BridgeError("the tracker could not be read (%s)" % type(exc).__name__)
@@ -467,7 +505,9 @@ class TrackerClient(object):
             if any("not found" in m.lower() or "entity not found" in m.lower() for m in msgs):
                 return None
             raise BridgeError("the tracker refused a read: %s" % ("; ".join(msgs) or "?"))
-        return doc.get("data") or {}
+        if not isinstance(doc.get("data"), dict):
+            raise BridgeError("the tracker's answer carried no data")
+        return doc["data"]
 
     def viewer_id(self):
         return ((self._query(Q_VIEWER, {}) or {}).get("viewer") or {}).get("id")
@@ -531,20 +571,28 @@ def account_refusal(profile, me, cfg):
         return "the account is a bot or an app"
     if profile.get("is_restricted") or profile.get("is_ultra_restricted"):
         return "the account is a guest; only full members may answer"
-    if profile.get("team_id") and profile.get("team_id") != me["team_id"]:
+    # Same workspace must be POSITIVE: an account Slack names no workspace for is refused.
+    if not profile.get("team_id"):
+        return "Slack named no workspace for the account"
+    if profile.get("team_id") != me["team_id"]:
         return "the account belongs to another Slack workspace"
     if cfg["allowed_slack_users"] and profile.get("id") not in cfg["allowed_slack_users"]:
         return "the account is not on this bridge's list of members who may answer"
     return None
 
 
-def question_text(issue, requester, cfg, now):
+def question_text(issue, requester, cfg, now, by_bot=False):
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
     state = notify.safe_title((issue.get("state") or {}).get("name") or "an unknown state")
     team = ((issue.get("team") or {}).get("key")) or "?"
-    who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+    # A bot's request is credited in words, never @mentioned: a mention of the chat bot
+    # in its own thread could start a chat session whose reply lands after the question.
+    if by_bot:
+        who = "the chat bot"
+    else:
+        who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = ("the bridge moves it to Plan it for you" if cfg["act"] else
             "the bridge records it; this version moves nothing yet")
     return ("*Plan this?* %s “%s”: in %s on %s, filed by %s.\n"
@@ -569,11 +617,16 @@ class Pass(object):
         self.me = None
         self.users = {}
         self.threads = {}                  # (channel, root ts) -> messages read this pass
+        self.unrecorded = {}               # thread key -> latest_reply, once all handled
+        self.secrets = live_secrets(cfg)
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
                        "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0}
 
+    def clean(self, text):
+        return notify.redact(text, self.secrets)
+
     def say(self, line):
-        self.out.write(line + "\n")
+        self.out.write(self.clean(line) + "\n")
 
     def save(self):
         """Write-through: after every message, so a later failure loses nothing said."""
@@ -581,6 +634,7 @@ class Pass(object):
             save_state(self.cfg, self.state)
 
     def post(self, channel, thread_ts, text):
+        text = self.clean(text)
         if self.dry:
             self.say("  [dry-run] would post in %s thread %s (%d chars)"
                      % (channel, thread_ts, len(text)))
@@ -590,9 +644,16 @@ class Pass(object):
         return ts
 
     def mark(self, channel, msg, what):
+        # Redacted BEFORE it is cut short: a cut credential would no longer match.
         self.state["handled"][key_of(channel, msg.get("ts"))] = {
-            "at": iso(self.now), "what": what}
+            "at": iso(self.now), "what": self.clean(what)[:160]}
         self.state["attempts"].pop(key_of(channel, msg.get("ts")), None)
+
+    def account(self, uid):
+        """Slack's own `users.info` for a sender, read once a pass."""
+        if uid not in self.users:
+            self.users[uid] = self.slack.user(uid)
+        return self.users[uid]
 
     # -- reading -------------------------------------------------------------------
     def read_thread(self, channel, root):
@@ -614,7 +675,9 @@ class Pass(object):
             if m.get("latest_reply") and m.get("latest_reply") == seen:
                 continue
             msgs.extend(self.read_thread(channel, root))
-            self.state["threads"][key_of(channel, root)] = m.get("latest_reply")
+            # Recorded as read only once every message gathered here is handled (run): a
+            # failure or the deadline leaves it unrecorded, so the next pass reads it again.
+            self.unrecorded[key_of(channel, root)] = m.get("latest_reply")
         # The thread of every OPEN question is read whatever the window says: its root
         # may be older than the window, and its answer must still be heard.
         for q in self.state["questions"].values():
@@ -652,6 +715,9 @@ class Pass(object):
                     continue
                 self.handle_once(channel, msg)
                 self.save()
+            self.state["threads"].update(self.unrecorded)
+            self.unrecorded = {}
+            self.save()
         self.expire()
         self.prune()
         self.save()
@@ -669,10 +735,11 @@ class Pass(object):
             if tries < 3:
                 self.save()
                 raise
-            self.mark(channel, msg, "gave up: %s" % str(exc)[:120])
+            # The log line and the record are redacted where they are written (say, mark).
+            self.mark(channel, msg, "gave up: %s" % exc)
             self.counts["gave_up"] += 1
             self.say("  gave up on message %s after %d failed passes: %s"
-                     % (msg.get("ts"), tries, str(exc)[:160]))
+                     % (msg.get("ts"), tries, exc))
             try:
                 self.post(channel, msg.get("thread_ts") or msg.get("ts"),
                           "I could not handle this message after %d tries, so I have "
@@ -705,12 +772,26 @@ class Pass(object):
     def request(self, channel, msg, kind, ident):
         thread = msg.get("thread_ts") or msg.get("ts")
         requester = msg.get("user") or msg.get("bot_id") or ""
+        by_bot = bool(msg.get("bot_id") or msg.get("app_id"))
+        if kind == "approve":
+            # Recognised so it is never silent. The action is a later ticket (KIT-223);
+            # nothing is read and nothing is changed.
+            self.refuse_request(channel, msg, thread, "Approving from Slack is not built in "
+                                "this version of the bridge, so nothing was changed.",
+                                "approve is not built")
+            return
+        # Every request that would read the tracker counts, found or not: the key is the
+        # owner's, shared with Stage E. Past the limit a request is refused with no read,
+        # and that is said at most once an hour in a channel.
         hour_ago = self.now - 3600
         recent = [t for t in self.state["asked_at"] if t > hour_ago]
         if len(recent) >= self.cfg["max_questions_per_hour"]:
-            self.refuse_request(channel, msg, thread, "I have asked %d questions in the last "
-                                "hour, which is my limit. Ask again later." % len(recent),
-                                "rate limit")
+            if self.state["limit_said"].get(channel, 0) <= hour_ago:
+                self.post(channel, thread, "I have looked up %d tickets in the last hour, "
+                          "which is my limit. Ask again later." % len(recent))
+                self.state["limit_said"][channel] = self.now
+            self.mark(channel, msg, "refused: rate limit")
+            self.counts["refused"] += 1
             return
         open_now = [q for q in self.state["questions"].values() if q.get("status") == OPEN]
         if len(open_now) >= self.cfg["max_open_questions"]:
@@ -726,6 +807,7 @@ class Pass(object):
                                                                else "another thread"),
                                     "already asked")
                 return
+        self.state["asked_at"].append(self.now)
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
@@ -739,21 +821,22 @@ class Pass(object):
                                 "team not planned")
             return
         posted = self.post(channel, thread, question_text(issue, requester, self.cfg,
-                                                          self.now))
+                                                          self.now, by_bot=by_bot))
         self.state["questions"][key_of(channel, posted)] = {
             "kind": kind, "ticket": issue["identifier"], "ticket_id": issue.get("id"),
             "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
             "asked_for": requester, "status": OPEN}
-        self.state["asked_at"].append(self.now)
         self.mark(channel, msg, "asked: %s %s" % (kind, issue["identifier"]))
         self.counts["asked"] += 1
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
                                                        requester or "?"))
 
-    def foreign_bot_after(self, channel, q, msg):
-        """True when any bot other than the bridge posted in the question's thread between
-        the question and this answer, or the bridge's own account posted something it has
-        no record of posting. Either could be a look-alike question."""
+    def foreign_post_after(self, channel, q, msg):
+        """True when anything the bridge cannot vouch for posted in the question's thread
+        between the question and this answer: a bot or an app, Slackbot, an account that
+        could not answer itself (a guest, another workspace, no sender named), or the
+        bridge's own account posting something it has no record of. Any of them could be a
+        look-alike question. A verified member's post is not."""
         lo, hi = ts_float(q.get("ts")), ts_float(msg.get("ts"))
         for m in self.threads.get((channel, q.get("thread")), []):
             t = ts_float(m.get("ts"))
@@ -761,18 +844,26 @@ class Pass(object):
                 continue
             ours = (m.get("user") == self.me["user_id"]
                     or (self.me.get("bot_id") and m.get("bot_id") == self.me["bot_id"]))
-            if ours and key_of(channel, m.get("ts")) not in self.state["posted"]:
+            if ours:
+                if key_of(channel, m.get("ts")) not in self.state["posted"]:
+                    return True
+                continue
+            if m.get("bot_id") or m.get("app_id") or m.get("subtype") == "bot_message":
                 return True
-            if not ours and (m.get("bot_id") or m.get("app_id") or m.get("subtype")
-                             == "bot_message"):
+            if m.get("user") == "USLACKBOT":
+                return True
+            if not m.get("user") or account_refusal(self.account(m["user"]), self.me,
+                                                    self.cfg):
                 return True
         return False
 
-    def question_edited(self, channel, q):
+    def question_closed(self, channel, q):
+        """Why the question can no longer be answered as asked, or None. A question gone
+        from its thread (deleted) is closed, never taken as unchanged."""
         for m in self.threads.get((channel, q.get("thread")), []):
             if m.get("ts") == q.get("ts"):
-                return bool(m.get("edited"))
-        return False
+                return "was changed after I asked it" if m.get("edited") else None
+        return "is no longer in this thread"
 
     def answer(self, channel, msg, is_yes, hint):
         thread = msg["thread_ts"]
@@ -799,28 +890,27 @@ class Pass(object):
             self.counts["refused"] += 1
             return
         qkey, q = open_here[0]
-        if self.question_edited(channel, q):
+        # From here on a question's status changes only AFTER the reply saying so is
+        # posted: a failed post leaves it open, and the next pass says it.
+        closed = self.question_closed(channel, q)
+        if closed:
+            self.post(channel, thread, "My question about %s %s, so I have closed it. Ask "
+                      "again with `plan %s`." % (q["ticket"], closed, q["ticket"]))
             q["status"] = EXPIRED
-            self.post(channel, thread, "My question about %s was changed after I asked it, "
-                      "so I have closed it. Ask again with `plan %s`." % (q["ticket"],
-                                                                         q["ticket"]))
-            self.mark(channel, msg, "refused: question edited")
+            self.mark(channel, msg, "refused: question %s" % closed)
             self.counts["refused"] += 1
             return
-        if not hint and self.foreign_bot_after(channel, q, msg):
+        if not hint and self.foreign_post_after(channel, q, msg):
             self.post(channel, thread, "Something other than me posted in this thread after "
                       "my question, so I can't be sure which question you are answering. "
                       "Reply `%s %s` to answer the one about %s." % (word, q["ticket"],
                                                                      q["ticket"]))
-            self.mark(channel, msg, "refused: bot posted after the question")
+            self.mark(channel, msg, "refused: something else posted after the question")
             self.counts["refused"] += 1
             return
         why = message_refusal(msg, self.me)
         if why is None:
-            uid = msg["user"]
-            if uid not in self.users:
-                self.users[uid] = self.slack.user(uid)
-            why = account_refusal(self.users[uid], self.me, self.cfg)
+            why = account_refusal(self.account(msg["user"]), self.me, self.cfg)
         if why:
             self.post(channel, thread, "I can't take that as an answer to the question about "
                       "%s: %s." % (q["ticket"], why))
@@ -830,23 +920,21 @@ class Pass(object):
             return
         # Judged by when the answer was SENT: a yes sent in time while the Mac slept counts.
         if ts_float(msg.get("ts")) - q["asked_at"] > self.cfg["question_ttl_hours"] * 3600:
-            q["status"] = EXPIRED
             self.post(channel, thread, "The question about %s has expired. Ask again with "
                       "`plan %s`." % (q["ticket"], q["ticket"]))
+            q["status"] = EXPIRED
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
-        q["answered_by"] = msg["user"]
-        q["answered_ts"] = msg.get("ts")
         if not is_yes:
-            q["status"] = DECLINED
             self.post(channel, thread, "OK, %s is not planned." % q["ticket"])
+            q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
             return
-        q["status"] = CONFIRMED
         self.post(channel, thread, "Confirmed by <@%s>. This version of the bridge acts on "
                   "nothing yet, so %s was not changed." % (msg["user"], q["ticket"]))
+        q.update(status=CONFIRMED, answered_by=msg["user"], answered_ts=msg.get("ts"))
         self.mark(channel, msg, "confirmed: %s" % q["ticket"])
         self.counts["confirmed"] += 1
         self.say("  confirmed: %s %s by %s (acts on nothing in this version)"
@@ -871,6 +959,8 @@ class Pass(object):
             (k, q) for k, q in self.state["questions"].items()
             if q.get("status") == OPEN or q.get("asked_at", 0) >= horizon)
         self.state["asked_at"] = [t for t in self.state["asked_at"] if t > self.now - 3600]
+        self.state["limit_said"] = dict((c, t) for c, t in self.state["limit_said"].items()
+                                        if t > self.now - 3600)
 
 
 def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout):
@@ -895,11 +985,7 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
         raise Deadline()
 
     armed = False
-    # Every credential the config names that is set, collected first, so an output is
-    # redacted against it even when a transport was handed in.
-    secrets = [os.environ.get(cfg[k], "").strip() for k in ("slack_token_env",
-                                                             "linear_key_env")]
-    secrets = [v for v in secrets if v]
+    secrets = live_secrets(cfg)
     lock = None
     if timeout and hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _alarm)
@@ -954,6 +1040,7 @@ OWNER = "00000000-0000-4000-8000-000000000001"
 CHAN = "C0000000AA"
 ALICE, BOB, GUEST, GONE, OTHERWS, CHATBOT = ("U0ALICE001", "U0BOB00001", "U0GUEST001",
                                              "U0GONE0001", "U0OTHER001", "U0CHATBOT1")
+APPUSER, UGUEST, NOTEAM = "U0APPUSER1", "U0UGUEST01", "U0NOTEAM01"
 
 
 class FakeSlack(object):
@@ -970,6 +1057,11 @@ class FakeSlack(object):
             GONE: {"id": GONE, "team_id": TEAM, "deleted": True},
             OTHERWS: {"id": OTHERWS, "team_id": "T0OTHER000"},
             CHATBOT: {"id": CHATBOT, "team_id": TEAM, "is_bot": True},
+            APPUSER: {"id": APPUSER, "team_id": TEAM, "is_app_user": True},
+            UGUEST: {"id": UGUEST, "team_id": TEAM, "is_ultra_restricted": True},
+            NOTEAM: {"id": NOTEAM},
+            # Slack documents Slackbot as is_bot false, so only its id gives it away.
+            "USLACKBOT": {"id": "USLACKBOT", "team_id": TEAM},
         }
         self._clock = 0
 
@@ -1103,6 +1195,10 @@ def selftest():
         def posted(slack):
             return [t for _c, _th, t in slack.posts]
 
+        def status_of(cfg):
+            doc = json.load(open(state_path(cfg)))
+            return [v["status"] for v in doc["questions"].values()]
+
         # 1. FIRST PASS: everything already in the window is seen, and nothing is asked.
         cfg, slack, tracker = world("first")
         slack.add(ALICE, "plan PROD-5")
@@ -1160,6 +1256,13 @@ def selftest():
                 ("file", ALICE, {"files": [{"id": "F1"}]}, "file"),
                 ("other-workspace-message", ALICE, {"user_team": "T0OTHER000"},
                  "another Slack workspace"),
+                ("other-workspace-team-field", ALICE, {"team": "T0OTHER000"},
+                 "another Slack workspace"),
+                ("other-workspace-source-team", ALICE, {"source_team": "T0OTHER000"},
+                 "another Slack workspace"),
+                ("app-user", APPUSER, None, "bot or an app"),
+                ("ultra-restricted-guest", UGUEST, None, "guest"),
+                ("no-workspace-named", NOTEAM, None, "no workspace"),
                 ("no-sender", None, None, "no sender")):
             code, statuses, last = refused_by("refuse-" + name, user, extra)
             check("refused:" + name, (code, statuses, needle in last), (EXIT_OK, [OPEN], True))
@@ -1514,6 +1617,283 @@ def selftest():
             dict(EXAMPLE_CONFIG, chat_api_base="http://evil.example/api",
                  state_dir=os.path.join(tmp, "api")))), True)
 
+        # 11c. REVIEW FIXES, second round (KIT-221 review, 2026-10-10) ----------------
+        # The host pin, apart from the scheme: https alone is not enough.
+        for name, base in (("another-host", "https://evil.example/api"),
+                           ("a-slack-look-alike", "https://slack.com.evil.example/api")):
+            check("config-refuses-%s-over-https" % name, "chat_api_base" in _config_error(
+                dict(EXAMPLE_CONFIG, chat_api_base=base,
+                     state_dir=os.path.join(tmp, "api"))), True)
+        check("config-takes-slacks-own-api", _config_error(dict(
+            EXAMPLE_CONFIG, chat_api_base="https://slack.com/api",
+            state_dir=os.path.join(tmp, "api"))), "")
+
+        # The grammar is the whole line: a reply that only STARTS with yes or no, or a
+        # request with words after the id, is none of them.
+        c, s, t = world("grammar-anchors")
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        s.add(BOB, "yesterday I said we should wait on this", thread=root)
+        run(c, s, t)
+        check("grammar:yesterday-is-not-a-yes", status_of(c), [OPEN])
+        s.add(BOB, "nobody wants this", thread=root)
+        run(c, s, t)
+        check("grammar:nobody-is-not-a-no", status_of(c), [OPEN])
+        s.add(ALICE, "plan PROD-6 now")
+        run(c, s, t)
+        check("grammar:plan-with-words-after-the-id-is-not-a-request",
+              any("PROD-6" in x for x in posted(s)), False)
+
+        # `approve <id>` is recognised: answered once, nothing read, nothing changed.
+        c, s, t = world("approve")
+        run(c, s, t)
+        s.add(ALICE, "approve PROD-5")
+        run(c, s, t)
+        check("approve-is-answered-once-and-changes-nothing",
+              (["not built" in x for x in posted(s)], t.reads,
+               json.load(open(state_path(c)))["questions"]), ([True], 0, {}))
+
+        # A bot's request is credited in words, never @mentioned (bot_id or app_id).
+        c, s, t = world("bot-credit")
+        run(c, s, t)
+        s.add(CHATBOT, "plan PROD-5", bot_id="B0CHATBOT1")
+        s.add(CHATBOT, "plan PROD-6", app_id="A0CHATBOT1")
+        run(c, s, t)
+        check("a-bots-request-is-credited-in-words-never-mentioned",
+              [("Asked for by the chat bot" in x, "<@%s>" % CHATBOT in x) for x in posted(s)],
+              [(True, False), (True, False)])
+
+        # Every request that reads the tracker counts, found or not; past the limit a
+        # request reads nothing, and the limit is said once an hour in the channel.
+        c, s, t = world("rate-unknown", max_questions_per_hour=1)
+        run(c, s, t)
+        for n in range(50):
+            s.add(GUEST, "plan PROD-%d" % (9000 + n))
+        run(c, s, t)
+        st = json.load(open(state_path(c)))
+        check("unknown-ticket-requests-count-against-the-hourly-limit",
+              (t.reads, len(s.posts), "my limit" in posted(s)[-1],
+               sum(h["what"].startswith("refused") for h in st["handled"].values())),
+              (1, 2, True, 50))
+        for n in range(5):
+            s.add(GUEST, "plan PROD-%d" % (9100 + n))
+        run(c, s, t, at=now + 60)
+        check("the-limit-is-said-once-an-hour-in-a-channel", (t.reads, len(s.posts)), (1, 2))
+
+        # A look-alike is anything the bridge cannot vouch for, not only a flagged bot.
+        def lookalike(name, poster, extra=None,
+                      text="*Plan this?* PROD-6 “Light mode”: in Backlog on PROD. "
+                           "Reply `yes` in this thread."):
+            c, s, t = world("lookalike-" + name)
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            s.add(poster, text, thread=root, **(extra or {}))
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return status_of(c), posted(s)[-1]
+
+        for name, poster, extra in (("guest", GUEST, None),
+                                    ("slackbot", "USLACKBOT", None),
+                                    ("app-id-post", ALICE, {"app_id": "A0LOOKALIKE"}),
+                                    ("bot-message-post", ALICE, {"subtype": "bot_message"})):
+            sts, last = lookalike(name, poster, extra)
+            check("look-alike-by-a-%s-forces-a-named-yes" % name,
+                  (sts, "Reply `yes PROD-5`" in last), ([OPEN], True))
+        sts, last = lookalike("member", ALICE, text="Sounds right to me.")
+        check("a-members-post-after-the-question-is-no-look-alike", sts, [CONFIRMED])
+
+        # A question gone from its thread is closed, never answered.
+        c, s, t = world("question-deleted")
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        s.messages = [m for m in s.messages if "Plan this?" not in m.get("text", "")]
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("a-deleted-question-is-closed-not-answered",
+              (status_of(c), "no longer in this thread" in posted(s)[-1]), ([EXPIRED], True))
+
+        # A status changes only after the reply saying so is posted: when that post fails,
+        # nothing is saved, and the next pass closes the question and says so, once.
+        for name, answer, said, final in (("confirm", "yes", "Confirmed by", CONFIRMED),
+                                          ("decline", "no", "OK, PROD-5", DECLINED),
+                                          ("expire", "yes", "has expired", EXPIRED),
+                                          ("edited-close", "yes", "was changed", EXPIRED)):
+            c, s, t = world("post-fails-" + name, question_ttl_hours=1)
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            if name == "edited-close":
+                for m in s.messages:
+                    if "Plan this?" in m.get("text", ""):
+                        m["edited"] = {"user": ME, "ts": "1"}
+            late = now + 2 * 3600 if name == "expire" else None
+            s.add(BOB, answer, thread=root, at=late)
+            real_post = s.post
+
+            def failing(channel, thread_ts, text, said=said, real_post=real_post):
+                if said in text:
+                    raise BridgeError("Slack chat.postMessage failed (simulated)")
+                return real_post(channel, thread_ts, text)
+            s.post = failing
+            code, _o = run(c, s, t, at=late and late + 60)
+            saved = status_of(c)
+            s.post = real_post
+            run(c, s, t, at=late and late + 120)
+            check("a-failed-%s-post-saves-nothing-and-the-next-pass-says-it" % name,
+                  (code, saved, status_of(c), sum(said in x for x in posted(s))),
+                  (EXIT_ERROR, [OPEN], [final], 1))
+
+        # A request posted as a thread reply survives a failed pass, and the deadline.
+        c, s, t = world("thread-reply-blip")
+        run(c, s, t)
+        root = s.add(ALICE, "I want light mode")
+        s.add(CHATBOT, "plan PROD-6", thread=root, bot_id="B0CHATBOT1")
+        t.fail = True
+        code, _o = run(c, s, t)
+        t.fail = False
+        run(c, s, t)
+        check("a-thread-reply-request-is-asked-after-a-tracker-blip",
+              (code, sum("*Plan this?* PROD-6" in x for x in posted(s))), (EXIT_ERROR, 1))
+        # The first reply is handled with no post and no question, so nothing else would
+        # make the next pass read the thread again.
+        c, s, t = world("thread-reply-deadline")
+        run(c, s, t)
+        root = s.add(ALICE, "I want light mode")
+        s.add(CHATBOT, "I filed it as PROD-6.", thread=root, bot_id="B0CHATBOT1")
+        s.add(CHATBOT, "plan PROD-6", thread=root, bot_id="B0CHATBOT1")
+        real_issue = t.issue
+
+        def deadline_on_prod6(ident):
+            if ident == "PROD-6":
+                raise Deadline()
+            return real_issue(ident)
+        t.issue = deadline_on_prod6
+        code = run_command(c, False, 30, slack=s, tracker=t, out=io.StringIO(), now=now)
+        t.issue = real_issue
+        run(c, s, t)
+        check("a-thread-reply-request-is-asked-after-a-deadline-mid-thread",
+              (code, [x.split("“")[0] for x in posted(s)]),
+              (EXIT_TIMEOUT, ["*Plan this?* PROD-6 "]))
+
+        # A state file of another schema is refused, like one that cannot be read.
+        c, s, t = world("wrong-schema")
+        os.makedirs(c["state_dir"], exist_ok=True)
+        with open(state_path(c), "w") as fh:
+            json.dump(dict(new_state(), schema="pipeline-bridge-state/0"), fh)
+        code, out = run(c, s, t)
+        check("a-state-file-of-another-schema-is-refused",
+              (code, "is not a %s document" % STATE_SCHEMA in out, s.posts),
+              (EXIT_ERROR, True, []))
+
+        # The REAL clients, with only the transport stubbed: a refusal from Slack or the
+        # tracker is never read as "nothing there" or "not found".
+        def through(answer, call):
+            def stub(_url, _headers, payload=None, timeout=20):
+                return answer(payload)
+            real_http = globals()["_http_json"]
+            globals()["_http_json"] = stub
+            try:
+                return call()
+            except BridgeError as exc:
+                return "BridgeError: %s" % exc
+            finally:
+                globals()["_http_json"] = real_http
+
+        def http_error(code, body):
+            def answer(_payload):
+                raise urllib.error.HTTPError(TRACKER_API, code, "x", {}, io.BytesIO(body))
+            return answer
+
+        slack_real = SlackClient(cfg_for("real-clients"), "slack-test-token")
+        got = through(lambda _p: {"ok": False, "error": "not_in_channel"},
+                      lambda: slack_real.history(CHAN, 0, 10))
+        check("real-slack:ok-false-is-an-error-not-an-empty-channel",
+              (str(got).startswith("BridgeError"), "not_in_channel" in str(got)), (True, True))
+        got = through(lambda _p: {"ok": True, "messages": [{"ts": "1.0"}],
+                                  "response_metadata": {"next_cursor": "more"}},
+                      lambda: slack_real.history(CHAN, 0, 2))
+        check("real-slack:history-past-the-page-cap-is-an-error",
+              (str(got).startswith("BridgeError"), "more than 2 pages" in str(got)),
+              (True, True))
+        got = through(lambda _p: {"errors": [{"message": "Authentication required"}]},
+                      lambda: TrackerClient("k").issue("PROD-5"))
+        check("real-tracker:an-auth-error-is-an-error-not-not-found",
+              str(got).startswith("BridgeError"), True)
+        got = through(lambda _p: {}, lambda: TrackerClient("k").issue("PROD-5"))
+        check("real-tracker:an-answer-with-no-data-is-an-error-not-not-found",
+              str(got).startswith("BridgeError"), True)
+        for code, raw in ((503, b""), (502, b"{}"), (429, b'{"message": "rate limited"}'),
+                          (500, b'{"data": {"issue": null, "viewer": null}}')):
+            for what, call in (("issue", lambda: TrackerClient("k").issue("PROD-5")),
+                               ("viewer", lambda: TrackerClient("k").viewer_id())):
+                got = through(http_error(code, raw), call)
+                check("real-tracker:http-%d-%s-is-could-not-check" % (code, what),
+                      str(got).startswith("BridgeError"), True)
+
+        def viewer_ok_issue_503(payload):
+            if "BridgeViewer" in payload["query"]:
+                return {"data": {"viewer": {"id": OWNER}}}
+            return http_error(503, b"")(payload)
+        c, s, _t = world("tracker-outage")
+        through(viewer_ok_issue_503, lambda: run(c, s, TrackerClient("k")))
+        s.add(ALICE, "plan PROD-5")
+        code, _o = through(viewer_ok_issue_503, lambda: run(c, s, TrackerClient("k")))
+        check("a-tracker-outage-exits-1-and-is-not-said-as-not-found",
+              (code, any("can't find" in x for x in posted(s))), (EXIT_ERROR, False))
+
+        # The real transport refuses a redirect: the token never reaches where it points.
+        import http.server
+        import threading
+
+        class _Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.hits.append((self.path, self.headers.get("Authorization")))
+                if self.path.startswith("/api/"):
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.1:%d/stolen"
+                                     % self.server.server_address[1])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = json.dumps({"ok": True, "user_id": ME, "team_id": TEAM}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+        server.hits = []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        saved_env = dict((k, os.environ.get(k)) for k in ("no_proxy", "NO_PROXY"))
+        os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+        try:
+            local = SlackClient({"chat_api_base": "http://127.0.0.1:%d/api"
+                                 % server.server_address[1]}, "redirect-test-token")
+            try:
+                local.auth_test()
+                got = "followed"
+            except BridgeError as exc:
+                got = str(exc)
+            check("transport:a-redirect-is-refused-and-the-token-never-reaches-its-target",
+                  ("could not be read" in got, [h for h in server.hits if h[0] == "/stolen"],
+                   [h[1] for h in server.hits]),
+                  (True, [], ["Bearer redirect-test-token"]))
+        finally:
+            server.shutdown()
+            server.server_close()
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
         # 12. CONFIG: every problem at once; the chat bot's token name and `act` refused.
         os.makedirs(os.path.join(tmp, "in-a-repo", ".git"))
         try:
@@ -1539,8 +1919,9 @@ def selftest():
             s.add(ALICE, "plan PROD-6")
 
             def leaky(_ident):
-                raise BridgeError("the tracker echoed Authorization: %s"
-                                  % os.environ["STAGE_E_LINEAR_API_KEY"])
+                # Padded so the key straddles where the state record is cut short.
+                raise BridgeError("the tracker echoed %s Authorization: %s"
+                                  % ("x" * 90, os.environ["STAGE_E_LINEAR_API_KEY"]))
             t.issue = leaky
             out = io.StringIO()
             code = run_command(c, False, 30, slack=s, tracker=t, out=out, now=now)
@@ -1551,6 +1932,31 @@ def selftest():
             check("credential-redacted-everywhere",
                   ("2" * 30 in out.getvalue() + beat_text, "redacted" in beat_text),
                   (False, True))
+            # ... and on the give-up path, the third failed pass: the log line, the state
+            # file and the heartbeat. The state file is mode 600.
+            logs = []
+            for _ in range(2):
+                out = io.StringIO()
+                logs.append((run_command(c, False, 30, slack=s, tracker=t, out=out,
+                                         now=now), out.getvalue()))
+            state_text = open(state_path(c)).read()
+            written = "".join(l for _c, l in logs) + state_text + open(heartbeat_path(c)).read()
+            check("credential-redacted-on-the-give-up-path",
+                  ([code for code, _l in logs], "gave up" in logs[-1][1],
+                   os.environ["STAGE_E_LINEAR_API_KEY"][:16] in written,
+                   "redacted" in state_text, "redacted" in logs[-1][1]),
+                  ([EXIT_ERROR, EXIT_OK], True, False, True, True))
+            check("state-file-is-mode-600", oct(os.stat(state_path(c)).st_mode & 0o777),
+                  oct(0o600))
+            # A Slack post is redacted too: a key pasted into a ticket's title never posts.
+            c2, s2, t2 = world("redact-post")
+            run(c2, s2, t2)
+            t2.issues["PROD-7"] = dict(t2.issues["PROD-6"], identifier="PROD-7", title=(
+                "key %s pasted" % os.environ["STAGE_E_LINEAR_API_KEY"]))
+            s2.add(ALICE, "plan PROD-7")
+            run(c2, s2, t2)
+            check("credential-redacted-in-a-slack-post",
+                  ("2" * 30 in posted(s2)[-1], "redacted" in posted(s2)[-1]), (False, True))
         finally:
             os.environ.pop("BRIDGE_SLACK_BOT_TOKEN", None)
             os.environ.pop("STAGE_E_LINEAR_API_KEY", None)

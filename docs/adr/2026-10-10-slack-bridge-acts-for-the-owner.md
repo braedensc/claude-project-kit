@@ -36,19 +36,23 @@ Three facts shape the answer:
 
 A separate job, **the bridge**, is the only path from the chat to an action as the owner.
 
-- **It asks; a member answers.** A request is one strict line (`plan <ticket id>`) from anyone,
-  the chat bot included. The bridge reads the ticket with the owner's key and posts its OWN
-  question, built only from what it read. Only a "yes" in that question's thread, after it,
-  from a verified member, takes the action. The yes binds to the question in the bridge's own
-  state, never to a ticket named in someone's text. A bare "yes" is refused when another
-  bot posted in the thread after the question, or the bridge's own account posted something
-  it has no record of, since a look-alike could have misled the person; `yes <ticket id>` is
-  asked for instead. An edited question is closed. A tricked chat bot can make the bridge
-  ask; it cannot make it act.
+- **It asks; a member answers.** A request is one strict line, `plan <ticket id>` or
+  `approve <ticket id>`, from anyone, the chat bot included. The first build answers `approve`
+  once, saying it is not built yet, and changes nothing. For `plan`, the bridge reads the
+  ticket with the owner's key and posts its OWN question, built only from what it read. Only a
+  "yes" in that question's thread, after it, from a verified member, takes the action. The yes
+  binds to the question in the bridge's own state, never to a ticket named in someone's text. A
+  bare "yes" is refused when anything other than the bridge or a verified member posted in the
+  thread after the question (a bot, an app, Slackbot, a guest), or the bridge's own account
+  posted something it has no record of, since a look-alike could have misled the person;
+  `yes <ticket id>` is asked for instead. An edited question is closed, and so is one that is
+  gone from its thread. A question's status changes only after the bridge's reply saying so is
+  posted. A tricked chat bot can make the bridge ask; it cannot make it act.
 - **It knows its own bot.** The config names the bridge app's bot user, and a token that
   answers to anyone else is refused before anything is read.
 - **The sender is checked with Slack itself.** The `user` field from Slack's own history call,
-  then `users.info`: a human, not deleted, not a guest, not an app, same workspace. Bot posts,
+  then `users.info`: a human, not deleted, not a guest, not an app, same workspace. Same
+  workspace must be shown: an account Slack names no workspace for is refused. Bot posts,
   edits, files and subtypes are refused. An optional list narrows who may answer.
 - **Any full member may answer, with the owner's reach** (owner decision, 2026-10-10, KIT-117).
   That is how he shares the pipeline with people he trusts. The trusted-members rule stands:
@@ -56,7 +60,8 @@ A separate job, **the bridge**, is the only path from the chat to an action as t
 - **It polls; it does not listen.** Each pass reads the channel's history over a window (seven
   days), the threads that changed, and every open question's thread, and handles each message
   once. A yes sent while the Mac slept is acted on when it wakes, inside the question's 24
-  hours.
+  hours. A thread is found through its first message, so a new reply in a thread older than
+  the window is not read unless the thread holds an open question.
 - **It runs as the dispatcher's own account and reuses the owner's stored key** (owner
   decisions, 2026-10-10). **It has its own Slack app.** If it posted as the chat bot, the chat
   bot could post a question that looked like the bridge's, and a member's yes under it would
@@ -65,7 +70,9 @@ A separate job, **the bridge**, is the only path from the chat to an action as t
   thread. A Slack or tracker failure exits 1 and leaves the message for the next pass. A state
   file it cannot read is refused, never taken for a first pass. State is written after every
   message, one pass runs at a time, and a message that fails three passes running is given
-  up on and said, so one bad message cannot stall the bridge.
+  up on and said, so one bad message cannot stall the bridge. Every request that reads the
+  tracker counts against the hourly limit, found or not, since the key is shared with
+  Stage E; past it, requests are refused unread and that is said once an hour.
 
 ## Consequences
 

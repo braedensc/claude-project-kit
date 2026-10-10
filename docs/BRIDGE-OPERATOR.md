@@ -181,13 +181,16 @@ message, a reply with a file, or a member not on `ALLOWED_SLACK_USERS`.
 
 The bridge checks every answer with Slack's own records. It refuses:
 
-- a guest, a bot or an app account, a deactivated account, or one from another workspace;
+- a guest, a bot or an app account, a deactivated account, one from another workspace, or
+  one Slack names no workspace for;
 - a bot post, an edited message, a message with a file, or any special message type;
 - a "yes" to a question it did not ask, in another thread, or older than the question;
 - a bare "yes" when two questions are open in one thread (it asks for `yes <ticket id>`);
-- a bare "yes" when any other bot posted in the thread after the question, since a
-  look-alike question could have misled you (it asks for `yes <ticket id>`);
-- any answer to a question that was edited after it was posted (it closes the question);
+- a bare "yes" when anything but the bridge or a member posted in the thread after the
+  question (a bot, an app, Slackbot or a guest), since a look-alike question could have
+  misled you (it asks for `yes <ticket id>`);
+- any answer to a question that was edited or deleted after it was posted (it closes the
+  question);
 - a "yes" sent more than 24 hours after the question. A "yes" sent in time still counts if
   the Mac was asleep and handles it later.
 
@@ -195,7 +198,12 @@ A message the bridge cannot handle three passes running is given up on, said onc
 passed over, so one bad message cannot stall it.
 
 A request (`plan <ticket id>`) can come from anyone, the chat bot included. Asking is harmless;
-only the answer acts. It asks at most 20 questions an hour, and one per ticket at a time.
+only the answer acts. It looks up at most 20 requests an hour, found or not, and asks one
+question per ticket at a time. Past that limit it refuses requests without reading them, and
+says so once an hour. A request from the chat bot credits "the chat bot", with no mention.
+
+`approve <ticket id>` is recognised too. This version answers it once, saying approving from
+Slack is not built yet, and changes nothing.
 
 ---
 
