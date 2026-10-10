@@ -432,6 +432,31 @@ def _now():
     return time.time()
 
 
+def _awake_clock():
+    """Seconds this machine has been AWAKE since boot — a clock that stops while it sleeps
+    (KIT-211). macOS: CLOCK_UPTIME_RAW (mach_absolute_time), which keeps running in a
+    background ("dark") wake, because jobs run then. Linux: CLOCK_MONOTONIC, which excludes
+    suspend. None when neither can be read; staleness is then judged by the wall clock alone,
+    exactly as before this existed."""
+    try:
+        if hasattr(time, "CLOCK_UPTIME_RAW"):
+            return float(time.clock_gettime(time.CLOCK_UPTIME_RAW))
+        return float(time.monotonic())
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _boot_wall():
+    """The wall-clock time this machine booted, or None. The awake clock restarts at boot, so
+    a mark recorded before it measures nothing after it. macOS: CLOCK_MONOTONIC_RAW keeps
+    counting while asleep; Linux: CLOCK_BOOTTIME does."""
+    name = "CLOCK_MONOTONIC_RAW" if sys.platform == "darwin" else "CLOCK_BOOTTIME"
+    try:
+        return time.time() - float(time.clock_gettime(getattr(time, name)))
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def _iso(epoch=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch if epoch is not None else _now()))
 
@@ -491,19 +516,66 @@ def stale_after(interval_seconds, multiplier):
     return max(MIN_STALE_AFTER_SECONDS, int(interval_seconds) * int(multiplier))
 
 
-def judge_one(job, spec, raw, now, limit, blind):
+# ── Awake time (KIT-211) ───────────────────────────────────────────────────────
+# A job cannot write a heartbeat while the machine sleeps, so a heartbeat's age is judged
+# in AWAKE time. Each pass records one mark, [wall time, awake clock], in its state. The
+# awake time since a beat is then the awake clock now, less the clock at the last mark
+# before the beat, less the wall time from that mark to the beat. It only ever subtracts
+# sleep it measured. Sleep between that mark and the beat is subtracted too (the job ran
+# at the beat, so the machine was awake then, but maybe not throughout), which makes the
+# figure an UNDERESTIMATE: a stopped job is paged late by at most one monitor interval,
+# never early. A beat older than every mark falls back to the wall clock for that stretch.
+# This replaces nothing: the monitor's own missed-schedule rule (`blind`) still stands.
+AWAKE_MARKS_KEPT = 400      # ~8 days of half-hourly passes; the state file stays small
+
+
+def awake_age(beat_at, now, clock_now, marks, boot_at=None):
+    """Seconds of AWAKE time since `beat_at`, or None when it cannot be told (no clock, no
+    marks yet). Never more than the wall-clock age."""
+    if clock_now is None or not marks:
+        return None
+    wall_age = max(0.0, now - beat_at)
+    valid = []
+    for mark in marks:
+        if not (isinstance(mark, (list, tuple)) and len(mark) == 2):
+            continue
+        w, c = mark
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (w, c)):
+            continue
+        # A mark from before the last boot measured a clock that has since restarted.
+        if (boot_at is not None and w < boot_at) or c > clock_now or w > now:
+            continue
+        valid.append((float(w), float(c)))
+    if not valid:
+        # Every mark predates a reboot: the machine has been awake at most since boot.
+        return max(0.0, min(wall_age, clock_now)) if boot_at is not None else None
+    before = [m for m in valid if m[0] <= beat_at]
+    if before:
+        w, c = max(before)
+        est = (clock_now - c) - (beat_at - w)
+    else:
+        w, c = min(valid)
+        est = (clock_now - c) + (w - beat_at)
+    return max(0.0, min(wall_age, est))
+
+
+def judge_one(job, spec, raw, now, limit, blind, awake=None):
     """One verdict for one job. `raw` is what read_beat() found:
       {"exists": bool, "doc": dict|None, "error": str|None, "path": str}
 
     `blind` is the sleep blind spot: staleness is not judgeable this pass. It suppresses
-    ONLY the two clock-derived verdicts. A missing, failing or unjudgeable heartbeat does
+    ONLY the two clock-derived verdicts.
+
+    `awake`, when given, maps the beat's time to the AWAKE seconds since it (KIT-211), or
+    None; the staleness limit is then measured in awake time, because a job cannot beat
+    while the machine sleeps. None, or no `awake`, judges by the wall clock as before. A missing, failing or unjudgeable heartbeat does
     not become healthy because the machine was asleep.
 
     A beat its job marks as a rehearsal is judged by its time like any other — the job did
     run — and its row says it was a rehearsal, so it is never read as a pass of the loaded
     job.
     """
-    out = _judge_beat(job, spec, raw, now, limit, blind)
+    out = _judge_beat(job, spec, raw, now, limit, blind, awake)
     doc = raw.get("doc")
     if (spec.get("dry_field") and isinstance(doc, dict) and doc.get(spec["dry_field"]) is True
             and out["verdict"] not in ("missing", "unreadable")):
@@ -511,7 +583,7 @@ def judge_one(job, spec, raw, now, limit, blind):
     return out
 
 
-def _judge_beat(job, spec, raw, now, limit, blind):
+def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
     """judge_one's verdict, before a rehearsal is named."""
     out = {"job": job, "label": spec["label"], "path": raw.get("path", ""),
            "result": None, "age_seconds": None, "beat_at": None, "detail": ""}
@@ -547,7 +619,16 @@ def _judge_beat(job, spec, raw, now, limit, blind):
     out["result"] = result_of(doc, spec)
     out["age_seconds"] = max(0, int(now - stamp))
     running = out["result"] in (spec.get("running") or ())
-    if out["age_seconds"] > limit:
+    awake_s = awake(stamp) if awake is not None else None
+    judged_age = out["age_seconds"]
+    slept_note = ""
+    if awake_s is not None:
+        out["awake_seconds"] = int(awake_s)
+        judged_age = int(awake_s)
+        if out["age_seconds"] - judged_age >= 60:
+            slept_note = (" (%s of it awake: the machine slept the rest, and a job cannot "
+                          "beat while it sleeps)" % human_age(judged_age))
+    if judged_age > limit:
         if blind:
             out["verdict"] = "unknown-after-gap"
             out["detail"] = ("last beat %s (%s ago), older than the %ds limit — but this "
@@ -556,8 +637,10 @@ def _judge_beat(job, spec, raw, now, limit, blind):
                              % (out["beat_at"], human_age(out["age_seconds"]), limit))
             return out
         out["verdict"] = "wedged" if running else "stale"
-        out["detail"] = ("last beat %s (%s ago), past the %ds limit%s"
-                         % (out["beat_at"], human_age(out["age_seconds"]), limit,
+        out["detail"] = ("last beat %s (%s ago%s), past the %ds limit%s"
+                         % (out["beat_at"], human_age(out["age_seconds"]),
+                            "" if not slept_note else ", %s awake" % human_age(judged_age),
+                            limit,
                             "; it says a pass was still running, so that pass started and "
                             "never finished" if running else ""))
         return out
@@ -573,19 +656,20 @@ def _judge_beat(job, spec, raw, now, limit, blind):
                                 or "the PAUSED file in the driver's state directory"))
             return out
         out["verdict"] = "ok"
-        out["detail"] = "last beat %s ago, result %r%s" % (
-            human_age(out["age_seconds"]), out["result"],
+        out["detail"] = "last beat %s ago%s, result %r%s" % (
+            human_age(out["age_seconds"]), slept_note, out["result"],
             "" if out["result"] != "paused" else
             " (paused on purpose since %s — it is doing nothing, deliberately)"
             % ((raw.get("doc") or {}).get("paused_since") or "an unknown time"))
     elif running:
         out["verdict"] = "running"
-        out["detail"] = "last beat %s ago, a pass was in flight" % human_age(out["age_seconds"])
+        out["detail"] = "last beat %s ago%s, a pass was in flight" % (
+            human_age(out["age_seconds"]), slept_note)
     else:
         out["verdict"] = "failing"
-        out["detail"] = ("last beat %s ago and it reports %r — it RAN and could not do it, "
+        out["detail"] = ("last beat %s ago%s and it reports %r — it RAN and could not do it, "
                          "which is not the same as being down"
-                         % (human_age(out["age_seconds"]), out["result"]))
+                         % (human_age(out["age_seconds"]), slept_note, out["result"]))
     return out
 
 
@@ -1104,13 +1188,24 @@ def judge(cfg, state, now):
     if last_run is not None:
         gap = int(max(0, now - last_run))
         blind = gap > cfg["run_interval_seconds"] * cfg["stale_multiplier"]
+    # KIT-211: judge each beat's age in AWAKE time, from the marks earlier passes recorded.
+    clock_now = _awake_clock()
+    marks = state.get("awake_marks") if isinstance(state.get("awake_marks"), list) else []
+    boot_at = _boot_wall()
+
+    def awake(stamp):
+        return awake_age(stamp, now, clock_now, marks, boot_at)
     verdicts = []
     for job in cfg["watch"]:
         spec = WATCHERS[job]
         limit = stale_after(cfg["intervals"][job], cfg["stale_multiplier"])
-        verdicts.append(judge_one(job, spec, read_beat(beat_path(cfg, job)), now, limit, blind))
+        verdicts.append(judge_one(job, spec, read_beat(beat_path(cfg, job)), now, limit, blind,
+                                  awake if clock_now is not None else None))
     unwatched = set(WATCHERS) - set(cfg["watch"])
-    return build_report(verdicts, unwatched, blind, gap)
+    report = build_report(verdicts, unwatched, blind, gap)
+    report["awake_clock"] = clock_now
+    report["boot_at"] = _iso(boot_at) if boot_at is not None else None
+    return report
 
 
 def run_pass(cfg, post=True, dry_run=False, poster=None):
@@ -1172,6 +1267,9 @@ def run_pass(cfg, post=True, dry_run=False, poster=None):
     if not dry_run:
         new_state = dict(state)
         new_state["last_run_at"] = _iso(now)
+        if report.get("awake_clock") is not None:
+            old = state.get("awake_marks") if isinstance(state.get("awake_marks"), list) else []
+            new_state["awake_marks"] = (old + [[now, report["awake_clock"]]])[-AWAKE_MARKS_KEPT:]
         if posted:
             new_state["last_posted_at"] = _iso(now)
             new_state["last_posted_fingerprint"] = report["fingerprint"]
@@ -1407,6 +1505,59 @@ def selftest():
                                  "error": "boom"}, blind=True) == "unreadable")
     ok("the stale limit has a floor, so jitter on a tiny interval cannot page",
        stale_after(5, 2) == MIN_STALE_AFTER_SECONDS and stale_after(300, 2) == 600)
+
+    # ── 4b. Short naps: a heartbeat's age is AWAKE time (KIT-211) ────────────────────
+    # The incident: the monitor ran at 14:10; the notifier beat at 14:21; the Mac slept
+    # 14:23-14:39; the monitor ran at 14:40 and paged "notifier stale, 19m". Awake time since
+    # that beat was 3 minutes.
+    aa = globals().get("awake_age")
+    ok("KIT-211: awake_age exists", aa is not None)
+    if aa is not None:
+        T = parse_iso("2026-10-09T14:40:00Z")
+        mark = [[T - 1800, 100000.0]]
+        clock = 100000.0 + 14 * 60
+        nap_beat = T - 19 * 60
+        ok("KIT-211: the 2026-10-09 nap — a 19-minute-old beat had 3 minutes awake",
+           aa(nap_beat, T, clock, mark) == 180, aa(nap_beat, T, clock, mark))
+        ok("awake the whole time: the awake age is the wall age",
+           aa(nap_beat, T, 100000.0 + 1800, mark) == 19 * 60)
+        ok("the awake age never exceeds the wall age",
+           aa(nap_beat, T, 100000.0 + 99999, mark) == 19 * 60)
+        ok("no marks yet: None, so the wall clock judges exactly as before",
+           aa(nap_beat, T, clock, []) is None)
+        ok("no awake clock on this machine: None", aa(nap_beat, T, None, mark) is None)
+        ok("a beat older than every mark falls back to wall time for that stretch",
+           aa(T - 3600, T, 100000.0 + 1800, mark) == 3600)
+        ok("a mark from before a reboot is ignored; awake-since-boot bounds the age",
+           aa(nap_beat, T, 300.0, mark, boot_at=T - 400) == 300)
+        ok("a pre-boot mark is ignored even when its clock reading is below now's",
+           aa(T - 600, T, 900.0, [[T - 1800, 200.0]], boot_at=T - 1000) == 600)
+        ok("a mark whose clock is ahead of now (a reboot, no boot time known) is ignored",
+           aa(nap_beat, T, 300.0, mark) is None)
+        ok("malformed marks are ignored, never trusted",
+           aa(nap_beat, T, clock, [["x", 1], [True, 2.0], [T - 1800]]) is None)
+
+        def rp(ts):
+            return beat("review-poller", result="ok", ended_at=_iso(ts))
+        slept = judge_one("review-poller", WATCHERS["review-poller"], rp(nap_beat), T, 1080,
+                          False, awake=lambda s: aa(s, T, clock, mark))
+        ok("KIT-211: a nap after the beat is not stale", slept["verdict"] == "ok", slept)
+        ok("…and the row says how much of its age was sleep", "awake" in slept["detail"],
+           slept["detail"])
+        stopped = judge_one("review-poller", WATCHERS["review-poller"], rp(T - 3600), T, 1080,
+                            False, awake=lambda s: aa(s, T, 100000.0 + 1800, mark))
+        ok("KIT-211: a job that stopped while the machine was awake is still stale",
+           stopped["verdict"] == "stale", stopped)
+        # Lid closed for 7 hours, the job died 30 minutes after the monitor's mark, and
+        # background wakes added up to 66 minutes awake: 36 of them after the beat.
+        dark = judge_one("review-poller", WATCHERS["review-poller"], rp(T - 6.5 * 3600), T, 1080,
+                         False, awake=lambda s: aa(s, T, 98000.0 + 66 * 60, [[T - 7 * 3600, 98000.0]]))
+        ok("KIT-211: awake time adds up across background wakes, so a stopped job still pages",
+           dark["verdict"] == "stale", dark)
+        blind_wake = judge_one("review-poller", WATCHERS["review-poller"], rp(T - 86400), T, 1080,
+                               True, awake=lambda s: aa(s, T, clock, mark))
+        ok("a blind pass (the monitor missed its own schedule) is still unknown-after-gap",
+           blind_wake["verdict"] == "unknown-after-gap", blind_wake)
 
     # ── 5. Fingerprints: identity of a verdict SET, not of a moment ───────────────────
     a = [{"job": "b", "verdict": "stale"}, {"job": "a", "verdict": "ok"}]
@@ -1907,6 +2058,51 @@ def selftest():
         woke = json.load(open(heartbeat_path(load_config(path)), encoding="utf-8"))
         ok("…and the heartbeat records the unjudged verdict by name",
            woke["verdicts"]["review-poller"] == "unknown-after-gap", woke)
+
+        # (j2) KIT-211, end to end: the monitor last ran 30 min ago (not blind), the job beat
+        #      11 min ago against a 10-min limit, and the machine was awake for only 10 of
+        #      those 30 minutes. Measured awake, the beat is fresh: nothing pages. Then the
+        #      same beat with the machine awake throughout: it is stale, and it pages.
+        g = globals()
+        real_clock, real_boot = g.get("_awake_clock"), g.get("_boot_wall")
+        # The host's real boot time must not decide the test: a CI runner boots minutes
+        # before the job, which would make the 30-minute-old mark a pre-boot one.
+        g["_boot_wall"] = lambda: _now() - 10 * 86400
+        nap_state = {"schema": STATE_SCHEMA, "last_run_at": _iso(_now() - 1800),
+                     "last_posted_fingerprint": "review-poller=ok", "last_posted_problem": False,
+                     "last_posted_target": "KIT-000", "last_posted_at": _iso(_now() - 1800),
+                     "suppressed_changes": 0, "awake_marks": [[_now() - 1800, 50000.0]]}
+        try:
+            write(live)
+            _atomic_write_json(state_path(load_config(path)), nap_state)
+            _atomic_write_json(hb, {"schema": WATCHERS["review-poller"]["schema"],
+                                    "result": "ok", "ended_at": _iso(_now() - 660)})
+            g["_awake_clock"] = lambda: 50000.0 + 600
+            sent_before = len(sent)
+            code = cmd_run(Args(), poster=fake_poster)
+            napped = json.load(open(heartbeat_path(load_config(path)), encoding="utf-8"))
+            ok("KIT-211: a nap after the beat pages nothing",
+               len(sent) == sent_before and code == EXIT_OK, (code, sent[sent_before:]))
+            ok("KIT-211: …and the job reads ok, not stale",
+               napped["verdicts"]["review-poller"] == "ok", napped["verdicts"])
+            marks = json.load(open(state_path(load_config(path)), encoding="utf-8")).get(
+                "awake_marks") or []
+            ok("KIT-211: …and the pass recorded its own awake mark",
+               len(marks) == 2 and marks[-1][1] == 50000.0 + 600, marks)
+            _atomic_write_json(state_path(load_config(path)), nap_state)
+            g["_awake_clock"] = lambda: 50000.0 + 1800
+            code = cmd_run(Args(), poster=fake_poster)
+            ok("KIT-211: the same beat with the machine awake throughout still pages",
+               len(sent) == sent_before + 1, (code, sent[sent_before:]))
+        finally:
+            if real_clock is not None:
+                g["_awake_clock"] = real_clock
+            else:
+                g.pop("_awake_clock", None)
+            if real_boot is not None:
+                g["_boot_wall"] = real_boot
+            else:
+                g.pop("_boot_wall", None)
 
         # (k) rearm: the next pass is handled like a wake, and nothing else changes
         spath = state_path(load_config(path))
