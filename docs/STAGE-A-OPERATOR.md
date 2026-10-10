@@ -209,12 +209,15 @@ What it does, in order:
      If it never answers, the step stops there and prints `sudo launchctl print
      system/<label>` to look first.
    - **The probe.** After a yes, it files two test tickets per repository, as you, and hands
-     them to the agent. It reads where the dispatcher sent them. It reads the tool list the
-     session was given from the dispatcher's own session log, and a helper's from the
-     session's answer. A tool outside the keep-set in any list it read stops the probe,
-     without asking. Then it asks you **one** question: is the team's agent guidance
-     empty, or silent about planning and building? The API cannot read it. It records the
-     sign-off and closes the tickets.
+     them to the agent. The planning setup's own instructions say what to do with a ticket
+     of exactly the probe's title; the tickets' text only points there (KIT-215). It reads
+     where the dispatcher sent them. It reads the tool list the session was given from the
+     dispatcher's own session log, and a helper's from the session's answer. If the same
+     log shows no helper was started, that answer's helper list is dropped. If the log
+     cannot be read, the answer is used for both lists, and the probe says so. A tool
+     outside the keep-set in any list it read stops the probe, without asking. Then it asks
+     you **one** question: is the team's agent guidance empty, or silent about planning and
+     building? The API cannot read it. It records the sign-off and closes the tickets.
 
      Two more questions come only when a list was not measured. If a list came back but
      could not be read, it asks about that list alone. If no helper list came back, it
@@ -303,9 +306,10 @@ wall clock.
 - **The tracker's limit on a session's final message is unmeasured.** A twenty-child plan
   measures about 50,000 characters. An overlong one arrives as "no plan", never a partial one.
 - **A helper session inherits the fence, per the runner's source.** It is not measured
-  yet. The probe's questions sit in the ticket's text, and a planning session that follows
-  its brief refuses them, so it starts no helper (KIT-208). The probe's record then says
-  the helper was not measured.
+  live yet. The probe's steps now sit in the planning setup's own instructions, keyed on
+  the probe's exact title, so a session that follows them starts a helper (KIT-215). That
+  this happens on a live session is not yet seen. If the log shows no helper, the record
+  says the helper was not measured.
 - **The duplicate check compares titles, not intent.**
 - **Nothing watches the job's heartbeat automatically.** The heartbeat monitor does not know
   this job yet (KIT-192); `verify` is what reads it.
@@ -322,4 +326,7 @@ wall clock.
   list that still held a fenced tool would fail the probe loudly, never pass it.
 - **A planning session could read files in the role account's home**, if its file-reading
   tool reaches there. The probe leaves a harmless test file beside the planner's own files,
-  asks the session to read it, and reports what came back. Tracked as KIT-162.
+  asks the session to read it, and reports what came back. If the file's contents come
+  back, that is "read", whatever the log shows: they cannot come back unread. "Not
+  returned" counts only when the dispatcher's log shows the read was attempted. Without
+  that, or when the log cannot be read, the result is "no answer". Tracked as KIT-162.

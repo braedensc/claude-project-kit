@@ -882,6 +882,46 @@ definition naming servers the installer cannot name is refused outright.
 The live probe stays, and its card now says what to expect: the two tool lists should match.
 Source is what the runtime should do; the probe is what it did.
 
+### Update 2026-10-10 — the probe's steps live in the brief, keyed on its exact title (KIT-215)
+
+This supersedes the probe's wording above where they differ.
+
+**What broke.** On the first live run (2026-10-03) the probe's four steps sat in the probe
+ticket's text. A planning session that follows its brief treats ticket text as data, so it
+refused them. Nothing about a helper session or the test file was measured (KIT-208,
+defect 1).
+
+**Decision (the owner's, 2026-10-10).** The planning brief ends with one fixed paragraph.
+It applies only when the delegated ticket's own title is exactly one of the installer's two
+probe titles, read from the `<title>` line of the prompt's first `<linear_issue>` block. A
+title written in the idea or a ticket's text does not count. The paragraph names the four
+steps and this machine's test file, so the entry is composed with that path. The probe
+tickets' text only points at the brief. `entry_problems` refuses an entry without the
+paragraph, and a loadable entry whose paragraph names no real file.
+
+**Why this trusts nothing new.** The title triggers the paragraph, but the brief's own
+fixed text drives it. A ticket cannot add a step, and a forged title gets only four
+harmless steps. Only the owner can start a session in a planning entry. The planner job
+titles its tickets "Planning run for …", so no idea can produce either title. The fence is
+unchanged, and the idea is still data.
+
+**Measured from the dispatcher's log, not the answer.** The probe already read the
+session's tool list from the dispatcher's own session log. The same reader now also
+reports two booleans: whether the session called `Task` or `Agent`, and whether it called
+`Read` on the test file. It prints no message and no call's input. A helper list in the
+answer is dropped when the log shows no helper started. When the log cannot be read,
+the answer's helper list is used, and the probe says so. The test file counts as READ
+whenever its contents come back, whatever the log shows: they cannot come back unread.
+It counts as NOT-RETURNED only when the log shows the read was attempted. Otherwise,
+and whenever the log cannot be read, it is NO-ANSWER.
+
+**Rejected.** A separate probe entry with its own brief would measure a different entry
+from the planning one, and stay reachable at any time. A label only the installer applies
+would first need proof that labels reach a session's prompt.
+
+**Not proven.** No live probe has run with the paragraph. A helper's own tool list still
+comes from the session's answer, because no log line records what a helper held.
+
 ## Update 2026-09-23 — planning built into each work team (KIT-184)
 
 **The decision.** The owner decided on 2026-09-21, and approved the design on 2026-09-23,
