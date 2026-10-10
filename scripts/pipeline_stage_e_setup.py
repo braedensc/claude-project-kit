@@ -21,7 +21,9 @@ ticket when their health changes, so the `heartbeat-monitor` step stops on a car
 until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name. With
 NOTIFIER_JOB_LABEL set it watches the human-action notifier's heartbeat too, at the
 interval launchd holds for that job plus the notifier's own pass clock (KIT-156);
-empty, the step says the notifier is not watched.
+empty, the step says the notifier is not watched. With HEALTH_STATUS_FILE set it reads
+the owner's hourly health watch's status file as a fifth heartbeat (KIT-236), so a
+problem that watch finds pages chat too; empty, the step says it is not watched.
 
 And one thing that is NOT the role account's: the `conflict-waker` step installs
 the local half of the conflict loop for the PERSON running this command — a user
@@ -610,6 +612,12 @@ CONF_DEFAULTS = {
     # (KIT-156). Empty leaves it unwatched, and the `heartbeat-monitor` step says so by name.
     # Set, launchd must hold that job: its interval is read from launchd, not from here.
     "NOTIFIER_JOB_LABEL": "",
+    # The owner's health watch (scripts/pipeline_watch.py, KIT-236): the status file its
+    # update.conf names as HEALTH_STATUS_FILE, and its WATCH_INTERVAL_SECONDS. Empty leaves
+    # it unwatched, and the `heartbeat-monitor` step says so by name. Set, install the watch
+    # first: until it writes the file, the monitor reads it `missing` and pages.
+    "HEALTH_STATUS_FILE": "",
+    "HEALTH_WATCH_INTERVAL_SECONDS": "3600",
 }
 # The kit's own grader-path guard, by name — the one check a session can never turn
 # green, because it is red exactly until a person applies the label it demands. It is
@@ -763,6 +771,16 @@ def validate_conf(values):
     if nlabel and not _RDNS_RE.match(nlabel):
         errors.append("NOTIFIER_JOB_LABEL %r is not a reverse-DNS launchd label — the "
                       "notifier's JOB_LABEL, or empty to leave it unwatched" % nlabel)
+    hfile = (conf.get("HEALTH_STATUS_FILE") or "").strip()
+    if hfile and not os.path.isabs(hfile):
+        errors.append("HEALTH_STATUS_FILE %r must be an absolute path: the HEALTH_STATUS_FILE "
+                      "the health watch's update.conf names, or empty to leave it unwatched"
+                      % hfile)
+    hint = conf.get("HEALTH_WATCH_INTERVAL_SECONDS", "")
+    if not hint.isdigit() or int(hint) < HEALTH_WATCH_MIN_INTERVAL:
+        errors.append("HEALTH_WATCH_INTERVAL_SECONDS must be the health watch's own "
+                      "WATCH_INTERVAL_SECONDS, at least %d (got %r)"
+                      % (HEALTH_WATCH_MIN_INTERVAL, hint))
     if conf.get("SEVERITY_THRESHOLD") not in ("low", "medium", "high", "critical"):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
@@ -4910,6 +4928,14 @@ MONITOR_DAEMON_PASS_SECONDS = 900
 MONITOR_GOOD_RESULTS = ("ok", "declined")
 MONITOR_HEARTBEAT_POLLS = 18
 MONITOR_HEARTBEAT_POLL_SECONDS = 5
+# The owner's health watch, as the fifth watched job (KIT-236). Its longest healthy pass is
+# every kind changing at once: one alert send per kind, each up to 390 s (a dispatch, then
+# finding its run, then watching it), plus the checks. So 2700 s is added to its interval,
+# as each daemon's pass clock is to its own. The minimum interval is the watch's own floor.
+# The battery asserts both against the watch when that script is in the checkout.
+HEALTH_WATCH_JOB = "health-watch"
+HEALTH_WATCH_PASS_SECONDS = 2700
+HEALTH_WATCH_MIN_INTERVAL = 600
 # The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
 # installer's default path, as the role account; what the notifier's own loader assumes
 # when a key is absent is held here, and the battery asserts it against that loader.
@@ -4951,7 +4977,26 @@ def monitor_config(conf, notifier=None):
         doc["watch"].append(NOTIFIER_WATCH_JOB)
         doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
         doc["notifier_state_dir"] = notifier["state_dir"]
+    health_file = (conf.get("HEALTH_STATUS_FILE") or "").strip()
+    if health_file:
+        doc["watch"].append(HEALTH_WATCH_JOB)
+        doc["intervals"][HEALTH_WATCH_JOB] = (int(conf["HEALTH_WATCH_INTERVAL_SECONDS"])
+                                              + HEALTH_WATCH_PASS_SECONDS)
+        doc["health_status_file"] = health_file
     return doc
+
+
+def _health_watch_note(conf):
+    """One note for the step: whether the health watch's status file is read, and by what
+    gap. Printed whole, like the notifier's."""
+    health_file = (conf.get("HEALTH_STATUS_FILE") or "").strip()
+    if not health_file:
+        return "the health watch is not watched (HEALTH_STATUS_FILE is empty)"
+    interval = int(conf["HEALTH_WATCH_INTERVAL_SECONDS"])
+    return ("it reads the health watch's status file %s: every %d + %d s pass = %d s. Until "
+            "`python3 scripts/pipeline_watch.py install` has run, that file is missing and "
+            "the monitor pages it" % (health_file, interval, HEALTH_WATCH_PASS_SECONDS,
+                                      interval + HEALTH_WATCH_PASS_SECONDS))
 
 
 def notifier_label(conf):
@@ -5229,7 +5274,7 @@ def step_heartbeat_monitor(ctx, apply_it):
     watch_note = _notifier_watch_note(notifier)
     # The row is cut at 96 characters when printed, and this clause sits at its end, so it is
     # ALSO returned as a note, which prints whole — watched, paused, or not configured.
-    watch_notes = [watch_note]
+    watch_notes = [watch_note, _health_watch_note(conf)]
     want_conf, want_plist = monitor_config(conf, notifier), _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
@@ -10733,7 +10778,7 @@ def _selftest_body():
     try:
         _mcfg = hbm.load_config(_mpath)
         expect("monitor-config-accepted",
-               set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier"}
+               set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier", HEALTH_WATCH_JOB}
                and _mcfg["notify_ticket_id"] == "KIT-7"
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
                                           "finding-poller": 300 + 900}
@@ -10751,6 +10796,65 @@ def _selftest_body():
            and COMPONENT_EXIT_DECLINED == hbm.EXIT_DECLINED
            and MONITOR_RUN_TIMEOUT_SECONDS >= 1,
            "a name or code this file holds for the monitor no longer matches the script")
+
+    # THE HEALTH WATCH (KIT-236): empty is unwatched and said by name; set, it is a fifth
+    # watched job at its own interval plus its pass clock, and the monitor's loader takes it.
+    expect("health-watch-conf", CONF_DEFAULTS.get("HEALTH_STATUS_FILE") == ""
+           and CONF_DEFAULTS.get("HEALTH_WATCH_INTERVAL_SECONDS") == "3600"
+           and HEALTH_WATCH_JOB in hbm.WATCHERS,
+           "HEALTH_STATUS_FILE must default to empty (unwatched), its interval to hourly, and "
+           "the monitor must know the job")
+    expect("health-watch-conf", HEALTH_WATCH_JOB not in monitor_config(_cm)["watch"]
+           and "health_status_file" not in monitor_config(_cm)
+           and "HEALTH_STATUS_FILE is empty" in _health_watch_note(_cm),
+           "an empty HEALTH_STATUS_FILE must leave the watch unread, and say so")
+    for _bad, _why in (("HEALTH_STATUS_FILE=pipeline-health/status.json\n", "absolute path"),
+                       ("HEALTH_WATCH_INTERVAL_SECONDS=300\n", "at least 600"),
+                       ("HEALTH_WATCH_INTERVAL_SECONDS=hourly\n", "at least 600")):
+        _herrs = validate_conf(parse_conf(GOOD_CONF + _bad)[0])[1]
+        expect("health-watch-conf", any(_why in e for e in _herrs),
+               "%r was not refused: %s" % (_bad.strip(), _herrs))
+    _hfile = os.path.join(_mdir, "shared", "status.json")
+    _ch = dict(_cm, HEALTH_STATUS_FILE=_hfile)
+    _hdoc = monitor_config(_ch)
+    expect("health-watch-config", _hdoc["watch"][-1] == HEALTH_WATCH_JOB
+           and _hdoc["intervals"][HEALTH_WATCH_JOB] == 3600 + HEALTH_WATCH_PASS_SECONDS
+           and _hdoc["health_status_file"] == _hfile
+           and "6300 s" in _health_watch_note(_ch),
+           "a set HEALTH_STATUS_FILE must make the watch a watched job: %s" % _hdoc)
+    _hpath = os.path.join(_mdir, "monitor-health.json")
+    with open(_hpath, "w", encoding="utf-8") as fh:
+        json.dump(dict(_hdoc, state_dir=os.path.join(_mdir, "s"),
+                       finding_state_dir=os.path.join(_mdir, "f")), fh)
+    try:
+        _hcfg = hbm.load_config(_hpath)
+        expect("health-watch-config", HEALTH_WATCH_JOB in _hcfg["watch"]
+               and hbm.beat_path(_hcfg, HEALTH_WATCH_JOB) == os.path.realpath(_hfile),
+               "the monitor read back %s" % _hcfg)
+    except hbm.MonitorError as exc:
+        failures.append("health-watch-config: the monitor refused it: %s" % exc)
+    # The watch's own floor and its worst pass, when that script is in this checkout. It
+    # arrived in its own pull request; without it, this says the check did not run.
+    if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "pipeline_watch.py")):
+        import pipeline_watch as _pw
+        expect("health-watch-agrees", _pw.STATUS_SCHEMA == hbm.WATCHERS[HEALTH_WATCH_JOB]["schema"]
+               and HEALTH_WATCH_PASS_SECONDS
+               >= len(_pw.KINDS) * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300,
+               "the health watch's schema or worst pass no longer matches what is held here")
+
+        def _floor_errs(seconds):
+            return [e for e in _pw.pu.validate_conf(
+                {"WATCH_INTERVAL_SECONDS": str(seconds)})[1] if "WATCH_INTERVAL_SECONDS" in e]
+        expect("health-watch-agrees",
+               _pw.pu.CONF_DEFAULTS["WATCH_INTERVAL_SECONDS"]
+               == CONF_DEFAULTS["HEALTH_WATCH_INTERVAL_SECONDS"]
+               and _floor_errs(HEALTH_WATCH_MIN_INTERVAL) == []
+               and _floor_errs(HEALTH_WATCH_MIN_INTERVAL - 1) != [],
+               "the health watch's default interval or its floor no longer matches this file's")
+    else:
+        print("NOT CHECKED: scripts/pipeline_watch.py is not in this checkout, so the health "
+              "watch's interval floor and pass clock were not checked against it")
 
     # A PASS INSIDE ITS OWN DEADLINE IS NOT STALE. The pass clock this file adds is each
     # daemon's own default, and with the config it writes, a review poller whose last pass
@@ -11201,7 +11305,8 @@ def _selftest_body():
                            notifier_state_dir=os.path.join(_mdir, "n")), fh)
         try:
             _ncfg = hbm.load_config(_npath)
-            expect("notifier-watch-accepted", set(_ncfg["watch"]) == set(hbm.WATCHERS)
+            expect("notifier-watch-accepted", set(_ncfg["watch"])
+                   == set(hbm.WATCHERS) - {HEALTH_WATCH_JOB}
                    and _ncfg["intervals"].get("notifier") == 500,
                    "the monitor read back %s" % _ncfg)
         except hbm.MonitorError as exc:

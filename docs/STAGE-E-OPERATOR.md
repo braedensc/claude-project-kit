@@ -482,7 +482,7 @@ poller would.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key; creates backlog tickets and posts receipts, nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
+| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
@@ -1533,7 +1533,7 @@ them takes `sudo -u`:
 > installs it** at its `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
 > `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the install steps.
 >
-> **It watches up to four jobs, and its comments reach your chat channel** (KIT-156). Each
+> **It watches up to five jobs, and its comments reach your chat channel** (KIT-156). Each
 > comment carries a mark on its first line that the human-action notifier pings on, once,
 > with no label (`docs/NOTIFIER-OPERATOR.md`, *The daemon-health page*). Set
 > `NOTIFIER_JOB_LABEL` in `stage-e.conf` to the notifier's `JOB_LABEL` and the monitor
@@ -1543,6 +1543,11 @@ them takes `sudo -u`:
 > refused, and the `code` step asks before it stops anything, so a refusal leaves every job
 > loaded. Left empty, the note says the notifier is not watched. A stopped notifier still
 > pings nobody: the comment lands and says so.
+>
+> **The fifth is your hourly health watch** (KIT-236, `docs/UPDATE-OPERATOR.md`). Set
+> `HEALTH_STATUS_FILE` and `HEALTH_WATCH_INTERVAL_SECONDS` in `stage-e.conf` to match its
+> `update.conf`, and the monitor reads its status file. A problem it finds then pages your
+> channel, once per set of problems. Install the watch first, or the file reads as missing.
 
 ```sh
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
