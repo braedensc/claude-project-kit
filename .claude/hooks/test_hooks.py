@@ -1134,7 +1134,7 @@ def _pl_pin(root, **over):
 
 def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
                           cfg_raw=None, pin_raw=None, worktree_cfg_raw=None,
-                          dirty=None, pins_in_repo=None):
+                          dirty=None, pins_in_repo=None, lane_marker=None, root_name=None):
     """Throwaway repo with the pipeline CONFIGURED. Returns (root, hook_copy, pins).
 
     `cfg_raw`/`pin_raw` write the file verbatim (the malformed-config and
@@ -1146,8 +1146,16 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
     config points the pin INSIDE the worktree — the §7 hard-fail, and the payload a
     poisoned config would want most: a pins directory the session can write is a
     pin the session can forge. `pin=None` means no pin at all (a human's ad-hoc
-    session in a configured repo)."""
+    session in a configured repo).
+
+    `lane_marker` names an OS account whose dispatcher's-lane marker is written under
+    the pins root (KIT-241); True means the account running the battery. `root_name`
+    makes the repo's folder carry that name, as the dispatcher names a worktree after
+    its ticket."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pl-"))
+    if root_name:
+        root = os.path.join(root, root_name)
+        os.makedirs(root)
     pins = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pins-"))
     hooks = os.path.join(root, ".claude", "hooks")
     os.makedirs(hooks)
@@ -1168,6 +1176,12 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
         _pl_write(root, "delivery.json", worktree_cfg_raw)
     for rel, content in (dirty or {}).items():
         _pl_write(root, rel, content)
+    if lane_marker:
+        import pwd
+        who = pwd.getpwuid(os.getuid()).pw_name if lane_marker is True else lane_marker
+        os.makedirs(os.path.join(pins, "dispatched-lane"), exist_ok=True)
+        with open(os.path.join(pins, "dispatched-lane", who), "w") as f:
+            f.write("")
     if pin is not None:
         key = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
         body = pin_raw if pin_raw is not None else json.dumps(
@@ -1359,6 +1373,29 @@ def main():
     # matching must survive a config that resolves no label ID at all.
     pl_nolbl_root, pl_nolbl, pl_nolbl_pins = make_pipeline_sandbox(
         cfg_over={"linear": {"labels": {"ids": {}, "required": []}}})
+    # KIT-241 (B8): a dispatcher's lane that writes no pin. Its account carries the lane
+    # marker under the pins root; with the worktree named after a ticket, and without.
+    pl_lane_root, pl_lane, pl_lane_pins = make_pipeline_sandbox(pin=None, lane_marker=True)
+    pl_laneown_root, pl_laneown, pl_laneown_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-123")
+    pl_laneother_root, pl_laneother, pl_laneother_pins = make_pipeline_sandbox(
+        pin=None, lane_marker="someone-else-entirely")
+    pl_laneteam_root, pl_laneteam, pl_laneteam_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="OTH-5")
+    # The marker's `~` is the ACCOUNT's home, never $HOME: a session can move $HOME for
+    # the next session through a worktree env file the dispatcher loads (KIT-240). A
+    # marker planted under a fake $HOME must not count.
+    import pwd as _pwd
+    lane_fakehome = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-home-"))
+    _home_pins = "hook-battery-home-pins-%d" % os.getpid()
+    os.makedirs(os.path.join(lane_fakehome, _home_pins, "dispatched-lane"))
+    with open(os.path.join(lane_fakehome, _home_pins, "dispatched-lane",
+                           _pwd.getpwuid(os.getuid()).pw_name), "w") as f:
+        f.write("")
+    pl_lanehome_root, pl_lanehome, pl_lanehome_pins = make_pipeline_sandbox(
+        pin=None, cfg_over={"dispatch": {"pinsRoot": "~/" + _home_pins}})
+    lane_home_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_lanehome_root,
+                     "HOME": lane_fakehome}
     # A project whose base branch is NOT `main`. The stacked-branch guard reads
     # `github.defaultBranch` from the COMMITTED config on the default branch, so
     # `develop` must become a legal base — and `main`/`master` must stay legal
@@ -1420,6 +1457,10 @@ def main():
         pl_disarm_root, pl_disarm_pins, pl_expplan_root, pl_expplan_pins,
         pl_pinsin_root, pl_pinsin_pins, pl_pinsbad_root, pl_pinsbad_pins,
         pl_nolbl_root, pl_nolbl_pins, pl_dev_root, pl_dev_pins,
+        pl_lane_root, pl_lane_pins, os.path.dirname(pl_laneown_root), pl_laneown_pins,
+        pl_laneother_root, pl_laneother_pins,
+        os.path.dirname(pl_laneteam_root), pl_laneteam_pins,
+        pl_lanehome_root, pl_lanehome_pins, lane_fakehome,
     ]
 
     stack_hooks = {s: make_stack_repo(s) for s in STACK_SCENARIOS}
@@ -2166,6 +2207,41 @@ def main():
          mcp("save_issue", id="ENG-123", labels=["agent:blocked"]), BLOCK, pl_nolbl),
         ("lifecycle-label: an EXPIRED planning pin still blocks (a lapse grants nothing)",
          mcp("save_issue", id="ENG-777", labels=["agent:queued"]), BLOCK, pl_expplan),
+        # ── KIT-241 (B8): the dispatcher's lane, which writes no pin ───────────────
+        # The account carries the lane marker, so "no pin" no longer reads as a human's
+        # ad-hoc session: the pinned `ticket` rules apply, the own ticket read from the
+        # worktree folder the dispatcher named after it.
+        ("lane: a direct create_issue blocked (file a finding comment instead)",
+         mcp("create_issue", title="unrelated bug", teamId="ENG"), BLOCK, pl_lane),
+        ("lane: an upsert save_issue with no target is a create — blocked",
+         mcp("save_issue", title="sneaky", teamId="ENG"), BLOCK, pl_laneown),
+        ("lane: setting a protected label blocked",
+         mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]), BLOCK, pl_laneown),
+        ("lane: minting provenance:agent on a create blocked (twice over)",
+         mcp("create_issue", teamId="ENG", labels=["provenance:agent"]), BLOCK, pl_lane),
+        ("lane: an issue write when the worktree names no ticket fails CLOSED",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_lane),
+        ("lane: a comment when the worktree names no ticket stays allowed (§4 reporting)",
+         mcp("save_comment", issueId="ENG-456", body="progress"), ALLOW, pl_lane),
+        ("lane: a state change on its OWN ticket allowed",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_laneown),
+        ("lane: writing ANOTHER ticket blocked",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_laneown),
+        ("lane: commenting on ANOTHER ticket blocked",
+         mcp("save_comment", issueId="ENG-456", body="hi"), BLOCK, pl_laneown),
+        ("lane: commenting on its OWN ticket allowed",
+         mcp("save_comment", issueId="ENG-123", body="done; see the PR"), ALLOW, pl_laneown),
+        ("lane: rewriting its OWN ticket's description blocked (AC integrity)",
+         mcp("save_issue", id="ENG-123", description="new scope"), BLOCK, pl_laneown),
+        ("lane: a worktree named for ANOTHER team's ticket names no own ticket — closed",
+         mcp("save_issue", id="OTH-5", stateId=PL_RAW), BLOCK, pl_laneteam),
+        ("lane: a marker under a moved $HOME does not count (the account's home does)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_lanehome,
+         lane_home_env, pl_lanehome_root),
+        ("lane: a marker for ANOTHER account is not this session's lane",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_laneother),
+        ("lane: a person's session (no marker, no pin) still creates freely",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_nopin),
         # PROTECTED labels beyond agent:*/blocked: — the tracker-MCP path must refuse the
         # SAME set the gh/Bash path does. A session minting `provenance:human` fakes a
         # human's signal; `provenance:agent` is the safe-outputs executor's to apply on a

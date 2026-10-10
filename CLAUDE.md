@@ -378,9 +378,11 @@ The loop, when it *is* on:
    so that is the case here** — report the finding as a ticket comment as before; a person
    files. Either way the discipline holds: don't widen the diff, and `provenance:*`,
    `agent:*`, `blocked:*` and `hooks-change` are never yours to apply. In a configured
-   project the guard **enforces** both — a direct `create_issue`/`save_issue`-with-no-target,
-   and a `save_issue(labels=[…])` naming any protected class, are blocked on the tracker-MCP
-   path exactly as `gh` is. That block is **expected, not an error to route around**: take
+   project the guard **enforces** both for a pinned session, and for a session on a
+   dispatcher's lane whose account carries the lane marker (KIT-241, card CK-10) — a direct
+   `create_issue`/`save_issue`-with-no-target, and a `save_issue(labels=[…])` naming any
+   protected class, are blocked on the tracker-MCP path exactly as `gh` is. Without a pin
+   or a marker, it does not. That block is **expected, not an error to route around**: take
    it as the signal to use the request path (or a comment), not to find another spelling.
    The request path is **capped at three findings per run** — a fourth rejects the whole
    batch (all-or-nothing, §8), taking your telemetry and review move with it — so file the

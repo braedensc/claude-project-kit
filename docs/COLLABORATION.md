@@ -538,7 +538,11 @@ Stop hook between them:
      write is a pin it can forge); and a malformed, unrecognized, foreign-worktree or
      — in `ticket` mode — **expired** pin. Write-blocking and approval checks fail
      **closed**; checks that merely withhold autonomy from an *unpinned* session fail
-     **open**, so a human's ad-hoc session in a configured repo is never bricked. An
+     **open**, so a human's ad-hoc session in a configured repo is never bricked. A
+     session on a dispatcher's lane that writes no pin is not ad-hoc: its account
+     carries a root-owned lane marker under the pins root (card CK-10), and with it the
+     tracker guards apply as for a pinned `ticket` session, its own ticket read from
+     the worktree folder's name (KIT-241). An
      **expiry is not an absence**, though: a lapsed pin means a binding was issued
      and can no longer be verified, so reading it as "unpinned" would make waiting an
      escape. A broken `delivery.json` still leaves `delivery.json` itself editable, so

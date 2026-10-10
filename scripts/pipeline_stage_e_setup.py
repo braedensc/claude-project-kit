@@ -1616,6 +1616,28 @@ CARDS = {
         "good": "the heartbeat-monitor row says loaded, commenting on your ticket",
         "attest": None,
     },
+    "CK-10": {
+        "title": "Mark the dispatcher's lane for the kit hook (KIT-241)",
+        "why": ("The dispatcher writes no pin, so the kit hook used to read its sessions as "
+                "your own ad-hoc ones: they could create tickets directly, set protected "
+                "labels, and write other tickets. The hook now gives a session the pinned "
+                "rules when its account carries this marker. The marker must be a file no "
+                "session can create or delete, so it is root's, under the pins root, in a "
+                "folder root owns. Without it nothing breaks, and those guards stay open on "
+                "this lane."),
+        "do": ["Run these three lines. The pins root below is the default; if a project's",
+               "committed delivery.json sets dispatch.pinsRoot, use that folder instead:",
+               "    sudo -u ${ROLE_ACCOUNT} mkdir -p ~${ROLE_ACCOUNT}/.claude/pipeline/pins",
+               "    sudo install -d -o root -g wheel -m 755 "
+               "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane",
+               "    sudo install -o root -g wheel -m 444 /dev/null "
+               "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane/${ROLE_ACCOUNT}",
+               "Then check it:",
+               "    ls -l ~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane",
+               "Your own account gets no marker: your sessions keep the open rules."],
+        "good": "one file named ${ROLE_ACCOUNT}, owned by root, mode -r--r--r--",
+        "attest": None,
+    },
 }
 
 ATTESTATIONS = {
@@ -1662,7 +1684,7 @@ def print_card(cid, conf=None):
     for line in card["do"]:
         say("  " + _fill(line, conf))
     say("")
-    say("GOOD: %s" % card["good"])
+    say("GOOD: %s" % _fill(card["good"], conf))
     if card["attest"]:
         say("SIGN-OFF: %s — %s" % (card["attest"], ATTESTATIONS[card["attest"]]))
     say("")
@@ -10876,6 +10898,22 @@ def _selftest_body():
                and "stays open" in " ".join(CARDS["CK-9"]["do"])
                and "Accepted risks" in CARDS["CK-9"]["why"],
                "CK-9 must steer to a never-delegated, open ticket and name the session risk")
+        # CK-10 (KIT-241): the lane marker is root's, read-only, named for the role account,
+        # under the pins root; filled from the conf, the person's own account untouched.
+        import io as _io
+        import contextlib as _ctxlib
+        _buf = _io.StringIO()
+        with _ctxlib.redirect_stdout(_buf):
+            print_card("CK-10", {"ROLE_ACCOUNT": "_exrole"})
+        _ck10 = _buf.getvalue()
+        expect("lane-marker-card",
+               all(t in _ck10 for t in (
+                   "install -d -o root -g wheel -m 755 ~_exrole/.claude/pipeline/pins/"
+                   "dispatched-lane",
+                   "install -o root -g wheel -m 444 /dev/null ~_exrole/.claude/pipeline/pins/"
+                   "dispatched-lane/_exrole",
+                   "GOOD: one file named _exrole, owned by root", "dispatch.pinsRoot"))
+               and "${ROLE_ACCOUNT}" not in _ck10, _ck10[-900:])
 
         # Off, and nothing installed: said by name, nothing written.
         ctxO, fakeO = _monitor_ctx(value="off", loaded=False)
