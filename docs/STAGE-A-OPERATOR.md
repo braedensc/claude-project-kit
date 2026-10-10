@@ -210,6 +210,13 @@ What it does, in order:
    - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py
      drill`). It makes the dispatcher refuse one planning ticket and checks planning stops.
      Then it puts the setting back and probes again, which is what lets planning start.
+     It files its idea in the backlog and moves it to Plan it. It wakes the job only once
+     the idea's history shows that move, because the job checks the history first.
+
+     A drill has three endings. **Passed:** planning stopped. **Failed:** the job filed a
+     planning ticket and planning did not stop. **Could not test** (exit 4): the job filed
+     no planning ticket, so nothing was tested. Then the drill prints the job's own answer,
+     if it gave one. Fix what it names and run the drill again.
 
 What is still yours, at most:
 
