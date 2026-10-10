@@ -6973,6 +6973,15 @@ def selftest():
     m = dict(good); m["appendInstruction"] = PLANNING_BRIEF
     check("fence-mutant-brief-without-the-probe", any(
         "probe paragraph" in p for p in entry_problems(m)), True)
+    # The paragraph is there, but keyed on a title the installer does not file, or without
+    # its heading: a planner that follows it refuses the real probe, so the entry is
+    # refused. One part at a time, so each part of the check is pinned.
+    for which, part in (("heading", "THE INSTALLER'S PROBE."), ("tag-title", PROBE_TITLE_TOOLS),
+                        ("label-title", PROBE_TITLE_LABEL)):
+        m = dict(good); m["appendInstruction"] = brief_ai.replace(part, "Some other probe title")
+        check("fence-mutant-probe-paragraph-wrong-%s" % which,
+              (part in m["appendInstruction"],
+               any("probe paragraph" in p for p in entry_problems(m))), (False, True))
     m = dict(good); m["appendInstruction"] = brief_ai.replace(
         "/srv/role-home/.stage-a/probe-canary.txt", PROBE_FILE_PLACEHOLDER)
     check("fence-mutant-loadable-entry-names-no-test-file", any(

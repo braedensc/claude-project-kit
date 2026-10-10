@@ -212,11 +212,12 @@ What it does, in order:
      them to the agent. The planning setup's own instructions say what to do with a ticket
      of exactly the probe's title; the tickets' text only points there (KIT-215). It reads
      where the dispatcher sent them. It reads the tool list the session was given from the
-     dispatcher's own session log, and a helper's from the session's answer. That answer
-     counts only when the same log shows a helper was started. A tool outside the keep-set
-     in any list it read stops the probe, without asking. Then it asks you **one** question: is the team's agent guidance
-     empty, or silent about planning and building? The API cannot read it. It records the
-     sign-off and closes the tickets.
+     dispatcher's own session log, and a helper's from the session's answer. If the same
+     log shows no helper was started, that answer's helper list is dropped. If the log
+     cannot be read, the answer is used for both lists, and the probe says so. A tool
+     outside the keep-set in any list it read stops the probe, without asking. Then it asks
+     you **one** question: is the team's agent guidance empty, or silent about planning and
+     building? The API cannot read it. It records the sign-off and closes the tickets.
 
      Two more questions come only when a list was not measured. If a list came back but
      could not be read, it asks about that list alone. If no helper list came back, it
@@ -325,5 +326,7 @@ wall clock.
   list that still held a fenced tool would fail the probe loudly, never pass it.
 - **A planning session could read files in the role account's home**, if its file-reading
   tool reaches there. The probe leaves a harmless test file beside the planner's own files,
-  asks the session to read it, and reports what came back. The answer counts only when the
-  dispatcher's log shows the read was attempted. Tracked as KIT-162.
+  asks the session to read it, and reports what came back. If the file's contents come
+  back, that is "read", whatever the log shows: they cannot come back unread. "Not
+  returned" counts only when the dispatcher's log shows the read was attempted. Without
+  that, or when the log cannot be read, the result is "no answer". Tracked as KIT-162.

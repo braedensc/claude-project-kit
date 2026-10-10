@@ -909,8 +909,11 @@ unchanged, and the idea is still data.
 session's tool list from the dispatcher's own session log. The same reader now also
 reports two booleans: whether the session called `Task` or `Agent`, and whether it called
 `Read` on the test file. It prints no message and no call's input. A helper list in the
-answer counts only when the log shows a helper started. The test file counts as read or
-not returned only when the log shows the read was attempted; otherwise it is NO-ANSWER.
+answer is dropped when the log shows no helper started. When the log cannot be read,
+the answer's helper list is used, and the probe says so. The test file counts as READ
+whenever its contents come back, whatever the log shows: they cannot come back unread.
+It counts as NOT-RETURNED only when the log shows the read was attempted. Otherwise,
+and whenever the log cannot be read, it is NO-ANSWER.
 
 **Rejected.** A separate probe entry with its own brief would measure a different entry
 from the planning one, and stay reachable at any time. A label only the installer applies
