@@ -236,6 +236,8 @@ npm run test:conflict        # conflict loop: fix request, bounded escalation, u
                              #   local-session-only worktrees, capped pass, heartbeat
 npm run test:conflict-waker-setup  # the waker's installer: a user LaunchAgent, signed-off
                              #   dry run, stale heartbeat = NOT RUNNING, no sudo path
+npm run test:update          # review-and-update (KIT-238): UNKNOWN is never "current";
+                             #   an update refuses under an agent and stops before any change
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
