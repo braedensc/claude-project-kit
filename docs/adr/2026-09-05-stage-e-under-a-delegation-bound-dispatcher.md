@@ -1032,3 +1032,46 @@ scratch directory outside this repository:
   this ADR wires it, and the gate to reopen it is stated above.
 - No `delivery.json` ships in the kit, so every pipeline script — including the new one —
   is inert here; its `--selftest` is what has teeth, and it runs in CI.
+
+## Update 2026-10-10 — the delegation lane gets the tracker guards (KIT-241)
+
+A delegation binding writes no pin, and the hook read "no pin" as a human's ad-hoc
+session: every withholding tracker guard failed open for dispatched sessions. They could
+create tickets directly, set `provenance:*`, `agent:*`, `blocked:*` or `hooks-change`,
+and write other tickets.
+
+**Decision.** The lane is marked by a file no session can create or delete:
+`<pinsRoot>/dispatched-lane/<OS account>`, root-owned, mode 444, in a root-owned folder,
+written by the owner from the Stage E installer's card CK-10. The pins root already lives
+outside every worktree, and the hook reads it from the committed `delivery.json` on the
+default branch. With the marker and no pin, the hook applies the pinned `ticket` rules:
+no protected label, no direct create, issue writes only to the ticket the worktree folder
+is named after (the dispatcher cuts `<base>/<ISSUE-ID>`, or `<base>/<ISSUE-ID>/<repo>`),
+no comment on another ticket, and no rewrite of the own ticket's acceptance criteria. Any
+team's key counts: a Stage E review session in `REV-12` owns `REV-12`. The folder is the
+session's own root, never a subagent's widened one. An issue write that cannot be tied to
+that ticket fails closed, and so does any write naming a ticket when the folder names
+none; a comment with no resolvable target stays allowed.
+
+**Why a file, read this way.** The marker's account and home come from the account
+database, never `$USER` or `$HOME`. The dispatcher loads a worktree's env file into the
+next session it starts there (KIT-240), so a session could move either for its successor.
+A settings `env` value would have reached the hook too (measured on the bundled CLI), but
+a file outside the worktree is simpler to reason about and needs no settings merge.
+
+**The same reading for everything around the marker** (review of the change). A pin found
+switches the marker check off, so `~` in the pins root is the account database's home for
+the pin and the pins-root containment check too, never `$HOME`: otherwise a session could
+plant a pin under a moved `$HOME` for its successor and switch the lane off. `$LOGNAME` is
+never read either. A marker the hook cannot check for (any error but "no such file"), or an
+account the database cannot name, counts as the lane, so an error cannot open the guards.
+And the pipeline stays on while a commit holds `delivery.json`: grader-path protection is
+pinned-only, so on this lane `mv delivery.json x` was allowed and switched every guard off.
+The Stage E installer's `lane-marker` row now measures the marker, so a machine without it
+no longer verifies clean.
+
+**Residuals, named.** An unsandboxed process running as the role account could rename
+the root-owned folder's parent entry and so remove the marker; no session is unsandboxed
+on a coding entry, and the chat lane holds no write tool. Grader-path protection is still
+pinned-only on this lane: turning it on changes what a live coding session may edit, so it
+is the owner's call, not this change's.

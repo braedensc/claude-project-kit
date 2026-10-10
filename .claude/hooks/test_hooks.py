@@ -1134,7 +1134,8 @@ def _pl_pin(root, **over):
 
 def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
                           cfg_raw=None, pin_raw=None, worktree_cfg_raw=None,
-                          dirty=None, pins_in_repo=None):
+                          dirty=None, pins_in_repo=None, lane_marker=None, root_name=None,
+                          cfg_branch_only=False, cfg_aside=None):
     """Throwaway repo with the pipeline CONFIGURED. Returns (root, hook_copy, pins).
 
     `cfg_raw`/`pin_raw` write the file verbatim (the malformed-config and
@@ -1146,8 +1147,21 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
     config points the pin INSIDE the worktree — the §7 hard-fail, and the payload a
     poisoned config would want most: a pins directory the session can write is a
     pin the session can forge. `pin=None` means no pin at all (a human's ad-hoc
-    session in a configured repo)."""
+    session in a configured repo).
+
+    `lane_marker` names an OS account whose dispatcher's-lane marker is written under
+    the pins root (KIT-241); True means the account running the battery. `root_name`
+    makes the repo's folder carry that name, as the dispatcher names a worktree after
+    its ticket; it may be a nested path (`ENG-123/app`, the multi-repo layout), and
+    the sandbox's top folder is then that many levels up.
+
+    `cfg_branch_only` commits `delivery.json` on the feature branch only (the adoption
+    PR); `cfg_aside` then takes the working copy away: "moved" renames it, "deleted"
+    commits its deletion on the branch (KIT-241)."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pl-"))
+    if root_name:
+        root = os.path.join(root, root_name)
+        os.makedirs(root)
     pins = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pins-"))
     hooks = os.path.join(root, ".claude", "hooks")
     os.makedirs(hooks)
@@ -1161,13 +1175,32 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
     _pl_write(root, "src/app.ts", "export const x = 1\n")
     _pl_write(root, ".github/workflows/ci.yml", "name: CI\n")
     _git(root, "add", "-A")
+    if cfg_branch_only:
+        _git(root, "rm", "-q", "--cached", "delivery.json")
     _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
          "commit", "-q", "-m", "seed")
     _git(root, "checkout", "-q", "-b", branch)
+    if cfg_branch_only:
+        _git(root, "add", "delivery.json")
+        _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+             "commit", "-q", "-m", "adopt the pipeline")
+    if cfg_aside == "moved":
+        os.rename(os.path.join(root, "delivery.json"),
+                  os.path.join(root, "delivery.aside.json"))
+    elif cfg_aside == "deleted":
+        _git(root, "rm", "-q", "delivery.json")
+        _git(root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+             "commit", "-q", "-m", "drop it")
     if worktree_cfg_raw is not None:
         _pl_write(root, "delivery.json", worktree_cfg_raw)
     for rel, content in (dirty or {}).items():
         _pl_write(root, rel, content)
+    if lane_marker:
+        import pwd
+        who = pwd.getpwuid(os.getuid()).pw_name if lane_marker is True else lane_marker
+        os.makedirs(os.path.join(pins, "dispatched-lane"), exist_ok=True)
+        with open(os.path.join(pins, "dispatched-lane", who), "w") as f:
+            f.write("")
     if pin is not None:
         key = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
         body = pin_raw if pin_raw is not None else json.dumps(
@@ -1175,6 +1208,36 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
         with open(os.path.join(pins, key + ".json"), "w") as f:
             f.write(body)
     return root, hook_copy, pins
+
+
+# The hook reads this OS account's name and home from the account database (KIT-241), so
+# a case about `~` needs a home the battery may write to without touching the real one.
+# This launcher runs the hook copy beside it with the database's entry for this uid
+# changed: its home is the one given, or, given None, the lookup fails. The hook file
+# itself is the one under test, unchanged; only the database it asks is.
+_ACCOUNT_LAUNCHER = '''
+import os, runpy, sys, types
+import pwd as _real
+_me = _real.getpwuid(os.getuid())
+def getpwuid(uid):
+    if HOME is None:
+        raise KeyError("getpwuid(): uid not found: %d" % uid)
+    return types.SimpleNamespace(pw_name=_me.pw_name, pw_uid=_me.pw_uid, pw_dir=HOME)
+fake = types.ModuleType("pwd")
+fake.getpwuid, fake.getpwnam, fake.getpwall = getpwuid, _real.getpwnam, _real.getpwall
+sys.modules["pwd"] = fake
+sys.argv = [HOOK]
+runpy.run_path(HOOK, run_name="__main__")
+'''
+
+
+def make_account_launcher(hook_copy, home, tag):
+    """A launcher for `hook_copy` that answers the account database with `home` as this
+    uid's home (None: no entry at all). Returns its path, used as the case's hook."""
+    path = os.path.join(os.path.dirname(hook_copy), "launch-%s.py" % tag)
+    with open(path, "w") as f:
+        f.write("HOOK, HOME = %r, %r\n" % (hook_copy, home) + _ACCOUNT_LAUNCHER)
+    return path
 
 
 
@@ -1359,6 +1422,84 @@ def main():
     # matching must survive a config that resolves no label ID at all.
     pl_nolbl_root, pl_nolbl, pl_nolbl_pins = make_pipeline_sandbox(
         cfg_over={"linear": {"labels": {"ids": {}, "required": []}}})
+    # KIT-241 (B8): a dispatcher's lane that writes no pin. Its account carries the lane
+    # marker under the pins root; with the worktree named after a ticket, and without.
+    pl_lane_root, pl_lane, pl_lane_pins = make_pipeline_sandbox(pin=None, lane_marker=True)
+    pl_laneown_root, pl_laneown, pl_laneown_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-123")
+    pl_laneother_root, pl_laneother, pl_laneother_pins = make_pipeline_sandbox(
+        pin=None, lane_marker="someone-else-entirely")
+    # A Stage E review session runs in REV-12, in a repository whose own team is ENG:
+    # the folder names its ticket whatever the team.
+    pl_laneteam_root, pl_laneteam, pl_laneteam_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="REV-12")
+    # The multi-repo layout, <base>/<ISSUE-ID>/<repo>: the parent folder names the
+    # ticket, a grandparent does not.
+    pl_lanemulti_root, pl_lanemulti, pl_lanemulti_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-123/app")
+    pl_lanedeep_root, pl_lanedeep, pl_lanedeep_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-124/repos/app")
+    # A sibling worktree named after ANOTHER ticket. A subagent acting from it widens
+    # its root there, and is still ENG-123's: the ticket comes from the session's root.
+    lane_sibling = os.path.join(os.path.dirname(pl_laneown_root), "ENG-456")
+    _git(pl_laneown_root, "worktree", "add", "-q", "-b", "feat/eng-456-other",
+         lane_sibling, "main")
+    lane_sub_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_laneown_root,
+                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    # $USER and $LOGNAME are the session's to move (KIT-240); the account is not.
+    lane_user_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_lane_root,
+                     "USER": "someone-else-entirely", "LOGNAME": "someone-else-entirely"}
+    # delivery.json out of the working tree is not the pipeline switched off: moved
+    # aside, its deletion committed, or (the adoption PR) held by HEAD alone.
+    pl_lanemoved_root, pl_lanemoved, pl_lanemoved_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, cfg_aside="moved")
+    pl_lanedel_root, pl_lanedel, pl_lanedel_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, cfg_aside="deleted")
+    pl_laneadopt_root, pl_laneadopt, pl_laneadopt_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, cfg_branch_only=True, cfg_aside="moved")
+    pl_adopt_root, pl_adopt, pl_adopt_pins = make_pipeline_sandbox(
+        pin=None, cfg_branch_only=True, cfg_aside="moved")
+    # Could-not-check is not absent (§13). A `dispatched-lane` that points at itself
+    # fails the look-up with ELOOP for any account; one this account may not search
+    # fails with EACCES (root searches anything, so that case runs only as non-root).
+    # A `dispatched-lane` that is a plain file is ENOTDIR: no marker can be there.
+    pl_laneloop_root, pl_laneloop, pl_laneloop_pins = make_pipeline_sandbox(pin=None)
+    os.symlink("dispatched-lane", os.path.join(pl_laneloop_pins, "dispatched-lane"))
+    pl_lanefile_root, pl_lanefile, pl_lanefile_pins = make_pipeline_sandbox(pin=None)
+    _pl_write(pl_lanefile_pins, "dispatched-lane", "")
+    pl_laneshut_root, pl_laneshut, pl_laneshut_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True)
+    os.chmod(os.path.join(pl_laneshut_pins, "dispatched-lane"), 0)
+    # `~` in the pins root is the ACCOUNT's home, never $HOME: a session can move $HOME
+    # for the next session through a worktree env file the dispatcher loads (KIT-240).
+    # That goes for the pin as well as the marker: a pin found switches the marker check
+    # off, so a pin forged under a moved $HOME would switch the lane off. Each case runs
+    # through a launcher that gives the account database a temp home (no case touches
+    # the real one), with $HOME moved to a folder holding a forged maintenance pin AND a
+    # planted marker. Neither may count; what is under the account's home does.
+    import pwd as _pwd
+    _me = _pwd.getpwuid(os.getuid()).pw_name
+    pl_acct_root, pl_acct, pl_acct_pins = make_pipeline_sandbox(
+        pin=None, cfg_over={"dispatch": {"pinsRoot": "~/pins"}})
+    _acct_key = hashlib.sha256(pl_acct_root.encode("utf-8")).hexdigest()[:16]
+    lane_fakehome = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-home-"))
+    _pl_write(lane_fakehome, "pins/dispatched-lane/" + _me, "")
+    _pl_write(lane_fakehome, "pins/%s.json" % _acct_key, json.dumps(_pl_pin(
+        pl_acct_root, session_mode="maintenance", ticket=None)))
+    acct_homes = {k: os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-acct-"))
+                  for k in ("empty", "lane", "pin")}
+    _pl_write(acct_homes["lane"], "pins/dispatched-lane/" + _me, "")
+    _pl_write(acct_homes["pin"], "pins/%s.json" % _acct_key,
+              json.dumps(_pl_pin(pl_acct_root)))
+    acct_launch = {k: make_account_launcher(pl_acct, home, k)
+                   for k, home in acct_homes.items()}
+    # …the account's home INSIDE the repo puts the pins root there, whatever $HOME says;
+    # and an account the database cannot name at all counts as the lane.
+    acct_launch["in-repo"] = make_account_launcher(
+        pl_acct, os.path.join(pl_acct_root, "home"), "in-repo")
+    acct_launch["none"] = make_account_launcher(pl_acct, None, "none")
+    nopin_noacct = make_account_launcher(pl_nopin, None, "none")
+    lane_home_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_acct_root, "HOME": lane_fakehome}
     # A project whose base branch is NOT `main`. The stacked-branch guard reads
     # `github.defaultBranch` from the COMMITTED config on the default branch, so
     # `develop` must become a legal base — and `main`/`master` must stay legal
@@ -1420,6 +1561,16 @@ def main():
         pl_disarm_root, pl_disarm_pins, pl_expplan_root, pl_expplan_pins,
         pl_pinsin_root, pl_pinsin_pins, pl_pinsbad_root, pl_pinsbad_pins,
         pl_nolbl_root, pl_nolbl_pins, pl_dev_root, pl_dev_pins,
+        pl_lane_root, pl_lane_pins, os.path.dirname(pl_laneown_root), pl_laneown_pins,
+        pl_laneother_root, pl_laneother_pins,
+        os.path.dirname(pl_laneteam_root), pl_laneteam_pins,
+        os.path.dirname(os.path.dirname(pl_lanemulti_root)), pl_lanemulti_pins,
+        os.path.dirname(os.path.dirname(os.path.dirname(pl_lanedeep_root))),
+        pl_lanedeep_pins, pl_lanemoved_root, pl_lanemoved_pins,
+        pl_lanedel_root, pl_lanedel_pins, pl_laneadopt_root, pl_laneadopt_pins,
+        pl_adopt_root, pl_adopt_pins, pl_laneloop_root, pl_laneloop_pins,
+        pl_lanefile_root, pl_lanefile_pins, pl_laneshut_root, pl_laneshut_pins,
+        pl_acct_root, pl_acct_pins, lane_fakehome, *acct_homes.values(),
     ]
 
     stack_hooks = {s: make_stack_repo(s) for s in STACK_SCENARIOS}
@@ -2166,6 +2317,93 @@ def main():
          mcp("save_issue", id="ENG-123", labels=["agent:blocked"]), BLOCK, pl_nolbl),
         ("lifecycle-label: an EXPIRED planning pin still blocks (a lapse grants nothing)",
          mcp("save_issue", id="ENG-777", labels=["agent:queued"]), BLOCK, pl_expplan),
+        # ── KIT-241 (B8): the dispatcher's lane, which writes no pin ───────────────
+        # The account carries the lane marker, so "no pin" no longer reads as a human's
+        # ad-hoc session: the pinned `ticket` rules apply, the own ticket read from the
+        # worktree folder the dispatcher named after it.
+        ("lane: a direct create_issue blocked (file a finding comment instead)",
+         mcp("create_issue", title="unrelated bug", teamId="ENG"), BLOCK, pl_lane),
+        ("lane: an upsert save_issue with no target is a create — blocked",
+         mcp("save_issue", title="sneaky", teamId="ENG"), BLOCK, pl_laneown),
+        ("lane: setting a protected label blocked",
+         mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]), BLOCK, pl_laneown),
+        ("lane: minting provenance:agent on a create blocked (twice over)",
+         mcp("create_issue", teamId="ENG", labels=["provenance:agent"]), BLOCK, pl_lane),
+        ("lane: an issue write when the worktree names no ticket fails CLOSED",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_lane),
+        ("lane: a comment NAMING a ticket when the worktree names none fails CLOSED",
+         mcp("save_comment", issueId="ENG-456", body="progress"), BLOCK, pl_lane),
+        ("lane: …and an attachment naming another team's ticket, too",
+         mcp("create_attachment", issueId="OTH-9", url="https://example.invalid/x"),
+         BLOCK, pl_lane),
+        ("lane: a comment with no resolvable target stays allowed (§4 reporting)",
+         mcp("save_comment", issueId="9f1c2d3e-0000-4000-8000-000000000000",
+             body="progress"), ALLOW, pl_lane),
+        ("lane: a state change on its OWN ticket allowed",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_laneown),
+        ("lane: writing ANOTHER ticket blocked",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_laneown),
+        ("lane: commenting on ANOTHER ticket blocked",
+         mcp("save_comment", issueId="ENG-456", body="hi"), BLOCK, pl_laneown),
+        ("lane: commenting on its OWN ticket allowed",
+         mcp("save_comment", issueId="ENG-123", body="done; see the PR"), ALLOW, pl_laneown),
+        ("lane: rewriting its OWN ticket's description blocked (AC integrity)",
+         mcp("save_issue", id="ENG-123", description="new scope"), BLOCK, pl_laneown),
+        ("lane: a worktree named for ANOTHER team's ticket owns it (review session, REV-12)",
+         mcp("save_issue", id="REV-12", stateId=PL_RAW), ALLOW, pl_laneteam),
+        ("lane: that review session commenting on the PR's ticket blocked",
+         mcp("save_comment", issueId="ENG-456", body="LGTM"), BLOCK, pl_laneteam),
+        ("lane: multi-repo layout — the PARENT folder names the own ticket",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_lanemulti),
+        ("lane: multi-repo layout — writing another ticket still blocked",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_lanemulti),
+        ("lane: a GRANDPARENT folder names no own ticket — closed",
+         mcp("save_issue", id="ENG-124", stateId=PL_RAW), BLOCK, pl_lanedeep),
+        ("lane: a subagent acting from a sibling worktree may not write ITS ticket",
+         sub(mcp("save_issue", id="ENG-456", stateId=PL_RAW)), BLOCK, pl_laneown,
+         lane_sub_env, lane_sibling),
+        ("lane: …and still writes the session's own ticket from there",
+         sub(mcp("save_issue", id="ENG-123", stateId=PL_RAW)), ALLOW, pl_laneown,
+         lane_sub_env, lane_sibling),
+        ("lane: $USER and $LOGNAME moved do not move the account (still blocked)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lane,
+         lane_user_env, pl_lane_root),
+        ("lane: delivery.json moved aside — the pipeline is still on, create blocked",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanemoved),
+        ("lane: its deletion committed on the branch — the default branch's copy counts",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanedel),
+        ("lane: held by HEAD alone (adoption) and moved aside — create blocked",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_laneadopt),
+        ("pipeline: held by HEAD alone and moved aside — that copy is read, not BROKEN",
+         write(os.path.join(pl_adopt_root, "src/app.ts"), "x"), ALLOW, pl_adopt),
+        ("lane: a marker the hook cannot look for counts as the lane (ELOOP)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_laneloop),
+        ("lane: a `dispatched-lane` that is a plain file holds no marker (ENOTDIR)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_lanefile),
+        ("lane: an account the database cannot name counts as the lane",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, nopin_noacct),
+        ("lane: a marker and a pin under a moved $HOME do not count",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, acct_launch["empty"],
+         lane_home_env, pl_acct_root),
+        ("lane: the account home's marker counts though $HOME holds a forged pin",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, acct_launch["lane"],
+         lane_home_env, pl_acct_root),
+        ("pinned: the account home's pin counts though $HOME holds a forged one",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, acct_launch["pin"],
+         lane_home_env, pl_acct_root),
+        ("pins root: `~` inside the repo by the ACCOUNT's home fails closed, whatever $HOME",
+         write(os.path.join(pl_acct_root, "src/app.ts"), "x"), BLOCK,
+         acct_launch["in-repo"], lane_home_env, pl_acct_root),
+        ("pins root: `~` with no home in the account database fails closed",
+         write(os.path.join(pl_acct_root, "src/app.ts"), "x"), BLOCK,
+         acct_launch["none"], lane_home_env, pl_acct_root),
+        ("lane: a marker for ANOTHER account is not this session's lane",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_laneother),
+        ("lane: a person's session (no marker, no pin) still creates freely",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_nopin),
+        *([("lane: a marker in a folder this account may not search counts (EACCES)",
+            mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_laneshut)]
+          if os.geteuid() != 0 else []),
         # PROTECTED labels beyond agent:*/blocked: — the tracker-MCP path must refuse the
         # SAME set the gh/Bash path does. A session minting `provenance:human` fakes a
         # human's signal; `provenance:agent` is the safe-outputs executor's to apply on a
@@ -2558,6 +2796,7 @@ def main():
         print(f"[{'PASS' if ok else 'FAIL'}] {name}")
         failures += 0 if ok else 1
 
+    os.chmod(os.path.join(pl_laneshut_pins, "dispatched-lane"), 0o755)   # so it can go
     for r in (desk_root, desk_root + "-desk", desk_root + "-deskcode",
               amb_root, amb_root + "-desk", amb_root + "-deskcode", amb_root + ".desk",
               dstop_nopr_root, dstop_nopr_root + "-desk", dstop_nopr_root + "-deskcode",
