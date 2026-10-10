@@ -133,11 +133,63 @@ keeps its old binary until something restarts it.
 - no key holds a credential;
 - a value with a credential's shape is refused.
 
+## The health watch
+
+`scripts/pipeline_watch.py` runs one pass of the checks below, by default every hour, as a
+LaunchAgent under your login. It tells you when the answer **changes**: once when a problem
+appears, once more when it clears. Added 2026-10-10 (KIT-236). The defect that started it,
+KIT-214, broke every desktop session's guards for six days and told no one.
+
+| Kind | Fires when |
+|---|---|
+| `hooks` | the Stop hook recorded, in the last 24 hours, that it could not tell which worktree a session ran in (`.claude/.stop-pr-nag/session-*__root-unresolved` in each `HOOK_CHECKOUTS` checkout) |
+| `updates` | a dispatcher or Homebrew row of `review` is `BEHIND`, needs a `RESTART`, or is `UNKNOWN`. The kit checkout is listed but never fires: it moves with every merge. Re-measured every 20 hours |
+| `release` | a dispatcher release is newer than the version `DISPATCHER_VERSION` pins |
+| `dispatcher` | the dispatcher has not answered `/version` on this machine for two passes |
+| `front-door` | `PUBLIC_STATUS_URL` has not answered 200 for two passes while the internet answers |
+| `disk` | free space on `/` is under `DISK_FLOOR_GB` |
+
+A single bad pass never fires a liveness kind. With no internet, `front-door` is `UNKNOWN`,
+not an outage: a laptop in a background wake has no network. `UNKNOWN` never pages and never
+clears an alert.
+
+**Where it tells you.**
+- **GitHub:** a changed kind dispatches `ALERT_WORKFLOW` in `ALERT_REPO`, which must be a
+  **private** repo, because alert text carries machine state. That workflow
+  (`templates/workflows/pipeline-alert.yml`) opens or closes one issue per kind as
+  `github-actions[bot]` and @mentions `ALERT_PAGE_TO`. The watch then finds that run and
+  waits for it. A run that failed is not recorded as sent, so the next pass sends again.
+- **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
+  monitor to read and page through the notifier.
+- Either one empty is OFF, and every pass says so.
+
+The job cannot report its own death. The heartbeat monitor pages when the status file
+stops changing.
+
+**Asking the tech lead.** Every alert says where the full findings are: the status file. The
+Slack tech lead runs as the dispatcher's account and can read that file, so ask it in the
+channel to explain an alert. Anything that needs `sudo`, `launchctl` or an installer it
+prints for you; it never runs it.
+
+**Install it**, once, in your own terminal:
+
+```bash
+python3 scripts/pipeline_watch.py run --dry-run    # what it would say, sending nothing
+python3 scripts/pipeline_watch.py install          # shows a dry pass, then asks for yes
+python3 scripts/pipeline_watch.py status           # the last pass, per kind
+```
+
+`install` refuses in an agent environment. It records the `brew`, `gh`, `npm` and `git`
+directories your shell has now in the job's `PATH`. Re-run it after moving any of them.
+
 ## What is not proven
 
 - `update dispatcher` against the live dispatcher. The battery drives a scripted launchd
   and npm; the first real run is the 0.2.69 → 0.2.73 upgrade (KIT-235).
 - That `brew info`'s index is fresh. Homebrew refreshes it on its own schedule, so a
   just-released version can read as current for a while (no ticket yet).
-- A scheduled weekly review that pages through Slack and GitHub. That is the next slice of
-  KIT-238, using KIT-236's channels.
+- The health watch end to end on a real machine: a GitHub issue opened and closed by a live
+  run, and the Slack page through the heartbeat monitor (the monitor reading the status
+  file is the next slice of KIT-236).
+- That a `front-door` probe from this machine sees what the tracker's webhooks see. Both go
+  through the same public name, but the tracker connects from elsewhere (no ticket yet).
