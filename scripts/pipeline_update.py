@@ -80,6 +80,9 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_BLOCKED = 0, 1, 2, 3, 4, 10
 
 CURRENT, BEHIND, AHEAD, UNKNOWN, ABSENT = "CURRENT", "BEHIND", "AHEAD", "UNKNOWN", "ABSENT"
+# A daemon whose installed version arrived after its process started: it still runs the
+# old binary until something restarts it, so it counts as behind.
+RESTART = "RESTART"
 
 NOT_CHECKED_YET = (
     "the role account's Node (KIT-238 slice 2)",
@@ -375,22 +378,53 @@ def review_brew(env, conf):
                 found[item.get("token")] = (item.get("installed"), item.get("version"))
             else:
                 inst = item.get("installed") or []
-                found[item.get("name")] = (inst[-1].get("version") if inst else None,
-                                           (item.get("versions") or {}).get("stable"))
+                stable = (item.get("versions") or {}).get("stable")
+                # Homebrew's packaging revision is part of the version it installs:
+                # 2.56.0_1 is stable 2.56.0 at revision 1 (seen live 2026-10-10).
+                revision = item.get("revision") or 0
+                if stable and isinstance(revision, int) and revision > 0:
+                    stable = "%s_%d" % (stable, revision)
+                found[item.get("name")] = (inst[-1].get("version") if inst else None, stable,
+                                           inst[-1].get("time") if inst else None)
         for n in names:
-            installed, latest = found.get(n, (None, None))
+            installed, latest, installed_at = (tuple(found.get(n, ())) + (None, None, None))[:3]
             if not installed:
                 rows.append(row("%s %s" % (kind, n), ABSENT, None, latest, "",
                                 "not installed with Homebrew on this machine"))
                 continue
             cmd = "brew upgrade %s%s" % ("--cask " if kind == "cask" else "", n)
             note = ""
+            state = compare(installed, latest)
             if n in restarts:
                 cmd += " && sudo launchctl kickstart -k system/%s" % restarts[n]
                 note = "a running daemon: the restart line picks up the new binary"
-            rows.append(row("%s %s" % (kind, n), compare(installed, latest), installed, latest,
-                            cmd, note))
+                if state in (CURRENT, AHEAD):
+                    running_since = daemon_started(env, restarts[n])
+                    if running_since is None:
+                        state = UNKNOWN
+                        note = ("its launchd job %s is not running, so which binary it would run is "
+                                "unknown" % restarts[n])
+                    elif isinstance(installed_at, (int, float)) and running_since < installed_at:
+                        state = RESTART
+                        cmd = "sudo launchctl kickstart -k system/%s" % restarts[n]
+                        note = ("%s was installed after the daemon started, so it still runs the "
+                                "old binary" % installed)
+            rows.append(row("%s %s" % (kind, n), state, installed, latest, cmd, note))
     return rows
+
+
+def daemon_started(env, label):
+    """When the launchd job's current process started (epoch), or None when it has no
+    process. Read without root: `launchctl print` names the pid, `ps` its start time."""
+    got = env.runner.read(["launchctl", "print", "system/" + label])
+    m = re.search(r"^\s*pid = (\d+)\s*$", got.out, re.M) if got.ok else None
+    if not m:
+        return None
+    ps = env.runner.read(["ps", "-o", "lstart=", "-p", m.group(1)])
+    try:
+        return time.mktime(time.strptime(ps.out.strip(), "%a %b %d %H:%M:%S %Y")) if ps.ok else None
+    except ValueError:
+        return None
 
 
 def review_kit(env, conf):
@@ -427,7 +461,8 @@ def review_kit(env, conf):
 def review(env, conf, as_json=False):
     rows = review_dispatcher(env, conf) + review_brew(env, conf) + review_kit(env, conf)
     states = [r["state"] for r in rows]
-    code = EX_UNKNOWN if UNKNOWN in states else (EX_BLOCKED if BEHIND in states else EX_OK)
+    code = EX_UNKNOWN if UNKNOWN in states else (
+        EX_BLOCKED if (BEHIND in states or RESTART in states) else EX_OK)
     if as_json:
         print(json.dumps({"rows": rows, "not_checked_yet": list(NOT_CHECKED_YET),
                           "exit": code}, indent=1))
@@ -439,7 +474,7 @@ def review(env, conf, as_json=False):
                                        r_["target"]))
         if r_["note"]:
             say("           %s" % r_["note"])
-        if r_["state"] == BEHIND and r_["command"]:
+        if r_["state"] in (BEHIND, RESTART) and r_["command"]:
             say("           update: %s" % r_["command"])
     say("")
     say("NOT CHECKED YET (so this table is not the whole machine):")
@@ -866,9 +901,55 @@ def selftest():
             {"name": "caddy", "installed": [{"version": "2.10.2"}], "versions": {"stable": "2.10.2"}},
             {"name": "gh", "installed": [{"version": "2.102.0"}], "versions": {"stable": "2.102.0"}}]})),
         ("rev-parse HEAD", 0, tip + "\n"), ("rev-parse --abbrev-ref HEAD", 0, "main\n"),
-        ("ls-remote", 0, "ref: refs/heads/main\tHEAD\n%s\tHEAD\n" % tip)]),
+        ("ls-remote", 0, "ref: refs/heads/main\tHEAD\n%s\tHEAD\n" % tip),
+        ("launchctl print system/com.test.front-door", 0, "\tpid = 4242\n"),
+        ("ps -o lstart= -p 4242", 0, time.strftime("%a %b %d %H:%M:%S %Y\n", time.localtime(2000)))]),
         http=http({"version": {"cyrus_cli_version": "0.2.73"}}), home=home)
     check("review: everything current exits 0", review(allcur, _conf()), EX_OK)
+
+    # Homebrew's packaging revision is part of the version: 2.56.0_1 is CURRENT against
+    # stable 2.56.0 with revision 1, and 2.56.0 is BEHIND it (seen live 2026-10-10).
+    rev = json.dumps({"formulae": [
+        {"name": "caddy", "installed": [{"version": "2.10.2", "time": 1000}],
+         "versions": {"stable": "2.10.2"}, "revision": 0},
+        {"name": "gh", "installed": [{"version": "2.56.0_1", "time": 1000}],
+         "versions": {"stable": "2.56.0"}, "revision": 1}]})
+
+    def brew_env(formulae_json, extra=()):
+        return Env(runner=se.FakeRunner([("brew info --json=v2 --cask", 0, json.dumps(
+            {"casks": [{"token": "claude-code", "installed": "2.1.287", "version": "2.1.287"}]})),
+            ("brew info --json=v2 caddy gh", 0, formulae_json)] + list(extra)),
+            http=http({}), home=home)
+    states = {r["component"]: r["state"] for r in review_brew(brew_env(rev, [
+        ("launchctl print system/com.test.front-door", 0, "\tstate = running\n\tpid = 4242\n"),
+        ("ps -o lstart= -p 4242", 0, time.strftime("%a %b %d %H:%M:%S %Y\n",
+                                                    time.localtime(2000)))]), _conf())}
+    check("review: a Homebrew revision suffix is CURRENT, not AHEAD", states.get("formula gh"), CURRENT)
+    stale_daemon = review_brew(brew_env(rev.replace('"time": 1000}], "versions": {"stable": "2.10.2"}',
+                                                    '"time": 3000}], "versions": {"stable": "2.10.2"}'), [
+        ("launchctl print system/com.test.front-door", 0, "\tpid = 4242\n"),
+        ("ps -o lstart= -p 4242", 0, time.strftime("%a %b %d %H:%M:%S %Y\n",
+                                                    time.localtime(2000)))]), _conf())
+    caddy_row = [r for r in stale_daemon if r["component"] == "formula caddy"][0]
+    check("review: a daemon started BEFORE its installed version arrived needs a RESTART",
+          (caddy_row["state"], "kickstart -k system/com.test.front-door" in caddy_row["command"]),
+          (RESTART, True))
+    check("review: a daemon started AFTER its install is CURRENT", states.get("formula caddy"), CURRENT)
+    down = review_brew(brew_env(rev, [("launchctl print system/com.test.front-door", 113,
+                                       "Could not find service")]), _conf())
+    check("review: a daemon that is not running is UNKNOWN, never current",
+          [r["state"] for r in down if r["component"] == "formula caddy"], [UNKNOWN])
+    check("review: RESTART counts as behind in the exit code",
+          review(Env(runner=se.FakeRunner([("brew info --json=v2 --cask", 0, json.dumps(
+              {"casks": [{"token": "claude-code", "installed": "2.1.287", "version": "2.1.287"}]})),
+              ("brew info --json=v2 caddy gh", 0, rev.replace('"time": 1000}], "versions": {"stable": "2.10.2"}',
+                                                              '"time": 3000}], "versions": {"stable": "2.10.2"}')),
+              ("launchctl print system/com.test.front-door", 0, "\tpid = 4242\n"),
+              ("ps -o lstart= -p 4242", 0, time.strftime("%a %b %d %H:%M:%S %Y\n", time.localtime(2000))),
+              ("rev-parse HEAD", 0, tip + "\n"), ("rev-parse --abbrev-ref HEAD", 0, "main\n"),
+              ("ls-remote", 0, "ref: refs/heads/main\tHEAD\n%s\tHEAD\n" % tip)]),
+              http=http({"version": {"cyrus_cli_version": "0.2.73"}}), home=home), _conf()),
+          EX_BLOCKED)
 
     # -- update dispatcher ------------------------------------------------------
     def up_env(launchd, versions=("0.2.69",), answer="yes", agent=False):
