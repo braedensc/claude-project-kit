@@ -1417,11 +1417,15 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
-        # nothing: provenance:agent never auto-approves (§5).
+        # nothing: provenance:agent never auto-approves (§5). Its first lines say what
+        # approving does, on and off, for the owner who approves it (KIT-216).
         epic_desc = ("> Epic drafted by a planning session from **%s**. "
-                     "`provenance:agent` — awaiting a person's approval to release "
-                     "its children (§4, §5).\n>\n> %s\n\n%s"
-                     % (pinned, receipt, plan["epic"]["body"]))
+                     "`provenance:agent` — awaiting a person's approval (§4, §5). To "
+                     "approve, move it to the state this project maps to `ready`. Where "
+                     "the approve step is switched on, it then moves each child that "
+                     "passes the readiness gate to `ready`; where that step is off (the "
+                     "default), approving moves no child. %s\n>\n> %s\n\n%s"
+                     % (pinned, APPROVAL_STARTS_NOTHING, receipt, plan["epic"]["body"]))
         epic = client.create_issue(
             team_id, plan["epic"]["title"], epic_desc, forced["landing_state"],
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
@@ -1662,6 +1666,14 @@ def selftest():
         check("epic-no-parent", epic["parent_id"], None)
         check("epic-owner-subscribed", epic["subscriber_ids"], ["owner-1"])
         check("epic-never-assigned-to-session", epic["assignee_id"], None)
+        # KIT-216: the epic's own description is what the owner approves. It says what
+        # approving does with the approve step on and off, and claims no release.
+        check("epic-says-what-approving-does",
+              (APPROVAL_STARTS_NOTHING in epic["description"],
+               "where that step is off (the default), approving moves no child"
+               in epic["description"],
+               "release its children" in epic["description"]),
+              (True, True, False))
         check("child-parent-forced-to-epic", all(k["parent_id"] == epic["id"] for k in kids), True)
         check("child-provenance-epic-forced",
               all("lbl-prov-epic" in k["label_ids"] for k in kids), True)
