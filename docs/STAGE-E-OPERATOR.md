@@ -370,6 +370,18 @@ gate; only the first does now.
    lane. That is Stage E handing the work to a person, and it is the only ticket move it
    makes.
 
+   **It pages you either way (KIT-225).** A clean or below-threshold conclusion first leaves
+   one comment on the coding ticket. Its first line is the `ready-to-merge` mark, and its
+   second the pull request. The notifier pages on it and links the pull request. A spent
+   budget's ticket comment opens with the `agent:needs-human` mark, which pages too. If the
+   ready comment fails, nothing is moved, and the next pass says it again. A `ready` ledger
+   row records each one with its commit, so a retried move for that commit says nothing new.
+   It can still come twice. If Linear saves the comment but the driver never hears back, the
+   driver counts it as failed and says it again: a second page, chosen over losing the page.
+   It also comes again if the lane move failed, the pull request was bounced after all, and
+   it later concludes at a new commit. The page needs `BOUNCE_ACTOR_IDS` in the notifier
+   (`docs/NOTIFIER-OPERATOR.md`).
+
    **After that hand-off the pull request is yours, and the driver stops re-prompting it.**
    Say a later push turns a required check red, or a fresh review comes back at the
    threshold. The driver leaves **one comment on the coding ticket** saying what changed.
