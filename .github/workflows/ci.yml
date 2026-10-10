@@ -322,6 +322,18 @@ jobs:
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
 
+      # The Slack bridge (KIT-220, KIT-221): the one job that may act for the owner from
+      # the chat. Every sender checked with Slack itself (guests, bots, deactivated and
+      # other-workspace accounts, edits, files and subtypes refused), its own question
+      # bound to its own state, catch-up after sleep, a corrupt state refused, and no
+      # tracker write anywhere in this version (a source scan). Its installer writes the
+      # token from a hidden prompt as the role account, never loads the job, and refuses
+      # under a model.
+      - name: Slack bridge selftest (sender check, question binding, catch-up, no write)
+        run: python3 scripts/pipeline_bridge.py --selftest
+      - name: Slack bridge installer selftest (token, install, verify, agent-refused)
+        run: python3 scripts/pipeline_bridge_setup.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 

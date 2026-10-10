@@ -231,6 +231,9 @@ npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built int
 npm run test:install         # the one command (scripts/pipeline_install.py): skills, then
                              #   Stage E after a yes, then Stage A; refused under a model
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
+npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
+                             #   catch-up after sleep, no tracker write in this version
+npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,
                              #   local-session-only worktrees, capped pass, heartbeat
