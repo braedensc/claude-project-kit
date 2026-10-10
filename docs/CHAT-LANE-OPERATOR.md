@@ -588,6 +588,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file and backups folder included |
+| `chat-rules` | the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
@@ -630,6 +631,42 @@ Not that: a `Write` or a `touch` that ran. The grant did not load: restart the d
 (card CK-C5) and test again.
 Expected, and accepted: tools named `mcp__cyrus-tools__…` appear. The trim cannot remove
 that server.
+
+### Step 14 — The chat bot's rules (piece 8, KIT-226)
+
+Do this once the bridge runs (`docs/BRIDGE-OPERATOR.md`). The rules hand every request to it.
+
+```sh
+python3 scripts/pipeline_chat_lane_setup.py chat-rules
+python3 scripts/pipeline_chat_lane_setup.py chat-rules --apply
+```
+
+**Why.** The dispatcher's own Slack prompt tells a chat session to create an issue and
+assign it to itself. It says that assignment "kicks off work". Here only your own hand-over
+starts work, so that starts nothing, and the bot would say it had.
+
+**Where.** `<dispatcher home>/slack-workspaces/CLAUDE.md`. Every chat thread runs in a
+folder under it, so every chat session reads the rules. No coding, planning or review
+session does. That was measured on the dispatcher's bundled Claude Code, 2026-10-10.
+
+Set `IDEA_TEAM_KEYS` in `chat-lane.conf` so the rules name the teams the bot may file in.
+
+**The flow, end to end:**
+
+1. You write: "I want dark mode".
+2. The bot files one idea in the work team's Backlog. It replies `plan PROD-123` and nothing
+   else.
+3. The bridge asks: *Plan this?* You, or any member, reply `yes`.
+4. The bridge moves the idea to Plan it, as you. The planner plans it and files an epic.
+5. You write: "start it". The bot replies `approve PROD-130`. The bridge lists the children
+   and asks. A `yes` starts them, in order.
+
+Good: `verify`'s `chat-rules` row says ALREADY-DONE.
+Not that: FAILED, "not what this checkout composes". Either the kit changed the rules, so run
+`chat-rules --apply`, or someone edited the file. Find out who.
+
+These are instructions, not a guard. What holds is that the dispatcher starts work only on
+your hand-over, and the bridge acts only on a member's yes to its own question.
 
 ---
 
@@ -732,6 +769,8 @@ These came out of reading the dispatcher's source for this build.
 - That the anchored deny rules block a `Read` in a chat session. This rests on Claude Code's
   permissions page, not on a live test (KIT-174).
 - That the port rule refuses a second device. Card `CK-C4` measures it (KIT-117).
+- That the chat bot follows its rules (piece 8) over the dispatcher's built-in prompt. A
+  CLAUDE.md is a strong instruction, not a guard. The first live idea is the test (KIT-227).
 - That the anchor survives a reboot. The race is real: the operating system's own
   packet-filter job, `/System/Library/LaunchDaemons/com.apple.pfctl.plist`, runs
   `pfctl -f /etc/pf.conf` at load with nothing ordering it against this LaunchDaemon (read on

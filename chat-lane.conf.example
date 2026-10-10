@@ -111,3 +111,10 @@ FRONT_DOOR_BIN=/opt/homebrew/bin/caddy
 #
 # RULE: `@` and then letters, digits, `_` or `-`.
 FRONT_DOOR_MATCHER=@dispatcher
+
+# Optional (KIT-226). The work teams the chat bot may file an idea in, comma-
+# separated. Piece 8's rules name them. Unset, the rules say "the work team for
+# that project" and tell the bot to ask when it cannot tell.
+#
+# RULE: team keys, capitals and digits, starting with a capital, like PROD.
+#IDEA_TEAM_KEYS=PROD
