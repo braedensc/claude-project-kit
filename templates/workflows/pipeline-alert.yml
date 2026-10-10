@@ -1,0 +1,241 @@
+name: Pipeline alert
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pipeline health alert — INERT template. Unlike its siblings it does not
+# belong in the project it ships with: copy it into a PRIVATE repository's
+# `.github/workflows/` (an ops repo such as example-org/ops-repo). Never a
+# public one — the alert text carries machine state: what is installed, which
+# version, what is down, how full a disk is.
+#
+# The hole this closes: the machine that runs the pipeline checks its own
+# health (`scripts/pipeline_watch.py run`), but a check that only prints
+# reaches nobody, and an issue the owner files with their OWN token does not
+# notify them — GitHub never notifies you of your own actions. So the caller
+# only dispatches this workflow; github-actions[bot] opens the issue, and its
+# @mention reaches the owner (email + phone push; same chassis as
+# pipeline-failure-alert.yml).
+#
+# One open issue per KIND of problem, deduplicated by a FIXED title per kind
+# held in the script below — a caller cannot fork a second issue by rewording.
+#   • state=firing → open the issue, or comment on the open one; page every time.
+#   • state=ok     → comment "cleared" and close it; with nothing open, say so
+#                    and succeed. A clear pages nobody (the assignee still sees
+#                    the comment).
+# An unknown kind, a failed close, or a page that reached nobody fails the run.
+#
+# How the caller dispatches it (the file must be on the default branch):
+#   gh workflow run pipeline-alert.yml -R <owner>/<repo> --ref main \
+#     -f kind=<kind> -f state=<firing|ok> -f summary=<text>
+# The caller's token needs Actions write on that repo (the classic `repo`
+# scope, or a fine-grained token with Actions: Read and write). The summary is
+# untrusted free text: it is capped at 4000 characters, every `@` in it is
+# defused so it pages nobody, and it sits in a fence it cannot break out of.
+#
+# What it needs: GitHub Actions enabled on that repo, and the ALERT_PAGE_TO
+# repository variable (logins or org/team, comma-separated). It is required on
+# an org-owned repo, where an @mention of the organization notifies nobody; on
+# a person's repo it falls back to the owner. It is not a secret:
+#   gh variable set ALERT_PAGE_TO -R <owner>/<repo> --body "your-login"
+# Issue writes need a writable token: keep `issues: write` below, and if your
+# org restricts it, set Settings → Actions → General → Workflow permissions to
+# "Read and write permissions".
+#
+# Cost: each dispatch is one short job with no checkout — a few minutes a month
+# of a private repo's metered Actions minutes. No secrets, no placeholders.
+# ══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Which problem (each kind has one fixed issue title)'
+        type: choice
+        required: true
+        options:
+          - hooks
+          - updates
+          - release
+          - dispatcher
+          - front-door
+          - disk
+          - watch-job
+      state:
+        description: 'firing opens or comments on the issue; ok clears and closes it'
+        type: choice
+        required: true
+        options:
+          - firing
+          - ok
+      summary:
+        description: 'What the check saw (untrusted: capped, fenced, @ defused)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+# One run per kind at a time, queued not cancelled: the chassis lists open issues
+# and then creates one, so two `firing` runs at once would both find nothing and
+# file two. GitHub keeps one WAITING run per group — a newer dispatch replaces a
+# waiting one, so the latest state wins.
+concurrency:
+  group: pipeline-alert-${{ inputs.kind }}
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    name: Open, comment on or close the alert issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        # Inputs reach the script ONLY through env. An expression inside `script:` is
+        # pasted into the JavaScript before it runs, so a summary could then run code.
+        env:
+          KIND: ${{ inputs.kind }}
+          STATE: ${{ inputs.state }}
+          SUMMARY: ${{ inputs.summary }}
+          ALERT_PAGE_TO: ${{ vars.ALERT_PAGE_TO }}
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            // ── WHO THIS ALERT PAGES ── identical in every alert template (scripts/check_alert_pages.py
+            // runs each copy). An @mention of an ORGANIZATION notifies nobody and an organization
+            // cannot be assigned, so the repository owner is never paged blindly. In order: the
+            // ALERT_PAGE_TO repository variable (logins or org/team, comma- or space-separated);
+            // else the owner, when the owner is a person. When neither applies the issue is still
+            // filed, says "Nobody was paged", and the run FAILS: a page that reaches nobody must
+            // not look delivered.
+            async function alertRecipients() {
+              const { owner, repo } = context.repo
+              const names = (process.env.ALERT_PAGE_TO || '').split(/[\s,]+/).filter(Boolean).map((n) => n.replace(/^@/, ''))
+              // A login, or an org/team slug. Nothing else is ever embedded after an `@`.
+              const mentionable = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,99})?$/
+              const rejected = names.filter((n) => !mentionable.test(n))
+              const logins = [...new Set(names.filter((n) => mentionable.test(n)))]
+              if (logins.length) return { logins, whose: 'ALERT_PAGE_TO', rejected }
+              let ownerType
+              try {
+                ownerType = (await github.rest.repos.get({ owner, repo })).data.owner.type
+              } catch (e) {
+                core.warning(`could not read who owns ${owner}/${repo}: ${e.message}`)
+                return { logins: [], whose: 'this run could not read who owns the repository. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+              }
+              if (ownerType === 'User') return { logins: [owner], whose: 'the repository owner', rejected }
+              return { logins: [], whose: 'the repository owner is an organization, which an @mention does not notify. Set the ALERT_PAGE_TO repository variable to the logins that should be paged', rejected }
+            }
+            function pageLine({ logins, whose }, what) {
+              if (!logins.length) return `**Nobody was paged:** ${whose}.`
+              return `cc ${logins.map((l) => '@' + l).join(', ')} (${whose}) — ${what}`
+            }
+            // Assign whoever the page names (the "assign" reason keeps them subscribed to later
+            // comments), then fail the run if the page named nobody or the variable was malformed.
+            async function page(issue_number, { logins, whose, rejected }) {
+              const { owner, repo } = context.repo
+              const people = logins.filter((l) => !l.includes('/')) // a team is mentioned, never assigned
+              if (people.length) {
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: people })
+                } catch (e) { // e.g. not a collaborator: the @mention is the page, this is extra
+                  core.warning(`#${issue_number}: could not assign ${people.join(', ')}: ${e.message}`)
+                }
+              }
+              if (rejected.length) core.setFailed(`ALERT_PAGE_TO names ${JSON.stringify(rejected)}, which is not a GitHub login or org/team`)
+              if (!logins.length) core.setFailed(`#${issue_number}: this alert paged NOBODY — ${whose}.`)
+            }
+            // ── end WHO THIS ALERT PAGES ──
+            // The FIXED title per kind IS the dedupe key: one open issue per kind, however often
+            // the check fires. It lives here, not in an input, so a caller cannot fork a second
+            // issue by rewording. Change a title and the issue open under the old one is
+            // orphaned — close that one by hand.
+            const TITLES = {
+              'hooks': '🚨 Pipeline health: the kit hooks cannot tell which checkout a session is in',
+              'updates': '🚨 Pipeline health: something needs updating',
+              'release': '🚨 Pipeline health: a dispatcher release is newer than the pinned version',
+              'dispatcher': '🚨 Pipeline health: the dispatcher is not answering',
+              'front-door': '🚨 Pipeline health: the public front door is not answering',
+              'disk': '🚨 Pipeline health: the disk is nearly full',
+              'watch-job': '🚨 Pipeline health: the health check job itself stopped reporting',
+            }
+            const kind = String(process.env.KIND || '')
+            const state = String(process.env.STATE || '')
+            if (!Object.prototype.hasOwnProperty.call(TITLES, kind)) {
+              core.setFailed(`unknown kind ${JSON.stringify(kind.slice(0, 60))} (expected one of ${Object.keys(TITLES).join(', ')}): nothing was filed`)
+              return
+            }
+            if (state !== 'firing' && state !== 'ok') {
+              core.setFailed(`unknown state ${JSON.stringify(state.slice(0, 60))} (expected firing or ok): nothing was filed`)
+              return
+            }
+            const title = TITLES[kind]
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`
+
+            // The summary is UNTRUSTED free text from the caller. Capped in characters (not
+            // UTF-16 units, so a cut never splits one); a zero-width space after every `@`, so
+            // no mention in it pages anyone; every backtick swapped for a look-alike (U+02CB),
+            // so it cannot close the fence it is shown in.
+            const CAP = 4000
+            const chars = [...String(process.env.SUMMARY || '').replace(/\r\n?/g, '\n').trim()]
+            const summary = chars.slice(0, CAP).join('')
+              .replace(/@/g, '@\u200b')
+              .replace(/`/g, '\u02cb')
+            function summaryLines() {
+              const out = ['```text', summary, '```']
+              if (chars.length > CAP) out.push(`_Summary truncated: the first ${CAP} of ${chars.length} characters are shown._`)
+              return out
+            }
+
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
+            const existing = open.data.find((i) => i.title === title && !i.pull_request)
+
+            if (state === 'ok') {
+              // Contract §13: say WHICH nothing. A clear with nothing open is normal (the check
+              // reports ok on every healthy pass), and the log must not read like a failure.
+              if (!existing) {
+                core.info(`nothing open, nothing to close: no open issue is titled "${title}"`)
+                return
+              }
+              const cleared = [
+                `**Cleared.** The health check reports \`${kind}\` is fine again ([run](${runUrl})).`,
+                ...(summary ? ['', ...summaryLines()] : []),
+              ].join('\n')
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body: cleared })
+              try {
+                await github.rest.issues.update({ owner, repo, issue_number: existing.number, state: 'closed' })
+              } catch (e) {
+                // Left open, the issue says "cleared" while it looks live; the next `ok`
+                // dispatch finds it open and tries again. Until then this run is red.
+                core.setFailed(`#${existing.number}: commented "cleared" but could not close it: ${e.message}`)
+                return
+              }
+              core.info(`Cleared and closed #${existing.number}`)
+              return
+            }
+
+            const recipients = await alertRecipients()
+            const body = [
+              `The pipeline health check reports **${kind}** ([run](${runUrl})).`,
+              '',
+              ...(summary ? summaryLines() : ['_The check sent no summary._']),
+              '',
+              'This issue closes itself when the check reports this kind clear again. Each report while it stays open adds a comment and pages again.',
+              '',
+              // @mention a person on EVERY firing comment, as pipeline-failure-alert.yml does:
+              // the "mention" reason is delivered, emailed and pushed even under a
+              // "Participating and @mentions" watch, so a still-firing alert keeps nudging.
+              pageLine(recipients, 'this needs a person until it clears.'),
+            ].join('\n')
+            let number
+            if (existing) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: existing.number, body })
+              number = existing.number
+              core.info(`Commented on #${number}`)
+            } else {
+              const created = await github.rest.issues.create({ owner, repo, title, body })
+              number = created.data.number
+              core.info(`Opened #${number}`)
+            }
+            await page(number, recipients)
