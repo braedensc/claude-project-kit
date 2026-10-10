@@ -883,7 +883,7 @@ def selftest():
                    environ={"CLAUDECODE": "1"} if agent else {}, home=home)
 
     base = [("grep -oE", 1, ""), ("/bin/test -e", 1, ""), ("grep -qE", 1, ""),
-            ("echo ~", 0, "/Users/_testdispatch\n"), ("npm root -g", 0, "copied\n"),
+            ("echo ~", 0, "/var/selftest-home/_testdispatch\n"), ("npm root -g", 0, "copied\n"),
             ("PlistBuddy", 0, "120\n"), ("printf", 0, "")]
     ok_env = up_env(_Launchd(base))
     ok_env.any_platform = True
