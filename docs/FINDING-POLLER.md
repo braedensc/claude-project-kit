@@ -35,7 +35,12 @@ One comment on its own ticket, containing a fenced block:
 ````
 
 Nothing else — no create, no label, no state. Posting the comment is a plain `save_comment`
-a session already may do; creating the ticket is not, and the guard blocks it.
+a session already may do. Creating the ticket itself is not allowed, but what stops it
+depends on how the session was started:
+
+- **The dispatcher wrote a pin:** the guard blocks a ticket session's direct create.
+- **The dispatcher binds by delegation:** nothing blocks it yet. Only the session brief's
+  rule asks for the comment instead (see above).
 
 ## What the poller forces (none of it the session's to choose)
 
@@ -85,9 +90,13 @@ than that window are not re-asked for until the file is repaired or removed.
 - **Flood guard:** at most `max_per_source` findings per source ticket, counted across every
   pass (default 3, §8's cap). A request over it is declined for good and recorded, so it
   never holds the scan window back, and the source ticket gets one note saying so. Before
-  KIT-234 the count restarted each pass, so one session could have any number filed. At
-  most `max_per_run` across a pass; extras are left for the next pass and named in the
-  log — never silently dropped (§13).
+  KIT-234 the count restarted each pass, so one session could have any number filed. The
+  note counts as sent only once it posts. If it cannot be posted, the pass exits 1, the
+  heartbeat names the ticket, and every later pass tries again until it posts. At most
+  `max_per_run` across a pass; extras are left for the next pass and named in the log —
+  never silently dropped (§13). The per-ticket cap is checked first, so a request over it
+  is declined even when the pass is full. The pass summary counts declined requests on
+  their own, apart from "already filed".
 - **Dedup: the seen-set is the authority**, and the only one. It is keyed by source comment
   id, written atomically, written *through* the moment each ticket is created, and a corrupt
   one refuses the run rather than re-filing. The `Filed as` receipt is a record for a
@@ -110,7 +119,7 @@ than that window are not re-asked for until the file is repaired or removed.
 
 | File | What it says |
 | --- | --- |
-| `seen.json` | every source comment already filed. **The dedup authority** — do not delete |
+| `seen.json` | every source comment already filed or declined, and each cap note posted. **The dedup authority** — do not delete |
 | `watermarks.json` | how far each team has been read and resolved |
 | `heartbeat.json` | when the last pass ran, and what it decided |
 
@@ -119,7 +128,8 @@ reads every Stage E daemon: `result` is `ok`, `error` or `usage`, beside `exit_c
 `started_at`, `ended_at`, and this poller's `filed` / `skipped` counts.
 
 Exit codes: **0** the pass ran (even if it filed nothing) · **1** the pass could not
-complete · **2** bad arguments, an unreadable or invalid config, or a missing credential.
+complete, or a cap note it owes could not be posted (the heartbeat's `error` names the
+ticket) · **2** bad arguments, an unreadable or invalid config, or a missing credential.
 
 ## Enabling it (operator)
 
