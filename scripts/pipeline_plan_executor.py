@@ -722,7 +722,7 @@ def render_success_comment(idea_id, epic, children, epic_title, duplicates=None)
         dep = ""
         if child.get("depends_on"):
             dep = " — depends on %s" % ", ".join(
-                "#%d" % d for d in child["depends_on"])
+                children[d][0]["identifier"] for d in child["depends_on"])
         lines.append("  - [%s](%s) — `%s`%s"
                      % (created["identifier"], created.get("url") or "",
                         _sanitize(child["title"]), dep))
@@ -833,6 +833,49 @@ def render_no_output_comment(idea_id):
 # --------------------------------------------------------------------------- #
 # The Definition-of-Ready gate — a subprocess, not a judgment (§5)
 # --------------------------------------------------------------------------- #
+def creation_order(children):
+    """The children's indexes, each after every child it depends on, lowest index first
+    among those ready. The plan was already checked for cycles and bad edges."""
+    left = set(range(len(children)))
+    order = []
+    while left:
+        ready = [i for i in sorted(left)
+                 if not set(children[i].get("depends_on") or []) & left]
+        if not ready:                    # unreachable after the cycle check; never hang
+            ready = [min(left)]
+        order.append(ready[0])
+        left.discard(ready[0])
+    return order
+
+
+def child_context_block(epic, epic_title, children, i, created):
+    """The few lines a child opens with (KIT-228): its epic, its place in the plan, the
+    ids it depends on, the children that build on it, and where to read first. Written
+    before the child's first `## ` heading, which the readiness gate does not read. A
+    coding session given the child alone would otherwise never learn it has an epic."""
+    deps = [d for d in (children[i].get("depends_on") or []) if d in created]
+    later = [j for j, c in enumerate(children) if i in (c.get("depends_on") or [])]
+    lines = ["> **Part of epic [%s](%s): %s.** This is child %d of %d in its plan."
+             % (epic["identifier"], epic.get("url") or "", _sanitize(epic_title), i + 1,
+                len(children))]
+    if deps:
+        lines.append("> **Depends on:** %s. Start only after these are merged."
+                     % "; ".join("[%s](%s) %s" % (created[d]["identifier"],
+                                                  created[d].get("url") or "",
+                                                  _sanitize(children[d]["title"]))
+                                 for d in deps))
+    else:
+        lines.append("> **Depends on:** nothing else in this epic.")
+    if later:
+        lines.append("> **Builds on this one:** %s."
+                     % "; ".join("child %d, %s" % (j + 1, _sanitize(children[j]["title"]))
+                                 for j in later))
+    lines.append("> **Before you plan:** read the epic's description (the plan, its "
+                 "non-goals and its delivery order), its other children, and this "
+                 "ticket's \"blocked by\" links.")
+    return "\n>\n".join(lines)
+
+
 def run_dor(child_tickets, config_path, repo_root):
     """Run check_ticket_dor.py --strict over every child. Returns (ok, reports).
 
@@ -1417,16 +1460,23 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         created.append("epic %s" % epic["identifier"])
 
         # The children — backlog, provenance:epic, parent FORCED to the epic
-        # created just now. The session supplied no parent id.
-        created_children = []
-        for child in plan["children"]:
+        # created just now. The session supplied no parent id. Created in
+        # DEPENDENCY ORDER, so each child's opening block can name the ids it
+        # depends on (KIT-228); listed below in the plan's own order.
+        by_index = {}
+        for i in creation_order(plan["children"]):
+            child = plan["children"][i]
             label_ids = [forced["prov_epic"]] + [
                 forced["label_ids"][k] for k in (child.get("labels") or [])]
+            body = (child_context_block(epic, plan["epic"]["title"], plan["children"], i,
+                                        by_index) + "\n\n" + child["body"])
             issue = client.create_issue(
-                team_id, child["title"], child["body"], forced["landing_state"],
+                team_id, child["title"], body, forced["landing_state"],
                 label_ids, parent_id=epic["id"], project_id=project_id)
             created.append("child %s" % issue["identifier"])
-            created_children.append((issue, child))
+            by_index[i] = issue
+        created_children = [(by_index[i], child)
+                            for i, child in enumerate(plan["children"])]
 
         # Dependency edges → blockedBy relations.
         for i, (_, child) in enumerate(created_children):
@@ -1656,6 +1706,52 @@ def selftest():
         check("child-landing-raw", all(k["state_id"] == "state-raw" for k in kids), True)
         check("child-carries-proposed-labels", "lbl-m" in kids[0]["label_ids"], True)
         check("child-not-assigned", all(k["assignee_id"] is None for k in kids), True)
+        # KIT-228 (B1): every child opens with its epic, its place in the plan and the ids
+        # it depends on, before its first heading; the planner's text follows unchanged.
+        heads = [k["description"].split("\n## ", 1)[0] for k in kids]
+        check("child-context-names-the-epic", all(
+            h.startswith("> **Part of epic [%s](%s)" % (epic["identifier"], epic["url"]))
+            for h in heads), True)
+        check("child-context-place", ["child 1 of 2" in heads[0], "child 2 of 2" in heads[1]],
+              [True, True])
+        check("child-context-dependency-by-id",
+              (kids[0]["identifier"] in heads[1], "nothing else in this epic" in heads[0]),
+              (True, True))
+        check("child-context-names-what-builds-on-it",
+              "child 2, Executor forces every authority field" in heads[0], True)
+        check("child-context-says-read-the-epic-first",
+              all("read the epic's description" in h for h in heads), True)
+        check("child-body-follows-unchanged",
+              all(k["description"].endswith("\n\n" + _GOOD_CHILD_BODY) for k in kids), True)
+        decorated = build_child_tickets(
+            dict(_tree()["requests"][0], children=[
+                {"title": k["title"], "body": k["description"],
+                 "labels": ["track:meta", "effort:S"]} for k in kids]), "KIT", "state-raw")
+        ok_dor, _rep = run_dor(decorated, cfg_path, tmp)
+        check("child-context-passes-the-readiness-gate", ok_dor, True)
+        summary_lines = fake.comments[0][1].splitlines()
+        check("summary-dependency-by-id", any(
+            kids[1]["identifier"] in ln and ("depends on %s" % kids[0]["identifier"]) in ln
+            for ln in summary_lines), True)
+        check("summary-no-position-numbers", "depends on #" in fake.comments[0][1], False)
+        # A FORWARD dependency: child 1 depends on child 2, so child 2 is created first and
+        # child 1's block can name its id.
+        fwd = FakeLinear()
+        fwd_tree = _tree(children=[
+            {"title": "Use the new index", "body": _GOOD_CHILD_BODY,
+             "labels": ["track:meta", "effort:S"], "depends_on": [1]},
+            {"title": "Build the new index", "body": _GOOD_CHILD_BODY,
+             "labels": ["track:meta", "effort:S"]}])
+        check("forward-dependency-tree-files", run(fwd_tree, client=fwd), EXIT_OK)
+        fkids = fwd.issues[1:]
+        check("forward-dependency-created-first", [k["title"] for k in fkids],
+              ["Build the new index", "Use the new index"])
+        check("forward-dependency-named-by-id",
+              fkids[0]["identifier"] in fkids[1]["description"].split("\n## ", 1)[0], True)
+        check("forward-dependency-place-is-the-plans",
+              ("child 2 of 2" in fkids[0]["description"], "child 1 of 2" in fkids[1]["description"]),
+              (True, True))
+        check("forward-dependency-relation", fwd.relations, [(fkids[0]["id"], fkids[1]["id"])])
         # depends_on [0] on child index 1 → blockedBy: children[0] blocks children[1]
         check("one-relation", len(fake.relations), 1)
         check("relation-direction", fake.relations[0], (kids[0]["id"], kids[1]["id"]))
