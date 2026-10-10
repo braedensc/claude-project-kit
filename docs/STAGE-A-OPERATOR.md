@@ -68,7 +68,10 @@ Never both on one ticket.
     too (KIT-216). **Never delegate the epic itself.** Its session would try to build the
     whole plan at once. And once the epic has a branch, the dispatcher cuts every child's
     worktree from it (0.2.69, `GitService.js:296-316`), so each child's pull request is
-    stacked on the epic's.
+    stacked on the epic's. From 0.2.71 a child's finished session also wakes the epic's.
+    **Never put the `orchestrator` or `graphite` label on the epic or a child.** From
+    0.2.73 those prompts hand each child to the agent themselves, and a `graphite` child
+    is cut from the branch of the ticket it waits on: a stack again.
 
 ## 3. Why routing is checked, and what happens when it goes wrong
 
