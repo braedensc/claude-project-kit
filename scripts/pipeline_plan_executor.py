@@ -663,15 +663,23 @@ def build_child_tickets(plan, team_key, landing_state_id):
     project) so the whole tree is gated before anything is created. The DoR gate
     checks a child's internal consistency, which does not depend on the epic's
     real id, so gating against the sentinel is sound and leaves no orphan.
+
+    Each description is the one the child is FILED with (KIT-228): its opening
+    block, with the sentinel standing in for every id not issued yet, then the
+    planner's body. The gate reads that block too, so it judges the filed text.
     """
     pending_epic = "%s-0" % team_key
+    pending = {"identifier": pending_epic, "url": ""}
+    children = plan["children"]
     tickets = []
-    for child in plan["children"]:
+    for i, child in enumerate(children):
         labels = list(child.get("labels") or []) + ["provenance:epic"]
         tickets.append({
             "id": None,
             "title": child["title"],
-            "description": child["body"],
+            "description": child_description(
+                pending, plan["epic"]["title"], children, i,
+                {j: pending for j in range(len(children))}),
             "labels": labels,
             "projectId": PENDING_PROJECT,
             "parentId": pending_epic,
@@ -848,32 +856,50 @@ def creation_order(children):
     return order
 
 
+def _quoted_title(title):
+    """A title as an inline code span, for a child's opening block. A title is the
+    planner's name for a ticket, not unfinished text: the gate skips TODO, FIXME, XXX
+    and template prompts inside a span. A backtick would end the span early, and a line
+    break would end it and the quote, so neither survives as itself."""
+    return "`%s`" % " ".join(_sanitize(title).replace("`", "'").split())
+
+
 def child_context_block(epic, epic_title, children, i, created):
     """The few lines a child opens with (KIT-228): its epic, its place in the plan, the
     ids it depends on, the children that build on it, and where to read first. Written
-    before the child's first `## ` heading, which the readiness gate does not read. A
-    coding session given the child alone would otherwise never learn it has an epic."""
+    before the child's first `## ` heading. A coding session given the child alone would
+    otherwise never learn it has an epic. The gate's section rules start at that
+    heading, but its draft-marker rule reads the whole text, so titles are quoted as
+    code spans, and the gate is run over this block before anything is created."""
     deps = [d for d in (children[i].get("depends_on") or []) if d in created]
     later = [j for j, c in enumerate(children) if i in (c.get("depends_on") or [])]
     lines = ["> **Part of epic [%s](%s): %s.** This is child %d of %d in its plan."
-             % (epic["identifier"], epic.get("url") or "", _sanitize(epic_title), i + 1,
+             % (epic["identifier"], epic.get("url") or "", _quoted_title(epic_title), i + 1,
                 len(children))]
     if deps:
         lines.append("> **Depends on:** %s. Start only after these are merged."
                      % "; ".join("[%s](%s) %s" % (created[d]["identifier"],
                                                   created[d].get("url") or "",
-                                                  _sanitize(children[d]["title"]))
+                                                  _quoted_title(children[d]["title"]))
                                  for d in deps))
     else:
         lines.append("> **Depends on:** nothing else in this epic.")
     if later:
         lines.append("> **Builds on this one:** %s."
-                     % "; ".join("child %d, %s" % (j + 1, _sanitize(children[j]["title"]))
+                     % "; ".join("child %d, %s"
+                                 % (j + 1, _quoted_title(children[j]["title"]))
                                  for j in later))
     lines.append("> **Before you plan:** read the epic's description (the plan, its "
                  "non-goals and its delivery order), its other children, and this "
                  "ticket's \"blocked by\" links.")
     return "\n>\n".join(lines)
+
+
+def child_description(epic, epic_title, children, i, created):
+    """Child i's description: its opening block, then the planner's body unchanged.
+    The one spelling both the gate and the create use."""
+    return (child_context_block(epic, epic_title, children, i, created) + "\n\n"
+            + children[i]["body"])
 
 
 def run_dor(child_tickets, config_path, repo_root):
@@ -903,6 +929,14 @@ def run_dor(child_tickets, config_path, repo_root):
         raise ExecutorError("the DoR gate produced no JSON verdict (%s): %s"
                             % (exc, proc.stderr.strip()))
     return bool(result.get("ok")), result.get("tickets", [])
+
+
+# Said first in a DoR rejection: a marker found only in a quoted title would
+# otherwise send a planner looking for it in a body that does not hold it.
+DOR_JUDGED_AS_FILED = (
+    "Each child is judged as it would be filed, opening lines included. Those lines "
+    "quote the epic's title and linked children's titles, so a marker such as TBD in a "
+    "title counts as well.")
 
 
 def dor_failure_lines(reports, children):
@@ -1229,7 +1263,7 @@ def materialise(args, client=None):
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
                        "%d child(ren) failed the Definition-of-Ready gate" %
                        sum(1 for r in reports if r.get("errors")),
-                       dor_failure_lines(reports, children))
+                       [DOR_JUDGED_AS_FILED] + dor_failure_lines(reports, children))
 
     # ── Everything passed. Create. (dry-run stops here.) ───────────────────
     if args.dry_run:
@@ -1468,8 +1502,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             child = plan["children"][i]
             label_ids = [forced["prov_epic"]] + [
                 forced["label_ids"][k] for k in (child.get("labels") or [])]
-            body = (child_context_block(epic, plan["epic"]["title"], plan["children"], i,
-                                        by_index) + "\n\n" + child["body"])
+            body = child_description(epic, plan["epic"]["title"], plan["children"], i,
+                                     by_index)
             issue = client.create_issue(
                 team_id, child["title"], body, forced["landing_state"],
                 label_ids, parent_id=epic["id"], project_id=project_id)
@@ -1718,16 +1752,23 @@ def selftest():
               (kids[0]["identifier"] in heads[1], "nothing else in this epic" in heads[0]),
               (True, True))
         check("child-context-names-what-builds-on-it",
-              "child 2, Executor forces every authority field" in heads[0], True)
+              "child 2, `Executor forces every authority field`" in heads[0], True)
         check("child-context-says-read-the-epic-first",
               all("read the epic's description" in h for h in heads), True)
         check("child-body-follows-unchanged",
               all(k["description"].endswith("\n\n" + _GOOD_CHILD_BODY) for k in kids), True)
-        decorated = build_child_tickets(
-            dict(_tree()["requests"][0], children=[
-                {"title": k["title"], "body": k["description"],
-                 "labels": ["track:meta", "effort:S"]} for k in kids]), "KIT", "state-raw")
-        ok_dor, _rep = run_dor(decorated, cfg_path, tmp)
+        def as_filed(tree, issues):
+            """The gate's view of the children exactly as the tracker holds them."""
+            tickets = build_child_tickets(tree["requests"][0], "KIT", "state-raw")
+            return [dict(t, description=k["description"]) for t, k in zip(tickets, issues)]
+
+        # The gate judges the text that is filed, block and all; only the ids differ.
+        link = re.compile(r"\[[A-Z]+-\d+\]\([^)]*\)")
+        check("gate-judges-the-filed-text-but-ids",
+              [link.sub("[id]", t["description"])
+               for t in build_child_tickets(_tree()["requests"][0], "KIT", "state-raw")],
+              [link.sub("[id]", k["description"]) for k in kids])
+        ok_dor, _rep = run_dor(as_filed(_tree(), kids), cfg_path, tmp)
         check("child-context-passes-the-readiness-gate", ok_dor, True)
         summary_lines = fake.comments[0][1].splitlines()
         check("summary-dependency-by-id", any(
@@ -1752,6 +1793,50 @@ def selftest():
               ("child 2 of 2" in fkids[0]["description"], "child 1 of 2" in fkids[1]["description"]),
               (True, True))
         check("forward-dependency-relation", fwd.relations, [(fkids[0]["id"], fkids[1]["id"])])
+        # A title is quoted in other children's opening blocks, so it goes in as a code
+        # span: "TODO" in a title names a ticket, it is not unfinished text. The gate
+        # reads those blocks too, before anything is created, so the children as filed
+        # pass it exactly as the tree did.
+        todo = FakeLinear()
+        todo_tree = _tree()
+        todo_tree["requests"][0]["epic"]["title"] = "Remove every TODO marker from the parser"
+        todo_tree["requests"][0]["children"][0]["title"] = "Retire the TODO-list importer"
+        check("todo-titles-tree-files", run(todo_tree, client=todo), EXIT_OK)
+        tkids = todo.issues[1:]
+        ok_todo, rep_todo = (run_dor(as_filed(todo_tree, tkids), cfg_path, tmp) if tkids
+                             else (False, []))
+        check("todo-titles-children-as-filed-pass-strict-dor",
+              (ok_todo, len(rep_todo)), (True, 2))
+        theads = "\n".join(k["description"].split("\n## ", 1)[0] for k in tkids)
+        check("titles-quoted-as-code-spans",
+              ("): `Remove every TODO marker from the parser`.** This is child" in theads,
+               "`Retire the TODO-list importer`. Start only after" in theads,
+               "child 2, `Executor forces every authority field`." in theads),
+              (True, True, True))
+        # A backtick would end the span early, and a line break would end it and the
+        # quote, so neither reaches the block as itself.
+        odd = FakeLinear()
+        odd_tree = _tree()
+        odd_tree["requests"][0]["epic"]["title"] = "Clean up the parser\nand its TODO list"
+        odd_tree["requests"][0]["children"][0]["title"] = "Drop the `XXX` shim"
+        check("odd-titles-tree-files", run(odd_tree, client=odd), EXIT_OK)
+        ok_odd, rep_odd = (run_dor(as_filed(odd_tree, odd.issues[1:]), cfg_path, tmp)
+                           if odd.issues else (False, []))
+        check("odd-titles-children-as-filed-pass-strict-dor",
+              (ok_odd, len(rep_odd)), (True, 2))
+        forged = _marker(ESC_NEEDS_INPUT)
+        check("quoted-title-defuses-a-forged-mark", forged in _quoted_title("x " + forged),
+              False)
+        # The gate reads draft markers inside a code span too. A title carrying one would
+        # file children that fail the gate, so the tree is refused BEFORE anything exists,
+        # and the refusal says each child was judged with its opening lines.
+        tbd = FakeLinear()
+        tbd_tree = _tree()
+        tbd_tree["requests"][0]["epic"]["title"] = "Settle the TBD export format"
+        check("draft-marker-title-refused-before-create",
+              (run(tbd_tree, client=tbd), len(tbd.issues)), (EXIT_REJECTED, 0))
+        check("draft-marker-refusal-says-judged-as-filed",
+              "judged as it would be filed" in "".join(b for _i, b in tbd.comments), True)
         # depends_on [0] on child index 1 → blockedBy: children[0] blocks children[1]
         check("one-relation", len(fake.relations), 1)
         check("relation-direction", fake.relations[0], (kids[0]["id"], kids[1]["id"]))
