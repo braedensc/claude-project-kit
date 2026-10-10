@@ -36,6 +36,10 @@ notifier.conf
 # chat-lane.conf.example is the committed one.
 chat-lane.conf
 
+# The Slack bridge installer's filled-in settings — same reasoning as stage-e.conf.
+# bridge.conf.example is the committed one.
+bridge.conf
+
 # Dependencies
 node_modules/
 
