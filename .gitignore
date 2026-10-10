@@ -39,6 +39,9 @@ chat-lane.conf
 # The Slack bridge installer's filled-in settings — same reasoning as stage-e.conf.
 # bridge.conf.example is the committed one.
 bridge.conf
+# The review-and-update command's filled-in settings — same reasoning as
+# stage-e.conf. update.conf.example is the committed one.
+update.conf
 
 # Dependencies
 node_modules/

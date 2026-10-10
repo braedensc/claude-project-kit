@@ -1,0 +1,64 @@
+# update.conf.example — every value the review-and-update command reads.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp update.conf.example update.conf
+#   $EDITOR update.conf
+#   python3 scripts/pipeline_update.py review             # read-only, any time
+#   python3 scripts/pipeline_update.py update dispatcher  # a person, in a terminal
+#
+# Guide: docs/UPDATE-OPERATOR.md.
+#
+# FORMAT.  `KEY=value`, one per line; `#` starts a comment only at the start of
+# a line.  Parsed, never sourced.  A duplicate or unknown key is an error.  No
+# value here ever holds a credential, and the command never reads one: the
+# pre-flight reads only the NAMES in the dispatcher's env file.
+#
+# WHAT IS OPTIONAL.  Every section can be left empty.  An empty section is
+# reported as "not configured on this machine", never as "current".
+# ---------------------------------------------------------------------------
+
+# --- The dispatcher --------------------------------------------------------
+# All three or none.  The same values as stage-e.conf and chat-lane.conf.
+# The values below are refused as typed, so an unedited file cannot run.
+DISPATCHER_SERVICE=com.example.dispatcher
+ROLE_ACCOUNT=_exdispatch
+DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env
+
+# The port its /version and /status routes answer on, on 127.0.0.1.
+DISPATCHER_PORT=3456
+
+# The npm package the role account runs, and the version to move it to:
+# `latest`, or an exact version.  Pin one when a newer release has not been
+# reviewed yet — the review command then reports the pin, not the registry.
+DISPATCHER_PACKAGE=cyrus-ai
+DISPATCHER_VERSION=latest
+
+# The shell line that puts the role account's Node on PATH (run under bash,
+# as a login shell, before every npm command).
+DISPATCHER_NODE_SETUP=. "$HOME/.nvm/nvm.sh"
+
+# `off` adds CYRUS_SENTRY_DISABLED=1 to the env file during an update, if it is
+# absent.  (The dispatcher reports errors only when a team id is set at all;
+# this keeps it off even if one ever is.)  `unchanged` leaves the file alone.
+DISPATCHER_SENTRY=unchanged
+
+# Env NAMES that must be ABSENT before an update, because each one changes what
+# the dispatcher does at start-up.  A trailing * matches a prefix.  A hit stops
+# the update before anything changes.  Remove a name here only on purpose.
+DISPATCHER_FORBIDDEN_ENV=CYRUS_API_KEY,CYRUS_TEAM_ID,CYRUS_ENABLE_WARM_SESSIONS,ZULIP_*
+
+# --- Homebrew --------------------------------------------------------------
+# Casks and formulae to compare against Homebrew's index, comma-separated.
+# BREW_RESTARTS names the ones a launchd job runs, as formula:label, so the
+# update line it prints restarts the job onto the new binary.
+BREW_CASKS=claude-code
+BREW_FORMULAE=gh,git
+BREW_RESTARTS=
+
+# --- The kit ---------------------------------------------------------------
+# The checkout to compare against its origin.  Empty means the checkout this
+# command runs from.  On a pipeline machine that should be the one the hooks
+# run from: every session's guards are read from that checkout.
+KIT_CHECKOUT=

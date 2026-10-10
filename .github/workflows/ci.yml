@@ -406,6 +406,14 @@ jobs:
       - name: Conflict waker installer selftest (LaunchAgent, heartbeat, agent-refused)
         run: python3 scripts/pipeline_conflict_waker_setup.py --selftest
 
+      # The review-and-update command (scripts/pipeline_update.py, KIT-238): a component
+      # it cannot measure is UNKNOWN, never current; the not-checked list prints every time;
+      # an update refuses under an agent, stops before any change on a forbidden env name or
+      # a missing "yes", never installs over a job launchd still holds, never starts after a
+      # failed install, and checks the version that answers.
+      - name: Review-and-update selftest (UNKNOWN is not current, agent-refused, safe order)
+        run: python3 scripts/pipeline_update.py --selftest
+
       # The union check (pr-union-check.yml): a check and the fixture it rejects, each green
       # alone, are red together and bisected to the PR that joined last; a textual conflict
       # inside the union is skipped by name; the cap skips loudly; could-not is its own
