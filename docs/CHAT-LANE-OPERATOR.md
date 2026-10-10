@@ -71,7 +71,7 @@ card without its commands, and exits 2.
 |---|---|
 | `compose` | Prints all seven pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
 | `compose --piece N` | Prints one piece alone. `--piece 4` prints only the port-block script, so you can save it to a file. |
-| `verify` | Reads the dispatcher's config, its env file, the role account's user settings and the front door's config **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value. Changes nothing. Refuses to run under a model. |
+| `verify` | Reads the dispatcher's config, its env file, the role account's user settings, the front door's config and the newest chat session's start-up tool list **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value or a message. Changes nothing. Refuses to run under a model. |
 | `merge` | Pieces 1, 2 and 5. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
 | `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
@@ -128,6 +128,28 @@ the role account's env file. So do this soon after you pull:
    redundant and harmless.
 5. Run `front-door`. Good: `/slack-webhook is already on the line. Nothing to change.`
 6. Run `verify` again. Good: exit 0.
+
+### Already on before the diff rules? (KIT-212)
+
+The tracker's tool server carries six tools that act on a pull request: `merge_diff`,
+`submit_diff_review`, `update_diff`, `save_diff_comment`, `resolve_diff_thread` and
+`delete_diff_comment`. One merges. One records a review decision, such as an approval.
+Piece 5 now denies all six. Until it is merged, a chat session can call them.
+
+1. Pull this checkout.
+2. Run `verify`. Expect `user-settings` to name the six missing rules and `merge`: exit 10.
+   Expect `chat-tools` to name any of the six that the newest chat session holds. If no
+   chat session has run yet, it says `UNKNOWN` and `verify` exits 4 instead.
+3. Run `merge`, then `merge --apply`. It adds only those six rules.
+4. Restart the dispatcher, only when it is idle: card `CK-C5`, which `merge` prints. A
+   session keeps the tools it started with, chat or coding, until it ends.
+5. Ask the bot one question in a **new** thread.
+6. Run `verify` again.
+
+Good: `chat-tools` says none of the tracker tools merges, reviews or writes a pull request,
+and `verify` exits 0.
+Not that: `chat-tools` still names a tool after step 5. Check that the thread was new, and
+that `user-settings` is clean.
 
 ---
 
@@ -268,13 +290,20 @@ hard-coded empty (`RunnerConfigBuilder.js:78`).
 | `mcp__cyrus-tools` | The dispatcher's own tool server, running in the dispatcher's process, outside any sandbox. It can send a message into **any** running session by id, with no check on the caller (`cyrus-tools/index.js:181`; `EdgeWorker.js:4138-4170`). It can read **any** file the role account can read and upload it to the tracker, public if asked (`cyrus-tools/index.js:72-107`). |
 | `mcp__cyrus-docs` | A documentation search run by a third party (`McpConfigService.js:82-85`). That service sees what the session searches for. |
 
+**The tracker server stays whole, too.** `mcp__linear` is in the list above, and the
+dispatcher would append it anyway. So a chat session holds every tool the tracker's hosted
+server lists for the dispatcher's token: reading and writing tickets, comments, projects and
+documents. The grant cannot hold part of a server. The six diff tools that write are taken
+away by piece 5 instead (Step 4). The diff tools that only read stay: `get_diff`,
+`list_diffs` and `get_diff_threads`.
+
 One more path adds tools. Any `mcp__` name in the first **active** repository entry's
 `allowedTools` joins the chat grant (`RunnerConfigBuilder.js:63-66`;
 `ChatRepositoryProvider.js:18-20`). First active, not first in the file: the dispatcher
 skips entries with `isActive` false (`EdgeWorker.js:274-290`), so retiring one promotes the
 next. Keep every entry free of them; `verify` checks the live order.
 
-### Step 4 — Deny secret-file reads in the role account's user settings (piece 5)
+### Step 4 — Deny secret-file reads and the tracker's diff writes in the role account's user settings (piece 5)
 
 A chat session's folder is a fresh directory, not a project (`ChatSessionHandler.js:427-432`).
 So the only settings file it loads is the role account's own `~/.claude/settings.json`
@@ -299,10 +328,24 @@ temp copies an installer writes beside that file while it runs (`~/.stage-e/env.
 `~/.stage-e/backups`, where the three writers copy a file before changing it. A `~/` rule
 matches under the home of the account the session runs as.
 
+**The last six rules are tool rules, not file rules (KIT-212).** Each names one of the
+tracker's diff tools that write: `mcp__linear__merge_diff`, `mcp__linear__submit_diff_review`,
+`mcp__linear__update_diff`, `mcp__linear__save_diff_comment`,
+`mcp__linear__resolve_diff_thread` and `mcp__linear__delete_diff_comment`. Merging and
+approving are a person's actions only, and no part of the pipeline reviews through the
+tracker. A deny rule is the only way to take these tools from a chat session, because the
+grant cannot hold part of a server (Step 3). On the Claude Code build the dispatcher runs,
+a rule naming one tool takes it out of the session's tool list and leaves the server's
+other tools. That was measured with a stand-in server, with no permission callback and with
+one that allows everything.
+
 **What they do not stop.** They block the `Read` tool. They do **not** stop the upload tool
 in `mcp__cyrus-tools`, which opens the file inside the dispatcher's own process
 (`cyrus-tools/index.js:107`). And they apply to **every** session the role account runs,
-coding and review too.
+coding and review too. The six tool rules close the tracker's path to a merge or an
+approval. A session holding a GitHub token with write access has a second path, through
+GitHub itself. The session's own grant and the repository's branch protection guard that
+one.
 
 ### Step 5 — Block the dispatcher's port from the network (piece 4)
 
@@ -587,10 +630,14 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `notifier-token-absent` | the notifier's token name is **not** in the dispatcher's env file |
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
-| `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file and backups folder included |
+| `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
+| `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
+
+On a fresh lane, `chat-tools` says `UNKNOWN` here, because no chat session has started yet,
+so `verify` exits 4. Run it again after the live check in Step 13. Good then: exit 0.
 
 `verify` cannot see the network from outside. `port-block` says the rule is loaded; card
 `CK-C4` is the proof that it works. `front-door` says the line is right; card `CK-C2`'s
@@ -697,6 +744,10 @@ deployment accepts the same list.
 
 ### Closed once applied, open until then
 
+- **The tracker's merge and review tools** (KIT-212). **Closed once piece 5's six tool
+  rules are merged and the dispatcher restarts when idle (card `CK-C5`); open until then.**
+  A session started before the merge keeps them until it ends. `chat-tools` measures the
+  newest chat session only.
 - **The dispatcher listening on every network interface** once `CYRUS_HOST_EXTERNAL=true`
   loads. **Closed once the Step 5 rule is applied and card CK-C4 passes; open until then.**
   No setting keeps the signature check and drops the every-interface listen.
@@ -723,8 +774,13 @@ These came out of reading the dispatcher's source for this build.
 - That a live chat session is fenced as measured, beyond the calls card `CK-C3` makes. It
   was measured once, on 2026-09-24 (KIT-196). Which read-only commands the SDK approves is
   the SDK's rule, not this kit's, and it can change with the SDK.
-- Whether the chat grant can name single tools of a server instead of the whole server
+- Whether a later dispatcher lets the chat grant hold part of a server. In 0.2.69 it
+  appends the whole server whatever the grant names (`ToolPermissionResolver.js:72-77`)
   (KIT-117).
+- That the tracker's hosted server lists the six diff tools for the dispatcher's token at
+  all. `chat-tools` reads the live list (KIT-212).
+- That a chat session refuses a call to a denied tool. The local test on the same build
+  measured the tool list, and made no model call (KIT-212).
 - Whether a sandboxed coding session can actually reach Slack with the chat token, through
   its shell or the injected server (KIT-157).
 - Whether the tool server's upload reads a file outside a session on a live dispatcher, and
