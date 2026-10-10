@@ -60,8 +60,15 @@ Never both on one ticket.
    It files the epic as `provenance:agent`, every child as `provenance:epic`, and makes the
    epic every child's parent.
 9. The job tells the idea where the result is, and closes the planning ticket.
-10. **You approve.** Moving the epic to the state the project maps to `ready` is the one
-    gesture that releases the tree. Then you delegate each child yourself.
+10. **You approve, then you release.** Move the epic to the state the project maps to
+    `ready`. That approves the tree. It releases the children only where the approve step
+    is installed and switched on (`docs/AUTONOMY.md`). That step is off by default, and then
+    the move starts nothing. You release each child yourself, by delegating it to the
+    agent, and a child only after the ones it depends on. The executor's summary says so
+    too (KIT-216). **Never delegate the epic itself.** Its session would try to build the
+    whole plan at once. And once the epic has a branch, the dispatcher cuts every child's
+    worktree from it (0.2.69, `GitService.js:296-316`), so each child's pull request is
+    stacked on the epic's.
 
 ## 3. Why routing is checked, and what happens when it goes wrong
 
