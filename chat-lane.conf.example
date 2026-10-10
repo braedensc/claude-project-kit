@@ -9,10 +9,10 @@
 #   python3 scripts/pipeline_chat_lane_setup.py verify        # after you apply them
 #
 # Every command checks this file first and reports EVERY bad value in one pass.
-# `compose` prints and `verify` reads. Three subcommands write, as the role
-# account, only when you run them: `merge --apply`, `env-names` and
-# `front-door --apply`. None of them restarts anything. The steps are in
-# docs/CHAT-LANE-OPERATOR.md.
+# `compose` prints and `verify` reads. Four subcommands write, as the role
+# account, only when you run them: `merge --apply`, `env-names`,
+# `front-door --apply` and `chat-rules --apply`. None of them restarts
+# anything. The steps are in docs/CHAT-LANE-OPERATOR.md.
 #
 # ---------------------------------------------------------------------------
 # WHAT THIS FILE IS, AND WHAT IT MAY NEVER BE
@@ -74,6 +74,15 @@ NOTIFIER_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
 # installers use.
 ROLE_ENV_FILE=~/.stage-e/env
 
+# Piece 8, the chat bot's rules (KIT-226). They hand every request to the
+# bridge, so leave this `off` until the bridge runs. While it is off, `verify`'s
+# chat-rules row says so and does not fail, and `chat-rules` refuses. Step 14
+# sets it to `on`. From then on a missing or changed rules file keeps `verify`
+# from passing, like any other piece.
+#
+# RULE: off or on. The default is off.
+CHAT_RULES=off
+
 # ---------------------------------------------------------------------------
 # OPTIONAL — the printed restarts and the front-door subcommand need these.
 # Leave one unset and every command that needs it prints
@@ -111,3 +120,17 @@ FRONT_DOOR_BIN=/opt/homebrew/bin/caddy
 #
 # RULE: `@` and then letters, digits, `_` or `-`.
 FRONT_DOOR_MATCHER=@dispatcher
+
+# Optional (KIT-226). The work teams the chat bot may file an idea in, comma-
+# separated. Piece 8's rules name them. Unset, the rules say "the work team for
+# that project" and tell the bot to ask when it cannot tell.
+#
+# RULE: team keys, capitals and digits, starting with a capital, like PROD.
+#IDEA_TEAM_KEYS=PROD
+
+# Optional. The health watch's status file, readable by the role account. Piece
+# 8's rules tell the chat bot to `cat` it when someone asks about a health
+# alert. Unset, the rules say "the status file the alert names".
+#
+# RULE: an absolute path.
+#HEALTH_STATUS_FILE=/Users/Shared/pipeline-health/status.json

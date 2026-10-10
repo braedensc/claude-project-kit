@@ -25,6 +25,9 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
               the four names into the dispatcher's env file. `--remove` takes them out.
     front-door piece 7: adds the Slack path to the front door's one allowlist line.
               Dry run by default; `--apply` writes; `--remove` takes the path off.
+    chat-rules piece 8 (KIT-226): writes the chat bot's rules where every chat session
+              reads them and nothing else does. Dry run by default; `--apply` writes.
+              Refuses until chat-lane.conf sets CHAT_RULES=on (Step 14).
     card      prints a checkpoint card: CK-C1 (create the chat app), CK-C2 (the front
               door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
               from a second device), CK-C5 (restart the dispatcher, only when it is
@@ -152,6 +155,7 @@ THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
 import argparse
 import contextlib
 import getpass
+import hashlib
 import inspect
 import io
 import json
@@ -172,7 +176,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # the two installers cannot disagree on any of them.
 from pipeline_stage_e_setup import _self_path as _stage_e_self_path  # noqa: E402
 from pipeline_stage_e_setup import (  # noqa: E402
-    ALREADY_DONE, BLOCKED, FAILED, UNKNOWN,
+    ALREADY_DONE, BLOCKED, FAILED, UNKNOWN, SKIPPED,
     EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED, EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED,
     REVIEW_BRIEF_FINGERPRINT, TRACKER_FENCE_SERVERS,
     _ACCOUNT_RE, _BLOB_RE, _CRED_PREFIXES, _ENV_NAME_RE, _RDNS_RE,
@@ -873,12 +877,15 @@ class ConfError(Exception):
 CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_CONFIG", "DISPATCHER_ENV_FILE", "FRONT_DOOR_HOST")
 CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
                  "DISPATCHER_PORT": DEFAULT_DISPATCHER_PORT,
-                 "ROLE_ENV_FILE": DEFAULT_ROLE_ENV_FILE}
+                 "ROLE_ENV_FILE": DEFAULT_ROLE_ENV_FILE,
+                 # Piece 8, the chat bot's rules (KIT-226): off until Step 14 turns them on.
+                 "CHAT_RULES": "off"}
 # Optional, and empty when unset (KIT-197). A printed command that needs one says
 # "not composed: set <KEY> in chat-lane.conf" instead of printing a placeholder; a
 # subcommand that needs one refuses, naming it.
 CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
-                 "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
+                 "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS",
+                 "HEALTH_STATUS_FILE")
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # What `front-door` needs, and what verify's front-door row needs.
 FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
@@ -974,6 +981,17 @@ def validate_conf(values):
     if conf["FRONT_DOOR_MATCHER"] and not _MATCHER_RE.match(conf["FRONT_DOOR_MATCHER"]):
         errors.append("FRONT_DOOR_MATCHER %r is not a named matcher: @ and then letters, "
                       "digits, _ or -" % conf["FRONT_DOOR_MATCHER"])
+    if conf.get("HEALTH_STATUS_FILE") and not conf["HEALTH_STATUS_FILE"].startswith("/"):
+        errors.append("HEALTH_STATUS_FILE must be an absolute path (got %r)"
+                      % conf["HEALTH_STATUS_FILE"])
+    bad_teams = [t for t in idea_team_keys(conf) if not _TEAM_KEY_RE.match(t)]
+    if bad_teams:
+        errors.append("IDEA_TEAM_KEYS names %s, which %s not a team key: capitals and "
+                      "digits, starting with a capital, like PROD"
+                      % (", ".join(bad_teams), "is" if len(bad_teams) == 1 else "are"))
+    if conf.get("CHAT_RULES") not in ("off", "on"):
+        errors.append("CHAT_RULES is off or on: off until Step 14, once the bridge runs "
+                      "(got %r)" % conf.get("CHAT_RULES"))
     role_env = conf.get("ROLE_ENV_FILE") or ""
     if not role_env.startswith(("/", "~/")) or role_env in ("/", "~/"):
         errors.append("ROLE_ENV_FILE must be an absolute path, or start with ~/ for the role "
@@ -1016,10 +1034,10 @@ def cmd_compose(conf, conf_path="chat-lane.conf", piece=None):
     say(" Chat lane — every piece, composed for you to apply")
     say(rule)
     say(" conf: %s    dispatcher source read: %s" % (conf_path, SOURCE_VERSION))
-    para("This command read no live file and changed nothing. Three subcommands write pieces "
-         "1, 2, 3, 5 and 7 for you, as the role account, when you run them: merge, env-names "
-         "and front-door. The rest is yours by hand. Apply everything in the order at the "
-         "end, then run:  python3 %s verify" % _self_path(), " ")
+    para("This command read no live file and changed nothing. Four subcommands write pieces "
+         "1, 2, 3, 5, 7 and 8 for you, as the role account, when you run them: merge, "
+         "env-names, front-door and chat-rules. The rest is yours by hand. Apply everything "
+         "in the order at the end, then run:  python3 %s verify" % _self_path(), " ")
     say("")
     _compose_warning()
     for n in sorted(COMPOSE_PIECES):
@@ -1361,9 +1379,122 @@ def _compose_piece_7(conf):
     say("")
 
 
+# -- Piece 8 -----------------------------------------------------------------
+# THE CHAT BOT'S RULES (KIT-226). The dispatcher's own Slack prompt tells a chat session
+# to create an issue and assign it to itself, and that the assignment "kicks off work"
+# (SlackChatAdapter.js:156-170, the same in 0.2.69 and 0.2.73). Here the dispatcher starts
+# work only for the owner, so that starts nothing, and the bot would say it had. These
+# rules replace it: file one idea, then hand the request to the bridge in one line.
+CHAT_WORKSPACES = "slack-workspaces"
+CHAT_RULES_FILE = "CLAUDE.md"
+_TEAM_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
+CHAT_RULES_TEMPLATE = """# Rules for the tech lead in this Slack channel
+
+<!-- Written by the kit's chat-lane installer (piece 8, KIT-226). `verify` checks this
+file byte for byte. Do not edit it here: change the kit, then run `chat-rules --apply`. -->
+
+These rules override the "Orchestration Notes" in your system prompt. In this deployment
+you never start work yourself.
+
+## Who acts
+
+A separate job, the bridge, acts for the owner. It acts only after a workspace member
+answers `yes` to a question the bridge itself posts.
+
+You never move a ticket to another state. You never delegate or assign a ticket, approve
+one, merge, or add or remove a label. Never say you did any of these. Never say that work
+has started.
+
+## When someone asks for new work
+
+For example: "I want dark mode".
+
+1. Read enough of the code to describe the work well.
+2. File ONE idea in %(where)s. Put it in the Backlog state. Give it a clear title. In the
+   description, write the request in the member's own words, then what you learned from
+   the code. Leave it unassigned, with no delegate and no labels.
+3. Reply with exactly one line and nothing else: `plan <ticket id>`, for example
+   `plan PROD-123`.
+
+The bridge then asks the member to confirm. Planning starts only after their `yes`.
+
+## When a plan is ready
+
+The planner files the plan as an epic with child tickets. If a member wants it started,
+reply with exactly one line and nothing else: `approve <epic id>`. The bridge lists the
+children and asks them to confirm.
+
+## When a health alert fires
+
+The pipeline's own health watch posts it, not a person. When someone asks about one:
+
+1. Read the status file %(status)s. It holds each finding, and no credential.
+2. Explain each finding in plain words: what is wrong, what it affects, and what the
+   owner should run. A finding in the `unknown` state means it could not be checked, not
+   that something is down: say "could not check".
+   If the file's `written_at` is more than about two hours old, the watch itself has
+   stopped. Say that first, and do not trust the rest of the file.
+3. Print any fix that needs sudo, launchctl or an installer as a command line for the
+   owner. Never run it, and never say you did.
+
+If you cannot read the file, say so, and ask the owner to run
+`python3 scripts/pipeline_watch.py status` and paste what it prints.
+
+## When you are not sure
+
+Ask the member. Never guess a ticket id, and never file a second idea for the same request.
+"""
+
+
+def idea_team_keys(conf):
+    return [t for t in re.split(r"[,\s]+", (conf or {}).get("IDEA_TEAM_KEYS") or "") if t]
+
+
+def chat_rules_path(conf):
+    """Every chat thread's folder is <dispatcher home>/slack-workspaces/<thread>
+    (ChatSessionHandler.js:430), and the home is the folder that holds config.json
+    (ConfigService.js:13). Claude Code reads a CLAUDE.md from each folder above the one it
+    starts in, so a file here reaches every chat session, and no coding, planning or review
+    session (measured on the dispatcher's bundled CLI, 2.1.245, 2026-10-10)."""
+    return os.path.join(os.path.dirname(conf["DISPATCHER_CONFIG"]), CHAT_WORKSPACES,
+                        CHAT_RULES_FILE)
+
+
+def chat_rules_text(conf):
+    teams = idea_team_keys(conf)
+    where = ("the work team for that project: one of %s. If you cannot tell which, ask"
+             % ", ".join(teams) if teams else
+             "the work team for that project. If you cannot tell which, ask")
+    status = ("with `cat %s`" % conf["HEALTH_STATUS_FILE"]
+              if (conf or {}).get("HEALTH_STATUS_FILE") else "the alert names")
+    return CHAT_RULES_TEMPLATE % {"where": where, "status": status}
+
+
+def _compose_piece_8(conf):
+    say("PIECE 8 — THE CHAT BOT'S RULES (KIT-226)")
+    para("Where: %s, as %s. Every chat session reads it; no coding, planning or review "
+         "session does. Install it after the bridge (docs/BRIDGE-OPERATOR.md): the rules "
+         "hand every request to the bridge." % (chat_rules_path(conf), conf["ROLE_ACCOUNT"]))
+    say("")
+    for line in chat_rules_text(conf).splitlines():
+        say("    " + line)
+    say("")
+    para("Set CHAT_RULES=on in chat-lane.conf first. Until then verify's chat-rules row says "
+         "the rules are off and does not fail, and chat-rules refuses. Then chat-rules writes "
+         "it for you, as the role account, mode 600:  python3 %s chat-rules , then  "
+         "chat-rules --apply . From then on verify's chat-rules row checks it byte for byte."
+         % _self_path())
+    para("WHAT THIS DOES NOT STOP. These are instructions, not a guard. The dispatcher starts "
+         "work only when the owner delegates, and the bridge acts only on a member's yes to "
+         "its own question; those are what hold. A chat session cannot rewrite this file: "
+         "its grant has no Write or Edit, and its shell runs read-only commands only (card "
+         "CK-C3, KIT-196). verify still checks it byte for byte.")
+    say("")
+
+
 COMPOSE_PIECES = {1: _compose_piece_1, 2: _compose_piece_2, 3: _compose_piece_3,
                   4: _compose_piece_4, 5: _compose_piece_5, 6: _compose_piece_6,
-                  7: _compose_piece_7}
+                  7: _compose_piece_7, 8: _compose_piece_8}
 
 
 # -- Order -------------------------------------------------------------------
@@ -1399,6 +1530,9 @@ def _compose_order(conf):
         "private channel and invite the bot.",
         "10. %s verify" % me,
         "11. Card CK-C3: the live check, in the channel.",
+        "12. Once the bridge runs (docs/BRIDGE-OPERATOR.md), piece 8, the chat bot's rules: "
+        "set CHAT_RULES=on in chat-lane.conf, then  %s chat-rules , then  chat-rules "
+        "--apply ." % me,
         "To turn the lane off later: card CK-C6.",
     )
     for step in steps:
@@ -1966,8 +2100,19 @@ def front_door(path, matcher):
              for i, line in enumerate(text.split("\n")) if head.match(line)]
     return {"path": path, "sha256": digest(raw), "candidates": found[:50]}
 
+def chat_rules(config_path):
+    # The chat bot's rules (KIT-226), beside every chat thread's folder.
+    path = os.path.join(os.path.dirname(config_path), "slack-workspaces", "CLAUDE.md")
+    if os.path.islink(path):
+        return {"path": path, "error": "a symbolic link"}
+    try:
+        raw = raw_of(path)
+    except Exception as exc:
+        return {"path": path, "error": why(exc)}
+    return {"path": path, "sha256": digest(raw)}
+
 out = {"config": config(sys.argv[1]), "env": env(sys.argv[2]),
-       "userSettings": user_settings()}
+       "userSettings": user_settings(), "chatRules": chat_rules(sys.argv[1])}
 if len(sys.argv) > 5:
     out["frontDoor"] = front_door(sys.argv[4], sys.argv[5])
 print(json.dumps(out))
@@ -2433,6 +2578,40 @@ def check_user_settings(conf, us, env_facts):
                 "%s carries every composed deny rule" % path)
 
 
+def check_chat_rules(conf, cr):
+    """KIT-226: the chat bot's rules, byte for byte what this checkout composes. Off until
+    Step 14 sets CHAT_RULES=on: the rules hand every request to the bridge, so they wait
+    for it, and a row that stayed BLOCKED until then would make BLOCKED the lane's normal
+    state and hide real drift behind it (review of KIT-226)."""
+    path = cr.get("path") or chat_rules_path(conf)
+    remedy = "run  chat-rules , then  chat-rules --apply  (once the bridge runs)"
+    err = cr.get("error")
+    if conf.get("CHAT_RULES") != "on":
+        return _row("chat-rules", SKIPPED,
+                    "chat rules: off (CHAT_RULES=off); Step 14 turns them on",
+                    [] if err == "missing" else
+                    ["note: %s is there anyway. Every chat session reads it, and this row "
+                     "does not check it while CHAT_RULES=off" % path])
+    if err == "missing":
+        return _row("chat-rules", BLOCKED,
+                    "no chat rules at %s, so chat sessions follow the dispatcher's own "
+                    "prompt, which tells them to assign work to themselves" % path, [remedy])
+    if err == "a symbolic link":
+        return _row("chat-rules", FAILED, "%s is a symbolic link; the rules must be a plain "
+                    "file the role account owns" % path, [remedy + " after removing it"])
+    if err:
+        return _row("chat-rules", UNKNOWN, "%s is %s" % (path, err))
+    want = hashlib.sha256(chat_rules_text(conf).encode("utf-8")).hexdigest()
+    if cr.get("sha256") != want:
+        return _row("chat-rules", FAILED,
+                    "%s is not what this checkout composes: the kit changed the rules, or "
+                    "someone edited the file" % path,
+                    [remedy + " to put them back",
+                     "if nobody here changed them, find out who did: every chat session "
+                     "reads this file"])
+    return _row("chat-rules", ALREADY_DONE, "%s is what this checkout composes" % path)
+
+
 def check_front_door(conf, fd):
     """The front door's allowlist line, read as the role account (KIT-197). `fd` is
     `front_door_digest`'s answer. The Slack path and the tracker path on the one line is
@@ -2488,6 +2667,7 @@ def check_front_door(conf, fd):
 
 CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env", "ip-validation-off",
           "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings",
+          "chat-rules",
           "front-door")
 
 
@@ -2514,6 +2694,7 @@ def evaluate(facts, conf, pf=None):
         rows.append(check_notifier_absent(conf, env_facts))
         rows.append(check_hosted_keys_absent(env_facts))
         rows.append(check_user_settings(conf, us, env_facts))
+        rows.append(check_chat_rules(conf, facts.get("chatRules") or {"error": "missing"}))
         rows.append(check_front_door(conf, front_door_digest(facts.get("frontDoor"),
                                                              conf.get("FRONT_DOOR_MATCHER"))))
     rows.append(check_port_block(conf, pf, env_facts) if pf is not None else
@@ -2522,9 +2703,9 @@ def evaluate(facts, conf, pf=None):
     return sorted(rows, key=lambda r: order.get(r["check"], len(CHECKS)))
 
 
-_SEVERITY = (FAILED, UNKNOWN, BLOCKED, ALREADY_DONE)
+_SEVERITY = (FAILED, UNKNOWN, BLOCKED, ALREADY_DONE, SKIPPED)
 _VERIFY_EXIT = {FAILED: EX_FAILED, UNKNOWN: EX_UNKNOWN, BLOCKED: EX_BLOCKED,
-                ALREADY_DONE: EX_OK}
+                ALREADY_DONE: EX_OK, SKIPPED: EX_OK}
 
 
 def worst_exit(rows):
@@ -3068,8 +3249,52 @@ except OSError as exc:
     stop(1, "%s: %s. Nothing more was written." % (exc.strerror, exc.filename))
 '''
 
+CHAT_RULES_WRITER_PY = r'''
+# CHAT-RULES-WRITER (KIT-226): the chat bot's rules, written as the role account.
+import hashlib, os, sys
+
+def say(msg):
+    print(msg)
+    sys.stdout.flush()
+
+def stop(code, msg):
+    say(("REFUSED: " if code == 3 else "FAILED: ") + msg)
+    sys.exit(code)
+
+def main():
+    path = sys.argv[1]
+    data = sys.stdin.buffer.read()
+    if not data:
+        stop(2, "no rules arrived on standard input. Nothing was written.")
+    folder = os.path.dirname(path)
+    if os.path.islink(folder) or (os.path.lexists(folder) and not os.path.isdir(folder)):
+        stop(3, "%s is not a plain folder. Nothing was written." % folder)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if os.path.islink(path) or (os.path.lexists(path) and not os.path.isfile(path)):
+        stop(3, "%s is not a plain file. Nothing was written." % path)
+    if os.path.isfile(path):
+        with open(path, "rb") as fh:
+            if fh.read() == data:
+                say("UNCHANGED %s is already these rules. Nothing was written." % path)
+                sys.exit(9)
+    tmp = "%s.chat-lane.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    say("WROTE     %s, mode 600, sha256 %s" % (path, hashlib.sha256(data).hexdigest()))
+    sys.exit(0)
+
+try:
+    main()
+except OSError as exc:
+    stop(1, "%s: %s. Nothing more was written." % (exc.strerror, exc.filename))
+'''
+
 # The programs the write scan exempts, by exact text.
-WRITER_PROGRAMS = (MERGE_WRITER_PY, ENV_WRITER_SH, FRONT_WRITER_PY)
+WRITER_PROGRAMS = (MERGE_WRITER_PY, ENV_WRITER_SH, FRONT_WRITER_PY, CHAT_RULES_WRITER_PY)
 
 
 def merge_writer_command(conf):
@@ -3089,11 +3314,16 @@ def front_door_writer_command(conf):
                                              shlex.quote(conf["FRONT_DOOR_BIN"]))
 
 
+def chat_rules_writer_command(conf):
+    return "/usr/bin/python3 -c %s %s" % (shlex.quote(CHAT_RULES_WRITER_PY),
+                                          shlex.quote(chat_rules_path(conf)))
+
+
 def _role_write(runner, account, script, stdin, what, secret=False):
-    """THE ONE WRITE SEAM. Every write this file makes is one of the three writer programs,
-    run as the role account, reached only from `merge --apply`, `env-names` and
-    `front-door --apply` — subcommands a person runs, each of which has already refused an
-    agent environment. `--selftest` checks nothing else in the file asks for a write."""
+    """THE ONE WRITE SEAM. Every write this file makes is one of the four writer programs,
+    run as the role account, reached only from `merge --apply`, `env-names`,
+    `front-door --apply` and `chat-rules --apply` — subcommands a person runs, each of
+    which has already refused an agent environment. `--selftest` checks nothing else in the file asks for a write."""
     runner.dry_run = False
     return runner.as_role(account, script, stdin=stdin, why=what, secret_stdin=secret)
 
@@ -3336,6 +3566,70 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
     para("The dispatcher reloads its config on a change (ConfigManager.js:51-62): its log "
          "says \"Config file changed, reloading...\". Nothing was restarted.", "")
     return worst_exit(rows)
+
+
+# --------------------------------------------------------------------------- #
+# chat-rules — piece 8 (KIT-226).
+# --------------------------------------------------------------------------- #
+def cmd_chat_rules(conf, runner, sudo, apply_it=False):
+    found = agent_env_markers_present()
+    if found:
+        say(refusal_text(found, "chat-rules"))
+        return EX_REFUSED
+    if conf.get("CHAT_RULES") != "on":
+        say("REFUSED: chat-rules needs CHAT_RULES=on in chat-lane.conf, and it is off. Step "
+            "14 turns it on, once the bridge runs. Nothing was read or changed. To read the "
+            "rules first:  python3 %s compose --piece 8" % _self_path())
+        return EX_USAGE
+    account, path, text = conf["ROLE_ACCOUNT"], chat_rules_path(conf), chat_rules_text(conf)
+    say("Chat-lane chat-rules — %s" % ("APPLY" if apply_it else
+                                       "DRY RUN: nothing will be changed"))
+    say("  Piece 8, the chat bot's rules: %s, as %s (sha256 %s…)."
+        % (path, account, hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]))
+    sudo.acquire("`chat-rules` reads the chat bot's rules as the %s role account%s."
+                 % (account, ", and writes them as that account" if apply_it
+                    else ", and changes nothing"), _resume("chat-rules", apply_it))
+    facts, why_not = probe_facts(runner, conf)
+    if facts is None:
+        say("NOT MEASURED: the read-only probe as %s did not run (%s). Nothing was changed."
+            % (account, why_not))
+        return EX_UNKNOWN
+    row = check_chat_rules(conf, facts.get("chatRules") or {"error": "missing"})
+    if row["outcome"] == ALREADY_DONE:
+        say("UNCHANGED %s is already what this checkout composes. Nothing was written." % path)
+        print_rows([row])
+        return EX_OK
+    if row["outcome"] == UNKNOWN:
+        print_rows([row])
+        return worst_exit([row])
+    if not apply_it:
+        print_rows([row])
+        say("DRY RUN: nothing was changed. Run it again with --apply to write it, as %s."
+            % account)
+        return EX_BLOCKED
+    res = _role_write(runner, account, chat_rules_writer_command(conf), text,
+                      "write the chat bot's rules to %s, as %s" % (path, account))
+    _relay(res)
+    if res.rc == 9:
+        return EX_OK
+    if res.rc == 3:
+        return EX_REFUSED
+    if not res.ok:
+        say("FAILED: the writer exited %d." % res.rc)
+        return EX_FAILED
+    again, why_not = probe_facts(runner, conf)
+    if again is None:
+        say("NOT MEASURED after the write: the probe as %s did not run (%s)."
+            % (account, why_not))
+        return EX_UNKNOWN
+    row = check_chat_rules(conf, again.get("chatRules") or {"error": "missing"})
+    say("")
+    say("-- the row, read again as verify reads it --")
+    print_rows([row])
+    say("")
+    para("A chat session reads the rules when it starts. Nothing was restarted, and none "
+         "needs to be.", "")
+    return worst_exit([row])
 
 
 # --------------------------------------------------------------------------- #
@@ -3591,11 +3885,12 @@ def cmd_front_door(conf, runner, sudo, apply_it=False, remove=False):
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
-WRITING_COMMANDS = ("merge", "env-names", "front-door")
+WRITING_COMMANDS = ("merge", "env-names", "front-door", "chat-rules")
 # The flags each command takes. Anything else is a usage error, so `merge --remove` cannot
 # be read as a command that removed something.
 _FLAGS = {"compose": (), "verify": (), "card": (), "merge": ("apply",),
-          "env-names": ("remove",), "front-door": ("apply", "remove")}
+          "env-names": ("remove",), "front-door": ("apply", "remove"),
+          "chat-rules": ("apply",)}
 
 
 def build_parser():
@@ -3607,9 +3902,9 @@ def build_parser():
                    + list(WRITING_COMMANDS))
     p.add_argument("target", nargs="?", help="a CK-id for `card`")
     p.add_argument("--conf", default="chat-lane.conf")
-    p.add_argument("--piece", type=int, help="compose: print one piece (1 to 7) alone")
+    p.add_argument("--piece", type=int, help="compose: print one piece (1 to 8) alone")
     p.add_argument("--apply", action="store_true",
-                   help="merge, front-door: write (the default is a dry run)")
+                   help="merge, front-door, chat-rules: write (the default is a dry run)")
     p.add_argument("--remove", action="store_true",
                    help="env-names, front-door: take the chat lane's names, or path, out")
     p.add_argument("--selftest", action="store_true")
@@ -3669,6 +3964,8 @@ def main(argv=None, runner=None, sudo=None):
             return cmd_verify(conf, runner, sudo)
         if args.command == "merge":
             return cmd_merge(conf, runner, sudo, args.apply)
+        if args.command == "chat-rules":
+            return cmd_chat_rules(conf, runner, sudo, args.apply)
         if args.command == "env-names":
             return cmd_env_names(conf, runner, sudo, args.remove,
                                  sys.stdin.isatty() and sys.stdout.isatty())
@@ -4165,7 +4462,7 @@ def _selftest_body():
         env_path = os.path.join(tmp, "dispatcher", ".env")
         front_path = os.path.join(tmp, "front", "Caddyfile")
         vconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
-                     FRONT_DOOR_CONFIG=front_path)
+                     FRONT_DOOR_CONFIG=front_path, CHAT_RULES="on")
         _put(front_path, FRONT_DOOR_FIXTURE.replace("/extra-path", "/slack-webhook"))
         review_brief = REVIEW_BRIEF_FINGERPRINT + ". More."
         planning_brief = PLANNING_BRIEF_FINGERPRINT + ". More."
@@ -4199,10 +4496,17 @@ def _selftest_body():
             return json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
                                "permissions": {"deny": deny}})
 
-        def probe(config_obj, env_text, settings_text):
+        def probe(config_obj, env_text, settings_text, rules=True):
             _put(cfg_path, json.dumps(config_obj) if not isinstance(config_obj, str)
                  else config_obj)
             _put(env_path, env_text)
+            # The chat bot's rules (KIT-226), as chat-rules --apply leaves them, or none.
+            rules_path = os.path.join(os.path.dirname(cfg_path), "slack-workspaces",
+                                      "CLAUDE.md")
+            if rules:
+                _put(rules_path, chat_rules_text(vconf))
+            elif os.path.exists(rules_path):
+                os.unlink(rules_path)
             spath = os.path.join(home, ".claude", "settings.json")
             if settings_text is None:
                 if os.path.exists(spath):
@@ -4228,12 +4532,12 @@ def _selftest_body():
                        "JSON line (%d bytes)" % len(ran.stdout))
                 return {}
 
-        def verify_with(ran, **pf):
+        def verify_with(ran, vc=None, **pf):
             fake = _FakeRunner([("/usr/bin/python3 -c", ran.returncode, ran.stdout,
                                  ran.stderr)] + _pf_answers(**pf))
             fakes.append(fake)
             sudo = _FakeSudo()
-            rc_v, printed = _capture(cmd_verify, vconf, fake, sudo)
+            rc_v, printed = _capture(cmd_verify, vc or vconf, fake, sudo)
             outputs.append(printed)
             return rc_v, printed, fake, sudo
 
@@ -4261,6 +4565,18 @@ def _selftest_body():
         expect("entry-kinds", kinds == {"coding-a": "coding", "coding-b": "coding",
                                         "reviews-a": "review",
                                         "stage-a-planning-plan": "planning"}, kinds)
+
+        # No rules file yet. CHAT_RULES=off, the default until Step 14, keeps verify clean
+        # and says so by name; on, the same lane is not clean (review of KIT-226).
+        ran = probe(good_config(), good_env(), good_settings, rules=False)
+        for value, want_rc, needle in (
+                ("off", EX_OK, "chat rules: off (CHAT_RULES=off); Step 14 turns them on"),
+                ("on", EX_BLOCKED, "no chat rules at")):
+            rc_v, printed, _f, _s = verify_with(ran, dict(vconf, CHAT_RULES=value))
+            flat_v = " ".join(printed.split())
+            expect("verify-chat-rules-%s-with-no-file" % value, rc_v == want_rc
+                   and needle in flat_v and ("No drift" in flat_v) == (value == "off"),
+                   (rc_v, printed[-900:]))
 
         # grant mismatch
         cfg_m = good_config()
@@ -4771,13 +5087,14 @@ def _selftest_body():
     # …and the seam is reached from the three writing subcommands and from nowhere else:
     # once from merge and front-door, twice from env-names (its set and its --remove).
     callers = {fn.__name__: inspect.getsource(fn).count("_role_write(")
-               for fn in (cmd_merge, cmd_env_names, cmd_front_door)}
-    expect("write-seam-callers", above_scan.count("_role_write(") == 4
-           and callers == {"cmd_merge": 1, "cmd_env_names": 2, "cmd_front_door": 1},
+               for fn in (cmd_merge, cmd_env_names, cmd_front_door, cmd_chat_rules)}
+    expect("write-seam-callers", above_scan.count("_role_write(") == 5
+           and callers == {"cmd_merge": 1, "cmd_env_names": 2, "cmd_front_door": 1,
+                           "cmd_chat_rules": 1},
            (above_scan.count("_role_write("), callers))
     expect("write-seam-callers-refuse-agents", all(
         "agent_env_markers_present()" in inspect.getsource(fn)
-        for fn in (cmd_merge, cmd_env_names, cmd_front_door)))
+        for fn in (cmd_merge, cmd_env_names, cmd_front_door, cmd_chat_rules)))
     for tok in WRITE_TOKENS:
         expect("no-write-token:" + tok, tok not in above_scan,
                "the non-test source holds %r" % tok)
@@ -4792,6 +5109,9 @@ def _selftest_body():
 
     # -- KIT-197: the owner-run writers, the printed commands, the front-door row -----
     _selftest_kit197(expect, conf)
+
+    # -- KIT-226: the chat bot's rules file ---------------------------------------
+    _selftest_kit226(expect, conf)
 
     if failures:
         for f in failures:
@@ -5039,6 +5359,176 @@ def _value_commands(script):
     return words
 
 
+def _selftest_kit226(expect, conf):
+    """The chat bot's rules (KIT-226): composed from the conf, written as the role account
+    through the one write seam, and read back by verify. A crash is a failed case."""
+    try:
+        _selftest_kit226_body(expect, conf)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
+        expect("crashed:kit226", False, "%s: %s" % (type(exc).__name__, str(exc)[:400]))
+
+
+def _selftest_kit226_body(expect, conf):
+    path = chat_rules_path(conf)
+    expect("chat-rules-sit-above-every-chat-thread",
+           path == os.path.join(os.path.dirname(conf["DISPATCHER_CONFIG"]), "slack-workspaces",
+                                "CLAUDE.md"), path)
+    text = chat_rules_text(conf)
+    for needle in ("`plan <ticket id>`", "`approve <epic id>`", "Backlog", "the bridge",
+                   "You never move a ticket", "Never say you did", "Orchestration Notes",
+                   "nothing else"):
+        expect("chat-rules-say:" + needle, needle in text, text[:300])
+    for needle in ("When a health alert fires", "Never run it", "pipeline_watch.py status",
+                   "could not check", "written_at"):
+        expect("chat-rules-say:" + needle, needle in text, text[-600:])
+    healthy = chat_rules_text(dict(conf, HEALTH_STATUS_FILE="/srv/health/status.json"))
+    expect("chat-rules-name-the-status-file-when-set",
+           "`cat /srv/health/status.json`" in healthy and "/srv/health" not in text,
+           healthy[-600:])
+    _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0],
+                                  HEALTH_STATUS_FILE="relative/status.json"))
+    expect("conf-HEALTH_STATUS_FILE-absolute", any("HEALTH_STATUS_FILE" in e for e in errs),
+           errs)
+    teamed = chat_rules_text(dict(conf, IDEA_TEAM_KEYS="PROD,TOD"))
+    expect("chat-rules-name-the-idea-teams-when-set",
+           "one of PROD, TOD." in teamed and "one of" not in text, teamed[:300])
+    _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0], IDEA_TEAM_KEYS="prod,TOD"))
+    expect("conf-IDEA_TEAM_KEYS-checked", any("IDEA_TEAM_KEYS" in e for e in errs), errs)
+    # CHAT_RULES: off until Step 14 turns the rules on (review of KIT-226).
+    expect("conf-CHAT_RULES-default-off", conf.get("CHAT_RULES") == "off",
+           conf.get("CHAT_RULES"))
+    _v, errs = parse_conf(GOOD_CONF_TEXT + "CHAT_RULES=on\n")
+    expect("conf-CHAT_RULES-known", not errs, errs)
+    _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0], CHAT_RULES="yes"))
+    expect("conf-CHAT_RULES-checked", any("CHAT_RULES" in e for e in errs), errs)
+    on, off = dict(conf, CHAT_RULES="on"), dict(conf, CHAT_RULES="off")
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    for name, facts, want in (("missing", {"path": path, "error": "missing"}, BLOCKED),
+                              ("current", {"path": path, "sha256": sha}, ALREADY_DONE),
+                              ("changed", {"path": path, "sha256": "0" * 64}, FAILED),
+                              ("link", {"path": path, "error": "a symbolic link"}, FAILED),
+                              ("unreadable", {"path": path, "error": "unreadable"}, UNKNOWN)):
+        row = check_chat_rules(on, facts)
+        expect("chat-rules-row:" + name, row["outcome"] == want, row)
+    for name, facts in (("missing", {"path": path, "error": "missing"}),
+                        ("present", {"path": path, "sha256": "0" * 64})):
+        row = check_chat_rules(off, facts)
+        expect("chat-rules-row-off:" + name, row["outcome"] == SKIPPED
+               and worst_exit([row]) == EX_OK
+               and row["detail"] == "chat rules: off (CHAT_RULES=off); Step 14 turns them on"
+               and bool(row["lines"]) == (name == "present")
+               and all(path in line for line in row["lines"]), row)
+    for c, want in ((on, BLOCKED), (off, SKIPPED)):
+        expect("chat-rules-is-a-verify-row:" + c["CHAT_RULES"], "chat-rules" in CHECKS and any(
+            r["check"] == "chat-rules" and r["outcome"] == want
+            for r in evaluate({"config": {"error": "missing"}}, c)))
+
+    # Piece 8 is composed like every other piece: `compose` prints it, rules and all.
+    rc, out = _capture(cmd_compose, conf)
+    p8 = out[out.find("PIECE 8 "):out.find("THE ORDER")]
+    flat8 = " ".join(p8.split())
+    expect("compose-prints-piece-8", rc == EX_OK and "PIECE 8 " in out
+           and "    # Rules for the tech lead in this Slack channel" in p8
+           and "WHAT THIS DOES NOT STOP" in p8 and "CHAT_RULES=on" in flat8, p8[:300])
+    order8 = " ".join(out[out.find("THE ORDER"):].split())
+    expect("compose-order-turns-chat-rules-on", "CHAT_RULES=on" in order8
+           and order8.find("CHAT_RULES=on") < order8.find("chat-rules --apply"), order8[-400:])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # verify's probe never reads through a link: one to the right bytes is still a
+        # link, so whoever controls its target never controls the rules (review of KIT-226).
+        lhome = os.path.join(tmp, "probe-link")
+        lcfg = os.path.join(lhome, "config.json")
+        bait = os.path.join(tmp, "bait.md")
+        _put(bait, text)
+        lrules = chat_rules_path(dict(on, DISPATCHER_CONFIG=lcfg))
+        os.makedirs(os.path.dirname(lrules))
+        os.symlink(bait, lrules)
+        ran = subprocess.run([sys.executable, "-c", FACTS_PY, lcfg,
+                              os.path.join(lhome, "dispatcher.env"), "3456"],
+                             capture_output=True, text=True, env=dict(os.environ, HOME=lhome))
+        try:
+            cr = json.loads(ran.stdout).get("chatRules") or {"error": "missing"}
+        except ValueError:
+            cr = {"error": "the probe printed no JSON"}
+        row = check_chat_rules(on, cr)
+        expect("chat-rules-probe-refuses-a-link",
+               (cr.get("error"), "sha256" in cr, row["outcome"])
+               == ("a symbolic link", False, FAILED), (cr, row, ran.stderr[-300:]))
+
+        def write(data, target):
+            r = subprocess.run(["/usr/bin/python3", "-c", CHAT_RULES_WRITER_PY, target],
+                               input=data.encode("utf-8"), stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT)
+            return r.returncode, r.stdout.decode("utf-8")
+        target = os.path.join(tmp, "home", "slack-workspaces", "CLAUDE.md")
+        rc, out = write(text, target)
+        with open(target, encoding="utf-8") as fh:
+            got = fh.read()
+        expect("chat-rules-writer-writes-it-private",
+               (rc, got == text, oct(os.stat(target).st_mode & 0o777), "WROTE" in out)
+               == (0, True, "0o600", True), out)
+        rc, out = write(text, target)
+        expect("chat-rules-writer-unchanged-is-9", (rc, "UNCHANGED" in out) == (9, True), out)
+        rc, out = write(text + "\nmore", target)
+        with open(target, encoding="utf-8") as fh:
+            expect("chat-rules-writer-replaces", rc == 0 and fh.read().endswith("more"), out)
+        victim = os.path.join(tmp, "victim")
+        _put(victim, "untouched")
+        os.makedirs(os.path.join(tmp, "l1", "slack-workspaces"))
+        os.symlink(victim, os.path.join(tmp, "l1", "slack-workspaces", "CLAUDE.md"))
+        rc, out = write(text, os.path.join(tmp, "l1", "slack-workspaces", "CLAUDE.md"))
+        with open(victim, encoding="utf-8") as fh:
+            expect("chat-rules-writer-refuses-a-link", (rc, fh.read()) == (3, "untouched"), out)
+        os.makedirs(os.path.join(tmp, "l2"))
+        os.makedirs(os.path.join(tmp, "real"))
+        os.symlink(os.path.join(tmp, "real"), os.path.join(tmp, "l2", "slack-workspaces"))
+        rc, out = write(text, os.path.join(tmp, "l2", "slack-workspaces", "CLAUDE.md"))
+        expect("chat-rules-writer-refuses-a-linked-folder",
+               (rc, os.listdir(os.path.join(tmp, "real"))) == (3, []), out)
+
+        # End to end, as the role account: dry run, apply, verify's row, apply again.
+        home = os.path.join(tmp, "role")
+        os.makedirs(home)
+        cyrus = os.path.join(home, "dispatcher-home")
+        rconf = dict(on, DISPATCHER_CONFIG=os.path.join(cyrus, "config.json"),
+                     DISPATCHER_ENV_FILE=os.path.join(cyrus, "dispatcher.env"))
+        rpath = chat_rules_path(rconf)
+        mach = _RoleMachine(home, _pf_answers())
+        for apply_it in (False, True):
+            sudo = _FakeSudo()
+            rc, out = _capture(cmd_chat_rules, dict(rconf, CHAT_RULES="off"), mach, sudo,
+                               apply_it)
+            expect("chat-rules-refuses-while-off:%s" % ("apply" if apply_it else "dry-run"),
+                   (rc, os.path.exists(rpath), sudo.acquisitions, mach.role_runs)
+                   == (EX_USAGE, False, 0, []) and "CHAT_RULES=on" in out, out)
+        rc, out = _capture(cmd_chat_rules, rconf, mach, _FakeSudo(), False)
+        expect("chat-rules-dry-run-writes-nothing",
+               (rc, os.path.exists(rpath), "DRY RUN" in out) == (EX_BLOCKED, False, True), out)
+        rc, out = _capture(cmd_chat_rules, rconf, mach, _FakeSudo(), True)
+        expect("chat-rules-apply-writes-as-the-role-and-reads-it-back",
+               rc == EX_OK and os.path.exists(rpath) and "chat-rules" in out
+               and "ALREADY-DONE" in out, out[-600:])
+        rc, out = _capture(cmd_chat_rules, rconf, mach, _FakeSudo(), True)
+        expect("chat-rules-apply-again-changes-nothing", rc == EX_OK and "UNCHANGED" in out,
+               out[-400:])
+        os.environ[AGENT_ENV_MARKERS[0]] = "1"
+        try:
+            rc, out = _capture(cmd_chat_rules, rconf, mach, _FakeSudo(), True)
+        finally:
+            os.environ.pop(AGENT_ENV_MARKERS[0], None)
+        expect("chat-rules-refuses-an-agent", rc == EX_REFUSED, out)
+
+    # Could not check is exit 4, never "run --apply", and nothing is written (KIT-226).
+    for apply_it in (False, True):
+        fake = _FakeRunner([("/usr/bin/python3 -c", 0, json.dumps(
+            {"chatRules": {"path": path, "error": "unreadable"}}), "")])
+        rc, out = _capture(cmd_chat_rules, on, fake, _FakeSudo(), apply_it)
+        expect("chat-rules-could-not-check-is-exit-4:%s" % ("apply" if apply_it else "dry-run"),
+               (rc, fake.writes, "DRY RUN: nothing was changed" in out)
+               == (EX_UNKNOWN, [], False), out)
+
+
 def _selftest_kit197(expect, conf):
     """The owner-run writers (merge, env-names, front-door), the printed commands filled from
     the conf, and verify's front-door row. Each group records a crash as a failed case rather
@@ -5109,9 +5599,9 @@ def _selftest_kit197(expect, conf):
         with tempfile.TemporaryDirectory() as tmp:
             cpath = os.path.join(tmp, "chat-lane.conf")
             _put(cpath, GOOD_CONF_TEXT)
-            for n in range(1, 8):
+            for n in range(1, 9):
                 rc, out = _capture(main, ["compose", "--piece", str(n), "--conf", cpath])
-                others = [m for m in range(1, 8) if m != n and ("PIECE %d " % m) in out]
+                others = [m for m in range(1, 9) if m != n and ("PIECE %d " % m) in out]
                 if n == 4:
                     expect("compose-piece-4-is-only-the-script",
                            rc == EX_OK and out == "\n".join(pf_install_commands("3456")) + "\n"
