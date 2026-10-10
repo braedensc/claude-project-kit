@@ -188,6 +188,15 @@ What it does, in order:
    - **The plan kind.** If a planned repository's `delivery.json` does not switch plans on,
      it shows the change, opens the pull request **as you**, and waits for you to merge
      it. If the repository's checks ask for the guard-change label, you add it.
+
+     Before it opens anything, it checks the change against the repository's **own** copy
+     of the schema, `schemas/delivery.schema.json` on its default branch. That copy is what
+     the repository's CI checks against. A copy from an older kit may not know
+     `findingTicket`. Then the step stops before any pull request, with card `CA-SCHEMA`,
+     and names the fields the copy does not know. Bring that copy and the section 1 rows
+     of the repository's `docs/PIPELINE-CONTRACT.md` up to the kit's (`/sync-kit` there
+     does it), merge, and run the one command again. A copy it cannot read stops the step
+     as could not look, not as clean.
    - **The key.** By default the planner reuses the key the review jobs already store, so
      nothing is asked. With `LINEAR_KEY_FILE=.stage-a/env`, it asks once for a key of the
      planner's own.
@@ -231,6 +240,7 @@ What is still yours, at most:
 | Once | Type your Mac password. |
 | First run, if the key is not stored yet | Paste your Linear key at a hidden prompt. |
 | Each planned repository | Merge the pull request it opened (and add the guard-change label if the checks ask). |
+| A repository whose schema copy is older than the kit's | Bring its schema and contract up to the kit's first (card `CA-SCHEMA`). |
 | Before each change | Type `y`, or `yes` where it asks for the word. |
 | The probe | Answer the agent-guidance question, and any question about a tool list it could not measure. |
 | At the end | Plan two test ideas and one real idea, then sign `CA-LANE` (the card lists them). |
