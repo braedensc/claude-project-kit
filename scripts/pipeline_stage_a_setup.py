@@ -473,7 +473,9 @@ PLANNING_BRIEF_REQUIRED = (
     "Emit no telemetry block",               # the executor would read it as a question
     "approves nothing",
     "`Delivery order`",                      # the plan says the merge order (KIT-233)
+    "they should merge, and why",            # ... and the reason for it
     "what it takes from the children before it",   # each child knows its place
+    "what the children after it rely on",    # ... and what later children assume
 )
 # Phrases the brief must never carry again: each one described a lane that does
 # not exist.
@@ -6795,7 +6797,8 @@ def selftest():
         "only one `track:*` and one `effort:*`", "adds `provenance:epic` itself",
         "Guard change: needs the owner's acknowledgement.", "duplicate-check pass",
         "Emit no telemetry block", "approves nothing",
-        "`Delivery order`", "what it takes from the children before it")
+        "`Delivery order`", "they should merge, and why",
+        "what it takes from the children before it", "what the children after it rely on")
     for phrase in required_literals:
         check("brief-carries:%s" % phrase, phrase in PLANNING_BRIEF, True)
     check("brief-required-tuple-matches-literals", PLANNING_BRIEF_REQUIRED, required_literals)
