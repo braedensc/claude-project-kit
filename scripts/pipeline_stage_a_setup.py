@@ -400,10 +400,14 @@ PLANNING_BRIEF = (
     "finding against you.\n\n"
     "WHAT YOU RUN. First a PRD read out of the real code: current behaviour with a "
     "file path behind every claim, the problem, the change, non-goals, risks, rollout "
-    "and open questions. Then the decomposition into child tickets, each a vertical "
-    "slice that ships and reviews on its own, with the five sections of the "
+    "and open questions, and a `Delivery order` section: the children in the order "
+    "they should merge, and why. Then the decomposition into child tickets, each a "
+    "vertical slice that ships and reviews on its own, with the five sections of the "
     "repository's ticket template (Context, Acceptance criteria, Out of scope, Test "
-    "plan, Pointers; read `docs/TICKET-TEMPLATE.md` if it exists). Then four rubric "
+    "plan, Pointers; read `docs/TICKET-TEMPLATE.md` if it exists). Each child's "
+    "Context says what it takes from the children before it, and what the children "
+    "after it rely on: a coding session given that child alone must know what it may "
+    "assume exists. Then four rubric "
     "passes, each in a fresh helper session: architecture (fits how this code is "
     "built), security (authz, data exposure, input trust, secrets), ux-product (a "
     "usable slice per child; empty, error and loading states named) and sizing-split "
@@ -468,6 +472,8 @@ PLANNING_BRIEF_REQUIRED = (
     "duplicate-check pass",                  # a pass it cannot run, said aloud
     "Emit no telemetry block",               # the executor would read it as a question
     "approves nothing",
+    "`Delivery order`",                      # the plan says the merge order (KIT-233)
+    "what it takes from the children before it",   # each child knows its place
 )
 # Phrases the brief must never carry again: each one described a lane that does
 # not exist.
@@ -6788,7 +6794,8 @@ def selftest():
         "Put nothing after it", "pipeline-safe-outputs/1", "`ticket-comment`",
         "only one `track:*` and one `effort:*`", "adds `provenance:epic` itself",
         "Guard change: needs the owner's acknowledgement.", "duplicate-check pass",
-        "Emit no telemetry block", "approves nothing")
+        "Emit no telemetry block", "approves nothing",
+        "`Delivery order`", "what it takes from the children before it")
     for phrase in required_literals:
         check("brief-carries:%s" % phrase, phrase in PLANNING_BRIEF, True)
     check("brief-required-tuple-matches-literals", PLANNING_BRIEF_REQUIRED, required_literals)
