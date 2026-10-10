@@ -36,6 +36,10 @@ notifier.conf
 # chat-lane.conf.example is the committed one.
 chat-lane.conf
 
+# The review-and-update command's filled-in settings — same reasoning as
+# stage-e.conf. update.conf.example is the committed one.
+update.conf
+
 # Dependencies
 node_modules/
 
