@@ -27,6 +27,7 @@ to this very file.
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,6 +55,10 @@ HOOK = os.environ.get("HOOK_UNDER_TEST") or os.path.join(HOOKS_DIR, "pre-tool-us
 # this can never change what CI actually verifies.
 STOP_HOOK = os.environ.get("STOP_HOOK_UNDER_TEST") or os.path.join(
     HOOKS_DIR, "stop-pr-check.py")
+# session-start.py is NOT self-protected, so it is edited in place; this only lets a
+# candidate be pointed at like the other two.
+SESSION_START_HOOK = os.environ.get("SESSION_START_UNDER_TEST") or os.path.join(
+    HOOKS_DIR, "session-start.py")
 
 BLOCK, ALLOW = True, False
 
@@ -551,6 +556,67 @@ def make_worktree_sandbox():
     codename = root + "-codename"
     _git(root, "worktree", "add", "-q", "-b", "claude/wt-codename-ab12", codename)
     return root, hook_copy, sibling, codename
+
+
+# ── KIT-214: the desktop app's session layout ────────────────────────────────
+# From Claude Code 2.1.286 the desktop app hands hooks CLAUDE_PROJECT_DIR = the
+# repository's MAIN checkout (on `main`) while the session runs in a worktree. The
+# hooks therefore load from the main checkout, and the only value naming the
+# session's worktree that the model cannot move is the payload's `transcript_path`:
+# ~/.claude/projects/<launch dir, non-alphanumerics → "-">/<session>.jsonl.
+TX_BASE = os.path.join(tempfile.gettempdir(), "hook-battery-projects")
+
+
+def tx(launch_dir, session="battery-session"):
+    """The transcript path the harness would give a session launched in launch_dir."""
+    return os.path.join(TX_BASE, re.sub(r"[^a-zA-Z0-9]", "-", launch_dir), session + ".jsonl")
+
+
+def desk(payload, launch_dir, session="battery-session"):
+    """Mark a payload as coming from a desktop session launched in launch_dir."""
+    return {**payload, "transcript_path": tx(launch_dir, session)}
+
+
+def make_desktop_sandbox(extra_worktree_suffix=None):
+    """The 2.1.286+ desktop layout: the main checkout on `main` holds the hooks and is
+    CLAUDE_PROJECT_DIR; the session works in a linked worktree on a feature branch.
+    Also a codename worktree (naming guard) and, optionally, a worktree whose path
+    sanitizes to the SAME transcript folder name as the session's (ambiguity case).
+    Returns (main_root, pre_hook, stop_hook, wt, codename_wt, env)."""
+    root, hook_copy = make_sandbox("main")
+    wt = root + "-desk"
+    _git(root, "worktree", "add", "-q", "-b", "feat/desktop", wt)
+    codename_wt = root + "-deskcode"
+    _git(root, "worktree", "add", "-q", "-b", "claude/desk-codename-ab12", codename_wt)
+    if extra_worktree_suffix:
+        _git(root, "worktree", "add", "-q", "-b", "feat/collide", root + extra_worktree_suffix)
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": root,
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    stop_copy = os.path.join(root, ".claude", "hooks", "stop-pr-check.py")
+    return root, hook_copy, stop_copy, wt, codename_wt, env
+
+
+def make_desktop_stop_sandbox(list_json, view_json):
+    """Desktop layout for the Stop hook: the session's worktree is on a pushed feature
+    branch one commit AHEAD of main, with a mocked `gh`. Before KIT-214 the Stop hook
+    (rooted at the main checkout) saw `main` here and checked nothing."""
+    root, _hook, stop_copy, wt, _code, _env = make_desktop_sandbox()
+    _git(wt, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "--allow-empty", "-q", "-m", "ahead")
+    _git(root, "remote", "add", "origin", os.devnull)
+    _git(root, "update-ref", "refs/remotes/origin/main", "main")
+    _git(wt, "update-ref", "refs/remotes/origin/feat/desktop", "HEAD")
+    _git(root, "config", "branch.feat/desktop.remote", "origin")
+    _git(root, "config", "branch.feat/desktop.merge", "refs/heads/feat/desktop")
+    body = (
+        'case "$1 $2" in\n'
+        f"  'pr list') echo '{list_json}' ;;\n"
+        f"  'pr view') echo '{view_json}' ;;\n"
+        "  'repo view') echo 'main' ;;\n"
+        "esac"
+    )
+    env = _fake_gh(root, body)
+    return root, stop_copy, wt, env
 
 
 def make_stop_sandbox(list_json, view_json, repo_default="main", committed_cfg=None,
@@ -1122,6 +1188,18 @@ def main():
     feat_root, feat_hook = make_sandbox("feat/battery")
     codename_root, codename_hook = make_sandbox("claude/cool-jones-ab12cd")
     wt_root, wt_hook, wt_sibling, wt_codename = make_worktree_sandbox()
+    # KIT-214: the desktop layout (hooks + CLAUDE_PROJECT_DIR = main checkout on main;
+    # the session in a linked worktree), plus one whose extra worktree collides with
+    # the session's transcript folder name, so the match is ambiguous.
+    desk_root, desk_hook, _desk_stop, desk_wt, desk_code, desk_env = make_desktop_sandbox()
+    amb_root, amb_hook, _amb_stop, amb_wt, _amb_code, amb_env = make_desktop_sandbox(
+        extra_worktree_suffix=".desk")
+    dstop_nopr_root, dstop_nopr, dstop_nopr_wt, dstop_nopr_env = make_desktop_stop_sandbox(
+        "[]", "{}")
+    # A worktree deleted from disk but still listed by git (not yet pruned): a match
+    # on it must never become the root, or every guard reads an empty branch.
+    gone_root, gone_hook, _gone_stop, gone_wt, _gone_code, gone_env = make_desktop_sandbox()
+    shutil.rmtree(gone_wt)
     # Item-7 subagent env: the hook file lives in the PARENT checkout (wt_hook)
     # and CLAUDE_PROJECT_DIR points there — exactly what a subagent session in
     # its own SDK-created worktree inherits. The acting session is simulated by
@@ -1564,6 +1642,60 @@ def main():
         ("cwd in an UNRELATED repo cannot disarm the cross-worktree guard",
          sub(write(os.path.join(wt_sibling, "src/x.ts"), "x")), BLOCK, wt_hook,
          subagent_env, unrelated_root),
+
+        # ── KIT-214: a desktop worktree session (CLAUDE_PROJECT_DIR = the main
+        #    checkout on `main`, hooks loaded from there) is judged by the worktree its
+        #    TRANSCRIPT FOLDER names — one of this repo's own worktrees, exactly one
+        #    match, or the anchor as before. The first two FAILED on the pre-fix hook:
+        #    every desktop session was "cross-worktree" and "on main".
+        ("desktop session: Write into its OWN worktree allowed (KIT-214)",
+         desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt), ALLOW, desk_hook,
+         desk_env, desk_wt),
+        ("desktop session: git commit in its OWN worktree allowed (KIT-214)",
+         desk(bash("git commit -F /tmp/msg.txt"), desk_wt), ALLOW, desk_hook,
+         desk_env, desk_wt),
+        ("desktop session: Write into the MAIN checkout still blocked",
+         desk(write(os.path.join(desk_root, "src/x.ts"), "x"), desk_wt), BLOCK, desk_hook,
+         desk_env, desk_wt),
+        ("desktop session: Write into a SIBLING worktree still blocked",
+         desk(write(os.path.join(desk_code, "src/x.ts"), "x"), desk_wt), BLOCK, desk_hook,
+         desk_env, desk_wt),
+        ("desktop session on a claude/<codename> worktree: commit still blocked (naming)",
+         desk(bash("git commit -F /tmp/msg.txt"), desk_code), BLOCK, desk_hook,
+         desk_env, desk_code),
+        ("desktop session: a cd into the main checkout does not move the root",
+         desk(write(os.path.join(desk_root, "src/x.ts"), "x"), desk_wt), BLOCK, desk_hook,
+         desk_env, desk_root),
+        ("desktop session: after a cd, its own worktree is still its root",
+         desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt), ALLOW, desk_hook,
+         desk_env, desk_root),
+        ("transcript naming the MAIN checkout keeps the anchor (worktree Write blocked)",
+         desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_root), BLOCK, desk_hook,
+         desk_env, desk_wt),
+        ("no transcript_path keeps the anchor (worktree Write blocked)",
+         write(os.path.join(desk_wt, "src/x.ts"), "x"), BLOCK, desk_hook,
+         desk_env, desk_wt),
+        ("transcript of an UNRELATED repo's checkout keeps the anchor",
+         desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), unrelated_root), BLOCK,
+         desk_hook, desk_env, desk_wt),
+        ("transcript folder matching TWO worktrees keeps the anchor (ambiguous)",
+         desk(write(os.path.join(amb_wt, "src/x.ts"), "x"), amb_wt), BLOCK, amb_hook,
+         amb_env, amb_wt),
+        # …and BOTH colliding worktrees stay blocked, so a resolver that picked either
+        # one (rather than refusing the ambiguity) fails one of these two every time.
+        ("ambiguous transcript folder: the OTHER colliding worktree is blocked too",
+         desk(write(os.path.join(amb_root + ".desk", "src/x.ts"), "x"), amb_wt), BLOCK,
+         amb_hook, amb_env, amb_wt),
+        ("transcript folder over the harness's 200-char limit keeps the anchor",
+         {**write(os.path.join(desk_wt, "src/x.ts"), "x"),
+          "transcript_path": os.path.join(TX_BASE, "x" * 230, "s.jsonl")}, BLOCK,
+         desk_hook, desk_env, desk_wt),
+        ("transcript naming a DELETED (still listed) worktree keeps the anchor",
+         desk(write(os.path.join(gone_wt, "src/x.ts"), "x"), gone_wt), BLOCK, gone_hook,
+         gone_env, gone_root),
+        ("a subagent outside any repo falls back to the SESSION's worktree, not main",
+         sub(desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_wt)), ALLOW,
+         desk_hook, desk_env, nongit_dir),
 
         # ── self-protection: Claude can't edit the hooks that guard it ────────
         ("Edit pre-tool-use.py blocked (self-protect)",
@@ -2156,6 +2288,11 @@ def main():
          {}, BLOCK, stop_wtcfg, stop_wtcfg_env),
         ("stop: origin/HEAD's branch is a base without asking GitHub",
          {}, ALLOW, stop_ohead, stop_ohead_env),
+        # KIT-214: the hook lives in the main checkout (on main); the session's own
+        # worktree has a pushed branch with no PR. Pre-fix this ALLOWED silently: the
+        # hook judged the main checkout and checked nothing.
+        ("stop: desktop worktree session, pushed branch with NO PR blocks (KIT-214)",
+         {"transcript_path": tx(dstop_nopr_wt)}, BLOCK, dstop_nopr, dstop_nopr_env),
     ]
 
     # What the not-green messages SAY. The Stop hook is the enforcement — a session
@@ -2346,6 +2483,15 @@ def main():
         ("stderr reason: repointing origin/HEAD is the config anchor's",
          bash("git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/feat/other"),
          "rewrite a git ref", stack_hooks["feat"]),
+        # KIT-214: when the transcript names a launch folder that matches no worktree,
+        # the block must say the hook misjudged the session — a fault to report, not
+        # a change to retry or respell.
+        ("stderr reason: an unresolvable session root is named as a fault (KIT-214)",
+         desk(write(os.path.join(desk_wt, "src/x.ts"), "x"), desk_root + "-gone"),
+         "could not tell which worktree", desk_hook, desk_env, desk_wt),
+        ("stderr reason: the commit block carries the same note when unresolved",
+         desk(bash("git commit -F /tmp/msg.txt"), desk_root + "-gone"),
+         "tell the owner", desk_hook, desk_env, desk_wt),
     ]
     for _rc in reason_cases:
         name, payload, needle, hook_path = _rc[:4]
@@ -2354,6 +2500,69 @@ def main():
         failures += check_reason_on_stderr(name, payload, needle, hook_path=hook_path,
                                            env=_env, cwd=_cwd)
 
+    # KIT-214, contract §13: when the Stop hook cannot tell which worktree the session
+    # is in, it must say it checked nothing — once per session — rather than exit
+    # silently as if there were nothing to check.
+    seq_ran += 1
+    gone = desk(dict(), dstop_nopr_root + "-gone", session="unresolved-session")
+    u1 = run_stop_hook_json({**gone, "session_id": "unresolved-session"}, dstop_nopr,
+                            env=dstop_nopr_env)
+    u2 = run_stop_hook_json({**gone, "session_id": "unresolved-session"}, dstop_nopr,
+                            env=dstop_nopr_env)
+    ok = (u1.get("decision") != "block"
+          and "checked NOTHING this turn" in u1.get("systemMessage", "")
+          and u2 == {})
+    print(f"[{'PASS' if ok else 'FAIL'}] stop: an unresolvable session root says it checked "
+          f"nothing, once per session (KIT-214)")
+    failures += 0 if ok else 1
+
+    # KIT-214: session-start.py (advisory, not self-protected) describes the session's
+    # own worktree, and WARNS THE PERSON (systemMessage) when the guards are about to
+    # judge the session as a different checkout than the one it started in. The
+    # second check is the one that would have caught the 2.1.286 change on day one:
+    # with no usable transcript the guards fall back to the main checkout, while the
+    # session started in its worktree.
+    # The three hooks each carry their own copy of the transcript-folder resolver
+    # (they are standalone scripts; two are self-protected). A drifted copy would
+    # judge the same session two ways, so the copies must be byte-identical.
+    seq_ran += 1
+    _copies = set()
+    for _p in (HOOK, STOP_HOOK, SESSION_START_HOOK):
+        with open(_p) as _fh:
+            _m = re.search(r"def _sanitized_dir.*?return found\.pop\(\), False\n"
+                           r"    return None, folder not in anchor_names\n", _fh.read(), re.S)
+        _copies.add(_m.group(0) if _m else f"MISSING in {_p}")
+    ok = len(_copies) == 1 and not next(iter(_copies)).startswith("MISSING")
+    print(f"[{'PASS' if ok else 'FAIL'}] the transcript-folder resolver is identical in all "
+          f"three hooks (KIT-214)")
+    failures += 0 if ok else 1
+
+    def _session_start(payload, cwd):
+        r = subprocess.run([sys.executable, SESSION_START_HOOK], input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=30, env=desk_env, cwd=cwd)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+
+    for name, payload, cwd, ctx_needle, warn in (
+        ("session-start: a desktop session is described by its OWN worktree",
+         desk({}, desk_wt), desk_wt, "on branch `feat/desktop`", False),
+        ("session-start: guards judging the main checkout for a worktree session WARN the person",
+         {}, desk_wt, "on branch `main`", True),
+        ("session-start: a session in the main checkout gets no warning",
+         desk({}, desk_root), desk_root, "on branch `main`", False),
+    ):
+        seq_ran += 1
+        out = _session_start(payload, cwd)
+        ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+        msg = out.get("systemMessage", "")
+        ok = ctx_needle in ctx and (("will judge this session as" in msg) == warn)
+        print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+        failures += 0 if ok else 1
+
+    for r in (desk_root, desk_root + "-desk", desk_root + "-deskcode",
+              amb_root, amb_root + "-desk", amb_root + "-deskcode", amb_root + ".desk",
+              dstop_nopr_root, dstop_nopr_root + "-desk", dstop_nopr_root + "-deskcode",
+              gone_root, gone_root + "-deskcode"):
+        shutil.rmtree(r, ignore_errors=True)
     for r in (main_root, master_root, feat_root, codename_root, wt_root, wt_sibling,
               wt_codename, nongit_dir, unrelated_root, merged_root, open_root,
               gherr_root, stop_nopr_root, stop_red_root, stop_green_root,

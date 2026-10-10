@@ -53,6 +53,85 @@ def _run(args, timeout=4):
         return ""
 
 
+# -- The session's own worktree, from its transcript folder (KIT-214) ----------
+# Identical to pre-tool-use.py's copy; read the reasoning there. Keep the three
+# copies (pre-tool-use.py, stop-pr-check.py, this file) the same. Here it decides
+# which checkout the orientation line describes, and lets this hook warn the person
+# when the guards are about to judge the session as a different checkout.
+def _sanitized_dir(path: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def _transcript_worktree(data, anchor: str):
+    """(worktree, unresolved) for this session's transcript folder.
+
+    worktree: the one worktree of `anchor`'s repo whose path names the transcript
+    folder, realpath'd, or None. unresolved: True when the payload names a launch
+    folder that is NOT the anchor and no single worktree matches it. That is the
+    state in which every guard would judge the session as the anchor, so the
+    callers say so out loud (contract §13) instead of failing quietly."""
+    tp = data.get("transcript_path") if isinstance(data, dict) else None
+    if not isinstance(tp, str) or not tp.strip():
+        return None, False
+    folder = os.path.basename(os.path.dirname(tp))
+    if not folder:
+        return None, False
+    anchor_names = {_sanitized_dir(anchor), _sanitized_dir(os.path.realpath(anchor))}
+    try:
+        r = subprocess.run(
+            ["git", "-C", anchor, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None, folder not in anchor_names
+    if r.returncode != 0:
+        return None, folder not in anchor_names
+    found = set()
+    for line in r.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        listed = line[len("worktree "):].strip()
+        real = os.path.realpath(listed)
+        if folder in (_sanitized_dir(listed), _sanitized_dir(real)) and os.path.isdir(real):
+            found.add(real)
+    if len(found) == 1:
+        return found.pop(), False
+    return None, folder not in anchor_names
+
+
+ROOT_MISMATCH_MSG = (
+    "⚠ Kit hooks will judge this session as `{root}`, but it started in `{started}`. "
+    "Expect every edit and commit to be blocked, and the end-of-turn PR check to check "
+    "nothing. This is a harness or kit fault, not your work (KIT-214): tell the owner, "
+    "and do not work around the guards."
+)
+
+
+def _root_mismatch(root: str) -> str:
+    """The warning above, or "" when the guards and the session agree.
+
+    At SessionStart the process cwd is still the session's LAUNCH folder: no tool
+    has run, so nothing has moved it. Comparing it with the root the guards will use
+    catches any future change in what the harness tells hooks, not only the one
+    KIT-214 fixed. Advisory only, like everything in this file."""
+    started = _run(["git", "rev-parse", "--show-toplevel"])
+    if not started:
+        return ""
+    started, root = os.path.realpath(started), os.path.realpath(root)
+    if started == root:
+        return ""
+    same_repo = _run(["git", "-C", started, "rev-parse", "--git-common-dir"])
+    root_repo = _run(["git", "-C", root, "rev-parse", "--git-common-dir"])
+    if not same_repo or not root_repo:
+        return ""
+    if (os.path.realpath(os.path.join(started, same_repo))
+            != os.path.realpath(os.path.join(root, root_repo))):
+        return ""  # a different repo entirely: not this hook set's checkout to judge
+    return ROOT_MISMATCH_MSG.format(root=root, started=started)
+
+
 # -- Untrusted-data fence ------------------------------------------------------
 # Ticket text is written by whoever can edit the tracker, so in the general case it is
 # attacker-influenceable: it must reach the model as DATA, never as instructions. The
@@ -268,16 +347,28 @@ def _ticket_context(root: str, branch: str):
 def main():
     # Read the payload but don't require anything from it.
     try:
-        json.load(sys.stdin)
+        data = json.load(sys.stdin)
     except Exception:
-        pass
+        data = {}
 
-    root = os.environ.get("CLAUDE_PROJECT_DIR", ".")
+    anchor = os.environ.get("CLAUDE_PROJECT_DIR", ".")
+    try:
+        session_root, _unresolved = _transcript_worktree(data, os.path.realpath(anchor))
+    except Exception:
+        session_root = None
+    root = session_root or anchor
     branch = _run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"])
     if not branch:
         sys.exit(0)  # not a git repo — say nothing
 
+    try:
+        warning = _root_mismatch(root)
+    except Exception:
+        warning = ""
+
     lines = [f"Repo orientation (SessionStart hook): on branch `{branch}`."]
+    if warning:
+        lines.insert(0, warning)
 
     dirty = _run(["git", "-C", root, "status", "--porcelain"])
     lines.append("Working tree: " + ("dirty (uncommitted changes)." if dirty else "clean."))
@@ -311,12 +402,15 @@ def main():
     except Exception:
         pass
 
-    print(json.dumps({
+    out = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": context,
         }
-    }))
+    }
+    if warning:
+        out["systemMessage"] = warning  # shown to the PERSON, not only the model
+    print(json.dumps(out))
     sys.exit(0)
 
 

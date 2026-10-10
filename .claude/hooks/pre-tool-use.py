@@ -122,30 +122,109 @@ def _git_common_dir(d: str):
     return None
 
 
+# ── The session's own worktree, from its transcript folder (KIT-214) ─────────
+# From Claude Code 2.1.286 (first seen 2026-10-04) the desktop app sets
+# CLAUDE_PROJECT_DIR to the repository's MAIN checkout for a session running in a
+# worktree: it is the launch option `projectConfigRoot`, where project settings and
+# hooks load from. Before that it named the session's own worktree, and every guard
+# here was written to that meaning. With the old reading, every desktop worktree
+# session was judged to be on `main`: each Edit/Write was "cross-worktree" and each
+# commit was "on main", while the Stop hook checked nothing.
+# The cwd cannot stand in for it (model-movable, see _resolve_root). The payload's
+# `transcript_path` can: the harness files a session's transcript under
+# ~/.claude/projects/<launch dir, every non-alphanumeric character turned into "-">/,
+# and no tool call moves it. Matching that folder name against THIS repo's own
+# worktree list recovers the session's worktree. Exactly one match, or nothing: an
+# ambiguous, missing or foreign match keeps the anchor, the strict reading. The
+# harness truncates names over 200 characters and appends a hash, so a very long
+# worktree path never matches and keeps the anchor too.
+# The same function sits in stop-pr-check.py and session-start.py; keep all three
+# identical (the battery runs one fixture set against each).
+def _sanitized_dir(path: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def _transcript_worktree(data, anchor: str):
+    """(worktree, unresolved) for this session's transcript folder.
+
+    worktree: the one worktree of `anchor`'s repo whose path names the transcript
+    folder, realpath'd, or None. unresolved: True when the payload names a launch
+    folder that is NOT the anchor and no single worktree matches it. That is the
+    state in which every guard would judge the session as the anchor, so the
+    callers say so out loud (contract §13) instead of failing quietly."""
+    tp = data.get("transcript_path") if isinstance(data, dict) else None
+    if not isinstance(tp, str) or not tp.strip():
+        return None, False
+    folder = os.path.basename(os.path.dirname(tp))
+    if not folder:
+        return None, False
+    anchor_names = {_sanitized_dir(anchor), _sanitized_dir(os.path.realpath(anchor))}
+    try:
+        r = subprocess.run(
+            ["git", "-C", anchor, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None, folder not in anchor_names
+    if r.returncode != 0:
+        return None, folder not in anchor_names
+    found = set()
+    for line in r.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        listed = line[len("worktree "):].strip()
+        real = os.path.realpath(listed)
+        if folder in (_sanitized_dir(listed), _sanitized_dir(real)) and os.path.isdir(real):
+            found.add(real)
+    if len(found) == 1:
+        return found.pop(), False
+    return None, folder not in anchor_names
+
+
+# Set by _resolve_root; appended to the branch and cross-worktree blocks so a session
+# that is misjudged can tell its owner WHY, rather than retrying or respelling.
+ROOT_UNRESOLVED_NOTE = (
+    "\n⚠ This hook could not tell which worktree this session runs in: its transcript "
+    "folder matches none (or more than one) of this repo's worktrees, so it judged the "
+    "session as `{anchor}`. That is a harness or kit fault, not your change (KIT-214). "
+    "Do not work around it; tell the owner."
+)
+_ROOT_NOTE = ""
+
+
 def _resolve_root(data) -> str:
     """The acting session's root, resolved per-invocation from the payload.
 
-    CLAUDE_PROJECT_DIR is the anchor because it is NOT model-mutable. The cwd is
-    consulted ONLY to widen to a subagent's own worktree, and only when both
-    conditions hold:
-      1. the payload carries `agent_id` (the CLI sets it only for a subagent), and
-      2. the cwd's git toplevel shares a --git-common-dir with the anchor.
-    Either check failing falls back to the anchor. This is deliberate: the hook is
-    spawned with the CURRENT session cwd, which a persisted `cd` moves — so a
-    cwd-derived root would let `cd ~/other-checkout` switch OFF the branch,
-    branch-naming and cross-worktree guards for the rest of the session. Widening
-    can only ever move WITHIN one repo's worktrees, never to a foreign repo.
+    CLAUDE_PROJECT_DIR is the anchor because it is NOT model-mutable. Two values may
+    widen it, each only to another worktree of the SAME repo:
+      1. the transcript folder (see _transcript_worktree) names the worktree the
+         session was launched in, which is what CLAUDE_PROJECT_DIR meant before
+         Claude Code 2.1.286. The model cannot move it.
+      2. the cwd, ONLY for a subagent: the payload carries `agent_id` (the CLI sets
+         it only for a subagent) AND the cwd's git toplevel shares a
+         --git-common-dir with the anchor.
+    Anything else falls back. This is deliberate: the hook is spawned with the
+    CURRENT session cwd, which a persisted `cd` moves — so a cwd-derived root for a
+    main session would let `cd ~/other-checkout` switch OFF the branch,
+    branch-naming and cross-worktree guards for the rest of the session.
     """
+    global _ROOT_NOTE
     env_root = os.path.realpath(_ENV_ROOT)
+    session_root, unresolved = _transcript_worktree(data, env_root)
+    _ROOT_NOTE = ROOT_UNRESOLVED_NOTE.format(anchor=env_root) if unresolved else ""
+    session_root = session_root or env_root
     if not data.get("agent_id"):
-        return env_root  # main session → stable anchor, never the cwd
+        return session_root  # main session → its launch worktree, never the cwd
     top = _cwd_git_toplevel()
     if not top:
-        return env_root
+        return session_root
     common = _git_common_dir(top)
     if common and common == _git_common_dir(env_root):
+        _ROOT_NOTE = ""
         return top  # same repo family → a genuine sibling worktree
-    return env_root
+    return session_root
 
 
 PROJECT_ROOT = os.path.realpath(_ENV_ROOT)
@@ -2683,21 +2762,22 @@ def _dispatch(data) -> None:
                 )
             except Exception:
                 _suggested = os.path.join(PROJECT_ROOT, "<same-relative-path>")
-            block(CROSS_WORKTREE_HELP.format(owner=_owner, here=PROJECT_ROOT, suggested=_suggested))
+            block(CROSS_WORKTREE_HELP.format(owner=_owner, here=PROJECT_ROOT, suggested=_suggested)
+                  + _ROOT_NOTE)
 
     if tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")):
         branch = _current_branch()
         if branch in PROTECTED_BRANCHES:
-            block(BRANCH_HELP.format(branch=branch))
+            block(BRANCH_HELP.format(branch=branch) + _ROOT_NOTE)
         elif branch and not BRANCH_NAME_RE.match(branch):
-            block(BRANCH_NAME_HELP.format(branch=branch))
+            block(BRANCH_NAME_HELP.format(branch=branch) + _ROOT_NOTE)
 
     if tool == "Bash" and re.search(r"\bgit\s+commit\b", inp.get("command", "")):
         branch = _current_branch()
         if branch in PROTECTED_BRANCHES:
-            block(BRANCH_HELP.format(branch=branch))
+            block(BRANCH_HELP.format(branch=branch) + _ROOT_NOTE)
         elif branch and not BRANCH_NAME_RE.match(branch):
-            block(BRANCH_NAME_HELP.format(branch=branch))
+            block(BRANCH_NAME_HELP.format(branch=branch) + _ROOT_NOTE)
         elif _has_upstream():
             merged = _merged_pr_info(branch)
             if merged:

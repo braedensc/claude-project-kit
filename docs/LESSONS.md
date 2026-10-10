@@ -75,6 +75,19 @@ production build "looked fine" and was silently broken. Hence the permanent batt
 (`test_hooks.py`, in CI) and the ritual: stage a fake `ghp_…` token (must block),
 commit `.env.example` (must pass), confirm the audit log grew.
 
+**A harness value a guard trusts can change meaning under it, silently.** From Claude
+Code 2.1.286 (2026-10-04) the desktop app set `CLAUDE_PROJECT_DIR` to the repository's
+main checkout for a session working in a worktree. The hooks still read it as "this
+session's checkout". So every desktop session was judged to be on `main`: each edit and
+commit was blocked, and the Stop hook checked nothing. That lasted 6 days, and nobody
+was told. The fix reads a value the model cannot move, the transcript folder.
+
+The durable half is the warning. At SessionStart the cwd is still the launch folder, so
+the hook compares it with the root the guards will use, and tells the person when they
+differ. When a guard rests on a harness value, also check that value against an
+independent one, and say out loud when they disagree (KIT-214;
+`docs/adr/2026-10-10-session-root-from-the-transcript-folder.md`).
+
 ## Git, GitHub & CI
 
 **Merge THEN require (branch protection ordering).** A job's `name:` IS its
