@@ -881,7 +881,8 @@ CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
 # "not composed: set <KEY> in chat-lane.conf" instead of printing a placeholder; a
 # subcommand that needs one refuses, naming it.
 CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
-                 "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS")
+                 "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS",
+                 "HEALTH_STATUS_FILE")
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # What `front-door` needs, and what verify's front-door row needs.
 FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
@@ -977,6 +978,9 @@ def validate_conf(values):
     if conf["FRONT_DOOR_MATCHER"] and not _MATCHER_RE.match(conf["FRONT_DOOR_MATCHER"]):
         errors.append("FRONT_DOOR_MATCHER %r is not a named matcher: @ and then letters, "
                       "digits, _ or -" % conf["FRONT_DOOR_MATCHER"])
+    if conf.get("HEALTH_STATUS_FILE") and not conf["HEALTH_STATUS_FILE"].startswith("/"):
+        errors.append("HEALTH_STATUS_FILE must be an absolute path (got %r)"
+                      % conf["HEALTH_STATUS_FILE"])
     bad_teams = [t for t in idea_team_keys(conf) if not _TEAM_KEY_RE.match(t)]
     if bad_teams:
         errors.append("IDEA_TEAM_KEYS names %s, which %s not a team key: capitals and "
@@ -1414,6 +1418,19 @@ The planner files the plan as an epic with child tickets. If a member wants it s
 reply with exactly one line and nothing else: `approve <epic id>`. The bridge lists the
 children and asks them to confirm.
 
+## When a health alert fires
+
+The pipeline's own health watch posts it, not a person. When someone asks about one:
+
+1. Read the status file %(status)s. It holds each finding, and no credential.
+2. Explain each finding in plain words: what is wrong, what it affects, and what the
+   owner should run.
+3. Print any fix that needs sudo, launchctl or an installer as a command line for the
+   owner. Never run it, and never say you did.
+
+If you cannot read the file, say so, and ask the owner to run
+`python3 scripts/pipeline_watch.py status` and paste what it prints.
+
 ## When you are not sure
 
 Ask the member. Never guess a ticket id, and never file a second idea for the same request.
@@ -1439,7 +1456,9 @@ def chat_rules_text(conf):
     where = ("the work team for that project: one of %s. If you cannot tell which, ask"
              % ", ".join(teams) if teams else
              "the work team for that project. If you cannot tell which, ask")
-    return CHAT_RULES_TEMPLATE % {"where": where}
+    status = ("with `cat %s`" % conf["HEALTH_STATUS_FILE"]
+              if (conf or {}).get("HEALTH_STATUS_FILE") else "the alert names")
+    return CHAT_RULES_TEMPLATE % {"where": where, "status": status}
 
 
 def _compose_piece_8(conf):
@@ -5317,6 +5336,16 @@ def _selftest_kit226_body(expect, conf):
                    "You never move a ticket", "Never say you did", "Orchestration Notes",
                    "nothing else"):
         expect("chat-rules-say:" + needle, needle in text, text[:300])
+    for needle in ("When a health alert fires", "Never run it", "pipeline_watch.py status"):
+        expect("chat-rules-say:" + needle, needle in text, text[-600:])
+    healthy = chat_rules_text(dict(conf, HEALTH_STATUS_FILE="/srv/health/status.json"))
+    expect("chat-rules-name-the-status-file-when-set",
+           "`cat /srv/health/status.json`" in healthy and "/srv/health" not in text,
+           healthy[-600:])
+    _v, errs = validate_conf(dict(parse_conf(GOOD_CONF_TEXT)[0],
+                                  HEALTH_STATUS_FILE="relative/status.json"))
+    expect("conf-HEALTH_STATUS_FILE-absolute", any("HEALTH_STATUS_FILE" in e for e in errs),
+           errs)
     teamed = chat_rules_text(dict(conf, IDEA_TEAM_KEYS="PROD,TOD"))
     expect("chat-rules-name-the-idea-teams-when-set",
            "one of PROD, TOD." in teamed and "one of" not in text, teamed[:300])

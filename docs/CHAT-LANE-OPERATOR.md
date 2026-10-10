@@ -650,6 +650,10 @@ folder under it, so every chat session reads the rules. No coding, planning or r
 session does. That was measured on the dispatcher's bundled Claude Code, 2026-10-10.
 
 Set `IDEA_TEAM_KEYS` in `chat-lane.conf` so the rules name the teams the bot may file in.
+Set `HEALTH_STATUS_FILE` to the health watch's status file, so the rules tell the bot where
+to read a health alert's findings. It reads with plain `cat`, which this lane already allows
+(the read-only shell, KIT-196). Any fix that needs sudo, launchctl or an installer, it prints
+for you and never runs.
 
 **The flow, end to end:**
 

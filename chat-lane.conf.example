@@ -118,3 +118,10 @@ FRONT_DOOR_MATCHER=@dispatcher
 #
 # RULE: team keys, capitals and digits, starting with a capital, like PROD.
 #IDEA_TEAM_KEYS=PROD
+
+# Optional. The health watch's status file, readable by the role account. Piece
+# 8's rules tell the chat bot to `cat` it when someone asks about a health
+# alert. Unset, the rules say "the status file the alert names".
+#
+# RULE: an absolute path.
+#HEALTH_STATUS_FILE=/Users/Shared/pipeline-health/status.json
