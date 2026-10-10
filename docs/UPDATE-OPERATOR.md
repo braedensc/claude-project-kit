@@ -27,6 +27,7 @@ One row per component. Each row is in one of these states:
 |---|---|
 | `CURRENT` | installed equals the target |
 | `BEHIND` | the row prints the exact line that updates it |
+| `RESTART` | a running daemon's newer version is installed, but its process started before that, so it still runs the old binary. The row prints the restart line |
 | `AHEAD` | installed is newer than a version you pinned |
 | `UNKNOWN` | it could not be measured. **This is not current** |
 | `ABSENT` | not configured, or not installed here |
@@ -35,8 +36,12 @@ The components it checks:
 - **The dispatcher.** The version its own `/version` route reports, against the package
   registry's latest, or against `DISPATCHER_VERSION` if you pinned one. A dispatcher that
   does not answer is `UNKNOWN`: it may be down.
-- **Homebrew casks and formulae** you list. A formula that a launchd job runs (the front
-  door, the tunnel) gets an update line that also restarts the job onto the new binary.
+- **Homebrew casks and formulae** you list. The target is Homebrew's version including its
+  packaging revision, so `2.56.0_1` is current against `2.56.0` revision 1. A formula that a
+  launchd job runs (the front door, the tunnel) gets an update line that also restarts the
+  job onto the new binary. When the version is current, the job's process is checked too:
+  if it started before that version was installed, the row is `RESTART`. If the job is not
+  running at all, the row is `UNKNOWN`. `launchctl print` and `ps` need no password.
 - **The kit checkout** against its origin's default branch. On a pipeline machine, point
   it at the checkout the hooks run from (KIT-214).
 
@@ -53,7 +58,7 @@ whole machine:
 
 Exit codes, per contract §13:
 - **0:** all current.
-- **10:** something is behind.
+- **10:** something is behind, or a daemon needs a restart.
 - **4:** something could not be measured. This one wins over 10, because "could not
   check" must never look like "nothing to do".
 - **2:** the conf is missing or wrong.
