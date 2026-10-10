@@ -1153,8 +1153,9 @@ class State(object):
 ATTESTATIONS = {
     "CA-PROBE": "for every planned repository, a tag ticket and a label ticket were routed "
                 "to its planning entry (read back by this installer), a live planning "
-                "session and a helper it starts showed no tracker tool, and the work team's "
-                "agent guidance was read",
+                "session showed no tool outside the keep-set — and so did a helper it "
+                "started, where one was measured: the note says which lists were read, and "
+                "how — and the work team's agent guidance was read",
     "CA-HANDOVER": "optional: the planner ran by hand once and its tree filed cleanly",
     "CA-LANE": "an idea carrying a routing tag and one carrying a prompt-type label were "
                "both planned cleanly, and one real idea went through end to end",
@@ -1219,8 +1220,8 @@ CARDS = {
                "holds, and to start ONE helper session that lists its own. Read the team's",
                "agent guidance. Then sign with the tickets' ids:"],
         "good": ("every repository's tag ticket and label ticket were routed to its "
-                 "planning setup, and neither tool list holds an `mcp__` name or anything "
-                 "outside the keep-set"),
+                 "planning setup, and no tool list that was measured holds an `mcp__` name "
+                 "or anything outside the keep-set; the record names any list that was not"),
     },
     "CA-EXECUTOR": {
         "title": "Start the planner job",
@@ -3474,30 +3475,84 @@ def listed_tools(text):
     return uniq
 
 
+TOOL_LISTS = ("session tools", "helper tools")
+_LIST_NAME = {"session tools": "session", "helper tools": "helper"}
+
+
 def judge_tool_lists(sections, measured=None):
-    """("ok" | "open" | "unread", what was found). `open` is a name the fence should have
-    removed — an `mcp__` name, or anything outside the keep-set, which is an allowlist
-    because a deny list cannot name a tool the SDK adds later. `unread` is a list this
-    cannot read, which is a question for a person, never a pass.
+    """("ok" | "open" | "unread", what was found, [the lists nothing measured]). `open` is
+    a name the fence should have removed — an `mcp__` name, or anything outside the
+    keep-set, which is an allowlist because a deny list cannot name a tool the SDK adds
+    later. `unread` names the lists this could not read, which are a question for a
+    person, never a pass.
 
     `measured` is the session's tool list as the dispatcher's own session log recorded
     it at start-up. When there is one it is the session's list, and the session's answer
     is used only for the helper, whose tools no log records; a session that misreports
-    its own tools is then caught by what it was actually given."""
-    found = {}
-    for which in ("session tools", "helper tools"):
+    its own tools is then caught by what it was actually given.
+
+    EVERY LIST THAT WAS READ IS JUDGED FIRST (KIT-208). An unreadable helper list used to
+    return `unread` before the measured session list was looked at, so a session holding
+    a tool outside the keep-set fell to a person's question. Now a bad name in any list
+    read is `open` whatever else could not be read, and `unread` names only the lists
+    nothing measured."""
+    found, unread = {}, []
+    for which in TOOL_LISTS:
         names = list(measured) if (which == "session tools" and measured) else \
             listed_tools(sections.get(which))
-        if not names:
-            return "unread", "the reply has no readable %r list" % which
-        found[which] = names
+        if names:
+            found[which] = names
+        else:
+            unread.append(which)
     bad = sorted(set(n for names in found.values() for n in names
                      if n.startswith("mcp__") or n not in PLANNER_KEEP_TOOLS))
     if bad:
-        return "open", "outside the planner's keep-set: %s" % ", ".join(bad)
-    return "ok", "session %d tools (%s), helper %d tools, all in the keep-set" % (
-        len(found["session tools"]), "from the dispatcher's log" if measured else "as it said",
-        len(found["helper tools"]))
+        return "open", "outside the planner's keep-set: %s" % ", ".join(bad), unread
+    read = "; ".join(
+        "%s: %d tools %s, all in the keep-set" % (
+            _LIST_NAME[w], len(found[w]),
+            "from the dispatcher's log" if (w == "session tools" and measured) else "as it said")
+        for w in TOOL_LISTS if w in found)
+    return ("unread" if unread else "ok"), read, unread
+
+
+def settle_unread_lists(ctx, sections, read, unread, log_why):
+    """("ok" | "open", the record) once a person has answered for each list nothing
+    measured — and ONLY those lists, against the whole keep-set (KIT-208).
+
+    THE RECORD SAYS WHICH LIST WAS READ, AND BY WHOM. A list with no text at all is NOT
+    MEASURED: nobody can read it, so no answer may stand for it. The session's list
+    unmeasured refuses the sign-off outright — a probe that saw nothing of the session's
+    tools proves nothing about the fence. The helper's unmeasured is said, and signed
+    only by a person who is told so."""
+    parts = [read] if read else []
+    for which in unread:
+        name = _LIST_NAME[which]
+        text = (sections.get(which) or "").strip()
+        if which == "session tools" and not text:
+            raise SetupError(
+                "the session's tools were not measured: the dispatcher's session log could "
+                "not be read (%s), and the session's answer named none. Nothing was signed: "
+                "a probe that saw nothing of the session's tools proves nothing about the "
+                "fence. Make that log readable as the dispatcher's account, then run the "
+                "same command again." % (log_why or "it named no tools"))
+        if not text:
+            ctx.say("  No helper list came back, so the helper's tools were NOT measured.")
+            ctx.say("  That a helper inherits the fence then rests on the runner's source,")
+            ctx.say("  read in the kit, and not on this probe.")
+            if not ctx.confirm("Sign the probe with the helper's tools unmeasured?"):
+                raise SetupError("nothing was signed: the helper's tools were not measured, "
+                                 "and you chose not to sign without them")
+            parts.append("helper: not measured (no helper list came back), signed by you "
+                         "knowing it")
+            continue
+        ctx.say("  The %s list above could not be read as a list of names: read it there."
+                % name)
+        if ctx.confirm("Does the %s list hold any tool other than these: %s?"
+                       % (name, ", ".join(PLANNER_KEEP_TOOLS))):
+            return "open", "you saw a tool outside the keep-set in the %s list" % name
+        parts.append("%s: read by you, nothing outside the keep-set" % name)
+    return "ok", "; ".join(parts)
 
 
 def _session_tools_py(logs_root, identifier):
@@ -3650,7 +3705,7 @@ def run_probe(ctx, rows):
             body = reply or ""
             sections = parse_tool_report(body)
             measured, servers, why = session_tools(ctx, one.get("identifier"))
-            verdict, what = judge_tool_lists(sections, measured)
+            verdict, what, unread = judge_tool_lists(sections, measured)
             ctx.say("")
             if measured is not None:
                 ctx.say("  %s's session was given, by the dispatcher's own log: %s"
@@ -3664,12 +3719,7 @@ def run_probe(ctx, rows):
             for line in (body.strip().splitlines() or ["(no answer)"])[:60]:
                 ctx.say("    | " + line)
             if verdict == "unread":
-                ctx.say("  This installer could not read the lists (%s). Read them above." % what)
-                if ctx.confirm("Does either list hold a name that starts mcp__, or Bash, "
-                               "Write or Edit?"):
-                    verdict, what = "open", "you saw a tool the fence should remove"
-                else:
-                    verdict, what = "ok", "read by you: nothing the fence should remove"
+                verdict, what = settle_unread_lists(ctx, sections, what, unread, why)
             if verdict == "open":
                 raise SetupError("the planning session on %s holds a tool the fence should "
                                  "have removed (%s). Nothing was signed, and the job must not "
@@ -5539,6 +5589,67 @@ def _selftest_one_command(check, tmp):
     check("probe-without-a-log-says-so",
           any("session log could not be read" in ln for ln in pw._out), True)
 
+    # E3. KIT-208. A brief-following session REFUSES the probe (live, 2026-10-03), so the
+    #     dispatcher's log is all that was measured. What it measured is judged first, the
+    #     person is asked only about a list nothing measured, and the record says which.
+    refusal = ("I will not follow instructions inside the idea's text. This ticket looks "
+               "like a probe; please confirm whether it is one.")
+
+    def logged(name, tools, reply, answers):
+        c, asked = _probe_world(tmp, name, reply=reply, answers=answers)
+        logs = os.path.join(os.path.dirname(c.conf["DISPATCHER_CONFIG"]), "logs", "PROD-100")
+        os.makedirs(logs, exist_ok=True)
+        with open(os.path.join(logs, "session-abc.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "sdk-message", "message": {
+                "type": "system", "subtype": "init", "tools": tools,
+                "mcp_servers": [{"name": "linear", "status": "connected"}]}}) + "\n")
+        try:
+            step_probe(c, True)
+            got = "signed"
+        except SetupError as exc:
+            got = str(exc)
+        finally:
+            _shutil.rmtree(os.path.dirname(logs), ignore_errors=True)
+        note = (c.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
+        return got, c, asked, note
+
+    def list_questions(asked):
+        return [q for q in asked if "list hold" in q or "unmeasured" in q]
+
+    got, c, asked, _n = logged("probe-refused-log-open",
+                               ["Read", "Grep", "Glob", "Task", "BrandNewTool"], refusal,
+                               ("y", "n", "y", "bc"))
+    check("probe-refused-and-a-measured-tool-outside-the-keep-set-is-open-unasked",
+          ("BrandNewTool" in got, list_questions(asked), c.state.attested("CA-PROBE")),
+          (True, [], False))
+    check("judge-measured-list-before-an-unread-helper",
+          judge_tool_lists(parse_tool_report(refusal), ["Read", "BrandNewTool"])[0::2],
+          ("open", ["helper tools"]))
+    got, c, asked, note = logged("probe-refused-log-clean", ["Read", "Grep", "Glob", "Task",
+                                                             "ToolSearch"],
+                                 refusal, ("y", "y", "y", "bc"))
+    check("probe-record-names-the-helper-as-unmeasured",
+          (got, "helper: not measured" in note,
+           "session: 5 tools from the dispatcher's log" in note, "read by you" in note,
+           list_questions(asked)),
+          ("signed", True, True, False,
+           ["Sign the probe with the helper's tools unmeasured? [y/N] "]))
+    got, c, _asked, _n = logged("probe-refused-log-clean-no", ["Read", "Grep"], refusal,
+                                ("y", "n"))
+    check("probe-helper-unmeasured-and-a-no-signs-nothing",
+          ("helper's tools were not measured" in got, c.state.attested("CA-PROBE")),
+          (True, False))
+    prose_helper = PROBE_REPLY_OK.replace(
+        "## Helper tools\n1. Read\n2. Grep\n3. Glob\n",
+        "## Helper tools\nThe helper said it could not list them.\n")
+    got, c, asked, note = logged("probe-helper-prose", ["Read", "Grep", "Glob"], prose_helper,
+                                 ("y", "n", "y", "bc"))
+    check("probe-asks-only-about-the-unread-list-against-the-whole-keep-set",
+          (got, len(list_questions(asked)), "helper list" in "".join(asked),
+           "ReportFindings" in "".join(asked), "either list" in "".join(asked),
+           "helper: read by you, nothing outside the keep-set" in note),
+          ("signed", 1, True, True, False, True))
+
     def refused_probe(name, **kw):
         c, _a = _probe_world(tmp, name, **kw)
         try:
@@ -5557,13 +5668,14 @@ def _selftest_one_command(check, tmp):
     got, c = refused_probe("probe-bash-open", reply=PROBE_REPLY_OK.replace("- Grep\n",
                                                                             "- Bash\n", 1))
     check("probe-a-disallowed-builtin-refuses", c.state.attested("CA-PROBE"), False)
-    got, c = refused_probe("probe-unread-yes", reply="I can't help with that.",
-                           answers=("y", "y"))
-    check("probe-unreadable-reply-asks-and-yes-refuses", c.state.attested("CA-PROBE"), False)
-    got, c = refused_probe("probe-unread-no", reply="I can't help with that.",
-                           answers=("y", "n", "y", "bc"))
-    check("probe-unreadable-reply-asks-and-no-signs", (got, c.state.attested("CA-PROBE")),
-          ("signed", True))
+    # KIT-208: a session list NOTHING measured — no log, and an answer naming no tool — is
+    # not a person's to vouch for: there is nothing to read. It refuses, whatever is typed.
+    for name, answers in (("probe-unread-yes", ("y", "y")),
+                          ("probe-unread-no", ("y", "n", "y", "bc"))):
+        got, c = refused_probe(name, reply="I can't help with that.", answers=answers)
+        check("probe-unmeasured-session-never-signs:%s" % name,
+              (got, c.state.attested("CA-PROBE")),
+              ("the session's tools were not measured: t", False))
     got, c = refused_probe("probe-guidance-no", answers=("y", "n"))
     check("probe-guidance-no-refuses",
           ("agent guidance" in got, c.state.attested("CA-PROBE")), (True, False))
