@@ -126,12 +126,34 @@ driver's default pass wall clock.
 
 ## The sleeping laptop
 
-launchd runs a missed interval on wake, so for one interval after a wake **every** heartbeat
-is legitimately old and a naive monitor pages on all of them. So the monitor reads its own
-last-run timestamp first: if it missed its *own* schedule by more than `stale_multiplier`
-intervals, the machine was not running, staleness is not judged this pass, and the report
-says so in those words. `missing`, `failing` and `unreadable` are still judged — none of
-them depends on the clock. The next pass judges staleness normally.
+A job cannot write a heartbeat while the machine sleeps. launchd does not make up for it:
+an interval that falls during sleep is skipped, not replayed (`man 5 launchd.plist`,
+`StartInterval`). So after a sleep, heartbeats are old for a reason that is not a fault.
+
+**A heartbeat's age is judged in awake time (KIT-211).** Each pass records one mark in its
+state: the wall time, and a clock that stops while the machine sleeps. On macOS that clock
+is `CLOCK_UPTIME_RAW`, which keeps running during a background ("dark") wake, when jobs do
+run. On Linux it is `CLOCK_MONOTONIC`. From the last mark before a beat, the monitor works
+out how much of the beat's age the machine was awake, and judges that against the limit.
+- A nap after the beat is not counted. On 2026-10-09 a 16-minute nap made a 19-minute-old
+  notifier beat look stale. It had had 3 minutes awake, and today it would read `ok`.
+- A job that stops while the machine stays awake still pages within its limit.
+- With the lid closed, awake time adds up across background wakes, so a stopped job still
+  pages, later.
+- The figure only ever subtracts sleep it measured. Sleep between the monitor's last mark
+  and the beat counts against the job too, so a stopped job pages at most one monitor
+  interval late, never early.
+- A beat older than every mark falls back to the wall clock for that stretch, as before.
+  So does a machine with no such clock.
+- A mark from before a reboot is ignored: the clock restarts at boot.
+
+The row says so when sleep was discounted, for example "5m of it awake".
+
+**The monitor's own missed schedule still counts.** It reads its own last-run timestamp
+first. If it missed its *own* schedule by more than `stale_multiplier` intervals, staleness
+is not judged this pass, and the report says so in those words. `missing`, `failing` and
+`unreadable` are still judged, because none of them depends on the clock. The next pass
+judges staleness normally.
 
 `rearm --config FILE` does the same on purpose. It removes the last-run timestamp from the
 state file, keeps every other field, posts nothing and writes no heartbeat. The installer
