@@ -523,6 +523,23 @@ Still open: the notifier's own death (KIT-45). Who can really write the mark is 
 holding the monitor's tracker key, as for the planning marks (`docs/NOTIFIER-OPERATOR.md`,
 *What is not proven*).
 
+## Update 2026-10-10 — the pull-request moment, "reviewed and green", is built (KIT-225)
+
+Decision 5's second half. When Stage E concludes a pull request clean or below the
+threshold, the bounce driver leaves one comment on the coding ticket, before it moves the
+ticket: the `ready-to-merge` mark on line 1 and the pull request alone on line 2. A failed
+comment stops the conclusion with nothing moved, so the next pass says it again; a `ready`
+ledger row keeps a retried move from saying it twice. The budget-spent comment now opens
+with `agent:needs-human`, so that moment pages too.
+
+The notifier accepts `ready-to-merge` only from `bounce_actor_ids`, on the daemon-health
+pattern: optional, OFF and said while unset, deferred not dropped, a forgery named and
+skipped. It applies no label. Its ping links the pull request instead of the ticket, read
+from line 2 only for that author and only in the exact shape of one, so `build_message`
+still takes no comment text. The installer resolves `BOUNCE_ACTOR_IDS` (default `self`, the
+Stage E key's user) like the monitor's ids. The "opened" half is still not built: it needs
+the code host, which the notifier does not read.
+
 ## Update 2026-09-24 — the chat lane is on, and the composer writes (KIT-197, KIT-196)
 
 **The lane was switched on, and kept on.** A deployment turned the conversational lane on on

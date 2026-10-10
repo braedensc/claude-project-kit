@@ -35,7 +35,8 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
                  account's shell, its value never read into this process
     labels       agent:blocked and agent:needs-human resolved by exact name, every team key
                  resolved, and `self` — for the planning marks' author (EXECUTOR_ACTOR_IDS)
-                 and the heartbeat monitor's (MONITOR_ACTOR_IDS, KIT-156)
+                 and the heartbeat monitor's (MONITOR_ACTOR_IDS, KIT-156) and the bounce
+                 driver's (BOUNCE_ACTOR_IDS, KIT-225)
     config       the notifier's config, composed and passed through the notifier's OWN
                  loader before anything is written
     job          the LaunchDaemon plist, installed and not loaded — and never over another
@@ -311,6 +312,10 @@ CONF_DEFAULTS = {
     # handover checks that they do. `off` composes no ids, and the notifier then pages on
     # those marks from nobody and says so on every pass.
     "MONITOR_ACTOR_IDS": "self",
+    # Who may author the bounce driver's ready-to-merge mark (KIT-225). The driver writes it
+    # under the Stage E key, so `self` is its author on a one-key deployment. `off` composes
+    # no ids, and the notifier then pages on that mark from nobody and says so every pass.
+    "BOUNCE_ACTOR_IDS": "self",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose so an unedited copy of the example cannot run.
@@ -507,6 +512,21 @@ def validate_conf(values, invoking_user=None):
     if len(set(monitors)) != len(monitors):
         errors.append("MONITOR_ACTOR_IDS repeats an entry")
 
+    bouncers = split_list(conf.get("BOUNCE_ACTOR_IDS"))
+    if not bouncers:
+        errors.append("BOUNCE_ACTOR_IDS is empty. Say who may write the bounce driver's "
+                      "ready-to-merge mark: `self` (the default), tracker actor ids, or `off` to "
+                      "leave that page OFF by name")
+    elif MONITOR_OFF in bouncers and len(bouncers) > 1:
+        errors.append("BOUNCE_ACTOR_IDS mixes `off` with an author (%s): `off` stands alone"
+                      % ", ".join(bouncers))
+    for actor in bouncers:
+        if actor not in (EXECUTOR_SELF, MONITOR_OFF) and not _ACTOR_RE.match(actor):
+            errors.append("BOUNCE_ACTOR_IDS entry %r is neither `self`, `off` nor a tracker "
+                          "actor id" % actor)
+    if len(set(bouncers)) != len(bouncers):
+        errors.append("BOUNCE_ACTOR_IDS repeats an entry")
+
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
             errors.append("%s must be the NAME of an environment variable in UPPER_SNAKE — "
@@ -648,7 +668,7 @@ def render_plist(conf, home):
         log=_xml_escape(log_path(conf, home)))
 
 
-def compose_config(conf, label_ids, actor_ids, monitor_ids=()):
+def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=()):
     """The notifier's config, from the conf and the resolved ids. `~` stays literal: the notifier
     expands it when it runs, as the role account.
 
@@ -670,6 +690,8 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=()):
     }
     if monitor_ids:
         doc["monitor_actor_ids"] = list(monitor_ids)
+    if bounce_ids:
+        doc["bounce_actor_ids"] = list(bounce_ids)
     return doc
 
 
@@ -1656,7 +1678,12 @@ def step_labels(ctx, apply_it):
     monitors_off = monitors_conf == [MONITOR_OFF]
     if monitors_off:
         monitors_conf = []
-    wants_self = EXECUTOR_SELF in actors_conf or EXECUTOR_SELF in monitors_conf
+    bouncers_conf = split_list(conf.get("BOUNCE_ACTOR_IDS", EXECUTOR_SELF))
+    bouncers_off = bouncers_conf == [MONITOR_OFF]
+    if bouncers_off:
+        bouncers_conf = []
+    wants_self = (EXECUTOR_SELF in actors_conf or EXECUTOR_SELF in monitors_conf
+                  or EXECUTOR_SELF in bouncers_conf)
     if ctx.agent:
         raise Unknown(
             "NOT MEASURED — agent environment (%s set): no tracker request is made from a model's "
@@ -1664,7 +1691,8 @@ def step_labels(ctx, apply_it):
             % (", ".join(ctx.agent), " and ".join(LABEL_KEYS),
                " and `self` (%s)" % ", ".join(
                    k for k, v in (("EXECUTOR_ACTOR_IDS", actors_conf),
-                                  ("MONITOR_ACTOR_IDS", monitors_conf)) if EXECUTOR_SELF in v)
+                                  ("MONITOR_ACTOR_IDS", monitors_conf),
+                                  ("BOUNCE_ACTOR_IDS", bouncers_conf)) if EXECUTOR_SELF in v)
                if wants_self else "",
                " Ids an earlier run recorded are kept, unchecked." if ctx.ids.get("label_ids") else ""),
             "a person runs the same command with $%s in the environment of that ONE command"
@@ -1731,13 +1759,15 @@ def step_labels(ctx, apply_it):
     # The heartbeat monitor's author, resolved exactly as the executor's is (KIT-156). Whether
     # `self` really IS the monitor's author — the same key — is the handover's to measure.
     monitors = resolve("MONITOR_ACTOR_IDS", monitors_conf)
+    # The bounce driver's author, resolved the same way (KIT-225).
+    bouncers = resolve("BOUNCE_ACTOR_IDS", bouncers_conf)
     if problems:
         raise SetupError("the labels step found %d problem(s):\n%s"
                          % (len(problems), "\n".join("  - " + p for p in problems)))
     before = ctx.ids.get("label_ids") or {}
     changed = [k for k in LABEL_KEYS if before.get(k) and before.get(k) != label_ids[k]]
     ctx.ids = {"label_ids": label_ids, "executor_actor_ids": actors,
-               "monitor_actor_ids": monitors,
+               "monitor_actor_ids": monitors, "bounce_actor_ids": bouncers,
                "team_ids": dict((k, str(v.get("id"))) for k, v in sorted(teams.items()) if v)}
     detail = ("%s resolved by exact name at workspace scope (%s); %d executor author id(s)%s; "
               "%d team key(s) resolved (%s); %s"
@@ -1747,6 +1777,8 @@ def step_labels(ctx, apply_it):
                  ", ".join(sorted(teams)),
                  "MONITOR_ACTOR_IDS=off" if monitors_off
                  else "%d heartbeat-monitor author id(s)" % len(monitors)))
+    detail += ("; BOUNCE_ACTOR_IDS=off" if bouncers_off
+               else "; %d bounce-driver author id(s)" % len(bouncers))
     if changed:
         detail += "; CHANGED since the ledger: %s" % ", ".join(changed)
     notes = []
@@ -1755,6 +1787,10 @@ def step_labels(ctx, apply_it):
                      "author, so it pages on the daemon-health marks from nobody and says "
                      "`daemon-health marks: OFF` on every pass. A stopped Stage E daemon then "
                      "pages nobody here (KIT-156).")
+    if bouncers_off:
+        notes.append("BOUNCE_ACTOR_IDS=off: the notifier's config names no bounce-driver author, "
+                     "so it pages on the ready-to-merge mark from nobody and says "
+                     "`ready-to-merge marks: OFF` on every pass (KIT-225).")
     return True, detail, notes
 
 
@@ -1831,14 +1867,31 @@ def monitor_ids_unresolved(conf, ids):
     return ""
 
 
+def bounce_ids_unresolved(conf, ids):
+    """Why the ledger's bounce-driver author ids cannot be composed for this conf, or "" —
+    the same rule as the monitor's, for the ready-to-merge mark (KIT-225). A ledger from
+    before it has none, so the config waits on the labels step instead of dropping the key."""
+    bouncers = split_list(conf.get("BOUNCE_ACTOR_IDS", EXECUTOR_SELF))
+    if bouncers == [MONITOR_OFF]:
+        return ""
+    have = ids.get("bounce_actor_ids") or []
+    if not have:
+        return "the bounce-driver author ids (BOUNCE_ACTOR_IDS)"
+    named = [m for m in bouncers if m != EXECUTOR_SELF and m not in have]
+    if named:
+        return "the bounce-driver author ids (BOUNCE_ACTOR_IDS now names %s)" % ", ".join(named)
+    return ""
+
+
 def step_config(ctx, apply_it):
     conf = ctx.conf
     label_ids = ctx.ids.get("label_ids") or {}
     actors = ctx.ids.get("executor_actor_ids") or []
     missing = [k for k in LABEL_KEYS if not label_ids.get(k)] + ([] if actors else ["the executor ids"])
-    unresolved = monitor_ids_unresolved(conf, ctx.ids)
-    if unresolved:
-        missing.append(unresolved)
+    for unresolved in (monitor_ids_unresolved(conf, ctx.ids),
+                       bounce_ids_unresolved(conf, ctx.ids)):
+        if unresolved:
+            missing.append(unresolved)
     if missing:
         what = "waits on the labels step: %s not resolved yet" % ", ".join(missing)
         if apply_it:
@@ -1848,7 +1901,9 @@ def step_config(ctx, apply_it):
     # from a run when it was on would otherwise keep paging while the conf says off.
     monitor_ids = ([] if split_list(conf.get("MONITOR_ACTOR_IDS", EXECUTOR_SELF)) == [MONITOR_OFF]
                    else ctx.ids.get("monitor_actor_ids") or [])
-    body = validate_composed(compose_config(conf, label_ids, actors, monitor_ids),
+    bounce_ids = ([] if split_list(conf.get("BOUNCE_ACTOR_IDS", EXECUTOR_SELF)) == [MONITOR_OFF]
+                  else ctx.ids.get("bounce_actor_ids") or [])
+    body = validate_composed(compose_config(conf, label_ids, actors, monitor_ids, bounce_ids),
                              ctx.role_home)
     unknown_keys = clone_lacks_keys(ctx, json.loads(body))
     if unknown_keys:
@@ -2955,6 +3010,14 @@ def _selftest_body():
        refused("MONITOR_ACTOR_IDS=off,self\n", "`off` stands alone"))
     ok("refuse: MONITOR_ACTOR_IDS repeating an entry",
        refused("MONITOR_ACTOR_IDS=self,self\n", "MONITOR_ACTOR_IDS repeats an entry"))
+    ok("refuse: BOUNCE_ACTOR_IDS left empty, naming `self` and `off`",
+       refused("BOUNCE_ACTOR_IDS=\n", "BOUNCE_ACTOR_IDS is empty"))
+    ok("refuse: BOUNCE_ACTOR_IDS mixing `off` with an id",
+       refused("BOUNCE_ACTOR_IDS=off,self\n", "BOUNCE_ACTOR_IDS mixes `off`"))
+    ok("refuse: BOUNCE_ACTOR_IDS repeating an entry",
+       refused("BOUNCE_ACTOR_IDS=self,self\n", "BOUNCE_ACTOR_IDS repeats an entry"))
+    ok("refuse: a BOUNCE_ACTOR_IDS entry that is no id",
+       refused("BOUNCE_ACTOR_IDS=not an id!\n", "BOUNCE_ACTOR_IDS entry"))
     _off_values, _off_errors = parse_conf(good_text + "MONITOR_ACTOR_IDS=off\n")
     ok("conf: MONITOR_ACTOR_IDS=off is accepted, by name",
        _off_errors == [] and validate_conf(_off_values, person)[1] == []
@@ -3735,7 +3798,8 @@ def _selftest_body():
         os.makedirs(root11)
         ctx, fake11 = machine_ctx(root11)
         ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
-                   "monitor_actor_ids": ["viewer-uuid-0001"]}
+                   "monitor_actor_ids": ["viewer-uuid-0001"],
+                   "bounce_actor_ids": ["viewer-uuid-0001"]}
         saved_compose = globals()["compose_config"]
 
         def dropping(conf, label_ids, actor_ids, *rest):
@@ -3767,7 +3831,8 @@ def _selftest_body():
             with open(clone_notifier, "w", encoding="utf-8") as fh:
                 fh.write(older)
             ctx_o.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
-                         "monitor_actor_ids": [] if "off" in extra else ["viewer-uuid-0001"]}
+                         "monitor_actor_ids": [] if "off" in extra else ["viewer-uuid-0001"],
+                         "bounce_actor_ids": ["viewer-uuid-0001"]}
             (_c, rows_o), out_o = quiet(lambda: run_steps(ctx_o, True,
                                                           steps=(("config", "", step_config),)))
             return rows_o, out_o, f_o
@@ -3841,7 +3906,8 @@ def _selftest_body():
                 fh.write(str(rc))
             ctx, _f = machine_ctx(r13, home=h13)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
-                       "monitor_actor_ids": ["viewer-uuid-0001"]}
+                       "monitor_actor_ids": ["viewer-uuid-0001"],
+                       "bounce_actor_ids": ["viewer-uuid-0001"]}
             steps13 =tuple((s, t, f) for s, t, f in STEPS if s in ("preflight", "config", "job", "dry-run"))
             (code, rows), out = quiet(lambda: run_steps(ctx, True, keep_going=True, steps=steps13))
             got = rows_of(rows).get("dry-run")
@@ -3916,6 +3982,47 @@ def _selftest_body():
            and ctx14b.ids.get("monitor_actor_ids") == [] and "MONITOR_ACTOR_IDS=off" in out14,
            "%s\n%s" % (written, out14[-600:]))
 
+        # ── 14c. BOUNCE_ACTOR_IDS (KIT-225): the same three shapes as the monitor's ──
+        written, out14, ctx14c = monitor_ids_case("BOUNCE_ACTOR_IDS=bounce-actor-0009,self\n")
+        ok("labels: BOUNCE_ACTOR_IDS names ids and `self`; both land in the composed config",
+           written.get("bounce_actor_ids") == ["bounce-actor-0009", "viewer-uuid-0001"],
+           "%s\n%s" % (written, out14[-600:]))
+        written, out14, ctx14c = monitor_ids_case("BOUNCE_ACTOR_IDS=off\n")
+        ok("labels: BOUNCE_ACTOR_IDS=off composes NO bounce_actor_ids, and says so by name",
+           written and "bounce_actor_ids" not in written
+           and ctx14c.ids.get("bounce_actor_ids") == [] and "BOUNCE_ACTOR_IDS=off" in out14,
+           "%s\n%s" % (written, out14[-600:]))
+        written, out14, ctx14c = monitor_ids_case("")
+        ok("labels: BOUNCE_ACTOR_IDS defaults to `self`, the Stage E key's user",
+           written.get("bounce_actor_ids") == ["viewer-uuid-0001"],
+           "%s\n%s" % (written, out14[-600:]))
+        r14c = tempfile.mkdtemp(prefix="bounce-off-ledger.", dir=tmp_root)
+        ctx14c, f14c = machine_ctx(r14c, conf=good_conf("BOUNCE_ACTOR_IDS=off\n"))
+        ctx14c.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                      "monitor_actor_ids": ["viewer-uuid-0001"],
+                      "bounce_actor_ids": ["viewer-uuid-0001"]}
+        (_c14c, rows14c), _o14c = quiet(lambda: run_steps(ctx14c, True,
+                                                          steps=(("config", "", step_config),)))
+        try:
+            with open(os.path.join(f14c.home, ".stage-e", "notifier.json"), encoding="utf-8") as fh:
+                written14c = json.load(fh)
+        except (OSError, ValueError):
+            written14c = None
+        ok("config: BOUNCE_ACTOR_IDS=off composes no bounce ids, even over a ledger that holds "
+           "some", rows14c[0][1] == DONE and written14c is not None
+           and "bounce_actor_ids" not in written14c, (rows14c, written14c))
+        for extra_b, ids_b, want_b in (
+                ("BOUNCE_ACTOR_IDS=off\n", {}, ""),
+                ("", {}, "BOUNCE_ACTOR_IDS"),
+                ("", {"bounce_actor_ids": ["viewer-uuid-0001"]}, ""),
+                ("BOUNCE_ACTOR_IDS=bounce-actor-0009\n",
+                 {"bounce_actor_ids": ["viewer-uuid-0001"]}, "bounce-actor-0009")):
+            got_b = bounce_ids_unresolved(good_conf(extra_b), ids_b)
+            ok("config: %s against a ledger holding %s — %s"
+               % (extra_b.strip() or "BOUNCE_ACTOR_IDS=self", ids_b.get("bounce_actor_ids"),
+                  "waits on the labels step" if want_b else "composable"),
+               (want_b in got_b and got_b) if want_b else got_b == "", got_b)
+
         # ── 14b'. the ledger's monitor ids are composed only when they answer this conf ──
         # A ledger from before KIT-156 holds none; `verify` keeps the ledger's ids unchecked.
         # Composing those would reproduce the old file and call it current (see 3b). `off`
@@ -3940,7 +4047,8 @@ def _selftest_body():
         c14o = good_conf("MONITOR_ACTOR_IDS=off\n")
         ctx14o, f14o = machine_ctx(r14o, conf=c14o)
         ctx14o.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
-                      "monitor_actor_ids": ["viewer-uuid-0001"]}
+                      "monitor_actor_ids": ["viewer-uuid-0001"],
+                      "bounce_actor_ids": ["viewer-uuid-0001"]}
         (_c14o, rows14o), out14o = quiet(lambda: run_steps(ctx14o, True,
                                                            steps=(("config", "", step_config),)))
         try:

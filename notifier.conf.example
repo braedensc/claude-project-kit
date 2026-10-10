@@ -129,3 +129,10 @@ DISPATCHER_STATE_ROOT=
 # A change here takes a `run` with the tracker key in your shell: `verify`
 # never asks for the key, so it cannot resolve these ids.
 MONITOR_ACTOR_IDS=self
+
+# Who may author the bounce driver's ready-to-merge mark: the page that says
+# Stage E is done with a pull request and it is yours to merge (KIT-225).
+# Same values as above: `self`, actor ids, or `off`.  The driver writes the
+# mark with the Stage E key, so `self` is right when both use one key.
+# The mark carries no label.  Anything holding that key can write one.
+BOUNCE_ACTOR_IDS=self

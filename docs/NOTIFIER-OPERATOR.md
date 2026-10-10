@@ -41,9 +41,10 @@ One pass every few minutes, as the role account:
 | `planning-no-output` | the plan executor | a planning run produced nothing | `agent:blocked` |
 | `planning-rejected` | the plan executor | a plan was refused | none |
 | `agent:blocked` | a stopped session | a session needs a decision | `agent:blocked` |
-| `agent:needs-human` | a stopped session | a session is terminal until you act | `agent:needs-human` |
+| `agent:needs-human` | a stopped session, or the bounce driver when a fix budget is spent | a session is terminal until you act | `agent:needs-human` |
 | `daemon-health-incident` | the heartbeat monitor | a watched Stage E daemon needs a look | none |
 | `daemon-health-recovered` | the heartbeat monitor | the watched daemons are reporting again | none |
+| `ready-to-merge` | the bounce driver | a pull request is ready for you to merge, with its link | none |
 
 **The four planning marks count only from the executor's author ids** (`EXECUTOR_ACTOR_IDS`).
 A session that can comment could otherwise forge one. A planning mark from anyone else is
@@ -59,6 +60,12 @@ and every pass says `daemon-health marks: OFF` — so a config written before th
 keeps loading. A mark seen while the key is absent is **deferred, not dropped**: it is not
 recorded as seen, so once the key is set, every health comment still among the newest the
 notifier reads pings, oldest first.
+
+**The ready-to-merge mark counts only from the bounce driver's author ids**
+(`BOUNCE_ACTOR_IDS`, KIT-225), on the same rules as the health marks: anyone else's is named
+and skipped, and unset it is OFF and said every pass. Its ping links the pull request named
+on the comment's second line, only when that line is exactly one. Anything else, and the
+ping links the ticket.
 
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
@@ -186,7 +193,7 @@ nothing.
 | `preflight` | reads the conf, finds the role account's home, runs the notifier's own selftest from this checkout, and checks that account's clone holds every file the notifier runs **byte for byte as this checkout does** (sha256, read as that account) | any problem, all listed at once. A clone file that is missing, unreadable, or different is named |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private | card `CK-N1` |
 | `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer |
-| `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS` and `MONITOR_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
+| `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS`, `MONITOR_ACTOR_IDS` and `BOUNCE_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
 | `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it, and after the notifier in the role account's clone is seen to know every key in it | a composition the notifier would refuse fails here, before anything is written. So does a key the clone's older notifier does not know |
 | `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
@@ -449,6 +456,15 @@ Do steps 1 and 2 in one sitting. Between them the monitor already marks its comm
 notifier does not page on them yet. Any it posts in that gap ping late, when step 2 lands,
 oldest first. The same goes for switching `MONITOR_ACTOR_IDS` from `off` to on later.
 
+**The ready-to-merge page (KIT-225), after the merge that brings it.** Run the Stage E
+installer's `run`, which moves the clone. Then run this installer's `run` with
+`$STAGE_E_LINEAR_API_KEY` set in your shell. It resolves `BOUNCE_ACTOR_IDS` and rewrites
+the config. Until then the config step waits on the labels step and says so.
+
+Good: the next pass's summary says `ready-to-merge marks: ON`.
+Not that: `ready-to-merge marks: OFF (bounce_actor_ids is unset)`. The `run` with the key
+has not landed.
+
 **Pausing this notifier while the monitor watches it.** Unload it as usual. The Stage E
 installer's `heartbeat-monitor` row then says `notifier paused: not watched; load it, then
 run this again`, and the step does not fail. A monitor already watching it reports it stale.
@@ -515,7 +531,11 @@ share. It stops there, before it changes anything: run the two again in the orde
   dispatcher's tools can read the role account's env file, a dispatched session can too
   (KIT-162). A dispatched session commenting in the ordinary way writes as the dispatcher's
   own account, so it cannot forge the mark. A forged mark applies no label: it costs one
-  ping. The `agent:*` marks are already accepted from anyone. (KIT-156)
+  ping. The `agent:*` marks are already accepted from anyone. (KIT-156) The same holds for
+  `BOUNCE_ACTOR_IDS=self` and the ready-to-merge mark: a forged one costs one ping that
+  links at most a pull request. (KIT-225)
+- **That a live ready-to-merge comment pages and links the pull request.** The selftests
+  drive both ends; no live conclusion has yet. (KIT-227)
 - **Whether every comment posted with that key starts with its writer's own text.** The
   monitor defuses `<!--` in everything it embeds. The bounce driver copies reviewer and
   session text into its comments and does not defuse `<!--`, and that its first line is
