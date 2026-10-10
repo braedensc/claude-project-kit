@@ -510,11 +510,13 @@ Stop hook between them:
      **only** when a project opted into the agentic delivery pipeline. The single
      discriminator is whether `delivery.json` exists at the repo root, and the
      existence test runs before anything that can fail: absent → exit 0, no output,
-     no git, no network, so a project that never adopted the pipeline behaves exactly
-     as it always did. Everything they trust comes from the **dispatcher**, never the
-     session — the pinned ticket and session mode from a pin file *outside* the
-     worktree, config values from the committed copy on the default branch, states
-     and labels compared by **ID** rather than display name. They block: moving a
+     no network, and one local git read (whether a commit holds the file — a copy
+     moved out of the working tree still counts), so a project that never adopted
+     the pipeline behaves exactly as it always did. Everything they trust comes
+     from the **dispatcher**, never the session — the pinned ticket and session
+     mode from a pin file *outside* the worktree, config values from the committed
+     copy on the default branch, states and labels compared by **ID** rather than
+     display name. They block: moving a
      ticket into the `ready` state (**approving work is a human's action, with no
      in-session exception** — only `epic/*` provenance auto-approves and only *out of
      session*, through `scripts/check_auto_approve.py`, which can read the epic;
@@ -542,7 +544,11 @@ Stop hook between them:
      session on a dispatcher's lane that writes no pin is not ad-hoc: its account
      carries a root-owned lane marker under the pins root (card CK-10), and with it the
      tracker guards apply as for a pinned `ticket` session, its own ticket read from
-     the worktree folder's name (KIT-241). An
+     the name of the session's worktree folder, or its parent (KIT-241). A marker the
+     hook cannot check for counts as there. `~` in the pins root is the account's
+     home from the account database, never `$HOME`, for the pin as for the marker;
+     and moving `delivery.json` out of the working tree leaves the pipeline on while
+     a commit still holds it. An
      **expiry is not an absence**, though: a lapsed pin means a binding was issued
      and can no longer be verified, so reading it as "unpinned" would make waiting an
      escape. A broken `delivery.json` still leaves `delivery.json` itself editable, so

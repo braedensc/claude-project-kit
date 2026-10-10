@@ -1634,6 +1634,8 @@ CARDS = {
                "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane/${ROLE_ACCOUNT}",
                "Then check it:",
                "    ls -l ~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane",
+               "`verify` reads it too, as the role account, at the pins root each",
+               "repository's committed delivery.json names: its lane-marker row.",
                "Your own account gets no marker: your sessions keep the open rules."],
         "good": "one file named ${ROLE_ACCOUNT}, owned by root, mode -r--r--r--",
         "attest": None,
@@ -5389,6 +5391,106 @@ def step_heartbeat_monitor(ctx, apply_it):
                   % (ctx.role_home, MONITOR_LOG))
 
 
+# --------------------------------------------------------------------------- #
+# The dispatcher's lane marker (KIT-241)
+# --------------------------------------------------------------------------- #
+# The kit hook gives a session with no pin the pinned tracker guards only when its OS
+# account carries a root-owned marker, <pinsRoot>/dispatched-lane/<account> (card CK-10).
+# Nothing measured it, so a machine without one read clean here while every dispatched
+# session ran with those guards open. This step reads it the way the hook does: the pins
+# root from each served repository's COMMITTED delivery.json (on the refs the hook trusts),
+# `~` as the role account's home from the account database, and the marker with lstat.
+# A repository with no delivery.json has the hook's pipeline guards off: it needs none.
+LANE_MARKER_DIR = "dispatched-lane"
+DEFAULT_PINS_ROOT = "~/.claude/pipeline/pins"
+
+# Exit 7: not a clone this account can read. Exit 9: no trusted ref holds the file.
+DELIVERY_READ_SH = (
+    'p=%s; git -C "$p" rev-parse --git-dir >/dev/null 2>&1 || exit 7; '
+    'for r in origin/main origin/master main master; do '
+    'git -C "$p" show "$r:delivery.json" 2>/dev/null && exit 0; done; exit 9')
+
+# Prints the marker's path, then the owner uid of the marker and of its folder. Exit 9:
+# no marker (ENOENT or ENOTDIR, as the hook reads it). Any other error is a traceback.
+LANE_MARKER_PY = (
+    "import errno,os,pwd,sys\n"
+    "e=pwd.getpwuid(os.getuid())\n"
+    "raw=sys.argv[1]\n"
+    "root=(os.path.join(e.pw_dir,raw[2:]) if raw=='~' or raw.startswith('~/')\n"
+    "      else os.path.expanduser(raw))\n"
+    "f=os.path.join(root,%r,e.pw_name)\n"
+    "print(f)\n"
+    "try:\n"
+    "  a=os.lstat(f)\n"
+    "except OSError as x:\n"
+    "  if x.errno in (errno.ENOENT,errno.ENOTDIR): sys.exit(9)\n"
+    "  raise\n"
+    "print(a.st_uid,os.lstat(os.path.dirname(f)).st_uid)\n" % LANE_MARKER_DIR)
+
+
+def step_lane_marker(ctx, apply_it):
+    """Measured, never written: the marker must be a file no session can create or delete,
+    so root writes it, by hand, from card CK-10. `run` stops here until it is there."""
+    r = ctx.runner
+    if "entries" not in ctx.dispatcher:
+        # Not read is not empty: "no repository needs a marker" would be a guess.
+        raise Unknown("the dispatcher's config was not read on this pass, so which "
+                      "repositories need the lane marker is not known",
+                      "Clear the preflight row first; its reason is printed with it.")
+    roots, notes, seen = {}, [], set()
+    for entry in ctx.dispatcher.get("entries", []) or []:
+        repo = entry.get("repositoryPath")
+        if not repo or repo in seen:
+            continue
+        seen.add(repo)
+        got = r.as_role(ctx.account, DELIVERY_READ_SH % shlex.quote(repo))
+        if got.rc == 9:
+            continue
+        if not got.ok:
+            raise Unknown("could not read the committed delivery.json of %s as %s "
+                          "(exit %s): %s" % (repo, ctx.account, got.rc,
+                                             (got.err or got.out).strip()[:160]),
+                          "Give the role account read access to that clone, then run\n"
+                          "    python3 %s verify" % _self_path())
+        try:
+            raw = (json.loads(got.out).get("dispatch") or {}).get("pinsRoot")
+        except (ValueError, AttributeError):
+            raw = None
+            notes.append("%s: its committed delivery.json does not read as a config, so the "
+                         "kit hook refuses every change there until it is fixed. Its marker "
+                         "is looked for at the default pins root." % repo)
+        roots.setdefault(raw if isinstance(raw, str) and raw.strip() else DEFAULT_PINS_ROOT,
+                         []).append(repo)
+    if not roots:
+        return True, ("no repository the dispatcher serves has a committed delivery.json, "
+                      "so the kit hook's pipeline guards are off in all of them and no "
+                      "lane marker is needed"), notes
+    found, problems = [], []
+    for raw, repos in sorted(roots.items()):
+        got = r.as_role(ctx.account, "/usr/bin/python3 -c %s %s"
+                        % (shlex.quote(LANE_MARKER_PY), shlex.quote(raw.strip())))
+        lines = got.out.strip().splitlines()
+        path = lines[0] if lines else "<%s>/%s/%s" % (raw, LANE_MARKER_DIR, ctx.account)
+        if got.rc == 9:
+            problems.append("no lane marker at %s (for %s)" % (path, ", ".join(repos)))
+            continue
+        owners = lines[1].split() if got.ok and len(lines) > 1 else []
+        if len(owners) != 2:
+            raise Unknown("could not look for the lane marker under %s as %s (exit %s): %s"
+                          % (raw, ctx.account, got.rc, (got.err or got.out).strip()[-160:]),
+                          "Read that path as the role account, then run\n"
+                          "    python3 %s verify" % _self_path())
+        if owners != ["0", "0"]:
+            problems.append("the lane marker %s, or its folder, is not root's (owner "
+                            "uids %s): a file the role account owns is one a session "
+                            "could delete" % (path, " and ".join(owners)))
+            continue
+        found.append(path)
+    if problems:
+        raise Blocked("CK-10", "; ".join(problems))
+    return True, "the lane marker is root's: %s" % ", ".join(found), notes
+
+
 def step_handover(ctx, apply_it):
     """The end-to-end sign-off, and the fence it watched. See FENCE_NOTE.
 
@@ -5439,6 +5541,8 @@ STEPS = (
      step_heartbeat_monitor),
     ("conflict-waker", "your own conflict waker — the local half of the conflict loop",
      step_conflict_waker),
+    ("lane-marker", "the root-owned marker that gives dispatched sessions the hook's "
+     "tracker guards", step_lane_marker),
     ("handover", "one real ticket, watched end to end", step_handover),
 )
 
@@ -11414,6 +11518,95 @@ def _selftest_body():
            and order.index("heartbeat-monitor") < order.index("handover"),
            "the monitor step must follow `enable`: %s" % order)
 
+    # -- KIT-241. THE LANE MARKER IS MEASURED, NOT ONLY CARDED ------------------ #
+    # CK-10 was reachable only by `card CK-10` typed by hand, so a machine without the
+    # marker verified clean while the hook's tracker guards stayed open on the lane.
+    def _lane_ctx(read=None, probe=None):
+        c, f, _a = _healthy_ctx(conf)
+        lead = []
+        if read is not None:
+            lead.append(('git -C "$p" show', read[0], read[1]))
+        if probe is not None:
+            lead.append(("dispatched-lane", probe[0], probe[1]))
+        f.answers = lead + f.answers
+        return c, f
+
+    def _probed(f):
+        return [_fmt(a) for a in f.reads if "dispatched-lane" in _fmt(a)]
+
+    marker = ("/Users/<role-account>/.claude/pipeline/pins/dispatched-lane/%s"
+              % conf["ROLE_ACCOUNT"])
+    cases += 1
+    ctxL, fakeL = _lane_ctx()
+    okL, detailL, _nL = step_lane_marker(ctxL, apply_it=False)
+    expect("lane-marker-held", okL is True and marker in detailL and not fakeL.writes
+           and any("sudo -u %s -H" % conf["ROLE_ACCOUNT"] in p
+                   and "'~/.claude/pipeline/pins'" in p for p in _probed(fakeL)),
+           "a root-owned marker read %r, probes %s, writes %s"
+           % (detailL, _probed(fakeL), fakeL.writes))
+    for label, probe, needle in (
+            ("lane-marker-absent", (9, marker + "\n"), "no lane marker at " + marker),
+            ("lane-marker-role-owned", (0, marker + "\n501 0\n"), "is not root's"),
+            ("lane-marker-folder-role-owned", (0, marker + "\n0 501\n"), "is not root's")):
+        cases += 1
+        ctxX, _fX = _lane_ctx(probe=probe)
+        try:
+            step_lane_marker(ctxX, apply_it=True)
+            failures.append("%s: the step held" % label)
+        except Blocked as exc:
+            expect(label, exc.card_id == "CK-10" and needle in exc.extra,
+                   "blocked on %s saying %r" % (exc.card_id, exc.extra))
+    for label, read, probe in (
+            ("lane-marker-clone-unreadable", (7, ""), None),
+            ("lane-marker-probe-crashed", None,
+             (1, marker + "\nTraceback (most recent call last):\nPermissionError\n"))):
+        cases += 1
+        ctxX, _fX = _lane_ctx(read=read, probe=probe)
+        try:
+            step_lane_marker(ctxX, apply_it=False)
+            failures.append("%s: could not look, and the step held" % label)
+        except Unknown:
+            pass
+        except Blocked as exc:
+            failures.append("%s: could not look, and read it as missing (%s)"
+                            % (label, exc.extra))
+    # A dispatcher config this pass did not read is not one with no repositories.
+    cases += 1
+    ctxD, _fD = _lane_ctx()
+    ctxD.dispatcher = {}
+    try:
+        step_lane_marker(ctxD, apply_it=False)
+        failures.append("lane-marker-config-unread: an unread config read as nothing to mark")
+    except Unknown:
+        pass
+    # A repository with no delivery.json has the hook's pipeline guards off: no marker
+    # is needed, and none is looked for.
+    cases += 1
+    ctxN, fakeN = _lane_ctx(read=(9, ""))
+    okN, detailN, _nN = step_lane_marker(ctxN, apply_it=False)
+    expect("lane-marker-no-pipeline", okN is True and "no lane marker is needed" in detailN
+           and not _probed(fakeN), "%r, probes %s" % (detailN, _probed(fakeN)))
+    # The pins root the COMMITTED config names is the one asked about.
+    cases += 1
+    ctxP, fakeP = _lane_ctx(read=(0, json.dumps({"version": 1,
+                                                  "dispatch": {"pinsRoot": "/srv/pins"}})),
+                            probe=(0, "/srv/pins/dispatched-lane/x\n0 0\n"))
+    step_lane_marker(ctxP, apply_it=False)
+    expect("lane-marker-pins-root", any("/srv/pins" in p for p in _probed(fakeP)),
+           "probes %s" % _probed(fakeP))
+    # A whole `verify` of a healthy machine with no marker: red on that row alone, and
+    # `status` names the card that clears it.
+    cases += 1
+    ctxV, fakeV = _lane_ctx(probe=(9, marker + "\n"))
+    ctxV.runner.dry_run = True
+    codeV, outV = _quiet(lambda: cmd_verify(ctxV))
+    rowsV = {s: r["outcome"] for s, r in ctxV.state.data["steps"].items()
+             if r["outcome"] not in (DONE, ALREADY_DONE, SKIPPED)}
+    codeS, outS = _quiet(lambda: cmd_status(ctxV))
+    expect("lane-marker-verify", codeV == EX_BLOCKED and rowsV == {"lane-marker": BLOCKED}
+           and not fakeV.writes and "card CK-10" in outS and codeS == EX_BLOCKED,
+           "verify exit %s rows %s; status exit %s: %s" % (codeV, rowsV, codeS, outS[-300:]))
+
     say("")
     if failures:
         for f in failures:
@@ -11493,7 +11686,14 @@ def _settled_ctx(conf):
         "linear_key_env": "STAGE_E_LINEAR_API_KEY", "state_dir": "~/.stage-e/finding",
         "lookback_hours": 72, "max_per_source": 3, "max_per_run": 20,
     }
-    answers += [
+    answers = [
+        # KIT-241: the served repository's committed delivery.json, and the lane marker,
+        # root's, in a root-owned folder. First, so no broader needle answers them.
+        ("git -C \"$p\" show", 0, json.dumps({"version": 1, "dispatch": {
+            "pinsRoot": DEFAULT_PINS_ROOT}})),
+        ("dispatched-lane", 0, "%s/.claude/pipeline/pins/%s/%s\n0 0\n"
+         % (ctx.role_home, LANE_MARKER_DIR, conf["ROLE_ACCOUNT"])),
+    ] + answers + [
         # The finding poller's dry run — keyed on its OWN script name and placed
         # before "scan --dry-run" below, because that needle is a substring of the
         # finding command too (it also ends `scan … --dry-run`). First-match wins.
