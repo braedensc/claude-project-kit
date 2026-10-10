@@ -49,7 +49,9 @@ THE THINGS THIS FILE IS SHAPED AROUND
      issues no state-move mutation at all. The epic carries `provenance:agent`, which by
      §5 never auto-approves — so the epic cannot approve itself, and a person
      moving it to exactly `ready` is the one gate that releases the tree (§5
-     rule 2: any other out-of-intake state releases nothing).
+     rule 2: any other out-of-intake state releases nothing). That gate is read
+     only by the approve tier; where that is off (the default), the move releases
+     nothing either, and each child starts only when it is delegated (KIT-216).
      --selftest asserts no state-move / approve / merge path exists in this file.
 
   3. All-or-nothing, including the DoR gate (contract §8, §13). One malformed
@@ -698,6 +700,15 @@ def guard_change_children(children):
             or _GUARD_PATH_RE.search(child.get("body") or "")]
 
 
+# What approving does, said wherever the owner is asked to approve (KIT-216). The move to
+# `ready` is read only by the approve tier; either way no child starts until it is
+# delegated, and where nothing delegates for the owner, the owner does it.
+APPROVAL_STARTS_NOTHING = (
+    "Approving starts no work by itself: a child starts only when it is delegated to the "
+    "agent. Where nothing delegates for you, delegate each child yourself, a child only "
+    "after the ones it depends on (§11).")
+
+
 def render_success_comment(idea_id, epic, children, epic_title, duplicates=None):
     """One markdown comment posted back on the idea ticket, for the owner.
 
@@ -740,8 +751,7 @@ def render_success_comment(idea_id, epic, children, epic_title, duplicates=None)
         "",
         "After that, a child reaches `ready` only by the approve tier, if it is "
         "switched on for this project (it re-checks each child against the "
-        "readiness gate first), or by you moving it. A child starts work only "
-        "when someone delegates it (§11).",
+        "readiness gate first), or by you moving it. " + APPROVAL_STARTS_NOTHING,
     ]
     return "\n".join(lines)
 
@@ -792,6 +802,8 @@ def render_refiled_summary(idea_id, epic, receipt):
         "was filed again. To approve, move the epic to the state this project maps to "
         "`ready`." % (idea_id, epic["identifier"], epic.get("url") or "",
                       len(epic["children"]), ", ".join(epic["children"]) or "none"),
+        "",
+        APPROVAL_STARTS_NOTHING,
         "",
         receipt,
     ])
@@ -1405,11 +1417,15 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         created.append("project `%s`" % _sanitize(plan["epic"]["title"])[:80])
 
         # The epic — backlog, provenance:agent, owner subscribed. It approves
-        # nothing: provenance:agent never auto-approves (§5).
+        # nothing: provenance:agent never auto-approves (§5). Its first lines say what
+        # approving does, on and off, for the owner who approves it (KIT-216).
         epic_desc = ("> Epic drafted by a planning session from **%s**. "
-                     "`provenance:agent` — awaiting a person's approval to release "
-                     "its children (§4, §5).\n>\n> %s\n\n%s"
-                     % (pinned, receipt, plan["epic"]["body"]))
+                     "`provenance:agent` — awaiting a person's approval (§4, §5). To "
+                     "approve, move it to the state this project maps to `ready`. Where "
+                     "the approve step is switched on, it then moves each child that "
+                     "passes the readiness gate to `ready`; where that step is off (the "
+                     "default), approving moves no child. %s\n>\n> %s\n\n%s"
+                     % (pinned, APPROVAL_STARTS_NOTHING, receipt, plan["epic"]["body"]))
         epic = client.create_issue(
             team_id, plan["epic"]["title"], epic_desc, forced["landing_state"],
             [forced["prov_agent"]], parent_id=None, project_id=project_id,
@@ -1650,6 +1666,14 @@ def selftest():
         check("epic-no-parent", epic["parent_id"], None)
         check("epic-owner-subscribed", epic["subscriber_ids"], ["owner-1"])
         check("epic-never-assigned-to-session", epic["assignee_id"], None)
+        # KIT-216: the epic's own description is what the owner approves. It says what
+        # approving does with the approve step on and off, and claims no release.
+        check("epic-says-what-approving-does",
+              (APPROVAL_STARTS_NOTHING in epic["description"],
+               "where that step is off (the default), approving moves no child"
+               in epic["description"],
+               "release its children" in epic["description"]),
+              (True, True, False))
         check("child-parent-forced-to-epic", all(k["parent_id"] == epic["id"] for k in kids), True)
         check("child-provenance-epic-forced",
               all("lbl-prov-epic" in k["label_ids"] for k in kids), True)
@@ -2254,6 +2278,17 @@ def selftest():
             "KIT-1", {"identifier": "KIT-2"}, [({"identifier": "KIT-3"},
                                                 {"title": "t", "body": "plain"})], "e"),
               False)
+        # KIT-216: approving starts no work by itself, and both summaries say who starts
+        # each child.
+        for label, text in (
+                ("success", render_success_comment(
+                    "KIT-1", {"identifier": "KIT-2"}, [({"identifier": "KIT-3"},
+                                                        {"title": "t", "body": "plain"})], "e")),
+                ("refiled", render_refiled_summary(
+                    "KIT-1", {"identifier": "KIT-2", "children": ["KIT-3"]}, "r"))):
+            check("summary-says-approval-starts-nothing:" + label,
+                  "Approving starts no work by itself" in text
+                  and "delegate each child yourself" in text, True)
 
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
