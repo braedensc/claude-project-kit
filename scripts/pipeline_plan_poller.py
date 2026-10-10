@@ -84,7 +84,9 @@ WHO CAN START A RUN, AND ON WHAT
   decision of 2026-10-10): the tracker never records a state change a ticket's own
   creator makes in its first minutes, so an idea written and moved at once has no move to
   read. Another actor's state change is recorded at once, so any recorded change voids
-  this, and then only a recorded move into Plan it starts a run. And only on a FRESH idea: a ticket with a delegate, an
+  this, and then only a recorded move into Plan it starts a run. An idea the job
+  already told it has no move keeps needing a real move; its creation never counts
+  later. And only on a FRESH idea: a ticket with a delegate, an
   agent session, a `provenance:*` or `agent:*` label, a parent or children, or a pull
   request attached is live work that was dragged into Plan it, and gets one note and no
   run. At most `max_new_runs` start per pass and `max_runs_per_day` per UTC day, across
@@ -1286,28 +1288,35 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
         if memo.get("updatedAt") == idea.get("updatedAt") and memo.get("settled"):
             continue                       # nothing moved since this idea was settled
         # Every note here is said ONCE: a comment moves the idea's updatedAt, so a note
-        # keyed on updatedAt would be posted again on every pass.
+        # keyed on updatedAt would be posted again on every pass. The idea is settled at its
+        # current updatedAt either way: the pass after a note records the updatedAt that
+        # note moved, and later passes skip it without reading its history again.
         try:
             hist_issue, nodes = read_history(linear, idea["id"])
         except HistoryTooLong:
             if not memo.get("long_noted"):
                 post_comment(linear, idea["id"], REFUSED_LONG_HISTORY % cfg["plan_it_state"],
                              dry_run)
-                seen["ideas"][idea["id"]] = dict(memo, long_noted=True,
-                                                 updatedAt=idea.get("updatedAt"), settled=True)
-                save_seen(cfg["state_dir"], seen, dry_run)
-            stats["refused"] += 1
+                stats["refused"] += 1
+            seen["ideas"][idea["id"]] = dict(memo, long_noted=True,
+                                             updatedAt=idea.get("updatedAt"), settled=True)
+            save_seen(cfg["state_dir"], seen, dry_run)
             continue
         trigger = trigger_from(hist_issue, nodes, team["plan_it_id"], idea["id"])
+        if trigger is not None and trigger.get("creation") and memo.get("no_move_noted"):
+            # Already told it has no move, by an earlier pass or by the job before KIT-164,
+            # which read no creation. That note asked the owner to move it, so it keeps
+            # needing a real move.
+            trigger = None
         if trigger is None:
             mark = history_mark(nodes)
             if memo.get("no_move_noted") != mark:
                 post_comment(linear, idea["id"], REFUSED_NO_MOVE % (
                     cfg["plan_it_state"], cfg["plan_it_state"]), dry_run)
-                seen["ideas"][idea["id"]] = dict(memo, no_move_noted=mark,
-                                                 updatedAt=idea.get("updatedAt"), settled=True)
-                save_seen(cfg["state_dir"], seen, dry_run)
-            stats["refused"] += 1
+                stats["refused"] += 1
+            seen["ideas"][idea["id"]] = dict(memo, no_move_noted=mark,
+                                             updatedAt=idea.get("updatedAt"), settled=True)
+            save_seen(cfg["state_dir"], seen, dry_run)
             continue
         tid = trigger["id"]
         if tid in seen["triggers"]:
@@ -1980,6 +1989,7 @@ class FakeLinear(object):
         self.setup_hook = False
         self.history_desc = False
         self.comment_bumps = False     # Linear moves an issue's updatedAt on a new comment
+        self.history_reads = 0
         self.watch_stop_dir = None
         self.stop_at_move = []
         self.fail_times = {}       # operation -> how many more calls of it raise
@@ -2062,6 +2072,7 @@ class FakeLinear(object):
                            "pageInfo": {"hasNextPage": False}}}
 
     def _PlanHistory(self, v):
+        self.history_reads += 1
         hist = list(self.ideas[v["id"]]["history"])
         hist.sort(key=lambda h: h["createdAt"], reverse=self.history_desc)
         start = int(v.get("after") or 0)
@@ -2472,6 +2483,53 @@ def selftest():
         fake3.ideas["idea-12"]["updatedAt"] = "u9"
         one_pass(cfg3, fake3)
         check("owner-move-on-anothers-idea-runs", planned(fake3).count("PROD-12"), 1)
+        # A creation never stands in for an idea already told it has no move. That note
+        # asked the owner to move it, so it keeps needing a real move: here, once its
+        # creator can be read, and after an upgrade from the job before KIT-164, which
+        # read no creation and keyed the note on updatedAt.
+        fake3.ideas["idea-13"]["creator"] = OWNER
+        fake3.ideas["idea-13"]["updatedAt"] = "u9"
+        one_pass(cfg3, fake3)
+        check("noted-idea-creation-no-run", planned(fake3).count("PROD-13"), 0)
+        f = FakeLinear(FakeClock())
+        f.comment_bumps = True
+        f.add_idea(10, moves=0)
+        cfg_up = cfg_for("upgrade")
+        old = load_seen(cfg_up["state_dir"])
+        old["ideas"]["idea-10"] = {"no_move_noted": "u1", "updatedAt": "u1", "settled": True}
+        save_seen(cfg_up["state_dir"], old, False)
+        f.ideas["idea-10"]["updatedAt"] = "c1"           # the old note moved updatedAt
+        for _ in range(3):
+            one_pass(cfg_up, f)
+        check("upgrade-noted-idea-no-run", runs(f), [])
+        check("upgrade-noted-idea-no-trigger", load_seen(cfg_up["state_dir"])["triggers"], {})
+        check("upgrade-noted-idea-said-once-more", len(f.comments), 1)
+        f.ideas["idea-10"]["history"].append({"id": "move-10", "createdAt": MOVE_AT,
+                                              "actorId": OWNER, "fromStateId": "prod-backlog",
+                                              "toStateId": "prod-plan-it"})
+        f.ideas["idea-10"]["updatedAt"] = "u9"
+        one_pass(cfg_up, f)
+        check("upgrade-noted-idea-runs-on-a-real-move", len(runs(f)), 1)
+        # A refusal settles the idea: the pass after its note records the updatedAt that
+        # note moved, and later passes skip it without reading its history again. A long
+        # history is HISTORY_MAX_PAGES reads a pass on the owner's key otherwise.
+        f = FakeLinear(FakeClock())
+        f.comment_bumps = True
+        f.add_idea(14, moves=0)
+        f.ideas["idea-14"]["history"].append({"id": "todo-14", "createdAt": MOVE_AT,
+                                              "actorId": OWNER, "fromStateId": "prod-backlog",
+                                              "toStateId": "prod-todo"})
+        f.add_idea(16, moves=0, extra_history=HISTORY_MAX_PAGES * HISTORY_PAGE + 1)
+        cfg_rr = cfg_for("reread")
+        reads, refused = [], []
+        for _ in range(4):
+            before = f.history_reads
+            refused.append(one_pass(cfg_rr, f)[1]["refused"])
+            reads.append(f.history_reads - before)
+        check("refusal-reads-history-first", reads[0], 1 + HISTORY_MAX_PAGES)
+        check("refusal-settled-not-reread", reads[2:], [0, 0])
+        check("refusal-counted-when-said", refused, [2, 0, 0, 0])
+        check("refusal-said-once", len(f.comments), 2)
 
         # 7. THE WHOLE HISTORY IS READ (KIT-183). The move sits after 120 other entries, and
         #    the history is served oldest-first and then newest-first: found both ways. A

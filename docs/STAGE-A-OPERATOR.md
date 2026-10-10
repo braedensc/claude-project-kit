@@ -114,6 +114,9 @@ and it cannot merge.
   Any recorded state change, by anyone, means only a recorded move into Plan it counts.
 - Says each refusal once per ticket, until the ticket's history changes. A new move gets a
   new answer.
+- Never counts your creation of a ticket it already told has no move. That includes ideas
+  an older version refused; each gets the note once more. Move it out of Plan it and back
+  in.
 - Starts nothing on **live work**, with one note and no run: a ticket that is delegated, has
   an agent session, carries a `provenance:*` or `agent:*` label, has a parent or children, or
   has a pull request attached.

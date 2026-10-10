@@ -1120,9 +1120,11 @@ created it, it sits in Plan it, and its history holds **no state change at all**
 creation then stands in for the move, and its creator for the mover. The trigger's id is
 `created-<idea id>`, so the planning ticket and the job's record name it as for a move.
 Any recorded state change voids this, and then only a recorded move into Plan it counts,
-checked against the owner as before. The drill files its idea straight into Plan it, and
-wakes the job once the idea reads back, through the job's own reader, as the owner's
-creation.
+checked against the owner as before. An idea the job already told it has no move keeps
+needing a real move. Its creation never counts later, so ideas the job refused before
+this change do not start on their own once it is installed; each gets the note once
+more. The drill files its idea straight into Plan it, and wakes the job once the idea
+reads back, through the job's own reader, as the owner's creation.
 
 **Why this trusts nothing new.** The owner-only rule already trusts the key that writes as
 the owner. A creation by that key is the same identity. Another actor's state change is
@@ -1134,6 +1136,8 @@ refused with its own note.
 `updatedAt`, and a comment moves `updatedAt`. Had the tracker done that here, the note would
 have been posted again on every pass. It is now keyed on the history itself, so a new move
 gets a new answer and nothing else does. The "history too long" note is said once per idea.
+Either way the idea is then settled at its current `updatedAt`, so a later pass does not
+read its history again.
 
 **Rejected.** Waiting the window out (the drill files, waits about 15 minutes, then moves):
 slow, and it rests on a window that is bracketed, not measured. Measuring the window first:
