@@ -322,6 +322,23 @@ MONITOR_INTERVAL_SECONDS=1800
 # unwatched and says so by name on every run.
 NOTIFIER_JOB_LABEL=
 
+# The owner's hourly health watch (scripts/pipeline_watch.py,
+# docs/UPDATE-OPERATOR.md).  It checks what no daemon reports on itself: hooks
+# that cannot tell a session's worktree, updates due, a dispatcher or front
+# door that is down, a full disk.  It writes one world-readable status file.
+#
+# Set, the heartbeat monitor reads that file as a fifth heartbeat.  A problem
+# the watch finds then pages chat like a daemon that is down, once per set of
+# problems.  A watch that stopped writing reads as stale.  Install the watch
+# first (`python3 scripts/pipeline_watch.py install`): until it writes the
+# file, the monitor pages it as missing.
+#
+# RULE: the same absolute path as HEALTH_STATUS_FILE in update.conf, or EMPTY,
+# which leaves the watch unread and says so by name on every run.
+HEALTH_STATUS_FILE=
+# RULE: the same value as WATCH_INTERVAL_SECONDS in update.conf (at least 600).
+HEALTH_WATCH_INTERVAL_SECONDS=3600
+
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from
 # each repository's own `delivery.json` on its committed default branch.  Keep
