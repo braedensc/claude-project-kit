@@ -19,13 +19,20 @@ question that looked like the bridge's.
     token     asks for the bridge app's bot token at a hidden prompt and writes it into the
               role account's env file, as that account, under SLACK_TOKEN_ENV. Refuses a
               token that is already in that file under another name (the chat bot's or the
-              notifier's), and prints names and lengths only.
+              notifier's), and refuses the dispatcher's env file as ENV_FILE. Prints names
+              and lengths only.
     install   writes the config (as the role account) and the plist (as root). Dry run by
-              default; `--apply` writes. It never loads the job: that is card CK-B2.
+              default; `--apply` writes. The plist is installed disabled, so a restart does
+              not load it either. It never loads the job: that is card CK-B2.
     verify    read-only: the config and plist are the composed ones, the env file names both
               credentials, the job's own dry run passes as the role account, launchd holds
               the job, and its heartbeat is fresh.
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off.
+
+WHO RUNS SUDO. `token`, `install` and `verify` ask for the administrator password once,
+then run sudo themselves: as the role account (`sudo -u`), and as root to write the plist
+and to ask launchd whether the job is loaded. None of them starts or stops the job. The
+`launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person to run.
 
 REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `install` and `verify`.
 `verify` runs the job's own dry run, which reads the owner's tracker key; a model has no
@@ -143,6 +150,14 @@ def validate_conf(values):
         if conf[key] and not PATH_RE.match(conf[key]):
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
                           % (key, conf[key]))
+    # The dispatcher hands its env file to every session it starts. The same file under
+    # another spelling (`~/x` against an absolute path, or a link) is caught by the token
+    # writer, which resolves both as the role account.
+    if conf["DISPATCHER_ENV_FILE"] and (os.path.normpath(conf["DISPATCHER_ENV_FILE"])
+                                        == os.path.normpath(conf["ENV_FILE"])):
+        errors.append("ENV_FILE and DISPATCHER_ENV_FILE both name %s. The bridge's token goes "
+                      "in the role account's own env file, never the dispatcher's: every "
+                      "session the dispatcher starts can read that one" % conf["ENV_FILE"])
     if conf["JOB_LABEL"] and not LABEL_RE.match(conf["JOB_LABEL"]):
         errors.append("JOB_LABEL must be reverse-DNS like com.example.bridge, got %r"
                       % conf["JOB_LABEL"])
@@ -220,10 +235,18 @@ def resolve(value, home):
     return os.path.join(home, value[2:]) if value.startswith("~/") else value
 
 
+# The Stage E installer's own plist template, INSTALLED DISABLED, as Stage A's job is.
+# launchd loads every job in /Library/LaunchDaemons at boot, so a job installed and "not
+# loaded" would start at the next restart, before the person's card CK-B2. Its enable line
+# overrides `Disabled` in launchd's own record, which outlives a restart.
+_RUN_AT_LOAD = "  <key>RunAtLoad</key><true/>\n"
+PLIST = se.PLIST.replace(_RUN_AT_LOAD, _RUN_AT_LOAD + "  <key>Disabled</key><true/>\n")
+
+
 def render_plist(conf, home):
-    """The Stage E installer's own plist template, filled in. launchd expands nothing."""
+    """The plist template above, filled in. launchd expands nothing."""
     log = os.path.dirname(resolve(conf["BRIDGE_CONFIG"], home)) + "/" + LOG_NAME
-    return se.PLIST.format(
+    return PLIST.format(
         label=_xml_escape(conf["JOB_LABEL"]), account=_xml_escape(conf["ROLE_ACCOUNT"]),
         home=_xml_escape(home), path=_xml_escape(se.DAEMON_PATH),
         command=_xml_escape(job_command(conf)), interval=int(conf["INTERVAL_SECONDS"]),
@@ -250,11 +273,14 @@ CARDS = {
        "the chat bot's own app, or the notifier's. The bridge needs its own bot identity, "
        "or the chat bot could post a question that looks like the bridge's."),
     "CK-B2": ("Load the bridge job", [
-        "sudo launchctl bootstrap system {PLIST}",
         "sudo launchctl enable system/{JOB_LABEL}",
+        "sudo launchctl bootstrap system {PLIST}",
         "Wait one interval, then:  python3 {SELF} verify --conf {CONF}",
     ], "verify says the job is loaded and its heartbeat is fresh.",
-       "`Bootstrap failed: 5` — it is already loaded. Run verify instead."),
+       "`Bootstrap failed: 5`. The job is installed turned off, and CK-B3 turns it off "
+       "again; until line 1 turns it on, the load fails. If line 1 ran, the job is already "
+       "loaded, or was unloaded a moment ago. Run verify: if `loaded` passes, you are done. "
+       "If not, wait ten seconds and run lines 1 and 2 again."),
     "CK-B3": ("Turn the bridge off", [
         "sudo launchctl bootout system/{JOB_LABEL}",
         "sudo launchctl disable system/{JOB_LABEL}",
@@ -301,6 +327,19 @@ def refused(found):
     return EX_REFUSED
 
 
+_RESUME = "  Fix that and run the same command again:"
+
+
+def no_privilege(exc, resume):
+    """Exit 5, saying why. The Stage E refusal's own words, with its last line naming
+    THIS installer, not Stage E's."""
+    say("")
+    say(str(exc).split("\n" + _RESUME)[0])
+    say(_RESUME)
+    say("      python3 %s %s" % (os.path.abspath(__file__), resume))
+    return EX_NOPRIV
+
+
 # Reads the env file's NAMES (never a value), the config's bytes and the heartbeat. Every
 # read is wrapped; an error is reported by its class.
 FACTS_PY = r'''
@@ -335,6 +374,13 @@ TOKEN_WRITER_PY = r'''
 import os, re, sys, time
 env_path, name = os.path.expanduser(sys.argv[1]), sys.argv[2]
 others = [os.path.expanduser(a) for a in sys.argv[3:] if a]
+for other in others:
+    if os.path.realpath(other) == os.path.realpath(env_path):
+        print("REFUSED: %s is the same file as DISPATCHER_ENV_FILE (%s). The bridge's token "
+              "goes in the role account's own env file, never the dispatcher's: every session "
+              "the dispatcher starts can read that one. Nothing was written."
+              % (env_path, other))
+        sys.exit(3)
 token = sys.stdin.read().strip()
 lines = []
 if os.path.exists(env_path):
@@ -466,8 +512,8 @@ def cmd_token(conf, runner, sudo, reader=None, tty=None):
     try:
         sudo.acquire("`token` writes the bridge app's token into %s as %s."
                      % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"]), "token")
-    except se.NoPrivilege:
-        return EX_NOPRIV
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "token")
     value = (reader or getpass.getpass)("The bridge app's Bot User OAuth Token (hidden): ")
     value = (value or "").strip()
     if not TOKEN_RE.match(value):
@@ -491,11 +537,12 @@ def cmd_install(conf, runner, sudo, apply_it):
     found = agent_markers_present()
     if found:
         return refused(found)
+    resume = "install --apply" if apply_it else "install"
     try:
         sudo.acquire("`install` reads the role account's home and files, and %s the job's "
-                     "config and plist." % ("writes" if apply_it else "compares"), "install")
-    except se.NoPrivilege:
-        return EX_NOPRIV
+                     "config and plist." % ("writes" if apply_it else "compares"), resume)
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, resume)
     home = home_of(runner, conf["ROLE_ACCOUNT"])
     if not home:
         say("UNKNOWN: the home of %s could not be read." % conf["ROLE_ACCOUNT"])
@@ -532,7 +579,7 @@ def cmd_install(conf, runner, sudo, apply_it):
             if not res.ok:
                 say("FAILED: %s" % (res.err or "").strip()[:200])
                 return EX_FAILED
-        say("  wrote %s (not loaded)" % plist_path(conf))
+        say("  wrote %s (installed turned off, not loaded)" % plist_path(conf))
     say("")
     print_card("CK-B2", conf)
     return EX_OK
@@ -546,8 +593,8 @@ def cmd_verify(conf, runner, sudo, now=None):
     try:
         sudo.acquire("`verify` reads the role account's files and runs the bridge's own dry "
                      "run as that account. It changes nothing.", "verify")
-    except se.NoPrivilege:
-        return EX_NOPRIV
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "verify")
     runner.dry_run = True
     rows = []
     home = home_of(runner, conf["ROLE_ACCOUNT"])
@@ -573,7 +620,15 @@ def cmd_verify(conf, runner, sudo, now=None):
                      "the plist is the composed one" if plist_now.ok and plist_now.out ==
                      render_plist(conf, home) else "run `install --apply`"))
         dry = runner.as_role(conf["ROLE_ACCOUNT"], job_command(conf) + " --dry-run")
-        last = ((dry.out or "").strip().splitlines() or [""])[-1][:200]
+        # A config problem is said on stderr only, and so is the shell's own error about
+        # the env file. The shell can echo a line of that file, so a line shaped like a
+        # credential is never shown.
+        said = ((dry.out or "").strip() or (dry.err or "").strip()).splitlines() or [""]
+        last = said[-1]
+        if bridge.notify.secret_hits(last):
+            last = "its last line is shaped like a credential, so it is not shown: read %s" % (
+                LOG_NAME)
+        last = last[:200]
         rows.append(("dry-run", se.ALREADY_DONE if dry.rc == 0 else se.FAILED,
                      last or "the job printed nothing"))
         loaded = runner.as_root(["/bin/launchctl", "print", "system/%s" % conf["JOB_LABEL"]])
@@ -637,9 +692,11 @@ class _RoleRunner(se.Runner):
     """Runs the role-account programs for real, through /bin/sh, with HOME a temp home;
     root commands write into a temp tree; launchctl answers from `loaded`."""
 
-    def __init__(self, home, root, loaded=False, job_rc=0):
+    def __init__(self, home, root, loaded=False, job_rc=0,
+                 job_out="bridge: 0 message(s) examined (dry run)\n", job_err=""):
         se.Runner.__init__(self)
         self.home, self.root, self.loaded, self.job_rc = home, root, loaded, job_rc
+        self.job_out, self.job_err = job_out, job_err
         self.stdins = []
 
     def _exec(self, argv, stdin, timeout, cwd=None):
@@ -648,7 +705,7 @@ class _RoleRunner(se.Runner):
         if argv[:2] == ["sudo", "-u"]:
             script = argv[-1]
             if "pipeline_bridge.py" in script and "--dry-run" in script:
-                return se.Result(self.job_rc, "bridge: 0 message(s) examined (dry run)\n", "")
+                return se.Result(self.job_rc, self.job_out, self.job_err)
             p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True,
                                text=True, env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
             return se.Result(p.returncode, p.stdout, p.stderr)
@@ -714,6 +771,21 @@ def selftest():
             check("conf-names:" + needle, needle in joined, True)
         _c, errs = validate_conf(dict(values, SLACK_TOKEN_ENV="SLACK_BOT_TOKEN"))
         check("conf-refuses-the-chat-bots-token-name", any("chat bot" in e for e in errs), True)
+        # Each path lands inside the job's shell command, and the account in `sudo -u`: a
+        # value with anything after its plain characters is refused, by key.
+        inject = '~/kit"; /usr/bin/touch /tmp/pwned; "'
+        check("conf-path-with-shell-after-it-refused",
+              [k for k in ("ROLE_KIT_CLONE", "ENV_FILE", "BRIDGE_CONFIG", "STATE_DIR",
+                           "DISPATCHER_ENV_FILE")
+               if not any(e.startswith(k + " must be") for e in
+                          validate_conf(dict(values, **{k: inject}))[1])], [])
+        _c, errs = validate_conf(dict(values, ROLE_ACCOUNT="_exdispatch;id"))
+        check("conf-account-with-junk-after-it-refused",
+              any(e.startswith("ROLE_ACCOUNT") for e in errs), True)
+        # The bridge's token must never go in the dispatcher's env file.
+        _c, errs = validate_conf(dict(values, DISPATCHER_ENV_FILE="~/.stage-e/./env"))
+        check("conf-env-file-is-the-dispatchers-refused",
+              any("ENV_FILE and DISPATCHER_ENV_FILE" in e for e in errs), True)
         _v, perrs = parse_conf("NOPE=1\nbroken line\nTEAM_KEYS=A\nTEAM_KEYS=B\n"
                                "OWNER_USER_ID=xoxb-%s\n" % ("z" * 30))
         check("conf-parse-errors", len(perrs), 4)
@@ -737,8 +809,19 @@ def selftest():
               ("<string>_exdispatch</string>" in plist, "com.example.bridge" in plist,
                "<integer>60</integer>" in plist, "/srv/role-home/.stage-e/bridge.log"
                in plist), (True, True, True, True))
+        # Installed disabled: launchd loads every plist in /Library/LaunchDaemons at boot.
+        import plistlib
+        parsed = plistlib.loads(plist.encode("utf-8"))
+        check("plist-installed-disabled", (parsed.get("Disabled"), parsed.get("RunAtLoad")),
+              (True, True))
         check("cards-all-print", all(cap(print_card, c, conf)[1].startswith(c)
                                      for c in CARDS), True)
+        # Enable, then load: a job turned off with CK-B3 (or installed disabled) will not
+        # load until it is enabled.
+        b2 = cap(print_card, "CK-B2", conf)[1]
+        check("card-b2-enables-before-it-loads",
+              0 <= b2.find("launchctl enable system/") < b2.find("launchctl bootstrap system"),
+              True)
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
             "PIECE 1", "PIECE 2", "PIECE 3", "acts on nothing"))), (EX_OK, True))
@@ -768,6 +851,11 @@ def selftest():
                   cap(cmd_token, conf, r, _FakeSudo(), lambda _p: "x", False)[0], EX_BLOCKED)
             check("token-not-a-token",
                   cap(cmd_token, conf, r, _FakeSudo(), lambda _p: "hello", True)[0], EX_USAGE)
+            # The env file is sourced by a shell: anything after the token would run.
+            rc, out = cap(cmd_token, dict(conf, DISPATCHER_ENV_FILE=""), r, _FakeSudo(),
+                          lambda _p: "xoxb-%s $(id)" % ("j" * 30), True)
+            check("token-with-shell-after-it-refused", (rc, "j" * 30 in open(envp).read()),
+                  (EX_USAGE, False))
             rc, out = cap(cmd_token, conf, r, _FakeSudo(), lambda _p: "xoxb-" + "n" * 30, True)
             check("token-already-held-by-another-name", (rc, "NOTIFIER_TOKEN" in out),
                   (EX_REFUSED, True))
@@ -776,6 +864,48 @@ def selftest():
             rc, out = cap(cmd_token, conf, r, _FakeSudo(), lambda _p: "xoxb-" + "c" * 30, True)
             check("token-the-chat-bots-own-refused", (rc, "SLACK_BOT_TOKEN" in out,
                                                       "c" * 30 in out), (EX_REFUSED, True, False))
+            # A dispatcher env file it cannot read, or one that IS the role account's env
+            # file under another name, is refused: nothing is written.
+            fresh = "xoxb-" + "s" * 30
+            rc, out = cap(cmd_token, dict(conf, DISPATCHER_ENV_FILE="~/missing.env"), r,
+                          _FakeSudo(), lambda _p: fresh, True)
+            check("token-unreadable-dispatcher-env-refused",
+                  (rc, "could not be read" in out, "s" * 30 in open(envp).read()),
+                  (EX_REFUSED, True, False))
+            os.symlink(envp, os.path.join(home, "dispatcher-link.env"))
+            rc, out = cap(cmd_token, dict(conf, DISPATCHER_ENV_FILE="~/dispatcher-link.env"), r,
+                          _FakeSudo(), lambda _p: fresh, True)
+            check("token-dispatcher-env-is-the-same-file-refused",
+                  (rc, "DISPATCHER_ENV_FILE" in out, "s" * 30 in open(envp).read()),
+                  (EX_REFUSED, True, False))
+            # The writer's temp file is opened O_EXCL|O_NOFOLLOW: a link planted at its
+            # name, symbolic or hard, is refused and the file it points at is untouched.
+            # (Each run pins its own pid: the backup's name carries it too.)
+            for pid, kind, make in ((4242, "symlink", os.symlink), (4243, "hardlink", os.link)):
+                victim = os.path.join(tmp, "victim-" + kind)
+                with open(victim, "w") as fh:
+                    fh.write("untouched\n")
+                planted = "%s.bridge-setup.%d" % (envp, pid)
+                make(victim, planted)
+                pin_pid = "import os\nos.getpid = lambda: %d\n" % pid
+                res = r.as_role(conf["ROLE_ACCOUNT"],
+                                py(pin_pid + TOKEN_WRITER_PY, conf["ENV_FILE"],
+                                   conf["SLACK_TOKEN_ENV"]), stdin="xoxb-%s\n" % ("u" * 30))
+                check("token-tmp-refuses-a-planted-" + kind,
+                      (res.ok, open(victim).read() == "untouched\n",
+                       "u" * 30 in open(envp).read()), (False, True, False))
+                if os.path.lexists(planted):
+                    os.remove(planted)
+            # A declined administrator password says why, and names THIS installer to
+            # run again.
+            for name, fn, args in (("token", cmd_token, (lambda _p: fresh, True)),
+                                   ("install", cmd_install, (True,)),
+                                   ("verify", cmd_verify, ())):
+                rc, out = cap(fn, conf, r, se.SudoSession(validate=lambda: 1), *args)
+                check("no-sudo-says-why:" + name,
+                      (rc, "NO ADMINISTRATOR ACCESS" in out,
+                       "pipeline_bridge_setup.py " + name in out,
+                       "pipeline_stage_e_setup.py" in out), (EX_NOPRIV, True, True, False))
             good = "xoxb-" + "b" * 30
             rc, out = cap(cmd_token, conf, r, _FakeSudo(), lambda _p: good, True)
             env_text = open(envp).read()
@@ -844,6 +974,21 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True, job_rc=1),
                           _FakeSudo(), now=at + 30)
             check("verify-failing-dry-run-fails", rc, EX_FAILED)
+            # A config problem is said on stderr only: the row shows it, not "nothing".
+            rc, out = cap(cmd_verify, conf, _RoleRunner(
+                home, root, loaded=True, job_rc=2, job_out="",
+                job_err="FAIL: config problems:\n  - config 'lookback_days' must be a "
+                        "positive integer, got 0\n"), _FakeSudo(), now=at + 30)
+            check("verify-dry-run-shows-stderr",
+                  (rc, bool(re.search(r"dry-run\s+FAILED\s+- config 'lookback_days'", out))),
+                  (EX_FAILED, True))
+            # ...but never a line shaped like a credential (a shell can echo an env line).
+            rc, out = cap(cmd_verify, conf, _RoleRunner(
+                home, root, loaded=True, job_rc=2, job_out="",
+                job_err="sh: xoxb-%s: command not found\n" % ("q" * 30)), _FakeSudo(),
+                now=at + 30)
+            check("verify-dry-run-stderr-credential-not-shown", (rc, "q" * 30 in out),
+                  (EX_FAILED, False))
             with open(envp, "w") as fh:
                 fh.write("STAGE_E_LINEAR_API_KEY=x\n")
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),

@@ -23,6 +23,16 @@ Every file here is generic. Keep your filled-in values in your private runbook.
 - **The trusted-members rule.** Anyone in the workspace can say "yes" with your reach. Admit
   only people you fully trust, as full members, with two-factor sign-in.
 
+### What runs `sudo`, and what you run
+
+- **`token`, `install` and `verify` run `sudo` themselves.** Each asks for your
+  administrator password once, at the start. Then it reads and writes as the role account,
+  and `install --apply` writes the job's file into `/Library/LaunchDaemons` as root.
+  `verify` also asks launchd, as root, whether the job is loaded.
+- **You run the `launchctl` lines that start and stop the job.** Cards CK-B2 and CK-B3
+  print them. The installer never runs them.
+- **`compose` and `card` need no password.** They read nothing on the machine.
+
 ---
 
 ## Step 1 — Fill in the settings file
@@ -34,6 +44,9 @@ cp bridge.conf.example bridge.conf && chmod 600 bridge.conf && ${EDITOR:-nano} b
 Seven values are required: the role account, its kit clone, the channel id, your tracker
 user id, the team keys, a job label, and the bridge bot's member ID (Step 2). None of them is
 secret. Set `DISPATCHER_ENV_FILE` too, so `token` can refuse the chat bot's own token.
+It must be a different file from `ENV_FILE`. The dispatcher hands its env file to every
+session it starts, so the bridge's token must never go there. The installer refuses the
+same file.
 
 Then read what it builds:
 
@@ -78,6 +91,8 @@ Good: `wrote BRIDGE_SLACK_BOT_TOKEN (… characters) into …/env, mode 600`. Th
 never printed.
 Not that: `REFUSED: that token is already in the env file under …`. You pasted another app's
 token. Copy the bridge app's own.
+Not that: `REFUSED: … is the same file as DISPATCHER_ENV_FILE`. The two settings name one
+file, perhaps through a link. Point `ENV_FILE` at the role account's own env file.
 
 ---
 
@@ -89,10 +104,11 @@ python3 scripts/pipeline_bridge_setup.py install --apply
 ```
 
 The first prints what it would write. The second writes the job's config, as the role
-account, and its LaunchDaemon file, as root. It never starts the job.
+account, and its LaunchDaemon file, as root. It never starts the job. The job is installed
+turned off, so a restart before Step 5 does not start it either.
 
-Good: `wrote …/bridge.json` and `wrote /Library/LaunchDaemons/<label>.plist (not loaded)`,
-then card CK-B2.
+Good: `wrote …/bridge.json` and `wrote /Library/LaunchDaemons/<label>.plist (installed
+turned off, not loaded)`, then card CK-B2.
 Not that: `UNKNOWN: the home of … could not be read`. The role account is missing or locked.
 
 ---
@@ -103,10 +119,13 @@ Not that: `UNKNOWN: the home of … could not be read`. The role account is miss
 python3 scripts/pipeline_bridge_setup.py card CK-B2
 ```
 
-Run the two `sudo launchctl` lines it prints.
+Run the two `sudo launchctl` lines it prints, in order. The `enable` line comes first: the
+job is installed turned off, and it will not load until that line turns it on.
 
 Good: no output from either line.
-Not that: `Bootstrap failed: 5`. It is already loaded. Go to Step 6.
+Not that: `Bootstrap failed: 5`. Check that the `enable` line ran. If it did, the job is
+already loaded, or was unloaded a moment ago: go to Step 6. If `verify` says it is not
+loaded, wait ten seconds and run both lines again.
 
 ---
 
@@ -123,7 +142,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `config` | the job's config is the composed one |
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command) |
 | `plist` | the LaunchDaemon file is the composed one |
-| `dry-run` | the job's own dry run, as the role account, exits 0 |
+| `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
 | `loaded` | launchd holds the job |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 
@@ -143,6 +162,11 @@ Good: within a minute the bridge replies in that thread, *Plan this?*, with the 
 title, state, team and who filed it.
 Not that: no reply after two minutes. Run `verify`; the `heartbeat` row says what the last
 pass did.
+
+**Post a request as a new message.** Each pass reads the last seven days of the channel,
+and it finds a thread through the thread's first message. A request posted as a reply in a
+thread whose first message is older than seven days is not read, and nothing says so. Post
+it as a new message in the channel instead.
 
 Reply `yes` in that thread.
 
@@ -186,6 +210,8 @@ Run the two lines it prints.
 Good: `launchctl print system/<label>` says it could not find the service.
 Not that: deleting the plist and stopping there. launchd keeps a loaded job until it is booted
 out.
+
+To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disable` here.
 
 ---
 

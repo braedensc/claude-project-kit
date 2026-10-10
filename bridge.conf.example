@@ -48,7 +48,8 @@ BOT_USER_ID=U0123456789
 #ALLOWED_SLACK_USERS=
 
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
-# `token` also refuses the chat bot's token.
+# `token` also refuses the chat bot's token. It must be a different file from
+# ENV_FILE: the dispatcher hands this one to every session it starts.
 #DISPATCHER_ENV_FILE=
 
 #ENV_FILE=~/.stage-e/env
