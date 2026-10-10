@@ -32,15 +32,74 @@ and stops blocking.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 
+# The ANCHOR: the checkout this hook file lives in ($CLAUDE_PROJECT_DIR/.claude/hooks
+# in production). Since Claude Code 2.1.286 a desktop worktree session's
+# CLAUDE_PROJECT_DIR is the repository's MAIN checkout, so the anchor alone sees
+# `main` and the hook checked nothing for that session (KIT-214). The session's own
+# worktree is recovered from the transcript folder below, after the payload is read.
 PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 PROTECTED_BRANCHES = {"main", "master"}
 STATE_DIR = os.path.join(PROJECT_ROOT, ".claude", ".stop-pr-nag")
+
+# ── The session's own worktree, from its transcript folder (KIT-214) ─────────
+# Identical to pre-tool-use.py's copy; read the reasoning there. Keep the three
+# copies (pre-tool-use.py, this file, session-start.py) the same.
+def _sanitized_dir(path: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def _transcript_worktree(data, anchor: str):
+    """(worktree, unresolved) for this session's transcript folder.
+
+    worktree: the one worktree of `anchor`'s repo whose path names the transcript
+    folder, realpath'd, or None. unresolved: True when the payload names a launch
+    folder that is NOT the anchor and no single worktree matches it. That is the
+    state in which every guard would judge the session as the anchor, so the
+    callers say so out loud (contract §13) instead of failing quietly."""
+    tp = data.get("transcript_path") if isinstance(data, dict) else None
+    if not isinstance(tp, str) or not tp.strip():
+        return None, False
+    folder = os.path.basename(os.path.dirname(tp))
+    if not folder:
+        return None, False
+    anchor_names = {_sanitized_dir(anchor), _sanitized_dir(os.path.realpath(anchor))}
+    try:
+        r = subprocess.run(
+            ["git", "-C", anchor, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None, folder not in anchor_names
+    if r.returncode != 0:
+        return None, folder not in anchor_names
+    found = set()
+    for line in r.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        listed = line[len("worktree "):].strip()
+        real = os.path.realpath(listed)
+        if folder in (_sanitized_dir(listed), _sanitized_dir(real)) and os.path.isdir(real):
+            found.add(real)
+    if len(found) == 1:
+        return found.pop(), False
+    return None, folder not in anchor_names
+
+
+UNRESOLVED_MSG = (
+    "⚠ The end-of-turn PR check could not tell which worktree this session runs in "
+    "(its transcript folder matches none, or more than one, of this repo's worktrees), "
+    "so it checked NOTHING this turn: no missing-PR, red-CI, conflict or stacked-PR "
+    "check ran. That is a harness or kit fault (KIT-214). Tell the owner."
+)
 
 # GitHub check conclusions that mean "this needs attention," excluding SUCCESS,
 # NEUTRAL, SKIPPED, and null/pending (still running — not something to nag about).
@@ -260,6 +319,23 @@ except Exception:
 # block, don't nag twice in the same cycle. The per-(branch,reason,sha) dedup
 # above is the real backstop, since this field isn't guaranteed.
 if data.get("stop_hook_active"):
+    sys.exit(0)
+
+# Re-root on the session's own worktree (KIT-214). Every helper above reads
+# PROJECT_ROOT and STATE_DIR at call time, so reassigning them here moves them all.
+# When the transcript names a launch folder that matches no single worktree, the
+# anchor is the WRONG checkout to judge: say so, once per session, rather than
+# report "nothing to do" (contract §13).
+_session_root, _unresolved = _transcript_worktree(
+    data, os.path.realpath(PROJECT_ROOT))
+if _session_root:
+    PROJECT_ROOT = _session_root
+    STATE_DIR = os.path.join(PROJECT_ROOT, ".claude", ".stop-pr-nag")
+elif _unresolved:
+    _sid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(data.get("session_id") or "unknown"))[:80]
+    if not _already_nagged("session-" + _sid, "root-unresolved", "1"):
+        _record_nag("session-" + _sid, "root-unresolved", "1")
+        _notice(UNRESOLVED_MSG)
     sys.exit(0)
 
 code, branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
