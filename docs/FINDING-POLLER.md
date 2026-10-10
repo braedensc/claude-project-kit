@@ -15,9 +15,14 @@ lives depends on the dispatch backend:*
 | `local-daemon` (Cyrus) | a `pipeline-finding/1` **comment** on its own ticket | **`scripts/pipeline_finding_poller.py`**, run by the role account |
 
 On a local-daemon backend the session holds the tracker tools directly, so there is no
-credential-free CI job to hide behind — the tool-fence (the PreToolUse guard) stops the
-session creating a ticket, and this poller, running as the dispatcher's role account
+credential-free CI job to hide behind. This poller, running as the dispatcher's role account
 **outside** any session, does the creating. Same seam as `pipeline_review_poller.py`.
+
+**What stops a session creating a ticket itself is only partly built.** The PreToolUse
+guard's tracker checks act only where a dispatch pin exists, and a dispatcher that binds by
+delegation writes none, so there they let a direct create through (`pre-tool-use.py`, the
+`if pin:` branches). On that lane the rule in the session brief is the only thing asking
+for the request instead. Closing it is a hook change, tracked as KIT-213's build item B8.
 
 ## What a session writes
 
@@ -30,11 +35,17 @@ One comment on its own ticket, containing a fenced block:
 ````
 
 Nothing else — no create, no label, no state. Posting the comment is a plain `save_comment`
-a session already may do; creating the ticket is not, and the guard blocks it.
+a session already may do. Creating the ticket itself is not allowed, but what stops it
+depends on how the session was started:
+
+- **The dispatcher wrote a pin:** the guard blocks a ticket session's direct create.
+- **The dispatcher binds by delegation:** nothing blocks it yet. Only the session brief's
+  rule asks for the comment instead (see above).
 
 ## What the poller forces (none of it the session's to choose)
 
-For each finding, one `issueCreate` in the **same team** as the source ticket, with:
+For each finding, one `issueCreate` in the **same team** as the source ticket, and in the
+source's **project** when it has one, with:
 
 - **state = that team's Backlog** (intake). Never `ready`/started/`review`/done.
 - **label = `provenance:agent`**, applied by the poller. A session can request no
@@ -42,12 +53,15 @@ For each finding, one `issueCreate` in the **same team** as the source ticket, w
   `blocked:*`, `hooks-change`) from anything a session names.
 - **subscriber = the configured owner**, so it reaches a person. **No assignee** — the
   ticket is never assigned to the session's identity.
-- a **provenance line** in the body naming the source ticket.
+- a **provenance line** in the body naming the source ticket, and the source's epic when it
+  has one, both read from the tracker.
 
-It then records the source comment id in its seen-set and posts a `Filed as <ID>` receipt on
-the source ticket. Its **only** Linear writes are that `issueCreate` and that
-`commentCreate`. It trusts a finding **only** from the configured agent user, so an outside
-commenter cannot inject one.
+It then records the source comment id in its seen-set, links the new ticket to its source
+with one `related` link (never a parent, so a finding never reads as part of an approved
+tree), and posts a `Filed as <ID>` receipt on the source ticket. Its **only** Linear writes
+are that `issueCreate`, that `issueRelationCreate`, and `commentCreate` for the receipt and
+the cap note below. It trusts a finding **only** from the configured agent user, so an
+outside commenter cannot inject one.
 
 ## Which comments a pass reads
 
@@ -73,9 +87,16 @@ than that window are not re-asked for until the file is repaired or removed.
 
 ## Safety limits
 
-- **Flood guard:** at most `max_per_source` findings per source ticket per run (default 3,
-  §8's cap) and `max_per_run` across a pass. Extras are left for the next pass and named in
-  the log — never silently dropped (§13).
+- **Flood guard:** at most `max_per_source` findings per source ticket, counted across every
+  pass (default 3, §8's cap). A request over it is declined for good and recorded, so it
+  never holds the scan window back, and the source ticket gets one note saying so. Before
+  KIT-234 the count restarted each pass, so one session could have any number filed. The
+  note counts as sent only once it posts. If it cannot be posted, the pass exits 1, the
+  heartbeat names the ticket, and every later pass tries again until it posts. At most
+  `max_per_run` across a pass; extras are left for the next pass and named in the log —
+  never silently dropped (§13). The per-ticket cap is checked first, so a request over it
+  is declined even when the pass is full. The pass summary counts declined requests on
+  their own, apart from "already filed".
 - **Dedup: the seen-set is the authority**, and the only one. It is keyed by source comment
   id, written atomically, written *through* the moment each ticket is created, and a corrupt
   one refuses the run rather than re-filing. The `Filed as` receipt is a record for a
@@ -98,7 +119,7 @@ than that window are not re-asked for until the file is repaired or removed.
 
 | File | What it says |
 | --- | --- |
-| `seen.json` | every source comment already filed. **The dedup authority** — do not delete |
+| `seen.json` | every source comment already filed or declined, and each cap note posted. **The dedup authority** — do not delete |
 | `watermarks.json` | how far each team has been read and resolved |
 | `heartbeat.json` | when the last pass ran, and what it decided |
 
@@ -107,7 +128,8 @@ reads every Stage E daemon: `result` is `ok`, `error` or `usage`, beside `exit_c
 `started_at`, `ended_at`, and this poller's `filed` / `skipped` counts.
 
 Exit codes: **0** the pass ran (even if it filed nothing) · **1** the pass could not
-complete · **2** bad arguments, an unreadable or invalid config, or a missing credential.
+complete, or a cap note it owes could not be posted (the heartbeat's `error` names the
+ticket) · **2** bad arguments, an unreadable or invalid config, or a missing credential.
 
 ## Enabling it (operator)
 
