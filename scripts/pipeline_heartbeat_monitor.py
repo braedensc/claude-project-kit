@@ -2064,7 +2064,10 @@ def selftest():
         #      those 30 minutes. Measured awake, the beat is fresh: nothing pages. Then the
         #      same beat with the machine awake throughout: it is stale, and it pages.
         g = globals()
-        real_clock = g.get("_awake_clock")
+        real_clock, real_boot = g.get("_awake_clock"), g.get("_boot_wall")
+        # The host's real boot time must not decide the test: a CI runner boots minutes
+        # before the job, which would make the 30-minute-old mark a pre-boot one.
+        g["_boot_wall"] = lambda: _now() - 10 * 86400
         nap_state = {"schema": STATE_SCHEMA, "last_run_at": _iso(_now() - 1800),
                      "last_posted_fingerprint": "review-poller=ok", "last_posted_problem": False,
                      "last_posted_target": "KIT-000", "last_posted_at": _iso(_now() - 1800),
@@ -2096,6 +2099,10 @@ def selftest():
                 g["_awake_clock"] = real_clock
             else:
                 g.pop("_awake_clock", None)
+            if real_boot is not None:
+                g["_boot_wall"] = real_boot
+            else:
+                g.pop("_boot_wall", None)
 
         # (k) rearm: the next pass is handled like a wake, and nothing else changes
         spath = state_path(load_config(path))
