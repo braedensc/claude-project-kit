@@ -275,7 +275,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | `backend` | string | Where sessions run: `github-actions`, `local-daemon`, `cloud`. |
 | `labelTrigger` | string | Canonical label key (resolved through `linear.labels.ids`) whose presence queues a ticket. Default `agent:queued`. |
 | `pauseOnCapacity` | boolean | On a provider capacity error, pause the queue and apply `blocked:capacity` instead of consuming a `totalAttempts` slot. Capacity is not the ticket's fault. |
-| `pinsRoot` | string | Directory for pin files. Default `~/.claude/pipeline/pins`. Must resolve outside every worktree and outside the repo. Pins are **short-lived** — written per dispatch, deleted at session end, expiring in hours — so nothing durable may be stored here (§9). |
+| `pinsRoot` | string | Directory for pin files. Default `~/.claude/pipeline/pins`. `~` is the home the account database gives the OS account, never `$HOME` (§3). Must resolve outside every worktree and outside the repo. Pins are **short-lived** — written per dispatch, deleted at session end, expiring in hours — so nothing durable may be stored here (§9). **One exception:** `dispatched-lane/<OS account>`, the root-owned lane marker a person writes once for a dispatcher that writes no pins (§3). It is durable on purpose, and a cleanup of stale pins leaves that folder alone. |
 | `statePath` | string \| null | Where the dispatcher state record (§9) is kept, for backends that need a location named. `null` when the backend supplies its own durable store — which is the case for `github-actions`, where the store is the `pipeline-state` artifact. Must resolve outside every worktree and outside the repo. |
 
 ### `monitoring`
@@ -322,11 +322,20 @@ Nothing else decides it. No environment variable, no label, no settings flag, no
 asked one way, by every pipeline-scoped guard, skill and workflow. A second
 discriminator is a second thing to desync.
 
+**Moving the file aside does not turn the pipeline off.** The PreToolUse hook is what a
+session would most want switched off, so it asks the same question more carefully: when
+the working tree has no `delivery.json`, a copy committed at `HEAD`, or on the
+default-branch refs the config is read from (§1), still counts. That is one local
+`git cat-file`, with no network. Without it, a plain `mv delivery.json x` switched every
+pipeline guard off, and `git checkout -- delivery.json` put the file back with nothing
+in the diff (KIT-241). When only `HEAD` holds it (the adoption PR, moved aside), the hook
+reads that copy.
+
 ### Three states — and *off* is not *broken*
 
 | State | Condition | Behavior |
 |---|---|---|
-| **Off** | `delivery.json` absent | Every pipeline-scoped guard, skill and workflow **no-ops immediately**: exit 0, no output, no diagnostics, no network, no git. Indistinguishable from a kit checkout without the pipeline at all. |
+| **Off** | `delivery.json` absent | Every pipeline-scoped guard, skill and workflow **no-ops immediately**: exit 0, no output, no diagnostics, no network, no git — except the hook's one local read of whether a commit holds the file (above). Indistinguishable from a kit checkout without the pipeline at all. |
 | **Configured** | `delivery.json` present and valid | Pipeline-scoped guards active per this contract. |
 | **Broken** | `delivery.json` present but unreadable, unparseable, or failing the §7 validator — or `session_mode: ticket` with a missing, expired, or mismatched pin | **Fails closed.** Block with a reason naming the file and the fix, per the kit's fail-closed doctrine. |
 
@@ -342,7 +351,8 @@ So the check order is fixed, and the existence test comes first:
 
 1. **Does `<repo root>/delivery.json` exist?** No → **exit 0 immediately.** Before
    parsing anything, before resolving a pin, before shelling out to git or the network.
-   Nothing that can fail may run ahead of this test.
+   Nothing that can fail may run ahead of this test. (The hook's one exception is the
+   local check above for a committed copy; it fails to *off*, never to a block.)
 2. Yes → parse and validate it. Failure here is **broken** → block with a reason.
 3. Mode-specific checks (pin, ticket, budget) → block on failure.
 
@@ -406,10 +416,19 @@ the session starts**.
 ```
 <pinsRoot>/<pin_key>.json
 <pinsRoot>/ledger.jsonl        # append-only, one row per pin ever written
+<pinsRoot>/dispatched-lane/<OS account>   # the lane marker (below); root's, durable
 
 pin_key  = sha256(realpath(<session root>)).hexdigest()[:16]
 pinsRoot = delivery.json → dispatch.pinsRoot   (default ~/.claude/pipeline/pins)
 ```
+
+**`~` is the account's home, never `$HOME`.** A reader and a writer resolve `~` in
+`pinsRoot` to the home the account database gives the OS account they run as. A
+delegation-bound dispatcher loads a worktree's env file into the next session it starts
+there (KIT-240), so a session could move `$HOME` for its successor and plant a pin under
+it. A pin found there would bind nothing a dispatcher wrote, and it would switch the lane
+marker check off. The OS account's name comes from the same database, never `$USER` or
+`$LOGNAME`.
 
 `<session root>` is resolved **exactly as `.claude/hooks/pre-tool-use.py` resolves it**:
 anchor on `CLAUDE_PROJECT_DIR` (falling back to the hook file's location), widened to
@@ -536,15 +555,38 @@ empty rather than handed something invented.
 2. Derive the session root; compute `pin_key`; read the pin.
 3. Verify `pin_version`, `expires_at`, and `worktree` == derived session root.
 4. **Absence of a pin never grants autonomy.** In `ticket` mode a missing pin is
-   *broken* and fails closed. In every other mode, checks that would *withhold*
-   something fail open (a human's ad-hoc session in a configured repo must not be
-   bricked) and checks that would *grant* extra autonomy fail closed.
+   *broken* and fails closed. With no pin at all, read the **lane marker** next (below).
+   With no marker either, checks that would *withhold* something fail open (a human's
+   ad-hoc session in a configured repo must not be bricked) and checks that would
+   *grant* extra autonomy fail closed.
 
 > **Tamper-evident, not tamper-proof.** The session's shell runs as the same user, so
 > `0444` and a path outside the repo raise the cost of tampering — they do not make it
 > impossible. The ledger makes divergence detectable, and the real guarantee is the one
 > the rest of the kit already rests on: nothing lands without a reviewed PR and CI. The
 > pin's job is to make the honest path deterministic and the dishonest path visible.
+
+### The lane marker (a dispatcher that writes no pin)
+
+A dispatcher that binds a session by a person's delegation writes no pin, so without
+more its sessions would read as a human's ad-hoc ones. Its OS account carries a marker
+instead: `<pinsRoot>/dispatched-lane/<OS account>`, owned by root, in a folder root owns,
+written once by a person (the Stage E installer's card CK-10, measured by its
+`lane-marker` row). A session cannot create or delete it.
+
+A reader with **no pin** looks for it with `lstat`:
+
+- **No such file** (`ENOENT`, or `ENOTDIR` on the way): not the lane. Step 4 above.
+- **There:** the dispatcher's lane. Tracker writes get the pinned `ticket` rules: no
+  protected label, no direct create, no rewrite of the own ticket's acceptance criteria,
+  and writes only to the session's **own ticket** — the one its worktree folder is named
+  after (`<base>/<ISSUE-ID>`), or the folder above it (`<base>/<ISSUE-ID>/<repo>`). Any
+  team's key counts. The folder is the session's root, never a subagent's widened one.
+  When neither folder names a ticket, an issue write and a write naming any ticket fail
+  closed; a comment with no resolvable target stays allowed (§4 reporting).
+- **Could not check** — any other error, or an account the database cannot name: the
+  lane. Reading "could not look" as "a person's session" would let an error open every
+  guard the marker turns on.
 
 ---
 

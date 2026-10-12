@@ -220,12 +220,21 @@ def worktree_roots(root):
 def resolve_pins_root(cfg, session_root):
     """The pin store, or die. Mirrors the hook's `_pins_root_inside_repo`: a
     pins directory the session can reach is not a pin store (§3; §7 makes it a
-    validator hard-fail), and an unresolvable value counts as inside."""
+    validator hard-fail), and an unresolvable value counts as inside.
+
+    `~` is this account's home from the account database, never $HOME, because
+    that is where the hook looks for the pin (§3 path convention, KIT-241). A
+    shell whose $HOME was moved would otherwise write a pin the hook never finds."""
     raw = (cfg.get("dispatch") or {}).get("pinsRoot") or DEFAULT_PINS_ROOT
     if not isinstance(raw, str) or not raw.strip():
         die("delivery.json dispatch.pinsRoot is empty or not a string — refusing "
             "to guess where the binding lives (contract §1, §7)", 1)
-    expanded = os.path.expanduser(raw.strip())
+    raw = raw.strip()
+    if raw == "~" or raw.startswith("~/"):
+        import pwd
+        expanded = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, raw[2:])
+    else:
+        expanded = os.path.expanduser(raw)
     if not os.path.isabs(expanded):
         die(f"delivery.json dispatch.pinsRoot ({raw!r}) is relative. It must "
             f"resolve outside every worktree and outside the repo (§1).", 1)
@@ -1225,6 +1234,21 @@ def selftest():
         r = _st_run(["ENG-123", "--session-root", root5, "--ticket-file", tf5])
         expect(r.returncode == 1 and "inside" in r.stderr,
                f"a pinsRoot inside the repo must be refused: {r.returncode} {r.stderr[-300:]}")
+        # …and `~` is the account database's home, where the hook reads the pin,
+        #    never a moved $HOME (KIT-241).
+        import pwd
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = tmp
+        try:
+            got = resolve_pins_root({"dispatch": {"pinsRoot": "~/ld-pins"}}, root4)
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+        expect(got == os.path.realpath(os.path.join(pwd.getpwuid(os.getuid()).pw_dir,
+                                                    "ld-pins")),
+               f"`~` must be the account's home, not $HOME: {got}")
         rel = _st_cfg("relative/pins")
         root6, _, tf6 = _st_repo(tmp, cfg=rel)
         r = _st_run(["ENG-123", "--session-root", root6, "--ticket-file", tf6])

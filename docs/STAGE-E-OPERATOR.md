@@ -164,7 +164,7 @@ pulled — is invisible to it, so a machine that has drifted still reads clean. 
 the one that measures, and it is the one to run after every merge to the default branch and
 whenever `status` looks better than the machine feels.
 
-**Nine cards exist and five are usual:** merge the pull requests that carry Stage E
+**Ten cards exist and five are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
 installer checks and prints, and has no code path to either); read the dry-run count before
 anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
@@ -175,6 +175,11 @@ names one or says `off`); and watch one real ticket become a reviewed pull reque
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
 (`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
+One more you run once, by hand: `CK-10` writes the root-owned lane marker that gives this
+dispatcher's sessions the kit hook's tracker guards, since it writes no pin (KIT-241). The
+`lane-marker` step looks for it as the role account, at the pins root each repository's
+committed `delivery.json` names, and `run` and `verify` stop on `CK-10` until it is there.
+A repository with no `delivery.json` needs no marker.
 
 **You type each secret once — plus once more if a stored one stops working.** The two
 values are asked for at a hidden prompt on the run that has none, written straight into the
