@@ -10,6 +10,13 @@ WHAT THIS IS
   operator remembering to `cat` three files under another account's home. The human-action
   notifier writes one too, and it is the fourth job this monitor can watch (KIT-156).
 
+  The fifth is the owner's hourly health watch (scripts/pipeline_watch.py, KIT-236). It
+  checks what no daemon reports on itself: hooks that cannot tell a session's worktree,
+  updates due, a dispatcher or front door that is down, a full disk. It writes one
+  world-readable status file. Read here, a problem it finds reaches chat by the same
+  mark and the same notifier as a daemon that is down, and a watch that stopped writing
+  reads as stale.
+
   This is that consumer, and nothing more. One scheduled, one-shot pass, run by the SAME
   role account as the daemons it watches, on a LONGER interval. It reads the files of the
   jobs named in `watch`, judges each one, and when the verdict CHANGES it posts ONE comment
@@ -220,6 +227,10 @@ STATE_SCHEMA = "pipeline-heartbeat-monitor-state/1"
 HEALTH_INCIDENT = "daemon-health-incident"
 HEALTH_RECOVERED = "daemon-health-recovered"
 NOTIFIER_JOB = "notifier"
+HEALTH_WATCH_JOB = "health-watch"
+# What one health-watch finding may add to a comment: its kind, and its summary cut short.
+HEALTH_SUMMARY_CHARS = 240
+HEALTH_KIND_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 
 def mark_line(mark):
@@ -248,10 +259,17 @@ DEFAULT_COOLDOWN_SECONDS = 900
 DEFAULT_RUN_TIMEOUT_SECONDS = 120
 MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot page on jitter
 
-# ── The four jobs, and how each one's heartbeat is shaped ──────────────────────────────
+# ── The five jobs, and how each one's heartbeat is shaped ──────────────────────────────
 #
 # `dir_key`      which config directory the file sits in (the finding poller has its own,
 #                so its heartbeat.json cannot collide with the review poller's).
+# `path_key`     instead of `dir_key` + `filename`: the config key holding the file's whole
+#                path (the health watch, whose path its owner chooses).
+# `findings_field`  a list of {kind, state, summary} the job found. A `failing` row names
+#                them, so the comment says WHAT is wrong rather than only that it is.
+# `incident_field`  a value that joins this job's part of the fingerprint: the health
+#                watch's firing kinds. A new kind firing is a new incident; the same kinds an
+#                hour later are not.
 # `ts_fields`    timestamp fields in PRIORITY order — the first present and parseable wins.
 #                The bounce driver's `finished_at` is preferred over its `at` because `at`
 #                is rewritten by the mid-pass `running` beat.
@@ -334,6 +352,23 @@ WATCHERS = {
         "good": ("ok",),
         "running": (),
     },
+    # The owner's health watch (KIT-236). It runs as the OWNER, hourly, and its `result` is
+    # `problem` while any kind it checks is firing: that reads `failing` here, and the row
+    # names the kinds. Kinds it could not check this pass (`unknown`, e.g. no internet for
+    # the front door) never page, by the watch's own rule; the ok row names them.
+    HEALTH_WATCH_JOB: {
+        "label": "health watch",
+        "writer": "scripts/pipeline_watch.py",
+        "path_key": "health_status_file",
+        "schema": "pipeline-health-status/1",
+        "ts_fields": ("written_at",),
+        "result_field": "result",
+        "bool_field": None,
+        "good": ("ok",),
+        "running": (),
+        "findings_field": "findings",
+        "incident_field": "firing",
+    },
 }
 
 # Verdicts that mean a person should look. `unreadable` is in here on purpose: a monitor
@@ -371,6 +406,10 @@ CONFIG_KEYS = {
     "notifier_state_dir": "where the notifier's heartbeat lives: its config's `state_dir`. "
                           "Defaults to state_dir, which is where the notifier writes it by "
                           "default",
+    "health_status_file": "the health watch's status file, as an absolute path: the "
+                          "HEALTH_STATUS_FILE its own conf names. Required when "
+                          "'health-watch' is in 'watch'; must be outside every git working "
+                          "tree",
     "monitor_state_dir": "where THIS job's state file and heartbeat live; defaults to "
                          "state_dir; must be outside every git working tree",
     "watch": "which jobs this machine actually runs: any of %s. Required — an "
@@ -508,6 +547,42 @@ def result_of(doc, spec):
     if isinstance(raw, str) and raw.strip():
         return raw.strip().lower()
     return None
+
+
+def _kinds(value):
+    """A list of kind names, keeping only well-formed ones, sorted. Anything else in the
+    file is dropped here rather than embedded: a kind joins the fingerprint, and the
+    fingerprint is the state file's identity for an incident."""
+    if not isinstance(value, list):
+        return []
+    return sorted(set(k for k in value if isinstance(k, str) and HEALTH_KIND_RE.match(k)))
+
+
+def incident_of(doc, spec):
+    """This job's addition to its fingerprint pair, or "" — the health watch's firing kinds."""
+    field = spec.get("incident_field")
+    if not field or not isinstance(doc, dict):
+        return ""
+    return ",".join(_kinds(doc.get(field)))
+
+
+def findings_text(doc, spec, state):
+    """The `state` findings as `kind: summary; …`, each summary on one line and cut short.
+    A `|` would split the comment's table cell and becomes `/`; a mark is defused where the
+    row is embedded, like every other heartbeat-derived value."""
+    items = doc.get(spec.get("findings_field") or "") if isinstance(doc, dict) else None
+    out = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("state") != state:
+            continue
+        kind = item.get("kind")
+        if not (isinstance(kind, str) and HEALTH_KIND_RE.match(kind)):
+            continue
+        summary = " ".join(str(item.get("summary") or "").split()).replace("|", "/")
+        if len(summary) > HEALTH_SUMMARY_CHARS:
+            summary = summary[:HEALTH_SUMMARY_CHARS - 1].rstrip() + "…"
+        out.append("%s: %s" % (kind, summary or "(no summary)"))
+    return "; ".join(out)
 
 
 def stale_after(interval_seconds, multiplier):
@@ -661,10 +736,23 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
             "" if out["result"] != "paused" else
             " (paused on purpose since %s — it is doing nothing, deliberately)"
             % ((raw.get("doc") or {}).get("paused_since") or "an unknown time"))
+        unchecked = findings_text(doc, spec, "unknown") if spec.get("findings_field") else ""
+        if unchecked:
+            # Never a page, by the watch's own rule; named so "ok" is not read as "all checked".
+            out["detail"] += "; could not check this pass (does not page): %s" % unchecked
     elif running:
         out["verdict"] = "running"
         out["detail"] = "last beat %s ago%s, a pass was in flight" % (
             human_age(out["age_seconds"]), slept_note)
+    elif spec.get("findings_field"):
+        # The health watch RAN and found something wrong elsewhere: say what, and let the
+        # firing kinds name the incident.
+        out["verdict"] = "failing"
+        out["incident"] = incident_of(doc, spec)
+        out["detail"] = ("last check %s ago%s found a problem: %s"
+                         % (human_age(out["age_seconds"]), slept_note,
+                            findings_text(doc, spec, "firing")
+                            or "result %r with no finding named" % out["result"]))
     else:
         out["verdict"] = "failing"
         out["detail"] = ("last beat %s ago%s and it reports %r — it RAN and could not do it, "
@@ -696,8 +784,10 @@ def human_age(seconds):
 
 
 def _pair(verdict):
-    """One job's part of a fingerprint: `job=verdict`."""
-    return "%s=%s" % (verdict["job"], verdict["verdict"])
+    """One job's part of a fingerprint: `job=verdict`, or `job=verdict:incident` for a job
+    whose problem has its own identity (the health watch's firing kinds)."""
+    pair = "%s=%s" % (verdict["job"], verdict["verdict"])
+    return pair + (":" + verdict["incident"] if verdict.get("incident") else "")
 
 
 def fingerprint(verdicts):
@@ -837,6 +927,23 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
                          "the jobs named above, and it is the job that turns this comment into "
                          "a chat ping. A ping comes late, if at all: only once the notifier "
                          "works again while this comment is still among the newest it reads.")
+    health_row = next((v for v in report["problems"] if v["job"] == HEALTH_WATCH_JOB), None)
+    if not recovery and health_row is not None:
+        # Fixed text: the path is this monitor's own config value, and the rest is a sentence
+        # about where to look, not anything the status file said.
+        if health_row["verdict"] == "failing":
+            lines.append("**The health watch found a problem outside the daemons.** Each "
+                         "finding is in the table above. To dig in, ask the tech lead in chat "
+                         "to read `%s` and explain it, or run `python3 scripts/pipeline_watch.py "
+                         "status` in the kit checkout. A fix that needs sudo, launchctl or an "
+                         "installer is printed for the owner to run; the tech lead never "
+                         "runs it."
+                         % defuse(health_row.get("path") or "the status file"))
+        else:
+            lines.append("**The health watch itself is not reporting**, so nothing outside "
+                         "the daemons is being checked. It is the owner's hourly job, loaded "
+                         "with `python3 scripts/pipeline_watch.py install`; it runs only while "
+                         "the owner is logged in.")
     if report["unwatched"]:
         lines.append("Not watched on this machine, so not judged: %s."
                      % ", ".join(report["unwatched"]))
@@ -1000,11 +1107,31 @@ def load_config(path):
     # a state dir inside a worktree and then writes no heartbeat at all, so a beat found in
     # one is by construction not the notifier's. A directory only an unwatched job would use
     # is never read, so it is not judged.
-    for key in sorted(set(WATCHERS[job]["dir_key"] for job in watch)):
+    for key in sorted(set(WATCHERS[job]["dir_key"] for job in watch
+                          if WATCHERS[job].get("dir_key"))):
         if dirs[key] != monitor_dir and _inside_git_worktree(dirs[key]):
             problems.append("'%s' (%s) is inside a git working tree. A session can write a "
                             "worktree, and a heartbeat written there would make a job that is "
                             "down read as healthy" % (key, dirs[key]))
+    # The health watch's file, by the same rule: a session that could write it could write
+    # `result: ok` over a problem the watch found.
+    health_file = raw.get("health_status_file")
+    if health_file == "":
+        health_file = None
+    if health_file is not None and (not isinstance(health_file, str)
+                                    or not os.path.isabs(os.path.expanduser(health_file))):
+        problems.append("'health_status_file' must be an absolute path, the HEALTH_STATUS_FILE "
+                        "the health watch's own conf names")
+        health_file = None
+    elif health_file:
+        health_file = os.path.realpath(os.path.expanduser(health_file))
+        if _inside_git_worktree(os.path.dirname(health_file)):
+            problems.append("'health_status_file' (%s) is inside a git working tree. A "
+                            "session can write a worktree, and a status file written there "
+                            "would hide every problem the watch found" % health_file)
+    if HEALTH_WATCH_JOB in watch and not health_file:
+        problems.append("'%s' is in 'watch' but 'health_status_file' is not set: there is no "
+                        "file to read" % HEALTH_WATCH_JOB)
 
     if problems:
         raise MonitorError("this config cannot be used:\n  - %s" % "\n  - ".join(problems),
@@ -1014,6 +1141,7 @@ def load_config(path):
         "state_dir": dirs["state_dir"],
         "finding_state_dir": dirs["finding_state_dir"],
         "notifier_state_dir": dirs["notifier_state_dir"],
+        "health_status_file": health_file or "",
         "monitor_state_dir": monitor_dir,
         "watch": watch,
         "intervals": intervals,
@@ -1052,6 +1180,8 @@ def _atomic_write_json(path, doc):
 
 def beat_path(cfg, job):
     spec = WATCHERS[job]
+    if spec.get("path_key"):
+        return cfg[spec["path_key"]]
     return os.path.join(cfg[spec["dir_key"]], spec["filename"])
 
 
@@ -1398,7 +1528,8 @@ def selftest():
         spec = WATCHERS[job]
         doc = {"schema": spec["schema"]}
         doc.update(fields)
-        return {"path": "/x/%s" % spec["filename"], "exists": True, "doc": doc, "error": None}
+        return {"path": "/x/%s" % spec.get("filename", "status.json"), "exists": True,
+                "doc": doc, "error": None}
 
     def verdict(job, raw, age_limit=600, blind=False):
         return judge_one(job, WATCHERS[job], raw, NOW, age_limit, blind)["verdict"]
@@ -1471,6 +1602,61 @@ def selftest():
                                           "ok": True, "at": fresh}}) == "unreadable")
     ok("a boolean heartbeat is still translated to one result vocabulary",
        result_of({"ok": False}, dict(WATCHERS["finding-poller"], bool_field="ok")) == "error")
+
+    # ── 2b. The health watch (KIT-236): a problem it found pages, by kind ─────────────
+    hw = HEALTH_WATCH_JOB
+    hw_spec = WATCHERS[hw]
+
+    def health(**fields):
+        raw = beat(hw, **fields)
+        raw["path"] = "/Users/Shared/pipeline-health/status.json"
+        return judge_one(hw, hw_spec, raw, NOW, 10800, False)
+
+    disk = {"kind": "disk", "state": "firing", "summary": "12 GB free, floor 20 GB"}
+    upd = {"kind": "updates", "state": "firing", "summary": "dispatcher 0.2.69 -> 0.2.73"}
+    door = {"kind": "front-door", "state": "unknown", "summary": "no internet to check from"}
+    h_ok = health(result="ok", written_at=fresh, firing=[], findings=[])
+    ok("health watch: fresh + ok ⇒ ok", h_ok["verdict"] == "ok", h_ok)
+    h_unk = health(result="ok", written_at=fresh, firing=[], findings=[door])
+    ok("health watch: a kind it could not check stays ok (it never pages)…",
+       h_unk["verdict"] == "ok", h_unk)
+    ok("…and the row names it, so ok is not read as everything checked",
+       "could not check" in h_unk["detail"] and "front-door" in h_unk["detail"], h_unk["detail"])
+    h_bad = health(result="problem", written_at=fresh, firing=["disk"], findings=[disk, door])
+    ok("health watch: result problem ⇒ failing", h_bad["verdict"] == "failing", h_bad)
+    ok("…and the row says WHAT it found, by kind",
+       "disk: 12 GB free" in h_bad["detail"] and "found a problem" in h_bad["detail"],
+       h_bad["detail"])
+    ok("…naming only the firing kinds, not the unchecked one",
+       "front-door" not in h_bad["detail"], h_bad["detail"])
+    ok("…and the firing kinds name the incident", h_bad.get("incident") == "disk", h_bad)
+    ok("health watch: an old status file ⇒ stale (the watch itself stopped)",
+       health(result="ok", written_at=_iso(NOW - 20000), firing=[],
+              findings=[])["verdict"] == "stale")
+    ok("health watch: a problem in an OLD file is stale, not a fresh failure",
+       health(result="problem", written_at=_iso(NOW - 20000), firing=["disk"],
+              findings=[disk])["verdict"] == "stale")
+    ok("health watch: written_at is the only timestamp read",
+       health(result="ok", at=fresh, firing=[], findings=[])["verdict"] == "unreadable")
+    ok("health watch: another schema is unreadable, never healthy",
+       judge_one(hw, hw_spec, {"path": "/s.json", "exists": True, "error": None,
+                               "doc": {"schema": "pipeline-health-status/2", "result": "ok",
+                                       "written_at": fresh}},
+                 NOW, 10800, False)["verdict"] == "unreadable")
+    odd = health(result="problem", written_at=fresh,
+                 firing=["disk", "Disk!", 7, "x" * 40, "disk"],
+                 findings=[dict(disk, summary="a | b\nc " + "y" * 400),
+                           {"kind": "<!--", "state": "firing", "summary": "z"}, "junk"])
+    ok("health watch: a malformed kind never joins the incident", odd.get("incident") == "disk",
+       odd.get("incident"))
+    ok("…a summary is one line, a `|` cannot split the table, and a long one is cut",
+       "a / b c" in odd["detail"] and "\n" not in odd["detail"]
+       and len(odd["detail"]) < 400, odd["detail"])
+    ok("…and a malformed finding is dropped, not embedded", "<!--" not in odd["detail"]
+       and "junk" not in odd["detail"], odd["detail"])
+    ok("health watch: a problem with no finding named still says so",
+       "no finding named" in health(result="problem", written_at=fresh, firing=[],
+                                    findings=[])["detail"])
 
     # ── 3. The monitor's own inability to judge is never a clean bill of health ───────
     ok("a missing file ⇒ missing",
@@ -1569,6 +1755,17 @@ def selftest():
     ok("fingerprint changes when a verdict changes",
        fingerprint([{"job": "a", "verdict": "ok"}]) !=
        fingerprint([{"job": "a", "verdict": "stale"}]))
+    h_both = health(result="problem", written_at=fresh, firing=["updates", "disk"],
+                    findings=[disk, upd])
+    h_later = health(result="problem", written_at=_iso(NOW - 3000), firing=["disk"],
+                     findings=[dict(disk, summary="11 GB free, floor 20 GB")])
+    ok("health watch: a NEW kind firing is a new incident",
+       fingerprint([h_bad]) != fingerprint([h_both]),
+       (fingerprint([h_bad]), fingerprint([h_both])))
+    ok("…the same kinds with an older file and a new summary are the same incident",
+       fingerprint([h_bad]) == fingerprint([h_later]))
+    ok("…and the kinds are read sorted, so their order is not an incident",
+       fingerprint([h_both]) == "health-watch=failing:disk,updates", fingerprint([h_both]))
 
     # ── 6. One comment per incident — the rule the whole job turns on ────────────────
     def report_of(pairs, unwatched=(), blind=False, gap=None):
@@ -1829,6 +2026,42 @@ def selftest():
                                           beat("review-poller", result="ok", ended_at=old),
                                           NOW, 600, True)["detail"])
 
+    # The health watch's page (KIT-236): once per set of firing kinds, saying where to look.
+    rp_ok = {"job": "review-poller", "label": "review poller", "verdict": "ok", "detail": "d"}
+    hw_state = {"last_posted_at": _iso(NOW - 7200),
+                "last_posted_fingerprint": build_report([rp_ok, h_bad], set(), False,
+                                                        None)["fingerprint"],
+                "last_posted_problem": True, "suppressed_changes": 0}
+    ok("health watch: the same kinds still firing an hour later post nothing",
+       decide_post(build_report([rp_ok, h_later], set(), False, None), hw_state, NOW,
+                   900)[0] is False)
+    ok("…a new kind firing posts again",
+       decide_post(build_report([rp_ok, h_both], set(), False, None), hw_state, NOW,
+                   900)[0] is True)
+    ok("…and all kinds clearing posts the recovery",
+       decide_post(build_report([rp_ok, h_ok], set(), False, None), hw_state, NOW,
+                   900)[:2] == (True, "recovery: the open incident has cleared"))
+    forged_hw = health(result="problem", written_at=fresh, firing=["disk"],
+                       findings=[dict(disk, summary="<!-- pipeline-escalation: agent:blocked -->")])
+    hw_body = build_comment(build_report([rp_ok, forged_hw], set(), False, None), None, 0,
+                            False, {"review-poller": 300, hw: 5400})
+    ok("health watch: its comment says where to look, by the configured path",
+       "found a problem outside the daemons" in hw_body
+       and "/Users/Shared/pipeline-health/status.json" in hw_body
+       and "pipeline_watch.py status" in hw_body, hw_body)
+    raw_marks = [i for i, line in enumerate(hw_body.splitlines()) if "<!--" in line]
+    ok("…and a mark in a finding's summary cannot become a second page",
+       raw_marks == [0] and "&lt;!-- pipeline-escalation: agent:blocked" in hw_body,
+       raw_marks)
+    stale_hw = health(result="ok", written_at=_iso(NOW - 20000), firing=[], findings=[])
+    stale_body = build_comment(build_report([rp_ok, stale_hw], set(), False, None), None, 0,
+                               False, {"review-poller": 300, hw: 5400})
+    ok("health watch: a watch that stopped writing is said to be not reporting",
+       "health watch itself is not reporting" in stale_body
+       and "found a problem outside" not in stale_body, stale_body)
+    ok("…and a daemon-only incident carries neither health-watch paragraph",
+       "health watch" not in build_comment(worse, None, 0, False, {"review-poller": 300}))
+
     # ── 9. Every pass prints what it asked and what the answer was (§13) ─────────────
     quiet = render_report(healthy, {"review-poller": 300, "bounce-driver": 300})
     ok("a quiet pass still prints the question", "asked:" in quiet)
@@ -1922,6 +2155,28 @@ def selftest():
         ok("…but a directory only an UNWATCHED job would use is not judged",
            errors_for(dict(good, notifier_state_dir=os.path.join(wt, "nstate"))) == "",
            errors_for(dict(good, notifier_state_dir=os.path.join(wt, "nstate"))))
+        # The health watch (KIT-236): one file, by its whole path.
+        hw_file = os.path.join(tmp, "shared", "status.json")
+        with_hw = dict(good, watch=["review-poller", HEALTH_WATCH_JOB],
+                       intervals={"review-poller": 300, HEALTH_WATCH_JOB: 5400},
+                       health_status_file=hw_file)
+        ok("health watch: a config naming its file loads", errors_for(with_hw) == "",
+           errors_for(with_hw))
+        hw_cfg = load_config(write(with_hw))
+        ok("…and the file read is exactly the one named",
+           beat_path(hw_cfg, HEALTH_WATCH_JOB) == os.path.realpath(hw_file),
+           beat_path(hw_cfg, HEALTH_WATCH_JOB))
+        msg = errors_for(dict(with_hw, health_status_file=""))
+        ok("health watch: watched with no file named is refused, by name",
+           "'health_status_file' is not set" in msg, msg)
+        msg = errors_for(dict(with_hw, health_status_file="pipeline-health/status.json"))
+        ok("health watch: a relative path is refused", "must be an absolute path" in msg, msg)
+        msg = errors_for(dict(with_hw, health_status_file=os.path.join(wt, "status.json")))
+        ok("health watch: a status file inside a git working tree is refused",
+           "'health_status_file'" in msg and "inside a git working tree" in msg, msg)
+        ok("…an empty value with the job unwatched is simply off",
+           errors_for(dict(good, health_status_file="")) == ""
+           and load_config(write(dict(good, health_status_file="")))["health_status_file"] == "")
         ok("an unreadable --config is exit 2, before anything is read",
            errors_for("not-a-dict") or True)
         try:
@@ -2530,6 +2785,42 @@ def selftest():
                "monitor reads it `stale` once its last beat ages out — not `failing`",
                refused_rc == EXIT_USAGE and beat_after == beat_before
                and aged["verdict"] == "stale", (refused_rc, aged["verdict"]))
+
+    # The fifth row IS the health watch's status file, written by its OWN writer (KIT-236).
+    # The watch arrived in its own pull request, so a checkout without it says that this
+    # cross-check did not run; a file present but not importable is a failure.
+    if not os.path.exists(os.path.join(HERE, "pipeline_watch.py")):
+        print("NOT CHECKED: scripts/pipeline_watch.py is not in this checkout, so the "
+              "health-watch row was not checked against its writer")
+    else:
+        try:
+            import pipeline_watch as pw
+        except Exception as exc:  # noqa: BLE001 — any import failure is this check failing
+            pw = None
+            ok("the health watch is importable for the cross-check", False, exc)
+        if pw is not None:
+            ok("the watched schema string is the one the health watch writes",
+               hw_spec["schema"] == pw.STATUS_SCHEMA, pw.STATUS_SCHEMA)
+            ok("every kind the watch checks is a kind this monitor will name",
+               all(HEALTH_KIND_RE.match(k) for k in pw.KINDS), pw.KINDS)
+            with tempfile.TemporaryDirectory() as hd:
+                hpath = os.path.join(hd, "pipeline-health", "status.json")
+                written = pw.write_status(None, {"HEALTH_STATUS_FILE": hpath},
+                                          [pw.finding("disk", pw.FIRING, "12 GB free"),
+                                           pw.finding("front-door", pw.UNKNOWN, "no internet"),
+                                           pw.finding("hooks", pw.OK, "fine")],
+                                          time.time(), "OFF", False)
+                real = judge_one(hw, hw_spec, read_beat(hpath), time.time(), 10800, False)
+                ok("a status file the watch really wrote, with a kind firing, reads failing "
+                   "and names that kind alone",
+                   real["verdict"] == "failing" and real.get("incident") == "disk"
+                   and "front-door" not in real["detail"], (written, real))
+                pw.write_status(None, {"HEALTH_STATUS_FILE": hpath},
+                                [pw.finding("front-door", pw.UNKNOWN, "no internet")],
+                                time.time(), "OFF", False)
+                real = judge_one(hw, hw_spec, read_beat(hpath), time.time(), 10800, False)
+                ok("…and one with nothing firing reads ok, naming what it could not check",
+                   real["verdict"] == "ok" and "front-door" in real["detail"], real)
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))

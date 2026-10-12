@@ -33,7 +33,7 @@ is worse than none at all.
 
 ## What it watches
 
-One row per job, because the heartbeats do not agree on field names and rewriting four jobs
+One row per job, because the heartbeats do not agree on field names and rewriting five jobs
 for one reader's convenience would be the larger change:
 
 | Job | File | Freshness from | Good result |
@@ -42,6 +42,21 @@ for one reader's convenience would be the larger change:
 | bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle`, `declined`, `paused` |
 | finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
 | notifier | `<notifier_state_dir>/notifier-heartbeat.json` | `at` | exit `0` only |
+| health watch | `<health_status_file>` (a whole path) | `written_at` | `ok` |
+
+**The health watch is the owner's job, not a daemon.** It is `scripts/pipeline_watch.py`
+(`docs/UPDATE-OPERATOR.md`), an hourly user LaunchAgent. It checks what no daemon reports on
+itself: hooks, updates due, the dispatcher, the front door, the disk. It writes one
+world-readable status file, and this monitor reads that file like a heartbeat:
+
+- `result: problem` reads **failing**. The row names each firing kind and its summary.
+- The firing kinds are part of the fingerprint. A new kind firing pages again. The same
+  kinds an hour later do not.
+- A kind the watch could not check (`unknown`) never pages. The `ok` row names it.
+- A file that stopped changing reads **stale**: the watch itself is not running. It runs
+  only while the owner is logged in.
+- The comment says where to look: ask the tech lead in chat to read the file, or run
+  `python3 scripts/pipeline_watch.py status`.
 
 **The notifier writes an exit code, not a result word.** The monitor reads it through the
 same exit table every Stage E job shares: 0 is `ok`, and 1, 2, 3 and 4 are `failing`. Its
@@ -287,6 +302,8 @@ three daemons are loaded. Name the ticket in `stage-e.conf`, or turn it off by n
 HEARTBEAT_MONITOR_TICKET=KIT-123      # or: HEARTBEAT_MONITOR_TICKET=off
 MONITOR_INTERVAL_SECONDS=1800         # optional; this is the default
 NOTIFIER_JOB_LABEL=                   # optional: the notifier's JOB_LABEL, to watch it too
+HEALTH_STATUS_FILE=                   # optional: the health watch's status file, to read it too
+HEALTH_WATCH_INTERVAL_SECONDS=3600    # the health watch's WATCH_INTERVAL_SECONDS
 ```
 
 Left empty, `run` stops at card `CK-9`. Pick a ticket you read that no session is ever
@@ -301,7 +318,8 @@ With a ticket named, the step does six things:
    reaches nobody.
 2. It writes `~/.stage-e/monitor.json` under the role account. The intervals come from the
    same conf values launchd schedules the three daemons by, plus 900 s for one pass. With
-   `NOTIFIER_JOB_LABEL` set, the notifier is a fourth watched job (below).
+   `NOTIFIER_JOB_LABEL` set, the notifier is a fourth watched job (below). With
+   `HEALTH_STATUS_FILE` set, the health watch is a fifth (below).
 3. It runs the monitor's own `check`. A config the monitor refuses (exit 2) is never loaded.
    Exit 3 means it found a problem on its first look, which is its job.
 4. It installs `<prefix>.stage-e-monitor` as a fourth system LaunchDaemon, logging to
@@ -362,6 +380,21 @@ monitor. A run that stops between them prints which jobs are still off. With
 label the `heartbeat-monitor` step would refuse stops the run with every job still loaded,
 not after the monitor was stopped. A paused notifier does not stop it.
 
+**Reading the health watch.** Install the watch first: `python3 scripts/pipeline_watch.py
+install`, as yourself (`docs/UPDATE-OPERATOR.md`). Then set two `stage-e.conf` values to
+match its `update.conf`, and run the Stage E installer:
+
+- `HEALTH_STATUS_FILE`: the same absolute path as its `HEALTH_STATUS_FILE`.
+- `HEALTH_WATCH_INTERVAL_SECONDS`: the same number as its `WATCH_INTERVAL_SECONDS`.
+
+The step adds `health-watch` to `watch`, at that interval plus 2700 s. That is one alert
+send per kind if every kind changes at once. Empty, the step's note says the health watch is
+not watched, by name.
+
+Good: the watch writes the file, then the monitor reads it.
+Not: set the path before the watch is installed. The monitor then reads it as missing, and
+pages.
+
 ## Running it by hand
 
 This section is for a machine where the installer does not manage the monitor: there is no
@@ -377,6 +410,9 @@ python3 scripts/pipeline_heartbeat_monitor.py run   --config ~/.stage-e/monitor.
 To watch the notifier by hand, add `notifier` to `watch`, give it an interval (its launchd
 interval plus its `run_timeout_seconds`), and set `notifier_state_dir` if the notifier's
 `state_dir` is not this file's `state_dir`.
+
+To read the health watch by hand, add `health-watch` to `watch` and set `health_status_file`
+to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 2700.
 
 `check` judges and prints and writes nothing at all — not even the run clock, because a
 rehearsal that moved it would make the next real pass mis-judge. `run --dry-run` is the same
