@@ -84,6 +84,14 @@ jobs:
       - name: Placeholder integrity (used == documented)
         run: python3 scripts/check_placeholders.py
 
+      # A session copies the brief's escalation mark and finding block word for word, so a
+      # brief that drifts from the notifier's or the finding job's own parser turns every
+      # real escalation into silence (KIT-231). Judged with the readers' own code.
+      - name: Session brief formats match their readers
+        run: |
+          python3 scripts/check_session_brief.py --selftest
+          python3 scripts/check_session_brief.py
+
       - name: Definition-of-Ready gate selftest
         run: python3 scripts/check_ticket_dor.py --selftest
 
