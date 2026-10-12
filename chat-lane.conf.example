@@ -134,3 +134,23 @@ FRONT_DOOR_MATCHER=@dispatcher
 #
 # RULE: an absolute path.
 #HEALTH_STATUS_FILE=/Users/Shared/pipeline-health/status.json
+
+# Optional (KIT-257). Trust files a SANDBOXED session's own tools must read,
+# comma-separated. Piece 5 puts them in the role account's user settings, under
+# sandbox.filesystem.allowRead, and adds no other allow of any kind.
+#
+# Why it exists: in a sandboxed session (a coding session the dispatcher
+# starts), piece 5's Read denies also block every shell command and every
+# process it starts, at the operating-system level. Read(//**/*.pem) then hides
+# the dispatcher's egress CA certificate from git, and a push fails. The deny
+# stays, because a private key can sit beside that certificate with a .pem
+# name. Name the certificate here instead: that one file is re-opened, nothing
+# else.
+#
+# Leave it unset unless a sandboxed push or fetch fails with "error setting
+# certificate verify locations". Unset, no trust file is allowed.
+#
+# RULE: each an absolute path to one file. No glob (* ? [ ] { }), no ..
+# segment, no trailing slash, no "key" in the file name, not .key, and not a
+# file piece 5 denies by name. Every bad entry is named, all at once.
+#SANDBOX_TRUST_FILES=/opt/example-dispatcher/certs/egress-ca.pem

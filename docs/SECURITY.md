@@ -72,9 +72,16 @@ Claude Code enforces itself. This matters: per
 the docs, **deny wins even under `defaultMode: bypassPermissions`**, deny beats allow
 across every settings scope, and deny rules aren't gated by the workspace-trust
 dialog — so secret-file reads are blocked immediately, even if the PreToolUse hook
-were removed. It's belt-and-suspenders with the hook, not a replacement (deny covers
-built-in Read/Edit/Grep and recognized `cat`/`head` Bash reads, but not an arbitrary
-subprocess opening the file — which the hook and OS sandboxing cover). The list
+were removed. It's belt-and-suspenders with the hook, not a replacement. How far a
+deny reaches depends on the sandbox. Without one, it covers built-in Read/Edit/Grep and
+recognized `cat`/`head` Bash reads, but not an arbitrary subprocess opening the file —
+the hook covers that case. In a **sandboxed** session it reaches further: Claude Code
+merges every `Read` deny into the sandbox's `denyRead`, an OS-level block on every shell
+command and every child process it starts. So a deny can also hide a file the session's
+own tools need, such as a `.pem` CA certificate git checks its connection with. The fix
+is one exact-file `sandbox.filesystem.allowRead` entry, never a narrower deny, a folder
+or a glob (the chat-lane composer's `SANDBOX_TRUST_FILES`, `docs/CHAT-LANE-OPERATOR.md`
+Step 4). The list
 deliberately **enumerates** real env-file names rather than using a `Read(.env.*)`
 wildcard: the wildcard would also catch `.env.example` — the one env file that's
 *meant* to be read and edited — and deny rules can't express exceptions; exotic

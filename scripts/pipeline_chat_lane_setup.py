@@ -17,9 +17,10 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
     compose   prints every piece, or one (`--piece N`; piece 4 alone is only its script).
               Reads no live file, needs no role-account access, runs anywhere. Exit 0, or
               2 on a conf error.
-    verify    read-only live measurement: four files, and the newest chat session's
-              start-up tool list (names only), as the role account, and pf's loaded
-              rules as root. One outcome per check.
+    verify    read-only live measurement: four files, any trust file (a yes or no for
+              a private key, never its bytes), and the newest chat session's start-up
+              tool list (names only), as the role account, and pf's loaded rules as
+              root. One outcome per check.
     merge     pieces 1, 2 and 5 into the dispatcher config and the role account's user
               settings. Dry run by default; `--apply` writes.
     env-names piece 3: asks for the chat app's two secrets at hidden prompts and writes
@@ -693,6 +694,67 @@ def user_deny_patterns(conf):
     return out
 
 
+# THE SANDBOX'S TRUST FILES (KIT-257). In a sandboxed session, Claude Code merges every
+# Read deny from the settings it loads into the sandbox's OS-level denyRead, which blocks
+# the session's shell commands and every process they start. So `Read(//**/*.pem)` above
+# also hides a `.pem` file the session's own tooling needs: the dispatcher's egress CA
+# certificate, which git verifies its connection with. A push then fails. The deny stays,
+# because a private key with a `.pem` name can sit beside that certificate. Instead the
+# conf names each such file exactly, and piece 5 puts it in `sandbox.filesystem.allowRead`,
+# which re-opens that one path inside the denied region and nothing beside it. Sandbox
+# paths are not permission rules: `/x` is absolute there. Never `permissions.allow`.
+TRUST_GLOB_CHARS = "*?[]{}"
+
+
+def sandbox_trust_files(conf):
+    """SANDBOX_TRUST_FILES as a list: comma-separated, blanks dropped, each once."""
+    out = []
+    for part in ((conf or {}).get("SANDBOX_TRUST_FILES") or "").split(","):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out
+
+
+def _exact_deny_paths(conf):
+    """The absolute paths piece 5 denies by name: `Read(//a/b)` with no glob is `/a/b`."""
+    out = []
+    for rule in user_deny_patterns(conf):
+        m = re.match(r"^Read\(/(/.*)\)$", rule)
+        if m and not any(ch in m.group(1) for ch in TRUST_GLOB_CHARS):
+            out.append(os.path.normpath(m.group(1)))
+    return out
+
+
+def trust_file_problems(conf):
+    """Every problem with every SANDBOX_TRUST_FILES entry, each naming its entry. An entry
+    must be one exact file: absolute, no glob, no `..`, not a folder, not a key, and not a
+    file piece 5 denies by name."""
+    problems = []
+    denied = _exact_deny_paths(conf)
+    for entry in sandbox_trust_files(conf):
+        say_entry = "SANDBOX_TRUST_FILES entry %r" % entry
+        name = entry.rsplit("/", 1)[-1].lower()
+        if not entry.startswith("/"):
+            problems.append("%s is not an absolute path" % say_entry)
+        if any(ch in entry for ch in TRUST_GLOB_CHARS):
+            problems.append("%s holds a glob character (* ? [ ] { }): name one exact file"
+                            % say_entry)
+        if ".." in entry.split("/"):
+            problems.append("%s has a .. segment: name the file by its own path" % say_entry)
+        if entry.endswith("/"):
+            problems.append("%s ends with a slash: name a file, never a folder" % say_entry)
+        if "key" in name:
+            problems.append('%s has "key" in its file name: a private key is never a trust '
+                            "file" % say_entry)
+        if name.endswith(".key"):
+            problems.append("%s ends .key: a private key is never a trust file" % say_entry)
+        if os.path.normpath(entry) in denied:
+            problems.append("%s is a file piece 5 denies by name: allowing it would undo "
+                            "that deny" % say_entry)
+    return problems
+
+
 def repo_deny_drift(settings):
     """Problems when a settings object's deny list no longer matches REPO_DENY_PATTERNS."""
     perms = settings.get("permissions") if isinstance(settings, dict) else None
@@ -916,7 +978,7 @@ CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
 # subcommand that needs one refuses, naming it.
 CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
                  "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS",
-                 "HEALTH_STATUS_FILE")
+                 "HEALTH_STATUS_FILE", "SANDBOX_TRUST_FILES")
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # What `front-door` needs, and what verify's front-door row needs.
 FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
@@ -1027,6 +1089,7 @@ def validate_conf(values):
     if not role_env.startswith(("/", "~/")) or role_env in ("/", "~/"):
         errors.append("ROLE_ENV_FILE must be an absolute path, or start with ~/ for the role "
                       "account's own home (got %r)" % role_env)
+    errors.extend(trust_file_problems(conf))
     return conf, errors
 
 
@@ -1344,10 +1407,20 @@ def _compose_piece_5(conf):
          "already there. Never overwrite the file: the account may already have one. "
          "No hooks." % conf["ROLE_ACCOUNT"])
     say("")
-    block = json.dumps({"permissions": {"deny": user_deny_patterns(conf)}}, indent=2)
+    block = json.dumps(user_settings_block(conf), indent=2)
     for line in block.splitlines():
         say("    " + line)
     say("")
+    trust = sandbox_trust_files(conf)
+    if trust:
+        para("The sandbox key is SANDBOX_TRUST_FILES: %d trust file(s) a sandboxed session's "
+             "own tooling must read, each named exactly. Merge them into the file's "
+             "sandbox.filesystem.allowRead list and keep every entry and key already there. "
+             "Never a permissions.allow rule." % len(trust))
+    else:
+        para("No trust files are allowed: SANDBOX_TRUST_FILES is empty, so there is no "
+             "sandbox key. Set it only when a sandboxed session cannot read a file its own "
+             "tooling needs (see THE TRUST FILES below).")
     para("Why the rules start with //**/ or ~/: the first twelve are this repository's own "
          "denies, which are relative, and a relative rule matches under the session's "
          "current directory only. A chat session's is a fresh, empty folder. Anchored, each "
@@ -1376,7 +1449,29 @@ def _compose_piece_5(conf):
          "tracker's path to a merge or an approval. A session holding a GitHub token with "
          "write access has a second path, through GitHub itself; the session's own grant "
          "and the repository's branch protection guard that one.")
+    para("THE TRUST FILES. In a sandboxed session (a coding session the dispatcher starts) "
+         "these Read denies are more than tool rules: Claude Code merges them into the "
+         "sandbox's denyRead, an OS-level block on every shell command and every child "
+         "process it starts. So Read(//**/*.pem) also hides a .pem file the session's own "
+         "tooling needs, such as the dispatcher's egress CA certificate that git checks its "
+         "connection with, and a push fails. The deny stays: a private key with a .pem name "
+         "can sit beside that certificate. Name the certificate's exact path in "
+         "SANDBOX_TRUST_FILES instead. An exact file re-opens that one path and nothing "
+         "beside it: never a folder, never a glob, never a file holding a private key. The "
+         "conf refuses a glob, a folder's trailing slash and any name with \"key\" in it; "
+         "merge will not add a file that holds PRIVATE KEY; and verify's trust-files row "
+         "fails on each.")
     say("")
+
+
+def user_settings_block(conf):
+    """Piece 5 as one object: the deny list, and the trust files under
+    sandbox.filesystem.allowRead when there are any. Never permissions.allow."""
+    block = {"permissions": {"deny": user_deny_patterns(conf)}}
+    trust = sandbox_trust_files(conf)
+    if trust:
+        block["sandbox"] = {"filesystem": {"allowRead": trust}}
+    return block
 
 
 # -- Piece 6 -----------------------------------------------------------------
@@ -2111,24 +2206,59 @@ def env(path):
             "ipValidationOff": ip_off,
             "serverPortMatches": live_port == int(sys.argv[3])}
 
-def user_settings():
+def sandbox_path(entry):
+    # The sandbox's own path rules, for user settings: `/x` (and the older `//x`) is
+    # absolute, `~/x` is under the home, anything else is under ~/.claude.
+    if entry.startswith("/"):
+        return "/" + entry.lstrip("/")
+    if entry.startswith("~/"):
+        return os.path.expanduser(entry)
+    return os.path.join(os.path.expanduser("~"), ".claude", entry)
+
+def trust(entry):
+    # Booleans and a byte count only, never a byte of the file. A link is not followed.
+    q = sandbox_path(entry)
+    if os.path.islink(q):
+        return {"symlink": True}
+    if os.path.isdir(q):
+        return {"folder": True}
+    try:
+        raw = raw_of(q)
+    except Exception as exc:
+        return {"error": why(exc)}
+    return {"bytes": len(raw), "privateKey": b"PRIVATE KEY" in raw}
+
+def user_settings(listed):
     path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
         raw = raw_of(path)
         s = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        return {"path": path, "error": why(exc)}
+        return {"path": path, "error": why(exc),
+                "trust": dict((p, trust(p)) for p in listed)}
+    out = {"path": path, "sha256": digest(raw)}
+    # sandbox.filesystem.allowRead (KIT-257): the same rule as deny below. A wrong type is
+    # reported, never read as an empty list.
+    sb = s.get("sandbox", {}) if isinstance(s, dict) else None
+    fs = sb.get("filesystem", {}) if isinstance(sb, dict) else None
+    allow = fs.get("allowRead", []) if isinstance(fs, dict) else None
+    if isinstance(allow, list):
+        out["allowRead"] = [a[:300] for a in allow if isinstance(a, str)]
+        out["allowReadOther"] = len([a for a in allow if not isinstance(a, str)])
+    else:
+        out["allowReadError"] = "is not a list under a sandbox object and a filesystem object"
+    seen = list(listed) + [a for a in out.get("allowRead", []) if a not in listed]
+    out["trust"] = dict((p, trust(p)) for p in seen)
     # The shape the merge writer can extend: an object, whose permissions (when present)
     # is an object, whose deny (when present) is a list. Anything else is reported, never
     # read as an empty list the writer would then refuse.
     perms = s.get("permissions", {}) if isinstance(s, dict) else None
     deny = perms.get("deny", []) if isinstance(perms, dict) else None
     if not isinstance(deny, list):
-        return {"path": path, "sha256": digest(raw),
-                "error": "unparseable (not a settings object with a permissions.deny list)"}
-    return {"path": path, "sha256": digest(raw),
-            "deny": [str(d)[:300] for d in deny],
-            "hasHooks": bool(s.get("hooks"))}
+        out["error"] = "unparseable (not a settings object with a permissions.deny list)"
+        return out
+    out.update({"deny": [str(d)[:300] for d in deny], "hasHooks": bool(s.get("hooks"))})
+    return out
 
 def chat_tools(logs):
     # The newest chat session's start-up tool list: the tracker's tool NAMES only, never
@@ -2199,21 +2329,28 @@ def chat_rules(config_path):
         return {"path": path, "error": why(exc)}
     return {"path": path, "sha256": digest(raw)}
 
-out = {"config": config(sys.argv[1]), "env": env(sys.argv[2]),
-       "userSettings": user_settings(), "chatRules": chat_rules(sys.argv[1]),
-       "chatTools": chat_tools(os.path.join(os.path.dirname(sys.argv[1]), "logs"))}
-if len(sys.argv) > 5:
-    out["frontDoor"] = front_door(sys.argv[4], sys.argv[5])
+ARGS, TRUST = sys.argv[1:], []
+if "--trust" in ARGS:
+    ARGS, TRUST = ARGS[:ARGS.index("--trust")], ARGS[ARGS.index("--trust") + 1:]
+out = {"config": config(ARGS[0]), "env": env(ARGS[1]),
+       "userSettings": user_settings(TRUST), "chatRules": chat_rules(ARGS[0]),
+       "chatTools": chat_tools(os.path.join(os.path.dirname(ARGS[0]), "logs"))}
+if len(ARGS) > 4:
+    out["frontDoor"] = front_door(ARGS[3], ARGS[4])
 print(json.dumps(out))
 '''.replace("[:HEAD]", "[:%d]" % INSTRUCTION_HEAD_CHARS)
 
 
 def facts_command(conf):
     """The /bin/sh script `as_role` runs. Paths are arguments, never spliced into code. The
-    front door's file and matcher go last, and only when both are set."""
+    front door's file and matcher come next, only when both are set; then, only when there
+    are any, `--trust` and the trust files (KIT-257), each an absolute path the conf
+    checked, so none of them can be `--trust`."""
     args = [conf["DISPATCHER_CONFIG"], conf["DISPATCHER_ENV_FILE"], conf["DISPATCHER_PORT"]]
     if all(conf.get(k) for k in FRONT_DOOR_READ_KEYS):
         args += [conf["FRONT_DOOR_CONFIG"], conf["FRONT_DOOR_MATCHER"]]
+    if sandbox_trust_files(conf):
+        args += ["--trust"] + sandbox_trust_files(conf)
     return "/usr/bin/python3 -c %s %s" % (shlex.quote(FACTS_PY),
                                           " ".join(shlex.quote(a) for a in args))
 
@@ -2667,6 +2804,86 @@ def check_user_settings(conf, us, env_facts):
                 "%s carries every composed deny rule" % path)
 
 
+def _trust_unsafe(facts):
+    """Why a trust file the probe inspected must not be allowed, or None. Missing is not a
+    reason: an allow for a file that is not there yet re-opens nothing."""
+    facts = facts or {}
+    if facts.get("symlink"):
+        return "is a symbolic link"
+    if facts.get("folder"):
+        return "is a folder"
+    if facts.get("privateKey"):
+        return "holds the text PRIVATE KEY"
+    return None
+
+
+def check_trust_files(conf, us, env_facts):
+    """The sandbox's trust files (KIT-257): every listed file is in the user settings'
+    sandbox.filesystem.allowRead, and no entry there re-opens more than one exact file."""
+    listed = sandbox_trust_files(conf)
+    names = set((env_facts or {}).get("names") or [])
+    path = us.get("path") or "~/.claude/settings.json"
+    if "CLAUDE_CONFIG_DIR" in names:
+        return _row("trust-files", UNKNOWN,
+                    "the dispatcher env file sets CLAUDE_CONFIG_DIR, so sessions read user "
+                    "settings from that directory, not %s" % path)
+    err = us.get("error")
+    if err and "allowRead" not in us and "allowReadError" not in us and err != "missing":
+        return _row("trust-files", FAILED if err.startswith("unparseable") else UNKNOWN,
+                    "%s is %s" % (path, err))
+    live = us.get("allowRead") or []
+    trust = us.get("trust") or {}
+    broken = []
+    if us.get("allowReadError"):
+        broken.append("sandbox.filesystem.allowRead %s" % us["allowReadError"])
+    if us.get("allowReadOther"):
+        broken.append("%d allowRead entr%s not a path" % (
+            us["allowReadOther"], "y is" if us["allowReadOther"] == 1 else "ies are"))
+    broken += ["%s is a glob: it re-opens every file it matches" % a for a in live
+               if any(ch in a for ch in TRUST_GLOB_CHARS)]
+    broken += ["%s %s" % (p, _trust_unsafe(f)) for p, f in sorted(trust.items())
+               if _trust_unsafe(f)]
+    if broken:
+        return _row("trust-files", FAILED,
+                    "%d problem(s) with the sandbox's read exceptions: each must re-open one "
+                    "exact trust file and nothing more" % len(broken),
+                    broken + ["each must be one exact file: never a folder, a glob, a link "
+                              "or a file holding a private key. Fix SANDBOX_TRUST_FILES or "
+                              "the allowRead list in %s by hand" % path])
+    unread = sorted(p for p, f in trust.items() if (f or {}).get("error") not in (None,
+                                                                                  "missing"))
+    if unread:
+        return _row("trust-files", UNKNOWN,
+                    "could not read %d trust file(s) as the role account, so could not "
+                    "check them for a private key" % len(unread),
+                    ["%s is %s" % (p, trust[p]["error"]) for p in unread])
+    missing = [p for p in listed if p not in live]
+    if missing:
+        return _row("trust-files", BLOCKED,
+                    "%d trust file(s) missing from sandbox.filesystem.allowRead in %s"
+                    % (len(missing), path),
+                    ["missing: " + m for m in missing]
+                    + ["run  merge , then  merge --apply : it adds only the missing entries "
+                       "and keeps every other entry and key"])
+    extra = [a for a in live if a not in listed]
+    lines = ["not composed (SANDBOX_TRUST_FILES does not list it): " + a for a in extra]
+    lines += ["not on disk yet, so its allow re-opens nothing: " + p for p in listed
+              if (trust.get(p) or {}).get("error") == "missing"]
+    if not listed and not live:
+        return _row("trust-files", ALREADY_DONE,
+                    "No trust files are allowed: SANDBOX_TRUST_FILES is empty, and %s has "
+                    "no sandbox read exception" % path)
+    if not listed:
+        return _row("trust-files", ALREADY_DONE,
+                    "SANDBOX_TRUST_FILES is empty, so this composes no trust file. %s holds "
+                    "%d sandbox read exception(s) it did not compose, each an exact file"
+                    % (path, len(live)), lines)
+    return _row("trust-files", ALREADY_DONE,
+                "%s allows the sandbox to read %d trust file(s), each an exact file: not a "
+                "folder, a glob or a link, and none holds a private key" % (path, len(listed)),
+                lines)
+
+
 def check_chat_tools(ct):
     """The tracker tools the newest chat session was given, as its own start-up line
     recorded them (KIT-212). A session gets its tool list when it starts or resumes, so a
@@ -2800,7 +3017,7 @@ def check_front_door(conf, fd):
 
 CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env", "ip-validation-off",
           "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings",
-          "chat-tools", "chat-rules", "front-door")
+          "chat-tools", "trust-files", "chat-rules", "front-door")
 
 
 def evaluate(facts, conf, pf=None):
@@ -2827,6 +3044,7 @@ def evaluate(facts, conf, pf=None):
         rows.append(check_hosted_keys_absent(env_facts))
         rows.append(check_user_settings(conf, us, env_facts))
         rows.append(check_chat_tools(facts.get("chatTools")))
+        rows.append(check_trust_files(conf, us, env_facts))
         rows.append(check_chat_rules(conf, facts.get("chatRules") or {"error": "missing"}))
         rows.append(check_front_door(conf, front_door_digest(facts.get("frontDoor"),
                                                              conf.get("FRONT_DOOR_MATCHER"))))
@@ -2900,10 +3118,10 @@ def cmd_verify(conf, runner, sudo):
     runner.dry_run = True
     account = conf["ROLE_ACCOUNT"]
     say("Chat lane verify — read-only. It reads the dispatcher config, its env file, the")
-    say("user settings, the front door's config and the newest chat session's log as %s,"
-        % account)
-    say("through one program that prints names, tool lists and allowlist paths and never a")
-    say("value or a message, and asks pf, as root, what it has loaded. Your login password")
+    say("user settings, any trust file, the front door's config and the newest chat")
+    say("session's log as %s, through one program that prints names, tool lists," % account)
+    say("allowlist paths and yes-or-no answers, never a value or a message, and asks pf, as")
+    say("root, what it has loaded. Your login password")
     say("may be asked for, once.")
     sudo.acquire("`verify` reads four files and the newest chat session's start-up tool list "
                  "as the %s role account, and asks pf, as root, which rules it holds. It "
@@ -3080,6 +3298,7 @@ def main():
     if not isinstance(patch, dict):
         stop(2, "the patch on standard input is not a JSON object. Nothing was written.")
     ops, deny_add = patch.get("config") or [], patch.get("deny") or []
+    allow_add = patch.get("allowRead") or []
     home = os.path.expanduser("~")
     backups = os.path.join(home, ".stage-e", "backups")
     s_path = os.path.join(home, ".claude", "settings.json")
@@ -3098,12 +3317,14 @@ def main():
             apply_op(cfg, op)
         new_cfg = render(cfg, raw.decode("utf-8")).encode("utf-8")
     s_raw = new_settings = None
-    if deny_add:
+    if deny_add or allow_add:
         # The settings checksum is not optional: a patch without it would switch the check
-        # off (review of KIT-197, finding 49). None means "there was no file".
+        # off (review of KIT-197, finding 49). None means "there was no file". It is of the
+        # bytes read just now, compared with the plan's read of this run: whoever wrote the
+        # file last, and however it is laid out, only the parsed object is judged.
         if "settingsSha256" not in patch:
-            stop(2, "the patch adds deny rules and carries no settings checksum. Nothing was "
-                    "written.")
+            stop(2, "the patch adds to the user settings and carries no settings checksum. "
+                    "Nothing was written.")
         exists = os.path.exists(s_path)
         s_raw = read(s_path) if exists else None
         now = hashlib.sha256(s_raw).hexdigest() if exists else None
@@ -3111,12 +3332,27 @@ def main():
             stop(3, "%s changed since it was read. Nothing was written. Run merge "
                     "again." % s_path)
         settings, ok = loads(s_raw) if exists else ({}, True)
-        perms = settings.setdefault("permissions", {}) if ok and isinstance(settings, dict) else None
-        deny = perms.setdefault("deny", []) if isinstance(perms, dict) else None
-        if not isinstance(deny, list):
-            stop(1, "%s is not a JSON object with a permissions.deny list. Nothing was "
-                    "written: merge piece 5 into it by hand." % s_path)
-        deny.extend([x for x in deny_add if x not in deny])
+        if not ok or not isinstance(settings, dict):
+            stop(1, "%s is not a JSON object. Nothing was written: merge piece 5 into it by "
+                    "hand." % s_path)
+        if deny_add:
+            perms = settings.setdefault("permissions", {})
+            deny = perms.setdefault("deny", []) if isinstance(perms, dict) else None
+            if not isinstance(deny, list):
+                stop(1, "%s is not a JSON object with a permissions.deny list. Nothing was "
+                        "written: merge piece 5 into it by hand." % s_path)
+            deny.extend([x for x in deny_add if x not in deny])
+        if allow_add:
+            # Only sandbox.filesystem.allowRead, and only by adding: every other key under
+            # sandbox and filesystem stays, and permissions.allow is never written.
+            box = settings.setdefault("sandbox", {})
+            fs = box.setdefault("filesystem", {}) if isinstance(box, dict) else None
+            allow = fs.setdefault("allowRead", []) if isinstance(fs, dict) else None
+            if not isinstance(allow, list):
+                stop(1, "%s has a sandbox, sandbox.filesystem or sandbox.filesystem.allowRead "
+                        "of the wrong type. Nothing was written: add the trust files by "
+                        "hand." % s_path)
+            allow.extend([x for x in allow_add if x not in allow])
         new_settings = render(settings, s_raw.decode("utf-8") if exists else None).encode("utf-8")
 
     # 2. The dispatcher config, in place, after a private copy. The checksum is taken
@@ -3489,9 +3725,10 @@ def _plan_line(line):
 # merge — pieces 1, 2 and 5.
 # --------------------------------------------------------------------------- #
 def merge_plan(conf, facts):
-    """(lines, config operations, deny rules to add), from the probe's facts, with the SAME
-    functions `verify` uses: owner_grant, fence_entry, prompt_type_gaps, user_deny_patterns
-    and entry_kind. It reads nothing itself, and its lines hold no value."""
+    """(lines, config operations, deny rules to add, trust files to add), from the probe's
+    facts, with the SAME functions `verify` uses: owner_grant, fence_entry,
+    prompt_type_gaps, user_deny_patterns, sandbox_trust_files and entry_kind. It reads
+    nothing itself, and its lines hold no value."""
     cfg = facts.get("config") or {}
     env_facts = facts.get("env") or {}
     us = facts.get("userSettings") or {}
@@ -3618,17 +3855,44 @@ def merge_plan(conf, facts):
                             len(deny_add), ", ".join(deny_add)))
         else:
             lines.append("ok          %s already carries every composed deny rule" % s_path)
-    return lines, ops, deny_add
+
+    # Piece 5's trust files (KIT-257): added to sandbox.filesystem.allowRead, never more.
+    allow_add = []
+    listed = sandbox_trust_files(conf)
+    if not listed or "CLAUDE_CONFIG_DIR" in names or (us.get("error") and
+                                                       us.get("error") != "missing"):
+        if listed:
+            lines.append("NOT MERGED  the trust files are not added to %s, for the reason "
+                         "above" % s_path)
+    elif us.get("allowReadError"):
+        lines.append("CANNOT      %s: sandbox.filesystem.allowRead %s. The trust files are "
+                     "not added: fix it by hand" % (s_path, us["allowReadError"]))
+    else:
+        have, seen = us.get("allowRead") or [], us.get("trust") or {}
+        for entry in [p for p in listed if p not in have]:
+            unsafe = _trust_unsafe(seen.get(entry))
+            if unsafe:
+                lines.append("CANNOT      trust file %s %s: it is not added" % (entry, unsafe))
+            else:
+                allow_add.append(entry)
+        if allow_add:
+            lines.append("ALLOW READ  %s: add %d trust file(s) to sandbox.filesystem.allowRead: "
+                         "%s" % (s_path, len(allow_add), ", ".join(allow_add)))
+        elif all(p in have for p in listed):
+            lines.append("ok          %s already allows every trust file" % s_path)
+    return lines, ops, deny_add, allow_add
 
 
 def merge_rows(conf, facts):
-    """The grant, coding-fence and user-settings rows, as `verify` prints them."""
+    """The grant, coding-fence, user-settings and trust-files rows, as `verify` prints
+    them."""
     cfg = facts.get("config") or {"error": "missing"}
     env_facts = facts.get("env") or {"error": "missing"}
     us = facts.get("userSettings") or {"error": "missing"}
     rows = (_config_unmeasured(cfg, ("grant", "coding-fence")) if cfg.get("error") else
             [check_grant(cfg), check_fence(cfg, env_facts)])
-    return rows + [check_user_settings(conf, us, env_facts)]
+    return rows + [check_user_settings(conf, us, env_facts),
+                   check_trust_files(conf, us, env_facts)]
 
 
 def cmd_merge(conf, runner, sudo, apply_it=False):
@@ -3655,14 +3919,14 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
         say("%s: the dispatcher config %s is %s. Nothing was changed."
             % ("FAILED" if broken else "NOT MEASURED", conf["DISPATCHER_CONFIG"], cfg["error"]))
         return EX_FAILED if broken else EX_UNKNOWN
-    lines, ops, deny_add = merge_plan(conf, facts)
+    lines, ops, deny_add, allow_add = merge_plan(conf, facts)
     us = facts.get("userSettings") or {}
     say("  config    %s" % conf["DISPATCHER_CONFIG"])
     say("  settings  %s" % (us.get("path") or "~/.claude/settings.json"))
     for line in lines:
         _plan_line(line)
     say("")
-    if not ops and not deny_add:
+    if not ops and not deny_add and not allow_add:
         # "Nothing to do" and "could not do it" must not read alike (contract §13).
         held = [l for l in lines if l.startswith(("CANNOT", "NOT MERGED", "LEFT ALONE"))]
         say("Nothing this command can write: %d line(s) above name a piece it did not merge "
@@ -3678,7 +3942,7 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
             % account)
         return EX_BLOCKED
     patch = {"configSha256": cfg.get("sha256"), "config": ops,
-             "settingsSha256": us.get("sha256"), "deny": deny_add}
+             "settingsSha256": us.get("sha256"), "deny": deny_add, "allowRead": allow_add}
     res = _role_write(runner, account, merge_writer_command(conf), json.dumps(patch),
                       "merge pieces 1, 2 and 5 into %s and the user settings, as %s"
                       % (conf["DISPATCHER_CONFIG"], account))
@@ -5373,6 +5637,9 @@ def _selftest_body():
 
     # -- KIT-226: the chat bot's rules file ---------------------------------------
     _selftest_kit226(expect, conf)
+
+    # -- KIT-257: the sandbox's trust files ---------------------------------------
+    _selftest_kit257(expect, conf)
 
     if failures:
         for f in failures:
@@ -7120,6 +7387,381 @@ def _selftest_kit197(expect, conf):
         finally:
             os.environ.pop(marker, None)
     group("agent-refused", agent_refused)
+
+
+
+# --------------------------------------------------------------------------- #
+# KIT-257 — the sandbox's trust files.
+#
+# A generic example path in the conf cases. On disk the battery's trust files end .crt,
+# not .pem: a sandboxed session that runs this battery under the composed
+# Read(//**/*.pem) deny could not read a .pem file it made itself.
+# --------------------------------------------------------------------------- #
+TRUST_EXAMPLE = "/opt/example-dispatcher/certs/egress-ca.pem"
+_FAKE_CERT = "-----BEGIN CERTIFICATE-----\nMIIBfakefakefake\n-----END CERTIFICATE-----\n"
+# Assembled at run time, so the source holds no literal of a key's shape.
+_FAKE_KEY_TEXT = ("-----BEGIN " + "EC " + "PRIVATE" + " KEY-----\nsentinel-key-body-7c1d\n"
+                  "-----END " + "EC " + "PRIVATE" + " KEY-----\n")
+
+
+def _selftest_kit257(expect, conf):
+    """The sandbox's trust files (KIT-257): the conf key, piece 5, merge and verify's
+    trust-files row. Every case stands alone: a crash, or a name this file does not
+    define, fails that case and never the rest."""
+    def case(name, fn):
+        try:
+            ok, detail = fn()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 — a crash is a failed case
+            ok, detail = False, "%s: %s" % (type(exc).__name__, str(exc)[:400])
+        expect("kit257-" + name, ok, detail)
+
+    def conf_errors(value, extra=""):
+        values, perrs = parse_conf(MINIMAL_CONF_TEXT + extra
+                                   + "SANDBOX_TRUST_FILES=%s\n" % value)
+        got, verrs = validate_conf(values)
+        return got, perrs + verrs
+
+    # -- the conf key: optional, empty by default, every entry an exact file ----------
+    def optional():
+        got, errs = validate_conf(parse_conf(MINIMAL_CONF_TEXT)[0])
+        return (not errs and got.get("SANDBOX_TRUST_FILES") == ""
+                and sandbox_trust_files(got) == []), (errs, got.get("SANDBOX_TRUST_FILES"))
+    case("conf-key-optional-and-empty", optional)
+
+    def accepts():
+        # "key" in a FOLDER's name, and ".." inside a file name, are not refused.
+        want = [TRUST_EXAMPLE, "/opt/example-dispatcher/keyring/other-ca.crt",
+                "/srv/example/ca..bundle.crt"]
+        got, errs = conf_errors(" , ".join(want) + ",")
+        return not errs and sandbox_trust_files(got) == want, (errs, got.get(
+            "SANDBOX_TRUST_FILES"))
+    case("conf-accepts-exact-files", accepts)
+
+    role_abs = "ROLE_ENV_FILE=/srv/example/role/env\n"
+    for label, entry, needle, extra in (
+            ("relative", "certs/egress-ca.pem", "absolute path", ""),
+            ("home-relative", "~/certs/egress-ca.pem", "absolute path", ""),
+            ("glob-star", "/opt/x/*.pem", "glob character", ""),
+            ("glob-question", "/opt/x/ca?.pem", "glob character", ""),
+            ("glob-open-bracket", "/opt/x/ca[1.pem", "glob character", ""),
+            ("glob-close-bracket", "/opt/x/ca1].pem", "glob character", ""),
+            ("glob-open-brace", "/opt/x/ca{1.pem", "glob character", ""),
+            ("glob-close-brace", "/opt/x/ca1}.pem", "glob character", ""),
+            ("dot-dot", "/opt/x/../y/ca.pem", ".. segment", ""),
+            ("trailing-slash", "/opt/x/certs/", "ends with a slash", ""),
+            ("key-in-name", "/opt/x/egress-ca-key.pem", '"key" in its file name', ""),
+            ("key-any-case", "/opt/x/Egress-CA-KEY.pem", '"key" in its file name', ""),
+            ("dot-key", "/opt/x/server.key", "ends .key", ""),
+            ("dot-key-any-case", "/opt/x/SERVER.KEY", "ends .key", ""),
+            ("denied-config", "/opt/example-dispatcher/config.json", "piece 5 denies", ""),
+            ("denied-env-file", "/opt/example-dispatcher/.env", "piece 5 denies", ""),
+            ("denied-role-env", "/srv/example/role/env", "piece 5 denies", role_abs)):
+        def refused(entry=entry, needle=needle, extra=extra):
+            _got, errs = conf_errors(entry, extra)
+            hits = [e for e in errs if repr(entry) in e and needle in e]
+            return len(hits) == 1, errs
+        case("conf-refuses:" + label, refused)
+
+    def all_at_once():
+        bad = ("certs/a.crt", "/opt/x/*.crt", "/opt/x/b-key.crt")
+        _got, errs = conf_errors(",".join(bad))
+        named = [b for b in bad if any(repr(b) in e for e in errs)]
+        return named == list(bad) and len(errs) == 3, errs
+    case("conf-names-every-bad-entry-at-once", all_at_once)
+
+    # -- piece 5: sandbox.filesystem.allowRead, and never permissions.allow -------------
+    listed_conf = dict(conf, SANDBOX_TRUST_FILES=TRUST_EXAMPLE)
+
+    def block_of(c):
+        rc, out = _capture(cmd_compose, c, "chat-lane.conf", 5)
+        lines = out.splitlines()
+        start = lines.index("    {")
+        end = lines.index("    }", start)
+        return rc, out, json.loads("\n".join(l[4:] for l in lines[start:end + 1]))
+
+    def compose_list():
+        rc, _out, block = block_of(listed_conf)
+        return (rc == EX_OK
+                and block.get("sandbox") == {"filesystem": {"allowRead": [TRUST_EXAMPLE]}}
+                and block.get("permissions") == {"deny": user_deny_patterns(
+                    dict(conf, SANDBOX_TRUST_FILES=""))}), block
+    case("compose-allow-read-beside-an-unchanged-deny", compose_list)
+
+    def compose_empty():
+        rc, out, block = block_of(dict(conf, SANDBOX_TRUST_FILES=""))
+        flat = " ".join(out.split())
+        return (rc == EX_OK and "sandbox" not in block
+                and "No trust files are allowed" in flat), (block, flat[-500:])
+    case("compose-empty-list-says-no-trust-files", compose_empty)
+
+    def compose_explains():
+        _rc, out, _b = block_of(listed_conf)
+        flat = " ".join(out.split())
+        return ("SANDBOX_TRUST_FILES" in flat and "child process" in flat
+                and "never a folder" in flat), flat[-900:]
+    case("compose-explains-the-trust-files", compose_explains)
+
+    # -- the role account, through the REAL probe and the REAL writer -------------------
+    def fixture(tmp, settings_text=None, listed=None, cert_text=_FAKE_CERT):
+        home = os.path.join(tmp, "role-home")
+        os.makedirs(home, exist_ok=True)
+        cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+        env_path = os.path.join(tmp, "dispatcher", ".env")
+        cert = os.path.join(tmp, "certs", "egress-ca.crt")
+        _put(cert, cert_text)
+        # The private key beside it: never listed, never allowed.
+        _put(os.path.join(tmp, "certs", "egress-ca-key.crt"), _FAKE_KEY_TEXT)
+        doc = _fenced_fixture()
+        doc["slackAllowedTools"] = owner_grant([REPO_ONE, REPO_TWO])
+        _put(cfg_path, json.dumps(doc, indent=2) + "\n")
+        _put(env_path, "CYRUS_HOST_EXTERNAL=true\n")
+        c = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
+                 FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"),
+                 SANDBOX_TRUST_FILES=",".join([cert] if listed is None else listed))
+        spath = os.path.join(home, ".claude", "settings.json")
+        if settings_text is not None:
+            _put(spath, settings_text)
+        return c, home, spath, cert
+
+    def denies(c, sandbox=None, **more):
+        doc = {"permissions": {"deny": user_deny_patterns(c)}}
+        if sandbox is not None:
+            doc["sandbox"] = sandbox
+        doc.update(more)
+        return json.dumps(doc, indent=2) + "\n"
+
+    def row_of(c, home, check="trust-files"):
+        facts, why_not = probe_facts(_RoleMachine(home, _pf_answers()), c)
+        rows = [r for r in evaluate(facts, c, None) if r["check"] == check]
+        return (rows[0] if rows else {"outcome": "no %s row" % check,
+                                      "detail": str(why_not), "lines": []}), facts
+
+    def merge_keeps_and_adds():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            other = os.path.join(tmp, "other-ca.crt")
+            _put(other, _FAKE_CERT)
+            before = {"permissions": {"deny": user_deny_patterns(c), "ask": ["Bash(make)"]},
+                      "sandbox": {"enabled": True, "excludedCommands": ["docker"],
+                                  "filesystem": {"denyRead": ["~/private"],
+                                                 "allowWrite": ["/tmp/build"],
+                                                 "allowRead": [other]}},
+                      "model": "kept"}
+            _put(spath, json.dumps(before, indent=2) + "\n")
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, c, mach, _FakeSudo(), True)
+            after = json.loads(_read(spath))
+            want = json.loads(json.dumps(before))
+            want["sandbox"]["filesystem"]["allowRead"] = [other, cert]
+            return (rc == EX_OK and after == want and len(mach.writes) == 1
+                    and re.search(r"trust-files\s+ALREADY-DONE", out)), (rc, after, out[-700:])
+    case("merge-adds-only-and-keeps-every-other-key", merge_keeps_and_adds)
+
+    def merge_dry_run():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp, settings_text=None)
+            text = denies(c)
+            _put(spath, text)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, c, mach, _FakeSudo(), False)
+            return (rc == EX_BLOCKED and mach.writes == [] and _read(spath) == text
+                    and re.search(r"ALLOW READ\s.*" + re.escape(cert), " ".join(out.split()))
+                    ), (rc, out[-500:])
+    case("merge-dry-run-names-the-allow-and-writes-nothing", merge_dry_run)
+
+    def merge_never_allow():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, _cert = fixture(tmp)
+            _put(spath, json.dumps({"model": "kept"}) + "\n")
+            rc, _out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                                _FakeSudo(), True)
+            after = json.loads(_read(spath))
+            perms = after.get("permissions") or {}
+            return (rc == EX_OK and sorted(perms) == ["deny"]
+                    and "allowRead" in json.dumps(after)), after
+    case("merge-never-writes-permissions-allow", merge_never_allow)
+
+    def merge_twice():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, _cert = fixture(tmp, settings_text=None)
+            _put(spath, denies(c))
+            _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()), _FakeSudo(), True)
+            snap = _read_bytes(spath)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, c, mach, _FakeSudo(), True)
+            return (rc == EX_OK and mach.writes == [] and _read_bytes(spath) == snap
+                    and "Nothing to write" in out
+                    and json.loads(snap.decode())["sandbox"]["filesystem"]["allowRead"]
+                    == [c["SANDBOX_TRUST_FILES"]]), (rc, out[-400:])
+    case("merge-twice-adds-nothing", merge_twice)
+
+    # The hand stopgap: the composer's file with the entry merged in by setdefault at each
+    # level, the whole file re-serialized as json.dumps(indent=2) + "\n", and a byte copy
+    # left beside it at mode 600. Judged as parsed JSON: nothing to add, verified clean.
+    def stopgap():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            first = json.dumps({"env": {"SECRET_THING": SENTINELS[3]},
+                                "permissions": {"deny": user_deny_patterns(c)}},
+                               indent=4)
+            _put(spath, first)
+            doc = json.loads(_read(spath))
+            (doc.setdefault("sandbox", {}).setdefault("filesystem", {})
+             .setdefault("allowRead", []).append(cert))
+            bak = spath + ".bak-kit256-20261012T021500Z"
+            _put(bak, first)
+            os.chmod(bak, 0o600)
+            _put(spath, json.dumps(doc, indent=2) + "\n")
+            snap = _read_bytes(spath)
+            mach = _RoleMachine(home, _pf_answers())
+            rc, out = _capture(cmd_merge, c, mach, _FakeSudo(), True)
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+            rows = {r["check"]: r["outcome"] for r in evaluate(facts, c, None)}
+            return (rc == EX_OK and mach.writes == [] and _read_bytes(spath) == snap
+                    and "Nothing to write" in out
+                    and rows.get("user-settings") == ALREADY_DONE
+                    and rows.get("trust-files") == ALREADY_DONE
+                    and SENTINELS[3] not in out + json.dumps(facts)), (rc, rows, out[-500:])
+    case("stopgap-shaped-file-merges-nothing-and-verifies-clean", stopgap)
+
+    # A sandbox, filesystem or allowRead of the wrong type: the plan says CANNOT and the
+    # writer refuses, and neither writes the settings file.
+    shapes = (("sandbox-a-list", []), ("filesystem-a-string", {"filesystem": "x"}),
+              ("allow-read-a-string", {"filesystem": {"allowRead": "/opt/x/a.crt"}}),
+              ("allow-read-null", {"filesystem": {"allowRead": None}}))
+    for label, sandbox in shapes:
+        def plan_refuses(sandbox=sandbox):
+            with tempfile.TemporaryDirectory() as tmp:
+                c, home, spath, _cert = fixture(tmp)
+                text = denies(c, sandbox)
+                _put(spath, text)
+                rc_d, out_d = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                                       _FakeSudo(), False)
+                rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                                   _FakeSudo(), True)
+                return ("CANNOT" in out_d and "ALLOW READ" not in out_d
+                        and rc == EX_FAILED and _read(spath) == text
+                        and re.search(r"trust-files\s+FAILED", out)), (rc_d, rc, out[-500:])
+        case("merge-plan-refuses-wrong-type:" + label, plan_refuses)
+
+        def writer_refuses(sandbox=sandbox):
+            with tempfile.TemporaryDirectory() as tmp:
+                c, home, spath, cert = fixture(tmp)
+                text = denies(c, sandbox)
+                _put(spath, text)
+                ran = subprocess.run(
+                    ["/bin/sh", "-c", "cd / && " + merge_writer_command(c).replace(
+                        "/usr/bin/python3", shlex.quote(sys.executable))],
+                    input=json.dumps({"config": [], "deny": [], "allowRead": [cert],
+                                      "settingsSha256": hashlib.sha256(
+                                          _read_bytes(spath)).hexdigest()}),
+                    capture_output=True, text=True, timeout=60,
+                    env={"HOME": home, "PATH": "/usr/bin:/bin"})
+                return (ran.returncode == 1 and "Nothing was written" in ran.stdout
+                        and _read(spath) == text
+                        and not os.path.isdir(os.path.join(home, ".stage-e"))), (
+                    ran.returncode, ran.stdout[-300:], ran.stderr[-300:])
+        case("merge-writer-refuses-wrong-type:" + label, writer_refuses)
+
+    def writer_checksum():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            text = denies(c)
+            _put(spath, text)
+
+            def run(patch):
+                return subprocess.run(
+                    ["/bin/sh", "-c", "cd / && " + merge_writer_command(c).replace(
+                        "/usr/bin/python3", shlex.quote(sys.executable))],
+                    input=json.dumps(patch), capture_output=True, text=True, timeout=60,
+                    env={"HOME": home, "PATH": "/usr/bin:/bin"}).returncode
+            no_sum = run({"config": [], "allowRead": [cert]})
+            wrong = run({"config": [], "allowRead": [cert], "settingsSha256": "0" * 64})
+            return (no_sum, wrong, _read(spath) == text) == (2, 3, True), (no_sum, wrong)
+    case("merge-writer-allow-needs-the-settings-checksum", writer_checksum)
+
+    def merge_holds_back_a_key():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp, cert_text=_FAKE_CERT + _FAKE_KEY_TEXT)
+            text = denies(c)
+            _put(spath, text)
+            rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True)
+            return ("CANNOT" in out and cert in " ".join(out.split())
+                    and _read(spath) == text and "sentinel-key-body" not in out
+                    and rc == EX_FAILED), (rc, out[-500:])
+    case("merge-holds-back-a-file-holding-a-private-key", merge_holds_back_a_key)
+
+    # -- verify's trust-files row ------------------------------------------------------
+    def verify_case(name, want, needle, settings=None, listed=None, cert_text=_FAKE_CERT,
+                    setup=None, env_extra=""):
+        def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                c, home, spath, cert = fixture(tmp, listed=listed, cert_text=cert_text)
+                if setup is not None:
+                    c = setup(tmp, c, cert)
+                sandbox = settings(tmp, cert) if settings is not None else None
+                _put(spath, denies(c, sandbox))
+                if env_extra:
+                    _put(c["DISPATCHER_ENV_FILE"], "CYRUS_HOST_EXTERNAL=true\n" + env_extra)
+                row, facts = row_of(c, home)
+                text = _row_text(row) if row.get("check") else str(row)
+                return (row["outcome"] == want and needle in " ".join(text.split())
+                        and "sentinel-key-body" not in text + json.dumps(facts)), row
+        case("verify-" + name, run)
+
+    def allow(*entries):
+        return lambda tmp, cert: {"filesystem": {"allowRead": [
+            e(tmp, cert) if callable(e) else e for e in entries]}}
+    this = lambda tmp, cert: cert  # noqa: E731
+    verify_case("clean", ALREADY_DONE, "exact file", allow(this))
+    verify_case("blocked-when-a-listed-entry-is-missing", BLOCKED, "merge")
+    verify_case("failed-on-a-glob-entry", FAILED, "/opt/example-dispatcher/certs/*.pem",
+                allow(this, "/opt/example-dispatcher/certs/*.pem"))
+    verify_case("failed-on-a-folder-entry", FAILED, "folder",
+                allow(this, lambda tmp, cert: os.path.dirname(cert)))
+    verify_case("failed-on-an-entry-that-is-not-a-path", FAILED, "not a path",
+                allow(this, 5))
+    verify_case("failed-on-a-wrong-type", FAILED, "allowRead",
+                lambda tmp, cert: {"filesystem": {"allowRead": cert}})
+
+    def linked(tmp, c, cert):
+        link = os.path.join(tmp, "certs", "linked-ca.crt")
+        os.symlink(cert, link)
+        return dict(c, SANDBOX_TRUST_FILES=link)
+    verify_case("failed-on-a-symbolic-link", FAILED, "link",
+                lambda tmp, cert: {"filesystem": {"allowRead": [
+                    os.path.join(tmp, "certs", "linked-ca.crt")]}}, setup=linked)
+    verify_case("failed-on-a-private-key", FAILED, "PRIVATE KEY", allow(this),
+                cert_text=_FAKE_CERT + _FAKE_KEY_TEXT)
+    verify_case("failed-on-an-unlisted-entry-holding-a-private-key", FAILED, "PRIVATE KEY",
+                allow(this, lambda tmp, cert: os.path.join(tmp, "certs", "egress-ca-key.crt")))
+    verify_case("empty-list-says-no-trust-files", ALREADY_DONE, "No trust files are allowed",
+                listed=[])
+    verify_case("unknown-under-claude-config-dir", UNKNOWN, "CLAUDE_CONFIG_DIR", allow(this),
+                env_extra="CLAUDE_CONFIG_DIR=/srv/example/claude\n")
+    if os.geteuid() != 0:
+        def unreadable(tmp, c, cert):
+            os.chmod(cert, 0)
+            return c
+        verify_case("unknown-when-a-trust-file-cannot-be-read", UNKNOWN, "could not",
+                    allow(this), setup=unreadable)
+
+    def probe_counts_only():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp, cert_text=_FAKE_CERT + _FAKE_KEY_TEXT)
+            _put(spath, denies(c, {"filesystem": {"allowRead": [cert]}}))
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+            trust = ((facts or {}).get("userSettings") or {}).get("trust") or {}
+            seen = trust.get(cert) or {}
+            return (seen.get("privateKey") is True
+                    and all(isinstance(v, (bool, int)) for v in seen.values())
+                    and "BEGIN" not in json.dumps(facts)), facts
+    case("probe-reports-booleans-and-counts-only", probe_counts_only)
+
+    def checks_has_row():
+        return "trust-files" in CHECKS, CHECKS
+    case("verify-checks-include-trust-files", checks_has_row)
 
 
 if __name__ == "__main__":
