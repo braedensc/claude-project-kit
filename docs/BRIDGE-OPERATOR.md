@@ -1,14 +1,16 @@
 # Slack bridge — operator steps
 
-*Written 2026-10-10 (KIT-221). Design: `docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
+*Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, the plan action). Design:
+`docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
 
 The bridge lets a trusted member of your Slack workspace act as you, from the chat. Someone
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
 checks with Slack itself who said yes.
 
-**This first version acts on nothing.** It reads, checks, asks and records. A "yes" is
-confirmed in the thread, and nothing in the tracker changes. Planning an idea, approving an
-epic and answering a stuck session come next (KIT-222, KIT-223, KIT-224).
+**It does one thing, and only once you switch it on.** With `ACT=yes`, a verified "yes" to
+`plan <ticket id>` moves that idea into Plan it, as you, and the planner starts on it. With
+`ACT=no`, the default, it asks and records, and nothing in the tracker changes. Approving an
+epic and answering a stuck session come next (KIT-223, KIT-224).
 
 Every file here is generic. Keep your filled-in values in your private runbook.
 
@@ -170,10 +172,41 @@ it as a new message in the channel instead.
 
 Reply `yes` in that thread.
 
-Good: *Confirmed by @you. This version of the bridge acts on nothing yet, so … was not
-changed.*
+Good, with `ACT=no`: *Confirmed by @you. Acting is switched off here, so … was not changed.*
 Not that: *I can't take that as an answer …*. The reply names why: a guest account, an edited
 message, a reply with a file, or a member not on `ALLOWED_SLACK_USERS`.
+
+---
+
+## Step 8 — Let it plan
+
+When you have watched it ask and confirm, set `ACT=yes` in `bridge.conf`, then:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py install --apply
+```
+
+The job reads its config every pass, so there is nothing to reload. A question asked before
+the change is closed when answered, since its text promised something else. Ask again.
+
+Try it on a small idea: `plan <ticket id>`, then `yes` in the thread.
+
+Good: *Moved … to Plan it for @you. The planner starts on it within a few minutes.* The
+ticket gets one comment naming who said yes.
+Not that: *… looks like live work …*. The ticket is delegated, has a session, a parent,
+children, a pull request, or a `provenance:*` or `agent:*` label. The bridge refuses exactly
+what the planner would.
+
+A ticket already in Plan it is refused before the bridge asks.
+
+Before it moves anything, the bridge reads the ticket again. One already in Plan it is said
+and left alone. One that moved to another team is refused. One whose title, text, team,
+labels or state changed since the question moves nothing: the bridge closes the question and
+asks you to ask again. It acts at most 10 times an hour.
+
+If the comment naming who said yes cannot be written, the move still stands. The thread says
+so, and every pass tries the comment again. Until it lands, each pass exits 1 and `verify`
+shows the job failing.
 
 ---
 
@@ -243,5 +276,8 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
   stops the pass with a named failure (KIT-227).
 - That a "yes" sent while the Mac sleeps is acted on after it wakes. The tests cover it; no
   live run has (KIT-227).
-- Everything the bridge will do in the tracker. This version does nothing there (KIT-222,
-  KIT-223, KIT-224).
+- That an idea the chat bot filed, moved by the bridge with your key, enters its history
+  at once as your move, so the planner accepts it. The evidence says another actor's change
+  is recorded at once; this case is untested (KIT-227).
+- Approving an epic and answering a stuck session from Slack. Not built yet (KIT-223,
+  KIT-224).

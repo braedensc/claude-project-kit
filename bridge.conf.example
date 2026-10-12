@@ -43,6 +43,12 @@ BOT_USER_ID=U0123456789
 
 # --- Optional, with their defaults -----------------------------------------
 
+# Whether a verified yes acts. no: the bridge asks and records only. yes: a
+# verified yes to `plan <ticket id>` moves that idea into Plan it, as the owner.
+# Start with no, watch it ask, then set yes and run `install --apply`.
+#ACT=no
+#PLAN_IT_STATE=Plan it
+
 # The only Slack user ids who may answer a question. Empty means any full
 # member of the workspace: guests, bots and other workspaces are always refused.
 #ALLOWED_SLACK_USERS=

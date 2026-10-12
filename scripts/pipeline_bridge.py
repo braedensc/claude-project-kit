@@ -12,11 +12,19 @@ can start planning or work. This job is the one bridge across: it reads the Slac
 checks WITH SLACK ITSELF who sent each message, and acts in the tracker with the owner's
 key — only after a verified member answers "yes" to a question the bridge asked itself.
 
-THIS VERSION ACTS ON NOTHING. It reads, verifies, asks and records. A verified "yes" is
-recorded as confirmed and said in the thread; no tracker write exists in this file (the
-selftest scans its own source for one). The actions are later tickets: KIT-222 (plan an
-idea), KIT-223 (approve an epic and start its children in order), KIT-224 (answer a stuck
-session, replacing the notifier's reply relay).
+ONE ACTION, AND ONLY WITH `act` ON (KIT-222). With `act` off (the default) it reads,
+verifies, asks and records, and a verified "yes" changes nothing. With `act` on, a verified
+"yes" to a `plan` question moves that idea into its team's Plan it state, AS THE OWNER, so
+the planner job starts planning it. Before it asks, and again before it moves, the ticket
+is re-read and refused if it is live work, by the planner's own rules
+(`pipeline_plan_poller.live_work_reasons`, imported), or already in Plan it. The question
+records the ticket as it showed it (its title, text, team, labels and state) and the
+settings its text states; a yes after either changed moves nothing and closes the question.
+Its tracker writes are exactly two, pinned by the selftest: one `issueUpdate` setting
+`stateId` only, and one `commentCreate` naming who said yes. A move cannot be taken back,
+so a comment that fails is OWED: the thread says so, and every pass writes it again and
+exits 1 until it lands. Later tickets add the rest: KIT-223 (approve an epic and start its
+children in order), KIT-224 (answer a stuck session, replacing the notifier's reply relay).
 
 WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 
@@ -87,13 +95,14 @@ SAYS WHICH NOTHING IT DID (contract §13)
 
 WHAT IT NEVER DOES
 
-  It writes nothing to the tracker in this version. It never posts outside its configured
-  channels, never posts a message's own text back, and never prints a credential: both are
-  read from env vars the config NAMES (the job's wrapper sources the role account's env
-  file), and every line it writes (the log, the state file, a Slack post) is redacted
-  against them. The state file is written mode 600.
+  It writes to the tracker only the two writes above, and only with `act` on. It never
+  posts outside its configured channels, never posts a message's own text back, and never
+  prints a credential: both are read from env vars the config NAMES (the job's wrapper
+  sources the role account's env file), and every line it writes (the log, the state file,
+  a Slack post) is redacted against them. The state file is written mode 600.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -113,6 +122,9 @@ if HERE not in sys.path:
 # scrub for the chat provider, its secret scan and redaction, its atomic JSON write and its
 # worktree test. One copy of each means one place to fix it.
 import pipeline_notify_local as notify  # noqa: E402
+# The planner job's own rules for what is live work, and its own team query: the bridge
+# refuses exactly what the planner would, so it never moves a ticket the planner refuses.
+import pipeline_plan_poller as poller  # noqa: E402
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED, EXIT_TIMEOUT = (
     notify.EXIT_OK, notify.EXIT_ERROR, notify.EXIT_USAGE, notify.EXIT_DECLINED,
@@ -146,7 +158,9 @@ CONFIG_KEYS = {
                               "hour, found or not (default 20)",
     "max_history_pages": "how many pages of channel history one pass may read (default 10)",
     "run_timeout_seconds": "wall clock for one pass (default 120)",
-    "act": "whether the bridge acts; must be false in this version, which has no action",
+    "act": "whether a verified yes acts in the tracker (default false: ask and record only)",
+    "plan_it_state": "the name of each team's Plan it state (default Plan it)",
+    "max_actions_per_hour": "how many actions the bridge takes in an hour (default 10)",
 }
 
 EXAMPLE_CONFIG = {
@@ -177,6 +191,7 @@ NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
 
 OPEN, CONFIRMED, DECLINED, EXPIRED = "open", "confirmed", "declined", "expired"
+DONE, REFUSED = "done", "refused"
 
 
 class BridgeError(Exception):
@@ -229,6 +244,8 @@ def validate_config(raw):
         "max_history_pages": raw.get("max_history_pages", 10),
         "run_timeout_seconds": raw.get("run_timeout_seconds", 120),
         "act": raw.get("act", False),
+        "plan_it_state": raw.get("plan_it_state") or "Plan it",
+        "max_actions_per_hour": raw.get("max_actions_per_hour", 10),
     }
     if cfg["schema"] != CONFIG_SCHEMA:
         errors.append("config 'schema' must be %r, got %r" % (CONFIG_SCHEMA, cfg["schema"]))
@@ -268,7 +285,8 @@ def validate_config(raw):
                       "U0123456789 (empty for any full member), got %r" % (allowed,))
     numbers_ok = True
     for key in ("question_ttl_hours", "lookback_days", "max_questions_per_hour",
-                "max_history_pages", "run_timeout_seconds", "max_open_questions"):
+                "max_history_pages", "run_timeout_seconds", "max_open_questions",
+                "max_actions_per_hour"):
         value = cfg[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append("config %r must be a positive integer, got %r" % (key, value))
@@ -280,9 +298,9 @@ def validate_config(raw):
                       % (cfg["question_ttl_hours"], cfg["lookback_days"]))
     if not isinstance(cfg["act"], bool):
         errors.append("config 'act' must be true or false, got %r" % (cfg["act"],))
-    elif cfg["act"]:
-        errors.append("config 'act' is true, but this version of the bridge has no action "
-                      "to take; set it to false")
+    if not isinstance(cfg["plan_it_state"], str) or not cfg["plan_it_state"].strip():
+        errors.append("config 'plan_it_state' must be a state name, got %r"
+                      % (cfg["plan_it_state"],))
     if notify._inside_git_worktree(cfg["state_dir"]):
         errors.append("config 'state_dir' (%s) is inside a git working tree — the record of "
                       "open questions must live outside every worktree, where no session "
@@ -321,8 +339,9 @@ def heartbeat_path(cfg):
 def new_state():
     # asked_at: when each tracker lookup for a request was made (the hourly limit).
     # limit_said: per channel, when the bridge last said that limit was reached.
+    # owed: attribution comments a failed write left unwritten; retried every pass.
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
-            "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}}
+            "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": []}
 
 
 def load_state(cfg):
@@ -347,6 +366,10 @@ def load_state(cfg):
     doc.setdefault("posted", {})
     doc.setdefault("attempts", {})
     doc.setdefault("limit_said", {})
+    doc.setdefault("owed", [])
+    if not isinstance(doc["owed"], list):
+        raise BridgeError("the bridge's state %s has no readable list of owed comments. "
+                          "Nothing was done" % path)
     return doc, False
 
 
@@ -467,16 +490,27 @@ Q_VIEWER = "query BridgeViewer { viewer { id } }"
 Q_ISSUE = """
 query BridgeIssue($id: String!) {
   issue(id: $id) {
-    id identifier title createdAt
-    state { name type }
+    id identifier title description createdAt
+    state { id name type }
     team { key }
+    labels(first: 50) { nodes { name } }
     creator { name displayName }
   }
+}"""
+# THE BRIDGE'S ONLY TWO TRACKER WRITES (KIT-222). The selftest pins both: no other mutation
+# exists in this file, and the update carries `stateId` and nothing else.
+M_MOVE = """
+mutation BridgeMove($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+}"""
+M_COMMENT = """
+mutation BridgeComment($issueId: String!, $body: String!) {
+  commentCreate(input: { issueId: $issueId, body: $body }) { success }
 }"""
 
 
 class TrackerClient(object):
-    """The tracker, READ ONLY in this version: two queries, one fixed endpoint."""
+    """The tracker, at one fixed endpoint: reads, and the writes the selftest pins."""
 
     def __init__(self, key):
         self.key = key
@@ -515,6 +549,39 @@ class TrackerClient(object):
     def issue(self, identifier):
         data = self._query(Q_ISSUE, {"id": identifier})
         return (data or {}).get("issue")
+
+    def linear(self, query, variables):
+        """The planner's own call shape, so its functions run unchanged."""
+        return self._query(query, variables) or {}
+
+    def live_work(self, issue_id):
+        """Why the ticket is live work, by the planner's own rules, or []."""
+        return poller.live_work_reasons(self.linear, issue_id, poller.SessionIndex(self.linear))
+
+    def plan_it_state(self, team_key, name):
+        """(state id, None), or (None, why) unless the team has exactly one state of that
+        name and it is a to-do (unstarted) state, as the planner requires."""
+        nodes = ((self.linear(poller.Q_TEAM, {"key": team_key}).get("teams") or {})
+                 .get("nodes")) or []
+        if len(nodes) != 1:
+            return None, "%d teams have the key %s" % (len(nodes), team_key)
+        states = [s for s in ((nodes[0].get("states") or {}).get("nodes") or [])
+                  if (s.get("name") or "") == name]
+        if len(states) != 1:
+            return None, "%s has %d states named %r" % (team_key, len(states), name)
+        if states[0].get("type") != "unstarted":
+            return None, "%s's %r state is not a to-do state" % (team_key, name)
+        return states[0]["id"], None
+
+    def move(self, issue_id, state_id):
+        data = self._query(M_MOVE, {"id": issue_id, "stateId": state_id}) or {}
+        if not (data.get("issueUpdate") or {}).get("success"):
+            raise BridgeError("the tracker would not move the ticket")
+
+    def comment(self, issue_id, body):
+        data = self._query(M_COMMENT, {"issueId": issue_id, "body": body}) or {}
+        if not (data.get("commentCreate") or {}).get("success"):
+            raise BridgeError("the tracker would not take the comment")
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -581,6 +648,21 @@ def account_refusal(profile, me, cfg):
     return None
 
 
+def label_names(node):
+    return set((n or {}).get("name") for n in ((node.get("labels") or {}).get("nodes") or []))
+
+
+def ticket_fingerprint(issue):
+    """What a plan question showed, and what the planner will read: the ticket's id, title,
+    text, team, labels and state. A session or the chat bot can write a ticket, so a yes
+    moves it only while this still matches."""
+    text = json.dumps([issue.get("id") or "", issue.get("title") or "",
+                       issue.get("description") or "", (issue.get("team") or {}).get("key") or "",
+                       sorted(label_names(issue) - {None}),
+                       (issue.get("state") or {}).get("id") or ""])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def question_text(issue, requester, cfg, now, by_bot=False):
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
@@ -593,7 +675,7 @@ def question_text(issue, requester, cfg, now, by_bot=False):
         who = "the chat bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
-    then = ("the bridge moves it to Plan it for you" if cfg["act"] else
+    then = ("the bridge moves it to %s for you" % cfg["plan_it_state"] if cfg["act"] else
             "the bridge records it; this version moves nothing yet")
     return ("*Plan this?* %s “%s”: in %s on %s, filed by %s.\n"
             "Reply `yes` in this thread within %d hours, and %s. Reply `no` to drop it. "
@@ -620,7 +702,7 @@ class Pass(object):
         self.unrecorded = {}               # thread key -> latest_reply, once all handled
         self.secrets = live_secrets(cfg)
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
-                       "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0}
+                       "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0, "acted": 0}
 
     def clean(self, text):
         return notify.redact(text, self.secrets)
@@ -718,9 +800,15 @@ class Pass(object):
             self.state["threads"].update(self.unrecorded)
             self.unrecorded = {}
             self.save()
+        self.pay_owed()
         self.expire()
         self.prune()
         self.save()
+        if self.state["owed"]:
+            raise BridgeError("%d attribution comment(s) still owed, on %s. The actions they "
+                              "record stand; each pass writes them again until they land"
+                              % (len(self.state["owed"]), ", ".join(
+                                  o.get("ticket") or "?" for o in self.state["owed"])))
 
     def handle_once(self, channel, msg):
         """One message, with a failure counted against it. Three failed passes and it is
@@ -820,12 +908,27 @@ class Pass(object):
                                             ", ".join(self.cfg["team_keys"])),
                                 "team not planned")
             return
+        if (issue.get("state") or {}).get("name") == self.cfg["plan_it_state"]:
+            # The yes path's own words: a ticket already there is not asked about.
+            self.refuse_request(channel, msg, thread, "%s is already in %s."
+                                % (issue["identifier"], self.cfg["plan_it_state"]),
+                                "already in plan it")
+            return
+        live = self.tracker.live_work(issue["id"])
+        if live:
+            self.refuse_request(channel, msg, thread, "%s looks like live work, so I won't "
+                                "ask about planning it: %s." % (issue["identifier"],
+                                                                "; ".join(live)), "live work")
+            return
         posted = self.post(channel, thread, question_text(issue, requester, self.cfg,
                                                           self.now, by_bot=by_bot))
         self.state["questions"][key_of(channel, posted)] = {
             "kind": kind, "ticket": issue["identifier"], "ticket_id": issue.get("id"),
             "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
-            "asked_for": requester, "status": OPEN}
+            "asked_for": requester, "status": OPEN,
+            # WHAT THE MEMBER SAW, and the terms the question stated: a yes acts only while
+            # both still hold.
+            "fingerprint": ticket_fingerprint(issue), "promised": self.promised(kind)}
         self.mark(channel, msg, "asked: %s %s" % (kind, issue["identifier"]))
         self.counts["asked"] += 1
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
@@ -932,13 +1035,125 @@ class Pass(object):
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
             return
-        self.post(channel, thread, "Confirmed by <@%s>. This version of the bridge acts on "
-                  "nothing yet, so %s was not changed." % (msg["user"], q["ticket"]))
-        q.update(status=CONFIRMED, answered_by=msg["user"], answered_ts=msg.get("ts"))
-        self.mark(channel, msg, "confirmed: %s" % q["ticket"])
+        if q.get("promised") != self.promised(q["kind"]):
+            self.post(channel, thread, "My settings changed since I asked about %s, so this "
+                      "yes acts on nothing, and I have closed the question. Ask again with "
+                      "`%s %s`." % (q["ticket"], q["kind"], q["ticket"]))
+            q.update(status=REFUSED, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, "refused: settings changed since asked")
+            self.counts["refused"] += 1
+            return
         self.counts["confirmed"] += 1
-        self.say("  confirmed: %s %s by %s (acts on nothing in this version)"
-                 % (q["kind"], q["ticket"], msg["user"]))
+        if not self.cfg["act"]:
+            self.post(channel, thread, "Confirmed by <@%s>. Acting is switched off here, so "
+                      "%s was not changed." % (msg["user"], q["ticket"]))
+            q.update(status=CONFIRMED, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, "confirmed: %s" % q["ticket"])
+            self.say("  confirmed: %s %s by %s (acting is off)"
+                     % (q["kind"], q["ticket"], msg["user"]))
+            return
+        self.act_plan(channel, thread, q, msg)
+
+    def promised(self, kind):
+        """The settings a question's text states, as they are now. Recorded when it is
+        asked: a yes acts only on the terms the member read."""
+        return {"act": self.cfg["act"], "plan_it_state": self.cfg["plan_it_state"],
+                "question_ttl_hours": self.cfg["question_ttl_hours"]}
+
+    def owe(self, issue_id, ticket, body):
+        """An attribution comment that failed: kept, and written again every pass."""
+        self.state["owed"].append({"issue_id": issue_id, "ticket": ticket, "body": body,
+                                   "since": self.now})
+        self.save()
+
+    def pay_owed(self):
+        """Every pass: write each owed attribution comment. The action it records stands,
+        and the pass stays loud (exit 1) while one is still owed."""
+        if self.dry:
+            return
+        for o in list(self.state["owed"]):
+            try:
+                self.tracker.comment(o["issue_id"], o["body"])
+            except BridgeError as exc:
+                self.say("  still owed: the comment on %s: %s" % (o.get("ticket"), exc))
+                continue
+            self.state["owed"].remove(o)
+            self.save()
+            self.say("  wrote the owed comment on %s" % o.get("ticket"))
+
+    def act_plan(self, channel, thread, q, msg):
+        """Move the idea into its team's Plan it state, as the owner. Re-read first: the
+        ticket may have changed since the question. Idempotent: a ticket already in Plan it
+        is said and left alone, so a pass that crashed after the move never moves twice."""
+        def finish(status, text, what):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text)
+            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, what)
+        hour_ago = self.now - 3600
+        acted = [t for t in self.state.setdefault("acted_at", []) if t > hour_ago]
+        if len(acted) >= self.cfg["max_actions_per_hour"]:
+            self.post(channel, thread, "I have acted %d times in the last hour, which is my "
+                      "limit. Say yes again later." % len(acted))
+            self.mark(channel, msg, "refused: action limit")
+            self.counts["refused"] += 1
+            return
+        issue = self.tracker.issue(q["ticket"])
+        if not issue or not issue.get("id"):
+            finish(REFUSED, "I can't find %s in the tracker any more, so nothing was moved."
+                   % q["ticket"], "refused: gone")
+            return
+        team = (issue.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            finish(REFUSED, "%s is now on %s, which the bridge does not plan on, so nothing "
+                   "was moved." % (q["ticket"], team or "no team"), "refused: team")
+            return
+        state_id, why = self.tracker.plan_it_state(team, self.cfg["plan_it_state"])
+        if not state_id:
+            finish(REFUSED, "I can't move %s: %s." % (q["ticket"], why), "refused: no state")
+            return
+        if (issue.get("state") or {}).get("id") == state_id:
+            finish(DONE, "%s is already in %s." % (q["ticket"], self.cfg["plan_it_state"]),
+                   "done: already")
+            return
+        if ticket_fingerprint(issue) != q.get("fingerprint"):
+            finish(REFUSED, "%s changed since I asked (its title, text, team, labels or "
+                   "state), so nothing was moved, and I have closed the question. Ask again "
+                   "with `plan %s`." % (q["ticket"], q["ticket"]), "refused: changed since asked")
+            return
+        live = self.tracker.live_work(issue["id"])
+        if live:
+            finish(REFUSED, "%s looks like live work now, so nothing was moved: %s."
+                   % (q["ticket"], "; ".join(live)), "refused: live work")
+            return
+        if self.dry:
+            self.say("  [dry-run] would move %s to %s" % (q["ticket"], self.cfg["plan_it_state"]))
+            return
+        profile = self.users.get(msg["user"]) or {}
+        name = notify.safe_title(profile.get("real_name") or
+                                 (profile.get("profile") or {}).get("display_name") or
+                                 msg["user"])
+        self.tracker.move(issue["id"], state_id)
+        self.state["acted_at"].append(self.now)
+        when = iso(ts_float(msg.get("ts")))
+        body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who said yes in "
+                "Slack at %s." % (self.cfg["plan_it_state"], name, msg["user"], when))
+        owed = ""
+        try:
+            self.tracker.comment(issue["id"], body)
+        except BridgeError as exc:
+            # The move stands: it cannot be taken back. The record of who said yes is owed.
+            self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
+                     % (q["ticket"], exc))
+            self.owe(issue["id"], q["ticket"], body)
+            owed = (" The move was done, but the comment naming who approved it could not be "
+                    "written; I will try again.")
+        finish(DONE, "Moved %s to %s for <@%s>. The planner starts on it within a few "
+               "minutes.%s" % (q["ticket"], self.cfg["plan_it_state"], msg["user"], owed),
+               "done: moved %s" % q["ticket"])
+        self.counts["acted"] = self.counts.get("acted", 0) + 1
+        self.say("  acted: moved %s to %s for %s" % (q["ticket"], self.cfg["plan_it_state"],
+                                                     msg["user"]))
 
     # -- housekeeping --------------------------------------------------------------
     def expire(self):
@@ -961,6 +1176,8 @@ class Pass(object):
         self.state["asked_at"] = [t for t in self.state["asked_at"] if t > self.now - 3600]
         self.state["limit_said"] = dict((c, t) for c, t in self.state["limit_said"].items()
                                         if t > self.now - 3600)
+        self.state["acted_at"] = [t for t in self.state.get("acted_at", [])
+                                  if t > self.now - 3600]
 
 
 def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout):
@@ -968,10 +1185,10 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout):
     p = Pass(cfg, slack, tracker, state, first, dry_run, now or time.time(), out)
     p.run()
     c = p.counts
-    summary = ("bridge: %d message(s) examined, %d asked, %d confirmed, %d declined, "
-               "%d expired, %d refused, %d given up%s%s" % (
-                   c["examined"], c["asked"], c["confirmed"], c["declined"], c["expired"],
-                   c["refused"], c["gave_up"], "; first pass: %d already in the window, "
+    summary = ("bridge: %d message(s) examined, %d asked, %d confirmed, %d acted, "
+               "%d declined, %d expired, %d refused, %d given up%s%s" % (
+                   c["examined"], c["asked"], c["confirmed"], c["acted"], c["declined"],
+                   c["expired"], c["refused"], c["gave_up"], "; first pass: %d already in the window, "
                    "answered none" % c["baseline"] if first else "",
                    " (dry run)" if dry_run else ""))
     out.write(summary + "\n")
@@ -1138,9 +1355,29 @@ class FakeTracker(object):
         }
         self.reads = 0
         self.fail = False
+        self.live = {}                 # issue uuid -> reasons
+        self.plan_it = {"PROD": ("st-plan-it", None)}
+        self.moves, self.comments = [], []
+        for i in self.issues.values():
+            i["state"]["id"] = "st-backlog"
 
     def viewer_id(self):
         return self.viewer
+
+    def live_work(self, issue_id):
+        return list(self.live.get(issue_id, []))
+
+    def plan_it_state(self, team_key, name):
+        return self.plan_it.get(team_key, (None, "no %r on %s" % (name, team_key)))
+
+    def move(self, issue_id, state_id):
+        self.moves.append((issue_id, state_id))
+        for i in self.issues.values():
+            if i["id"] == issue_id:
+                i["state"] = {"id": state_id, "name": "Plan it", "type": "unstarted"}
+
+    def comment(self, issue_id, body):
+        self.comments.append((issue_id, body))
 
     def issue(self, ident):
         self.reads += 1
@@ -1595,6 +1832,48 @@ def selftest():
                   None)
         finally:
             globals()["_http_json"] = real_http
+        # The real tracker client runs the PLANNER'S OWN functions unchanged (KIT-222).
+        sent = []
+        idea_labels = [[{"name": "track:x"}]]
+
+        def by_operation(url, headers, payload=None, timeout=20):
+            op = re.search(r"(?:query|mutation)\s+(\w+)", payload["query"]).group(1)
+            sent.append((op, payload["variables"]))
+            answers = {
+                "PlanIdea": {"issue": {"id": "u", "delegate": None, "parent": None,
+                                       "children": {"nodes": []},
+                                       "labels": {"nodes": idea_labels[0]},
+                                       "attachments": {"nodes": []}}},
+                "PlanSessions": {"agentSessions": {"nodes": [],
+                                                   "pageInfo": {"hasNextPage": False}}},
+                "PlanTeam": {"teams": {"nodes": [{"id": "team", "key": "PROD", "states": {
+                    "nodes": [{"id": "st-plan-it", "name": "Plan it", "type": "unstarted"},
+                              {"id": "st-x", "name": "Doing", "type": "started"}]},
+                    "labels": {"nodes": []}}]}},
+                "BridgeMove": {"issueUpdate": {"success": True}},
+                "BridgeComment": {"commentCreate": {"success": True}},
+            }
+            return {"data": answers[op]}
+        real_http = globals()["_http_json"]
+        globals()["_http_json"] = by_operation
+        try:
+            tc = TrackerClient("k")
+            check("wiring-live-work-clean", tc.live_work("u"), [])
+            idea_labels[0] = [{"name": "provenance:epic"}]
+            check("wiring-live-work-by-the-planners-rules",
+                  any("provenance:epic" in r for r in tc.live_work("u")), True)
+            check("wiring-plan-it-state", tc.plan_it_state("PROD", "Plan it"),
+                  ("st-plan-it", None))
+            check("wiring-a-started-state-is-refused",
+                  tc.plan_it_state("PROD", "Doing")[0], None)
+            tc.move("u", "st-plan-it")
+            tc.comment("u", "who said yes")
+            check("wiring-the-move-carries-stateId-only",
+                  [v for op, v in sent if op == "BridgeMove"], [{"id": "u",
+                                                                 "stateId": "st-plan-it"}])
+        finally:
+            globals()["_http_json"] = real_http
+
         # The lock: a second pass does nothing, and says so.
         import fcntl
         c, s, t = world("lock")
@@ -1894,18 +2173,197 @@ def selftest():
                 else:
                     os.environ[k] = v
 
+        # 11d. THE PLAN ACTION (KIT-222) ------------------------------------------------
+        # Acting off (the default): a yes changes nothing, and says so.
+        c, s, t = world("act-off")
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("act-off-moves-nothing", (t.moves, t.comments, "switched off" in posted(s)[-1]),
+              ([], [], True))
+        # Acting on: a verified yes moves the idea into Plan it, as the owner, once.
+        c, s, t = world("act-on", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        check("act-on-question-says-it-will-move", "moves it to Plan it for you"
+              in posted(s)[-1], True)
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        st = json.load(open(state_path(c)))
+        check("yes-moves-the-idea", (t.moves, [v["status"] for v in st["questions"].values()],
+                                     "Moved PROD-5 to Plan it" in posted(s)[-1]),
+              ([("uuid-5", "st-plan-it")], [DONE], True))
+        check("the-move-names-who-said-yes", len(t.comments) == 1 and BOB in t.comments[0][1]
+              and "said yes in Slack" in t.comments[0][1], True)
+        s.add(ALICE, "yes", thread=root)
+        run(c, s, t)
+        check("a-second-yes-moves-nothing", len(t.moves), 1)
+        # Re-read before moving: already in Plan it is said, and nothing moves twice.
+        c, s, t = world("already", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.issues["PROD-5"]["state"] = {"id": "st-plan-it", "name": "Plan it",
+                                       "type": "unstarted"}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("already-in-plan-it-is-said-not-moved", (t.moves, "already in Plan it"
+                                                        in posted(s)[-1]), ([], True))
+        # Live work: refused before asking, and again before moving.
+        c, s, t = world("live-before", act=True)
+        run(c, s, t)
+        t.live["uuid-5"] = ["it is delegated to someone"]
+        s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        check("live-work-refused-before-asking", ("looks like live work" in posted(s)[-1],
+                                                  json.load(open(state_path(c)))["questions"]),
+              (True, {}))
+        c, s, t = world("live-after", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.live["uuid-5"] = ["it has an agent session"]
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("live-work-refused-before-moving", (t.moves, "live work now" in posted(s)[-1]),
+              ([], True))
+        # A team with no single to-do Plan it state: refused, said.
+        c, s, t = world("no-state", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.plan_it = {}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("no-plan-it-state-refused", (t.moves, "can't move PROD-5" in posted(s)[-1]),
+              ([], True))
+        # A ticket moved to another team after the question: refused, nothing moved.
+        c, s, t = world("team-moved", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        t.issues["PROD-5"]["team"] = {"key": "OPS"}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("a-ticket-moved-off-a-planned-team-is-refused",
+              (t.moves, "now on OPS" in posted(s)[-1]), ([], True))
+        # The action limit.
+        c, s, t = world("act-limit", act=True, max_actions_per_hour=1)
+        run(c, s, t)
+        r5 = s.add(ALICE, "plan PROD-5")
+        r6 = s.add(ALICE, "plan PROD-6")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=r5)
+        s.add(BOB, "yes", thread=r6)
+        run(c, s, t)
+        check("action-limit", (len(t.moves), "my limit" in posted(s)[-1]), (1, True))
+        # A guest's yes never moves anything, with acting on.
+        c, s, t = world("act-guest", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        s.add(GUEST, "yes", thread=root)
+        run(c, s, t)
+        check("a-guest-yes-moves-nothing-with-acting-on", t.moves, [])
+
+        # REVIEW OF KIT-222, 1: a yes moves only the ticket the member was shown. The question
+        # records its title, text, team, labels and state; a yes after any of them changed
+        # moves nothing, closes the question and asks for a new request.
+        for name, change in (
+                ("retitled", lambda i: i.update(title="Something the member never saw")),
+                ("rewritten", lambda i: i.update(description="Different work entirely.")),
+                ("relabelled", lambda i: i.update(labels={"nodes": [{"name": "track:other"}]})),
+                ("restated", lambda i: i.update(state={"id": "st-todo", "name": "Todo",
+                                                       "type": "unstarted"})),
+                ("moved-to-another-planned-team", lambda i: i.update(team={"key": "DEV"})),
+                ("another-ticket-under-the-id", lambda i: i.update(id="uuid-other"))):
+            c, s, t = world("plan-changed-" + name, act=True, team_keys=["PROD", "DEV"])
+            t.plan_it["DEV"] = ("st-plan-it", None)
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            change(t.issues["PROD-5"])
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            check("a-plan-yes-after-the-ticket-changed-moves-nothing:" + name,
+                  (t.moves, status_of(c), "changed since I asked" in posted(s)[-1],
+                   "`plan PROD-5`" in posted(s)[-1]), ([], [REFUSED], True, True))
+        check("the-plan-fingerprint-reads-what-it-hashes",
+              ("description" in Q_ISSUE, "labels(first: 50) { nodes { name } }" in Q_ISSUE),
+              (True, True))
+
+        # 2: a ticket already in Plan it is refused before asking, in the yes path's words.
+        c, s, t = world("plan-already-before-asking", act=True)
+        run(c, s, t)
+        t.issues["PROD-5"]["state"] = {"id": "st-plan-it", "name": "Plan it",
+                                       "type": "unstarted"}
+        s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        check("already-in-plan-it-is-refused-before-asking",
+              (posted(s), json.load(open(state_path(c)))["questions"]),
+              (["PROD-5 is already in Plan it."], {}))
+
+        # 3: a yes binds to the terms its question stated. Settings changed since it was
+        # asked (acting switched on or off, another Plan it state, another time limit) close
+        # the question, and nothing acts.
+        for name, asked, answered in (
+                ("acting-switched-on", {}, {"act": True}),
+                ("acting-switched-off", {"act": True}, {"act": False}),
+                ("plan-it-state-renamed", {"act": True}, {"act": True,
+                                                          "plan_it_state": "Ready to plan"}),
+                ("time-limit-changed", {"act": True}, {"act": True,
+                                                       "question_ttl_hours": 48})):
+            c, s, t = world("plan-promise-" + name, **asked)
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            run(dict(c, **answered), s, t)
+            check("a-plan-yes-under-other-settings-than-asked-acts-on-nothing:" + name,
+                  (t.moves, status_of(c), "settings changed since" in posted(s)[-1],
+                   sum("Confirmed" in x for x in posted(s))), ([], [REFUSED], True, 0))
+
+        # 4: the move stands when its attribution comment fails, and the comment is owed:
+        # said in the thread, kept in state, retried every pass, and loud until it lands.
+        c, s, t = world("plan-comment-fails", act=True)
+        run(c, s, t)
+        root = s.add(ALICE, "plan PROD-5")
+        run(c, s, t)
+        real_comment = t.comment
+
+        def refusing_comment(_issue_id, _body):
+            raise BridgeError("the tracker would not take the comment (simulated)")
+        t.comment = refusing_comment
+        s.add(BOB, "yes", thread=root)
+        codes = [run(c, s, t)[0], run(c, s, t)[0]]
+        owed = json.load(open(state_path(c))).get("owed")
+        t.comment = real_comment
+        codes += [run(c, s, t)[0], run(c, s, t)[0]]
+        check("a-failed-plan-comment-is-owed-retried-and-loud-until-it-lands",
+              (t.moves, status_of(c), codes,
+               sum("could not be written; I will try again" in x for x in posted(s)),
+               [o.get("ticket") for o in owed or []], len(t.comments),
+               BOB in (t.comments or [("", "")])[0][1],
+               json.load(open(state_path(c))).get("owed")),
+              ([("uuid-5", "st-plan-it")], [DONE], [EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK],
+               1, ["PROD-5"], 1, True, []))
+
         # 12. CONFIG: every problem at once; the chat bot's token name and `act` refused.
         os.makedirs(os.path.join(tmp, "in-a-repo", ".git"))
         try:
             validate_config({"schema": "x", "channel_ids": ["nope"], "team_keys": [],
-                             "slack_token_env": "SLACK_BOT_TOKEN", "act": True,
+                             "slack_token_env": "SLACK_BOT_TOKEN", "act": "yes",
                              "question_ttl_hours": 0, "bogus": 1,
                              "state_dir": os.path.join(tmp, "in-a-repo", "state")})
             errs = ""
         except BridgeError as exc:
             errs = str(exc)
         for needle in ("unknown config key", "'schema'", "channel_ids", "owner_user_id",
-                       "team_keys", "chat bot's own name", "has no action", "question_ttl_hours",
+                       "team_keys", "chat bot's own name", "'act' must be true or false",
+                       "question_ttl_hours",
                        "git working tree"):
             check("config-names:" + needle, needle in errs, True)
 
@@ -1963,8 +2421,17 @@ def selftest():
         check("missing-credential-is-usage", run_command(c, False, 30, out=io.StringIO()),
               EXIT_USAGE)
 
-    # 14. THIS VERSION WRITES NOTHING TO THE TRACKER: no mutation anywhere above the tests.
-    check("no-tracker-write", "mutation" in body.lower(), False)
+    # 14. EXACTLY TWO TRACKER WRITES (KIT-222): a state move carrying `stateId` only, and a
+    #     comment. No other mutation anywhere above the tests.
+    mutations = re.findall(r"\bmutation\s+(\w+)", body)
+    check("only-two-tracker-writes", sorted(mutations), ["BridgeComment", "BridgeMove"])
+    check("the-move-sets-stateId-only",
+          re.search(r"issueUpdate\(id: \$id, input: \{ stateId: \$stateId \}\)", body)
+          is not None and body.count("issueUpdate(") == 1, True)
+    check("no-other-write-verb", [v for v in ("issueCreate", "issueDelete", "issueArchive",
+                                              "issueAddLabel", "issueRelationCreate",
+                                              "agentSessionCreate", "delegate")
+                                  if v in body], [])
     check("tracker-endpoint-fixed", body.count("https://api.linear.app/graphql"), 1)
 
     if failures:

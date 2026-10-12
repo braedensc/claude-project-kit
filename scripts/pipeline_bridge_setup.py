@@ -100,6 +100,9 @@ CONF_KEYS = {
     "JOB_LABEL": ("", "the LaunchDaemon label, reverse-DNS, e.g. com.example.bridge"),
     "INTERVAL_SECONDS": ("60", "how often the job runs"),
     "APP_NAME": ("Pipeline bridge", "the Slack app's display name"),
+    "ACT": ("no", "yes: a verified yes moves the idea into Plan it, as the owner. no: the "
+                  "bridge asks and records only"),
+    "PLAN_IT_STATE": ("Plan it", "the name of each team's Plan it state"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -161,6 +164,8 @@ def validate_conf(values):
     if conf["JOB_LABEL"] and not LABEL_RE.match(conf["JOB_LABEL"]):
         errors.append("JOB_LABEL must be reverse-DNS like com.example.bridge, got %r"
                       % conf["JOB_LABEL"])
+    if conf["ACT"] not in ("yes", "no"):
+        errors.append("ACT must be yes or no, got %r" % conf["ACT"])
     if not conf["INTERVAL_SECONDS"].isdigit() or not 15 <= int(conf["INTERVAL_SECONDS"]) <= 3600:
         errors.append("INTERVAL_SECONDS must be a whole number from 15 to 3600")
     if not errors:
@@ -198,7 +203,8 @@ def compose_config(conf):
         "bot_user_id": conf["BOT_USER_ID"],
         "team_keys": split_list(conf["TEAM_KEYS"]),
         "allowed_slack_users": split_list(conf["ALLOWED_SLACK_USERS"]),
-        "act": False,
+        "act": conf["ACT"] == "yes",
+        "plan_it_state": conf["PLAN_IT_STATE"],
     }
 
 
@@ -497,8 +503,12 @@ def cmd_compose(conf, conf_path):
     say("  2. `install`, then `install --apply`.")
     say("  3. Card CK-B2: load it. Then `verify`.")
     say("")
-    say("This version acts on nothing: a verified yes is recorded and said, and nothing in "
-        "the tracker changes.")
+    if conf["ACT"] == "yes":
+        say("ACT=yes: a verified yes to `plan <ticket id>` moves that idea into %s, as the "
+            "owner. Nothing else in the tracker is ever written." % conf["PLAN_IT_STATE"])
+    else:
+        say("ACT=no: a verified yes is recorded and said, and nothing in the tracker changes. "
+            "Set ACT=yes and run `install --apply` to let it act.")
     return EX_OK
 
 
@@ -757,7 +767,18 @@ def selftest():
               bridge.validate_config(dict(compose_config(conf), state_dir="/tmp/x-%d"
                                           % os.getpid()))["channel_ids"],
               ["C0000000AA", "C0000000BB"])
-        check("config-acts-on-nothing", compose_config(conf)["act"], False)
+        check("config-acts-on-nothing-by-default", compose_config(conf)["act"], False)
+        on, _e = validate_conf(dict(values, ACT="yes"))
+        check("config-acts-with-ACT-yes", (compose_config(on)["act"],
+                                           compose_config(on)["plan_it_state"]),
+              (True, "Plan it"))
+        named, _e = validate_conf(dict(values, PLAN_IT_STATE="Ready to plan"))
+        check("config-carries-the-plan-it-state-name",
+              compose_config(named)["plan_it_state"], "Ready to plan")
+        check("conf-ACT-must-be-yes-or-no",
+              any("ACT must be yes or no" in e for e in validate_conf(dict(values,
+                                                                          ACT="true"))[1]),
+              True)
         example = os.path.join(os.path.dirname(HERE), "bridge.conf.example")
         ex_conf, ex_errs = load_conf(example)
         check("example-conf-is-valid", (ex_errs, sorted(k for k in CONF_KEYS
@@ -824,7 +845,7 @@ def selftest():
               True)
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
-            "PIECE 1", "PIECE 2", "PIECE 3", "acts on nothing"))), (EX_OK, True))
+            "PIECE 1", "PIECE 2", "PIECE 3", "ACT=no"))), (EX_OK, True))
 
         with tempfile.TemporaryDirectory() as tmp:
             home, root = os.path.join(tmp, "home"), os.path.join(tmp, "root")

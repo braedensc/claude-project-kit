@@ -113,3 +113,28 @@ A separate job, **the bridge**, is the only path from the chat to an action as t
   missing scope is a named failure, exit 1 (KIT-227).
 - That an idea created by the chat bot and moved by the bridge is recorded in history at once
   (KIT-227).
+
+## Update 2026-10-10 — the first action: plan an idea (KIT-222)
+
+With `act` on, a verified "yes" to a `plan` question moves that idea into its team's Plan it
+state, with the owner's key, so the planner job plans it. The bridge refuses exactly what
+the planner would: it imports the planner's own `live_work_reasons` and team-state query,
+and runs them before it asks and again before it moves. It re-reads the ticket first, so a
+ticket already in Plan it is said and left alone, and a pass that crashed after a move
+never moves twice. Its tracker writes are exactly two, pinned by the selftest: one
+`issueUpdate` setting `stateId` and nothing else, and one `commentCreate` naming the Slack
+member who said yes and when. It acts at most `max_actions_per_hour` times an hour.
+
+**A yes binds to what the question showed.** The question records a fingerprint of the
+ticket (its id, title, description, team, labels and state) and the settings its text states
+(`act`, `plan_it_state`, `question_ttl_hours`). A coding session or the chat bot can write a
+ticket, so a yes after the ticket changed moves nothing; and a yes after the settings changed
+acts on nothing, so a question that promised "nothing moves" never moves anything. Either
+closes the question and asks for a new request. A ticket already in Plan it is refused before
+asking. These follow the 2026-10-10 review of KIT-222.
+
+**A move whose comment fails is owed a comment.** The move cannot be taken back. The thread
+says the comment could not be written; the state records it as owed; every pass writes it
+again, and exits 1 until it lands, so a missing record of who said yes is never silent.
+
+`act` ships off. The owner watches the bridge ask and record first, then turns it on.
