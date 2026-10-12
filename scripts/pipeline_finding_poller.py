@@ -45,6 +45,9 @@ WHAT THIS DOES, PER FINDING
   `finding_actor_ids`. The seen-set records the mark as `owed` before it is posted and
   `posted` after. A pass that leaves one owed exits 1, and the next pass retries it. A retry
   first reads the ticket, so a post that landed but lost its answer is never made twice.
+  When that read answers that the ticket no longer exists (a not-found error, or
+  `issue: null`), the mark is recorded `gone`, said once, and no longer owed (KIT-250). A
+  read that merely fails leaves it owed.
 
 WHICH COMMENTS A PASS READS  (and why it is not the tickets that changed)
 
@@ -87,8 +90,9 @@ DEDUP: THE SEEN-SET IS THE AUTHORITY
   It was removed rather than left to read as a safety net that was not one. The operational
   consequence is stated plainly in docs/FINDING-POLLER.md: the state dir is the dedup
   record, so a seen-set that is deleted or restored from elsewhere can re-file findings
-  already filed. A pass that finds no seen-set says so in its log rather than assuming it
-  is the first one.
+  already filed. A real pass that finds no seen-set writes an empty one at once (KIT-250),
+  so a missing file is never just "nothing filed yet", and the log says which it is: no
+  heartbeat yet is a first pass; a heartbeat from an earlier pass means the file was lost.
 
 WHAT IT NEVER DOES (asserted in --selftest, the way every Stage E script asserts it)
 
@@ -97,9 +101,10 @@ WHAT IT NEVER DOES (asserted in --selftest, the way every Stage E script asserts
   never touches the SOURCE ticket's state or labels; never approves, merges or comments on
   a PR. Its ONLY Linear writes are `issueCreate` (the finding ticket, in the source's
   project), `issueRelationCreate` (one `related` link from it to the source, KIT-234) and
-  `commentCreate` (the receipt, and the one cap note below). It trusts a finding only from
-  the configured agent user — a comment from anyone else is ignored, so a finding cannot be
-  injected by an outside commenter.
+  `commentCreate` for three comments: the "Filed as" receipt and the one cap note below,
+  both on the SOURCE ticket, and the finding-filed mark on the NEW ticket (KIT-243). It
+  trusts a finding only from the configured agent user — a comment from anyone else is
+  ignored, so a finding cannot be injected by an outside commenter.
 
 FLOOD GUARD
 
@@ -134,8 +139,8 @@ Usage:
     pipeline_finding_poller.py --example-config
     pipeline_finding_poller.py --selftest
 Exit: 0 = the pass ran (even if it filed nothing), 1 = the pass could not complete, or a
-      cap note it owes could not be posted, 2 = usage: bad arguments, an unreadable/invalid
-      config, or a missing credential.
+      cap note or finding-filed mark it owes could not be posted, 2 = usage: bad arguments,
+      an unreadable/invalid config, or a missing credential.
 """
 import argparse
 import json
@@ -199,6 +204,14 @@ class PollerError(Exception):
 
 class ConfigError(PollerError):
     """A deployment/config problem — a distinct, fixable class of PollerError."""
+
+
+class LinearNotFound(PollerError):
+    """The tracker ANSWERED that what was asked for does not exist (KIT-250).
+
+    Still a PollerError, so every caller that does not ask this question keeps treating it
+    as a failed pass. Only the owed-mark retry reads it as an answer: a ticket that is gone
+    can never carry the mark, so the mark stops being owed."""
 
 
 def log(msg):
@@ -565,13 +578,7 @@ def load_seen(path):
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
     except FileNotFoundError:
-        # Said out loud, because the seen-set is the ONLY dedup authority (the receipt is
-        # a record, not a guard). On a first pass this line is the truth; on any later one
-        # it means the file was lost, and findings already filed can be filed again.
-        log("no seen-set at %s — reading this pass as a FIRST pass. If this poller has run "
-            "before, the file was lost: findings it already filed can be filed a second "
-            "time, because the seen-set is the only thing that remembers them." % path)
-        return {}
+        return {}            # run_scan says which kind of missing it is (missing_seen_note)
     except (OSError, ValueError) as exc:
         raise PollerError(refuse % ("is unreadable (%s)" % exc))
     if not isinstance(doc, dict) or doc.get("schema") != SEEN_SCHEMA:
@@ -585,6 +592,41 @@ def load_seen(path):
 
 def save_seen(path, seen):
     _atomic_write_json(path, {"schema": SEEN_SCHEMA, "seen": seen})
+
+
+def missing_seen_note(state_dir, dry_run):
+    """The log line for a pass that finds no seen-set, saying WHICH of two things it is.
+
+    Said out loud, because the seen-set is the ONLY dedup authority. A real pass writes an
+    empty one the moment it finds none (KIT-250). Before, it was written only once something
+    was filed, so every pass on a quiet deployment said the file "was lost" — and a warning
+    that fires every pass teaches the reader to ignore the one time it is true.
+
+    The heartbeat tells the two apart. No heartbeat, or only one from a run that never got a
+    config (`result: usage` — it never reached the seen-set): a true FIRST pass. Any other
+    heartbeat: an earlier pass ran and wrote a seen-set, so the file was LOST, and findings
+    already filed can be filed a second time.
+    """
+    sp, hp = seen_path(state_dir), heartbeat_path(state_dir)
+    try:
+        with open(hp, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        beat = None
+    except (OSError, ValueError):
+        beat = {"result": "unreadable"}
+    if beat is not None and not isinstance(beat, dict):
+        beat = {"result": "unreadable"}
+    if beat is None or beat.get("result") == "usage":
+        return ("no seen-set at %s and no earlier pass on record (no heartbeat at %s): this "
+                "is the FIRST pass. %s" % (sp, hp, "A dry run writes nothing, so this line "
+                                                   "repeats until a real pass runs." if dry_run
+                                           else "It writes an empty seen-set now, so this "
+                                                "line does not repeat."))
+    return ("WARNING: no seen-set at %s, although the heartbeat at %s shows an earlier pass "
+            "ran (ended %s, result %s). The seen-set was LOST: findings already filed can be "
+            "filed a second time, because it is the only thing that remembers them."
+            % (sp, hp, beat.get("ended_at") or "?", beat.get("result") or "?"))
 
 
 def load_watermarks(path):
@@ -666,7 +708,16 @@ def linear_graphql(query, variables, api_key):
         with urllib.request.urlopen(req, timeout=60) as resp:
             payload = json.load(resp)
     except urllib.error.HTTPError as exc:
-        log("Linear API HTTP %d body: %r" % (exc.code, exc.read()[:400]))
+        try:
+            body = exc.read() or b""
+        except (AttributeError, OSError, ValueError):
+            body = b""
+        log("Linear API HTTP %d body: %r" % (exc.code, body[:400]))
+        # Linear answers an id that does not exist with an error STATUS and a GraphQL body
+        # naming it not found. That is an answer, not a failed read. Any other error status
+        # (an outage, a proxy's 503, an empty body) stays a failure.
+        if _all_not_found(_graphql_errors(body)):
+            raise LinearNotFound("Linear API: not found (body logged)")
         raise PollerError("Linear API HTTP %d (body logged)" % exc.code)
     except urllib.error.URLError as exc:
         raise PollerError("could not reach the Linear API: %s" % exc.reason)
@@ -674,8 +725,31 @@ def linear_graphql(query, variables, api_key):
         raise PollerError("Linear API call failed: %s" % exc)
     if payload.get("errors"):
         log("Linear API error payload: %s" % json.dumps(payload["errors"])[:600])
+        if _all_not_found(payload["errors"]):
+            raise LinearNotFound("Linear API: not found (payload logged)")
         raise PollerError("Linear API error (payload logged)")
     return payload.get("data") or {}
+
+
+_NOT_FOUND_RE = re.compile(r"\bnot found\b", re.IGNORECASE)
+
+
+def _graphql_errors(body):
+    """The `errors` list of a GraphQL body, or [] when the body is not one."""
+    try:
+        doc = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    except (ValueError, AttributeError):
+        return []
+    errors = doc.get("errors") if isinstance(doc, dict) else None
+    return errors if isinstance(errors, list) else []
+
+
+def _all_not_found(errors):
+    """True only when there are errors and EVERY one names something as not found
+    ("Entity not found: Issue"). A not-found beside any other error is a failed read."""
+    msgs = [e.get("message") for e in errors or [] if isinstance(e, dict)]
+    return (bool(msgs) and len(msgs) == len(errors)
+            and all(isinstance(m, str) and _NOT_FOUND_RE.search(m) for m in msgs))
 
 
 _Q_TEAM = """
@@ -878,7 +952,7 @@ def post_receipt(source_uuid, filed_id, api_key):
 # The pass
 # --------------------------------------------------------------------------- #
 FINDING_FILED_MARK = "<!-- pipeline-escalation: finding-filed -->"
-MARK_OWED, MARK_POSTED = "owed", "posted"
+MARK_OWED, MARK_POSTED, MARK_GONE = "owed", "posted", "gone"
 
 
 def render_finding_mark(source_id):
@@ -896,11 +970,23 @@ def post_finding_mark(filed_ref, source_id, api_key):
 
 
 def carries_own_mark(filed_ref, viewer_id, api_key):
-    """Whether the filed ticket already holds a finding-filed mark written by THIS key.
+    """Whether the filed ticket already holds a finding-filed mark written by THIS key —
+    or None when the tracker answers that the ticket no longer exists (KIT-250).
 
     Only this key's copy counts: a mark someone else wrote is one the notifier will not page
-    on, so treating it as ours would leave the owner unpaged."""
-    data = linear_graphql(_Q_TICKET_COMMENTS, {"id": filed_ref}, api_key)
+    on, so treating it as ours would leave the owner unpaged.
+
+    "No longer exists" is the tracker's own answer: a GraphQL error naming the ticket not
+    found, or `issue: null`. A read that fails in any other way raises, so the mark stays
+    owed — and an answer with no `issue` field at all is a failed read, never a gone one."""
+    try:
+        data = linear_graphql(_Q_TICKET_COMMENTS, {"id": filed_ref}, api_key)
+    except LinearNotFound:
+        return None
+    if "issue" not in data:
+        raise PollerError("the tracker's answer for %s carried no issue" % filed_ref)
+    if data["issue"] is None:
+        return None
     nodes = (((data.get("issue") or {}).get("comments") or {}).get("nodes")) or []
     return any((n.get("body") or "").split("\n", 1)[0].strip() == FINDING_FILED_MARK
                and ((n.get("user") or {}).get("id")) == viewer_id for n in nodes)
@@ -931,11 +1017,20 @@ def settle_owed_marks(seen, state_dir, api_key, dry_run, deadline):
             left.append(cid)
             continue
         try:
-            if not carries_own_mark(ref, viewer, api_key):
+            present = carries_own_mark(ref, viewer, api_key)
+            if present is False:
                 post_finding_mark(ref, rec.get("source"), api_key)
         except PollerError as exc:
             log("NOTE: the finding-filed mark on %s is still owed (%s)" % (rec.get("filed"), exc))
             left.append(cid)
+            continue
+        if present is None:
+            # GONE (KIT-250): the tracker says the ticket no longer exists, so no mark can
+            # ever land on it. Owed for ever, it failed every pass. Recorded, said once.
+            rec["mark"], rec["gone_at"] = MARK_GONE, _now_iso()
+            save_seen(seen_path(state_dir), seen)
+            log("the finding-filed mark on %s is no longer owed: the tracker says the ticket "
+                "no longer exists, so the owner is not paged for it" % rec.get("filed"))
             continue
         rec["mark"] = MARK_POSTED
         save_seen(seen_path(state_dir), seen)
@@ -960,6 +1055,12 @@ def run_scan(cfg, api_key, dry_run, deadline):
     """
     state_dir = cfg["state_dir"]
     seen = load_seen(seen_path(state_dir))
+    if not os.path.exists(seen_path(state_dir)):
+        log(missing_seen_note(state_dir, dry_run))
+        if not dry_run:
+            # Written on entry, not at the end: a pass that then fails at the tracker must
+            # still leave one, or the next pass would read its heartbeat and call it LOST.
+            save_seen(seen_path(state_dir), seen)
     watermarks = load_watermarks(watermark_path(state_dir))
     scan_started = _now_iso()
     # A debt from an earlier pass is discharged before new work (KIT-243).
@@ -1338,7 +1439,8 @@ def selftest():
     class _FakeLinear:
         """Answers this file's GraphQL documents and records every write and every ask."""
 
-        def __init__(self, comments, note_fault=None, on_ticket=None, mark_fault=None):
+        def __init__(self, comments, note_fault=None, on_ticket=None, mark_fault=None,
+                     gone=None, read_fault=False, scan_fault=False):
             self.comments, self.created, self.receipts, self.asked = comments, [], [], []
             self.related = []
             self.note_fault = note_fault   # None, "raise" or "unsuccessful": KIT-7's cap note
@@ -1346,9 +1448,27 @@ def selftest():
             # "fail" never lands, "lost" lands and then loses its answer.
             self.on_ticket = dict(on_ticket or {})
             self.mark_fault = mark_fault
+            # KIT-250: tickets that no longer exist, each answered as Linear answers it —
+            # "error" (a GraphQL error naming it not found) or "null" (`issue: null`) — and
+            # a ticket read, or the comment scan, that merely fails.
+            self.gone = dict(gone or {})
+            self.read_fault, self.scan_fault = read_fault, scan_fault
 
         def __call__(self, query, variables, api_key):
             self.asked.append((query, variables))
+            if self.scan_fault and "comments(filter:" in query:
+                raise PollerError("simulated: Linear API HTTP 503 (body logged)")
+            if "issue(id:" in query and variables.get("id") in self.gone:
+                if self.gone[variables["id"]] == "null":
+                    return {"issue": None}
+                raise globals().get("LinearNotFound", PollerError)(
+                    "Linear API: not found (body logged)")
+            if "issue(id:" in query and self.read_fault:
+                if self.read_fault == "empty":
+                    return {}                 # an answer with no `issue` field at all
+                raise PollerError("simulated: Linear API HTTP 503 (body logged)")
+            if "commentCreate" in query and variables.get("issueId") in self.gone:
+                raise PollerError("Linear API error (payload logged)")
             if "teams(filter:" in query:
                 return {"teams": {"nodes": [{
                     "id": "team-1", "key": variables["key"],
@@ -1693,6 +1813,151 @@ def selftest():
         ok("mark: a finding filed before the mark existed is never paged after the fact",
            rc_o == EXIT_OK and fake_o.receipts == []
            and not any("issue(id:" in q for q, _v in fake_o.asked))
+
+    # 3e. A MARK OWED ON A TICKET THAT IS GONE (KIT-250). Before, it stayed owed for ever:
+    #     every pass exited 1 and the heartbeat monitor reported the finding job as failing
+    #     over a ticket nobody can page about. The tracker answering "no such ticket" — as a
+    #     not-found error or as `issue: null` — ends the debt, once, and says so once. A
+    #     read that merely FAILS is not that answer: the mark stays owed and the pass red.
+    def _gone_log(text):
+        return "no longer exists" in text
+
+    for shape in ("error", "null"):
+        with tempfile.TemporaryDirectory() as d:
+            state, cfg_path = _setup(d)
+            _pass(_FakeLinear([_fresh("g1")], mark_fault="fail"), cfg_path)
+            fake_g1, log_g1 = _FakeLinear([], gone={"new-1": shape}), []
+            rc_g1 = _pass(fake_g1, cfg_path, capture=log_g1)
+            hb_g1 = json.load(open(heartbeat_path(state)))
+            ok("gone (%s): a mark owed on a ticket that no longer exists stops being owed, "
+               "and the pass is green" % shape,
+               rc_g1 == EXIT_OK and hb_g1["result"] == "ok"
+               and (load_seen(seen_path(state)).get("g1") or {}).get("mark") == "gone")
+            ok("gone (%s): the log says so, naming the ticket, and nothing is posted" % shape,
+               _gone_log(log_g1[0]) and "KIT-901" in log_g1[0] and _mark_posts(fake_g1) == [])
+            fake_g2, log_g2 = _FakeLinear([], gone={"new-1": shape}), []
+            rc_g2 = _pass(fake_g2, cfg_path, capture=log_g2)
+            ok("gone (%s): said once — the next pass neither reads the ticket nor repeats it"
+               % shape,
+               rc_g2 == EXIT_OK and not _gone_log(log_g2[0])
+               and not any("issue(id:" in q for q, _v in fake_g2.asked))
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        _pass(_FakeLinear([_fresh("g2")], mark_fault="fail"), cfg_path)
+        fake_r, log_r = _FakeLinear([], read_fault=True), []
+        rc_r = _pass(fake_r, cfg_path, capture=log_r)
+        hb_r = json.load(open(heartbeat_path(state)))
+        ok("gone: a ticket read that merely FAILS leaves the mark owed and the pass red",
+           rc_r == EXIT_ERROR and hb_r["result"] == "error" and "KIT-901" in (hb_r["error"] or "")
+           and (load_seen(seen_path(state)).get("g2") or {}).get("mark") == MARK_OWED
+           and not _gone_log(log_r[0]))
+        fake_e, log_e = _FakeLinear([], read_fault="empty"), []
+        rc_e = _pass(fake_e, cfg_path, capture=log_e)
+        ok("gone: an answer that carries no issue at all is a failed read — owed, nothing "
+           "posted, the pass red",
+           rc_e == EXIT_ERROR and _mark_posts(fake_e) == [] and not _gone_log(log_e[0])
+           and (load_seen(seen_path(state)).get("g2") or {}).get("mark") == MARK_OWED)
+
+    # How linear_graphql reports the answer: Linear says an id does not exist with an error
+    # STATUS and a GraphQL body naming it not found (or the same body with a 200). That,
+    # and only that, is the not-found class; every other failure stays a plain PollerError.
+    _nf = globals().get("LinearNotFound", ())
+
+    def _raised(status, body):
+        import urllib.request as _ur
+        real_open, real_err = _ur.urlopen, sys.stderr
+
+        def fake_open(req, timeout=None):
+            if status == 200:
+                return io.BytesIO(body)
+            raise urllib.error.HTTPError(LINEAR_API, status, "x", {}, io.BytesIO(body))
+        _ur.urlopen, sys.stderr = fake_open, io.StringIO()
+        try:
+            linear_graphql("query { x }", {}, "k")
+        except PollerError as exc:
+            return exc
+        finally:
+            _ur.urlopen, sys.stderr = real_open, real_err
+        return None
+
+    not_found = json.dumps({"errors": [{"message": "Entity not found: Issue",
+                                        "extensions": {"code": "INPUT_ERROR"}}],
+                            "data": None}).encode()
+    ok("not-found: an error STATUS whose GraphQL body names the entity not found",
+       isinstance(_raised(400, not_found), _nf))
+    ok("not-found: the same body with a 200", isinstance(_raised(200, not_found), _nf))
+    for label, status, body in (
+            ("a 503 with no GraphQL body", 503, b"<html>bad gateway</html>"),
+            ("an error status with some other GraphQL error", 400,
+             b'{"errors": [{"message": "Rate limit exceeded"}]}'),
+            ("a not-found beside another error", 200,
+             b'{"errors": [{"message": "Entity not found: Issue"}, '
+             b'{"message": "Internal error"}]}')):
+        exc = _raised(status, body)
+        ok("not-found: %s is a FAILED read, not a not-found" % label,
+           isinstance(exc, PollerError) and not isinstance(exc, _nf))
+
+    # 3f. THE SEEN-SET ON A QUIET DEPLOYMENT (KIT-250). It was written only when something
+    #     was filed or declined, so a poller that had run for weeks with nothing to file
+    #     said "the file was lost" on every pass — the line that exists to flag a real loss.
+    #     Now a real pass writes an empty one when it finds none, a dry run writes nothing,
+    #     and the line says which case it is: no heartbeat yet is a first pass; a heartbeat
+    #     from an earlier pass means the file was lost.
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        log_q1 = []
+        rc_q1 = _pass(_FakeLinear([]), cfg_path, ["--dry-run"], capture=log_q1)
+        ok("seen-set: a dry run on a fresh state dir writes no seen-set",
+           rc_q1 == EXIT_OK and not os.path.exists(seen_path(state)))
+        ok("seen-set: and its log calls it a true FIRST pass, with no earlier pass on record",
+           "FIRST pass" in log_q1[0] and "no earlier pass on record" in log_q1[0]
+           and "LOST" not in log_q1[0])
+        log_q2 = []
+        rc_q2 = _pass(_FakeLinear([]), cfg_path, capture=log_q2)
+        ok("seen-set: a real pass with nothing to file writes an EMPTY seen-set",
+           rc_q2 == EXIT_OK and os.path.exists(seen_path(state))
+           and load_seen(seen_path(state)) == {})
+        log_q3 = []
+        _pass(_FakeLinear([]), cfg_path, capture=log_q3)
+        ok("seen-set: so the next pass says nothing about a missing one",
+           "no seen-set" not in log_q3[0])
+        if os.path.exists(seen_path(state)):
+            os.remove(seen_path(state))
+        log_q4 = []
+        _pass(_FakeLinear([]), cfg_path, capture=log_q4)
+        ok("seen-set: one missing although the heartbeat shows earlier passes is called LOST",
+           "LOST" in log_q4[0] and "FIRST pass" not in log_q4[0])
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        os.makedirs(state)
+        json.dump({"schema": HEARTBEAT_SCHEMA, "result": "usage", "exit_code": EXIT_USAGE},
+                  open(heartbeat_path(state), "w"))
+        log_u = []
+        _pass(_FakeLinear([]), cfg_path, capture=log_u)
+        ok("seen-set: a heartbeat from a run that never got a config is still a FIRST pass",
+           "no earlier pass on record" in log_u[0] and "LOST" not in log_u[0])
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        rc_x = _pass(_FakeLinear([], scan_fault=True), cfg_path, capture=[])
+        log_x = []
+        _pass(_FakeLinear([]), cfg_path, capture=log_x)
+        ok("seen-set: a first pass that fails at the tracker still leaves one, so the next "
+           "pass does not call it lost",
+           rc_x == EXIT_ERROR and "no seen-set" not in log_x[0])
+
+    # 3g. The docstring's list of Linear writes names every mutation this file holds, and
+    #     every comment it posts — it is what a reviewer reads to know what the job may do.
+    writes = " ".join((globals().get("__doc__") or "").split(
+        "ONLY Linear writes", 1)[-1].split("It trusts", 1)[0].split())
+    mutations = sorted({op for name, text in globals().items() if name.startswith("_M_")
+                        for op in re.findall(r"(\w+)\(input", text)})
+    ok("doc: the ONLY-writes list names every mutation (%s)" % ", ".join(mutations),
+       len(mutations) == 3 and all(op in writes for op in mutations))
+    ok("doc: and every comment: the receipt, the cap note and the finding-filed mark",
+       all(k in writes for k in ("receipt", "cap note", "finding-filed mark")))
 
     # 4. THE ERROR HEARTBEAT. A config or credential failure used to exit before the
     #    heartbeat was written, leaving a stale timestamp — the symptom of a daemon that
