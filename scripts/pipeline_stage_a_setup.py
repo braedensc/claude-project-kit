@@ -4026,18 +4026,20 @@ def _stop_since(ctx, since):
 # into Plan it at once and woke the job; the job read it 1.9 seconds after it was filed,
 # found no move into Plan it in the idea's history that it could check, and refused it —
 # correctly. No planning ticket was filed, so the miss-detection the drill exists to prove
-# was never reached, and the drill waited out its limit and blamed it anyway. So the idea
-# is filed in the backlog, moved, and the job is woken only once the history it checks
-# shows the move.
-DRILL_CREATION_WAIT_SECONDS = 30
-DRILL_MOVE_WAIT_SECONDS = 60
+# was never reached, and the drill waited out its limit and blamed it anyway. The move
+# never entered the history at all: the tracker does not record a state change a ticket's
+# creator makes in its first minutes (KIT-164). The job now counts the owner's creation as
+# the move, so the idea is filed straight into Plan it, and the job is woken only once the
+# idea reads back, through the job's own reader, as the owner's creation.
+DRILL_CREATION_WAIT_SECONDS = 60
 DRILL_POLL_SECONDS = 5
 # The first line of every answer the job posts on an idea INSTEAD of filing a planning
 # ticket: a front-door refusal, or the day's limit reached. Taken from the job's own text,
 # so the two cannot drift apart.
 FRONT_DOOR_HEADINGS = tuple(sorted(set(
     text.split("\n", 1)[0].split(":", 1)[0] for text in (
-        poller.REFUSED_NOT_OWNER, poller.REFUSED_NO_MOVE, poller.REFUSED_LONG_HISTORY,
+        poller.REFUSED_NOT_OWNER, poller.REFUSED_NOT_OWNER_CREATED, poller.REFUSED_NO_MOVE,
+        poller.REFUSED_LONG_HISTORY,
         poller.REFUSED_UNSAFE, poller.REFUSED_LIVE, poller.WAITING_DAILY))))
 Q_DRILL_IDEA = """
 query StageADrillIdea($id: String!) {
@@ -4049,24 +4051,6 @@ query StageADrillRuns($filter: IssueFilter!) {
     nodes { id identifier description }
   }
 }"""
-
-
-def drill_start_state(states, plan_it_id):
-    """The state the drill files its idea in: the team's first backlog state, else its
-    first to-do state other than Plan it. Never Plan it: a move INTO it is what the job
-    checks, and an idea born there has none."""
-    for kind in ("backlog", "unstarted"):
-        rows = sorted((s for s in states if s.get("type") == kind and s.get("id") != plan_it_id),
-                      key=lambda s: s.get("position") or 0)
-        if rows:
-            return rows[0]
-    return None
-
-
-def idea_history(ctx, idea_id):
-    """The first page of an idea's history, read with the job's own query."""
-    data = ctx.tracker.post(poller.Q_HISTORY, {"id": idea_id, "after": None})
-    return ((((data.get("issue") or {}).get("history")) or {}).get("nodes")) or []
 
 
 def front_door_answer(ctx, idea_id):
@@ -4094,8 +4078,8 @@ def drill_run_ticket(ctx, team_id, identifier):
 
 
 def run_drill(ctx):
-    """Break ONE planning entry's allowed user, move a harmless idea into Plan it, and
-    watch the planner job cancel the planning ticket and stop planning. Then put the entry
+    """Break ONE planning entry's allowed user, file a harmless idea straight into Plan
+    it, and watch the planner job cancel the planning ticket and stop planning. Then put the entry
     back, close the idea, and run the probe again, which is the only thing that clears a
     stop. Recorded in the ledger as the drill's result; FAILED when a planning ticket was
     filed and planning did not stop, which is the finding the drill exists to catch.
@@ -4119,16 +4103,12 @@ def run_drill(ctx):
     team = ((ctx.state.data.get("ids") or {}).get("teams") or {}).get(row["team_key"]) or {}
     if not team.get("plan_it_state_id"):
         raise SetupError("the tracker step has not recorded %s's Plan it state" % row["team_key"])
-    start = drill_start_state(ctx.tracker.team_states(team["team_id"]), team["plan_it_state_id"])
-    if start is None:
-        raise SetupError("%s has no backlog or to-do state other than %s to file the drill's "
-                         "idea in" % (row["team_key"], conf_value(conf, "PLAN_IT_STATE")))
     ctx.say("")
     ctx.say("The drill, on %s (%s):" % (row["team_key"], row["repo"]))
     ctx.say("  1. the planning setup is changed to let nobody start a session, and the")
     ctx.say("     dispatcher restarts;")
-    ctx.say("  2. a harmless idea is filed in %s and moved to Plan it, as you;"
-            % start.get("name"))
+    ctx.say("  2. a harmless idea is filed straight into Plan it, as you: your creation")
+    ctx.say("     counts as the move;")
     ctx.say("  3. the planner job must cancel its planning ticket and stop all planning;")
     ctx.say("  4. the setup is put back, the dispatcher restarts, the idea is closed, and")
     ctx.say("     the probe runs again, which is what lets planning start again.")
@@ -4148,36 +4128,30 @@ def run_drill(ctx):
     try:
         apply_planning_entries(ctx, broken, [], "the drill: nobody may start a planning session")
         idea = own.create(team["team_id"], DRILL_TITLE, DRILL_BODY, [], None, "drill",
-                          state_id=start["id"])
+                          state_id=team["plan_it_state_id"])
         ident = idea.get("identifier")
-        ctx.say("  filed %s in %s; waiting for the tracker to record it" % (ident,
-                                                                           start.get("name")))
-        if _wait(ctx, "the tracker to record %s" % ident,
-                 lambda: idea_history(ctx, idea["id"]) or None,
-                 DRILL_CREATION_WAIT_SECONDS, every=DRILL_POLL_SECONDS) is None:
-            ctx.say("  %s's history is still empty after %d s; moving it anyway, and the "
-                    "move is read back below" % (ident, DRILL_CREATION_WAIT_SECONDS))
-        own.move(idea["id"], team["plan_it_state_id"])
-        ctx.say("  moved %s to %s; reading its history back until the move is there "
-                "(up to %d s)" % (ident, plan_it, DRILL_MOVE_WAIT_SECONDS))
-        trigger = _wait(ctx, "the move to show in %s's history" % ident,
+        ctx.say("  filed %s in %s; reading it back as the planner job will (up to %d s)"
+                % (ident, plan_it, DRILL_CREATION_WAIT_SECONDS))
+        trigger = _wait(ctx, "%s to read back as your creation" % ident,
                         lambda: poller.latest_trigger(ctx.tracker.post, idea["id"],
                                                       team["plan_it_state_id"]),
-                        DRILL_MOVE_WAIT_SECONDS, every=DRILL_POLL_SECONDS)
+                        DRILL_CREATION_WAIT_SECONDS, every=DRILL_POLL_SECONDS)
         if trigger is None:
             raise Unknown(
-                "the drill could not test anything: the move of %s into %s never showed in "
-                "its history within %d seconds. The planner job checks that history before "
-                "it plans, so it would have refused the idea; it was not woken."
-                % (ident, plan_it, DRILL_MOVE_WAIT_SECONDS),
+                "the drill could not test anything: %s never read back as your creation in "
+                "%s within %d seconds. The planner job reads it the same way before it plans, "
+                "so it would have refused the idea; it was not woken."
+                % (ident, plan_it, DRILL_CREATION_WAIT_SECONDS),
                 "run the drill again:  python3 %s drill" % _self_path())
         if trigger.get("actorId") != conf.get("OWNER_USER_ID"):
             raise Unknown(
-                "the drill could not test anything: %s's history records the move into %s "
-                "as made by %s, not by OWNER_USER_ID, and the planner job plans only the "
-                "owner's move. It was not woken." % (ident, plan_it, trigger.get("actorId")),
+                "the drill could not test anything: the tracker names %s, not OWNER_USER_ID, "
+                "as the one who %s %s, and the planner job plans only the owner's. It was "
+                "not woken." % (trigger.get("actorId"), "created" if trigger.get("creation")
+                                else "moved into %s" % plan_it, ident),
                 "check that your Linear key is the owner's, then run the drill again")
-        ctx.say("  the move is in %s's history; waking the planner job" % ident)
+        ctx.say("  %s reads back as your %s; waking the planner job"
+                % (ident, "creation" if trigger.get("creation") else "move"))
         ctx.host.kick_job(conf["JOB_LABEL"])
         limit = int(conf_value(conf, "ROUTING_WAIT_SECONDS")) + \
             2 * int(conf_value(conf, "POLL_INTERVAL_SECONDS")) + 120
@@ -4880,12 +4854,15 @@ class FakeLinear(object):
         # (routing activities, the session's final answer) — or None for no session.
         self.dispatch = None
         self.sessions_running = []                 # identifiers of running sessions
-        # ISSUE HISTORY, as the tracker serves it: a creation shows at once, and a move
-        # shows only after `history_lag` more reads of that issue's history — the delay
-        # the live drill ran into (KIT-209).
+        # ISSUE HISTORY, as the tracker serves it: a creation leaves no STATE change in the
+        # history (measured 2026-10-10, KIT-164), a move shows only after `history_lag` more
+        # reads of that issue's history — the delay the live drill ran into (KIT-209) — and
+        # the creator reads back only after `creator_lag` reads.
         self.histories = {}                        # issue id -> visible history nodes
         self._hidden = {}                          # issue id -> [(reads left, node)]
         self.history_lag = 0
+        self.creator_lag = 0
+        self._creator_reads = {}                   # issue id -> history reads so far
         self.comments = {}                         # issue id -> [{body, createdAt}]
 
     def _reach(self):
@@ -4977,7 +4954,8 @@ class FakeLinear(object):
             self.created.append("issue:" + ident)
             self.histories[iid] = [{"id": "h-create-" + ident, "createdAt": now_iso(),
                                     "actorId": self.viewer, "fromStateId": None,
-                                    "toStateId": entry.get("stateId")}]
+                                    "toStateId": None}]
+            self.issues[iid]["createdAt"] = now_iso()
             if entry.get("delegateId") and self.dispatch is not None:
                 got = self.dispatch(ident, entry)
                 if got is not None:
@@ -5006,7 +4984,12 @@ class FakeLinear(object):
                 else:
                     still.append((left - 1, node))
             self._hidden[v["id"]] = still
-            return {"issue": {"history": {"nodes": list(self.histories.get(v["id"], [])),
+            reads = self._creator_reads[v["id"]] = self._creator_reads.get(v["id"], 0) + 1
+            rec = self.issues.get(v["id"]) or {}
+            return {"issue": {"createdAt": rec.get("createdAt"),
+                              "creator": ({"id": self.viewer} if rec and reads > self.creator_lag
+                                          else None),
+                              "history": {"nodes": list(self.histories.get(v["id"], [])),
                                           "pageInfo": {"hasNextPage": False,
                                                        "endCursor": None}}}}
         if "StageADrillIdea" in query:
@@ -5943,7 +5926,9 @@ def _selftest_one_command(check, tmp):
             broken = ((live.get(ENTRY) or {}).get("userAccessControl") or {}).get(
                 "allowedUsers") == [DRILL_NOBODY]
             ideas = [i for i, r in t.issues.items() if r["input"]["title"] == DRILL_TITLE]
-            in_plan_it = any(s == PLAN_IT["id"] for i, s in t.moves if i in ideas)
+            in_plan_it = (any(s == PLAN_IT["id"] for i, s in t.moves if i in ideas)
+                          or any(t.issues[i]["input"].get("stateId") == PLAN_IT["id"]
+                                 for i in ideas))
             stop_file = ROLE_STATE_DIR + "/stop.json"
             if broken and in_plan_it:
                 iid = ideas[-1]
@@ -5980,7 +5965,7 @@ def _selftest_one_command(check, tmp):
         c.host.drill_trips = trips
         c.host.drill_files = files            # does the job file a planning ticket at all
         c.host.drill_refuses = refuses        # a front-door answer the job gives instead
-        c.tracker.history_lag = lag           # reads before a move shows in the history
+        c.tracker.creator_lag = lag           # reads before the idea's creator reads back
         c.host.on_kick = job_pass(ref)
         restarts = []
         c.restart_dispatcher = lambda backup: restarts.append(backup)
@@ -6020,8 +6005,9 @@ def _drill_cases(check, drill_world):
           live[ENTRY]["userAccessControl"]["allowedUsers"], [GOOD_CONF["OWNER_USER_ID"]])
     check("drill-restarts-twice", len(restarts), 2)
     idea = [i for i, r in dw.tracker.issues.items() if r["input"]["title"] == DRILL_TITLE]
-    check("drill-idea-moved-in-then-closed",
-          [s for i, s in dw.tracker.moves if i in idea], [PLAN_IT["id"], "s-canceled"])
+    check("drill-idea-filed-in-plan-it-then-closed",
+          ([dw.tracker.issues[i]["input"].get("stateId") for i in idea],
+           [s for i, s in dw.tracker.moves if i in idea]), ([PLAN_IT["id"]], ["s-canceled"]))
     check("drill-probe-signed-again-after-the-stop",
           dw.state.data["ids"]["probe"]["signed_at"] >= drill.get("stop_at", "~")
           and dw.state.data["ids"]["probe"]["signed_at"] >= first_probe, True)
@@ -6045,11 +6031,12 @@ def _drill_cases(check, drill_world):
     dn, restarts_n = drill_world("drill-declined", answers=("y", "y", "bc", "no"))
     check("drill-declined-changes-nothing", (run_drill(dn), restarts_n), (None, []))
 
-    # KIT-209. THE JOB'S FRONT DOOR FIRST: the idea is filed in the backlog, and the job is
-    # woken only once the history it checks shows the move into Plan it.
+    # KIT-209, KIT-164. THE JOB'S FRONT DOOR FIRST: the owner's creation counts as the move,
+    # so the idea is filed straight into Plan it, and the job is woken only once the idea
+    # reads back, with the job's own reader, as the owner's creation.
     idea_in = [r["input"].get("stateId") for r in dw.tracker.issues.values()
                if r["input"]["title"] == DRILL_TITLE]
-    check("drill-files-its-idea-in-the-backlog", idea_in, ["s-backlog"])
+    check("drill-files-its-idea-straight-into-plan-it", idea_in, [PLAN_IT["id"]])
 
     def drill_outcome(c):
         try:
@@ -6067,9 +6054,9 @@ def _drill_cases(check, drill_world):
     def refusals(c):
         return [m["body"] for ms in c.tracker.comments.values() for m in ms]
 
-    dl, _r = drill_world("drill-move-shows-on-second-read", lag=1)
+    dl, _r = drill_world("drill-creation-reads-back-on-second-read", lag=1)
     kind, _why = drill_outcome(dl)
-    check("drill-wakes-the-job-only-once-the-history-shows-the-move",
+    check("drill-wakes-the-job-only-once-the-creation-reads-back",
           (kind, refusals(dl), dl.host.kicks >= 1), ("passed", [], True))
     dr, _r = drill_world("drill-front-door-refusal",
                          refuses=poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))
@@ -6083,11 +6070,13 @@ def _drill_cases(check, drill_world):
     check("drill-with-no-planning-ticket-did-not-test-the-miss-detection",
           (kind, "miss-detection was not tested" in why, "FAILED" in why, restored(dz)),
           ("could-not-test", True, False, True))
-    dm, _r = drill_world("drill-move-never-shows", lag=10 ** 6)
+    dm, _r = drill_world("drill-creation-never-reads-back", lag=10 ** 6)
     kind, why = drill_outcome(dm)
-    check("drill-whose-move-never-shows-wakes-nothing",
-          (kind, "never showed in its history" in why, dm.host.kicks, restored(dm)),
-          ("could-not-test", True, 0, True))
+    check("drill-whose-creation-never-reads-back-wakes-nothing",
+          (kind, "never read back" in why, dm.host.kicks, restored(dm),
+           [s for i, s in dm.tracker.moves
+            if dm.tracker.issues.get(i, {}).get("input", {}).get("title") == DRILL_TITLE]),
+          ("could-not-test", True, 0, True, ["s-canceled"]))
     check("drill-front-door-headings-are-the-jobs",
           FRONT_DOOR_HEADINGS, ("### Planning waits until tomorrow",
                                 "### Planning was not started"))
