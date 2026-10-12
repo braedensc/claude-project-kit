@@ -143,7 +143,7 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | Kind | Fires when |
 |---|---|
 | `hooks` | the Stop hook recorded, in the last 24 hours, that it could not tell which worktree a session ran in (`.claude/.stop-pr-nag/session-*__root-unresolved` in each `HOOK_CHECKOUTS` checkout). It clears 24 hours after the last such record |
-| `updates` | a dispatcher or Homebrew row of `review` is `BEHIND`, needs a `RESTART`, or is `UNKNOWN`. The kit checkout is listed but never fires: it moves with every merge. Re-measured every 20 hours, and on every pass while its alert is open, so a fix clears it within the hour |
+| `updates` | a dispatcher row of `review` is `BEHIND`, or a Homebrew row is `BEHIND`, needs a `RESTART`, or is `UNKNOWN`. A dispatcher that cannot be measured makes `updates` `UNKNOWN`: an update stops it, and that must not clear the alert. The kit checkout is listed but never fires: it moves with every merge. A review that finds nothing wrong is reused for 20 hours; one that finds something is re-measured every pass, so a fix clears within the hour |
 | `release` | a dispatcher release is newer than the version `DISPATCHER_VERSION` pins |
 | `dispatcher` | the dispatcher has not answered `/version` on this machine for two passes |
 | `front-door` | `PUBLIC_STATUS_URL` has not answered 200 for two passes while the internet answers |
