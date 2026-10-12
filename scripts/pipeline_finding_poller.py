@@ -39,6 +39,13 @@ WHAT THIS DOES, PER FINDING
   Then it records the source comment id in the seen-set and posts a "Filed as <ID>" reply
   on the source ticket.
 
+  It also leaves ONE comment on the NEW ticket (KIT-243): line 1 is the `finding-filed`
+  mark, line 2 the source ticket. That mark is what pages the owner — this job writes with
+  the owner's own key, so Linear itself tells nobody. The notifier accepts it only from
+  `finding_actor_ids`. The seen-set records the mark as `owed` before it is posted and
+  `posted` after. A pass that leaves one owed exits 1, and the next pass retries it. A retry
+  first reads the ticket, so a post that landed but lost its answer is never made twice.
+
 WHICH COMMENTS A PASS READS  (and why it is not the tickets that changed)
 
   A finding is a COMMENT, so the scan is keyed on the COMMENT's `createdAt` — never on the
@@ -712,6 +719,15 @@ mutation($issueId: String!, $body: String!) {
   commentCreate(input: {issueId: $issueId, body: $body}) { success }
 }"""
 
+# A retry's two reads (KIT-243): who this key is, and what the filed ticket already carries.
+_Q_VIEWER = """
+query { viewer { id } }"""
+
+_Q_TICKET_COMMENTS = """
+query($id: String!) {
+  issue(id: $id) { comments(first: 50) { nodes { body user { id } } } }
+}"""
+
 _M_RELATE = """
 mutation($input: IssueRelationCreateInput!) {
   issueRelationCreate(input: $input) { success }
@@ -861,8 +877,75 @@ def post_receipt(source_uuid, filed_id, api_key):
 # --------------------------------------------------------------------------- #
 # The pass
 # --------------------------------------------------------------------------- #
+FINDING_FILED_MARK = "<!-- pipeline-escalation: finding-filed -->"
+MARK_OWED, MARK_POSTED = "owed", "posted"
+
+
+def render_finding_mark(source_id):
+    """The comment the notifier pages on: the mark alone on line 1, the source on line 2."""
+    return ("%s\n%s\n\nA session working on **%s** asked for this follow-up, and the finding "
+            "job filed it here, in the backlog." % (FINDING_FILED_MARK, source_id, source_id))
+
+
+def post_finding_mark(filed_ref, source_id, api_key):
+    res = (linear_graphql(_M_COMMENT, {"issueId": filed_ref,
+                                       "body": render_finding_mark(source_id)}, api_key)
+           .get("commentCreate")) or {}
+    if not res.get("success"):
+        raise PollerError("commentCreate did not succeed for the finding-filed mark")
+
+
+def carries_own_mark(filed_ref, viewer_id, api_key):
+    """Whether the filed ticket already holds a finding-filed mark written by THIS key.
+
+    Only this key's copy counts: a mark someone else wrote is one the notifier will not page
+    on, so treating it as ours would leave the owner unpaged."""
+    data = linear_graphql(_Q_TICKET_COMMENTS, {"id": filed_ref}, api_key)
+    nodes = (((data.get("issue") or {}).get("comments") or {}).get("nodes")) or []
+    return any((n.get("body") or "").split("\n", 1)[0].strip() == FINDING_FILED_MARK
+               and ((n.get("user") or {}).get("id")) == viewer_id for n in nodes)
+
+
+def settle_owed_marks(seen, state_dir, api_key, dry_run, deadline):
+    """Retry every finding-filed mark an earlier pass left owed. Returns the ones still owed.
+
+    Each is looked for on its ticket first, so a post that landed but lost its answer is
+    recorded, not repeated. A finding filed before the mark existed carries no `mark` key
+    and is never paged after the fact."""
+    owed = [cid for cid, rec in sorted(seen.items()) if rec.get("mark") == MARK_OWED]
+    if not owed:
+        return []
+    if dry_run:
+        for cid in owed:
+            log("DRY-RUN would retry the finding-filed mark on %s" % seen[cid].get("filed"))
+        return []
+    viewer = ((linear_graphql(_Q_VIEWER, {}, api_key).get("viewer")) or {}).get("id")
+    if not viewer:
+        raise PollerError("the tracker named no user for this key, so an owed finding-filed "
+                          "mark cannot be checked before it is retried")
+    left = []
+    for cid in owed:
+        rec = seen[cid]
+        ref = rec.get("filed_uuid") or rec.get("filed")
+        if time.time() > deadline:
+            left.append(cid)
+            continue
+        try:
+            if not carries_own_mark(ref, viewer, api_key):
+                post_finding_mark(ref, rec.get("source"), api_key)
+        except PollerError as exc:
+            log("NOTE: the finding-filed mark on %s is still owed (%s)" % (rec.get("filed"), exc))
+            left.append(cid)
+            continue
+        rec["mark"] = MARK_POSTED
+        save_seen(seen_path(state_dir), seen)
+        log("posted the owed finding-filed mark on %s" % rec.get("filed"))
+    return [seen[cid].get("filed") for cid in left]
+
+
 def run_scan(cfg, api_key, dry_run, deadline):
-    """One pass. Returns (filed, already_filed, declined, left_behind, asked, unposted).
+    """One pass. Returns (filed, already_filed, declined, left_behind, asked, unposted,
+    owed_marks).
 
     The kinds of "not filed" are counted apart on purpose: `already_filed` is work that is
     DONE, `declined` is a request over the per-ticket cap that will never be filed, and
@@ -879,6 +962,8 @@ def run_scan(cfg, api_key, dry_run, deadline):
     seen = load_seen(seen_path(state_dir))
     watermarks = load_watermarks(watermark_path(state_dir))
     scan_started = _now_iso()
+    # A debt from an earlier pass is discharged before new work (KIT-243).
+    owed_marks = settle_owed_marks(seen, state_dir, api_key, dry_run, deadline)
 
     candidates, asked, complete = [], [], {}
     for key in cfg["teams"]:
@@ -943,11 +1028,22 @@ def run_scan(cfg, api_key, dry_run, deadline):
         # ticket exists — BEFORE the receipt. The other order (receipt, then seen-set) put
         # a second failure between creating a ticket and remembering it, and a receipt that
         # failed to post cost the dedup record and filed the finding twice on the next pass.
-        seen[cand["comment_id"]] = {"filed": filed_id, "source": cand["source_id"],
-                                    "at": _now_iso()}
+        seen[cand["comment_id"]] = {"filed": filed_id, "filed_uuid": filed_uuid,
+                                    "source": cand["source_id"], "at": _now_iso(),
+                                    "mark": MARK_OWED}
         save_seen(seen_path(state_dir), seen)
         log("filed %s from %s" % (filed_id, cand["source_id"]))
         filed += 1
+        # THE PAGE (KIT-243). Owed until it lands; a failure is retried by the next pass.
+        try:
+            post_finding_mark(filed_uuid or filed_id, cand["source_id"], api_key)
+            seen[cand["comment_id"]]["mark"] = MARK_POSTED
+            save_seen(seen_path(state_dir), seen)
+        except PollerError as exc:
+            log("NOTE: %s was filed and recorded, but its finding-filed mark could not be "
+                "posted (%s). The owner is not paged until it is; the next pass retries it."
+                % (filed_id, exc))
+            owed_marks.append(filed_id)
         try:
             link_finding(filed_uuid, cand["source_uuid"], api_key)
         except PollerError as exc:
@@ -979,7 +1075,7 @@ def run_scan(cfg, api_key, dry_run, deadline):
     if not dry_run and advance_watermarks(watermarks, cfg["teams"], complete,
                                           left_behind, scan_started):
         save_watermarks(watermark_path(state_dir), watermarks)
-    return filed, already, declined, len(left_behind), asked, unposted
+    return filed, already, declined, len(left_behind), asked, unposted, owed_marks
 
 
 def cmd_scan(args):
@@ -1002,7 +1098,7 @@ def cmd_scan(args):
 
     deadline = time.time() + (args.timeout or DEFAULT_RUN_TIMEOUT_SECONDS)
     try:
-        filed, already, declined, left, asked, unposted = run_scan(
+        filed, already, declined, left, asked, unposted, owed = run_scan(
             cfg, api_key, args.dry_run, deadline)
     except PollerError as exc:
         write_heartbeat(cfg["state_dir"], EXIT_ERROR, started_at, started_mono,
@@ -1020,12 +1116,18 @@ def cmd_scan(args):
         return EXIT_ERROR
 
     # A cap note that could not be posted is a pass that could not do all it owed: the
-    # session and the owner are not yet told. It exits 1 and the heartbeat names the ticket.
-    code, error = EXIT_OK, None
+    # session and the owner are not yet told. So is a finding-filed mark still owed: the
+    # finding was filed, but the owner was not paged (KIT-243). Either exits 1, and the
+    # heartbeat names it.
+    problems = []
     if unposted:
-        code = EXIT_ERROR
-        error = ("the cap note on %s could not be posted; it stays owed and the next pass "
-                 "tries again" % ", ".join(unposted))
+        problems.append("the cap note on %s could not be posted; it stays owed and the next "
+                        "pass tries again" % ", ".join(unposted))
+    if owed:
+        problems.append("%d finding-filed mark(s) still owed (%s); the next pass retries"
+                        % (len(owed), ", ".join(owed)))
+    error = "; and ".join(problems) or None
+    code = EXIT_ERROR if error else EXIT_OK
     write_heartbeat(cfg["state_dir"], code, started_at, started_mono, args.dry_run,
                     filed=filed, skipped=already + declined + left, error=error)
     # NOTHING TO DO SAYS WHAT IT ASKED AND WHAT CAME BACK. A bare "0 filed" is an
@@ -1236,10 +1338,14 @@ def selftest():
     class _FakeLinear:
         """Answers this file's GraphQL documents and records every write and every ask."""
 
-        def __init__(self, comments, note_fault=None):
+        def __init__(self, comments, note_fault=None, on_ticket=None, mark_fault=None):
             self.comments, self.created, self.receipts, self.asked = comments, [], [], []
             self.related = []
             self.note_fault = note_fault   # None, "raise" or "unsuccessful": KIT-7's cap note
+            # KIT-243: what each filed ticket already carries, and how a mark post fails —
+            # "fail" never lands, "lost" lands and then loses its answer.
+            self.on_ticket = dict(on_ticket or {})
+            self.mark_fault = mark_fault
 
         def __call__(self, query, variables, api_key):
             self.asked.append((query, variables))
@@ -1265,8 +1371,20 @@ def selftest():
                     if self.note_fault == "raise":
                         raise PollerError("Linear API HTTP 503 (body logged)")
                     return {"commentCreate": {"success": False}}
+                is_mark = variables["body"].startswith("<!-- pipeline-escalation: finding-filed")
+                if is_mark and self.mark_fault == "fail":
+                    raise PollerError("simulated: the mark post never landed")
                 self.receipts.append(variables)
+                self.on_ticket.setdefault(variables["issueId"], []).append(
+                    {"body": variables["body"], "user": {"id": "u-self"}})
+                if is_mark and self.mark_fault == "lost":
+                    raise PollerError("simulated: the mark landed, its answer was lost")
                 return {"commentCreate": {"success": True}}
+            if "viewer" in query:
+                return {"viewer": {"id": "u-self"}}
+            if "issue(id:" in query:
+                return {"issue": {"comments": {"nodes": list(
+                    self.on_ticket.get(variables["id"], []))}}}
             if "issueRelationCreate" in query:
                 self.related.append(variables["input"])
                 return {"issueRelationCreate": {"success": True}}
@@ -1324,8 +1442,9 @@ def selftest():
                              "type": "related"}])
         ok("pass: a finding from anyone but the agent user is never filed",
            len(fake.created) == 1)
+        receipts = [r for r in fake.receipts if r["body"].startswith("Filed as")]
         ok("pass: the receipt is posted on the SOURCE ticket",
-           len(fake.receipts) == 1 and fake.receipts[0].get("issueId") == "iss-7")
+           len(receipts) == 1 and receipts[0].get("issueId") == "iss-7")
         seen_now = load_seen(seen_path(state))
         ok("pass: the seen-set records the source COMMENT id", "cmt-1" in seen_now)
         ok("pass: the watermark advanced for the team that was scanned",
@@ -1479,6 +1598,101 @@ def selftest():
            rc_h == EXIT_OK and fake_h.receipts == [] and fake_h.created == [])
         ok("cap note: a request declined on an earlier pass is not counted as filed",
            "already filed 0" in log_h[0] and "declined over the per-ticket cap 2" in log_h[0])
+
+    # 3d. THE FINDING-FILED MARK (KIT-243). One comment on the NEW ticket — the mark on line
+    #     1, the source on line 2 — which is what the notifier pages on. A post that fails is
+    #     OWED: the pass goes red, and the next pass posts it once. A post that landed but
+    #     lost its answer is found on the ticket and never posted a second time.
+    def _mark_posts(fake):
+        return [r for r in fake.receipts if r["body"].startswith(FINDING_FILED_MARK)]
+
+    def _fresh(cid):
+        return dict(finding_comment, id=cid,
+                    createdAt=_iso(datetime.now(timezone.utc) - timedelta(minutes=5)))
+
+    def _setup(d):
+        state = os.path.join(d, "state")
+        path = os.path.join(d, "poller.json")
+        json.dump({"teams": ["KIT"], "owner_user_id": "u-owner", "agent_user_id": "u-agent",
+                   "linear_key_env": key_env, "state_dir": state}, open(path, "w"))
+        return state, path
+
+    os.environ[key_env] = "not-a-real-key"
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        fake_m = _FakeLinear([_fresh("m1")])
+        rc_m = _pass(fake_m, cfg_path)
+        posts = _mark_posts(fake_m)
+        ok("mark: ONE finding-filed comment, on the NEW ticket, its second line the source",
+           rc_m == EXIT_OK and len(posts) == 1 and posts[0]["issueId"] == "new-1"
+           and posts[0]["body"].split("\n")[1] == "KIT-7")
+        ok("mark: the seen-set records it as posted",
+           (load_seen(seen_path(state)).get("m1") or {}).get("mark") == MARK_POSTED)
+        os.remove(watermark_path(state))
+        fake_m2 = _FakeLinear([_fresh("m1")], on_ticket=fake_m.on_ticket)
+        _pass(fake_m2, cfg_path)
+        ok("mark: a rerun files nothing and posts no second mark",
+           fake_m2.created == [] and _mark_posts(fake_m2) == [])
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        fake_f = _FakeLinear([_fresh("m2")], mark_fault="fail")
+        rc_f = _pass(fake_f, cfg_path)
+        entry = load_seen(seen_path(state)).get("m2") or {}
+        hb_f = json.load(open(heartbeat_path(state)))
+        ok("mark: a post that FAILS leaves the finding filed and recorded, the mark OWED, "
+           "and the pass red",
+           rc_f == EXIT_ERROR and len(fake_f.created) == 1 and entry.get("filed") == "KIT-901"
+           and entry.get("mark") == MARK_OWED and hb_f["result"] == "error"
+           and "finding-filed" in (hb_f["error"] or ""))
+        fake_fd = _FakeLinear([_fresh("m2")], on_ticket=fake_f.on_ticket)
+        rc_fd = _pass(fake_fd, cfg_path, ["--dry-run"])
+        ok("mark: a dry run says it would retry the owed mark, and posts nothing",
+           rc_fd == EXIT_OK and fake_fd.receipts == []
+           and (load_seen(seen_path(state)).get("m2") or {}).get("mark") == MARK_OWED)
+        fake_f2 = _FakeLinear([_fresh("m2")], on_ticket=fake_f.on_ticket)
+        rc_f2 = _pass(fake_f2, cfg_path)
+        posts_f2 = _mark_posts(fake_f2)
+        ok("mark: the next pass posts it ONCE, on the same ticket, files nothing, goes green",
+           rc_f2 == EXIT_OK and fake_f2.created == [] and len(posts_f2) == 1
+           and posts_f2[0]["issueId"] == "new-1"
+           and (load_seen(seen_path(state)).get("m2") or {}).get("mark") == MARK_POSTED)
+        fake_f3 = _FakeLinear([_fresh("m2")], on_ticket=fake_f2.on_ticket)
+        _pass(fake_f3, cfg_path)
+        ok("mark: and the pass after that posts nothing", _mark_posts(fake_f3) == [])
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        fake_l = _FakeLinear([_fresh("m3")], mark_fault="lost")
+        rc_l = _pass(fake_l, cfg_path)
+        ok("mark: a post whose answer was lost is OWED, and the pass red",
+           rc_l == EXIT_ERROR
+           and (load_seen(seen_path(state)).get("m3") or {}).get("mark") == MARK_OWED)
+        fake_l2 = _FakeLinear([_fresh("m3")], on_ticket=fake_l.on_ticket)
+        rc_l2 = _pass(fake_l2, cfg_path)
+        ok("mark: the next pass FINDS it on the ticket and never posts it twice",
+           rc_l2 == EXIT_OK and _mark_posts(fake_l2) == []
+           and (load_seen(seen_path(state)).get("m3") or {}).get("mark") == MARK_POSTED)
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        fake_s = _FakeLinear([_fresh("m4")], mark_fault="fail")
+        _pass(fake_s, cfg_path)
+        forged = {"new-1": [{"body": render_finding_mark("KIT-7"), "user": {"id": "a-session"}}]}
+        fake_s2 = _FakeLinear([_fresh("m4")], on_ticket=forged)
+        _pass(fake_s2, cfg_path)
+        ok("mark: a copy of the mark by SOMEONE ELSE does not count as ours; ours is posted",
+           len(_mark_posts(fake_s2)) == 1)
+
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        save_seen(seen_path(state), {"old-1": {"filed": "KIT-800", "source": "KIT-7",
+                                               "at": "2026-09-01T00:00:00Z"}})
+        fake_o = _FakeLinear([])
+        rc_o = _pass(fake_o, cfg_path)
+        ok("mark: a finding filed before the mark existed is never paged after the fact",
+           rc_o == EXIT_OK and fake_o.receipts == []
+           and not any("issue(id:" in q for q, _v in fake_o.asked))
 
     # 4. THE ERROR HEARTBEAT. A config or credential failure used to exit before the
     #    heartbeat was written, leaving a stale timestamp — the symptom of a daemon that

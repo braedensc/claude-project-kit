@@ -35,8 +35,9 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
                  account's shell, its value never read into this process
     labels       agent:blocked and agent:needs-human resolved by exact name, every team key
                  resolved, and `self` — for the planning marks' author (EXECUTOR_ACTOR_IDS)
-                 and the heartbeat monitor's (MONITOR_ACTOR_IDS, KIT-156) and the bounce
-                 driver's (BOUNCE_ACTOR_IDS, KIT-225)
+                 and the heartbeat monitor's (MONITOR_ACTOR_IDS, KIT-156), the bounce
+                 driver's (BOUNCE_ACTOR_IDS, KIT-225) and the finding job's
+                 (FINDING_ACTOR_IDS, KIT-243)
     config       the notifier's config, composed and passed through the notifier's OWN
                  loader before anything is written
     job          the LaunchDaemon plist, installed and not loaded — and never over another
@@ -204,6 +205,9 @@ MONITOR_DEFAULT_STATE_DIR = "~/.stage-e/state"
 BOUNCE_CONFIG_PATH = "~/.stage-e/config.json"
 BOUNCE_DEFAULT_KEY_ENV = "LINEAR_OWNER_API_KEY"
 BOUNCE_KEY_ENV_ALIAS = "linear_key_env"
+# The finding job's config, as the Stage E installer writes it, and the key it falls back to.
+FINDING_CONFIG_PATH = "~/.stage-e/finding/poller.json"
+FINDING_DEFAULT_KEY_ENV = "STAGE_E_LINEAR_API_KEY"
 # The name the dispatcher's own Slack lane reads out of the dispatcher's environment — which is
 # copied into every session. The notifier's token may never live under it (owner, 2026-09-17).
 DISPATCHER_CHAT_TOKEN_ENV = "SLACK_BOT_TOKEN"
@@ -324,6 +328,9 @@ CONF_DEFAULTS = {
     # under the Stage E key, so `self` is its author on a one-key deployment. `off` composes
     # no ids, and the notifier then pages on that mark from nobody and says so every pass.
     "BOUNCE_ACTOR_IDS": "self",
+    # Who may author the finding job's finding-filed mark (KIT-243). The job writes it under
+    # the Stage E key too, so `self` is its author on a one-key deployment.
+    "FINDING_ACTOR_IDS": "self",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose so an unedited copy of the example cannot run.
@@ -535,6 +542,21 @@ def validate_conf(values, invoking_user=None):
     if len(set(bouncers)) != len(bouncers):
         errors.append("BOUNCE_ACTOR_IDS repeats an entry")
 
+    finders = split_list(conf.get("FINDING_ACTOR_IDS"))
+    if not finders:
+        errors.append("FINDING_ACTOR_IDS is empty. Say who may write the finding job's "
+                      "finding-filed mark: `self` (the default), tracker actor ids, or `off` to "
+                      "leave that page OFF by name")
+    elif MONITOR_OFF in finders and len(finders) > 1:
+        errors.append("FINDING_ACTOR_IDS mixes `off` with an author (%s): `off` stands alone"
+                      % ", ".join(finders))
+    for actor in finders:
+        if actor not in (EXECUTOR_SELF, MONITOR_OFF) and not _ACTOR_RE.match(actor):
+            errors.append("FINDING_ACTOR_IDS entry %r is neither `self`, `off` nor a tracker "
+                          "actor id" % actor)
+    if len(set(finders)) != len(finders):
+        errors.append("FINDING_ACTOR_IDS repeats an entry")
+
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
             errors.append("%s must be the NAME of an environment variable in UPPER_SNAKE — "
@@ -676,7 +698,8 @@ def render_plist(conf, home):
         log=_xml_escape(log_path(conf, home)))
 
 
-def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=()):
+def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
+                   finding_ids=()):
     """The notifier's config, from the conf and the resolved ids. `~` stays literal: the notifier
     expands it when it runs, as the role account.
 
@@ -700,6 +723,8 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=()):
         doc["monitor_actor_ids"] = list(monitor_ids)
     if bounce_ids:
         doc["bounce_actor_ids"] = list(bounce_ids)
+    if finding_ids:
+        doc["finding_actor_ids"] = list(finding_ids)
     return doc
 
 
@@ -1690,8 +1715,12 @@ def step_labels(ctx, apply_it):
     bouncers_off = bouncers_conf == [MONITOR_OFF]
     if bouncers_off:
         bouncers_conf = []
+    finders_conf = split_list(conf.get("FINDING_ACTOR_IDS", EXECUTOR_SELF))
+    finders_off = finders_conf == [MONITOR_OFF]
+    if finders_off:
+        finders_conf = []
     wants_self = (EXECUTOR_SELF in actors_conf or EXECUTOR_SELF in monitors_conf
-                  or EXECUTOR_SELF in bouncers_conf)
+                  or EXECUTOR_SELF in bouncers_conf or EXECUTOR_SELF in finders_conf)
     if ctx.agent:
         raise Unknown(
             "NOT MEASURED — agent environment (%s set): no tracker request is made from a model's "
@@ -1700,7 +1729,8 @@ def step_labels(ctx, apply_it):
                " and `self` (%s)" % ", ".join(
                    k for k, v in (("EXECUTOR_ACTOR_IDS", actors_conf),
                                   ("MONITOR_ACTOR_IDS", monitors_conf),
-                                  ("BOUNCE_ACTOR_IDS", bouncers_conf)) if EXECUTOR_SELF in v)
+                                  ("BOUNCE_ACTOR_IDS", bouncers_conf),
+                                  ("FINDING_ACTOR_IDS", finders_conf)) if EXECUTOR_SELF in v)
                if wants_self else "",
                " Ids an earlier run recorded are kept, unchecked." if ctx.ids.get("label_ids") else ""),
             "a person runs the same command with $%s in the environment of that ONE command"
@@ -1769,6 +1799,8 @@ def step_labels(ctx, apply_it):
     monitors = resolve("MONITOR_ACTOR_IDS", monitors_conf)
     # The bounce driver's author, resolved the same way (KIT-225).
     bouncers = resolve("BOUNCE_ACTOR_IDS", bouncers_conf)
+    # The finding job's author, resolved the same way (KIT-243).
+    finders = resolve("FINDING_ACTOR_IDS", finders_conf)
     if problems:
         raise SetupError("the labels step found %d problem(s):\n%s"
                          % (len(problems), "\n".join("  - " + p for p in problems)))
@@ -1776,6 +1808,7 @@ def step_labels(ctx, apply_it):
     changed = [k for k in LABEL_KEYS if before.get(k) and before.get(k) != label_ids[k]]
     ctx.ids = {"label_ids": label_ids, "executor_actor_ids": actors,
                "monitor_actor_ids": monitors, "bounce_actor_ids": bouncers,
+               "finding_actor_ids": finders,
                "team_ids": dict((k, str(v.get("id"))) for k, v in sorted(teams.items()) if v)}
     detail = ("%s resolved by exact name at workspace scope (%s); %d executor author id(s)%s; "
               "%d team key(s) resolved (%s); %s"
@@ -1787,6 +1820,8 @@ def step_labels(ctx, apply_it):
                  else "%d heartbeat-monitor author id(s)" % len(monitors)))
     detail += ("; BOUNCE_ACTOR_IDS=off" if bouncers_off
                else "; %d bounce-driver author id(s)" % len(bouncers))
+    detail += ("; FINDING_ACTOR_IDS=off" if finders_off
+               else "; %d finding-job author id(s)" % len(finders))
     if changed:
         detail += "; CHANGED since the ledger: %s" % ", ".join(changed)
     notes = []
@@ -1799,6 +1834,10 @@ def step_labels(ctx, apply_it):
         notes.append("BOUNCE_ACTOR_IDS=off: the notifier's config names no bounce-driver author, "
                      "so it pages on the ready-to-merge mark from nobody and says "
                      "`ready-to-merge marks: OFF` on every pass (KIT-225).")
+    if finders_off:
+        notes.append("FINDING_ACTOR_IDS=off: the notifier's config names no finding-job author, "
+                     "so it pages on the finding-filed mark from nobody and says "
+                     "`finding-filed marks: OFF` on every pass (KIT-243).")
     return True, detail, notes
 
 
@@ -1891,13 +1930,29 @@ def bounce_ids_unresolved(conf, ids):
     return ""
 
 
+def finding_ids_unresolved(conf, ids):
+    """Why the ledger's finding-job author ids cannot be composed for this conf, or "" — the
+    same rule again, for the finding-filed mark (KIT-243)."""
+    finders = split_list(conf.get("FINDING_ACTOR_IDS", EXECUTOR_SELF))
+    if finders == [MONITOR_OFF]:
+        return ""
+    have = ids.get("finding_actor_ids") or []
+    if not have:
+        return "the finding-job author ids (FINDING_ACTOR_IDS)"
+    named = [m for m in finders if m != EXECUTOR_SELF and m not in have]
+    if named:
+        return "the finding-job author ids (FINDING_ACTOR_IDS now names %s)" % ", ".join(named)
+    return ""
+
+
 def step_config(ctx, apply_it):
     conf = ctx.conf
     label_ids = ctx.ids.get("label_ids") or {}
     actors = ctx.ids.get("executor_actor_ids") or []
     missing = [k for k in LABEL_KEYS if not label_ids.get(k)] + ([] if actors else ["the executor ids"])
     for unresolved in (monitor_ids_unresolved(conf, ctx.ids),
-                       bounce_ids_unresolved(conf, ctx.ids)):
+                       bounce_ids_unresolved(conf, ctx.ids),
+                       finding_ids_unresolved(conf, ctx.ids)):
         if unresolved:
             missing.append(unresolved)
     if missing:
@@ -1911,7 +1966,10 @@ def step_config(ctx, apply_it):
                    else ctx.ids.get("monitor_actor_ids") or [])
     bounce_ids = ([] if split_list(conf.get("BOUNCE_ACTOR_IDS", EXECUTOR_SELF)) == [MONITOR_OFF]
                   else ctx.ids.get("bounce_actor_ids") or [])
-    body = validate_composed(compose_config(conf, label_ids, actors, monitor_ids, bounce_ids),
+    finding_ids = ([] if split_list(conf.get("FINDING_ACTOR_IDS", EXECUTOR_SELF)) == [MONITOR_OFF]
+                   else ctx.ids.get("finding_actor_ids") or [])
+    body = validate_composed(compose_config(conf, label_ids, actors, monitor_ids, bounce_ids,
+                                            finding_ids),
                              ctx.role_home)
     unknown_keys = clone_lacks_keys(ctx, json.loads(body))
     if unknown_keys:
@@ -2635,6 +2693,67 @@ def ready_to_merge_lines(ctx):
     return on, off, unproven
 
 
+def finding_filed_lines(ctx):
+    """(on, off, unproven) for the finding job's finding-filed page (KIT-243), on the pattern
+    of ready_to_merge_lines. The job's end is its own config, read as the role account: the
+    teams it files into, and the key it comments with."""
+    conf = ctx.conf
+    on, off, unproven = [], [], []
+    finders = split_list(conf.get("FINDING_ACTOR_IDS", EXECUTOR_SELF))
+    if finders == [MONITOR_OFF]:
+        off.append("the finding-filed page: FINDING_ACTOR_IDS=off, so this notifier pages on the "
+                   "finding job's mark from nobody and says `finding-filed marks: OFF` on every "
+                   "pass (KIT-243)")
+        return on, off, unproven
+    try:
+        doc, why_not = read_role_json(ctx, FINDING_CONFIG_PATH, "the finding job's config")
+    except Unknown as exc:
+        unproven.append("the finding-filed page: not measured on this pass — %s (KIT-243)"
+                        % exc.what)
+        return on, off, unproven
+    named = [m for m in finders if m != EXECUTOR_SELF]
+    if doc is None:
+        off.append("the finding-filed page: the finding job's config %s is %s as %s, so nothing "
+                   "here can tell who writes the mark. The Stage E installer's `config` step "
+                   "writes it (KIT-243)" % (FINDING_CONFIG_PATH, why_not, ctx.account))
+        return on, off, unproven
+    key_env = str(doc.get("linear_key_env") or FINDING_DEFAULT_KEY_ENV)
+    teams = [t.upper() for t in split_list(conf["TEAM_KEYS"])]
+    job_teams = doc.get("teams") if isinstance(doc.get("teams"), list) else []
+    unscanned = [str(t) for t in job_teams if str(t).upper() not in teams]
+    composed = (json.loads(ctx.composed["body"]).get("finding_actor_ids") or []
+                if ctx.config_current and ctx.composed else None)
+    if unscanned:
+        off.append("the finding-filed page: the finding job files into %s, and TEAM_KEYS (%s) "
+                   "does not scan %s, so this notifier never reads those marks. Add %s to "
+                   "TEAM_KEYS and run this installer again (KIT-243)"
+                   % (", ".join(unscanned), ", ".join(teams),
+                      "it" if len(unscanned) == 1 else "them", ", ".join(unscanned)))
+    elif not named and key_env != conf["LINEAR_KEY_ENV"]:
+        off.append("the finding-filed page: FINDING_ACTOR_IDS=self is the user of $%s, and the "
+                   "finding job comments with $%s, another key. Every real finding-filed mark is "
+                   "then skipped as another author's, while the notifier's summary still says "
+                   "`finding-filed marks: ON`. Name the finding job's author id in "
+                   "FINDING_ACTOR_IDS, or give both jobs one key (KIT-243)"
+                   % (conf["LINEAR_KEY_ENV"], key_env))
+    elif composed is None:
+        unproven.append("the finding-filed page: the notifier's config %s is not the one this "
+                        "pass composed (see the `config` row), so whether the job pages on the "
+                        "mark is not proven on this pass (KIT-243)" % conf["NOTIFIER_CONFIG"])
+    elif not composed or [m for m in named if m not in composed]:
+        unproven.append("the finding-filed page: the notifier's config %s does not hold every id "
+                        "FINDING_ACTOR_IDS names (%s). Run this installer's `run` with $%s set in "
+                        "your shell (KIT-243)" % (conf["NOTIFIER_CONFIG"],
+                                                 ", ".join(finders), conf["LINEAR_KEY_ENV"]))
+    else:
+        on.append("the finding-filed page: each finding the job files carries a mark this "
+                  "notifier pings on, once per finding, with its link and no label (KIT-243)")
+        unproven.append("that only the finding job writes the finding-filed mark: anything "
+                        "holding $%s can. The mark applies no label, so a forged one costs a "
+                        "ping that links a ticket (KIT-243)" % key_env)
+    return on, off, unproven
+
+
 def handover_lines(ctx):
     conf = ctx.conf
     # The interval launchd reported, never the conf's: the conf says what the file asks for,
@@ -2653,7 +2772,9 @@ def handover_lines(ctx):
                 "copy-it-out residual no fence closes (KIT-157)"]
     h_on, h_off, h_unproven = daemon_health_lines(ctx)
     r_on, r_off, r_unproven = ready_to_merge_lines(ctx)
-    return on + h_on + r_on, h_off + r_off + off, h_unproven + r_unproven + unproven
+    f_on, f_off, f_unproven = finding_filed_lines(ctx)
+    return (on + h_on + r_on + f_on, h_off + r_off + f_off + off,
+            h_unproven + r_unproven + f_unproven + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -3101,6 +3222,14 @@ def _selftest_body():
        refused("BOUNCE_ACTOR_IDS=self,self\n", "BOUNCE_ACTOR_IDS repeats an entry"))
     ok("refuse: a BOUNCE_ACTOR_IDS entry that is no id",
        refused("BOUNCE_ACTOR_IDS=not an id!\n", "BOUNCE_ACTOR_IDS entry"))
+    ok("refuse: FINDING_ACTOR_IDS left empty, naming `self` and `off`",
+       refused("FINDING_ACTOR_IDS=\n", "FINDING_ACTOR_IDS is empty"))
+    ok("refuse: FINDING_ACTOR_IDS mixing `off` with an id",
+       refused("FINDING_ACTOR_IDS=off,self\n", "FINDING_ACTOR_IDS mixes `off`"))
+    ok("refuse: FINDING_ACTOR_IDS repeating an entry",
+       refused("FINDING_ACTOR_IDS=self,self\n", "FINDING_ACTOR_IDS repeats an entry"))
+    ok("refuse: a FINDING_ACTOR_IDS entry that is no id",
+       refused("FINDING_ACTOR_IDS=not an id!\n", "FINDING_ACTOR_IDS entry"))
     _off_values, _off_errors = parse_conf(good_text + "MONITOR_ACTOR_IDS=off\n")
     ok("conf: MONITOR_ACTOR_IDS=off is accepted, by name",
        _off_errors == [] and validate_conf(_off_values, person)[1] == []
@@ -3882,7 +4011,8 @@ def _selftest_body():
         ctx, fake11 = machine_ctx(root11)
         ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
                    "monitor_actor_ids": ["viewer-uuid-0001"],
-                   "bounce_actor_ids": ["viewer-uuid-0001"]}
+                   "bounce_actor_ids": ["viewer-uuid-0001"],
+                   "finding_actor_ids": ["viewer-uuid-0001"]}
         saved_compose = globals()["compose_config"]
 
         def dropping(conf, label_ids, actor_ids, *rest):
@@ -3915,7 +4045,8 @@ def _selftest_body():
                 fh.write(older)
             ctx_o.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
                          "monitor_actor_ids": [] if "off" in extra else ["viewer-uuid-0001"],
-                         "bounce_actor_ids": ["viewer-uuid-0001"]}
+                         "bounce_actor_ids": ["viewer-uuid-0001"],
+                         "finding_actor_ids": ["viewer-uuid-0001"]}
             (_c, rows_o), out_o = quiet(lambda: run_steps(ctx_o, True,
                                                           steps=(("config", "", step_config),)))
             return rows_o, out_o, f_o
@@ -3990,7 +4121,8 @@ def _selftest_body():
             ctx, _f = machine_ctx(r13, home=h13)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
                        "monitor_actor_ids": ["viewer-uuid-0001"],
-                       "bounce_actor_ids": ["viewer-uuid-0001"]}
+                       "bounce_actor_ids": ["viewer-uuid-0001"],
+                       "finding_actor_ids": ["viewer-uuid-0001"]}
             steps13 =tuple((s, t, f) for s, t, f in STEPS if s in ("preflight", "config", "job", "dry-run"))
             (code, rows), out = quiet(lambda: run_steps(ctx, True, keep_going=True, steps=steps13))
             got = rows_of(rows).get("dry-run")
@@ -4092,7 +4224,8 @@ def _selftest_body():
         ctx14c, f14c = machine_ctx(r14c, conf=good_conf("BOUNCE_ACTOR_IDS=off\n"))
         ctx14c.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
                       "monitor_actor_ids": ["viewer-uuid-0001"],
-                      "bounce_actor_ids": ["viewer-uuid-0001"]}
+                      "bounce_actor_ids": ["viewer-uuid-0001"],
+                      "finding_actor_ids": ["viewer-uuid-0001"]}
         (_c14c, rows14c), _o14c = quiet(lambda: run_steps(ctx14c, True,
                                                           steps=(("config", "", step_config),)))
         try:
@@ -4114,6 +4247,68 @@ def _selftest_body():
                % (extra_b.strip() or "BOUNCE_ACTOR_IDS=self", ids_b.get("bounce_actor_ids"),
                   "waits on the labels step" if want_b else "composable"),
                (want_b in got_b and got_b) if want_b else got_b == "", got_b)
+
+        # ── 14d. FINDING_ACTOR_IDS (KIT-243): the same three shapes again ──────────
+        written, out14, ctx14d = monitor_ids_case("FINDING_ACTOR_IDS=finding-actor-0009,self\n")
+        ok("labels: FINDING_ACTOR_IDS names ids and `self`; both land in the composed config",
+           written.get("finding_actor_ids") == ["finding-actor-0009", "viewer-uuid-0001"],
+           "%s\n%s" % (written, out14[-600:]))
+        # `self` is looked up when the finding job's ids are the only ones asking for it.
+        written, out14, ctx14d = monitor_ids_case(
+            "MONITOR_ACTOR_IDS=off\nBOUNCE_ACTOR_IDS=off\n",
+            text=good_text.replace("EXECUTOR_ACTOR_IDS=self", "EXECUTOR_ACTOR_IDS=actor-0000-explicit"))
+        ok("labels: FINDING_ACTOR_IDS=self is looked up when only the finding job asks for `self`",
+           written.get("finding_actor_ids") == ["viewer-uuid-0001"]
+           and written.get("executor_actor_ids") == ["actor-0000-explicit"],
+           "%s\n%s" % (written, out14[-600:]))
+        written, out14, ctx14d = monitor_ids_case("FINDING_ACTOR_IDS=off\n")
+        ok("labels: FINDING_ACTOR_IDS=off composes NO finding_actor_ids, and says so by name",
+           written and "finding_actor_ids" not in written
+           and ctx14d.ids.get("finding_actor_ids") == [] and "FINDING_ACTOR_IDS=off" in out14,
+           "%s\n%s" % (written, out14[-600:]))
+        written, out14, ctx14d = monitor_ids_case("")
+        ok("labels: FINDING_ACTOR_IDS defaults to `self`, the Stage E key's user",
+           written.get("finding_actor_ids") == ["viewer-uuid-0001"],
+           "%s\n%s" % (written, out14[-600:]))
+        r14d = tempfile.mkdtemp(prefix="finding-off-ledger.", dir=tmp_root)
+        ctx14d, f14d = machine_ctx(r14d, conf=good_conf("FINDING_ACTOR_IDS=off\n"))
+        ctx14d.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                      "monitor_actor_ids": ["viewer-uuid-0001"],
+                      "bounce_actor_ids": ["viewer-uuid-0001"],
+                      "finding_actor_ids": ["viewer-uuid-0001"]}
+        (_c14d, rows14d), _o14d = quiet(lambda: run_steps(ctx14d, True,
+                                                          steps=(("config", "", step_config),)))
+        try:
+            with open(os.path.join(f14d.home, ".stage-e", "notifier.json"), encoding="utf-8") as fh:
+                written14d = json.load(fh)
+        except (OSError, ValueError):
+            written14d = None
+        ok("config: FINDING_ACTOR_IDS=off composes no finding ids, even over a ledger that "
+           "holds some", rows14d[0][1] == DONE and written14d is not None
+           and "finding_actor_ids" not in written14d, (rows14d, written14d))
+        r14e = tempfile.mkdtemp(prefix="finding-unresolved-ledger.", dir=tmp_root)
+        ctx14e, f14e = machine_ctx(r14e, conf=good_conf(""))
+        ctx14e.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                      "monitor_actor_ids": ["viewer-uuid-0001"],
+                      "bounce_actor_ids": ["viewer-uuid-0001"]}
+        (_c14e, rows14e), out14e = quiet(lambda: run_steps(
+            ctx14e, True, steps=(("config", "", step_config),)))
+        ok("config: a ledger from before KIT-243 holds no finding ids, so the config WAITS on "
+           "the labels step and writes nothing (it never drops the page quietly)",
+           rows14e[0][1] == UNKNOWN and "FINDING_ACTOR_IDS" in rows14e[0][2]
+           and not os.path.exists(os.path.join(f14e.home, ".stage-e", "notifier.json")),
+           (rows14e, out14e[-400:]))
+        for extra_f, ids_f, want_f in (
+                ("FINDING_ACTOR_IDS=off\n", {}, ""),
+                ("", {}, "FINDING_ACTOR_IDS"),
+                ("", {"finding_actor_ids": ["viewer-uuid-0001"]}, ""),
+                ("FINDING_ACTOR_IDS=finding-actor-0009\n",
+                 {"finding_actor_ids": ["viewer-uuid-0001"]}, "finding-actor-0009")):
+            got_f = finding_ids_unresolved(good_conf(extra_f), ids_f)
+            ok("config: %s against a ledger holding %s — %s"
+               % (extra_f.strip() or "FINDING_ACTOR_IDS=self", ids_f.get("finding_actor_ids"),
+                  "waits on the labels step" if want_f else "composable"),
+               (want_f in got_f and got_f) if want_f else got_f == "", got_f)
 
         # ── 14b'. the ledger's monitor ids are composed only when they answer this conf ──
         # A ledger from before KIT-156 holds none; `verify` keeps the ledger's ids unchecked.
@@ -4140,7 +4335,8 @@ def _selftest_body():
         ctx14o, f14o = machine_ctx(r14o, conf=c14o)
         ctx14o.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
                       "monitor_actor_ids": ["viewer-uuid-0001"],
-                      "bounce_actor_ids": ["viewer-uuid-0001"]}
+                      "bounce_actor_ids": ["viewer-uuid-0001"],
+                      "finding_actor_ids": ["viewer-uuid-0001"]}
         (_c14o, rows14o), out14o = quiet(lambda: run_steps(ctx14o, True,
                                                            steps=(("config", "", step_config),)))
         try:
@@ -4159,11 +4355,14 @@ def _selftest_body():
                    "intervals": {"notifier": 300 + 240}, "run_interval_seconds": 1800}
         # The bounce driver's config as the Stage E installer writes it: the keys this reads.
         bounce_cfg = {"linear_api_key_env": "STAGE_E_LINEAR_API_KEY", "team_keys": ["KIT"]}
+        # …and the finding job's, as the Stage E installer writes it (KIT-243).
+        finding_cfg = {"linear_key_env": "STAGE_E_LINEAR_API_KEY", "teams": ["KIT"]}
         handover_writes, handover_reads = [], []
 
         def handover_with(monitor_doc, extra="", ids_m=("viewer-uuid-0001",), env=None,
                           beat=30, beat_result="ok", beat_dry=False, notifier_end="current",
-                          bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",)):
+                          bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",),
+                          finding_doc=finding_cfg, ids_f=("viewer-uuid-0001",)):
             """The handover's daemon-health lines over one machine. `beat` is the age of the
             MONITOR's own heartbeat in seconds (None: it has written none; "garbage": not
             JSON). `notifier_end` is this end: "current" is a config row that composed and
@@ -4177,10 +4376,11 @@ def _selftest_body():
             c["__source__"] = "notifier.conf"
             ctx, f = machine_ctx(r, conf=c, env=env)
             ctx.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
-                       "monitor_actor_ids": list(ids_m), "bounce_actor_ids": list(ids_b)}
+                       "monitor_actor_ids": list(ids_m), "bounce_actor_ids": list(ids_b),
+                       "finding_actor_ids": list(ids_f)}
             if notifier_end == "current":
                 body_h = validate_composed(compose_config(c, ids, ["actor-0001"], list(ids_m),
-                                                          list(ids_b)), f.home)
+                                                          list(ids_b), list(ids_f)), f.home)
                 ctx.composed = {"body": body_h, "sha256": _sha(body_h)}
                 ctx.config_current = True
             else:
@@ -4197,6 +4397,11 @@ def _selftest_body():
                 with open(os.path.join(f.home, ".stage-e", "config.json"), "w",
                           encoding="utf-8") as fh:
                     json.dump(bounce_doc, fh)
+            if finding_doc is not None:
+                os.makedirs(os.path.join(f.home, ".stage-e", "finding"), exist_ok=True)
+                with open(os.path.join(f.home, ".stage-e", "finding", "poller.json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump(finding_doc, fh)
             if beat == "garbage":
                 os.makedirs(os.path.join(f.home, ".stage-e", "state"), exist_ok=True)
                 with open(os.path.join(f.home, ".stage-e", "state", "monitor-heartbeat.json"),
@@ -4207,7 +4412,8 @@ def _selftest_body():
             on, off, unproven = handover_lines(ctx)
             handover_writes.extend(f.writes)
             handover_reads.extend(s for s in f.role_scripts
-                                  if "monitor.json" in s or "config.json" in s)
+                                  if "monitor.json" in s or "config.json" in s
+                                  or "poller.json" in s)
             return " || ".join(["ON: " + l for l in on] + ["OFF: " + l for l in off]
                                + ["NOT PROVEN: " + l for l in unproven])
 
@@ -4389,6 +4595,53 @@ def _selftest_body():
            == (_bounce.DEFAULT_CONFIG_PATH, _bounce.CONFIG_DEFAULTS["linear_api_key_env"],
                "linear_api_key_env"),
            (BOUNCE_CONFIG_PATH, _bounce.DEFAULT_CONFIG_PATH))
+
+        # ── 14e. the finding-filed page (KIT-243): both ends, on the same pattern ──
+        # The finding job writes its mark with the key its own config names; `self` is the
+        # user of THIS notifier's key. Two keys, and every real mark is skipped as a forgery.
+        text = handover_with(mon_doc)
+        ok("handover: one key for both jobs — the finding-filed page is ON, naming the key",
+           "ON: the finding-filed page" in text and "OFF: the finding-filed page" not in text,
+           text)
+        text = handover_with(mon_doc, finding_doc=dict(finding_cfg,
+                                                       linear_key_env="OTHER_TRACKER_KEY"))
+        ok("handover: `self` is another key's user than the finding job's — OFF, naming both "
+           "keys and FINDING_ACTOR_IDS, never ON",
+           "OFF: the finding-filed page" in text and "OTHER_TRACKER_KEY" in text
+           and "FINDING_ACTOR_IDS" in text and "ON: the finding-filed page" not in text, text)
+        text = handover_with(mon_doc, finding_doc={"teams": ["KIT"]})
+        ok("handover: a finding config naming no key is the job's own default — the same key, ON",
+           "ON: the finding-filed page" in text and "OFF: the finding-filed page" not in text,
+           text)
+        text = handover_with(mon_doc, finding_doc=dict(finding_cfg, teams=["KIT", "OPS"]))
+        ok("handover: the finding job files into a team TEAM_KEYS does not scan — OFF, by team",
+           "OFF: the finding-filed page" in text and "OPS" in text
+           and "ON: the finding-filed page" not in text, text)
+        text = handover_with(mon_doc, finding_doc=None)
+        ok("handover: no finding job config — OFF, naming the file",
+           "OFF: the finding-filed page" in text and "poller.json" in text
+           and "ON: the finding-filed page" not in text, text)
+        text = handover_with(mon_doc, extra="FINDING_ACTOR_IDS=off\n", ids_f=())
+        ok("handover: FINDING_ACTOR_IDS=off — the finding-filed page is OFF, by name",
+           "OFF: the finding-filed page" in text and "FINDING_ACTOR_IDS=off" in text
+           and "ON: the finding-filed page" not in text, text)
+        text = handover_with(mon_doc, ids_f=())
+        ok("handover: a composed config with no finding-job ids — NOT PROVEN, never ON",
+           "NOT PROVEN: the finding-filed page" in text
+           and "ON: the finding-filed page" not in text, text)
+        ok("handover: the finding job's config was READ as the role account, never written",
+           any("poller.json" in s for s in handover_reads) and handover_writes == [],
+           (handover_reads[-1:], handover_writes))
+        import pipeline_finding_poller as _finder
+        _fd = tempfile.mkdtemp(prefix="finding-default-key.", dir=tmp_root)
+        with open(os.path.join(_fd, "poller.json"), "w", encoding="utf-8") as fh:
+            json.dump({"teams": ["KIT"], "owner_user_id": "u", "agent_user_id": "a",
+                       "state_dir": os.path.join(_fd, "state")}, fh)
+        ok("handover: the finding job's config path and default key name are the job's own",
+           FINDING_CONFIG_PATH == "~/.stage-e/finding/poller.json"
+           and FINDING_DEFAULT_KEY_ENV
+           == _finder.load_config(os.path.join(_fd, "poller.json"))["linear_key_env"],
+           (FINDING_CONFIG_PATH, FINDING_DEFAULT_KEY_ENV))
 
         # PINNED (the KIT-178 review round, 2026-09-24): the monitor calls the notifier stale
         # LATER than this installer's own `verify` does, so `verify` is the first to go red.

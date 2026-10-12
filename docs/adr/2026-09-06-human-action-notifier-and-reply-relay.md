@@ -544,6 +544,19 @@ Stage E key's user) like the monitor's ids, and its handover says OFF when `self
 driver's key differ, since every real mark would then be skipped. The "opened" half is still
 not built: it needs the code host, which the notifier does not read.
 
+## Update 2026-10-10 — a filed finding pages (KIT-243)
+
+The finding job files a session's follow-up into the backlog with the owner's own key, so
+Linear notified nobody. It now leaves one comment on the new ticket: the `finding-filed`
+mark on line 1 and the source ticket on line 2. The seen-set records the mark `owed` before
+the post and `posted` after; a pass that leaves one owed exits 1, and the next retries it
+after reading the ticket, so a post whose answer was lost is never made twice.
+
+The notifier accepts `finding-filed` only from `finding_actor_ids`, on the same pattern as
+`ready-to-merge`. It applies no label, and pages once per finding TICKET rather than per
+comment, so a doubled mark still pages once. The installer resolves `FINDING_ACTOR_IDS`
+(default `self`).
+
 ## Update 2026-09-24 — the chat lane is on, and the composer writes (KIT-197, KIT-196)
 
 **The lane was switched on, and kept on.** A deployment turned the conversational lane on on
