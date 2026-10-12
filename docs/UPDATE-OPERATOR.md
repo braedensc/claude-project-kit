@@ -142,8 +142,8 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 
 | Kind | Fires when |
 |---|---|
-| `hooks` | the Stop hook recorded, in the last 24 hours, that it could not tell which worktree a session ran in (`.claude/.stop-pr-nag/session-*__root-unresolved` in each `HOOK_CHECKOUTS` checkout) |
-| `updates` | a dispatcher or Homebrew row of `review` is `BEHIND`, needs a `RESTART`, or is `UNKNOWN`. The kit checkout is listed but never fires: it moves with every merge. Re-measured every 20 hours |
+| `hooks` | the Stop hook recorded, in the last 24 hours, that it could not tell which worktree a session ran in (`.claude/.stop-pr-nag/session-*__root-unresolved` in each `HOOK_CHECKOUTS` checkout). It clears 24 hours after the last such record |
+| `updates` | a dispatcher or Homebrew row of `review` is `BEHIND`, needs a `RESTART`, or is `UNKNOWN`. The kit checkout is listed but never fires: it moves with every merge. Re-measured every 20 hours, and on every pass while its alert is open, so a fix clears it within the hour |
 | `release` | a dispatcher release is newer than the version `DISPATCHER_VERSION` pins |
 | `dispatcher` | the dispatcher has not answered `/version` on this machine for two passes |
 | `front-door` | `PUBLIC_STATUS_URL` has not answered 200 for two passes while the internet answers |
@@ -167,20 +167,21 @@ The job cannot report its own death. The heartbeat monitor pages when the status
 stops changing.
 
 **Asking the tech lead.** Every alert says where the full findings are: the status file. The
-Slack tech lead runs as the dispatcher's account and can read that file, so ask it in the
-channel to explain an alert. Anything that needs `sudo`, `launchctl` or an installer it
-prints for you; it never runs it.
+Slack tech lead runs as the dispatcher's account, which can read that file. Once the chat
+lane's rules name the file (KIT-226, not merged), ask it in the channel to explain an alert.
+Anything that needs `sudo`, `launchctl` or an installer it prints for you; it never runs it.
 
 **Install it**, once, in your own terminal:
 
 ```bash
 python3 scripts/pipeline_watch.py run --dry-run    # what it would say, sending nothing
-python3 scripts/pipeline_watch.py install          # shows a dry pass, then asks for yes
+python3 scripts/pipeline_watch.py install          # shows a pass that sends nothing, then asks for yes
 python3 scripts/pipeline_watch.py status           # the last pass, per kind
 ```
 
 `install` refuses in an agent environment. It records the `brew`, `gh`, `npm` and `git`
-directories your shell has now in the job's `PATH`. Re-run it after moving any of them.
+directories your shell has now in the job's `PATH`. Re-run it after moving any of them. A
+"no" changes nothing: a job already loaded keeps running.
 
 ## What is not proven
 
@@ -189,7 +190,6 @@ directories your shell has now in the job's `PATH`. Re-run it after moving any o
 - That `brew info`'s index is fresh. Homebrew refreshes it on its own schedule, so a
   just-released version can read as current for a while (no ticket yet).
 - The health watch end to end on a real machine: a GitHub issue opened and closed by a live
-  run, and the Slack page through the heartbeat monitor (the monitor reading the status
-  file is the next slice of KIT-236).
+  run, and the Slack page through the heartbeat monitor reading the status file (KIT-218).
 - That a `front-door` probe from this machine sees what the tracker's webhooks see. Both go
   through the same public name, but the tracker connects from elsewhere (no ticket yet).

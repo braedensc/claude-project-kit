@@ -186,7 +186,11 @@ def check_hooks(env, conf):
 def check_updates(env, conf, state):
     now = _now(env)
     cached = state.get("review") or {}
-    if cached.get("at") and now - cached["at"] < UPDATE_REVIEW_EVERY:
+    # While an `updates` alert is open, re-measure every pass, so a fix clears it within the
+    # hour rather than when the cache expires (KIT-249). Healthy, the cache spares the
+    # registry and Homebrew an hourly question.
+    open_alert = ((state.get("kinds") or {}).get("updates") or {}).get("sent") == FIRING
+    if cached.get("at") and now - cached["at"] < UPDATE_REVIEW_EVERY and not open_alert:
         rows = cached.get("rows") or []
     else:
         rows = pu.review_dispatcher(env, conf) + pu.review_brew(env, conf)
@@ -311,6 +315,19 @@ def send_github(env, conf, kind, state, summary):
     started = _now(env)
     argv = ["gh", "workflow", "run", wf, "-R", repo, "--ref", "main", "-f", "kind=" + kind,
             "-f", "state=" + state, "-f", "summary=" + _clip(summary + "\n\n" + diagnose(conf))]
+    list_argv = ["gh", "run", "list", "-R", repo, "--workflow", wf, "--event", "workflow_dispatch",
+                 "--limit", "5", "--json", "databaseId,createdAt"]
+
+    def listed():
+        got = env.runner.read(list_argv, timeout=30)
+        try:
+            return json.loads(got.out) if got.ok else []
+        except ValueError:
+            return []
+    # The runs that exist BEFORE this dispatch are not its run. Without this, a second kind
+    # sent in the same pass could watch the first kind's finished run and count it as its
+    # own, so its own failed run would never be retried (KIT-249).
+    before = set() if env.runner.dry_run else {str(r.get("databaseId")) for r in listed()}
     out = env.runner.write("tell GitHub that %s is %s" % (kind, state), argv, timeout=60)
     if out.skipped:
         return True, "dry run"
@@ -318,14 +335,9 @@ def send_github(env, conf, kind, state, summary):
         return False, "the dispatch was refused: %s" % (out.err or out.out).strip()[:160]
     run_id = None
     for _ in range(RUN_FIND_TRIES):
-        got = env.runner.read(["gh", "run", "list", "-R", repo, "--workflow", wf, "--event",
-                               "workflow_dispatch", "--limit", "5", "--json",
-                               "databaseId,createdAt"], timeout=30)
-        try:
-            runs = json.loads(got.out) if got.ok else []
-        except ValueError:
-            runs = []
-        fresh = [r for r in runs if (_parse_iso(r.get("createdAt")) or 0) >= started - 30]
+        runs = listed()
+        fresh = [r for r in runs if str(r.get("databaseId")) not in before
+                 and (_parse_iso(r.get("createdAt")) or 0) >= started - 30]
         if fresh:
             run_id = str(sorted(fresh, key=lambda r: r.get("createdAt", ""))[-1]["databaseId"])
             break
@@ -439,8 +451,10 @@ def agent_plist(conf, python, kit, path_env, home):
     log = os.path.join(home, ".pipeline-update", "watch.log")
     return {
         "Label": conf["WATCH_LABEL"],
-        "ProgramArguments": [python, os.path.join(kit, "scripts", "pipeline_watch.py"), "run",
-                             "--conf", conf["__source__"]],
+        # `--conf` belongs to the top-level parser, so it goes BEFORE `run`; after it, argparse
+        # refuses it and every pass exits 2 (KIT-249). Absolute, because launchd runs from `/`.
+        "ProgramArguments": [python, os.path.join(kit, "scripts", "pipeline_watch.py"),
+                             "--conf", os.path.abspath(conf["__source__"]), "run"],
         "StartInterval": int(conf["WATCH_INTERVAL_SECONDS"]),
         "RunAtLoad": True,
         "EnvironmentVariables": {"PATH": path_env, "HOME": home},
@@ -469,23 +483,35 @@ def install(env, conf, uninstall_only=False):
     plist = os.path.join(_home(env), "Library", "LaunchAgents", label + ".plist")
     domain = "gui/%d" % os.getuid()
     r = env.runner
-    r.write("stop %s if it is loaded" % label, ["launchctl", "bootout", "%s/%s" % (domain, label)])
+    bootout = ["launchctl", "bootout", "%s/%s" % (domain, label)]
     if uninstall_only:
+        r.write("stop %s if it is loaded" % label, bootout)
         if os.path.exists(plist) and not r.dry_run:
             os.remove(plist)
         say("Uninstalled %s (plist removed: %s)." % (label, plist))
         return EX_OK
-    say("A dry pass first, so you see what the job will report:")
-    run_pass(env, conf, dry_run=True)
+    # The preview sends NOTHING: its runner is put in dry-run mode for the pass, not only the
+    # pass's own bookkeeping. Before KIT-249 it dispatched the alert for real, before the yes.
+    say("A dry pass first, so you see what the job will report. It sends nothing:")
+    saved, r.dry_run = r.dry_run, True
+    try:
+        run_pass(env, conf, dry_run=True)
+    finally:
+        r.dry_run = saved
     doc = agent_plist(conf, sys.executable, KIT, _path_env(), _home(env))
     say("")
     say("The job: %s every %ds, as you, from %s" % (label, doc["StartInterval"], KIT))
     say("  it runs `pipeline_watch.py run`, logs to %s, and changes nothing it reports on." % doc["StandardOutPath"])
     if env.ask("Type yes to install it: ").strip().lower() != "yes":
-        say("Not confirmed. Nothing was installed.")
+        say("Not confirmed. Nothing was installed, and a job already loaded was left running.")
         return EX_FIRING
+    # Only after the yes: a "no" must not leave a working job stopped.
+    r.write("stop %s if it is loaded" % label, bootout)
     if not r.dry_run:
         os.makedirs(os.path.dirname(plist), exist_ok=True)
+        # launchd does not create the log's folder, and a job whose log cannot be opened does
+        # not start (KIT-249).
+        os.makedirs(os.path.dirname(doc["StandardOutPath"]), mode=0o700, exist_ok=True)
         with open(plist, "wb") as fh:
             plistlib.dump(doc, fh)
     boot = r.write("load %s" % label, ["launchctl", "bootstrap", domain, plist])
@@ -566,10 +592,33 @@ def selftest():
         assert not errors, errors
         return c
 
+    class FakeGitHub(se.FakeRunner):
+        """`gh run list` as GitHub answers it: a dispatch's run is listed only AFTER that
+        dispatch. Each successful `gh workflow run` adds one run, shaped like the scripted
+        one, with the next id (newest first, as gh lists them)."""
+
+        def __init__(self, answers):
+            se.FakeRunner.__init__(self, answers)
+            self.dispatched = 0
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            line = se._fmt(argv)
+            if "gh run list" in line:
+                template = next((json.loads(out)[0] for needle, rc, out in self.answers
+                                 if "gh run list" in needle and rc == 0 and json.loads(out)), None)
+                if template is not None:
+                    runs = [dict(template, databaseId=template["databaseId"] + i)
+                            for i in range(self.dispatched)]
+                    return se.Result(0, json.dumps(runs[::-1]), "")
+            res = se.FakeRunner._exec(self, argv, stdin, timeout, cwd)
+            if "gh workflow run" in line and res.rc == 0:
+                self.dispatched += 1
+            return res
+
     def make_env(home, version="0.2.73", latest="0.2.73", door=200, net=200, free_gb=100,
                  gh=(), now=T, answer="yes", environ=None):
         table = [("npm view cyrus-ai version", 0, latest + "\n")] + list(gh)
-        env = pu.Env(runner=se.FakeRunner(table),
+        env = pu.Env(runner=FakeGitHub(table),
                      http=lambda url: {"cyrus_cli_version": version} if version and url.endswith("/version") else None,
                      sleep=lambda s: None, ask=lambda q: answer,
                      environ={} if environ is None else environ, home=home)
@@ -675,6 +724,12 @@ def selftest():
         check("the review is cached for hours, not re-run every pass", cached["state"], FIRING)
         fresh = check_updates(make_env(home, version="0.2.73", now=T + 21 * 3600), c, st)
         check("…and re-measured after the cache expires", fresh["state"], OK)
+        st_open = {"kinds": {"updates": {"sent": FIRING}}}
+        check_updates(make_env(home, version="0.2.69"), c, st_open)
+        st_open["kinds"]["updates"]["sent"] = FIRING
+        check("while an `updates` alert is open, a fix clears it on the next pass, not the "
+              "cache's expiry", check_updates(make_env(home, version="0.2.73", now=T + 3600), c,
+                                              st_open)["state"], OK)
         check("a dispatcher that does not answer is the `dispatcher` kind's, not `updates`'",
               check_updates(make_env(home, version=None), c, {})["state"], OK)
 
@@ -686,6 +741,21 @@ def selftest():
               any("GitHub alerts: OFF" in q for q in quiet), True)
         check("…and with no status file it says the monitor has nothing to read",
               any("HEALTH_STATUS_FILE is empty" in q for q in quiet), True)
+
+        # -- two kinds in one pass each watch their OWN run (KIT-249) -------------------------
+        # `updates` is sent first and its run succeeds; `disk`'s run fails. Before the fix, the
+        # disk send could pick the updates run, which had already succeeded, and record disk as
+        # sent, so its failed run was never retried.
+        two_home = tempfile.mkdtemp(prefix="watch-two-")
+        two_gh = [("gh workflow run", 0, ""),
+                  ("gh run list", 0, json.dumps([{"databaseId": 200, "createdAt": _iso(T + 5)}])),
+                  ("gh run watch 200", 0, ""), ("gh run watch 201", 1, "the run failed")]
+        env = make_env(two_home, version="0.2.69", free_gb=1, gh=two_gh)
+        code = run_pass(env, conf(KIT_CHECKOUT=kit))
+        kinds = load_state(env).get("kinds") or {}
+        check("two kinds sent in one pass: each is judged by its own run",
+              (code, kinds.get("updates", {}).get("sent"), kinds.get("disk", {}).get("sent", OK)),
+              (EX_FAILED, FIRING, OK))
 
         # -- dry run sends and writes nothing ----------------------------------------------
         env = make_env(home, free_gb=1, gh=gh_ok(T + 50000), now=T + 50000)
@@ -708,15 +778,51 @@ def selftest():
               (install(env, c), os.path.exists(os.path.join(home, "Library", "LaunchAgents",
                                                             c["WATCH_LABEL"] + ".plist"))),
               (EX_FIRING, False))
+        # THE PREVIEW SENDS NOTHING (KIT-249). With something firing and GitHub on, the old
+        # preview dispatched the alert before the yes; a "no" then left an issue open that
+        # nothing closes, and a "yes" paged twice.
+        preview_home = tempfile.mkdtemp(prefix="watch-preview-")
+        launchd = [("launchctl bootout", 0, ""), ("launchctl bootstrap", 0, "")]
+        firing_conf = conf(KIT_CHECKOUT=kit)
+        firing_conf["__source__"] = "/kit/update.conf"
+        for answer in ("no", "yes"):
+            env = make_env(preview_home, version="0.2.69", gh=gh_ok(T) + launchd, answer=answer)
+            install(env, firing_conf)
+            check("the install preview sends no alert, answered %s" % answer,
+                  "gh workflow run" in env.runner.applied, False)
+        # A fresh home, so the folder is the install's doing and not an earlier pass's.
+        check("…a yes stops any old job, then loads the new one",
+              [a for a in env.runner.applied if a.startswith("launchctl")],
+              ["launchctl bootout", "launchctl bootstrap"])
+        check("…and creates the folder the job's log goes in (launchd will not)",
+              os.path.isdir(os.path.join(preview_home, ".pipeline-update")), True)
+        env = make_env(preview_home, gh=launchd, answer="no")
+        install(env, c)
+        check("…and a no leaves a job that is already loaded running",
+              "launchctl bootout" in env.runner.applied, False)
         env = make_env(home, gh=[("launchctl bootout", 0, ""), ("launchctl bootstrap", 0, "")])
         code = install(env, c)
         plist = os.path.join(home, "Library", "LaunchAgents", c["WATCH_LABEL"] + ".plist")
         doc = plistlib.load(open(plist, "rb"))
         check("install writes the LaunchAgent and loads it in the user's own domain",
-              (code, doc["StartInterval"], doc["ProgramArguments"][2:4],
+              (code, doc["StartInterval"], doc["ProgramArguments"][2:],
                any(w["argv"][:2] == ["launchctl", "bootstrap"] and w["argv"][2].startswith("gui/")
                    for w in env.runner.writes)),
-              (EX_OK, 3600, ["run", "--conf"], True))
+              (EX_OK, 3600, ["--conf", "/kit/update.conf", "run"], True))
+        # THE JOB'S OWN COMMAND LINE, through the real parser (KIT-249): before this, the plist
+        # put `--conf` after `run`, argparse refused it, and every pass exited 2 while the
+        # assertion above checked that same broken order.
+        job_conf = os.path.join(home, "job.conf")
+        with open(job_conf, "w", encoding="utf-8") as fh:
+            fh.write("".join("%s=%s\n" % (k, v) for k, v in c.items() if not k.startswith("__")))
+        argv = list(doc["ProgramArguments"][2:])
+        argv[1] = job_conf
+        try:
+            parsed = main(argv, env=make_env(tempfile.mkdtemp(prefix="watch-job-")))
+        except SystemExit as exc:
+            parsed = "argparse refused it: exit %s" % exc.code
+        check("the job's command line is one the script accepts, and runs a pass",
+              parsed in (EX_OK, EX_FIRING, EX_UNKNOWN), True)
         check("the job's PATH ends with the system directories",
               doc["EnvironmentVariables"]["PATH"].endswith("/usr/bin:/bin:/usr/sbin:/sbin"), True)
         # launchd runs the job from `/`, so the settings path it is given must be absolute
@@ -734,8 +840,8 @@ def selftest():
             os.chdir(here)
         doc = plistlib.load(open(plist, "rb"))
         check("install with a relative --conf gives the job an absolute settings path",
-              (code, os.path.isabs(doc["ProgramArguments"][4]),
-               os.path.realpath(doc["ProgramArguments"][4])),
+              (code, os.path.isabs(doc["ProgramArguments"][3]),
+               os.path.realpath(doc["ProgramArguments"][3])),
               (EX_OK, True, os.path.realpath(os.path.join(home, "watch-rel.conf"))))
 
     check("the probe names itself: Cloudflare refuses Python's default user agent",
