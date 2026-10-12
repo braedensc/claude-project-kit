@@ -1,0 +1,64 @@
+# bridge.conf.example — every value the Slack bridge installer reads.
+#
+#   cp bridge.conf.example bridge.conf && chmod 600 bridge.conf
+#   $EDITOR bridge.conf                                      # seven values, none secret
+#   python3 scripts/pipeline_bridge_setup.py compose         # read what it builds
+#
+# Then docs/BRIDGE-OPERATOR.md, step by step. The installer reports EVERY bad
+# value in one pass.
+#
+# FORMAT: `KEY=value`, one per line. `#` starts a comment only at the start of a
+# line. Parsed, never sourced. A key set twice is an error naming both lines.
+# NO KEY HERE EVER HOLDS A CREDENTIAL: a value shaped like one is refused, by
+# key name only. The bridge app's token goes in at `token`'s hidden prompt.
+#
+# It runs beside an existing Stage E install: the same role account, its clone
+# of this kit, and its env file, which already holds the owner's tracker key.
+
+# --- Required --------------------------------------------------------------
+
+# The dispatcher's role account. The bridge runs as it (owner decision,
+# 2026-10-10): its own Slack app keeps it apart from the chat bot.
+ROLE_ACCOUNT=_exampledispatch
+
+# That account's clone of this kit, which the job runs from.
+ROLE_KIT_CLONE=~/kit
+
+# The private channel(s) the bridge reads and answers in: the chat bot's
+# channel. Comma-separated. Invite the bridge app to each (card CK-B1).
+CHANNEL_IDS=C0123456789
+
+# The tracker user id of the owner, whose key the bridge acts with.
+OWNER_USER_ID=00000000-0000-4000-8000-000000000001
+
+# The work teams whose tickets the bridge will ask about. Comma-separated.
+TEAM_KEYS=PROD
+
+# The LaunchDaemon label, reverse-DNS.
+JOB_LABEL=com.example.bridge
+
+# The bridge app's own bot user id: its member ID, copied from the app's profile
+# in Slack (card CK-B1). The job refuses any token that answers to another bot.
+BOT_USER_ID=U0123456789
+
+# --- Optional, with their defaults -----------------------------------------
+
+# The only Slack user ids who may answer a question. Empty means any full
+# member of the workspace: guests, bots and other workspaces are always refused.
+#ALLOWED_SLACK_USERS=
+
+# The dispatcher's own env file, where the chat bot's token lives. With it set,
+# `token` also refuses the chat bot's token. It must be a different file from
+# ENV_FILE: the dispatcher hands this one to every session it starts.
+#DISPATCHER_ENV_FILE=
+
+#ENV_FILE=~/.stage-e/env
+# The NAME the bridge app's token is stored under. Never SLACK_BOT_TOKEN, the
+# chat bot's own name.
+#SLACK_TOKEN_ENV=BRIDGE_SLACK_BOT_TOKEN
+# The NAME of the owner's tracker key, which Stage E already stores.
+#LINEAR_KEY_ENV=STAGE_E_LINEAR_API_KEY
+#BRIDGE_CONFIG=~/.stage-e/bridge.json
+#STATE_DIR=~/.stage-e/state
+#INTERVAL_SECONDS=60
+#APP_NAME=Pipeline bridge
