@@ -317,6 +317,25 @@ answer twice.
 
 ---
 
+## Prove it live — card CK-B4
+
+Every action above is tested against stand-ins until you run them for real. The card lists
+each proof with what Good looks like, in the order they become possible:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py card CK-B4
+```
+
+Good: each step held, and its result is a comment on the live-proofs ticket.
+Not that: a step taken on trust. Mark it not proven instead, with its ticket.
+
+Two steps check what the chat lane can read, and neither reads the real env file: a read
+that worked would post the token into Slack. The decoy sits beside the env file, so it proves
+only the rule for the file's copies. The env file's own rule is checked by the chat lane's
+`verify`, whose `user-settings` row measures it.
+
+---
+
 ## Who can answer, and what is refused
 
 The bridge checks every answer with Slack's own records. It refuses:

@@ -28,7 +28,8 @@ question that looked like the bridge's.
               credentials, the job's own dry run passes as the role account, launchd holds
               the job, its heartbeat is fresh, and the notifier's pings file, in
               NOTIFIER_STATE_DIR, is there and is the notifier's (KIT-224).
-    card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off.
+    card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
+              CK-B4 prove it live.
 
 WHO RUNS SUDO. `token`, `install` and `verify` ask for the administrator password once,
 then run sudo themselves: as the role account (`sudo -u`), and as root to write the plist
@@ -314,6 +315,42 @@ CARDS = {
        "again; until line 1 turns it on, the load fails. If line 1 ran, the job is already "
        "loaded, or was unloaded a moment ago. Run verify: if `loaded` passes, you are done. "
        "If not, wait ten seconds and run lines 1 and 2 again."),
+    "CK-B4": ("Prove the bridge live (KIT-227)", [
+        "Plan from Slack: in the chat channel, write \"I want\" and something small. Good: "
+        "the tech lead files one idea and replies `plan <id>`; the bridge asks; after your "
+        "`yes` the idea is in Plan it, its history shows your move at once, and the planner's "
+        "ticket appears within ten minutes.",
+        "Who may answer: on a fresh question, have a second full member, a guest and a bot "
+        "each reply `yes`. Good: only the full member's yes acts, and each refusal is said in "
+        "the thread.",
+        "While the Mac is asleep: ask a question, put the Mac to sleep, reply `yes` from your "
+        "phone, then wake it within 24 hours. Good: the bridge acts on that yes on its first "
+        "pass after waking.",
+        "Approve a plan: once one is filed, `approve <epic id>`, then `yes`. Good: the epic "
+        "moves to Todo, its children start one at a time in order, and each child's session "
+        "starts exactly as when you hand a ticket over yourself.",
+        "Answer a stuck session: when a ping says a session needs a decision, reply under it. "
+        "Good: one comment naming you lands in that session's thread, and it carries on.",
+        "Ready to merge: when Stage E concludes a pull request clean. Good: a ping says it is "
+        "ready to merge and links the pull request.",
+        "What the chat lane can read, with a decoy: run  sudo -u {ROLE_ACCOUNT} -H sh -c "
+        "'echo decoy > {DECOY}'  then ask the tech lead to read {DECOY} . Good: it is "
+        "refused. That proves {COPIES_RULE}, the rule for the env file's sibling copies (a "
+        "writer's temp copy holds the token too). It does not test {ENV_RULE}, the rule for "
+        "the env file itself: the next step checks that one. Then remove the decoy:  sudo -u "
+        "{ROLE_ACCOUNT} -H sh -c 'rm {DECOY}'",
+        "The env file's own rule, without reading the file: run  python3 "
+        "scripts/pipeline_chat_lane_setup.py verify --conf chat-lane.conf . Good: its "
+        "user-settings row is ALREADY-DONE, and the same script's  compose --piece 5 --conf "
+        "chat-lane.conf  lists {ENV_RULE}. That "
+        "row measures every deny rule the chat lane composes, in the role account's user "
+        "settings. The rule is made from chat-lane.conf's ROLE_ENV_FILE, so that must be "
+        "{ENV_FILE}. Do not have the tech lead read the env file itself: a read that worked "
+        "would post the token into Slack.",
+        "Record each result as a comment on the live-proofs ticket, and update your private "
+        "runbook.",
+    ], "every step above held, and each result is a comment on the live-proofs ticket.",
+       "a step taken on trust: mark it not proven instead, with its ticket."),
     "CK-B3": ("Turn the bridge off", [
         "sudo launchctl bootout system/{JOB_LABEL}",
         "sudo launchctl disable system/{JOB_LABEL}",
@@ -323,10 +360,17 @@ CARDS = {
 
 
 def card_values(conf, conf_path):
+    # The chat lane's own rule spelling (KIT-227 review): the card names the rules that
+    # composer writes for this env file, never a guess at them.
+    import pipeline_chat_lane_setup as chat_lane
     conf = conf or dict((k, d or "<%s>" % k) for k, (d, _doc) in CONF_KEYS.items())
     return {"APP_NAME": conf["APP_NAME"], "JOB_LABEL": conf["JOB_LABEL"],
+            "ROLE_ACCOUNT": conf["ROLE_ACCOUNT"],
             "PLIST": plist_path(conf), "SELF": os.path.abspath(__file__),
-            "CONF": conf_path}
+            "CONF": conf_path, "ENV_FILE": conf["ENV_FILE"],
+            "DECOY": conf["ENV_FILE"] + ".decoy-proof",
+            "ENV_RULE": chat_lane._path_rule(conf["ENV_FILE"]),
+            "COPIES_RULE": chat_lane._path_rule(conf["ENV_FILE"] + ".*")}
 
 
 def print_card(cid, conf=None, conf_path=DEFAULT_CONF):
@@ -934,6 +978,41 @@ def selftest():
         check("card-b2-enables-before-it-loads",
               0 <= b2.find("launchctl enable system/") < b2.find("launchctl bootstrap system"),
               True)
+        # KIT-227: the live proofs, one card the owner runs, filled from the conf.
+        _ck4 = cap(print_card, "CK-B4", conf)[1]
+        for needle in ("I want", "history shows your move", "guest", "asleep",
+                       "approve", "one at a time", "needs a decision", "ready to merge",
+                       "env.decoy-proof", "sudo -u _exdispatch -H sh -c", "Record"):
+            check("live-proofs-card-says:" + needle, needle in _ck4, True)
+        check("live-proofs-card-never-reads-the-real-env-file",
+              ("cat ~/.stage-e/env " not in _ck4 and "read ~/.stage-e/env " not in _ck4
+               and "sh -c 'rm ~/.stage-e/env.decoy-proof'" in _ck4), True)
+        # KIT-227 review: the decoy is filled from ENV_FILE and is said to prove the rule
+        # for the env file's sibling copies only. The env file's own rule is checked
+        # without reading it, by the chat lane's verify row that measures it. The only
+        # file the tech lead is asked to read is the decoy.
+        import pipeline_chat_lane_setup as chat_lane
+        for env in ("~/.stage-e/env", "/srv/role/bridge.env"):
+            vconf, verrs = validate_conf(dict(values, ENV_FILE=env, DISPATCHER_ENV_FILE=""))
+            card = cap(print_card, "CK-B4", vconf)[1]
+            decoy = env + ".decoy-proof"
+            own, copies = chat_lane._path_rule(env), chat_lane._path_rule(env + ".*")
+            asked = [a.rstrip(".,") for a in re.findall(r"ask the tech lead to read (\S+)",
+                                                         card)]
+            check("live-proofs-card-decoy-from-ENV_FILE:" + env,
+                  (verrs, asked, "echo decoy > %s'" % decoy in card,
+                   "sh -c 'rm %s'" % decoy in card), ([], [decoy], True, True))
+            check("live-proofs-card-says-what-the-decoy-proves:" + env,
+                  ("proves %s" % copies in card, "does not test %s" % own in card,
+                   "same rule" in card), (True, True, False))
+            check("live-proofs-card-checks-the-env-files-own-rule-by-verify:" + env,
+                  ("pipeline_chat_lane_setup.py verify" in card, "user-settings" in card,
+                   "lists %s" % own in card), (True, True, True))
+            check("live-proofs-card-rules-are-the-chat-lanes:" + env,
+                  [r in chat_lane.user_deny_patterns({"ROLE_ENV_FILE": env})
+                   for r in (own, copies)], [True, True])
+            check("live-proofs-card-names-no-other-env-file:" + env,
+                  env == "~/.stage-e/env" or "~/.stage-e/env" not in card, True)
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
             "PIECE 1", "PIECE 2", "PIECE 3", "ACT=no"))), (EX_OK, True))
