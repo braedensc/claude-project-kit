@@ -217,7 +217,10 @@ setting its own lifecycle labels is a session editing its own supervision.
 **Never move anything to `ready`.** Tickets land in the backlog and a human approves
 them. The human's single approving action is on the **epic**: downstream auto-approval of
 `epic/*` children requires the referenced epic to be in a human-approved state, so
-approving the epic is what releases the tree — and it is the human's to make, not yours.
+approving the epic is what lets the approve step move its children to `ready` — and it is
+the human's to make, not yours. That step is off by default, and then approving moves no
+child. Either way, approving starts no work: a child starts only when it is delegated to
+the agent, and only after the children it depends on.
 
 **Re-runnable:** before creating, search the project for issues with the same title or
 the same `epic/<EPIC-ID>` provenance and skip the ones that exist. If a create fails
@@ -292,7 +295,9 @@ Every difference from the interactive path, step by step:
 
 The epic is **`provenance:agent`, not `provenance:human`**: a session drafted it, so by §5
 it never auto-approves. The human gate is the same on both paths — move the epic to the
-state the project maps to `ready` (§5 rule 2) to release the tree.
+state the project maps to `ready` (§5 rule 2) to approve the tree. Only the approve step
+reads that move, and only where it is switched on. With it off, the move changes no
+child. Either way, a child starts only when it is delegated.
 
 The interactive path stays the default. The unattended path is what a planning dispatcher
 entry runs, and it is the only way a session with no tracker tool reaches the board.
