@@ -109,6 +109,9 @@ CONF_KEYS = (
     "DISPATCHER_PACKAGE", "DISPATCHER_VERSION", "DISPATCHER_NODE_SETUP",
     "DISPATCHER_SENTRY", "DISPATCHER_FORBIDDEN_ENV",
     "BREW_CASKS", "BREW_FORMULAE", "BREW_RESTARTS", "KIT_CHECKOUT",
+    # The health watch (scripts/pipeline_watch.py, KIT-236) reads these too.
+    "HEALTH_STATUS_FILE", "ALERT_REPO", "ALERT_WORKFLOW", "PUBLIC_STATUS_URL",
+    "DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS", "WATCH_LABEL", "HOOK_CHECKOUTS",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -121,6 +124,14 @@ CONF_DEFAULTS = {
     "BREW_FORMULAE": "",
     "BREW_RESTARTS": "",
     "KIT_CHECKOUT": "",
+    "HEALTH_STATUS_FILE": "",
+    "ALERT_REPO": "",
+    "ALERT_WORKFLOW": "pipeline-alert.yml",
+    "PUBLIC_STATUS_URL": "",
+    "DISK_FLOOR_GB": "20",
+    "WATCH_INTERVAL_SECONDS": "3600",
+    "WATCH_LABEL": "local.pipeline-health-watch",
+    "HOOK_CHECKOUTS": "",
 }
 DISPATCHER_KEYS = ("DISPATCHER_SERVICE", "ROLE_ACCOUNT", "DISPATCHER_ENV_FILE")
 CONF_UNEDITED = {"DISPATCHER_SERVICE": "com.example.dispatcher",
@@ -245,6 +256,27 @@ def validate_conf(values):
     kit = conf.get("KIT_CHECKOUT", "")
     if kit and not kit.startswith("/"):
         errors.append("KIT_CHECKOUT must be an absolute path (got %r)" % kit)
+    status = conf.get("HEALTH_STATUS_FILE", "")
+    if status and not status.startswith("/"):
+        errors.append("HEALTH_STATUS_FILE must be an absolute path (got %r)" % status)
+    repo = conf.get("ALERT_REPO", "")
+    if repo and not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
+        errors.append("ALERT_REPO must be owner/repo (got %r)" % repo)
+    if not re.match(r"^[A-Za-z0-9_.-]+\.ya?ml$", conf.get("ALERT_WORKFLOW", "")):
+        errors.append("ALERT_WORKFLOW must be a workflow file name (got %r)" % conf.get("ALERT_WORKFLOW"))
+    url = conf.get("PUBLIC_STATUS_URL", "")
+    if url and not url.startswith("https://"):
+        errors.append("PUBLIC_STATUS_URL must be an https:// URL (got %r)" % url)
+    for key in ("DISK_FLOOR_GB", "WATCH_INTERVAL_SECONDS"):
+        if not conf.get(key, "").isdigit() or int(conf[key]) <= 0:
+            errors.append("%s must be a positive whole number (got %r)" % (key, conf.get(key)))
+    if conf.get("WATCH_INTERVAL_SECONDS", "").isdigit() and int(conf["WATCH_INTERVAL_SECONDS"]) < 600:
+        errors.append("WATCH_INTERVAL_SECONDS below 600 checks the package registry far too often")
+    if not se._RDNS_RE.match(conf.get("WATCH_LABEL", "")):
+        errors.append("WATCH_LABEL %r is not a reverse-DNS launchd label" % conf.get("WATCH_LABEL"))
+    for path in split_list(conf.get("HOOK_CHECKOUTS")):
+        if not path.startswith("/"):
+            errors.append("HOOK_CHECKOUTS entry %r must be an absolute path" % path)
     return conf, errors
 
 

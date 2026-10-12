@@ -62,3 +62,34 @@ BREW_RESTARTS=
 # command runs from.  On a pipeline machine that should be the one the hooks
 # run from: every session's guards are read from that checkout.
 KIT_CHECKOUT=
+
+# --- The health watch (scripts/pipeline_watch.py) --------------------------
+# One hourly pass of the checks in docs/UPDATE-OPERATOR.md, "The health
+# watch". It alerts only when a kind CHANGES between firing and ok.
+
+# The status file the heartbeat monitor reads (the Slack path). It must sit
+# where the dispatcher's role account can read it, so not in your home:
+# /Users/Shared is the macOS place for that. Empty: no status file, and the
+# monitor has nothing to read (every pass says so).
+HEALTH_STATUS_FILE=
+
+# The PRIVATE repo whose `pipeline-alert.yml` (templates/workflows/) opens and
+# closes one issue per kind as github-actions[bot]. Never a public repo: the
+# alert text carries machine state. Empty: GitHub alerts are OFF (said every pass).
+ALERT_REPO=
+ALERT_WORKFLOW=pipeline-alert.yml
+
+# The dispatcher's public status URL, through the front door and tunnel.
+# Empty: not checked.
+PUBLIC_STATUS_URL=
+
+# Free space on / below which `disk` fires, in GB.
+DISK_FLOOR_GB=20
+
+# How often the LaunchAgent runs a pass, in seconds (600 or more).
+WATCH_INTERVAL_SECONDS=3600
+WATCH_LABEL=local.pipeline-health-watch
+
+# The checkouts whose hooks may leave a "could not tell which worktree"
+# record, comma-separated. Empty: KIT_CHECKOUT (or this kit).
+HOOK_CHECKOUTS=

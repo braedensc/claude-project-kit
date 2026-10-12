@@ -402,6 +402,12 @@ jobs:
       - name: Review-and-update selftest (UNKNOWN is not current, agent-refused, safe order)
         run: python3 scripts/pipeline_update.py --selftest
 
+      # The health watch (scripts/pipeline_watch.py, KIT-236): one page per problem and one
+      # per recovery; a single bad pass, or no internet, never pages; a GitHub run that
+      # failed is not recorded as sent; the status file the monitor reads is world-readable.
+      - name: Health watch selftest (alert on change, debounced, delivery checked)
+        run: python3 scripts/pipeline_watch.py --selftest
+
       # The union check (pr-union-check.yml): a check and the fixture it rejects, each green
       # alone, are red together and bisected to the PR that joined last; a textual conflict
       # inside the union is skipped by name; the cap skips loudly; could-not is its own
