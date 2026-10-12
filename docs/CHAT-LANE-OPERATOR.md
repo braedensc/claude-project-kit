@@ -876,6 +876,10 @@ These came out of reading the dispatcher's source for this build.
   whether any user-level rule can take that server away from the chat lane (KIT-162).
 - That the anchored deny rules block a `Read` in a chat session. This rests on Claude Code's
   permissions page, not on a live test (KIT-174).
+- That a private key beside a trust file stays unreadable once the trust file is allowed.
+  The push it unblocks was seen live, on 2026-10-12. No session has tried to read the key,
+  because the kit's own guard refuses a command that names a `.pem` file. This rests on the
+  exact-file shape, and on `trust-files` failing on a glob or a folder entry (KIT-257).
 - That the port rule refuses a second device. Card `CK-C4` measures it (KIT-117).
 - That the chat bot follows its rules (piece 8) over the dispatcher's built-in prompt. A
   CLAUDE.md is a strong instruction, not a guard. The first live idea is the test (KIT-227).
