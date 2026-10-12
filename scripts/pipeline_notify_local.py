@@ -62,6 +62,13 @@ WHAT THIS IS
   The budget-spent page needs nothing new: the bounce driver's exhaustion comment opens
   with `agent:needs-human`, which is accepted from any author.
 
+  THE FINDING-FILED MARK (KIT-243) tells the owner a session's follow-up was filed. The
+  finding job writes it on the NEW ticket, under the owner's key, so Linear itself notifies
+  nobody. It is accepted only from `finding_actor_ids`, on the same pattern: optional, OFF and
+  said while unset, deferred not dropped, a forgery named. It carries no label, and the page
+  names and links the finding. It pages ONCE PER FINDING TICKET, keyed on the ticket and not
+  the comment: a mark the job wrote twice still pages once.
+
 WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script asserts it)
 
   It never merges, never approves, never enables auto-merge, and never labels a pull request.
@@ -317,6 +324,9 @@ HEALTH_MARKS = (ESC_HEALTH_INCIDENT, ESC_HEALTH_RECOVERED)
 # The bounce driver's page (KIT-225). Accepted only from `bounce_actor_ids`.
 ESC_READY_TO_MERGE = "ready-to-merge"
 READY_MARKS = (ESC_READY_TO_MERGE,)
+# The finding job's page (KIT-243). Accepted only from `finding_actor_ids`.
+ESC_FINDING_FILED = "finding-filed"
+FINDING_MARKS = (ESC_FINDING_FILED,)
 # The only shape a ready-to-merge page may link: a pull request on the code host, whole.
 PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$")
 
@@ -366,6 +376,11 @@ MARKS = {
         "label": None,
         "why_no_label": "a merge is a person's act, not a block",
     },
+    ESC_FINDING_FILED: {
+        "moment": "A session's finding was filed for you",
+        "label": None,
+        "why_no_label": "a backlog ticket for a person to read, not a block",
+    },
 }
 
 # The mark as every producer writes it, matched on a body's FIRST line only.
@@ -380,7 +395,7 @@ MARK_RE = re.compile(
 # GitHub-Actions lane already publishes, kept so the two lanes never disagree.
 MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_BLOCKED, ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
-                   ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE]
+                   ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE, ESC_FINDING_FILED]
 
 # Deliberately NOT a mark. The plan executor writes it on informational notes; paging on it
 # would turn every filed plan's footnote into a notification.
@@ -406,6 +421,9 @@ CONFIG_KEYS = {
     "bounce_actor_ids": "actor ids allowed to author the ready-to-merge mark (the bounce "
                         "driver's tracker author). Optional: unset, that mark is accepted "
                         "from nobody and every pass says 'ready-to-merge marks: OFF'",
+    "finding_actor_ids": "actor ids allowed to author the finding-filed mark (the finding "
+                         "job's tracker author). Optional: unset, that mark is accepted from "
+                         "nobody and every pass says 'finding-filed marks: OFF'",
     "max_events_per_pass": "flood guard; above it the pass sends one summary and declines",
     "lookback_comments": "how many recent comments per ticket to examine",
     "run_timeout_seconds": "wall clock for one pass; exceeding it is exit 4, not exit 1",
@@ -447,6 +465,7 @@ EXAMPLE_CONFIG = {
     "executor_actor_ids": ["<plan-executor actor uuid>"],
     "monitor_actor_ids": ["<heartbeat-monitor author uuid>"],
     "bounce_actor_ids": ["<bounce-driver author uuid>"],
+    "finding_actor_ids": ["<finding-job author uuid>"],
     "max_events_per_pass": 25,
     "lookback_comments": 20,
     "run_timeout_seconds": 240,
@@ -516,6 +535,7 @@ def load_config(path):
         # never quietly read as one author id per character.
         "monitor_actor_ids": raw.get("monitor_actor_ids", []),
         "bounce_actor_ids": raw.get("bounce_actor_ids", []),
+        "finding_actor_ids": raw.get("finding_actor_ids", []),
         "max_events_per_pass": raw.get("max_events_per_pass") or 25,
         "lookback_comments": raw.get("lookback_comments") or 20,
         "run_timeout_seconds": raw.get("run_timeout_seconds") or 240,
@@ -583,6 +603,12 @@ def load_config(path):
         errors.append(
             "config 'bounce_actor_ids' must be a list of the bounce driver's tracker author "
             "id(s), or absent to leave the ready-to-merge mark OFF, got %r" % (bouncers,))
+    finders = cfg["finding_actor_ids"]
+    if not isinstance(finders, list) or not all(isinstance(a, str) and a.strip()
+                                                for a in finders):
+        errors.append(
+            "config 'finding_actor_ids' must be a list of the finding job's tracker author "
+            "id(s), or absent to leave the finding-filed mark OFF, got %r" % (finders,))
 
     # The relay switch is a real boolean or it is refused: the string "false" is truthy, and
     # reading it as ON would start relaying on a config that says off.
@@ -964,6 +990,11 @@ def event_id(comment_id):
     return "comment:%s" % comment_id
 
 
+def finding_event_id(ticket_uuid):
+    """The finding-filed mark's dedupe key: one notification per finding TICKET, forever."""
+    return "finding:%s" % ticket_uuid
+
+
 def ticket_url(cfg, ticket_id):
     return cfg["ticket_url_template"].replace("{id}", ticket_id)
 
@@ -993,6 +1024,8 @@ def is_authorised(mark, author_id, cfg):
         allowed = cfg.get("monitor_actor_ids") or []
     elif mark in READY_MARKS:
         allowed = cfg.get("bounce_actor_ids") or []
+    elif mark in FINDING_MARKS:
+        allowed = cfg.get("finding_actor_ids") or []
     else:
         allowed = cfg.get("executor_actor_ids") or []
     return bool(author_id) and author_id in allowed
@@ -1006,6 +1039,8 @@ HEALTH_UNAUTHORISED_SKIP = "daemon-health mark from an author not in monitor_act
 HEALTH_OFF_SKIP = "daemon-health mark while monitor_actor_ids is unset (OFF)"
 READY_UNAUTHORISED_SKIP = "ready-to-merge mark from an author not in bounce_actor_ids"
 READY_OFF_SKIP = "ready-to-merge mark while bounce_actor_ids is unset (OFF)"
+FINDING_UNAUTHORISED_SKIP = "finding-filed mark from an author not in finding_actor_ids"
+FINDING_OFF_SKIP = "finding-filed mark while finding_actor_ids is unset (OFF)"
 
 
 def ready_link(body):
@@ -1104,13 +1139,22 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                     skipped.append((tid, cid, "%s: from author %s — not paged"
                                     % (READY_UNAUTHORISED_SKIP,
                                        comment.get("author_id") or "(none)")))
+                elif mark in FINDING_MARKS and not cfg.get("finding_actor_ids"):
+                    skipped.append((tid, cid, "%s — not paged" % FINDING_OFF_SKIP))
+                elif mark in FINDING_MARKS:
+                    skipped.append((tid, cid, "%s: from author %s — not paged"
+                                    % (FINDING_UNAUTHORISED_SKIP,
+                                       comment.get("author_id") or "(none)")))
                 else:
                     skipped.append((tid, cid,
                                     "mark %s from an unauthorised author — only the configured "
                                     "executor may produce it" % mark))
                 continue
 
-            key = event_id(cid)
+            # A finding pages once per TICKET (KIT-243): the job may write its mark twice
+            # when a post's answer is lost, and the second copy must not page again.
+            key = (finding_event_id(ticket.get("uuid") or tid) if mark in FINDING_MARKS
+                   else event_id(cid))
             if key in emitted:
                 skipped.append((tid, cid, "duplicate within this pass"))
                 continue
@@ -1968,6 +2012,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         problems.append("%d ready-to-merge mark(s) NOT paged — %s" % (
             len(ready_forged), "; ".join("%s comment %s: %s" % s for s in ready_forged)))
     ready_off = [s for s in skipped if (s[2] or "").startswith(READY_OFF_SKIP)]
+    # …and for the finding job's finding-filed mark (KIT-243).
+    finding_forged = [s for s in skipped
+                      if (s[2] or "").startswith(FINDING_UNAUTHORISED_SKIP)]
+    if finding_forged:
+        problems.append("%d finding-filed mark(s) NOT paged — %s" % (
+            len(finding_forged), "; ".join("%s comment %s: %s" % s for s in finding_forged)))
+    finding_off = [s for s in skipped if (s[2] or "").startswith(FINDING_OFF_SKIP)]
 
     for event in events:
         try:
@@ -2165,6 +2216,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         summary += (" | ready-to-merge marks: OFF (bounce_actor_ids is unset) — %d seen, not "
                     "paged yet: each pages once bounce_actor_ids is set, if it is still among "
                     "the newest comments read" % len(ready_off))
+    if cfg.get("finding_actor_ids"):
+        summary += (" | finding-filed marks: ON, from %d finding-job author id(s)"
+                    % len(cfg["finding_actor_ids"]))
+    else:
+        summary += (" | finding-filed marks: OFF (finding_actor_ids is unset) — %d seen, not "
+                    "paged yet: each pages once finding_actor_ids is set, if it is still among "
+                    "the newest comments read" % len(finding_off))
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -2312,10 +2370,10 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all nine ADR marks are known", set(MARKS) == {
+    ok("all ten ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
         ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
-        "ready-to-merge"},
+        "ready-to-merge", "finding-filed"},
        sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
@@ -2717,6 +2775,82 @@ def selftest():
            and not is_authorised(READY, EXEC, cfg_r)
            and not any(is_authorised(m, BOUNCER, cfg_r) for m in planning + (HEALTH_IN,)),
            [(m, is_authorised(m, BOUNCER, cfg_r)) for m in planning])
+
+        # ── §7j. The finding job's finding-filed mark (KIT-243) ─────────────────────
+        # Accepted only from `finding_actor_ids`; unset, from nobody, and the pass says OFF.
+        # The page names the FINDING (the ticket the mark sits on) and links it. One page per
+        # finding ticket, however many marks it carries: a doubled comment pages once.
+        FOUND = "finding-filed"
+        FINDER = "finding-actor-1"
+        cfg_f = load_config_from(dict(good, finding_actor_ids=[FINDER]), tmp)
+        cfg_f_off = load_config_from(dict((k, v) for k, v in good.items()
+                                          if k != "finding_actor_ids"), tmp)
+        try:
+            load_config_from(dict(good, finding_actor_ids="self"), tmp)
+            ok("a finding_actor_ids that is not a list is refused by name", False)
+        except NotifierError as exc:
+            ok("a finding_actor_ids that is not a list is refused by name",
+               "'finding_actor_ids' must be a list" in str(exc), str(exc))
+
+        def found_tkt(tid, cids, author=FINDER):
+            return [{"id": tid, "uuid": "u-" + tid, "title": "Stale comment in the poller",
+                     "label_ids": [],
+                     "comments": [{"id": cid, "body": marker(FOUND) + "\nKIT-7",
+                                   "author_id": author,
+                                   "created_at": "2026-10-10T12:0%d:00.000Z" % n}
+                                  for n, cid in enumerate(cids)]}]
+        chat_f1, tracker_f1 = _FakeChat(), _FakeTracker(found_tkt("KIT-40", ["f1"]))
+        res_f1 = run_once(cfg_f, tracker_f1, chat_f1, False, out=buf)
+        res_f2 = run_once(cfg_f, _FakeTracker(found_tkt("KIT-40", ["f1"])), _FakeChat(),
+                          False, out=buf)
+        ok("a finding-filed mark from the finding job pings once, names the finding and "
+           "links it",
+           len(chat_f1.posts) == 1 and "finding was filed" in chat_f1.posts[0]
+           and "KIT-40" in chat_f1.posts[0]
+           and "https://linear.app/example/issue/KIT-40" in chat_f1.posts[0]
+           and res_f1["exit"] == EXIT_OK and res_f2["sent"] == 0,
+           (chat_f1.posts, res_f1["summary"]))
+        ok("…applies no label", tracker_f1.labels == [], tracker_f1.labels)
+        ok("…and the pass says the finding-filed marks are on",
+           "finding-filed marks: ON" in res_f1["summary"], res_f1["summary"])
+        chat_fd = _FakeChat()
+        res_fd = run_once(cfg_f, _FakeTracker(found_tkt("KIT-41", ["fd1", "fd2"])), chat_fd,
+                          False, out=buf)
+        ok("a finding whose mark was written twice still pages ONCE",
+           len(chat_fd.posts) == 1 and res_fd["exit"] == EXIT_OK,
+           (chat_fd.posts, res_fd["summary"]))
+        chat_fd2 = _FakeChat()
+        run_once(cfg_f, _FakeTracker(found_tkt("KIT-41", ["fd1", "fd2", "fd3"])), chat_fd2,
+                 False, out=buf)
+        ok("…and a third copy on a later pass pages nobody", chat_fd2.posts == [],
+           chat_fd2.posts)
+        forged_f = found_tkt("KIT-42", ["f3"], author="a-session")
+        chat_ff, tracker_ff = _FakeChat(), _FakeTracker(forged_f)
+        res_ff = run_once(cfg_f, tracker_ff, chat_ff, False, out=buf)
+        named_f = all(t in res_ff["summary"] for t in ("KIT-42", "f3", "a-session"))
+        ok("a forged finding-filed mark is NAMED, pages nobody, and changes no exit code",
+           named_f and chat_ff.posts == [] and res_ff["exit"] == EXIT_OK
+           and "finding-filed mark(s) NOT paged" in res_ff["summary"], res_ff["summary"])
+        chat_fo = _FakeChat()
+        res_fo = run_once(cfg_f_off, _FakeTracker(found_tkt("KIT-43", ["f4"])), chat_fo,
+                          False, out=buf)
+        ok("with finding_actor_ids unset, the pass says finding-filed marks are OFF, saw one, "
+           "and paged nobody",
+           "finding-filed marks: OFF" in res_fo["summary"] and "1 seen" in
+           res_fo["summary"].split("finding-filed marks: OFF", 1)[1] and chat_fo.posts == [],
+           res_fo["summary"])
+        chat_fo2 = _FakeChat()
+        run_once(cfg_f, _FakeTracker(found_tkt("KIT-43", ["f4"])), chat_fo2, False, out=buf)
+        ok("…DEFERRED, not dropped: the first pass with the key set pages it",
+           len(chat_fo2.posts) == 1 and "KIT-43" in chat_fo2.posts[0], chat_fo2.posts)
+        ok("the gate is its own: the finding job writes only its own mark, and nobody else "
+           "writes it",
+           is_authorised(FOUND, FINDER, cfg_f)
+           and not is_authorised(FOUND, EXEC, cfg_f)
+           and not is_authorised(FOUND, BOUNCER, dict(cfg_f, bounce_actor_ids=[BOUNCER]))
+           and not any(is_authorised(m, FINDER, cfg_f)
+                       for m in planning + (HEALTH_IN, READY)),
+           [(m, is_authorised(m, FINDER, cfg_f)) for m in planning])
 
         # The REAL tracker read asks for each comment's time and keeps it, so that order is
         # the tracker's own and not a fixture's.

@@ -58,10 +58,25 @@ source's **project** when it has one, with:
 
 It then records the source comment id in its seen-set, links the new ticket to its source
 with one `related` link (never a parent, so a finding never reads as part of an approved
-tree), and posts a `Filed as <ID>` receipt on the source ticket. Its **only** Linear writes
-are that `issueCreate`, that `issueRelationCreate`, and `commentCreate` for the receipt and
-the cap note below. It trusts a finding **only** from the configured agent user, so an
-outside commenter cannot inject one.
+tree), and posts a `Filed as <ID>` receipt on the source ticket. It also leaves one comment
+on the new ticket, which is how you hear about it (next section). Its **only** Linear writes
+are that `issueCreate`, that `issueRelationCreate`, and `commentCreate` for the receipt, the
+page mark and the cap note below. It trusts a finding **only** from the configured agent
+user, so an outside commenter cannot inject one.
+
+## How you hear about a finding (KIT-243)
+
+The poller writes with your own key, so Linear tells you nothing about the tickets it files.
+So it leaves one comment on each new ticket. Its first line is the `finding-filed` mark. Its
+second line names the source ticket. The notifier pages on that mark once per finding, with
+a link to the new ticket. It accepts the mark only from `FINDING_ACTOR_IDS`
+(`docs/NOTIFIER-OPERATOR.md`).
+
+- The seen-set records the mark as `owed` before the post, and `posted` after it.
+- A post that fails leaves it owed, and the pass exits 1. The next pass retries it.
+- A retry reads the ticket first. A post that landed but lost its answer is recorded, never
+  made twice. Only a mark written by the poller's own key counts.
+- A finding filed before this existed carries no mark, and is never paged after the fact.
 
 ## Which comments a pass reads
 
@@ -119,7 +134,7 @@ than that window are not re-asked for until the file is repaired or removed.
 
 | File | What it says |
 | --- | --- |
-| `seen.json` | every source comment already filed or declined, and each cap note posted. **The dedup authority** — do not delete |
+| `seen.json` | every source comment already filed or declined, each cap note posted, and whether each finding's page mark was posted. **The dedup authority** — do not delete |
 | `watermarks.json` | how far each team has been read and resolved |
 | `heartbeat.json` | when the last pass ran, and what it decided |
 
@@ -128,8 +143,9 @@ reads every Stage E daemon: `result` is `ok`, `error` or `usage`, beside `exit_c
 `started_at`, `ended_at`, and this poller's `filed` / `skipped` counts.
 
 Exit codes: **0** the pass ran (even if it filed nothing) · **1** the pass could not
-complete, or a cap note it owes could not be posted (the heartbeat's `error` names the
-ticket) · **2** bad arguments, an unreadable or invalid config, or a missing credential.
+complete, a cap note it owes could not be posted, or a filed finding's page mark is still
+owed (the heartbeat's `error` names which) · **2** bad arguments, an unreadable or
+invalid config, or a missing credential.
 
 ## Enabling it (operator)
 

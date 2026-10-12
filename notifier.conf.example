@@ -136,3 +136,10 @@ MONITOR_ACTOR_IDS=self
 # mark with the Stage E key, so `self` is right when both use one key.
 # The mark carries no label.  Anything holding that key can write one.
 BOUNCE_ACTOR_IDS=self
+
+# Who may author the finding job's finding-filed mark: the page that says a
+# session's follow-up was filed into the backlog for you (KIT-243).
+# Same values as above.  The finding job writes the mark with the Stage E
+# key, so `self` is right when both use one key.
+# The mark carries no label.  Anything holding that key can write one.
+FINDING_ACTOR_IDS=self
