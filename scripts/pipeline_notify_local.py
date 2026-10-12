@@ -281,6 +281,9 @@ EXIT_TIMEOUT = 4
 HEARTBEAT_SCHEMA = "pipeline-notifier-heartbeat/1"
 SEEN_SCHEMA = "pipeline-notifier-seen/1"
 RELAY_SCHEMA = "pipeline-notifier-relay/1"
+# KIT-224: the pings the Slack bridge may answer, recorded here because the bridge holds no
+# notifier token and the notifier holds no bridge token. The bridge reads this file.
+BRIDGE_PINGS_SCHEMA = "pipeline-notifier-bridge-pings/1"
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 
@@ -432,6 +435,11 @@ CONFIG_KEYS = {
                    "zero new writes. On needs the groups:history chat scope",
     "owner_chat_user_id": "the ONE chat user whose replies are relayed (U + 8 or more "
                           "capitals/digits); required only with reply_relay on",
+    "bridge_pings": "true records each agent:blocked ping's chat message, ticket and session "
+                    "thread in notifier-bridge-pings.json beside the seen-set, so the Slack "
+                    "bridge can answer it in the relay's place (KIT-224). The file is written "
+                    "on the first pass, before any ping. false (the default) records "
+                    "nothing. Never together with reply_relay",
     "relay_max_chars": "a longer reply is logged and dropped, never truncated (default 1000)",
     "relay_max_per_hour": "relays above this in a trailing hour are logged and dropped "
                           "(default 6)",
@@ -542,6 +550,7 @@ def load_config(path):
         # The relay keys take `raw.get(key, default)`, not `or`: a 0 cap or a "false" string
         # must be a named error, never quietly swapped for the default.
         "reply_relay": raw.get("reply_relay", False),
+        "bridge_pings": raw.get("bridge_pings", False),
         "owner_chat_user_id": raw.get("owner_chat_user_id", ""),
         "relay_max_chars": raw.get("relay_max_chars", DEFAULT_RELAY_MAX_CHARS),
         "relay_max_per_hour": raw.get("relay_max_per_hour", DEFAULT_RELAY_MAX_PER_HOUR),
@@ -609,6 +618,16 @@ def load_config(path):
         errors.append(
             "config 'finding_actor_ids' must be a list of the finding job's tracker author "
             "id(s), or absent to leave the finding-filed mark OFF, got %r" % (finders,))
+
+    # KIT-224: the bridge answers stuck sessions in the relay's place. Two jobs answering
+    # the same ping would post the same answer twice, so the two switches never both hold.
+    if not isinstance(cfg["bridge_pings"], bool):
+        errors.append("config 'bridge_pings' must be true or false, got %r"
+                      % (cfg["bridge_pings"],))
+    elif cfg["bridge_pings"] and cfg["reply_relay"] is True:
+        errors.append("config 'bridge_pings' and 'reply_relay' are both on — two jobs would "
+                      "answer the same ping. The Slack bridge replaces the relay (KIT-224): "
+                      "turn 'reply_relay' off")
 
     # The relay switch is a real boolean or it is refused: the string "false" is truthy, and
     # reading it as ON would start relaying on a config that says off.
@@ -777,6 +796,46 @@ def load_relay(cfg):
             "replies": dict(doc.get("replies") or {}),
             "relays": list(doc.get("relays") or []),
             "unrelayable": dict(doc.get("unrelayable") or {})}
+
+
+def bridge_pings_path(cfg):
+    return os.path.join(cfg["state_dir"], "notifier-bridge-pings.json")
+
+
+def load_bridge_pings(cfg):
+    """The pings recorded for the Slack bridge (KIT-224). Read ONLY with `bridge_pings` on.
+    A MISSING file records nothing yet; a CORRUPT one refuses the pass before anything is
+    sent, since a ping sent without its record could never be answered."""
+    path = bridge_pings_path(cfg)
+    if not os.path.exists(path):
+        return {"messages": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise NotifierError("could not read the bridge pings %s: %s — refusing to run, since "
+                            "a ping sent now could not be recorded for the bridge"
+                            % (path, exc), code=EXIT_ERROR)
+    if (not isinstance(doc, dict) or doc.get("schema") != BRIDGE_PINGS_SCHEMA
+            or not isinstance(doc.get("messages", {}), dict)):
+        raise NotifierError("the bridge pings %s is not a %s document — refusing to run"
+                            % (path, BRIDGE_PINGS_SCHEMA), code=EXIT_ERROR)
+    return {"messages": dict(doc.get("messages") or {})}
+
+
+def save_bridge_pings(cfg, bridge_state, now):
+    """Save the bridge's pings, dropping any older than the relay's lookback: the bridge
+    never reads a thread that old. A failure RAISES, like the relay's own save."""
+    horizon = now - RELAY_LOOKBACK_SECONDS
+    kept = dict((k, v) for k, v in bridge_state["messages"].items()
+                if (_ts_seconds((v or {}).get("ts")) or 0) >= horizon)
+    bridge_state["messages"] = kept
+    try:
+        _atomic_write_json(bridge_pings_path(cfg), {"schema": BRIDGE_PINGS_SCHEMA,
+                                                    "messages": kept})
+    except OSError as exc:
+        raise NotifierError("could not save the bridge pings %s: %s"
+                            % (bridge_pings_path(cfg), exc), code=EXIT_ERROR)
 
 
 def save_relay(cfg, relay_state):
@@ -1939,6 +1998,14 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
     sent_keys, labelled_keys = set(state["sent"]), set(state["labelled"])
     relay_on = cfg.get("reply_relay") is True
     relay_state = load_relay(cfg) if relay_on else None
+    bridge_on = cfg.get("bridge_pings") is True
+    bridge_state = load_bridge_pings(cfg) if bridge_on else None
+    if bridge_on and not dry_run and not os.path.exists(bridge_pings_path(cfg)):
+        # Written on the first pass with the switch on, before any ping: the bridge
+        # installer's verify reads this file to see the switch is on (KIT-224 review). A
+        # failed write refuses the pass before anything is sent.
+        save_bridge_pings(cfg, bridge_state, now)
+    bridge_failures = []
     tickets, read_failures = [], []
     for team in cfg["team_keys"]:
         try:
@@ -2106,6 +2173,30 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                             "pages it again and records the target; the owner may see this "
                             "ping twice" % (event["ticket_id"], redact(str(exc), secrets)))
 
+            # KIT-224: the same record, kept for the Slack bridge instead, which answers in
+            # the relay's place. Saved at once, and a failed save keeps the key out of the
+            # seen-set, exactly as the relay's own record does.
+            if bridge_on and is_relayable_mark(event["mark"]):
+                recorded = record_relayable(
+                    bridge_state,
+                    (reply or {}).get("channel") or cfg["chat_channel_id"],
+                    (reply or {}).get("ts"), event, _iso_at(now))
+                if not recorded:
+                    declined += 1
+                    problems.append(
+                        "%s: paged, but the chat API returned no message timestamp — the "
+                        "bridge cannot answer under this ping" % event["ticket_id"])
+                elif not dry_run:
+                    try:
+                        save_bridge_pings(cfg, bridge_state, now)
+                    except NotifierError as exc:
+                        bridge_state["messages"].pop(recorded, None)
+                        sent_keys.discard(event["key"])
+                        bridge_failures.append(
+                            "%s: the ping was sent but could not be recorded for the bridge "
+                            "(%s) — its key is kept out of the seen-set, so the next pass "
+                            "pages it again" % (event["ticket_id"], redact(str(exc), secrets)))
+
             if event["label"]:
                 try:
                     apply_label(cfg, tracker, event)
@@ -2198,6 +2289,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
             code = EXIT_ERROR
             summary = ("FAIL: the reply relay could not do what it was asked: %s — this is "
                        "NOT 'no replies' | %s" % ("; ".join(relay["failures"]), summary))
+    if bridge_on:
+        summary += (" | bridge pings: ON, %d recorded for the Slack bridge to answer"
+                    % len(bridge_state["messages"]))
+        if bridge_failures:
+            code = EXIT_ERROR
+            summary = ("FAIL: a ping could not be recorded for the bridge: %s | %s"
+                       % ("; ".join(bridge_failures), summary))
     # …and so do the daemon-health marks: on from which authors, or OFF and how many unpaged.
     if cfg.get("monitor_actor_ids"):
         summary += (" | daemon-health marks: ON, from %d monitor author id(s)"
@@ -3079,6 +3177,9 @@ def selftest():
         # ── §11. The reply relay (KIT-118) — off by default, every guard proven ─────
         _relay_selftest(ok, tmp, good, tkt)
 
+        # ── §11z. Pings recorded for the Slack bridge (KIT-224) ──────────────────────
+        _bridge_pings_selftest(ok, tmp, good)
+
     # ── §10. What it never does — asserted against this file's own source ────────
     source = open(__file__, encoding="utf-8").read()
     # Scan EVERYTHING except the selftest body: a prefix split left main() unscanned, so a
@@ -3833,6 +3934,142 @@ def _relay_selftest(ok, tmp, good, tkt):
     ok("a ping with no chat timestamp is a named decline, never a silent non-target",
        res_ts["exit"] == EXIT_DECLINED
        and "no message timestamp" in res_ts["summary"], res_ts["summary"])
+
+
+def _bridge_pings_selftest(ok, tmp, good):
+    """KIT-224 — the notifier records each agent:blocked ping's target where the Slack
+    bridge can read it; the bridge answers stuck sessions in the relay's place. Lives in
+    the span §10's own-source scan skips, like the relay's own selftest."""
+    import io
+    NOW = 1800000000.0
+    buf = io.StringIO()
+
+    def cfg_for(name, **over):
+        doc = dict(good, state_dir=os.path.join(tmp, "bp-" + name))
+        doc.update(over)
+        return load_config_from(doc, tmp)
+
+    def marker(label):
+        return "<!-- pipeline-escalation: %s -->" % label
+
+    def ticket(tid, mark, cid, parent):
+        return {"id": tid, "uuid": "u-" + tid, "title": "T", "label_ids": [],
+                "comments": [{"id": cid, "body": marker(mark) + "\nwhich one?",
+                              "author_id": "a-session", "parent_id": parent}]}
+
+    ok("bridge pings are OFF by default", cfg_for("default")["bridge_pings"] is False)
+    for name, bad, needle in (
+            ("not-bool", {"bridge_pings": "yes"}, "'bridge_pings' must be true or false"),
+            ("both", {"bridge_pings": True, "reply_relay": True,
+                      "owner_chat_user_id": "U0OWNER001",
+                      "dispatcher_agent_user_id": "agent-1"}, "both on")):
+        try:
+            cfg_for(name, **bad)
+            ok("bridge pings config refused: " + name, False)
+        except NotifierError as exc:
+            ok("bridge pings config refused: " + name, needle in str(exc), str(exc))
+
+    cfg_on = cfg_for("on", bridge_pings=True)
+    chat = _FakeChat(base_ts=NOW)
+    res = run_once(cfg_on, _FakeTracker([ticket("KIT-30", ESC_BLOCKED, "b1", "root-30"),
+                                         ticket("KIT-31", ESC_NEEDS_HUMAN, "b2", "root-31")]),
+                   chat, False, out=buf, now=NOW)
+    with open(bridge_pings_path(cfg_on), encoding="utf-8") as fh:
+        doc = json.load(fh)
+    recs = list(doc["messages"].values())
+    ok("ON: an agent:blocked ping records its ticket and its session thread, and a "
+       "needs-human ping records nothing",
+       [(r.get("ticket_id"), r.get("thread_id")) for r in recs] == [("KIT-30", "root-30")],
+       recs)
+    ok("ON: the record names the chat message the reply will sit under",
+       bool(recs) and recs[0].get("channel") == "C0123456789" and bool(recs[0].get("ts")),
+       recs)
+    ok("ON: the notifier writes no relay state and reads no thread",
+       not os.path.exists(relay_path(cfg_on)) and chat.reads == [])
+    ok("ON: the pass says the bridge can answer", "bridge pings: ON" in res["summary"],
+       res["summary"])
+    ok("ON: a needs-human ping is not counted as a ping the bridge failed to record",
+       "cannot answer under this ping" not in res["summary"] and res["declined"] == 0,
+       res["summary"])
+
+    cfg_off = cfg_for("off")
+    run_once(cfg_off, _FakeTracker([ticket("KIT-32", ESC_BLOCKED, "b3", "root-32")]),
+             _FakeChat(base_ts=NOW), False, out=buf, now=NOW)
+    ok("OFF: nothing is recorded for the bridge",
+       not os.path.exists(bridge_pings_path(cfg_off)))
+
+    cfg_bad = cfg_for("corrupt", bridge_pings=True)
+    os.makedirs(cfg_bad["state_dir"], exist_ok=True)
+    with open(bridge_pings_path(cfg_bad), "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    chat_bad = _FakeChat(base_ts=NOW)
+    refused = None
+    try:
+        run_once(cfg_bad, _FakeTracker([ticket("KIT-33", ESC_BLOCKED, "b4", "root-33")]),
+                 chat_bad, False, out=buf, now=NOW)
+    except NotifierError as exc:
+        refused = exc
+    ok("a corrupt bridge-pings file refuses the pass before anything is sent",
+       refused is not None and "bridge pings" in str(refused) and chat_bad.posts == [],
+       repr(refused))
+
+    st = load_bridge_pings(cfg_on)
+    old = "%.6f" % (NOW - 8 * 86400)
+    st["messages"]["chat:C0123456789:" + old] = {"ts": old, "ticket_id": "KIT-1"}
+    save_bridge_pings(cfg_on, st, NOW)
+    with open(bridge_pings_path(cfg_on), encoding="utf-8") as fh:
+        kept = json.load(fh)["messages"].values()
+    ok("a recorded ping older than the lookback is pruned on the next save",
+       all(r.get("ticket_id") != "KIT-1" for r in kept) and any(
+           r.get("ticket_id") == "KIT-30" for r in kept))
+
+    # The file is there from the first pass with the switch on, before any ping is
+    # recorded: the bridge installer's verify reads it to see the switch is on (KIT-224
+    # review). A dry run writes nothing.
+    cfg_new = cfg_for("first-pass", bridge_pings=True)
+    run_once(cfg_new, _FakeTracker([]), _FakeChat(base_ts=NOW), True, out=buf, now=NOW)
+    dry_wrote = os.path.exists(bridge_pings_path(cfg_new))
+    run_once(cfg_new, _FakeTracker([]), _FakeChat(base_ts=NOW), False, out=buf, now=NOW)
+    try:
+        with open(bridge_pings_path(cfg_new), encoding="utf-8") as fh:
+            first_doc = json.load(fh)
+    except (OSError, ValueError):
+        first_doc = None
+    ok("ON: the first pass writes the pings file before any ping, and a dry run does not",
+       not dry_wrote and first_doc == {"schema": BRIDGE_PINGS_SCHEMA, "messages": {}},
+       (dry_wrote, first_doc))
+
+    # A ping sent but not recorded for the bridge (KIT-224 review): its record is dropped,
+    # its key stays out of the seen-set so the next pass pages it again, and the pass exits
+    # 1 naming it. The other ping in the same pass is still recorded.
+    real_save, save_calls = save_bridge_pings, []
+
+    def fails_first(cfg_, state_, now_):
+        save_calls.append(1)
+        if len(save_calls) == 1:
+            raise NotifierError("could not save the bridge pings: disk full (simulated)")
+        return real_save(cfg_, state_, now_)
+    two = [ticket("KIT-40", ESC_BLOCKED, "b6", "root-40"),
+           ticket("KIT-41", ESC_BLOCKED, "b7", "root-41")]
+    chat_f = _FakeChat(base_ts=NOW)
+    globals()["save_bridge_pings"] = fails_first
+    try:
+        res_f = run_once(cfg_new, _FakeTracker(two), chat_f, False, out=buf, now=NOW)
+    finally:
+        globals()["save_bridge_pings"] = real_save
+    lost = "KIT-40" if "KIT-40" in (chat_f.posts or [""])[0] else "KIT-41"
+    kept_id = "KIT-41" if lost == "KIT-40" else "KIT-40"
+    with open(bridge_pings_path(cfg_new), encoding="utf-8") as fh:
+        on_disk = sorted(r.get("ticket_id") for r in json.load(fh)["messages"].values())
+    ok("a ping not recorded for the bridge fails the pass, naming it",
+       res_f["exit"] == EXIT_ERROR and "could not be recorded for the bridge" in
+       res_f["summary"] and lost in res_f["summary"].split("|")[0], res_f["summary"])
+    ok("…its record is dropped, and the other ping's is kept",
+       on_disk == [kept_id], (lost, on_disk))
+    chat_again = _FakeChat(base_ts=NOW + 10)
+    run_once(cfg_new, _FakeTracker(two), chat_again, False, out=buf, now=NOW)
+    ok("…and its key stays out of the seen-set: the next pass pages it, and only it, again",
+       len(chat_again.posts) == 1 and lost in chat_again.posts[0], (lost, chat_again.posts))
 
 
 def load_config_from(doc, tmpdir):

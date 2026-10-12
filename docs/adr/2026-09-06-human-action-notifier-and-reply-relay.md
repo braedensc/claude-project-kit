@@ -557,6 +557,14 @@ The notifier accepts `finding-filed` only from `finding_actor_ids`, on the same 
 comment, so a doubled mark still pages once. The installer resolves `FINDING_ACTOR_IDS`
 (default `self`).
 
+## Update 2026-10-10 — the Slack bridge replaces the reply relay (KIT-224)
+
+The relay stays built and off. The owner chose the Slack bridge to carry replies instead
+(`docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`): it checks every sender with Slack
+and accepts any full member, where the relay accepted one configured user. The notifier's
+part is one new switch, `bridge_pings`: it records each `agent:blocked` ping's target in a
+file the bridge reads, and it refuses to run with `reply_relay` on as well.
+
 ## Update 2026-09-24 — the chat lane is on, and the composer writes (KIT-197, KIT-196)
 
 **The lane was switched on, and kept on.** A deployment turned the conversational lane on on

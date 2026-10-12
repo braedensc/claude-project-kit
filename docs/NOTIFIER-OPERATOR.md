@@ -462,6 +462,15 @@ Do steps 1 and 2 in one sitting. Between them the monitor already marks its comm
 notifier does not page on them yet. Any it posts in that gap ping late, when step 2 lands,
 oldest first. The same goes for switching `MONITOR_ACTOR_IDS` from `off` to on later.
 
+**Answering a stuck session from Slack (KIT-224).** The notifier's own reply relay stays
+off. Set `BRIDGE_PINGS=yes` and run `run`: the notifier then records each "session stopped"
+ping where the Slack bridge can read it, and the bridge passes a member's reply under it to
+the session. `docs/BRIDGE-OPERATOR.md`, Step 10, has the rest. The two cannot both be on.
+
+Good: the next pass's summary says `bridge pings: ON`, and `notifier-bridge-pings.json` is in
+its `STATE_DIR`. The bridge reads it there: put that dir in `bridge.conf` too.
+Not that: `'bridge_pings' and 'reply_relay' are both on`. Turn the relay off.
+
 **The ready-to-merge page (KIT-225), after the merge that brings it.** Run the Stage E
 installer's `run`, which moves the clone. Then run this installer's `run` with
 `$STAGE_E_LINEAR_API_KEY` set in your shell. It resolves `BOUNCE_ACTOR_IDS` and rewrites

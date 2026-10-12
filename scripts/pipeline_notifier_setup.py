@@ -331,6 +331,9 @@ CONF_DEFAULTS = {
     # Who may author the finding job's finding-filed mark (KIT-243). The job writes it under
     # the Stage E key too, so `self` is its author on a one-key deployment.
     "FINDING_ACTOR_IDS": "self",
+    # KIT-224: record each agent:blocked ping for the Slack bridge, which answers a member's
+    # reply under it in the session's own thread. The notifier's own relay stays off.
+    "BRIDGE_PINGS": "no",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose so an unedited copy of the example cannot run.
@@ -556,6 +559,8 @@ def validate_conf(values, invoking_user=None):
                           "actor id" % actor)
     if len(set(finders)) != len(finders):
         errors.append("FINDING_ACTOR_IDS repeats an entry")
+    if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
+        errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
 
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
@@ -725,6 +730,10 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
         doc["bounce_actor_ids"] = list(bounce_ids)
     if finding_ids:
         doc["finding_actor_ids"] = list(finding_ids)
+    # Composed only when on, so a config written before the key existed stays byte-identical
+    # and an older clone is never handed a key it does not know.
+    if conf.get("BRIDGE_PINGS") == "yes":
+        doc["bridge_pings"] = True
     return doc
 
 
@@ -2766,8 +2775,15 @@ def handover_lines(ctx):
     on = ["the notifier job system/%s: %s (KIT-116)" % (conf["JOB_LABEL"], loaded),
           "its only tracker write: %s, added on the marks that name them (KIT-116)"
           % " and ".join(LABEL_KEYS)]
-    off = ["replies: no component reads the channel, so a reply there reaches nobody; answer in "
-           "the tracker (KIT-118)"]
+    if conf.get("BRIDGE_PINGS") == "yes":
+        on.append("replies: the notifier's own relay stays off. It records each agent:blocked "
+                  "ping for the Slack bridge, which passes a member's reply under it to the "
+                  "session's own thread (KIT-224)")
+        off = []
+    else:
+        off = ["replies: no component reads the channel, so a reply there reaches nobody; "
+               "answer in the tracker (KIT-118). The Slack bridge can answer them once "
+               "BRIDGE_PINGS=yes (KIT-224)"]
     unproven = ["what a session can reach with the dispatcher's own Slack token, and the "
                 "copy-it-out residual no fence closes (KIT-157)"]
     h_on, h_off, h_unproven = daemon_health_lines(ctx)
@@ -3220,6 +3236,13 @@ def _selftest_body():
        refused("BOUNCE_ACTOR_IDS=off,self\n", "BOUNCE_ACTOR_IDS mixes `off`"))
     ok("refuse: BOUNCE_ACTOR_IDS repeating an entry",
        refused("BOUNCE_ACTOR_IDS=self,self\n", "BOUNCE_ACTOR_IDS repeats an entry"))
+    ok("refuse: BRIDGE_PINGS that is neither yes nor no",
+       refused("BRIDGE_PINGS=maybe\n", "BRIDGE_PINGS must be yes or no"))
+    _bp_on = compose_config(good_conf("BRIDGE_PINGS=yes\n"), {}, ["a-1"])
+    _bp_off = compose_config(good_conf(""), {}, ["a-1"])
+    ok("config: BRIDGE_PINGS=yes composes bridge_pings, and the default composes no such key "
+       "(KIT-224)", _bp_on.get("bridge_pings") is True and "bridge_pings" not in _bp_off,
+       (_bp_on, _bp_off))
     ok("refuse: a BOUNCE_ACTOR_IDS entry that is no id",
        refused("BOUNCE_ACTOR_IDS=not an id!\n", "BOUNCE_ACTOR_IDS entry"))
     ok("refuse: FINDING_ACTOR_IDS left empty, naming `self` and `off`",
