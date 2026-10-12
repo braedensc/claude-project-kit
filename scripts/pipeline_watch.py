@@ -473,9 +473,16 @@ def _path_env():
     return ":".join(dirs + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 
 
+def refuse_if_agent(action, environ):
+    """The update script's refusal, naming THIS script's command for the person to run."""
+    pu.refuse_if_agent(action, environ, script="pipeline_watch.py",
+                       why="It loads or removes a job that runs as you every hour; a session\n"
+                           "  does not install its own supervision.",
+                       read_only="run --dry-run")
+
+
 def install(env, conf, uninstall_only=False):
-    pu.refuse_if_agent("pipeline_watch.py " + ("uninstall" if uninstall_only else "install"),
-                       env.environ)
+    refuse_if_agent("uninstall" if uninstall_only else "install", env.environ)
     if sys.platform != "darwin" and not getattr(env, "any_platform", False):
         raise pu.UpdateError("the scheduled job is a launchd LaunchAgent: macOS only. Elsewhere, "
                              "run `pipeline_watch.py run` hourly from cron or a systemd timer.")
@@ -544,7 +551,7 @@ def main(argv=None, env=None):
     env = env or pu.Env()
     try:
         if args.cmd in ("install", "uninstall"):
-            pu.refuse_if_agent("pipeline_watch.py " + args.cmd, env.environ)
+            refuse_if_agent(args.cmd, env.environ)
         if args.cmd == "status":
             return status(env)
         conf = pu.load_conf(args.conf)
@@ -773,6 +780,14 @@ def selftest():
         check("install is refused in an agent environment",
               main(["--conf", "/nonexistent", "install"], env=make_env(home, environ={"CLAUDECODE": "1"})),
               EX_REFUSED)
+        try:
+            refuse_if_agent("install", {"CLAUDECODE": "1"})
+            said = ""
+        except pu.Refusal as exc:
+            said = str(exc)
+        check("…and the refusal names this script's own command, not the update script's",
+              ("python3 scripts/pipeline_watch.py install" in said, "pipeline_update.py" in said,
+               "dispatcher" in said), (True, False, False))
         env = make_env(home, answer="no")
         check("install without a typed yes installs nothing",
               (install(env, c), os.path.exists(os.path.join(home, "Library", "LaunchAgents",

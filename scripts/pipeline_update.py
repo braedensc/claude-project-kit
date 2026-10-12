@@ -165,17 +165,22 @@ class Refusal(Exception):
     pass
 
 
-def refuse_if_agent(action, env=None):
+def refuse_if_agent(action, env=None, script="pipeline_update.py",
+                    why="It stops and restarts the dispatcher that starts every session; a "
+                        "session\n  doing that to itself is exactly what the refusal is for.",
+                    read_only="review"):
+    """Refuse `action` in an agent environment, naming the command a PERSON runs instead.
+    The health watch passes its own script, reason and read-only command, so its refusal
+    does not tell a person to run `pipeline_update.py pipeline_watch.py install`."""
     env = os.environ if env is None else env
     found = [m for m in AGENT_ENV_MARKERS if m in env]
     if found:
         raise Refusal(
             "REFUSED: `%s` changes this machine and this is an agent environment (%s set).\n"
-            "  It stops and restarts the dispatcher that starts every session; a session\n"
-            "  doing that to itself is exactly what the refusal is for. A PERSON runs it:\n"
-            "      python3 scripts/pipeline_update.py %s\n"
-            "  Read-only meanwhile:  python3 scripts/pipeline_update.py review"
-            % (action, ", ".join(found), action))
+            "  %s A PERSON runs it:\n"
+            "      python3 scripts/%s %s\n"
+            "  Read-only meanwhile:  python3 scripts/%s %s"
+            % (action, ", ".join(found), why, script, action, script, read_only))
 
 
 # --------------------------------------------------------------------------- #
