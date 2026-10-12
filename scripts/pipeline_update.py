@@ -293,7 +293,9 @@ def load_conf(path):
     if errors:
         raise ConfError("update.conf has %d problem(s); nothing was attempted:\n  "
                           % len(errors) + "\n  ".join(errors))
-    conf["__source__"] = path
+    # Absolute, because the health watch's LaunchAgent runs `--conf <this>` from launchd, whose
+    # working directory is `/`: a relative path there names a file the job cannot open (KIT-247).
+    conf["__source__"] = os.path.abspath(path)
     return conf
 
 
@@ -884,6 +886,17 @@ def selftest():
     check("conf: the committed example parses, and is refused only for its 3 placeholders",
           (said.count("example value"), "unknown key" in said, "not KEY=value" in said),
           (3, False, False))
+    here = os.getcwd()
+    try:
+        os.chdir(home)
+        with open("rel-update.conf", "w", encoding="utf-8") as fh:
+            fh.write("BREW_CASKS=claude-code\n")
+        source = load_conf("rel-update.conf")["__source__"]
+    finally:
+        os.chdir(here)
+    check("conf: a relative --conf is recorded as an absolute path (launchd runs from /)",
+          (os.path.isabs(source), os.path.realpath(source)),
+          (True, os.path.realpath(os.path.join(home, "rel-update.conf"))))
 
     # -- review ---------------------------------------------------------------
     brew_cask = json.dumps({"casks": [{"token": "claude-code", "installed": "2.1.153", "version": "2.1.287"}]})

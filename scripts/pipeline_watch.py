@@ -719,6 +719,24 @@ def selftest():
               (EX_OK, 3600, ["run", "--conf"], True))
         check("the job's PATH ends with the system directories",
               doc["EnvironmentVariables"]["PATH"].endswith("/usr/bin:/bin:/usr/sbin:/sbin"), True)
+        # launchd runs the job from `/`, so the settings path it is given must be absolute
+        # however `--conf` was typed (KIT-247).
+        with open(os.path.join(home, "watch-rel.conf"), "w", encoding="utf-8") as fh:
+            fh.write("".join("%s=%s\n" % (k, v) for k, v in conf(KIT_CHECKOUT=kit).items()
+                             if not k.startswith("__")))
+        here = os.getcwd()
+        try:
+            os.chdir(home)
+            code = main(["--conf", "watch-rel.conf", "install"],
+                        env=make_env(home, gh=[("launchctl bootout", 0, ""),
+                                               ("launchctl bootstrap", 0, "")]))
+        finally:
+            os.chdir(here)
+        doc = plistlib.load(open(plist, "rb"))
+        check("install with a relative --conf gives the job an absolute settings path",
+              (code, os.path.isabs(doc["ProgramArguments"][4]),
+               os.path.realpath(doc["ProgramArguments"][4])),
+              (EX_OK, True, os.path.realpath(os.path.join(home, "watch-rel.conf"))))
 
     check("the probe names itself: Cloudflare refuses Python's default user agent",
           _request("https://door.example.com/status").get_header("User-agent"), USER_AGENT)
