@@ -60,9 +60,10 @@ $EDITOR chat-lane.conf                                      # none of them secre
 python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 ```
 
-The conf has eight values, and seven optional ones: `DISPATCHER_SERVICE`,
-`FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN`, `FRONT_DOOR_MATCHER`, and
-`IDEA_TEAM_KEYS` and `HEALTH_STATUS_FILE` for piece 8. One of the eight, `CHAT_RULES`, stays
+The conf has eight values, and eight optional ones: `DISPATCHER_SERVICE`,
+`FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN`, `FRONT_DOOR_MATCHER`,
+`IDEA_TEAM_KEYS` and `HEALTH_STATUS_FILE` for piece 8, and `SANDBOX_TRUST_FILES` for
+piece 5 (Step 4). One of the eight, `CHAT_RULES`, stays
 `off` until Step 14. Leave an optional one unset and every printed command that needs it
 says `not composed: set <KEY> in chat-lane.conf`, and a subcommand that needs it refuses.
 Nothing is guessed. A conf with a problem (an unknown key, say) composes nothing: `card`
@@ -72,7 +73,7 @@ lists the problems first, prints the card without its commands, and exits 2.
 |---|---|
 | `compose` | Prints all eight pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
 | `compose --piece N` | Prints one piece alone. `--piece 4` prints only the port-block script, so you can save it to a file. |
-| `verify` | Reads the dispatcher's config, its env file, the role account's user settings, the front door's config and the newest chat session's start-up tool list **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value or a message. Changes nothing. Refuses to run under a model. |
+| `verify` | Reads the dispatcher's config, its env file, the role account's user settings, any trust file (Step 4: a yes or no for a private key, never its bytes), the front door's config and the newest chat session's start-up tool list **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists and allowlist paths, never a value or a message. Changes nothing. Refuses to run under a model. |
 | `merge` | Pieces 1, 2 and 5. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
 | `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
@@ -193,11 +194,17 @@ the same functions. It prints entry names, key names and tool lists only.
   warning for you to remove by hand.
 - It adds only the missing deny rules to the user settings, and keeps every other rule
   and key. A new file is made at mode 600.
+- It adds only the missing trust files to `sandbox.filesystem.allowRead` (Step 4), and
+  keeps every other entry and every other `sandbox` key. It never writes
+  `permissions.allow`.
+- It judges the user settings as parsed JSON, never as text, so a file edited by hand or
+  laid out differently is fine. Just before it writes, it checks the file has not changed
+  since its own read.
 
-With `--apply` it then reads everything again and prints the `grant`, `coding-fence` and
-`user-settings` rows as `verify` would.
+With `--apply` it then reads everything again and prints the `grant`, `coding-fence`,
+`user-settings` and `trust-files` rows as `verify` would.
 
-Good: those three rows say `ALREADY-DONE`, and a second `merge --apply` says `Nothing to
+Good: those four rows say `ALREADY-DONE`, and a second `merge --apply` says `Nothing to
 write: every piece this command merges is already in place`.
 Not that: `REFUSED: … changed since it was read`, or `… changed while it was being backed
 up`. The dispatcher refreshed a token in between. Run it again.
@@ -349,6 +356,37 @@ coding and review too. The six tool rules close the tracker's path to a merge or
 approval. A session holding a GitHub token with write access has a second path, through
 GitHub itself. The session's own grant and the repository's branch protection guard that
 one.
+
+**In a sandboxed session they block much more than the `Read` tool.** The chat lane has no
+sandbox, but a coding session the dispatcher starts does. There, Claude Code merges every
+`Read` deny from the settings it loads into the sandbox's `denyRead`. That is an
+operating-system block on every shell command and every process those commands start.
+So `Read(//**/*.pem)` also hides a `.pem` file the session's own tools need. The usual one
+is the dispatcher's egress CA certificate. Git checks its connection with it, so a push
+fails with `error setting certificate verify locations`.
+
+Don't: delete or narrow the `*.pem` deny. A private key can sit beside that certificate with
+a `.pem` name, readable by the same account. The deny is what hides it from the session.
+
+Do: put the certificate's exact path in `SANDBOX_TRUST_FILES` in `chat-lane.conf`. Piece 5
+then adds it to `sandbox.filesystem.allowRead` in the same user settings file. An exact
+file re-opens that one path and nothing beside it. Every deny stays.
+
+```sh
+SANDBOX_TRUST_FILES=/opt/example-dispatcher/certs/egress-ca.pem
+```
+
+Set it only when a sandboxed session cannot read a file its own tools need. Otherwise
+leave it unset: `verify` then says `No trust files are allowed`.
+
+The conf refuses an entry that is not one exact file: a relative path, a glob
+(`* ? [ ] { }`), a `..` segment, a trailing slash, a name with `key` in it, a `.key` file,
+or a file piece 5 denies by name. It names every bad entry at once. `merge` will not add a
+file that is a symbolic link, a folder, or holds the text `PRIVATE KEY`. `verify` reads
+each trust file as the role account and reports only yes or no, never what is in it.
+
+Don't: add a folder or a glob to `allowRead` by hand. `verify`'s `trust-files` row fails on
+either, and on any entry that is a link or holds a private key.
 
 ### Step 5 — Block the dispatcher's port from the network (piece 4)
 
@@ -634,6 +672,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
+| `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder or not a path, or when a trust file is a symbolic link or holds the text `PRIVATE KEY`. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
 | `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
 | `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
