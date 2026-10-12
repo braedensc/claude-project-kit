@@ -28,8 +28,11 @@ WHAT THIS IS
   | agent:needs-human        | a stopped session     | terminal until a person acts      | needs-human    |
   |                          | or the planner job,   | (the planner job: a misrouted     |                |
   |                          | on its planning ticket| planning ticket; planning stopped)|                |
+  |                          | or the bounce driver  | (the bounce driver: its fix       |                |
+  |                          | (KIT-225)             | budget is spent)                  |                |
   | daemon-health-incident   | heartbeat monitor     | a watched daemon needs a look     | no             |
   | daemon-health-recovered  | heartbeat monitor     | the watched daemons report again  | no             |
+  | ready-to-merge           | bounce driver         | Stage E is done; merge the PR     | no             |
 
   The review lane's "NOT reviewed" verdict is deliberately NOT paged on: it is a CI-visible
   verdict, not a person's decision (ADR, same table).
@@ -46,10 +49,18 @@ WHAT THIS IS
   author — without changing the exit code. A dead notifier cannot page about itself: the
   monitor's comment still lands, and says it pinged nobody (KIT-45 is the off-box answer).
 
-  NOT IN THIS BUILD: the pull-request human moment (ADR decision 5, "opened" until the review
-  lane is live and "reviewed and green" after). It needs the code host, which this pass does
-  not read. There is deliberately NO `pr_human_moment` config key until the lane exists — an
-  accepted key whose only effect is to be validated is the silent no-op §13 forbids.
+  THE READY-TO-MERGE MARK (KIT-225) is the pull-request human moment, "reviewed and green"
+  (ADR decision 5). The bounce driver writes it, under the owner's key, when Stage E
+  concludes a pull request clean or below the threshold. It is accepted only from
+  `bounce_actor_ids`, on exactly the pattern of the daemon-health marks: optional, OFF and
+  said while unset, deferred not dropped. It carries no label. Its page links the PULL
+  REQUEST instead of the ticket: the URL is read from line 2 of that comment, from that
+  author only, and only when the line is exactly `https://github.com/<owner>/<repo>/pull/<n>`;
+  anything else and the page links the ticket. The "opened" half is still not in this build:
+  it needs the code host, which this pass does not read.
+
+  The budget-spent page needs nothing new: the bounce driver's exhaustion comment opens
+  with `agent:needs-human`, which is accepted from any author.
 
 WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script asserts it)
 
@@ -303,6 +314,11 @@ ESC_NEEDS_HUMAN = "agent:needs-human"
 ESC_HEALTH_INCIDENT = "daemon-health-incident"
 ESC_HEALTH_RECOVERED = "daemon-health-recovered"
 HEALTH_MARKS = (ESC_HEALTH_INCIDENT, ESC_HEALTH_RECOVERED)
+# The bounce driver's page (KIT-225). Accepted only from `bounce_actor_ids`.
+ESC_READY_TO_MERGE = "ready-to-merge"
+READY_MARKS = (ESC_READY_TO_MERGE,)
+# The only shape a ready-to-merge page may link: a pull request on the code host, whole.
+PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$")
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -345,6 +361,11 @@ MARKS = {
         "label": None,
         "why_no_label": "daemon health is not a ticket's lifecycle",
     },
+    ESC_READY_TO_MERGE: {
+        "moment": "A pull request is ready for you to merge",
+        "label": None,
+        "why_no_label": "a merge is a person's act, not a block",
+    },
 }
 
 # The mark as every producer writes it, matched on a body's FIRST line only.
@@ -359,7 +380,7 @@ MARK_RE = re.compile(
 # GitHub-Actions lane already publishes, kept so the two lanes never disagree.
 MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_BLOCKED, ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
-                   ESC_HEALTH_RECOVERED]
+                   ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE]
 
 # Deliberately NOT a mark. The plan executor writes it on informational notes; paging on it
 # would turn every filed plan's footnote into a notification.
@@ -382,6 +403,9 @@ CONFIG_KEYS = {
                          "heartbeat monitor's tracker author). Optional: unset, those marks "
                          "are accepted from nobody and every pass says "
                          "'daemon-health marks: OFF'",
+    "bounce_actor_ids": "actor ids allowed to author the ready-to-merge mark (the bounce "
+                        "driver's tracker author). Optional: unset, that mark is accepted "
+                        "from nobody and every pass says 'ready-to-merge marks: OFF'",
     "max_events_per_pass": "flood guard; above it the pass sends one summary and declines",
     "lookback_comments": "how many recent comments per ticket to examine",
     "run_timeout_seconds": "wall clock for one pass; exceeding it is exit 4, not exit 1",
@@ -422,6 +446,7 @@ EXAMPLE_CONFIG = {
     "label_ids": {"agent:blocked": "<uuid>", "agent:needs-human": "<uuid>"},
     "executor_actor_ids": ["<plan-executor actor uuid>"],
     "monitor_actor_ids": ["<heartbeat-monitor author uuid>"],
+    "bounce_actor_ids": ["<bounce-driver author uuid>"],
     "max_events_per_pass": 25,
     "lookback_comments": 20,
     "run_timeout_seconds": 240,
@@ -490,6 +515,7 @@ def load_config(path):
         # `raw.get(key, default)`, like the relay keys: a string here must be a named error,
         # never quietly read as one author id per character.
         "monitor_actor_ids": raw.get("monitor_actor_ids", []),
+        "bounce_actor_ids": raw.get("bounce_actor_ids", []),
         "max_events_per_pass": raw.get("max_events_per_pass") or 25,
         "lookback_comments": raw.get("lookback_comments") or 20,
         "run_timeout_seconds": raw.get("run_timeout_seconds") or 240,
@@ -551,6 +577,12 @@ def load_config(path):
             "config 'monitor_actor_ids' must be a list of the heartbeat monitor's tracker "
             "author id(s), or absent to leave the daemon-health marks OFF, got %r"
             % (monitors,))
+    bouncers = cfg["bounce_actor_ids"]
+    if not isinstance(bouncers, list) or not all(isinstance(a, str) and a.strip()
+                                                 for a in bouncers):
+        errors.append(
+            "config 'bounce_actor_ids' must be a list of the bounce driver's tracker author "
+            "id(s), or absent to leave the ready-to-merge mark OFF, got %r" % (bouncers,))
 
     # The relay switch is a real boolean or it is refused: the string "false" is truthy, and
     # reading it as ON would start relaying on a config that says off.
@@ -959,6 +991,8 @@ def is_authorised(mark, author_id, cfg):
         return True
     if mark in HEALTH_MARKS:
         allowed = cfg.get("monitor_actor_ids") or []
+    elif mark in READY_MARKS:
+        allowed = cfg.get("bounce_actor_ids") or []
     else:
         allowed = cfg.get("executor_actor_ids") or []
     return bool(author_id) and author_id in allowed
@@ -970,6 +1004,16 @@ SATURATED_SKIP = "comment window saturated"
 # wrote the monitor's mark; the second is counted in the summary's OFF clause.
 HEALTH_UNAUTHORISED_SKIP = "daemon-health mark from an author not in monitor_actor_ids"
 HEALTH_OFF_SKIP = "daemon-health mark while monitor_actor_ids is unset (OFF)"
+READY_UNAUTHORISED_SKIP = "ready-to-merge mark from an author not in bounce_actor_ids"
+READY_OFF_SKIP = "ready-to-merge mark while bounce_actor_ids is unset (OFF)"
+
+
+def ready_link(body):
+    """The pull request a ready-to-merge comment names on its line 2, or "" unless that line
+    is exactly one. Called only for an author already checked."""
+    lines = (body or "").split("\n")
+    line = lines[1].strip() if len(lines) > 1 else ""
+    return line if PR_URL_RE.match(line) else ""
 
 
 def select_events(tickets, sent_keys, cfg, labelled_keys=None):
@@ -1054,6 +1098,12 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                     skipped.append((tid, cid, "%s: mark %s from author %s — not paged"
                                     % (HEALTH_UNAUTHORISED_SKIP, mark,
                                        comment.get("author_id") or "(none)")))
+                elif mark in READY_MARKS and not cfg.get("bounce_actor_ids"):
+                    skipped.append((tid, cid, "%s — not paged" % READY_OFF_SKIP))
+                elif mark in READY_MARKS:
+                    skipped.append((tid, cid, "%s: from author %s — not paged"
+                                    % (READY_UNAUTHORISED_SKIP,
+                                       comment.get("author_id") or "(none)")))
                 else:
                     skipped.append((tid, cid,
                                     "mark %s from an unauthorised author — only the configured "
@@ -1088,7 +1138,8 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 "ticket_id": tid,
                 "ticket_uuid": ticket.get("uuid"),
                 "ticket_title": ticket.get("title") or "",
-                "url": ticket_url(cfg, tid or ""),
+                "url": ((mark in READY_MARKS and ready_link(body))
+                        or ticket_url(cfg, tid or "")),
                 "label": label_for(mark),
                 "existing_labels": ticket.get("label_ids") or [],
             }
@@ -1911,6 +1962,12 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         problems.append("%d daemon-health mark(s) NOT paged — %s" % (
             len(health_forged), "; ".join("%s comment %s: %s" % s for s in health_forged)))
     health_off = [s for s in skipped if (s[2] or "").startswith(HEALTH_OFF_SKIP)]
+    # …and the same two shapes for the bounce driver's ready-to-merge mark (KIT-225).
+    ready_forged = [s for s in skipped if (s[2] or "").startswith(READY_UNAUTHORISED_SKIP)]
+    if ready_forged:
+        problems.append("%d ready-to-merge mark(s) NOT paged — %s" % (
+            len(ready_forged), "; ".join("%s comment %s: %s" % s for s in ready_forged)))
+    ready_off = [s for s in skipped if (s[2] or "").startswith(READY_OFF_SKIP)]
 
     for event in events:
         try:
@@ -2101,6 +2158,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         summary += (" | daemon-health marks: OFF (monitor_actor_ids is unset) — %d seen, not "
                     "paged yet: each pages once monitor_actor_ids is set, if it is still among "
                     "the newest comments read" % len(health_off))
+    if cfg.get("bounce_actor_ids"):
+        summary += (" | ready-to-merge marks: ON, from %d bounce-driver author id(s)"
+                    % len(cfg["bounce_actor_ids"]))
+    else:
+        summary += (" | ready-to-merge marks: OFF (bounce_actor_ids is unset) — %d seen, not "
+                    "paged yet: each pages once bounce_actor_ids is set, if it is still among "
+                    "the newest comments read" % len(ready_off))
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -2248,9 +2312,10 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all eight ADR marks are known", set(MARKS) == {
+    ok("all nine ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
-        ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered"},
+        ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
+        "ready-to-merge"},
        sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
@@ -2588,6 +2653,70 @@ def selftest():
            len(chat_p_on.posts) == 2 and "needs a look" in chat_p_on.posts[0]
            and "reporting again" in chat_p_on.posts[1] and res_p_on["exit"] == EXIT_OK,
            (chat_p_on.posts, res_p_on["summary"]))
+
+        # ── §7i. The bounce driver's ready-to-merge mark (KIT-225) ──────────────────
+        # Accepted only from `bounce_actor_ids`; unset, from nobody, and the pass says OFF.
+        # The page names the ticket and links the PULL REQUEST, read from line 2 of the
+        # driver's own comment and only in the exact shape of one.
+        READY = "ready-to-merge"
+        BOUNCER = "bounce-actor-1"
+        cfg_r = load_config_from(dict(good, bounce_actor_ids=[BOUNCER]), tmp)
+        cfg_r_off = load_config_from(dict((k, v) for k, v in good.items()
+                                          if k != "bounce_actor_ids"), tmp)
+        try:
+            load_config_from(dict(good, bounce_actor_ids="self"), tmp)
+            ok("a bounce_actor_ids that is not a list is refused by name", False)
+        except NotifierError as exc:
+            ok("a bounce_actor_ids that is not a list is refused by name",
+               "'bounce_actor_ids' must be a list" in str(exc), str(exc))
+
+        def ready_tkt(tid, cid, line2, author=BOUNCER):
+            return [{"id": tid, "uuid": "u-" + tid, "title": "Dark mode", "label_ids": [],
+                     "comments": [{"id": cid, "body": marker(READY) + "\n" + line2
+                                   + "\n**Stage E — ready for you to merge.**",
+                                   "author_id": author}]}]
+        pr = "https://github.com/o/r/pull/41"
+        chat_r1, tracker_r1 = _FakeChat(), _FakeTracker(ready_tkt("KIT-30", "r1", pr))
+        res_r1 = run_once(cfg_r, tracker_r1, chat_r1, False, out=buf)
+        res_r2 = run_once(cfg_r, _FakeTracker(ready_tkt("KIT-30", "r1", pr)), _FakeChat(),
+                          False, out=buf)
+        ok("a ready-to-merge mark from the bounce driver pings once, names the ticket and "
+           "links the pull request",
+           len(chat_r1.posts) == 1 and "ready for you to merge" in chat_r1.posts[0]
+           and "KIT-30" in chat_r1.posts[0] and pr in chat_r1.posts[0]
+           and res_r1["exit"] == EXIT_OK and res_r2["sent"] == 0,
+           (chat_r1.posts, res_r1["summary"]))
+        ok("…applies no label", tracker_r1.labels == [], tracker_r1.labels)
+        ok("…and the pass says the ready-to-merge marks are on",
+           "ready-to-merge marks: ON" in res_r1["summary"], res_r1["summary"])
+        for bad in ("https://evil.example/o/r/pull/41", pr + "?x=<!channel>",
+                    "see https://github.com/o/r/pull/41", ""):
+            chat_b = _FakeChat()
+            run_once(cfg_r, _FakeTracker(ready_tkt("KIT-31", "rb-%d" % len(bad), bad)),
+                     chat_b, False, out=buf)
+            ok("a second line that is not exactly a pull request is not linked: %r" % bad,
+               len(chat_b.posts) == 1 and "https://linear.app/example/issue/KIT-31"
+               in chat_b.posts[0] and "evil" not in chat_b.posts[0]
+               and "channel" not in chat_b.posts[0], chat_b.posts)
+        forged_r = ready_tkt("KIT-32", "r3", pr, author="a-session")
+        chat_fr, tracker_fr = _FakeChat(), _FakeTracker(forged_r)
+        res_fr = run_once(cfg_r, tracker_fr, chat_fr, False, out=buf)
+        named_r = all(t in res_fr["summary"] for t in ("KIT-32", "r3", "a-session"))
+        ok("a forged ready-to-merge mark is NAMED, pages nobody, and changes no exit code",
+           named_r and chat_fr.posts == [] and res_fr["exit"] == EXIT_OK, res_fr["summary"])
+        chat_ro = _FakeChat()
+        res_ro = run_once(cfg_r_off, _FakeTracker(ready_tkt("KIT-33", "r4", pr)), chat_ro,
+                          False, out=buf)
+        ok("with bounce_actor_ids unset, the pass says ready-to-merge marks are OFF, saw one, "
+           "and paged nobody",
+           "ready-to-merge marks: OFF" in res_ro["summary"] and "1 seen" in
+           res_ro["summary"].split("ready-to-merge marks: OFF", 1)[1] and chat_ro.posts == [],
+           res_ro["summary"])
+        ok("the gate is three-way: the driver writes only its own mark",
+           is_authorised(READY, BOUNCER, cfg_r)
+           and not is_authorised(READY, EXEC, cfg_r)
+           and not any(is_authorised(m, BOUNCER, cfg_r) for m in planning + (HEALTH_IN,)),
+           [(m, is_authorised(m, BOUNCER, cfg_r)) for m in planning])
 
         # The REAL tracker read asks for each comment's time and keeps it, so that order is
         # the tracker's own and not a fixture's.

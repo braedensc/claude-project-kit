@@ -41,8 +41,9 @@ WHAT HAPPENS WHEN NOTHING NEEDS BOUNCING (the conclusion)
   the BASIS (`clean` | `below-threshold` | `exhausted`), and the original coding ticket
   is moved once into the NEEDS-APPROVAL lane (`linear.stateIds.needsApproval`, contract
   §1). That state is the only one this file can write and that move is the only ticket
-  move it makes; nothing else about the conclusion changes anything — no comment, no
-  label, no approval, no merge. Exhaustion concludes the same way and additionally
+  move it makes. Before the move it leaves one comment on that ticket, the ready-to-merge
+  page (KIT-225); nothing else about the conclusion changes anything — no label, no
+  approval, no merge. Exhaustion concludes the same way and additionally
   applies `agent:needs-human`, which is what separates "we ran out of road" from
   "nothing needed fixing" on the board.
 
@@ -507,6 +508,15 @@ DELIVERY_FILE = "delivery.json"
 # Linear WorkflowState.type values that mean "this ticket will not be worked further".
 TERMINAL_STATE_TYPES = ("completed", "canceled")
 NEEDS_HUMAN_KEY = "agent:needs-human"
+# THE TWO PAGES THIS DRIVER WRITES (KIT-225). The notifier pages on a comment whose FIRST
+# line is one of its marks. `agent:needs-human` opens the budget-spent comment; the
+# ready-to-merge mark opens the one comment a clean or below-threshold conclusion leaves, and
+# the notifier accepts that one only from this driver's own author (`bounce_actor_ids`).
+READY_MARK = "ready-to-merge"
+
+
+def escalation_line(mark):
+    return "<!-- pipeline-escalation: %s -->" % mark
 # The canonical `linear.stateIds` key (contract §1) for the lane a CONCLUDED review
 # hands to a person. This driver writes that state and no other, and the lane is
 # provisioned `unstarted` on purpose: a `started` lane would join the dispatcher's
@@ -1203,6 +1213,7 @@ def render_exhaustion_pr_comment(ticket_id, pr_number, spent, max_bounces, reaso
 def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reason):
     reason = sanitize_untrusted(reason)    # a ticket description is what the dispatcher parses; a comment
     return "\n".join([                     # is not, but every copied text goes through the same gate
+        escalation_line(NEEDS_HUMAN_KEY),  # the notifier's page (KIT-225): first line, nothing before it
         "**Stage E — bounce budget spent.** PR #%d (%s) has used all %d automated fix round "
         "trip(s) (%d spent); the last trigger still stands: %s." % (pr_number, pr_url, max_bounces, spent, reason),
         "",
@@ -1210,6 +1221,20 @@ def render_exhaustion_ticket_comment(pr_number, pr_url, spent, max_bounces, reas
         "driver applies `%s` alongside this comment and moves this ticket to the "
         "needs-approval lane where the project configures one; it never merges, never "
         "approves, and moves the ticket nowhere else." % NEEDS_HUMAN_KEY,
+    ])
+
+
+def render_ready_to_merge_comment(owner_repo, pr_number, basis):
+    """The comment a clean or below-threshold conclusion leaves on the coding ticket
+    (KIT-225): the mark, then the pull request ALONE on line 2, which the notifier links.
+    Built from the driver's own target, never from text a session wrote."""
+    verdict = ("came back with findings below the bar" if basis == "below-threshold"
+               else "came back clean")
+    return "\n".join([
+        escalation_line(READY_MARK),
+        "https://github.com/%s/pull/%d" % (owner_repo, pr_number),
+        "**Stage E — ready for you to merge.** The required checks passed and the review %s. "
+        "A person merges; the bounce driver never does." % verdict,
     ])
 
 
@@ -2052,8 +2077,8 @@ def ledger_view(path, owner_repo, pr_number):
     for exactly the case that must never be read as a silent session: a bounce whose send
     failed, which is already loud on the PR (`send-failed`) and whose session was never
     prompted at all."""
-    prior, last_spent, exhausted, concluded, notices, refreshes, blocked = (
-        0, None, None, None, [], 0, None)
+    prior, last_spent, exhausted, concluded, notices, refreshes, blocked, ready = (
+        0, None, None, None, [], 0, None, None)
     delivered = set()
     # Conflict-fix rows (`conflict`, `conflict-delivered`, `conflict-send-failed`,
     # `conflict-result`) are their own list and never touch `prior`: a conflict fix spends
@@ -2074,6 +2099,8 @@ def ledger_view(path, owner_repo, pr_number):
             exhausted = row
         elif outcome == "concluded":
             concluded = row
+        elif outcome == "ready":
+            ready = row
         elif outcome == "notice":
             notices.append(row)
         elif outcome == "refresh":
@@ -2084,7 +2111,8 @@ def ledger_view(path, owner_repo, pr_number):
             conflicts.append(row)
     return {"prior": prior, "last_spent": last_spent, "exhausted": exhausted,
             "concluded": concluded, "notices": notices, "refreshes": refreshes,
-            "delivered_bounces": delivered, "blocked": blocked, "conflicts": conflicts}
+            "delivered_bounces": delivered, "blocked": blocked, "conflicts": conflicts,
+            "ready": ready}
 
 
 def append_row(path, **fields):
@@ -3213,8 +3241,16 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
     move, SAID on stdout — a project that has not provisioned
     `linear.stateIds.needsApproval` is off, not broken, and a later pass makes the move
     once it is), and FAILED (row written, Linear refused the move — a problem, exit 2,
-    retried next pass). Never a label, never a comment, never a merge, never an
-    approval."""
+    retried next pass). Never a label, never a merge, never an approval.
+
+    ONE COMMENT, BEFORE ANY OF IT (KIT-225): a clean or below-threshold conclusion first
+    leaves the ready-to-merge comment, the owner's page that the PR is theirs, and records
+    a `ready` row. It goes first, and a failure stops the conclusion here with nothing
+    moved or recorded, so the next pass says it again: a page is the one thing a lane move
+    without it would lose. That includes a comment the tracker saved but never answered for,
+    which is then said twice: a repeat, chosen over a lost page. The `ready` row, which names
+    its head, stops a retried move at that head from saying it twice; a later conclusion at a
+    new head says it again."""
     state_id = str(sit.get("needs_approval_state_id") or "")
     issue_id = str((sit.get("issue") or {}).get("id") or "")
     note, problems = "", []
@@ -3229,13 +3265,30 @@ def record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=None):
         problems.append("needs-approval move: no original ticket resolved for this PR")
     else:
         lane = "moved"
+    # Once per HEAD, not once per pull request: a refused move leaves the conclusion owed, so
+    # the PR can be bounced again and conclude at a later head, and that is the one to page.
+    said = sit.get("ready") or {}
+    said_here = bool(said) and str(said.get("head_sha") or "") == str(sit.get("head_sha") or "")
+    say_ready = basis != EXHAUSTED_BASIS and bool(issue_id) and not said_here
     if dry_run:
+        if say_ready:
+            print("[dry-run] would leave the ready-to-merge comment on %s" % sit.get("ticket_id"))
         print("[dry-run] would record a `concluded` row (basis %s) for %s#%d and %s — "
               "nothing written"
               % (basis, sit["repo"], sit["pr"],
                  "move %s to the needs-approval lane (state id %r)" % (sit.get("ticket_id"), state_id)
                  if lane == "moved" else "move nothing (%s)" % (note or "; ".join(problems))))
         return True, []
+    if say_ready:
+        body = render_ready_to_merge_comment(sit["repo"], sit["pr"], basis)
+        try:
+            linear_comment(issue_id, body, cfg)
+        except BounceError as exc:
+            return False, ["ready-to-merge comment: %s — nothing was moved or recorded, and the "
+                           "next pass says it again" % exc]
+        append_row(ledger_path(state_dir), repo=sit["repo"], pr=sit["pr"],
+                   ticket_id=sit.get("ticket_id"), outcome="ready", basis=basis,
+                   head_sha=sit.get("head_sha"))
     if lane == "moved":
         try:
             linear_set_state(issue_id, state_id, cfg)
@@ -3267,11 +3320,12 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     no merge, and `agent:needs-human` stays exactly what it was (a spent budget), so the
     two ways Stage E ends stay distinguishable on the board.
 
-    ONE COMMENT IS POSTED, and it is telemetry's. `record_conclusion` writes no comment at
-    all; `emit_telemetry` below hands the artifact to the §4 publisher, whose only Linear
-    mutation is a `commentCreate` on the pinned ticket. This docstring said "no comment"
-    for two releases while a comment landed on every conclusion — which is the reading a
-    person does when a comment appears and they go looking for the code that posts it."""
+    TWO COMMENTS ARE POSTED. `record_conclusion` leaves the ready-to-merge comment, the
+    owner's page (KIT-225), before it moves anything; `emit_telemetry` below hands the
+    artifact to the §4 publisher, whose only Linear mutation is a `commentCreate` on the
+    pinned ticket. This docstring said "no comment" for two releases while a comment landed
+    on every conclusion — which is the reading a person does when a comment appears and they
+    go looking for the code that posts it."""
     basis = verdict.get("basis") or "clean"
     # ONE ROW PER CONCLUSION, not one per pass that completes it (review of #140). A
     # needs-approval move that keeps failing brings this path back every pass, and each
@@ -3298,8 +3352,8 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
     emit_status = said.get("status", "not emitted: the conclusion was never recorded")
     if problems:
         sys.stderr.write("FAIL: %s#%d concluded (%s) but the needs-approval move did not land "
-                         "(%s); the conclusion is on the ledger and the next run retries the "
-                         "move. telemetry: %s\n"
+                         "(%s); whatever is not on the ledger yet, the next run retries. "
+                         "telemetry: %s\n"
                          % (sit["repo"], sit["pr"], basis, "; ".join(problems), emit_status))
         return EXIT_USAGE
     print("%s — recorded; telemetry: %s" % (describe(sit, verdict), emit_status))
@@ -5469,8 +5523,18 @@ def selftest():
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
-                check("%s review CONCLUDES: exit 0, the lane move, then telemetry" % label,
-                      (rc, kinds()), (EXIT_OK, ["state", "telemetry"]))
+                check("%s review CONCLUDES: exit 0, the ready comment, the lane move, then "
+                      "telemetry" % label,
+                      (rc, kinds()), (EXIT_OK, ["ticketComment", "state", "telemetry"]))
+                ready = body_of("ticketComment").split("\n")
+                check("KIT-225 %s: the ready comment's first line is the ready-to-merge mark, "
+                      "its second the pull request alone" % label,
+                      (ready[0], ready[1]),
+                      ("<!-- pipeline-escalation: ready-to-merge -->", "https://github.com/o/r/pull/41"))
+                check("KIT-225 %s: it is a TOP-LEVEL comment on the original ticket, never a "
+                      "thread reply (which would resume the session)" % label,
+                      ([c[1] for c in calls if c[0] == "ticketComment"],
+                       [c for c in calls if c[0] == "reply"]), (["iss-uuid"], []))
                 check("KIT-130: %s conclusion row says no model session runs for it" % label,
                       "conclusion" in [c for c in calls if c[0] == "telemetry"][-1][1]["_session"].get("no_session", ""), True)
                 check("%s review: the hand-off RETIRES the outstanding re-review request" % label,
@@ -5518,16 +5582,73 @@ def selftest():
             finally:
                 globals()["linear_set_state"] = saved_state
             check("KIT-152 a refused lane move is exit 2, and the row is still reported once",
-                  (rc_c1, first), (EXIT_USAGE, ["state", "telemetry"]))
+                  (rc_c1, first), (EXIT_USAGE, ["ticketComment", "state", "telemetry"]))
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc_c2 = run_one(41, "o/r", cfg, tmp, "bounce", False)
-            check("KIT-152 …and the retry moves the ticket without a SECOND telemetry comment",
+            check("KIT-152 …and the retry moves the ticket without a SECOND telemetry comment "
+                  "(KIT-225: or a second ready comment, which would page twice)",
                   (rc_c2, [c[0] for c in calls]), (EXIT_OK, ["state"]))
+
             check("KIT-152 …each concluded row saying whether its row landed",
                   [str(r.get("telemetry") or "")[:8]
                    for r in read_ledger(ledger_path(tmp)) if r["outcome"] == "concluded"],
                   ["emitted", "not re-e"])
+
+        # KIT-225. A READY COMMENT THAT FAILS IS RETRIED, AND NOTHING IS MOVED WITHOUT IT. The
+        # comment is the owner's only page that the PR is theirs; sent before the move and
+        # recorded before the move, so a failure costs a retry and never the page.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_json(os.path.join(tmp, "outcomes", "o__r__pr-41.json"), clean_record)
+            saved_comment = globals()["linear_comment"]
+
+            def refusing_comment(issue_id, body, cfg_):
+                calls.append(("ticketComment", issue_id, body))
+                raise BounceError("simulated: the tracker refused the comment")
+            globals()["linear_comment"] = refusing_comment
+            try:
+                calls.clear()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc_r1 = run_one(41, "o/r", cfg, tmp, "bounce", False)
+                first = [c[0] for c in calls]
+            finally:
+                globals()["linear_comment"] = saved_comment
+            check("KIT-225 a refused ready comment is exit 2, and nothing is moved or recorded",
+                  (rc_r1, first, [r["outcome"] for r in read_ledger(ledger_path(tmp))]),
+                  (EXIT_USAGE, ["ticketComment"], []))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc_r2 = run_one(41, "o/r", cfg, tmp, "bounce", False)
+            check("KIT-225 …the next pass says it, then moves",
+                  (rc_r2, [c[0] for c in calls]), (EXIT_OK, ["ticketComment", "state", "telemetry"]))
+            check("KIT-225 …one ready row, before the concluded row",
+                  [r["outcome"] for r in read_ledger(ledger_path(tmp))], ["ready", "concluded"])
+
+        # KIT-225. THE READY COMMENT IS SAID ONCE PER HEAD, NOT ONCE PER PULL REQUEST. A refused
+        # move leaves the conclusion owed, so the PR can be bounced again and conclude clean at
+        # a later head. That later conclusion is the one the owner must hear about: a `ready`
+        # row from the earlier head must not silence it. A retry at the SAME head stays silent.
+        with tempfile.TemporaryDirectory() as tmp:
+            def conclude_at(head):
+                sit_h = {"repo": "o/r", "pr": 41, "ticket_id": "ENG-41", "head_sha": head,
+                         "issue": {"id": "iss-uuid"}, "needs_approval_state_id": "st-na"}
+                sit_h.update(ledger_view(ledger_path(tmp), "o/r", 41))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return record_conclusion(sit_h, cfg, tmp, "clean", False)[0]
+            calls.clear()
+            world["state_fails"] = True
+            try:
+                moved_h = [conclude_at("aaaa"), conclude_at("aaaa")]
+            finally:
+                world["state_fails"] = False
+            moved_h.append(conclude_at("cccc"))
+            check("KIT-225 a refused move at head aaaa, retried there, then a clean conclusion at "
+                  "head cccc: one ready comment per head, and the retry at aaaa says nothing",
+                  (moved_h, [c[0] for c in calls],
+                   [(r["outcome"], r["head_sha"]) for r in read_ledger(ledger_path(tmp))]),
+                  ([False, False, True], ["ticketComment", "state", "state", "ticketComment", "state"],
+                   [("ready", "aaaa"), ("concluded", "aaaa"), ("concluded", "aaaa"),
+                    ("ready", "cccc"), ("concluded", "cccc")]))
 
         #       EVERY TERMINAL STATE REMAINS BANNED. The fixture names all six canonical
         #       states; the driver can reach exactly one of them. `done` is the one that
@@ -5638,6 +5759,11 @@ def selftest():
                 rc = run_one(41, "o/r", cfg, tmp, "bounce", False)
             check("exhaustion concludes too: two comments, the one label, the lane move",
                   (rc, kinds()), (EXIT_OK, ["prComment", "ticketComment", "label", "state", "telemetry"]))
+            check("KIT-225 exhaustion's ticket comment opens with the agent:needs-human mark, so "
+                  "the notifier pages it; and no ready-to-merge comment is written",
+                  ([c[2].split("\n")[0] for c in calls if c[0] == "ticketComment"],
+                   any("ready-to-merge" in c[2] for c in calls if c[0] == "ticketComment")),
+                  (["<!-- pipeline-escalation: agent:needs-human -->"], False))
             row = ledger_view(ledger_path(tmp), "o/r", 41)["concluded"]
             check("exhaustion's conclusion carries basis `exhausted`, the ticket and the move",
                   (row["basis"], row["moved"], row["ticket_id"]), ("exhausted", True, "ENG-41"))
