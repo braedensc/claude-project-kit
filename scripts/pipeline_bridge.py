@@ -12,19 +12,42 @@ can start planning or work. This job is the one bridge across: it reads the Slac
 checks WITH SLACK ITSELF who sent each message, and acts in the tracker with the owner's
 key — only after a verified member answers "yes" to a question the bridge asked itself.
 
-ONE ACTION, AND ONLY WITH `act` ON (KIT-222). With `act` off (the default) it reads,
-verifies, asks and records, and a verified "yes" changes nothing. With `act` on, a verified
-"yes" to a `plan` question moves that idea into its team's Plan it state, AS THE OWNER, so
-the planner job starts planning it. Before it asks, and again before it moves, the ticket
-is re-read and refused if it is live work, by the planner's own rules
-(`pipeline_plan_poller.live_work_reasons`, imported), or already in Plan it. The question
-records the ticket as it showed it (its title, text, team, labels and state) and the
-settings its text states; a yes after either changed moves nothing and closes the question.
-Its tracker writes are exactly two, pinned by the selftest: one `issueUpdate` setting
-`stateId` only, and one `commentCreate` naming who said yes. A move cannot be taken back,
-so a comment that fails is OWED: the thread says so, and every pass writes it again and
-exits 1 until it lands. Later tickets add the rest: KIT-223 (approve an epic and start its
-children in order), KIT-224 (answer a stuck session, replacing the notifier's reply relay).
+TWO ACTIONS, AND ONLY WITH `act` ON. With `act` off (the default) it reads, verifies,
+asks and records, and a verified "yes" changes nothing. With `act` on:
+
+  PLAN (KIT-222). A verified "yes" to a `plan` question moves that idea into its team's
+  Plan it state, AS THE OWNER, so the planner job starts planning it. Before it asks, and
+  again before it moves, the ticket is re-read and refused if it is live work, by the
+  planner's own rules (`pipeline_plan_poller.live_work_reasons`, imported), or already in
+  Plan it. The question records the ticket as it showed it (its title, text, team, labels
+  and state); a yes after any of them changed moves nothing and closes the question.
+
+  APPROVE (KIT-223). A verified "yes" to an `approve` question moves an epic the idea gate
+  filed (`provenance:agent`, every child `provenance:epic`) to its team's `ready_state`,
+  and records it as approved. From then on, every pass hands its children to the agent
+  user, AS THE OWNER, in dependency order: a child starts only when every ticket that
+  blocks it is Done, and at most `epic_wip` of one epic's children are started and
+  unfinished at once (a child marked Done while its session still runs counts until the
+  session ends). It never hands over the epic itself, a child already delegated or
+  with a session, or a child it started once before; an epic someone else handed to the
+  agent stops it, because its children would stack on the epic's branch, and so does an
+  epic or child carrying the dispatcher's `orchestrator` or `graphite` label. It hands over
+  only what the member saw: the question records each child's title, text, labels,
+  project and blockers, a yes after any of them changed approves nothing, and a child
+  added or changed after the yes (a session holds the tracker's write tools) is held and
+  said once. Each start is said once in the thread, and so is a stall, a pause, a child
+  outside the plan at work, a hand-over that never started, and the end. One epic the
+  tracker will not read stops nothing else, and the pass still exits 1.
+
+  Every question also records the settings its text states; a yes after they changed acts
+  on nothing and closes the question.
+
+Its tracker writes are exactly three, pinned by the selftest: one `issueUpdate` setting
+`stateId` only, one `issueUpdate` setting `delegateId` only, and one `commentCreate` naming
+who said yes. A move or a hand-over cannot be taken back, so a comment that fails is OWED:
+the thread says so, and every pass writes it again and exits 1 until it lands. Merging
+stays the owner's. KIT-224 (answer a stuck session, replacing the notifier's reply relay)
+comes next.
 
 WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 
@@ -39,20 +62,19 @@ WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 
 THE BRIDGE ASKS, A MEMBER ANSWERS
 
-  A request is one strict line, `plan <ticket id>`, from anyone in the channel, the chat
-  bot included: asking is harmless. (`approve <ticket id>` is recognised too; this version
-  answers it once, saying approving from Slack is not built yet, and changes nothing.) The
-  bridge reads the ticket from the tracker with the owner's key and posts its OWN question
-  in that thread, carrying only facts it read itself. A question is answered by a reply
-  `yes` or `no` in its thread, after it, from a verified member. A `yes` binds to the
-  question recorded in this job's state, never to a ticket named in someone's text: with
-  two questions open in one thread, a bare `yes` is refused and `yes <ticket id>` is asked
-  for. So is a bare `yes` when anything other than the bridge or a verified member posted
-  in the thread after the question (a bot, an app, Slackbot, a guest), because a look-alike
-  question could have changed what the person thought they were answering. A question
-  edited after it was posted, or gone from its thread, is refused and closed. A question
-  expires `question_ttl_hours` after it was asked, judged by when the answer was SENT, so a
-  yes sent while the Mac slept still counts. A question's status changes only after the
+  A request is one strict line, `plan <ticket id>` or `approve <epic id>`, from anyone in
+  the channel, the chat bot included: asking is harmless. The bridge reads the ticket from
+  the tracker with the owner's key and posts its OWN question in that thread, carrying only
+  facts it read itself. A question is answered by a reply `yes` or `no` in its thread,
+  after it, from a verified member. A `yes` binds to the question recorded in this job's
+  state, never to a ticket named in someone's text: with two questions open in one thread,
+  a bare `yes` is refused and `yes <ticket id>` is asked for. So is a bare `yes` when
+  anything other than the bridge or a verified member posted in the thread after the
+  question (a bot, an app, Slackbot, a guest), because a look-alike question could have
+  changed what the person thought they were answering. A question edited after it was
+  posted, or gone from its thread, is refused and closed. A question expires
+  `question_ttl_hours` after it was asked, judged by when the answer was SENT, so a yes
+  sent while the Mac slept still counts. A question's status changes only after the
   bridge's reply saying so is posted. A tricked chat bot can make the bridge ask; it cannot
   make it act.
 
@@ -95,7 +117,7 @@ SAYS WHICH NOTHING IT DID (contract §13)
 
 WHAT IT NEVER DOES
 
-  It writes to the tracker only the two writes above, and only with `act` on. It never
+  It writes to the tracker only the three writes above, and only with `act` on. It never
   posts outside its configured channels, never posts a message's own text back, and never
   prints a credential: both are read from env vars the config NAMES (the job's wrapper
   sources the role account's env file), and every line it writes (the log, the state file,
@@ -160,7 +182,14 @@ CONFIG_KEYS = {
     "run_timeout_seconds": "wall clock for one pass (default 120)",
     "act": "whether a verified yes acts in the tracker (default false: ask and record only)",
     "plan_it_state": "the name of each team's Plan it state (default Plan it)",
-    "max_actions_per_hour": "how many actions the bridge takes in an hour (default 10)",
+    "max_actions_per_hour": "how many actions the bridge takes in an hour, each child "
+                            "started included (default 10)",
+    "ready_state": "the name of each team's to-do state an approved epic moves to "
+                   "(default Todo)",
+    "agent_user_name": "the dispatcher's app user, by display name, that an approved "
+                       "epic's children are handed to; empty refuses every approve",
+    "epic_wip": "how many children of one approved epic may be started and unfinished at "
+                "once (default 1, at most 10)",
 }
 
 EXAMPLE_CONFIG = {
@@ -191,6 +220,16 @@ NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
 
 OPEN, CONFIRMED, DECLINED, EXPIRED = "open", "confirmed", "declined", "expired"
+FINISHED = ("completed", "canceled")
+GATE_EPIC_LABEL, GATE_CHILD_LABEL = "provenance:agent", "provenance:epic"
+MAX_CHILDREN = 30
+# Labels that switch the dispatcher into a mode where it hands out, or stacks, children
+# itself (0.2.73: the orchestrator prompts self-delegate sub-issues; a graphite child is cut
+# from its blocker's branch). Matched without regard to case.
+MODE_LABELS = ("orchestrator", "graphite")
+# How long a child handed over may sit unstarted before the bridge says its session may have
+# stopped. The dispatcher moves a ticket to a started state when its session begins.
+STUCK_START_SECONDS = 2 * 3600
 DONE, REFUSED = "done", "refused"
 
 
@@ -246,6 +285,9 @@ def validate_config(raw):
         "act": raw.get("act", False),
         "plan_it_state": raw.get("plan_it_state") or "Plan it",
         "max_actions_per_hour": raw.get("max_actions_per_hour", 10),
+        "ready_state": raw.get("ready_state") or "Todo",
+        "agent_user_name": raw.get("agent_user_name", ""),
+        "epic_wip": raw.get("epic_wip", 1),
     }
     if cfg["schema"] != CONFIG_SCHEMA:
         errors.append("config 'schema' must be %r, got %r" % (CONFIG_SCHEMA, cfg["schema"]))
@@ -286,7 +328,7 @@ def validate_config(raw):
     numbers_ok = True
     for key in ("question_ttl_hours", "lookback_days", "max_questions_per_hour",
                 "max_history_pages", "run_timeout_seconds", "max_open_questions",
-                "max_actions_per_hour"):
+                "max_actions_per_hour", "epic_wip"):
         value = cfg[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append("config %r must be a positive integer, got %r" % (key, value))
@@ -298,9 +340,14 @@ def validate_config(raw):
                       % (cfg["question_ttl_hours"], cfg["lookback_days"]))
     if not isinstance(cfg["act"], bool):
         errors.append("config 'act' must be true or false, got %r" % (cfg["act"],))
-    if not isinstance(cfg["plan_it_state"], str) or not cfg["plan_it_state"].strip():
-        errors.append("config 'plan_it_state' must be a state name, got %r"
-                      % (cfg["plan_it_state"],))
+    for key in ("plan_it_state", "ready_state"):
+        if not isinstance(cfg[key], str) or not cfg[key].strip():
+            errors.append("config %r must be a state name, got %r" % (key, cfg[key]))
+    if not isinstance(cfg["agent_user_name"], str):
+        errors.append("config 'agent_user_name' must be a display name, got %r"
+                      % (cfg["agent_user_name"],))
+    if numbers_ok and cfg["epic_wip"] > 10:
+        errors.append("config 'epic_wip' must be at most 10, got %d" % cfg["epic_wip"])
     if notify._inside_git_worktree(cfg["state_dir"]):
         errors.append("config 'state_dir' (%s) is inside a git working tree — the record of "
                       "open questions must live outside every worktree, where no session "
@@ -340,8 +387,10 @@ def new_state():
     # asked_at: when each tracker lookup for a request was made (the hourly limit).
     # limit_said: per channel, when the bridge last said that limit was reached.
     # owed: attribution comments a failed write left unwritten; retried every pass.
+    # epics: each approved epic the bridge is starting the children of (KIT-223).
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
-            "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": []}
+            "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
+            "epics": {}}
 
 
 def load_state(cfg):
@@ -369,6 +418,10 @@ def load_state(cfg):
     doc.setdefault("owed", [])
     if not isinstance(doc["owed"], list):
         raise BridgeError("the bridge's state %s has no readable list of owed comments. "
+                          "Nothing was done" % path)
+    doc.setdefault("epics", {})
+    if not isinstance(doc["epics"], dict):
+        raise BridgeError("the bridge's state %s has no readable list of approved epics. "
                           "Nothing was done" % path)
     return doc, False
 
@@ -497,11 +550,45 @@ query BridgeIssue($id: String!) {
     creator { name displayName }
   }
 }"""
-# THE BRIDGE'S ONLY TWO TRACKER WRITES (KIT-222). The selftest pins both: no other mutation
-# exists in this file, and the update carries `stateId` and nothing else.
+# An epic and its children, with what blocks each child. The page sizes are bounded, and a
+# page that runs over is refused, never read as complete.
+Q_EPIC = """
+query BridgeEpic($id: String!) {
+  issue(id: $id) {
+    id identifier title
+    state { id name type }
+    team { key }
+    delegate { id }
+    parent { id }
+    labels(first: 20) { nodes { name } }
+    children(first: %d) {
+      nodes {
+        id identifier title description
+        project { id }
+        state { id name type }
+        team { key }
+        delegate { id }
+        labels(first: 20) { nodes { name } }
+        children(first: 1) { nodes { id } }
+        inverseRelations(first: 20) {
+          nodes { type issue { id identifier state { name type } } }
+          pageInfo { hasNextPage }
+        }
+      }
+      pageInfo { hasNextPage }
+    }
+  }
+}""" % MAX_CHILDREN
+# THE BRIDGE'S ONLY THREE TRACKER WRITES (KIT-222, KIT-223). The selftest pins them: no
+# other write exists in this file, the move carries `stateId` and nothing else, and the
+# delegation carries `delegateId` and nothing else.
 M_MOVE = """
 mutation BridgeMove($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+}"""
+M_DELEGATE = """
+mutation BridgeDelegate($id: String!, $delegateId: String!) {
+  issueUpdate(id: $id, input: { delegateId: $delegateId }) { success }
 }"""
 M_COMMENT = """
 mutation BridgeComment($issueId: String!, $body: String!) {
@@ -514,6 +601,7 @@ class TrackerClient(object):
 
     def __init__(self, key):
         self.key = key
+        self._sessions = None
 
     def _query(self, query, variables):
         try:
@@ -558,7 +646,34 @@ class TrackerClient(object):
         """Why the ticket is live work, by the planner's own rules, or []."""
         return poller.live_work_reasons(self.linear, issue_id, poller.SessionIndex(self.linear))
 
-    def plan_it_state(self, team_key, name):
+    def epic(self, identifier):
+        data = self._query(Q_EPIC, {"id": identifier})
+        return (data or {}).get("issue")
+
+    def sessions_on(self, issue_id):
+        """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
+        if self._sessions is None:
+            self._sessions = poller.SessionIndex(self.linear)
+        return self._sessions.on_issue(issue_id)
+
+    def agent_user(self, name):
+        """(user id, None), or (None, why) unless exactly one active app user has that
+        display name — the planner's own query."""
+        data = self.linear(poller.Q_AGENT, {"filter": {"displayName": {"eq": name},
+                                                       "app": {"eq": True}}})
+        users = ((data.get("users") or {}).get("nodes")) or []
+        if len(users) != 1:
+            return None, "%d app users are called %r" % (len(users), name)
+        if not users[0].get("active"):
+            return None, "the app user %r is not active" % name
+        return users[0]["id"], None
+
+    def delegate(self, issue_id, agent_id):
+        data = self._query(M_DELEGATE, {"id": issue_id, "delegateId": agent_id}) or {}
+        if not (data.get("issueUpdate") or {}).get("success"):
+            raise BridgeError("the tracker would not hand the ticket to the agent")
+
+    def team_state(self, team_key, name):
         """(state id, None), or (None, why) unless the team has exactly one state of that
         name and it is a to-do (unstarted) state, as the planner requires."""
         nodes = ((self.linear(poller.Q_TEAM, {"key": team_key}).get("teams") or {})
@@ -684,6 +799,157 @@ def question_text(issue, requester, cfg, now, by_bot=False):
                cfg["question_ttl_hours"], then, who))
 
 
+def blockers_of(child):
+    """THE ORDER CHECK, shared with the order job (B9): (ticket, its state) for each ticket
+    that BLOCKS this one. The idea gate links a child to what it waits on with a `blocks`
+    relation from the blocker, so the blockers are the child's inverse `blocks` relations."""
+    out = []
+    for rel in ((child.get("inverseRelations") or {}).get("nodes")) or []:
+        issue = (rel or {}).get("issue") or {}
+        if rel.get("type") == "blocks" and issue.get("id"):
+            out.append((issue, issue.get("state") or {}))
+    return out
+
+
+def blocker_done(state):
+    return (state or {}).get("type") == "completed"
+
+
+def open_blockers(child):
+    """What this child still waits on, as `ID (State)`; [] when it may start. A child whose
+    blockers could not all be read never may."""
+    if (((child.get("inverseRelations") or {}).get("pageInfo")) or {}).get("hasNextPage"):
+        return ["more blockers than the bridge reads"]
+    return ["%s (%s)" % (b.get("identifier") or "?", st.get("name") or "?")
+            for b, st in blockers_of(child) if not blocker_done(st)]
+
+
+def ticket_number(identifier):
+    try:
+        return int((identifier or "").rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def in_order(children):
+    """The children in dependency order: each after the siblings that block it, ties by
+    ticket number. A loop in the plan leaves the rest in ticket order."""
+    ids = set(k["id"] for k in children)
+    waits = dict((k["id"], set(b["id"] for b, _st in blockers_of(k) if b["id"] in ids))
+                 for k in children)
+    left = sorted(children, key=lambda k: ticket_number(k.get("identifier")))
+    placed, out = set(), []
+    while left:
+        ready = [k for k in left if waits[k["id"]] <= placed]
+        if not ready:
+            out.extend(left)
+            break
+        out.append(ready[0])
+        placed.add(ready[0]["id"])
+        left.remove(ready[0])
+    return out
+
+
+def children_of(epic):
+    return ((epic.get("children") or {}).get("nodes")) or []
+
+
+def fingerprint(child):
+    """What the owner approved of a child: its title, text, labels, project and what it
+    waits on. A session holds the tracker's write tools, so a child is handed over only
+    while this still matches: text is the work, labels and project are its route, and the
+    blockers are its place in the order."""
+    text = json.dumps([child.get("title") or "", child.get("description") or "",
+                       sorted(label_names(child) - {None}),
+                       (child.get("project") or {}).get("id") or "",
+                       sorted(b.get("id") or "" for b, _st in blockers_of(child))])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def fingerprints(epic):
+    return dict((k["id"], fingerprint(k)) for k in children_of(epic))
+
+
+def changes_since(shown, epic):
+    """How the epic's children differ from the ones shown, in words; "" when they don't."""
+    now = fingerprints(epic)
+    names = dict((k["id"], k.get("identifier") or "?") for k in children_of(epic))
+    added = sorted(names[i] for i in now if i not in shown)
+    changed = sorted(names[i] for i in now if i in shown and now[i] != shown[i])
+    removed = len([i for i in shown if i not in now])
+    parts = []
+    if added:
+        parts.append("added: %s" % ", ".join(added))
+    if changed:
+        parts.append("changed: %s" % ", ".join(changed))
+    if removed:
+        parts.append("%d removed" % removed)
+    return "; ".join(parts)
+
+
+def epic_problems(epic, kids=None):
+    """Why this is not an epic the idea gate filed, or one whose children may not start;
+    [] when it may be approved. `kids` narrows the child checks to the approved ones."""
+    problems = []
+    if GATE_EPIC_LABEL not in label_names(epic):
+        problems.append("it does not carry `%s`, so the idea gate did not file it"
+                        % GATE_EPIC_LABEL)
+    if (epic.get("parent") or {}).get("id"):
+        problems.append("it has a parent ticket")
+    kids = children_of(epic) if kids is None else kids
+    if not kids:
+        problems.append("it has no child tickets")
+    if ((epic.get("children") or {}).get("pageInfo") or {}).get("hasNextPage"):
+        problems.append("it has more than %d children" % MAX_CHILDREN)
+    strays = [k.get("identifier") or "?" for k in kids if GATE_CHILD_LABEL not in label_names(k)]
+    if strays:
+        problems.append("%s lack%s `%s`, so the idea gate did not file %s"
+                        % (", ".join(strays), "s" if len(strays) == 1 else "",
+                           GATE_CHILD_LABEL, "it" if len(strays) == 1 else "them"))
+    nested = [k.get("identifier") or "?" for k in kids
+              if ((k.get("children") or {}).get("nodes"))]
+    if nested:
+        problems.append("%s ha%s child tickets of its own" % (", ".join(nested),
+                                                               "s" if len(nested) == 1 else "ve"))
+    team = (epic.get("team") or {}).get("key")
+    elsewhere = [k.get("identifier") or "?" for k in kids
+                 if ((k.get("team") or {}).get("key")) != team]
+    if elsewhere:
+        problems.append("%s is on another team" % ", ".join(elsewhere))
+    for node in [epic] + list(kids):
+        modes = sorted(n for n in label_names(node) if (n or "").lower() in MODE_LABELS)
+        if modes:
+            problems.append("%s carries `%s`, which makes the dispatcher hand out or stack "
+                            "children itself" % (node.get("identifier") or "?",
+                                                 "`, `".join(modes)))
+    if (epic.get("state") or {}).get("type") in FINISHED:
+        problems.append("it is %s" % ((epic.get("state") or {}).get("name") or "closed"))
+    return problems
+
+
+def approve_text(epic, requester, cfg, by_bot=False):
+    kids = in_order(children_of(epic))
+    listing = ", ".join("%s “%s”" % (k.get("identifier"), notify.safe_title(k.get("title")
+                                                                          or ""))
+                        for k in kids[:12])
+    if len(kids) > 12:
+        listing += ", and %d more" % (len(kids) - 12)
+    if by_bot:
+        who = "the chat bot"
+    else:
+        who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+    then = ("the bridge moves it to %s and hands its children to the agent for you, at most "
+            "%d at a time, each once the tickets it waits on are Done. Merging stays yours"
+            % (cfg["ready_state"], cfg["epic_wip"]) if cfg["act"] else
+            "the bridge records it; acting is switched off here, so nothing moves or starts")
+    return ("*Approve this plan?* %s “%s” on %s: %d children, in this order: %s.\n"
+            "Reply `yes` in this thread within %d hours, and %s. Reply `no` to leave it. "
+            "(Asked for by %s.)"
+            % (epic.get("identifier"), notify.safe_title(epic.get("title") or ""),
+               (epic.get("team") or {}).get("key") or "?", len(kids), listing,
+               cfg["question_ttl_hours"], then, who))
+
+
 def iso(seconds):
     return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -701,6 +967,7 @@ class Pass(object):
         self.threads = {}                  # (channel, root ts) -> messages read this pass
         self.unrecorded = {}               # thread key -> latest_reply, once all handled
         self.secrets = live_secrets(cfg)
+        self.release_errors = []
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
                        "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0, "acted": 0}
 
@@ -800,15 +1067,22 @@ class Pass(object):
             self.state["threads"].update(self.unrecorded)
             self.unrecorded = {}
             self.save()
+        self.release()
         self.pay_owed()
         self.expire()
         self.prune()
         self.save()
+        loud = []
+        if self.release_errors:
+            loud.append("could not follow %d approved epic(s): %s"
+                        % (len(self.release_errors), "; ".join(self.release_errors)))
         if self.state["owed"]:
-            raise BridgeError("%d attribution comment(s) still owed, on %s. The actions they "
-                              "record stand; each pass writes them again until they land"
-                              % (len(self.state["owed"]), ", ".join(
-                                  o.get("ticket") or "?" for o in self.state["owed"])))
+            loud.append("%d attribution comment(s) still owed, on %s. The actions they record "
+                        "stand; each pass writes them again until they land"
+                        % (len(self.state["owed"]), ", ".join(
+                            o.get("ticket") or "?" for o in self.state["owed"])))
+        if loud:
+            raise BridgeError("; ".join(loud))
 
     def handle_once(self, channel, msg):
         """One message, with a failure counted against it. Three failed passes and it is
@@ -861,13 +1135,6 @@ class Pass(object):
         thread = msg.get("thread_ts") or msg.get("ts")
         requester = msg.get("user") or msg.get("bot_id") or ""
         by_bot = bool(msg.get("bot_id") or msg.get("app_id"))
-        if kind == "approve":
-            # Recognised so it is never silent. The action is a later ticket (KIT-223);
-            # nothing is read and nothing is changed.
-            self.refuse_request(channel, msg, thread, "Approving from Slack is not built in "
-                                "this version of the bridge, so nothing was changed.",
-                                "approve is not built")
-            return
         # Every request that would read the tracker counts, found or not: the key is the
         # owner's, shared with Stage E. Past the limit a request is refused with no read,
         # and that is said at most once an hour in a channel.
@@ -896,6 +1163,9 @@ class Pass(object):
                                     "already asked")
                 return
         self.state["asked_at"].append(self.now)
+        if kind == "approve":
+            self.request_approve(channel, msg, thread, requester, ident, by_bot)
+            return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
@@ -920,8 +1190,58 @@ class Pass(object):
                                 "ask about planning it: %s." % (issue["identifier"],
                                                                 "; ".join(live)), "live work")
             return
-        posted = self.post(channel, thread, question_text(issue, requester, self.cfg,
-                                                          self.now, by_bot=by_bot))
+        self.ask(channel, msg, thread, kind, issue, requester,
+                 question_text(issue, requester, self.cfg, self.now, by_bot=by_bot))
+
+    def request_approve(self, channel, msg, thread, requester, ident, by_bot=False):
+        if not self.cfg["agent_user_name"].strip():
+            self.refuse_request(channel, msg, thread, "This bridge names no agent user "
+                                "(agent_user_name), so it cannot start an epic's children. "
+                                "Nothing was asked.", "no agent user")
+            return
+        epic = self.tracker.epic(ident)
+        if not epic or not epic.get("identifier"):
+            self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
+                                % ident, "not found")
+            return
+        team = (epic.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge acts only "
+                                "on %s." % (epic["identifier"], team or "no team",
+                                            ", ".join(self.cfg["team_keys"])),
+                                "team not planned")
+            return
+        if epic.get("id") in self.state["epics"]:
+            self.refuse_request(channel, msg, thread, "%s is already approved, and I am "
+                                "starting its children. Nothing was asked."
+                                % epic["identifier"], "already approved")
+            return
+        problems = epic_problems(epic)
+        if self.handed_over(epic):
+            problems.append("it is handed to the agent itself, so its children would stack "
+                            "on its branch")
+        if problems:
+            self.refuse_request(channel, msg, thread, "I won't ask about approving %s: %s."
+                                % (epic["identifier"], "; ".join(problems)),
+                                "not an idea-gate epic")
+            return
+        self.ask(channel, msg, thread, "approve", epic, requester,
+                 approve_text(epic, requester, self.cfg, by_bot=by_bot),
+                 children=fingerprints(epic))
+
+    def handed_over(self, node):
+        """True when the ticket is delegated to anyone, or has an agent session."""
+        return bool((node.get("delegate") or {}).get("id")
+                    or self.tracker.sessions_on(node["id"]))
+
+    def live_session(self, node):
+        """True while an agent session on the ticket has not ended, whatever its state says.
+        The workspace's sessions are read once a pass, so this costs no extra read."""
+        return any((n or {}).get("status") not in poller.SESSION_FINISHED
+                   for n in self.tracker.sessions_on(node["id"]))
+
+    def ask(self, channel, msg, thread, kind, issue, requester, text, children=None):
+        posted = self.post(channel, thread, text)
         self.state["questions"][key_of(channel, posted)] = {
             "kind": kind, "ticket": issue["identifier"], "ticket_id": issue.get("id"),
             "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
@@ -929,6 +1249,10 @@ class Pass(object):
             # WHAT THE MEMBER SAW, and the terms the question stated: a yes acts only while
             # both still hold.
             "fingerprint": ticket_fingerprint(issue), "promised": self.promised(kind)}
+        if children is not None:
+            # A yes approves exactly these children, as they were when the question was
+            # asked; any change before the yes approves nothing.
+            self.state["questions"][key_of(channel, posted)]["children"] = children
         self.mark(channel, msg, "asked: %s %s" % (kind, issue["identifier"]))
         self.counts["asked"] += 1
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
@@ -998,7 +1322,7 @@ class Pass(object):
         closed = self.question_closed(channel, q)
         if closed:
             self.post(channel, thread, "My question about %s %s, so I have closed it. Ask "
-                      "again with `plan %s`." % (q["ticket"], closed, q["ticket"]))
+                      "again with `%s %s`." % (q["ticket"], closed, q["kind"], q["ticket"]))
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: question %s" % closed)
             self.counts["refused"] += 1
@@ -1024,13 +1348,14 @@ class Pass(object):
         # Judged by when the answer was SENT: a yes sent in time while the Mac slept counts.
         if ts_float(msg.get("ts")) - q["asked_at"] > self.cfg["question_ttl_hours"] * 3600:
             self.post(channel, thread, "The question about %s has expired. Ask again with "
-                      "`plan %s`." % (q["ticket"], q["ticket"]))
+                      "`%s %s`." % (q["ticket"], q["kind"], q["ticket"]))
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
         if not is_yes:
-            self.post(channel, thread, "OK, %s is not planned." % q["ticket"])
+            self.post(channel, thread, "OK, %s is not %s." % (
+                q["ticket"], "approved" if q["kind"] == "approve" else "planned"))
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
@@ -1052,13 +1377,40 @@ class Pass(object):
             self.say("  confirmed: %s %s by %s (acting is off)"
                      % (q["kind"], q["ticket"], msg["user"]))
             return
-        self.act_plan(channel, thread, q, msg)
+        if q["kind"] == "approve":
+            self.act_approve(channel, thread, q, msg)
+        else:
+            self.act_plan(channel, thread, q, msg)
+
+    def actions_left(self):
+        hour_ago = self.now - 3600
+        return self.cfg["max_actions_per_hour"] - len(
+            [t for t in self.state.setdefault("acted_at", []) if t > hour_ago])
+
+    def refused_over_limit(self, channel, thread, msg):
+        if self.actions_left() > 0:
+            return False
+        self.post(channel, thread, "I have acted %d times in the last hour, which is my "
+                  "limit. Say yes again later." % self.cfg["max_actions_per_hour"])
+        self.mark(channel, msg, "refused: action limit")
+        self.counts["refused"] += 1
+        return True
+
+    def name_of(self, uid):
+        profile = self.users.get(uid) or {}
+        return notify.safe_title(profile.get("real_name") or
+                                 (profile.get("profile") or {}).get("display_name") or uid)
 
     def promised(self, kind):
         """The settings a question's text states, as they are now. Recorded when it is
         asked: a yes acts only on the terms the member read."""
-        return {"act": self.cfg["act"], "plan_it_state": self.cfg["plan_it_state"],
-                "question_ttl_hours": self.cfg["question_ttl_hours"]}
+        terms = {"act": self.cfg["act"], "question_ttl_hours": self.cfg["question_ttl_hours"]}
+        if kind == "approve":
+            terms.update(ready_state=self.cfg["ready_state"], epic_wip=self.cfg["epic_wip"],
+                         agent_user_name=self.cfg["agent_user_name"])
+        else:
+            terms.update(plan_it_state=self.cfg["plan_it_state"])
+        return terms
 
     def owe(self, issue_id, ticket, body):
         """An attribution comment that failed: kept, and written again every pass."""
@@ -1090,13 +1442,7 @@ class Pass(object):
             self.post(channel, thread, text)
             q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, what)
-        hour_ago = self.now - 3600
-        acted = [t for t in self.state.setdefault("acted_at", []) if t > hour_ago]
-        if len(acted) >= self.cfg["max_actions_per_hour"]:
-            self.post(channel, thread, "I have acted %d times in the last hour, which is my "
-                      "limit. Say yes again later." % len(acted))
-            self.mark(channel, msg, "refused: action limit")
-            self.counts["refused"] += 1
+        if self.refused_over_limit(channel, thread, msg):
             return
         issue = self.tracker.issue(q["ticket"])
         if not issue or not issue.get("id"):
@@ -1108,7 +1454,7 @@ class Pass(object):
             finish(REFUSED, "%s is now on %s, which the bridge does not plan on, so nothing "
                    "was moved." % (q["ticket"], team or "no team"), "refused: team")
             return
-        state_id, why = self.tracker.plan_it_state(team, self.cfg["plan_it_state"])
+        state_id, why = self.tracker.team_state(team, self.cfg["plan_it_state"])
         if not state_id:
             finish(REFUSED, "I can't move %s: %s." % (q["ticket"], why), "refused: no state")
             return
@@ -1129,10 +1475,7 @@ class Pass(object):
         if self.dry:
             self.say("  [dry-run] would move %s to %s" % (q["ticket"], self.cfg["plan_it_state"]))
             return
-        profile = self.users.get(msg["user"]) or {}
-        name = notify.safe_title(profile.get("real_name") or
-                                 (profile.get("profile") or {}).get("display_name") or
-                                 msg["user"])
+        name = self.name_of(msg["user"])
         self.tracker.move(issue["id"], state_id)
         self.state["acted_at"].append(self.now)
         when = iso(ts_float(msg.get("ts")))
@@ -1154,6 +1497,275 @@ class Pass(object):
         self.counts["acted"] = self.counts.get("acted", 0) + 1
         self.say("  acted: moved %s to %s for %s" % (q["ticket"], self.cfg["plan_it_state"],
                                                      msg["user"]))
+
+    def act_approve(self, channel, thread, q, msg):
+        """Move the epic to its team's ready state, as the owner, and record it as approved,
+        so every pass from now on starts its children in order. Re-read first."""
+        def finish(status, text, what):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text)
+            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, what)
+        if self.refused_over_limit(channel, thread, msg):
+            return
+        epic = self.tracker.epic(q["ticket"])
+        if not epic or not epic.get("id"):
+            finish(REFUSED, "I can't find %s in the tracker any more, so nothing was "
+                   "approved." % q["ticket"], "refused: gone")
+            return
+        team = (epic.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            finish(REFUSED, "%s is now on %s, which the bridge does not act on, so nothing "
+                   "was approved." % (q["ticket"], team or "no team"), "refused: team")
+            return
+        if epic["id"] in self.state["epics"]:
+            finish(DONE, "%s is already approved." % q["ticket"], "done: already")
+            return
+        changed = changes_since(q.get("children") or {}, epic)
+        if changed:
+            finish(REFUSED, "%s's children changed since I asked (%s), so nothing was "
+                   "approved. Ask again with `approve %s`." % (q["ticket"], changed,
+                                                              q["ticket"]),
+                   "refused: changed since asked")
+            return
+        problems = epic_problems(epic)
+        if self.handed_over(epic):
+            problems.append("it is handed to the agent itself, so its children would stack "
+                            "on its branch")
+        ready_id, why = self.tracker.team_state(team, self.cfg["ready_state"])
+        if not ready_id:
+            problems.append(why)
+        agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+        if not agent_id:
+            problems.append(why)
+        if problems:
+            finish(REFUSED, "I can't approve %s now: %s." % (q["ticket"], "; ".join(problems)),
+                   "refused: %s" % problems[0][:80])
+            return
+        if self.dry:
+            self.say("  [dry-run] would approve %s" % q["ticket"])
+            return
+        name = self.name_of(msg["user"])
+        when = iso(ts_float(msg.get("ts")))
+        state = epic.get("state") or {}
+        if state.get("id") != ready_id and state.get("type") in ("backlog", "triage",
+                                                                 "unstarted"):
+            self.tracker.move(epic["id"], ready_id)
+            self.state["acted_at"].append(self.now)
+        self.state["epics"][epic["id"]] = {
+            "ticket": epic["identifier"], "team": team, "channel": channel,
+            "thread": thread, "approved_by": msg["user"], "approved_name": name,
+            "approved_at": when, "started": [], "noted": [],
+            "approved": dict(q.get("children") or {}), "started_at": {}, "failures": 0}
+        self.save()
+        body = ("Approved in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
+                "\n\nIts children are handed to the agent in dependency order, at most %d at "
+                "once, each once the tickets it waits on are Done. Merging stays the owner's."
+                % (name, msg["user"], when, self.cfg["epic_wip"]))
+        owed = ""
+        try:
+            self.tracker.comment(epic["id"], body)
+        except BridgeError as exc:
+            # The approval stands. The record of who approved it is owed.
+            self.say("  NOTE: %s was approved, but its attribution comment failed: %s"
+                     % (q["ticket"], exc))
+            self.owe(epic["id"], q["ticket"], body)
+            owed = (" The approval was done, but the comment naming who approved it could not "
+                    "be written; I will try again.")
+        finish(DONE, "Approved %s for <@%s>. I'll hand its children to the agent in order, "
+               "at most %d at a time, each once what it waits on is Done, and say here as "
+               "each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
+               "done: approved %s" % q["ticket"])
+        self.counts["acted"] += 1
+        self.say("  acted: approved %s for %s" % (q["ticket"], msg["user"]))
+
+    def note(self, rec, key, text):
+        """Say it in the epic's thread once, however many passes find it."""
+        if key in rec["noted"]:
+            return
+        self.post(rec["channel"], rec["thread"], text)
+        rec["noted"] = (rec["noted"] + [key])[-200:]
+
+    def drop(self, epic_id, rec, text):
+        self.post(rec["channel"], rec["thread"], text)
+        self.state["epics"].pop(epic_id, None)
+        self.say("  stopped following %s" % rec["ticket"])
+
+    def release(self):
+        """Every pass: start the next children of each approved epic (KIT-223)."""
+        if not self.state["epics"]:
+            return
+        if not self.cfg["act"]:
+            self.say("  acting is off: %d approved epic(s) wait" % len(self.state["epics"]))
+            return
+        agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+        for epic_id in sorted(self.state["epics"]):
+            rec = self.state["epics"][epic_id]
+            if not agent_id:
+                self.note(rec, "agent:" + why, "I can't start %s's children: %s."
+                          % (rec["ticket"], why))
+                continue
+            # ONE EPIC'S FAILURE IS ITS OWN. A read the tracker refuses must not stop the
+            # other epics, or the expiry and pruning after them; the pass still ends loud.
+            try:
+                self.release_epic(epic_id, rec, agent_id)
+                rec["failures"] = 0
+            except BridgeError as exc:
+                rec["failures"] = rec.get("failures", 0) + 1
+                # Redacted BEFORE it is cut short: a cut credential would no longer match.
+                err = self.clean(str(exc))[:160]
+                self.release_errors.append("%s: %s" % (rec["ticket"], err))
+                if rec["failures"] == 3:
+                    self.note(rec, "unreadable", "I can't read %s (%s). I'll keep trying "
+                              "each pass, and start nothing in it until I can."
+                              % (rec["ticket"], err))
+            self.save()
+
+    def release_epic(self, epic_id, rec, agent_id):
+        ticket = rec["ticket"]
+        epic = self.tracker.epic(epic_id)
+        if not epic or epic.get("id") != epic_id:
+            self.drop(epic_id, rec, "%s is no longer in the tracker, so I've stopped starting "
+                      "its children." % ticket)
+            return
+        state = epic.get("state") or {}
+        if state.get("type") in FINISHED:
+            self.drop(epic_id, rec, "%s is %s, so I've stopped starting its children."
+                      % (ticket, state.get("name") or "closed"))
+            return
+        team = (epic.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            self.drop(epic_id, rec, "%s is now on %s, which the bridge does not act on, so "
+                      "I've stopped starting its children." % (ticket, team or "no team"))
+            return
+        if self.handed_over(epic):
+            self.drop(epic_id, rec, "%s itself was handed to the agent. Its children would "
+                      "stack on its branch, so I've stopped starting them." % ticket)
+            return
+        if state.get("type") in ("backlog", "triage"):
+            self.note(rec, "paused", "%s is back in %s, so I've paused starting its children. "
+                      "Move it to %s and they go on." % (ticket, state.get("name") or "Backlog",
+                                                         self.cfg["ready_state"]))
+            return
+        rec["noted"] = [n for n in rec["noted"] if n != "paused"]
+        approved = rec.get("approved") or {}
+        kids = in_order([k for k in children_of(epic) if k["id"] in approved])
+        problems = epic_problems(epic, kids)
+        if problems:
+            self.note(rec, "problems:" + "; ".join(problems), "I've paused starting %s's "
+                      "children: %s." % (ticket, "; ".join(problems)))
+            return
+
+        def live(k):
+            return (k.get("state") or {}).get("type") not in FINISHED
+        extras = [k for k in children_of(epic) if k["id"] not in approved and live(k)]
+        running = [k for k in extras if self.handed_over(k)
+                   or (k.get("state") or {}).get("type") == "started"]
+        for k in running:
+            self.note(rec, "atwork:" + k["id"], "%s is at work but was not in the plan you "
+                      "approved. It counts toward the limit of %d."
+                      % (k.get("identifier") or "?", self.cfg["epic_wip"]))
+        fresh = [k for k in extras if k not in running and "added:" + k["id"] not in rec["noted"]]
+        if fresh:
+            self.note(rec, "added:" + fresh[0]["id"], "%s %s added after the approval, so I "
+                      "won't hand %s over. Hand %s over yourself if %s yours."
+                      % (", ".join(k.get("identifier") or "?" for k in fresh),
+                         "was" if len(fresh) == 1 else "were",
+                         "it" if len(fresh) == 1 else "them",
+                         "it" if len(fresh) == 1 else "them",
+                         "it is" if len(fresh) == 1 else "they are"))
+            rec["noted"] += ["added:" + k["id"] for k in fresh[1:]]
+        unfinished = [k for k in kids if live(k)]
+        if not unfinished:
+            self.drop(epic_id, rec, "All %d children of %s are finished. Merging each one "
+                      "stays yours." % (len(kids), ticket))
+            return
+        running += [k for k in unfinished if self.handed_over(k)
+                    or (k.get("state") or {}).get("type") == "started"]
+        # A session can move its own child to Done while it still runs: a finished child
+        # holds its slot until its session ends, and the hold is said once.
+        for k in children_of(epic):
+            if not live(k) and self.live_session(k):
+                running.append(k)
+                self.note(rec, "running:" + k["id"], "%s is marked finished, but its session "
+                          "is still running. It counts toward the limit of %d until the "
+                          "session ends." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
+        for k in running:
+            since = (rec.get("started_at") or {}).get(k.get("identifier"))
+            if (since and self.now - since > STUCK_START_SECONDS
+                    and (k.get("state") or {}).get("type") in ("backlog", "triage",
+                                                               "unstarted")):
+                self.note(rec, "stuck:" + k["id"], "%s was handed to the agent at %s and has "
+                          "not started. Its session may have stopped. It still counts toward "
+                          "the limit of %d: hand it over again yourself, or cancel it."
+                          % (k["identifier"], iso(since), self.cfg["epic_wip"]))
+        room = self.cfg["epic_wip"] - len(running)
+        waiting, started, held = [], 0, 0
+        for k in unfinished:
+            if k in running:
+                continue
+            if k["identifier"] in rec["started"]:
+                waiting.append("%s was started once already; hand it over yourself if it "
+                               "needs another go" % k["identifier"])
+                continue
+            if fingerprint(k) != approved.get(k["id"]):
+                self.note(rec, "changed:%s:%s" % (k["id"], fingerprint(k)), "%s changed "
+                          "after the approval, so I won't hand it over. Hand it over "
+                          "yourself if the change is yours." % k["identifier"])
+                held += 1
+                continue
+            blockers = open_blockers(k)
+            if blockers:
+                waiting.append("%s waits on %s" % (k["identifier"], ", ".join(blockers)))
+                continue
+            if room <= 0:
+                continue
+            if self.actions_left() <= 0:
+                self.say("  action limit: %s waits for the next hour" % k["identifier"])
+                room = 0
+                continue
+            self.start_child(rec, k, kids, agent_id)
+            room -= 1
+            started += 1
+        if not running and not started and waiting and \
+                len(waiting) + held == len(unfinished):
+            self.note(rec, "stall:" + "; ".join(waiting), "Nothing in %s can start: %s."
+                      % (ticket, "; ".join(waiting)))
+
+    def start_child(self, rec, child, kids, agent_id):
+        ident = child["identifier"]
+        if self.dry:
+            self.say("  [dry-run] would hand %s to the agent" % ident)
+            return
+        self.tracker.delegate(child["id"], agent_id)
+        self.state["acted_at"].append(self.now)
+        rec["started"].append(ident)
+        rec.setdefault("started_at", {})[ident] = self.now
+        self.save()
+        after = [b.get("identifier") or "?" for b, _st in blockers_of(child)]
+        body = ("Started by the Slack bridge for **%s** (Slack user %s), who approved %s in "
+                "Slack at %s." % (rec["approved_name"], rec["approved_by"], rec["ticket"],
+                                  rec["approved_at"]))
+        if after:
+            body += "\n\nIt waited on %s, now Done." % ", ".join(after)
+        owed = ""
+        try:
+            self.tracker.comment(child["id"], body)
+        except BridgeError as exc:
+            # The hand-over stands: it cannot be taken back. The record of who approved it
+            # is owed.
+            self.say("  NOTE: %s was started, but its attribution comment failed: %s"
+                     % (ident, exc))
+            self.owe(child["id"], ident, body)
+            owed = (" The hand-over was done, but the comment naming who approved it could "
+                    "not be written; I will try again.")
+        position = [k["id"] for k in kids].index(child["id"]) + 1
+        self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
+            ident, notify.safe_title(child.get("title") or ""), position, len(kids),
+            ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
+            if after else "", owed))
+        self.counts["acted"] += 1
+        self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
 
     # -- housekeeping --------------------------------------------------------------
     def expire(self):
@@ -1356,8 +1968,13 @@ class FakeTracker(object):
         self.reads = 0
         self.fail = False
         self.live = {}                 # issue uuid -> reasons
-        self.plan_it = {"PROD": ("st-plan-it", None)}
-        self.moves, self.comments = [], []
+        self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo"}
+        self.agents = {"Agent": "agent-1"}
+        self.sessions = {}             # issue uuid -> sessions
+        self.overflow = set()          # epics whose children run past one page
+        self.blocker_overflow = set()  # children whose blockers run past one page
+        self.epics = {}                # epic identifier -> child identifiers, in filing order
+        self.moves, self.comments, self.delegations = [], [], []
         for i in self.issues.values():
             i["state"]["id"] = "st-backlog"
 
@@ -1367,14 +1984,86 @@ class FakeTracker(object):
     def live_work(self, issue_id):
         return list(self.live.get(issue_id, []))
 
-    def plan_it_state(self, team_key, name):
-        return self.plan_it.get(team_key, (None, "no %r on %s" % (name, team_key)))
+    def team_state(self, team_key, name):
+        sid = self.team_states.get((team_key, name))
+        return (sid, None) if sid else (None, "%s has no single to-do state named %r"
+                                        % (team_key, name))
+
+    def agent_user(self, name):
+        aid = self.agents.get(name)
+        return (aid, None) if aid else (None, "no app user is called %r" % name)
+
+    def sessions_on(self, issue_id):
+        return list(self.sessions.get(issue_id, []))
 
     def move(self, issue_id, state_id):
         self.moves.append((issue_id, state_id))
+        names = {"st-plan-it": "Plan it", "st-todo": "Todo"}
         for i in self.issues.values():
             if i["id"] == issue_id:
-                i["state"] = {"id": state_id, "name": "Plan it", "type": "unstarted"}
+                i["state"] = {"id": state_id, "name": names.get(state_id, state_id),
+                              "type": "unstarted"}
+
+    def delegate(self, issue_id, agent_id):
+        self.delegations.append((issue_id, agent_id))
+        for i in self.issues.values():
+            if i["id"] == issue_id:
+                i["delegate"] = {"id": agent_id}
+
+    def add_epic(self, ident, kids, epic_labels=("provenance:agent",),
+                 kid_label="provenance:epic"):
+        """An epic as the idea gate files it: children under it, linked by 'blocks'."""
+        def make(ident_, title, labels):
+            n = ident_.split("-")[1]
+            self.issues[ident_] = {
+                "id": "uuid-%s" % n, "identifier": ident_, "title": title,
+                "state": {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
+                "team": {"key": "PROD"}, "creator": {"displayName": "Planner"},
+                "labels": list(labels), "parent": None, "delegate": None, "blocked_by": [],
+                "description": "What %s does." % ident_}
+            return self.issues[ident_]
+        make(ident, "Epic %s" % ident, epic_labels)
+        self.epics[ident] = []
+        for kid, after in kids:
+            child = make(kid, "Child %s" % kid, [kid_label] if kid_label else [])
+            child["parent"] = {"id": self.issues[ident]["id"]}
+            child["blocked_by"] = list(after)
+            self.epics[ident].append(kid)
+
+    def set_state(self, ident, kind):
+        names = {"backlog": "Backlog", "unstarted": "Todo", "started": "In Progress",
+                 "completed": "Done", "canceled": "Canceled"}
+        self.issues[ident]["state"] = {"id": "st-" + kind, "name": names[kind], "type": kind}
+
+    def epic(self, ident):
+        self.reads += 1
+        if self.fail:
+            raise BridgeError("the tracker could not be read (simulated)")
+        e = self.issues.get(ident) or next(
+            (i for i in self.issues.values() if i["id"] == ident), None)
+        if not e:
+            return None
+        ident = e["identifier"]
+
+        def node(i):
+            return {"id": i["id"], "identifier": i["identifier"], "title": i["title"],
+                    "description": i.get("description"), "project": i.get("project"),
+                    "state": dict(i["state"]), "team": dict(i["team"]),
+                    "delegate": i.get("delegate"),
+                    "labels": {"nodes": [{"name": n} for n in i.get("labels", [])]},
+                    "children": {"nodes": [{"id": self.issues[k]["id"]}
+                                           for k in self.epics.get(i["identifier"], [])]},
+                    "inverseRelations": {"nodes": [
+                        {"type": "blocks", "issue": {
+                            "id": self.issues[b]["id"], "identifier": b,
+                            "state": dict(self.issues[b]["state"])}}
+                        for b in i.get("blocked_by", [])],
+                        "pageInfo": {"hasNextPage": i["identifier"] in self.blocker_overflow}}}
+        out = node(e)
+        out["parent"] = e.get("parent")
+        out["children"] = {"nodes": [node(self.issues[k]) for k in self.epics.get(ident, [])],
+                           "pageInfo": {"hasNextPage": ident in self.overflow}}
+        return out
 
     def comment(self, issue_id, body):
         self.comments.append((issue_id, body))
@@ -1835,6 +2524,23 @@ def selftest():
         # The real tracker client runs the PLANNER'S OWN functions unchanged (KIT-222).
         sent = []
         idea_labels = [[{"name": "track:x"}]]
+        agents = [[{"id": "agent-1", "active": True}]]
+
+        def kid(n, blockers):
+            return {"id": "uuid-%d" % n, "identifier": "PROD-%d" % n, "title": "c",
+                    "state": {"id": "s", "name": "Backlog", "type": "backlog"},
+                    "team": {"key": "PROD"}, "delegate": None,
+                    "labels": {"nodes": [{"name": "provenance:epic"}]},
+                    "children": {"nodes": []},
+                    "inverseRelations": {"nodes": [
+                        {"type": "related", "issue": {"id": "x", "identifier": "PROD-9",
+                                                      "state": {"name": "B",
+                                                                "type": "backlog"}}}] + [
+                        {"type": "blocks", "issue": {"id": "uuid-%d" % b,
+                                                     "identifier": "PROD-%d" % b,
+                                                     "state": {"name": "Backlog",
+                                                               "type": "backlog"}}}
+                        for b in blockers]}}
 
         def by_operation(url, headers, payload=None, timeout=20):
             op = re.search(r"(?:query|mutation)\s+(\w+)", payload["query"]).group(1)
@@ -1852,6 +2558,15 @@ def selftest():
                     "labels": {"nodes": []}}]}},
                 "BridgeMove": {"issueUpdate": {"success": True}},
                 "BridgeComment": {"commentCreate": {"success": True}},
+                "BridgeDelegate": {"issueUpdate": {"success": True}},
+                "PlanAgent": {"users": {"nodes": agents[0]}},
+                "BridgeEpic": {"issue": {
+                    "id": "uuid-50", "identifier": "PROD-50", "title": "e",
+                    "state": {"id": "s", "name": "Backlog", "type": "backlog"},
+                    "team": {"key": "PROD"}, "parent": None, "delegate": None,
+                    "labels": {"nodes": [{"name": "provenance:agent"}]},
+                    "children": {"nodes": [kid(51, []), kid(52, [51])],
+                                 "pageInfo": {"hasNextPage": False}}}},
             }
             return {"data": answers[op]}
         real_http = globals()["_http_json"]
@@ -1862,10 +2577,28 @@ def selftest():
             idea_labels[0] = [{"name": "provenance:epic"}]
             check("wiring-live-work-by-the-planners-rules",
                   any("provenance:epic" in r for r in tc.live_work("u")), True)
-            check("wiring-plan-it-state", tc.plan_it_state("PROD", "Plan it"),
+            check("wiring-plan-it-state", tc.team_state("PROD", "Plan it"),
                   ("st-plan-it", None))
             check("wiring-a-started-state-is-refused",
-                  tc.plan_it_state("PROD", "Doing")[0], None)
+                  tc.team_state("PROD", "Doing")[0], None)
+            check("wiring-agent-user", tc.agent_user("Agent"), ("agent-1", None))
+            agents[0] = [{"id": "agent-1", "active": True}, {"id": "agent-2", "active": True}]
+            check("wiring-two-agent-users-refused", tc.agent_user("Agent")[0], None)
+            agents[0] = [{"id": "agent-1", "active": False}]
+            check("wiring-an-inactive-agent-user-refused", tc.agent_user("Agent")[0], None)
+            ep = tc.epic("PROD-50")
+            check("wiring-epic-children-and-blockers",
+                  ([k["identifier"] for k in ep["children"]["nodes"]],
+                   [b["identifier"] for b, _s in blockers_of(ep["children"]["nodes"][1])]),
+                  (["PROD-51", "PROD-52"], ["PROD-51"]))
+            tc.delegate("u", "agent-1")
+            check("wiring-the-delegation-carries-delegateId-only",
+                  [v for op, v in sent if op == "BridgeDelegate"],
+                  [{"id": "u", "delegateId": "agent-1"}])
+            before = [op for op, _v in sent].count("PlanSessions")
+            check("wiring-sessions-read-once-per-pass",
+                  (tc.sessions_on("u"), tc.sessions_on("v"),
+                   [op for op, _v in sent].count("PlanSessions") - before), ([], [], 1))
             tc.move("u", "st-plan-it")
             tc.comment("u", "who said yes")
             check("wiring-the-move-carries-stateId-only",
@@ -1923,15 +2656,6 @@ def selftest():
         run(c, s, t)
         check("grammar:plan-with-words-after-the-id-is-not-a-request",
               any("PROD-6" in x for x in posted(s)), False)
-
-        # `approve <id>` is recognised: answered once, nothing read, nothing changed.
-        c, s, t = world("approve")
-        run(c, s, t)
-        s.add(ALICE, "approve PROD-5")
-        run(c, s, t)
-        check("approve-is-answered-once-and-changes-nothing",
-              (["not built" in x for x in posted(s)], t.reads,
-               json.load(open(state_path(c)))["questions"]), ([True], 0, {}))
 
         # A bot's request is credited in words, never @mentioned (bot_id or app_id).
         c, s, t = world("bot-credit")
@@ -2235,7 +2959,7 @@ def selftest():
         run(c, s, t)
         root = s.add(ALICE, "plan PROD-5")
         run(c, s, t)
-        t.plan_it = {}
+        t.team_states = {}
         s.add(BOB, "yes", thread=root)
         run(c, s, t)
         check("no-plan-it-state-refused", (t.moves, "can't move PROD-5" in posted(s)[-1]),
@@ -2281,7 +3005,7 @@ def selftest():
                 ("moved-to-another-planned-team", lambda i: i.update(team={"key": "DEV"})),
                 ("another-ticket-under-the-id", lambda i: i.update(id="uuid-other"))):
             c, s, t = world("plan-changed-" + name, act=True, team_keys=["PROD", "DEV"])
-            t.plan_it["DEV"] = ("st-plan-it", None)
+            t.team_states[("DEV", "Plan it")] = "st-plan-it"
             run(c, s, t)
             root = s.add(ALICE, "plan PROD-5")
             run(c, s, t)
@@ -2351,6 +3075,616 @@ def selftest():
               ([("uuid-5", "st-plan-it")], [DONE], [EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK],
                1, ["PROD-5"], 1, True, []))
 
+        # 11e. APPROVE AN EPIC, AND ITS CHILDREN START IN ORDER (KIT-223) -------------------
+        def approved(name, wip=1, kids=None, setup=None, **over):
+            c, s, t = world(name, act=True, agent_user_name="Agent", epic_wip=wip, **over)
+            t.add_epic("PROD-50", kids or (("PROD-51", ()), ("PROD-52", ("PROD-51",)),
+                                           ("PROD-53", ("PROD-52",))))
+            if setup:
+                setup(t)
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return c, s, t, root
+
+        def delegated(t):
+            return [i for i, _a in t.delegations]
+
+        def followed(c):
+            return sorted(json.load(open(state_path(c))).get("epics", {}))
+
+        c, s, t, root = approved("approve")
+        asked = [p for p in posted(s) if "Approve this plan?" in p]
+        check("approve-question-lists-the-children-in-order",
+              len(asked) == 1 and asked[0].index("PROD-51") < asked[0].index("PROD-52")
+              < asked[0].index("PROD-53"), True)
+        check("approve-moves-the-epic-to-ready", t.moves, [("uuid-50", "st-todo")])
+        check("the-epic-says-who-approved",
+              [b.splitlines()[0] for i, b in t.comments if i == "uuid-50"],
+              ["Approved in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
+               % (BOB, BOB, iso(float([m for m in s.messages if m.get("user") == BOB
+                                         and m.get("text") == "yes"][0]["ts"])))])
+        check("the-first-child-starts-at-once", delegated(t), ["uuid-51"])
+        check("delegated-to-the-agent", t.delegations[0][1], "agent-1")
+        first = [b for i, b in t.comments if i == "uuid-51"]
+        check("a-delegation-first-line-names-the-approver",
+              len(first) == 1 and BOB in first[0].splitlines()[0]
+              and "approved PROD-50" in first[0].splitlines()[0], True)
+        check("the-thread-says-the-child-started",
+              sum("Started PROD-51" in p for p in posted(s)), 1)
+        check("the-epic-is-never-delegated", "uuid-50" in delegated(t), False)
+        run(c, s, t)
+        check("wip-holds-the-next-child", delegated(t), ["uuid-51"])
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("the-next-child-starts-when-its-blocker-is-done", delegated(t),
+              ["uuid-51", "uuid-52"])
+        t.set_state("PROD-52", "completed")
+        run(c, s, t)
+        t.set_state("PROD-53", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("every-child-finished-is-said-once-and-the-epic-let-go",
+              (delegated(t), sum("are finished" in p for p in posted(s)), followed(c)),
+              (["uuid-51", "uuid-52", "uuid-53"], 1, []))
+
+        c, s, t, root = approved("order", wip=2, kids=(("PROD-51", ("PROD-52",)),
+                                                       ("PROD-52", ())))
+        check("dependency-order-not-ticket-order", delegated(t), ["uuid-52"])
+        asked = [p for p in posted(s) if "Approve this plan?" in p][0]
+        check("the-question-lists-dependency-order", asked.index("PROD-52")
+              < asked.index("PROD-51"), True)
+        c, s, t, root = approved("wip-two", wip=2, kids=(("PROD-51", ()), ("PROD-52", ()),
+                                                         ("PROD-53", ())))
+        check("wip-two-starts-two", delegated(t), ["uuid-51", "uuid-52"])
+
+        # A blocker reopened: what waits on it waits again, the stall is said once, and a
+        # child is never handed over twice.
+        c, s, t, root = approved("reopen", kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",)),
+                                                 ("PROD-53", ("PROD-51",))))
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        t.set_state("PROD-51", "backlog")
+        t.issues["PROD-51"]["delegate"] = None
+        t.set_state("PROD-52", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("a-reopened-blocker-holds-what-waits-on-it", delegated(t),
+              ["uuid-51", "uuid-52"])
+        check("a-stall-is-said-once",
+              sum("PROD-53 waits on PROD-51" in p for p in posted(s)), 1)
+
+        # A child already delegated, or with a session, is never handed over, and counts.
+        c, s, t, root = approved("pre-delegated", kids=(("PROD-51", ()), ("PROD-52", ())),
+                                 setup=lambda t_: t_.issues["PROD-51"].update(
+                                     delegate={"id": "someone"}))
+        check("a-delegated-child-is-not-handed-over-and-holds-wip", delegated(t), [])
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("then-the-next-starts", delegated(t), ["uuid-52"])
+        c, s, t, root = approved("has-session", kids=(("PROD-51", ()), ("PROD-52", ())),
+                                 setup=lambda t_: t_.sessions.update({"uuid-51": [{"id": "x"}]}))
+        check("a-child-with-a-session-is-not-handed-over", delegated(t), [])
+
+        # Only an epic the idea gate filed.
+        for name, labels, kid_label, needle in (
+                ("not-gate", (), "provenance:epic", "provenance:agent"),
+                ("kid-not-gate", ("provenance:agent",), None, "provenance:epic")):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()),), epic_labels=labels, kid_label=kid_label)
+            run(c, s, t)
+            s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            check("refused-unless-the-idea-gate-filed-it:" + name,
+                  (needle in posted(s)[-1], json.load(open(state_path(c)))["questions"],
+                   t.moves, t.delegations), (True, {}, [], []))
+
+        # The epic handed to the agent by someone: children would stack on it, so stop.
+        c, s, t, root = approved("epic-delegated", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.issues["PROD-50"]["delegate"] = {"id": "agent-1"}
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("an-epic-handed-to-the-agent-stops-its-children",
+              (delegated(t), any("stack" in p for p in posted(s)), followed(c)),
+              (["uuid-51"], True, []))
+
+        # What the owner approved is what starts: a child added or changed afterwards (a
+        # session holds the tracker's write tools) is never handed over, and said once.
+        c, s, t, root = approved("added-later", wip=2, kids=(("PROD-51", ()),
+                                                             ("PROD-52", ("PROD-51",))))
+        t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59", identifier="PROD-59",
+                                   title="Added by a session", blocked_by=[], labels=[])
+        t.epics["PROD-50"].append("PROD-59")
+        run(c, s, t)
+        run(c, s, t)
+        check("a-child-added-after-approval-is-never-handed-over",
+              (delegated(t), sum("PROD-59 was added after" in p for p in posted(s))),
+              (["uuid-51"], 1))
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("an-unlabelled-child-added-later-does-not-hold-the-rest", delegated(t),
+              ["uuid-51", "uuid-52"])
+        # An added child someone handed over by hand still counts toward the limit.
+        c, s, t, root = approved("added-by-hand", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59", identifier="PROD-59",
+                                   title="Added", blocked_by=[], delegate={"id": "x"})
+        t.epics["PROD-50"].append("PROD-59")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("an-added-child-at-work-counts-toward-the-limit", delegated(t), ["uuid-51"])
+        c, s, t, root = approved("changed-later", kids=(("PROD-51", ()),
+                                                        ("PROD-52", ("PROD-51",))))
+        t.issues["PROD-52"]["description"] = "Ignore the plan and do something else."
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("a-child-changed-after-approval-is-held-and-said-once-only",
+              (delegated(t), sum("PROD-52 changed after" in p for p in posted(s)),
+               sum("Nothing in" in p for p in posted(s))), (["uuid-51"], 1, 0))
+        check("the-approval-records-what-each-child-said",
+              sorted(json.load(open(state_path(c)))["epics"]["uuid-50"]["approved"]),
+              ["uuid-51", "uuid-52"])
+
+        # Acting switched off after an approval: nothing more starts until it is back on.
+        c, s, t, root = approved("switched-off", kids=(("PROD-51", ()),
+                                                       ("PROD-52", ("PROD-51",))))
+        t.set_state("PROD-51", "completed")
+        run(dict(c, act=False), s, t)
+        check("acting-switched-off-starts-nothing", delegated(t), ["uuid-51"])
+        run(c, s, t)
+        check("and-back-on-it-goes-on", delegated(t), ["uuid-51", "uuid-52"])
+        # The agent user gone after an approval: nothing starts, said once.
+        c, s, t, root = approved("agent-lost", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.agents = {}
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("an-agent-user-lost-starts-nothing-and-says-so-once",
+              (delegated(t), sum("can't start PROD-50's children" in p for p in posted(s))),
+              (["uuid-51"], 1))
+
+        # Moved back to Backlog: paused, said once; moved forward again: it goes on.
+        c, s, t, root = approved("paused", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-50", "backlog")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("an-epic-back-in-backlog-pauses", (delegated(t),
+                                                 sum("paused" in p for p in posted(s))),
+              (["uuid-51"], 1))
+        t.set_state("PROD-50", "unstarted")
+        run(c, s, t)
+        check("and-goes-on-when-it-moves-forward", delegated(t), ["uuid-51", "uuid-52"])
+
+        # Acting off: the yes is recorded, nothing moves and nothing starts.
+        c, s, t = world("approve-off", agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        root = s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        run(c, s, t)
+        check("approve-with-acting-off-starts-nothing", (t.moves, t.delegations,
+                                                         "switched off" in posted(s)[-1]),
+              ([], [], True))
+        # No agent user named: refused before asking. One that cannot be found: refused.
+        c, s, t = world("no-agent", act=True)
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        check("approve-without-an-agent-user-is-refused", "agent_user_name" in posted(s)[-1],
+              True)
+        c, s, t = world("agent-gone", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        root = s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        t.agents = {}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("an-agent-user-not-found-moves-nothing", (t.moves, t.delegations,
+                                                        "can't approve" in posted(s)[-1]),
+              ([], [], True))
+        # Approving is an action: over the limit, nothing moves.
+        c, s, t = world("approve-limit", act=True, agent_user_name="Agent",
+                        max_actions_per_hour=1)
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        r5 = s.add(ALICE, "plan PROD-5")
+        r50 = s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=r5)
+        s.add(BOB, "yes", thread=r50)
+        run(c, s, t)
+        check("approving-counts-against-the-action-limit",
+              (t.moves, t.delegations, "my limit" in posted(s)[-1]),
+              ([("uuid-5", "st-plan-it")], [], True))
+        # An epic moved to another team after the question: refused, nothing moves.
+        c, s, t = world("approve-team-moved", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        root = s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        for k in ("PROD-50", "PROD-51"):
+            t.issues[k]["team"] = {"key": "OPS"}
+        s.add(BOB, "yes", thread=root)
+        run(c, s, t)
+        check("an-epic-moved-off-a-team-is-refused", (t.moves, t.delegations,
+                                                      "now on OPS" in posted(s)[-1]),
+              ([], [], True))
+        # The action limit counts each child started.
+        c, s, t, root = approved("act-limit-kids", wip=3, max_actions_per_hour=2,
+                                 kids=(("PROD-51", ()), ("PROD-52", ()), ("PROD-53", ())))
+        check("the-action-limit-counts-children", delegated(t), ["uuid-51"])
+        run(c, s, t, at=now + 3700)
+        check("and-the-rest-start-an-hour-later", delegated(t),
+              ["uuid-51", "uuid-52", "uuid-53"])
+        # A dry run starts nothing.
+        c, s, t, root = approved("dry-release", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-51", "completed")
+        run(c, s, t, dry=True)
+        check("a-dry-run-starts-nothing", delegated(t), ["uuid-51"])
+        run(c, s, t)
+        check("a-real-pass-after-it-does", delegated(t), ["uuid-51", "uuid-52"])
+        # An epic already followed is not asked about again.
+        c, s, t, root = approved("again", kids=(("PROD-51", ()), ("PROD-52", ())))
+        s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        check("an-approved-epic-is-not-asked-again", "already approved" in posted(s)[-1], True)
+        # The order check, as a function the order job (B9) shares.
+        c, s, t = world("order-check")
+        t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+        node = t.epic("PROD-50")["children"]["nodes"][1]
+        check("open-blockers-names-each-blocker-and-its-state", open_blockers(node),
+              ["PROD-51 (Backlog)"])
+        t.set_state("PROD-51", "completed")
+        check("open-blockers-is-empty-once-done",
+              open_blockers(t.epic("PROD-50")["children"]["nodes"][1]), [])
+
+        # REVIEW OF KIT-223, 1 (HIGH): what the member saw is what starts. The children are
+        # recorded when the question is ASKED; a yes after they changed approves nothing.
+        for name, change in (
+                ("added-before-yes", lambda t_: (t_.issues.__setitem__("PROD-59", dict(
+                    t_.issues["PROD-52"], id="uuid-59", identifier="PROD-59", title="Sneaky",
+                    blocked_by=[])), t_.epics["PROD-50"].append("PROD-59"))),
+                ("changed-before-yes", lambda t_: t_.issues["PROD-52"].update(
+                    description="Do something else.")),
+                ("retitled-before-yes", lambda t_: t_.issues["PROD-52"].update(
+                    title="Something the member never saw")),
+                ("removed-before-yes", lambda t_: t_.epics["PROD-50"].remove("PROD-52")),
+                ("relabelled-before-yes", lambda t_: t_.issues["PROD-52"]["labels"].append(
+                    "track:other")),
+                ("unblocked-before-yes", lambda t_: t_.issues["PROD-52"].update(
+                    blocked_by=[])),
+                ("moved-project-before-yes", lambda t_: t_.issues["PROD-52"].update(
+                    project={"id": "another-project"}))):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            change(t)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            check("a-yes-after-the-children-changed-approves-nothing:" + name,
+                  (t.moves, t.delegations, "changed since I asked" in posted(s)[-1],
+                   followed(c)), ([], [], True, []))
+
+        # A child added later CARRYING provenance:epic is held exactly like an unlabelled one.
+        c, s, t, root = approved("added-labelled", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59", identifier="PROD-59",
+                                   title="Added", blocked_by=[], labels=["provenance:epic"])
+        t.epics["PROD-50"].append("PROD-59")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("a-labelled-child-added-later-is-never-handed-over",
+              (delegated(t), any("PROD-59 was added after" in p for p in posted(s))),
+              (["uuid-51", "uuid-52"], True))
+
+        # 2 (MEDIUM): a hold is never silent. A child outside the plan at work is named; a
+        # hand-over that never started is named after a while.
+        c, s, t, root = approved("extra-at-work", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59", identifier="PROD-59",
+                                   title="Added", blocked_by=[], labels=[])
+        t.epics["PROD-50"].append("PROD-59")
+        t.set_state("PROD-59", "started")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        run(c, s, t)
+        check("an-extra-child-at-work-holds-the-limit-and-is-said-once",
+              (delegated(t), sum("PROD-59 is at work" in p for p in posted(s))),
+              (["uuid-51"], 1))
+        c, s, t, root = approved("stuck-start", kids=(("PROD-51", ()), ("PROD-52", ())))
+        run(c, s, t, at=now + 3 * 3600)
+        run(c, s, t, at=now + 4 * 3600)
+        check("a-hand-over-that-never-started-is-said-once",
+              (delegated(t), sum("PROD-51 was handed to the agent" in p for p in posted(s))),
+              (["uuid-51"], 1))
+
+        # 3 (MEDIUM): one epic that cannot be read does not stop the others, or the pass's
+        # housekeeping; the pass still ends loud.
+        c, s, t, root = approved("one-bad-epic", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.add_epic("PROD-60", (("PROD-61", ()),))
+        r60 = s.add(ALICE, "approve PROD-60")
+        run(c, s, t)
+        s.add(BOB, "yes", thread=r60)
+        run(c, s, t)
+        stale = s.add(ALICE, "approve PROD-60")
+        real_epic = t.epic
+
+        def flaky(ident):
+            if ident in ("uuid-50", "PROD-50"):
+                raise BridgeError("Query too complex (simulated)")
+            return real_epic(ident)
+        t.epic = flaky
+        t.set_state("PROD-61", "completed")
+        st = json.load(open(state_path(c)))
+        st["questions"]["%s:x" % CHAN] = {"kind": "plan", "ticket": "PROD-6", "channel": CHAN,
+                                          "thread": stale, "ts": stale,
+                                          "asked_at": now - 30 * 3600, "status": OPEN}
+        json.dump(st, open(state_path(c), "w"))
+        code, _o = run(c, s, t)
+        st = json.load(open(state_path(c)))
+        check("one-unreadable-epic-is-loud-but-the-rest-of-the-pass-runs",
+              (code, st["questions"]["%s:x" % CHAN]["status"],
+               "all 1 children of prod-60" in " ".join(posted(s)).lower()),
+              (EXIT_ERROR, EXPIRED, True))
+        for _ in range(3):
+            run(c, s, t)
+        check("an-epic-unreadable-three-passes-is-said-once",
+              sum("I can't read PROD-50" in p for p in posted(s)), 1)
+        t.epic = real_epic
+
+        # 4 (MEDIUM): an epic moved off the bridge's teams is let go, by id, and said.
+        c, s, t, root = approved("moved-team", kids=(("PROD-51", ()), ("PROD-52", ())))
+        for k in ("PROD-50", "PROD-51", "PROD-52"):
+            t.issues[k]["team"] = {"key": "OPS"}
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("an-epic-moved-off-the-teams-is-let-go",
+              (delegated(t), any("now on OPS" in p for p in posted(s)), followed(c)),
+              (["uuid-51"], True, []))
+
+        # …and it is followed by its id, so a new identifier (a team move renames it) does
+        # not lose it.
+        c, s, t, root = approved("renamed", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.issues["PROD-77"] = t.issues.pop("PROD-50")
+        t.issues["PROD-77"]["identifier"] = "PROD-77"
+        t.epics["PROD-77"] = t.epics.pop("PROD-50")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("an-epic-is-followed-by-its-id", (delegated(t), followed(c)),
+              (["uuid-51", "uuid-52"], ["uuid-50"]))
+
+        # 5 (MEDIUM): many children added later are said once, together, and never again.
+        c, s, t, root = approved("many-added", kids=(("PROD-51", ()),))
+        for n in range(70, 92):
+            k = "PROD-%d" % n
+            t.issues[k] = dict(t.issues["PROD-51"], id="uuid-%d" % n, identifier=k,
+                               title="Added", blocked_by=[], labels=[], delegate=None)
+            t.epics["PROD-50"].append(k)
+        before = len(s.posts)
+        for _ in range(3):
+            run(c, s, t)
+        check("many-added-children-are-said-once-together", len(s.posts) - before, 1)
+
+        # 6: the orchestrator and graphite labels make the dispatcher hand out or stack
+        # children itself, so an epic carrying them anywhere is refused.
+        for where in ("epic", "child"):
+            c, s, t = world("mode-label-" + where, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()),))
+            t.issues["PROD-50" if where == "epic" else "PROD-51"]["labels"].append("Graphite")
+            run(c, s, t)
+            s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            check("a-dispatcher-mode-label-is-refused:" + where,
+                  ("`Graphite`" in posted(s)[-1], t.moves), (True, []))
+
+        # The approve question credits a bot in words too, never with a mention.
+        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()),))
+        run(c, s, t)
+        s.add(CHATBOT, "approve PROD-50", bot_id="B0CHATBOT1")
+        run(c, s, t)
+        check("an-approve-asked-by-a-bot-is-credited-in-words-never-mentioned",
+              ("Asked for by the chat bot" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
+              (True, False))
+
+        # REVIEW OF KIT-223 (2026-10-10, second review) ----------------------------------
+        # 1: a yes binds to the terms the approve question stated. Acting switched on, or
+        # another limit, ready state or agent user since it was asked: nothing acts.
+        for name, asked, answered in (
+                ("acting-switched-on", {}, {"act": True}),
+                ("epic-wip-raised", {"act": True}, {"act": True, "epic_wip": 3}),
+                ("ready-state-renamed", {"act": True}, {"act": True, "ready_state": "Ready"}),
+                ("agent-user-renamed", {"act": True}, {"act": True,
+                                                       "agent_user_name": "Other"})):
+            c, s, t = world("approve-promise-" + name, agent_user_name="Agent", **asked)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            s.add(BOB, "yes", thread=root)
+            run(dict(c, **answered), s, t)
+            check("an-approve-yes-under-other-settings-than-asked-acts-on-nothing:" + name,
+                  (t.moves, t.delegations, followed(c), status_of(c),
+                   "settings changed since" in posted(s)[-1]), ([], [], [], [REFUSED], True))
+
+        # 2: every re-check of what the idea gate filed is pinned, before asking...
+        for name, change, needle in (
+                ("a-child-on-another-team", lambda t_: t_.issues["PROD-51"].update(
+                    team={"key": "OPS"}), "PROD-51 is on another team"),
+                ("a-child-with-children", lambda t_: t_.epics.__setitem__("PROD-51",
+                                                                          ["PROD-6"]),
+                 "PROD-51 has child tickets of its own"),
+                ("an-epic-with-a-parent", lambda t_: t_.issues["PROD-50"].update(
+                    parent={"id": "uuid-6"}), "it has a parent ticket"),
+                ("a-finished-epic", lambda t_: t_.set_state("PROD-50", "canceled"),
+                 "it is Canceled"),
+                ("more-children-than-it-reads", lambda t_: t_.overflow.add("PROD-50"),
+                 "more than %d children" % MAX_CHILDREN)):
+            c, s, t = world("approve-refused-" + name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ())))
+            change(t)
+            run(c, s, t)
+            s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            check("refused-before-asking:" + name,
+                  (needle in posted(s)[-1], json.load(open(state_path(c)))["questions"]),
+                  (True, {}))
+        # ...at the yes...
+        for name, change, needle in (
+                ("the-epic-handed-over", lambda t_: t_.issues["PROD-50"].update(
+                    delegate={"id": "someone"}), "handed to the agent itself"),
+                ("the-epic-relabelled", lambda t_: t_.issues["PROD-50"]["labels"].append(
+                    "Graphite"), "`Graphite`")):
+            c, s, t = world("approve-yes-refused-" + name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ())))
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            change(t)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            check("refused-at-the-yes:" + name,
+                  (t.moves, t.delegations, followed(c), "can't approve" in posted(s)[-1],
+                   needle in posted(s)[-1]), ([], [], [], True, True))
+        # ...and on every pass after it.
+        c, s, t, root = approved("child-to-another-team", kids=(("PROD-51", ()),
+                                                                ("PROD-52", ("PROD-51",))))
+        t.issues["PROD-52"]["team"] = {"key": "OPS"}
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("a-child-moved-to-another-team-after-the-yes-pauses-the-epic",
+              (delegated(t), any("PROD-52 is on another team" in p for p in posted(s))),
+              (["uuid-51"], True))
+        c, s, t, root = approved("epic-canceled", kids=(("PROD-51", ()), ("PROD-52", ())))
+        t.set_state("PROD-50", "canceled")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        check("a-canceled-epic-is-let-go-for-good",
+              (delegated(t), followed(c),
+               any("PROD-50 is Canceled, so I've stopped" in p for p in posted(s))),
+              (["uuid-51"], [], True))
+        # The order: a canceled blocker is not a Done one; a page of blockers that runs over
+        # is never read as complete.
+        c, s, t, root = approved("blocker-canceled", kids=(("PROD-51", ()),
+                                                           ("PROD-52", ("PROD-51",))))
+        t.set_state("PROD-51", "canceled")
+        run(c, s, t)
+        check("a-canceled-blocker-holds-what-waits-on-it",
+              (delegated(t), any("PROD-52 waits on PROD-51 (Canceled)" in p
+                                 for p in posted(s))), (["uuid-51"], True))
+        c, s, t, root = approved("blocker-overflow", wip=2, kids=(("PROD-51", ()),
+                                                                  ("PROD-52", ())),
+                                 setup=lambda t_: t_.blocker_overflow.add("PROD-52"))
+        check("more-blockers-than-it-reads-never-starts",
+              (delegated(t), open_blockers(t.epic("PROD-50")["children"]["nodes"][1])),
+              (["uuid-51"], ["more blockers than the bridge reads"]))
+        # The limit: a child someone moved to a started state holds its slot, though no one
+        # handed it over.
+        c, s, t, root = approved("started-by-hand", kids=(("PROD-51", ()), ("PROD-52", ())),
+                                 setup=lambda t_: t_.set_state("PROD-51", "started"))
+        check("a-started-child-holds-the-limit-and-is-never-handed-over", delegated(t), [])
+        # An epic already in progress is approved where it is, never moved back to Todo.
+        c, s, t, root = approved("epic-in-progress", kids=(("PROD-51", ()),),
+                                 setup=lambda t_: t_.set_state("PROD-50", "started"))
+        check("an-epic-in-a-started-state-is-not-moved-back", (t.moves, delegated(t)),
+              ([], ["uuid-51"]))
+
+        # 3: a failed attribution comment is owed, said, retried every pass, and loud.
+        c, s, t = world("approve-comment-fails", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+        run(c, s, t)
+        root = s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        real_comment = t.comment
+        t.comment = refusing_comment
+        s.add(BOB, "yes", thread=root)
+        codes = [run(c, s, t)[0], run(c, s, t)[0]]
+        owed = json.load(open(state_path(c))).get("owed")
+        t.comment = real_comment
+        codes += [run(c, s, t)[0], run(c, s, t)[0]]
+        check("a-failed-approve-or-start-comment-is-owed-retried-and-loud-until-it-lands",
+              (t.moves, delegated(t), codes,
+               sum("could not be written; I will try again" in x for x in posted(s)),
+               sorted(o.get("ticket") for o in owed or []),
+               sorted(i for i, _b in t.comments),
+               json.load(open(state_path(c))).get("owed")),
+              ([("uuid-50", "st-todo")], ["uuid-51"],
+               [EXIT_ERROR, EXIT_ERROR, EXIT_OK, EXIT_OK], 2, ["PROD-50", "PROD-51"],
+               ["uuid-50", "uuid-51"], []))
+
+        # 4: a session can mark its own child Done while it still runs. The child holds its
+        # slot until the session ends.
+        c, s, t, root = approved("done-but-running", kids=(("PROD-51", ()),
+                                                           ("PROD-52", ("PROD-51",))))
+        t.sessions["uuid-51"] = [{"id": "s-51", "status": "active"}]
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        held = delegated(t)
+        t.sessions["uuid-51"] = [{"id": "s-51", "status": "complete"}]
+        run(c, s, t)
+        check("a-child-done-while-its-session-runs-holds-the-slot-until-it-ends",
+              (held, delegated(t)), (["uuid-51"], ["uuid-51", "uuid-52"]))
+        check("and-that-hold-is-said-once",
+              sum("PROD-51 is marked finished, but its session is still running" in p
+                  for p in posted(s)), 1)
+
+        # 5: pins the second review's mutants left standing. An approval said only after
+        # its post lands: a failed "Approved" post is said on the next pass, and nothing is
+        # recorded, moved or commented twice.
+        c, s, t = world("approve-post-fails", act=True, agent_user_name="Agent")
+        t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+        run(c, s, t)
+        root = s.add(ALICE, "approve PROD-50")
+        run(c, s, t)
+        real_post = s.post
+
+        def approved_post_fails(channel, thread_ts, text, real_post=real_post):
+            if text.startswith("Approved PROD-50"):
+                raise BridgeError("Slack chat.postMessage failed (simulated)")
+            return real_post(channel, thread_ts, text)
+        s.post = approved_post_fails
+        s.add(BOB, "yes", thread=root)
+        code, _o = run(c, s, t)
+        s.post = real_post
+        run(c, s, t)
+        check("a-failed-approved-post-is-said-next-pass-and-nothing-twice",
+              (code, t.moves, delegated(t), len([i for i, _b in t.comments if i == "uuid-50"]),
+               status_of(c), "PROD-50 is already approved." in posted(s)),
+              (EXIT_ERROR, [("uuid-50", "st-todo")], ["uuid-51"], 1, [DONE], True))
+        # An epic read that answers with another ticket is never followed as this one.
+        c, s, t, root = approved("epic-id-mismatch", kids=(("PROD-51", ()), ("PROD-52", ())))
+        real_epic = t.epic
+        t.epic = lambda ident: dict(real_epic(ident), id="uuid-someone-else")
+        t.set_state("PROD-51", "completed")
+        run(c, s, t)
+        t.epic = real_epic
+        check("an-epic-read-that-names-another-ticket-is-let-go",
+              (delegated(t), followed(c), any("no longer in the tracker" in p
+                                              for p in posted(s))), (["uuid-51"], [], True))
+        # A credential an unreadable epic's error echoes is redacted before it is cut short.
+        key = "lin_api_" + "3" * 30
+        os.environ["STAGE_E_LINEAR_API_KEY"] = key
+        try:
+            c, s, t, root = approved("epic-error-leaks", kids=(("PROD-51", ()),))
+
+            def leaky_epic(_ident):
+                # Padded so the key straddles where the error is cut short.
+                raise BridgeError("%s Authorization: %s" % ("x" * 130, key))
+            t.epic = leaky_epic
+            outs = [run(c, s, t)[1] for _ in range(3)]
+            check("an-unreadable-epics-error-is-redacted-before-it-is-cut",
+                  (any("I can't read PROD-50" in p for p in posted(s)),
+                   any(key[:10] in x for x in posted(s) + outs)), (True, False))
+        finally:
+            os.environ.pop("STAGE_E_LINEAR_API_KEY", None)
+
         # 12. CONFIG: every problem at once; the chat bot's token name and `act` refused.
         os.makedirs(os.path.join(tmp, "in-a-repo", ".git"))
         try:
@@ -2361,6 +3695,8 @@ def selftest():
             errs = ""
         except BridgeError as exc:
             errs = str(exc)
+        check("config-caps-epic-wip", "'epic_wip' must be at most 10" in _config_error(
+            dict(EXAMPLE_CONFIG, epic_wip=11, state_dir=os.path.join(tmp, "wip"))), True)
         for needle in ("unknown config key", "'schema'", "channel_ids", "owner_user_id",
                        "team_keys", "chat bot's own name", "'act' must be true or false",
                        "question_ttl_hours",
@@ -2421,16 +3757,22 @@ def selftest():
         check("missing-credential-is-usage", run_command(c, False, 30, out=io.StringIO()),
               EXIT_USAGE)
 
-    # 14. EXACTLY TWO TRACKER WRITES (KIT-222): a state move carrying `stateId` only, and a
-    #     comment. No other mutation anywhere above the tests.
+    # 14. EXACTLY THREE TRACKER WRITES (KIT-222, KIT-223): a state move carrying `stateId`
+    #     only, a delegation carrying `delegateId` only, and a comment. No other mutation
+    #     anywhere above the tests.
     mutations = re.findall(r"\bmutation\s+(\w+)", body)
-    check("only-two-tracker-writes", sorted(mutations), ["BridgeComment", "BridgeMove"])
+    check("only-three-tracker-writes", sorted(mutations),
+          ["BridgeComment", "BridgeDelegate", "BridgeMove"])
     check("the-move-sets-stateId-only",
           re.search(r"issueUpdate\(id: \$id, input: \{ stateId: \$stateId \}\)", body)
-          is not None and body.count("issueUpdate(") == 1, True)
+          is not None, True)
+    check("the-delegation-sets-delegateId-only",
+          re.search(r"issueUpdate\(id: \$id, input: \{ delegateId: \$delegateId \}\)",
+                    body) is not None and body.count("issueUpdate(") == 2, True)
     check("no-other-write-verb", [v for v in ("issueCreate", "issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
-                                              "agentSessionCreate", "delegate")
+                                              "agentSessionCreate", "assigneeId",
+                                              "labelIds", "parentId")
                                   if v in body], [])
     check("tracker-endpoint-fixed", body.count("https://api.linear.app/graphql"), 1)
 

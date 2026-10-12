@@ -44,10 +44,20 @@ BOT_USER_ID=U0123456789
 # --- Optional, with their defaults -----------------------------------------
 
 # Whether a verified yes acts. no: the bridge asks and records only. yes: a
-# verified yes to `plan <ticket id>` moves that idea into Plan it, as the owner.
+# verified yes to `plan <ticket id>` moves that idea into Plan it, and a yes to
+# `approve <epic id>` moves the epic to READY_STATE and hands its children to
+# AGENT_USER_NAME, in dependency order. Both act as the owner.
 # Start with no, watch it ask, then set yes and run `install --apply`.
 #ACT=no
 #PLAN_IT_STATE=Plan it
+
+# The dispatcher's app user, by its display name in the tracker: who an
+# approved epic's children are handed to. Empty refuses every `approve`.
+#AGENT_USER_NAME=
+# How many children of one approved epic may be started and unfinished at once.
+#EPIC_WIP=1
+# The to-do state an approved epic moves to.
+#READY_STATE=Todo
 
 # The only Slack user ids who may answer a question. Empty means any full
 # member of the workspace: guests, bots and other workspaces are always refused.

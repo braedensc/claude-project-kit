@@ -1,16 +1,21 @@
 # Slack bridge — operator steps
 
-*Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, the plan action). Design:
-`docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
+*Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, planning an idea; KIT-223,
+approving a plan). Design: `docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
 
 The bridge lets a trusted member of your Slack workspace act as you, from the chat. Someone
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
 checks with Slack itself who said yes.
 
-**It does one thing, and only once you switch it on.** With `ACT=yes`, a verified "yes" to
-`plan <ticket id>` moves that idea into Plan it, as you, and the planner starts on it. With
-`ACT=no`, the default, it asks and records, and nothing in the tracker changes. Approving an
-epic and answering a stuck session come next (KIT-223, KIT-224).
+**It does two things, and only once you switch it on.** With `ACT=yes`:
+
+- a verified "yes" to `plan <ticket id>` moves that idea into Plan it, as you, and the
+  planner starts on it;
+- a verified "yes" to `approve <epic id>` moves the epic to Todo. Then it hands the children
+  to the agent, as you, in the order the plan needs them.
+
+With `ACT=no`, the default, it asks and records, and nothing in the tracker changes.
+Answering a stuck session comes next (KIT-224).
 
 Every file here is generic. Keep your filled-in values in your private runbook.
 
@@ -210,6 +215,52 @@ shows the job failing.
 
 ---
 
+## Step 9 — Let it start an approved plan
+
+Set `AGENT_USER_NAME` in `bridge.conf` to the dispatcher's app user, spelled as the tracker
+shows it. Leave `EPIC_WIP=1` at first, so one child runs at a time. Then:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py install --apply
+```
+
+When the idea gate has filed a plan, say `approve <epic id>`. The bridge lists the children in
+the order they will start. Reply `yes` in that thread.
+
+Good: *Approved … for @you.* Then *Started … (1 of 4).* The epic and each child get one
+comment naming who approved.
+Not that: *I won't ask about approving …*. The epic must carry `provenance:agent`, and every
+child `provenance:epic`. The bridge approves only what the idea gate filed.
+
+From then on, each pass starts the next child once the tickets it waits on are Done. Each
+start is said in the thread. When nothing can start, it says so once, and why.
+
+- It never hands over the epic itself. If someone else does, it stops, because the children
+  would stack on the epic's branch.
+- It never hands over a child twice. A child you reopen is yours to hand over again.
+- It hands over only what you saw. The question records each child's title, text, labels,
+  project and what it waits on. If any of that changes before your yes, nothing is
+  approved and it asks you to ask again. A child added or changed after your yes is held
+  and said once. Coding sessions can write tickets, so this keeps their text from starting
+  work as you. Hand it over yourself if the change is yours.
+- It refuses an epic where the epic or a child carries the `orchestrator` or `graphite`
+  label. Those make the dispatcher hand out or stack children itself.
+- It says when a hold needs you: a child outside the plan is at work, or a child it handed
+  over has not started after two hours.
+- A child someone already handed over counts toward `EPIC_WIP`. So does a child marked
+  Done while its session still runs, until the session ends. The bridge says so once.
+- Your yes approves the terms the question stated. If `ACT`, `EPIC_WIP`, `READY_STATE` or
+  `AGENT_USER_NAME` changed since it asked, nothing is approved. Ask again.
+- If a comment naming who approved cannot be written, the approval or hand-over still
+  stands. The thread says so, and every pass tries the comment again. Until it lands, each
+  pass exits 1.
+- Move the epic back to Backlog to pause. Move it to Todo and it goes on.
+- Cancel the epic to stop for good.
+
+Each child counts toward the 10 actions an hour. Merging each pull request stays yours.
+
+---
+
 ## Who can answer, and what is refused
 
 The bridge checks every answer with Slack's own records. It refuses:
@@ -230,13 +281,11 @@ The bridge checks every answer with Slack's own records. It refuses:
 A message the bridge cannot handle three passes running is given up on, said once, and
 passed over, so one bad message cannot stall it.
 
-A request (`plan <ticket id>`) can come from anyone, the chat bot included. Asking is harmless;
-only the answer acts. It looks up at most 20 requests an hour, found or not, and asks one
-question per ticket at a time. Past that limit it refuses requests without reading them, and
-says so once an hour. A request from the chat bot credits "the chat bot", with no mention.
-
-`approve <ticket id>` is recognised too. This version answers it once, saying approving from
-Slack is not built yet, and changes nothing.
+A request (`plan <ticket id>` or `approve <epic id>`) can come from anyone, the chat bot
+included. Asking is harmless; only the answer acts. It looks up at most 20 requests an hour,
+found or not, and asks one question per ticket at a time. Past that limit it refuses requests
+without reading them, and says so once an hour. A request from the chat bot credits "the chat
+bot", with no mention.
 
 ---
 
@@ -259,6 +308,8 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
 ## What a deployment accepts when it turns this on
 
 - **Any full member acts with your reach.** That is the access rule, by design.
+- **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
+  most `EPIC_WIP` at once. Move the epic back to Backlog to pause it.
 - **The bridge's token and records sit in the dispatcher's account,** beside your tracker key.
   Any session holding the dispatcher's tool server can read them (KIT-162). With the token,
   someone could read the channel and post as the bridge. Such a post binds nothing: only
@@ -279,5 +330,12 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
 - That an idea the chat bot filed, moved by the bridge with your key, enters its history
   at once as your move, so the planner accepts it. The evidence says another actor's change
   is recorded at once; this case is untested (KIT-227).
-- Approving an epic and answering a stuck session from Slack. Not built yet (KIT-223,
-  KIT-224).
+- That handing a child to the agent with your key starts a session, as the planner's
+  hand-over at creation does. The dispatcher checks who handed it over; the tests cannot
+  (KIT-227).
+- That reading an epic with 30 children, every pass, fits the tracker's query and rate
+  limits. The key is shared with Stage E. A refusal stops the pass with a named failure
+  (KIT-227).
+- That a session's status reads as ended once it stops. A session left running holds its
+  child's slot after Done, and the thread says so once (KIT-227).
+- Answering a stuck session from Slack. Not built yet (KIT-224).

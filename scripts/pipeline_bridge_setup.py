@@ -100,9 +100,13 @@ CONF_KEYS = {
     "JOB_LABEL": ("", "the LaunchDaemon label, reverse-DNS, e.g. com.example.bridge"),
     "INTERVAL_SECONDS": ("60", "how often the job runs"),
     "APP_NAME": ("Pipeline bridge", "the Slack app's display name"),
-    "ACT": ("no", "yes: a verified yes moves the idea into Plan it, as the owner. no: the "
-                  "bridge asks and records only"),
+    "ACT": ("no", "yes: a verified yes moves an idea into Plan it, or approves an epic and "
+                  "starts its children, as the owner. no: the bridge asks and records only"),
     "PLAN_IT_STATE": ("Plan it", "the name of each team's Plan it state"),
+    "AGENT_USER_NAME": ("", "the dispatcher's app user, by display name, that an approved "
+                            "epic's children are handed to; empty refuses every approve"),
+    "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
+    "READY_STATE": ("Todo", "the name of each team's to-do state an approved epic moves to"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -168,6 +172,8 @@ def validate_conf(values):
         errors.append("ACT must be yes or no, got %r" % conf["ACT"])
     if not conf["INTERVAL_SECONDS"].isdigit() or not 15 <= int(conf["INTERVAL_SECONDS"]) <= 3600:
         errors.append("INTERVAL_SECONDS must be a whole number from 15 to 3600")
+    if not conf["EPIC_WIP"].isdigit() or not 1 <= int(conf["EPIC_WIP"]) <= 10:
+        errors.append("EPIC_WIP must be a whole number from 1 to 10")
     if not errors:
         try:
             bridge.validate_config(dict(compose_config(conf),
@@ -205,6 +211,9 @@ def compose_config(conf):
         "allowed_slack_users": split_list(conf["ALLOWED_SLACK_USERS"]),
         "act": conf["ACT"] == "yes",
         "plan_it_state": conf["PLAN_IT_STATE"],
+        "ready_state": conf["READY_STATE"],
+        "agent_user_name": conf["AGENT_USER_NAME"],
+        "epic_wip": int(conf["EPIC_WIP"]) if conf["EPIC_WIP"].isdigit() else conf["EPIC_WIP"],
     }
 
 
@@ -505,7 +514,14 @@ def cmd_compose(conf, conf_path):
     say("")
     if conf["ACT"] == "yes":
         say("ACT=yes: a verified yes to `plan <ticket id>` moves that idea into %s, as the "
-            "owner. Nothing else in the tracker is ever written." % conf["PLAN_IT_STATE"])
+            "owner." % conf["PLAN_IT_STATE"])
+        if conf["AGENT_USER_NAME"]:
+            say("  A verified yes to `approve <epic id>` moves the epic to %s and hands its "
+                "children to %s, as the owner, in dependency order, at most %s at a time. "
+                "Merging stays yours." % (conf["READY_STATE"], conf["AGENT_USER_NAME"],
+                                          conf["EPIC_WIP"]))
+        else:
+            say("  AGENT_USER_NAME is empty, so every `approve` is refused.")
     else:
         say("ACT=no: a verified yes is recorded and said, and nothing in the tracker changes. "
             "Set ACT=yes and run `install --apply` to let it act.")
@@ -772,6 +788,18 @@ def selftest():
         check("config-acts-with-ACT-yes", (compose_config(on)["act"],
                                            compose_config(on)["plan_it_state"]),
               (True, "Plan it"))
+        approving, _e = validate_conf(dict(values, AGENT_USER_NAME="Agent", EPIC_WIP="2",
+                                           READY_STATE="Ready"))
+        check("config-carries-the-approve-settings",
+              [compose_config(approving)[k] for k in ("agent_user_name", "epic_wip",
+                                                      "ready_state")], ["Agent", 2, "Ready"])
+        check("config-approve-defaults",
+              [compose_config(conf)[k] for k in ("agent_user_name", "epic_wip",
+                                                 "ready_state")], ["", 1, "Todo"])
+        for bad in ("0", "11", "two"):
+            check("conf-EPIC_WIP-refused:" + bad,
+                  any("EPIC_WIP must be" in e
+                      for e in validate_conf(dict(values, EPIC_WIP=bad))[1]), True)
         named, _e = validate_conf(dict(values, PLAN_IT_STATE="Ready to plan"))
         check("config-carries-the-plan-it-state-name",
               compose_config(named)["plan_it_state"], "Ready to plan")
