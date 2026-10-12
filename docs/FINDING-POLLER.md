@@ -76,6 +76,9 @@ a link to the new ticket. It accepts the mark only from `FINDING_ACTOR_IDS`
 - A post that fails leaves it owed, and the pass exits 1. The next pass retries it.
 - A retry reads the ticket first. A post that landed but lost its answer is recorded, never
   made twice. Only a mark written by the poller's own key counts.
+- If that read says the ticket no longer exists, the mark stops being owed. The seen-set
+  records it as `gone`, the log says so once, and the pass does not exit 1 for it. A read
+  that merely fails (network, an outage) leaves the mark owed.
 - A finding filed before this existed carries no mark, and is never paged after the fact.
 
 ## Which comments a pass reads
@@ -122,7 +125,10 @@ than that window are not re-asked for until the file is repaired or removed.
   **The operational consequence:** the state dir *is* the dedup record. A seen-set that is
   deleted, or restored from a machine that filed different findings, can file the same
   finding twice. Back up the state dir with the rest of the role account; never "reset" it
-  to clear a problem. A pass that finds no seen-set says so on its first log line.
+  to clear a problem. A real pass that finds no seen-set writes an empty one at once, so the
+  file exists from the first pass on. A pass that finds none says which case it is: **no
+  heartbeat yet** means a true first pass; **a heartbeat from an earlier pass** means the
+  seen-set was lost, and the line is a `WARNING`. A dry run writes nothing.
 - **Heartbeat:** every terminal path writes one — including a config or credential failure,
   which is the path that used to miss it. A stale heartbeat means *not running*; a fresh one
   with a non-`ok` result means *ran and could not do it* (§13). A `--dry-run` writes no
@@ -134,7 +140,7 @@ than that window are not re-asked for until the file is repaired or removed.
 
 | File | What it says |
 | --- | --- |
-| `seen.json` | every source comment already filed or declined, each cap note posted, and whether each finding's page mark was posted. **The dedup authority** — do not delete |
+| `seen.json` | every source comment already filed or declined, each cap note posted, and whether each finding's page mark is `owed`, `posted` or `gone` (its ticket no longer exists). Empty until something is filed. **The dedup authority** — do not delete |
 | `watermarks.json` | how far each team has been read and resolved |
 | `heartbeat.json` | when the last pass ran, and what it decided |
 
@@ -144,7 +150,8 @@ reads every Stage E daemon: `result` is `ok`, `error` or `usage`, beside `exit_c
 
 Exit codes: **0** the pass ran (even if it filed nothing) · **1** the pass could not
 complete, a cap note it owes could not be posted, or a filed finding's page mark is still
-owed (the heartbeat's `error` names which) · **2** bad arguments, an unreadable or
+owed (the heartbeat's `error` names which; a mark whose ticket no longer exists is not
+owed) · **2** bad arguments, an unreadable or
 invalid config, or a missing credential.
 
 ## Enabling it (operator)
