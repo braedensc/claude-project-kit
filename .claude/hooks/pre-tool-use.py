@@ -41,6 +41,7 @@ Layout:
      replace them for your datastore, keep the *shape* (protect remote,
      allow local).
 """
+import errno
 import hashlib
 import json
 import os
@@ -209,12 +210,16 @@ def _resolve_root(data) -> str:
     CURRENT session cwd, which a persisted `cd` moves — so a cwd-derived root for a
     main session would let `cd ~/other-checkout` switch OFF the branch,
     branch-naming and cross-worktree guards for the rest of the session.
+
+    The root BEFORE step 2 is kept in _SESSION_ROOT: what a session is bound to (the
+    ticket its worktree folder names, KIT-241) must not move with a subagent's cwd.
     """
-    global _ROOT_NOTE
+    global _ROOT_NOTE, _SESSION_ROOT
     env_root = os.path.realpath(_ENV_ROOT)
     session_root, unresolved = _transcript_worktree(data, env_root)
     _ROOT_NOTE = ROOT_UNRESOLVED_NOTE.format(anchor=env_root) if unresolved else ""
     session_root = session_root or env_root
+    _SESSION_ROOT = session_root
     if not data.get("agent_id"):
         return session_root  # main session → its launch worktree, never the cwd
     top = _cwd_git_toplevel()
@@ -228,6 +233,7 @@ def _resolve_root(data) -> str:
 
 
 PROJECT_ROOT = os.path.realpath(_ENV_ROOT)
+_SESSION_ROOT = PROJECT_ROOT
 
 
 # ── Branch guard: no edits or commits while on main ─────────────────────────
@@ -1958,7 +1964,8 @@ def _egress_hosts(cmd: str):
 #
 # ONE DISCRIMINATOR (contract §2): the pipeline is configured for a project IFF
 # `delivery.json` exists at the repo root. Absent → every guard below exits
-# immediately, before parsing anything, before touching git or the network. Most
+# immediately, before parsing anything and before the network; the one git call is
+# a local read of whether a commit still holds the file (_pipeline_configured). Most
 # projects that adopt this kit will never run a pipeline and must see no change
 # at all; conflating *off* with *broken* would brick every manual project, and
 # because the guard machinery is self-protected the agent could not repair it
@@ -2093,6 +2100,21 @@ CREATE_TICKET_HELP = (
     "Where no finding executor is configured, report the finding as a ticket comment "
     "instead; a person files."
 )
+LANE_CREATE_HELP = (
+    "🔒 This session runs on a dispatcher's lane that writes no pin (lane marker: "
+    "{marker}). Such a session may not create tickets directly, exactly "
+    "as a pinned `ticket`-mode session may not. This is EXPECTED — it is not an error to "
+    "work around. To file a follow-up finding, post a `pipeline-finding/1` block in a "
+    "comment on your own ticket (docs/SESSION-BRIEF.md); the finding job files it as "
+    "`provenance:agent`. Where no finding job runs, say it in a comment and a person files."
+)
+LANE_OWN_TICKET_HELP = (
+    "🔒 This session runs on a dispatcher's lane that writes no pin (lane marker: "
+    "{marker}). Its own ticket is the one its worktree folder is named after: {own}. "
+    "This write targets {targets}. A session writes to its own ticket only "
+    "(docs/PIPELINE-CONTRACT.md §3). Report anything out of scope in a comment on your "
+    "own ticket."
+)
 TEAM_SCOPE_HELP = (
     "🔒 This session's team is `{team}`; the write targets {targets}. "
     "`{mode}`-mode sessions get team-scoped writes, not workspace-wide ones."
@@ -2109,12 +2131,29 @@ AC_INTEGRITY_HELP = (
 
 def _pipeline_configured() -> bool:
     """Contract §2's ONE discriminator, and nothing that can fail may run ahead of
-    it. A working-tree stat: cheap, offline-safe, and loud to defeat (deleting a
-    tracked file lands in the diff, and `delivery.json` is itself risk-listed)."""
+    it. A working-tree stat first: cheap and offline-safe.
+
+    When the working tree has none, a COMMITTED copy still counts: at HEAD, or on
+    the default-branch refs the config is read from. One local `git cat-file`, no
+    network. Grader-path protection is pinned-only, so on a dispatcher's lane a
+    plain `mv delivery.json x` was allowed, and it switched every pipeline guard off
+    until a `git checkout -- delivery.json` put it back with nothing in the diff
+    (KIT-241). Committing the deletion, or checking out a commit from before the
+    pipeline was adopted, would do the same to a HEAD-only check. A repo with no
+    copy anywhere stays OFF, at the cost of that one git call."""
     try:
-        return os.path.isfile(os.path.join(PROJECT_ROOT, DELIVERY_FILE))
+        if os.path.isfile(os.path.join(PROJECT_ROOT, DELIVERY_FILE)):
+            return True
+    except Exception:
+        pass
+    specs = "".join(f"{ref}:{DELIVERY_FILE}\n" for ref in ("HEAD",) + _CONFIG_REFS)
+    try:
+        r = subprocess.run(["git", "-C", PROJECT_ROOT, "cat-file", "--batch-check"],
+                           input=specs, capture_output=True, text=True, timeout=3)
     except Exception:
         return False
+    return r.returncode == 0 and any(
+        line.split()[1:2] == ["blob"] for line in r.stdout.splitlines())
 
 
 _CONFIG_CACHE = None
@@ -2126,7 +2165,9 @@ def _read_delivery_config():
     agent's worktree; reading it would let a session raise its own budgets or
     blank the state ID this hook matches on. Falls back to the working tree only
     when no candidate ref carries the file at all — the adoption PR, where
-    nothing is dispatching anyway. `(None, source)` means BROKEN."""
+    nothing is dispatching anyway — and to the copy HEAD holds when the working
+    copy has been moved aside (see _pipeline_configured). `(None, source)` means
+    BROKEN."""
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
@@ -2147,8 +2188,11 @@ def _read_delivery_config():
             with open(os.path.join(PROJECT_ROOT, DELIVERY_FILE)) as fh:
                 raw, source = fh.read(), f"{DELIVERY_FILE} (working tree — adoption)"
         except Exception:
-            _CONFIG_CACHE = (None, DELIVERY_FILE)
-            return _CONFIG_CACHE
+            raw = _git_in(PROJECT_ROOT, "show", f"HEAD:{DELIVERY_FILE}", timeout=5)
+            source = f"HEAD:{DELIVERY_FILE} (adoption — the working copy was moved)"
+            if not raw:
+                _CONFIG_CACHE = (None, DELIVERY_FILE)
+                return _CONFIG_CACHE
     try:
         cfg = json.loads(raw)
     except Exception:
@@ -2183,10 +2227,91 @@ def _parse_iso_utc(s):
 
 
 def _pin_path(cfg) -> str:
-    root = ((cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins")
-    root = os.path.expanduser(root if isinstance(root, str) else "")
+    root = _pins_root(cfg)
+    if not root:
+        return ""
     key = hashlib.sha256(PROJECT_ROOT.encode("utf-8")).hexdigest()[:16]
     return os.path.join(root, key + ".json")
+
+
+# ── the dispatcher's lane without a pin (B8) ─────────────────────────────────
+# A dispatcher that binds by a person's delegation writes no pin, so its sessions used to
+# read as "a human's ad-hoc session" and every WITHHOLDING tracker guard failed open for
+# them. The lane is marked instead by a file the session cannot create or delete: one per
+# OS account, under the pins root, which is outside every worktree and comes from the
+# committed config. The account and its home come from the account database, never from
+# $USER or $HOME: the dispatcher loads a worktree's .env into the next session's
+# environment (KIT-240), so either could be moved by a session. That holds for the PIN
+# too: a pin read from under a moved $HOME is a pin the session forged, and a pin found
+# switches the marker check off (KIT-241). So `~` in `dispatch.pinsRoot` means the
+# account database's home everywhere it is read, by _pins_root.
+LANE_MARKER_DIR = "dispatched-lane"
+_TICKET_DIR_RE = re.compile(r"^([A-Z][A-Z0-9]*)-(\d+)$")
+LANE_UNCHECKED = "could not be checked, which counts as the lane"
+
+
+def _account():
+    try:
+        import pwd
+        entry = pwd.getpwuid(os.getuid())
+        return entry.pw_name, entry.pw_dir
+    except Exception:
+        return "", ""
+
+
+def _pins_root(cfg) -> str:
+    """`dispatch.pinsRoot` resolved, or "" when it cannot be: not a string, blank, or a
+    `~` path with no home in the account database. `~` is never read from $HOME."""
+    raw = (cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    raw = raw.strip()
+    if raw == "~" or raw.startswith("~/"):
+        _name, home = _account()
+        return os.path.join(home, raw[2:]) if home else ""
+    return os.path.expanduser(raw)        # absolute, or `~other`: the database too
+
+
+def _lane_marker(cfg) -> str:
+    """The lane marker this session's account carries, or "" when it carries none.
+
+    COULD-NOT-CHECK IS NOT ABSENT (contract §13). Absent is only ENOENT or ENOTDIR. Any
+    other error (a folder this account may not search, say), an account the database
+    cannot name, or a home it cannot give counts as the lane: the guards it turns on
+    are withholding ones, and reading "could not look" as "a person's session" would
+    open all of them by inducing an error."""
+    name, _home = _account()
+    root = _pins_root(cfg)
+    if not name or not root:
+        return "<the account database names no account or home for this uid: %s>" % (
+            LANE_UNCHECKED)
+    marker = os.path.join(root, LANE_MARKER_DIR, name)
+    try:
+        os.lstat(marker)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return ""
+        return "%s <%s: %s>" % (marker, exc.strerror or exc, LANE_UNCHECKED)
+    except Exception as exc:
+        return "%s <%s: %s>" % (marker, exc, LANE_UNCHECKED)
+    return marker
+
+
+def _worktree_ticket() -> str:
+    """The ticket the dispatcher named this session's worktree after, or "". The
+    dispatcher cuts a worktree at <base>/<ISSUE-ID> (one repository) or
+    <base>/<ISSUE-ID>/<repo> (several), a folder no sandboxed session can rename
+    (GitService.js, createGitWorktree). Any team's key: a Stage E review session runs
+    in REV-12 in a repository whose own team is another, and REV-12 is its ticket.
+
+    Read from the SESSION's root, never a subagent's cwd-widened one: on this lane every
+    sibling worktree is named after a ticket, so the widened root would hand a subagent
+    acting from <base>/ENG-456 that ticket as its own."""
+    for path in (_SESSION_ROOT, os.path.dirname(_SESSION_ROOT)):
+        m = _TICKET_DIR_RE.match(os.path.basename(path or ""))
+        if m:
+            return m.group(0)
+    return ""
 
 
 def _read_pin(cfg):
@@ -2241,12 +2366,17 @@ def _pins_root_inside_repo(cfg):
     re-checks it because a hook must not assume the validator ran — and because
     this is the highest-value payload of a poisoned config: redirect `pinsRoot`
     into the worktree and a session writes its own pin. Unresolvable → treated as
-    inside, i.e. fail CLOSED."""
+    inside, i.e. fail CLOSED. It checks the path the pin is READ from (_pins_root):
+    `~` from the account database, never $HOME."""
     raw = (cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"
     if not isinstance(raw, str) or not raw.strip():
         return "<unset>"
     try:
-        root = os.path.realpath(os.path.expanduser(raw.strip()))
+        root = _pins_root(cfg)
+        if not root:
+            return "%s <no home in the account database for `~`; set an absolute path>" % (
+                raw.strip())
+        root = os.path.realpath(root)
     except Exception:
         return str(raw)
     for other in [PROJECT_ROOT] + list(_worktree_roots()):
@@ -2580,17 +2710,19 @@ def _approval_guard():
     block(READY_HELP)
 
 
-def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id):
+def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane=""):
     team = str((cfg.get("linear") or {}).get("teamKey") or "").strip().upper()
     ready = _clean_id(((cfg.get("linear") or {}).get("stateIds") or {}).get("ready"))
     targets = _payload_ticket_ids(inp)
     foreign = {t for t in targets if team and not t.startswith(team + "-")}
+    own = _worktree_ticket() if (lane and not pin) else ""
 
     # ── 0. lifecycle-label: supervision labels belong to the dispatcher (§6) ───
-    # A WITHHOLDING check, so it is scoped to PINNED sessions: a human's ad-hoc
-    # session in a configured repo is not the thing being supervised. An EXPIRED
-    # pin is still a pin here — a lapsed binding must not hand back the labels.
-    if pin:
+    # A WITHHOLDING check, so it is scoped to PINNED sessions and to sessions on a
+    # dispatcher's lane (`lane`, B8): a human's ad-hoc session in a configured repo is
+    # not the thing being supervised. An EXPIRED pin is still a pin here — a lapsed
+    # binding must not hand back the labels.
+    if pin or lane:
         owned = _owned_label_hits(inp, cfg)
         if owned:
             block(LIFECYCLE_LABEL_HELP.format(
@@ -2625,14 +2757,29 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id):
         if foreign:
             block(TEAM_SCOPE_HELP.format(
                 team=team, mode=mode, targets=", ".join(sorted(foreign))))
-    # No pin (a human's ad-hoc session in a configured repo) → this WITHHOLDING
-    # check fails OPEN by design; the approval guard above already failed closed.
+    elif lane:
+        # B8: no pin, but the account carries the dispatcher's lane marker. The pinned
+        # `ticket` rules, with the own ticket read from the worktree's folder name. An
+        # issue write the guard cannot tie to that ticket fails CLOSED, and so does a
+        # comment naming any ticket when the folder names none (as a pin with no ticket
+        # ID does). A comment with no resolvable target stays allowed (§4 reporting).
+        if kind == "issue-create":
+            block(LANE_CREATE_HELP.format(marker=lane))
+        if (kind == "issue-write" or targets) and targets != {own}:
+            block(LANE_OWN_TICKET_HELP.format(
+                marker=lane, own=own or "none (the worktree is not named after a ticket)",
+                targets=", ".join(sorted(targets - {own}))
+                or "a ticket the guard cannot resolve"))
+    # No pin and no lane marker (a human's ad-hoc session in a configured repo) → this
+    # WITHHOLDING check fails OPEN by design; the approval guard above already failed
+    # closed.
 
     # ── 3. AC integrity — no rewriting your own definition of done ────────────
-    if kind == "issue-write" and pinned_id and pinned_id in targets:
+    mine = pinned_id or own
+    if kind == "issue-write" and mine and mine in targets:
         fields = _ac_fields_present(inp)
         if fields:
-            block(AC_INTEGRITY_HELP.format(fields=", ".join(fields), ticket=pinned_id))
+            block(AC_INTEGRITY_HELP.format(fields=", ".join(fields), ticket=mine))
 
 
 def _pipeline_guards(tool, inp) -> None:
@@ -2702,7 +2849,9 @@ def _pipeline_guards(tool, inp) -> None:
 
     kind = _tracker_write_kind(tool, inp, cfg)
     if kind:
-        _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id)
+        # B8: only an unpinned session needs the marker; a pin already says what it is.
+        lane = "" if pin else _lane_marker(cfg)
+        _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane)
 
 
 # ── Bash prose-stripping ──────────────────────────────────────────────────────
@@ -3036,8 +3185,8 @@ def _dispatch(data) -> None:
 
     # ═════════════════════════════════════════════════════════════════════════
     # 1b. PIPELINE GUARDS — LAST, so every universal guard's message wins over
-    #     a pipeline one, and so the whole section is a single no-op `stat` for
-    #     the projects (most of them) that never adopted the pipeline.
+    #     a pipeline one, and so the whole section is a no-op `stat` plus one local
+    #     `git cat-file` for the projects (most of them) that never adopted it.
     # ═════════════════════════════════════════════════════════════════════════
     _pipeline_guards(tool, inp)
 
