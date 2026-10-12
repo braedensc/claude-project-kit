@@ -8,6 +8,12 @@ in this repository.
 **Off unless installed.** Nothing in this document runs in a repository that has no
 `delivery.json` and no installed job. The kit ships the mechanism; a person installs it.
 
+**Approving from Slack.** With the Slack bridge acting (`docs/BRIDGE-OPERATOR.md`, Step 9),
+you approve in the chat instead: `approve <epic id>`, then a trusted member's `yes`. The
+bridge moves the epic to Todo. It hands the children to the agent for you, one at a time
+by default, each once the tickets it waits on are Done. It never hands over the epic
+itself, and merging stays yours.
+
 ---
 
 ## 1. What the gate is

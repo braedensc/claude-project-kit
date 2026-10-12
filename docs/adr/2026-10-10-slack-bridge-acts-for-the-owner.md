@@ -138,3 +138,70 @@ says the comment could not be written; the state records it as owed; every pass 
 again, and exits 1 until it lands, so a missing record of who said yes is never silent.
 
 `act` ships off. The owner watches the bridge ask and record first, then turns it on.
+
+## Update 2026-10-10 — the second action: approve a plan (KIT-223)
+
+With `act` on, a verified "yes" to an `approve` question moves an epic to its team's
+`ready_state`, with the owner's key, and records it as approved in the bridge's state.
+Every pass after that hands its children to the agent user named by `agent_user_name`,
+again with the owner's key, because the dispatcher starts a session only for a person it
+trusts.
+
+**Only what the idea gate filed.** The epic must carry `provenance:agent` and have no
+parent; every child must carry `provenance:epic`, sit on the epic's team, and have no
+children of its own. These are checked before asking, before approving, and on every pass.
+
+**Dependency order.** A child starts only when every ticket that blocks it is Done. The
+order check (`blockers_of`, `open_blockers`) is a pure function over the tracker's
+`blocks` relations, kept importable for the order job that checks hand-overs made by hand
+(B9). At most `epic_wip` children of one epic are started and unfinished at once; a child
+someone else handed over, or one with a session, counts and is never handed over again.
+
+**Only what the member saw.** The question records a fingerprint of each child: its title,
+description, labels, project and blockers. A coding session holds the tracker's write
+tools, and on the dispatcher lane nothing stops it writing tickets (B8). A yes after any
+child changed, or one was added or removed, approves nothing. After the yes, a child added
+to the epic, or one whose fingerprint changed, is never handed over: it is said once, and
+the owner hands it over by hand if the change is theirs. Without this, a session's text,
+route or order would start work with the owner's authority. The first build took the
+fingerprint at the yes; a review showed a session could change a child during the
+question's 24 hours, so it moved to the question.
+
+**The dispatcher's own modes.** An epic or child carrying `orchestrator` or `graphite` is
+refused: from 0.2.73 those prompts hand sub-issues to the agent themselves, and a
+`graphite` child is cut from its blocker's branch.
+
+**No silent hold, no shared failure.** A child outside the plan at work, and a child
+handed over that has not started after two hours, are said once, since each holds the
+limit. One epic the tracker will not read is retried each pass and said after three; the
+others go on, and the pass exits 1.
+
+**What it refuses to do.** It never hands over the epic itself, and stops following an epic
+that someone else handed to the agent, because the dispatcher cuts a sub-issue's worktree from its
+parent's branch when one exists, so every child would stack. It never hands a child over
+twice: a reopened child is the owner's to restart. Moving the epic back to Backlog pauses
+it; cancelling or finishing it ends it.
+
+**The terms the member read.** An approve question records the settings its text states
+(`act`, `epic_wip`, `ready_state`, `agent_user_name`, `question_ttl_hours`). A yes after any
+of them changed approves nothing and closes the question, so a question that said "nothing
+moves or starts" never starts paid sessions.
+
+**A Done state is not the end of a session.** A session holds the tracker's write tools and
+can mark its own child Done while it still runs. A finished child with a session that has
+not ended (by the planner's own `SESSION_FINISHED`) counts toward `epic_wip`, and the hold
+is said once. The sessions are read once a pass already, so this costs no extra read. With
+`epic_wip` above 1 a blocker marked Done early can still release what waits on it; the
+default of 1 holds the order too.
+
+**Owed comments.** A hand-over or an approval whose attribution comment fails stands, since
+it cannot be taken back. The thread says so, the comment is recorded as owed, and every
+pass writes it again and exits 1 until it lands.
+
+These three follow the second review of KIT-223 (2026-10-10), which also pinned every
+re-check of the epic with a selftest case.
+
+**Writes.** One more, pinned by the selftest: an `issueUpdate` carrying `delegateId` and
+nothing else. Each hand-over posts one comment whose first line names the member who
+approved and when, and one line in the Slack thread. Hand-overs count against
+`max_actions_per_hour`. Merging stays the owner's.
