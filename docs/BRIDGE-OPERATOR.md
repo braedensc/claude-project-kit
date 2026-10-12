@@ -7,15 +7,16 @@ The bridge lets a trusted member of your Slack workspace act as you, from the ch
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
 checks with Slack itself who said yes.
 
-**It does two things, and only once you switch it on.** With `ACT=yes`:
+**It does three things, and only once you switch it on.** With `ACT=yes`:
 
 - a verified "yes" to `plan <ticket id>` moves that idea into Plan it, as you, and the
   planner starts on it;
 - a verified "yes" to `approve <epic id>` moves the epic to Todo. Then it hands the children
-  to the agent, as you, in the order the plan needs them.
+  to the agent, as you, in the order the plan needs them;
+- a verified member's reply under a "session stopped and needs a decision" ping goes to that
+  session's own thread, as your answer, and the session carries on (KIT-224).
 
 With `ACT=no`, the default, it asks and records, and nothing in the tracker changes.
-Answering a stuck session comes next (KIT-224).
 
 Every file here is generic. Keep your filled-in values in your private runbook.
 
@@ -261,6 +262,61 @@ Each child counts toward the 10 actions an hour. Merging each pull request stays
 
 ---
 
+## Step 10 — Answer a stuck session from Slack
+
+The notifier pings you when a session stops with a question. Once this step is done, a reply
+under that ping is passed to the session as your answer. The notifier's own reply relay stays
+off: the bridge replaces it, with the same rules and a check with Slack on who replied.
+
+1. Invite the bridge's app to the notifier's pings channel.
+2. Add that channel's id to `CHANNEL_IDS` in `bridge.conf`, after the chat channel's.
+3. In `bridge.conf`, set `NOTIFIER_STATE_DIR` to the `STATE_DIR` in `notifier.conf`. Both
+   default to `~/.stage-e/state`. The bridge reads the notifier's pings file there.
+4. In `bridge.conf`, set `NOTIFIER_BOT_USER_ID` to the notifier app's member ID. Copy it from
+   the app's profile in Slack, as you did for `BOT_USER_ID`.
+5. Set `BRIDGE_PINGS=yes` in `notifier.conf`, and run the notifier installer:
+
+```sh
+python3 scripts/pipeline_notifier_setup.py run
+```
+
+6. Then the bridge's install again:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py install --apply
+```
+
+7. After the notifier's next pass, check the bridge:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py verify
+```
+
+Good: the `pings` row reads `ALREADY-DONE`. The notifier writes that file on its first pass
+with `BRIDGE_PINGS=yes`.
+Not that: `pings BLOCKED no pings file at …`. Either `BRIDGE_PINGS` is still `no`, or the
+two state dirs differ. Fix step 3 or step 5.
+
+Try it on the next real ping: reply under it, in its thread.
+
+Good: *Sent to … 's session as @you's answer.* The session's thread in the tracker gets one
+comment, naming you, with your words.
+Not that: *I can't pass that on to …*. It says why: a guest or a bot, an edited or long
+message, a credential in it, the hourly limit, a ticket on a team not in `TEAM_KEYS`, or a
+session thread that is gone.
+
+A ping sent before `BRIDGE_PINGS=yes` was never recorded, so no reply under it can be passed
+on. With `NOTIFIER_BOT_USER_ID` set, the bridge says so in that thread. Answer those in the
+tracker. Without it, the bridge cannot tell the notifier's pings apart, and its log says on
+every pass that such replies are not checked.
+
+It passes on at most 6 answers an hour, and never one longer than 1,000 characters: a long
+answer belongs in the tracker. Angle brackets are removed, so nothing you paste can turn into
+a mark. If the tracker never confirms a post, it says so in the thread and never sends that
+answer twice.
+
+---
+
 ## Who can answer, and what is refused
 
 The bridge checks every answer with Slack's own records. It refuses:
@@ -338,4 +394,5 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
   (KIT-227).
 - That a session's status reads as ended once it stops. A session left running holds its
   child's slot after Done, and the thread says so once (KIT-227).
-- Answering a stuck session from Slack. Not built yet (KIT-224).
+- That an answer passed on by the bridge resumes the session as the notifier's relay did.
+  The route is the one proven on 2026-09-08; this caller is not (KIT-227).

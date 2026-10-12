@@ -205,3 +205,17 @@ re-check of the epic with a selftest case.
 nothing else. Each hand-over posts one comment whose first line names the member who
 approved and when, and one line in the Slack thread. Hand-overs count against
 `max_actions_per_hour`. Merging stays the owner's.
+
+## Update 2026-10-10 — the third action: answer a stuck session (KIT-224)
+
+The bridge replaces the notifier's reply relay, which was built and left off. The relay's
+rules carry over unchanged and are imported, not copied: the recorded thread only, checked
+again before posting; the reply decoded and cleaned of every angle bracket to a fixed point;
+a size cap and an hourly cap; no credential shape; and at most once, recorded as pending and
+saved before the post. Two things change. The sender is any verified full member, checked
+with Slack as for every other answer, not one configured owner id. And the bridge reads no
+notifier state: the notifier, with `bridge_pings` on, writes each `agent:blocked` ping's
+chat message, ticket and session thread to a file beside its seen-set, and the bridge reads
+that file. Neither job holds the other's token. The two switches never both hold, so no ping
+can be answered twice. The answer is the bounce driver's thread reply, borrowed from one
+place, which is the route proven to resume a session on 2026-09-08.

@@ -143,3 +143,10 @@ BOUNCE_ACTOR_IDS=self
 # key, so `self` is right when both use one key.
 # The mark carries no label.  Anything holding that key can write one.
 FINDING_ACTOR_IDS=self
+
+# Whether this notifier records each agent:blocked ping for the Slack bridge
+# (KIT-224). yes: a trusted member's reply under such a ping is passed to the
+# session's own thread by the bridge, which checks with Slack who sent it. no:
+# a reply there reaches nobody; answer in the tracker. The notifier's own reply
+# relay stays off either way: the bridge replaces it.
+BRIDGE_PINGS=no

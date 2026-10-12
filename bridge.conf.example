@@ -59,6 +59,14 @@ BOT_USER_ID=U0123456789
 # The to-do state an approved epic moves to.
 #READY_STATE=Todo
 
+# Answering a stuck session (docs/BRIDGE-OPERATOR.md, Step 10). The notifier's
+# STATE_DIR, exactly as notifier.conf sets it: the bridge reads the pings the
+# notifier records there. And the notifier app's own bot user id (its member ID,
+# from its profile in Slack): with it, a reply under a ping the notifier did not
+# record is refused aloud instead of ignored, and `verify` needs the pings file.
+#NOTIFIER_STATE_DIR=~/.stage-e/state
+#NOTIFIER_BOT_USER_ID=
+
 # The only Slack user ids who may answer a question. Empty means any full
 # member of the workspace: guests, bots and other workspaces are always refused.
 #ALLOWED_SLACK_USERS=

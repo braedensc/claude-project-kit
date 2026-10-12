@@ -26,7 +26,8 @@ question that looked like the bridge's.
               not load it either. It never loads the job: that is card CK-B2.
     verify    read-only: the config and plist are the composed ones, the env file names both
               credentials, the job's own dry run passes as the role account, launchd holds
-              the job, and its heartbeat is fresh.
+              the job, its heartbeat is fresh, and the notifier's pings file, in
+              NOTIFIER_STATE_DIR, is there and is the notifier's (KIT-224).
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off.
 
 WHO RUNS SUDO. `token`, `install` and `verify` ask for the administrator password once,
@@ -107,6 +108,13 @@ CONF_KEYS = {
                             "epic's children are handed to; empty refuses every approve"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
     "READY_STATE": ("Todo", "the name of each team's to-do state an approved epic moves to"),
+    "NOTIFIER_STATE_DIR": ("~/.stage-e/state", "the notifier's STATE_DIR, as notifier.conf "
+                                               "sets it: the bridge reads the pings it "
+                                               "records there (KIT-224)"),
+    "NOTIFIER_BOT_USER_ID": ("", "optional: the notifier app's own Slack bot user id (its "
+                                 "member ID). A reply under one of its pings that it did "
+                                 "not record is then refused aloud, and `verify` needs the "
+                                 "pings file"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -153,7 +161,7 @@ def validate_conf(values):
     if conf["ROLE_ACCOUNT"] and not ACCOUNT_RE.match(conf["ROLE_ACCOUNT"]):
         errors.append("ROLE_ACCOUNT %r is not an account name" % conf["ROLE_ACCOUNT"])
     for key in ("ROLE_KIT_CLONE", "ENV_FILE", "BRIDGE_CONFIG", "STATE_DIR",
-                "DISPATCHER_ENV_FILE"):
+                "DISPATCHER_ENV_FILE", "NOTIFIER_STATE_DIR"):
         if conf[key] and not PATH_RE.match(conf[key]):
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
                           % (key, conf[key]))
@@ -198,8 +206,10 @@ def load_conf(path):
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 def compose_config(conf):
-    """The job's config. `~` stays literal: the job expands it as the role account."""
-    return {
+    """The job's config. `~` stays literal: the job expands it as the role account. The
+    pings file is the notifier's, in ITS state dir: left to the bridge's own, two state
+    dirs that differ would leave every answer under a ping unread (KIT-224 review)."""
+    doc = {
         "schema": bridge.CONFIG_SCHEMA,
         "state_dir": conf["STATE_DIR"],
         "slack_token_env": conf["SLACK_TOKEN_ENV"],
@@ -214,7 +224,15 @@ def compose_config(conf):
         "ready_state": conf["READY_STATE"],
         "agent_user_name": conf["AGENT_USER_NAME"],
         "epic_wip": int(conf["EPIC_WIP"]) if conf["EPIC_WIP"].isdigit() else conf["EPIC_WIP"],
+        "pings_file": pings_file(conf),
     }
+    if conf["NOTIFIER_BOT_USER_ID"]:
+        doc["notifier_bot_user_id"] = conf["NOTIFIER_BOT_USER_ID"]
+    return doc
+
+
+def pings_file(conf):
+    return bridge.notify.bridge_pings_path({"state_dir": conf["NOTIFIER_STATE_DIR"]})
 
 
 def config_bytes(conf):
@@ -359,7 +377,7 @@ def no_privilege(exc, resume):
 # read is wrapped; an error is reported by its class.
 FACTS_PY = r'''
 import hashlib, json, os, re, sys
-env_path, cfg_path, beat_path = [os.path.expanduser(a) for a in sys.argv[1:4]]
+env_path, cfg_path, beat_path, pings_path = [os.path.expanduser(a) for a in sys.argv[1:5]]
 out = {}
 try:
     names = []
@@ -381,6 +399,16 @@ try:
                                                        "summary"))
 except Exception as exc:
     out["heartbeat_error"] = type(exc).__name__
+try:
+    pings = json.load(open(pings_path))
+    out["pings_schema"] = (pings.get("schema") if isinstance(pings, dict)
+                           and isinstance(pings.get("messages"), dict) else None)
+except FileNotFoundError:
+    out["pings_missing"] = True
+except ValueError:
+    out["pings_schema"] = None
+except Exception as exc:
+    out["pings_error"] = type(exc).__name__
 print(json.dumps(out))
 '''
 
@@ -475,7 +503,7 @@ def home_of(runner, account):
 def read_facts(runner, conf):
     res = runner.as_role(conf["ROLE_ACCOUNT"], py(
         FACTS_PY, conf["ENV_FILE"], conf["BRIDGE_CONFIG"],
-        conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json"))
+        conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json", pings_file(conf)))
     if not res.ok:
         return None
     try:
@@ -676,6 +704,7 @@ def cmd_verify(conf, runner, sudo, now=None):
                      ("no heartbeat yet" if age is None else
                       "its last pass was %ss ago with exit %s: %s"
                       % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
+        rows.append(pings_row(conf, facts))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
     worst = [o for _c, o, _d in rows]
@@ -685,6 +714,24 @@ def cmd_verify(conf, runner, sudo, now=None):
             return code
     say("Good: the bridge is installed, loaded and passing.")
     return EX_OK
+
+
+def pings_row(conf, facts):
+    """The notifier writes its pings file on its first pass with BRIDGE_PINGS=yes, so a
+    missing file means that is off, or the two jobs name different state dirs. With
+    NOTIFIER_BOT_USER_ID set the owner has turned answering on, so a missing file blocks."""
+    path = pings_file(conf)
+    if facts.get("pings_error"):
+        return ("pings", se.UNKNOWN, "%s could not be read (%s)" % (path, facts["pings_error"]))
+    if facts.get("pings_missing"):
+        return ("pings", se.BLOCKED if conf["NOTIFIER_BOT_USER_ID"] else se.SKIPPED,
+                "no pings file at %s: BRIDGE_PINGS=yes is not set in notifier.conf, or its "
+                "STATE_DIR is not NOTIFIER_STATE_DIR. Until it is there, no reply under a "
+                "ping is answered (docs/BRIDGE-OPERATOR.md, Step 10)" % path)
+    if facts.get("pings_schema") != bridge.notify.BRIDGE_PINGS_SCHEMA:
+        return ("pings", se.FAILED, "%s is not a %s document"
+                % (path, bridge.notify.BRIDGE_PINGS_SCHEMA))
+    return ("pings", se.ALREADY_DONE, "the notifier records its pings at %s" % path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -793,6 +840,22 @@ def selftest():
         check("config-carries-the-approve-settings",
               [compose_config(approving)[k] for k in ("agent_user_name", "epic_wip",
                                                       "ready_state")], ["Agent", 2, "Ready"])
+        # KIT-224 review: the pings file is the NOTIFIER's, in its STATE_DIR, never left to
+        # the bridge's own state dir; the notifier's bot user is composed only when set.
+        pinged_conf, _e = validate_conf(dict(values, STATE_DIR="~/.bridge-state",
+                                             NOTIFIER_STATE_DIR="/srv/notifier/state",
+                                             NOTIFIER_BOT_USER_ID="U0NOTIFY01"))
+        check("config-pings-file-from-NOTIFIER_STATE_DIR",
+              (compose_config(conf).get("pings_file"),
+               compose_config(pinged_conf).get("pings_file"),
+               compose_config(pinged_conf).get("notifier_bot_user_id"),
+               "notifier_bot_user_id" in compose_config(conf)),
+              ("~/.stage-e/state/notifier-bridge-pings.json",
+               "/srv/notifier/state/notifier-bridge-pings.json", "U0NOTIFY01", False))
+        check("conf-NOTIFIER_BOT_USER_ID-must-be-a-user-id-not-the-bridges",
+              [any("notifier_bot_user_id" in e for e in validate_conf(dict(
+                  values, NOTIFIER_BOT_USER_ID=v))[1]) for v in ("notifier", "U0BRIDGE01")],
+              [True, True])
         check("config-approve-defaults",
               [compose_config(conf)[k] for k in ("agent_user_name", "epic_wip",
                                                  "ready_state")], ["", 1, "Todo"])
@@ -825,7 +888,7 @@ def selftest():
         inject = '~/kit"; /usr/bin/touch /tmp/pwned; "'
         check("conf-path-with-shell-after-it-refused",
               [k for k in ("ROLE_KIT_CLONE", "ENV_FILE", "BRIDGE_CONFIG", "STATE_DIR",
-                           "DISPATCHER_ENV_FILE")
+                           "DISPATCHER_ENV_FILE", "NOTIFIER_STATE_DIR")
                if not any(e.startswith(k + " must be") for e in
                           validate_conf(dict(values, **{k: inject}))[1])], [])
         _c, errs = validate_conf(dict(values, ROLE_ACCOUNT="_exdispatch;id"))
@@ -1011,6 +1074,30 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 30)
             check("verify-clean", (rc, "Good:" in out), (EX_OK, True))
+            # The notifier's pings file (KIT-224 review): with none, the row says so; with
+            # NOTIFIER_BOT_USER_ID set, the owner has turned pings on, so none blocks; a
+            # file that is not the notifier's document fails; the notifier's own passes.
+            check("verify-no-pings-file-is-said", bool(re.search(
+                r"pings\s+SKIPPED\s+no pings file at ~/.stage-e/state/notifier-bridge-pings"
+                r"\.json", out)), True)
+            pconf = dict(conf, NOTIFIER_BOT_USER_ID="U0NOTIFY01")
+            rc, out = cap(cmd_verify, pconf, _RoleRunner(home, root, loaded=True),
+                          _FakeSudo(), now=at + 30)
+            check("verify-no-pings-file-blocks-once-pings-are-on",
+                  (rc, bool(re.search(r"pings\s+BLOCKED", out)), "BRIDGE_PINGS=yes" in out),
+                  (EX_BLOCKED, True, True))
+            pings_path = os.path.join(home, ".stage-e", "state", "notifier-bridge-pings.json")
+            for name, doc, want_row in (
+                    ("not-the-notifiers", {"schema": "other/1", "messages": {}},
+                     r"pings\s+FAILED\s+.*is not a pipeline-notifier-bridge-pings/1"),
+                    ("the-notifiers", {"schema": bridge.notify.BRIDGE_PINGS_SCHEMA,
+                                       "messages": {}}, r"pings\s+ALREADY-DONE")):
+                with open(pings_path, "w") as fh:
+                    json.dump(doc, fh)
+                rc, out = cap(cmd_verify, pconf, _RoleRunner(home, root, loaded=True),
+                              _FakeSudo(), now=at + 30)
+                check("verify-pings-file:" + name, bool(re.search(want_row, out)), True)
+            os.remove(pings_path)
             check("verify-reads-no-credential-value", ("k" * 30 in out, "b" * 30 in out),
                   (False, False))
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=False), _FakeSudo(),
