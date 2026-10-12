@@ -183,21 +183,37 @@ def check_hooks(env, conf):
     return finding("hooks", OK, "no unresolved session in the last 24 hours")
 
 
+def _paging(rows):
+    """The review rows that fire `updates`. A dispatcher that cannot be measured is not one:
+    that is the `dispatcher` kind's to say."""
+    return [r for r in rows if r["state"] in (pu.BEHIND, pu.RESTART)
+            or (r["state"] == pu.UNKNOWN and not r["component"].startswith("dispatcher"))]
+
+
 def check_updates(env, conf, state):
     now = _now(env)
     cached = state.get("review") or {}
-    # While an `updates` alert is open, re-measure every pass, so a fix clears it within the
-    # hour rather than when the cache expires (KIT-249). Healthy, the cache spares the
-    # registry and Homebrew an hourly question.
-    open_alert = ((state.get("kinds") or {}).get("updates") or {}).get("sent") == FIRING
-    if cached.get("at") and now - cached["at"] < UPDATE_REVIEW_EVERY and not open_alert:
+    # The cache serves only while it says nothing is wrong. Anything it says IS wrong is
+    # re-measured every pass, so a fix clears within the hour whichever channel carried the
+    # alert (KIT-249, KIT-251). Healthy, it spares the registry and Homebrew an hourly question.
+    if (cached.get("at") and now - cached["at"] < UPDATE_REVIEW_EVERY
+            and not _paging(cached.get("rows") or [])):
         rows = cached.get("rows") or []
     else:
         rows = pu.review_dispatcher(env, conf) + pu.review_brew(env, conf)
-        state["review"] = {"at": now, "rows": rows}
-    paging = [r for r in rows if r["state"] in (pu.BEHIND, pu.RESTART)
-              or (r["state"] == pu.UNKNOWN and not r["component"].startswith("dispatcher"))]
+        unmeasured = any(r["state"] == pu.UNKNOWN and r["component"].startswith("dispatcher")
+                         for r in rows)
+        # A measurement missing the dispatcher is never cached: cached, it would read as
+        # "nothing behind" for 20 hours while the dispatcher is still behind (KIT-251).
+        if not unmeasured:
+            state["review"] = {"at": now, "rows": rows}
+    paging = _paging(rows)
     if not paging:
+        if any(r["state"] == pu.UNKNOWN and r["component"].startswith("dispatcher") for r in rows):
+            # Neither a page nor a clear: a dispatcher mid-restart (an update stops it) must
+            # not close an open `updates` alert (KIT-251).
+            return finding("updates", UNKNOWN, "the dispatcher's version could not be read this "
+                           "pass, so updates were not judged; the `dispatcher` kind says if it is down")
         return finding("updates", OK, "nothing behind")
     lines = ["%s: %s %s -> %s; update: %s" % (r["component"], r["state"], r["installed"],
                                                r["target"], r["command"] or r["note"])
@@ -308,7 +324,7 @@ def _clip(text):
     return text if len(text) <= SUMMARY_MAX else text[:SUMMARY_MAX] + " … (cut)"
 
 
-def send_github(env, conf, kind, state, summary):
+def send_github(env, conf, kind, state, summary, claimed=None):
     """(delivered, detail). Dispatch, then find that run and wait for it: an accepted
     dispatch whose run failed has filed nothing."""
     repo, wf = conf["ALERT_REPO"], conf["ALERT_WORKFLOW"]
@@ -324,10 +340,11 @@ def send_github(env, conf, kind, state, summary):
             return json.loads(got.out) if got.ok else []
         except ValueError:
             return []
-    # The runs that exist BEFORE this dispatch are not its run. Without this, a second kind
-    # sent in the same pass could watch the first kind's finished run and count it as its
-    # own, so its own failed run would never be retried (KIT-249).
-    before = set() if env.runner.dry_run else {str(r.get("databaseId")) for r in listed()}
+    # A run already claimed by an earlier send in this pass is not this dispatch's run.
+    # Without this, a second kind could watch the first kind's finished run and count it as
+    # its own, so its own failed run would never be retried (KIT-249). Kept in memory, so it
+    # cannot fail the way a pre-dispatch listing can (KIT-251).
+    claimed = set() if claimed is None else claimed
     out = env.runner.write("tell GitHub that %s is %s" % (kind, state), argv, timeout=60)
     if out.skipped:
         return True, "dry run"
@@ -336,7 +353,7 @@ def send_github(env, conf, kind, state, summary):
     run_id = None
     for _ in range(RUN_FIND_TRIES):
         runs = listed()
-        fresh = [r for r in runs if str(r.get("databaseId")) not in before
+        fresh = [r for r in runs if str(r.get("databaseId")) not in claimed
                  and (_parse_iso(r.get("createdAt")) or 0) >= started - 30]
         if fresh:
             run_id = str(sorted(fresh, key=lambda r: r.get("createdAt", ""))[-1]["databaseId"])
@@ -344,6 +361,7 @@ def send_github(env, conf, kind, state, summary):
         env.sleep(5)
     if run_id is None:
         return False, "the dispatch was accepted but no run appeared in %d s" % (RUN_FIND_TRIES * 5)
+    claimed.add(run_id)
     watch = env.runner.read(["gh", "run", "watch", run_id, "-R", repo, "--exit-status"],
                             timeout=RUN_WATCH_TIMEOUT)
     if not watch.ok:
@@ -384,7 +402,7 @@ def run_pass(env, conf, dry_run=False):
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf)]
-    failed, notes = [], []
+    failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
         rec = state.setdefault("kinds", {}).setdefault(f["kind"], {})
@@ -399,7 +417,7 @@ def run_pass(env, conf, dry_run=False):
             if not dry_run:
                 rec["sent"] = f["state"]
             continue
-        delivered, detail = send_github(env, conf, f["kind"], f["state"], f["summary"])
+        delivered, detail = send_github(env, conf, f["kind"], f["state"], f["summary"], claimed)
         notes.append("%s is now %s — GitHub: %s" % (f["kind"], f["state"], detail))
         if delivered and not dry_run:
             rec["sent"], rec["since"] = f["state"], _iso(now)
@@ -481,6 +499,37 @@ def refuse_if_agent(action, environ):
                        read_only="run --dry-run")
 
 
+def _load(env, domain, label, plist):
+    """Bootstrap the job once launchd has let go of the old one, retrying only EIO.
+
+    launchd keeps a booted-out job's record through its SIGTERM-to-SIGKILL window, and a
+    bootstrap inside that window answers `Bootstrap failed: 5`. Before KIT-251 a reinstall
+    could hit it and leave the watch unloaded. The same rule the update script applies to the
+    dispatcher, in the user's own domain and without root."""
+    r = env.runner
+    target = "%s/%s" % (domain, label)
+    polls = int((se.DEFAULT_EXIT_TIMEOUT + se.EXIT_TIMEOUT_HEADROOM) / se.BOOTOUT_POLL_SECONDS)
+    said = ""
+    for attempt in range(1, se.BOOTSTRAP_ATTEMPTS + 1):
+        for _ in range(polls):
+            if r.dry_run or not r.read(["launchctl", "print", target]).ok:
+                break
+            se._pause(se.BOOTOUT_POLL_SECONDS)
+        else:
+            raise pu.UpdateError("launchd still holds %s after %d s, so loading it again would "
+                                 "fail. Check: launchctl print %s"
+                                 % (label, polls * se.BOOTOUT_POLL_SECONDS, target))
+        boot = r.write("load %s" % label, ["launchctl", "bootstrap", domain, plist])
+        if boot.ok or boot.skipped:
+            return
+        said = (boot.err or boot.out).strip() or "bootstrap said nothing"
+        if not se._EIO.search(said):
+            break
+        se._pause(se.BOOTSTRAP_RETRY_SECONDS)
+    raise pu.UpdateError("launchctl bootstrap failed: %s. The job is NOT loaded; run install "
+                         "again." % said.splitlines()[0][:160])
+
+
 def install(env, conf, uninstall_only=False):
     refuse_if_agent("uninstall" if uninstall_only else "install", env.environ)
     if sys.platform != "darwin" and not getattr(env, "any_platform", False):
@@ -521,9 +570,7 @@ def install(env, conf, uninstall_only=False):
         os.makedirs(os.path.dirname(doc["StandardOutPath"]), mode=0o700, exist_ok=True)
         with open(plist, "wb") as fh:
             plistlib.dump(doc, fh)
-    boot = r.write("load %s" % label, ["launchctl", "bootstrap", domain, plist])
-    if not boot.ok and not boot.skipped:
-        raise pu.UpdateError("launchctl bootstrap failed: %s" % (boot.err or boot.out).strip()[:160])
+    _load(env, domain, label, plist)
     say("Installed. Check it with: launchctl print %s/%s ; python3 scripts/pipeline_watch.py status"
         % (domain, label))
     return EX_OK
@@ -587,6 +634,8 @@ def selftest():
 
     quiet = []
     se.say = lambda msg="": quiet.append(msg)
+    pauses = []
+    se._pause = lambda seconds: pauses.append(seconds)   # waits are walked, never slept
     T = 1791700000.0
 
     def conf(**over):
@@ -604,9 +653,9 @@ def selftest():
         dispatch. Each successful `gh workflow run` adds one run, shaped like the scripted
         one, with the next id (newest first, as gh lists them)."""
 
-        def __init__(self, answers):
+        def __init__(self, answers, lag=0):
             se.FakeRunner.__init__(self, answers)
-            self.dispatched = 0
+            self.lag, self.lists, self.visible_from = lag, 0, []
 
         def _exec(self, argv, stdin, timeout, cwd=None):
             line = se._fmt(argv)
@@ -614,18 +663,43 @@ def selftest():
                 template = next((json.loads(out)[0] for needle, rc, out in self.answers
                                  if "gh run list" in needle and rc == 0 and json.loads(out)), None)
                 if template is not None:
+                    self.lists += 1
+                    # `lag` listings pass before a dispatch's run shows up, as on GitHub.
                     runs = [dict(template, databaseId=template["databaseId"] + i)
-                            for i in range(self.dispatched)]
+                            for i, start in enumerate(self.visible_from) if self.lists > start]
                     return se.Result(0, json.dumps(runs[::-1]), "")
             res = se.FakeRunner._exec(self, argv, stdin, timeout, cwd)
             if "gh workflow run" in line and res.rc == 0:
-                self.dispatched += 1
+                self.visible_from.append(self.lists + self.lag)
             return res
 
+    class GuiLaunchd(FakeGitHub):
+        """launchd in the user's domain: a booted-out job lingers for `linger` polls, and each
+        bootstrap answers the next code in `boots` (the last repeating)."""
+
+        def __init__(self, answers, linger=0, boots=(0,), err="Bootstrap failed: 5: Input/output error"):
+            FakeGitHub.__init__(self, answers)
+            self.linger, self.boots, self.err, self.attempts = linger, list(boots), err, 0
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            line = se._fmt(argv)
+            if line.startswith("launchctl print gui/"):
+                if self.linger > 0:
+                    self.linger -= 1
+                    return se.Result(0, "state = running", "")
+                return se.Result(113, "", "Could not find service")
+            if line.startswith("launchctl bootout gui/"):
+                return se.Result(0, "", "")
+            if line.startswith("launchctl bootstrap gui/"):
+                rc = self.boots[min(self.attempts, len(self.boots) - 1)]
+                self.attempts += 1
+                return se.Result(rc, "", "" if rc == 0 else self.err)
+            return FakeGitHub._exec(self, argv, stdin, timeout, cwd)
+
     def make_env(home, version="0.2.73", latest="0.2.73", door=200, net=200, free_gb=100,
-                 gh=(), now=T, answer="yes", environ=None):
+                 gh=(), now=T, answer="yes", environ=None, runner=None):
         table = [("npm view cyrus-ai version", 0, latest + "\n")] + list(gh)
-        env = pu.Env(runner=FakeGitHub(table),
+        env = pu.Env(runner=runner(table) if runner else FakeGitHub(table),
                      http=lambda url: {"cyrus_cli_version": version} if version and url.endswith("/version") else None,
                      sleep=lambda s: None, ask=lambda q: answer,
                      environ={} if environ is None else environ, home=home)
@@ -724,21 +798,39 @@ def selftest():
         check("the pin being latest is ok", check_release(make_env(home), c)["state"], OK)
         check("`latest` (no pin) never fires release",
               check_release(make_env(home, latest="9.9.9"), conf(DISPATCHER_VERSION="latest"))["state"], OK)
-        st = {}
         check("an old dispatcher fires `updates`",
-              check_updates(make_env(home, version="0.2.69"), c, st)["state"], FIRING)
-        cached = check_updates(make_env(home, version="0.2.73", now=T + 3600), c, st)
-        check("the review is cached for hours, not re-run every pass", cached["state"], FIRING)
-        fresh = check_updates(make_env(home, version="0.2.73", now=T + 21 * 3600), c, st)
-        check("…and re-measured after the cache expires", fresh["state"], OK)
+              check_updates(make_env(home, version="0.2.69"), c, {})["state"], FIRING)
+        st = {}
+        check_updates(make_env(home, version="0.2.73"), c, st)
+        cached = check_updates(make_env(home, version="0.2.69", now=T + 3600), c, st)
+        check("a healthy review is cached for hours, not re-run every pass", cached["state"], OK)
+        fresh = check_updates(make_env(home, version="0.2.69", now=T + 21 * 3600), c, st)
+        check("…and re-measured after the cache expires", fresh["state"], FIRING)
+        # A review that says something is wrong is re-measured every pass, whichever channel
+        # carried the alert: here GitHub never recorded it (KIT-251).
+        st = {}
+        check_updates(make_env(home, version="0.2.69"), c, st)
+        check("a firing review is re-measured every pass, even with no alert recorded as sent",
+              check_updates(make_env(home, version="0.2.73", now=T + 3600), c, st)["state"], OK)
         st_open = {"kinds": {"updates": {"sent": FIRING}}}
         check_updates(make_env(home, version="0.2.69"), c, st_open)
         st_open["kinds"]["updates"]["sent"] = FIRING
         check("while an `updates` alert is open, a fix clears it on the next pass, not the "
               "cache's expiry", check_updates(make_env(home, version="0.2.73", now=T + 3600), c,
                                               st_open)["state"], OK)
-        check("a dispatcher that does not answer is the `dispatcher` kind's, not `updates`'",
-              check_updates(make_env(home, version=None), c, {})["state"], OK)
+        check("a dispatcher that does not answer neither fires nor clears `updates`",
+              check_updates(make_env(home, version=None), c, {})["state"], UNKNOWN)
+        # AN UPDATE STOPS THE DISPATCHER (KIT-251). A pass in that window must not close the open
+        # alert, nor cache "nothing behind" for 20 hours.
+        st = {"kinds": {"updates": {"sent": FIRING}}}
+        check_updates(make_env(home, version="0.2.69"), c, st)
+        review_before = json.dumps(st.get("review"), sort_keys=True)
+        mid = check_updates(make_env(home, version=None, now=T + 3600), c, st)
+        check("…an open alert survives a pass that could not read the dispatcher",
+              (mid["state"], json.dumps(st.get("review"), sort_keys=True) == review_before),
+              (UNKNOWN, True))
+        check("…and the next pass that can read it still fires",
+              check_updates(make_env(home, version="0.2.69", now=T + 7200), c, st)["state"], FIRING)
 
         # -- channels OFF are said, never silent ----------------------------------------
         quiet[:] = []
@@ -753,11 +845,15 @@ def selftest():
         # `updates` is sent first and its run succeeds; `disk`'s run fails. Before the fix, the
         # disk send could pick the updates run, which had already succeeded, and record disk as
         # sent, so its failed run was never retried.
-        two_home = tempfile.mkdtemp(prefix="watch-two-")
+        two_home = os.path.join(home, "two")
+        os.makedirs(two_home)
         two_gh = [("gh workflow run", 0, ""),
                   ("gh run list", 0, json.dumps([{"databaseId": 200, "createdAt": _iso(T + 5)}])),
                   ("gh run watch 200", 0, ""), ("gh run watch 201", 1, "the run failed")]
-        env = make_env(two_home, version="0.2.69", free_gb=1, gh=two_gh)
+        # GitHub lists each run one listing late, so the disk send's first look finds only the
+        # updates run: it must not take it.
+        env = make_env(two_home, version="0.2.69", free_gb=1, gh=two_gh,
+                       runner=lambda table: FakeGitHub(table, lag=1))
         code = run_pass(env, conf(KIT_CHECKOUT=kit))
         kinds = load_state(env).get("kinds") or {}
         check("two kinds sent in one pass: each is judged by its own run",
@@ -796,7 +892,8 @@ def selftest():
         # THE PREVIEW SENDS NOTHING (KIT-249). With something firing and GitHub on, the old
         # preview dispatched the alert before the yes; a "no" then left an issue open that
         # nothing closes, and a "yes" paged twice.
-        preview_home = tempfile.mkdtemp(prefix="watch-preview-")
+        preview_home = os.path.join(home, "preview")
+        os.makedirs(preview_home)
         launchd = [("launchctl bootout", 0, ""), ("launchctl bootstrap", 0, "")]
         firing_conf = conf(KIT_CHECKOUT=kit)
         firing_conf["__source__"] = "/kit/update.conf"
@@ -815,6 +912,25 @@ def selftest():
         install(env, c)
         check("…and a no leaves a job that is already loaded running",
               "launchctl bootout" in env.runner.applied, False)
+
+        # A REINSTALL WAITS FOR LAUNCHD TO LET GO, AND RETRIES EIO (KIT-251). launchd keeps a
+        # booted-out job's record for a while; a bootstrap inside that window answers EIO.
+        def reinstall(**knobs):
+            env = make_env(preview_home, runner=lambda table: GuiLaunchd(table, **knobs))
+            pauses[:] = []
+            try:
+                return install(env, c), env.runner.attempts, len(pauses), ""
+            except pu.UpdateError as exc:
+                return None, env.runner.attempts, len(pauses), str(exc)
+        code, attempts, waited, _ = reinstall(linger=2, boots=(1, 0))
+        check("a reinstall waits for the old job to leave, then retries one EIO",
+              (code, attempts, waited >= 2), (EX_OK, 2, True))
+        code, attempts, _, said = reinstall(boots=(1,), err="Bootstrap failed: 37: Operation already in progress")
+        check("…a failure that is not EIO is not retried, and says the job is not loaded",
+              (code, attempts, "NOT loaded" in said), (None, 1, True))
+        code, attempts, _, said = reinstall(linger=10 ** 6)
+        check("…and a job launchd never lets go of stops it before any bootstrap",
+              (code, attempts, "still holds" in said), (None, 0, True))
         env = make_env(home, gh=[("launchctl bootout", 0, ""), ("launchctl bootstrap", 0, "")])
         code = install(env, c)
         plist = os.path.join(home, "Library", "LaunchAgents", c["WATCH_LABEL"] + ".plist")
@@ -833,7 +949,9 @@ def selftest():
         argv = list(doc["ProgramArguments"][2:])
         argv[1] = job_conf
         try:
-            parsed = main(argv, env=make_env(tempfile.mkdtemp(prefix="watch-job-")))
+            job_home = os.path.join(home, "job")
+            os.makedirs(job_home)
+            parsed = main(argv, env=make_env(job_home))
         except SystemExit as exc:
             parsed = "argparse refused it: exit %s" % exc.code
         check("the job's command line is one the script accepts, and runs a pass",
