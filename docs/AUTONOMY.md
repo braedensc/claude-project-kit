@@ -189,6 +189,21 @@ of ticket state it takes over: on session start it moves the issue into the lowe
 (`EdgeWorker.ts:4164` → `:5577`). It writes nothing on finish — no move to review, no
 move to done — so the safe-outputs validator is **not** made redundant by it.
 
+### The same lane's delivery: a delegation it never heard
+
+That daemon learns of work only from the tracker's webhooks, and it never polls. The
+tracker retries a failed delivery three times, the last about 7 hours after the first, and
+then drops it. A dispatcher machine that sleeps through all three loses the delegation, and
+nothing says so. The tracker can also switch off a webhook that keeps failing, and then
+every later delegation is lost the same way.
+
+The catch-up poller covers both (`docs/CATCH-UP.md`, KIT-47). It is a Stage E daemon that
+finds a delegation the agent never answered, waits until the tracker's retries are spent,
+and replies once in its thread, which the daemon treats as a new prompt. It pages when the
+webhook is off. Its only write is that reply, and the wait is a floor the script refuses to
+lower: replying sooner would race a retry into a second session, because the daemon keeps
+no record of what it already started.
+
 ### What actually bounds a session nothing is metering
 
 Two operational facts, in the order they matter.

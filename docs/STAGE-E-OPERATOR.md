@@ -5,7 +5,7 @@ session that opened it to fix what the review found, a bounded number of times. 
 dispatcher does no reviewing of its own; this is the layer that does.
 
 **Mechanism** ships in this kit as tested `scripts/`. **Activation** — a Linear team, one
-dispatcher config entry per reviewed repository, three system daemons and a fourth unless
+dispatcher config entry per reviewed repository, four system daemons and a fifth unless
 you switch it off — is yours, at your
 own terminal. **No session installs, starts or edits a service.** This file is generic on
 purpose: no hostnames, account names, ids or paths from a real deployment. Keep the
@@ -112,10 +112,10 @@ A dry run never reaches the apply path, so it never prints the Runner's own `WOU
 dispatcher` line. Read the row, not that phrase.
 
 **A real pass also moves the code the daemons run.** It fast-forwards the role account's
-clone of the kit, and unloads all three daemons first so nothing execs out of a tree that
+clone of the kit, and unloads all four daemons first so nothing execs out of a tree that
 is moving — and the heartbeat monitor too, when it is loaded. The `enable` step reloads the
-three daemons, several checkpoints downstream. The `heartbeat-monitor` step right after it
-reloads the monitor. If the run stops at a card before `enable`, **all three loops are off**.
+four daemons, several checkpoints downstream. The `heartbeat-monitor` step right after it
+reloads the monitor. If the run stops at a card before `enable`, **all four loops are off**.
 If it stops at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
 the way out names which jobs are off, and it is the only thing that says so. A dry run does
 none of this. It reports one of three things and returns: that no file the jobs run has
@@ -499,9 +499,10 @@ poller would.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key. Creates backlog tickets, links each to its source, posts receipts and cap notes on the source ticket, and comments the finding-filed mark on the new ticket — nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Heartbeat monitor | The same account, a fourth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the three heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
+| Catch-up poller | The same account, a fourth system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
+| Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the four heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
-| State | `<role-account home>/.stage-e/state`, and `…/.stage-e/finding` for the finding poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
+| State | `<role-account home>/.stage-e/state`, `…/.stage-e/finding` for the finding poller, and `…/.stage-e/catchup` for the catch-up poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
 ### Why the role account and not yours
 
@@ -968,8 +969,8 @@ turning something off is still an edit to a file full of tokens.
    with them. A monitor left loaded judges the stopped daemons as stale and comments about a
    shutdown you made on purpose. Either unload all four jobs (Step 3d), or set
    `HEARTBEAT_MONITOR_TICKET=off` before the installer run in step 1 — that run unloads the
-   monitor and removes its plist — and then unload the three daemons. A later installer run
-   loads the three daemons again at its `enable` step. Leaving the daemons loaded with no
+   monitor and removes its plist — and then unload the four daemons. A later installer run
+   loads the four daemons again at its `enable` step. Leaving the daemons loaded with no
    review entries means review tickets that start no session.
 3. **Delete the backups you no longer need.** They are copies of the dispatcher's tracker
    tokens. The installer's prune only runs when the installer runs, and only over files
@@ -993,20 +994,22 @@ to it however your machine does that, and stay there until Step 4.
 ### 3a. The home and the state directory
 
 ```bash
-mkdir -p ~/.stage-e/state ~/.stage-e/finding
-chmod 700 ~/.stage-e ~/.stage-e/state ~/.stage-e/finding
+mkdir -p ~/.stage-e/state ~/.stage-e/finding ~/.stage-e/catchup
+chmod 700 ~/.stage-e ~/.stage-e/state ~/.stage-e/finding ~/.stage-e/catchup
 ```
 
-That home holds four kinds of thing, and the sandbox's deny-read of it is what keeps all
-four from the sessions: the env file of credentials (3b), the state directory, the finding
-poller's own directory, and `~/.stage-e/backups` — the copies of the dispatcher's config
+That home holds five kinds of thing, and the sandbox's deny-read of it is what keeps all
+five from the sessions: the env file of credentials (3b), the state directory, the finding
+poller's and the catch-up poller's own directories, and `~/.stage-e/backups` — the copies of the dispatcher's config
 taken in Step 2, which hold its tracker tokens. Everything under here is mode 700 or 600,
 owned by the role account.
 
 Everything review and bounce remember lives under `~/.stage-e/state`. The finding poller
 keeps its own config, state and log under `~/.stage-e/finding` instead — including a
 `heartbeat.json` of its own, which is the whole reason for the second directory: two
-heartbeat files with the same name in the same place cannot be told apart.
+heartbeat files with the same name in the same place cannot be told apart. The catch-up
+poller keeps its config, ledger, heartbeat and log under `~/.stage-e/catchup` for the same
+reason.
 
 | Path | Written by | What it is |
 |---|---|---|
@@ -1173,13 +1176,14 @@ its own process; the bounce driver does not, so every comment the driver posts f
 `gh` and the transport both read it first. `verify` reports such a line as outstanding work,
 and `run` removes it.
 
-### 3c. Three config files, not one
+### 3c. Four config files, not one
 
 The review poller **refuses** a config key it does not know, so a typo cannot silently fall
 back to a default. The bounce driver **ignores** unknown keys, so one file can feed it.
 Those two rules do not compose: a single file carrying the driver's own keys is not a valid
 poller config. The finding poller refuses unknown keys too, and takes a different set of
-them again. Give each its own file — the installer writes all three.
+them again, and so does the catch-up poller. Give each its own file — the installer writes
+all four.
 
 `~/.stage-e/poller.json` — `python3 scripts/pipeline_review_poller.py --example-config`
 prints this and lists every key it accepts:
@@ -1358,7 +1362,13 @@ prints this and lists every key it accepts:
   and **refuses to file a finding it cannot mark** (`docs/FINDING-POLLER.md`).
 - It reads the tracker key and no GitHub token at all; it never touches a pull request.
 
-All three files hold **names of environment variables**, never a value. The loaders refuse a
+`~/.stage-e/catchup/poller.json` — the catch-up poller's own
+(`python3 scripts/pipeline_catchup_poller.py --example-config` prints the shape). The
+installer writes it from the same work teams and agent user as the finding poller, plus
+`CATCHUP_DISPATCHER_URL` and `CATCHUP_FRONT_DOOR_URL`. Its wait before replying cannot be set
+below the tracker's own retries. `docs/CATCH-UP.md` has every key.
+
+All four files hold **names of environment variables**, never a value. The loaders refuse a
 value that does not look like a variable name.
 
 **Nothing validates the driver's ids.** Its `validate_config` checks the two credential
@@ -1411,7 +1421,7 @@ The installer checks the root as the role account, on every `run` and `verify`:
 The log's layout is read from the dispatcher's published source; if it moves, the rows
 say *no session log* rather than guessing.
 
-### 3d. The system LaunchDaemons — three, and a fourth unless it is off
+### 3d. The system LaunchDaemons — four, and a fifth unless it is off
 
 One-shot jobs. Each pass is scan → act → exit; the interval belongs to launchd, not to the
 script. **No `KeepAlive`** — it would restart a one-shot process in a tight loop.
@@ -1421,19 +1431,19 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 | `com.example.stage-e-poller` | `pipeline_review_poller.py … run` | `POLL_INTERVAL_SECONDS` (300) | `~/.stage-e/poller.log` |
 | `com.example.stage-e-bounce` | `pipeline_bounce_local.py run` | `BOUNCE_INTERVAL_SECONDS` (360) | `~/.stage-e/bounce.log` |
 | `com.example.stage-e-finding` | `pipeline_finding_poller.py scan …` | `FINDING_INTERVAL_SECONDS` (300) | `~/.stage-e/finding/poller.log` |
+| `com.example.stage-e-catchup` | `pipeline_catchup_poller.py run --config …/catchup/poller.json` | `CATCHUP_INTERVAL_SECONDS` (900) | `~/.stage-e/catchup/poller.log` |
 | `com.example.stage-e-monitor` | `pipeline_heartbeat_monitor.py run --config …/monitor.json` | `MONITOR_INTERVAL_SECONDS` (1800) | `~/.stage-e/monitor.log` |
 
-The fourth row is the heartbeat monitor. It has its own installer step, after the other
-three are loaded, and it is the only one the conf can switch off by name
-(`HEARTBEAT_MONITOR_TICKET=off`). With it off the installer loads three and removes a
-monitor an earlier run installed, and the privilege banner says three. **So: three daemons
-always, four when the monitor is on.** Elsewhere in this file "the three daemons" means
-review, bounce and finding — the trio that does the work — whether or not a fourth is
-watching them.
+The fifth row is the heartbeat monitor. It has its own installer step, after the other
+four are loaded, and it is the only one the conf can switch off by name
+(`HEARTBEAT_MONITOR_TICKET=off`). With it off the installer loads four and removes a
+monitor an earlier run installed, and the privilege banner says four. **So: four daemons
+always, five when the monitor is on.** Elsewhere in this file "the four daemons" means
+review, bounce, finding and catch-up — the jobs that do the work — whether or not a fifth
+is watching them.
 
-`FINDING_INTERVAL_SECONDS` **is not in `stage-e.conf.example`**; it defaults to 300, and you
-only need the line if you want a different interval. Offsetting the three from each other
-keeps them from starting together.
+Every interval is a `stage-e.conf` key with the default shown. Offsetting them from each
+other keeps them from starting together.
 
 ```xml
 <!-- /Library/LaunchDaemons/com.example.stage-e-poller.plist   root:wheel, mode 644 -->
@@ -1461,7 +1471,7 @@ keeps them from starting together.
 ```
 
 **Type the interpreter's full path, `/usr/bin/python3`, and never a bare `python3`.** All
-three jobs are pinned to Apple's own interpreter, deliberately: a package-manager Python
+four jobs are pinned to Apple's own interpreter, deliberately: a package-manager Python
 earlier on the path cannot verify the tracker's TLS certificate and every call fails with
 `CERTIFICATE_VERIFY_FAILED … unable to get local issuer certificate`. The same applies to
 anything you run by hand as the role account — copy the `ProgramArguments` line out of the
@@ -1483,16 +1493,23 @@ The third is the finding poller — label `com.example.stage-e-finding`, log
 set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 <scripts dir>/pipeline_finding_poller.py scan --config "$HOME/.stage-e/finding/poller.json"
 ```
 
+The fourth is the catch-up poller — label `com.example.stage-e-catchup`, log
+`~/.stage-e/catchup/poller.log`, and:
+
+```text
+set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 <scripts dir>/pipeline_catchup_poller.py run --config "$HOME/.stage-e/catchup/poller.json"
+```
+
 `<scripts dir>` is the `scripts/` directory of a plain clone of the kit-derived repository
 — a clone, never a dispatcher worktree. The pollers pass `--repo OWNER/REPO` on every
 GitHub call, so no script cares what directory it is started in.
 
 **That clone is the deployment, and nothing in a heartbeat or a log names its version.** All
-three daemons exec out of it, so a fix merged to the default branch is inert on the machine
-until the clone moves. `run` moves it for you — it unloads the three jobs and the heartbeat
-monitor, fast-forwards, reloads the three at its `enable` step and the monitor at its
+four daemons exec out of it, so a fix merged to the default branch is inert on the machine
+until the clone moves. `run` moves it for you — it unloads the four jobs and the heartbeat
+monitor, fast-forwards, reloads the four at its `enable` step and the monitor at its
 `heartbeat-monitor` step — and that is the only thing that does. The monitor runs from the
-same clone. Pull it by hand only with all four jobs unloaded, never under a running pass,
+same clone. Pull it by hand only with all five jobs unloaded, never under a running pass,
 and compare its `git rev-parse --short HEAD` against your own clone whenever behaviour
 surprises you. A stale daemon clone looks exactly like a bug.
 
@@ -1533,13 +1550,13 @@ could not do it* — the good lists differ per job, and `docs/HEARTBEAT-MONITOR.
 the review poller's `declined`, and the bounce driver's `idle`, `declined` and `paused`,
 are healthy. The notifier's file is shaped differently: `at` and an integer `exit`, and only
 exit `0` is good.
-**Count them** against the jobs you run — three, or four with the notifier: one fresh
+**Count them** against the jobs you run — four, or five with the notifier: one fresh
 heartbeat fewer than that is one whole daemon that is not running, and nothing else on the
 machine will say so. They live under the **role account's** home, not yours, so reading
 them takes `sudo -u`:
 
-> **Something can read them for you.** `scripts/pipeline_heartbeat_monitor.py` is a fourth
-> one-shot job, run by the same role account on a longer interval, that judges the three
+> **Something can read them for you.** `scripts/pipeline_heartbeat_monitor.py` is a fifth
+> one-shot job, run by the same role account on a longer interval, that judges the four
 > daemons' heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it — and posts
 > **one** comment on a ticket when the verdict changes — once per
 > incident, not once per pass, and one more when it clears. Under the installer it is off
@@ -1550,7 +1567,7 @@ them takes `sudo -u`:
 > installs it** at its `heartbeat-monitor` step, from `HEARTBEAT_MONITOR_TICKET` (KIT-127).
 > `docs/HEARTBEAT-MONITOR.md` has the verdicts, the limits and the install steps.
 >
-> **It watches up to five jobs, and its comments reach your chat channel** (KIT-156). Each
+> **It watches up to six jobs, and its comments reach your chat channel** (KIT-156). Each
 > comment carries a mark on its first line that the human-action notifier pings on, once,
 > with no label (`docs/NOTIFIER-OPERATOR.md`, *The daemon-health page*). Set
 > `NOTIFIER_JOB_LABEL` in `stage-e.conf` to the notifier's `JOB_LABEL` and the monitor
@@ -1561,13 +1578,13 @@ them takes `sudo -u`:
 > loaded. Left empty, the note says the notifier is not watched. A stopped notifier still
 > pings nobody: the comment lands and says so.
 >
-> **The fifth is your hourly health watch** (KIT-236, `docs/UPDATE-OPERATOR.md`). Set
+> **The sixth is your hourly health watch** (KIT-236, `docs/UPDATE-OPERATOR.md`). Set
 > `HEALTH_STATUS_FILE` and `HEALTH_WATCH_INTERVAL_SECONDS` in `stage-e.conf` to match its
 > `update.conf`, and the monitor reads its status file. A problem it finds then pages your
 > channel, once per set of problems. Install the watch first, or the file reads as missing.
 
 ```sh
-sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json'
+sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/heartbeat.json ~/.stage-e/state/bounce-heartbeat.json ~/.stage-e/finding/heartbeat.json ~/.stage-e/catchup/heartbeat.json'
 sudo -u <ROLE_ACCOUNT> -H /bin/sh -c 'cd / && cat ~/.stage-e/state/notifier-heartbeat.json'   # once the notifier is installed, at its default STATE_DIR
 ```
 
@@ -1587,6 +1604,7 @@ set -a; . ~/.stage-e/env; set +a
 /usr/bin/python3 <scripts dir>/pipeline_review_poller.py --config ~/.stage-e/poller.json scan --dry-run
 /usr/bin/python3 <scripts dir>/pipeline_bounce_local.py decide --all --json
 /usr/bin/python3 <scripts dir>/pipeline_finding_poller.py scan --config ~/.stage-e/finding/poller.json --dry-run
+/usr/bin/python3 <scripts dir>/pipeline_catchup_poller.py run --config ~/.stage-e/catchup/poller.json --dry-run
 ```
 
 (`/usr/bin/python3`, not `python3` — see 3d. A bare `python3` here is the
@@ -1620,6 +1638,13 @@ The finding poller's dry run reads the same tickets a live pass would, reports w
 file, and writes nothing. **It has no decline state — 0 is its only success**, and the
 installer treats any other exit as a failed pass. An empty team list is the usual first
 cause: the config was written from a conf whose `MANAGED_TEAM_KEYS` was left blank.
+
+The catch-up poller's dry run checks the dispatcher answers, reads whether its webhook is
+still on, and names each delegation it would reply to. It replies to nothing and writes
+nothing, not even its heartbeat. **Exit 3 is a finding, not a broken install**: the webhook
+is off, or a delegation it already replied to is still silent. The installer carries on and
+prints a note. Its first dry run is also the test of whether the tracker shows your key the
+dispatcher's webhook at all (`docs/CATCH-UP.md`, *What is not proven*).
 
 The publisher has its own dry run, if you want to see a comment rendered from a block you
 saved by hand. Give it the criteria the reviewer was given: `--acceptance` once per
@@ -2089,6 +2114,10 @@ driver pass prints a `criteria snapshots:` line. Delegate a throwaway ticket and
 delegation, delegate it again, and look for *replaced*. The history fields those checks
 read (`toDelegate`, `actor`) come from the tracker's published schema and are not yet
 observed live (no ticket yet).
+
+**The catch-up poller has not recovered a real lost delegation.** It is tested in the
+batteries only. `docs/CATCH-UP.md`, *What is not proven*, has the live test and the three
+other things no run has shown yet.
 
 **Step 6 has not run live.** Both conflict lanes are tested only in the batteries. The first
 real conflict on a dispatcher's pull request is its live test: watch for the thread reply,

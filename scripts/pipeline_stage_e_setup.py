@@ -9,20 +9,22 @@ exactly what to do, and exits 10. You do that one thing and run the SAME command
 again: it checks your work and carries on. It never asks you to type `y`.
 
 WHAT IT BUILDS.  The review-and-bounce layer beside an already-running
-dispatcher: a Reviews team in the tracker, an env file and three config files
-under the dispatcher's role account (the review poller's, the bounce driver's
-and the finding poller's), one repository entry per reviewed repository in the
-dispatcher's own config, and three system LaunchDaemons running one-shot
-passes — review poller, bounce driver, finding poller.
+dispatcher: a Reviews team in the tracker, an env file and four config files
+under the dispatcher's role account (the review poller's, the bounce driver's,
+the finding poller's and the catch-up poller's), one repository entry per
+reviewed repository in the dispatcher's own config, and four system LaunchDaemons
+running one-shot
+passes — review poller, bounce driver, finding poller, catch-up poller (KIT-47:
+it starts a delegation the dispatcher missed while it was down, docs/CATCH-UP.md).
 
-A fourth system LaunchDaemon reads those three's heartbeats: the heartbeat
+A fifth system LaunchDaemon reads those four's heartbeats: the heartbeat
 monitor (scripts/pipeline_heartbeat_monitor.py, KIT-127). It comments on ONE
 ticket when their health changes, so the `heartbeat-monitor` step stops on a card
 until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name. With
 NOTIFIER_JOB_LABEL set it watches the human-action notifier's heartbeat too, at the
 interval launchd holds for that job plus the notifier's own pass clock (KIT-156);
 empty, the step says the notifier is not watched. With HEALTH_STATUS_FILE set it reads
-the owner's hourly health watch's status file as a fifth heartbeat (KIT-236), so a
+the owner's hourly health watch's status file as another heartbeat (KIT-236), so a
 problem that watch finds pages chat too; empty, the step says it is not watched.
 
 And one thing that is NOT the role account's: the `conflict-waker` step installs
@@ -419,16 +421,17 @@ def review_entry_name(repo):
 # review is judged by.
 REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_finding_poller.py", "pipeline_heartbeat_monitor.py",
-                    "pipeline_review_local.py", "pipeline_review_basis.py",
-                    "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
+                    "pipeline_catchup_poller.py", "pipeline_review_local.py",
+                    "pipeline_review_basis.py", "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
                     "pipeline_machine_tickets.py")
 
-# The entry points of those four jobs — the roots the closure is walked from.
+# The entry points of those five jobs — the roots the closure is walked from.
 DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
-                        "pipeline_finding_poller.py", "pipeline_heartbeat_monitor.py")
+                        "pipeline_finding_poller.py", "pipeline_heartbeat_monitor.py",
+                        "pipeline_catchup_poller.py")
 
 # Directories of DATA the jobs read at run time out of the same clone. A review is
 # judged against schemas/review-findings.schema.json and a telemetry row against
@@ -589,6 +592,12 @@ CONF_DEFAULTS = {
     "POLL_INTERVAL_SECONDS": "300",
     "BOUNCE_INTERVAL_SECONDS": "360",
     "FINDING_INTERVAL_SECONDS": "300",
+    # The catch-up poller (KIT-47): re-prompts a delegation the dispatcher never received
+    # once it is older than Linear's retry ladder. It acts only when the dispatcher answers
+    # at CATCHUP_DISPATCHER_URL and, when set, the public CATCHUP_FRONT_DOOR_URL answers.
+    "CATCHUP_INTERVAL_SECONDS": "900",
+    "CATCHUP_DISPATCHER_URL": "http://127.0.0.1:3456",
+    "CATCHUP_FRONT_DOOR_URL": "",
     "SEVERITY_THRESHOLD": "medium",
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
@@ -767,6 +776,11 @@ def validate_conf(values):
     if monitor_value and monitor_value.lower() != "off" and not _TICKET_ID_RE.match(monitor_value):
         errors.append("HEARTBEAT_MONITOR_TICKET must be a ticket id like KIT-123, or `off` "
                       "(got %r)" % monitor_value)
+    for key, may_be_empty in (("CATCHUP_DISPATCHER_URL", False), ("CATCHUP_FRONT_DOOR_URL", True)):
+        url = (conf.get(key) or "").strip()
+        if (url or not may_be_empty) and not url.startswith(("http://", "https://")):
+            errors.append("%s must be an http(s) URL%s (got %r)"
+                          % (key, ", or empty" if may_be_empty else "", url))
     nlabel = (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
     if nlabel and not _RDNS_RE.match(nlabel):
         errors.append("NOTIFIER_JOB_LABEL %r is not a reverse-DNS launchd label — the "
@@ -785,7 +799,8 @@ def validate_conf(values):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
     for key in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS",
-                "FINDING_INTERVAL_SECONDS", "MONITOR_INTERVAL_SECONDS", "DIFF_CAP_CHARS",
+                "FINDING_INTERVAL_SECONDS", "CATCHUP_INTERVAL_SECONDS",
+                "MONITOR_INTERVAL_SECONDS", "DIFF_CAP_CHARS",
                 # A retention of ZERO would delete the copy it just took, which
                 # is the one thing the whole step refuses to proceed without.
                 "CONFIG_BACKUPS_KEPT"):
@@ -813,8 +828,8 @@ def load_conf(path):
 
 def daemon_labels(conf):
     """`com.example.dispatcher` -> the review and bounce labels beside it. The
-    finding poller's is `finding_label`, and `all_daemon_labels` is all THREE.
-    One value typed, three derived: a prefix typed twice is a prefix that
+    finding poller's is `finding_label`, the catch-up poller's `catchup_label`, and
+    `all_daemon_labels` is all FOUR. One value typed, four derived: a prefix typed twice is a prefix that
     disagrees."""
     prefix = conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0]
     return prefix + ".stage-e-poller", prefix + ".stage-e-bounce"
@@ -827,16 +842,21 @@ def finding_label(conf):
     return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-finding"
 
 
+def catchup_label(conf):
+    """The catch-up poller's launchd label (KIT-47), beside the finding poller's."""
+    return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-catchup"
+
+
 def all_daemon_labels(conf):
-    """Every Stage E daemon label, review + bounce + finding — for the loops that
-    install, load and check all of them uniformly."""
-    return daemon_labels(conf) + (finding_label(conf),)
+    """Every Stage E daemon label, review + bounce + finding + catch-up — for the loops
+    that install, load and check all of them uniformly."""
+    return daemon_labels(conf) + (finding_label(conf), catchup_label(conf))
 
 
 def monitor_label(conf):
-    """The heartbeat monitor's launchd label, beside the other three. NOT in
+    """The heartbeat monitor's launchd label, beside the other four. NOT in
     `all_daemon_labels`: its own step installs, loads and checks it, because it is
-    off by name on some machines and it must never block the three it watches."""
+    off by name on some machines and it must never block the four it watches."""
     return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-monitor"
 
 
@@ -1076,11 +1096,11 @@ def _privilege_reason(command, dry_run, account, conf):
         return ("`run --dry-run` measures this machine as the %s role account and as "
                 "root. It changes nothing." % account)
     if monitor_ticket(conf) == "off":
-        daemons = ("three system LaunchDaemons — the review poller, the bounce driver "
-                   "and the finding poller.")
-    else:
         daemons = ("four system LaunchDaemons — the review poller, the bounce driver, "
-                   "the finding poller and the heartbeat monitor.")
+                   "the finding poller and the catch-up poller.")
+    else:
+        daemons = ("five system LaunchDaemons — the review poller, the bounce driver, "
+                   "the finding poller, the catch-up poller and the heartbeat monitor.")
     return ("`run` reads and writes files as the %s role account, edits the dispatcher's "
             "config, and installs and loads %s" % (account, daemons))
 
@@ -1612,7 +1632,7 @@ CARDS = {
     },
     "CK-9": {
         "title": "Name the ticket the heartbeat monitor comments on",
-        "why": ("The three daemons each write a heartbeat, and nothing reads them unless the "
+        "why": ("The four daemons each write a heartbeat, and nothing reads them unless the "
                 "heartbeat monitor runs. It is deterministic code on the role account: no "
                 "model and no session. Its only tracker write is one comment, on one ticket, "
                 "when the daemons' health changes, and one more when it recovers. Which "
@@ -3239,8 +3259,20 @@ def step_configs(ctx, apply_it):
         "max_per_source": 3,
         "max_per_run": 20,
     }
+    # KIT-47 catch-up poller config. Same work teams and agent user as the finding poller;
+    # its own state dir, so its heartbeat and ledger collide with nothing. The age floor
+    # stays the script's default on purpose: the owner chose it (2026-10-27), and the
+    # script refuses anything inside Linear's retry ladder.
+    catchup = {
+        "agent_user_id": ids["agent_user_id"],
+        "teams": [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])],
+        "linear_key_env": conf["LINEAR_KEY_ENV"],
+        "state_dir": "~/.stage-e/catchup",
+        "dispatcher_url": conf["CATCHUP_DISPATCHER_URL"].strip(),
+        "front_door_url": conf["CATCHUP_FRONT_DOOR_URL"].strip(),
+    }
     wanted = {"poller.json": poller, "config.json": bounce,
-              "finding/poller.json": finding}
+              "finding/poller.json": finding, "catchup/poller.json": catchup}
 
     current = {}
     for fname in wanted:
@@ -3257,14 +3289,14 @@ def step_configs(ctx, apply_it):
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
-    # A `finding/…` file lands in a subdir cat cannot create; make it first (its
-    # own state dir doubles as its config dir), mode 700 like the rest.
-    if any("/" in f for f in stale):
-        mk = r.as_role(ctx.account, "umask 077; mkdir -p %s/finding" % ctx.stage_home,
-                       why="create the finding poller's state/config dir")
+    # A `finding/…` or `catchup/…` file lands in a subdir cat cannot create; make each
+    # first (each job's state dir doubles as its config dir), mode 700 like the rest.
+    for sub in sorted({f.split("/", 1)[0] for f in stale if "/" in f}):
+        mk = r.as_role(ctx.account, "umask 077; mkdir -p %s/%s" % (ctx.stage_home, sub),
+                       why="create the %s state/config dir" % sub)
         if not mk.ok and not mk.skipped:
-            raise SetupError("could not create %s/finding: %s"
-                             % (ctx.stage_home, (mk.err or "")[:200]))
+            raise SetupError("could not create %s/%s: %s"
+                             % (ctx.stage_home, sub, (mk.err or "")[:200]))
 
     for fname in sorted(stale):
         body = json.dumps(wanted[fname], indent=2, sort_keys=True) + "\n"
@@ -4596,6 +4628,14 @@ def _plists(ctx):
                               'scan --config "$HOME/.stage-e/finding/poller.json"'),
             interval=int(conf["FINDING_INTERVAL_SECONDS"]),
             log=home + "/.stage-e/finding/poller.log"),
+        # KIT-47 catch-up poller — a delegation the dispatcher never received is
+        # re-prompted once it is older than Linear's retry ladder.
+        catchup_label(conf): PLIST.format(
+            label=catchup_label(conf), account=ctx.account, home=home, path=DAEMON_PATH,
+            command=(common + '"$HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py" '
+                              'run --config "$HOME/.stage-e/catchup/poller.json"'),
+            interval=int(conf["CATCHUP_INTERVAL_SECONDS"]),
+            log=home + "/.stage-e/catchup/poller.log"),
     }
 
 
@@ -4687,7 +4727,7 @@ def _say_declines(text):
 
 
 def step_dry_run(ctx, apply_it):
-    """All three components' own dry runs, shape-checked. This is what CK-5 reads."""
+    """Every component's own dry run, shape-checked. This is what CK-5 reads."""
     r, notes = ctx.runner, []
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
     poller = r.as_role(ctx.account,
@@ -4701,6 +4741,10 @@ def step_dry_run(ctx, apply_it):
                         env + "/usr/bin/python3 %s/kit/scripts/pipeline_finding_poller.py "
                               "scan --config %s/finding/poller.json --dry-run"
                         % (ctx.stage_home, ctx.stage_home), timeout=600)
+    catchup = r.as_role(ctx.account,
+                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_catchup_poller.py "
+                              "run --config %s/catchup/poller.json --dry-run"
+                        % (ctx.stage_home, ctx.stage_home), timeout=900)
     blob = (poller.out + poller.err + bounce.out + bounce.err)
     say("")
     say("  -- the poller's dry run --")
@@ -4711,6 +4755,9 @@ def step_dry_run(ctx, apply_it):
         say("    " + line)
     say("  -- the finding poller's dry run --")
     for line in (finding.out + finding.err).strip().splitlines()[-14:]:
+        say("    " + line)
+    say("  -- the catch-up poller's dry run --")
+    for line in (catchup.out + catchup.err).strip().splitlines()[-14:]:
         say("    " + line)
     say("")
     # EVERY COMPONENT IS JUDGED BEFORE ANY IS REPORTED. Raising on the
@@ -4753,6 +4800,15 @@ def step_dry_run(ctx, apply_it):
     if finding.rc != 0:
         problems.append("the finding poller's dry run failed (exit %d). Nothing was "
                         "created: %s" % (finding.rc, (finding.err or finding.out).strip()[-400:]))
+    # The catch-up poller's exit 3 is a pass that RAN and found something only a person can
+    # fix (a disabled webhook, a session still silent after its re-prompt): it is reported,
+    # like the poller's decline, and the install goes on. Anything else is a failure.
+    if catchup.rc not in ok_codes:
+        problems.append("the catch-up poller's dry run failed (exit %d). Nothing was "
+                        "posted: %s" % (catchup.rc, (catchup.err or catchup.out).strip()[-400:]))
+    elif catchup.rc == COMPONENT_EXIT_DECLINED:
+        notes.append("the catch-up poller's dry run found something only a person can fix; "
+                     "its FIRING lines above say what")
     if problems:
         raise SetupError("\n".join(problems))
     declined = poller.rc == COMPONENT_EXIT_DECLINED
@@ -4770,9 +4826,15 @@ def step_dry_run(ctx, apply_it):
                               "UNKNOWN for at least one repository")
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off")
-    return True, ("all three dry runs ran and the count is signed off; "
+    return True, ("all four dry runs ran and the count is signed off; "
                   + ("the poller declined at least one pull request"
                      if declined else "the poller did not decline")), notes
+
+
+# Each daemon's heartbeat, under the role account's ~/.stage-e. One list, read by both of
+# step_enable's loops, so a daemon added later cannot be loaded without being waited for.
+DAEMON_HEARTBEATS = ("state/heartbeat.json", "state/bounce-heartbeat.json",
+                     "finding/heartbeat.json", "catchup/heartbeat.json")
 
 
 def step_enable(ctx, apply_it):
@@ -4782,7 +4844,7 @@ def step_enable(ctx, apply_it):
     labels = all_daemon_labels(conf)
     missing = []
     for label in labels:
-        # LOADED, not "running". All three jobs are one-shot — scan, act, exit — so
+        # LOADED, not "running". Every job is one-shot — scan, act, exit — so
         # for all but a few seconds of each interval a healthy job is a loaded
         # job that is not running. Reading `state = running` as health here
         # would report every healthy install as broken.
@@ -4790,10 +4852,10 @@ def step_enable(ctx, apply_it):
         if not got.ok:
             missing.append(label)
     beats = r.as_role(ctx.account,
-                      "for f in state/heartbeat.json state/bounce-heartbeat.json "
-                      "finding/heartbeat.json; do "
+                      "for f in %s; do "
                       "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
-                      "printf '%%s missing\\n' \"$f\"; done" % ctx.stage_home)
+                      "printf '%%s missing\\n' \"$f\"; done"
+                      % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
     have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
 
     # A PAUSE IS INVISIBLE TO EVERY ALARM (KIT-112, review of #137). A paused bounce driver
@@ -4810,9 +4872,10 @@ def step_enable(ctx, apply_it):
             % (ctx.stage_home,
                " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
 
-    if not missing and len(have_beats) == 3:
+    if not missing and len(have_beats) == len(DAEMON_HEARTBEATS):
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
-        return True, "all three daemons loaded and all heartbeats present", pause_notes
+        return True, "all %d daemons loaded and all heartbeats present" % len(
+            DAEMON_HEARTBEATS), pause_notes
     if not apply_it:
         return False, "would load %s; heartbeats present: %s" % (
             ", ".join(missing) or "none", ", ".join(have_beats) or "none"), pause_notes
@@ -4850,7 +4913,7 @@ def step_enable(ctx, apply_it):
                         why="load %s" % label)
         if not res.ok and not res.skipped:
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
-    # Only these three: a heartbeat monitor `code` stopped is the next step's to load.
+    # Only these four: a heartbeat monitor `code` stopped is the next step's to load.
     ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
     if ctx.runner.dry_run:
         return False, "would load the daemons and wait for their heartbeats", []
@@ -4858,16 +4921,18 @@ def step_enable(ctx, apply_it):
     deadline = time.time() + 90
     while time.time() < deadline:
         beats = r.as_role(ctx.account,
-                          "for f in state/heartbeat.json state/bounce-heartbeat.json "
-                          "finding/heartbeat.json; do "
+                          "for f in %s; do "
                           "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
-                          "printf '%%s missing\\n' \"$f\"; done" % ctx.stage_home)
+                          "printf '%%s missing\\n' \"$f\"; done"
+                          % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
         have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
-        if len(have_beats) == 3:
-            return False, "all three daemons loaded; all heartbeats appeared", []
+        if len(have_beats) == len(DAEMON_HEARTBEATS):
+            return False, "all %d daemons loaded; all heartbeats appeared" % len(
+                DAEMON_HEARTBEATS), []
         time.sleep(5)
-    raise Unknown("the daemons were loaded and only %d of 3 heartbeats appeared within 90s "
-                  "(%s)" % (len(have_beats), ", ".join(have_beats) or "none"),
+    raise Unknown("the daemons were loaded and only %d of %d heartbeats appeared within 90s "
+                  "(%s)" % (len(have_beats), len(DAEMON_HEARTBEATS),
+                            ", ".join(have_beats) or "none"),
                   "read the logs under the role account's ~/.stage-e/, one per daemon: a "
                   "stale timestamp means NOT RUNNING, a fresh one with a non-ok result "
                   "means RAN AND COULD NOT")
@@ -4940,7 +5005,8 @@ MONITOR_HEARTBEAT = "state/monitor-heartbeat.json"
 MONITOR_HEARTBEAT_SCHEMA = "pipeline-heartbeat-monitor-heartbeat/1"
 MONITOR_JOBS = (("review-poller", "POLL_INTERVAL_SECONDS"),
                 ("bounce-driver", "BOUNCE_INTERVAL_SECONDS"),
-                ("finding-poller", "FINDING_INTERVAL_SECONDS"))
+                ("finding-poller", "FINDING_INTERVAL_SECONDS"),
+                ("catch-up", "CATCHUP_INTERVAL_SECONDS"))
 MONITOR_STALE_MULTIPLIER = 2
 MONITOR_RUN_TIMEOUT_SECONDS = 120
 # The longest one daemon pass may run: the review poller's and the bounce driver's default
@@ -4988,6 +5054,7 @@ def monitor_config(conf, notifier=None):
     doc = {
         "state_dir": "~/.stage-e/state",
         "finding_state_dir": "~/.stage-e/finding",
+        "catchup_state_dir": "~/.stage-e/catchup",
         "watch": [job for job, _key in MONITOR_JOBS],
         "intervals": {job: int(conf[key]) + MONITOR_DAEMON_PASS_SECONDS
                       for job, key in MONITOR_JOBS},
@@ -5215,7 +5282,7 @@ def _monitor_off(ctx, apply_it):
     loaded = r.as_root(["launchctl", "print", "system/" + label]).ok
     installed = r.read(["test", "-f", plist]).ok
     if not loaded and not installed:
-        return True, ("OFF by conf (HEARTBEAT_MONITOR_TICKET=off): nothing reads the three "
+        return True, ("OFF by conf (HEARTBEAT_MONITOR_TICKET=off): nothing reads the four "
                       "heartbeats, so a daemon that stops is silent until someone reads them "
                       "by hand"), []
     if not apply_it:
@@ -6867,6 +6934,25 @@ def _selftest_body():
            mkdir_idx is not None and write_idx is not None and mkdir_idx < write_idx,
            "the finding subdir was not created before its config was written (mkdir=%s "
            "write=%s)" % (mkdir_idx, write_idx))
+    # …and the catch-up poller's, the same way, in ITS own subdir (KIT-47).
+    cases += 1
+    ctxCC, fakeCC = _settled_ctx(conf)
+    fakeCC.answers = [
+        ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),  # ONLY catch-up is stale
+        ("mkdir -p", 0, ""),
+        ("cat > ", 0, ""),
+    ] + list(fakeCC.answers)
+    okCC, detailCC, _x = step_configs(ctxCC, apply_it=True)
+    cwrites = [i for i, w in enumerate(fakeCC.writes)
+               if "cat >" in _fmt(w["argv"]) and "catchup/poller.json" in _fmt(w["argv"])]
+    cothers = [w for w in fakeCC.writes
+               if "cat >" in _fmt(w["argv"]) and "catchup/poller.json" not in _fmt(w["argv"])]
+    cmkdir = next((i for i, w in enumerate(fakeCC.writes)
+                   if "mkdir -p" in _fmt(w["argv"]) and "/catchup" in _fmt(w["argv"])), None)
+    expect("configs-catchup-subdir", len(cwrites) == 1 and okCC is False and not cothers
+           and cmkdir is not None and cmkdir < cwrites[0],
+           "the catch-up config was not written once, after its subdir, alone: %s (writes %s, "
+           "others %s, mkdir %s)" % (detailCC, cwrites, [w["why"] for w in cothers], cmkdir))
 
     # mutant: a step that always applies must turn this red.
     cases += 1
@@ -8728,6 +8814,27 @@ def _selftest_body():
                "poller" in str(exc) and "bounce driver" in str(exc),
                "only one of two broken components was reported — the other stays hidden "
                "exactly as the bounce driver did: %s" % exc)
+
+    # THE CATCH-UP POLLER (KIT-47): exit 3 is a finding for a person (a disabled webhook, a
+    # session still silent after its re-prompt), so the install goes on and says so; any
+    # other non-zero exit stops it, by name.
+    cases += 1
+    ctxC3, fakeC3 = _dry_run_ctx(conf)
+    fakeC3.answers = [("pipeline_catchup_poller.py", COMPONENT_EXIT_DECLINED,
+                       "FIRING webhook: Linear has DISABLED the dispatcher's webhook\n")] + \
+        fakeC3.answers
+    rowC3, _pC3 = _quiet(lambda: _dry_run_row(ctxC3))
+    expect("catchup-dry-run", isinstance(rowC3, tuple) and rowC3[0] is True
+           and any("catch-up" in str(n) for n in (rowC3[2] or [])),
+           "a catch-up finding stopped the install, or passed in silence: %r" % (rowC3,))
+    for rc in (1, 2):
+        ctxC, fakeC = _dry_run_ctx(conf)
+        fakeC.answers = [("pipeline_catchup_poller.py", rc, "boom\n")] + fakeC.answers
+        rowC, _pC = _quiet(lambda: _dry_run_row(ctxC))
+        expect("catchup-dry-run", isinstance(rowC, SetupError)
+               and "catch-up poller" in str(rowC) and "exit %d" % rc in str(rowC),
+               "a catch-up dry run that exited %d did not stop the install by name: %r"
+               % (rc, rowC))
 
     # ------------------------------------------------------------------ #
     # 16. THE CREDENTIAL IS ASKED FOR AT MOST ONCE, AND READ BEFORE IT IS
@@ -10708,12 +10815,14 @@ def _selftest_body():
     # Read off the printed line, so this pins what the person sees.
     cases += 1
     for ticketBN, tailBN in (
-            ("KIT-7", "installs and loads four system LaunchDaemons — the review poller, "
-                      "the bounce driver, the finding poller and the heartbeat monitor."),
-            ("", "installs and loads four system LaunchDaemons — the review poller, "
-                 "the bounce driver, the finding poller and the heartbeat monitor."),
-            ("off", "installs and loads three system LaunchDaemons — the review poller, "
-                    "the bounce driver and the finding poller.")):
+            ("KIT-7", "installs and loads five system LaunchDaemons — the review poller, "
+                      "the bounce driver, the finding poller, the catch-up poller and the "
+                      "heartbeat monitor."),
+            ("", "installs and loads five system LaunchDaemons — the review poller, "
+                 "the bounce driver, the finding poller, the catch-up poller and the "
+                 "heartbeat monitor."),
+            ("off", "installs and loads four system LaunchDaemons — the review poller, "
+                    "the bounce driver, the finding poller and the catch-up poller.")):
         confBN, errsBN = validate_conf(parse_conf(GOOD_CONF.replace(
             "HEARTBEAT_MONITOR_TICKET=off", "HEARTBEAT_MONITOR_TICKET=" + ticketBN))[0])
         ctxBN, _fBN = _settled_ctx(confBN)
@@ -10907,7 +11016,8 @@ def _selftest_body():
                set(_mcfg["watch"]) == set(hbm.WATCHERS) - {"notifier", HEALTH_WATCH_JOB}
                and _mcfg["notify_ticket_id"] == "KIT-7"
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
-                                          "finding-poller": 300 + 900}
+                                          "finding-poller": 300 + 900, "catch-up": 900 + 900}
+               and _mcfg["catchup_state_dir"].endswith("/.stage-e/catchup")
                and _mcfg["run_interval_seconds"] == 1800,
                "the monitor read back %s" % _mcfg)
         expect("monitor-names-agree",
@@ -11326,7 +11436,7 @@ def _selftest_body():
         ctxN, fakeN = _settled_ctx(_cm)
         fakeN.answers = [("launchctl print system/", 0, "\tstate = not running\n"),
                          ("heartbeat.json", 0, "state/heartbeat.json ok\nstate/bounce-heartbeat.json ok\n"
-                                               "finding/heartbeat.json ok\n")] + fakeN.answers
+                                               "finding/heartbeat.json ok\ncatchup/heartbeat.json ok\n")] + fakeN.answers
         ctxN.unloaded = list(all_daemon_labels(_cm)) + [mlabel]
         step_enable(ctxN, apply_it=True)
         expect("monitor-enable-leaves-it", ctxN.unloaded == [mlabel], "enable left %s" % ctxN.unloaded)
@@ -11334,11 +11444,19 @@ def _selftest_body():
         ctxL, fakeL = _settled_ctx(_cm)
         fakeL.answers = [("launchctl bootstrap system", 0, ""),
                          ("heartbeat.json", 0, "state/heartbeat.json ok\nstate/bounce-heartbeat.json ok\n"
-                                               "finding/heartbeat.json ok\n")] + fakeL.answers
+                                               "finding/heartbeat.json ok\ncatchup/heartbeat.json ok\n")] + fakeL.answers
         ctxL.unloaded = list(all_daemon_labels(_cm)) + [mlabel]
         _quiet(lambda: step_enable(ctxL, apply_it=True))
         expect("monitor-enable-leaves-it", ctxL.unloaded == [mlabel],
-               "loading the three left %s" % ctxL.unloaded)
+               "loading the four left %s" % ctxL.unloaded)
+        # Every daemon plist the `plists` step writes is LOADED by `enable`. A daemon added to
+        # the plists and not to the load list installs cleanly and never runs (KIT-47).
+        bootedL = [_fmt(w["argv"]) for w in ctxL.runner.writes
+                   if "launchctl bootstrap system" in _fmt(w["argv"])]
+        unbootedL = [lb for lb in _plists(ctxL)
+                     if not any(b.endswith(_dispatcher_plist(lb)) for b in bootedL)]
+        expect("enable-loads-every-plist", len(_plists(ctxL)) == 4 and not unbootedL,
+               "enable never loaded %s (it loaded: %s)" % (unbootedL, bootedL))
 
         # …and the exit notice then says the MONITOR is off, not review, bounce and finding.
         _x, outNM = _quiet(lambda: _unloaded_notice(ctxL))
@@ -11791,6 +11909,11 @@ def _settled_ctx(conf):
         "linear_key_env": "STAGE_E_LINEAR_API_KEY", "state_dir": "~/.stage-e/finding",
         "lookback_hours": 72, "max_per_source": 3, "max_per_run": 20,
     }
+    catchup = {
+        "agent_user_id": "u-agent", "teams": ["KIT"], "linear_key_env": "STAGE_E_LINEAR_API_KEY",
+        "state_dir": "~/.stage-e/catchup", "dispatcher_url": "http://127.0.0.1:3456",
+        "front_door_url": "",
+    }
     answers = [
         # KIT-241: the served repository's committed delivery.json, and the lane marker,
         # root's, in a root-owned folder. First, so no broader needle answers them.
@@ -11803,9 +11926,11 @@ def _settled_ctx(conf):
         # before "scan --dry-run" below, because that needle is a substring of the
         # finding command too (it also ends `scan … --dry-run`). First-match wins.
         ("pipeline_finding_poller.py", 0, "pass complete: 0 filed, 0 skipped (dry-run)\n"),
+        ("pipeline_catchup_poller.py", 0, "pass ok (dry run: nothing written): candidates 0\n"),
         ("cat $HOME/.stage-e/poller.json", 0, json.dumps(poller)),
         ("cat $HOME/.stage-e/config.json", 0, json.dumps(bounce)),
         ("cat $HOME/.stage-e/finding/poller.json", 0, json.dumps(finding)),
+        ("cat $HOME/.stage-e/catchup/poller.json", 0, json.dumps(catchup)),
         # The session-log root is there and the role account can enter it (KIT-149).
         ("d=/opt/example-dispatch/logs;", 0, ""),
         ("gh api repos/example-org/kit --jq", 0, "main\n"),
@@ -11972,8 +12097,9 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
         ("launchctl print system/" + poller_label, 0, "\tstate = not running\n"),
         ("launchctl print system/" + bounce_label, 0, "\tstate = not running\n"),
         ("launchctl print system/" + finding_label(conf), 0, "\tstate = not running\n"),
+        ("launchctl print system/" + catchup_label(conf), 0, "\tstate = not running\n"),
         ("heartbeat.json", 0, "state/heartbeat.json ok\nstate/bounce-heartbeat.json ok\n"
-                              "finding/heartbeat.json ok\n"),
+                              "finding/heartbeat.json ok\ncatchup/heartbeat.json ok\n"),
     ]
     # The dispatcher already carries matching review entries, and their load was
     # proven once, so nothing here bounces a live dispatcher to re-learn it.

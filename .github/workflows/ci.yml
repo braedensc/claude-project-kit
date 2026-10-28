@@ -203,6 +203,12 @@ jobs:
       # assignee. Offline selftest asserts the parse, dedup, both flood caps, and shape.
       - name: Stage E finding poller selftest (create-shape, dedup, flood caps)
         run: python3 scripts/pipeline_finding_poller.py --selftest
+      # The catch-up poller (KIT-47): a delegation the dispatcher never received is
+      # re-prompted once, past Linear's retry ladder, under the session's own thread.
+      # Offline selftest: every candidate rule, the floor's refusal, the gate, the
+      # webhook's three states, the cap, the ledger and the thread backstop.
+      - name: Stage E catch-up poller selftest (lost delegations, one re-prompt each)
+        run: python3 scripts/pipeline_catchup_poller.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
       # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
       # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent,

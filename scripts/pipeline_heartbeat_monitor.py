@@ -3,7 +3,7 @@
 
 WHAT THIS IS
 
-  Stage E's three daemons each write a heartbeat after every pass, precisely so that "the
+  Stage E's daemons each write a heartbeat after every pass, precisely so that "the
   job is dead" and "the job ran and had nothing to do" stop looking identical (§13). Until
   this file existed, **nothing read them.** The three heartbeats were a signal with no
   consumer: a daemon could stop for a week and the only thing that would notice was an
@@ -254,12 +254,14 @@ ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_FINDING_DIR = "~/.stage-e/finding"
+DEFAULT_CATCHUP_DIR = "~/.stage-e/catchup"
+CATCHUP_JOB = "catch-up"
 DEFAULT_STALE_MULTIPLIER = 2
 DEFAULT_COOLDOWN_SECONDS = 900
 DEFAULT_RUN_TIMEOUT_SECONDS = 120
 MIN_STALE_AFTER_SECONDS = 120        # floor, so a silly-small interval cannot page on jitter
 
-# ── The five jobs, and how each one's heartbeat is shaped ──────────────────────────────
+# ── The six jobs, and how each one's heartbeat is shaped ───────────────────────────────
 #
 # `dir_key`      which config directory the file sits in (the finding poller has its own,
 #                so its heartbeat.json cannot collide with the review poller's).
@@ -352,6 +354,25 @@ WATCHERS = {
         "good": ("ok",),
         "running": (),
     },
+    # The catch-up poller (KIT-47): re-prompts a delegation the dispatcher never received.
+    # `held` is a pass that found the dispatcher or the front door down and so attempted
+    # nothing — the health watch pages that outage, so here it is healthy. `problems` (a
+    # disabled webhook, a session still silent after its re-prompt) is failing, and the row
+    # names what by kind.
+    CATCHUP_JOB: {
+        "label": "catch-up poller",
+        "writer": "scripts/pipeline_catchup_poller.py",
+        "dir_key": "catchup_state_dir",
+        "filename": "heartbeat.json",
+        "schema": "pipeline-catchup-heartbeat/1",
+        "ts_fields": ("ended_at", "started_at"),
+        "result_field": "result",
+        "bool_field": None,
+        "good": ("ok", "held"),
+        "running": (),
+        "findings_field": "findings",
+        "incident_field": "firing",
+    },
     # The owner's health watch (KIT-236). It runs as the OWNER, hourly, and its `result` is
     # `problem` while any kind it checks is firing: that reads `failing` here, and the row
     # names the kinds. Kinds it could not check this pass (`unknown`, e.g. no internet for
@@ -406,6 +427,8 @@ CONFIG_KEYS = {
     "notifier_state_dir": "where the notifier's heartbeat lives: its config's `state_dir`. "
                           "Defaults to state_dir, which is where the notifier writes it by "
                           "default",
+    "catchup_state_dir": "where the catch-up poller's heartbeat lives (its own directory; "
+                         "default %s)" % DEFAULT_CATCHUP_DIR,
     "health_status_file": "the health watch's status file, as an absolute path: the "
                           "HEALTH_STATUS_FILE its own conf names. Required when "
                           "'health-watch' is in 'watch'; must be outside every git working "
@@ -1094,6 +1117,7 @@ def load_config(path):
     dirs = {}
     for key, default in (("state_dir", DEFAULT_STATE_DIR),
                          ("finding_state_dir", DEFAULT_FINDING_DIR),
+                         ("catchup_state_dir", DEFAULT_CATCHUP_DIR),
                          ("notifier_state_dir", raw.get("state_dir") or DEFAULT_STATE_DIR)):
         dirs[key] = os.path.realpath(os.path.expanduser(raw.get(key) or default))
     monitor_dir = os.path.realpath(os.path.expanduser(
@@ -1141,6 +1165,7 @@ def load_config(path):
         "state_dir": dirs["state_dir"],
         "finding_state_dir": dirs["finding_state_dir"],
         "notifier_state_dir": dirs["notifier_state_dir"],
+        "catchup_state_dir": dirs["catchup_state_dir"],
         "health_status_file": health_file or "",
         "monitor_state_dir": monitor_dir,
         "watch": watch,
@@ -2821,6 +2846,41 @@ def selftest():
                 real = judge_one(hw, hw_spec, read_beat(hpath), time.time(), 10800, False)
                 ok("…and one with nothing firing reads ok, naming what it could not check",
                    real["verdict"] == "ok" and "front-door" in real["detail"], real)
+
+    # The catch-up row IS the catch-up poller's heartbeat, written by its own writer (KIT-47).
+    try:
+        import pipeline_catchup_poller as pcp
+    except Exception as exc:  # noqa: BLE001 — any import failure is this check failing
+        pcp = None
+        ok("the catch-up poller is importable for the cross-check", False, exc)
+    if pcp is not None:
+        spec_c = WATCHERS[CATCHUP_JOB]
+        ok("the watched schema string is the one the catch-up poller writes",
+           spec_c["schema"] == pcp.HEARTBEAT_SCHEMA, pcp.HEARTBEAT_SCHEMA)
+        ok("…in the file and the default directory it writes",
+           os.path.basename(pcp.heartbeat_path("/d")) == spec_c["filename"]
+           and pcp.DEFAULT_STATE_DIR == DEFAULT_CATCHUP_DIR, (pcp.DEFAULT_STATE_DIR,))
+        others_c = [j for j, s in WATCHERS.items() if j != CATCHUP_JOB
+                    and s.get("filename") == spec_c["filename"]]
+        ok("…told apart from the other heartbeat.json files by its OWN directory key",
+           spec_c["dir_key"] == "catchup_state_dir" and others_c
+           and all(WATCHERS[j]["dir_key"] != spec_c["dir_key"] for j in others_c),
+           [(j, WATCHERS[j]["dir_key"]) for j in others_c])
+        with tempfile.TemporaryDirectory() as cd:
+            pcp.write_heartbeat(cd, "problems", pcp._iso(), False, [
+                {"kind": "webhook", "state": pcp.FIRING,
+                 "summary": "Linear has DISABLED the dispatcher's webhook (w-1)"}])
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cd)),
+                             time.time(), 1800, False)
+            ok("a disabled webhook, as the poller writes it, reads failing and names the kind",
+               real["verdict"] == "failing" and real.get("incident") == "webhook"
+               and "DISABLED" in real["detail"], real)
+            pcp.write_heartbeat(cd, "held", pcp._iso(), False, [
+                {"kind": "gate", "state": pcp.UNKNOWN, "summary": "the dispatcher did not answer"}])
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cd)),
+                             time.time(), 1800, False)
+            ok("…a held pass (the dispatcher down) reads ok, and says why",
+               real["verdict"] == "ok" and "dispatcher did not answer" in real["detail"], real)
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))
