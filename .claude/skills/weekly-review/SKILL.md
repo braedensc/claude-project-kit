@@ -160,7 +160,8 @@ reading but do not block.
 Then:
 
 - Save the document under `docs/reviews/YYYY-MM-DD-weekly.md` and open it as a normal PR.
-- File `proposed_tickets` into `raw` with `provenance:retro-proposal` (Linear's
+- File `proposed_tickets` into `raw`, set **by its ID** (`linear.stateIds.raw`: in a pinned
+  session the hook refuses a state set by name), with `provenance:retro-proposal` (Linear's
   `save_issue.labels` **replaces the whole label set** — read the existing labels back
   and write the full list, or you will silently drop every other label).
 - Open each `proposed_rubric_changes` entry as its **own** PR. One rubric change per PR;

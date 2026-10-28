@@ -50,7 +50,9 @@ for one reader's convenience would be the larger change:
 itself: hooks, updates due, the dispatcher, the front door, the disk. It writes one
 world-readable status file, and this monitor reads that file like a heartbeat:
 
-- `result: problem` reads **failing**. The row names each firing kind and its summary.
+- `result: problem` reads **failing**. The row names each firing kind and its summary. Only
+  outage kinds make a problem. Pending updates and a newer release are upkeep: the watch lists
+  them under `advisory`, they open a GitHub issue, and they never page from here (KIT-264).
 - The firing kinds are part of the fingerprint. A new kind firing pages again. The same
   kinds an hour later do not.
 - A kind the watch could not check (`unknown`) never pages. The `ok` row names it.
@@ -207,9 +209,17 @@ judged pass after it posts only if the verdicts differ from the last comment.
 
 ## One comment per incident, never one per pass
 
-The state file holds the fingerprint of the last verdict-set that was *posted*. A pass whose
-fingerprint matches posts nothing. A return to health posts one recovery comment. A changed
-problem is a new fingerprint and is announced.
+The state file holds the fingerprint of the last incident that was *posted*. The fingerprint
+is the problem verdicts alone: every job whose verdict pages, with its verdict (and, for the
+health watch, its firing kinds). Quiet verdicts (`ok`, `running`, `unknown-after-gap`) are not
+part of it. A pass whose fingerprint matches posts nothing. A return to health posts one
+recovery comment. A changed problem is a new fingerprint and is announced.
+
+**A healthy job flipping does not re-post an open incident.** Before KIT-259 the fingerprint
+held every job's verdict, so a bounce driver going `running` ↔ `ok` while a problem stayed
+open read as a change. One unchanged health-watch alert was posted 46 times in nine days, each
+one a ping. A fingerprint stored in the old form is read through the same filter, so the
+upgrade sends no extra ping.
 
 - **Per ticket:** the state also records the ticket the last comment went to. Change
   `notify_ticket_id` during an open incident, and the new ticket is told about it on the

@@ -277,10 +277,29 @@ def worktree_roots(repo_root):
         return roots, False
 
 
+def account_home():
+    """The home the account database gives this OS account, or "" when it gives none.
+    Never $HOME: a delegation-bound dispatcher loads a worktree's env file into the next
+    session (KIT-240), so $HOME is a value a session can move."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir or ""
+    except Exception:
+        return ""
+
+
 def expand_path(value, repo_root):
-    """§1: `~` is expanded to $HOME by readers. A relative path is repo-relative
-    — and therefore inside the repo, which is exactly what the caller tests."""
-    path = os.path.expanduser(value)
+    """§1, §3: `~` is the home the account database gives this OS account, never
+    $HOME — the reading the kit hook makes of `dispatch.pinsRoot`, so the two agree on
+    where the pins live. `~name` is that account's home, from the same database. A
+    relative path is repo-relative — and therefore inside the repo, which is exactly
+    what the caller tests. So is a `~` the database cannot resolve: the hook fails
+    closed on it, and this check must not pass it."""
+    if value == "~" or value.startswith("~/"):
+        home = account_home()
+        path = os.path.join(home, value[2:]) if home else value
+    else:
+        path = os.path.expanduser(value)
     if not os.path.isabs(path):
         path = os.path.join(repo_root, path)
     return path
@@ -1491,6 +1510,39 @@ def selftest():
             )
         if strict["ok"]:
             failures.append("--strict did not promote a warning to a failure")
+
+        # 3b. `~` is the ACCOUNT's home, never $HOME (§3, KIT-240): the containment
+        #     test reads pinsRoot where the hook reads it. $HOME moved into the repo
+        #     must not make `~/pins` inside; the account's home inside the repo must.
+        global account_home
+        saved_home, saved_account_home = os.environ.get("HOME"), account_home
+        try:
+            note()
+            os.environ["HOME"] = repo
+            config = good_config()
+            config["dispatch"]["pinsRoot"] = "~/pins"
+            account_home = lambda: outside  # noqa: E731
+            got = run(config, "delivery.json", repo, roots, schema, live_types=live_types)
+            if any(f["rule"] == "dispatch.pinsRoot" for f in got["errors"]):
+                failures.append("pinsRoot `~`: $HOME inside the repo was read as the "
+                                "account's home")
+            note()
+            os.environ["HOME"] = outside
+            account_home = lambda: repo  # noqa: E731
+            got = run(config, "delivery.json", repo, roots, schema, live_types=live_types)
+            if not any(f["rule"] == "dispatch.pinsRoot" for f in got["errors"]):
+                failures.append("pinsRoot `~`: the account's home inside the repo passed")
+            note()
+            account_home = lambda: ""  # noqa: E731
+            got = run(config, "delivery.json", repo, roots, schema, live_types=live_types)
+            if not any(f["rule"] == "dispatch.pinsRoot" for f in got["errors"]):
+                failures.append("pinsRoot `~` with no home in the account database passed")
+        finally:
+            account_home = saved_account_home
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
 
     # 4. OFF is silent. The headline §2 semantic: no delivery.json → exit 0 and
     #    NOT ONE BYTE of output on either stream.

@@ -60,6 +60,39 @@ def block(reason: str) -> None:
     sys.exit(2)
 
 
+# ── The environment every git (and gh) call here runs in ────────────────────
+# The guards below read the repository through git: which branch this is, which
+# worktrees exist, whether `delivery.json` is committed, what the committed config
+# says. git takes its repository, object store, index and config from the
+# ENVIRONMENT before the command line, and the environment is the session's to set: a
+# delegation-bound dispatcher loads a worktree's env file into the next session it
+# starts there (KIT-240). With GIT_DIR or GIT_OBJECT_DIRECTORY planted there, every
+# read answered from somewhere else; with a malformed config at a planted $HOME or
+# $XDG_CONFIG_HOME (or GIT_CONFIG_GLOBAL), every read failed. Either way a
+# `delivery.json` moved aside read as "the pipeline is off", and a planted GIT_DIR
+# could hand the hook another repository's branch or config. So no git or gh call
+# here inherits a GIT_* variable, and none reads a global git config at all
+# (GIT_CONFIG_GLOBAL is the null device): $HOME and $XDG_CONFIG_HOME, which name it,
+# are the session's too. Not "the account database's home" instead: a dispatcher's
+# sandbox denies reading home folders, and git dies on a global config it is not
+# permitted to read (EPERM; only EACCES is forgiven). The reads here need no global
+# setting; the system config stays, as the role account cannot write it. One call is
+# left as it was: the
+# transcript-folder resolver below, which must stay byte-identical to its copies in
+# the other two hooks; it can only name a listed worktree that is a real directory
+# matching the transcript folder, and otherwise keeps the anchor.
+_CHILD_ENV = None
+
+
+def _child_env():
+    global _CHILD_ENV
+    if _CHILD_ENV is None:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        _CHILD_ENV = env
+    return _CHILD_ENV
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. UNIVERSAL GUARDS — keep in every project
 # ════════════════════════════════════════════════════════════════════════════
@@ -94,6 +127,7 @@ def _cwd_git_toplevel():
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
+            env=_child_env(),
             text=True,
             timeout=3,
         )
@@ -113,6 +147,7 @@ def _git_common_dir(d: str):
         r = subprocess.run(
             ["git", "-C", d, "rev-parse", "--git-common-dir"],
             capture_output=True,
+            env=_child_env(),
             text=True,
             timeout=3,
         )
@@ -284,6 +319,7 @@ def _current_branch() -> str:
         r = subprocess.run(
             ["git", "-C", PROJECT_ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
+            env=_child_env(),
             text=True,
             timeout=3,
         )
@@ -337,6 +373,7 @@ def _worktree_roots():
         r = subprocess.run(
             ["git", "-C", PROJECT_ROOT, "worktree", "list", "--porcelain"],
             capture_output=True,
+            env=_child_env(),
             text=True,
             timeout=3,
         )
@@ -392,6 +429,7 @@ def _has_upstream() -> bool:
         r = subprocess.run(
             ["git", "-C", PROJECT_ROOT, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
             capture_output=True,
+            env=_child_env(),
             text=True,
             timeout=3,
         )
@@ -409,6 +447,7 @@ def _merged_pr_info(branch: str):
             ["gh", "pr", "view", branch, "--json", "state,number"],
             cwd=PROJECT_ROOT,
             capture_output=True,
+            env=_child_env(),
             text=True,
             timeout=5,
         )
@@ -1160,7 +1199,7 @@ def _git_in(dirpath, *args, timeout=3):
     """stdout of a READ-ONLY git command run in `dirpath`, or None on any failure."""
     try:
         r = subprocess.run(["git", "-C", dirpath, *args], capture_output=True,
-                           text=True, timeout=timeout)
+                           text=True, timeout=timeout, env=_child_env())
     except Exception:
         return None
     return r.stdout.strip() if r.returncode == 0 else None
@@ -2125,7 +2164,17 @@ AC_INTEGRITY_HELP = (
     "at dispatch, so a session that can rewrite its own ACs can make scope creep "
     "look compliant. It is the ticket-layer twin of weakening a test assertion. "
     "Comments and status changes stay allowed: say what changed, and let a human "
-    "amend the ticket."
+    "amend the ticket. A `patch` (a partial edit of the description) counts as an edit."
+)
+STATE_BY_ID_HELP = (
+    "🔒 This write sets a workflow state by something other than its ID: {values}. "
+    "Moving a ticket into the pipeline's `ready` state is an APPROVAL, which is a "
+    "human's action, and this guard knows `ready` only by its ID — a name or a state "
+    "type (`Ready`, `unstarted`) is a state it cannot tell apart from `ready`. In a "
+    "pinned or dispatched session a tracker write sets a state by ID only: the IDs are "
+    "`linear.stateIds` in the committed `delivery.json` (docs/PIPELINE-CONTRACT.md §1, "
+    "never `ready`). Where a safe-outputs executor runs, a session moves its own "
+    "ticket with a `ticket-state` request naming the canonical key instead (§8)."
 )
 
 
@@ -2149,7 +2198,8 @@ def _pipeline_configured() -> bool:
     specs = "".join(f"{ref}:{DELIVERY_FILE}\n" for ref in ("HEAD",) + _CONFIG_REFS)
     try:
         r = subprocess.run(["git", "-C", PROJECT_ROOT, "cat-file", "--batch-check"],
-                           input=specs, capture_output=True, text=True, timeout=3)
+                           input=specs, capture_output=True, text=True, timeout=3,
+                           env=_child_env())
     except Exception:
         return False
     return r.returncode == 0 and any(
@@ -2176,7 +2226,7 @@ def _read_delivery_config():
         try:
             r = subprocess.run(
                 ["git", "-C", PROJECT_ROOT, "show", f"{ref}:{DELIVERY_FILE}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=_child_env(),
             )
             if r.returncode == 0 and r.stdout.strip():
                 raw, source = r.stdout, f"{ref}:{DELIVERY_FILE}"
@@ -2237,15 +2287,28 @@ def _pin_path(cfg) -> str:
 # ── the dispatcher's lane without a pin (B8) ─────────────────────────────────
 # A dispatcher that binds by a person's delegation writes no pin, so its sessions used to
 # read as "a human's ad-hoc session" and every WITHHOLDING tracker guard failed open for
-# them. The lane is marked instead by a file the session cannot create or delete: one per
-# OS account, under the pins root, which is outside every worktree and comes from the
-# committed config. The account and its home come from the account database, never from
-# $USER or $HOME: the dispatcher loads a worktree's .env into the next session's
-# environment (KIT-240), so either could be moved by a session. That holds for the PIN
-# too: a pin read from under a moved $HOME is a pin the session forged, and a pin found
-# switches the marker check off (KIT-241). So `~` in `dispatch.pinsRoot` means the
-# account database's home everywhere it is read, by _pins_root.
+# them. The lane is marked instead by a file the session cannot create or delete, one per
+# OS account. The account and its home come from the account database, never from $USER
+# or $HOME: the dispatcher loads a worktree's env file into the next session's
+# environment (KIT-240), so either could be moved by a session. So `~` in
+# `dispatch.pinsRoot` means the account database's home everywhere it is read, by
+# _pins_root.
+#
+# WHERE THE MARKER LIVES. It is a fixed path in folders root owns all the way down,
+# /etc/claude-pipeline/dispatched-lane/<account> (card CK-10). It used to sit under the
+# pins root, <pinsRoot>/dispatched-lane/<account>, and that one still counts: either one
+# there makes the lane. But the pins root is created by the role account, and a folder
+# the role account owns is one it may rename, which takes the marker out of sight; root's
+# /etc cannot be renamed by it. Removing the old marker gains nothing once the new one is
+# there, which is why the two are OR'd and neither is required alone.
+#
+# THE MARKER WINS OVER A PIN. A dispatcher that writes no pin runs on this account, and
+# none writes a pin for it. A pin found for a session on a marked account is one the
+# session (or its predecessor) forged in the pins root, which that account can write when
+# its sandbox lets a write leave the worktree; read as a pin, it switched the lane off. So
+# the marker is read first, and with it the pin is not read at all (_pipeline_guards).
 LANE_MARKER_DIR = "dispatched-lane"
+LANE_MARKER_SYSTEM_DIR = "/etc/claude-pipeline/dispatched-lane"
 _TICKET_DIR_RE = re.compile(r"^([A-Z][A-Z0-9]*)-(\d+)$")
 LANE_UNCHECKED = "could not be checked, which counts as the lane"
 
@@ -2260,8 +2323,11 @@ def _account():
 
 
 def _pins_root(cfg) -> str:
-    """`dispatch.pinsRoot` resolved, or "" when it cannot be: not a string, blank, or a
-    `~` path with no home in the account database. `~` is never read from $HOME."""
+    """`dispatch.pinsRoot` resolved, or "" when it cannot be: not a string, blank, a `~`
+    path with no home in the account database, or a path that does not resolve to an
+    absolute one (a relative path, or `~name` for an account that does not exist). A
+    relative path would be read from the hook's cwd, which a session moves with `cd`.
+    `~` is never read from $HOME."""
     raw = (cfg.get("dispatch") or {}).get("pinsRoot") or "~/.claude/pipeline/pins"
     if not isinstance(raw, str) or not raw.strip():
         return ""
@@ -2269,11 +2335,15 @@ def _pins_root(cfg) -> str:
     if raw == "~" or raw.startswith("~/"):
         _name, home = _account()
         return os.path.join(home, raw[2:]) if home else ""
-    return os.path.expanduser(raw)        # absolute, or `~other`: the database too
+    root = os.path.expanduser(raw)        # absolute, or `~other`: the database too
+    return root if os.path.isabs(root) else ""
 
 
 def _lane_marker(cfg) -> str:
     """The lane marker this session's account carries, or "" when it carries none.
+
+    Two places count (see above): the system one, and the old one under the pins root.
+    Each is looked for with lstat, so the entry counts, not what it may point at.
 
     COULD-NOT-CHECK IS NOT ABSENT (contract §13). Absent is only ENOENT or ENOTDIR. Any
     other error (a folder this account may not search, say), an account the database
@@ -2281,20 +2351,29 @@ def _lane_marker(cfg) -> str:
     are withholding ones, and reading "could not look" as "a person's session" would
     open all of them by inducing an error."""
     name, _home = _account()
+    if not name:
+        return "<the account database names no account for this uid: %s>" % LANE_UNCHECKED
     root = _pins_root(cfg)
-    if not name or not root:
-        return "<the account database names no account or home for this uid: %s>" % (
-            LANE_UNCHECKED)
-    marker = os.path.join(root, LANE_MARKER_DIR, name)
-    try:
-        os.lstat(marker)
-    except OSError as exc:
-        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-            return ""
-        return "%s <%s: %s>" % (marker, exc.strerror or exc, LANE_UNCHECKED)
-    except Exception as exc:
-        return "%s <%s: %s>" % (marker, exc, LANE_UNCHECKED)
-    return marker
+    places = [os.path.join(LANE_MARKER_SYSTEM_DIR, name)]
+    if root:
+        places.append(os.path.join(root, LANE_MARKER_DIR, name))
+    unchecked = ""
+    for marker in places:
+        try:
+            os.lstat(marker)
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                unchecked = unchecked or "%s <%s: %s>" % (
+                    marker, exc.strerror or exc, LANE_UNCHECKED)
+            continue
+        except Exception as exc:
+            unchecked = unchecked or "%s <%s: %s>" % (marker, exc, LANE_UNCHECKED)
+            continue
+        return marker
+    if not root:
+        return unchecked or ("<the pins root does not resolve, so the marker under it %s>"
+                             % LANE_UNCHECKED)
+    return unchecked
 
 
 def _worktree_ticket() -> str:
@@ -2374,8 +2453,9 @@ def _pins_root_inside_repo(cfg):
     try:
         root = _pins_root(cfg)
         if not root:
-            return "%s <no home in the account database for `~`; set an absolute path>" % (
-                raw.strip())
+            return ("%s <not an absolute path once `~` is read from the account database "
+                    "(no home there, a relative path, or no such account); set an "
+                    "absolute path>" % raw.strip())
         root = os.path.realpath(root)
     except Exception:
         return str(raw)
@@ -2463,6 +2543,8 @@ _TRACKER_OTHER_WRITE_TOOLS = frozenset({
     "save_document", "save_project", "save_milestone", "save_release",
     "save_release_note", "save_status_update", "delete_status_update",
     "create_issue_label", "save_issue_label", "save_project_label",
+    "retire_issue_label", "restore_issue_label",
+    "retire_project_label", "restore_project_label",
     "save_diff_comment", "delete_diff_comment",
     "submit_diff_review", "resolve_diff_thread", "merge_diff",
     "create_attachment", "create_attachment_from_upload",
@@ -2514,7 +2596,10 @@ def _tracker_write_kind(tool, inp, cfg):
     return None
 
 
-_AC_FIELDS = {"description", "descriptiondata", "acceptancecriteria", "body", "title"}
+# `patch` is the Linear MCP's partial edit of the description (`save_issue`: replace,
+# insert, append, …): the same rewrite of the acceptance criteria, done in pieces.
+_AC_FIELDS = {"description", "descriptiondata", "acceptancecriteria", "body", "title",
+              "patch"}
 
 
 def _ac_fields_present(inp):
@@ -2550,21 +2635,22 @@ def _owned_label_hits(inp, cfg):
     Whole-field-value matching (via _payload_strings), so prose mentioning
     `agent:blocked` inside a comment body is reporting and does not match — the
     same rule _payload_ticket_ids uses. Add and remove both land here: the guard
-    matches the label being named at all, not the direction."""
+    matches the label being named at all, not the direction. A configured ID matches
+    case-insensitively, as _is_ready_id does: a UUID in capitals names the same label."""
     ids = ((cfg.get("linear") or {}).get("labels") or {}).get("ids") or {}
     by_id = {}
     if isinstance(ids, dict):
         for key, val in ids.items():
             if isinstance(key, str) and _OWNED_LABEL_RE.match(key.strip()):
-                cid = _clean_id(val)
+                cid = _clean_id(val).lower()
                 if cid:
                     by_id[cid] = key.strip()
     hits = set()
     for s in _payload_strings(inp):
         if _OWNED_LABEL_RE.match(s):
             hits.add(s.lower())
-        elif s in by_id:
-            hits.add(by_id[s].lower())
+        elif s.lower() in by_id:
+            hits.add(by_id[s.lower()].lower())
     return sorted(hits)
 
 
@@ -2710,12 +2796,57 @@ def _approval_guard():
     block(READY_HELP)
 
 
-def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane=""):
+# ── a supervised session sets a state by ID ───────────────────────────────────
+# The approval guard knows `ready` by its ID, and the Linear MCP's `save_issue` takes
+# `state` as a "type, name, or ID": `state: "Ready"` (or the type `unstarted`) moved a
+# ticket into `ready` past it. Nothing the kit tells a session to do sets a state by
+# name: /work and /ship move the own ticket through a safe-outputs `ticket-state`
+# request naming a canonical key (§8), and /plan-epic files with `linear.stateIds.raw`.
+# So in a pinned session or on the dispatcher's lane, a tracker write that sets a state
+# by anything but an ID is refused. Keys are compared lower-cased with `_` and `-`
+# removed. Writes whose verb is not an issue's (a project's `state` is its status) are
+# not asked.
+_STATE_KEYS = frozenset({"state", "stateid", "statename", "statetype", "status",
+                         "statusid", "statusname", "statustype", "workflowstate",
+                         "workflowstateid"})
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                      re.IGNORECASE)
+
+
+def _is_ready_id(value, ready) -> bool:
+    """`value` is the configured `ready` state ID. Case-insensitively: a UUID in capitals
+    names the same state to the tracker, so an exact match let one through."""
+    return bool(ready) and isinstance(value, str) and value.strip().lower() == ready.lower()
+
+
+def _states_not_by_id(inp, cfg):
+    """The state values this write sets by anything but an ID, as "`key: value`" strings.
+    An ID is a configured `linear.stateIds` value or a UUID. A name, a state type or an
+    object is one the guard cannot tell apart from `ready`. A null or blank value sets
+    no state."""
+    ids = {_clean_id(v).lower()
+           for v in (((cfg.get("linear") or {}).get("stateIds") or {}).values())}
+    ids.discard("")
+    named = []
+    for k, v in _walk_items(inp):
+        if not k or k.lower().replace("_", "").replace("-", "") not in _STATE_KEYS:
+            continue
+        if v is None or (isinstance(v, str) and (
+                not v.strip() or v.strip().lower() in ids or _UUID_RE.match(v.strip()))):
+            continue
+        named.append("`%s: %s`" % (k, json.dumps(v)[:60]))
+    return named
+
+
+def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="", tool=""):
     team = str((cfg.get("linear") or {}).get("teamKey") or "").strip().upper()
     ready = _clean_id(((cfg.get("linear") or {}).get("stateIds") or {}).get("ready"))
     targets = _payload_ticket_ids(inp)
     foreign = {t for t in targets if team and not t.startswith(team + "-")}
-    own = _worktree_ticket() if (lane and not pin) else ""
+    # The lane and a pin never meet: with the marker, no pin is read (_pipeline_guards).
+    own = _worktree_ticket() if lane else ""
+    m = _MCP_NAME_RE.match(tool or "")
+    verb = m.group("tool").lower() if m else ""
 
     # ── 0. lifecycle-label: supervision labels belong to the dispatcher (§6) ───
     # A WITHHOLDING check, so it is scoped to PINNED sessions and to sessions on a
@@ -2729,8 +2860,14 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="")
                 labels=", ".join("`" + o + "`" for o in owned)))
 
     # ── 1. state transition into `ready` — matched by state ID, never by name ──
-    if ready and _payload_has_value(inp, ready):
+    if ready and any(_is_ready_id(s, ready) for s in _payload_strings(inp)):
         _approval_guard()
+    # …and so a supervised session names a state by ID, or the match above cannot see
+    # an approval spelled `state: "Ready"`. A person's session stays as it was.
+    if (pin or lane) and verb not in _TRACKER_OTHER_WRITE_TOOLS:
+        named = _states_not_by_id(inp, cfg)
+        if named:
+            block(STATE_BY_ID_HELP.format(values=", ".join(named)))
 
     # ── 2. own-ticket-only writes ─────────────────────────────────────────────
     if mode == "ticket":
@@ -2758,7 +2895,8 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="")
             block(TEAM_SCOPE_HELP.format(
                 team=team, mode=mode, targets=", ".join(sorted(foreign))))
     elif lane:
-        # B8: no pin, but the account carries the dispatcher's lane marker. The pinned
+        # B8: the account carries the dispatcher's lane marker (and any pin went unread,
+        # see _pipeline_guards). The pinned
         # `ticket` rules, with the own ticket read from the worktree's folder name. An
         # issue write the guard cannot tie to that ticket fails CLOSED, and so does a
         # comment naming any ticket when the folder names none (as a pin with no ticket
@@ -2806,7 +2944,14 @@ def _pipeline_guards(tool, inp) -> None:
             return
         block(PINS_ROOT_HELP.format(path=bad_pins))
 
-    pin, pin_status, pin_file = _read_pin(cfg)
+    # The lane marker FIRST, and it wins over a pin (see LANE_MARKER_SYSTEM_DIR): no
+    # dispatcher writes a pin for an account that carries the marker, so a pin found
+    # there was forged. It is not read at all: not as a binding, and not as a broken one.
+    lane = _lane_marker(cfg)
+    if lane:
+        pin, pin_status, pin_file = None, "ignored", ""
+    else:
+        pin, pin_status, pin_file = _read_pin(cfg)
     ticket = pin.get("ticket") if (pin and isinstance(pin.get("ticket"), dict)) else None
     mode = str((pin or {}).get("session_mode") or "").strip().lower()
     pinned_id = str((ticket or {}).get("id") or "").strip().upper()
@@ -2849,9 +2994,7 @@ def _pipeline_guards(tool, inp) -> None:
 
     kind = _tracker_write_kind(tool, inp, cfg)
     if kind:
-        # B8: only an unpinned session needs the marker; a pin already says what it is.
-        lane = "" if pin else _lane_marker(cfg)
-        _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane)
+        _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane, tool)
 
 
 # ── Bash prose-stripping ──────────────────────────────────────────────────────

@@ -1075,3 +1075,59 @@ the root-owned folder's parent entry and so remove the marker; no session is uns
 on a coding entry, and the chat lane holds no write tool. Grader-path protection is still
 pinned-only on this lane: turning it on changes what a live coding session may edit, so it
 is the owner's call, not this change's.
+
+## Update 2026-10-11 — the marker moves to root's /etc and wins over a pin (KIT-241, second review)
+
+A bypass review of the merged change found the marker could be switched off two ways,
+and three gaps beside it.
+
+**A forged pin switched the lane off.** A pin found used to skip the marker check, and
+the pins root is created by the role account, so a session whose sandbox lets a write
+leave the worktree could forge one there (a maintenance pin: creates allowed, any in-team
+ticket writable). **Decision: the marker wins.** No dispatcher writes a pin for a marked
+account, so the hook reads the marker first and, with it, does not read a pin at all.
+
+**The marker's folders were the role account's.** The residual named above was wider
+than stated: the pins root and every folder above the marker's own were the role
+account's, and rename needs only write on the parent, so the role account itself could
+move the marker out of sight. **Decision: the marker lives at
+`/etc/claude-pipeline/dispatched-lane/<OS account>`**, a fixed path in folders root owns
+all the way down (on macOS `/etc` is `/private/etc`). Card CK-10 writes it with
+`install -d -o root -g wheel -m 755`, and the installer's `lane-marker` row requires it
+and checks that every folder above it, up to `/`, is root's and writable by no group or
+other account. The old marker still counts — either one makes the lane — so a machine
+that has only the old one keeps its guards until the new one is written; once it is,
+removing the old one gains nothing, and the row says the old one is there.
+
+**Three gaps beside it**, each now refused in a pinned or dispatched session:
+
+- *A state set by name.* The approval guard knows `ready` by its ID, and the Linear MCP's
+  `save_issue` takes `state` as a "type, name, or ID": `state: "Ready"` approved past it.
+  A tracker write that sets a state by anything but an ID is refused. Nothing the kit
+  tells a session to do sets one by name: `/work` and `/ship` move the own ticket through
+  a safe-outputs `ticket-state` request naming a canonical key, and `/plan-epic` files
+  with `linear.stateIds.raw`. The `ready` ID also matches whatever the case of its
+  letters, in every session.
+- *A partial description edit.* `save_issue`'s `patch` rewrote the own ticket's
+  acceptance criteria past AC integrity; it now counts as the description.
+- *git's environment.* The hook's git calls inherited the session's environment, so a
+  `GIT_DIR`, `GIT_OBJECT_DIRECTORY`, or a broken global config at a planted `$HOME`,
+  `$XDG_CONFIG_HOME` or `GIT_CONFIG_GLOBAL` (all reachable through the KIT-240 env file)
+  made a moved-aside `delivery.json` read as *off*, and a planted `GIT_DIR` could hand the
+  hook another repository's branch or config. They now run with no `GIT_*` variable and
+  no global git config (`GIT_CONFIG_GLOBAL` is the null device). Not the account's own
+  global config: the sandbox denies reading home folders, and git stops on a config file
+  it is not permitted to read (EPERM; only EACCES is forgiven).
+
+A relative `dispatch.pinsRoot` (read from the hook's cwd, which `cd` moves) is now
+refused as unresolved, and `scripts/check_delivery_config.py` reads `~` from the account
+database as the hook does.
+
+**Residuals, named.** Comments and relations naming another ticket by an internal UUID
+still pass on this lane, as the contract allows a target the guard cannot resolve (§4
+reporting). The transcript-folder resolver's one git call keeps the inherited
+environment, because it must stay byte-identical in all three hooks and the Stop hook is
+not changed here; it can only name a listed worktree that is a real directory matching
+the transcript folder. `PATH` is the session's too, through the same env file: a planted
+`git` (or `python3`, which runs the hooks) is a KIT-240 matter, not one a hook can close
+from inside.

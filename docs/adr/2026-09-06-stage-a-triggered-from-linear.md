@@ -909,18 +909,31 @@ unchanged, and the idea is still data.
 session's tool list from the dispatcher's own session log. The same reader now also
 reports two booleans: whether the session called `Task` or `Agent`, and whether it called
 `Read` on the test file. It prints no message and no call's input. A helper list in the
-answer is dropped when the log shows no helper started. When the log cannot be read,
-the answer's helper list is used, and the probe says so. The test file counts as READ
-whenever its contents come back, whatever the log shows: they cannot come back unread.
-It counts as NOT-RETURNED only when the log shows the read was attempted. Otherwise,
-and whenever the log cannot be read, it is NO-ANSWER.
+answer is not counted when the log shows no helper started (as corrected below, KIT-261).
+When the log cannot be read, the answer's helper list is used, and the probe says so. The
+test file counts as READ whenever its contents come back, whatever the log shows: they
+cannot come back unread. It counts as NOT-RETURNED only when the log shows the read was
+attempted. Otherwise, and whenever the log cannot be read, it is NO-ANSWER.
 
 **Rejected.** A separate probe entry with its own brief would measure a different entry
 from the planning one, and stay reachable at any time. A label only the installer applies
 would first need proof that labels reach a session's prompt.
 
 **Not proven.** No live probe has run with the paragraph. A helper's own tool list still
-comes from the session's answer, because no log line records what a helper held.
+comes from the session's answer, because no log line records what a helper held. The two
+booleans read the call records in the shape the runner's source writes (0.2.69 and
+0.2.73), not yet seen live; a log with none is not measured (KIT-261).
+
+**Corrected 2026-10-27 (KIT-261).** A review of the first build found three faults, and a
+triage proved them on main. The helper list was dropped before any list was judged, so a
+fenced tool named in it drew a yes/no question instead of a refusal. Now every list is
+judged as it came back, and a fenced name in any of them refuses the probe. Only then is a
+helper list with no helper behind it set aside. The record called that case "no helper
+list came back"; it now says a list came back and was not counted. Any text counts, not
+only names the installer can parse. Last, a log with no call records answered "no helper,
+no read" as if it had measured them. The reader now counts the call records it can read,
+in the same session file as the tool list: an older session's calls never speak for a
+newer one. With none, both are not measured, and the screen and the record say why.
 
 ## Update 2026-09-23 — planning built into each work team (KIT-184)
 

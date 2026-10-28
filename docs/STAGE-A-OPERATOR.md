@@ -239,17 +239,24 @@ What it does, in order:
      them to the agent. The planning setup's own instructions say what to do with a ticket
      of exactly the probe's title; the tickets' text only points there (KIT-215). It reads
      where the dispatcher sent them. It reads the tool list the session was given from the
-     dispatcher's own session log, and a helper's from the session's answer. If the same
-     log shows no helper was started, that answer's helper list is dropped. If the log
+     dispatcher's own session log, and a helper's from the session's answer. If the log
      cannot be read, the answer is used for both lists, and the probe says so. A tool
-     outside the keep-set in any list it read stops the probe, without asking. Then it asks
-     you **one** question: is the team's agent guidance empty, or silent about planning and
-     building? The API cannot read it. It records the sign-off and closes the tickets.
+     outside the keep-set in any list that came back stops the probe, without asking,
+     whatever the log says of a helper (KIT-261). Then it asks you **one** question: is the
+     team's agent guidance empty, or silent about planning and building? The API cannot
+     read it. It records the sign-off and closes the tickets.
 
      Two more questions come only when a list was not measured. If a list came back but
      could not be read, it asks about that list alone. If no helper list came back, it
-     says the helper was not measured and asks whether to sign anyway. The record says
-     which lists were read, and how. A session list nothing measured is never signed.
+     says the helper was not measured and asks whether to sign anyway. If a helper list
+     came back but the log shows no helper started, that list is **not counted**, even
+     as prose. It says so and asks the same question. The record says which lists were
+     read, and how. A session list nothing measured is never signed.
+
+     The same session's log also says whether a helper started and whether the test file
+     was read. An older session's log never answers for it. If that log holds no call
+     records at all, neither is measured. The probe says so, and the record gives that
+     reason.
    - **The job, started.** After a yes, it enables the job in launchd, starts it, and reads
      its first heartbeat. Enabled, it starts again after a reboot.
    - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py
@@ -336,8 +343,9 @@ wall clock.
 - **A helper session inherits the fence, per the runner's source.** It is not measured
   live yet. The probe's steps now sit in the planning setup's own instructions, keyed on
   the probe's exact title, so a session that follows them starts a helper (KIT-215). That
-  this happens on a live session is not yet seen. If the log shows no helper, the record
-  says the helper was not measured.
+  this happens on a live session is not yet seen. If the log shows no helper started, a
+  helper list in the answer is not counted, and the record says so. A fenced tool named
+  in it still stops the probe (KIT-261).
 - **The duplicate check compares titles, not intent.**
 - **Nothing watches the job's heartbeat automatically.** The heartbeat monitor does not know
   this job yet (KIT-192); `verify` is what reads it.
@@ -356,9 +364,14 @@ wall clock.
 - **The session log's tool list is read from the SDK's start-up message.** That it lists the
   tools after the fence removed them is read from the runner's source, not yet seen live. A
   list that still held a fenced tool would fail the probe loudly, never pass it.
+- **The log's call records are read in the shape the runner's source writes** (0.2.69
+  and 0.2.73). Whether a helper started, and whether the test file was read, come from
+  them. That shape is not yet seen live. A log with no call records reads as not
+  measured, with that reason, never as "no helper, no read" (KIT-261).
 - **A planning session could read files in the role account's home**, if its file-reading
   tool reaches there. The probe leaves a harmless test file beside the planner's own files,
   asks the session to read it, and reports what came back. If the file's contents come
   back, that is "read", whatever the log shows: they cannot come back unread. "Not
   returned" counts only when the dispatcher's log shows the read was attempted. Without
-  that, or when the log cannot be read, the result is "no answer". Tracked as KIT-162.
+  that, or when the log holds no call records or cannot be read, the result is "no
+  answer". Tracked as KIT-162.

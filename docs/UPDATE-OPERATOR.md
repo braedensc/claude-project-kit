@@ -160,7 +160,10 @@ clears an alert.
   `github-actions[bot]` and @mentions `ALERT_PAGE_TO`. The watch then finds that run and
   waits for it. A run that failed is not recorded as sent, so the next pass sends again.
 - **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
-  monitor to read and page through the notifier.
+  monitor to read and page through the notifier. Only outage kinds page: `hooks`,
+  `dispatcher`, `front-door`, `disk`. `updates` and `release` are upkeep. They open their
+  GitHub issue but never reach Slack, so a Slack ping always means something is broken. The
+  status file lists them under `advisory` (owner decision, 2026-10-27, KIT-264).
 - Either one empty is OFF, and every pass says so.
 
 The job cannot report its own death. The heartbeat monitor pages when the status file

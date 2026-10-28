@@ -92,7 +92,9 @@ DEDUP: THE SEEN-SET IS THE AUTHORITY
   record, so a seen-set that is deleted or restored from elsewhere can re-file findings
   already filed. A real pass that finds no seen-set writes an empty one at once (KIT-250),
   so a missing file is never just "nothing filed yet", and the log says which it is: no
-  heartbeat yet is a first pass; a heartbeat from an earlier pass means the file was lost.
+  heartbeat yet is a first pass; a heartbeat from a pass that ended with a seen-set means
+  the file was lost; a heartbeat from a version before KIT-263, which does not say, gets a
+  line naming both readings, since a quiet poller upgraded from before KIT-250 never had one.
 
 WHAT IT NEVER DOES (asserted in --selftest, the way every Stage E script asserts it)
 
@@ -594,6 +596,10 @@ def save_seen(path, seen):
     _atomic_write_json(path, {"schema": SEEN_SCHEMA, "seen": seen})
 
 
+# An earlier pass ran, and its heartbeat cannot say what it kept: the loud reading, LOST.
+UNREADABLE_BEAT = {"result": "unreadable", "seen_set": True}
+
+
 def missing_seen_note(state_dir, dry_run):
     """The log line for a pass that finds no seen-set, saying WHICH of two things it is.
 
@@ -603,9 +609,15 @@ def missing_seen_note(state_dir, dry_run):
     that fires every pass teaches the reader to ignore the one time it is true.
 
     The heartbeat tells the two apart. No heartbeat, or only one from a run that never got a
-    config (`result: usage` — it never reached the seen-set): a true FIRST pass. Any other
-    heartbeat: an earlier pass ran and wrote a seen-set, so the file was LOST, and findings
-    already filed can be filed a second time.
+    config (`result: usage` — it never reached the seen-set): a true FIRST pass. A heartbeat
+    that records its pass ENDED with a seen-set on disk (`seen_set: true`): the file was
+    LOST, and findings already filed can be filed a second time. One that records its pass
+    ended without one lost nothing: there was none to lose.
+
+    A heartbeat with no `seen_set` at all was written before KIT-263. Before KIT-250 a
+    seen-set was written only once something was filed, so a quiet deployment upgraded from
+    then has a heartbeat and never had a seen-set. That heartbeat cannot say which it is, so
+    the line names both readings rather than call every upgrade a loss.
     """
     sp, hp = seen_path(state_dir), heartbeat_path(state_dir)
     try:
@@ -614,19 +626,33 @@ def missing_seen_note(state_dir, dry_run):
     except FileNotFoundError:
         beat = None
     except (OSError, ValueError):
-        beat = {"result": "unreadable"}
+        beat = UNREADABLE_BEAT
     if beat is not None and not isinstance(beat, dict):
-        beat = {"result": "unreadable"}
+        beat = UNREADABLE_BEAT
     if beat is None or beat.get("result") == "usage":
         return ("no seen-set at %s and no earlier pass on record (no heartbeat at %s): this "
-                "is the FIRST pass. %s" % (sp, hp, "A dry run writes nothing, so this line "
-                                                   "repeats until a real pass runs." if dry_run
-                                           else "It writes an empty seen-set now, so this "
-                                                "line does not repeat."))
+                "is the FIRST pass. %s" % (sp, hp, _writes_now(dry_run)))
+    ended = (beat.get("ended_at") or "?", beat.get("result") or "?")
+    if beat.get("seen_set") is False:
+        return ("no seen-set at %s, and the earlier pass on record (heartbeat %s, ended %s, "
+                "result %s) ended without one too, so nothing it held was lost. %s"
+                % ((sp, hp) + ended + (_writes_now(dry_run),)))
+    if "seen_set" not in beat:
+        return ("no seen-set at %s. The heartbeat at %s (ended %s, result %s) is from a version "
+                "that did not record whether it kept one. If this poller was just upgraded and "
+                "had never filed a finding, that is expected: older versions wrote a seen-set "
+                "only once they filed. If it HAD filed findings, the seen-set was lost, and "
+                "they can be filed a second time. %s"
+                % ((sp, hp) + ended + (_writes_now(dry_run),)))
     return ("WARNING: no seen-set at %s, although the heartbeat at %s shows an earlier pass "
             "ran (ended %s, result %s). The seen-set was LOST: findings already filed can be "
             "filed a second time, because it is the only thing that remembers them."
-            % (sp, hp, beat.get("ended_at") or "?", beat.get("result") or "?"))
+            % ((sp, hp) + ended))
+
+
+def _writes_now(dry_run):
+    return ("A dry run writes nothing, so this line repeats until a real pass runs."
+            if dry_run else "It writes an empty seen-set now, so this line does not repeat.")
 
 
 def load_watermarks(path):
@@ -686,7 +712,10 @@ def write_heartbeat(state_dir, code, started_at, started_mono, dry_run,
            "started_at": started_at, "ended_at": _now_iso(),
            "duration_seconds": round(time.monotonic() - started_mono, 3),
            "pid": os.getpid(), "filed": int(filed), "skipped": int(skipped),
-           "error": error}
+           "error": error,
+           # Whether this pass ENDED with a seen-set on disk, so the next pass to find none
+           # can tell a loss from a file that never existed (missing_seen_note, KIT-263).
+           "seen_set": os.path.exists(seen_path(state_dir))}
     try:
         _atomic_write_json(heartbeat_path(state_dir), doc)
         return True
@@ -1928,6 +1957,44 @@ def selftest():
         _pass(_FakeLinear([]), cfg_path, capture=log_q4)
         ok("seen-set: one missing although the heartbeat shows earlier passes is called LOST",
            "LOST" in log_q4[0] and "FIRST pass" not in log_q4[0])
+
+    # 3f2. AFTER AN UPGRADE (KIT-263). A version before KIT-250 wrote a seen-set only once it
+    #      filed something, so a quiet deployment had a heartbeat and never a seen-set, and
+    #      its first pass on this version called the file LOST. A heartbeat now records
+    #      whether a seen-set was on disk when its pass ended; one without that record is
+    #      from an older version and gets a softer line that names both readings. One that
+    #      says a pass ended WITHOUT a seen-set lost nothing.
+    for label, extra, lost, words in (
+            ("an older version's heartbeat (no record)", {}, False, "upgrade"),
+            ("a heartbeat whose pass ended with a seen-set", {"seen_set": True}, True, "LOST"),
+            ("a heartbeat whose pass ended without one", {"seen_set": False}, False,
+             "ended without one")):
+        with tempfile.TemporaryDirectory() as d:
+            state, cfg_path = _setup(d)
+            os.makedirs(state)
+            json.dump(dict({"schema": HEARTBEAT_SCHEMA, "result": "ok", "exit_code": EXIT_OK,
+                            "ended_at": "2026-10-01T00:00:00Z"}, **extra),
+                      open(heartbeat_path(state), "w"))
+            log_h = []
+            rc_h = _pass(_FakeLinear([]), cfg_path, capture=log_h)
+            ok("seen-set: %s — %s" % (label, "LOST" if lost else "not called LOST"),
+               rc_h == EXIT_OK and ("LOST" in log_h[0]) == lost and words in log_h[0]
+               and "FIRST pass" not in log_h[0])
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        os.makedirs(state)
+        with open(heartbeat_path(state), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        log_h = []
+        _pass(_FakeLinear([]), cfg_path, capture=log_h)
+        ok("seen-set: an unreadable heartbeat still reads as LOST, never as an upgrade",
+           "LOST" in log_h[0] and "upgrade" not in log_h[0])
+    with tempfile.TemporaryDirectory() as d:
+        state, cfg_path = _setup(d)
+        _pass(_FakeLinear([]), cfg_path, capture=[])
+        with open(heartbeat_path(state), encoding="utf-8") as fh:
+            ok("seen-set: a real pass's heartbeat records that its seen-set was kept",
+               json.load(fh).get("seen_set") is True)
 
     with tempfile.TemporaryDirectory() as d:
         state, cfg_path = _setup(d)

@@ -127,8 +127,14 @@ than that window are not re-asked for until the file is repaired or removed.
   finding twice. Back up the state dir with the rest of the role account; never "reset" it
   to clear a problem. A real pass that finds no seen-set writes an empty one at once, so the
   file exists from the first pass on. A pass that finds none says which case it is: **no
-  heartbeat yet** means a true first pass; **a heartbeat from an earlier pass** means the
-  seen-set was lost, and the line is a `WARNING`. A dry run writes nothing.
+  heartbeat yet** means a true first pass; **a heartbeat from a pass that ended with a
+  seen-set** means the seen-set was lost, and the line is a `WARNING`. A dry run writes
+  nothing.
+  **Right after an upgrade,** expect one softer line instead. Older versions wrote a seen-set
+  only once they filed something, so a quiet poller has a heartbeat and no seen-set, and its
+  heartbeat does not say whether it kept one. The line names both readings: expected if the
+  poller had never filed a finding, a loss if it had. A real pass then writes the seen-set,
+  so the line does not repeat.
 - **Heartbeat:** every terminal path writes one — including a config or credential failure,
   which is the path that used to miss it. A stale heartbeat means *not running*; a fresh one
   with a non-`ok` result means *ran and could not do it* (§13). A `--dry-run` writes no
@@ -146,7 +152,9 @@ than that window are not re-asked for until the file is repaired or removed.
 
 `heartbeat.json` carries the same fields as the review poller's, so one monitoring rule
 reads every Stage E daemon: `result` is `ok`, `error` or `usage`, beside `exit_code`,
-`started_at`, `ended_at`, and this poller's `filed` / `skipped` counts.
+`started_at`, `ended_at`, and this poller's `filed` / `skipped` counts. Its `seen_set` says
+whether `seen.json` was on disk when the pass ended, which is how the next pass tells a lost
+seen-set from one that never existed.
 
 Exit codes: **0** the pass ran (even if it filed nothing) · **1** the pass could not
 complete, a cap note it owes could not be posted, or a filed finding's page mark is still

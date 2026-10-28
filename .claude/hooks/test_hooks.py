@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1052,11 +1053,14 @@ STACK_SCENARIOS = sorted({s for s, _, _ in STACK_CASES})
 # binding the session could rewrite is not a binding.
 PL_READY = "11111111-1111-4111-8111-111111111111"
 PL_RAW = "22222222-2222-4222-8222-222222222222"
+PL_READY_HEX = "abcdef01-2345-4abc-8def-abcdefabcdef"
 PL_LABEL = "33333333-3333-4333-8333-333333333333"
 # Dispatcher-owned lifecycle labels (§6) — the guard matches these by ID as well as
 # by canonical key, so the battery needs both halves resolved.
 PL_QUEUED = "44444444-4444-4444-8444-444444444444"
 PL_NEEDS_HUMAN = "55555555-5555-4555-8555-555555555555"
+# …and one with letters in it, so a case can spell a protected label's ID in capitals.
+PL_NEEDS_HUMAN_HEX = "abcdef01-2345-4abc-8def-abcdefabc055"
 PL_BRANCH = "feat/eng-123-token-refresh"
 
 
@@ -1132,10 +1136,35 @@ def _pl_pin(root, **over):
     }, over)
 
 
+# The lane marker's system path, /etc/claude-pipeline/dispatched-lane/<account>, is one
+# a battery cannot write without root, and one a machine running the battery may really
+# carry (a dispatcher's role account runs the kit's own gate). So each pipeline sandbox's
+# hook copy reads it from a folder of the sandbox's own instead: this one assignment is
+# the only text that differs from the hook under test, and a case below checks the hook
+# carries it exactly once. A hook without the line (an older one) is copied unchanged.
+SYSTEM_MARKER_LINE = 'LANE_MARKER_SYSTEM_DIR = "/etc/claude-pipeline/dispatched-lane"'
+_PL_SYSDIRS = {}      # hook copy → the folder standing in for the system marker folder
+_PL_TMP = []          # extra temp folders the pipeline sandboxes made, removed at the end
+
+
+def _install_hook_copy(hook_copy):
+    """Copy HOOK to `hook_copy`, its system marker folder pointed at a fresh temp one
+    (which does not exist yet: a case creates it). Returns that folder."""
+    sysroot = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-etc-"))
+    _PL_TMP.append(sysroot)
+    sysdir = os.path.join(sysroot, "claude-pipeline", "dispatched-lane")
+    with open(HOOK) as fh:
+        src = fh.read()
+    with open(hook_copy, "w") as fh:
+        fh.write(src.replace(SYSTEM_MARKER_LINE, "LANE_MARKER_SYSTEM_DIR = %r" % sysdir))
+    _PL_SYSDIRS[hook_copy] = sysdir
+    return sysdir
+
+
 def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
                           cfg_raw=None, pin_raw=None, worktree_cfg_raw=None,
                           dirty=None, pins_in_repo=None, lane_marker=None, root_name=None,
-                          cfg_branch_only=False, cfg_aside=None):
+                          cfg_branch_only=False, cfg_aside=None, system_marker=None):
     """Throwaway repo with the pipeline CONFIGURED. Returns (root, hook_copy, pins).
 
     `cfg_raw`/`pin_raw` write the file verbatim (the malformed-config and
@@ -1157,7 +1186,11 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
 
     `cfg_branch_only` commits `delivery.json` on the feature branch only (the adoption
     PR); `cfg_aside` then takes the working copy away: "moved" renames it, "deleted"
-    commits its deletion on the branch (KIT-241)."""
+    commits its deletion on the branch (KIT-241).
+
+    `system_marker` writes the marker at the SYSTEM path instead (the sandbox's stand-in
+    for /etc/claude-pipeline/dispatched-lane, see _install_hook_copy): True for the
+    account running the battery, or another account's name."""
     root = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-pl-"))
     if root_name:
         root = os.path.join(root, root_name)
@@ -1166,7 +1199,7 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
     hooks = os.path.join(root, ".claude", "hooks")
     os.makedirs(hooks)
     hook_copy = os.path.join(hooks, os.path.basename(HOOK))
-    shutil.copy(HOOK, hook_copy)
+    sysdir = _install_hook_copy(hook_copy)
     shutil.copy(STOP_HOOK, os.path.join(hooks, os.path.basename(STOP_HOOK)))
     _git(root, "init", "-q", "-b", "main")
     cfg_pins = pins if pins_in_repo is None else os.path.join(root, pins_in_repo)
@@ -1200,6 +1233,13 @@ def make_pipeline_sandbox(branch=PL_BRANCH, pin="default", cfg_over=None,
         who = pwd.getpwuid(os.getuid()).pw_name if lane_marker is True else lane_marker
         os.makedirs(os.path.join(pins, "dispatched-lane"), exist_ok=True)
         with open(os.path.join(pins, "dispatched-lane", who), "w") as f:
+            f.write("")
+    if system_marker:
+        import pwd
+        who = (pwd.getpwuid(os.getuid()).pw_name if system_marker is True
+               else system_marker)
+        os.makedirs(sysdir, exist_ok=True)
+        with open(os.path.join(sysdir, who), "w") as f:
             f.write("")
     if pin is not None:
         key = hashlib.sha256(root.encode("utf-8")).hexdigest()[:16]
@@ -1238,6 +1278,73 @@ def make_account_launcher(hook_copy, home, tag):
     with open(path, "w") as f:
         f.write("HOOK, HOME = %r, %r\n" % (hook_copy, home) + _ACCOUNT_LAUNCHER)
     return path
+
+
+# A few guard lines sit behind an earlier check that fails closed first, so no tool call
+# reaches them, and a block/allow case cannot tell such a line from one that is not there.
+# This loads the hook under test as a module (stdin that is not JSON makes its entry point
+# exit at once), with the account database answering as given, and prints what one of its
+# functions returns.
+_PROBE_LAUNCHER = '''
+import io, json, os, sys, types
+import pwd as _real
+_me = _real.getpwuid(os.getuid())
+def getpwuid(uid):
+    if HOME is None:
+        raise KeyError("getpwuid(): uid not found: %d" % uid)
+    return types.SimpleNamespace(pw_name=_me.pw_name, pw_uid=_me.pw_uid, pw_dir=HOME)
+fake = types.ModuleType("pwd")
+fake.getpwuid, fake.getpwnam, fake.getpwall = getpwuid, _real.getpwnam, _real.getpwall
+sys.modules["pwd"] = fake
+sys.stdin = io.StringIO("not json")
+g = {"__name__": "hook_probe", "__file__": HOOK}
+try:
+    with open(HOOK) as fh:
+        exec(compile(fh.read(), HOOK, "exec"), g)
+except SystemExit:
+    pass
+print(json.dumps(g[FN](*ARGS)))
+'''
+
+
+def probe_hook(fn, args, home, root):
+    """What the hook's own `fn(*args)` returns, the account database giving `home` as
+    this uid's home (None: no entry), with the session rooted at `root`."""
+    d = tempfile.mkdtemp(prefix="hook-battery-probe-")
+    path = os.path.join(d, "probe.py")
+    with open(path, "w") as f:
+        f.write("HOOK, HOME, FN, ARGS = %r, %r, %r, %r\n" % (HOOK, home, fn, list(args))
+                + _PROBE_LAUNCHER)
+    try:
+        r = subprocess.run([sys.executable, path], capture_output=True, text=True,
+                           timeout=30, cwd=root, env={**os.environ, "CLAUDE_PROJECT_DIR": root})
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError("probe of %s crashed (exit %s): %s" % (fn, r.returncode,
+                                                                  r.stderr[-300:]))
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def fake_git_env(root):
+    """An env for a hook run whose PATH puts a `git` first that answers `cat-file
+    --batch-check` with a blob line for every spec AND a failing exit, and runs the
+    real git for everything else: output a failed command printed must not count."""
+    real = shutil.which("git")
+    bindir = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-fakegit-"))
+    _PL_TMP.append(bindir)
+    with open(os.path.join(bindir, "git"), "w") as f:
+        f.write("#!/bin/sh\n"
+                "for a in \"$@\"; do\n"
+                "  if [ \"$a\" = \"--batch-check\" ]; then\n"
+                "    while read -r spec; do echo \"$spec blob 10\"; done\n"
+                "    exit 1\n"
+                "  fi\n"
+                "done\n"
+                "exec %s \"$@\"\n" % shlex.quote(real))
+    os.chmod(os.path.join(bindir, "git"), 0o755)
+    return {**os.environ, "CLAUDE_PROJECT_DIR": root,
+            "PATH": bindir + os.pathsep + os.environ.get("PATH", "")}
 
 
 
@@ -1500,6 +1607,116 @@ def main():
     acct_launch["none"] = make_account_launcher(pl_acct, None, "none")
     nopin_noacct = make_account_launcher(pl_nopin, None, "none")
     lane_home_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_acct_root, "HOME": lane_fakehome}
+    # The marker's SYSTEM path, /etc/claude-pipeline/dispatched-lane/<account> (CK-10):
+    # folders root owns all the way down, so the role account cannot rename it away the
+    # way it can rename the old one's folders under the pins root it created. Either one
+    # makes the lane. Each sandbox reads its own stand-in folder (_install_hook_copy).
+    pl_sys_root, pl_sys, pl_sys_pins = make_pipeline_sandbox(pin=None, system_marker=True)
+    pl_sysown_root, pl_sysown, pl_sysown_pins = make_pipeline_sandbox(
+        pin=None, system_marker=True, root_name="ENG-123")
+    pl_sysother_root, pl_sysother, pl_sysother_pins = make_pipeline_sandbox(
+        pin=None, system_marker="someone-else-entirely")
+    pl_sysdangle_root, pl_sysdangle, pl_sysdangle_pins = make_pipeline_sandbox(pin=None)
+    os.makedirs(_PL_SYSDIRS[pl_sysdangle])
+    os.symlink("/nonexistent/marker-target", os.path.join(_PL_SYSDIRS[pl_sysdangle], _me))
+    pl_sysloop_root, pl_sysloop, pl_sysloop_pins = make_pipeline_sandbox(pin=None)
+    os.makedirs(os.path.dirname(_PL_SYSDIRS[pl_sysloop]))
+    os.symlink("dispatched-lane", _PL_SYSDIRS[pl_sysloop])
+    pl_sysfile_root, pl_sysfile, pl_sysfile_pins = make_pipeline_sandbox(pin=None)
+    _pl_write(os.path.dirname(_PL_SYSDIRS[pl_sysfile]), "dispatched-lane", "")
+    # The old marker as a dangling symlink: lstat sees the entry, stat would not.
+    pl_lanedangle_root, pl_lanedangle, pl_lanedangle_pins = make_pipeline_sandbox(pin=None)
+    os.makedirs(os.path.join(pl_lanedangle_pins, "dispatched-lane"))
+    os.symlink("/nonexistent/marker-target",
+               os.path.join(pl_lanedangle_pins, "dispatched-lane", _me))
+    # THE MARKER WINS OVER A PIN. The pins root is the role account's own, so a session
+    # whose sandbox lets a write leave the worktree can forge a pin there; no dispatcher
+    # writes one for a marked account. A forged maintenance pin used to switch the lane
+    # off (creates allowed, any in-team ticket writable); a forged ticket pin named
+    # another ticket as the session's own.
+    pl_forgemaint_root, pl_forgemaint, pl_forgemaint_pins = make_pipeline_sandbox(
+        pin={"session_mode": "maintenance", "ticket": None}, lane_marker=True,
+        root_name="ENG-123")
+    pl_forgeticket_root, pl_forgeticket, pl_forgeticket_pins = make_pipeline_sandbox(
+        pin={"ticket": {"id": "ENG-456"}}, lane_marker=True, root_name="ENG-123")
+    pl_sysforge_root, pl_sysforge, pl_sysforge_pins = make_pipeline_sandbox(
+        pin={"session_mode": "maintenance", "ticket": None}, system_marker=True)
+    # The folder-name reading, pinned line by line: a folder that merely STARTS with a
+    # ticket ID names none; the session's own folder is read before its parent's; and
+    # a PINNED session's folder name binds nothing (its pin does).
+    pl_laneretry_root, pl_laneretry, pl_laneretry_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-123-retry")
+    pl_lanenest_root, pl_lanenest, pl_lanenest_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-456/ENG-123")
+    pl_planown_root, pl_planown, pl_planown_pins = make_pipeline_sandbox(
+        branch="feat/decompose-the-epic", root_name="ENG-123",
+        pin={"session_mode": "planning", "ticket": None})
+    # A `ready` ID with letters in it, so a case can spell it in capitals: a UUID names
+    # the same state to the tracker whatever the case of its letters.
+    _hex_states = {"linear": {"stateIds": {"raw": PL_RAW, "ready": PL_READY_HEX,
+                                           "working": "w-id", "review": "v-id",
+                                           "done": "d-id"}}}
+    pl_hex_root, pl_hex, pl_hex_pins = make_pipeline_sandbox(cfg_over=_hex_states)
+    pl_hexnopin_root, pl_hexnopin, pl_hexnopin_pins = make_pipeline_sandbox(
+        pin=None, cfg_over=_hex_states)
+    # …and a protected label's ID with letters in it, for the same reason: pinned, and
+    # on the lane in the folder named after its ticket.
+    _hex_labels = {"linear": {"labels": {"ids": {"track:platform": PL_LABEL,
+                                                 "effort:M": "e-id",
+                                                 "agent:queued": PL_QUEUED,
+                                                 "agent:needs-human": PL_NEEDS_HUMAN_HEX},
+                                         "required": []}}}
+    pl_hexlbl_root, pl_hexlbl, pl_hexlbl_pins = make_pipeline_sandbox(cfg_over=_hex_labels)
+    pl_hexlane_root, pl_hexlane, pl_hexlane_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-123", cfg_over=_hex_labels)
+    # …and the same ID CONFIGURED in capitals, met in lower case: the match is both ways.
+    _hex_labels_up = {"linear": {"labels": {
+        **_hex_labels["linear"]["labels"],
+        "ids": {**_hex_labels["linear"]["labels"]["ids"],
+                "agent:needs-human": PL_NEEDS_HUMAN_HEX.upper()}}}}
+    pl_hexup_root, pl_hexup, pl_hexup_pins = make_pipeline_sandbox(cfg_over=_hex_labels_up)
+    # A relative pinsRoot would be read from the hook's cwd, which `cd` moves.
+    pl_relpins_root, pl_relpins, pl_relpins_pins = make_pipeline_sandbox(
+        pin=None, cfg_over={"dispatch": {"pinsRoot": "relative/pins"}})
+    # A committed delivery.json that is present but empty, the working copy moved aside:
+    # BROKEN, and not reported as an adoption copy at HEAD.
+    pl_blank_root, pl_blank, pl_blank_pins = make_pipeline_sandbox(
+        pin=None, cfg_raw="   \n", cfg_aside="moved")
+    # The discriminator's cat-file, read strictly: a `delivery.json` that is a committed
+    # FOLDER is not a config, and a cat-file that FAILED is not an answer.
+    tree_root, tree_hook = make_sandbox("feat/battery-tree")
+    _pl_write(tree_root, "delivery.json/README", "not a config\n")
+    _git(tree_root, "add", "-A")
+    _git(tree_root, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "-q", "-m", "a folder named delivery.json")
+    fakegit_root, fakegit_hook = make_sandbox("feat/battery-fakegit")
+    fakegit_env = fake_git_env(fakegit_root)
+    # KIT-240's env file, planted for the next session: git's environment is the
+    # session's to set, and every git read the hook makes used to inherit it.
+    envplant = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-envplant-"))
+    _PL_TMP.append(envplant)
+    _git(envplant, "init", "-q", "empty")
+    os.makedirs(os.path.join(envplant, "objects"))
+    _pl_write(envplant, "home/.gitconfig", "[[[ not a config\n")
+    _pl_write(envplant, "xdg/git/config", "[[[ not a config\n")
+    # …a repository whose committed config moves the `ready` id and the pins root…
+    evil = os.path.join(envplant, "evil")
+    _git(envplant, "init", "-q", "-b", "main", "evil")
+    _pl_write(evil, "delivery.json", json.dumps(_pl_cfg(
+        os.path.join(envplant, "evil-pins"),
+        linear={"stateIds": {"raw": PL_RAW, "ready": "99999999-9999-4999-8999-999999999999",
+                             "working": "w-id", "review": "v-id", "done": "d-id"}})))
+    _git(evil, "add", "-A")
+    _git(evil, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "-q", "-m", "a config the session chose")
+    # …and one on a feature branch, for a checkout that is on `main`.
+    featrepo = os.path.join(envplant, "feat")
+    _git(envplant, "init", "-q", "-b", "feat/elsewhere", "feat")
+    _git(featrepo, "-c", "user.name=battery", "-c", "user.email=battery@test.invalid",
+         "commit", "--allow-empty", "-q", "-m", "seed")
+
+    def planted(root, **var):
+        return {**os.environ, "CLAUDE_PROJECT_DIR": root, **var}
     # A project whose base branch is NOT `main`. The stacked-branch guard reads
     # `github.defaultBranch` from the COMMITTED config on the default branch, so
     # `develop` must become a legal base — and `main`/`master` must stay legal
@@ -1571,6 +1788,21 @@ def main():
         pl_adopt_root, pl_adopt_pins, pl_laneloop_root, pl_laneloop_pins,
         pl_lanefile_root, pl_lanefile_pins, pl_laneshut_root, pl_laneshut_pins,
         pl_acct_root, pl_acct_pins, lane_fakehome, *acct_homes.values(),
+        pl_sys_root, pl_sys_pins, os.path.dirname(pl_sysown_root), pl_sysown_pins,
+        pl_sysother_root, pl_sysother_pins, pl_sysdangle_root, pl_sysdangle_pins,
+        pl_sysloop_root, pl_sysloop_pins, pl_sysfile_root, pl_sysfile_pins,
+        pl_lanedangle_root, pl_lanedangle_pins,
+        os.path.dirname(pl_forgemaint_root), pl_forgemaint_pins,
+        os.path.dirname(pl_forgeticket_root), pl_forgeticket_pins,
+        pl_sysforge_root, pl_sysforge_pins,
+        os.path.dirname(pl_laneretry_root), pl_laneretry_pins,
+        os.path.dirname(os.path.dirname(pl_lanenest_root)), pl_lanenest_pins,
+        os.path.dirname(pl_planown_root), pl_planown_pins,
+        pl_relpins_root, pl_relpins_pins, pl_blank_root, pl_blank_pins,
+        pl_hex_root, pl_hex_pins, pl_hexnopin_root, pl_hexnopin_pins,
+        pl_hexlbl_root, pl_hexlbl_pins, os.path.dirname(pl_hexlane_root), pl_hexlane_pins,
+        pl_hexup_root, pl_hexup_pins,
+        tree_root, fakegit_root,
     ]
 
     stack_hooks = {s: make_stack_repo(s) for s in STACK_SCENARIOS}
@@ -2349,6 +2581,15 @@ def main():
          mcp("save_comment", issueId="ENG-123", body="done; see the PR"), ALLOW, pl_laneown),
         ("lane: rewriting its OWN ticket's description blocked (AC integrity)",
          mcp("save_issue", id="ENG-123", description="new scope"), BLOCK, pl_laneown),
+        # Grader-path protection stays PINNED-ONLY on the lane, on purpose: the ADR's
+        # named residual (KIT-241). Turning it on changes what a live coding session may
+        # edit, so it is the owner's call. These two pin today's behaviour; flip them to
+        # BLOCK only in the change that turns it on, with the README and the ADR.
+        ("lane: grader-path protection stays pinned-only — Edit a CI workflow allowed",
+         edit(os.path.join(pl_lane_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_lane),
+        ("lane: …and the Bash half — sed -i on a CI workflow allowed",
+         bash(f"sed -i 's/a/b/' {os.path.join(pl_lane_root, '.github/workflows/ci.yml')}"),
+         ALLOW, pl_lane),
         ("lane: a worktree named for ANOTHER team's ticket owns it (review session, REV-12)",
          mcp("save_issue", id="REV-12", stateId=PL_RAW), ALLOW, pl_laneteam),
         ("lane: that review session commenting on the PR's ticket blocked",
@@ -2404,6 +2645,165 @@ def main():
         *([("lane: a marker in a folder this account may not search counts (EACCES)",
             mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_laneshut)]
           if os.geteuid() != 0 else []),
+        # ── the marker's system path, and the marker over a pin ───────────────────
+        ("lane: the SYSTEM marker alone makes the lane (create blocked)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_sys),
+        ("lane: …and with it the own ticket is still writable",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_sysown),
+        ("lane: …and another ticket is not",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_sysown),
+        ("lane: a SYSTEM marker for another account is not this session's lane",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_sysother),
+        ("lane: a SYSTEM marker that is a dangling symlink counts (lstat, not stat)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_sysdangle),
+        ("lane: a SYSTEM marker folder the hook cannot look in counts (ELOOP)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_sysloop),
+        ("lane: a SYSTEM `dispatched-lane` that is a plain file holds no marker (ENOTDIR)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), ALLOW, pl_sysfile),
+        ("lane: the OLD marker as a dangling symlink counts (lstat, not stat)",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanedangle),
+        ("lane: a pin forged beside the marker is ignored — a maintenance pin creates nothing",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_forgemaint),
+        ("lane: …and does not open another in-team ticket",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_forgemaint),
+        ("lane: …and the own ticket is still the folder's",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_forgemaint),
+        ("lane: a forged TICKET pin naming another ticket does not make it the own one",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_forgeticket),
+        ("lane: a pin forged beside the SYSTEM marker is ignored too",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_sysforge),
+        # ── the own ticket from the folder name, line by line ─────────────────────
+        ("lane: a folder that only STARTS with a ticket ID names none (ENG-123-retry)",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), BLOCK, pl_laneretry),
+        ("lane: the session's own folder is read before its parent (ENG-456/ENG-123)",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_lanenest),
+        ("lane: …so the parent's ticket is not the own one",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_lanenest),
+        ("pinned planning session in a folder named ENG-123: the folder binds nothing",
+         mcp("save_issue", id="ENG-123", description="the decomposed scope"), ALLOW,
+         pl_planown),
+        # ── where the pins root is read from ──────────────────────────────────────
+        ("pins root: `~` with no home fails closed when the cwd is OUTSIDE the repo too",
+         write(os.path.join(pl_acct_root, "src/app.ts"), "x"), BLOCK,
+         acct_launch["none"], lane_home_env, nongit_dir),
+        ("pins root: a RELATIVE pinsRoot fails closed, whatever the cwd",
+         write(os.path.join(pl_relpins_root, "src/app.ts"), "x"), BLOCK, pl_relpins,
+         {**os.environ, "CLAUDE_PROJECT_DIR": pl_relpins_root}, nongit_dir),
+        # ── the discriminator reads cat-file strictly ─────────────────────────────
+        ("pipeline: a committed FOLDER named delivery.json is not a config (off)",
+         write(os.path.join(tree_root, "src.ts"), "x"), ALLOW, tree_hook),
+        ("pipeline: a cat-file that FAILED is no answer, whatever it printed (off)",
+         write(os.path.join(fakegit_root, "src.ts"), "x"), ALLOW, fakegit_hook,
+         fakegit_env, fakegit_root),
+        # ── git's environment is not the session's to steer (KIT-240) ─────────────
+        ("git env: GIT_DIR planted + delivery.json moved aside — still on, create blocked",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanemoved,
+         planted(pl_lanemoved_root, GIT_DIR=os.path.join(envplant, "empty", ".git")),
+         pl_lanemoved_root),
+        ("git env: GIT_OBJECT_DIRECTORY planted — still on",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanemoved,
+         planted(pl_lanemoved_root, GIT_OBJECT_DIRECTORY=os.path.join(envplant, "objects")),
+         pl_lanemoved_root),
+        ("git env: GIT_CONFIG_GLOBAL at a malformed file — still on",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanemoved,
+         planted(pl_lanemoved_root,
+                 GIT_CONFIG_GLOBAL=os.path.join(envplant, "home", ".gitconfig")),
+         pl_lanemoved_root),
+        ("git env: $HOME at a malformed .gitconfig — still on",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanemoved,
+         planted(pl_lanemoved_root, HOME=os.path.join(envplant, "home")),
+         pl_lanemoved_root),
+        ("git env: $XDG_CONFIG_HOME at a malformed git config — still on",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_lanemoved,
+         planted(pl_lanemoved_root, XDG_CONFIG_HOME=os.path.join(envplant, "xdg")),
+         pl_lanemoved_root),
+        ("git env: GIT_DIR at a repo whose config moves `ready` — the real one still refused",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY), BLOCK, pl_laneown,
+         planted(pl_laneown_root, GIT_DIR=os.path.join(evil, ".git")), pl_laneown_root),
+        ("git env: GIT_DIR at a repo on a feature branch — the checkout is still on main",
+         write(os.path.join(main_root, "x.ts"), "x"), BLOCK, main_hook,
+         planted(main_root, GIT_DIR=os.path.join(featrepo, ".git")), main_root),
+        ("git env: GIT_DIR planted — a sibling worktree is still another worktree",
+         write(os.path.join(wt_sibling, "src/x.ts"), "x"), BLOCK, wt_hook,
+         planted(wt_root, GIT_DIR=os.path.join(envplant, "empty", ".git")), wt_root),
+        ("git env: GIT_DIR planted — a subagent's cwd outside the repo widens nothing",
+         sub(write(os.path.join(main_root, "x.ts"), "x")), BLOCK, main_hook,
+         planted(main_root, GIT_DIR=os.path.join(envplant, "empty", ".git")), nongit_dir),
+        ("git env: GIT_DIR planted — a subagent in an UNRELATED repo is not a sibling",
+         sub(write(os.path.join(main_root, "x.ts"), "x")), BLOCK, main_hook,
+         planted(main_root, GIT_DIR=os.path.join(envplant, "empty", ".git")),
+         unrelated_root),
+        ("git env: GIT_DIR at another repo — the adoption copy is still this HEAD's",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_laneadopt,
+         planted(pl_laneadopt_root, GIT_DIR=os.path.join(evil, ".git")), pl_laneadopt_root),
+        ("git env: GIT_DIR planted — a commit on a MERGED PR's branch is still refused",
+         bash("git commit -F /tmp/msg.txt"), BLOCK, merged_hook,
+         {**merged_env, "CLAUDE_PROJECT_DIR": merged_root,
+          "GIT_DIR": os.path.join(envplant, "empty", ".git")}, merged_root),
+        # ── a supervised session sets a state by ID (self-approval by name) ───────
+        ("state: a planning pin moving another ticket to `Ready` BY NAME blocked",
+         mcp("save_issue", id="ENG-456", state="Ready"), BLOCK, pl_plan),
+        ("state: a maintenance pin moving a ticket by state TYPE blocked",
+         mcp("save_issue", id="ENG-777", state="unstarted"), BLOCK, pl_maint),
+        ("state: the lane moving its OWN ticket to `Ready` by name blocked",
+         mcp("save_issue", id="ENG-123", state="Ready"), BLOCK, pl_laneown),
+        ("state: a pinned session's status BY NAME blocked",
+         mcp("update_issue_status", id="ENG-123", status="In Review"), BLOCK, pl_hook),
+        ("state: an unknown verb carrying a status name on the lane blocked",
+         mcp("set_issue_state", issueId="ENG-123", status="Ready"), BLOCK, pl_laneown),
+        ("state: a state by its ID (a UUID) in `state` stays allowed",
+         mcp("save_issue", id="ENG-123", state=PL_RAW), ALLOW, pl_laneown),
+        ("state: a state by a configured non-UUID ID stays allowed",
+         mcp("save_issue", id="ENG-123", state="w-id"), ALLOW, pl_laneown),
+        ("state: /plan-epic's filing shape (stateId = stateIds.raw) stays allowed",
+         mcp("save_issue", title="child of the epic", team="ENG", state=PL_RAW),
+         ALLOW, pl_plan),
+        ("state: a PROJECT's status by name is not an issue state (allowed)",
+         mcp("save_project", id="Payments", state="Planned"), ALLOW, pl_plan),
+        ("state: a person's session (no pin, no marker) is not asked",
+         mcp("save_issue", id="ENG-456", state="Ready"), ALLOW, pl_nopin),
+        ("ready: the `ready` ID in CAPITALS is still an approval (pinned)",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY_HEX.upper()), BLOCK, pl_hex),
+        ("ready: …and in a person's session too (the approval guard is unconditional)",
+         mcp("save_issue", id="ENG-123", stateId=PL_READY_HEX.upper()), BLOCK, pl_hexnopin),
+        # A protected label's configured ID in capitals names the same label, so it is
+        # the same block, in whichever field it is added or removed.
+        ("lifecycle-label: its configured ID as configured blocked (the fixture resolves)",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_NEEDS_HUMAN_HEX]), BLOCK, pl_hexlbl),
+        ("lifecycle-label: its configured ID in CAPITALS blocked (pinned, labelIds)",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         BLOCK, pl_hexlbl),
+        ("lifecycle-label: …in CAPITALS blocked (pinned, addedLabelIds)",
+         mcp("save_issue", id="ENG-123", addedLabelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         BLOCK, pl_hexlbl),
+        ("lifecycle-label: …in CAPITALS blocked (pinned, removedLabelIds)",
+         mcp("save_issue", id="ENG-123", removedLabelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         BLOCK, pl_hexlbl),
+        ("lifecycle-label: …in CAPITALS blocked (lane, labelIds)",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         BLOCK, pl_hexlane),
+        ("lifecycle-label: …in CAPITALS blocked (lane, addedLabelIds)",
+         mcp("save_issue", id="ENG-123", addedLabelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         BLOCK, pl_hexlane),
+        ("lifecycle-label: …in CAPITALS blocked (lane, removedLabelIds)",
+         mcp("save_issue", id="ENG-123", removedLabelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         BLOCK, pl_hexlane),
+        ("lifecycle-label: an ID CONFIGURED in capitals, met in lower case, blocked",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_NEEDS_HUMAN_HEX]), BLOCK, pl_hexup),
+        ("lifecycle-label: an UNCONFIGURED label ID in capitals allowed (pinned)",
+         mcp("save_issue", id="ENG-123",
+             labelIds=["ABCDEF01-2345-4ABC-8DEF-ABCDEFABC099"]), ALLOW, pl_hexlbl),
+        # ── AC integrity covers a partial edit ────────────────────────────────────
+        ("AC: a `patch` replacing text in the pinned ticket's description blocked",
+         mcp("save_issue", id="ENG-123", patch=[{
+             "op": "replace", "old_string": "tokens refresh before expiry",
+             "new_string": "nothing"}]), BLOCK, pl_hook),
+        ("AC: a `patch` appending to the lane's own ticket blocked",
+         mcp("save_issue", id="ENG-123", patch=[{"op": "append", "text": "\n- [x] done"}]),
+         BLOCK, pl_laneown),
+        ("AC: a `patch` on another in-team ticket in maintenance mode stays allowed",
+         mcp("save_issue", id="ENG-777", patch=[{"op": "append", "text": "\nnote"}]),
+         ALLOW, pl_maint),
         # PROTECTED labels beyond agent:*/blocked: — the tracker-MCP path must refuse the
         # SAME set the gh/Bash path does. A session minting `provenance:human` fakes a
         # human's signal; `provenance:agent` is the safe-outputs executor's to apply on a
@@ -2430,6 +2830,30 @@ def main():
          mcp("save_issue_label", name="hooks-change"), BLOCK, pl_hook),
         ("protected-label: save_issue_label with a benign name allowed",
          mcp("save_issue_label", name="bug"), ALLOW, pl_hook),
+        # The label LIFECYCLE verbs are label writes too: retiring `agent:blocked` takes
+        # it off the board as surely as removing it from the ticket. Same treatment.
+        ("protected-label: retire_issue_label naming agent:blocked blocked (pinned)",
+         mcp("retire_issue_label", id="agent:blocked"), BLOCK, pl_hook),
+        ("protected-label: restore_issue_label naming agent:blocked blocked (pinned)",
+         mcp("restore_issue_label", id="agent:blocked"), BLOCK, pl_hook),
+        ("protected-label: retire_project_label naming agent:blocked blocked (pinned)",
+         mcp("retire_project_label", id="agent:blocked"), BLOCK, pl_hook),
+        ("protected-label: restore_project_label naming agent:blocked blocked (pinned)",
+         mcp("restore_project_label", id="agent:blocked"), BLOCK, pl_hook),
+        ("protected-label: retire_issue_label naming agent:blocked blocked (lane)",
+         mcp("retire_issue_label", id="agent:blocked"), BLOCK, pl_laneown),
+        ("protected-label: restore_issue_label naming agent:blocked blocked (lane)",
+         mcp("restore_issue_label", id="agent:blocked"), BLOCK, pl_laneown),
+        ("protected-label: retire_project_label naming agent:blocked blocked (lane)",
+         mcp("retire_project_label", id="agent:blocked"), BLOCK, pl_laneown),
+        ("protected-label: restore_project_label naming agent:blocked blocked (lane)",
+         mcp("restore_project_label", id="agent:blocked"), BLOCK, pl_laneown),
+        ("protected-label: retire_issue_label by the configured ID in CAPITALS (lane)",
+         mcp("retire_issue_label", id=PL_NEEDS_HUMAN_HEX.upper()), BLOCK, pl_hexlane),
+        ("protected-label: retire_issue_label of a benign label allowed (pinned)",
+         mcp("retire_issue_label", id="bug"), ALLOW, pl_hook),
+        ("protected-label: restore_project_label of a benign label allowed (lane)",
+         mcp("restore_project_label", id="bug"), ALLOW, pl_laneown),
 
         # ══ CONFIG ANCHOR: the git ref store is human-only ════════════════════
         # Guards read `delivery.json`, the merged-PR base and the changed-file set
@@ -2684,12 +3108,23 @@ def main():
         ("stderr reason: lifecycle-label block names the label it refused",
          mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]),
          "agent:needs-human", pl_hook),
+        ("stderr reason: a label ID in CAPITALS is refused as the label it names",
+         mcp("save_issue", id="ENG-123", labelIds=[PL_NEEDS_HUMAN_HEX.upper()]),
+         "`agent:needs-human` — a PROTECTED label", pl_hexlbl),
+        ("stderr reason: retiring agent:blocked is refused as a protected label",
+         mcp("retire_issue_label", id="agent:blocked"),
+         "`agent:blocked` — a PROTECTED label", pl_laneown),
         ("stderr reason: config-anchor block says the ref store is human-only",
          bash("git update-ref refs/remotes/origin/main abc1234"),
          "rewrite a git ref", feat_hook),
         ("stderr reason: pinsRoot block names the resolved path",
          edit(os.path.join(pl_pinsin_root, "src/app.ts"), "x"),
          ".pipeline/pins", pl_pinsin),
+        ("stderr reason: an EMPTY committed config is BROKEN, not an adoption copy at HEAD",
+         write(os.path.join(pl_blank_root, "src/app.ts"), "x"),
+         "BROKEN (delivery.json)", pl_blank),
+        ("stderr reason: a by-name state block says states go by ID from delivery.json",
+         mcp("save_issue", id="ENG-456", state="Ready"), "linear.stateIds", pl_plan),
         ("stderr reason: protected-label block names the label it refused",
          bash(f"gh pr edit 7 --add-label {LBL_HOOKS}"), LBL_HOOKS, HOOK),
         ("stderr reason: protected-label block routes to the human, like a hook edit",
@@ -2775,6 +3210,35 @@ def main():
           f"three hooks (KIT-214)")
     failures += 0 if ok else 1
 
+    # The pipeline sandboxes read the system lane marker from a stand-in folder (see
+    # _install_hook_copy). What they test is the hook's path only if the hook names it,
+    # once, exactly as card CK-10 writes it.
+    seq_ran += 1
+    with open(HOOK) as _fh:
+        _n = _fh.read().count(SYSTEM_MARKER_LINE)
+    ok = _n == 1
+    print(f"[{'PASS' if ok else 'FAIL'}] the hook reads the lane marker at "
+          f"/etc/claude-pipeline/dispatched-lane/<account> (found {_n} time(s))")
+    failures += 0 if ok else 1
+
+    # Behind the pins-root check, which fails closed first, so no tool call reaches it:
+    # an unresolvable pins root gives NO pin path, never a relative one (which would be
+    # read from the hook's cwd, and `cd` moves that).
+    for _name, _args, _home in (
+            ("`~` with no home in the account database", [{"dispatch": {"pinsRoot": "~/pins"}}],
+             None),
+            ("a relative pinsRoot", [{"dispatch": {"pinsRoot": "relative/pins"}}],
+             acct_homes["empty"])):
+        seq_ran += 1
+        try:
+            _got = probe_hook("_pin_path", _args, _home, pl_nopin_root)
+        except Exception as _exc:
+            _got = "crash: %s" % _exc
+        ok = _got == ""
+        print(f"[{'PASS' if ok else 'FAIL'}] pin path: {_name} gives no pin path "
+              f"(got {_got!r})")
+        failures += 0 if ok else 1
+
     def _session_start(payload, cwd):
         r = subprocess.run([sys.executable, SESSION_START_HOOK], input=json.dumps(payload),
                            capture_output=True, text=True, timeout=30, env=desk_env, cwd=cwd)
@@ -2811,7 +3275,7 @@ def main():
               stop_stacked_root, stop_baseok_root, stop_msgstack_root, stop_trunk_root,
               stop_nogh_root, stop_cfg_root, stop_wtcfg_root, stop_ohead_root,
               stop_stackred_root, stop_offbase_root, *_STACK_TMP,
-              *pl_cleanup):
+              *pl_cleanup, *_PL_TMP):
         shutil.rmtree(r, ignore_errors=True)
 
     # Counts EVERY assertion, reason_cases included — an under-reported total once
