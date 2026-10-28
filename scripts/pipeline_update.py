@@ -582,6 +582,17 @@ def env_has(env, conf, name):
     return got.ok
 
 
+def _install(env, conf, to):
+    pkg = conf["DISPATCHER_PACKAGE"]
+    return env.runner.as_role(conf["ROLE_ACCOUNT"], _role(conf, "npm install -g %s@%s" % (pkg, to)),
+                              why="install %s@%s" % (pkg, to), timeout=INSTALL_TIMEOUT_SECONDS)
+
+
+def _bootstrap(env, plist):
+    return env.runner.as_root(["launchctl", "bootstrap", "system", plist],
+                              why="start the dispatcher on the new version")
+
+
 def _start(env, conf, label, plist):
     """Bootstrap, retrying only EIO (launchd still holding the old job), then wait for
     /version to answer. Returns the version it answers with, or raises."""
@@ -594,8 +605,7 @@ def _start(env, conf, label, plist):
             if not se._wait_until_gone(r, label, limit)[0]:
                 said = "launchd still holds %s; another bootstrap would only answer EIO" % label
                 break
-        boot = r.as_root(["launchctl", "bootstrap", "system", plist],
-                         why="start the dispatcher on the new version")
+        boot = _bootstrap(env, plist)
         if boot.skipped:
             return None
         if boot.ok and se._service_in_domain(r, label):
@@ -732,6 +742,12 @@ def update_dispatcher(env, conf, dry_run=False, sudo=None):
 
     stop = r.as_root(["launchctl", "bootout", "system/" + label], why="stop the dispatcher")
     if stop.skipped:
+        # KIT-253: steps 4 and 5 are the ones that change the most, so a dry run shows
+        # them too. Nothing was stopped, so there is nothing to wait for launchd about.
+        _install(env, conf, to)
+        _bootstrap(env, plist)
+        say("  WOULD then wait up to %d s for it to answer /version with %s"
+            % (DISPATCHER_ANSWER_WAIT_SECONDS, to))
         say("DRY RUN complete. Nothing was changed.")
         return EX_OK
     gone, waited = se._wait_until_gone(r, label, se._exit_timeout(r, plist) + se.EXIT_TIMEOUT_HEADROOM)
@@ -739,8 +755,7 @@ def update_dispatcher(env, conf, dry_run=False, sudo=None):
         _banner(conf, "IN AN UNKNOWN STATE (launchd still holds it after %ds)" % waited, frm, to, None)
         raise UpdateError("launchd still holds the dispatcher after %ds; nothing was installed" % waited)
 
-    inst = r.as_role(account, _role(conf, "npm install -g %s@%s" % (pkg, to)),
-                     why="install %s@%s" % (pkg, to), timeout=INSTALL_TIMEOUT_SECONDS)
+    inst = _install(env, conf, to)
     if not inst.ok:
         _banner(conf, "STOPPED (the install failed)", frm, to, copy_real)
         record(env, {"component": "dispatcher", "from": frm, "to": to, "result": "install-failed"})
@@ -1107,9 +1122,21 @@ def selftest():
     dry_runner.dry_run = True
     dry = up_env(dry_runner)
     dry.any_platform = True
+    del quiet[:]
     check("update --dry-run applies nothing",
           (update_dispatcher(dry, _conf(DISPATCHER_SENTRY="off"), dry_run=True, sudo=_Sudo()),
            dry.runner.applied), (EX_OK, []))
+    # KIT-253: the dry run stopped after the bootout, so the install and the start, the
+    # two steps that change the most, were never shown.
+    would = [m for m in quiet if m.startswith("  WOULD ")]
+    planned = ["keep a rollback copy", "turn the dispatcher's error reporting off",
+               "stop the dispatcher", "install ", "start the dispatcher on the new version"]
+    check("update --dry-run: each of the five planned steps has a WOULD line, in order",
+          [next((i for i, m in enumerate(would) if m[len("  WOULD "):].startswith(p)), None)
+           for p in planned], [0, 1, 2, 3, 4])
+    check("update --dry-run: the install line names the exact command, and nothing waits on launchd",
+          (any("npm install -g" in m and "@0.2.73" in m for m in quiet),
+           any("waiting for the dispatcher" in m for m in quiet)), (True, False))
 
     ledger = os.path.join(home, ".pipeline-update", "ledger.jsonl")
     try:
