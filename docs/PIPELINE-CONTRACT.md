@@ -86,8 +86,10 @@ assertion is the nudge that forces the choice to be made rather than drifted pas
 
 **Template constraint:** CI validates that every tracked `.json` file parses. So in the
 shipped template, **placeholder tokens appear only inside JSON strings**; numbers,
-booleans and enums carry real defaults instead. `~` in a path value is expanded to
-`$HOME` by readers.
+booleans and enums carry real defaults instead. `~` in a path value is the home the
+account database gives the OS account the reader runs as, never `$HOME` (§3 says why). A
+path that is not absolute once `~` is read that way is refused, never read from wherever
+the reader happens to run.
 
 ### `version`
 
@@ -275,7 +277,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | `backend` | string | Where sessions run: `github-actions`, `local-daemon`, `cloud`. |
 | `labelTrigger` | string | Canonical label key (resolved through `linear.labels.ids`) whose presence queues a ticket. Default `agent:queued`. |
 | `pauseOnCapacity` | boolean | On a provider capacity error, pause the queue and apply `blocked:capacity` instead of consuming a `totalAttempts` slot. Capacity is not the ticket's fault. |
-| `pinsRoot` | string | Directory for pin files. Default `~/.claude/pipeline/pins`. `~` is the home the account database gives the OS account, never `$HOME` (§3). Must resolve outside every worktree and outside the repo. Pins are **short-lived** — written per dispatch, deleted at session end, expiring in hours — so nothing durable may be stored here (§9). **One exception:** `dispatched-lane/<OS account>`, the root-owned lane marker a person writes once for a dispatcher that writes no pins (§3). It is durable on purpose, and a cleanup of stale pins leaves that folder alone. |
+| `pinsRoot` | string | Directory for pin files. Default `~/.claude/pipeline/pins`. `~` is the home the account database gives the OS account, never `$HOME` (§3). Must resolve outside every worktree and outside the repo. Pins are **short-lived** — written per dispatch, deleted at session end, expiring in hours — so nothing durable may be stored here (§9). **One exception:** `dispatched-lane/<OS account>`, the OLDER place of the root-owned lane marker a person writes once for a dispatcher that writes no pins (§3; it now lives in `/etc/claude-pipeline`). Where it is still there it is durable on purpose, and a cleanup of stale pins leaves that folder alone. |
 | `statePath` | string \| null | Where the dispatcher state record (§9) is kept, for backends that need a location named. `null` when the backend supplies its own durable store — which is the case for `github-actions`, where the store is the `pipeline-state` artifact. Must resolve outside every worktree and outside the repo. |
 
 ### `monitoring`
@@ -384,7 +386,7 @@ mechanics belong to the stream that implements each guard.
 | `ticket-branch` | configured **and** `branch.requireTicketId` | The branch embeds the pinned ticket ID, lowercased (§1) |
 | `scope-fence` | configured | Writes stay inside the pinned ticket's scope; a change touching `autonomy.riskPaths` forces human review |
 | `lifecycle-label` | configured | The session does not set its own `agent:*` or `blocked:capacity` labels (§6). Mechanically enforced by the safe-outputs validator, which refuses dispatcher- and human-owned label keys (§8) |
-| `self-approval` | configured | The session does not move a ticket `raw` → `ready`; only `epic/*` provenance auto-approves, and only out of session (§5). Mechanically enforced by the safe-outputs validator, which refuses `raw`, `ready` and `done` as transition targets however the caller is configured (§8) |
+| `self-approval` | configured | The session does not move a ticket `raw` → `ready`; only `epic/*` provenance auto-approves, and only out of session (§5). Mechanically enforced by the safe-outputs validator, which refuses `raw`, `ready` and `done` as transition targets however the caller is configured (§8). On a direct tracker write the hook matches `ready` by its ID, whatever the case of its letters; so a pinned or dispatched session sets a state **by ID only** (`linear.stateIds`), and a write setting one by name or by state type is refused — the guard cannot tell `Ready` from `ready` |
 | `telemetry-required` | configured | A terminal run posts exactly one valid telemetry block before the turn ends (§4), carried as a `ticket-comment` request and counted by the safe-outputs validator (§8) |
 
 ---
@@ -416,7 +418,8 @@ the session starts**.
 ```
 <pinsRoot>/<pin_key>.json
 <pinsRoot>/ledger.jsonl        # append-only, one row per pin ever written
-<pinsRoot>/dispatched-lane/<OS account>   # the lane marker (below); root's, durable
+<pinsRoot>/dispatched-lane/<OS account>   # the OLDER lane marker (below); still counts
+/etc/claude-pipeline/dispatched-lane/<OS account>   # the lane marker (below); root's
 
 pin_key  = sha256(realpath(<session root>)).hexdigest()[:16]
 pinsRoot = delivery.json → dispatch.pinsRoot   (default ~/.claude/pipeline/pins)
@@ -426,9 +429,22 @@ pinsRoot = delivery.json → dispatch.pinsRoot   (default ~/.claude/pipeline/pin
 `pinsRoot` to the home the account database gives the OS account they run as. A
 delegation-bound dispatcher loads a worktree's env file into the next session it starts
 there (KIT-240), so a session could move `$HOME` for its successor and plant a pin under
-it. A pin found there would bind nothing a dispatcher wrote, and it would switch the lane
-marker check off. The OS account's name comes from the same database, never `$USER` or
-`$LOGNAME`.
+it. A pin found there would bind nothing a dispatcher wrote. (On an account that carries
+the lane marker no pin is read at all, below.) The OS account's name comes from the same
+database, never `$USER` or `$LOGNAME`. A `pinsRoot` that is not absolute once `~` is read that way (a relative
+path, `~name` for no such account) is refused: a relative one would be read from the
+reader's cwd, which a session moves with `cd`.
+
+**Nor is git's environment the session's.** A reader that asks git — whether
+`delivery.json` is committed, what the committed copy says, which branch and worktrees
+these are — runs it with none of the session's `GIT_*` variables and with no global
+git config at all (`GIT_CONFIG_GLOBAL` is the null device, so a `$HOME` or
+`$XDG_CONFIG_HOME` the session moved names nothing git reads). A `GIT_DIR`,
+`GIT_OBJECT_DIRECTORY` or broken global git config planted in that env file would
+otherwise answer from another repository, or fail every read, and a `delivery.json`
+moved aside would then read as *off*. Not the account's own global config instead: a
+dispatcher's sandbox denies reading home folders, and git stops on a config it is not
+permitted to read.
 
 `<session root>` is resolved **exactly as `.claude/hooks/pre-tool-use.py` resolves it**:
 anchor on `CLAUDE_PROJECT_DIR` (falling back to the hook file's location), widened to
@@ -552,13 +568,14 @@ empty rather than handed something invented.
 ### Read protocol (hooks, validators)
 
 1. Confirm the pipeline is configured (§2). Not configured → **exit 0, do nothing.**
-2. Derive the session root; compute `pin_key`; read the pin.
-3. Verify `pin_version`, `expires_at`, and `worktree` == derived session root.
-4. **Absence of a pin never grants autonomy.** In `ticket` mode a missing pin is
-   *broken* and fails closed. With no pin at all, read the **lane marker** next (below).
-   With no marker either, checks that would *withhold* something fail open (a human's
-   ad-hoc session in a configured repo must not be bricked) and checks that would
-   *grant* extra autonomy fail closed.
+2. Read the **lane marker** (below). With one, stop here: no pin is read, and the lane
+   rules apply.
+3. Derive the session root; compute `pin_key`; read the pin.
+4. Verify `pin_version`, `expires_at`, and `worktree` == derived session root.
+5. **Absence of a pin never grants autonomy.** In `ticket` mode a missing pin is
+   *broken* and fails closed. With no pin and no marker, checks that would *withhold*
+   something fail open (a human's ad-hoc session in a configured repo must not be
+   bricked) and checks that would *grant* extra autonomy fail closed.
 
 > **Tamper-evident, not tamper-proof.** The session's shell runs as the same user, so
 > `0444` and a path outside the repo raise the cost of tampering — they do not make it
@@ -570,23 +587,37 @@ empty rather than handed something invented.
 
 A dispatcher that binds a session by a person's delegation writes no pin, so without
 more its sessions would read as a human's ad-hoc ones. Its OS account carries a marker
-instead: `<pinsRoot>/dispatched-lane/<OS account>`, owned by root, in a folder root owns,
-written once by a person (the Stage E installer's card CK-10, measured by its
-`lane-marker` row). A session cannot create or delete it.
+instead: `/etc/claude-pipeline/dispatched-lane/<OS account>`, owned by root, in folders
+root owns all the way down to `/`, written once by a person (the Stage E installer's
+card CK-10, measured by its `lane-marker` row, which checks every one of those folders).
+A session cannot create, delete or move it.
 
-A reader with **no pin** looks for it with `lstat`:
+The marker used to live at `<pinsRoot>/dispatched-lane/<OS account>`, and that place
+still counts: **either one makes the lane.** It is not enough alone, because the role
+account created the pins root and can rename the folders under it, which takes the
+marker out of sight; it cannot rename root's `/etc`. With the system marker in place,
+removing the old one gains nothing.
 
-- **No such file** (`ENOENT`, or `ENOTDIR` on the way): not the lane. Step 4 above.
-- **There:** the dispatcher's lane. Tracker writes get the pinned `ticket` rules: no
-  protected label, no direct create, no rewrite of the own ticket's acceptance criteria,
+**The marker wins over a pin.** No dispatcher writes a pin for an account that carries
+the marker, so a pin found for one was forged — the pins root is that account's to write
+whenever its sandbox lets a write leave the worktree. A reader that finds the marker does
+not read the pin at all: not as a binding, and not as a broken one.
+
+A reader looks for each place with `lstat`, so the entry counts, not what it points at:
+
+- **No such file** (`ENOENT`, or `ENOTDIR` on the way) in both places: not the lane.
+  Read the pin (step 3 above).
+- **There**, in either place: the dispatcher's lane. Tracker writes get the pinned
+  `ticket` rules: no protected label, no direct create, no state set by anything but its
+  ID, no rewrite of the own ticket's acceptance criteria (a partial `patch` included),
   and writes only to the session's **own ticket** — the one its worktree folder is named
   after (`<base>/<ISSUE-ID>`), or the folder above it (`<base>/<ISSUE-ID>/<repo>`). Any
   team's key counts. The folder is the session's root, never a subagent's widened one.
   When neither folder names a ticket, an issue write and a write naming any ticket fail
   closed; a comment with no resolvable target stays allowed (§4 reporting).
-- **Could not check** — any other error, or an account the database cannot name: the
-  lane. Reading "could not look" as "a person's session" would let an error open every
-  guard the marker turns on.
+- **Could not check** — any other error in either place, or an account the database
+  cannot name: the lane. Reading "could not look" as "a person's session" would let an
+  error open every guard the marker turns on.
 
 ---
 

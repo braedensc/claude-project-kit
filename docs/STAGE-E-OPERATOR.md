@@ -176,10 +176,16 @@ not do the work: no terminal to paste a credential at (`CK-2`), an API that woul
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
 (`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
 One more you run once, by hand: `CK-10` writes the root-owned lane marker that gives this
-dispatcher's sessions the kit hook's tracker guards, since it writes no pin (KIT-241). The
-`lane-marker` step looks for it as the role account, at the pins root each repository's
-committed `delivery.json` names, and `run` and `verify` stop on `CK-10` until it is there.
-A repository with no `delivery.json` needs no marker.
+dispatcher's sessions the kit hook's tracker guards, since it writes no pin (KIT-241). It
+lives at `/etc/claude-pipeline/dispatched-lane/<role account>`, in folders root owns all the
+way down, so the role account cannot move it out of sight. The `lane-marker` step looks for
+it as the role account, checks that every folder above it up to `/` is root's and writable
+by no one else, and `run` and `verify` stop on `CK-10` until it is. A repository with no
+`delivery.json` needs no marker. **Already wrote the older marker under the pins root?** It
+still counts in the hook, and the step says it is there, but it does not clear the row: the
+role account created the pins root and can rename the folders under it. Run the card again;
+the old one can stay. With the marker in place the hook reads no pin for that account, so
+a pin forged there switches nothing off.
 
 **You type each secret once — plus once more if a stored one stops working.** The two
 values are asked for at a hidden prompt on the run that has none, written straight into the

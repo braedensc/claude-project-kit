@@ -1638,22 +1638,26 @@ CARDS = {
         "title": "Mark the dispatcher's lane for the kit hook (KIT-241)",
         "why": ("The dispatcher writes no pin, so the kit hook used to read its sessions as "
                 "your own ad-hoc ones: they could create tickets directly, set protected "
-                "labels, and write other tickets. The hook now gives a session the pinned "
-                "rules when its account carries this marker. The marker must be a file no "
-                "session can create or delete, so it is root's, under the pins root, in a "
-                "folder root owns. Without it nothing breaks, and those guards stay open on "
-                "this lane."),
-        "do": ["Run these three lines. The pins root below is the default; if a project's",
-               "committed delivery.json sets dispatch.pinsRoot, use that folder instead:",
-               "    sudo -u ${ROLE_ACCOUNT} mkdir -p ~${ROLE_ACCOUNT}/.claude/pipeline/pins",
-               "    sudo install -d -o root -g wheel -m 755 "
-               "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane",
+                "labels, and write other tickets. The hook gives a session the pinned "
+                "rules when its account carries this marker, and then ignores any pin "
+                "found for it: no dispatcher writes a pin for this account, so one found "
+                "there was forged. The marker must be a file no session can create, delete "
+                "or move out of sight, so it is root's, in folders root owns all the way "
+                "down to /. An older marker under the pins root (dispatch.pinsRoot) still "
+                "counts, but the role account created the pins root and can rename the "
+                "folders under it. Without a marker nothing breaks, and those guards stay "
+                "open on this lane."),
+        "do": ["Run these two lines (on macOS /etc is /private/etc, which root owns):",
+               "    sudo install -d -o root -g wheel -m 755 /etc/claude-pipeline "
+               "/etc/claude-pipeline/dispatched-lane",
                "    sudo install -o root -g wheel -m 444 /dev/null "
-               "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane/${ROLE_ACCOUNT}",
+               "/etc/claude-pipeline/dispatched-lane/${ROLE_ACCOUNT}",
                "Then check it:",
-               "    ls -l ~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane",
-               "`verify` reads it too, as the role account, at the pins root each",
-               "repository's committed delivery.json names: its lane-marker row.",
+               "    ls -l /etc/claude-pipeline/dispatched-lane",
+               "`verify` reads it too, as the role account: its lane-marker row checks the",
+               "marker is root's and every folder above it, up to /, is root's and writable",
+               "by no group or other account. An older marker under the pins root may stay:",
+               "with this one in place it adds nothing, and the row says it is there.",
                "Your own account gets no marker: your sessions keep the open rules."],
         "good": "one file named ${ROLE_ACCOUNT}, owned by root, mode -r--r--r--",
         "attest": None,
@@ -5440,13 +5444,23 @@ def step_heartbeat_monitor(ctx, apply_it):
 # The dispatcher's lane marker (KIT-241)
 # --------------------------------------------------------------------------- #
 # The kit hook gives a session with no pin the pinned tracker guards only when its OS
-# account carries a root-owned marker, <pinsRoot>/dispatched-lane/<account> (card CK-10).
-# Nothing measured it, so a machine without one read clean here while every dispatched
-# session ran with those guards open. This step reads it the way the hook does: the pins
-# root from each served repository's COMMITTED delivery.json (on the refs the hook trusts),
-# `~` as the role account's home from the account database, and the marker with lstat.
-# A repository with no delivery.json has the hook's pipeline guards off: it needs none.
+# account carries a root-owned marker (card CK-10), and with the marker it reads no pin
+# at all. Nothing measured it, so a machine without one read clean here while every
+# dispatched session ran with those guards open.
+#
+# The marker the hook trusts is /etc/claude-pipeline/dispatched-lane/<account>: root's,
+# in folders root owns all the way down. The older one, <pinsRoot>/dispatched-lane/
+# <account>, still counts in the hook, but the role account created the pins root and
+# can rename the folders under it, which takes that marker out of sight. So this step
+# requires the system marker, checks every folder above it up to / (the path as written
+# and the path it resolves to; on macOS /etc is /private/etc), and reports the old one
+# for what it is. It reads them the way the hook does: as the role account, with lstat,
+# the old one at the pins root from each served repository's COMMITTED delivery.json
+# (on the refs the hook trusts), `~` as the role account's home from the account
+# database. A repository with no delivery.json has the hook's pipeline guards off: it
+# needs no marker.
 LANE_MARKER_DIR = "dispatched-lane"
+LANE_SYSTEM_DIR = "/etc/claude-pipeline/dispatched-lane"
 DEFAULT_PINS_ROOT = "~/.claude/pipeline/pins"
 
 # Exit 7: not a clone this account can read. Exit 9: no trusted ref holds the file.
@@ -5455,8 +5469,32 @@ DELIVERY_READ_SH = (
     'for r in origin/main origin/master main master; do '
     'git -C "$p" show "$r:delivery.json" 2>/dev/null && exit 0; done; exit 9')
 
-# Prints the marker's path, then the owner uid of the marker and of its folder. Exit 9:
-# no marker (ENOENT or ENOTDIR, as the hook reads it). Any other error is a traceback.
+# Prints the marker's path and its owner uid, then one line per folder above it up to /,
+# along the path as written and the path it resolves to: "<uid> <mode> <D|L> <folder>"
+# (L: a symlink, whose own mode means nothing). Exit 9: no marker (ENOENT or ENOTDIR, as
+# the hook reads it). Any other error is a traceback.
+LANE_SYSTEM_PY = (
+    "import errno,os,pwd,stat,sys\n"
+    "e=pwd.getpwuid(os.getuid())\n"
+    "f=os.path.join(%r,e.pw_name)\n"
+    "print(f)\n"
+    "try:\n"
+    "  a=os.lstat(f)\n"
+    "except OSError as x:\n"
+    "  if x.errno in (errno.ENOENT,errno.ENOTDIR): sys.exit(9)\n"
+    "  raise\n"
+    "print(a.st_uid)\n"
+    "seen=[]\n"
+    "for d in (os.path.dirname(f),os.path.realpath(os.path.dirname(f))):\n"
+    "  while d not in seen:\n"
+    "    seen.append(d)\n"
+    "    s=os.lstat(d)\n"
+    "    print(s.st_uid,oct(stat.S_IMODE(s.st_mode)),\n"
+    "          'L' if stat.S_ISLNK(s.st_mode) else 'D',d)\n"
+    "    d=os.path.dirname(d)\n" % LANE_SYSTEM_DIR)
+
+# The OLD marker, under a pins root. Prints its path, then the owner uid of the marker
+# and of its folder. Exit 9: no marker (ENOENT or ENOTDIR). Any other error: a traceback.
 LANE_MARKER_PY = (
     "import errno,os,pwd,sys\n"
     "e=pwd.getpwuid(os.getuid())\n"
@@ -5473,9 +5511,41 @@ LANE_MARKER_PY = (
     "print(a.st_uid,os.lstat(os.path.dirname(f)).st_uid)\n" % LANE_MARKER_DIR)
 
 
+def _system_marker_problems(ctx):
+    """What keeps the system marker from being one no session can remove: [] when it is
+    root's in folders only root can change. Unknown when it could not be looked at."""
+    got = ctx.runner.as_role(ctx.account, "/usr/bin/python3 -c %s"
+                             % shlex.quote(LANE_SYSTEM_PY))
+    lines = got.out.strip().splitlines()
+    path = lines[0] if lines else "%s/%s" % (LANE_SYSTEM_DIR, ctx.account)
+    if got.rc == 9:
+        return path, ["no lane marker at %s" % path]
+    rows = [line.split(" ", 3) for line in lines[2:]]
+    try:
+        if not got.ok or len(lines) < 3 or any(len(x) != 4 for x in rows):
+            raise ValueError(lines)
+        rows = [(uid, int(mode, 8), kind, folder) for uid, mode, kind, folder in rows]
+    except ValueError:
+        raise Unknown("could not look for the lane marker %s as %s (exit %s): %s"
+                      % (path, ctx.account, got.rc, (got.err or got.out).strip()[-160:]),
+                      "Read that path as the role account, then run\n"
+                      "    python3 %s verify" % _self_path())
+    problems = []
+    if lines[1].strip() != "0":
+        problems.append("the lane marker %s is not root's (owner uid %s): a file the role "
+                        "account owns is one a session could delete" % (path, lines[1].strip()))
+    for uid, mode, kind, folder in rows:
+        if uid != "0" or (kind != "L" and mode & 0o022):
+            problems.append("%s is not root's alone (owner uid %s, mode %s): an account "
+                            "that can write it can move the marker out of sight"
+                            % (folder, uid, oct(mode)))
+    return path, problems
+
+
 def step_lane_marker(ctx, apply_it):
-    """Measured, never written: the marker must be a file no session can create or delete,
-    so root writes it, by hand, from card CK-10. `run` stops here until it is there."""
+    """Measured, never written: the marker must be a file no session can create, delete or
+    hide, so root writes it, by hand, from card CK-10. `run` stops here until it is
+    there."""
     r = ctx.runner
     if "entries" not in ctx.dispatcher:
         # Not read is not empty: "no repository needs a marker" would be a guess.
@@ -5502,38 +5572,44 @@ def step_lane_marker(ctx, apply_it):
         except (ValueError, AttributeError):
             raw = None
             notes.append("%s: its committed delivery.json does not read as a config, so the "
-                         "kit hook refuses every change there until it is fixed. Its marker "
-                         "is looked for at the default pins root." % repo)
+                         "kit hook refuses every change there until it is fixed. Its old "
+                         "marker is looked for at the default pins root." % repo)
         roots.setdefault(raw if isinstance(raw, str) and raw.strip() else DEFAULT_PINS_ROOT,
                          []).append(repo)
     if not roots:
         return True, ("no repository the dispatcher serves has a committed delivery.json, "
                       "so the kit hook's pipeline guards are off in all of them and no "
                       "lane marker is needed"), notes
-    found, problems = [], []
+    path, problems = _system_marker_problems(ctx)
+    # The old marker, under each pins root: it still counts in the hook, so it is reported
+    # for what it is, never required. A look that fails hides nothing (the hook reads a
+    # marker it cannot look for as the lane), so it is a note, not an Unknown.
+    old = []
     for raw, repos in sorted(roots.items()):
         got = r.as_role(ctx.account, "/usr/bin/python3 -c %s %s"
                         % (shlex.quote(LANE_MARKER_PY), shlex.quote(raw.strip())))
         lines = got.out.strip().splitlines()
-        path = lines[0] if lines else "<%s>/%s/%s" % (raw, LANE_MARKER_DIR, ctx.account)
+        opath = lines[0] if lines else "<%s>/%s/%s" % (raw, LANE_MARKER_DIR, ctx.account)
         if got.rc == 9:
-            problems.append("no lane marker at %s (for %s)" % (path, ", ".join(repos)))
             continue
         owners = lines[1].split() if got.ok and len(lines) > 1 else []
         if len(owners) != 2:
-            raise Unknown("could not look for the lane marker under %s as %s (exit %s): %s"
-                          % (raw, ctx.account, got.rc, (got.err or got.out).strip()[-160:]),
-                          "Read that path as the role account, then run\n"
-                          "    python3 %s verify" % _self_path())
-        if owners != ["0", "0"]:
-            problems.append("the lane marker %s, or its folder, is not root's (owner "
-                            "uids %s): a file the role account owns is one a session "
-                            "could delete" % (path, " and ".join(owners)))
+            notes.append("could not look for the old lane marker under %s as %s (exit %s); "
+                         "the hook counts a marker it cannot look for as the lane"
+                         % (raw, ctx.account, got.rc))
             continue
-        found.append(path)
+        old.append("%s (owner uids %s)" % (opath, " and ".join(owners)))
     if problems:
+        if old:
+            problems.append("the old marker %s still marks the lane, but under the pins "
+                            "root, whose folders the role account can rename"
+                            % ", ".join(old))
         raise Blocked("CK-10", "; ".join(problems))
-    return True, "the lane marker is root's: %s" % ", ".join(found), notes
+    for o in old:
+        notes.append("the old lane marker %s still counts in the hook too; with %s in "
+                     "place it adds nothing, and removing it changes nothing" % (o, path))
+    return True, ("the lane marker is root's, in folders only root can change: %s"
+                  % path), notes
 
 
 def step_handover(ctx, apply_it):
@@ -11107,7 +11183,8 @@ def _selftest_body():
                and "Accepted risks" in CARDS["CK-9"]["why"],
                "CK-9 must steer to a never-delegated, open ticket and name the session risk")
         # CK-10 (KIT-241): the lane marker is root's, read-only, named for the role account,
-        # under the pins root; filled from the conf, the person's own account untouched.
+        # in root's /etc/claude-pipeline (folders the role account cannot rename); filled
+        # from the conf, the person's own account untouched, the old marker named.
         import io as _io
         import contextlib as _ctxlib
         _buf = _io.StringIO()
@@ -11116,12 +11193,13 @@ def _selftest_body():
         _ck10 = _buf.getvalue()
         expect("lane-marker-card",
                all(t in _ck10 for t in (
-                   "install -d -o root -g wheel -m 755 ~_exrole/.claude/pipeline/pins/"
-                   "dispatched-lane",
-                   "install -o root -g wheel -m 444 /dev/null ~_exrole/.claude/pipeline/pins/"
-                   "dispatched-lane/_exrole",
+                   "install -d -o root -g wheel -m 755 /etc/claude-pipeline "
+                   "/etc/claude-pipeline/dispatched-lane",
+                   "install -o root -g wheel -m 444 /dev/null "
+                   "/etc/claude-pipeline/dispatched-lane/_exrole",
                    "GOOD: one file named _exrole, owned by root", "dispatch.pinsRoot"))
-               and "${ROLE_ACCOUNT}" not in _ck10, _ck10[-900:])
+               and "${ROLE_ACCOUNT}" not in _ck10
+               and "sudo -u _exrole mkdir" not in _ck10, _ck10[-900:])
 
         # Off, and nothing installed: said by name, nothing written.
         ctxO, fakeO = _monitor_ctx(value="off", loaded=False)
@@ -11626,11 +11704,30 @@ def _selftest_body():
     # -- KIT-241. THE LANE MARKER IS MEASURED, NOT ONLY CARDED ------------------ #
     # CK-10 was reachable only by `card CK-10` typed by hand, so a machine without the
     # marker verified clean while the hook's tracker guards stayed open on the lane.
-    def _lane_ctx(read=None, probe=None):
+    # The marker the row requires is the SYSTEM one, in folders root owns all the way
+    # down; the old one under the pins root is reported, never required.
+    sysmark = "/etc/claude-pipeline/dispatched-lane/%s" % conf["ROLE_ACCOUNT"]
+
+    def _sysout(marker_uid="0", **bad):
+        """The system probe's answer: the marker's owner, then each folder above it."""
+        rows = [("0", "0o755", "D", "/etc/claude-pipeline/dispatched-lane"),
+                ("0", "0o755", "D", "/etc/claude-pipeline"),
+                ("0", "0o755", "L", "/etc"), ("0", "0o755", "D", "/"),
+                ("0", "0o755", "D", "/private/etc/claude-pipeline/dispatched-lane"),
+                ("0", "0o755", "D", "/private/etc/claude-pipeline"),
+                ("0", "0o755", "D", "/private/etc"), ("0", "0o755", "D", "/private")]
+        rows = [bad.get(r[3], r) for r in rows]
+        return "%s\n%s\n%s\n" % (sysmark, marker_uid, "\n".join(" ".join(r) for r in rows))
+
+    def _lane_ctx(read=None, probe=None, system=None):
+        """The healthy fixture, with the committed config, the SYSTEM probe and the OLD
+        marker's probe answered as given. The system answer always comes first: its
+        command names `dispatched-lane` too, so the old probe's needle would answer it."""
         c, f, _a = _healthy_ctx(conf)
         lead = []
         if read is not None:
             lead.append(('git -C "$p" show', read[0], read[1]))
+        lead.append(("/etc/claude-pipeline",) + (system or (0, _sysout())))
         if probe is not None:
             lead.append(("dispatched-lane", probe[0], probe[1]))
         f.answers = lead + f.answers
@@ -11643,30 +11740,65 @@ def _selftest_body():
               % conf["ROLE_ACCOUNT"])
     cases += 1
     ctxL, fakeL = _lane_ctx()
-    okL, detailL, _nL = step_lane_marker(ctxL, apply_it=False)
-    expect("lane-marker-held", okL is True and marker in detailL and not fakeL.writes
+    okL, detailL, notesL = step_lane_marker(ctxL, apply_it=False)
+    expect("lane-marker-held", okL is True and sysmark in detailL and not fakeL.writes
            and any("sudo -u %s -H" % conf["ROLE_ACCOUNT"] in p
-                   and "'~/.claude/pipeline/pins'" in p for p in _probed(fakeL)),
+                   and "/etc/claude-pipeline" in p for p in _probed(fakeL)),
            "a root-owned marker read %r, probes %s, writes %s"
            % (detailL, _probed(fakeL), fakeL.writes))
-    for label, probe, needle in (
-            ("lane-marker-absent", (9, marker + "\n"), "no lane marker at " + marker),
-            ("lane-marker-role-owned", (0, marker + "\n501 0\n"), "is not root's"),
-            ("lane-marker-folder-role-owned", (0, marker + "\n0 501\n"), "is not root's")):
+    # The old marker is still there on the healthy fixture: said, and said to add nothing.
+    cases += 1
+    expect("lane-marker-old-noted", any("old lane marker" in n and "adds nothing" in n
+                                        for n in notesL)
+           and any("'~/.claude/pipeline/pins'" in p for p in _probed(fakeL)),
+           "notes %s" % notesL)
+    for label, system, needle in (
+            ("lane-marker-absent", (9, sysmark + "\n"), "no lane marker at " + sysmark),
+            ("lane-marker-role-owned", (0, _sysout(marker_uid="501")), "is not root's"),
+            ("lane-marker-folder-role-owned",
+             (0, _sysout(**{"/etc/claude-pipeline": ("501", "0o755", "D",
+                                                     "/etc/claude-pipeline")})),
+             "/etc/claude-pipeline is not root's alone"),
+            ("lane-marker-folder-group-writable",
+             (0, _sysout(**{"/private/etc/claude-pipeline/dispatched-lane": (
+                 "0", "0o775", "D", "/private/etc/claude-pipeline/dispatched-lane")})),
+             "dispatched-lane is not root's alone"),
+            ("lane-marker-root-other-writable",
+             (0, _sysout(**{"/private": ("0", "0o757", "D", "/private")})),
+             "/private is not root's alone")):
         cases += 1
-        ctxX, _fX = _lane_ctx(probe=probe)
+        ctxX, _fX = _lane_ctx(system=system)
         try:
             step_lane_marker(ctxX, apply_it=True)
             failures.append("%s: the step held" % label)
         except Blocked as exc:
             expect(label, exc.card_id == "CK-10" and needle in exc.extra,
                    "blocked on %s saying %r" % (exc.card_id, exc.extra))
-    for label, read, probe in (
+    # A symlink's own mode means nothing (Linux shows 777): only its owner is asked.
+    cases += 1
+    ctxY, _fY = _lane_ctx(system=(0, _sysout(**{"/etc": ("0", "0o777", "L", "/etc")})))
+    try:
+        okY, _dY, _nY = step_lane_marker(ctxY, apply_it=False)
+        expect("lane-marker-symlink-mode", okY is True, "the row did not hold")
+    except Blocked as exc:
+        failures.append("lane-marker-symlink-mode: a 777 symlink /etc blocked the row (%s)"
+                        % exc.extra)
+    # No system marker, the old one still there: blocked, and the old one named as the
+    # thing that still marks the lane but can be renamed away.
+    cases += 1
+    ctxO, _fO = _lane_ctx(system=(9, sysmark + "\n"))
+    try:
+        step_lane_marker(ctxO, apply_it=False)
+        failures.append("lane-marker-old-only: the old marker alone held the row")
+    except Blocked as exc:
+        expect("lane-marker-old-only", exc.card_id == "CK-10" and marker in exc.extra
+               and "can rename" in exc.extra, "blocked saying %r" % exc.extra)
+    for label, read, system in (
             ("lane-marker-clone-unreadable", (7, ""), None),
             ("lane-marker-probe-crashed", None,
-             (1, marker + "\nTraceback (most recent call last):\nPermissionError\n"))):
+             (1, sysmark + "\nTraceback (most recent call last):\nPermissionError\n"))):
         cases += 1
-        ctxX, _fX = _lane_ctx(read=read, probe=probe)
+        ctxX, _fX = _lane_ctx(read=read, system=system)
         try:
             step_lane_marker(ctxX, apply_it=False)
             failures.append("%s: could not look, and the step held" % label)
@@ -11675,6 +11807,14 @@ def _selftest_body():
         except Blocked as exc:
             failures.append("%s: could not look, and read it as missing (%s)"
                             % (label, exc.extra))
+    # The OLD marker's look failing hides nothing (the hook counts it as the lane): a
+    # note, and the row still holds on the system marker.
+    cases += 1
+    ctxF, _fF = _lane_ctx(probe=(1, marker + "\nTraceback (most recent call last):\n"))
+    okF, _dF, notesF = step_lane_marker(ctxF, apply_it=False)
+    expect("lane-marker-old-unreadable", okF is True
+           and any("could not look for the old lane marker" in n for n in notesF),
+           "ok %s notes %s" % (okF, notesF))
     # A dispatcher config this pass did not read is not one with no repositories.
     cases += 1
     ctxD, _fD = _lane_ctx()
@@ -11691,7 +11831,7 @@ def _selftest_body():
     okN, detailN, _nN = step_lane_marker(ctxN, apply_it=False)
     expect("lane-marker-no-pipeline", okN is True and "no lane marker is needed" in detailN
            and not _probed(fakeN), "%r, probes %s" % (detailN, _probed(fakeN)))
-    # The pins root the COMMITTED config names is the one asked about.
+    # The pins root the COMMITTED config names is the one the old marker is looked at.
     cases += 1
     ctxP, fakeP = _lane_ctx(read=(0, json.dumps({"version": 1,
                                                   "dispatch": {"pinsRoot": "/srv/pins"}})),
@@ -11702,7 +11842,7 @@ def _selftest_body():
     # A whole `verify` of a healthy machine with no marker: red on that row alone, and
     # `status` names the card that clears it.
     cases += 1
-    ctxV, fakeV = _lane_ctx(probe=(9, marker + "\n"))
+    ctxV, fakeV = _lane_ctx(system=(9, sysmark + "\n"), probe=(9, marker + "\n"))
     ctxV.runner.dry_run = True
     codeV, outV = _quiet(lambda: cmd_verify(ctxV))
     rowsV = {s: r["outcome"] for s, r in ctxV.state.data["steps"].items()
@@ -11792,10 +11932,18 @@ def _settled_ctx(conf):
         "lookback_hours": 72, "max_per_source": 3, "max_per_run": 20,
     }
     answers = [
-        # KIT-241: the served repository's committed delivery.json, and the lane marker,
-        # root's, in a root-owned folder. First, so no broader needle answers them.
+        # KIT-241: the served repository's committed delivery.json; the lane marker,
+        # root's, in root's /etc/claude-pipeline with every folder above it root's and
+        # writable by no one else (the system probe, so before "dispatched-lane"); and
+        # the old marker under the pins root, still there. First, so no broader needle
+        # answers them.
         ("git -C \"$p\" show", 0, json.dumps({"version": 1, "dispatch": {
             "pinsRoot": DEFAULT_PINS_ROOT}})),
+        ("/etc/claude-pipeline", 0, "%s/%s\n0\n%s\n" % (
+            LANE_SYSTEM_DIR, conf["ROLE_ACCOUNT"], "\n".join(
+                "0 0o755 %s %s" % (k, d) for k, d in (
+                    ("D", LANE_SYSTEM_DIR), ("D", os.path.dirname(LANE_SYSTEM_DIR)),
+                    ("L", "/etc"), ("D", "/"))))),
         ("dispatched-lane", 0, "%s/.claude/pipeline/pins/%s/%s\n0 0\n"
          % (ctx.role_home, LANE_MARKER_DIR, conf["ROLE_ACCOUNT"])),
     ] + answers + [
