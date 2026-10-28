@@ -10,9 +10,9 @@
 
 WHAT IT INSTALLS (KIT-220, KIT-221). One job, run by launchd every INTERVAL_SECONDS as the
 dispatcher's own role account (owner decision, 2026-10-10): it reads the chat channels,
-checks each sender with Slack itself, and asks its own questions. This version acts on
-nothing. It needs its OWN Slack app: if it posted as the chat bot, the chat bot could post a
-question that looked like the bridge's.
+checks each sender with Slack itself, and asks its own questions. It acts only with ACT=yes,
+the default being no. It needs its OWN Slack app: if it posted as the chat bot, the chat bot
+could post a question that looked like the bridge's.
 
     compose   prints the bridge app's manifest, the job's config, its LaunchDaemon plist and
               the order to do things in. Reads nothing live; runs anywhere, a model included.
@@ -183,13 +183,22 @@ def validate_conf(values):
         errors.append("INTERVAL_SECONDS must be a whole number from 15 to 3600")
     if not conf["EPIC_WIP"].isdigit() or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
-    if not errors:
-        try:
-            bridge.validate_config(dict(compose_config(conf),
-                                        state_dir="/nonexistent-%s" % os.getpid()))
-        except bridge.BridgeError as exc:
-            errors.extend(str(exc).split("\n  - ")[1:] or [str(exc)])
+    # The job's own check runs whatever the checks above found, so every bad value is
+    # named in one pass. A value both refuse is named once, by its conf key.
+    named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
+    try:
+        bridge.validate_config(dict(compose_config(conf),
+                                    state_dir="/nonexistent-%s" % os.getpid()))
+    except bridge.BridgeError as exc:
+        errors.extend(e for e in str(exc).split("\n  - ")[1:] or [str(exc)]
+                      if not any("'%s'" % COMPOSED_AS[k] in e for k in named))
     return conf, errors
+
+
+# The conf keys with a check of their own above, and the config key each is composed into.
+COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
+               "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
+               "ACT": "act", "NOTIFIER_STATE_DIR": "pings_file"}
 
 
 def load_conf(path):
@@ -331,8 +340,11 @@ CARDS = {
         "starts exactly as when you hand a ticket over yourself.",
         "Answer a stuck session: when a ping says a session needs a decision, reply under it. "
         "Good: one comment naming you lands in that session's thread, and it carries on.",
-        "Ready to merge: when Stage E concludes a pull request clean. Good: a ping says it is "
-        "ready to merge and links the pull request.",
+        "Ready to merge: when Stage E concludes a pull request clean or below the threshold, "
+        "the bounce driver leaves its ready-to-merge mark, then moves the ticket to Needs "
+        "Approval in the same pass, and the notifier pages on the mark. Good: a ping says it "
+        "is ready to merge and links the pull request, and the ticket is in Needs Approval. "
+        "A ticket moved to Needs Approval by hand pages nothing: that is expected.",
         "What the chat lane can read, with a decoy: run  sudo -u {ROLE_ACCOUNT} -H sh -c "
         "'echo decoy > {DECOY}'  then ask the tech lead to read {DECOY} . Good: it is "
         "refused. That proves {COPIES_RULE}, the rule for the env file's sibling copies (a "
@@ -347,9 +359,26 @@ CARDS = {
         "settings. The rule is made from chat-lane.conf's ROLE_ENV_FILE, so that must be "
         "{ENV_FILE}. Do not have the tech lead read the env file itself: a read that worked "
         "would post the token into Slack.",
+        "The env file's backups, with a decoy: `token` copies the whole env file into "
+        "{BACKUPS} before it writes. Run  sudo -u {ROLE_ACCOUNT} -H sh -c 'echo decoy > "
+        "{BACKUPS_DECOY}'  then ask the tech lead to read {BACKUPS_DECOY} . Good: it is "
+        "refused. That proves {BACKUPS_RULE}, the chat lane's rule for its backups "
+        "folder.{BACKUPS_NOTE} Then remove the decoy:  sudo -u {ROLE_ACCOUNT} -H sh -c 'rm "
+        "{BACKUPS_DECOY}'",
+        "The bridge's own files, with a decoy: its config {BRIDGE_CONFIG}, its log {LOG}, its "
+        "state dir {STATE_DIR} (its questions, the messages it has seen, its heartbeat) and "
+        "the notifier's pings file {PINGS}. None holds a credential, and the chat lane "
+        "composes no rule for them: its  compose --piece 5 --conf chat-lane.conf  names none "
+        "of these paths. Run  sudo -u {ROLE_ACCOUNT} -H sh -c 'echo decoy > {STATE_DECOY}'  "
+        "then ask the tech lead to read {STATE_DECOY} . Expected: it is read. Record the "
+        "criterion \"the chat lane cannot read the bridge's files\" as not held for these "
+        "files, never as passed: that residual is accepted (KIT-162). Today no session can "
+        "write them, which is what keeps them from being forged. Then remove the decoy:  "
+        "sudo -u {ROLE_ACCOUNT} -H sh -c 'rm {STATE_DECOY}'",
         "Record each result as a comment on the live-proofs ticket, and update your private "
         "runbook.",
-    ], "every step above held, and each result is a comment on the live-proofs ticket.",
+    ], "every step above held, except the bridge's own files, which are recorded as not held "
+       "(KIT-162), and each result is a comment on the live-proofs ticket.",
        "a step taken on trust: mark it not proven instead, with its ticket."),
     "CK-B3": ("Turn the bridge off", [
         "sudo launchctl bootout system/{JOB_LABEL}",
@@ -364,13 +393,25 @@ def card_values(conf, conf_path):
     # composer writes for this env file, never a guess at them.
     import pipeline_chat_lane_setup as chat_lane
     conf = conf or dict((k, d or "<%s>" % k) for k, (d, _doc) in CONF_KEYS.items())
+    # Where `token` keeps its whole copies of the env file: the writer's own rule, below.
+    backups = os.path.dirname(conf["ENV_FILE"]) + "/backups"
     return {"APP_NAME": conf["APP_NAME"], "JOB_LABEL": conf["JOB_LABEL"],
             "ROLE_ACCOUNT": conf["ROLE_ACCOUNT"],
             "PLIST": plist_path(conf), "SELF": os.path.abspath(__file__),
             "CONF": conf_path, "ENV_FILE": conf["ENV_FILE"],
             "DECOY": conf["ENV_FILE"] + ".decoy-proof",
             "ENV_RULE": chat_lane._path_rule(conf["ENV_FILE"]),
-            "COPIES_RULE": chat_lane._path_rule(conf["ENV_FILE"] + ".*")}
+            "COPIES_RULE": chat_lane._path_rule(conf["ENV_FILE"] + ".*"),
+            "BACKUPS": backups, "BACKUPS_DECOY": backups + "/decoy-proof",
+            "BACKUPS_RULE": chat_lane.BACKUPS_DENY_RULE,
+            "BACKUPS_NOTE": "" if backups == chat_lane.ROLE_BACKUPS else (
+                " That rule names %s, not %s. Unless those are one folder, expect the decoy "
+                "to be read: the copies of the token there are then readable, and this step "
+                "is not held." % (chat_lane.ROLE_BACKUPS, backups)),
+            "BRIDGE_CONFIG": conf["BRIDGE_CONFIG"], "STATE_DIR": conf["STATE_DIR"],
+            "LOG": os.path.dirname(conf["BRIDGE_CONFIG"]) + "/" + LOG_NAME,
+            "STATE_DECOY": conf["STATE_DIR"].rstrip("/") + "/decoy-proof",
+            "PINGS": pings_file(conf)}
 
 
 def print_card(cid, conf=None, conf_path=DEFAULT_CONF):
@@ -435,12 +476,19 @@ except Exception as exc:
 try:
     raw = open(cfg_path).read()
     out["config_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+except FileNotFoundError:
+    out["config_missing"] = True
 except Exception as exc:
     out["config_error"] = type(exc).__name__
 try:
     beat = json.load(open(beat_path))
-    out["heartbeat"] = dict((k, beat.get(k)) for k in ("schema", "at", "exit", "dry",
-                                                       "summary"))
+    if isinstance(beat, dict):
+        out["heartbeat"] = dict((k, beat.get(k)) for k in ("schema", "at", "exit", "dry",
+                                                           "summary"))
+    else:
+        out["heartbeat_error"] = "not a JSON object"
+except FileNotFoundError:
+    out["heartbeat_missing"] = True
 except Exception as exc:
     out["heartbeat_error"] = type(exc).__name__
 try:
@@ -628,7 +676,16 @@ def cmd_token(conf, runner, sudo, reader=None, tty=None):
         say("  " + line)
     if res.rc == 3:
         return EX_REFUSED
-    return EX_OK if res.ok else EX_FAILED
+    if not res.ok:
+        # The writer's error is on stderr only. Its stdin carried the token, so a line
+        # shaped like a credential, as the token is, is never shown (KIT-262).
+        last = ((res.err or "").strip().splitlines() or ["it printed no error"])[-1]
+        if bridge.notify.secret_hits(last):
+            last = "its last line is shaped like a credential, so it is not shown"
+        say("FAILED: the token could not be written into %s, as %s (%s)."
+            % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"], last[:200]))
+        return EX_FAILED
+    return EX_OK
 
 
 def cmd_install(conf, runner, sudo, apply_it):
@@ -700,10 +757,16 @@ def cmd_verify(conf, runner, sudo, now=None):
     if not home or facts is None:
         rows.append(("role-account", se.UNKNOWN, "the role account's files could not be read"))
     else:
-        rows.append(("config", se.ALREADY_DONE if facts.get("config_sha256") ==
-                     sha(config_bytes(conf)) else se.BLOCKED,
-                     "the job's config is the composed one" if facts.get("config_sha256")
-                     == sha(config_bytes(conf)) else "run `install --apply`"))
+        # A file there that could not be read is UNKNOWN, with why: never a state verify
+        # did not see (KIT-262).
+        if facts.get("config_error"):
+            rows.append(("config", se.UNKNOWN, "%s could not be read (%s)"
+                         % (conf["BRIDGE_CONFIG"], facts["config_error"])))
+        else:
+            rows.append(("config", se.ALREADY_DONE if facts.get("config_sha256") ==
+                         sha(config_bytes(conf)) else se.BLOCKED,
+                         "the job's config is the composed one" if facts.get("config_sha256")
+                         == sha(config_bytes(conf)) else "run `install --apply`"))
         names = facts.get("env_names") or []
         missing = [n for n in (conf["SLACK_TOKEN_ENV"], conf["LINEAR_KEY_ENV"]) if n not in names]
         rows.append(("credentials", se.UNKNOWN if facts.get("env_error") else
@@ -742,12 +805,20 @@ def cmd_verify(conf, runner, sudo, now=None):
             pass
         fresh = (age is not None and age <= 3 * int(conf["INTERVAL_SECONDS"]) + 60
                  and beat.get("exit") == 0 and not beat.get("dry"))
-        rows.append(("heartbeat", se.ALREADY_DONE if fresh else
-                     (se.BLOCKED if age is None else se.FAILED),
-                     ("its last pass, %ds ago, exited 0" % age) if fresh else
-                     ("no heartbeat yet" if age is None else
-                      "its last pass was %ss ago with exit %s: %s"
-                      % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
+        beat_path = conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json"
+        # A heartbeat there but unread, unparsed or with no time it was written.
+        if age is None and not facts.get("heartbeat_missing"):
+            rows.append(("heartbeat", se.UNKNOWN, "%s could not be read (%s): the job's log, "
+                         "%s, says what its last pass did"
+                         % (beat_path, facts.get("heartbeat_error")
+                            or "it has no readable `at` time", LOG_NAME)))
+        else:
+            rows.append(("heartbeat", se.ALREADY_DONE if fresh else
+                         (se.BLOCKED if age is None else se.FAILED),
+                         ("its last pass, %ds ago, exited 0" % age) if fresh else
+                         ("no heartbeat yet" if age is None else
+                          "its last pass was %ss ago with exit %s: %s"
+                          % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
         rows.append(pings_row(conf, facts))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
@@ -923,8 +994,24 @@ def selftest():
                                       JOB_LABEL="nope", INTERVAL_SECONDS="5",
                                       CHANNEL_IDS="general"))
         joined = " | ".join(errs)
-        for needle in ("JOB_LABEL", "INTERVAL_SECONDS"):
+        # Every bad value in ONE pass (bridge.conf.example's promise): the job's own config
+        # check runs even when a conf-level check has already failed (KIT-262).
+        for needle in ("JOB_LABEL", "INTERVAL_SECONDS", "config 'channel_ids'", "chat bot"):
             check("conf-names:" + needle, needle in joined, True)
+        # ...and a value both checks refuse is named once, by its conf key.
+        _c, errs = validate_conf(dict(values, CHANNEL_IDS="", EPIC_WIP="two"))
+        check("conf-one-problem-one-line",
+              [len([e for e in errs if word in e.lower()]) for word in ("channel", "epic_wip")],
+              [1, 1])
+        # A NOTIFIER_STATE_DIR refused here is not named again as the job's pings file,
+        # whatever the job's own check makes of it (here: inside a git working tree).
+        with tempfile.TemporaryDirectory() as gtmp:
+            os.makedirs(os.path.join(gtmp, ".git"))
+            _c, errs = validate_conf(dict(values, NOTIFIER_STATE_DIR=gtmp + "/state dir"))
+            check("conf-a-refused-notifier-state-dir-named-once",
+                  ([e.split(" ")[0] for e in errs],
+                   [e for e in validate_conf(dict(values, NOTIFIER_STATE_DIR=gtmp + "/s"))[1]
+                    if "'pings_file'" in e] != []), (["NOTIFIER_STATE_DIR"], True))
         _c, errs = validate_conf(dict(values, SLACK_TOKEN_ENV="SLACK_BOT_TOKEN"))
         check("conf-refuses-the-chat-bots-token-name", any("chat bot" in e for e in errs), True)
         # Each path lands inside the job's shell command, and the account in `sudo -u`: a
@@ -984,6 +1071,13 @@ def selftest():
                        "approve", "one at a time", "needs a decision", "ready to merge",
                        "env.decoy-proof", "sudo -u _exdispatch -H sh -c", "Record"):
             check("live-proofs-card-says:" + needle, needle in _ck4, True)
+        # KIT-262 (review of KIT-227): the ready-to-merge step names the trigger the code
+        # has (Stage E's conclusion, clean or below the threshold, then the move to Needs
+        # Approval), and that a move by hand pages nothing.
+        _ready = [ln for ln in _ck4.splitlines() if "Ready to merge" in ln]
+        check("live-proofs-card-ready-to-merge-says-its-trigger",
+              [n for n in ("below the threshold", "Needs Approval", "by hand pages nothing")
+               if not _ready or n not in _ready[0]], [])
         check("live-proofs-card-never-reads-the-real-env-file",
               ("cat ~/.stage-e/env " not in _ck4 and "read ~/.stage-e/env " not in _ck4
                and "sh -c 'rm ~/.stage-e/env.decoy-proof'" in _ck4), True)
@@ -1000,7 +1094,7 @@ def selftest():
             asked = [a.rstrip(".,") for a in re.findall(r"ask the tech lead to read (\S+)",
                                                          card)]
             check("live-proofs-card-decoy-from-ENV_FILE:" + env,
-                  (verrs, asked, "echo decoy > %s'" % decoy in card,
+                  (verrs, asked[:1], "echo decoy > %s'" % decoy in card,
                    "sh -c 'rm %s'" % decoy in card), ([], [decoy], True, True))
             check("live-proofs-card-says-what-the-decoy-proves:" + env,
                   ("proves %s" % copies in card, "does not test %s" % own in card,
@@ -1013,6 +1107,57 @@ def selftest():
                    for r in (own, copies)], [True, True])
             check("live-proofs-card-names-no-other-env-file:" + env,
                   env == "~/.stage-e/env" or "~/.stage-e/env" not in card, True)
+        # KIT-262 (review of KIT-227): the read step covers EVERY bridge file a session must
+        # not read, each filled from the conf: the env file, its copies beside it, the
+        # backups `token` keeps of it, the config, the state dir and the notifier's pings
+        # file. The tech lead is asked to read decoys only, each made and removed as the
+        # role account. The config and records have no chat-lane rule, and the card says
+        # so (not held, accepted) instead of passing them on trust.
+        for over in ({}, {"ENV_FILE": "/srv/role/bridge.env",
+                          "BRIDGE_CONFIG": "/srv/role/bridge.json",
+                          "STATE_DIR": "/srv/role/state",
+                          "NOTIFIER_STATE_DIR": "/srv/notifier/state"}):
+            vconf, verrs = validate_conf(dict(values, DISPATCHER_ENV_FILE="", **over))
+            card = cap(print_card, "CK-B4", vconf)[1]
+            tag = vconf["ENV_FILE"]
+            backups = os.path.dirname(vconf["ENV_FILE"]) + "/backups"
+            log = os.path.dirname(vconf["BRIDGE_CONFIG"]) + "/bridge.log"
+            decoys = [vconf["ENV_FILE"] + ".decoy-proof", backups + "/decoy-proof",
+                      vconf["STATE_DIR"] + "/decoy-proof"]
+            asked = [a.rstrip(".,") for a in re.findall(r"ask the tech lead to read (\S+)",
+                                                         card)]
+            check("live-proofs-card-names-every-bridge-file:" + tag,
+                  (verrs, [p for p in (vconf["ENV_FILE"], backups, vconf["BRIDGE_CONFIG"],
+                                       log, vconf["STATE_DIR"], pings_file(vconf))
+                           if p not in card]), ([], []))
+            check("live-proofs-card-asks-for-decoys-only:" + tag, asked, decoys)
+            check("live-proofs-card-makes-and-removes-each-decoy:" + tag,
+                  [d for d in decoys if "sudo -u _exdispatch -H sh -c 'echo decoy > %s'" % d
+                   not in card or "sudo -u _exdispatch -H sh -c 'rm %s'" % d not in card], [])
+            rules = chat_lane.user_deny_patterns({"ROLE_ENV_FILE": vconf["ENV_FILE"]})
+            check("live-proofs-card-backups-rule-is-the-chat-lanes:" + tag,
+                  (chat_lane.BACKUPS_DENY_RULE in rules,
+                   "proves %s" % chat_lane.BACKUPS_DENY_RULE in card,
+                   (backups == chat_lane.ROLE_BACKUPS) == ("not %s" % backups not in card)),
+                  (True, True, True))
+            # What the card expects, against the chat lane's own rules (a glob match, as
+            # wide as theirs or wider): the env file's copies are covered, the backups only
+            # where the rule names them, and no rule covers the config or the records. If
+            # one ever does, this goes red and the card's "not held" is due a change.
+            import fnmatch
+
+            def covered(path):
+                return [r for r in rules if r.startswith(("Read(~/", "Read(//")) and
+                        fnmatch.fnmatchcase(path, r[5:-1][1:] if r.startswith("Read(//")
+                                            else r[5:-1])]
+            check("live-proofs-card-expects-what-the-rules-cover:" + tag,
+                  (bool(covered(decoys[0])), bool(covered(decoys[1])),
+                   [p for p in (vconf["BRIDGE_CONFIG"], log, decoys[2], pings_file(vconf))
+                    if covered(p)]),
+                  (True, backups == chat_lane.ROLE_BACKUPS, []))
+            check("live-proofs-card-says-the-records-are-not-held:" + tag,
+                  ("Expected: it is read" in card, "not held" in card, "KIT-162" in card),
+                  (True, True, True))
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
             "PIECE 1", "PIECE 2", "PIECE 3", "ACT=no"))), (EX_OK, True))
@@ -1118,6 +1263,32 @@ def selftest():
             check("no-sudo-declined-token",
                   cap(cmd_token, conf, r, _FakeSudo(ok=False), lambda _p: good, True)[0],
                   EX_NOPRIV)
+            # A writer that fails says why, from its error, never silently (KIT-262). A
+            # directory where the env file should be fails the read even for root.
+            os.makedirs(os.path.join(home, ".stage-e", "env-dir"))
+            rc, out = cap(cmd_token, dict(conf, ENV_FILE="~/.stage-e/env-dir",
+                                          DISPATCHER_ENV_FILE=""), r, _FakeSudo(),
+                          lambda _p: good, True)
+            check("token-writer-failure-says-why",
+                  (rc, "FAILED: the token could not be written into ~/.stage-e/env-dir" in out,
+                   "IsADirectoryError" in out, good in out), (EX_FAILED, True, True, False))
+
+            class _FailingWriter(_RoleRunner):
+                def _exec(self, argv, stdin, timeout, cwd=None):
+                    return se.Result(1, "", "Traceback (most recent call last):\n"
+                                     "ValueError: %s\n" % stdin.strip())
+            rc, out = cap(cmd_token, conf, _FailingWriter(home, root), _FakeSudo(),
+                          lambda _p: good, True)
+            check("token-writer-failure-never-shows-the-token",
+                  (rc, "FAILED: the token could not be written" in out, good in out,
+                   "b" * 30 in out), (EX_FAILED, True, False, False))
+
+            # Before install, a config that is not there yet is a step to take, not a
+            # failed read.
+            rc, out = cap(cmd_verify, conf, _RoleRunner(home, root), _FakeSudo())
+            check("verify-no-config-yet-says-install",
+                  bool(re.search(r"config\s+BLOCKED-ON-HUMAN\s+run `install --apply`", out)),
+                  True)
 
             # install: dry run writes nothing; --apply writes the config and plist and loads
             # nothing; a second run has nothing to do.
@@ -1142,6 +1313,9 @@ def selftest():
             # or failing heartbeat -> failed; a dry run that fails -> failed.
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=False), _FakeSudo())
             check("verify-not-loaded-blocks", (rc, "card CK-B2" in out), (EX_BLOCKED, True))
+            check("verify-no-heartbeat-file-yet-is-said",
+                  bool(re.search(r"heartbeat\s+BLOCKED-ON-HUMAN\s+no heartbeat yet", out)),
+                  True)
             os.makedirs(os.path.join(home, ".stage-e", "state"))
             beat = os.path.join(home, ".stage-e", "state", "bridge-heartbeat.json")
             with open(beat, "w") as fh:
@@ -1204,6 +1378,46 @@ def selftest():
                 now=at + 30)
             check("verify-dry-run-stderr-credential-not-shown", (rc, "q" * 30 in out),
                   (EX_FAILED, False))
+            # A heartbeat or config that is there but cannot be read is UNKNOWN, with why:
+            # never "no heartbeat yet" or "run `install --apply`", a state verify did not
+            # see (KIT-262). A directory in a file's place fails the read even for root.
+            beat_rows = []
+            os.rename(beat, beat + ".kept")
+            for name, body, why in (("unreadable", None, "(IsADirectoryError)"),
+                                    ("corrupt", "{not json", "(JSONDecodeError)"),
+                                    ("not-an-object", "[1]", "(not a JSON object)"),
+                                    ("no-time", '{"exit": 0}',
+                                     "(it has no readable `at` time)")):
+                if body is None:
+                    os.makedirs(beat)
+                else:
+                    with open(beat, "w") as fh:
+                        fh.write(body)
+                rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True),
+                              _FakeSudo(), now=at + 30)
+                row = [ln for ln in out.splitlines() if ln.strip().startswith("heartbeat")]
+                beat_rows.append((name, rc, row and row[0].split()[1],
+                                  bool(row) and "no heartbeat yet" in row[0],
+                                  bool(row) and why in row[0]))
+                (os.rmdir if body is None else os.remove)(beat)
+                if name == "unreadable":
+                    check("verify-unreadable-heartbeat-says-why",
+                          bool(row) and "~/.stage-e/state/bridge-heartbeat.json could not be "
+                          "read (IsADirectoryError)" in row[0], True)
+            os.rename(beat + ".kept", beat)
+            check("verify-a-heartbeat-it-cannot-read-is-unknown", beat_rows,
+                  [(n, EX_UNKNOWN, "UNKNOWN", False, True)
+                   for n in ("unreadable", "corrupt", "not-an-object", "no-time")])
+            cfgp = os.path.join(home, ".stage-e", "bridge.json")
+            os.rename(cfgp, cfgp + ".kept")
+            os.makedirs(cfgp)
+            rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
+                          now=at + 30)
+            os.rmdir(cfgp)
+            os.rename(cfgp + ".kept", cfgp)
+            check("verify-a-config-it-cannot-read-is-unknown",
+                  (rc, bool(re.search(r"config\s+UNKNOWN\s+~/.stage-e/bridge.json could not be "
+                                      r"read \(IsADirectoryError\)", out))), (EX_UNKNOWN, True))
             with open(envp, "w") as fh:
                 fh.write("STAGE_E_LINEAR_API_KEY=x\n")
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),

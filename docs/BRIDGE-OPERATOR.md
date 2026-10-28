@@ -101,6 +101,8 @@ Not that: `REFUSED: that token is already in the env file under …`. You pasted
 token. Copy the bridge app's own.
 Not that: `REFUSED: … is the same file as DISPATCHER_ENV_FILE`. The two settings name one
 file, perhaps through a link. Point `ENV_FILE` at the role account's own env file.
+Not that: `FAILED: the token could not be written into …`. The line ends with the writer's
+own error. A line shaped like a credential is never shown.
 
 ---
 
@@ -156,6 +158,8 @@ python3 scripts/pipeline_bridge_setup.py verify
 
 Good: `Good: the bridge is installed, loaded and passing.` and exit 0.
 Not that: `heartbeat FAILED`. Read the job's log, beside its config (`bridge.log`).
+Not that: `UNKNOWN … could not be read (…)`. The file is there, but `verify` could not read
+it. The row names the file and why. `no heartbeat yet` means the file is not there yet.
 
 **The first pass answers nothing.** It records every message already in the channel as seen,
 so an old request is never answered late.
@@ -326,13 +330,25 @@ each proof with what Good looks like, in the order they become possible:
 python3 scripts/pipeline_bridge_setup.py card CK-B4
 ```
 
-Good: each step held, and its result is a comment on the live-proofs ticket.
+Good: each step held, and its result is a comment on the live-proofs ticket. The one
+exception is the bridge's own files, below: record them as not held.
 Not that: a step taken on trust. Mark it not proven instead, with its ticket.
 
-Two steps check what the chat lane can read, and neither reads the real env file: a read
-that worked would post the token into Slack. The decoy sits beside the env file, so it proves
-only the rule for the file's copies. The env file's own rule is checked by the chat lane's
-`verify`, whose `user-settings` row measures it.
+Four steps check what the chat lane can read, each path filled from `bridge.conf`. None reads
+a real file: a read that worked could post the token into Slack. Each uses a decoy, or reads
+the chat lane's settings.
+
+- **The env file's copies.** A decoy beside the env file is refused. That proves only the
+  rule for the file's copies.
+- **The env file itself.** The chat lane's `verify` checks its rule; its `user-settings` row
+  measures it.
+- **The env file's backups.** `token` keeps whole copies of the env file in a `backups` folder
+  beside it. A decoy there is refused. The chat lane's rule names `~/.stage-e/backups` only,
+  so an `ENV_FILE` elsewhere leaves its backups readable. The card says so.
+- **The bridge's config and records:** its config, its log, its state dir and the
+  notifier's pings file. The chat lane has no rule for them, so a decoy in the state dir is
+  read. They hold no credential. Record them as not held, accepted with KIT-162, never as
+  passed.
 
 ---
 
@@ -391,6 +407,9 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
   questions in the bridge's own records count, an edited question is refused, and a bare
   "yes" after a post the bridge has no record of is refused too. Today no session can write
   the records, which is what keeps them from being forged.
+- **The chat lane can read the bridge's config, log and records.** No deny rule names them.
+  They hold ids, questions, a heartbeat and ping records, and no credential. Card CK-B4
+  checks this with a decoy.
 
 ---
 
