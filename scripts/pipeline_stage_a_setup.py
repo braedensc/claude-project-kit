@@ -3648,6 +3648,11 @@ def listed_tools(text):
 
 TOOL_LISTS = ("session tools", "helper tools")
 _LIST_NAME = {"session tools": "session", "helper tools": "helper"}
+# Why a helper list that DID come back is not counted (KIT-261), as the signed record says it.
+HELPER_NOT_COUNTED = ("helper: not measured (a list came back, but the dispatcher's log shows "
+                      "no helper started, so it was not counted)")
+# Why the log's call evidence is unmeasured although its tool list was read (KIT-261).
+NO_CALL_RECORDS = "the log holds no tool-call records"
 
 
 def judge_tool_lists(sections, measured=None):
@@ -3687,7 +3692,7 @@ def judge_tool_lists(sections, measured=None):
     return ("unread" if unread else "ok"), read, unread
 
 
-def settle_unread_lists(ctx, sections, read, unread, log_why):
+def settle_unread_lists(ctx, sections, read, unread, log_why, not_counted=()):
     """("ok" | "open", the record) once a person has answered for each list nothing
     measured — and ONLY those lists, against the whole keep-set (KIT-208).
 
@@ -3695,7 +3700,11 @@ def settle_unread_lists(ctx, sections, read, unread, log_why):
     MEASURED: nobody can read it, so no answer may stand for it. The session's list
     unmeasured refuses the sign-off outright — a probe that saw nothing of the session's
     tools proves nothing about the fence. The helper's unmeasured is said, and signed
-    only by a person who is told so."""
+    only by a person who is told so.
+
+    `not_counted` names a list that came back but is not counted: the helper's, when the
+    dispatcher's log shows no helper started (KIT-261). Its text is not a person's to vouch
+    for, and the record says a list came back, never that none did."""
     parts = [read] if read else []
     for which in unread:
         name = _LIST_NAME[which]
@@ -3707,6 +3716,17 @@ def settle_unread_lists(ctx, sections, read, unread, log_why):
                 "a probe that saw nothing of the session's tools proves nothing about the "
                 "fence. Make that log readable as the dispatcher's account, then run the "
                 "same command again." % (log_why or "it named no tools"))
+        if which in not_counted:
+            ctx.say("  A helper list came back, yet the log shows no helper session started:")
+            ctx.say("  that list is NOT counted, and the helper's tools were NOT measured.")
+            ctx.say("  That a helper inherits the fence then rests on the runner's source,")
+            ctx.say("  read in the kit, and not on this probe.")
+            if not ctx.confirm("Sign the probe with the helper's tools unmeasured?"):
+                raise SetupError("nothing was signed: a helper list came back, but the "
+                                 "dispatcher's log shows no helper started, so it was not "
+                                 "counted, and you chose not to sign without it")
+            parts.append(HELPER_NOT_COUNTED + ", signed by you knowing it")
+            continue
         if not text:
             ctx.say("  No helper list came back, so the helper's tools were NOT measured.")
             ctx.say("  That a helper inherits the fence then rests on the runner's source,")
@@ -3731,9 +3751,11 @@ def _session_tools_py(logs_root, identifier, read_path=None):
     out of its own session log: `<dispatcher home>/logs/<ticket>/session-*.jsonl`, whose
     SDK `system/init` message names every tool the session was given. It also says, as two
     booleans, whether the session started a helper (a `Task` or `Agent` call) and whether
-    it called `Read` on `read_path` (KIT-215). It prints tool and server NAMES and those two
-    answers only — never a prompt, a message, a call's input or anything else in the log.
-    The ticket id is checked `TEAM-12` before it is joined onto the path."""
+    it called `Read` on `read_path` (KIT-215), and how many tool-call records it could read
+    at all: with none, the two booleans measured nothing (KIT-261). It prints tool and
+    server NAMES, those answers and that count only — never a prompt, a message, a call's
+    input or anything else in the log. The ticket id is checked `TEAM-12` before it is
+    joined onto the path."""
     return (
         "import fnmatch,json,os,sys\n"
         "d=os.path.join(%r,%r)\n"
@@ -3748,6 +3770,7 @@ def _session_tools_py(logs_root, identifier, read_path=None):
         "out=None\n"
         "helper=False\n"
         "read=False\n"
+        "calls=0\n"
         "for p in reversed(fs):\n"
         "  for line in open(p,encoding='utf-8',errors='replace'):\n"
         "    try:\n"
@@ -3766,6 +3789,7 @@ def _session_tools_py(logs_root, identifier, read_path=None):
         "      for b in (m['message'].get('content') or []):\n"
         "        if not isinstance(b,dict) or b.get('type')!='tool_use':\n"
         "          continue\n"
+        "        calls+=1\n"
         "        if b.get('name') in ('Task','Agent'):\n"
         "          helper=True\n"
         "        inp=b.get('input') if isinstance(b.get('input'),dict) else {}\n"
@@ -3774,6 +3798,7 @@ def _session_tools_py(logs_root, identifier, read_path=None):
         "if out:\n"
         "  out['helper_started']=helper\n"
         "  out['read_attempted']=read\n"
+        "  out['tool_calls_seen']=calls\n"
         "print(json.dumps(out or {'error':'no start-up message with a tool list in the log'}))\n"
         % (logs_root, identifier, read_path))
 
@@ -3781,7 +3806,11 @@ def _session_tools_py(logs_root, identifier, read_path=None):
 def session_tools(ctx, identifier, read_path=None):
     """(tools, servers, None, evidence) as the dispatcher's session log recorded them, or
     (None, None, why, None) when it could not be read. `evidence` holds two booleans from
-    the same log: `helper_started` and `read_attempted` (of `read_path`)."""
+    the same log: `helper_started` and `read_attempted` (of `read_path`).
+
+    A log whose tool list was read but which holds NO tool-call record the reader knows is
+    (tools, servers, NO_CALL_RECORDS, None): its "no helper, no read" would be "did not
+    happen" and "cannot tell" at once, so it is not measured, and says why (KIT-261)."""
     if not _PROBE_TICKET_RE.match(identifier or ""):
         return None, None, "not a ticket id", None
     logs = os.path.join(os.path.dirname(ctx.conf["DISPATCHER_CONFIG"]), "logs")
@@ -3796,6 +3825,9 @@ def session_tools(ctx, identifier, read_path=None):
         doc = {"error": "it did not read back"}
     if doc.get("error") or not isinstance(doc.get("tools"), list):
         return None, None, doc.get("error") or "no tool list", None
+    calls = doc.get("tool_calls_seen")
+    if isinstance(calls, bool) or not isinstance(calls, int) or calls < 1:
+        return doc["tools"], doc.get("mcp_servers") or [], NO_CALL_RECORDS, None
     evidence = {"helper_started": doc.get("helper_started") is True,
                 "read_attempted": doc.get("read_attempted") is True}
     return doc["tools"], doc.get("mcp_servers") or [], None, evidence
@@ -3819,8 +3851,8 @@ CANARY_MEANING = {
     "NOT-RETURNED": ("the dispatcher's log shows the planning session tried to read the file, "
                      "and its contents did not come back: the read was refused, or the "
                      "session withheld them. Not proof of a wall."),
-    "NO-ANSWER": ("the dispatcher's log shows no attempt to read the file, or could not be "
-                  "read, so nothing is known."),
+    "NO-ANSWER": ("the dispatcher's log shows no attempt to read the file, holds no "
+                  "tool-call records, or could not be read, so nothing is known."),
 }
 
 
@@ -3901,19 +3933,26 @@ def run_probe(ctx, rows):
             sections = parse_tool_report(body)
             measured, servers, why, evidence = session_tools(ctx, one.get("identifier"),
                                                              canary)
-            if (evidence is not None and not evidence["helper_started"]
-                    and listed_tools(sections.get("helper tools"))):
-                # A helper list with no helper behind it is not a measurement (KIT-215).
-                ctx.say("  %s: the dispatcher's log shows no helper session started, so the "
-                        "helper list in the answer is not counted." % one.get("identifier"))
-                sections["helper tools"] = ""
+            # Every list that came back is judged AS RECEIVED: a fenced name in any of them
+            # refuses below, whatever the log says of a helper (KIT-261).
             verdict, what, unread = judge_tool_lists(sections, measured)
+            not_counted = ()
+            if (verdict != "open" and evidence is not None and not evidence["helper_started"]
+                    and (sections.get("helper tools") or "").strip()):
+                # A helper list with no helper behind it is not a measurement (KIT-215), and
+                # any text counts as a list that came back, not only parsed names (KIT-261).
+                not_counted = ("helper tools",)
+                verdict, what, unread = judge_tool_lists(dict(sections, **{"helper tools": ""}),
+                                                         measured)
             ctx.say("")
             if measured is not None:
                 ctx.say("  %s's session was given, by the dispatcher's own log: %s"
                         % (one.get("identifier"), ", ".join(measured) or "(nothing)"))
                 if servers:
                     ctx.say("  tool servers connected: %s" % ", ".join(servers))
+                if evidence is None:
+                    ctx.say("  %s: %s, so whether a helper started and whether the test "
+                            "file was read were NOT measured." % (one.get("identifier"), why))
             else:
                 ctx.say("  %s: the dispatcher's session log could not be read (%s), so the "
                         "session's own answer is used." % (one.get("identifier"), why))
@@ -3921,7 +3960,9 @@ def run_probe(ctx, rows):
             for line in (body.strip().splitlines() or ["(no answer)"])[:60]:
                 ctx.say("    | " + line)
             if verdict == "unread":
-                verdict, what = settle_unread_lists(ctx, sections, what, unread, why)
+                verdict, what = settle_unread_lists(ctx, sections, what, unread,
+                                                    why if measured is None else None,
+                                                    not_counted)
             if verdict == "open":
                 raise SetupError("the planning session on %s holds a tool the fence should "
                                  "have removed (%s). Nothing was signed, and the job must not "
@@ -3930,6 +3971,8 @@ def run_probe(ctx, rows):
                                  "neither keeps nor fences is one the dispatcher's SDK added: "
                                  "it needs a kit change that fences or keeps it."
                                  % (one.get("identifier"), what))
+            if measured is not None and evidence is None:
+                what += "; helper start and test-file read: not measured (%s)" % why
             canary_seen = judge_canary(body, sections, token,
                                        (evidence or {}).get("read_attempted"))
             results.append((row, one.get("identifier"), what, canary_seen))
@@ -5876,6 +5919,8 @@ def _selftest_one_command(check, tmp):
           ("signed", ["NO-ANSWER"]))
     # KIT-215: a helper list in the answer, when the log shows no helper started, is not
     # counted: the person is asked to sign with the helper unmeasured, and the record says so.
+    # KIT-261: and it says WHY — a list came back and was not counted, never "no helper list
+    # came back", which is a different case.
     got, c = with_log("probe-log-no-helper", ["Read", "Grep", "Glob", "Task"], helper=False,
                       answers=("y", "y", "y", "bc"))
     note = (c.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
@@ -5884,6 +5929,86 @@ def _selftest_one_command(check, tmp):
            any("no helper session started" in ln for ln in c._out),
            [q for q in with_log.asked if "unmeasured" in q]),
           ("signed", True, True, ["Sign the probe with the helper's tools unmeasured? [y/N] "]))
+    check("probe-helper-not-counted-says-a-list-came-back",
+          (HELPER_NOT_COUNTED in note, "no helper list came back" in note,
+           any("A helper list came back" in ln for ln in c._out),
+           any("No helper list came back" in ln for ln in c._out)),
+          (True, False, True, False))
+    # KIT-261: a fenced name in ANY list that came back refuses the probe, whatever the log
+    # says of a helper. Dropping the helper list before judging it turned the refusal into a
+    # yes/no a person could answer wrongly.
+    fenced_helper = PROBE_REPLY_OK.replace("## Helper tools\n1. Read\n2. Grep\n3. Glob\n",
+                                           "## Helper tools\n1. Read\n2. Grep\n"
+                                           "3. mcp__linear__save_issue\n")
+    for name, reply, needle in (
+            ("probe-log-no-helper-fenced-helper", fenced_helper, "mcp__linear__save_issue"),
+            ("probe-log-no-helper-new-tool-in-helper",
+             fenced_helper.replace("mcp__linear__save_issue", "BrandNewTool"), "BrandNewTool")):
+        got, c = with_log(name, ["Read", "Grep", "Glob", "Task"], reply=reply, helper=False,
+                          answers=("y", "y", "y", "bc"))
+        check("probe-fenced-helper-name-refuses-with-no-helper-in-the-log:%s" % name,
+              (needle in got, "fence should have removed" in got, c.state.attested("CA-PROBE"),
+               [q for q in with_log.asked if "unmeasured" in q or "list hold" in q]),
+              (True, True, False, []))
+    # KIT-261: ANY helper text counts as a list that came back, not only parsed names. A prose
+    # helper section with no helper in the log is not counted; nobody vouches for it.
+    prose_helper = PROBE_REPLY_OK.replace(
+        "## Helper tools\n1. Read\n2. Grep\n3. Glob\n",
+        "## Helper tools\nThe helper said it could not list them.\n")
+    got, c = with_log("probe-log-no-helper-prose", ["Read", "Grep", "Glob", "Task"],
+                      reply=prose_helper, helper=False, answers=("y", "y", "y", "bc"))
+    note = (c.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
+    check("probe-prose-helper-with-no-helper-in-the-log-is-not-counted",
+          (got, HELPER_NOT_COUNTED in note, "read by you" in note,
+           [q for q in with_log.asked if "unmeasured" in q or "list hold" in q]),
+          ("signed", True, False, ["Sign the probe with the helper's tools unmeasured? [y/N] "]))
+    got, c = with_log("probe-log-no-helper-prose-no", ["Read", "Grep", "Glob", "Task"],
+                      reply=prose_helper, helper=False, answers=("y", "n"))
+    check("probe-not-counted-helper-and-a-no-signs-nothing",
+          ("not counted" in got, c.state.attested("CA-PROBE")), (True, False))
+    # KIT-261: a log with NO tool-call records cannot say a helper did not start, or a read
+    # was not attempted: that is "not measured", with the reason, never a measured "no".
+    c0, _a = _probe_world(tmp, "probe-log-no-call-records")
+    logs = os.path.join(os.path.dirname(c0.conf["DISPATCHER_CONFIG"]), "logs", "PROD-100")
+    os.makedirs(logs, exist_ok=True)
+    with open(os.path.join(logs, "session-abc.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "sdk-message", "message": {
+            "type": "system", "subtype": "init", "tools": ["Read", "Grep", "Glob", "Task"],
+            "mcp_servers": []}}) + "\n")
+        # A call record in a shape the reader does not know is no record at all, and an
+        # assistant message with only text in it holds no call.
+        fh.write(json.dumps({"type": "sdk-message", "message": {"type": "assistant", "content": [
+            {"type": "tool_use", "id": "tu-1", "name": "Task", "input": {}}]}}) + "\n")
+        fh.write(json.dumps({"type": "sdk-message", "message": {"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "a reply never printed"}]}}}) + "\n")
+    st = session_tools(c0, "PROD-100", "/x")
+    check("session-tools-no-call-records-is-unmeasured",
+          (st[0], st[2], st[3]), (["Read", "Grep", "Glob", "Task"], NO_CALL_RECORDS, None))
+    real_run_python = c0.host.run_python
+    for label, count in (("missing", None), ("not-a-number", True), ("zero", 0)):
+        doc = {"tools": ["Read"], "mcp_servers": [], "helper_started": False,
+               "read_attempted": False}
+        if count is not None:
+            doc["tool_calls_seen"] = count
+        c0.host.run_python = lambda account, program, stdin=None, d=doc: (0, json.dumps(d))
+        check("session-tools-a-reader-count-%s-is-unmeasured" % label,
+              session_tools(c0, "PROD-100", "/x")[2:], (NO_CALL_RECORDS, None))
+    c0.host.run_python = real_run_python
+    try:
+        step_probe(c0, True)
+        got = "signed"
+    except SetupError as exc:
+        got = str(exc)
+    finally:
+        _shutil.rmtree(os.path.dirname(logs), ignore_errors=True)
+    note = (c0.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
+    check("probe-log-without-call-records-is-not-measured",
+          (got, any("no helper session started" in ln for ln in c0._out),
+           any(NO_CALL_RECORDS in ln and "NOT measured" in ln for ln in c0._out),
+           "not measured (%s)" % NO_CALL_RECORDS in note,
+           "helper: 3 tools as it said" in note,
+           list(c0.state.data["notes"].get("probe_canary", {}).values())),
+          ("signed", False, True, True, True, ["NO-ANSWER"]))
     got, c = with_log("probe-log-catches-a-lie", ["Read", "Grep", "mcp__linear__save_issue"])
     check("probe-log-beats-a-clean-self-report",
           ("mcp__linear__save_issue" in got, c.state.attested("CA-PROBE")), (True, False))
@@ -5938,16 +6063,28 @@ def _selftest_one_command(check, tmp):
            list_questions(asked)),
           ("signed", True, True, False,
            ["Sign the probe with the helper's tools unmeasured? [y/N] "]))
+    # KIT-261: no helper text at all keeps its own reason; only a list that came back is
+    # "not counted".
+    check("probe-empty-helper-record-says-none-came-back",
+          ("no helper list came back" in note, HELPER_NOT_COUNTED in note), (True, False))
+    # A start-up list naming no tools, and an answer naming none: the reason is the list,
+    # never the missing call records (KIT-261 keeps that reason out of this refusal).
+    got, c, _asked, _n = logged("probe-refused-log-names-no-tools", [], refusal,
+                                ("y", "y", "y", "bc"))
+    check("probe-empty-start-up-list-refusal-names-the-list",
+          ("(it named no tools)" in got, NO_CALL_RECORDS in got, c.state.attested("CA-PROBE")),
+          (True, False, False))
     got, c, _asked, _n = logged("probe-refused-log-clean-no", ["Read", "Grep"], refusal,
                                 ("y", "n"))
     check("probe-helper-unmeasured-and-a-no-signs-nothing",
           ("helper's tools were not measured" in got, c.state.attested("CA-PROBE")),
           (True, False))
-    prose_helper = PROBE_REPLY_OK.replace(
-        "## Helper tools\n1. Read\n2. Grep\n3. Glob\n",
-        "## Helper tools\nThe helper said it could not list them.\n")
-    got, c, asked, note = logged("probe-helper-prose", ["Read", "Grep", "Glob"], prose_helper,
-                                 ("y", "n", "y", "bc"))
+    # A prose helper list is a person's to read only when the log shows a helper started
+    # (KIT-261); with no helper in the log it is not counted, above.
+    got, c = with_log("probe-helper-prose", ["Read", "Grep", "Glob", "Task"], prose_helper,
+                      answers=("y", "n", "y", "bc"))
+    asked = with_log.asked
+    note = (c.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
     check("probe-asks-only-about-the-unread-list-against-the-whole-keep-set",
           (got, len(list_questions(asked)), "helper list" in "".join(asked),
            "ReportFindings" in "".join(asked), "either list" in "".join(asked),
