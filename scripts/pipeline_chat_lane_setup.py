@@ -168,6 +168,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -712,10 +713,19 @@ TRUST_SCAN_CAP = 1 << 20
 # is longer than any real path, and a cut copy could pass a check the whole entry fails.
 TRUST_PATH_MAX = 4096
 # macOS reaches /etc, /tmp and /var through /private, and the sandbox matches the
-# resolved path, so `/etc/x` and `/private/etc/x` are one file. Its default volume also
-# ignores letter case, so `.Stage-E/ENV` is `.stage-e/env`. A deny is matched against every
-# such spelling.
+# resolved path, so `/etc/x` and `/private/etc/x` are one file. A deny is matched against
+# both spellings.
 FIRMLINKED_TOPS = ("/etc", "/tmp", "/var")
+# The one open with flags the probe may make: read-only and non-blocking, to ask the
+# kernel a file's path. The selftest allows exactly this spelling.
+PROBE_NAMING_OPEN = "os.open(q, os.O_RDONLY | os.O_NONBLOCK)"
+
+
+def _fold(text):
+    """`text` as the Mac's default disk compares names: Unicode caseless matching. So
+    `.Stage-E`, `.\ufb06age-e` (a ligature) and `.\u017ftage-e` (a long s) are all
+    `.stage-e`, and an accented name matches in either of its two encodings."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", text).casefold())
 
 
 def sandbox_trust_files(conf):
@@ -786,16 +796,16 @@ def _path_spellings(path):
 def deny_reopened_by(conf, path, home=None):
     """The deny rule piece 5 composes that allowing `path` would undo, or None. A `~/` rule
     is matched two ways: expanded against `home` when it is known, and by its tail on a
-    folder boundary under any home, so it holds where the account does not exist yet. Every
-    spelling of the path is tried, and letter case is ignored."""
-    for spelled in _path_spellings(path):
+    folder boundary under any home, so it holds where the account does not exist yet. Both
+    sides are folded as the disk compares names, and every spelling of the path is tried."""
+    for spelled in _path_spellings(_fold(path)):
         for rule, pattern, from_home in _placed_denies(conf):
-            if not from_home and re.fullmatch(_deny_regex(pattern), spelled, re.I):
+            if not from_home and re.fullmatch(_deny_regex(_fold(pattern)), spelled):
                 return rule
-            if from_home and home and re.fullmatch(_deny_regex(
-                    os.path.normpath(os.path.join(home, pattern))), spelled, re.I):
+            if from_home and home and re.fullmatch(_deny_regex(_fold(
+                    os.path.normpath(os.path.join(home, pattern)))), spelled):
                 return rule
-            if from_home and re.search("/" + _deny_regex(pattern) + r"\Z", spelled, re.I):
+            if from_home and re.search("/" + _deny_regex(_fold(pattern)) + r"\Z", spelled):
                 return rule
     return None
 
@@ -2155,7 +2165,7 @@ def print_card(cid, conf=None, broken=False):
 # file). Every `open` in it takes one argument: read mode.
 # --------------------------------------------------------------------------- #
 FACTS_PY = r'''
-import hashlib, json, os, pathlib, re, stat, sys
+import fcntl, hashlib, json, os, pathlib, re, stat, sys
 QUOTES = "\"'`"
 
 def raw_of(path):
@@ -2319,13 +2329,30 @@ def trust(entry):
         return {"error": why(exc)}
     return {"bytes": st.st_size, "privateKey": key, "capped": capped}
 
+def on_disk(q):
+    # The path the kernel names a regular file by: every link resolved, and each name as
+    # the disk stores it, whatever case or Unicode spelling the entry used. The file is
+    # opened without blocking and not one byte is read. Elsewhere, or for a file that is
+    # not there, the links alone are resolved.
+    try:
+        if hasattr(fcntl, "F_GETPATH") and stat.S_ISREG(os.stat(q).st_mode):
+            fd = os.open(q, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+            finally:
+                os.close(fd)
+            return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+    except Exception:
+        pass
+    return os.path.realpath(q)
+
 def resolved(paths):
-    # Where each entry resolves through every link in the folders above it, as the role
-    # account sees them, when that differs from the entry: verify checks it against the
-    # denies too. A path, never a byte of the file.
+    # Where each entry is on disk, as the role account sees it, when that differs from the
+    # entry: verify and merge check it against the denies too. A path, never a byte of
+    # the file.
     out = {}
     for p in paths:
-        real = os.path.realpath(sandbox_path(p))
+        real = on_disk(sandbox_path(p))
         if real != sandbox_path(p):
             out[p] = real
     return out
@@ -5611,8 +5638,15 @@ def _selftest_body():
         for sentinel in SENTINELS:
             expect("no-value-in-output:" + sentinel[:20], sentinel not in joined,
                    "a value reached the output")
-        expect("probe-open-read-only", not re.search(r"open\([^)]*,", FACTS_PY),
+        # One open with flags is allowed, spelled exactly: on_disk's read-only,
+        # non-blocking open, which names the file and reads nothing.
+        others = FACTS_PY.replace(PROBE_NAMING_OPEN, "")
+        expect("probe-open-read-only", not re.search(r"open\([^)]*,", others),
                "the probe opens a file with a mode")
+        writable = FACTS_PY.replace("os.O_RDONLY | os.O_NONBLOCK",
+                                    "os.O_RDWR | os.O_NONBLOCK")
+        expect("probe-open-read-only-catches-a-writable-open", re.search(
+            r"open\([^)]*,", writable.replace(PROBE_NAMING_OPEN, "")), "a mutant passed")
 
     # -- the fake runner survives the Runner it subclasses growing a cwd argument.
     # A sibling pull request adds cwd to Stage E's Runner.read/_exec, and read() forwards
@@ -7617,7 +7651,15 @@ def _selftest_kit257(expect, conf):
             ("denied-role-env-through-private", "/private/etc/stage-e/role.env",
              "piece 5 denies", "ROLE_ENV_FILE=/etc/stage-e/role.env\n"),
             ("denied-role-env-without-private", "/etc/stage-e/role.env", "piece 5 denies",
-             "ROLE_ENV_FILE=/private/etc/stage-e/role.env\n")):
+             "ROLE_ENV_FILE=/private/etc/stage-e/role.env\n"),
+            ("denied-config-ligature", "/opt/example-dispatcher/con\ufb01g.json",
+             "piece 5 denies", ""),
+            ("denied-role-env-decomposed", "/srv/cafe\u0301/env", "piece 5 denies",
+             "ROLE_ENV_FILE=/srv/caf\u00e9/env\n"),
+            ("denied-role-env-composed", "/srv/caf\u00e9/env", "piece 5 denies",
+             "ROLE_ENV_FILE=/srv/cafe\u0301/env\n"),
+            ("denied-role-env-sharp-s", "/srv/stra\u00dfe/env", "piece 5 denies",
+             "ROLE_ENV_FILE=/srv/strasse/env\n")):
         def refused(entry=entry, needle=needle, extra=extra):
             _got, errs = conf_errors(entry, extra)
             hits = [e for e in errs if repr(entry) in e and needle in e]
@@ -7658,6 +7700,14 @@ def _selftest_kit257(expect, conf):
             ("role-env-in-its-home-any-case", "/SRV/role-homes/_exdispatch/.stage-e/Env",
              "/srv/role-homes/_exdispatch", ""),
             ("role-backup-any-case", role_dir + "/BACKUPS/settings.json", None, ""),
+            ("role-env-ligature", "/srv/role-homes/_exdispatch/.\ufb06age-e/env", None, ""),
+            ("role-env-long-s", "/srv/role-homes/_exdispatch/.\u017ftage-e/env", None, ""),
+            ("role-env-ligature-in-its-home",
+             "/srv/role-homes/_exdispatch/.\ufb05age-e/env", "/srv/role-homes/_exdispatch", ""),
+            ("role-env-configured-in-capitals", "/srv/role-homes/_exdispatch/.stage-e/env",
+             None, "ROLE_ENV_FILE=~/.Stage-E/ENV\n"),
+            ("role-env-configured-composed", "/srv/role-homes/_exdispatch/cafe\u0301/env",
+             None, "ROLE_ENV_FILE=~/caf\u00e9/env\n"),
             ("role-env-only-from-the-account-home-any-case",
              "/srv/role-homes/_Shared/.stage-e/ENV", "/srv/role-homes/_exdispatch",
              "ROLE_ENV_FILE=~/../_shared/.stage-e/env\n")):
@@ -8018,6 +8068,12 @@ def _selftest_kit257(expect, conf):
                     tmp, "role-home", ".Stage-E", "ENV")),
                 setup=role_env_on_disk)
 
+    verify_case("failed-on-the-role-env-file-spelled-with-a-ligature", FAILED,
+                "re-opens what piece 5 denies with Read(~/.stage-e/env)",
+                allow(this, lambda tmp, cert: os.path.join(
+                    tmp, "role-home", ".\ufb06age-e", "env")),
+                setup=role_env_on_disk)
+
     def linked_folder(tmp, c, cert):
         role_env_on_disk(tmp, c, cert)
         os.symlink(os.path.join(tmp, "role-home", ".stage-e"),
@@ -8081,6 +8137,23 @@ def _selftest_kit257(expect, conf):
                     and all(isinstance(v, (bool, int)) for v in seen.values())
                     and "BEGIN" not in json.dumps(facts)), facts
     case("probe-reports-booleans-and-counts-only", probe_counts_only)
+
+    def probe_names_the_on_disk_spelling():
+        # Where the kernel can name a file (macOS) and the disk ignores case, the probe
+        # reports the stored spelling of an entry written in another case.
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            odd = os.path.join(tmp, "CERTS", "EGRESS-CA.CRT")
+            if not (hasattr(fcntl, "F_GETPATH") and os.path.exists(odd)):
+                return True, "this disk cannot show it"
+            _put(spath, denies(c, {"filesystem": {"allowRead": [cert, odd]}}))
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+            real = ((facts or {}).get("userSettings") or {}).get("trustReal") or {}
+            got = real.get(odd) or ""
+            return got.endswith("/certs/egress-ca.crt"), real
+    case("probe-names-a-trust-file-by-its-on-disk-spelling",
+         probe_names_the_on_disk_spelling)
 
     def checks_has_row():
         return "trust-files" in CHECKS, CHECKS
