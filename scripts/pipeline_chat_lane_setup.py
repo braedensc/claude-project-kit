@@ -2314,32 +2314,42 @@ def open_regular(q):
     return None
 
 CERT_LINE = re.compile(rb"^[A-Za-z0-9+/=]+$")
+CERT_LABELS = (b"CERTIFICATE", b"TRUSTED CERTIFICATE", b"X509 CERTIFICATE")
 
 def cert_shape(raw):
     # How many certificate blocks the bytes hold, and how many other non-blank lines:
-    # outside a block, or inside one but not base64. Counts only.
+    # outside a block, or inside one but not base64. A block ends with its own label.
+    # A UTF-8 byte-order mark at the start is not a line. Counts only.
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
     blocks = other = 0
-    inside = False
+    label = None
     for line in raw.splitlines():
         s = line.strip()
-        if s == b"-----BEGIN CERTIFICATE-----" and not inside:
-            inside = True
-        elif s == b"-----END CERTIFICATE-----" and inside:
-            inside, blocks = False, blocks + 1
-        elif s and not (inside and CERT_LINE.match(s)):
+        begins = [x for x in CERT_LABELS if s == b"-----BEGIN " + x + b"-----"]
+        if begins and label is None:
+            label = begins[0]
+        elif label is not None and s == b"-----END " + label + b"-----":
+            label, blocks = None, blocks + 1
+        elif s and not (label is not None and CERT_LINE.match(s)):
             other += 1
-    return blocks, other + (1 if inside else 0)
+    return blocks, other + (1 if label is not None else 0)
 
 def writable_by_me(q):
-    # Whether this account can change the file or any folder above it. A yes or no.
-    d = q
-    while True:
-        if os.access(d, os.W_OK):
-            return True
-        up = os.path.dirname(d)
-        if up == d:
-            return False
-        d = up
+    # Whether this account can change the file or any folder above it, along the path the
+    # file really has: it can write one, or it owns one, and an owner can always make it
+    # writable. A yes or no, and yes when it cannot tell: this only adds a line.
+    try:
+        d = os.path.realpath(q)
+        while True:
+            if os.access(d, os.W_OK) or os.stat(d).st_uid == os.getuid():
+                return True
+            up = os.path.dirname(d)
+            if up == d:
+                return False
+            d = up
+    except OSError:
+        return True
 
 def trust(entry):
     # Booleans and counts only, never a byte of the file. A link is not followed. Only a
@@ -3085,7 +3095,10 @@ def check_trust_files(conf, us, env_facts):
                               "link, a hard link, a pipe or device, a file holding a "
                               "private key or anything else, or a file piece 5 denies. Fix "
                               "SANDBOX_TRUST_FILES or the allowRead list in %s by hand"
-                              % path])
+                              % path,
+                              "to keep only a file's certificates, list a clean copy: "
+                              "sed -n '/-----BEGIN CERTIFICATE-----/,"
+                              "/-----END CERTIFICATE-----/p' <file> > <clean file>"])
     unread = sorted(p for p, f in trust.items() if (f or {}).get("error") not in (None,
                                                                                   "missing"))
     if unread:
@@ -4112,6 +4125,10 @@ def merge_plan(conf, facts):
         have, seen = us.get("allowRead") or [], us.get("trust") or {}
         for entry in [p for p in listed if p not in have]:
             unsafe = _trust_unsafe(seen.get(entry))
+            error = (seen.get(entry) or {}).get("error")
+            if not unsafe and error not in (None, "missing"):
+                unsafe = ("could not be read as the role account (%s), so it was not "
+                          "checked" % error)
             reopens = _trust_reopens(conf, entry, us.get("home"), us.get("trustReal"))
             if reopens:
                 unsafe = "re-opens what piece 5 denies with %s" % reopens
@@ -8068,6 +8085,21 @@ def _selftest_kit257(expect, conf):
                     and _read(spath) == text and SENTINELS[2] not in out), (rc, out[-500:])
     case("merge-holds-back-a-hard-link-to-the-role-env-file", merge_holds_back_a_hard_link)
 
+    if os.geteuid() != 0:
+        def merge_holds_back_an_unread_file():
+            with tempfile.TemporaryDirectory() as tmp:
+                c, home, spath, cert = fixture(tmp)
+                os.chmod(cert, 0)
+                _put(spath, denies(c))
+                facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+                plan, _ops, _deny, allow_add = merge_plan(c, facts)
+                own = [line for line in plan
+                       if line.startswith("CANNOT") and "trust file" in line]
+                return (not allow_add and len(own) == 1
+                        and "could not be read as the role account" in own[0]), plan
+        case("merge-holds-back-a-trust-file-it-could-not-read",
+             merge_holds_back_an_unread_file)
+
     def merge_line_names_the_denied_file():
         # merge's own CANNOT line names the deny first, even when the file also fails
         # on its shape (the verify row it prints after would name it either way).
@@ -8219,6 +8251,18 @@ def _selftest_kit257(expect, conf):
                 cert_text=_FAKE_CERT.replace("\n", "\r\n"))
     verify_case("clean-with-spaces-around-the-lines", ALREADY_DONE, "exact file",
                 allow(this), cert_text=_FAKE_CERT.replace("\n", "  \n"))
+    verify_case("clean-with-a-byte-order-mark", ALREADY_DONE, "exact file", allow(this),
+                cert_text="\ufeff" + _FAKE_CERT)
+    verify_case("clean-with-a-trusted-certificate-label", ALREADY_DONE, "exact file",
+                allow(this),
+                cert_text=_FAKE_CERT.replace("CERTIFICATE", "TRUSTED CERTIFICATE"))
+    verify_case("failed-on-a-block-ended-by-another-label", FAILED,
+                "holds no certificate block", allow(this),
+                cert_text=_FAKE_CERT.replace("BEGIN CERTIFICATE",
+                                             "BEGIN TRUSTED CERTIFICATE"))
+    verify_case("failed-names-the-clean-copy-command", FAILED,
+                "to keep only a file's certificates, list a clean copy", allow(this),
+                cert_text=_FAKE_CERT + "subject=CN=example\n")
     verify_case("clean-says-the-role-account-could-replace-it", ALREADY_DONE,
                 "could replace it after this check", allow(this))
 

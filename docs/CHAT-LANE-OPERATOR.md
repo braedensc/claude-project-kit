@@ -401,6 +401,13 @@ as stored, with every folder link resolved. A file whose real path is a denied f
 refused. `verify` reads each trust file as the role account, only if it is a regular file
 and only its first 1 MiB, and reports yes, no and counts, never what is in it.
 
+Some tools write text beside the certificate, such as `subject=` lines or a title. Such a
+file is refused. List a clean copy that keeps only the certificate blocks:
+
+```sh
+sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' <file> > <clean file>
+```
+
 A check is true when it runs. If the role account can change a trust file or a folder
 above it, a process of that account could swap the file afterwards, and `verify` says so
 in a line. Keep trust files where only root or your own account can write, when you can.
