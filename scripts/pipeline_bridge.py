@@ -126,6 +126,9 @@ SAYS WHICH NOTHING IT DID (contract §13)
   Every request that reads the tracker counts against `max_questions_per_hour`, whether
   the ticket is found or not: the key is the owner's, shared with Stage E. Past the limit a
   request is refused without a read, and that is said at most once an hour per channel.
+  The reads an answer makes before it acts are not counted there: they come only after
+  `max_actions_per_hour` allows the act, for one answer per open question, so
+  `max_open_questions` bounds them too. The session listing is read at most once a pass.
 
 WHAT IT NEVER DOES
 
@@ -518,7 +521,8 @@ def write_heartbeat(cfg, result, now_iso):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# Transports — Slack and the tracker. READS, plus one Slack post. No tracker write.
+# Transports — Slack and the tracker. Reads, one Slack post, and the three tracker writes
+# the selftest pins (a move, a hand-over and a comment), made only with `act` on.
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
@@ -712,18 +716,24 @@ class TrackerClient(object):
         return self._query(query, variables) or {}
 
     def live_work(self, issue_id):
-        """Why the ticket is live work, by the planner's own rules, or []."""
-        return poller.live_work_reasons(self.linear, issue_id, poller.SessionIndex(self.linear))
+        """Why the ticket is live work, by the planner's own rules, or []. The session
+        listing is this pass's own, read once: a yes is always handled a pass after its
+        question, and each pass makes a new client."""
+        return poller.live_work_reasons(self.linear, issue_id, self.session_index())
 
     def epic(self, identifier):
         data = self._query(Q_EPIC, {"id": identifier})
         return (data or {}).get("issue")
 
-    def sessions_on(self, issue_id):
-        """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
+    def session_index(self):
+        """The workspace's recent agent sessions, read once a pass."""
         if self._sessions is None:
             self._sessions = poller.SessionIndex(self.linear)
-        return self._sessions.on_issue(issue_id)
+        return self._sessions
+
+    def sessions_on(self, issue_id):
+        """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
+        return self.session_index().on_issue(issue_id)
 
     def agent_user(self, name):
         """(user id, None), or (None, why) unless exactly one active app user has that
@@ -889,7 +899,7 @@ def question_text(issue, requester, cfg, now, by_bot=False):
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = ("the bridge moves it to %s for you" % cfg["plan_it_state"] if cfg["act"] else
-            "the bridge records it; this version moves nothing yet")
+            "the bridge records it; acting is switched off here, so nothing moves")
     return ("*Plan this?* %s “%s”: in %s on %s, filed by %s.\n"
             "Reply `yes` in this thread within %d hours, and %s. Reply `no` to drop it. "
             "(Asked for by %s.)"
@@ -2429,7 +2439,7 @@ def selftest():
         run(cfg, slack, tracker)
         check("request-handled-once", len(slack.posts), 1)
 
-        # 2. A VERIFIED MEMBER'S YES confirms — and in this version changes nothing.
+        # 2. A VERIFIED MEMBER'S YES confirms — and with acting off changes nothing.
         slack.add(BOB, "Yes.", thread=req)
         code, out = run(cfg, slack, tracker)
         check("yes-confirms", (code, "Confirmed by <@%s>" % BOB in posted(slack)[-1],
@@ -2785,10 +2795,12 @@ def selftest():
         run(c, s, t)
         check("a-yes-to-a-closed-question-is-answered", "no open question" in posted(s)[-1],
               True)
-        # The question says what this version does.
-        check("question-says-this-version-moves-nothing",
-              "this version moves nothing yet" in question_text(
-                  FakeTracker().issues["PROD-5"], ALICE, cfg_for("q"), now), True)
+        # With acting off, the question says nothing moves, in the approve question's words
+        # (KIT-262): this version can act, so "moves nothing yet" was wrong.
+        _q = question_text(FakeTracker().issues["PROD-5"], ALICE, cfg_for("q"), now)
+        check("question-says-acting-is-switched-off",
+              ("acting is switched off here, so nothing moves" in _q, "this version" in _q),
+              (True, False))
         # The tracker's error STATUS with a not-found body is "not found", not a stall.
         import io as _io
 
@@ -2876,10 +2888,20 @@ def selftest():
             check("wiring-the-delegation-carries-delegateId-only",
                   [v for op, v in sent if op == "BridgeDelegate"],
                   [{"id": "u", "delegateId": "agent-1"}])
+            # One client a pass: the session listing is paged once, however many tickets
+            # are checked, by live_work or sessions_on (KIT-262).
+            once = TrackerClient("k")
             before = [op for op, _v in sent].count("PlanSessions")
             check("wiring-sessions-read-once-per-pass",
-                  (tc.sessions_on("u"), tc.sessions_on("v"),
+                  (once.sessions_on("u"), once.sessions_on("v"),
                    [op for op, _v in sent].count("PlanSessions") - before), ([], [], 1))
+            once = TrackerClient("k")
+            before = [op for op, _v in sent].count("PlanSessions")
+            once.live_work("u")
+            once.live_work("v")
+            once.sessions_on("w")
+            check("wiring-live-work-reads-the-sessions-once-per-pass",
+                  [op for op, _v in sent].count("PlanSessions") - before, 1)
             tc.move("u", "st-plan-it")
             tc.comment("u", "who said yes")
             check("wiring-the-move-carries-stateId-only",
@@ -3273,6 +3295,39 @@ def selftest():
         s.add(GUEST, "yes", thread=root)
         run(c, s, t)
         check("a-guest-yes-moves-nothing-with-acting-on", t.moves, [])
+        # REVIEW OF KIT-222 (KIT-262): every other no-op case, with acting on too. Each
+        # refusal runs before the act, so a later edit that moved the act above one of
+        # them would write as the owner; each case here goes red if that happened.
+        def noop_with_acting_on(name, then, answer_at=None):
+            c, s, t = world("act-noop-" + name, act=True,
+                            **({"question_ttl_hours": 1} if answer_at else {}))
+            run(c, s, t)
+            root = s.add(ALICE, "plan PROD-5")
+            run(c, s, t)
+            then(s, root)
+            run(c, s, t, at=answer_at)
+            return (t.moves, t.comments, t.delegations), status_of(c), posted(s)[-1]
+
+        def edit_the_question(s, _root):
+            for m in s.messages:
+                if m.get("user") == ME and "Plan this?" in m.get("text", ""):
+                    m["edited"] = {"user": ME, "ts": "1"}
+        for name, then, answer_at, want_status, said in (
+                ("expired", lambda s, root: s.add(BOB, "yes", thread=root, at=now + 2 * 3600),
+                 now + 2 * 3600 + 60, EXPIRED, "has expired"),
+                ("bot-post", lambda s, root: s.add(BOB, "yes", thread=root,
+                                                   bot_id="B0OTHER001"),
+                 None, OPEN, "bot post"),
+                ("look-alike", lambda s, root: (
+                    s.add(CHATBOT, "*Plan this?* PROD-5 Something else. Reply yes.",
+                          thread=root, bot_id="B0CHATBOT1"),
+                    s.add(BOB, "yes", thread=root)), None, OPEN, "Reply `yes PROD-5`"),
+                ("edited-question", lambda s, root: (edit_the_question(s, root),
+                                                     s.add(BOB, "yes", thread=root)),
+                 None, EXPIRED, "was changed")):
+            writes, sts, last = noop_with_acting_on(name, then, answer_at)
+            check("a-yes-moves-nothing-with-acting-on:" + name,
+                  (writes, sts, said in last), (([], [], []), [want_status], True))
 
         # REVIEW OF KIT-222, 1: a yes moves only the ticket the member was shown. The question
         # records its title, text, team, labels and state; a yes after any of them changed
