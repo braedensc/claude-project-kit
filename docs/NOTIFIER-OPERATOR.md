@@ -565,9 +565,15 @@ share. It stops there, before it changes anything: run the two again in the orde
   (KIT-162). A dispatched session commenting in the ordinary way writes as the dispatcher's
   own account, so it cannot forge the mark. A forged mark applies no label: it costs one
   ping. The `agent:*` marks are already accepted from anyone. (KIT-156) The same holds for
-  `BOUNCE_ACTOR_IDS=self` and the ready-to-merge mark: a forged one costs one ping that
-  links at most a pull request. (KIT-225) And for `FINDING_ACTOR_IDS=self` and the
-  finding-filed mark: a forged one costs one ping that links a ticket. (KIT-243)
+  `FINDING_ACTOR_IDS=self` and the finding-filed mark: a forged one costs one ping that
+  links a ticket. (KIT-243)
+- **A forged ready-to-merge mark asks you to merge.** `BOUNCE_ACTOR_IDS=self` has the same
+  gap: anything holding that key can write the mark. Its ping says a pull request is ready
+  to merge. The comment says its checks passed and its review came back clean. Stage E may
+  never have concluded that pull request. So before you merge on that page, open the pull
+  request. Read Stage E's review comment and the checks there: no tracker key can write
+  those. The ticket's move to the needs-approval lane is a weaker sign, because that key can
+  move a ticket too. The page itself merges nothing. (KIT-225, KIT-263)
 - **That a live ready-to-merge comment pages and links the pull request.** The selftests
   drive both ends; no live conclusion has yet. (KIT-227)
 - **Whether every comment posted with that key starts with its writer's own text.** The
