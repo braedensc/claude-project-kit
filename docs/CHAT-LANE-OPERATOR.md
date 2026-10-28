@@ -384,7 +384,7 @@ The conf refuses an entry that is not one exact file: a relative path, a glob
 file. It also refuses a file piece 5 denies: the dispatcher's config and env file, and the
 role account's env file, its temp copies and anything in its backups folder. Those are
 caught written as the role account's own path, such as
-`/Users/_exdispatch/.stage-e/env`, and under any home, so the check holds before the
+`<role home>/.stage-e/env`, and under any home, so the check holds before the
 account exists. It names every bad entry at once. `merge` will not add a file that is a
 symbolic link, a folder, a pipe or device, one of those denied files, holds the text
 `PRIVATE KEY`, or is larger than 1 MiB. `verify` reads each trust file as the role account,

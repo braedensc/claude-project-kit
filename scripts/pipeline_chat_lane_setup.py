@@ -7585,15 +7585,15 @@ def _selftest_kit257(expect, conf):
         finally:
             globals()["role_home"] = saved
 
-    role_dir = "/Users/_exdispatch/.stage-e"
+    role_dir = "/srv/role-homes/_exdispatch/.stage-e"
     for label, entry, home, extra in (
             ("role-env-no-account", role_dir + "/env", None, ""),
             ("role-env-any-home", "/var/empty/elsewhere/.stage-e/env", None, ""),
-            ("role-env-in-its-home", role_dir + "/env", "/Users/_exdispatch", ""),
+            ("role-env-in-its-home", role_dir + "/env", "/srv/role-homes/_exdispatch", ""),
             ("role-env-copy", role_dir + "/env.notifier-setup.4242", None, ""),
             ("role-backup", role_dir + "/backups/settings.json.20261010T000000Z", None, ""),
-            ("role-env-only-from-the-account-home", "/Users/_shared/.stage-e/env",
-             "/Users/_exdispatch", "ROLE_ENV_FILE=~/../_shared/.stage-e/env\n"),
+            ("role-env-only-from-the-account-home", "/srv/role-homes/_shared/.stage-e/env",
+             "/srv/role-homes/_exdispatch", "ROLE_ENV_FILE=~/../_shared/.stage-e/env\n"),
             ("absolute-role-env-copy", "/srv/example/role/env.stage-e-setup.7", None,
              role_abs)):
         def refused_home(entry=entry, home=home, extra=extra):
@@ -7606,7 +7606,7 @@ def _selftest_kit257(expect, conf):
         # Only LIKE the role env file, its copies or its backups folder: not them.
         want = ["/opt/example.stage-e/env", role_dir + "/env-ca.crt",
                 role_dir + "/backups-ca.crt"]
-        got, errs = with_role_home("/Users/_exdispatch",
+        got, errs = with_role_home("/srv/role-homes/_exdispatch",
                                    lambda: conf_errors(",".join(want)))
         return not errs and sandbox_trust_files(got) == want, errs
     case("conf-accepts-names-beside-the-role-files", accepts_beside_the_role_files)
