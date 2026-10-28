@@ -16,7 +16,7 @@ WHAT THIS IS, AND WHY IT EXISTS (KIT-47)
     1. checks the dispatcher answers locally and the public front door answers, and posts
        nothing while either is down (a re-prompt then would travel a dead route). It still
        looks, so what it reports does not vanish while the route is down, and a route that
-       stays down for HELD_ALERT_PASSES passes in a row pages: a wrong URL looks the same;
+       stays down for HELD_ALERT_AWAKE_SECONDS of awake time pages: a wrong URL looks the same;
     2. asks Linear whether the dispatcher's webhook is still enabled, and says so loudly
        when it is not — that is the failure that silently ends everything;
     3. finds agent sessions where a person delegated or prompted the dispatcher and the
@@ -62,8 +62,8 @@ DEDUP: THE LEDGER IS THE RECORD, AND THE THREAD IS THE BACKSTOP
   it. Before any post the thread is read for this job's receipt line, written by this key's own
   user, so a post that landed but lost its answer — or a ledger that was lost — is never made
   twice. A corrupt ledger refuses the run, and one pass runs at a time. A session whose reply
-  fails stays owed, fails the pass loudly, and goes to the back of the line: it never blocks
-  the others. At most `max_per_pass` re-prompts per pass, `spacing_seconds` apart: each one starts a
+  fails stays owed and goes to the back of the line, so it never blocks the others; it is named
+  once (`unsent-<ticket>`, no page) and pages from its second failure, until it lands. At most `max_per_pass` re-prompts per pass, `spacing_seconds` apart: each one starts a
   dispatcher session whose setup runs a blocking `git fetch`, which can push other webhook
   acknowledgements past Linear's 5-second budget. Over the cap is LEFT for the next pass and
   named, never dropped (§13).
@@ -83,7 +83,8 @@ Usage:
 Exit: 0 = the pass ran (it may have re-prompted nothing), or it held because the dispatcher or
       the front door did not answer; 3 = it ran and found something only a person can fix (a
       disabled webhook, a session still silent after its re-prompt, a session read cut short,
-      a route down for many passes); 1 = the pass could not complete, or a reply failed;
+      a route down for two awake hours, a reply that failed twice); 1 = the pass could not
+      complete (the session read failed, a crash, an unusable state directory, a busy lock);
       2 = usage (bad arguments, config or credential); 4 = the wall clock ran out.
 """
 import argparse
@@ -832,7 +833,10 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     # tracker no longer has is let go; one it could not read is carried.
     unseen = [sid for sid, e in ledger.items()
               if e.get("state") in ("owed", "posted", "stuck") and sid not in seen]
-    unread = []
+    # Least recently re-read first, so the cap rotates through every watched session instead
+    # of re-reading the same few on every pass.
+    unseen.sort(key=lambda sid: (str((ledger.get(sid) or {}).get("reread_at") or ""), sid))
+    unread, reread_ids = [], set()
     for sid in unseen[:MAX_REREADS]:
         check_clock()
         try:
@@ -850,7 +854,12 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
             continue
         sessions.append(node)
         seen.add(sid)
+        reread_ids.add(sid)
         counts["reread"] += 1
+        if not dry_run:
+            ledger[sid] = dict(ledger.get(sid) or {}, reread_at=_iso(now))
+    if reread_ids and not dry_run:
+        save_ledger(path, ledger)
     unread.extend(unseen[MAX_REREADS:])
     if unread:
         findings.append({"kind": "reread", "state": UNKNOWN,
@@ -945,6 +954,21 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
         hold = "the session read was cut short, so a newer session on the same ticket may be unread"
     else:
         hold = None
+    if not hold and more and any(c[0].get("id") in reread_ids for c in candidates):
+        # A candidate found only by its id, on a cut read, is older than the cut: a newer
+        # session on its ticket may be among the unread pages, so it waits for a whole read.
+        late = [c for c in candidates if c[0].get("id") in reread_ids]
+        candidates = [c for c in candidates if c[0].get("id") not in reread_ids]
+        log("HOLDING %d re-prompt(s) found by id on a cut read: %s" % (
+            len(late), ", ".join((c[0].get("issue") or {}).get("identifier") or "?" for c in late)))
+        if not dry_run:
+            for node, _reason in late:
+                sid = node.get("id")
+                if (ledger.get(sid) or {}).get("state") != "owed":
+                    ledger[sid] = dict(ledger.get(sid) or {}, state="owed", held=True,
+                                       issue=(node.get("issue") or {}).get("identifier"))
+            save_ledger(path, ledger)
+        counts["carried"] += len(late)
     if hold:
         if candidates:
             log("HOLDING %d re-prompt(s) (%s): %s" % (
@@ -959,13 +983,13 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
                         ledger[sid] = {"state": "owed", "held": True, "at": _iso(now),
                                        "issue": (node.get("issue") or {}).get("identifier")}
                 save_ledger(path, ledger)
-        counts["carried"] = len(candidates)
+        counts["carried"] += len(candidates)
         candidates = []
 
     sent, posts = 0, 0
     for i, (node, reason) in enumerate(candidates):
         if posts >= cfg["max_per_pass"]:
-            counts["carried"] = len(candidates) - i
+            counts["carried"] += len(candidates) - i
             log("LEFT for the next pass (over max_per_pass %d): %s" % (
                 cfg["max_per_pass"], ", ".join((c[0].get("issue") or {}).get("identifier") or "?"
                                                for c in candidates[i:])))
@@ -979,18 +1003,19 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
         def note_failure(why_):
             log("FAILED %s: %s" % (ident, why_))
             counts["failed"] += 1
+            prior = ledger.get(sid) or {}
+            tries = int(prior.get("failures") or 0) + 1
             if not dry_run:
-                prior = ledger.get(sid) or {}
                 ledger[sid] = {"state": "owed", "issue": ident, "at": prior.get("at") or _iso(now),
-                               "failures": int(prior.get("failures") or 0) + 1,
-                               "last_error": why_[:240]}
+                               "failures": tries, "last_error": why_[:240]}
                 save_ledger(path, ledger)
-                tries = ledger[sid]["failures"]
-                kind = ticket_kind("unsent", node)
-                findings[:] = [f for f in findings if f["kind"] != kind]
-                findings.append({"kind": kind, "state": FIRING if tries >= 2 else UNKNOWN,
-                                 "summary": "%s: its reply has failed %d time(s); the last: %s"
-                                            % (ident, tries, why_[:240])})
+            # Reported in a dry run too: a rehearsal that could not read a thread must not
+            # read as fine, or the installer would install a job whose every reply fails.
+            kind = ticket_kind("unsent", node)
+            findings[:] = [f for f in findings if f["kind"] != kind]
+            findings.append({"kind": kind, "state": FIRING if tries >= 2 else UNKNOWN,
+                             "summary": "%s: its reply has failed %d time(s); the last: %s"
+                                        % (ident, tries, why_[:240])})
 
         try:
             thread = gql(Q_THREAD, {"id": root})
@@ -1596,6 +1621,43 @@ def selftest():
                  get=up, now=NOW)
         check("…and so is one answered and older than the lookback",
               load_ledger(ledger_path(cans["state_dir"])), {})
+
+        # -- a candidate found only by id on a cut read waits (review of #206) ------------
+        ccr = cfg(_dir="cut-reread", max_pages=2)
+        save_ledger(ledger_path(ccr["state_dir"]), {"s1old": {"state": "owed", "held": True,
+                                                              "issue": "KIT-9", "at": _iso(NOW)}})
+        newer = on_issue("s2new", 10, "i-X", acts=("AgentActivityResponseContent",))
+        older = on_issue("s1old", 20, "i-X")
+        fake = FakeLinear(None, pages=[[old("p1", 0.1)], [old("p2", 0.2)], [newer], [older]])
+        _c, _r, _f, countsCR = run_pass(ccr, "k", gql=fake, get=up, now=NOW)
+        check("on a cut read, a candidate found only by its id is held: its newer sibling may be unread",
+              ("c-s1old" in [r["parentId"] for r in fake.replies], countsCR["carried"] >= 1),
+              (False, True))
+
+        # -- the re-read cap rotates, so no watched session is starved -----------------------
+        crot = cfg(_dir="rotate")
+        save_ledger(ledger_path(crot["state_dir"]), {"w%02d" % i: {"state": "stuck", "issue": "KIT-%d" % i,
+                                                                   "at": _iso(NOW)} for i in range(25)})
+        tail = [session("w%02d" % i, 24 * 9, ident="KIT-%d" % i, comment="c-w%02d" % i) for i in range(25)]
+        fake1 = FakeLinear(None, pages=[[old("n1", 0.4)], [old("n2", 8)]], extra=tail)
+        run_pass(crot, "k", gql=fake1, get=up, now=NOW)
+        fake2 = FakeLinear(None, pages=[[old("n1", 0.4)], [old("n2", 8)]], extra=tail)
+        run_pass(crot, "k", gql=fake2, get=up, now=NOW + 900)
+        check("the re-read cap rotates: two passes reach all 25 watched sessions, not the same 20",
+              (len(fake1.rereads), len(set(fake1.rereads) | set(fake2.rereads))), (MAX_REREADS, 25))
+
+        # -- a dry run that cannot read a thread says so ----------------------------------
+        import io
+        import contextlib
+        saidD = io.StringIO()
+        with contextlib.redirect_stderr(saidD):
+            _c, resultD, findingsD, _n = run_pass(cfg(_dir="dry-thread"), "k", dry_run=True,
+                                                  gql=FakeLinear([session("s1", 8)],
+                                                                 fail_threads=("c-root",)),
+                                                  get=up, now=NOW)
+        check("a dry run whose thread read fails names it, so the rehearsal is not read as fine",
+              ([f["kind"] for f in findingsD if f["kind"].startswith("unsent")],
+               "] FAILED " in saidD.getvalue()), (["unsent-kit-1"], True))
 
         # -- a delegation held for a week is reported, not silently dropped ---------------
         chw = cfg(_dir="held-week")

@@ -2218,6 +2218,12 @@ class Blocked(Exception):
         self.extra = extra
 
 
+class SoftBlocked(Blocked):
+    """A card that waits on a person WITHOUT stopping `run`: the steps after it go on, the
+    card prints at the end, and the exit says a card is left. For an optional job (the
+    catch-up poller, CK-11) whose wait must not leave the review loops unloaded."""
+
+
 class Unknown(Exception):
     """Could not measure. Not a pass and not a failure — and it BLOCKS."""
 
@@ -2225,6 +2231,10 @@ class Unknown(Exception):
         Exception.__init__(self, what)
         self.what = what
         self.remedy = remedy
+
+
+class SoftUnknown(Unknown):
+    """An Unknown that does not stop `run`: recorded, printed at the end, and in the exit."""
 
 
 # --------------------------------------------------------------------------- #
@@ -4918,10 +4928,16 @@ def step_dry_run(ctx, apply_it):
         # A cut read is not a whole count, and a count is what CK-11 signs.
         ctx.catchup_problem = ("its dry run could not read every agent session (coverage); "
                                "raise CATCHUP_MAX_PAGES in stage-e.conf so the count is whole")
+    # A rehearsal whose thread reads failed would install a job whose every reply fails.
+    failed_reads = [l for l in catchup_said.splitlines() if "] FAILED " in l]
+    if failed_reads and not ctx.catchup_problem:
+        ctx.catchup_problem = ("its dry run could not read %d delegation thread(s): %s"
+                               % (len(failed_reads), failed_reads[0].split("] FAILED ", 1)[1][:200]))
     if ctx.catchup_problem and have_catchup:
-        notes.append("the catch-up poller: %s. It is not installed or reloaded until that is "
-                     "fixed; the other jobs go on. Or set CATCHUP_INTERVAL_SECONDS=off"
-                     % ctx.catchup_problem)
+        notes.append("the catch-up poller: %s. If it is not installed yet, it is not installed "
+                     "until that is fixed; one already installed is reloaded and reports it on "
+                     "its own heartbeat. The other jobs go on. Or set "
+                     "CATCHUP_INTERVAL_SECONDS=off" % ctx.catchup_problem)
     elif catchup.rc == COMPONENT_EXIT_DECLINED:
         notes.append("the catch-up poller's dry run found something only a person can fix; "
                      "its FIRING lines above say what")
@@ -5459,9 +5475,9 @@ def _monitor_off(ctx, apply_it):
 
 
 def _catchup_signed_count(ctx):
-    """N from A-CATCHUP-COUNT's "count read: N" note, or None when it names no number."""
+    """N from A-CATCHUP-COUNT's "count read: N" note, or None when it names no count."""
     signed = (ctx.state.data.get("attestations") or {}).get("A-CATCHUP-COUNT") or {}
-    m = re.search(r"(\d+)", str(signed.get("note") or ""))
+    m = re.search(r"count read:\s*(\d+)", str(signed.get("note") or ""), re.I)
     return int(m.group(1)) if m else None
 
 
@@ -5526,27 +5542,28 @@ def step_catchup(ctx, apply_it):
                    "(card CK-11). Or set CATCHUP_INTERVAL_SECONDS=off to decline it")
     problem = getattr(ctx, "catchup_problem", None)
     if problem and not installed:
-        return True, "NOT installed: %s" % problem[:160], [
-            "the catch-up poller is not installed: %s. Nothing else waits on it" % problem]
+        if problem.startswith("not measurable"):
+            # Before the first upgrade: `code` and `configs` already say what `run` will do.
+            return True, "NOT installed: %s" % problem, []
+        # Never a quiet "done": the job is off and something must be fixed. It does not stop
+        # `run` — the other jobs go on — and the exit says it is outstanding.
+        raise SoftUnknown("the catch-up poller is NOT installed: %s" % problem[:300],
+                          "fix what it names in stage-e.conf and run again, or set "
+                          "CATCHUP_INTERVAL_SECONDS=off to decline the job")
 
-    def waiting(detail, note):
-        # `run` goes on; a read-only pass names it as the card it is, so `verify` never says
-        # "no drift" while the job is not installed.
-        _say_catchup_candidates(candidates)
-        if not apply_it:
-            raise Blocked("CK-11", detail)
-        return True, detail + "; nothing else waits on it", [note]
+    # WAITING ON THE OWNER'S COUNT is a card in `run` and in `verify` alike — never a quiet
+    # "done" — and it never stops `run`: the steps after it go on (SoftBlocked).
     if not installed and not ctx.state.attested("A-CATCHUP-COUNT"):
-        return waiting("NOT installed: it waits for you to read its first count (CK-11)",
-                       "the catch-up poller is not installed, so a delegation lost while the "
-                       "dispatcher was down stays lost. To turn it on, " + how_to_sign)
+        _say_catchup_candidates(candidates)
+        raise SoftBlocked("CK-11", "NOT installed: it waits for you to read its first count")
     signed_n = _catchup_signed_count(ctx)
-    if not installed and candidates is not None and signed_n is not None \
-            and len(candidates) > signed_n:
-        return waiting("NOT installed: its count grew from %d to %d since you signed"
-                       % (signed_n, len(candidates)),
-                       "the catch-up poller stays off until the count you sign is the count it "
-                       "would start. To turn it on, " + how_to_sign)
+    if not installed and signed_n is None:
+        _say_catchup_candidates(candidates)
+        raise SoftBlocked("CK-11", "NOT installed: the sign-off names no count (\"count read: N\")")
+    if not installed and candidates is not None and len(candidates) > signed_n:
+        _say_catchup_candidates(candidates)
+        raise SoftBlocked("CK-11", "NOT installed: its count grew from %d to %d since you signed"
+                          % (signed_n, len(candidates)))
 
     if problem:
         say("  NOTE: the catch-up poller is installed, and %s. Its own heartbeat will say so." % problem)
@@ -6128,6 +6145,16 @@ def run_steps(ctx, apply_it, keep_going=False, resume=None):
         try:
             ok, detail, notes = fn(ctx, apply_it)
             row_notes.extend((sid, str(n)) for n in (notes or ()))
+        except SoftBlocked as exc:
+            rows.append((sid, BLOCKED, exc.extra or CARDS[exc.card_id]["title"]))
+            ctx.state.record(sid, BLOCKED, exc.card_id)
+            deferred.append(("softcard", exc.card_id, sid))
+            continue
+        except SoftUnknown as exc:
+            rows.append((sid, UNKNOWN, exc.what))
+            ctx.state.record(sid, UNKNOWN, exc.what)
+            deferred.append(("unknown", exc, sid))
+            continue
         except Blocked as exc:
             rows.append((sid, BLOCKED, exc.extra or CARDS[exc.card_id]["title"]))
             ctx.state.record(sid, BLOCKED, exc.card_id)
@@ -6172,7 +6199,11 @@ def run_steps(ctx, apply_it, keep_going=False, resume=None):
     ctx.state.save()
     _print_rows(rows, row_notes)
     for kind, payload, sid in deferred:
-        if kind == "card":
+        if kind == "softcard":
+            say("")
+            say("  step `%s` waits on checkpoint %s; nothing else waited on it:" % (sid, payload))
+            print_card(payload, ctx.conf)
+        elif kind == "card":
             say("")
             say("  step `%s` waits on checkpoint %s — read it with:" % (sid, payload))
             say("      python3 %s card %s" % (_self_path(), payload))
@@ -6554,6 +6585,9 @@ def cmd_attest(state, aid, initials, note):
         raise SetupError("--initials wants 2-4 LETTERS and nothing else (got %r); it is your "
                          "word with a date on it, not a measurement" % initials)
     note = (note or "").strip()
+    if aid == "A-CATCHUP-COUNT" and note and not re.search(r"count read:\s*\d+", note, re.I):
+        raise SetupError("A-CATCHUP-COUNT signs a COUNT: --note \"count read: N\", N the number "
+                         "of delegations the installer listed (got %r)" % note)
     if aid in ATTESTATIONS_NEEDING_NOTE and not note:
         raise SetupError("%s needs a --note saying what you read: %s\n"
                          "  e.g. --note \"count read: 7\"\n"
@@ -9287,6 +9321,22 @@ def _selftest_body():
     expect("catchup-dry-run", isinstance(rowC3, tuple) and rowC3[0] is True
            and any("catch-up" in str(n) for n in (rowC3[2] or [])),
            "a catch-up finding stopped the install, or passed in silence: %r" % (rowC3,))
+    def _catchup_row(c, apply_it=True):
+        """(kind, detail, printed): "ok"/"changed" with the detail, or "card"/"unknown" with
+        the soft exception's text — never a traceback out of the battery."""
+        box = {}
+
+        def call():
+            try:
+                ok_, det_, _n_ = step_catchup(c, apply_it=apply_it)
+                box["row"] = ("ok" if ok_ else "changed", det_)
+            except SoftBlocked as exc:
+                box["row"] = ("card:" + exc.card_id, exc.extra)
+            except SoftUnknown as exc:
+                box["row"] = ("unknown", exc.what)
+        _x, printed_ = _quiet(call)
+        return box["row"][0], box["row"][1], printed_
+
     # THE CATCH-UP POLLER NEVER STOPS THE INSTALL: a failed or held dry run is a note, and
     # its own step then will not install it — the review loops, unloaded by `code`, go on.
     precheck = ("test -f $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0, "")
@@ -9301,8 +9351,8 @@ def _selftest_body():
                % (rc, rowC))
         fakeC.answers = [("launchctl print system/" + catchup_label(conf), 1, ""),
                          ("test -f " + _dispatcher_plist(catchup_label(conf)), 1, "")] + fakeC.answers
-        (okCP, detCP, _n), _p = _quiet(lambda: step_catchup(ctxC, apply_it=True))
-        expect("catchup-dry-run", okCP is True and "NOT installed" in detCP
+        kindCP, detCP, _p = _catchup_row(ctxC)
+        expect("catchup-dry-run", kindCP == "unknown" and "NOT installed" in detCP
                and "exit %d" % rc in detCP and not [w for w in fakeC.writes
                                                     if catchup_label(conf) in _fmt(w["argv"])],
                "after a failed catch-up dry run, its step installed it anyway: %r" % detCP)
@@ -9325,6 +9375,13 @@ def _selftest_body():
            and any("CATCHUP_DISPATCHER_URL" in str(n) for n in (rowCH[2] or []))
            and "CATCHUP_DISPATCHER_URL" in (ctxCH.catchup_problem or ""),
            "a catch-up dry run that HELD stopped the install, or did not name the URL: %r" % (rowCH,))
+    ctxCF, fakeCF2 = _dry_run_ctx(conf)
+    fakeCF2.answers = [precheck, ("pipeline_catchup_poller.py", 0, "[catchup-poller] FAILED KIT-4: "
+                        "could not read its thread (Linear API error: Forbidden)\n")] + fakeCF2.answers
+    _quiet(lambda: _dry_run_row(ctxCF))
+    expect("catchup-dry-run", "could not read 1 delegation thread" in (ctxCF.catchup_problem or ""),
+           "a rehearsal whose thread read failed would have installed the job: %r"
+           % ctxCF.catchup_problem)
     ctxCV, fakeCV = _dry_run_ctx(conf)
     fakeCV.answers = [precheck, ("pipeline_catchup_poller.py", 3, "[catchup-poller] FIRING   "
                        "coverage the agent-session read stopped at max_pages\n")] + fakeCV.answers
@@ -9361,13 +9418,12 @@ def _selftest_body():
     cplist = _dispatcher_plist(clabel)
     fakeCK.answers = [("launchctl print system/" + clabel, 1, ""), ("test -f " + cplist, 1, "")] \
         + fakeCK.answers
-    (okU, detU, notesU), printedU = _quiet(lambda: step_catchup(ctxCK, apply_it=True))
-    expect("catchup-count-signed", okU is True and "NOT installed" in detU
+    kindU, detU, printedU = _catchup_row(ctxCK)
+    expect("catchup-count-signed", kindU == "card:CK-11" and "NOT installed" in detU
            and all(k in printedU for k in ("KIT-7", "KIT-8", "KIT-9"))
-           and any("attest" in n and "A-CATCHUP-COUNT" in n for n in notesU)
            and not [w for w in fakeCK.writes if clabel in _fmt(w["argv"])],
-           "unsigned, the catch-up step installed something, hid the list, or named no remedy: "
-           "%r %r %s" % (detU, notesU, [w["why"] for w in fakeCK.writes]))
+           "unsigned, the catch-up step installed something, hid the list, or was not card CK-11: "
+           "%r %r %s" % (kindU, detU, [w["why"] for w in fakeCK.writes]))
     # …and on a read-only pass (`verify`) the same state is the card it is, never "no drift".
     try:
         _quiet(lambda: step_catchup(ctxCK, apply_it=False))
@@ -9389,10 +9445,30 @@ def _selftest_body():
     expect("catchup-unloaded-notice", "leave it" in saidUO
            and "bootstrap system " + _dispatcher_plist(catchup_label(conf)) not in saidUO,
            "the notice told you to load a catch-up poller the conf declines: %r" % saidUO[-400:])
+    ctxRW, _fRW, _aRW = _healthy_ctx(conf)
+    ctxRW.state.data["attestations"].pop("A-CATCHUP-COUNT", None)
+    _fRW.answers = [("test -f " + _dispatcher_plist(clabel), 1, ""),
+                    ("launchctl print system/" + clabel, 1, "")] + _fRW.answers
+    (codeRW, rowsRW), printedRW = _quiet(lambda: run_steps(ctxRW, apply_it=True))
+    stepsRW = [st for st, _o, _d in rowsRW]
+    expect("catchup-card-stops-nothing", codeRW == EX_BLOCKED and "heartbeat-monitor" in stepsRW
+           and dict((st, o) for st, o, _d in rowsRW).get("catch-up") == BLOCKED
+           and "CK-11" in printedRW,
+           "a `run` waiting on CK-11 stopped before the monitor's step, or did not end on the "
+           "card: exit %s, steps %s" % (codeRW, stepsRW))
+    # A sign-off names the COUNT it read, or it is refused.
+    st_ck = State(tempfile.mkdtemp(prefix="stage-e-ck11."))
+    try:
+        _quiet(lambda: cmd_attest(st_ck, "A-CATCHUP-COUNT", "bc", "looked at KIT-12"))
+        refusedCK = ""
+    except SetupError as exc:
+        refusedCK = str(exc)
+    expect("catchup-count-signed", "count read: N" in refusedCK,
+           "A-CATCHUP-COUNT was signed with a note that names no count: %r" % refusedCK)
     # …signed for FEWER than the job would now start: still not installed.
     ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 2")
-    (okG, detG, _nG), _pG = _quiet(lambda: step_catchup(ctxCK, apply_it=True))
-    expect("catchup-count-signed", okG is True and "grew from 2 to 3" in detG
+    kindG, detG, _pG = _catchup_row(ctxCK)
+    expect("catchup-count-signed", kindG == "card:CK-11" and "grew from 2 to 3" in detG
            and not [w for w in fakeCK.writes if clabel in _fmt(w["argv"])],
            "a count that grew past the signed one was installed anyway: %r" % detG)
     # …signed for the count it would start: installed, loaded, and its heartbeat waited for.

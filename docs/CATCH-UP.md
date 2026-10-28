@@ -88,9 +88,10 @@ needs a live test first (see *What is not proven*).
 - **A reply that fails** stays owed and goes to the back of the line, so it never holds up
   the others. Once is named and retried. Twice in a row pages, as `unsent-<ticket>`, and it
   stays open until the reply lands or the delegation turns stuck.
-- **A recorded session the read does not reach is re-read by id.** An old stuck delegation
-  never drops out of view, and never drags the read deeper. One the tracker no longer has
-  is let go.
+- **A recorded session the read does not reach is re-read by id**, up to 20 a pass, the
+  least recently read first. An old stuck delegation never drops out of view, and never
+  drags the read deeper. One the tracker no longer has is let go. On a read cut short, a
+  delegation found only this way waits: a newer session on its ticket may be unread.
 - **A delegation still silent an hour after its reply is stuck.** It is never replied to
   again. It is reported on every pass until a person acts on it: answers it, ends it,
   removes the delegation or closes the ticket. The dispatcher sometimes stays silent on
@@ -146,13 +147,14 @@ it needs no new credential. `--example-config` prints every key of its own confi
 - **Card `CK-11`.** Its first real pass replies to every unanswered delegation from the past
   week, and each reply starts a paid session. The installer lists them all. Until you sign
   that count (`attest A-CATCHUP-COUNT`), the job is simply not installed: no plist, so no
-  reboot can start it. Nothing else waits on it, and every run says so.
+  reboot can start it. Nothing else waits on it: `run` loads everything else, then ends on
+  card `CK-11`, so it never reads as done.
 - Remove the delegation from any you do not want started, run again, and sign the new
   count. If the count grows past the one you signed before the job is first loaded, it
   stays off until you sign again.
-- **A dry run that fails, cannot reach the dispatcher or reads only part of the sessions
-  keeps the job uninstalled,** with a note naming why. Nothing else stops: the review jobs
-  load as usual. Fix it in `stage-e.conf` and run again.
+- **A dry run that fails, cannot reach the dispatcher, cannot read a delegation's thread or
+  reads only part of the sessions keeps the job uninstalled.** Nothing else stops: the review
+  jobs load as usual, and the run ends naming why. Fix it in `stage-e.conf` and run again.
 - **`verify` shows card `CK-11`** while the job waits for your count, so it never reads "no
   drift" with the job missing.
 - **To decline the job,** set `CATCHUP_INTERVAL_SECONDS=off`. One an earlier run installed

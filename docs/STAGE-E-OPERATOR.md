@@ -174,7 +174,8 @@ count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); na
 the heartbeat monitor comments on (`CK-9` — it does not appear once `HEARTBEAT_MONITOR_TICKET`
 names one or says `off`); read the catch-up poller's first count before it is installed
 (`CK-11` — each delegation it names starts a paid session, `docs/CATCH-UP.md`. It stops
-nothing: until you sign, the catch-up poller is simply not installed); and watch
+nothing: until you sign, the catch-up poller is simply not installed, and `run` loads
+everything else and then ends on the card); and watch
 one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
@@ -1668,8 +1669,9 @@ The catch-up poller's dry run checks the dispatcher answers, reads whether its w
 still on, and names every delegation it would ever reply to (`CANDIDATE` lines, not only the
 three one pass would send). It replies to nothing and writes nothing, not even its heartbeat.
 
-- **A catch-up dry run that fails, holds or reads only part of the sessions stops nothing**:
-  it is noted, and the `catch-up` step will not install the job until it is fixed. A held one
+- **A catch-up dry run that fails, holds, cannot read a thread or reads only part of the
+  sessions stops nothing**: it is noted, the `catch-up` step will not install the job until it
+  is fixed, and the run ends naming it (`UNKNOWN`) after loading everything else. A held one
   means the URL in `stage-e.conf` is wrong, since the dispatcher answered moments earlier.
 - **Exit 3 is a finding, not a broken install**: the webhook is off, or a delegation it
   already replied to is still silent. The installer carries on and prints a note.

@@ -76,7 +76,8 @@ account with the owner-scoped tracker key Stage E already stores.
   delegation from the past week, each a paid session. The installer lists them all, and
   installs the job only once the owner signs that count (card CK-11). It has its own step,
   like the heartbeat monitor's, so an unsigned job stops nothing else: it simply has no
-  plist, and no reboot can start it. A count that grows past the signed one before the first
+  plist, and no reboot can start it. The run loads everything else and ends on the card, so
+  neither `run` nor `verify` ever reads as done with the job missing. A count that grows past the signed one before the first
   load keeps it off. `CATCHUP_INTERVAL_SECONDS=off` declines it by name.
 - **It checks the webhook.** A disabled webhook is a firing finding; the heartbeat monitor
   pages it once. While it fires, no reply is sent, since none could arrive.
