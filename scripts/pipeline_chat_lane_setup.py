@@ -2315,25 +2315,69 @@ def open_regular(q):
 
 CERT_LINE = re.compile(rb"^[A-Za-z0-9+/=]+$")
 CERT_LABELS = (b"CERTIFICATE", b"TRUSTED CERTIFICATE", b"X509 CERTIFICATE")
+# Base64 blocks a CA file may carry beside its certificates: read like one, never counted.
+CARRIED_LABELS = (b"X509 CRL", b"PUBLIC KEY")
+BOM = b"\xef\xbb\xbf"
+# A line beside the certificates is judged by what secrets and settings look like, never
+# by what a bundle's own text looks like (a title, a subject, a fingerprint, a serial, an
+# OpenSSL text dump), so every bundle format stays readable.
+SECRET_WORDS = (rb"pass(?:word|wd|phrase)?|secret|token|bearer|credential|"
+                rb"api[_\-]?key|private[_\-]?key|client[_\-]?key|access[_\-]?key")
+SECRET_KEY = re.compile(rb"(?:^|[\s{,\"':/])[A-Za-z0-9_.\-]*?(?:" + SECRET_WORDS +
+                        rb")[A-Za-z0-9_.\-]*[\"']?\s*[:=]", re.I)
+AUTH_KEY = re.compile(rb"(?:^|[\s{,])[\"']?auth[\"']?\s*[:=]", re.I)
+SPACED_PASSWORD = re.compile(rb"(?:^|\s)pass(?:word|wd)\s+\S", re.I)
+ENV_ASSIGN = re.compile(rb"^(?:export\s+)?[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*=")
+TOKEN_SHAPE = re.compile(rb"(?:\b(?:gh[pousr]_[A-Za-z0-9]{20,}|"
+                         rb"github_pat_[A-Za-z0-9_]{20,}|"
+                         rb"xox[abprs]-[A-Za-z0-9\-]{10,}|sk-[A-Za-z0-9\-_]{20,}|"
+                         rb"sk_live_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|"
+                         rb"lin_api_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9\-_]{20,}|"
+                         rb"AIza[0-9A-Za-z\-_]{30,})|"
+                         rb"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,})")
+URL_CREDS = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@")
+# Not judged as a long run: a URL (its path joins words into one) and a GnuTLS key pin.
+NOT_A_RUN = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://\S+|pin-sha256:[A-Za-z0-9+/]{43}=")
+# A long run mixing lower case, upper case and digits: key data and tokens do; hex
+# fingerprints, serials, title underlines and words never do.
+LONG_RUN = re.compile(rb"[A-Za-z0-9+/_\-]{40,}")
+
+def mixed_case_and_digits(run):
+    return bool(re.search(rb"[a-z]", run) and re.search(rb"[A-Z]", run)
+                and re.search(rb"[0-9]", run))
+
+def secret_shaped(s):
+    return bool(SECRET_KEY.search(s) or AUTH_KEY.search(s) or SPACED_PASSWORD.search(s)
+                or ENV_ASSIGN.match(s) or TOKEN_SHAPE.search(s) or URL_CREDS.search(s)
+                or any(mixed_case_and_digits(r)
+                       for r in LONG_RUN.findall(NOT_A_RUN.sub(b" ", s))))
 
 def cert_shape(raw):
-    # How many certificate blocks the bytes hold, and how many other non-blank lines:
-    # outside a block, or inside one but not base64. A block ends with its own label.
-    # A UTF-8 byte-order mark at the start is not a line. Counts only.
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
-    blocks = other = 0
+    # Counts only: certificate blocks; other non-blank lines; and lines shaped like a
+    # secret or a setting, or not base64 inside a block (a block left open counts too).
+    # A block ends with its own label. A UTF-8 byte-order mark is not part of a line.
+    blocks = other = secret = 0
     label = None
     for line in raw.splitlines():
         s = line.strip()
-        begins = [x for x in CERT_LABELS if s == b"-----BEGIN " + x + b"-----"]
+        while s.startswith(BOM):
+            s = s[len(BOM):].strip()
+        begins = [x for x in CERT_LABELS + CARRIED_LABELS
+                  if s == b"-----BEGIN " + x + b"-----"]
         if begins and label is None:
             label = begins[0]
         elif label is not None and s == b"-----END " + label + b"-----":
-            label, blocks = None, blocks + 1
-        elif s and not (label is not None and CERT_LINE.match(s)):
+            blocks += label in CERT_LABELS
+            label = None
+        elif label is not None:
+            if s and not CERT_LINE.match(s):
+                other += 1
+                secret += 1
+        elif s:
             other += 1
-    return blocks, other + (1 if label is not None else 0)
+            secret += secret_shaped(s)
+    open_block = 1 if label is not None else 0
+    return blocks, other + open_block, secret + open_block
 
 def writable_by_me(q):
     # Whether this account can change the file or any folder above it, along the path the
@@ -2381,9 +2425,10 @@ def trust(entry):
             os.close(fd)
     except Exception as exc:
         return {"error": why(exc)}
-    blocks, other = cert_shape(b"".join(data))
+    blocks, other, secret = cert_shape(b"".join(data))
     return {"bytes": st.st_size, "privateKey": key, "capped": capped,
             "names": st.st_nlink, "certificates": blocks, "otherLines": other,
+            "secretShaped": secret,
             "roleWritable": writable_by_me(q)}
 
 def on_disk(q):
@@ -3018,6 +3063,11 @@ def _trust_unsafe(facts):
     if "certificates" in facts and not facts["certificates"]:
         return ("holds no certificate block: a trust file is a CA certificate in PEM form, "
                 "so a copy of any other file is refused")
+    if facts.get("secretShaped"):
+        return ("holds %d line(s) shaped like a secret or a setting (a token, a password, "
+                "a key, NAME=value, or text inside a certificate block): a trust file is a "
+                "CA certificate or bundle, never a config that also holds one"
+                % facts["secretShaped"])
     return None
 
 
@@ -8245,6 +8295,46 @@ def _selftest_kit257(expect, conf):
     verify_case("clean-with-a-system-bundle-says-its-text", ALREADY_DONE,
                 "holds 18 text line(s) beside its 2 certificate block(s)", allow(this),
                 cert_text=system_bundle)
+    # Real bundle text in every shape a common tool writes passes (Stage E review of #207,
+    # and an attack on 104 genuine bundle outputs): a certifi serial, a curl title
+    # underline and its SHA-256 header, an OpenSSL multi-line name, a URL, a GnuTLS pin, a
+    # public key or CRL block carried beside, and a byte-order mark mid-file.
+    bundle_lines = ("# Serial: " + "7" * 48 + "\n"
+                    + "Go Daddy Root Certificate Authority - G2\n"
+                    + "=" * 45 + "\n## SHA256: " + "ab" * 32 + "\n"
+                    "    countryName               = US\n"
+                    "CA Issuers - URI:http://www.example.es/fileadmin/Archivos/"
+                    "certificados/raizexample1.crt\n"
+                    "pin-sha256:" + "oC+voZLIy4HLE0FVT5wFtxzKKokLDRKY1oNkfJYe+98=" + "\n")
+    carried = ("-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n"
+               "-----END PUBLIC KEY-----\n-----BEGIN X509 CRL-----\nMIIBfakeCRL\n"
+               "-----END X509 CRL-----\n")
+    verify_case("clean-with-every-common-bundle-line", ALREADY_DONE, "exact file",
+                allow(this), cert_text=bundle_lines + _FAKE_CERT + carried + "\ufeff"
+                + _FAKE_CERT)
+
+    # A config that also holds a certificate is refused, by what its secrets look like.
+    # The fake values are assembled here, so no source line holds a token's shape.
+    fake_b64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" + "BKcwggSjAgEAAoIBAQC7"
+    indented = "".join("    " + line + "\n" for line in _FAKE_CERT.splitlines())
+    for label, text in (
+            ("env-line-beside", _FAKE_CERT + "STAGE_E_" + "KEY=abc123\n"),
+            ("yaml-token-beside", "ca: |\n" + indented + "tok" + "en: abcd\n"),
+            ("key-data-beside", "ca: |\n" + indented + "client-key-data: " + fake_b64
+                                + "\n"),
+            ("url-credentials", _FAKE_CERT + "https://me:" + "s3cr" + "et@example.com\n"),
+            ("docker-auth", _FAKE_CERT + '{"auths": {"r": {"au' + 'th": '
+                            '"dXNlcjpwYXNz"}}}\n'),
+            ("text-inside-a-block", "-----BEGIN CERTIFICATE-----\nSTAGE_E_" + "KEY=x\n"
+                                    "-----END CERTIFICATE-----\n"),
+            # Shorter than the long-run rule's 40, so only its prefix gives it away.
+            ("a-bare-token", _FAKE_CERT + "gh" + "p_" + "a1B2c3D4e5" * 2 + "wXyZ\n"),
+            # No key name at all: only the long mixed run gives it away.
+            ("a-bare-key-blob", _FAKE_CERT + "    " + fake_b64 + "\n"),
+            ("a-netrc-password", _FAKE_CERT + "machine example.com login me pass"
+                                 + "word hunter2\n")):
+        verify_case("failed-on-a-config-with-a-certificate:" + label, FAILED,
+                    "shaped like a secret or a setting", allow(this), cert_text=text)
     verify_case("clean-with-lines-beside-a-certificate-says-them", ALREADY_DONE,
                 "holds 1 text line(s) beside its 1 certificate block(s)", allow(this),
                 cert_text=_FAKE_CERT + "subject=CN=example\n")
