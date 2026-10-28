@@ -76,6 +76,11 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk")
+# Upkeep, not outage. These open and close their GitHub issue like any kind, but never make
+# the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
+# ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
+# still lists them, under `advisory`, for the tech lead and `status`.
+UPKEEP_KINDS = ("updates", "release")
 UPDATE_REVIEW_EVERY = 20 * 3600       # the registry and Homebrew need not be asked hourly
 DEBOUNCE = 2                          # a liveness kind fires after this many failing passes
 HOOK_EVIDENCE_SECONDS = 24 * 3600
@@ -373,11 +378,14 @@ def write_status(env, conf, findings, now, github_note, dry_run):
     path = conf.get("HEALTH_STATUS_FILE")
     if not path:
         return "OFF (HEALTH_STATUS_FILE is empty): the heartbeat monitor has nothing to read"
-    firing = sorted(f["kind"] for f in findings if f["state"] == FIRING)
+    lit = sorted(f["kind"] for f in findings if f["state"] == FIRING)
+    firing = [k for k in lit if k not in UPKEEP_KINDS]
+    advisory = [k for k in lit if k in UPKEEP_KINDS]
     unknown = sorted(f["kind"] for f in findings if f["state"] == UNKNOWN)
     doc = {"schema": STATUS_SCHEMA, "written_at": _iso(now),
+           # Outage kinds only: this is what the monitor turns into a Slack ping.
            "result": "problem" if firing else "ok",
-           "firing": firing, "unknown": unknown,
+           "firing": firing, "advisory": advisory, "unknown": unknown,
            # One identity per firing SET: a new kind firing pages again; a summary that only
            # gets older does not.
            "fingerprint": ",".join(firing) or "ok",
@@ -727,6 +735,34 @@ def selftest():
         check("…and writes the status file the monitor reads",
               (doc["schema"], doc["result"], doc["fingerprint"]), (STATUS_SCHEMA, "ok", "ok"))
         check("…readable by another account (0644)", oct(os.stat(status_file).st_mode & 0o777), "0o644")
+
+        # -- upkeep kinds open their GitHub issue but never page Slack (KIT-264) ----------
+        # Owner decision 2026-10-27: a Slack ping must mean something is broken. Pending
+        # updates and a newer release are upkeep: GitHub only, listed under `advisory`.
+        up_home = os.path.join(home, "upkeep")
+        os.makedirs(up_home)
+        up_file = os.path.join(up_home, "status.json")
+        cu = conf(HEALTH_STATUS_FILE=up_file)
+        env = make_env(up_home, version="0.2.69", gh=gh_ok(T))
+        code = run_pass(env, cu)
+        doc = json.load(open(up_file))
+        check("pending updates open their GitHub issue but leave the status file ok",
+              (code, any("kind=updates" in w["argv"] for w in env.runner.writes),
+               doc["result"], doc["firing"], doc.get("advisory"), doc["fingerprint"]),
+              (EX_FIRING, True, "ok", [], ["updates"], "ok"))
+        import pipeline_heartbeat_monitor as hbm
+        seen = hbm.judge_one(hbm.HEALTH_WATCH_JOB, hbm.WATCHERS[hbm.HEALTH_WATCH_JOB],
+                             hbm.read_beat(up_file), hbm.parse_iso(doc["written_at"]), 10800,
+                             False)
+        check("…so the heartbeat monitor reads it as ok, and pages nobody in Slack",
+              seen["verdict"], "ok")
+        env = make_env(up_home, version="0.2.69", latest="0.2.74", free_gb=1,
+                       gh=gh_ok(T + 3600), now=T + 3600)
+        run_pass(env, cu)
+        doc = json.load(open(up_file))
+        check("…an outage kind beside them still makes it a problem, naming only that kind",
+              (doc["result"], doc["firing"], doc["advisory"]),
+              ("problem", ["disk"], ["release", "updates"]))
 
         # -- the dispatcher stops: one pass is not enough, two fire, once ---------------
         env = make_env(home, version=None, gh=gh_ok(T))

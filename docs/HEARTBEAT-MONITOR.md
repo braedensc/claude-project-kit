@@ -49,7 +49,9 @@ for one reader's convenience would be the larger change:
 itself: hooks, updates due, the dispatcher, the front door, the disk. It writes one
 world-readable status file, and this monitor reads that file like a heartbeat:
 
-- `result: problem` reads **failing**. The row names each firing kind and its summary.
+- `result: problem` reads **failing**. The row names each firing kind and its summary. Only
+  outage kinds make a problem. Pending updates and a newer release are upkeep: the watch lists
+  them under `advisory`, they open a GitHub issue, and they never page from here (KIT-264).
 - The firing kinds are part of the fingerprint. A new kind firing pages again. The same
   kinds an hour later do not.
 - A kind the watch could not check (`unknown`) never pages. The `ok` row names it.
