@@ -2515,7 +2515,7 @@ def step_code(ctx, apply_it):
         # going to watch it. The `heartbeat-monitor` step refuses a notifier label it cannot
         # watch (never installed, another job, another config, no interval), and that step
         # runs after this one has stopped the monitor: a refusal there would leave the
-        # monitor — and so all three daemons' watch — unloaded. Asked here, the same refusal
+        # monitor — and so all four daemons' watch — unloaded. Asked here, the same refusal
         # stops the run with every job still loaded. A PAUSED notifier is no refusal.
         if monitor_ticket(conf) not in ("off", "") and notifier_label(conf):
             measure_notifier(ctx)
@@ -2573,7 +2573,7 @@ def step_code(ctx, apply_it):
 
 def step_tracker(ctx, apply_it):
     """The Reviews team, its states, the model label, the agent's membership,
-    and every id the three daemons need — resolved BY NAME, recorded by id."""
+    and every id the four daemons need — resolved BY NAME, recorded by id."""
     conf, st = ctx.conf, ctx.state
     ids = dict(st.data.get("ids") or {})
     key = conf["REVIEWS_TEAM_KEY"]
@@ -5089,7 +5089,7 @@ _RUN_INTERVAL_RE = re.compile(r"^\s*run interval = (\d+) seconds?\s*$", re.MULTI
 
 
 def monitor_config(conf, notifier=None):
-    """The monitor's config, from the same conf values the three daemons are scheduled
+    """The monitor's config, from the same conf values the four daemons are scheduled
     by — so its idea of "stale" follows the interval launchd really uses.
 
     Each job's interval is launchd's PLUS one pass's wall clock: the longest a healthy job
@@ -5514,7 +5514,7 @@ def step_heartbeat_monitor(ctx, apply_it):
                     % (label, waited, label))
             if label not in ctx.unloaded:
                 ctx.unloaded.append(label)
-    # REARMED IMMEDIATELY BEFORE IT IS LOADED. The three daemons were loaded moments ago,
+    # REARMED IMMEDIATELY BEFORE IT IS LOADED. The four daemons were loaded moments ago,
     # often after `code` stopped them, so their heartbeats are old for that reason and
     # their first passes may not have ended yet. A monitor whose own last run was recent
     # would judge those files stale and comment about daemons that are running. `rearm`
@@ -7076,6 +7076,15 @@ def _selftest_body():
            and cmkdir is not None and cmkdir < cwrites[0],
            "the catch-up config was not written once, after its subdir, alone: %s (writes %s, "
            "others %s, mkdir %s)" % (detailCC, cwrites, [w["why"] for w in cothers], cmkdir))
+    # …carrying the conf's webhook id, the remedy the poller names when it sees several.
+    ctxCW, fakeCW = _settled_ctx(dict(conf, CATCHUP_WEBHOOK_ID="wh-123"))
+    fakeCW.answers = [("cat $HOME/.stage-e/catchup/poller.json", 0, ""), ("mkdir -p", 0, ""),
+                      ("cat > ", 0, "")] + list(fakeCW.answers)
+    step_configs(ctxCW, apply_it=True)
+    sentCW = [json.loads(w["stdin"]) for w in fakeCW.writes
+              if "cat >" in _fmt(w["argv"]) and "catchup/poller.json" in _fmt(w["argv"])]
+    expect("configs-catchup-subdir", [d.get("webhook_id") for d in sentCW] == ["wh-123"],
+           "CATCHUP_WEBHOOK_ID did not reach the catch-up config: %s" % sentCW)
 
     # mutant: a step that always applies must turn this red.
     cases += 1
@@ -10965,8 +10974,8 @@ def _selftest_body():
            "password it exists to ask for — and every probe after it would prompt instead")
 
     # -- 19f. the reason names every daemon `run` installs --------------------
-    # The `heartbeat-monitor` step (KIT-127) installs a fourth system LaunchDaemon
-    # unless the conf turns it off by name. The banner said "three" either way.
+    # The `heartbeat-monitor` step (KIT-127) installs one more system LaunchDaemon
+    # unless the conf turns it off by name. The banner once said the same count either way.
     # Read off the printed line, so this pins what the person sees.
     cases += 1
     for ticketBN, tailBN in (

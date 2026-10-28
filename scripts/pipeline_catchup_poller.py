@@ -1182,6 +1182,12 @@ def selftest():
         _c, result, findings, _n = run_pass(cfg(_dir="wh3"), "k", gql=fake, get=up, now=NOW)
         check("a webhook read that fails is UNKNOWN, not a failed pass",
               (result, [f["state"] for f in findings if f["kind"] == "webhook"]), ("ok", [UNKNOWN]))
+        fake = FakeLinear([session("s1", 8)], hooks=[{"id": "w-1", "enabled": True, "url": None},
+                                                     {"id": "w-2", "enabled": False, "url": None}])
+        _c, resultW, findingsW, _n = run_pass(cfg(_dir="wh5"), "k", gql=fake, get=up, now=NOW)
+        check("two app webhooks and no webhook_id: could not tell, so it neither pages nor holds",
+              (resultW, [f["state"] for f in findingsW if f["kind"] == "webhook"], len(fake.replies)),
+              ("ok", [UNKNOWN], 1))
         fake = FakeLinear([], hooks=[{"id": "w-1", "enabled": True, "url": None},
                                      {"id": "w-2", "enabled": False, "url": None}])
         check("a pinned webhook_id is judged alone",
@@ -1265,8 +1271,8 @@ def selftest():
               (raisedX is not None and "KIT-1" in str(raisedX), [r["parentId"] for r in fake.replies],
                led.get("old", {}).get("failures"), led.get("new", {}).get("state")),
               (True, ["c-new"], 1, "posted"))
-        check("…and the failed pass still carries what it found", isinstance(
-            getattr(raisedX, "findings", None), list), True)
+        check("…and the failed pass still carries what it found",
+              [f["kind"] for f in getattr(raisedX, "findings", None) or []], ["webhook"])
         fake = FakeLinear([session("old", 30, ident="KIT-1", comment="c-old"),
                            session("new2", 9, ident="KIT-3", comment="c-new2")])
         run_pass(cfg(_dir="fail-one", max_per_pass=1), "k", gql=fake, get=up, now=NOW + 900)
@@ -1284,6 +1290,20 @@ def selftest():
               (failed, load_ledger(ledger_path(cf["state_dir"])).get("s1", {}).get("state"),
                load_ledger(ledger_path(cf["state_dir"])).get("s1", {}).get("failures")),
               (True, "owed", 1))
+        cfk = cfg(_dir="killed")
+        dying = FakeLinear([session("s1", 8)])
+        real_call = dying.__call__
+
+        def _dies_mid_reply(query, variables):
+            if "CatchupReply" in query:
+                raise RunTimeout()          # the pass clock fires while the reply is in flight
+            return real_call(query, variables)
+        try:
+            run_pass(cfk, "k", gql=_dies_mid_reply, get=up, now=NOW)
+        except RunTimeout:
+            pass
+        check("a pass killed mid-reply leaves the session OWED: the reply may have landed",
+              load_ledger(ledger_path(cfk["state_dir"])).get("s1", {}).get("state"), "owed")
         fake = FakeLinear([session("s1", 8)])
         run_pass(cf, "k", gql=fake, get=up, now=NOW + 60)
         check("…and the next pass posts it, after reading the thread",
