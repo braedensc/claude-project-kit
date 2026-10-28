@@ -1733,6 +1733,8 @@ CARDS = {
         "do": ["Nothing else waits on this: until you sign, the catch-up poller is simply",
                "not installed, and every run says so. To decline it for good, set",
                "CATCHUP_INTERVAL_SECONDS=off in stage-e.conf.",
+               "If the step names a problem instead (a wrong URL, a session read cut short,",
+               "a thread it could not read), fix what it names and run again first.",
                "Read the delegations the installer just listed above. Every one is",
                "re-prompted, up to three a pass, so the whole list is what you sign.",
                "For any you do NOT want started, remove its delegation or close the",
@@ -2231,10 +2233,6 @@ class Unknown(Exception):
         Exception.__init__(self, what)
         self.what = what
         self.remedy = remedy
-
-
-class SoftUnknown(Unknown):
-    """An Unknown that does not stop `run`: recorded, printed at the end, and in the exit."""
 
 
 # --------------------------------------------------------------------------- #
@@ -4931,7 +4929,8 @@ def step_dry_run(ctx, apply_it):
     # A rehearsal whose thread reads failed would install a job whose every reply fails.
     failed_reads = [l for l in catchup_said.splitlines() if "] FAILED " in l]
     if failed_reads and not ctx.catchup_problem:
-        ctx.catchup_problem = ("its dry run could not read %d delegation thread(s): %s"
+        ctx.catchup_problem = ("its dry run could not read %d delegation thread(s): %s. Run "
+                               "again; if it stays, the stored key cannot read comment threads"
                                % (len(failed_reads), failed_reads[0].split("] FAILED ", 1)[1][:200]))
     if ctx.catchup_problem and have_catchup:
         notes.append("the catch-up poller: %s. If it is not installed yet, it is not installed "
@@ -5545,11 +5544,10 @@ def step_catchup(ctx, apply_it):
         if problem.startswith("not measurable"):
             # Before the first upgrade: `code` and `configs` already say what `run` will do.
             return True, "NOT installed: %s" % problem, []
-        # Never a quiet "done": the job is off and something must be fixed. It does not stop
-        # `run` — the other jobs go on — and the exit says it is outstanding.
-        raise SoftUnknown("the catch-up poller is NOT installed: %s" % problem[:300],
-                          "fix what it names in stage-e.conf and run again, or set "
-                          "CATCHUP_INTERVAL_SECONDS=off to decline the job")
+        # Never a quiet "done", and never a stop: the job's own card (CK-11), naming what to
+        # fix. A card exits 10, which the one-command installer carries past, so an optional
+        # job's problem never holds back the idea gate or a Stage E update.
+        raise SoftBlocked("CK-11", "NOT installed: %s" % problem[:300])
 
     # WAITING ON THE OWNER'S COUNT is a card in `run` and in `verify` alike — never a quiet
     # "done" — and it never stops `run`: the steps after it go on (SoftBlocked).
@@ -6149,11 +6147,6 @@ def run_steps(ctx, apply_it, keep_going=False, resume=None):
             rows.append((sid, BLOCKED, exc.extra or CARDS[exc.card_id]["title"]))
             ctx.state.record(sid, BLOCKED, exc.card_id)
             deferred.append(("softcard", exc.card_id, sid))
-            continue
-        except SoftUnknown as exc:
-            rows.append((sid, UNKNOWN, exc.what))
-            ctx.state.record(sid, UNKNOWN, exc.what)
-            deferred.append(("unknown", exc, sid))
             continue
         except Blocked as exc:
             rows.append((sid, BLOCKED, exc.extra or CARDS[exc.card_id]["title"]))
@@ -9332,8 +9325,6 @@ def _selftest_body():
                 box["row"] = ("ok" if ok_ else "changed", det_)
             except SoftBlocked as exc:
                 box["row"] = ("card:" + exc.card_id, exc.extra)
-            except SoftUnknown as exc:
-                box["row"] = ("unknown", exc.what)
         _x, printed_ = _quiet(call)
         return box["row"][0], box["row"][1], printed_
 
@@ -9352,7 +9343,7 @@ def _selftest_body():
         fakeC.answers = [("launchctl print system/" + catchup_label(conf), 1, ""),
                          ("test -f " + _dispatcher_plist(catchup_label(conf)), 1, "")] + fakeC.answers
         kindCP, detCP, _p = _catchup_row(ctxC)
-        expect("catchup-dry-run", kindCP == "unknown" and "NOT installed" in detCP
+        expect("catchup-dry-run", kindCP == "card:CK-11" and "NOT installed" in detCP
                and "exit %d" % rc in detCP and not [w for w in fakeC.writes
                                                     if catchup_label(conf) in _fmt(w["argv"])],
                "after a failed catch-up dry run, its step installed it anyway: %r" % detCP)
@@ -9456,6 +9447,18 @@ def _selftest_body():
            and "CK-11" in printedRW,
            "a `run` waiting on CK-11 stopped before the monitor's step, or did not end on the "
            "card: exit %s, steps %s" % (codeRW, stepsRW))
+    # …and a catch-up dry-run PROBLEM is the same soft card, never an exit-4 unknown: the
+    # one-command installer carries past a card, and must not be held back by an optional job.
+    ctxRP, _fRP, _aRP = _healthy_ctx(conf)
+    _fRP.answers = [("test -f " + _dispatcher_plist(clabel), 1, ""),
+                    ("launchctl print system/" + clabel, 1, ""),
+                    ("pipeline_catchup_poller.py", 0, "[catchup-poller] FAILED KIT-4: could not read "
+                     "its thread (HTTP 502)\n")] + _fRP.answers
+    (codeRP, rowsRP), _pRP = _quiet(lambda: run_steps(ctxRP, apply_it=False, keep_going=True))
+    expect("catchup-card-stops-nothing", codeRP == EX_BLOCKED
+           and dict((st, o) for st, o, _d in rowsRP).get("catch-up") == BLOCKED,
+           "a catch-up dry-run problem made verify exit %s, not a card: %s"
+           % (codeRP, [(st, o) for st, o, _d in rowsRP if o not in (ALREADY_DONE, DONE)]))
     # A sign-off names the COUNT it read, or it is refused.
     st_ck = State(tempfile.mkdtemp(prefix="stage-e-ck11."))
     try:

@@ -1671,7 +1671,8 @@ three one pass would send). It replies to nothing and writes nothing, not even i
 
 - **A catch-up dry run that fails, holds, cannot read a thread or reads only part of the
   sessions stops nothing**: it is noted, the `catch-up` step will not install the job until it
-  is fixed, and the run ends naming it (`UNKNOWN`) after loading everything else. A held one
+  is fixed, and the run ends on card `CK-11` naming it, after loading everything else. A card
+  is what the one-command installer carries past, so this never holds back the idea gate. A held one
   means the URL in `stage-e.conf` is wrong, since the dispatcher answered moments earlier.
 - **Exit 3 is a finding, not a broken install**: the webhook is off, or a delegation it
   already replied to is still silent. The installer carries on and prints a note.
