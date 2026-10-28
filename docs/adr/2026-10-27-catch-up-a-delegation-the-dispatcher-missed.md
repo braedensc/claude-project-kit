@@ -31,29 +31,38 @@ anywhere, and a disabled webhook loses everything after it the same way.
 A Stage E daemon, **the catch-up poller**, runs every 15 minutes as the dispatcher's role
 account with the owner-scoped tracker key Stage E already stores.
 
-- **It finds what the dispatcher never answered.** The agent's sessions, read newest first: an
-  agent session with no activity at all from the agent, never started, ended or dismissed, on
-  a configured work team, not a planning ticket, not done or canceled, still delegated to the
-  agent, with a person who delegated it and a root comment to reply under.
+- **It finds what the dispatcher never answered.** An agent session with no activity at all
+  from the agent, never started, ended or dismissed, the agent's newest session on its ticket,
+  on a configured work team, not a planning ticket, not done or canceled, still delegated to
+  the agent, with a person who delegated it and a root comment to reply under. Only the newest
+  session counts because a person who restarted a lost delegation made a newer one, and a
+  reply under the old one would run the ticket twice.
 - **It waits until the tracker has given up.** A delegation is eligible only after 7 hours
-  30 minutes. The script refuses any wait below the tracker's 7-hour retry ladder. Replying
+  30 minutes. The script refuses any wait inside the tracker's 7-hour retry ladder. Replying
   sooner would race a late retry into a second session, since the dispatcher keeps no record
   of what it started. Older than a week is skipped.
-- **It replies once, in the thread.** The reply is fixed text with a marker, under the
-  session's root comment. Nothing else is written: no ticket, state, label or delegation.
+- **It replies once, in the thread.** The reply is fixed text ending in a plain receipt line,
+  under the session's root comment. Nothing else is written: no ticket, state, label or
+  delegation.
 - **Once is enforced twice.** A ledger outside every worktree records `owed` before the
-  reply and `posted` after; a damaged ledger stops the job. Before replying it reads the
-  thread for its own marker, so a lost ledger or a lost answer never sends a second reply.
-- **A session still silent an hour after its reply is reported as stuck, once**, and never
-  replied to again. The dispatcher stays silent on purpose in some cases, and only a person
-  can tell which.
-- **It holds its pass when the dispatcher cannot hear it.** Each pass first asks the
-  dispatcher's local status, and the public front door when configured. A reply sent then
-  would be one more lost delivery.
+  reply and `posted` after; a damaged ledger stops the job, and one pass runs at a time.
+  Before replying it reads the thread for its own receipt, in a reply by its own key, so a
+  lost ledger or a lost answer never sends a second reply.
+- **A session still silent an hour after its reply is stuck.** It is never replied to again,
+  and it is reported on every pass, under its own ticket's kind, until a person acts. The
+  monitor pages each stuck ticket once. The dispatcher stays silent on purpose in some cases,
+  and only a person can tell which.
+- **It holds its replies when the dispatcher cannot hear it, but keeps looking.** Each pass
+  asks the dispatcher's local status, and the public front door when configured. A reply sent
+  then would be one more lost delivery. A route down for 8 passes in a row pages: a wrong URL
+  looks exactly like that, and would otherwise read healthy forever.
+- **The first count is a person's.** Its first pass would reply to every unanswered
+  delegation from the past week, each a paid session. The installer lists them and stops on a
+  card until the owner signs the count.
 - **It checks the webhook.** A disabled webhook is a firing finding; the heartbeat monitor
   pages it once. While it fires, no reply is sent, since none could arrive.
 - **At most three replies a pass, a minute apart, oldest first.** The rest are carried and
-  named, never dropped.
+  named, never dropped. A reply that fails goes to the back of the line and fails the pass.
 
 ## Alternatives rejected
 
@@ -73,10 +82,10 @@ account with the owner-scoped tracker key Stage E already stores.
   tracker's own retries, as before.
 - **The reply appears as the owner.** It is posted with the owner's key, because that key is
   what Stage E stores. Its text is fixed and says it came from this job. Accepted.
-- **Stuck sessions need a person.** The job reports them and stops.
+- **Stuck sessions need a person.** The job reports them until one acts.
 - **Not covered:** a delegation older than the week-long lookback; a missed chat message (the
   chat app's own retries end after about six minutes; replaying one needs its signing secret);
   the review team, whose poller times its own sessions out.
 - **Not proven live** (`docs/CATCH-UP.md`, *What is not proven*): a real recovery; that a late
   retry after the reply does not start a second run; that the owner's key can list the
-  dispatcher's webhook.
+  dispatcher's webhook; what status the tracker gives an unanswered delegation.

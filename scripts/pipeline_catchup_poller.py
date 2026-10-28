@@ -13,8 +13,10 @@ WHAT THIS IS, AND WHY IT EXISTS (KIT-47)
   than Linear's whole retry ladder. A delegation made in any of those was lost for good.
 
   This job is the polling Cyrus lacks. One pass, run by the dispatcher's role account:
-    1. checks the dispatcher answers locally and the public front door answers, and does
-       nothing else when either is down (a re-prompt then would travel a dead route);
+    1. checks the dispatcher answers locally and the public front door answers, and posts
+       nothing while either is down (a re-prompt then would travel a dead route). It still
+       looks, so what it reports does not vanish while the route is down, and a route that
+       stays down for HELD_ALERT_PASSES passes in a row pages: a wrong URL looks the same;
     2. asks Linear whether the dispatcher's webhook is still enabled, and says so loudly
        when it is not — that is the failure that silently ends everything;
     3. finds agent sessions where a person delegated or prompted the dispatcher and the
@@ -45,17 +47,23 @@ WHAT COUNTS AS "NEVER ANSWERED" (all of it, or the session is left alone)
   ticket (the idea gate's own poller times those out), is neither completed nor canceled, and
   is still delegated to the agent. Its age is between the floor and `lookback_hours`.
 
+  Only the agent's NEWEST session on an issue is judged: a person who restarted a lost
+  delegation by hand made a newer one, and replying under the old one would run it twice.
+
   Zero activity can be BY DESIGN — Cyrus stays silent when routing finds no repository, when
   a user is blocked with `silent`, when the issue vanished. So a session is re-prompted once,
-  EVER. If it is still silent `stuck_after_seconds` after that, it is reported as stuck (one
-  page through the heartbeat monitor) and never re-prompted again: a person looks.
+  EVER. If it is still silent `stuck_after_seconds` after that, it is stuck: reported on every
+  pass under its own kind (`stuck-<ticket>`), so the heartbeat monitor pages it once, until a
+  person answers it, ends it, removes the delegation or closes the ticket. Never re-prompted.
 
 DEDUP: THE LEDGER IS THE RECORD, AND THE THREAD IS THE BACKSTOP
 
   `<state_dir>/ledger.json` records each session as `owed` before the post and `posted` after
-  it. Before any post the thread is read for this job's marker, so a post that landed but lost
-  its answer — or a ledger that was lost — is never made twice. A corrupt ledger refuses the
-  run. At most `max_per_pass` re-prompts per pass, `spacing_seconds` apart: each one starts a
+  it. Before any post the thread is read for this job's receipt line, written by this key's own
+  user, so a post that landed but lost its answer — or a ledger that was lost — is never made
+  twice. A corrupt ledger refuses the run, and one pass runs at a time. A session whose reply
+  fails stays owed, fails the pass loudly, and goes to the back of the line: it never blocks
+  the others. At most `max_per_pass` re-prompts per pass, `spacing_seconds` apart: each one starts a
   dispatcher session whose setup runs a blocking `git fetch`, which can push other webhook
   acknowledgements past Linear's 5-second budget. Over the cap is LEFT for the next pass and
   named, never dropped (§13).
@@ -74,8 +82,9 @@ Usage:
     pipeline_catchup_poller.py --selftest
 Exit: 0 = the pass ran (it may have re-prompted nothing), or it held because the dispatcher or
       the front door did not answer; 3 = it ran and found something only a person can fix (a
-      disabled webhook, a session still silent after its re-prompt); 1 = the pass could not
-      complete; 2 = usage (bad arguments, config or credential); 4 = the wall clock ran out.
+      disabled webhook, a session still silent after its re-prompt, a session read cut short,
+      a route down for many passes); 1 = the pass could not complete, or a reply failed;
+      2 = usage (bad arguments, config or credential); 4 = the wall clock ran out.
 """
 import argparse
 import json
@@ -114,12 +123,16 @@ DEFAULT_DISPATCHER_URL = "http://127.0.0.1:3456"
 AGENT_ACTIVITY_TYPES = ("AgentActivityThoughtContent", "AgentActivityActionContent",
                         "AgentActivityResponseContent", "AgentActivityErrorContent",
                         "AgentActivityElicitationContent")
-MARK = "<!-- pipeline-catchup: %s -->"       # not `pipeline-escalation`: nothing pings on it
-MARK_RE = re.compile(r"<!-- pipeline-catchup: ([A-Za-z0-9_-]+) -->")
+# The receipt is PLAIN TEXT, not an HTML comment: the tracker may normalise markdown on save,
+# and a receipt it strips is one that is never found. It counts only in a reply written by this
+# key's own user, so another member cannot suppress a re-prompt by pasting the line.
+MARK = "Catch-up receipt: %s"
+MARK_RE = re.compile(r"(?m)^Catch-up receipt: ([A-Za-z0-9_-]+)\s*$")
+HELD_ALERT_PASSES = 8                        # two awake hours on the default interval
 
 CONFIG_KEYS = {
     "agent_user_id": "the dispatcher agent's Linear user id: only its sessions are read",
-    "teams": "team KEYS whose delegations are caught up, e.g. [\"KIT\", \"TOD\"]. Leave the "
+    "teams": "team KEYS whose delegations are caught up, e.g. [\"ENG\"]. Leave the "
              "Reviews team out: the review poller times its own sessions out",
     "linear_key_env": "ENV VAR NAME holding the owner's tracker key (never the key)",
     "state_dir": "where the ledger and heartbeat live (default %s)" % DEFAULT_STATE_DIR,
@@ -140,7 +153,7 @@ CONFIG_KEYS = {
 
 EXAMPLE_CONFIG = {
     "agent_user_id": "<the dispatcher agent's Linear user UUID>",
-    "teams": ["KIT", "TOD"],
+    "teams": ["ENG"],
     "linear_key_env": "STAGE_E_LINEAR_API_KEY",
     "state_dir": DEFAULT_STATE_DIR,
     "age_floor_seconds": DEFAULT_AGE_FLOOR_SECONDS,
@@ -241,6 +254,14 @@ def load_config(path):
     hook = raw.get("webhook_id") or ""
     if not isinstance(hook, str) or (hook and not re.match(r"^[A-Za-z0-9-]+$", hook)):
         raise ConfigError("config 'webhook_id' must be a Linear id, or empty")
+    per_pass = _int(raw, "max_per_pass", DEFAULT_MAX_PER_PASS, 1, 10)
+    spacing = _int(raw, "spacing_seconds", DEFAULT_SPACING_SECONDS, 0)
+    clock = _int(raw, "run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS, 30)
+    if (per_pass - 1) * spacing > clock // 2:
+        raise ConfigError("config: %d re-prompts %d s apart sleep %d s, more than half the %d s "
+                          "pass clock. A pass cut short between a reply and its ledger entry "
+                          "leaves the receipt as the only record" % (
+                              per_pass, spacing, (per_pass - 1) * spacing, clock))
     return {
         "agent_user_id": agent.strip(),
         "teams": list(teams),
@@ -248,14 +269,14 @@ def load_config(path):
         "state_dir": os.path.realpath(os.path.expanduser(raw.get("state_dir") or DEFAULT_STATE_DIR)),
         "age_floor_seconds": floor,
         "lookback_hours": _int(raw, "lookback_hours", DEFAULT_LOOKBACK_HOURS, 1),
-        "max_per_pass": _int(raw, "max_per_pass", DEFAULT_MAX_PER_PASS, 1, 10),
-        "spacing_seconds": _int(raw, "spacing_seconds", DEFAULT_SPACING_SECONDS, 0),
+        "max_per_pass": per_pass,
+        "spacing_seconds": spacing,
         "stuck_after_seconds": _int(raw, "stuck_after_seconds", DEFAULT_STUCK_AFTER_SECONDS, 60),
         "max_pages": _int(raw, "max_pages", DEFAULT_MAX_PAGES, 1, 100),
         "dispatcher_url": base.rstrip("/"),
         "front_door_url": door,
         "webhook_id": hook,
-        "run_timeout_seconds": _int(raw, "run_timeout_seconds", DEFAULT_RUN_TIMEOUT_SECONDS, 30),
+        "run_timeout_seconds": clock,
     }
 
 
@@ -316,6 +337,12 @@ def load_ledger(path):
             doc.get("sessions"), dict):
         raise PollerError("ledger %s is not a %s document — refusing to run so no session is "
                           "re-prompted twice" % (path, LEDGER_SCHEMA))
+    bad = sorted(str(k) for k, v in doc["sessions"].items()
+                 if not isinstance(v, dict) or v.get("state") not in ("owed", "posted", "stuck"))
+    if bad:
+        raise PollerError("ledger %s has %d entr(y/ies) that are not owed, posted or stuck (%s) — "
+                          "refusing to run so no session is re-prompted twice"
+                          % (path, len(bad), ", ".join(bad[:3])))
     return dict(doc["sessions"])
 
 
@@ -403,7 +430,8 @@ query CatchupSessions($first: Int!, $after: String) {
 
 Q_THREAD = """
 query CatchupThread($id: String!) {
-  comment(id: $id) { id children(first: 50) { nodes { body } } }
+  viewer { id }
+  comment(id: $id) { id children(first: 100) { nodes { body user { id } } } }
 }"""
 
 M_REPLY = """
@@ -449,11 +477,18 @@ def webhook_finding(cfg, nodes, error=None):
     else:
         # An OAuth application's webhook carries no URL of its own (schema: "Null for OAuth
         # application webhooks"); a workspace webhook does, and is not the dispatcher's.
+        # More than one is ambiguous: another app's disabled webhook must never read as the
+        # dispatcher's and hold every re-prompt. Then it is a check it could not make.
         mine = [n for n in nodes if not n.get("url")]
         if not mine:
             return {"kind": "webhook", "state": UNKNOWN,
                     "summary": "this key sees no OAuth-application webhook, so the "
                                "dispatcher's cannot be checked; set webhook_id"}
+        if len(mine) > 1:
+            return {"kind": "webhook", "state": UNKNOWN,
+                    "summary": "this key sees %d OAuth-application webhooks (%s) and cannot "
+                               "tell which is the dispatcher's; set webhook_id to it"
+                               % (len(mine), ", ".join(str(n.get("id")) for n in mine[:5]))}
     off = [n.get("id") for n in mine if n.get("enabled") is not True]
     if off:
         return {"kind": "webhook", "state": FIRING,
@@ -470,20 +505,22 @@ def agent_activity(node):
                for a in acts)
 
 
-def classify(node, cfg, now, ledger):
+def classify(node, cfg, now, ledger, gate_open=True):
     """(verdict, reason) for one agent session. Verdicts:
     skip      — not a lost delegation, or not ours to wake;
     young     — maybe lost, but still inside Linear's retry ladder;
     candidate — lost: re-prompt it;
     waiting   — re-prompted, not yet answered, not yet stuck;
-    stuck     — re-prompted and still silent past stuck_after_seconds."""
+    stuck     — re-prompted and still silent past stuck_after_seconds. It STAYS stuck, and is
+                reported on every pass, until a person acts: answers it, ends it, removes the
+                delegation or closes the ticket. Any of those is a skip below, checked first.
+    With the gate closed a re-prompted session is not newly judged stuck: its silence is the
+    dispatcher's outage, which the gate already reports."""
     if ((node.get("appUser") or {}).get("id")) != cfg["agent_user_id"]:
         return "skip", "another agent's session"
     issue = node.get("issue") or {}
     ident = issue.get("identifier") or "?"
     entry = ledger.get(node.get("id") or "")
-    if entry and entry.get("state") == "stuck":
-        return "skip", "%s was already reported stuck" % ident
     if agent_activity(node) or node.get("startedAt") or node.get("endedAt") or node.get(
             "dismissedAt"):
         return "skip", "%s was answered" % ident
@@ -501,9 +538,11 @@ def classify(node, cfg, now, ledger):
         return "skip", "%s has no creator (Cyrus would block any re-prompt)" % ident
     if not (node.get("comment") or {}).get("id"):
         return "skip", "%s has no thread to reply under" % ident
+    if entry and entry.get("state") == "stuck":
+        return "stuck", "%s was re-prompted at %s and is still silent" % (ident, entry.get("at"))
     if entry and entry.get("state") == "posted":
         at = parse_iso(entry.get("at")) or now
-        if now - at >= cfg["stuck_after_seconds"]:
+        if gate_open and now - at >= cfg["stuck_after_seconds"]:
             return "stuck", "%s was re-prompted at %s and is still silent" % (ident, entry.get("at"))
         return "waiting", "%s was re-prompted at %s" % (ident, entry.get("at"))
     born = parse_iso(node.get("createdAt"))
@@ -528,38 +567,112 @@ def reprompt_body(node):
 
 
 def thread_has_mark(data, session_id):
+    """Does a reply written by THIS key's own user carry this session's receipt?"""
+    me = (data.get("viewer") or {}).get("id")
     for child in (((data.get("comment") or {}).get("children") or {}).get("nodes")) or []:
-        m = MARK_RE.search((child or {}).get("body") or "")
-        if m and m.group(1) == session_id:
+        child = child or {}
+        if not me or ((child.get("user") or {}).get("id")) != me:
+            continue
+        if any(m == session_id for m in MARK_RE.findall(child.get("body") or "")):
             return True
     return False
+
+
+def stuck_kind(node):
+    """One firing kind per stuck ticket, so a second stuck ticket pages and the same one an
+    hour later does not. The monitor accepts `[a-z][a-z0-9-]{0,31}`."""
+    ident = re.sub(r"[^a-z0-9-]", "-", ((node.get("issue") or {}).get("identifier") or "").lower())
+    return ("stuck-" + ident)[:32].rstrip("-") or "stuck"
+
+
+def newest_by_issue(sessions, agent):
+    """{issue id: the newest createdAt among the agent's sessions on it}."""
+    out = {}
+    for n in sessions:
+        n = n or {}
+        iid = (n.get("issue") or {}).get("id")
+        born = parse_iso(n.get("createdAt"))
+        if iid and born is not None and ((n.get("appUser") or {}).get("id")) == agent:
+            out[iid] = max(out.get(iid, born), born)
+    return out
 
 
 # --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
+def gate_path(state_dir):
+    return os.path.join(state_dir, "gate.json")
+
+
+def load_held(state_dir):
+    """How many passes in a row have held. Not a safety record — a damaged file only delays
+    the alert — so it reads as 0 and says so."""
+    try:
+        with open(gate_path(state_dir), encoding="utf-8") as fh:
+            value = json.load(fh).get("held_passes", 0)
+        return value if isinstance(value, int) and value >= 0 else 0
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError, AttributeError) as exc:
+        log("NOTE: %s is unreadable (%s); counting held passes from 0" % (gate_path(state_dir), exc))
+        return 0
+
+
+def last_firing(state_dir):
+    """The FIRING findings of the last heartbeat, for a held pass that could not read Linear:
+    carried, so a pass that could not look never reads as a recovery."""
+    try:
+        with open(heartbeat_path(state_dir), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return [dict(f, summary="(from the last pass that could look) %s" % f.get("summary"))
+                for f in doc.get("findings") or []
+                if isinstance(f, dict) and f.get("state") == FIRING and f.get("kind") != "gate"]
+    except Exception:  # noqa: BLE001 — nothing to carry is the honest fallback
+        return []
+
+
 def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=None,
              deadline=None):
     """(exit_code, result, findings, counts). Writes the ledger as it goes; the caller writes
-    the heartbeat."""
+    the heartbeat. A PollerError it raises carries `.findings` and `.counts`, so a pass that
+    failed part-way still reports what it found."""
     gql = gql or (lambda q, v: linear_graphql(q, v, api_key))
     get = get or http_get
     sleep = sleep or time.sleep
     now = time.time() if now is None else now
     counts = {"sessions": 0, "candidates": 0, "reprompted": 0, "carried": 0, "young": 0,
-              "waiting": 0, "stuck": 0, "healed": 0}
+              "waiting": 0, "stuck": 0, "healed": 0, "superseded": 0, "failed": 0}
     findings = []
 
     def check_clock():
         if deadline is not None and time.monotonic() > deadline:
             raise RunTimeout()
 
-    open_, why = gate(cfg, get)
-    if not open_:
-        log("HELD: %s. Nothing is re-prompted while the route is down." % why)
-        return EXIT_OK, "held", [{"kind": "gate", "state": UNKNOWN, "summary": why}], counts
+    def failed(message):
+        exc = PollerError(message)
+        exc.findings, exc.counts = findings, counts
+        return exc
+
     path = ledger_path(cfg["state_dir"])
     ledger = load_ledger(path)
+
+    # THE GATE GATES POSTING, NOT LOOKING. A held pass still reads the webhook and the
+    # sessions, so a disabled webhook or a stuck session stays reported while the dispatcher
+    # is down — a pass that stopped looking would read as a recovery.
+    open_, why = gate(cfg, get)
+    held = 0 if open_ else load_held(cfg["state_dir"]) + 1
+    if not dry_run and (held or load_held(cfg["state_dir"])):
+        try:
+            _atomic_write_json(gate_path(cfg["state_dir"]), {"held_passes": held, "at": _iso(now)})
+        except OSError as exc:
+            log("NOTE: could not record the held count (%s)" % exc)
+    if not open_:
+        log("HELD: %s. Nothing is re-prompted while the route is down." % why)
+        loud = held >= HELD_ALERT_PASSES
+        findings.append({"kind": "gate", "state": FIRING if loud else UNKNOWN, "summary": (
+            "%s, %d passes in a row. If the dispatcher is up, CATCHUP_DISPATCHER_URL or "
+            "CATCHUP_FRONT_DOOR_URL is wrong, and nothing lost will ever be started" % (why, held)
+            if loud else why)})
 
     try:
         hook = webhook_finding(cfg, (gql(Q_WEBHOOKS, {}).get("webhooks") or {}).get("nodes"))
@@ -571,31 +684,43 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     # The tracker documents the sort FIELD (createdAt) but not its direction, so nothing here
     # assumes one. The read ends early only when what it has read so far is NEWEST FIRST and
     # a whole page is past the lookback: nothing after that page can be woken. Oldest first,
-    # or a direction it cannot tell, it reads on. A read cut at max_pages before either end
-    # is said as a check this pass could not make, never as a clean pass.
+    # or a direction it cannot tell, it reads on. A read cut at max_pages before either end is
+    # a blind spot that lasts until a person raises max_pages, so it is FIRING, not a note.
     cutoff = now - cfg["lookback_hours"] * 3600
     sessions, after, more = [], None, False
-    for _ in range(cfg["max_pages"]):
-        conn = gql(Q_SESSIONS, {"first": DEFAULT_PAGE_SIZE, "after": after}).get(
-            "agentSessions") or {}
-        page = conn.get("nodes") or []
-        sessions.extend(page)
-        info = conn.get("pageInfo") or {}
-        more = bool(info.get("hasNextPage"))
-        after = info.get("endCursor")
-        check_clock()
-        if not more or not after:
-            more = False
-            break
-        first = parse_iso((sessions[0] or {}).get("createdAt"))
-        last = parse_iso((sessions[-1] or {}).get("createdAt"))
-        ages = [parse_iso((n or {}).get("createdAt")) for n in page]
-        newest_first = first is not None and last is not None and first > last
-        if newest_first and page and all(t is not None and t < cutoff for t in ages):
-            more = False
-            break
+    try:
+        for _ in range(cfg["max_pages"]):
+            conn = gql(Q_SESSIONS, {"first": DEFAULT_PAGE_SIZE, "after": after}).get(
+                "agentSessions") or {}
+            page = conn.get("nodes") or []
+            sessions.extend(page)
+            info = conn.get("pageInfo") or {}
+            more = bool(info.get("hasNextPage"))
+            after = info.get("endCursor")
+            check_clock()
+            if not more or not after:
+                more = False
+                break
+            first = parse_iso((sessions[0] or {}).get("createdAt"))
+            last = parse_iso((sessions[-1] or {}).get("createdAt"))
+            ages = [parse_iso((n or {}).get("createdAt")) for n in page]
+            newest_first = first is not None and last is not None and first > last
+            if newest_first and page and all(t is not None and t < cutoff for t in ages):
+                more = False
+                break
+    except PollerError as exc:
+        if open_:
+            raise failed("could not read the agent sessions: %s" % exc)
+        # Held AND unable to read Linear: the machine is half awake. Say so, and carry what
+        # the last pass that could look found, so this beat is not read as a recovery.
+        findings.append({"kind": "sessions", "state": UNKNOWN,
+                         "summary": "could not read the agent sessions while held: %s" % exc})
+        findings.extend(last_firing(cfg["state_dir"]))
+        problem = any(f["state"] == FIRING for f in findings)
+        return (EXIT_DECLINED if problem else EXIT_OK), ("problems" if problem else "held"), \
+            findings, counts
     if more:
-        findings.append({"kind": "coverage", "state": UNKNOWN,
+        findings.append({"kind": "coverage", "state": FIRING,
                          "summary": "the agent-session read stopped at max_pages (%d page(s) of "
                                     "%d) before its end or the lookback; a lost delegation "
                                     "could be beyond it. Raise max_pages" % (
@@ -603,37 +728,53 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
         log("NOTE: " + findings[-1]["summary"])
     counts["sessions"] = len(sessions)
 
+    # ONE SESSION PER ISSUE. A person who restarted a lost delegation by hand made a newer
+    # session on the same issue; replying under the old one would run the ticket twice. Only
+    # the agent's newest session on an issue is ever judged.
+    newest = newest_by_issue(sessions, cfg["agent_user_id"])
     candidates, stuck = [], []
     for node in sessions:
-        verdict, reason = classify(node, cfg, now, ledger)
+        node = node or {}
+        verdict, reason = classify(node, cfg, now, ledger, gate_open=open_)
+        born = parse_iso(node.get("createdAt"))
+        iid = (node.get("issue") or {}).get("id")
+        if verdict != "skip" and iid in newest and born is not None and born < newest[iid]:
+            counts["superseded"] += 1
+            continue
         if verdict in ("young", "waiting"):
             counts[verdict] += 1
         elif verdict == "stuck":
             stuck.append((node, reason))
         elif verdict == "candidate":
             candidates.append((node, reason))
-    candidates.sort(key=lambda c: parse_iso(c[0].get("createdAt")) or 0)
+    # A session whose re-prompt failed before goes to the back, so it never blocks newer ones.
+    candidates.sort(key=lambda c: ((ledger.get(c[0].get("id")) or {}).get("failures", 0),
+                                   parse_iso(c[0].get("createdAt")) or 0))
     counts["candidates"] = len(candidates)
 
     for node, reason in stuck:
         counts["stuck"] += 1
         sid = node.get("id")
-        findings.append({"kind": "stuck", "state": FIRING,
-                         "summary": "%s. A person should look: Cyrus may have dropped it on "
-                                    "purpose (no repository routed, a blocked user)." % reason})
-        if not dry_run:
+        findings.append({"kind": stuck_kind(node), "state": FIRING,
+                         "summary": "%s. A person should look: the dispatcher may have dropped it "
+                                    "on purpose (no repository routed, a blocked user). Reported "
+                                    "until someone answers it, ends it, removes the delegation "
+                                    "or closes the ticket" % reason})
+        if not dry_run and (ledger.get(sid) or {}).get("state") != "stuck":
             ledger[sid] = dict(ledger.get(sid) or {}, state="stuck", reported_at=_iso(now))
             save_ledger(path, ledger)
 
-    if hook["state"] == FIRING:
-        log("HOLDING %d re-prompt(s): the webhook is disabled, so a reply would reach nothing."
-            % len(candidates))
+    if not open_ or hook["state"] == FIRING:
+        if candidates:
+            log("HOLDING %d re-prompt(s): %s" % (len(candidates), (
+                "the webhook is disabled, so a reply would reach nothing" if open_
+                else "the route to the dispatcher is down")))
         counts["carried"] = len(candidates)
         candidates = []
 
-    sent = 0
+    sent, posts, errors = 0, 0, []
     for i, (node, reason) in enumerate(candidates):
-        if sent >= cfg["max_per_pass"]:
+        if posts >= cfg["max_per_pass"]:
             counts["carried"] = len(candidates) - i
             log("LEFT for the next pass (over max_per_pass %d): %s" % (
                 cfg["max_per_pass"], ", ".join((c[0].get("issue") or {}).get("identifier") or "?"
@@ -642,37 +783,63 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
         check_clock()
         sid = node.get("id")
         issue = node.get("issue") or {}
+        ident = issue.get("identifier") or "?"
         root = (node.get("comment") or {}).get("id")
-        if thread_has_mark(gql(Q_THREAD, {"id": root}), sid):
-            counts["healed"] += 1
-            log("%s already carries this job's re-prompt; recording it, not posting again"
-                % issue.get("identifier"))
+
+        def note_failure(why_):
+            errors.append("%s: %s" % (ident, why_))
+            counts["failed"] += 1
             if not dry_run:
-                ledger[sid] = {"state": "posted", "issue": issue.get("identifier"), "at": _iso(now)}
+                prior = ledger.get(sid) or {}
+                ledger[sid] = {"state": "owed", "issue": ident, "at": prior.get("at") or _iso(now),
+                               "failures": int(prior.get("failures") or 0) + 1}
+                save_ledger(path, ledger)
+
+        try:
+            thread = gql(Q_THREAD, {"id": root})
+        except PollerError as exc:
+            note_failure("could not read its thread (%s)" % exc)
+            continue
+        if thread_has_mark(thread, sid):
+            counts["healed"] += 1
+            log("%s already carries this job's re-prompt; recording it, not posting again" % ident)
+            if not dry_run:
+                ledger[sid] = {"state": "posted", "issue": ident, "at": _iso(now)}
                 save_ledger(path, ledger)
             continue
         if dry_run:
-            log("WOULD re-prompt %s: %s" % (issue.get("identifier"), reason))
-            sent += 1
+            log("WOULD re-prompt %s: %s" % (ident, reason))
+            posts += 1
             continue
-        if sent:
+        if posts:
             sleep(cfg["spacing_seconds"])
-        ledger[sid] = {"state": "owed", "issue": issue.get("identifier"), "at": _iso(now)}
+        posts += 1
+        ledger[sid] = dict(ledger.get(sid) or {}, state="owed", issue=ident, at=_iso(now))
         save_ledger(path, ledger)
-        data = gql(M_REPLY, {"input": {"issueId": issue.get("id"), "parentId": root,
-                                       "body": reprompt_body(node)}})
-        if not (data.get("commentCreate") or {}).get("success"):
-            raise PollerError("the re-prompt for %s did not report success; it stays owed and "
-                              "the next pass reads its thread before trying again"
-                              % issue.get("identifier"))
-        ledger[sid] = {"state": "posted", "issue": issue.get("identifier"), "at": _iso(now)}
+        try:
+            data = gql(M_REPLY, {"input": {"issueId": issue.get("id"), "parentId": root,
+                                           "body": reprompt_body(node)}})
+            landed = bool((data.get("commentCreate") or {}).get("success"))
+        except PollerError as exc:
+            note_failure("the reply failed (%s); it stays owed, and the next pass reads the "
+                         "thread before trying again" % exc)
+            continue
+        if not landed:
+            note_failure("the reply did not report success; it stays owed, and the next pass "
+                         "reads the thread before trying again")
+            continue
+        ledger[sid] = {"state": "posted", "issue": ident, "at": _iso(now)}
         save_ledger(path, ledger)
         sent += 1
-        log("RE-PROMPTED %s: %s" % (issue.get("identifier"), reason))
+        log("RE-PROMPTED %s: %s" % (ident, reason))
     counts["reprompted"] = sent
+    if errors:
+        raise failed("could not re-prompt %d session(s): %s" % (len(errors), "; ".join(errors)))
 
     problem = any(f["state"] == FIRING for f in findings)
-    return (EXIT_DECLINED if problem else EXIT_OK), ("problems" if problem else "ok"), findings, counts
+    if problem:
+        return EXIT_DECLINED, "problems", findings, counts
+    return EXIT_OK, ("ok" if open_ else "held"), findings, counts
 
 
 # --------------------------------------------------------------------------- #
@@ -691,6 +858,20 @@ def cmd_run(args):
         return EXIT_USAGE
     timeout = args.timeout or cfg["run_timeout_seconds"]
 
+    # ONE PASS AT A TIME. A pass run by hand beside the scheduled one would read the same
+    # unmarked thread and reply twice. A dry run writes nothing, so it takes no lock.
+    lock = None
+    if not args.dry_run:
+        import fcntl
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            lock = open(os.path.join(state_dir, "pass.lock"), "w")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            log("ERROR: another pass holds %s/pass.lock (%s); this one did nothing, and the "
+                "running pass writes the heartbeat" % (state_dir, exc))
+            return EXIT_ERROR
+
     def _fired(_signum, _frame):
         raise RunTimeout()
     signal.signal(signal.SIGALRM, _fired)
@@ -704,10 +885,21 @@ def cmd_run(args):
         return EXIT_TIMEOUT
     except PollerError as exc:
         log("ERROR: %s" % exc)
-        write_heartbeat(state_dir, "error", started, args.dry_run, error=str(exc))
+        for f in getattr(exc, "findings", None) or []:
+            log("%-8s %-8s %s" % (f["state"].upper(), f["kind"], f["summary"]))
+        write_heartbeat(state_dir, "error", started, args.dry_run,
+                        getattr(exc, "findings", None) or (), getattr(exc, "counts", None),
+                        error=str(exc))
+        return EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001 — a bug must still leave a heartbeat saying so
+        log("ERROR: the pass crashed: %s: %s" % (type(exc).__name__, exc))
+        write_heartbeat(state_dir, "error", started, args.dry_run,
+                        error="crashed: %s: %s" % (type(exc).__name__, exc))
         return EXIT_ERROR
     finally:
         signal.alarm(0)
+        if lock is not None:
+            lock.close()
     for f in findings:
         log("%-8s %-8s %s" % (f["state"].upper(), f["kind"], f["summary"]))
     log("pass %s%s: %s" % (result, " (dry run: nothing written)" if args.dry_run else "",
@@ -784,11 +976,12 @@ def selftest():
 
     class FakeLinear:
         def __init__(self, sessions, hooks=None, threads=None, fail_reply=False, hooks_error=False,
-                     pages=None):
+                     pages=None, fail_threads=(), sessions_error=False):
             self.sessions, self.hooks = sessions, hooks if hooks is not None else [
                 {"id": "w-1", "enabled": True, "url": None}]
             self.threads, self.fail_reply, self.hooks_error = threads or {}, fail_reply, hooks_error
             self.pages, self.page_reads = pages, 0
+            self.fail_threads, self.sessions_error = set(fail_threads), sessions_error
             self.replies, self.queries = [], []
 
         def __call__(self, query, variables):
@@ -798,6 +991,8 @@ def selftest():
                     raise PollerError("HTTP 403")
                 return {"webhooks": {"nodes": self.hooks}}
             if "CatchupSessions" in query:
+                if self.sessions_error:
+                    raise PollerError("could not reach the Linear API: offline")
                 if self.pages is not None:
                     i = self.page_reads
                     self.page_reads += 1
@@ -807,8 +1002,13 @@ def selftest():
                 return {"agentSessions": {"nodes": self.sessions,
                                           "pageInfo": {"hasNextPage": False, "endCursor": None}}}
             if "CatchupThread" in query:
-                return {"comment": {"id": variables["id"], "children": {"nodes": [
-                    {"body": b} for b in self.threads.get(variables["id"], [])]}}}
+                if variables["id"] in self.fail_threads:
+                    raise PollerError("Linear API error (payload logged)")
+                # A thread entry is a body (written by the key's own user) or (body, author).
+                return {"viewer": {"id": OWNER}, "comment": {"id": variables["id"], "children": {
+                    "nodes": [{"body": b[0], "user": {"id": b[1]}} if isinstance(b, tuple)
+                              else {"body": b, "user": {"id": OWNER}}
+                              for b in self.threads.get(variables["id"], [])]}}}
             if "CatchupReply" in query:
                 self.replies.append(variables["input"])
                 return {"commentCreate": {"success": not self.fail_reply, "comment": {"id": "r"}}}
@@ -818,7 +1018,7 @@ def selftest():
 
     with tempfile.TemporaryDirectory() as tmp:
         def cfg(**over):
-            raw = dict(EXAMPLE_CONFIG, agent_user_id=AGENT, state_dir=os.path.join(tmp, over.pop(
+            raw = dict(EXAMPLE_CONFIG, agent_user_id=AGENT, teams=["KIT"], state_dir=os.path.join(tmp, over.pop(
                 "_dir", "s")), front_door_url="https://door.example.com/status", spacing_seconds=0)
             raw.update(over)
             p = os.path.join(tmp, "c.json")
@@ -864,8 +1064,16 @@ def selftest():
         posted_old = {"s1": {"state": "posted", "at": _iso(NOW - 7200)}}
         check("re-prompted and still silent past stuck_after: stuck",
               classify(session("s1", 9), c, NOW, posted_old)[0], "stuck")
-        check("…and once reported stuck, never again",
-              classify(session("s1", 9), c, NOW, {"s1": {"state": "stuck"}})[0], "skip")
+        check("…and once stuck it STAYS stuck, reported until a person acts",
+              classify(session("s1", 9), c, NOW, {"s1": {"state": "stuck"}})[0], "stuck")
+        check("…which answering it ends",
+              classify(session("s1", 9, acts=("AgentActivityResponseContent",)), c, NOW,
+                       {"s1": {"state": "stuck"}})[0], "skip")
+        check("…as does removing the delegation",
+              classify(session("s1", 9, delegate="someone"), c, NOW, {"s1": {"state": "stuck"}})[0],
+              "skip")
+        check("with the route down, a re-prompted session is not newly judged stuck",
+              classify(session("s1", 9), c, NOW, posted_old, gate_open=False)[0], "waiting")
 
         # -- the age floor cannot be set inside Linear's retry ladder ------------------
         try:
@@ -952,10 +1160,10 @@ def selftest():
         fake = FakeLinear(None, pages=[[old("m1", 0.4)], [old("m2", 1)], [old("m3", 2)]])
         codeP, resultP, findingsP, _n = run_pass(cfg(_dir="pg-cut", max_pages=2), "k", gql=fake,
                                                  get=up, now=NOW)
-        check("a read cut at max_pages inside the lookback is a check it could not make",
+        check("a read cut at max_pages before its end is a blind spot a person must fix: firing",
               (fake.page_reads, codeP, [(f["kind"], f["state"]) for f in findingsP
                                         if f["kind"] == "coverage"]),
-              (2, EXIT_OK, [("coverage", UNKNOWN)]))
+              (2, EXIT_DECLINED, [("coverage", FIRING)]))
 
         # -- the webhook -----------------------------------------------------------------
         fake = FakeLinear([session("s1", 8)], hooks=[{"id": "w-1", "enabled": False, "url": None}])
@@ -984,12 +1192,86 @@ def selftest():
         save_ledger(ledger_path(cst["state_dir"]), {"s1": {"state": "posted", "at": _iso(NOW - 7200)}})
         fake = FakeLinear([session("s1", 10)])
         code, result, findings, _n = run_pass(cst, "k", gql=fake, get=up, now=NOW)
-        check("a re-prompted session still silent is a problem, reported once",
+        check("a re-prompted session still silent is a problem, named by its own ticket",
               (code, result, fake.replies, [f["kind"] for f in findings if f["state"] == FIRING]),
-              (EXIT_DECLINED, "problems", [], ["stuck"]))
-        _c, result, _f, _n = run_pass(cst, "k", gql=FakeLinear([session("s1", 10)]), get=up,
-                                      now=NOW + 60)
-        check("…and the next pass does not report it again", result, "ok")
+              (EXIT_DECLINED, "problems", [], ["stuck-kit-1"]))
+        fake = FakeLinear([session("s1", 10)])
+        _c, result, findings, _n = run_pass(cst, "k", gql=fake, get=up, now=NOW + 900)
+        check("…and the next pass reports it AGAIN (the monitor pages once), never re-prompting",
+              (result, fake.replies, [f["kind"] for f in findings if f["state"] == FIRING],
+               load_ledger(ledger_path(cst["state_dir"]))["s1"]["state"]),
+              ("problems", [], ["stuck-kit-1"], "stuck"))
+        check("a second stuck ticket is a second kind, so it pages too",
+              (stuck_kind(session("s1", 1, ident="KIT-1")), stuck_kind(session("s2", 1, ident="KIT-22"))),
+              ("stuck-kit-1", "stuck-kit-22"))
+        cstq = cfg(_dir="stuck-held")
+        save_ledger(ledger_path(cstq["state_dir"]), {"s1": {"state": "stuck", "at": _iso(NOW - 9000)}})
+        fake = FakeLinear([session("s1", 10)], hooks=[{"id": "w-1", "enabled": False, "url": None}])
+        _c, result, findings, _n = run_pass(cstq, "k", gql=fake, get=lambda u: (None, "down"), now=NOW)
+        check("a HELD pass still looks: a stuck session and a disabled webhook stay reported",
+              (result, sorted(f["kind"] for f in findings if f["state"] == FIRING)),
+              ("problems", ["stuck-kit-1", "webhook"]))
+        fake = FakeLinear([session("s1", 10)], sessions_error=True)
+        write_heartbeat(cstq["state_dir"], "problems", _iso(), False,
+                        [{"kind": "stuck-kit-1", "state": FIRING, "summary": "KIT-1 is silent"}])
+        _c, result, findings, _n = run_pass(cstq, "k", gql=fake, get=lambda u: (None, "down"), now=NOW)
+        check("held AND unable to read Linear: what the last pass found is carried, not cleared",
+              (result, [f["kind"] for f in findings if f["state"] == FIRING],
+               [f["state"] for f in findings if f["kind"] == "sessions"]),
+              ("problems", ["stuck-kit-1"], [UNKNOWN]))
+
+        # -- the gate: a route that never opens becomes loud ------------------------------
+        cgh = cfg(_dir="held-streak")
+        results = [run_pass(cgh, "k", gql=FakeLinear([session("s1", 8)]),
+                            get=lambda u: (None, "refused"), now=NOW)[1]
+                   for _ in range(HELD_ALERT_PASSES)]
+        check("held passes are fine for a while, then a wrong URL or a dead dispatcher pages",
+              (results[0], results[HELD_ALERT_PASSES - 2], results[-1]), ("held", "held", "problems"))
+        run_pass(cgh, "k", gql=FakeLinear([]), get=up, now=NOW)
+        check("…and one open pass resets the count", load_held(cgh["state_dir"]), 0)
+
+        # -- one session per issue -------------------------------------------------------
+        def on_issue(sid, age_h, issue_id, acts=()):
+            n = session(sid, age_h, ident="KIT-9", comment="c-" + sid, acts=acts)
+            n["issue"]["id"] = issue_id
+            return n
+        fake = FakeLinear([on_issue("a", 9, "i-x"), on_issue("b", 8.5, "i-x",
+                                                             acts=("AgentActivityThoughtContent",))])
+        _c, _r, _f, countsS = run_pass(cfg(_dir="sup1"), "k", gql=fake, get=up, now=NOW)
+        check("a lost session with a NEWER session on the same issue is never re-prompted",
+              (fake.replies, countsS["superseded"]), ([], 1))
+        fake = FakeLinear([on_issue("a", 9, "i-x"), on_issue("b", 8.5, "i-x")])
+        run_pass(cfg(_dir="sup2"), "k", gql=fake, get=up, now=NOW)
+        check("…and two lost sessions on one issue get ONE reply, under the newest",
+              [r["parentId"] for r in fake.replies], ["c-b"])
+
+        # -- the receipt -----------------------------------------------------------------
+        fake = FakeLinear([session("s1", 8)], threads={"c-root": [(MARK % "s1", "someone-else")]})
+        run_pass(cfg(_dir="spoof"), "k", gql=fake, get=up, now=NOW)
+        check("a receipt pasted by another member does not suppress the reply", len(fake.replies), 1)
+
+        # -- one failing session never blocks the others ---------------------------------
+        cfx = cfg(_dir="fail-one")
+        fake = FakeLinear([session("old", 30, ident="KIT-1", comment="c-old"),
+                           session("new", 9, ident="KIT-2", comment="c-new")],
+                          fail_threads=("c-old",))
+        try:
+            run_pass(cfx, "k", gql=fake, get=up, now=NOW)
+            raisedX = None
+        except PollerError as exc:
+            raisedX = exc
+        led = load_ledger(ledger_path(cfx["state_dir"]))
+        check("a session whose thread cannot be read fails the pass, LOUDLY, and the rest go on",
+              (raisedX is not None and "KIT-1" in str(raisedX), [r["parentId"] for r in fake.replies],
+               led.get("old", {}).get("failures"), led.get("new", {}).get("state")),
+              (True, ["c-new"], 1, "posted"))
+        check("…and the failed pass still carries what it found", isinstance(
+            getattr(raisedX, "findings", None), list), True)
+        fake = FakeLinear([session("old", 30, ident="KIT-1", comment="c-old"),
+                           session("new2", 9, ident="KIT-3", comment="c-new2")])
+        run_pass(cfg(_dir="fail-one", max_per_pass=1), "k", gql=fake, get=up, now=NOW + 900)
+        check("…and next pass a session that failed before goes to the back of the line",
+              [r["parentId"] for r in fake.replies], ["c-new2"])
 
         # -- a failed post stays owed; the next pass reads the thread first --------------
         cf = cfg(_dir="fail")
@@ -999,8 +1281,9 @@ def selftest():
         except PollerError:
             failed = True
         check("a re-prompt that did not report success fails the pass and stays owed",
-              (failed, load_ledger(ledger_path(cf["state_dir"])).get("s1", {}).get("state")),
-              (True, "owed"))
+              (failed, load_ledger(ledger_path(cf["state_dir"])).get("s1", {}).get("state"),
+               load_ledger(ledger_path(cf["state_dir"])).get("s1", {}).get("failures")),
+              (True, "owed", 1))
         fake = FakeLinear([session("s1", 8)])
         run_pass(cf, "k", gql=fake, get=up, now=NOW + 60)
         check("…and the next pass posts it, after reading the thread",
@@ -1027,6 +1310,14 @@ def selftest():
         except PollerError:
             refused = True
         check("a corrupt ledger refuses the run rather than risk a second re-prompt", refused, True)
+        cb2 = cfg(_dir="bad2")
+        save_ledger(ledger_path(cb2["state_dir"]), {"s1": "posted"})
+        try:
+            run_pass(cb2, "k", gql=FakeLinear([session("s1", 8)]), get=up, now=NOW)
+            said = ""
+        except PollerError as exc:
+            said = str(exc)
+        check("…and so does a ledger entry that is not owed, posted or stuck", "s1" in said, True)
 
         # -- every terminal path of a real run writes the heartbeat ----------------------
         bad_cfg = os.path.join(tmp, "broken.json")
@@ -1043,11 +1334,44 @@ def selftest():
         check("the heartbeat lists firing kinds and the non-ok findings, for the monitor",
               (beat["firing"], [f["kind"] for f in beat["findings"]]), (["webhook"], ["webhook"]))
 
+        # A bug, and a second pass beside a running one: both leave a record, neither posts.
+        good_cfg = os.path.join(tmp, "good.json")
+        with open(good_cfg, "w") as fh:
+            json.dump(dict(EXAMPLE_CONFIG, agent_user_id=AGENT, linear_key_env="CATCHUP_SELFTEST_KEY",
+                           state_dir=os.path.join(tmp, "crash")), fh)
+        saved_pass, saved_key = globals()["run_pass"], os.environ.get("CATCHUP_SELFTEST_KEY")
+        os.environ["CATCHUP_SELFTEST_KEY"] = "not-a-real-key"
+
+        def _boom(*_a, **_k):
+            raise ValueError("a bug")
+        globals()["run_pass"] = _boom
+        try:
+            code = main(["run", "--config", good_cfg])
+            beat = json.load(open(heartbeat_path(os.path.join(tmp, "crash"))))
+            check("a pass that crashes still writes a heartbeat saying so",
+                  (code, beat["result"], "crashed" in (beat.get("error") or "")),
+                  (EXIT_ERROR, "error", True))
+            import fcntl
+            os.remove(heartbeat_path(os.path.join(tmp, "crash")))
+            with open(os.path.join(tmp, "crash", "pass.lock"), "w") as held_lock:
+                fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                code = main(["run", "--config", good_cfg])
+            check("a second pass beside a running one does nothing and leaves the beat to it",
+                  (code, os.path.exists(heartbeat_path(os.path.join(tmp, "crash")))),
+                  (EXIT_ERROR, False))
+        finally:
+            globals()["run_pass"] = saved_pass
+            if saved_key is None:
+                os.environ.pop("CATCHUP_SELFTEST_KEY", None)
+            else:
+                os.environ["CATCHUP_SELFTEST_KEY"] = saved_key
+
         # -- config ----------------------------------------------------------------------
         for bad, why in (({"teams": ["kit"]}, "team KEYS"), ({"agent_user_id": ""}, "agent_user_id"),
                          ({"linear_key_env": "lin_api_abc"}, "ENV VAR NAME"),
                          ({"max_per_pass": 50}, "max_per_pass"), ({"surprise": 1}, "unknown"),
-                         ({"front_door_url": "door"}, "front_door_url")):
+                         ({"front_door_url": "door"}, "front_door_url"),
+                         ({"max_per_pass": 10, "spacing_seconds": 60}, "pass clock")):
             try:
                 cfg(_dir="cfg", **bad)
                 said = ""
@@ -1066,7 +1390,8 @@ def selftest():
           len(re.findall(r"\bos\.environ\b", body)), 1)
     check("it never touches a pull request or a chat token",
           bool(re.search(r"/pulls\b|\bgh\s|\bslack\b|xoxb", body, re.IGNORECASE)), False)
-    check("its marker is not one the notifier pings on", "pipeline-escalation" in MARK, False)
+    check("its receipt is plain text, and not a mark the notifier pings on",
+          ("pipeline-escalation" in MARK, "<!--" in MARK), (False, False))
 
     for f in fails:
         print("FAIL:", f)

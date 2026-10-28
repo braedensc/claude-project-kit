@@ -124,7 +124,7 @@ did move; or, when it could not fetch or could not compare, that it does not kno
 stops the pass with a remedy rather than guessing.
 
 **`verify` reads `behind` only when a file the jobs run changed.** Those files are every
-script the four jobs load, their imports included, and `schemas/`, which a review and a
+script the five jobs load, their imports included, and `schemas/`, which a review and a
 telemetry row are judged against. A merge that touched none of them — a doc, an ADR,
 another project's script — leaves `verify` at `ALREADY-DONE`, naming both commits. `run`
 still fast-forwards whenever the commits differ, so the clone never drifts.
@@ -164,14 +164,16 @@ pulled — is invisible to it, so a machine that has drifted still reads clean. 
 the one that measures, and it is the one to run after every merge to the default branch and
 whenever `status` looks better than the machine feels.
 
-**Ten cards exist and five are usual:** merge the pull requests that carry Stage E
+**Eleven cards exist and six are usual:** merge the pull requests that carry Stage E
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
 installer checks and prints, and has no code path to either); read the dry-run count before
 anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
 only you know whether that number is the one you meant); read your conflict waker's dry-run
 count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); name the ticket
 the heartbeat monitor comments on (`CK-9` — it does not appear once `HEARTBEAT_MONITOR_TICKET`
-names one or says `off`); and watch one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
+names one or says `off`); read the catch-up poller's first count before it is loaded
+(`CK-11` — each delegation it names starts a paid session, `docs/CATCH-UP.md`); and watch
+one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
 (`CK-4`), and a code host that would not name a repository's required checks (`CK-6`).
@@ -967,7 +969,7 @@ turning something off is still an edit to a file full of tokens.
    empty `REVIEW_REPOS` is a conf the validator refuses, deliberately.
 2. If you want the pollers and the bounce driver stopped too, stop **the heartbeat monitor**
    with them. A monitor left loaded judges the stopped daemons as stale and comments about a
-   shutdown you made on purpose. Either unload all four jobs (Step 3d), or set
+   shutdown you made on purpose. Either unload all five jobs (Step 3d), or set
    `HEARTBEAT_MONITOR_TICKET=off` before the installer run in step 1 — that run unloads the
    monitor and removes its plist — and then unload the four daemons. A later installer run
    loads the four daemons again at its `enable` step. Leaving the daemons loaded with no
@@ -1366,7 +1368,8 @@ prints this and lists every key it accepts:
 (`python3 scripts/pipeline_catchup_poller.py --example-config` prints the shape). The
 installer writes it from the same work teams and agent user as the finding poller, plus
 `CATCHUP_DISPATCHER_URL` and `CATCHUP_FRONT_DOOR_URL`. Its wait before replying cannot be set
-below the tracker's own retries. `docs/CATCH-UP.md` has every key.
+below the tracker's own retries. `--example-config` prints every key; `docs/CATCH-UP.md`
+explains the ones you set.
 
 All four files hold **names of environment variables**, never a value. The loaders refuse a
 value that does not look like a variable name.
@@ -1595,7 +1598,8 @@ because that account cannot traverse your home. They are harmless. The installer
 every role-account command at `/`, so it no longer prints them (KIT-112).
 
 Two cases leave no heartbeat at all: a config that cannot be read (the job exits before it
-learns where its state directory is), and somebody stopping the process on purpose.
+learns where its state directory is — the catch-up poller still writes one, saying `usage`),
+and somebody stopping the process on purpose.
 
 ### 3e. Dry run first — before any job is loaded
 

@@ -308,7 +308,7 @@ def step_stage_e(io, conf, skip):
         # all that is left then is a card, it carries on.
         return stop(io, STAGE_E_MEANS.get(code, "Stage E's installer stopped part way "
                                                 "(exit %d). The lines above say where." % code)
-                    + " If it said its jobs are unloaded, review, bounce and findings stay off "
+                    + " If it said its jobs are unloaded, review, bounce, findings and catch-up stay off "
                       "until it finishes. Clear what it names, then run this command again.",
                     code)
     # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's

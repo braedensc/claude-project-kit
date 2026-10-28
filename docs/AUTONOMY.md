@@ -200,9 +200,9 @@ every later delegation is lost the same way.
 The catch-up poller covers both (`docs/CATCH-UP.md`, KIT-47). It is a Stage E daemon that
 finds a delegation the agent never answered, waits until the tracker's retries are spent,
 and replies once in its thread, which the daemon treats as a new prompt. It pages when the
-webhook is off. Its only write is that reply, and the wait is a floor the script refuses to
-lower: replying sooner would race a retry into a second session, because the daemon keeps
-no record of what it already started.
+webhook is off. Its only write is that reply. The script refuses any wait inside the
+tracker's retries: replying sooner would race a retry into a second session, because the
+daemon keeps no record of what it already started.
 
 ### What actually bounds a session nothing is metering
 

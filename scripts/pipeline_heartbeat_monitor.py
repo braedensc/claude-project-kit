@@ -772,10 +772,19 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
         # firing kinds name the incident.
         out["verdict"] = "failing"
         out["incident"] = incident_of(doc, spec)
-        out["detail"] = ("last check %s ago%s found a problem: %s"
+        # A pass that could not finish says why in its own `error`; the page carries it, so
+        # "it could not do it" is never worded as "it found something".
+        err = " ".join(str(doc.get("error") or "").split()).replace("|", "/") \
+            if isinstance(doc, dict) else ""
+        if len(err) > HEALTH_SUMMARY_CHARS:
+            err = err[:HEALTH_SUMMARY_CHARS - 1].rstrip() + "…"
+        found = findings_text(doc, spec, "firing")
+        failed = ("the pass did not finish (%s): %s" % (out["result"], err)) if err else ""
+        out["detail"] = ("last check %s ago%s %s"
                          % (human_age(out["age_seconds"]), slept_note,
-                            findings_text(doc, spec, "firing")
-                            or "result %r with no finding named" % out["result"]))
+                            "; ".join(x for x in (("found a problem: " + found) if found else "",
+                                                  failed) if x)
+                            or "found a problem: result %r with no finding named" % out["result"]))
     else:
         out["verdict"] = "failing"
         out["detail"] = ("last beat %s ago%s and it reports %r — it RAN and could not do it, "
@@ -2881,6 +2890,19 @@ def selftest():
                              time.time(), 1800, False)
             ok("…a held pass (the dispatcher down) reads ok, and says why",
                real["verdict"] == "ok" and "dispatcher did not answer" in real["detail"], real)
+            pcp.write_heartbeat(cd, "error", pcp._iso(), False,
+                                error="ledger /x/ledger.json is unreadable — move or repair it")
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cd)),
+                             time.time(), 1800, False)
+            ok("…a pass that could not finish is failing and the page says WHY, not 'found'",
+               real["verdict"] == "failing" and "did not finish" in real["detail"]
+               and "ledger" in real["detail"] and "found a problem" not in real["detail"], real)
+            pcp.write_heartbeat(cd, "problems", pcp._iso(), False, [
+                {"kind": "stuck-kit-12", "state": pcp.FIRING, "summary": "KIT-12 is silent"}])
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cd)),
+                             time.time(), 1800, False)
+            ok("…and each stuck ticket is its own incident, so a second one pages",
+               real["verdict"] == "failing" and real.get("incident") == "stuck-kit-12", real)
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))

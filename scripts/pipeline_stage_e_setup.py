@@ -598,6 +598,9 @@ CONF_DEFAULTS = {
     "CATCHUP_INTERVAL_SECONDS": "900",
     "CATCHUP_DISPATCHER_URL": "http://127.0.0.1:3456",
     "CATCHUP_FRONT_DOOR_URL": "",
+    # Empty checks the one OAuth-application webhook the key can see. With several, the
+    # check cannot tell which is the dispatcher's and says so: name it here.
+    "CATCHUP_WEBHOOK_ID": "",
     "SEVERITY_THRESHOLD": "medium",
     "LINEAR_KEY_ENV": "STAGE_E_LINEAR_API_KEY",
     "GITHUB_TOKEN_ENV": "GH_TOKEN",
@@ -781,6 +784,9 @@ def validate_conf(values):
         if (url or not may_be_empty) and not url.startswith(("http://", "https://")):
             errors.append("%s must be an http(s) URL%s (got %r)"
                           % (key, ", or empty" if may_be_empty else "", url))
+    hook_id = (conf.get("CATCHUP_WEBHOOK_ID") or "").strip()
+    if hook_id and not re.match(r"^[A-Za-z0-9-]+$", hook_id):
+        errors.append("CATCHUP_WEBHOOK_ID must be a Linear webhook id, or empty (got %r)" % hook_id)
     nlabel = (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
     if nlabel and not _RDNS_RE.match(nlabel):
         errors.append("NOTIFIER_JOB_LABEL %r is not a reverse-DNS launchd label — the "
@@ -1678,6 +1684,23 @@ CARDS = {
         "good": "one file named ${ROLE_ACCOUNT}, owned by root, mode -r--r--r--",
         "attest": None,
     },
+    "CK-11": {
+        "title": "Read the catch-up poller's first count before it is loaded (KIT-47)",
+        "why": ("Its first real pass replies once to every delegation from the past week that "
+                "the dispatcher never answered, and each reply starts a paid session. Some "
+                "were dropped on purpose, and some you may not want any more. The dry-run "
+                "lines above name every one. Only you know which you want started."),
+        "do": ["Read the WOULD re-prompt lines the installer just printed above.",
+               "For any you do NOT want started, remove its delegation or close the",
+               "ticket, then re-run: the count drops, because it is then skipped.",
+               "When the count is what you meant, sign it off and re-run:",
+               "    python3 scripts/pipeline_stage_e_setup.py attest A-CATCHUP-COUNT "
+               "--initials " + INITIALS_PLACEHOLDER + " --note \"count read: N\"",
+               "(YOUR initials, 2-4 letters, and N the count you just read. This is asked",
+               "once, before the job is first loaded.)"],
+        "good": "the count you attested is the count you meant",
+        "attest": "A-CATCHUP-COUNT",
+    },
 }
 
 ATTESTATIONS = {
@@ -1688,12 +1711,14 @@ ATTESTATIONS = {
                        "tools were probed under the fence the entries carry (CK-7)"),
     "A-ENTRY-LOADED": ("the dispatcher really loaded the review entries — the behavioural "
                        "proof, when its startup banner says nothing"),
+    "A-CATCHUP-COUNT": ("the catch-up poller's first count is the number you meant: each "
+                        "delegation it names gets one reply, which starts a paid session (CK-11)"),
 }
 
 # Sign-offs that are worth nothing without a note. A-DRY-RUN records that you
 # read a COUNT — the number of pull requests the first real pass will open a paid
 # session for — so a sign-off carrying no number records a click, not a reading.
-ATTESTATIONS_NEEDING_NOTE = frozenset(("A-DRY-RUN",))
+ATTESTATIONS_NEEDING_NOTE = frozenset(("A-DRY-RUN", "A-CATCHUP-COUNT"))
 
 NEVER = [
     "Never merge a pull request, and never approve one. An approval says somebody else",
@@ -3270,6 +3295,7 @@ def step_configs(ctx, apply_it):
         "state_dir": "~/.stage-e/catchup",
         "dispatcher_url": conf["CATCHUP_DISPATCHER_URL"].strip(),
         "front_door_url": conf["CATCHUP_FRONT_DOOR_URL"].strip(),
+        "webhook_id": (conf.get("CATCHUP_WEBHOOK_ID") or "").strip(),
     }
     wanted = {"poller.json": poller, "config.json": bounce,
               "finding/poller.json": finding, "catchup/poller.json": catchup}
@@ -4803,9 +4829,19 @@ def step_dry_run(ctx, apply_it):
     # The catch-up poller's exit 3 is a pass that RAN and found something only a person can
     # fix (a disabled webhook, a session still silent after its re-prompt): it is reported,
     # like the poller's decline, and the install goes on. Anything else is a failure.
+    catchup_said = catchup.out + catchup.err
     if catchup.rc not in ok_codes:
         problems.append("the catch-up poller's dry run failed (exit %d). Nothing was "
                         "posted: %s" % (catchup.rc, (catchup.err or catchup.out).strip()[-400:]))
+    elif "HELD:" in catchup_said:
+        # The dispatcher answers at install time — the entry step just proved it — so a held
+        # dry run is a wrong URL, and a job that would hold on every pass, forever.
+        problems.append("the catch-up poller's dry run HELD: it could not reach the dispatcher "
+                        "at CATCHUP_DISPATCHER_URL (%s) or the front door at "
+                        "CATCHUP_FRONT_DOOR_URL (%s). Fix the URL in stage-e.conf and re-run: %s"
+                        % (ctx.conf["CATCHUP_DISPATCHER_URL"],
+                           ctx.conf["CATCHUP_FRONT_DOOR_URL"] or "not set",
+                           [l for l in catchup_said.splitlines() if "HELD:" in l][0][-300:]))
     elif catchup.rc == COMPONENT_EXIT_DECLINED:
         notes.append("the catch-up poller's dry run found something only a person can fix; "
                      "its FIRING lines above say what")
@@ -4826,6 +4862,14 @@ def step_dry_run(ctx, apply_it):
                               "UNKNOWN for at least one repository")
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off")
+    would = [l.split("WOULD re-prompt", 1)[1].strip() for l in catchup_said.splitlines()
+             if "WOULD re-prompt" in l]
+    if not ctx.state.attested("A-CATCHUP-COUNT"):
+        say("  The catch-up poller's first pass would re-prompt %d delegation(s):" % len(would))
+        for line in would:
+            say("    " + line)
+        raise Blocked("CK-11", "the catch-up poller's first count (%d) has not been signed off"
+                      % len(would))
     return True, ("all four dry runs ran and the count is signed off; "
                   + ("the poller declined at least one pull request"
                      if declined else "the poller did not decline")), notes
@@ -4835,6 +4879,7 @@ def step_dry_run(ctx, apply_it):
 # step_enable's loops, so a daemon added later cannot be loaded without being waited for.
 DAEMON_HEARTBEATS = ("state/heartbeat.json", "state/bounce-heartbeat.json",
                      "finding/heartbeat.json", "catchup/heartbeat.json")
+HEARTBEAT_WAIT_SECONDS = 180
 
 
 def step_enable(ctx, apply_it):
@@ -4918,7 +4963,9 @@ def step_enable(ctx, apply_it):
     if ctx.runner.dry_run:
         return False, "would load the daemons and wait for their heartbeats", []
 
-    deadline = time.time() + 90
+    # 180 s, not 90: the catch-up poller's first pass may reply up to three times, a minute
+    # apart, before it writes its heartbeat.
+    deadline = time.time() + HEARTBEAT_WAIT_SECONDS
     while time.time() < deadline:
         beats = r.as_role(ctx.account,
                           "for f in %s; do "
@@ -4930,8 +4977,8 @@ def step_enable(ctx, apply_it):
             return False, "all %d daemons loaded; all heartbeats appeared" % len(
                 DAEMON_HEARTBEATS), []
         time.sleep(5)
-    raise Unknown("the daemons were loaded and only %d of %d heartbeats appeared within 90s "
-                  "(%s)" % (len(have_beats), len(DAEMON_HEARTBEATS),
+    raise Unknown("the daemons were loaded and only %d of %d heartbeats appeared within %ds "
+                  "(%s)" % (len(have_beats), len(DAEMON_HEARTBEATS), HEARTBEAT_WAIT_SECONDS,
                             ", ".join(have_beats) or "none"),
                   "read the logs under the role account's ~/.stage-e/, one per daemon: a "
                   "stale timestamp means NOT RUNNING, a fresh one with a non-ok result "
@@ -5888,11 +5935,11 @@ def _unloaded_notice(ctx):
     """Say it out loud when a run ends with the loops switched off.
 
     `code` stops every daemon before it moves the clone under them. The
-    far-downstream `enable` step starts the three again, and the
+    far-downstream `enable` step starts the four again, and the
     `heartbeat-monitor` step after it starts the monitor. A run that blocks in
     between leaves those jobs OFF, and silence there looks exactly like a
     healthy install. Each is named for what it is: a run that stops at the
-    monitor's step has review, bounce and finding running, and saying they are
+    monitor's step has review, bounce, finding and catch-up running, and saying they are
     off would send a person to look at loops that are fine."""
     if not ctx.unloaded:
         return
@@ -5903,7 +5950,7 @@ def _unloaded_notice(ctx):
         say("")
         say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
         say("under them, and did not get as far as the step that loads them again — so review,")
-        say("bounce and finding are OFF until it does:")
+        say("bounce, finding and catch-up are OFF until it does:")
         for label in core:
             say("    %s" % label)
     rearm = None
@@ -8835,6 +8882,38 @@ def _selftest_body():
                and "catch-up poller" in str(rowC) and "exit %d" % rc in str(rowC),
                "a catch-up dry run that exited %d did not stop the install by name: %r"
                % (rc, rowC))
+    # A HELD dry run is a wrong URL: the dispatcher answered moments ago, so a job that holds
+    # now would hold on every pass, and read healthy doing it.
+    ctxCH, fakeCH = _dry_run_ctx(conf)
+    fakeCH.answers = [("pipeline_catchup_poller.py", 0, "[catchup-poller] HELD: the dispatcher "
+                       "did not answer http://127.0.0.1:9999/version (refused).\n")] + fakeCH.answers
+    rowCH, _pCH = _quiet(lambda: _dry_run_row(ctxCH))
+    expect("catchup-dry-run", isinstance(rowCH, SetupError)
+           and "CATCHUP_DISPATCHER_URL" in str(rowCH),
+           "a catch-up dry run that HELD did not stop the install, naming the URL: %r" % (rowCH,))
+    # THE FIRST COUNT IS SIGNED (CK-11): each delegation it names starts a paid session.
+    cases += 1
+    ctxCK, fakeCK = _dry_run_ctx(conf)
+    ctxCK.state.data["attestations"].pop("A-CATCHUP-COUNT", None)
+    fakeCK.answers = [("pipeline_catchup_poller.py", 0,
+                       "[catchup-poller] WOULD re-prompt KIT-7: KIT-7 was delegated and never "
+                       "answered\n[catchup-poller] WOULD re-prompt KIT-8: KIT-8 was delegated and "
+                       "never answered\n")] + fakeCK.answers
+    rowCK, printedCK = _quiet(lambda: _dry_run_row(ctxCK))
+    expect("catchup-count-signed", isinstance(rowCK, Blocked) and rowCK.card_id == "CK-11"
+           and "(2)" in rowCK.extra
+           and "KIT-7" in printedCK and "KIT-8" in printedCK,
+           "an unsigned first catch-up count did not stop at CK-11, naming each delegation: %r"
+           % (rowCK,))
+    ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 2")
+    rowCK2, _p = _quiet(lambda: _dry_run_row(ctxCK))
+    expect("catchup-count-signed", isinstance(rowCK2, tuple) and rowCK2[0] is True,
+           "a signed catch-up count still stopped the install: %r" % (rowCK2,))
+    expect("catchup-count-signed", "A-CATCHUP-COUNT" in ATTESTATIONS_NEEDING_NOTE
+           and CARDS["CK-11"]["attest"] == "A-CATCHUP-COUNT", "CK-11 is not a noted sign-off")
+    expect("catchup-conf", any("CATCHUP_WEBHOOK_ID" in e for e in validate_conf(
+        dict(parse_conf(GOOD_CONF)[0], CATCHUP_WEBHOOK_ID="not an id!"))[1]),
+           "a CATCHUP_WEBHOOK_ID that is not an id was accepted")
 
     # ------------------------------------------------------------------ #
     # 16. THE CREDENTIAL IS ASKED FOR AT MOST ONCE, AND READ BEFORE IT IS
@@ -11912,7 +11991,7 @@ def _settled_ctx(conf):
     catchup = {
         "agent_user_id": "u-agent", "teams": ["KIT"], "linear_key_env": "STAGE_E_LINEAR_API_KEY",
         "state_dir": "~/.stage-e/catchup", "dispatcher_url": "http://127.0.0.1:3456",
-        "front_door_url": "",
+        "front_door_url": "", "webhook_id": "",
     }
     answers = [
         # KIT-241: the served repository's committed delivery.json, and the lane marker,
@@ -12013,6 +12092,7 @@ def _dry_run_ctx(conf, poller=_CLEAN_POLLER, bounce=_CLEAN_BOUNCE):
         a for a in fake.answers
         if a[0] not in ("scan --dry-run", " ".join(BOUNCE_DRY_RUN_ARGS))]
     ctx.state.attest("A-DRY-RUN", "xx", "count read: 2")
+    ctx.state.attest("A-CATCHUP-COUNT", "xx", "count read: 0")
     return ctx, fake
 
 
@@ -12113,6 +12193,7 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
     if stored_env:
         _with_stored_env(ctx, fake, conf)
     ctx.state.attest("A-DRY-RUN", "xx", "count read: 0")
+    ctx.state.attest("A-CATCHUP-COUNT", "xx", "count read: 0")
     # …signed under the fence the entries carry, which the entry step records again
     # on every pass.
     fence = review_fence(ctx)

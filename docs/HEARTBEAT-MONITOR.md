@@ -59,12 +59,20 @@ world-readable status file, and this monitor reads that file like a heartbeat:
 - The comment says where to look: ask the tech lead in chat to read the file, or run
   `python3 scripts/pipeline_watch.py status`.
 
-**The catch-up poller's `held` is good.** It held its pass because the dispatcher or its
-front door did not answer (`docs/CATCH-UP.md`). That outage is the health watch's to page,
+**The catch-up poller's `held` is good.** It held its replies because the dispatcher or its
+front door did not answer (`docs/CATCH-UP.md`). A short outage is the health watch's to page,
 so this row only names it. Its `problems` reads **failing**, and the row names each firing
-kind the way the health watch's does: `webhook` (the tracker switched the dispatcher's
-webhook off) or `stuck` (a delegation still silent after the job's reply). A new kind pages
-again; the same kinds an hour later do not. A check it could not make never pages.
+kind the way the health watch's does:
+
+- `webhook`: the tracker switched the dispatcher's webhook off;
+- `stuck-<ticket>`: a delegation still silent after the job's reply. Each ticket is its own
+  kind, so a second one pages, and it fires until a person acts on it;
+- `coverage`: the session list was cut short, so a lost delegation could be beyond it;
+- `gate`: the route has been down for 8 passes in a row, which is also how a wrong URL looks.
+
+A new kind pages again; the same kinds an hour later do not. A check it could not make never
+pages. Its `error`, `usage` and `timeout` read **failing**, and the row quotes the job's own
+reason.
 
 **The notifier writes an exit code, not a result word.** The monitor reads it through the
 same exit table every Stage E job shares: 0 is `ok`, and 1, 2, 3 and 4 are `failing`. Its
@@ -105,7 +113,8 @@ on, or a pass cut short. The finding poller has no exit 3.
 
 The three pollers' files share a filename and are told apart by **directory**. The selftest
 cross-checks every schema string and filename against the writers, and judges heartbeats
-the review poller's, the finding poller's and the notifier's own writers produced — the
+the review poller's, the finding poller's, the catch-up poller's and the notifier's own
+writers produced — the
 notifier's at each exit it can leave — so a renamed field turns CI red instead of quietly
 reading as healthy — or, the way it actually failed once, paging on every healthy file.
 
