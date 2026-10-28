@@ -162,6 +162,7 @@ import inspect
 import io
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -704,6 +705,9 @@ def user_deny_patterns(conf):
 # which re-opens that one path inside the denied region and nothing beside it. Sandbox
 # paths are not permission rules: `/x` is absolute there. Never `permissions.allow`.
 TRUST_GLOB_CHARS = "*?[]{}"
+# The most of one trust file verify's probe scans for PRIVATE KEY. A CA certificate is a
+# few KB; a file larger than this is not checked whole, and the trust-files row fails it.
+TRUST_SCAN_CAP = 1 << 20
 
 
 def sandbox_trust_files(conf):
@@ -716,22 +720,72 @@ def sandbox_trust_files(conf):
     return out
 
 
-def _exact_deny_paths(conf):
-    """The absolute paths piece 5 denies by name: `Read(//a/b)` with no glob is `/a/b`."""
+def role_home(account):
+    """The role account's home folder, or None where the account cannot be looked up (not
+    created yet, or another machine)."""
+    try:
+        return pwd.getpwnam(account).pw_dir if account else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _deny_regex(pattern):
+    """A deny rule's path as a regex over one whole path: `**` crosses folders, `*` and `?`
+    stay inside one name, and a final `/**` is the folder and everything under it."""
+    out, i = [], 0
+    under = pattern.endswith("/**")
+    if under:
+        pattern = pattern[:-3]
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+            continue
+        out.append({"*": "[^/]*", "?": "[^/]"}.get(pattern[i]) or re.escape(pattern[i]))
+        i += 1
+    return "".join(out) + ("(?:/.*)?" if under else "")
+
+
+def _placed_denies(conf):
+    """(rule, path pattern, from home) for each Read deny piece 5 composes that names a
+    place: `Read(//abs…)` is absolute, `Read(~/…)` under the role account's home. The
+    anchored repository patterns (`//**/…`) name a file anywhere, and re-opening one of
+    those exactly is what a trust file is for."""
     out = []
     for rule in user_deny_patterns(conf):
-        m = re.match(r"^Read\(/(/.*)\)$", rule)
-        if m and not any(ch in m.group(1) for ch in TRUST_GLOB_CHARS):
-            out.append(os.path.normpath(m.group(1)))
+        m = re.match(r"^Read\((.*)\)$", rule)
+        p = m.group(1) if m else ""
+        if p.startswith("//") and not p.startswith("//**"):
+            out.append((rule, p[1:], False))
+        elif p.startswith("~/"):
+            out.append((rule, p[2:], True))
     return out
+
+
+def deny_reopened_by(conf, path, home=None):
+    """The deny rule piece 5 composes that allowing `path` would undo, or None. A `~/` rule
+    is matched two ways: expanded against `home` when it is known, and by its tail on a
+    folder boundary under any home, so it holds where the account does not exist yet."""
+    path = os.path.normpath(path)
+    for rule, pattern, from_home in _placed_denies(conf):
+        if not from_home and re.fullmatch(_deny_regex(pattern), path):
+            return rule
+        if from_home and home and re.fullmatch(
+                _deny_regex(os.path.normpath(os.path.join(home, pattern))), path):
+            return rule
+        if from_home and re.search("/" + _deny_regex(pattern) + r"\Z", path):
+            return rule
+    return None
 
 
 def trust_file_problems(conf):
     """Every problem with every SANDBOX_TRUST_FILES entry, each naming its entry. An entry
     must be one exact file: absolute, no glob, no `..`, not a folder, not a key, and not a
-    file piece 5 denies by name."""
+    path a placed piece 5 deny covers: the dispatcher's config and env file, and the role
+    account's env file, its copies and its backups, under the role account's home or any
+    home."""
     problems = []
-    denied = _exact_deny_paths(conf)
+    home = role_home((conf or {}).get("ROLE_ACCOUNT"))
     for entry in sandbox_trust_files(conf):
         say_entry = "SANDBOX_TRUST_FILES entry %r" % entry
         name = entry.rsplit("/", 1)[-1].lower()
@@ -749,9 +803,10 @@ def trust_file_problems(conf):
                             "file" % say_entry)
         if name.endswith(".key"):
             problems.append("%s ends .key: a private key is never a trust file" % say_entry)
-        if os.path.normpath(entry) in denied:
-            problems.append("%s is a file piece 5 denies by name: allowing it would undo "
-                            "that deny" % say_entry)
+        reopened = deny_reopened_by(conf, entry, home) if entry.startswith("/") else None
+        if reopened:
+            problems.append("%s is a path piece 5 denies with %s: allowing it would undo "
+                            "that deny" % (say_entry, reopened))
     return problems
 
 
@@ -2078,7 +2133,7 @@ def print_card(cid, conf=None, broken=False):
 # file). Every `open` in it takes one argument: read mode.
 # --------------------------------------------------------------------------- #
 FACTS_PY = r'''
-import hashlib, json, os, pathlib, re, sys
+import hashlib, json, os, pathlib, re, stat, sys
 QUOTES = "\"'`"
 
 def raw_of(path):
@@ -2217,16 +2272,30 @@ def sandbox_path(entry):
 
 def trust(entry):
     # Booleans and a byte count only, never a byte of the file. A link is not followed.
+    # Only a regular file is opened: a pipe can block forever and a device can never end.
+    # At most TRUST_SCAN_CAP bytes are scanned for PRIVATE KEY, in chunks that overlap.
     q = sandbox_path(entry)
     if os.path.islink(q):
         return {"symlink": True}
     if os.path.isdir(q):
         return {"folder": True}
     try:
-        raw = raw_of(q)
+        st = os.stat(q)
+        if not stat.S_ISREG(st.st_mode):
+            return {"notRegular": True}
+        seen, key, tail = 0, False, b""
+        with pathlib.Path(q).open("rb") as fh:
+            while seen < TRUST_SCAN_CAP and not key:
+                chunk = fh.read(min(65536, TRUST_SCAN_CAP - seen))
+                if not chunk:
+                    break
+                seen += len(chunk)
+                key = b"PRIVATE KEY" in tail + chunk
+                tail = chunk[-10:]
+            capped = not key and seen >= TRUST_SCAN_CAP and fh.read(1) != b""
     except Exception as exc:
         return {"error": why(exc)}
-    return {"bytes": len(raw), "privateKey": b"PRIVATE KEY" in raw}
+    return {"bytes": st.st_size, "privateKey": key, "capped": capped}
 
 def user_settings(listed):
     path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
@@ -2234,9 +2303,10 @@ def user_settings(listed):
         raw = raw_of(path)
         s = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        return {"path": path, "error": why(exc),
+        return {"path": path, "home": os.path.expanduser("~"), "error": why(exc),
                 "trust": dict((p, trust(p)) for p in listed)}
-    out = {"path": path, "sha256": digest(raw)}
+    # The home: verify expands a `~/` deny and a `~/` allowRead entry against it.
+    out = {"path": path, "home": os.path.expanduser("~"), "sha256": digest(raw)}
     # sandbox.filesystem.allowRead (KIT-257): the same rule as deny below. A wrong type is
     # reported, never read as an empty list.
     sb = s.get("sandbox", {}) if isinstance(s, dict) else None
@@ -2338,7 +2408,8 @@ out = {"config": config(ARGS[0]), "env": env(ARGS[1]),
 if len(ARGS) > 4:
     out["frontDoor"] = front_door(ARGS[3], ARGS[4])
 print(json.dumps(out))
-'''.replace("[:HEAD]", "[:%d]" % INSTRUCTION_HEAD_CHARS)
+'''.replace("[:HEAD]", "[:%d]" % INSTRUCTION_HEAD_CHARS).replace(
+    "TRUST_SCAN_CAP", str(TRUST_SCAN_CAP))
 
 
 def facts_command(conf):
@@ -2812,9 +2883,31 @@ def _trust_unsafe(facts):
         return "is a symbolic link"
     if facts.get("folder"):
         return "is a folder"
+    if facts.get("notRegular"):
+        return "is not a regular file (a pipe, a device or a socket)"
     if facts.get("privateKey"):
         return "holds the text PRIVATE KEY"
+    if facts.get("capped"):
+        return ("is larger than %d MiB, the most verify scans for PRIVATE KEY, so it was "
+                "not checked whole" % (TRUST_SCAN_CAP >> 20))
     return None
+
+
+def _sandbox_path(entry, home):
+    """An allowRead entry as the sandbox reads it, the probe's own rule with the probe's
+    home: `/x` (and the older `//x`) is absolute, `~/x` is under the home, anything else
+    is under ~/.claude."""
+    if entry.startswith("/"):
+        return "/" + entry.lstrip("/")
+    if entry.startswith("~/"):
+        return os.path.join(home, entry[2:])
+    return os.path.join(home, ".claude", entry)
+
+
+def _trust_reopens(conf, entry, home):
+    """The piece 5 deny an allowRead entry would undo, read with the role account's home
+    as the probe reported it, or None."""
+    return deny_reopened_by(conf, _sandbox_path(entry, home or "/"), home)
 
 
 def check_trust_files(conf, us, env_facts):
@@ -2841,15 +2934,23 @@ def check_trust_files(conf, us, env_facts):
             us["allowReadOther"], "y is" if us["allowReadOther"] == 1 else "ies are"))
     broken += ["%s is a glob: it re-opens every file it matches" % a for a in live
                if any(ch in a for ch in TRUST_GLOB_CHARS)]
+    broken += ["%s ends with a slash: it names a folder, and re-opens every file in it once "
+               "the folder exists" % a for a in live
+               if a.endswith("/") and not (trust.get(a) or {}).get("folder")]
     broken += ["%s %s" % (p, _trust_unsafe(f)) for p, f in sorted(trust.items())
                if _trust_unsafe(f)]
+    home = us.get("home")
+    broken += ["%s re-opens what piece 5 denies with %s" % (p, _trust_reopens(conf, p, home))
+               for p in listed + [a for a in live if a not in listed]
+               if _trust_reopens(conf, p, home)]
     if broken:
         return _row("trust-files", FAILED,
                     "%d problem(s) with the sandbox's read exceptions: each must re-open one "
                     "exact trust file and nothing more" % len(broken),
-                    broken + ["each must be one exact file: never a folder, a glob, a link "
-                              "or a file holding a private key. Fix SANDBOX_TRUST_FILES or "
-                              "the allowRead list in %s by hand" % path])
+                    broken + ["each must be one exact file: never a folder, a glob, a link, "
+                              "a pipe or device, a file holding a private key, or a file "
+                              "piece 5 denies. Fix SANDBOX_TRUST_FILES or the allowRead list "
+                              "in %s by hand" % path])
     unread = sorted(p for p, f in trust.items() if (f or {}).get("error") not in (None,
                                                                                   "missing"))
     if unread:
@@ -3871,6 +3972,9 @@ def merge_plan(conf, facts):
         have, seen = us.get("allowRead") or [], us.get("trust") or {}
         for entry in [p for p in listed if p not in have]:
             unsafe = _trust_unsafe(seen.get(entry))
+            reopens = _trust_reopens(conf, entry, us.get("home"))
+            if reopens and not unsafe:
+                unsafe = "re-opens what piece 5 denies with %s" % reopens
             if unsafe:
                 lines.append("CANNOT      trust file %s %s: it is not added" % (entry, unsafe))
             else:
@@ -7469,6 +7573,44 @@ def _selftest_kit257(expect, conf):
         return named == list(bad) and len(errs) == 3, errs
     case("conf-names-every-bad-entry-at-once", all_at_once)
 
+    # The role account's own files, written as an absolute path (review of PR #198). The
+    # default ROLE_ENV_FILE is ~/.stage-e/env, so its deny is a `~/` rule, while a trust
+    # entry is absolute. Refused by the role account's home where it can be looked up, and
+    # by the rule's tail under any home where it cannot.
+    def with_role_home(home, fn):
+        saved = globals()["role_home"]
+        globals()["role_home"] = lambda account: home
+        try:
+            return fn()
+        finally:
+            globals()["role_home"] = saved
+
+    role_dir = "/Users/_exdispatch/.stage-e"
+    for label, entry, home, extra in (
+            ("role-env-no-account", role_dir + "/env", None, ""),
+            ("role-env-any-home", "/var/empty/elsewhere/.stage-e/env", None, ""),
+            ("role-env-in-its-home", role_dir + "/env", "/Users/_exdispatch", ""),
+            ("role-env-copy", role_dir + "/env.notifier-setup.4242", None, ""),
+            ("role-backup", role_dir + "/backups/settings.json.20261010T000000Z", None, ""),
+            ("role-env-only-from-the-account-home", "/Users/_shared/.stage-e/env",
+             "/Users/_exdispatch", "ROLE_ENV_FILE=~/../_shared/.stage-e/env\n"),
+            ("absolute-role-env-copy", "/srv/example/role/env.stage-e-setup.7", None,
+             role_abs)):
+        def refused_home(entry=entry, home=home, extra=extra):
+            _got, errs = with_role_home(home, lambda: conf_errors(entry, extra))
+            hits = [e for e in errs if repr(entry) in e and "piece 5 denies" in e]
+            return len(hits) == 1 and len(errs) == 1, errs
+        case("conf-refuses:" + label, refused_home)
+
+    def accepts_beside_the_role_files():
+        # Only LIKE the role env file, its copies or its backups folder: not them.
+        want = ["/opt/example.stage-e/env", role_dir + "/env-ca.crt",
+                role_dir + "/backups-ca.crt"]
+        got, errs = with_role_home("/Users/_exdispatch",
+                                   lambda: conf_errors(",".join(want)))
+        return not errs and sandbox_trust_files(got) == want, errs
+    case("conf-accepts-names-beside-the-role-files", accepts_beside_the_role_files)
+
     # -- piece 5: sandbox.filesystem.allowRead, and never permissions.allow -------------
     listed_conf = dict(conf, SANDBOX_TRUST_FILES=TRUST_EXAMPLE)
 
@@ -7692,6 +7834,24 @@ def _selftest_kit257(expect, conf):
                     and rc == EX_FAILED), (rc, out[-500:])
     case("merge-holds-back-a-file-holding-a-private-key", merge_holds_back_a_key)
 
+    def merge_holds_back_the_role_env():
+        with tempfile.TemporaryDirectory() as tmp:
+            role_env = os.path.join(tmp, "role-home", ".stage-e", "env")
+            c, home, spath, _cert = fixture(tmp, listed=[role_env])
+            _put(role_env, "STAGE_E_KEY=%s\n" % SENTINELS[2])
+            text = denies(c)
+            _put(spath, text)
+            rc_d, out_d = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                                   _FakeSudo(), False)
+            rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True)
+            flat = " ".join(out_d.split())
+            return ("CANNOT" in flat and "Read(~/.stage-e/env)" in flat
+                    and "ALLOW READ" not in flat and rc == EX_FAILED
+                    and _read(spath) == text and SENTINELS[2] not in out_d + out), (
+                rc_d, rc, out_d[-500:])
+    case("merge-holds-back-the-role-env-file", merge_holds_back_the_role_env)
+
     # -- verify's trust-files row ------------------------------------------------------
     def verify_case(name, want, needle, settings=None, listed=None, cert_text=_FAKE_CERT,
                     setup=None, env_extra=""):
@@ -7740,6 +7900,62 @@ def _selftest_kit257(expect, conf):
                 listed=[])
     verify_case("unknown-under-claude-config-dir", UNKNOWN, "CLAUDE_CONFIG_DIR", allow(this),
                 env_extra="CLAUDE_CONFIG_DIR=/srv/example/claude\n")
+
+    # The role account's own files, re-opened by a live entry (review of PR #198, 1).
+    def role_file(*parts):
+        return lambda tmp, cert: os.path.join(tmp, "role-home", ".stage-e", *parts)
+
+    def role_env_on_disk(tmp, c, cert):
+        _put(os.path.join(tmp, "role-home", ".stage-e", "env"), "STAGE_E_KEY=x\n")
+        return c
+    verify_case("failed-on-the-role-env-file-as-a-home-path", FAILED,
+                "~/.stage-e/env re-opens what piece 5 denies with Read(~/.stage-e/env)",
+                allow(this, "~/.stage-e/env"), setup=role_env_on_disk)
+    verify_case("failed-on-the-role-env-file-as-an-absolute-path", FAILED,
+                "re-opens what piece 5 denies with Read(~/.stage-e/env)",
+                allow(this, role_file("env")), setup=role_env_on_disk)
+    verify_case("failed-on-a-role-env-copy", FAILED, "Read(~/.stage-e/env.*)",
+                allow(this, role_file("env.stage-e-setup.99")))
+    verify_case("failed-on-a-role-backup", FAILED, "Read(~/.stage-e/backups/**)",
+                allow(this, role_file("backups", "settings.json.20261010T000000Z")))
+
+    def climbing(tmp, c, cert):
+        return dict(c, ROLE_ENV_FILE="~/../shared/.stage-e/env")
+    verify_case("failed-on-a-role-env-file-only-the-probe-home-finds", FAILED,
+                "Read(~/../shared/.stage-e/env)",
+                allow(this, lambda tmp, cert: os.path.join(tmp, "shared", ".stage-e", "env")),
+                setup=climbing)
+
+    # Only a regular file is read, and only so far (review of PR #198, 2).
+    verify_case("failed-on-a-device-entry", FAILED, "/dev/null is not a regular file",
+                allow(this, "/dev/null"))
+
+    def fifo(tmp, c, cert):
+        os.mkfifo(os.path.join(tmp, "certs", "pipe-ca.crt"))
+        return c
+    verify_case("failed-on-a-pipe-entry", FAILED, "pipe-ca.crt is not a regular file",
+                allow(this, lambda tmp, cert: os.path.join(tmp, "certs", "pipe-ca.crt")),
+                setup=fifo)
+    verify_case("failed-on-a-file-over-the-scan-cap", FAILED, "not checked whole",
+                allow(this), cert_text=_FAKE_CERT + "#" * TRUST_SCAN_CAP)
+    once = ("-----BEGIN " + "EC " + "PRIVATE" + " KEY-----\nsentinel-key-body-7c1d\n")
+    verify_case("failed-on-a-key-across-a-chunk-boundary", FAILED, "PRIVATE KEY",
+                allow(this), cert_text="#" * (65536 - 5 - once.index("PRIVATE")) + once)
+
+    # A trailing slash names a folder, on disk or not yet (review of PR #198, 3).
+    verify_case("failed-on-a-slash-entry-not-on-disk-yet", FAILED, "ends with a slash",
+                allow(this, lambda tmp, cert: os.path.join(tmp, "certs-later") + "/"))
+
+    def slash_folder_once():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            _put(spath, denies(c, {"filesystem": {"allowRead": [
+                cert, os.path.dirname(cert) + "/"]}}))
+            row, _facts = row_of(c, home)
+            text = " ".join(_row_text(row).split())
+            return (row["outcome"] == FAILED and "is a folder" in text
+                    and "ends with a slash" not in text), text[-600:]
+    case("verify-names-an-existing-slash-folder-once", slash_folder_once)
     if os.geteuid() != 0:
         def unreadable(tmp, c, cert):
             os.chmod(cert, 0)

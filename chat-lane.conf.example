@@ -152,5 +152,7 @@ FRONT_DOOR_MATCHER=@dispatcher
 #
 # RULE: each an absolute path to one file. No glob (* ? [ ] { }), no ..
 # segment, no trailing slash, no "key" in the file name, not .key, and not a
-# file piece 5 denies by name. Every bad entry is named, all at once.
+# file piece 5 denies: the dispatcher's config and env file, or the role
+# account's env file, its copies and its backups, under any home. Every bad
+# entry is named, all at once.
 #SANDBOX_TRUST_FILES=/opt/example-dispatcher/certs/egress-ca.pem
