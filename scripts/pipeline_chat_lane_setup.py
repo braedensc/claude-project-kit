@@ -3018,9 +3018,6 @@ def _trust_unsafe(facts):
     if "certificates" in facts and not facts["certificates"]:
         return ("holds no certificate block: a trust file is a CA certificate in PEM form, "
                 "so a copy of any other file is refused")
-    if facts.get("otherLines"):
-        return ("holds %d line(s) that are not certificate text: a trust file holds PEM "
-                "certificates and nothing else" % facts["otherLines"])
     return None
 
 
@@ -3090,15 +3087,11 @@ def check_trust_files(conf, us, env_facts):
         return _row("trust-files", FAILED,
                     "%d problem(s) with the sandbox's read exceptions: each must re-open one "
                     "exact trust file and nothing more" % len(broken),
-                    broken + ["each must be one exact file holding only PEM "
-                              "certificates, under one name: never a folder, a glob, a "
-                              "link, a hard link, a pipe or device, a file holding a "
-                              "private key or anything else, or a file piece 5 denies. Fix "
-                              "SANDBOX_TRUST_FILES or the allowRead list in %s by hand"
-                              % path,
-                              "to keep only a file's certificates, list a clean copy: "
-                              "sed -n '/-----BEGIN CERTIFICATE-----/,"
-                              "/-----END CERTIFICATE-----/p' <file> > <clean file>"])
+                    broken + ["each must be one exact file holding PEM certificates and "
+                              "no private key, under one name: never a folder, a glob, a "
+                              "link, a hard link, a pipe or device, or a file piece 5 "
+                              "denies. Fix SANDBOX_TRUST_FILES or the allowRead list in %s "
+                              "by hand" % path])
     unread = sorted(p for p, f in trust.items() if (f or {}).get("error") not in (None,
                                                                                   "missing"))
     if unread:
@@ -3118,6 +3111,10 @@ def check_trust_files(conf, us, env_facts):
     lines = ["not composed (SANDBOX_TRUST_FILES does not list it): " + a for a in extra]
     lines += ["not on disk yet, so its allow re-opens nothing: " + p for p in listed
               if (trust.get(p) or {}).get("error") == "missing"]
+    lines += ["%s: holds %d text line(s) beside its %d certificate block(s), as a system "
+              "CA bundle does (a subject or a title per certificate). Counted, not read "
+              "out" % (p, f["otherLines"], f.get("certificates") or 0)
+              for p, f in sorted(trust.items()) if (f or {}).get("otherLines")]
     lines += ["%s: the role account can change it or a folder above it, so a process of "
               "that account could replace it after this check" % p
               for p, f in sorted(trust.items())
@@ -3133,8 +3130,8 @@ def check_trust_files(conf, us, env_facts):
                     % (path, len(live)), lines)
     return _row("trust-files", ALREADY_DONE,
                 "%s allows the sandbox to read %d trust file(s), each an exact file "
-                "holding only certificates, under one name: not a folder, a glob or a "
-                "link, and none holds a private key" % (path, len(listed)),
+                "holding certificates, under one name: not a folder, a glob or a link, "
+                "and none holds a private key" % (path, len(listed)),
                 lines)
 
 
@@ -8236,13 +8233,21 @@ def _selftest_kit257(expect, conf):
     verify_case("failed-on-a-copy-of-an-env-file", FAILED, "holds no certificate block",
                 allow(this, lambda tmp, cert: os.path.join(tmp, "certs", "copied-ca.crt")),
                 setup=env_copy)
-    verify_case("failed-on-lines-appended-to-a-certificate", FAILED,
-                "holds 1 line(s) that are not certificate text", allow(this),
-                cert_text=_FAKE_CERT + "STAGE_E_KEY=x\n")
-    verify_case("failed-on-other-text-inside-a-certificate-block", FAILED,
-                "holds 1 line(s) that are not certificate text", allow(this),
-                cert_text="-----BEGIN CERTIFICATE-----\nSTAGE_E_KEY=x\n"
-                          "-----END CERTIFICATE-----\n")
+    # A system CA bundle: a title and a text dump beside each certificate. Text is counted
+    # and said, never refused: git reads this exact file, so it cannot be swapped for a
+    # copy without its text (the live egress bundle, 2026-10-27: 2791 such lines).
+    system_bundle = ("### Example Root CA\n\n=== /C=US/O=Example/CN=Example Root CA\n"
+                     "Certificate:\n    Data:\n        Version: 3 (0x2)\n"
+                     "        Signature Algorithm: sha256WithRSAEncryption\n"
+                     "        Subject: C=US, O=Example, CN=Example Root CA\n"
+                     "            X509v3 Basic Constraints: critical\n"
+                     "                CA:TRUE\n" + _FAKE_CERT) * 2
+    verify_case("clean-with-a-system-bundle-says-its-text", ALREADY_DONE,
+                "holds 18 text line(s) beside its 2 certificate block(s)", allow(this),
+                cert_text=system_bundle)
+    verify_case("clean-with-lines-beside-a-certificate-says-them", ALREADY_DONE,
+                "holds 1 text line(s) beside its 1 certificate block(s)", allow(this),
+                cert_text=_FAKE_CERT + "subject=CN=example\n")
     verify_case("failed-on-an-unended-certificate-block", FAILED,
                 "holds no certificate block", allow(this), cert_text="-----BEGIN CERTIFICATE-----\nMIIBfake\n")
     verify_case("clean-with-a-bundle-of-two", ALREADY_DONE, "exact file", allow(this),
@@ -8260,9 +8265,15 @@ def _selftest_kit257(expect, conf):
                 "holds no certificate block", allow(this),
                 cert_text=_FAKE_CERT.replace("BEGIN CERTIFICATE",
                                              "BEGIN TRUSTED CERTIFICATE"))
-    verify_case("failed-names-the-clean-copy-command", FAILED,
-                "to keep only a file's certificates, list a clean copy", allow(this),
-                cert_text=_FAKE_CERT + "subject=CN=example\n")
+    def no_text_no_line():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            _put(spath, denies(c, {"filesystem": {"allowRead": [cert]}}))
+            row, _facts = row_of(c, home)
+            text = " ".join(_row_text(row).split())
+            return (row["outcome"] == ALREADY_DONE
+                    and "text line(s)" not in text), text[-400:]
+    case("verify-says-nothing-of-text-when-there-is-none", no_text_no_line)
     verify_case("clean-says-the-role-account-could-replace-it", ALREADY_DONE,
                 "could replace it after this check", allow(this))
 
