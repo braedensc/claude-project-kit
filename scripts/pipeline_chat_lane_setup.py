@@ -716,9 +716,10 @@ TRUST_PATH_MAX = 4096
 # resolved path, so `/etc/x` and `/private/etc/x` are one file. A deny is matched against
 # both spellings.
 FIRMLINKED_TOPS = ("/etc", "/tmp", "/var")
-# The one open with flags the probe may make: read-only and non-blocking, to ask the
-# kernel a file's path. The selftest allows exactly this spelling.
-PROBE_NAMING_OPEN = "os.open(q, os.O_RDONLY | os.O_NONBLOCK)"
+# The one open with flags the probe may make: read-only, non-blocking and never through a
+# final link, to read a trust file and ask the kernel its path. The selftest allows exactly
+# this spelling.
+PROBE_NAMING_OPEN = "os.open(q, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)"
 
 
 def _fold(text):
@@ -2302,46 +2303,93 @@ def sandbox_path(entry):
         return os.path.expanduser(entry)
     return os.path.join(os.path.expanduser("~"), ".claude", entry)
 
+def open_regular(q):
+    # A regular file opened read-only, without blocking and never through a final link,
+    # and judged on the open file itself: a pipe or link swapped in after a look cannot
+    # hang or redirect the probe. None for anything that is not a regular file.
+    fd = os.open(q, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    if stat.S_ISREG(os.fstat(fd).st_mode):
+        return fd
+    os.close(fd)
+    return None
+
+CERT_LINE = re.compile(rb"^[A-Za-z0-9+/=]+$")
+
+def cert_shape(raw):
+    # How many certificate blocks the bytes hold, and how many other non-blank lines:
+    # outside a block, or inside one but not base64. Counts only.
+    blocks = other = 0
+    inside = False
+    for line in raw.splitlines():
+        s = line.strip()
+        if s == b"-----BEGIN CERTIFICATE-----" and not inside:
+            inside = True
+        elif s == b"-----END CERTIFICATE-----" and inside:
+            inside, blocks = False, blocks + 1
+        elif s and not (inside and CERT_LINE.match(s)):
+            other += 1
+    return blocks, other + (1 if inside else 0)
+
+def writable_by_me(q):
+    # Whether this account can change the file or any folder above it. A yes or no.
+    d = q
+    while True:
+        if os.access(d, os.W_OK):
+            return True
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
+
 def trust(entry):
-    # Booleans and a byte count only, never a byte of the file. A link is not followed.
-    # Only a regular file is opened: a pipe can block forever and a device can never end.
-    # At most TRUST_SCAN_CAP bytes are scanned for PRIVATE KEY, in chunks that overlap.
+    # Booleans and counts only, never a byte of the file. A link is not followed. Only a
+    # regular file is read, at most TRUST_SCAN_CAP bytes, in chunks that overlap: for
+    # PRIVATE KEY, for its certificate blocks and the lines outside them, and for how
+    # many names it has on disk (a hard link gives one file two).
     q = sandbox_path(entry)
     if os.path.islink(q):
         return {"symlink": True}
     if os.path.isdir(q):
         return {"folder": True}
     try:
-        st = os.stat(q)
-        if not stat.S_ISREG(st.st_mode):
+        fd = open_regular(q)
+        if fd is None:
             return {"notRegular": True}
-        seen, key, tail = 0, False, b""
-        with pathlib.Path(q).open("rb") as fh:
+        try:
+            st = os.fstat(fd)
+            seen, key, tail, data = 0, False, b"", []
             while seen < TRUST_SCAN_CAP and not key:
-                chunk = fh.read(min(65536, TRUST_SCAN_CAP - seen))
+                chunk = os.read(fd, min(65536, TRUST_SCAN_CAP - seen))
                 if not chunk:
                     break
                 seen += len(chunk)
                 key = b"PRIVATE KEY" in tail + chunk
                 tail = chunk[-10:]
-            capped = not key and seen >= TRUST_SCAN_CAP and fh.read(1) != b""
+                data.append(chunk)
+            capped = not key and seen >= TRUST_SCAN_CAP and os.read(fd, 1) != b""
+        finally:
+            os.close(fd)
     except Exception as exc:
         return {"error": why(exc)}
-    return {"bytes": st.st_size, "privateKey": key, "capped": capped}
+    blocks, other = cert_shape(b"".join(data))
+    return {"bytes": st.st_size, "privateKey": key, "capped": capped,
+            "names": st.st_nlink, "certificates": blocks, "otherLines": other,
+            "roleWritable": writable_by_me(q)}
 
 def on_disk(q):
-    # The path the kernel names a regular file by: every link resolved, and each name as
-    # the disk stores it, whatever case or Unicode spelling the entry used. The file is
-    # opened without blocking and not one byte is read. Elsewhere, or for a file that is
-    # not there, the links alone are resolved.
+    # The path the kernel names a regular file by: every folder link resolved, and each
+    # name as the disk stores it, whatever case or Unicode spelling the entry used. Not
+    # one byte is read. Elsewhere, or for a file that is not there, links alone are
+    # resolved.
     try:
-        if hasattr(fcntl, "F_GETPATH") and stat.S_ISREG(os.stat(q).st_mode):
-            fd = os.open(q, os.O_RDONLY | os.O_NONBLOCK)
-            try:
-                raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            finally:
-                os.close(fd)
-            return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+        if hasattr(fcntl, "F_GETPATH"):
+            fd = open_regular(q)
+            if fd is not None:
+                try:
+                    raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+                finally:
+                    os.close(fd)
+                return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
     except Exception:
         pass
     return os.path.realpath(q)
@@ -2954,6 +3002,15 @@ def _trust_unsafe(facts):
     if facts.get("capped"):
         return ("is larger than %d MiB, the most verify scans for PRIVATE KEY, so it was "
                 "not checked whole" % (TRUST_SCAN_CAP >> 20))
+    if (facts.get("names") or 1) > 1:
+        return ("has %d names on disk (a hard link): another of its names could be a file "
+                "piece 5 denies" % facts["names"])
+    if "certificates" in facts and not facts["certificates"]:
+        return ("holds no certificate block: a trust file is a CA certificate in PEM form, "
+                "so a copy of any other file is refused")
+    if facts.get("otherLines"):
+        return ("holds %d line(s) that are not certificate text: a trust file holds PEM "
+                "certificates and nothing else" % facts["otherLines"])
     return None
 
 
@@ -3023,10 +3080,12 @@ def check_trust_files(conf, us, env_facts):
         return _row("trust-files", FAILED,
                     "%d problem(s) with the sandbox's read exceptions: each must re-open one "
                     "exact trust file and nothing more" % len(broken),
-                    broken + ["each must be one exact file: never a folder, a glob, a link, "
-                              "a pipe or device, a file holding a private key, or a file "
-                              "piece 5 denies. Fix SANDBOX_TRUST_FILES or the allowRead list "
-                              "in %s by hand" % path])
+                    broken + ["each must be one exact file holding only PEM "
+                              "certificates, under one name: never a folder, a glob, a "
+                              "link, a hard link, a pipe or device, a file holding a "
+                              "private key or anything else, or a file piece 5 denies. Fix "
+                              "SANDBOX_TRUST_FILES or the allowRead list in %s by hand"
+                              % path])
     unread = sorted(p for p, f in trust.items() if (f or {}).get("error") not in (None,
                                                                                   "missing"))
     if unread:
@@ -3046,6 +3105,10 @@ def check_trust_files(conf, us, env_facts):
     lines = ["not composed (SANDBOX_TRUST_FILES does not list it): " + a for a in extra]
     lines += ["not on disk yet, so its allow re-opens nothing: " + p for p in listed
               if (trust.get(p) or {}).get("error") == "missing"]
+    lines += ["%s: the role account can change it or a folder above it, so a process of "
+              "that account could replace it after this check" % p
+              for p, f in sorted(trust.items())
+              if (f or {}).get("roleWritable")]
     if not listed and not live:
         return _row("trust-files", ALREADY_DONE,
                     "No trust files are allowed: SANDBOX_TRUST_FILES is empty, and %s has "
@@ -3056,8 +3119,9 @@ def check_trust_files(conf, us, env_facts):
                     "%d sandbox read exception(s) it did not compose, each an exact file"
                     % (path, len(live)), lines)
     return _row("trust-files", ALREADY_DONE,
-                "%s allows the sandbox to read %d trust file(s), each an exact file: not a "
-                "folder, a glob or a link, and none holds a private key" % (path, len(listed)),
+                "%s allows the sandbox to read %d trust file(s), each an exact file "
+                "holding only certificates, under one name: not a folder, a glob or a "
+                "link, and none holds a private key" % (path, len(listed)),
                 lines)
 
 
@@ -4049,7 +4113,7 @@ def merge_plan(conf, facts):
         for entry in [p for p in listed if p not in have]:
             unsafe = _trust_unsafe(seen.get(entry))
             reopens = _trust_reopens(conf, entry, us.get("home"), us.get("trustReal"))
-            if reopens and not unsafe:
+            if reopens:
                 unsafe = "re-opens what piece 5 denies with %s" % reopens
             if unsafe:
                 lines.append("CANNOT      trust file %s %s: it is not added" % (entry, unsafe))
@@ -7986,6 +8050,40 @@ def _selftest_kit257(expect, conf):
     case("merge-holds-back-a-denied-file-through-a-linked-folder",
          merge_holds_back_a_linked_folder)
 
+    def merge_holds_back_a_hard_link():
+        # A second name for the role env file, under a certificate's name: no path check
+        # can see it, so its names and its shape are what refuse it.
+        with tempfile.TemporaryDirectory() as tmp:
+            linked = os.path.join(tmp, "certs", "egress-ca-copy.crt")
+            c, home, spath, _cert = fixture(tmp, listed=[linked])
+            _put(os.path.join(home, ".stage-e", "env"), "STAGE_E_KEY=%s\n" % SENTINELS[2])
+            os.link(os.path.join(home, ".stage-e", "env"), linked)
+            text = denies(c)
+            _put(spath, text)
+            rc, out = _capture(cmd_merge, c, _RoleMachine(home, _pf_answers()),
+                               _FakeSudo(), True)
+            flat = " ".join(out.split())
+            return ("CANNOT" in flat and "has 2 names on disk" in flat
+                    and "ALLOW READ" not in flat and rc == EX_FAILED
+                    and _read(spath) == text and SENTINELS[2] not in out), (rc, out[-500:])
+    case("merge-holds-back-a-hard-link-to-the-role-env-file", merge_holds_back_a_hard_link)
+
+    def merge_line_names_the_denied_file():
+        # merge's own CANNOT line names the deny first, even when the file also fails
+        # on its shape (the verify row it prints after would name it either way).
+        with tempfile.TemporaryDirectory() as tmp:
+            linked = os.path.join(tmp, "certs", "linked", "env")
+            c, home, spath, _cert = fixture(tmp, listed=[linked])
+            _put(os.path.join(home, ".stage-e", "env"), "STAGE_E_KEY=x\n")
+            os.symlink(os.path.join(home, ".stage-e"), os.path.dirname(linked))
+            _put(spath, denies(c))
+            facts, _w = probe_facts(_RoleMachine(home, _pf_answers()), c)
+            plan = merge_plan(c, facts)[0]
+            own = [line for line in plan
+                   if line.startswith("CANNOT") and "trust file" in line]
+            return (len(own) == 1 and "re-opens what piece 5 denies" in own[0]), own
+    case("merge-own-line-names-the-denied-file-first", merge_line_names_the_denied_file)
+
     # -- verify's trust-files row ------------------------------------------------------
     def verify_case(name, want, needle, settings=None, listed=None, cert_text=_FAKE_CERT,
                     setup=None, env_extra=""):
@@ -8088,6 +8186,41 @@ def _selftest_kit257(expect, conf):
                 allow(this, lambda tmp, cert: "/" + "./" * 2100 + os.path.relpath(
                     os.path.join(tmp, "role-home", ".stage-e", "env"), "/")),
                 setup=role_env_on_disk)
+
+    # A trust file is judged by its names on disk and its shape, which no path check can
+    # see (review of PR #198, round 4).
+    def hard_link(tmp, c, cert):
+        role_env_on_disk(tmp, c, cert)
+        os.link(os.path.join(tmp, "role-home", ".stage-e", "env"),
+                os.path.join(tmp, "certs", "linked-ca.crt"))
+        return c
+    verify_case("failed-on-a-hard-link-to-the-role-env-file", FAILED, "has 2 names on disk",
+                allow(this, lambda tmp, cert: os.path.join(tmp, "certs", "linked-ca.crt")),
+                setup=hard_link)
+
+    def env_copy(tmp, c, cert):
+        _put(os.path.join(tmp, "certs", "copied-ca.crt"), "STAGE_E_KEY=x\n")
+        return c
+    verify_case("failed-on-a-copy-of-an-env-file", FAILED, "holds no certificate block",
+                allow(this, lambda tmp, cert: os.path.join(tmp, "certs", "copied-ca.crt")),
+                setup=env_copy)
+    verify_case("failed-on-lines-appended-to-a-certificate", FAILED,
+                "holds 1 line(s) that are not certificate text", allow(this),
+                cert_text=_FAKE_CERT + "STAGE_E_KEY=x\n")
+    verify_case("failed-on-other-text-inside-a-certificate-block", FAILED,
+                "holds 1 line(s) that are not certificate text", allow(this),
+                cert_text="-----BEGIN CERTIFICATE-----\nSTAGE_E_KEY=x\n"
+                          "-----END CERTIFICATE-----\n")
+    verify_case("failed-on-an-unended-certificate-block", FAILED,
+                "holds no certificate block", allow(this), cert_text="-----BEGIN CERTIFICATE-----\nMIIBfake\n")
+    verify_case("clean-with-a-bundle-of-two", ALREADY_DONE, "exact file", allow(this),
+                cert_text=_FAKE_CERT * 2)
+    verify_case("clean-with-windows-line-ends", ALREADY_DONE, "exact file", allow(this),
+                cert_text=_FAKE_CERT.replace("\n", "\r\n"))
+    verify_case("clean-with-spaces-around-the-lines", ALREADY_DONE, "exact file",
+                allow(this), cert_text=_FAKE_CERT.replace("\n", "  \n"))
+    verify_case("clean-says-the-role-account-could-replace-it", ALREADY_DONE,
+                "could replace it after this check", allow(this))
 
     # Only a regular file is read, and only so far (review of PR #198, 2).
     verify_case("failed-on-a-device-entry", FAILED, "/dev/null is not a regular file",
