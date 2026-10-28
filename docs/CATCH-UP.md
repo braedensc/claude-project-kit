@@ -145,10 +145,10 @@ signing secret, which could forge any message.
 
 - A real lost delegation has never been recovered. The test: stop the dispatcher for more
   than 7.5 hours, delegate a throwaway ticket, start it again, and watch the job reply and
-  the dispatcher start the work. No ticket yet.
+  the dispatcher start the work. KIT-268.
 - That a late tracker retry, arriving after the job's reply, does not start a second run.
-  The wait is chosen so it cannot happen; it has never been tested. No ticket yet.
+  The wait is chosen so it cannot happen; it has never been tested. KIT-268.
 - That the tracker lists the dispatcher's webhook to the owner's key. If it does not, the
-  webhook check always reads "could not check". The first dry run says which. No ticket yet.
+  webhook check always reads "could not check". The first dry run says which. KIT-268.
 - What status the tracker gives a delegation nobody answered. The job does not depend on it;
-  it judges by activity and timestamps. No ticket yet.
+  it judges by activity and timestamps. KIT-268.
