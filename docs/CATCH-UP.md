@@ -40,7 +40,9 @@ by replying once in that delegation's own thread.
    delivers that reply to the dispatcher, which starts the work.
 
 At most three replies per pass, a minute apart. More are left for the next pass and named
-in the log, never dropped. If its read of the session list was cut short, it sends none: a
+in the log, never dropped. A delegation held back (the route down, the webhook off) is
+remembered, so one held past the week is reported, not lost from view. If its read of the
+session list was cut short in an order it could not tell is newest first, it sends none: a
 newer session on the same ticket could be the unread one.
 
 ---
@@ -83,8 +85,12 @@ needs a live test first (see *What is not proven*).
   in a reply written by its own key. A reply that landed but lost its answer, or a lost
   ledger, is never sent twice. A line someone else pasted does not count.
 - **One pass at a time.** A pass started by hand beside the scheduled one does nothing.
-- **A reply that fails** stays owed, fails the pass loudly, and goes to the back of the
-  line. It never holds up the others.
+- **A reply that fails** stays owed and goes to the back of the line, so it never holds up
+  the others. Once is named and retried. Twice in a row pages, as `unsent-<ticket>`, and it
+  stays open until the reply lands or the delegation turns stuck.
+- **A recorded session the read does not reach is re-read by id.** An old stuck delegation
+  never drops out of view, and never drags the read deeper. One the tracker no longer has
+  is let go.
 - **A delegation still silent an hour after its reply is stuck.** It is never replied to
   again. It is reported on every pass until a person acts on it: answers it, ends it,
   removes the delegation or closes the ticket. The dispatcher sometimes stays silent on
@@ -104,6 +110,7 @@ pass that failed or crashed. The heartbeat monitor reads it like the other Stage
 | A disabled webhook | One page, naming how to switch it back on |
 | A delegation still silent after its reply | One page per ticket, naming it |
 | The session list was cut short (`max_pages`) | One page: a lost delegation could be beyond it |
+| A reply that failed twice in a row | One page per ticket, until it lands |
 | The route down for two awake hours | One page: a dead dispatcher, or a wrong URL in the config |
 | A pass that could not finish | A page saying why, in the job's own words; what was already open stays open |
 | The webhook could not be read this pass | Nothing new: if it was disabled last time, that stands and replies stay held |
@@ -143,8 +150,11 @@ it needs no new credential. `--example-config` prints every key of its own confi
 - Remove the delegation from any you do not want started, run again, and sign the new
   count. If the count grows past the one you signed before the job is first loaded, it
   stays off until you sign again.
-- **A dry run that cannot reach the dispatcher stops the install.** The URL is wrong: fix it
-  in `stage-e.conf` and run again.
+- **A dry run that fails, cannot reach the dispatcher or reads only part of the sessions
+  keeps the job uninstalled,** with a note naming why. Nothing else stops: the review jobs
+  load as usual. Fix it in `stage-e.conf` and run again.
+- **`verify` shows card `CK-11`** while the job waits for your count, so it never reads "no
+  drift" with the job missing.
 - **To decline the job,** set `CATCHUP_INTERVAL_SECONDS=off`. One an earlier run installed
   is then unloaded and removed.
 

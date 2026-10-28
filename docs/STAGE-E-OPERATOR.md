@@ -1668,14 +1668,15 @@ The catch-up poller's dry run checks the dispatcher answers, reads whether its w
 still on, and names every delegation it would ever reply to (`CANDIDATE` lines, not only the
 three one pass would send). It replies to nothing and writes nothing, not even its heartbeat.
 
-- **A dry run that cannot reach the dispatcher stops the install**: the dispatcher answered
-  moments earlier, so the URL in `stage-e.conf` is wrong.
+- **A catch-up dry run that fails, holds or reads only part of the sessions stops nothing**:
+  it is noted, and the `catch-up` step will not install the job until it is fixed. A held one
+  means the URL in `stage-e.conf` is wrong, since the dispatcher answered moments earlier.
 - **Exit 3 is a finding, not a broken install**: the webhook is off, or a delegation it
   already replied to is still silent. The installer carries on and prints a note.
 - **A webhook it cannot check gets a note too**: on such a machine a disabled webhook would
   never page (`docs/CATCH-UP.md`, *What is not proven*).
 - The `catch-up` step reads its list. Unsigned, it prints the list and card `CK-11`, and
-  installs nothing.
+  installs nothing; `verify` shows `CK-11` as the card it is.
 
 The publisher has its own dry run, if you want to see a comment rendered from a block you
 saved by hand. Give it the criteria the reviewer was given: `--acceptance` once per

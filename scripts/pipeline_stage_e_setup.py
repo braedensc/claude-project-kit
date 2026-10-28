@@ -1123,7 +1123,7 @@ def _privilege_reason(command, dry_run, account, conf):
                 "root. It changes nothing." % account)
     names = ["the review poller", "the bounce driver", "the finding poller"]
     if not catchup_off(conf):
-        names.append("the catch-up poller")
+        names.append("the catch-up poller (once you sign its first count)")
     if monitor_ticket(conf) != "off":
         names.append("the heartbeat monitor")
     daemons = "%s system LaunchDaemons — %s and %s." % (
@@ -4821,8 +4821,21 @@ def step_dry_run(ctx, apply_it):
                         env + "/usr/bin/python3 %s/kit/scripts/pipeline_finding_poller.py "
                               "scan --config %s/finding/poller.json --dry-run"
                         % (ctx.stage_home, ctx.stage_home), timeout=600)
+    ctx.catchup_problem = None
+    have_catchup = catchup_off(ctx.conf) or r.as_role(
+        ctx.account, "test -f %s/kit/scripts/pipeline_catchup_poller.py && test -f "
+                     "%s/catchup/poller.json" % (ctx.stage_home, ctx.stage_home)).ok
     if catchup_off(ctx.conf):
         catchup = Result(0, "[catchup-poller] OFF by conf (CATCHUP_INTERVAL_SECONDS=off)\n", "")
+    elif not have_catchup:
+        # Before `run` moves the clone and writes its config, there is nothing to measure. Said,
+        # and not a failure: a `verify` before the first upgrade must not stop the one command
+        # that would fix it.
+        catchup = Result(0, "[catchup-poller] NOT YET MEASURABLE: the clone or its config does "
+                            "not have it until `run` moves the clone and writes the config\n", "")
+        ctx.catchup_problem = "not measurable until `run` moves the clone"
+        notes.append("the catch-up poller's dry run did not run: its script or config is not in "
+                     "place until `run` moves the clone and writes it")
     else:
         catchup = r.as_role(ctx.account,
                             env + "/usr/bin/python3 %s/kit/scripts/pipeline_catchup_poller.py "
@@ -4887,18 +4900,28 @@ def step_dry_run(ctx, apply_it):
     # fix (a disabled webhook, a session still silent after its re-prompt): it is reported,
     # like the poller's decline, and the install goes on. Anything else is a failure.
     catchup_said = catchup.out + catchup.err
+    # THE CATCH-UP POLLER NEVER STOPS THE INSTALL. Its dry run failing, or holding, is noted,
+    # and the catch-up step then will not install (or reload) it: the review loops, unloaded by
+    # `code` moments ago, must not stay off for an optional job.
     if catchup.rc not in ok_codes:
-        problems.append("the catch-up poller's dry run failed (exit %d). Nothing was "
-                        "posted: %s" % (catchup.rc, (catchup.err or catchup.out).strip()[-400:]))
+        ctx.catchup_problem = ("its dry run failed (exit %d): %s"
+                               % (catchup.rc, (catchup.err or catchup.out).strip()[-300:]))
     elif "HELD:" in catchup_said:
         # The dispatcher answers at install time — the entry step just proved it — so a held
         # dry run is a wrong URL, and a job that would hold on every pass, forever.
-        problems.append("the catch-up poller's dry run HELD: it could not reach the dispatcher "
-                        "at CATCHUP_DISPATCHER_URL (%s) or the front door at "
-                        "CATCHUP_FRONT_DOOR_URL (%s). Fix the URL in stage-e.conf and re-run: %s"
-                        % (ctx.conf["CATCHUP_DISPATCHER_URL"],
-                           ctx.conf["CATCHUP_FRONT_DOOR_URL"] or "not set",
-                           [l for l in catchup_said.splitlines() if "HELD:" in l][0][-300:]))
+        ctx.catchup_problem = (
+            "its dry run HELD: it could not reach the dispatcher at CATCHUP_DISPATCHER_URL (%s) or "
+            "the front door at CATCHUP_FRONT_DOOR_URL (%s); fix the URL in stage-e.conf: %s"
+            % (ctx.conf["CATCHUP_DISPATCHER_URL"], ctx.conf["CATCHUP_FRONT_DOOR_URL"] or "not set",
+               [l for l in catchup_said.splitlines() if "HELD:" in l][0][-300:]))
+    elif re.search(r"\bFIRING\s+coverage\b", catchup_said):
+        # A cut read is not a whole count, and a count is what CK-11 signs.
+        ctx.catchup_problem = ("its dry run could not read every agent session (coverage); "
+                               "raise CATCHUP_MAX_PAGES in stage-e.conf so the count is whole")
+    if ctx.catchup_problem and have_catchup:
+        notes.append("the catch-up poller: %s. It is not installed or reloaded until that is "
+                     "fixed; the other jobs go on. Or set CATCHUP_INTERVAL_SECONDS=off"
+                     % ctx.catchup_problem)
     elif catchup.rc == COMPONENT_EXIT_DECLINED:
         notes.append("the catch-up poller's dry run found something only a person can fix; "
                      "its FIRING lines above say what")
@@ -5501,21 +5524,32 @@ def step_catchup(ctx, apply_it):
     how_to_sign = ("read the list above, then: python3 scripts/pipeline_stage_e_setup.py attest "
                    "A-CATCHUP-COUNT --initials <yours> --note \"count read: N\" and run again "
                    "(card CK-11). Or set CATCHUP_INTERVAL_SECONDS=off to decline it")
-    if not installed and not ctx.state.attested("A-CATCHUP-COUNT"):
+    problem = getattr(ctx, "catchup_problem", None)
+    if problem and not installed:
+        return True, "NOT installed: %s" % problem[:160], [
+            "the catch-up poller is not installed: %s. Nothing else waits on it" % problem]
+
+    def waiting(detail, note):
+        # `run` goes on; a read-only pass names it as the card it is, so `verify` never says
+        # "no drift" while the job is not installed.
         _say_catchup_candidates(candidates)
-        return True, ("NOT installed: it waits for you to read its first count (CK-11); "
-                      "nothing else waits on it"), [
-            "the catch-up poller is not installed, so a delegation lost while the dispatcher "
-            "was down stays lost. To turn it on, " + how_to_sign]
+        if not apply_it:
+            raise Blocked("CK-11", detail)
+        return True, detail + "; nothing else waits on it", [note]
+    if not installed and not ctx.state.attested("A-CATCHUP-COUNT"):
+        return waiting("NOT installed: it waits for you to read its first count (CK-11)",
+                       "the catch-up poller is not installed, so a delegation lost while the "
+                       "dispatcher was down stays lost. To turn it on, " + how_to_sign)
     signed_n = _catchup_signed_count(ctx)
     if not installed and candidates is not None and signed_n is not None \
             and len(candidates) > signed_n:
-        _say_catchup_candidates(candidates)
-        return True, ("NOT installed: its count grew from %d to %d since you signed; nothing "
-                      "else waits on it" % (signed_n, len(candidates))), [
-            "the catch-up poller stays off until the count you sign is the count it would "
-            "start. To turn it on, " + how_to_sign]
+        return waiting("NOT installed: its count grew from %d to %d since you signed"
+                       % (signed_n, len(candidates)),
+                       "the catch-up poller stays off until the count you sign is the count it "
+                       "would start. To turn it on, " + how_to_sign)
 
+    if problem:
+        say("  NOTE: the catch-up poller is installed, and %s. Its own heartbeat will say so." % problem)
     want = _catchup_plist(ctx)
     have = r.as_root(["cat", plist])
     stale = not have.ok or have.out != want
@@ -6300,15 +6334,27 @@ def _unloaded_notice(ctx):
     if not ctx.unloaded:
         return
     mlabel = monitor_label(ctx.conf)
-    core = [l for l in ctx.unloaded if l != mlabel]
+    clabel = catchup_label(ctx.conf)
+    core = [l for l in ctx.unloaded if l not in (mlabel, clabel)]
     advice = list(core)
-    if core:
+    if clabel in ctx.unloaded and not catchup_off(ctx.conf):
+        advice.append(clabel)
+    if core or clabel in advice:
+        named = ["review", "bounce", "finding"] if core else []
+        if clabel in advice:
+            named.append("catch-up")
         say("")
         say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
-        say("under them, and did not get as far as the step that loads them again — so review,")
-        say("bounce, finding and catch-up are OFF until it does:")
-        for label in core:
+        say("under them, and did not get as far as the step that loads them again — so %s %s"
+            % (", ".join(named[:-1]) + (" and " if len(named) > 1 else "") + named[-1],
+               "is OFF until it does:" if len(named) == 1 else "are OFF until it does:"))
+        for label in advice:
             say("    %s" % label)
+    if clabel in ctx.unloaded and catchup_off(ctx.conf):
+        say("")
+        say("The catch-up poller was stopped too. CATCHUP_INTERVAL_SECONDS=off, so leave it")
+        say("unloaded. The `catch-up` step removes its plist; until that step runs, the next")
+        say("boot loads it again.")
     rearm = None
     if mlabel in ctx.unloaded:
         say("")
@@ -9241,23 +9287,50 @@ def _selftest_body():
     expect("catchup-dry-run", isinstance(rowC3, tuple) and rowC3[0] is True
            and any("catch-up" in str(n) for n in (rowC3[2] or [])),
            "a catch-up finding stopped the install, or passed in silence: %r" % (rowC3,))
+    # THE CATCH-UP POLLER NEVER STOPS THE INSTALL: a failed or held dry run is a note, and
+    # its own step then will not install it — the review loops, unloaded by `code`, go on.
+    precheck = ("test -f $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0, "")
     for rc in (1, 2):
         ctxC, fakeC = _dry_run_ctx(conf)
-        fakeC.answers = [("pipeline_catchup_poller.py", rc, "boom\n")] + fakeC.answers
+        fakeC.answers = [precheck, ("pipeline_catchup_poller.py", rc, "boom\n")] + fakeC.answers
         rowC, _pC = _quiet(lambda: _dry_run_row(ctxC))
-        expect("catchup-dry-run", isinstance(rowC, SetupError)
-               and "catch-up poller" in str(rowC) and "exit %d" % rc in str(rowC),
-               "a catch-up dry run that exited %d did not stop the install by name: %r"
+        expect("catchup-dry-run", isinstance(rowC, tuple) and rowC[0] is True
+               and any("catch-up poller" in str(n) and "exit %d" % rc in str(n)
+                       for n in (rowC[2] or [])),
+               "a catch-up dry run that exited %d stopped the install, or passed in silence: %r"
                % (rc, rowC))
+        fakeC.answers = [("launchctl print system/" + catchup_label(conf), 1, ""),
+                         ("test -f " + _dispatcher_plist(catchup_label(conf)), 1, "")] + fakeC.answers
+        (okCP, detCP, _n), _p = _quiet(lambda: step_catchup(ctxC, apply_it=True))
+        expect("catchup-dry-run", okCP is True and "NOT installed" in detCP
+               and "exit %d" % rc in detCP and not [w for w in fakeC.writes
+                                                    if catchup_label(conf) in _fmt(w["argv"])],
+               "after a failed catch-up dry run, its step installed it anyway: %r" % detCP)
+    # Before `run` moves the clone, the script is not there to run: said, not failed.
+    ctxNY, fakeNY = _dry_run_ctx(conf)
+    fakeNY.answers = [(precheck[0], 1, "")] + fakeNY.answers
+    rowNY, _p = _quiet(lambda: _dry_run_row(ctxNY))
+    expect("catchup-dry-run", isinstance(rowNY, tuple) and rowNY[0] is True
+           and any("until `run` moves the clone" in str(n) for n in (rowNY[2] or [])),
+           "a verify before the first upgrade failed on a script the clone does not have yet: %r"
+           % (rowNY,))
     # A HELD dry run is a wrong URL: the dispatcher answered moments ago, so a job that holds
     # now would hold on every pass, and read healthy doing it.
     ctxCH, fakeCH = _dry_run_ctx(conf)
-    fakeCH.answers = [("pipeline_catchup_poller.py", 0, "[catchup-poller] HELD: the dispatcher "
-                       "did not answer http://127.0.0.1:9999/version (refused).\n")] + fakeCH.answers
+    fakeCH.answers = [precheck, ("pipeline_catchup_poller.py", 0, "[catchup-poller] HELD: the "
+                       "dispatcher did not answer http://127.0.0.1:9999/version (refused).\n")] \
+        + fakeCH.answers
     rowCH, _pCH = _quiet(lambda: _dry_run_row(ctxCH))
-    expect("catchup-dry-run", isinstance(rowCH, SetupError)
-           and "CATCHUP_DISPATCHER_URL" in str(rowCH),
-           "a catch-up dry run that HELD did not stop the install, naming the URL: %r" % (rowCH,))
+    expect("catchup-dry-run", isinstance(rowCH, tuple) and rowCH[0] is True
+           and any("CATCHUP_DISPATCHER_URL" in str(n) for n in (rowCH[2] or []))
+           and "CATCHUP_DISPATCHER_URL" in (ctxCH.catchup_problem or ""),
+           "a catch-up dry run that HELD stopped the install, or did not name the URL: %r" % (rowCH,))
+    ctxCV, fakeCV = _dry_run_ctx(conf)
+    fakeCV.answers = [precheck, ("pipeline_catchup_poller.py", 3, "[catchup-poller] FIRING   "
+                       "coverage the agent-session read stopped at max_pages\n")] + fakeCV.answers
+    _quiet(lambda: _dry_run_row(ctxCV))
+    expect("catchup-dry-run", "CATCHUP_MAX_PAGES" in (ctxCV.catchup_problem or ""),
+           "a cut session read was accepted as a whole count to sign: %r" % ctxCV.catchup_problem)
     # THE FIRST COUNT IS SIGNED (CK-11), AND NOTHING ELSE WAITS ON IT. The dry run collects
     # EVERY candidate (CANDIDATE lines, not the capped WOULD lines) and never stops the run;
     # the catch-up step installs the job only once that count is signed, and says so either way.
@@ -9295,6 +9368,27 @@ def _selftest_body():
            and not [w for w in fakeCK.writes if clabel in _fmt(w["argv"])],
            "unsigned, the catch-up step installed something, hid the list, or named no remedy: "
            "%r %r %s" % (detU, notesU, [w["why"] for w in fakeCK.writes]))
+    # …and on a read-only pass (`verify`) the same state is the card it is, never "no drift".
+    try:
+        _quiet(lambda: step_catchup(ctxCK, apply_it=False))
+        verifyCK = None
+    except Blocked as exc:
+        verifyCK = exc.card_id
+    expect("catchup-count-signed", verifyCK == "CK-11",
+           "verify read an uninstalled, unsigned catch-up poller as done: %r" % verifyCK)
+    # The exit notice names what this run stopped, and never tells you to load a declined job.
+    ctxUN, _fUN = _settled_ctx(conf)
+    ctxUN.unloaded = [catchup_label(conf)]
+    _x, saidUN = _quiet(lambda: _unloaded_notice(ctxUN))
+    expect("catchup-unloaded-notice", "catch-up is OFF until it does" in saidUN
+           and "review" not in saidUN.split("so ", 1)[-1].split("OFF")[0],
+           "the notice for a stopped catch-up poller named the wrong jobs: %r" % saidUN[-400:])
+    ctxUO, _fUO = _settled_ctx(dict(conf, CATCHUP_INTERVAL_SECONDS="off"))
+    ctxUO.unloaded = [catchup_label(conf)]
+    _x, saidUO = _quiet(lambda: _unloaded_notice(ctxUO))
+    expect("catchup-unloaded-notice", "leave it" in saidUO
+           and "bootstrap system " + _dispatcher_plist(catchup_label(conf)) not in saidUO,
+           "the notice told you to load a catch-up poller the conf declines: %r" % saidUO[-400:])
     # …signed for FEWER than the job would now start: still not installed.
     ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 2")
     (okG, detG, _nG), _pG = _quiet(lambda: step_catchup(ctxCK, apply_it=True))
@@ -11332,13 +11426,14 @@ def _selftest_body():
     cases += 1
     for ticketBN, tailBN in (
             ("KIT-7", "installs and loads five system LaunchDaemons — the review poller, "
-                      "the bounce driver, the finding poller, the catch-up poller and the "
-                      "heartbeat monitor."),
+                      "the bounce driver, the finding poller, the catch-up poller (once you "
+                      "sign its first count) and the heartbeat monitor."),
             ("", "installs and loads five system LaunchDaemons — the review poller, "
-                 "the bounce driver, the finding poller, the catch-up poller and the "
-                 "heartbeat monitor."),
+                 "the bounce driver, the finding poller, the catch-up poller (once you sign "
+                 "its first count) and the heartbeat monitor."),
             ("off", "installs and loads four system LaunchDaemons — the review poller, "
-                    "the bounce driver, the finding poller and the catch-up poller.")):
+                    "the bounce driver, the finding poller and the catch-up poller (once you "
+                    "sign its first count).")):
         confBN, errsBN = validate_conf(parse_conf(GOOD_CONF.replace(
             "HEARTBEAT_MONITOR_TICKET=off", "HEARTBEAT_MONITOR_TICKET=" + ticketBN))[0])
         ctxBN, _fBN = _settled_ctx(confBN)

@@ -69,6 +69,7 @@ kind the way the health watch's does:
 - `webhook`: the tracker switched the dispatcher's webhook off;
 - `stuck-<ticket>`: a delegation still silent after the job's reply. Each ticket is its own
   kind, so a second one pages, and it fires until a person acts on it;
+- `unsent-<ticket>`: a reply that failed twice in a row, open until it lands;
 - `coverage`: the session list was cut short, so a lost delegation could be beyond it;
 - `gate`: the route has been down for two awake hours, which is also how a wrong URL looks.
 

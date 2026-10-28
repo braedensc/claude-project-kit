@@ -66,9 +66,12 @@ account with the owner-scoped tracker key Stage E already stores.
   tracker, failed or ran out of time carries the last full pass's open findings, so it never
   reads as a recovery. A webhook read that fails keeps a disabled webhook disabled, and its
   hold on replies. A pass that could not finish is its own incident in the monitor.
-- **Only the newest session on a ticket, and only a complete read.** A tie on one ticket gets
-  one reply. A session read cut short at its page limit sends no reply: the unread session
-  could be the newer one.
+- **Only the newest session on a ticket, and only a read it can trust.** A tie on one ticket
+  gets one reply. A read cut short at its page limit in an order it could not tell is newest
+  first sends no reply: an unread session could be the newer one. A session the ledger still
+  watches that the paged read did not reach is re-read by id (`agentSession(id)`), never by
+  reading deeper, so an old stuck ticket neither drops out of view nor stalls every pass. A
+  delegation held back is recorded as owed, so one held past the lookback is reported.
 - **The first count is a person's.** Its first pass would reply to every unanswered
   delegation from the past week, each a paid session. The installer lists them all, and
   installs the job only once the owner signs that count (card CK-11). It has its own step,
@@ -81,8 +84,8 @@ account with the owner-scoped tracker key Stage E already stores.
   session, so three caps what one pass can spend. And a burst of session starts can delay the
   dispatcher's other answers past the tracker's 5-second limit (context, point 5). Three per
   15-minute pass still drains 12 an hour, and it matches the finding poller's cap of three. The
-  rest are carried and named, never dropped. A reply that fails goes to the back of the line
-  and fails the pass.
+  rest are carried and named, never dropped. A reply that fails goes to the back of the line;
+  failing twice in a row it is its own incident until it lands.
 
 ## Alternatives rejected
 
