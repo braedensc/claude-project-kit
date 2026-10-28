@@ -41,6 +41,22 @@ in the log, never dropped.
 
 ---
 
+## Why at most three replies a pass, a minute apart
+
+- **Each reply starts a paid session.** Three caps what one pass can spend, even if a bug
+  or a long outage makes everything look lost at once.
+- **A burst of starts can lose more work.** The dispatcher runs a blocking `git fetch` as
+  it starts a session, before it answers other webhooks. Several starts in a row can push
+  those answers past the tracker's 5-second limit. A late answer counts as a failed
+  delivery: the problem this job exists to fix. The minute between replies is for the same
+  reason.
+- **The backlog still drains.** Three per 15-minute pass is 12 an hour, so a day's lost
+  delegations restart within an hour or two of the Mac waking.
+- **It matches the kit's other flood caps.** The finding poller also stops at three per
+  ticket.
+
+---
+
 ## Why it waits 7 hours 30 minutes
 
 The tracker's own retries cover 7 hours. If this job replied sooner, and the tracker's own

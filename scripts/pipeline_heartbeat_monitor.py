@@ -742,7 +742,10 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
                             "; it says a pass was still running, so that pass started and "
                             "never finished" if running else ""))
         return out
-    if out["result"] in (spec.get("good") or ()):
+    # A FIRING FINDING ALWAYS PAGES, whatever the result word says. A job whose good words
+    # include `held` must not hide a firing gate or webhook behind it (review of #206).
+    firing_now = bool(spec.get("findings_field")) and bool(findings_text(doc, spec, "firing"))
+    if out["result"] in (spec.get("good") or ()) and not firing_now:
         paused_for = _paused_seconds(raw.get("doc") or {}, now)
         if out["result"] == "paused" and paused_for is not None and paused_for > PAUSED_MAX_SECONDS:
             out["verdict"] = "paused-too-long"
@@ -2956,6 +2959,53 @@ def selftest():
                              time.time(), 1800, False)
             ok("…and each stuck ticket is its own incident, so a second one pages",
                real["verdict"] == "failing" and real.get("incident") == "stuck-kit-12", real)
+            pcp.write_heartbeat(cd, "held", pcp._iso(), False, [
+                {"kind": "webhook", "state": pcp.FIRING, "summary": "Linear has DISABLED it"}])
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cd)),
+                             time.time(), 1800, False)
+            ok("…a firing finding pages even under a good result word like `held`",
+               real["verdict"] == "failing" and real.get("incident") == "webhook", real)
+
+        # END TO END, from the poller's own pass and writer: the pages the docs promise for a
+        # route that stays down, and for a webhook disabled while it is down (review of #206).
+        def _fake_linear(enabled):
+            def gql(query, _variables):
+                if "CatchupWebhooks" in query:
+                    return {"webhooks": {"nodes": [{"id": "w-1", "enabled": enabled, "url": None}]}}
+                if "CatchupSessions" in query:
+                    return {"agentSessions": {"nodes": [], "pageInfo": {"hasNextPage": False,
+                                                                       "endCursor": None}}}
+                raise AssertionError("unexpected query")
+            return gql
+        down = lambda _url: (None, "connection refused")  # noqa: E731
+        with tempfile.TemporaryDirectory() as ce:
+            cfg_c = {"agent_user_id": "agent-1", "teams": ["KIT"], "state_dir": ce,
+                     "age_floor_seconds": pcp.DEFAULT_AGE_FLOOR_SECONDS, "lookback_hours": 168,
+                     "max_per_pass": 3, "spacing_seconds": 0, "stuck_after_seconds": 3600,
+                     "max_pages": 10, "dispatcher_url": "http://127.0.0.1:1",
+                     "front_door_url": "", "webhook_id": "", "run_timeout_seconds": 600}
+            verdicts = []
+            for _ in range(pcp.HELD_ALERT_PASSES):
+                _c, result, found, counts = pcp.run_pass(cfg_c, "k", gql=_fake_linear(True),
+                                                         get=down)
+                pcp.write_heartbeat(ce, result, pcp._iso(), False, found, counts)
+                verdicts.append(judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(ce)),
+                                          time.time(), 1800, False))
+            ok("a route down for a few passes reads ok (the health watch pages a short outage)",
+               verdicts[0]["verdict"] == "ok", verdicts[0])
+            ok("…and down for %d passes in a row, the poller's own beat pages `gate`"
+               % pcp.HELD_ALERT_PASSES,
+               verdicts[-1]["verdict"] == "failing" and verdicts[-1].get("incident") == "gate",
+               verdicts[-1])
+        with tempfile.TemporaryDirectory() as cw:
+            cfg_w = dict(cfg_c, state_dir=cw)
+            _c, result, found, counts = pcp.run_pass(cfg_w, "k", gql=_fake_linear(False), get=down)
+            pcp.write_heartbeat(cw, result, pcp._iso(), False, found, counts)
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cw)),
+                             time.time(), 1800, False)
+            ok("a webhook disabled WHILE the route is down still pages, naming the re-enable step",
+               real["verdict"] == "failing" and real.get("incident") == "webhook"
+               and "Settings" in real["detail"], real)
 
     if fails:
         print("FAIL: %d heartbeat-monitor selftest case(s) failed:" % len(fails))

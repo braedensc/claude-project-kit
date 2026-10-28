@@ -751,6 +751,12 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     candidates.sort(key=lambda c: ((ledger.get(c[0].get("id")) or {}).get("failures", 0),
                                    parse_iso(c[0].get("createdAt")) or 0))
     counts["candidates"] = len(candidates)
+    # A DRY RUN NAMES EVERY CANDIDATE, before the hold and the cap trim what THIS pass would
+    # post: the installer's first-count sign-off (CK-11) is a cost gate, and every candidate is
+    # a paid session sooner or later. A count of only this pass's three would undercount it.
+    if dry_run:
+        for node, reason in candidates:
+            log("CANDIDATE %s: %s" % ((node.get("issue") or {}).get("identifier") or "?", reason))
 
     for node, reason in stuck:
         counts["stuck"] += 1
@@ -1144,6 +1150,20 @@ def selftest():
         cs = cfg(_dir="spacing", spacing_seconds=60)
         run_pass(cs, "k", gql=FakeLinear(many), get=up, now=NOW, sleep=slept.append)
         check("…spaced spacing_seconds apart", slept, [60, 60])
+        import io
+        import contextlib
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            run_pass(cfg(_dir="cap-dry", max_per_pass=2), "k", dry_run=True,
+                     gql=FakeLinear(many), get=up, now=NOW)
+        check("a dry run names EVERY candidate for the cost sign-off, not just this pass's cap",
+              (said.getvalue().count("CANDIDATE "), said.getvalue().count("WOULD re-prompt")), (5, 2))
+        said = io.StringIO()
+        with contextlib.redirect_stderr(said):
+            run_pass(cfg(_dir="cap-dry-held"), "k", dry_run=True, gql=FakeLinear(
+                many, hooks=[{"id": "w-1", "enabled": False, "url": None}]), get=up, now=NOW)
+        check("…including when a disabled webhook holds them all",
+              said.getvalue().count("CANDIDATE "), 5)
 
         # -- paging: no reliance on the tracker's sort direction -------------------------
         old = lambda sid, d: session(sid, 24 * d, ident="KIT-" + sid, comment="c-" + sid)  # noqa: E731

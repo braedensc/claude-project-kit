@@ -197,7 +197,9 @@ then drops it. A dispatcher machine that sleeps through all three loses the dele
 nothing says so. The tracker can also switch off a webhook that keeps failing, and then
 every later delegation is lost the same way.
 
-The catch-up poller covers both (`docs/CATCH-UP.md`, KIT-47). It is a Stage E daemon that
+**Delegation durability on this lane comes from the tracker's three retries plus the
+catch-up poller, not from the dispatcher.** The poller covers both gaps (`docs/CATCH-UP.md`,
+KIT-47). It is a Stage E daemon that
 finds a delegation the agent never answered, waits until the tracker's retries are spent,
 and replies once in its thread, which the daemon treats as a new prompt. It pages when the
 webhook is off. Its only write is that reply. The script refuses any wait inside the

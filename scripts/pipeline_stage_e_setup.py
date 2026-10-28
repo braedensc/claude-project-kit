@@ -1694,7 +1694,8 @@ CARDS = {
                 "the dispatcher never answered, and each reply starts a paid session. Some "
                 "were dropped on purpose, and some you may not want any more. The dry-run "
                 "lines above name every one. Only you know which you want started."),
-        "do": ["Read the WOULD re-prompt lines the installer just printed above.",
+        "do": ["Read the delegations the installer just listed above. Every one is",
+               "re-prompted, up to three a pass, so the whole list is what you sign.",
                "For any you do NOT want started, remove its delegation or close the",
                "ticket, then re-run: the count drops, because it is then skipped.",
                "When the count is what you meant, sign it off and re-run:",
@@ -4866,10 +4867,13 @@ def step_dry_run(ctx, apply_it):
                               "UNKNOWN for at least one repository")
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off")
-    would = [l.split("WOULD re-prompt", 1)[1].strip() for l in catchup_said.splitlines()
-             if "WOULD re-prompt" in l]
+    # EVERY candidate, not the WOULD lines: those are only what one pass posts under the cap,
+    # and none while a disabled webhook holds them. Each candidate is a paid session in time.
+    would = [l.split("CANDIDATE", 1)[1].strip() for l in catchup_said.splitlines()
+             if "] CANDIDATE " in l]
     if not ctx.state.attested("A-CATCHUP-COUNT"):
-        say("  The catch-up poller's first pass would re-prompt %d delegation(s):" % len(would))
+        say("  The catch-up poller would re-prompt %d delegation(s), up to three a pass:"
+            % len(would))
         for line in would:
             say("    " + line)
         raise Blocked("CK-11", "the catch-up poller's first count (%d) has not been signed off"
@@ -8980,17 +8984,22 @@ def _selftest_body():
     cases += 1
     ctxCK, fakeCK = _dry_run_ctx(conf)
     ctxCK.state.data["attestations"].pop("A-CATCHUP-COUNT", None)
+    # The poller's dry run names EVERY candidate (CANDIDATE) and only this pass's capped few
+    # as WOULD; the count is the candidates, or the sign-off undercounts the spend.
     fakeCK.answers = [("pipeline_catchup_poller.py", 0,
+                       "[catchup-poller] CANDIDATE KIT-7: KIT-7 was delegated and never answered\n"
+                       "[catchup-poller] CANDIDATE KIT-8: KIT-8 was delegated and never answered\n"
+                       "[catchup-poller] CANDIDATE KIT-9: KIT-9 was delegated and never answered\n"
                        "[catchup-poller] WOULD re-prompt KIT-7: KIT-7 was delegated and never "
-                       "answered\n[catchup-poller] WOULD re-prompt KIT-8: KIT-8 was delegated and "
-                       "never answered\n")] + fakeCK.answers
+                       "answered\n[catchup-poller] LEFT for the next pass (over max_per_pass 1): "
+                       "KIT-8, KIT-9\n")] + fakeCK.answers
     rowCK, printedCK = _quiet(lambda: _dry_run_row(ctxCK))
     expect("catchup-count-signed", isinstance(rowCK, Blocked) and rowCK.card_id == "CK-11"
-           and "(2)" in rowCK.extra
+           and "(3)" in rowCK.extra and "KIT-9" in printedCK
            and "KIT-7" in printedCK and "KIT-8" in printedCK,
            "an unsigned first catch-up count did not stop at CK-11, naming each delegation: %r"
            % (rowCK,))
-    ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 2")
+    ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 3")
     rowCK2, _p = _quiet(lambda: _dry_run_row(ctxCK))
     expect("catchup-count-signed", isinstance(rowCK2, tuple) and rowCK2[0] is True,
            "a signed catch-up count still stopped the install: %r" % (rowCK2,))

@@ -22,6 +22,11 @@ tracker's webhooks:
    since 2026-09-08: it is how the bounce driver re-prompts a session.
 4. **Replaying the webhook ourselves would need its signing secret**, which could forge any
    event the dispatcher accepts.
+5. **The dispatcher can answer late.** It runs a blocking `git fetch` as it starts a session,
+   before it answers other webhooks, so a burst of session starts can push those answers
+   past the tracker's 5-second limit. A late answer is a failed delivery.
+6. **It checks no `webhookTimestamp`.** A replayed delivery is accepted however old, so the
+   host's clock is not load-bearing. This job replays nothing, and its reply is a fresh event.
 
 So a delegation made while the Mac slept for more than 7 hours is lost, with no error
 anywhere, and a disabled webhook loses everything after it the same way.
@@ -61,11 +66,20 @@ account with the owner-scoped tracker key Stage E already stores.
   card until the owner signs the count.
 - **It checks the webhook.** A disabled webhook is a firing finding; the heartbeat monitor
   pages it once. While it fires, no reply is sent, since none could arrive.
-- **At most three replies a pass, a minute apart, oldest first.** The rest are carried and
-  named, never dropped. A reply that fails goes to the back of the line and fails the pass.
+- **At most three replies a pass, a minute apart, oldest first.** Each reply starts a paid
+  session, so three caps what one pass can spend. And a burst of session starts can delay the
+  dispatcher's other answers past the tracker's 5-second limit (context, point 5). Three per
+  15-minute pass still drains 12 an hour, and it matches the finding poller's cap of three. The
+  rest are carried and named, never dropped. A reply that fails goes to the back of the line
+  and fails the pass.
 
 ## Alternatives rejected
 
+- **A scheduled GitHub Actions job, as the ticket first proposed.** It would need the owner's
+  full-scope tracker key as an Actions secret, a new place for that key to live. It also cannot
+  see the dispatcher on its own machine, so it could not hold while the dispatcher is down.
+  The role account already holds the key, and the heartbeat monitor plus the notifier is
+  already this lane's deduplicated alert path.
 - **Replay the delivery to the dispatcher locally.** Needs the webhook's signing secret, which
   forges anything.
 - **Remove and re-add the delegation.** A delegation is a person's signal: the dispatcher's
