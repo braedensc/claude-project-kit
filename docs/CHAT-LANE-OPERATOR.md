@@ -410,14 +410,23 @@ file, so it cannot be swapped for a copy without the text.
 A config that also holds a certificate is refused. A kubeconfig or a YAML file can embed
 a CA next to a token, and listing it would let a session read the token. So any line
 shaped like a secret or a setting fails the file:
-- a key named like a secret (a token, a password, a secret, an API, client or private key)
+- a key named like a secret: a token, a password, a secret, a salt, a cookie, an
+  `Authorization` header, a webhook, or an API, client, private or access key
+- a name ending `_key` or `Key` (`signing_key`, `masterKey`), or a line that starts with
+  a bare `key`
 - an `ALL_CAPS_NAME=value` line
-- a known token, or a password in a URL
+- a known token, a Slack or Discord webhook URL, or a password or token in a URL
 - a long run that mixes upper case, lower case and digits, as key data does
-- anything but base64 inside a certificate block
+- a line over 1,024 characters
+- anything but base64 inside a certificate block, or `=` anywhere but its end
 
 None of these appear in a real bundle's text. They were checked against 104 bundle
-formats that OpenSSL, certifi, curl, keytool, p11-kit, GnuTLS and macOS write.
+formats that OpenSSL, certifi, curl, keytool, p11-kit, GnuTLS and macOS write. A saved
+TLS capture that prints its session secrets is refused too, and so is a keytool capture
+holding a password prompt.
+
+What it cannot see is a secret with nothing to name it: a short or one-case value on a
+line alone, such as a bare hex string. So list only a file you would hand to a session.
 
 A check is true when it runs. If the role account can change a trust file or a folder
 above it, a process of that account could swap the file afterwards, and `verify` says so

@@ -2313,7 +2313,7 @@ def open_regular(q):
     os.close(fd)
     return None
 
-CERT_LINE = re.compile(rb"^[A-Za-z0-9+/=]+$")
+CERT_LINE = re.compile(rb"^[A-Za-z0-9+/]+={0,2}$")
 CERT_LABELS = (b"CERTIFICATE", b"TRUSTED CERTIFICATE", b"X509 CERTIFICATE")
 # Base64 blocks a CA file may carry beside its certificates: read like one, never counted.
 CARRIED_LABELS = (b"X509 CRL", b"PUBLIC KEY")
@@ -2321,10 +2321,21 @@ BOM = b"\xef\xbb\xbf"
 # A line beside the certificates is judged by what secrets and settings look like, never
 # by what a bundle's own text looks like (a title, a subject, a fingerprint, a serial, an
 # OpenSSL text dump), so every bundle format stays readable.
-SECRET_WORDS = (rb"pass(?:word|wd|phrase)?|secret|token|bearer|credential|"
+SECRET_WORDS = (rb"pass(?:word|wd|phrase)?|pwd|secret|token|bearer|credential|"
+                rb"authori[sz]ation|webhook|salt|hmac|cookie|"
                 rb"api[_\-]?key|private[_\-]?key|client[_\-]?key|access[_\-]?key")
-SECRET_KEY = re.compile(rb"(?:^|[\s{,\"':/])[A-Za-z0-9_.\-]*?(?:" + SECRET_WORDS +
-                        rb")[A-Za-z0-9_.\-]*[\"']?\s*[:=]", re.I)
+KEY_START = rb"(?:^|[\s{,\"':/;&?<])"
+SECRET_KEY = re.compile(KEY_START + rb"[A-Za-z0-9_.\-]*?(?:" + SECRET_WORDS +
+                        rb")[A-Za-z0-9_.\-]*(?:[\"']?\s*[:=]|>)", re.I)
+# A line that starts by naming a bare key: YAML `key: x`, env `KEY=x`. Only at the start:
+# mid-line, "Server Temp Key:" is a TLS capture's and "Public Key" certificate text.
+BARE_KEY = re.compile(rb"^[\"']?key[\"']?\s*[:=]", re.I)
+# A token used as a URL's user: scheme://<token>@host.
+URL_TOKEN_USER = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://[A-Za-z0-9_\-]{20,}@")
+# A name ending _key, or camelCase ...Key, with a value: signing_key, masterKey. Never a
+# bare "Key": a TLS capture says "Server Temp Key:", and certificate text "Public Key".
+KEY_SUFFIX = re.compile(KEY_START + rb"[A-Za-z0-9_.\-]*(?:_[Kk][Ee][Yy]|[a-z0-9]Key)"
+                        rb"[\"']?\s*[:=]")
 AUTH_KEY = re.compile(rb"(?:^|[\s{,])[\"']?auth[\"']?\s*[:=]", re.I)
 SPACED_PASSWORD = re.compile(rb"(?:^|\s)pass(?:word|wd)\s+\S", re.I)
 ENV_ASSIGN = re.compile(rb"^(?:export\s+)?[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*=")
@@ -2334,20 +2345,28 @@ TOKEN_SHAPE = re.compile(rb"(?:\b(?:gh[pousr]_[A-Za-z0-9]{20,}|"
                          rb"sk_live_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|"
                          rb"lin_api_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9\-_]{20,}|"
                          rb"AIza[0-9A-Za-z\-_]{30,})|"
-                         rb"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,})")
+                         rb"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}|"
+                         rb"hooks\.slack\.com/services/|"
+                         rb"discord(?:app)?\.com/api/webhooks/)")
 URL_CREDS = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@")
 # Not judged as a long run: a URL (its path joins words into one) and a GnuTLS key pin.
-NOT_A_RUN = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://\S+|pin-sha256:[A-Za-z0-9+/]{43}=")
+NOT_A_RUN = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://\S+|pin-sha256:[A-Za-z0-9+/]{43}=|"
+                       rb"\b0x[0-9A-Fa-f]+")
 # A long run mixing lower case, upper case and digits: key data and tokens do; hex
 # fingerprints, serials, title underlines and words never do.
-LONG_RUN = re.compile(rb"[A-Za-z0-9+/_\-]{40,}")
+LONG_RUN = re.compile(rb"[A-Za-z0-9+/\-]{40,}")
+# A line longer than any bundle's text is refused unread: it costs the patterns time, and
+# no certificate tool writes one.
+TRUST_LINE_MAX = 1024
 
 def mixed_case_and_digits(run):
     return bool(re.search(rb"[a-z]", run) and re.search(rb"[A-Z]", run)
                 and re.search(rb"[0-9]", run))
 
 def secret_shaped(s):
-    return bool(SECRET_KEY.search(s) or AUTH_KEY.search(s) or SPACED_PASSWORD.search(s)
+    return bool(SECRET_KEY.search(s) or KEY_SUFFIX.search(s) or AUTH_KEY.search(s)
+                or BARE_KEY.match(s) or URL_TOKEN_USER.search(s)
+                or SPACED_PASSWORD.search(s)
                 or ENV_ASSIGN.match(s) or TOKEN_SHAPE.search(s) or URL_CREDS.search(s)
                 or any(mixed_case_and_digits(r)
                        for r in LONG_RUN.findall(NOT_A_RUN.sub(b" ", s))))
@@ -2375,7 +2394,7 @@ def cert_shape(raw):
                 secret += 1
         elif s:
             other += 1
-            secret += secret_shaped(s)
+            secret += len(s) > TRUST_LINE_MAX or secret_shaped(s)
     open_block = 1 if label is not None else 0
     return blocks, other + open_block, secret + open_block
 
@@ -3066,7 +3085,7 @@ def _trust_unsafe(facts):
     if facts.get("secretShaped"):
         return ("holds %d line(s) shaped like a secret or a setting (a token, a password, "
                 "a key, NAME=value, or text inside a certificate block): a trust file is a "
-                "CA certificate or bundle, never a config that also holds one"
+                "CA certificate or bundle, never a file that also holds a credential"
                 % facts["secretShaped"])
     return None
 
@@ -8309,6 +8328,13 @@ def _selftest_kit257(expect, conf):
     carried = ("-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n"
                "-----END PUBLIC KEY-----\n-----BEGIN X509 CRL-----\nMIIBfakeCRL\n"
                "-----END X509 CRL-----\n")
+    # …and three more: a TLS capture's "Server Temp Key" and session lines, a keychain
+    # attribute dump's 0x hex, and a long underscored CA name in a comment.
+    bundle_lines += ("Server Temp Key: X25519, 253 bits\nSSL-Session:\n"
+                     "    Protocol  : TLSv1.3\n"
+                     '    "hpky"<blob>=0xC151AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12CD34'
+                     '  "Hpky"\n'
+                     "# Hellenic_Academic_and_Research_Institutions_RootCA_2015\n")
     verify_case("clean-with-every-common-bundle-line", ALREADY_DONE, "exact file",
                 allow(this), cert_text=bundle_lines + _FAKE_CERT + carried + "\ufeff"
                 + _FAKE_CERT)
@@ -8332,7 +8358,21 @@ def _selftest_kit257(expect, conf):
             # No key name at all: only the long mixed run gives it away.
             ("a-bare-key-blob", _FAKE_CERT + "    " + fake_b64 + "\n"),
             ("a-netrc-password", _FAKE_CERT + "machine example.com login me pass"
-                                 + "word hunter2\n")):
+                                 + "word hunter2\n"),
+            ("a-hex-signing-key", _FAKE_CERT + "signing" + "_key: " + "a1" * 32 + "\n"),
+            ("a-camelcase-key", _FAKE_CERT + '{"master' + 'Key": "FAKEvalue123"}\n'),
+            ("an-authorization-header", _FAKE_CERT + "Authori" + "zation: Basic FAKE\n"),
+            ("a-connection-string", _FAKE_CERT + "Server=db;Database=app;P" + "wd=FAKE\n"),
+            ("an-xml-password", _FAKE_CERT + "<pass" + "word>FAKE</password>\n"),
+            ("a-webhook-url", _FAKE_CERT + "url: https://hooks.sl" + "ack.com/services/"
+                              "T000/B000/FAKE\n"),
+            ("an-assignment-inside-a-block", "-----BEGIN CERTIFICATE-----\nMIIBfake\n"
+                                             "tok" + "en=FAKEvalue123\n"
+                                             "-----END CERTIFICATE-----\n"),
+            ("a-line-longer-than-any-bundle-writes", _FAKE_CERT + "# " + "a" * 1100 + "\n"),
+            ("a-yaml-bare-key", "api:\n  ke" + "y: FAKEvalue123\n  ca: |\n" + indented),
+            ("a-token-as-url-user", _FAKE_CERT + "url = https://" + "ab12cd34" * 5
+                                    + "@github.com/org/repo.git\n")):
         verify_case("failed-on-a-config-with-a-certificate:" + label, FAILED,
                     "shaped like a secret or a setting", allow(this), cert_text=text)
     verify_case("clean-with-lines-beside-a-certificate-says-them", ALREADY_DONE,
