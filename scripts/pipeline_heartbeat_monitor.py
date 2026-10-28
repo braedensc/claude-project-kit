@@ -791,10 +791,25 @@ def _pair(verdict):
 
 
 def fingerprint(verdicts):
-    """The identity of a verdict-SET, stable under ordering. Ages and details are
-    deliberately excluded: an incident whose only change is that it got older is the same
-    incident, and including the age would page every pass."""
-    return "|".join(_pair(v) for v in sorted(verdicts, key=lambda v: v["job"]))
+    """The identity of an INCIDENT: its problem verdicts, stable under ordering.
+
+    Quiet verdicts (`ok`, `running`, `unknown-after-gap`) are left out. A healthy job going
+    `running` <-> `ok` while a problem stays open is the same incident; counted, it posted
+    the open incident again on every flip, 46 times in nine days (KIT-259). Ages and details
+    are excluded for the same reason: an incident that only got older is the same incident.
+    Everything quiet is the empty fingerprint, which is how a recovery reads."""
+    return "|".join(_pair(v) for v in sorted(verdicts, key=lambda v: v["job"])
+                    if v["verdict"] in PROBLEM_VERDICTS)
+
+
+def _problems_only(stored):
+    """A stored fingerprint, reduced the way fingerprint() now builds one. One written
+    before KIT-259 lists every job; read unreduced, the first pass after the upgrade would
+    see a different incident and ping once more for nothing."""
+    if not stored:
+        return stored
+    return "|".join(p for p in stored.split("|")
+                    if p.partition("=")[2].partition(":")[0] in PROBLEM_VERDICTS)
 
 
 def build_report(verdicts, unwatched, blind, gap_seconds):
@@ -830,7 +845,7 @@ def decide_post(report, state, now, cooldown, target=None):
     It never posts a recovery. The next pass that judges staleness decides.
     """
     current = report["fingerprint"]
-    last = state.get("last_posted_fingerprint")
+    last = _problems_only(state.get("last_posted_fingerprint"))
     last_was_problem = bool(state.get("last_posted_problem"))
     carried = int(state.get("suppressed_changes") or 0)
     recorded = state.get("last_posted_target")
@@ -1800,6 +1815,44 @@ def selftest():
                  "last_posted_problem": False, "suppressed_changes": 0}
     ok("steady health after a recovery posts nothing",
        decide_post(healthy, recovered, NOW + 20000, 900)[0] is False)
+
+    # QUIET FLAPS ARE ONE INCIDENT (KIT-259). Live, 2026-10-18..27: an incident open for days
+    # was posted again on every flip of a healthy job between `running` and `ok`, because
+    # those quiet verdicts were part of the fingerprint. 46 comments, each a ping.
+    flap_a = report_of([("health-watch", "failing"), ("bounce-driver", "running"),
+                        ("review-poller", "ok")])
+    flap_b = report_of([("health-watch", "failing"), ("bounce-driver", "ok"),
+                        ("review-poller", "ok")])
+    flap_said = {"last_posted_at": _iso(NOW - 7200),
+                 "last_posted_fingerprint": flap_a["fingerprint"],
+                 "last_posted_problem": True, "suppressed_changes": 0}
+    ok("an open incident is not posted again when a healthy job flips running -> ok",
+       decide_post(flap_b, flap_said, NOW, 900)[0] is False,
+       decide_post(flap_b, flap_said, NOW, 900)[1])
+    state, posts = {}, 0
+    for i in range(12):
+        rep = flap_a if i % 2 == 0 else flap_b
+        should, _why, _carried = decide_post(rep, state, NOW + i * 3600, 900)
+        if should:
+            posts += 1
+            state = {"last_posted_at": _iso(NOW + i * 3600),
+                     "last_posted_fingerprint": rep["fingerprint"],
+                     "last_posted_problem": True, "suppressed_changes": 0}
+    ok("…a replay of twelve flapping passes posts exactly once", posts == 1, posts)
+    old_style = dict(flap_said, last_posted_fingerprint="bounce-driver=running|"
+                     "health-watch=failing|review-poller=ok")
+    ok("…a fingerprint stored before this fix reads as the same incident, so the upgrade "
+       "sends no extra ping", decide_post(flap_b, old_style, NOW, 900)[0] is False)
+    ok("…a NEW problem during it is still announced",
+       decide_post(report_of([("health-watch", "failing"), ("bounce-driver", "stale"),
+                              ("review-poller", "ok")]), flap_said, NOW, 900)[0] is True)
+    ok("…and the incident's recovery is still posted",
+       decide_post(report_of([("health-watch", "ok"), ("bounce-driver", "running"),
+                              ("review-poller", "ok")]), flap_said, NOW, 900)[0] is True)
+    quiet_fp = report_of([("a", "ok"), ("b", "running")])["fingerprint"]
+    ok("the fingerprint is the problem verdicts alone",
+       (flap_a["fingerprint"], quiet_fp) == ("health-watch=failing", ""),
+       (flap_a["fingerprint"], quiet_fp))
 
     # A pass that could not judge staleness (a wake, or a rearm) is not a recovery.
     open_incident = {"last_posted_at": _iso(NOW - 5000),
