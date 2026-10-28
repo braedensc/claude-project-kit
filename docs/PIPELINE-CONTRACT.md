@@ -596,7 +596,11 @@ The marker used to live at `<pinsRoot>/dispatched-lane/<OS account>`, and that p
 still counts: **either one makes the lane.** It is not enough alone, because the role
 account created the pins root and can rename the folders under it, which takes the
 marker out of sight; it cannot rename root's `/etc`. With the system marker in place,
-removing the old one gains nothing.
+removing the old one gains nothing **for a reader that knows the system marker.** A project
+made from the kit carries its own copy of the hook, and a copy older than the system marker
+reads only the old one. While a served repository's committed hook is such a copy, the old
+marker under that repository's pins root is still required; the installer's `lane-marker`
+row reads each served hook and stops on CK-10 while one has no marker it reads.
 
 **The marker wins over a pin.** No dispatcher writes a pin for an account that carries
 the marker, so a pin found for one was forged — the pins root is that account's to write
