@@ -1,6 +1,6 @@
 # The heartbeat monitor — the job that reads the other daemons' heartbeats
 
-Stage E's four daemons each write a heartbeat after every pass, so that *the job is dead*
+Stage E's daemons each write a heartbeat after every pass, so that *the job is dead*
 and *the job ran and had nothing to do* stop looking identical (contract §13). For a while
 **nothing read them.** A heartbeat with no consumer is not a health signal; it is a file
 that would have told someone, if anyone had looked. `scripts/pipeline_heartbeat_monitor.py`
@@ -8,7 +8,7 @@ is the consumer.
 
 It is deterministic code — no model, no prompt, no tokens — run by the **same role account**
 as the daemons it watches, on a **longer interval**. One pass: read the watched files (the
-four daemons', and the human-action notifier's when it is watched), judge each, and when
+daemons', and the human-action notifier's when it is watched), judge each, and when
 the verdict *changes*, post **one** comment on a configured tracker ticket. That comment
 pings your private chat channel through the notifier (KIT-156).
 
@@ -70,11 +70,21 @@ kind the way the health watch's does:
 - `stuck-<ticket>`: a delegation still silent after the job's reply. Each ticket is its own
   kind, so a second one pages, and it fires until a person acts on it;
 - `coverage`: the session list was cut short, so a lost delegation could be beyond it;
-- `gate`: the route has been down for 8 passes in a row, which is also how a wrong URL looks.
+- `gate`: the route has been down for two awake hours, which is also how a wrong URL looks.
 
 A new kind pages again; the same kinds an hour later do not. A check it could not make never
-pages. Its `error`, `usage` and `timeout` read **failing**, and the row quotes the job's own
-reason.
+pages.
+
+- **An open incident pages whatever the result word says.** A `held` beat that carries a
+  firing kind reads **failing**. Judged from the job's `firing` field, so the health watch's
+  upkeep findings, which it keeps out of that field, still never page (KIT-264).
+- **A pass that could not finish is its own incident**, `could-not-finish`. Its `error`,
+  `usage` and `timeout` read **failing**, the row quotes the job's own reason, and the open
+  kinds it carried stay named beside it.
+- **It is watched only once installed.** Its own installer step runs just before the
+  monitor's, and installs it only once its first count is signed (`CK-11`). Until then, or
+  with `CATCHUP_INTERVAL_SECONDS=off`, its absent heartbeat would page forever, so it is
+  left out of `watch` and the step's note says so.
 
 **The notifier writes an exit code, not a result word.** The monitor reads it through the
 same exit table every Stage E job shares: 0 is `ok`, and 1, 2, 3 and 4 are `failing`. Its
@@ -323,7 +333,7 @@ an environment holds.
 ## Installing it
 
 **The Stage E installer installs it (KIT-127).** Its `heartbeat-monitor` step runs after the
-four daemons are loaded. Name the ticket in `stage-e.conf`, or turn it off by name:
+daemons are loaded. Name the ticket in `stage-e.conf`, or turn it off by name:
 
 ```sh
 HEARTBEAT_MONITOR_TICKET=KIT-123      # or: HEARTBEAT_MONITOR_TICKET=off
@@ -344,7 +354,8 @@ With a ticket named, the step does six things:
 1. It checks that the stored tracker key can read the ticket. A comment to a missing ticket
    reaches nobody.
 2. It writes `~/.stage-e/monitor.json` under the role account. The intervals come from the
-   same conf values launchd schedules the four daemons by, plus 900 s for one pass. With
+   same conf values launchd schedules the daemons by, plus 900 s for one pass. The catch-up
+   poller is in it only once its own step has installed it. With
    `NOTIFIER_JOB_LABEL` set, the notifier is a fifth watched job (below). With
    `HEALTH_STATUS_FILE` set, the health watch is a sixth (below).
 3. It runs the monitor's own `check`. A config the monitor refuses (exit 2) is never loaded.

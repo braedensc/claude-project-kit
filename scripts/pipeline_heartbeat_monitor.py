@@ -742,9 +742,11 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
                             "; it says a pass was still running, so that pass started and "
                             "never finished" if running else ""))
         return out
-    # A FIRING FINDING ALWAYS PAGES, whatever the result word says. A job whose good words
-    # include `held` must not hide a firing gate or webhook behind it (review of #206).
-    firing_now = bool(spec.get("findings_field")) and bool(findings_text(doc, spec, "firing"))
+    # AN OPEN INCIDENT ALWAYS PAGES, whatever the result word says: a job whose good words
+    # include `held` must not hide a firing gate or webhook behind it (review of #206). Judged
+    # from the job's own `firing` field, not from each finding's state: the health watch lists
+    # upkeep findings as firing-state yet keeps them out of `firing` on purpose (KIT-264).
+    firing_now = bool(spec.get("findings_field")) and bool(incident_of(doc, spec))
     if out["result"] in (spec.get("good") or ()) and not firing_now:
         paused_for = _paused_seconds(raw.get("doc") or {}, now)
         if out["result"] == "paused" and paused_for is not None and paused_for > PAUSED_MAX_SECONDS:
@@ -775,6 +777,11 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
         # firing kinds name the incident.
         out["verdict"] = "failing"
         out["incident"] = incident_of(doc, spec)
+        # A PASS THAT COULD NOT FINISH IS ITS OWN INCIDENT. Without this an error beat and a
+        # problems beat with the same firing kinds share a fingerprint, so a reply that fails
+        # on every pass would never page while another incident stays open (review of #206).
+        if isinstance(doc, dict) and doc.get("error"):
+            out["incident"] = "could-not-finish" + (("," + out["incident"]) if out["incident"] else "")
         # A pass that could not finish says why in its own `error`; the page carries it, so
         # "it could not do it" is never worded as "it found something".
         err = " ".join(str(doc.get("error") or "").split()).replace("|", "/") \
@@ -2965,6 +2972,13 @@ def selftest():
                              time.time(), 1800, False)
             ok("…a firing finding pages even under a good result word like `held`",
                real["verdict"] == "failing" and real.get("incident") == "webhook", real)
+            pcp.write_heartbeat(cd, "error", pcp._iso(), False, [
+                {"kind": "webhook", "state": pcp.FIRING, "summary": "Linear has DISABLED it"}],
+                error="could not re-prompt 1 session(s): KIT-4: HTTP 503")
+            real = judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(cd)),
+                             time.time(), 1800, False)
+            ok("…and a pass that could not finish is its own incident, beside one already open",
+               real.get("incident") == "could-not-finish,webhook" and "KIT-4" in real["detail"], real)
 
         # END TO END, from the poller's own pass and writer: the pages the docs promise for a
         # route that stays down, and for a webhook disabled while it is down (review of #206).
@@ -2984,17 +2998,21 @@ def selftest():
                      "max_per_pass": 3, "spacing_seconds": 0, "stuck_after_seconds": 3600,
                      "max_pages": 10, "dispatcher_url": "http://127.0.0.1:1",
                      "front_door_url": "", "webhook_id": "", "run_timeout_seconds": 600}
-            verdicts = []
-            for _ in range(pcp.HELD_ALERT_PASSES):
+            verdicts, tick = [], [0.0]
+
+            def _awake():
+                tick[0] += 900.0          # one pass every 15 awake minutes
+                return tick[0]
+            for _ in range(1 + pcp.HELD_ALERT_AWAKE_SECONDS // 900):
                 _c, result, found, counts = pcp.run_pass(cfg_c, "k", gql=_fake_linear(True),
-                                                         get=down)
+                                                         get=down, awake=_awake)
                 pcp.write_heartbeat(ce, result, pcp._iso(), False, found, counts)
                 verdicts.append(judge_one(CATCHUP_JOB, spec_c, read_beat(pcp.heartbeat_path(ce)),
                                           time.time(), 1800, False))
             ok("a route down for a few passes reads ok (the health watch pages a short outage)",
                verdicts[0]["verdict"] == "ok", verdicts[0])
-            ok("…and down for %d passes in a row, the poller's own beat pages `gate`"
-               % pcp.HELD_ALERT_PASSES,
+            ok("…and down for %d awake minutes, the poller's own beat pages `gate`"
+               % (pcp.HELD_ALERT_AWAKE_SECONDS // 60),
                verdicts[-1]["verdict"] == "failing" and verdicts[-1].get("incident") == "gate",
                verdicts[-1])
         with tempfile.TemporaryDirectory() as cw:

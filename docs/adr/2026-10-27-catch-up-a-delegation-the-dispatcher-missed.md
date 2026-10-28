@@ -59,11 +59,22 @@ account with the owner-scoped tracker key Stage E already stores.
   and only a person can tell which.
 - **It holds its replies when the dispatcher cannot hear it, but keeps looking.** Each pass
   asks the dispatcher's local status, and the public front door when configured. A reply sent
-  then would be one more lost delivery. A route down for 8 passes in a row pages: a wrong URL
-  looks exactly like that, and would otherwise read healthy forever.
+  then would be one more lost delivery. A route down for two hours of AWAKE time pages: a
+  wrong URL looks exactly like that, and would otherwise read healthy forever. Awake time,
+  because a night of dark wakes with no network is many held passes and no outage.
+- **What it found stays found until it can look again.** A pass that could not read the
+  tracker, failed or ran out of time carries the last full pass's open findings, so it never
+  reads as a recovery. A webhook read that fails keeps a disabled webhook disabled, and its
+  hold on replies. A pass that could not finish is its own incident in the monitor.
+- **Only the newest session on a ticket, and only a complete read.** A tie on one ticket gets
+  one reply. A session read cut short at its page limit sends no reply: the unread session
+  could be the newer one.
 - **The first count is a person's.** Its first pass would reply to every unanswered
-  delegation from the past week, each a paid session. The installer lists them and stops on a
-  card until the owner signs the count.
+  delegation from the past week, each a paid session. The installer lists them all, and
+  installs the job only once the owner signs that count (card CK-11). It has its own step,
+  like the heartbeat monitor's, so an unsigned job stops nothing else: it simply has no
+  plist, and no reboot can start it. A count that grows past the signed one before the first
+  load keeps it off. `CATCHUP_INTERVAL_SECONDS=off` declines it by name.
 - **It checks the webhook.** A disabled webhook is a firing finding; the heartbeat monitor
   pages it once. While it fires, no reply is sent, since none could arrive.
 - **At most three replies a pass, a minute apart, oldest first.** Each reply starts a paid

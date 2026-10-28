@@ -12,12 +12,13 @@ WHAT IT BUILDS.  The review-and-bounce layer beside an already-running
 dispatcher: a Reviews team in the tracker, an env file and four config files
 under the dispatcher's role account (the review poller's, the bounce driver's,
 the finding poller's and the catch-up poller's), one repository entry per
-reviewed repository in the dispatcher's own config, and four system LaunchDaemons
-running one-shot
-passes — review poller, bounce driver, finding poller, catch-up poller (KIT-47:
-it starts a delegation the dispatcher missed while it was down, docs/CATCH-UP.md).
+reviewed repository in the dispatcher's own config, and three system LaunchDaemons
+running one-shot passes — review poller, bounce driver, finding poller. A fourth, the
+catch-up poller (KIT-47: it starts a delegation the dispatcher missed while it was down,
+docs/CATCH-UP.md), has its own step and is installed only once its first count is signed
+(CK-11), or never with CATCHUP_INTERVAL_SECONDS=off.
 
-A fifth system LaunchDaemon reads those four's heartbeats: the heartbeat
+A fifth system LaunchDaemon reads the others' heartbeats: the heartbeat
 monitor (scripts/pipeline_heartbeat_monitor.py, KIT-127). It comments on ONE
 ticket when their health changes, so the `heartbeat-monitor` step stops on a card
 until HEARTBEAT_MONITOR_TICKET names that ticket, or says `off` by name. With
@@ -595,7 +596,11 @@ CONF_DEFAULTS = {
     # The catch-up poller (KIT-47): re-prompts a delegation the dispatcher never received
     # once it is older than Linear's retry ladder. It acts only when the dispatcher answers
     # at CATCHUP_DISPATCHER_URL and, when set, the public CATCHUP_FRONT_DOOR_URL answers.
+    # `off` declines the job by name: it is not installed, and one an earlier run installed is
+    # unloaded and its plist removed. Left on, it is installed only once its first count is
+    # signed (CK-11).
     "CATCHUP_INTERVAL_SECONDS": "900",
+    "CATCHUP_MAX_PAGES": "10",
     "CATCHUP_DISPATCHER_URL": "http://127.0.0.1:3456",
     "CATCHUP_FRONT_DOOR_URL": "",
     # Empty checks the one OAuth-application webhook the key can see. With several, the
@@ -804,8 +809,15 @@ def validate_conf(values):
     if conf.get("SEVERITY_THRESHOLD") not in ("low", "medium", "high", "critical"):
         errors.append("SEVERITY_THRESHOLD must be low|medium|high|critical (got %r)"
                       % conf.get("SEVERITY_THRESHOLD"))
+    cval = (conf.get("CATCHUP_INTERVAL_SECONDS") or "").strip()
+    if cval.lower() != "off" and (not cval.isdigit() or int(cval) <= 0):
+        errors.append("CATCHUP_INTERVAL_SECONDS must be a positive integer, or `off` to decline "
+                      "the catch-up poller by name (got %r)" % cval)
+    pages = (conf.get("CATCHUP_MAX_PAGES") or "").strip()
+    if not pages.isdigit() or not 1 <= int(pages) <= 100:
+        errors.append("CATCHUP_MAX_PAGES must be an integer from 1 to 100 (got %r)" % pages)
     for key in ("POLL_INTERVAL_SECONDS", "BOUNCE_INTERVAL_SECONDS",
-                "FINDING_INTERVAL_SECONDS", "CATCHUP_INTERVAL_SECONDS",
+                "FINDING_INTERVAL_SECONDS",
                 "MONITOR_INTERVAL_SECONDS", "DIFF_CAP_CHARS",
                 # A retention of ZERO would delete the copy it just took, which
                 # is the one thing the whole step refuses to proceed without.
@@ -834,9 +846,10 @@ def load_conf(path):
 
 def daemon_labels(conf):
     """`com.example.dispatcher` -> the review and bounce labels beside it. The
-    finding poller's is `finding_label`, the catch-up poller's `catchup_label`, and
-    `all_daemon_labels` is all FOUR. One value typed, four derived: a prefix typed twice is a prefix that
-    disagrees."""
+    finding poller's is `finding_label`, and `all_daemon_labels` is all THREE. The
+    catch-up poller's `catchup_label` is beside them, and has its own step, like the
+    heartbeat monitor's. One value typed, every label derived: a prefix typed twice
+    is a prefix that disagrees."""
     prefix = conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0]
     return prefix + ".stage-e-poller", prefix + ".stage-e-bounce"
 
@@ -849,20 +862,27 @@ def finding_label(conf):
 
 
 def catchup_label(conf):
-    """The catch-up poller's launchd label (KIT-47), beside the finding poller's."""
+    """The catch-up poller's launchd label (KIT-47). NOT in `all_daemon_labels`: its own
+    step installs and loads it, and only once its first count is signed (CK-11), because
+    its first pass can start one paid session per week-old unanswered delegation."""
     return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-catchup"
 
 
+def catchup_off(conf):
+    """CATCHUP_INTERVAL_SECONDS=off declines the catch-up poller by name."""
+    return (conf.get("CATCHUP_INTERVAL_SECONDS") or "").strip().lower() == "off"
+
+
 def all_daemon_labels(conf):
-    """Every Stage E daemon label, review + bounce + finding + catch-up — for the loops
-    that install, load and check all of them uniformly."""
-    return daemon_labels(conf) + (finding_label(conf), catchup_label(conf))
+    """The three daemons `enable` loads together, review + bounce + finding — for the
+    loops that install, load and check all of them uniformly."""
+    return daemon_labels(conf) + (finding_label(conf),)
 
 
 def monitor_label(conf):
-    """The heartbeat monitor's launchd label, beside the other four. NOT in
+    """The heartbeat monitor's launchd label, beside the others. NOT in
     `all_daemon_labels`: its own step installs, loads and checks it, because it is
-    off by name on some machines and it must never block the four it watches."""
+    off by name on some machines and it must never block the jobs it watches."""
     return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-monitor"
 
 
@@ -1101,12 +1121,13 @@ def _privilege_reason(command, dry_run, account, conf):
     if dry_run:
         return ("`run --dry-run` measures this machine as the %s role account and as "
                 "root. It changes nothing." % account)
-    if monitor_ticket(conf) == "off":
-        daemons = ("four system LaunchDaemons — the review poller, the bounce driver, "
-                   "the finding poller and the catch-up poller.")
-    else:
-        daemons = ("five system LaunchDaemons — the review poller, the bounce driver, "
-                   "the finding poller, the catch-up poller and the heartbeat monitor.")
+    names = ["the review poller", "the bounce driver", "the finding poller"]
+    if not catchup_off(conf):
+        names.append("the catch-up poller")
+    if monitor_ticket(conf) != "off":
+        names.append("the heartbeat monitor")
+    daemons = "%s system LaunchDaemons — %s and %s." % (
+        {3: "three", 4: "four", 5: "five"}[len(names)], ", ".join(names[:-1]), names[-1])
     return ("`run` reads and writes files as the %s role account, edits the dispatcher's "
             "config, and installs and loads %s" % (account, daemons))
 
@@ -1694,15 +1715,19 @@ CARDS = {
                 "the dispatcher never answered, and each reply starts a paid session. Some "
                 "were dropped on purpose, and some you may not want any more. The dry-run "
                 "lines above name every one. Only you know which you want started."),
-        "do": ["Read the delegations the installer just listed above. Every one is",
+        "do": ["Nothing else waits on this: until you sign, the catch-up poller is simply",
+               "not installed, and every run says so. To decline it for good, set",
+               "CATCHUP_INTERVAL_SECONDS=off in stage-e.conf.",
+               "Read the delegations the installer just listed above. Every one is",
                "re-prompted, up to three a pass, so the whole list is what you sign.",
                "For any you do NOT want started, remove its delegation or close the",
                "ticket, then re-run: the count drops, because it is then skipped.",
                "When the count is what you meant, sign it off and re-run:",
                "    python3 scripts/pipeline_stage_e_setup.py attest A-CATCHUP-COUNT "
                "--initials " + INITIALS_PLACEHOLDER + " --note \"count read: N\"",
-               "(YOUR initials, 2-4 letters, and N the count you just read. This is asked",
-               "once, before the job is first loaded.)"],
+               "(YOUR initials, 2-4 letters, and N the count you just read. It is asked",
+               "once, before the job is first loaded. If the count grows past N before",
+               "then, the job stays off until you sign again.)"],
         "good": "the count you attested is the count you meant",
         "attest": "A-CATCHUP-COUNT",
     },
@@ -2507,6 +2532,10 @@ def step_code(ctx, apply_it):
         return True, same, []
 
     stop_labels = all_daemon_labels(conf)
+    # The catch-up poller execs from the same clone, and is stopped only when it is loaded:
+    # a job never installed (its first count unsigned, or `off`) is not one to report as off.
+    if r.as_root(["launchctl", "print", "system/" + catchup_label(conf)]).ok:
+        stop_labels = stop_labels + (catchup_label(conf),)
     # The heartbeat monitor execs from the same clone. It is stopped whenever it is
     # loaded, even under `off` (its own step removes it then), and only then: a job this
     # machine never loaded is not one to report as switched off.
@@ -3301,6 +3330,7 @@ def step_configs(ctx, apply_it):
         "dispatcher_url": conf["CATCHUP_DISPATCHER_URL"].strip(),
         "front_door_url": conf["CATCHUP_FRONT_DOOR_URL"].strip(),
         "webhook_id": (conf.get("CATCHUP_WEBHOOK_ID") or "").strip(),
+        "max_pages": int(conf.get("CATCHUP_MAX_PAGES") or 10),
     }
     wanted = {"poller.json": poller, "config.json": bounce,
               "finding/poller.json": finding, "catchup/poller.json": catchup}
@@ -4659,15 +4689,19 @@ def _plists(ctx):
                               'scan --config "$HOME/.stage-e/finding/poller.json"'),
             interval=int(conf["FINDING_INTERVAL_SECONDS"]),
             log=home + "/.stage-e/finding/poller.log"),
-        # KIT-47 catch-up poller — a delegation the dispatcher never received is
-        # re-prompted once it is older than Linear's retry ladder.
-        catchup_label(conf): PLIST.format(
-            label=catchup_label(conf), account=ctx.account, home=home, path=DAEMON_PATH,
-            command=(common + '"$HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py" '
-                              'run --config "$HOME/.stage-e/catchup/poller.json"'),
-            interval=int(conf["CATCHUP_INTERVAL_SECONDS"]),
-            log=home + "/.stage-e/catchup/poller.log"),
     }
+
+
+def _catchup_plist(ctx):
+    """The catch-up poller's plist (KIT-47): a delegation the dispatcher never received is
+    re-prompted once it is older than Linear's retry ladder. Installed only by its own step."""
+    conf, home = ctx.conf, ctx.role_home
+    return PLIST.format(
+        label=catchup_label(conf), account=ctx.account, home=home, path=DAEMON_PATH,
+        command=(DAEMON_EXEC + '"$HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py" '
+                               'run --config "$HOME/.stage-e/catchup/poller.json"'),
+        interval=int(conf["CATCHUP_INTERVAL_SECONDS"]),
+        log=home + "/.stage-e/catchup/poller.log")
 
 
 def step_daemons(ctx, apply_it):
@@ -4772,10 +4806,13 @@ def step_dry_run(ctx, apply_it):
                         env + "/usr/bin/python3 %s/kit/scripts/pipeline_finding_poller.py "
                               "scan --config %s/finding/poller.json --dry-run"
                         % (ctx.stage_home, ctx.stage_home), timeout=600)
-    catchup = r.as_role(ctx.account,
-                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_catchup_poller.py "
-                              "run --config %s/catchup/poller.json --dry-run"
-                        % (ctx.stage_home, ctx.stage_home), timeout=900)
+    if catchup_off(ctx.conf):
+        catchup = Result(0, "[catchup-poller] OFF by conf (CATCHUP_INTERVAL_SECONDS=off)\n", "")
+    else:
+        catchup = r.as_role(ctx.account,
+                            env + "/usr/bin/python3 %s/kit/scripts/pipeline_catchup_poller.py "
+                                  "run --config %s/catchup/poller.json --dry-run"
+                            % (ctx.stage_home, ctx.stage_home), timeout=900)
     blob = (poller.out + poller.err + bounce.out + bounce.err)
     say("")
     say("  -- the poller's dry run --")
@@ -4850,6 +4887,14 @@ def step_dry_run(ctx, apply_it):
     elif catchup.rc == COMPONENT_EXIT_DECLINED:
         notes.append("the catch-up poller's dry run found something only a person can fix; "
                      "its FIRING lines above say what")
+    # A WEBHOOK CHECK THAT CANNOT RUN never pages, so the install says so once, here: on such
+    # a machine a disabled webhook would go unnoticed (KIT-268).
+    unchecked = [l.split("webhook", 1)[1].strip() for l in catchup_said.splitlines()
+                 if re.search(r"\bUNKNOWN\s+webhook\b", l)]
+    if unchecked:
+        notes.append("the catch-up poller cannot check the dispatcher's webhook: %s. A disabled "
+                     "webhook would then never page. CATCHUP_WEBHOOK_ID helps only when the "
+                     "key sees several; record which on KIT-268" % unchecked[0][:240])
     if problems:
         raise SetupError("\n".join(problems))
     declined = poller.rc == COMPONENT_EXIT_DECLINED
@@ -4869,15 +4914,10 @@ def step_dry_run(ctx, apply_it):
         raise Blocked("CK-5", "the counts above have not been signed off")
     # EVERY candidate, not the WOULD lines: those are only what one pass posts under the cap,
     # and none while a disabled webhook holds them. Each candidate is a paid session in time.
-    would = [l.split("CANDIDATE", 1)[1].strip() for l in catchup_said.splitlines()
-             if "] CANDIDATE " in l]
-    if not ctx.state.attested("A-CATCHUP-COUNT"):
-        say("  The catch-up poller would re-prompt %d delegation(s), up to three a pass:"
-            % len(would))
-        for line in would:
-            say("    " + line)
-        raise Blocked("CK-11", "the catch-up poller's first count (%d) has not been signed off"
-                      % len(would))
+    # The catch-up step reads this list; it decides, and it never stops the run.
+    ctx.catchup_candidates = None if catchup_off(ctx.conf) else [
+        l.split("] CANDIDATE", 1)[1].strip() for l in catchup_said.splitlines()
+        if "] CANDIDATE " in l]
     return True, ("all four dry runs ran and the count is signed off; "
                   + ("the poller declined at least one pull request"
                      if declined else "the poller did not decline")), notes
@@ -4886,8 +4926,12 @@ def step_dry_run(ctx, apply_it):
 # Each daemon's heartbeat, under the role account's ~/.stage-e. One list, read by both of
 # step_enable's loops, so a daemon added later cannot be loaded without being waited for.
 DAEMON_HEARTBEATS = ("state/heartbeat.json", "state/bounce-heartbeat.json",
-                     "finding/heartbeat.json", "catchup/heartbeat.json")
-HEARTBEAT_WAIT_SECONDS = 180
+                     "finding/heartbeat.json")
+CATCHUP_HEARTBEAT = "catchup/heartbeat.json"
+HEARTBEAT_WAIT_SECONDS = 90
+# The catch-up poller's first pass may reply three times, a minute apart, before it writes
+# its heartbeat.
+CATCHUP_HEARTBEAT_WAIT_SECONDS = 180
 
 
 def step_enable(ctx, apply_it):
@@ -4925,7 +4969,7 @@ def step_enable(ctx, apply_it):
             % (ctx.stage_home,
                " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
 
-    if not missing and len(have_beats) == len(DAEMON_HEARTBEATS):
+    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats):
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
         return True, "all %d daemons loaded and all heartbeats present" % len(
             DAEMON_HEARTBEATS), pause_notes
@@ -4971,8 +5015,6 @@ def step_enable(ctx, apply_it):
     if ctx.runner.dry_run:
         return False, "would load the daemons and wait for their heartbeats", []
 
-    # 180 s, not 90: the catch-up poller's first pass may reply up to three times, a minute
-    # apart, before it writes its heartbeat.
     deadline = time.time() + HEARTBEAT_WAIT_SECONDS
     while time.time() < deadline:
         beats = r.as_role(ctx.account,
@@ -4981,7 +5023,7 @@ def step_enable(ctx, apply_it):
                           "printf '%%s missing\\n' \"$f\"; done"
                           % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
         have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
-        if len(have_beats) == len(DAEMON_HEARTBEATS):
+        if set(DAEMON_HEARTBEATS) <= set(have_beats):
             return False, "all %d daemons loaded; all heartbeats appeared" % len(
                 DAEMON_HEARTBEATS), []
         time.sleep(5)
@@ -5060,8 +5102,9 @@ MONITOR_HEARTBEAT = "state/monitor-heartbeat.json"
 MONITOR_HEARTBEAT_SCHEMA = "pipeline-heartbeat-monitor-heartbeat/1"
 MONITOR_JOBS = (("review-poller", "POLL_INTERVAL_SECONDS"),
                 ("bounce-driver", "BOUNCE_INTERVAL_SECONDS"),
-                ("finding-poller", "FINDING_INTERVAL_SECONDS"),
-                ("catch-up", "CATCHUP_INTERVAL_SECONDS"))
+                ("finding-poller", "FINDING_INTERVAL_SECONDS"))
+# Watched only when installed: unsigned or `off`, its absent heartbeat would page forever.
+CATCHUP_WATCH_JOB = ("catch-up", "CATCHUP_INTERVAL_SECONDS")
 MONITOR_STALE_MULTIPLIER = 2
 MONITOR_RUN_TIMEOUT_SECONDS = 120
 # The longest one daemon pass may run: the review poller's and the bounce driver's default
@@ -5092,7 +5135,7 @@ NOTIFIER_DEFAULT_STATE_DIR = "~/.stage-e/state"
 _RUN_INTERVAL_RE = re.compile(r"^\s*run interval = (\d+) seconds?\s*$", re.MULTILINE)
 
 
-def monitor_config(conf, notifier=None):
+def monitor_config(conf, notifier=None, catchup=False):
     """The monitor's config, from the same conf values the four daemons are scheduled
     by — so its idea of "stale" follows the interval launchd really uses.
 
@@ -5104,7 +5147,10 @@ def monitor_config(conf, notifier=None):
     `notifier` is what `measure_notifier` read, or None: with it, the notifier is a fourth
     watched job, by the same rule — the interval launchd holds for it, plus its own pass
     clock — and its heartbeat is read from its own state directory. A PAUSED notifier is
-    not watched on this pass: the config is the one written with no notifier at all."""
+    not watched on this pass: the config is the one written with no notifier at all.
+
+    `catchup` is whether the catch-up poller is installed (its own step, just before this
+    one, measured it): watched then, by the same rule as the daemons, and never otherwise."""
     notifier = _notifier_watched(notifier)
     doc = {
         "state_dir": "~/.stage-e/state",
@@ -5119,6 +5165,10 @@ def monitor_config(conf, notifier=None):
         "notify_ticket_id": monitor_ticket(conf),
         "linear_key_env": conf["LINEAR_KEY_ENV"],
     }
+    if catchup and not catchup_off(conf):
+        job, key = CATCHUP_WATCH_JOB
+        doc["watch"].append(job)
+        doc["intervals"][job] = int(conf[key]) + MONITOR_DAEMON_PASS_SECONDS
     if notifier:
         doc["watch"].append(NOTIFIER_WATCH_JOB)
         doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
@@ -5370,6 +5420,125 @@ def _monitor_off(ctx, apply_it):
     return False, "OFF by conf: unloaded %s and removed its plist" % label, []
 
 
+def _catchup_signed_count(ctx):
+    """N from A-CATCHUP-COUNT's "count read: N" note, or None when it names no number."""
+    signed = (ctx.state.data.get("attestations") or {}).get("A-CATCHUP-COUNT") or {}
+    m = re.search(r"(\d+)", str(signed.get("note") or ""))
+    return int(m.group(1)) if m else None
+
+
+def _say_catchup_candidates(candidates):
+    if candidates is None:
+        say("  (the catch-up poller's dry run did not run in this pass, so its list is not shown)")
+        return
+    say("  The catch-up poller would re-prompt %d delegation(s), up to three a pass, each one a "
+        "paid session:" % len(candidates))
+    for line in candidates[:40]:
+        say("    " + line[:160])
+    if len(candidates) > 40:
+        say("    …and %d more" % (len(candidates) - 40))
+
+
+def step_catchup(ctx, apply_it):
+    """The catch-up poller (KIT-47, docs/CATCH-UP.md): its own step, after `enable` and before
+    the heartbeat monitor's, so the monitor watches it only once it is installed.
+
+    It is installed ONLY once its first count is signed (A-CATCHUP-COUNT, card CK-11): its
+    first pass replies once to every unanswered delegation from the past week, and each reply
+    starts a paid session. Until then there is no plist at all — so no reboot can start it —
+    and this step says so on every run. It never stops the run: the other jobs load either
+    way. A count that grew past the one signed keeps it off until it is signed again.
+    CATCHUP_INTERVAL_SECONDS=off declines it by name, and removes one an earlier run
+    installed."""
+    r, conf = ctx.runner, ctx.conf
+    label = catchup_label(conf)
+    plist = _dispatcher_plist(label)
+    loaded = r.as_root(["launchctl", "print", "system/" + label]).ok
+    installed = r.read(["test", "-f", plist]).ok
+    candidates = getattr(ctx, "catchup_candidates", None)
+
+    if catchup_off(conf):
+        if not loaded and not installed:
+            return True, "OFF by conf (CATCHUP_INTERVAL_SECONDS=off): a delegation lost while " \
+                         "the dispatcher was down stays lost", []
+        if not apply_it:
+            return False, ("OFF by conf, and %s is still %s — would unload it and remove its "
+                           "plist" % (label, "loaded" if loaded else "installed")), []
+        if loaded:
+            out = r.as_root(["launchctl", "bootout", "system/" + label],
+                            why="unload %s: CATCHUP_INTERVAL_SECONDS=off" % label)
+            if not out.skipped:
+                gone, waited = _wait_until_gone(r, label,
+                                                _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+                if not gone:
+                    raise SetupError(
+                        "the catch-up poller was told to stop and launchd still holds %s %ds "
+                        "later.\nIts plist was NOT removed, so the next run tries again.\n"
+                        "Stop it by hand, then run the installer again:\n"
+                        "    sudo launchctl bootout system/%s" % (label, waited, label))
+        res = r.as_root(["rm", "-f", plist],
+                        why="remove %s, so the next boot does not load it again" % plist)
+        if not res.ok and not res.skipped:
+            raise SetupError("could not remove %s: %s" % (plist, (res.err or "").strip()[:200]))
+        ctx.unloaded = [l for l in ctx.unloaded if l != label]
+        return False, "OFF by conf: unloaded %s and removed its plist" % label, []
+
+    how_to_sign = ("read the list above, then: python3 scripts/pipeline_stage_e_setup.py attest "
+                   "A-CATCHUP-COUNT --initials <yours> --note \"count read: N\" and run again "
+                   "(card CK-11). Or set CATCHUP_INTERVAL_SECONDS=off to decline it")
+    if not installed and not ctx.state.attested("A-CATCHUP-COUNT"):
+        _say_catchup_candidates(candidates)
+        return True, ("NOT installed: it waits for you to read its first count (CK-11); "
+                      "nothing else waits on it"), [
+            "the catch-up poller is not installed, so a delegation lost while the dispatcher "
+            "was down stays lost. To turn it on, " + how_to_sign]
+    signed_n = _catchup_signed_count(ctx)
+    if not installed and candidates is not None and signed_n is not None \
+            and len(candidates) > signed_n:
+        _say_catchup_candidates(candidates)
+        return True, ("NOT installed: its count grew from %d to %d since you signed; nothing "
+                      "else waits on it" % (signed_n, len(candidates))), [
+            "the catch-up poller stays off until the count you sign is the count it would "
+            "start. To turn it on, " + how_to_sign]
+
+    want = _catchup_plist(ctx)
+    have = r.as_root(["cat", plist])
+    stale = not have.ok or have.out != want
+    if not stale and loaded and label not in ctx.unloaded:
+        return True, "loaded and current (%s)" % label, []
+    if not apply_it:
+        return False, "would %s %s" % ("install and load" if stale else "load", label), []
+    if stale:
+        _install_plist(r, label, want)
+    out = r.as_root(["launchctl", "bootout", "system/" + label],
+                    why="unload %s before loading it (bootstrap does not re-read a loaded plist)"
+                        % label)
+    if not out.skipped:
+        _wait_until_gone(r, label, _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
+    res = r.as_root(["launchctl", "bootstrap", "system", plist], why="load %s" % label)
+    if not res.ok and not res.skipped:
+        raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
+    ctx.unloaded = [l for l in ctx.unloaded if l != label]
+    if r.dry_run:
+        return False, "would load %s and wait for its heartbeat" % label, []
+    deadline = time.time() + CATCHUP_HEARTBEAT_WAIT_SECONDS
+    while time.time() < deadline:
+        beats = r.as_role(ctx.account,
+                          "for f in %s; do "
+                          "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
+                          "printf '%%s missing\\n' \"$f\"; done"
+                          % (CATCHUP_HEARTBEAT, ctx.stage_home))
+        if any(l.split()[0] == CATCHUP_HEARTBEAT for l in beats.out.splitlines()
+               if l.endswith(" ok")):
+            return False, "loaded %s; its heartbeat appeared" % label, []
+        time.sleep(5)
+    raise Unknown("the catch-up poller was loaded and its heartbeat did not appear within %ds"
+                  % CATCHUP_HEARTBEAT_WAIT_SECONDS,
+                  "read ~/.stage-e/catchup/poller.log under the role account: a stale "
+                  "heartbeat means NOT RUNNING, a fresh one with a non-ok result means RAN AND "
+                  "COULD NOT")
+
+
 def step_heartbeat_monitor(ctx, apply_it):
     """The fourth role-account job: it reads the three heartbeats and comments on ONE
     ticket when their health changes (scripts/pipeline_heartbeat_monitor.py,
@@ -5421,7 +5590,12 @@ def step_heartbeat_monitor(ctx, apply_it):
     # The row is cut at 96 characters when printed, and this clause sits at its end, so it is
     # ALSO returned as a note, which prints whole — watched, paused, or not configured.
     watch_notes = [watch_note, _health_watch_note(conf)]
-    want_conf, want_plist = monitor_config(conf, notifier), _monitor_plist(ctx)
+    catchup_on = (not catchup_off(conf)
+                  and r.read(["test", "-f", _dispatcher_plist(catchup_label(conf))]).ok)
+    watch_notes.append("it watches the catch-up poller" if catchup_on else
+                       "the catch-up poller is not watched: it is not installed")
+    want_conf = monitor_config(conf, notifier, catchup=catchup_on)
+    want_plist = _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
         have_conf = json.loads(got.out) if got.ok and got.out.strip() else None
@@ -5776,6 +5950,7 @@ STEPS = (
     ("daemons", "the plists, rendered, linted and installed", step_daemons),
     ("dry-run", "the dry runs, read before anything is on", step_dry_run),
     ("enable", "load the daemons and see their heartbeats", step_enable),
+    ("catch-up", "the catch-up poller, once you have read its first count", step_catchup),
     ("heartbeat-monitor", "the job that reads those heartbeats, and the ticket it comments on",
      step_heartbeat_monitor),
     ("conflict-waker", "your own conflict waker — the local half of the conflict loop",
@@ -6236,9 +6411,11 @@ def cmd_attest(state, aid, initials, note):
         raise SetupError("%s needs a --note saying what you read: %s\n"
                          "  e.g. --note \"count read: 7\"\n"
                          "  This sign-off is the only thing between you and one paid session "
-                         "per eligible pull request, and a sign-off with no number in it "
+                         "per %s, and a sign-off with no number in it "
                          "records that somebody clicked, not that somebody read."
-                         % (aid, ATTESTATIONS[aid]))
+                         % (aid, ATTESTATIONS[aid],
+                            "unanswered delegation" if aid == "A-CATCHUP-COUNT"
+                            else "eligible pull request"))
     bound = {}
     if aid in ATTESTATIONS_BOUND_TO_FENCE:
         # A SIGN-OFF OF A LIVE REVIEWER NAMES THE FENCE IT RAN UNDER. With none
@@ -8980,31 +9157,96 @@ def _selftest_body():
     expect("catchup-dry-run", isinstance(rowCH, SetupError)
            and "CATCHUP_DISPATCHER_URL" in str(rowCH),
            "a catch-up dry run that HELD did not stop the install, naming the URL: %r" % (rowCH,))
-    # THE FIRST COUNT IS SIGNED (CK-11): each delegation it names starts a paid session.
+    # THE FIRST COUNT IS SIGNED (CK-11), AND NOTHING ELSE WAITS ON IT. The dry run collects
+    # EVERY candidate (CANDIDATE lines, not the capped WOULD lines) and never stops the run;
+    # the catch-up step installs the job only once that count is signed, and says so either way.
     cases += 1
+    ck_out = ("[catchup-poller] CANDIDATE KIT-7: KIT-7 was delegated and never answered\n"
+              "[catchup-poller] CANDIDATE KIT-8: KIT-8 was delegated and never answered\n"
+              "[catchup-poller] CANDIDATE KIT-9: KIT-9 was delegated and never answered\n"
+              "[catchup-poller] WOULD re-prompt KIT-7: KIT-7 was delegated and never answered\n"
+              "[catchup-poller] LEFT for the next pass (over max_per_pass 1): KIT-8, KIT-9\n")
     ctxCK, fakeCK = _dry_run_ctx(conf)
     ctxCK.state.data["attestations"].pop("A-CATCHUP-COUNT", None)
-    # The poller's dry run names EVERY candidate (CANDIDATE) and only this pass's capped few
-    # as WOULD; the count is the candidates, or the sign-off undercounts the spend.
-    fakeCK.answers = [("pipeline_catchup_poller.py", 0,
-                       "[catchup-poller] CANDIDATE KIT-7: KIT-7 was delegated and never answered\n"
-                       "[catchup-poller] CANDIDATE KIT-8: KIT-8 was delegated and never answered\n"
-                       "[catchup-poller] CANDIDATE KIT-9: KIT-9 was delegated and never answered\n"
-                       "[catchup-poller] WOULD re-prompt KIT-7: KIT-7 was delegated and never "
-                       "answered\n[catchup-poller] LEFT for the next pass (over max_per_pass 1): "
-                       "KIT-8, KIT-9\n")] + fakeCK.answers
-    rowCK, printedCK = _quiet(lambda: _dry_run_row(ctxCK))
-    expect("catchup-count-signed", isinstance(rowCK, Blocked) and rowCK.card_id == "CK-11"
-           and "(3)" in rowCK.extra and "KIT-9" in printedCK
-           and "KIT-7" in printedCK and "KIT-8" in printedCK,
-           "an unsigned first catch-up count did not stop at CK-11, naming each delegation: %r"
-           % (rowCK,))
+    fakeCK.answers = [("pipeline_catchup_poller.py", 0, ck_out)] + fakeCK.answers
+    rowCK, _pCK = _quiet(lambda: _dry_run_row(ctxCK))
+    expect("catchup-count-signed", isinstance(rowCK, tuple) and rowCK[0] is True
+           and len(ctxCK.catchup_candidates or []) == 3,
+           "the dry run stopped the run on CK-11, or did not collect every candidate: %r %r"
+           % (rowCK, getattr(ctxCK, "catchup_candidates", None)))
+    ctxCW2, fakeCW2 = _dry_run_ctx(conf)
+    fakeCW2.answers = [("pipeline_catchup_poller.py", 0,
+                        "[catchup-poller] UNKNOWN  webhook  this key sees no OAuth-application "
+                        "webhook, so the dispatcher's cannot be checked and a disabled one would "
+                        "never page (KIT-268)\n")] + fakeCW2.answers
+    rowCW2, _p = _quiet(lambda: _dry_run_row(ctxCW2))
+    expect("catchup-webhook-unchecked", isinstance(rowCW2, tuple)
+           and any("cannot check the dispatcher's webhook" in str(n) for n in (rowCW2[2] or [])),
+           "a webhook the catch-up poller cannot check passed the install in silence: %r" % (rowCW2,))
+    clabel = catchup_label(conf)
+    cplist = _dispatcher_plist(clabel)
+    fakeCK.answers = [("launchctl print system/" + clabel, 1, ""), ("test -f " + cplist, 1, "")] \
+        + fakeCK.answers
+    (okU, detU, notesU), printedU = _quiet(lambda: step_catchup(ctxCK, apply_it=True))
+    expect("catchup-count-signed", okU is True and "NOT installed" in detU
+           and all(k in printedU for k in ("KIT-7", "KIT-8", "KIT-9"))
+           and any("attest" in n and "A-CATCHUP-COUNT" in n for n in notesU)
+           and not [w for w in fakeCK.writes if clabel in _fmt(w["argv"])],
+           "unsigned, the catch-up step installed something, hid the list, or named no remedy: "
+           "%r %r %s" % (detU, notesU, [w["why"] for w in fakeCK.writes]))
+    # …signed for FEWER than the job would now start: still not installed.
+    ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 2")
+    (okG, detG, _nG), _pG = _quiet(lambda: step_catchup(ctxCK, apply_it=True))
+    expect("catchup-count-signed", okG is True and "grew from 2 to 3" in detG
+           and not [w for w in fakeCK.writes if clabel in _fmt(w["argv"])],
+           "a count that grew past the signed one was installed anyway: %r" % detG)
+    # …signed for the count it would start: installed, loaded, and its heartbeat waited for.
     ctxCK.state.attest("A-CATCHUP-COUNT", "bc", "count read: 3")
-    rowCK2, _p = _quiet(lambda: _dry_run_row(ctxCK))
-    expect("catchup-count-signed", isinstance(rowCK2, tuple) and rowCK2[0] is True,
-           "a signed catch-up count still stopped the install: %r" % (rowCK2,))
+    fakeCK.answers = [("cat " + cplist, 1, ""), ("plutil -lint", 0, "OK"), ("install -o root", 0, ""),
+                      ("launchctl bootout system/" + clabel, 0, ""),
+                      ("launchctl bootstrap system " + cplist, 0, ""),
+                      ("catchup/heartbeat.json", 0, "catchup/heartbeat.json ok\n")] + fakeCK.answers
+    (okS, detS, _nS), _pS = _quiet(lambda: step_catchup(ctxCK, apply_it=True))
+    wroteS = [_fmt(w["argv"]) for w in fakeCK.writes if clabel in _fmt(w["argv"])]
+    expect("catchup-count-signed", okS is False and "heartbeat appeared" in detS
+           and any("install -o root" in w for w in wroteS)
+           and any("launchctl bootstrap system" in w for w in wroteS),
+           "signed, the catch-up step did not install, load and wait: %r %s" % (detS, wroteS))
     expect("catchup-count-signed", "A-CATCHUP-COUNT" in ATTESTATIONS_NEEDING_NOTE
            and CARDS["CK-11"]["attest"] == "A-CATCHUP-COUNT", "CK-11 is not a noted sign-off")
+    # OFF BY NAME: one an earlier run installed is unloaded and its plist removed.
+    cases += 1
+    conf_off = dict(conf, CATCHUP_INTERVAL_SECONDS="off")
+    expect("catchup-off", not validate_conf(dict(parse_conf(GOOD_CONF)[0],
+                                                 CATCHUP_INTERVAL_SECONDS="off"))[1]
+           and any("CATCHUP_INTERVAL_SECONDS" in e for e in validate_conf(
+               dict(parse_conf(GOOD_CONF)[0], CATCHUP_INTERVAL_SECONDS="0"))[1])
+           and any("CATCHUP_MAX_PAGES" in e for e in validate_conf(
+               dict(parse_conf(GOOD_CONF)[0], CATCHUP_MAX_PAGES="500"))[1]),
+           "CATCHUP_INTERVAL_SECONDS=off, =0, or CATCHUP_MAX_PAGES=500 was judged wrongly")
+    ctxO, fakeO = _settled_ctx(conf_off)
+    globals()["_pause"], saved_pause_o = (lambda _s: None), globals()["_pause"]
+    try:
+        fakeO.answers = [("launchctl print system/" + clabel, 0, "state = not running"),
+                         ("test -f " + cplist, 0, ""), ("launchctl bootout system/" + clabel, 0, ""),
+                         ("rm -f " + cplist, 0, "")] + fakeO.answers
+        fakeO.answers = [a for a in fakeO.answers if a[0] != "launchctl print system/" + clabel] \
+            + [("launchctl print system/" + clabel, 1, "")]
+        (okO, detO, _nO), _pO = _quiet(lambda: step_catchup(ctxO, apply_it=True))
+    finally:
+        globals()["_pause"] = saved_pause_o
+    expect("catchup-off", okO is False and "removed its plist" in detO
+           and any("rm -f " + cplist in _fmt(w["argv"]) for w in fakeO.writes),
+           "CATCHUP_INTERVAL_SECONDS=off left an installed catch-up poller in place: %r" % detO)
+    ctxO2, fakeO2 = _settled_ctx(conf_off)
+    fakeO2.answers = [("launchctl print system/" + clabel, 1, ""), ("test -f " + cplist, 1, "")] \
+        + fakeO2.answers
+    (okO2, detO2, _n), _p = _quiet(lambda: step_catchup(ctxO2, apply_it=True))
+    expect("catchup-off", okO2 is True and "OFF by conf" in detO2 and not fakeO2.writes,
+           "off with nothing installed was not a quiet, named off: %r" % detO2)
+    expect("catchup-off", "the catch-up poller" not in _privilege_reason("run", False, "x", conf_off)
+           and "the catch-up poller" in _privilege_reason("run", False, "x", conf),
+           "the privilege banner does not follow CATCHUP_INTERVAL_SECONDS=off")
     expect("catchup-conf", any("CATCHUP_WEBHOOK_ID" in e for e in validate_conf(
         dict(parse_conf(GOOD_CONF)[0], CATCHUP_WEBHOOK_ID="not an id!"))[1]),
            "a CATCHUP_WEBHOOK_ID that is not an id was accepted")
@@ -11182,7 +11424,7 @@ def _selftest_body():
     _mdir = tempfile.mkdtemp(prefix="stage-e-selftest-monitor.")
     _mpath = os.path.join(_mdir, MONITOR_CONFIG)
     with open(_mpath, "w", encoding="utf-8") as fh:
-        json.dump(monitor_config(_cm), fh)
+        json.dump(monitor_config(_cm, catchup=True), fh)
     try:
         _mcfg = hbm.load_config(_mpath)
         expect("monitor-config-accepted",
@@ -11191,7 +11433,10 @@ def _selftest_body():
                and _mcfg["intervals"] == {"review-poller": 300 + 900, "bounce-driver": 360 + 900,
                                           "finding-poller": 300 + 900, "catch-up": 900 + 900}
                and _mcfg["catchup_state_dir"].endswith("/.stage-e/catchup")
-               and _mcfg["run_interval_seconds"] == 1800,
+               and _mcfg["run_interval_seconds"] == 1800
+               and "catch-up" not in monitor_config(_cm)["watch"]
+               and "catch-up" not in monitor_config(dict(_cm, CATCHUP_INTERVAL_SECONDS="off"),
+                                                    catchup=True)["watch"],
                "the monitor read back %s" % _mcfg)
         expect("monitor-names-agree",
                os.path.basename(hbm.heartbeat_path(_mcfg)) == os.path.basename(MONITOR_HEARTBEAT)
@@ -11606,7 +11851,8 @@ def _selftest_body():
             step_code(ctxK, apply_it=True)
         except Blocked:
             pass
-        expect("monitor-code-stops", ctxK.unloaded == list(all_daemon_labels(ctxK.conf)) + [mlabel],
+        expect("monitor-code-stops", ctxK.unloaded == list(all_daemon_labels(ctxK.conf))
+               + [catchup_label(ctxK.conf), mlabel],
                "code recorded %s" % ctxK.unloaded)
         ctxN, fakeN = _settled_ctx(_cm)
         fakeN.answers = [("launchctl print system/", 0, "\tstate = not running\n"),
@@ -11630,7 +11876,8 @@ def _selftest_body():
                    if "launchctl bootstrap system" in _fmt(w["argv"])]
         unbootedL = [lb for lb in _plists(ctxL)
                      if not any(b.endswith(_dispatcher_plist(lb)) for b in bootedL)]
-        expect("enable-loads-every-plist", len(_plists(ctxL)) == 4 and not unbootedL,
+        expect("enable-loads-every-plist", len(_plists(ctxL)) == 3 and not unbootedL
+               and catchup_label(ctxL.conf) not in _plists(ctxL),
                "enable never loaded %s (it loaded: %s)" % (unbootedL, bootedL))
 
         # …and the exit notice then says the MONITOR is off, not review, bounce and finding.
@@ -11741,7 +11988,7 @@ def _selftest_body():
         try:
             _ncfg = hbm.load_config(_npath)
             expect("notifier-watch-accepted", set(_ncfg["watch"])
-                   == set(hbm.WATCHERS) - {HEALTH_WATCH_JOB}
+                   == set(hbm.WATCHERS) - {HEALTH_WATCH_JOB, CATCHUP_WATCH_JOB[0]}
                    and _ncfg["intervals"].get("notifier") == 500,
                    "the monitor read back %s" % _ncfg)
         except hbm.MonitorError as exc:
@@ -11912,9 +12159,11 @@ def _selftest_body():
     finally:
         globals()["_pause"] = _saved_pause_m
     order = [s for s, _t, _f in STEPS]
-    expect("monitor-step-order", order.index("heartbeat-monitor") == order.index("enable") + 1
+    expect("monitor-step-order", order.index("catch-up") == order.index("enable") + 1
+           and order.index("heartbeat-monitor") == order.index("catch-up") + 1
            and order.index("heartbeat-monitor") < order.index("handover"),
-           "the monitor step must follow `enable`: %s" % order)
+           "the catch-up step must follow `enable`, and the monitor's the catch-up step, so the "
+           "monitor watches the catch-up poller only once it is installed: %s" % order)
 
     # -- KIT-241. THE LANE MARKER IS MEASURED, NOT ONLY CARDED ------------------ #
     # CK-10 was reachable only by `card CK-10` typed by hand, so a machine without the
@@ -12122,6 +12371,9 @@ def _settled_ctx(conf):
     plists = _plists(ctx)
     answers = [("cat /Library/LaunchDaemons/%s.plist" % label, 0, body)
                for label, body in plists.items()]
+    if not catchup_off(ctx.conf):
+        answers.append(("cat /Library/LaunchDaemons/%s.plist" % catchup_label(ctx.conf), 0,
+                        _catchup_plist(ctx)))
     poller = {
         "reviews_team_key": "REV", "reviews_team_id": "t1",
         "agent_user_name": "dispatcher-agent", "cyrus_agent_user_id": "u-agent",
@@ -12149,7 +12401,7 @@ def _settled_ctx(conf):
     catchup = {
         "agent_user_id": "u-agent", "teams": ["KIT"], "linear_key_env": "STAGE_E_LINEAR_API_KEY",
         "state_dir": "~/.stage-e/catchup", "dispatcher_url": "http://127.0.0.1:3456",
-        "front_door_url": "", "webhook_id": "",
+        "front_door_url": "", "webhook_id": "", "max_pages": 10,
     }
     answers = [
         # KIT-241: the served repository's committed delivery.json; the lane marker,

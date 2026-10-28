@@ -18,10 +18,13 @@ by replying once in that delegation's own thread.
 1. **Checks the route.** It replies only if the dispatcher answers on this machine and,
    when configured, the public front door answers too. A machine half-awake in the night
    may have a network but no running dispatcher, and a reply sent then would reach nothing.
-   While the route is down it still looks, so nothing it reported goes quiet.
+   While the route is down it still looks, so nothing it reported goes quiet. A route down
+   for two hours of awake time pages: a wrong URL looks the same. A night of brief dark
+   wakes does not.
 2. **Checks the webhook.** It asks the tracker whether the dispatcher's webhook is still
    enabled. The tracker can switch off a webhook that keeps failing, and then every later
-   delegation is lost too.
+   delegation is lost too. While it is off, no reply is sent: none could arrive. A read that
+   fails is not a recovery: the last answer stands.
 3. **Finds delegations nobody answered.** A delegation counts only if all of this is true:
    - it belongs to the dispatcher's agent, and the agent never wrote anything in it — no
      thought, action, answer, error or question;
@@ -37,7 +40,8 @@ by replying once in that delegation's own thread.
    delivers that reply to the dispatcher, which starts the work.
 
 At most three replies per pass, a minute apart. More are left for the next pass and named
-in the log, never dropped.
+in the log, never dropped. If its read of the session list was cut short, it sends none: a
+newer session on the same ticket could be the unread one.
 
 ---
 
@@ -100,9 +104,10 @@ pass that failed or crashed. The heartbeat monitor reads it like the other Stage
 | A disabled webhook | One page, naming how to switch it back on |
 | A delegation still silent after its reply | One page per ticket, naming it |
 | The session list was cut short (`max_pages`) | One page: a lost delegation could be beyond it |
-| The route down for 8 passes in a row | One page: a dead dispatcher, or a wrong URL in the config |
-| A pass that could not finish | A page saying why, in the job's own words |
-| The webhook could not be checked | Nothing pages; the monitor's row says it could not check |
+| The route down for two awake hours | One page: a dead dispatcher, or a wrong URL in the config |
+| A pass that could not finish | A page saying why, in the job's own words; what was already open stays open |
+| The webhook could not be read this pass | Nothing new: if it was disabled last time, that stands and replies stay held |
+| The webhook could not be checked at all | Nothing pages; the installer and the monitor's row say so |
 | The route down for a short while | Nothing pages here; the health watch, if you installed it, pages that outage |
 | The job itself stopped | The monitor pages it as stale |
 
@@ -114,26 +119,34 @@ ticket to prove it.
 
 ## Install it
 
-The Stage E installer installs it as a fourth Stage E daemon, from `stage-e.conf`:
+The Stage E installer installs it as a fourth Stage E daemon, in its own `catch-up` step,
+from `stage-e.conf`:
 
 | Key | Default | What it is |
 | --- | --- | --- |
-| `CATCHUP_INTERVAL_SECONDS` | `900` | How often a pass runs |
+| `CATCHUP_INTERVAL_SECONDS` | `900` | How often a pass runs; `off` declines the job |
 | `CATCHUP_DISPATCHER_URL` | `http://127.0.0.1:3456` | The dispatcher's own address on this machine |
 | `CATCHUP_FRONT_DOOR_URL` | empty | The public status address; empty judges by the local answer alone |
 | `CATCHUP_WEBHOOK_ID` | empty | Set only when the job says it sees several app webhooks; it names them |
+| `CATCHUP_MAX_PAGES` | `10` | Pages of 50 sessions read per pass; raise it only when the job says its read was cut short |
 
 The teams are the installer's `MANAGED_TEAM_KEYS`. The review team is never caught up: the
 review poller times its own sessions out. It uses the tracker key Stage E already stores, so
 it needs no new credential. `--example-config` prints every key of its own config file.
 
-**Two things can stop the installer before the job first runs:**
+**It is turned on only once you have read its first count.**
 
-- If the dry run cannot reach the dispatcher, the URL is wrong. Fix it and run again.
-- **Card `CK-11`.** The first real pass replies to every unanswered delegation from the
-  past week, and each reply starts a paid session. The installer lists them. Remove the
-  delegation from any you do not want started, run again, and sign the count:
-  `attest A-CATCHUP-COUNT`.
+- **Card `CK-11`.** Its first real pass replies to every unanswered delegation from the past
+  week, and each reply starts a paid session. The installer lists them all. Until you sign
+  that count (`attest A-CATCHUP-COUNT`), the job is simply not installed: no plist, so no
+  reboot can start it. Nothing else waits on it, and every run says so.
+- Remove the delegation from any you do not want started, run again, and sign the new
+  count. If the count grows past the one you signed before the job is first loaded, it
+  stays off until you sign again.
+- **A dry run that cannot reach the dispatcher stops the install.** The URL is wrong: fix it
+  in `stage-e.conf` and run again.
+- **To decline the job,** set `CATCHUP_INTERVAL_SECONDS=off`. One an earlier run installed
+  is then unloaded and removed.
 
 To see what it would do, as the role account:
 

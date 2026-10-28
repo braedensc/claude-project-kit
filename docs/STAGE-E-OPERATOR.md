@@ -5,8 +5,8 @@ session that opened it to fix what the review found, a bounded number of times. 
 dispatcher does no reviewing of its own; this is the layer that does.
 
 **Mechanism** ships in this kit as tested `scripts/`. **Activation** — a Linear team, one
-dispatcher config entry per reviewed repository, four system daemons and a fifth unless
-you switch it off — is yours, at your
+dispatcher config entry per reviewed repository, three system daemons, a fourth once you
+sign its first count and a fifth unless you switch it off — is yours, at your
 own terminal. **No session installs, starts or edits a service.** This file is generic on
 purpose: no hostnames, account names, ids or paths from a real deployment. Keep the
 filled-in copy in your private runbook.
@@ -112,11 +112,12 @@ A dry run never reaches the apply path, so it never prints the Runner's own `WOU
 dispatcher` line. Read the row, not that phrase.
 
 **A real pass also moves the code the daemons run.** It fast-forwards the role account's
-clone of the kit, and unloads all four daemons first so nothing execs out of a tree that
-is moving — and the heartbeat monitor too, when it is loaded. The `enable` step reloads the
-four daemons, several checkpoints downstream. The `heartbeat-monitor` step right after it
-reloads the monitor. If the run stops at a card before `enable`, **all four loops are off**.
-If it stops at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
+clone of the kit, and unloads the three daemons first so nothing execs out of a tree that
+is moving — and the catch-up poller and the heartbeat monitor too, when they are loaded. The
+`enable` step reloads the three daemons, several checkpoints downstream; the `catch-up` step
+right after it reloads the catch-up poller, and the `heartbeat-monitor` step after that the
+monitor. If the run stops at a card before `enable`, **all the loops are off**. If it stops
+at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
 the way out names which jobs are off, and it is the only thing that says so. A dry run does
 none of this. It reports one of three things and returns: that no file the jobs run has
 moved, so `run` would only fast-forward and restart them; or the names of the files that
@@ -171,8 +172,9 @@ anything is switched on (`CK-5` — the first real pass opens a ticket per eligi
 only you know whether that number is the one you meant); read your conflict waker's dry-run
 count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); name the ticket
 the heartbeat monitor comments on (`CK-9` — it does not appear once `HEARTBEAT_MONITOR_TICKET`
-names one or says `off`); read the catch-up poller's first count before it is loaded
-(`CK-11` — each delegation it names starts a paid session, `docs/CATCH-UP.md`); and watch
+names one or says `off`); read the catch-up poller's first count before it is installed
+(`CK-11` — each delegation it names starts a paid session, `docs/CATCH-UP.md`. It stops
+nothing: until you sign, the catch-up poller is simply not installed); and watch
 one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
 not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
 the Reviews team's git automations (`CK-3`), one that would not add the agent to the team
@@ -507,8 +509,8 @@ poller would.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key. Creates backlog tickets, links each to its source, posts receipts and cap notes on the source ticket, and comments the finding-filed mark on the new ticket — nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Catch-up poller | The same account, a fourth system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
-| Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the four heartbeats — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
+| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
+| Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the daemons' heartbeats (the catch-up poller's once it is installed) — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, `…/.stage-e/finding` for the finding poller, and `…/.stage-e/catchup` for the catch-up poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
@@ -978,7 +980,7 @@ turning something off is still an edit to a file full of tokens.
    shutdown you made on purpose. Either unload all five jobs (Step 3d), or set
    `HEARTBEAT_MONITOR_TICKET=off` before the installer run in step 1 — that run unloads the
    monitor and removes its plist — and then unload the four daemons. A later installer run
-   loads the four daemons again at its `enable` step. Leaving the daemons loaded with no
+   loads them again at its `enable` and `catch-up` steps. Leaving the daemons loaded with no
    review entries means review tickets that start no session.
 3. **Delete the backups you no longer need.** They are copies of the dispatcher's tracker
    tokens. The installer's prune only runs when the installer runs, and only over files
@@ -1443,13 +1445,19 @@ script. **No `KeepAlive`** — it would restart a one-shot process in a tight lo
 | `com.example.stage-e-catchup` | `pipeline_catchup_poller.py run --config …/catchup/poller.json` | `CATCHUP_INTERVAL_SECONDS` (900) | `~/.stage-e/catchup/poller.log` |
 | `com.example.stage-e-monitor` | `pipeline_heartbeat_monitor.py run --config …/monitor.json` | `MONITOR_INTERVAL_SECONDS` (1800) | `~/.stage-e/monitor.log` |
 
-The fifth row is the heartbeat monitor. It has its own installer step, after the other
-four are loaded, and it is the only one the conf can switch off by name
-(`HEARTBEAT_MONITOR_TICKET=off`). With it off the installer loads four and removes a
-monitor an earlier run installed, and the privilege banner says four. **So: four daemons
-always, five when the monitor is on.** Elsewhere in this file "the four daemons" means
-review, bounce, finding and catch-up — the jobs that do the work — whether or not a fifth
-is watching them.
+The last two rows have their own installer steps, after `enable` loads the first three.
+
+- **The catch-up poller** is installed only once you sign its first count (card `CK-11`).
+  Until then it has no plist at all, so no reboot can start it, and every run says so.
+  Nothing else waits on it. `CATCHUP_INTERVAL_SECONDS=off` declines it by name, and removes
+  one an earlier run installed.
+- **The heartbeat monitor** is switched off by name with `HEARTBEAT_MONITOR_TICKET=off`;
+  the installer then removes a monitor an earlier run installed.
+
+**So: three daemons always, a fourth once you sign, a fifth when the monitor is on.** The
+privilege banner names the ones the conf turns on. Elsewhere in this file "the four daemons"
+means review, bounce, finding and catch-up — the jobs that do the work — and the first three
+on a machine where the catch-up poller is not installed yet.
 
 Every interval is a `stage-e.conf` key with the default shown. Offsetting them from each
 other keeps them from starting together.
@@ -1516,8 +1524,9 @@ GitHub call, so no script cares what directory it is started in.
 **That clone is the deployment, and nothing in a heartbeat or a log names its version.** All
 four daemons exec out of it, so a fix merged to the default branch is inert on the machine
 until the clone moves. `run` moves it for you — it unloads the four jobs and the heartbeat
-monitor, fast-forwards, reloads the four at its `enable` step and the monitor at its
-`heartbeat-monitor` step — and that is the only thing that does. The monitor runs from the
+monitor, fast-forwards, reloads three at its `enable` step, the catch-up poller at its
+`catch-up` step and the monitor at its `heartbeat-monitor` step — and that is the only thing
+that does. The monitor runs from the
 same clone. Pull it by hand only with all five jobs unloaded, never under a running pass,
 and compare its `git rev-parse --short HEAD` against your own clone whenever behaviour
 surprises you. A stale daemon clone looks exactly like a bug.
@@ -1650,11 +1659,17 @@ installer treats any other exit as a failed pass. An empty team list is the usua
 cause: the config was written from a conf whose `MANAGED_TEAM_KEYS` was left blank.
 
 The catch-up poller's dry run checks the dispatcher answers, reads whether its webhook is
-still on, and names each delegation it would reply to. It replies to nothing and writes
-nothing, not even its heartbeat. **Exit 3 is a finding, not a broken install**: the webhook
-is off, or a delegation it already replied to is still silent. The installer carries on and
-prints a note. Its first dry run is also the test of whether the tracker shows your key the
-dispatcher's webhook at all (`docs/CATCH-UP.md`, *What is not proven*).
+still on, and names every delegation it would ever reply to (`CANDIDATE` lines, not only the
+three one pass would send). It replies to nothing and writes nothing, not even its heartbeat.
+
+- **A dry run that cannot reach the dispatcher stops the install**: the dispatcher answered
+  moments earlier, so the URL in `stage-e.conf` is wrong.
+- **Exit 3 is a finding, not a broken install**: the webhook is off, or a delegation it
+  already replied to is still silent. The installer carries on and prints a note.
+- **A webhook it cannot check gets a note too**: on such a machine a disabled webhook would
+  never page (`docs/CATCH-UP.md`, *What is not proven*).
+- The `catch-up` step reads its list. Unsigned, it prints the list and card `CK-11`, and
+  installs nothing.
 
 The publisher has its own dry run, if you want to see a comment rendered from a block you
 saved by hand. Give it the criteria the reviewer was given: `--acceptance` once per

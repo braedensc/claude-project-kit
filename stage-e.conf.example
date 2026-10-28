@@ -252,8 +252,13 @@ FINDING_INTERVAL_SECONDS=300
 # by the local answer alone.  A wrong URL stops the install at its dry run.
 # CATCHUP_WEBHOOK_ID: leave EMPTY.  Set it only when the job says it sees
 # several OAuth-application webhooks and cannot tell which is the dispatcher's;
-# it names them.
+# it names them.  CATCHUP_MAX_PAGES: raise it only when the job says its read
+# of agent sessions was cut short (50 per page).
+# It is installed only once you sign its first count (card CK-11): until then
+# it is simply not installed, and nothing else waits on it.  To decline it for
+# good, set CATCHUP_INTERVAL_SECONDS=off.
 CATCHUP_INTERVAL_SECONDS=900
+CATCHUP_MAX_PAGES=10
 CATCHUP_DISPATCHER_URL=http://127.0.0.1:3456
 CATCHUP_FRONT_DOOR_URL=
 CATCHUP_WEBHOOK_ID=
