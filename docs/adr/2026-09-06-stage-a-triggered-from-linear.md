@@ -931,8 +931,9 @@ judged as it came back, and a fenced name in any of them refuses the probe. Only
 helper list with no helper behind it set aside. The record called that case "no helper
 list came back"; it now says a list came back and was not counted. Any text counts, not
 only names the installer can parse. Last, a log with no call records answered "no helper,
-no read" as if it had measured them. The reader now counts the call records it can read.
-With none, both are not measured, and the screen and the record say why.
+no read" as if it had measured them. The reader now counts the call records it can read,
+in the same session file as the tool list: an older session's calls never speak for a
+newer one. With none, both are not measured, and the screen and the record say why.
 
 ## Update 2026-09-23 — planning built into each work team (KIT-184)
 

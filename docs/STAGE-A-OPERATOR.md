@@ -253,9 +253,10 @@ What it does, in order:
      as prose. It says so and asks the same question. The record says which lists were
      read, and how. A session list nothing measured is never signed.
 
-     The log also says whether a helper started and whether the test file was read. If it
-     holds no call records at all, neither is measured. The probe says so, and the record
-     gives that reason.
+     The same session's log also says whether a helper started and whether the test file
+     was read. An older session's log never answers for it. If that log holds no call
+     records at all, neither is measured. The probe says so, and the record gives that
+     reason.
    - **The job, started.** After a yes, it enables the job in launchd, starts it, and reads
      its first heartbeat. Enabled, it starts again after a reboot.
    - **The routing drill**, if you want it now (or later: `pipeline_stage_a_setup.py

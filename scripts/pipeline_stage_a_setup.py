@@ -3752,10 +3752,12 @@ def _session_tools_py(logs_root, identifier, read_path=None):
     SDK `system/init` message names every tool the session was given. It also says, as two
     booleans, whether the session started a helper (a `Task` or `Agent` call) and whether
     it called `Read` on `read_path` (KIT-215), and how many tool-call records it could read
-    at all: with none, the two booleans measured nothing (KIT-261). It prints tool and
-    server NAMES, those answers and that count only — never a prompt, a message, a call's
-    input or anything else in the log. The ticket id is checked `TEAM-12` before it is
-    joined onto the path."""
+    at all: with none, the two booleans measured nothing (KIT-261). The count and both
+    booleans come from the same file as the tool list, the newest one with a start-up
+    message: an older session's calls never make a newer one look measured. It prints
+    tool and server NAMES, those answers and that count only — never a prompt, a message,
+    a call's input or anything else in the log. The ticket id is checked `TEAM-12` before
+    it is joined onto the path."""
     return (
         "import fnmatch,json,os,sys\n"
         "d=os.path.join(%r,%r)\n"
@@ -3768,10 +3770,11 @@ def _session_tools_py(logs_root, identifier, read_path=None):
         "fs=sorted((os.path.join(d,n) for n in names if fnmatch.fnmatch(n,'session-*.jsonl')),"
         "key=lambda p:(os.path.getmtime(p),p))\n"
         "out=None\n"
-        "helper=False\n"
-        "read=False\n"
-        "calls=0\n"
         "for p in reversed(fs):\n"
+        "  init=None\n"
+        "  helper=False\n"
+        "  read=False\n"
+        "  calls=0\n"
         "  for line in open(p,encoding='utf-8',errors='replace'):\n"
         "    try:\n"
         "      m=json.loads(line)\n"
@@ -3781,9 +3784,9 @@ def _session_tools_py(logs_root, identifier, read_path=None):
         "      m=m.get('message')\n"
         "    if not isinstance(m,dict):\n"
         "      continue\n"
-        "    if out is None and m.get('type')=='system' and m.get('subtype')=='init' "
+        "    if init is None and m.get('type')=='system' and m.get('subtype')=='init' "
         "and isinstance(m.get('tools'),list):\n"
-        "      out={'tools':[str(t)[:80] for t in m['tools']],'mcp_servers':"
+        "      init={'tools':[str(t)[:80] for t in m['tools']],'mcp_servers':"
         "[str(s.get('name') if isinstance(s,dict) else s)[:80] for s in (m.get('mcp_servers') or [])]}\n"
         "    if m.get('type')=='assistant' and isinstance(m.get('message'),dict):\n"
         "      for b in (m['message'].get('content') or []):\n"
@@ -3795,10 +3798,12 @@ def _session_tools_py(logs_root, identifier, read_path=None):
         "        inp=b.get('input') if isinstance(b.get('input'),dict) else {}\n"
         "        if rp and b.get('name')=='Read' and inp.get('file_path')==rp:\n"
         "          read=True\n"
-        "if out:\n"
-        "  out['helper_started']=helper\n"
-        "  out['read_attempted']=read\n"
-        "  out['tool_calls_seen']=calls\n"
+        "  if init is not None:\n"
+        "    out=init\n"
+        "    out['helper_started']=helper\n"
+        "    out['read_attempted']=read\n"
+        "    out['tool_calls_seen']=calls\n"
+        "    break\n"
         "print(json.dumps(out or {'error':'no start-up message with a tool list in the log'}))\n"
         % (logs_root, identifier, read_path))
 
@@ -6009,6 +6014,39 @@ def _selftest_one_command(check, tmp):
            "helper: 3 tools as it said" in note,
            list(c0.state.data["notes"].get("probe_canary", {}).values())),
           ("signed", False, True, True, True, ["NO-ANSWER"]))
+    # KIT-261: the call count, the helper and the read come from the same session file as
+    # the tool list, the newest with a start-up message. A ticket handed out twice keeps the
+    # older session's log, and its calls must never speak for the newer session. The newer
+    # file sorts first by name, so only its time can make it the newest.
+    def two_sessions(name, newest_calls):
+        c1, _a = _probe_world(tmp, name)
+        logs = os.path.join(os.path.dirname(c1.conf["DISPATCHER_CONFIG"]), "logs",
+                            "PROD-100")
+        os.makedirs(logs, exist_ok=True)
+        for fname, tools, calls, when in (
+                ("session-older.jsonl", ["Read", "Grep", "Glob", "Task"],
+                 [("Task", {}), ("Read", {"file_path": "/x"})], 1000000000),
+                ("session-newer.jsonl", ["Read", "Grep", "Glob"], newest_calls,
+                 2000000000)):
+            path = os.path.join(logs, fname)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "sdk-message", "message": {
+                    "type": "system", "subtype": "init", "tools": tools,
+                    "mcp_servers": []}}) + "\n")
+                for call in calls:
+                    fh.write(tool_use(*call))
+            os.utime(path, (when, when))
+        try:
+            return session_tools(c1, "PROD-100", "/x")
+        finally:
+            _shutil.rmtree(os.path.dirname(logs), ignore_errors=True)
+    check("session-tools-an-older-sessions-calls-do-not-measure-the-newest",
+          two_sessions("session-tools-older-calls", []),
+          (["Read", "Grep", "Glob"], [], NO_CALL_RECORDS, None))
+    check("session-tools-helper-and-read-are-the-newest-sessions",
+          two_sessions("session-tools-older-helper", [("Grep", {"pattern": "x"})]),
+          (["Read", "Grep", "Glob"], [], None,
+           {"helper_started": False, "read_attempted": False}))
     got, c = with_log("probe-log-catches-a-lie", ["Read", "Grep", "mcp__linear__save_issue"])
     check("probe-log-beats-a-clean-self-report",
           ("mcp__linear__save_issue" in got, c.state.attested("CA-PROBE")), (True, False))
