@@ -2313,27 +2313,90 @@ def open_regular(q):
     os.close(fd)
     return None
 
-CERT_LINE = re.compile(rb"^[A-Za-z0-9+/=]+$")
+CERT_LINE = re.compile(rb"^[A-Za-z0-9+/]+={0,2}$")
 CERT_LABELS = (b"CERTIFICATE", b"TRUSTED CERTIFICATE", b"X509 CERTIFICATE")
+# Base64 blocks a CA file may carry beside its certificates: read like one, never counted.
+CARRIED_LABELS = (b"X509 CRL", b"PUBLIC KEY")
+BOM = b"\xef\xbb\xbf"
+# A line beside the certificates is judged by what secrets and settings look like, never
+# by what a bundle's own text looks like (a title, a subject, a fingerprint, a serial, an
+# OpenSSL text dump), so every bundle format stays readable.
+SECRET_WORDS = (rb"pass(?:word|wd|phrase)?|pwd|secret|token|bearer|credential|"
+                rb"authori[sz]ation|webhook|salt|hmac|cookie|"
+                rb"api[_\-]?key|private[_\-]?key|client[_\-]?key|access[_\-]?key")
+KEY_START = rb"(?:^|[\s{,\"':/;&?<])"
+SECRET_KEY = re.compile(KEY_START + rb"[A-Za-z0-9_.\-]*?(?:" + SECRET_WORDS +
+                        rb")[A-Za-z0-9_.\-]*(?:[\"']?\s*[:=]|>)", re.I)
+# A line that starts by naming a bare key: YAML `key: x`, env `KEY=x`. Only at the start:
+# mid-line, "Server Temp Key:" is a TLS capture's and "Public Key" certificate text.
+BARE_KEY = re.compile(rb"^[\"']?key[\"']?\s*[:=]", re.I)
+# A token used as a URL's user: scheme://<token>@host.
+URL_TOKEN_USER = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://[A-Za-z0-9_\-]{20,}@")
+# A name ending _key, or camelCase ...Key, with a value: signing_key, masterKey. Never a
+# bare "Key": a TLS capture says "Server Temp Key:", and certificate text "Public Key".
+KEY_SUFFIX = re.compile(KEY_START + rb"[A-Za-z0-9_.\-]*(?:_[Kk][Ee][Yy]|[a-z0-9]Key)"
+                        rb"[\"']?\s*[:=]")
+AUTH_KEY = re.compile(rb"(?:^|[\s{,])[\"']?auth[\"']?\s*[:=]", re.I)
+SPACED_PASSWORD = re.compile(rb"(?:^|\s)pass(?:word|wd)\s+\S", re.I)
+ENV_ASSIGN = re.compile(rb"^(?:export\s+)?[A-Z][A-Z0-9]*_[A-Z0-9_]*\s*=")
+TOKEN_SHAPE = re.compile(rb"(?:\b(?:gh[pousr]_[A-Za-z0-9]{20,}|"
+                         rb"github_pat_[A-Za-z0-9_]{20,}|"
+                         rb"xox[abprs]-[A-Za-z0-9\-]{10,}|sk-[A-Za-z0-9\-_]{20,}|"
+                         rb"sk_live_[A-Za-z0-9]{10,}|AKIA[0-9A-Z]{16}|"
+                         rb"lin_api_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9\-_]{20,}|"
+                         rb"AIza[0-9A-Za-z\-_]{30,})|"
+                         rb"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}|"
+                         rb"hooks\.slack\.com/services/|"
+                         rb"discord(?:app)?\.com/api/webhooks/)")
+URL_CREDS = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@")
+# Not judged as a long run: a URL (its path joins words into one) and a GnuTLS key pin.
+NOT_A_RUN = re.compile(rb"[A-Za-z][A-Za-z0-9+.\-]*://\S+|pin-sha256:[A-Za-z0-9+/]{43}=|"
+                       rb"\b0x[0-9A-Fa-f]+")
+# A long run mixing lower case, upper case and digits: key data and tokens do; hex
+# fingerprints, serials, title underlines and words never do.
+LONG_RUN = re.compile(rb"[A-Za-z0-9+/\-]{40,}")
+# A line longer than any bundle's text is refused unread: it costs the patterns time, and
+# no certificate tool writes one.
+TRUST_LINE_MAX = 1024
+
+def mixed_case_and_digits(run):
+    return bool(re.search(rb"[a-z]", run) and re.search(rb"[A-Z]", run)
+                and re.search(rb"[0-9]", run))
+
+def secret_shaped(s):
+    return bool(SECRET_KEY.search(s) or KEY_SUFFIX.search(s) or AUTH_KEY.search(s)
+                or BARE_KEY.match(s) or URL_TOKEN_USER.search(s)
+                or SPACED_PASSWORD.search(s)
+                or ENV_ASSIGN.match(s) or TOKEN_SHAPE.search(s) or URL_CREDS.search(s)
+                or any(mixed_case_and_digits(r)
+                       for r in LONG_RUN.findall(NOT_A_RUN.sub(b" ", s))))
 
 def cert_shape(raw):
-    # How many certificate blocks the bytes hold, and how many other non-blank lines:
-    # outside a block, or inside one but not base64. A block ends with its own label.
-    # A UTF-8 byte-order mark at the start is not a line. Counts only.
-    if raw.startswith(b"\xef\xbb\xbf"):
-        raw = raw[3:]
-    blocks = other = 0
+    # Counts only: certificate blocks; other non-blank lines; and lines shaped like a
+    # secret or a setting, or not base64 inside a block (a block left open counts too).
+    # A block ends with its own label. A UTF-8 byte-order mark is not part of a line.
+    blocks = other = secret = 0
     label = None
     for line in raw.splitlines():
         s = line.strip()
-        begins = [x for x in CERT_LABELS if s == b"-----BEGIN " + x + b"-----"]
+        while s.startswith(BOM):
+            s = s[len(BOM):].strip()
+        begins = [x for x in CERT_LABELS + CARRIED_LABELS
+                  if s == b"-----BEGIN " + x + b"-----"]
         if begins and label is None:
             label = begins[0]
         elif label is not None and s == b"-----END " + label + b"-----":
-            label, blocks = None, blocks + 1
-        elif s and not (label is not None and CERT_LINE.match(s)):
+            blocks += label in CERT_LABELS
+            label = None
+        elif label is not None:
+            if s and not CERT_LINE.match(s):
+                other += 1
+                secret += 1
+        elif s:
             other += 1
-    return blocks, other + (1 if label is not None else 0)
+            secret += len(s) > TRUST_LINE_MAX or secret_shaped(s)
+    open_block = 1 if label is not None else 0
+    return blocks, other + open_block, secret + open_block
 
 def writable_by_me(q):
     # Whether this account can change the file or any folder above it, along the path the
@@ -2381,9 +2444,10 @@ def trust(entry):
             os.close(fd)
     except Exception as exc:
         return {"error": why(exc)}
-    blocks, other = cert_shape(b"".join(data))
+    blocks, other, secret = cert_shape(b"".join(data))
     return {"bytes": st.st_size, "privateKey": key, "capped": capped,
             "names": st.st_nlink, "certificates": blocks, "otherLines": other,
+            "secretShaped": secret,
             "roleWritable": writable_by_me(q)}
 
 def on_disk(q):
@@ -3018,9 +3082,11 @@ def _trust_unsafe(facts):
     if "certificates" in facts and not facts["certificates"]:
         return ("holds no certificate block: a trust file is a CA certificate in PEM form, "
                 "so a copy of any other file is refused")
-    if facts.get("otherLines"):
-        return ("holds %d line(s) that are not certificate text: a trust file holds PEM "
-                "certificates and nothing else" % facts["otherLines"])
+    if facts.get("secretShaped"):
+        return ("holds %d line(s) shaped like a secret or a setting (a token, a password, "
+                "a key, NAME=value, or text inside a certificate block): a trust file is a "
+                "CA certificate or bundle, never a file that also holds a credential"
+                % facts["secretShaped"])
     return None
 
 
@@ -3090,15 +3156,11 @@ def check_trust_files(conf, us, env_facts):
         return _row("trust-files", FAILED,
                     "%d problem(s) with the sandbox's read exceptions: each must re-open one "
                     "exact trust file and nothing more" % len(broken),
-                    broken + ["each must be one exact file holding only PEM "
-                              "certificates, under one name: never a folder, a glob, a "
-                              "link, a hard link, a pipe or device, a file holding a "
-                              "private key or anything else, or a file piece 5 denies. Fix "
-                              "SANDBOX_TRUST_FILES or the allowRead list in %s by hand"
-                              % path,
-                              "to keep only a file's certificates, list a clean copy: "
-                              "sed -n '/-----BEGIN CERTIFICATE-----/,"
-                              "/-----END CERTIFICATE-----/p' <file> > <clean file>"])
+                    broken + ["each must be one exact file holding PEM certificates and "
+                              "no private key, under one name: never a folder, a glob, a "
+                              "link, a hard link, a pipe or device, or a file piece 5 "
+                              "denies. Fix SANDBOX_TRUST_FILES or the allowRead list in %s "
+                              "by hand" % path])
     unread = sorted(p for p, f in trust.items() if (f or {}).get("error") not in (None,
                                                                                   "missing"))
     if unread:
@@ -3118,6 +3180,10 @@ def check_trust_files(conf, us, env_facts):
     lines = ["not composed (SANDBOX_TRUST_FILES does not list it): " + a for a in extra]
     lines += ["not on disk yet, so its allow re-opens nothing: " + p for p in listed
               if (trust.get(p) or {}).get("error") == "missing"]
+    lines += ["%s: holds %d text line(s) beside its %d certificate block(s), as a system "
+              "CA bundle does (a subject or a title per certificate). Counted, not read "
+              "out" % (p, f["otherLines"], f.get("certificates") or 0)
+              for p, f in sorted(trust.items()) if (f or {}).get("otherLines")]
     lines += ["%s: the role account can change it or a folder above it, so a process of "
               "that account could replace it after this check" % p
               for p, f in sorted(trust.items())
@@ -3133,8 +3199,8 @@ def check_trust_files(conf, us, env_facts):
                     % (path, len(live)), lines)
     return _row("trust-files", ALREADY_DONE,
                 "%s allows the sandbox to read %d trust file(s), each an exact file "
-                "holding only certificates, under one name: not a folder, a glob or a "
-                "link, and none holds a private key" % (path, len(listed)),
+                "holding certificates, under one name: not a folder, a glob or a link, "
+                "and none holds a private key" % (path, len(listed)),
                 lines)
 
 
@@ -8236,13 +8302,82 @@ def _selftest_kit257(expect, conf):
     verify_case("failed-on-a-copy-of-an-env-file", FAILED, "holds no certificate block",
                 allow(this, lambda tmp, cert: os.path.join(tmp, "certs", "copied-ca.crt")),
                 setup=env_copy)
-    verify_case("failed-on-lines-appended-to-a-certificate", FAILED,
-                "holds 1 line(s) that are not certificate text", allow(this),
-                cert_text=_FAKE_CERT + "STAGE_E_KEY=x\n")
-    verify_case("failed-on-other-text-inside-a-certificate-block", FAILED,
-                "holds 1 line(s) that are not certificate text", allow(this),
-                cert_text="-----BEGIN CERTIFICATE-----\nSTAGE_E_KEY=x\n"
-                          "-----END CERTIFICATE-----\n")
+    # A system CA bundle: a title and a text dump beside each certificate. Text is counted
+    # and said, never refused: git reads this exact file, so it cannot be swapped for a
+    # copy without its text (the live egress bundle, 2026-10-27: 2791 such lines).
+    system_bundle = ("### Example Root CA\n\n=== /C=US/O=Example/CN=Example Root CA\n"
+                     "Certificate:\n    Data:\n        Version: 3 (0x2)\n"
+                     "        Signature Algorithm: sha256WithRSAEncryption\n"
+                     "        Subject: C=US, O=Example, CN=Example Root CA\n"
+                     "            X509v3 Basic Constraints: critical\n"
+                     "                CA:TRUE\n" + _FAKE_CERT) * 2
+    verify_case("clean-with-a-system-bundle-says-its-text", ALREADY_DONE,
+                "holds 18 text line(s) beside its 2 certificate block(s)", allow(this),
+                cert_text=system_bundle)
+    # Real bundle text in every shape a common tool writes passes (Stage E review of #207,
+    # and an attack on 104 genuine bundle outputs): a certifi serial, a curl title
+    # underline and its SHA-256 header, an OpenSSL multi-line name, a URL, a GnuTLS pin, a
+    # public key or CRL block carried beside, and a byte-order mark mid-file.
+    bundle_lines = ("# Serial: " + "7" * 48 + "\n"
+                    + "Go Daddy Root Certificate Authority - G2\n"
+                    + "=" * 45 + "\n## SHA256: " + "ab" * 32 + "\n"
+                    "    countryName               = US\n"
+                    "CA Issuers - URI:http://www.example.es/fileadmin/Archivos/"
+                    "certificados/raizexample1.crt\n"
+                    "pin-sha256:" + "oC+voZLIy4HLE0FVT5wFtxzKKokLDRKY1oNkfJYe+98=" + "\n")
+    carried = ("-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n"
+               "-----END PUBLIC KEY-----\n-----BEGIN X509 CRL-----\nMIIBfakeCRL\n"
+               "-----END X509 CRL-----\n")
+    # …and three more: a TLS capture's "Server Temp Key" and session lines, a keychain
+    # attribute dump's 0x hex, and a long underscored CA name in a comment.
+    bundle_lines += ("Server Temp Key: X25519, 253 bits\nSSL-Session:\n"
+                     "    Protocol  : TLSv1.3\n"
+                     '    "hpky"<blob>=0xC151AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12CD34'
+                     '  "Hpky"\n'
+                     "# Hellenic_Academic_and_Research_Institutions_RootCA_2015\n")
+    verify_case("clean-with-every-common-bundle-line", ALREADY_DONE, "exact file",
+                allow(this), cert_text=bundle_lines + _FAKE_CERT + carried + "\ufeff"
+                + _FAKE_CERT)
+
+    # A config that also holds a certificate is refused, by what its secrets look like.
+    # The fake values are assembled here, so no source line holds a token's shape.
+    fake_b64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" + "BKcwggSjAgEAAoIBAQC7"
+    indented = "".join("    " + line + "\n" for line in _FAKE_CERT.splitlines())
+    for label, text in (
+            ("env-line-beside", _FAKE_CERT + "STAGE_E_" + "KEY=abc123\n"),
+            ("yaml-token-beside", "ca: |\n" + indented + "tok" + "en: abcd\n"),
+            ("key-data-beside", "ca: |\n" + indented + "client-key-data: " + fake_b64
+                                + "\n"),
+            ("url-credentials", _FAKE_CERT + "https://me:" + "s3cr" + "et@example.com\n"),
+            ("docker-auth", _FAKE_CERT + '{"auths": {"r": {"au' + 'th": '
+                            '"dXNlcjpwYXNz"}}}\n'),
+            ("text-inside-a-block", "-----BEGIN CERTIFICATE-----\nSTAGE_E_" + "KEY=x\n"
+                                    "-----END CERTIFICATE-----\n"),
+            # Shorter than the long-run rule's 40, so only its prefix gives it away.
+            ("a-bare-token", _FAKE_CERT + "gh" + "p_" + "a1B2c3D4e5" * 2 + "wXyZ\n"),
+            # No key name at all: only the long mixed run gives it away.
+            ("a-bare-key-blob", _FAKE_CERT + "    " + fake_b64 + "\n"),
+            ("a-netrc-password", _FAKE_CERT + "machine example.com login me pass"
+                                 + "word hunter2\n"),
+            ("a-hex-signing-key", _FAKE_CERT + "signing" + "_key: " + "a1" * 32 + "\n"),
+            ("a-camelcase-key", _FAKE_CERT + '{"master' + 'Key": "FAKEvalue123"}\n'),
+            ("an-authorization-header", _FAKE_CERT + "Authori" + "zation: Basic FAKE\n"),
+            ("a-connection-string", _FAKE_CERT + "Server=db;Database=app;P" + "wd=FAKE\n"),
+            ("an-xml-password", _FAKE_CERT + "<pass" + "word>FAKE</password>\n"),
+            ("a-webhook-url", _FAKE_CERT + "url: https://hooks.sl" + "ack.com/services/"
+                              "T000/B000/FAKE\n"),
+            ("an-assignment-inside-a-block", "-----BEGIN CERTIFICATE-----\nMIIBfake\n"
+                                             "tok" + "en=FAKEvalue123\n"
+                                             "-----END CERTIFICATE-----\n"),
+            ("a-line-longer-than-any-bundle-writes", _FAKE_CERT + "# " + "a" * 1100 + "\n"),
+            ("a-yaml-bare-key", "api:\n  ke" + "y: FAKEvalue123\n  ca: |\n" + indented),
+            ("a-token-as-url-user", _FAKE_CERT + "url = https://" + "ab12cd34" * 5
+                                    + "@github.com/org/repo.git\n")):
+        verify_case("failed-on-a-config-with-a-certificate:" + label, FAILED,
+                    "shaped like a secret or a setting", allow(this), cert_text=text)
+    verify_case("clean-with-lines-beside-a-certificate-says-them", ALREADY_DONE,
+                "holds 1 text line(s) beside its 1 certificate block(s)", allow(this),
+                cert_text=_FAKE_CERT + "subject=CN=example\n")
     verify_case("failed-on-an-unended-certificate-block", FAILED,
                 "holds no certificate block", allow(this), cert_text="-----BEGIN CERTIFICATE-----\nMIIBfake\n")
     verify_case("clean-with-a-bundle-of-two", ALREADY_DONE, "exact file", allow(this),
@@ -8260,9 +8395,15 @@ def _selftest_kit257(expect, conf):
                 "holds no certificate block", allow(this),
                 cert_text=_FAKE_CERT.replace("BEGIN CERTIFICATE",
                                              "BEGIN TRUSTED CERTIFICATE"))
-    verify_case("failed-names-the-clean-copy-command", FAILED,
-                "to keep only a file's certificates, list a clean copy", allow(this),
-                cert_text=_FAKE_CERT + "subject=CN=example\n")
+    def no_text_no_line():
+        with tempfile.TemporaryDirectory() as tmp:
+            c, home, spath, cert = fixture(tmp)
+            _put(spath, denies(c, {"filesystem": {"allowRead": [cert]}}))
+            row, _facts = row_of(c, home)
+            text = " ".join(_row_text(row).split())
+            return (row["outcome"] == ALREADY_DONE
+                    and "text line(s)" not in text), text[-400:]
+    case("verify-says-nothing-of-text-when-there-is-none", no_text_no_line)
     verify_case("clean-says-the-role-account-could-replace-it", ALREADY_DONE,
                 "could replace it after this check", allow(this))
 
