@@ -2697,8 +2697,12 @@ def ready_to_merge_lines(ctx):
                      % (" and the user of $%s" % conf["LINEAR_KEY_ENV"]
                         if EXECUTOR_SELF in bouncers else "")))
         unproven.append("that only the bounce driver writes the ready-to-merge mark: anything "
-                        "holding $%s can. The mark applies no label, so a forged one costs a ping "
-                        "that links at most a pull request (KIT-225)" % key_env)
+                        "holding $%s can. The mark applies no label, but a forged one asks you "
+                        "to merge a pull request Stage E may never have concluded. Before you "
+                        "merge on that page, read Stage E's review and the checks on the pull "
+                        "request itself, which no tracker key can write. The ticket's move to "
+                        "the needs-approval lane is a weaker sign: that key can move a ticket "
+                        "too (KIT-225, KIT-263)" % key_env)
     return on, off, unproven
 
 
@@ -4558,6 +4562,18 @@ def _selftest_body():
         ok("handover: one key for both jobs — the ready-to-merge page is ON, naming the key",
            "ON: the ready-to-merge page" in text and "$STAGE_E_LINEAR_API_KEY" in text
            and "OFF: the ready-to-merge page" not in text, text)
+        # KIT-263. A forged ready-to-merge mark is not "a ping that links a pull request": it
+        # asks a person to merge one. The line says so, and says what to read before merging:
+        # the review and checks on the pull request, which no tracker key writes, and not the
+        # lane alone, which that key can move.
+        _forge = [ln for ln in text.replace(" || ", "\n").splitlines()
+                  if "only the bounce driver writes the ready-to-merge mark" in ln]
+        ok("handover: the forged-mark line says a forged page asks for a merge, and what to "
+           "check on the pull request before merging",
+           len(_forge) == 1 and "merge" in _forge[0].split("can.", 1)[-1]
+           and "checks on the pull request" in _forge[0]
+           and "needs-approval lane is a weaker sign" in _forge[0]
+           and "links at most a pull request" not in _forge[0], _forge)
         other_key = dict(bounce_cfg, linear_api_key_env="OTHER_TRACKER_KEY")
         text = handover_with(mon_doc, bounce_doc=other_key)
         ok("handover: `self` is another key's user than the bounce driver's — OFF, naming both "

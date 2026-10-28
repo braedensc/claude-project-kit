@@ -855,25 +855,37 @@ def render_no_output_comment(idea_id):
 # --------------------------------------------------------------------------- #
 def creation_order(children):
     """The children's indexes, each after every child it depends on, lowest index first
-    among those ready. The plan was already checked for cycles and bad edges."""
+    among those ready. The plan was already checked for cycles and bad edges, so a plan
+    with no child ready is this file's bug: it raises, rather than pick one and file a
+    child before what it depends on (KIT-263)."""
     left = set(range(len(children)))
     order = []
     while left:
         ready = [i for i in sorted(left)
                  if not set(children[i].get("depends_on") or []) & left]
-        if not ready:                    # unreachable after the cycle check; never hang
-            ready = [min(left)]
+        if not ready:
+            raise ExecutorError("no order exists for children %s: each depends on another "
+                                "of them, which the cycle check should have refused"
+                                % sorted(left))
         order.append(ready[0])
         left.discard(ready[0])
     return order
 
 
 def _quoted_title(title):
-    """A title as an inline code span, for a child's opening block. A title is the
-    planner's name for a ticket, not unfinished text: the gate skips TODO, FIXME, XXX
-    and template prompts inside a span. A backtick would end the span early, and a line
-    break would end it and the quote, so neither survives as itself."""
-    return "`%s`" % " ".join(_sanitize(title).replace("`", "'").split())
+    """A title quoted for a child's opening block. A title is the planner's name for a
+    ticket, not unfinished text: the gate skips TODO, FIXME, XXX and template prompts
+    inside a code span, so a title of two or more words goes in one. A backtick would
+    end the span early, and a line break would end it and the quote, so neither survives
+    as itself.
+
+    A ONE-WORD title goes in quotation marks instead (KIT-263). A span with no space in
+    it can read as a repository path to the approve tier, which takes every span that
+    looks like a path, so `delivery.json` as an epic's title held every sibling for a
+    path none of them names. Plain text is never a path. The gate reads all of it, so a
+    one-word TODO is refused before anything is created, as TBD in any title is."""
+    flat = " ".join(_sanitize(title).replace("`", "'").split())
+    return ("`%s`" if " " in flat else '"%s"') % flat
 
 
 def child_context_block(epic, epic_title, children, i, created):
@@ -881,9 +893,16 @@ def child_context_block(epic, epic_title, children, i, created):
     ids it depends on, the children that build on it, and where to read first. Written
     before the child's first `## ` heading. A coding session given the child alone would
     otherwise never learn it has an epic. The gate's section rules start at that
-    heading, but its draft-marker rule reads the whole text, so titles are quoted as
-    code spans, and the gate is run over this block before anything is created."""
-    deps = [d for d in (children[i].get("depends_on") or []) if d in created]
+    heading, but its draft-marker rule reads the whole text, so titles are quoted
+    (_quoted_title), and the gate is run over this block before anything is created."""
+    deps = list(children[i].get("depends_on") or [])
+    missing = [d for d in deps if d not in created]
+    if missing:
+        # Dropping them would file "depends on nothing" over a child that does (KIT-263).
+        raise ExecutorError("child %d depends on %s, which %s not been created. Its opening "
+                            "lines would say it depends on nothing, so it is not filed."
+                            % (i, ", ".join("child %s" % d for d in missing),
+                               "has" if len(missing) == 1 else "have"))
     later = [j for j, c in enumerate(children) if i in (c.get("depends_on") or [])]
     lines = ["> **Part of epic [%s](%s): %s.** This is child %d of %d in its plan."
              % (epic["identifier"], epic.get("url") or "", _quoted_title(epic_title), i + 1,
@@ -1265,8 +1284,12 @@ def materialise(args, client=None):
 
     # ── The DoR gate over every child (§5) ─────────────────────────────────
     children = plan["children"]
-    child_tickets = build_child_tickets(plan, team_key, _landing_state_or_placeholder(cfg, finding_cfg))
     try:
+        # Ordered here, before the gate, as well as in _create: a plan that cannot be
+        # ordered is refused before the epic exists, never partway through (KIT-263).
+        creation_order(children)
+        child_tickets = build_child_tickets(plan, team_key,
+                                            _landing_state_or_placeholder(cfg, finding_cfg))
         ok, reports = run_dor(child_tickets, config_path, args.repo_root)
     except ExecutorError as exc:
         print("::error:: %s" % exc, file=sys.stderr)
@@ -1861,6 +1884,66 @@ def selftest():
               (run(tbd_tree, client=tbd), len(tbd.issues)), (EXIT_REJECTED, 0))
         check("draft-marker-refusal-says-judged-as-filed",
               "judged as it would be filed" in "".join(b for _i, b in tbd.comments), True)
+        # KIT-263. A ONE-TOKEN title in a code span reads as a repository path to the approve
+        # tier: candidate_paths takes every span that looks_like_path passes, and only a
+        # space keeps a span from passing. So `delivery.json` as an epic title held every
+        # sibling on risk-paths for a file none of them names. Such a title is quoted as
+        # plain text, which is never a path.
+        import check_auto_approve as _aa
+        tok = FakeLinear()
+        tok_tree = _tree()
+        tok_tree["requests"][0]["epic"]["title"] = "delivery.json"
+        tok_tree["requests"][0]["children"][0]["title"] = "scripts/check_ticket_dor.py"
+        check("one-token-path-titles-tree-files", run(tok_tree, client=tok), EXIT_OK)
+        check("one-token-path-titles-are-no-child's-path",
+              [_aa.candidate_paths(k["description"].split("\n## ", 1)[0])
+               for k in tok.issues[1:]], [[], []])
+        check("one-token-title-still-quoted",
+              '): "delivery.json".** This is child' in tok.issues[2]["description"], True)
+        ok_tok, rep_tok = (run_dor(as_filed(tok_tree, tok.issues[1:]), cfg_path, tmp)
+                           if tok.issues else (False, []))
+        check("one-token-path-titles-children-as-filed-pass-strict-dor",
+              (ok_tok, len(rep_tok)), (True, 2))
+        # Plain text is all read by the gate, so a one-token TODO is refused before create,
+        # as TBD in any title already is: what is gated is what would be filed.
+        bare = FakeLinear()
+        bare_tree = _tree()
+        bare_tree["requests"][0]["children"][0]["title"] = "TODO"
+        check("one-token-marker-title-refused-before-create",
+              (run(bare_tree, client=bare), len(bare.issues)), (EXIT_REJECTED, 0))
+        # KIT-263. The two "impossible" cases in ordering a plan were silent fallbacks: a
+        # cycle took the lowest index anyway, and a dependency missing from `created` was
+        # dropped, so the child said it depended on nothing. Each now raises, and the
+        # order is checked before the gate, so nothing is created on a plan that cannot
+        # be ordered even if validation ever lets one through.
+        cyc = [{"title": "A one", "depends_on": [1]}, {"title": "B two", "depends_on": [0]}]
+        try:
+            creation_order(cyc)
+            cyc_raised = False
+        except ExecutorError:
+            cyc_raised = True
+        check("creation-order-refuses-a-cycle", cyc_raised, True)
+        try:
+            child_context_block({"identifier": "KIT-1", "url": "u"}, "An epic",
+                                [{"title": "Build it"}, {"title": "Use it", "depends_on": [0]}],
+                                1, {})
+            gap_raised = False
+        except ExecutorError:
+            gap_raised = True
+        check("context-block-refuses-a-dependency-not-created", gap_raised, True)
+        saved_dep_errors = globals()["dependency_errors"]
+        globals()["dependency_errors"] = lambda _children: []
+        try:
+            for label, deps in (("cycle", ([1], [0])), ("missing", ([], [5]))):
+                bad = FakeLinear()
+                bad_tree = _tree()
+                for kid, d in zip(bad_tree["requests"][0]["children"], deps):
+                    kid["depends_on"] = d
+                rc_bad = run(bad_tree, client=bad)
+                check("unorderable-plan-%s-past-validation-creates-nothing" % label,
+                      (rc_bad, len(bad.projects), len(bad.issues)), (EXIT_ERRORED, 0, 0))
+        finally:
+            globals()["dependency_errors"] = saved_dep_errors
         # depends_on [0] on child index 1 → blockedBy: children[0] blocks children[1]
         check("one-relation", len(fake.relations), 1)
         check("relation-direction", fake.relations[0], (kids[0]["id"], kids[1]["id"]))

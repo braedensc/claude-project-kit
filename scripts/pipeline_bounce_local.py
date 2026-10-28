@@ -2054,10 +2054,11 @@ def read_ledger(path):
 
 def ledger_view(path, owner_repo, pr_number):
     """{'prior', 'last_spent', 'exhausted', 'concluded', 'notices', 'refreshes',
-    'delivered_bounces', 'blocked'} for one PR. Only `outcome == "spent"` rows count
-    toward the budget — those are appended BEFORE a send, so a failed send still spent
-    its bounce (over-count, never under-count). A missing ledger reads as zero; an
-    unreadable or corrupt one raises (read_ledger) rather than resetting the budget.
+    'delivered_bounces', 'blocked', 'conflicts', 'ready'} for one PR. Only
+    `outcome == "spent"` rows count toward the budget — those are appended BEFORE a send,
+    so a failed send still spent its bounce (over-count, never under-count). A missing
+    ledger reads as zero; an unreadable or corrupt one raises (read_ledger) rather than
+    resetting the budget.
 
     `concluded` and `blocked` are the LAST such row, not a count: a conclusion whose lane
     move failed appends another on the retry, exactly as a partly-announced exhaustion
@@ -2076,7 +2077,12 @@ def ledger_view(path, owner_repo, pr_number):
     says a bounce was counted, a `delivered` row says the session was told. The two differ
     for exactly the case that must never be read as a silent session: a bounce whose send
     failed, which is already loud on the PR (`send-failed`) and whose session was never
-    prompted at all."""
+    prompted at all.
+
+    `ready` is the LAST ready-to-merge row (KIT-225), and it carries the head it was said
+    at: record_conclusion compares that head with the current one, so the page is said
+    once per head. `conflicts` is EVERY conflict-fix row, kept apart from `prior` because a
+    conflict fix spends the conflict monitor's request budget, never budgets.maxBounces."""
     prior, last_spent, exhausted, concluded, notices, refreshes, blocked, ready = (
         0, None, None, None, [], 0, None, None)
     delivered = set()
@@ -3350,6 +3356,13 @@ def perform_conclude(sit, verdict, cfg, state_dir, dry_run):
 
     _settled, problems = record_conclusion(sit, cfg, state_dir, basis, dry_run, after_move=tell)
     emit_status = said.get("status", "not emitted: the conclusion was never recorded")
+    if problems and "status" not in said:
+        # `tell` runs on every path that records the conclusion, so it never ran: the
+        # ready-to-merge comment failed first, and nothing was concluded or moved (KIT-263).
+        sys.stderr.write("FAIL: %s#%d was not concluded: the ready-to-merge page did not land "
+                         "(%s). telemetry: %s\n"
+                         % (sit["repo"], sit["pr"], "; ".join(problems), emit_status))
+        return EXIT_USAGE
     if problems:
         sys.stderr.write("FAIL: %s#%d concluded (%s) but the needs-approval move did not land "
                          "(%s); whatever is not on the ledger yet, the next run retries. "
@@ -5606,9 +5619,10 @@ def selftest():
                 calls.append(("ticketComment", issue_id, body))
                 raise BounceError("simulated: the tracker refused the comment")
             globals()["linear_comment"] = refusing_comment
+            err_r1 = io.StringIO()
             try:
                 calls.clear()
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_r1):
                     rc_r1 = run_one(41, "o/r", cfg, tmp, "bounce", False)
                 first = [c[0] for c in calls]
             finally:
@@ -5616,6 +5630,14 @@ def selftest():
             check("KIT-225 a refused ready comment is exit 2, and nothing is moved or recorded",
                   (rc_r1, first, [r["outcome"] for r in read_ledger(ledger_path(tmp))]),
                   (EXIT_USAGE, ["ticketComment"], []))
+            # KIT-263. Its headline says what happened: nothing concluded, and no move was
+            # tried. "Concluded … but the move did not land" sent a reader to the lane.
+            check("KIT-263 …and its FAIL line says the PR was NOT concluded and names the "
+                  "page, never a move that was not attempted",
+                  ("was not concluded" in err_r1.getvalue(),
+                   "ready-to-merge" in err_r1.getvalue(),
+                   "move did not land" in err_r1.getvalue()),
+                  (True, True, False))
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc_r2 = run_one(41, "o/r", cfg, tmp, "bounce", False)
@@ -5649,6 +5671,14 @@ def selftest():
                   ([False, False, True], ["ticketComment", "state", "state", "ticketComment", "state"],
                    [("ready", "aaaa"), ("concluded", "aaaa"), ("concluded", "aaaa"),
                     ("ready", "cccc"), ("concluded", "cccc")]))
+
+        # KIT-263. ledger_view's docstring opens with the keys it returns; it is what a
+        # reader of record_conclusion looks up to learn what `ready` holds.
+        with tempfile.TemporaryDirectory() as tmp:
+            _lv_keys = set(ledger_view(ledger_path(tmp), "o/r", 41))
+        _lv_doc = set(re.findall(r"'(\w+)'", (ledger_view.__doc__ or "").split("}", 1)[0]))
+        check("KIT-263 ledger_view's docstring names every key it returns",
+              sorted(_lv_keys - _lv_doc), [])
 
         #       EVERY TERMINAL STATE REMAINS BANNED. The fixture names all six canonical
         #       states; the driver can reach exactly one of them. `done` is the one that
