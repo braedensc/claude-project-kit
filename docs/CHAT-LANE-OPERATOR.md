@@ -385,16 +385,19 @@ file. It also refuses a file piece 5 denies: the dispatcher's config and env fil
 role account's env file, its temp copies and anything in its backups folder. Those are
 caught written as the role account's own path, such as
 `<role home>/.stage-e/env`, and under any home, so the check holds before the
-account exists. It names every bad entry at once. `merge` will not add a file that is a
-symbolic link, a folder, a pipe or device, one of those denied files, holds the text
-`PRIVATE KEY`, or is larger than 1 MiB. `verify` reads each trust file as the role account,
-only if it is a regular file and only its first 1 MiB, and reports yes or no, never what
-is in it.
+account exists. They are caught in any letter case, because the Mac's disk ignores case.
+`/etc`, `/tmp` and `/var` are caught with or without `/private` in front, because macOS
+treats both as one folder. It names every bad entry at once. `merge` will not add a file
+that is a symbolic link, a folder, a pipe or device, one of those denied files, holds the
+text `PRIVATE KEY`, or is larger than 1 MiB. It also refuses a file whose folder is a link
+leading to a denied file. `verify` reads each trust file as the role account, only if it is
+a regular file and only its first 1 MiB, and reports yes or no, never what is in it.
 
 Don't: add a folder or a glob to `allowRead` by hand. `verify`'s `trust-files` row fails on
 either, on an entry that ends with `/` even before the folder exists, and on any entry that
 is a link, a pipe or device, a file piece 5 denies, larger than 1 MiB, or holds a private
-key.
+key. It also fails on an entry whose folder is a link leading to a denied file, and on an
+entry longer than 4096 characters.
 
 ### Step 5 — Block the dispatcher's port from the network (piece 4)
 
@@ -680,7 +683,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `hosted-keys-absent` | neither `CYRUS_API_KEY` nor `CYRUS_TEAM_ID` is in the dispatcher's env file, checked by name |
 | `port-block` | the anchor refuses the port for `inet` and `inet6` off loopback, pf says `Status: Enabled`, the LaunchDaemon and rules file are installed, and `CYRUS_SERVER_PORT` matches `DISPATCHER_PORT` |
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
-| `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder, ends with `/`, is not a path or re-opens a file piece 5 denies, or when a trust file is a symbolic link, not a regular file, larger than 1 MiB or holds the text `PRIVATE KEY`. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
+| `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder, ends with `/`, is not a path, is longer than 4096 characters or re-opens a file piece 5 denies (in any letter case, with or without `/private`, or through a linked folder), or when a trust file is a symbolic link, not a regular file, larger than 1 MiB or holds the text `PRIVATE KEY`. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
 | `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
 | `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
