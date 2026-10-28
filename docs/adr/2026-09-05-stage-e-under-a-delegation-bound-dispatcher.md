@@ -1096,8 +1096,15 @@ all the way down (on macOS `/etc` is `/private/etc`). Card CK-10 writes it with
 `install -d -o root -g wheel -m 755`, and the installer's `lane-marker` row requires it
 and checks that every folder above it, up to `/`, is root's and writable by no group or
 other account. The old marker still counts — either one makes the lane — so a machine
-that has only the old one keeps its guards until the new one is written; once it is,
-removing the old one gains nothing, and the row says the old one is there.
+that has only the old one keeps its guards until the new one is written. Once it is,
+removing the old one gains nothing, but only for a hook that reads the new one. A project
+made from the kit carries its own copy of the hook, and until that copy is ported it reads
+only the old marker; with the new marker alone, its dispatched sessions would see none,
+and `verify` would still read green. So the row also reads each served repository's committed hook
+(on the same trusted refs as its `delivery.json`). One that does not name the system
+marker needs the old marker under its pins root, and the row blocks on CK-10 while that is
+missing; the card keeps the old marker's two lines for that case. Only when every served
+hook reads the system marker does the row say the old one adds nothing.
 
 **Three gaps beside it**, each now refused in a pinned or dispatched session:
 

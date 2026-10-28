@@ -183,9 +183,15 @@ it as the role account, checks that every folder above it up to `/` is root's an
 by no one else, and `run` and `verify` stop on `CK-10` until it is. A repository with no
 `delivery.json` needs no marker. **Already wrote the older marker under the pins root?** It
 still counts in the hook, and the step says it is there, but it does not clear the row: the
-role account created the pins root and can rename the folders under it. Run the card again;
-the old one can stay. With the marker in place the hook reads no pin for that account, so
-a pin forged there switches nothing off.
+role account created the pins root and can rename the folders under it. Run the card again.
+**A project made from the kit carries its own copy of the hook**, and a copy older than the
+system marker reads only the older one. So the step also reads each served repository's
+committed hook. While one reads only the older marker, that marker is required too, under
+that repository's pins root: the row names the repository and stops on `CK-10` until it is
+there (the card's older-hook lines), and says to keep it once it is. Port that project's
+hook and the older marker is no longer needed; the row says when it adds nothing. With the
+marker in place the hook reads no pin for that account, so a pin forged there switches
+nothing off.
 
 **You type each secret once — plus once more if a stored one stops working.** The two
 values are asked for at a hidden prompt on the run that has none, written straight into the
