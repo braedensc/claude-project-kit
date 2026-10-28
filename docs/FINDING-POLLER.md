@@ -164,12 +164,12 @@ invalid config, or a missing credential.
 
 ## Enabling it (operator)
 
-**Nothing here is installed by hand any more.** Since PR #94 the poller is one of the three
+**Nothing here is installed by hand any more.** Since PR #94 the poller is one of the four
 daemons `scripts/pipeline_stage_e_setup.py` installs, so `run` is the whole procedure:
 `docs/STAGE-E-OPERATOR.md`. That one pass creates the `provenance:agent` label at workspace
 scope, writes `~/.stage-e/finding/poller.json` from the conf's `MANAGED_TEAM_KEYS` and the
 ids it resolved, installs the third LaunchDaemon on `FINDING_INTERVAL_SECONDS`, and waits on
-a third heartbeat before it calls the install loaded.
+every daemon's heartbeat before it calls the install loaded.
 
 What the installer does **not** decide is the part that was never a config value: which
 teams are yours. `MANAGED_TEAM_KEYS` has no default, and the poller refuses an empty team

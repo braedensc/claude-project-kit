@@ -295,6 +295,7 @@ def step_stage_e(io, conf, skip):
             return stop(io, "nothing changed. Stage E comes first, because the same kit change "
                             "teaches its jobs to leave planning tickets alone. Run this again "
                             "when you are ready.", EX_BLOCKED)
+        ran_at = io.now()
         code, _out = io.run([sys.executable, STAGE_E, "run", "--conf", conf])
         if io.interrupted:
             return stop(io, INTERRUPTED % "Stage E's installer", code or EX_BLOCKED)
@@ -302,13 +303,26 @@ def step_stage_e(io, conf, skip):
             io.say("")
             io.say("Stage E is up to date.")
             return None
+        # A RUN THAT FINISHED, ENDING ON THE CATCH-UP POLLER'S CARD (CK-11). That card never
+        # stops `run`: every step ran, through its last, and every job is loaded. Only that
+        # optional job waits on a person, so the idea gate is not held back for it.
+        if code == 10:
+            ran = io.stage_e_steps(ran_at) or {}
+            others = [o for st, o in ran.items() if st != "catch-up"]
+            if "handover" in ran and ran.get("catch-up") == "BLOCKED-ON-HUMAN" \
+                    and ran.get("code") in ("DONE", "ALREADY-DONE") \
+                    and all(o in ("DONE", "ALREADY-DONE") for o in others):
+                io.say("")
+                io.say("Stage E is up to date. Its catch-up poller waits for you to read its "
+                       "first count (card CK-11, above); that does not block the idea gate.")
+                return None
         # A RUN THAT STOPPED PART WAY IS NEVER CARRIED PAST. It may have moved the code and
         # stopped before reloading the review jobs, so "the code is current" says nothing
         # about whether they are running. The next pass's check tells the two apart: if
         # all that is left then is a card, it carries on.
         return stop(io, STAGE_E_MEANS.get(code, "Stage E's installer stopped part way "
                                                 "(exit %d). The lines above say where." % code)
-                    + " If it said its jobs are unloaded, review, bounce and findings stay off "
+                    + " If it said its jobs are unloaded, review, bounce, findings and catch-up stay off "
                       "until it finishes. Clear what it names, then run this command again.",
                     code)
     # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's
@@ -545,6 +559,25 @@ def selftest():
     check("stage-e-declined-stops-before-the-idea-gate",
           (code, "pipeline_stage_e_setup.py run" in io.ran,
            "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False, False))
+    # A RUN THAT FINISHED ON THE CATCH-UP POLLER'S CARD carries on; one that stopped on a
+    # card part way does not (KIT-47).
+    finished = {"code": "DONE", "enable": "DONE", "catch-up": "BLOCKED-ON-HUMAN",
+                "heartbeat-monitor": "DONE", "handover": "ALREADY-DONE"}
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                         "pipeline_stage_e_setup.py run": 10}, answers=[True],
+                  steps=[{"code": "WOULD-CHANGE"}, finished])
+    check("stage-e-run-ending-on-ck11-carries-on",
+          ("pipeline_stage_a_setup.py run" in io.ran, code), (True, EX_OK))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                         "pipeline_stage_e_setup.py run": 10}, answers=[True],
+                  steps=[{"code": "WOULD-CHANGE"}, {"code": "DONE", "dry-run": "BLOCKED-ON-HUMAN"}])
+    check("stage-e-run-stopped-on-a-card-part-way-stops",
+          ("pipeline_stage_a_setup.py run" in io.ran, code), (False, EX_BLOCKED))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                         "pipeline_stage_e_setup.py run": 10}, answers=[True],
+                  steps=[{"code": "WOULD-CHANGE"}, {"code": "DONE", "catch-up": "BLOCKED-ON-HUMAN"}])
+    check("stage-e-run-that-never-reached-its-last-step-stops",
+          ("pipeline_stage_a_setup.py run" in io.ran, code), (False, EX_BLOCKED))
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 1,
                          "pipeline_stage_e_setup.py run": 1}, answers=[True])
     check("stage-e-failure-stops-before-the-idea-gate",

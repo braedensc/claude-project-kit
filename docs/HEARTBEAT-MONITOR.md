@@ -1,6 +1,6 @@
 # The heartbeat monitor — the job that reads the other daemons' heartbeats
 
-Stage E's three daemons each write a heartbeat after every pass, so that *the job is dead*
+Stage E's daemons each write a heartbeat after every pass, so that *the job is dead*
 and *the job ran and had nothing to do* stop looking identical (contract §13). For a while
 **nothing read them.** A heartbeat with no consumer is not a health signal; it is a file
 that would have told someone, if anyone had looked. `scripts/pipeline_heartbeat_monitor.py`
@@ -8,7 +8,7 @@ is the consumer.
 
 It is deterministic code — no model, no prompt, no tokens — run by the **same role account**
 as the daemons it watches, on a **longer interval**. One pass: read the watched files (the
-three daemons', and the human-action notifier's when it is watched), judge each, and when
+daemons', and the human-action notifier's when it is watched), judge each, and when
 the verdict *changes*, post **one** comment on a configured tracker ticket. That comment
 pings your private chat channel through the notifier (KIT-156).
 
@@ -33,7 +33,7 @@ is worse than none at all.
 
 ## What it watches
 
-One row per job, because the heartbeats do not agree on field names and rewriting five jobs
+One row per job, because the heartbeats do not agree on field names and rewriting six jobs
 for one reader's convenience would be the larger change:
 
 | Job | File | Freshness from | Good result |
@@ -41,6 +41,7 @@ for one reader's convenience would be the larger change:
 | review poller | `<state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `declined` |
 | bounce driver | `<state_dir>/bounce-heartbeat.json` | `finished_at`, then `at` | `ok`, `idle`, `declined`, `paused` |
 | finding poller | `<finding_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok` |
+| catch-up poller | `<catchup_state_dir>/heartbeat.json` | `ended_at`, then `started_at` | `ok`, `held` |
 | notifier | `<notifier_state_dir>/notifier-heartbeat.json` | `at` | exit `0` only |
 | health watch | `<health_status_file>` (a whole path) | `written_at` | `ok` |
 
@@ -59,6 +60,32 @@ world-readable status file, and this monitor reads that file like a heartbeat:
   only while the owner is logged in.
 - The comment says where to look: ask the tech lead in chat to read the file, or run
   `python3 scripts/pipeline_watch.py status`.
+
+**The catch-up poller's `held` is good.** It held its replies because the dispatcher or its
+front door did not answer (`docs/CATCH-UP.md`). A short outage is the health watch's to page,
+so this row only names it. Its `problems` reads **failing**, and the row names each firing
+kind the way the health watch's does:
+
+- `webhook`: the tracker switched the dispatcher's webhook off;
+- `stuck-<ticket>`: a delegation still silent after the job's reply. Each ticket is its own
+  kind, so a second one pages, and it fires until a person acts on it;
+- `unsent-<ticket>`: a reply that failed twice in a row, open until it lands;
+- `coverage`: the session list was cut short, so a lost delegation could be beyond it;
+- `gate`: the route has been down for two awake hours, which is also how a wrong URL looks.
+
+A new kind pages again; the same kinds an hour later do not. A check it could not make never
+pages.
+
+- **An open incident pages whatever the result word says.** A `held` beat that carries a
+  firing kind reads **failing**. Judged from the job's `firing` field, so the health watch's
+  upkeep findings, which it keeps out of that field, still never page (KIT-264).
+- **A pass that could not finish is its own incident**, `could-not-finish`. Its `error`,
+  `usage` and `timeout` read **failing**, the row quotes the job's own reason, and the open
+  kinds it carried stay named beside it.
+- **It is watched only once installed.** Its own installer step runs just before the
+  monitor's, and installs it only once its first count is signed (`CK-11`). Until then, or
+  with `CATCHUP_INTERVAL_SECONDS=off`, its absent heartbeat would page forever, so it is
+  left out of `watch` and the step's note says so.
 
 **The notifier writes an exit code, not a result word.** The monitor reads it through the
 same exit table every Stage E job shares: 0 is `ok`, and 1, 2, 3 and 4 are `failing`. Its
@@ -97,9 +124,10 @@ non-clean pull requests were ones it was never meant to act on, and it said so o
 schedule. Its `problems` and `deadline` stay bad: each is a pull request it could not act
 on, or a pass cut short. The finding poller has no exit 3.
 
-The two pollers' files share a filename and are told apart by **directory**. The selftest
+The three pollers' files share a filename and are told apart by **directory**. The selftest
 cross-checks every schema string and filename against the writers, and judges heartbeats
-the review poller's, the finding poller's and the notifier's own writers produced — the
+the review poller's, the finding poller's, the catch-up poller's and the notifier's own
+writers produced — the
 notifier's at each exit it can leave — so a renamed field turns CI red instead of quietly
 reading as healthy — or, the way it actually failed once, paging on every healthy file.
 
@@ -218,8 +246,8 @@ upgrade sends no extra ping.
 - **Outside every git working tree**, and refused inside one: a file a session can write is
   a file a session could use to suppress a page about its own pull request. The same goes
   for every watched job's heartbeat directory (`state_dir`, `finding_state_dir`,
-  `notifier_state_dir`): a fresh `ok` beat written there would make a job that is down read
-  as healthy. A directory only an unwatched job would use is not checked.
+  `catchup_state_dir`, `notifier_state_dir`): a fresh `ok` beat written there would make a
+  job that is down read as healthy. A directory only an unwatched job would use is not checked.
 
 ## Off unless a ticket is set — but never silently off
 
@@ -306,7 +334,7 @@ an environment holds.
 ## Installing it
 
 **The Stage E installer installs it (KIT-127).** Its `heartbeat-monitor` step runs after the
-three daemons are loaded. Name the ticket in `stage-e.conf`, or turn it off by name:
+daemons are loaded. Name the ticket in `stage-e.conf`, or turn it off by name:
 
 ```sh
 HEARTBEAT_MONITOR_TICKET=KIT-123      # or: HEARTBEAT_MONITOR_TICKET=off
@@ -327,12 +355,13 @@ With a ticket named, the step does six things:
 1. It checks that the stored tracker key can read the ticket. A comment to a missing ticket
    reaches nobody.
 2. It writes `~/.stage-e/monitor.json` under the role account. The intervals come from the
-   same conf values launchd schedules the three daemons by, plus 900 s for one pass. With
-   `NOTIFIER_JOB_LABEL` set, the notifier is a fourth watched job (below). With
-   `HEALTH_STATUS_FILE` set, the health watch is a fifth (below).
+   same conf values launchd schedules the daemons by, plus 900 s for one pass. The catch-up
+   poller is in it only once its own step has installed it. With
+   `NOTIFIER_JOB_LABEL` set, the notifier is a fifth watched job (below). With
+   `HEALTH_STATUS_FILE` set, the health watch is a sixth (below).
 3. It runs the monitor's own `check`. A config the monitor refuses (exit 2) is never loaded.
    Exit 3 means it found a problem on its first look, which is its job.
-4. It installs `<prefix>.stage-e-monitor` as a fourth system LaunchDaemon, logging to
+4. It installs `<prefix>.stage-e-monitor` as a fifth system LaunchDaemon, logging to
    `~/.stage-e/monitor.log`.
 5. It runs the monitor's `rearm`, so the first pass does not judge the reloaded daemons'
    old heartbeats as stale. A failed `rearm` is a failed step, and the job is not loaded.
@@ -358,7 +387,7 @@ name. The note prints whole under the steps table, where a row's text is cut sho
 | What it finds | What the step does |
 |---|---|
 | launchd holds the label, running the notifier on that config | watches it |
-| launchd does not hold the label, and `/Library/LaunchDaemons/<label>.plist` is there | **paused**: not watched on this pass, and the step's note says `notifier paused: not watched; load it, then run this again`. The step does not fail, and the monitor is loaded for the other three |
+| launchd does not hold the label, and `/Library/LaunchDaemons/<label>.plist` is there | **paused**: not watched on this pass, and the step's note says `notifier paused: not watched; load it, then run this again`. The step does not fail, and the monitor is loaded for the other four |
 | launchd does not hold the label, and no plist is there | refused, by name: an absent heartbeat would page on every pass |
 | the label runs something else, or the notifier on another `--config` | refused, by name. This step reads only `~/.stage-e/notifier.json`, so keep the notifier installer's `NOTIFIER_CONFIG` at its default |
 | `~/.stage-e/notifier.json` is absent | refused, by name |
@@ -383,8 +412,8 @@ installed and removes its plist, so the next boot does not load it again. If lau
 holds the job after the unload, the step fails, names the `sudo launchctl bootout` command,
 and keeps the plist so the next run finds the job again.
 
-The `code` step unloads a loaded monitor with the other three before it moves the clone they
-all run from. `enable` loads the three again, and the `heartbeat-monitor` step loads the
+The `code` step unloads a loaded monitor with the other four before it moves the clone they
+all run from. `enable` loads the four again, and the `heartbeat-monitor` step loads the
 monitor. A run that stops between them prints which jobs are still off. With
 `NOTIFIER_JOB_LABEL` set, `code` measures the notifier **before** it unloads anything, so a
 label the `heartbeat-monitor` step would refuse stops the run with every job still loaded,
