@@ -1692,8 +1692,10 @@ CARDS = {
                 "or move out of sight, so it is root's, in folders root owns all the way "
                 "down to /. An older marker under the pins root (dispatch.pinsRoot) still "
                 "counts, but the role account created the pins root and can rename the "
-                "folders under it. Without a marker nothing breaks, and those guards stay "
-                "open on this lane."),
+                "folders under it. A project made from the kit carries its own copy of the "
+                "hook. Until that copy is ported, it reads only the older marker, so that "
+                "project needs the older one too. Without a marker its hook can read, "
+                "nothing breaks, and those guards stay open on this lane."),
         "do": ["Run these two lines (on macOS /etc is /private/etc, which root owns):",
                "    sudo install -d -o root -g wheel -m 755 /etc/claude-pipeline "
                "/etc/claude-pipeline/dispatched-lane",
@@ -1701,10 +1703,23 @@ CARDS = {
                "/etc/claude-pipeline/dispatched-lane/${ROLE_ACCOUNT}",
                "Then check it:",
                "    ls -l /etc/claude-pipeline/dispatched-lane",
-               "`verify` reads it too, as the role account: its lane-marker row checks the",
-               "marker is root's and every folder above it, up to /, is root's and writable",
-               "by no group or other account. An older marker under the pins root may stay:",
-               "with this one in place it adds nothing, and the row says it is there.",
+               "Only while a served repository's committed hook predates the system marker,",
+               "also run these three. The lane-marker row names each such repository. They",
+               "use the default pins root. A repository whose delivery.json sets",
+               "dispatch.pinsRoot needs the marker under that folder instead. The first",
+               "line makes the pins root as the role account, so no folder of its own",
+               "becomes root's:",
+               "    sudo -u ${ROLE_ACCOUNT} mkdir -p ~${ROLE_ACCOUNT}/.claude/pipeline/pins",
+               "    sudo install -d -o root -g wheel -m 755 "
+               "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane",
+               "    sudo install -o root -g wheel -m 444 /dev/null "
+               "~${ROLE_ACCOUNT}/.claude/pipeline/pins/dispatched-lane/${ROLE_ACCOUNT}",
+               "`verify` reads them as the role account. Its lane-marker row checks the",
+               "system marker is root's and every folder above it, up to /, is root's and",
+               "writable by no group or other account. It also reads each served",
+               "repository's committed hook, and blocks while one that reads only the older",
+               "marker has none. Once every served hook reads the system marker, the older",
+               "one adds nothing, and the row says so.",
                "Your own account gets no marker: your sessions keep the open rules."],
         "good": "one file named ${ROLE_ACCOUNT}, owned by root, mode -r--r--r--",
         "attest": None,
@@ -5751,15 +5766,41 @@ def step_heartbeat_monitor(ctx, apply_it):
 # (on the refs the hook trusts), `~` as the role account's home from the account
 # database. A repository with no delivery.json has the hook's pipeline guards off: it
 # needs no marker.
+#
+# A PROJECT MADE FROM THE KIT CARRIES ITS OWN COPY OF THE HOOK, and a copy older than
+# the system marker reads only the old one. On a machine with the system marker alone,
+# that project's dispatched sessions see no marker and run with the lane guards open.
+# So the step reads each served repository's COMMITTED hook too, on the same refs: one
+# that does not name the system marker needs the old marker under its pins root, and the
+# row blocks while it is missing. Only when every served hook reads the system marker
+# does the old one add nothing.
 LANE_MARKER_DIR = "dispatched-lane"
 LANE_SYSTEM_DIR = "/etc/claude-pipeline/dispatched-lane"
 DEFAULT_PINS_ROOT = "~/.claude/pipeline/pins"
+KIT_HOOK_PATH = ".claude/hooks/pre-tool-use.py"
 
 # Exit 7: not a clone this account can read. Exit 9: no trusted ref holds the file.
 DELIVERY_READ_SH = (
     'p=%s; git -C "$p" rev-parse --git-dir >/dev/null 2>&1 || exit 7; '
     'for r in origin/main origin/master main master; do '
     'git -C "$p" show "$r:delivery.json" 2>/dev/null && exit 0; done; exit 9')
+
+# The line by which a hook reads the system marker: the kit hook's own constant. A hook that
+# only mentions the folder (a comment, a docstring) does not read it.
+HOOK_SYSTEM_MARKER_LINE = 'LANE_MARKER_SYSTEM_DIR = "%s"' % LANE_SYSTEM_DIR
+
+# The committed kit hook, on the same refs in the same order: the first ref that holds
+# it is the one read. Prints 1 if it assigns the system marker's folder, 0 if not.
+# Exit 7: not a clone this account can read. Exit 9: no trusted ref holds the file.
+# Exit 8: a ref holds it and it could not be read. No pipe: a pipe's status is its last
+# command's, so a failed read would print 0 and read as "an older hook".
+HOOK_READ_SH = (
+    'f=%s; p=%%s; git -C "$p" rev-parse --git-dir >/dev/null 2>&1 || exit 7; '
+    'for r in origin/main origin/master main master; do '
+    'git -C "$p" cat-file -e "$r:$f" 2>/dev/null || continue; '
+    'h=$(git -C "$p" cat-file -p "$r:$f") || exit 8; '
+    'case $h in *%s*) echo 1 ;; *) echo 0 ;; esac; exit 0; done; exit 9'
+    % (KIT_HOOK_PATH, shlex.quote(HOOK_SYSTEM_MARKER_LINE)))
 
 # Prints the marker's path and its owner uid, then one line per folder above it up to /,
 # along the path as written and the path it resolves to: "<uid> <mode> <D|L> <folder>"
@@ -5834,6 +5875,23 @@ def _system_marker_problems(ctx):
     return path, problems
 
 
+def _hook_reads_system_marker(ctx, repo):
+    """Whether `repo`'s committed kit hook reads the system marker: True or False, or
+    None when no trusted ref holds a kit hook (it reads no marker at all). Unknown when
+    the hook could not be read: an older hook is not a guess this row may make."""
+    got = ctx.runner.as_role(ctx.account, HOOK_READ_SH % shlex.quote(repo))
+    if got.rc == 9:
+        return None
+    answer = got.out.strip()
+    if not got.ok or answer not in ("0", "1"):
+        raise Unknown("could not read the committed kit hook (%s) of %s as %s (exit %s): %s"
+                      % (KIT_HOOK_PATH, repo, ctx.account, got.rc,
+                         (got.err or got.out).strip()[:160]),
+                      "Give the role account read access to that clone, then run\n"
+                      "    python3 %s verify" % _self_path())
+    return answer == "1"
+
+
 def step_lane_marker(ctx, apply_it):
     """Measured, never written: the marker must be a file no session can create, delete or
     hide, so root writes it, by hand, from card CK-10. `run` stops here until it is
@@ -5845,6 +5903,9 @@ def step_lane_marker(ctx, apply_it):
                       "repositories need the lane marker is not known",
                       "Clear the preflight row first; its reason is printed with it.")
     roots, notes, seen = {}, [], set()
+    # The pins roots whose old marker a served repository's hook still needs: its
+    # committed hook predates the system marker and reads only the old one.
+    older, no_hook = {}, []
     for entry in ctx.dispatcher.get("entries", []) or []:
         repo = entry.get("repositoryPath")
         if not repo or repo in seen:
@@ -5866,40 +5927,80 @@ def step_lane_marker(ctx, apply_it):
             notes.append("%s: its committed delivery.json does not read as a config, so the "
                          "kit hook refuses every change there until it is fixed. Its old "
                          "marker is looked for at the default pins root." % repo)
-        roots.setdefault(raw if isinstance(raw, str) and raw.strip() else DEFAULT_PINS_ROOT,
-                         []).append(repo)
+        root = raw if isinstance(raw, str) and raw.strip() else DEFAULT_PINS_ROOT
+        roots.setdefault(root, []).append(repo)
+        reads = _hook_reads_system_marker(ctx, repo)
+        if reads is None:
+            no_hook.append(repo)
+            notes.append("%s: no kit hook (%s) is committed on any trusted ref, so it reads "
+                         "no lane marker at all, old or new, and none of the lane guards "
+                         "apply there" % (repo, KIT_HOOK_PATH))
+        elif not reads:
+            older.setdefault(root, []).append(repo)
     if not roots:
         return True, ("no repository the dispatcher serves has a committed delivery.json, "
                       "so the kit hook's pipeline guards are off in all of them and no "
                       "lane marker is needed"), notes
     path, problems = _system_marker_problems(ctx)
-    # The old marker, under each pins root: it still counts in the hook, so it is reported
-    # for what it is, never required. A look that fails hides nothing (the hook reads a
-    # marker it cannot look for as the lane), so it is a note, not an Unknown.
-    old = []
+    # The old marker, under each pins root. A served repository whose committed hook
+    # predates the system marker reads only this one, so for it the old marker is
+    # required; for the rest it is reported for what it is. A look that fails is a note
+    # where the kit hook decides (it reads a marker it cannot look for as the lane), and
+    # Unknown where an older copy does, since how that copy treats it is not known.
+    old, present, missing, unread = [], {}, [], []
     for raw, repos in sorted(roots.items()):
         got = r.as_role(ctx.account, "/usr/bin/python3 -c %s %s"
                         % (shlex.quote(LANE_MARKER_PY), shlex.quote(raw.strip())))
         lines = got.out.strip().splitlines()
         opath = lines[0] if lines else "<%s>/%s/%s" % (raw, LANE_MARKER_DIR, ctx.account)
         if got.rc == 9:
+            if raw in older:
+                missing.append(
+                    "the committed hook of %s predates %s and reads only the old marker, "
+                    "and there is none at %s, so dispatched sessions there run with the "
+                    "lane guards open. Run card CK-10's lines for an older hook (under that "
+                    "pins root), or port the hook from the kit"
+                    % (", ".join(older[raw]), LANE_SYSTEM_DIR, opath))
             continue
         owners = lines[1].split() if got.ok and len(lines) > 1 else []
         if len(owners) != 2:
-            notes.append("could not look for the old lane marker under %s as %s (exit %s); "
-                         "the hook counts a marker it cannot look for as the lane"
-                         % (raw, ctx.account, got.rc))
+            if raw in older:
+                unread.append("could not look for the old lane marker under %s as %s (exit "
+                              "%s), and the committed hook of %s reads only that one"
+                              % (raw, ctx.account, got.rc, ", ".join(older[raw])))
+            else:
+                notes.append("could not look for the old lane marker under %s as %s (exit "
+                             "%s); the hook counts a marker it cannot look for as the lane"
+                             % (raw, ctx.account, got.rc))
             continue
         old.append("%s (owner uids %s)" % (opath, " and ".join(owners)))
-    if problems:
-        if old:
+        present[raw] = old[-1]
+    if problems or missing:
+        if problems and old:
             problems.append("the old marker %s still marks the lane, but under the pins "
                             "root, whose folders the role account can rename"
                             % ", ".join(old))
-        raise Blocked("CK-10", "; ".join(problems))
-    for o in old:
-        notes.append("the old lane marker %s still counts in the hook too; with %s in "
-                     "place it adds nothing, and removing it changes nothing" % (o, path))
+        raise Blocked("CK-10", "; ".join(problems + missing))
+    if unread:
+        raise Unknown("; ".join(unread) + ", so whether its lane guards hold is not known",
+                      "Let the role account read that pins root, then run\n"
+                      "    python3 %s verify" % _self_path())
+    every = not older and not no_hook
+    for raw, o in sorted(present.items()):
+        if raw in older:
+            notes.append("keep the old lane marker %s: the committed hook of %s predates %s "
+                         "and reads only that one, so removing it opens the lane guards "
+                         "there. It is the weaker marker: the role account created the pins "
+                         "root and can rename the folders under it. Port the hook from the "
+                         "kit, and this row says when the old marker is no longer needed"
+                         % (o, ", ".join(older[raw]), path))
+        elif every:
+            notes.append("the old lane marker %s still counts in the hook too; with %s in "
+                         "place it adds nothing, and removing it changes nothing" % (o, path))
+        else:
+            notes.append("the old lane marker %s still counts in the hook too. Leave it "
+                         "until every served repository's committed hook reads %s; this "
+                         "row says when it is no longer needed" % (o, path))
     return True, ("the lane marker is root's, in folders only root can change: %s"
                   % path), notes
 
@@ -11651,7 +11752,23 @@ def _selftest_body():
                    "/etc/claude-pipeline/dispatched-lane/_exrole",
                    "GOOD: one file named _exrole, owned by root", "dispatch.pinsRoot"))
                and "${ROLE_ACCOUNT}" not in _ck10
-               and "sudo -u _exrole mkdir" not in _ck10, _ck10[-900:])
+               and _ck10.find("sudo -u _exrole mkdir")
+               > _ck10.find("predates the system marker") > 0, _ck10[-900:])
+        # …and the older marker's two lines, for a served repository whose committed hook
+        # predates the system marker (a project made from the kit carries its own copy),
+        # marked as needed only then, with the row named as what says which.
+        cases += 1
+        expect("lane-marker-card-older-hook",
+               all(t in _ck10 for t in (
+                   "sudo -u _exrole mkdir -p ~_exrole/.claude/pipeline/pins",
+                   "install -d -o root -g wheel -m 755 "
+                   "~_exrole/.claude/pipeline/pins/dispatched-lane",
+                   "install -o root -g wheel -m 444 /dev/null "
+                   "~_exrole/.claude/pipeline/pins/dispatched-lane/_exrole",
+                   "predates the system marker", "lane-marker row names"))
+               and "own copy of the hook" in CARDS["CK-10"]["why"]
+               and "with this one in place it adds nothing" not in " ".join(
+                   CARDS["CK-10"]["do"]), _ck10[-1400:])
 
         # Off, and nothing installed: said by name, nothing written.
         ctxO, fakeO = _monitor_ctx(value="off", loaded=False)
@@ -12169,7 +12286,8 @@ def _selftest_body():
     # CK-10 was reachable only by `card CK-10` typed by hand, so a machine without the
     # marker verified clean while the hook's tracker guards stayed open on the lane.
     # The marker the row requires is the SYSTEM one, in folders root owns all the way
-    # down; the old one under the pins root is reported, never required.
+    # down; the old one under the pins root is reported, and required only where a served
+    # repository's committed hook predates the system marker (KIT-252, below).
     sysmark = "/etc/claude-pipeline/dispatched-lane/%s" % conf["ROLE_ACCOUNT"]
 
     def _sysout(marker_uid="0", **bad):
@@ -12183,12 +12301,22 @@ def _selftest_body():
         rows = [bad.get(r[3], r) for r in rows]
         return "%s\n%s\n%s\n" % (sysmark, marker_uid, "\n".join(" ".join(r) for r in rows))
 
-    def _lane_ctx(read=None, probe=None, system=None):
+    # The committed kit hook's reader names the system folder too, so its answer comes
+    # first of all. Named by the hook's own path, so a reader of another file misses.
+    hook_needle = ".claude/hooks/pre-tool-use.py; p="
+
+    def _lane_ctx(read=None, probe=None, system=None, hook=None, repos=(), extra=()):
         """The healthy fixture, with the committed config, the SYSTEM probe and the OLD
         marker's probe answered as given. The system answer always comes first: its
-        command names `dispatched-lane` too, so the old probe's needle would answer it."""
+        command names `dispatched-lane` too, so the old probe's needle would answer it.
+        The committed hook's read comes before all of them: `hook` for every repository,
+        or a (rc, out) per path in `repos`, each added to the dispatcher's entries.
+        `extra` answers go first of all."""
         c, f, _a = _healthy_ctx(conf)
-        lead = []
+        lead = list(extra) + [(hook_needle + "%s;" % rp, rc, out) for rp, (rc, out) in repos]
+        c.dispatcher["entries"] = list(c.dispatcher["entries"]) + [
+            {"id": rp, "name": rp, "repositoryPath": rp} for rp, _x in repos]
+        lead.append((hook_needle,) + (hook or (0, "1\n")))
         if read is not None:
             lead.append(('git -C "$p" show', read[0], read[1]))
         lead.append(("/etc/claude-pipeline",) + (system or (0, _sysout())))
@@ -12198,7 +12326,12 @@ def _selftest_body():
         return c, f
 
     def _probed(f):
-        return [_fmt(a) for a in f.reads if "dispatched-lane" in _fmt(a)]
+        """The marker probes: reads naming `dispatched-lane`, the hook's read aside."""
+        return [_fmt(a) for a in f.reads
+                if "dispatched-lane" in _fmt(a) and hook_needle not in _fmt(a)]
+
+    def _hook_reads(f):
+        return [_fmt(a) for a in f.reads if hook_needle in _fmt(a)]
 
     marker = ("/Users/<role-account>/.claude/pipeline/pins/dispatched-lane/%s"
               % conf["ROLE_ACCOUNT"])
@@ -12316,6 +12449,270 @@ def _selftest_body():
            and not fakeV.writes and "card CK-10" in outS and codeS == EX_BLOCKED,
            "verify exit %s rows %s; status exit %s: %s" % (codeV, rowsV, codeS, outS[-300:]))
 
+    # -- KIT-252 (Stage E review of #201). A SERVED HOOK MAY PREDATE THE SYSTEM MARKER --- #
+    # A project made from the kit carries its own copy of the hook, and until it is ported
+    # that copy reads only the old marker. On a machine with the system marker alone, its
+    # dispatched sessions see no marker at all, so the row must not read green there. The
+    # step reads each served repository's COMMITTED hook, as the role account.
+    older_hook = (0, "0\n")
+    # An older hook, and no old marker: blocked on CK-10, naming the repository, the old
+    # marker's path and the remedy.
+    cases += 1
+    ctxH1, fakeH1 = _lane_ctx(hook=older_hook, probe=(9, marker + "\n"))
+    try:
+        step_lane_marker(ctxH1, apply_it=False)
+        failures.append("lane-marker-older-hook-no-old: an older hook with no old marker "
+                        "held the row")
+    except Blocked as exc:
+        expect("lane-marker-older-hook-no-old",
+               exc.card_id == "CK-10" and "/x/kit" in exc.extra and marker in exc.extra
+               and "older hook" in exc.extra and "port the hook" in exc.extra
+               and any("sudo -u %s -H" % conf["ROLE_ACCOUNT"] in h
+                       for h in _hook_reads(fakeH1)),
+               "blocked saying %r; hook reads %s" % (exc.extra, _hook_reads(fakeH1)))
+    except Unknown as exc:
+        failures.append("lane-marker-older-hook-no-old: Unknown (%s)" % exc)
+    # …and a whole `verify` of that machine is red on that row alone: never green while a
+    # served repository's lane is open.
+    cases += 1
+    ctxHV, fakeHV = _lane_ctx(hook=older_hook, probe=(9, marker + "\n"))
+    ctxHV.runner.dry_run = True
+    codeHV, _outHV = _quiet(lambda: cmd_verify(ctxHV))
+    rowsHV = {s: r["outcome"] for s, r in ctxHV.state.data["steps"].items()
+              if r["outcome"] not in (DONE, ALREADY_DONE, SKIPPED)}
+    expect("lane-marker-verify-older-hook", codeHV == EX_BLOCKED
+           and rowsHV == {"lane-marker": BLOCKED} and not fakeHV.writes,
+           "verify exit %s rows %s" % (codeHV, rowsHV))
+    # An older hook, and the old marker there: the row holds, and says to keep it and why
+    # it is the weaker one. Never "adds nothing": removing it opens that repository.
+    cases += 1
+    ctxH2, _fH2 = _lane_ctx(hook=older_hook)
+    try:
+        okH2, _dH2, notesH2 = step_lane_marker(ctxH2, apply_it=False)
+        expect("lane-marker-older-hook-kept", okH2 is True
+               and any("keep the old lane marker" in n and "/x/kit" in n and "can rename" in n
+                       for n in notesH2)
+               and not any("adds nothing" in n for n in notesH2), "notes %s" % notesH2)
+    except (Blocked, Unknown) as exc:
+        failures.append("lane-marker-older-hook-kept: the row did not hold (%s)" % exc)
+    # A look for the old marker that fails, where an older hook reads only that one:
+    # Unknown, never a pass.
+    cases += 1
+    ctxH9, _fH9 = _lane_ctx(hook=older_hook,
+                            probe=(1, "Traceback (most recent call last)\n"))
+    try:
+        step_lane_marker(ctxH9, apply_it=False)
+        failures.append("lane-marker-older-hook-look-failed: the row held")
+    except Unknown as exc:
+        expect("lane-marker-older-hook-look-failed",
+               "/x/kit" in str(exc) and "reads only that one" in str(exc),
+               "Unknown %s" % exc)
+    except Blocked as exc:
+        failures.append("lane-marker-older-hook-look-failed: blocked (%s)" % exc.extra)
+    # Every served repository's hook reads the system marker: only then "adds nothing".
+    cases += 1
+    ctxH3, fakeH3 = _lane_ctx(repos=(("/x/app", (0, "1\n")),))
+    try:
+        okH3, _dH3, notesH3 = step_lane_marker(ctxH3, apply_it=False)
+        expect("lane-marker-every-hook-new", okH3 is True
+               and any("old lane marker" in n and "adds nothing" in n for n in notesH3)
+               and not any("keep the old lane marker" in n for n in notesH3)
+               and len(_hook_reads(fakeH3)) == 2,
+               "notes %s; hook reads %s" % (notesH3, _hook_reads(fakeH3)))
+    except (Blocked, Unknown) as exc:
+        failures.append("lane-marker-every-hook-new: the row did not hold (%s)" % exc)
+    # One of two repositories has an older hook: the row names that one, not the other,
+    # whether its old marker is there (kept) or not (blocked).
+    cases += 1
+    ctxH4, _fH4 = _lane_ctx(repos=(("/x/app", older_hook),))
+    try:
+        okH4, _dH4, notesH4 = step_lane_marker(ctxH4, apply_it=False)
+        expect("lane-marker-one-hook-older-kept", okH4 is True
+               and any("keep the old lane marker" in n and "/x/app" in n
+                       and "/x/kit" not in n for n in notesH4)
+               and not any("adds nothing" in n for n in notesH4), "notes %s" % notesH4)
+    except (Blocked, Unknown) as exc:
+        failures.append("lane-marker-one-hook-older-kept: the row did not hold (%s)" % exc)
+    cases += 1
+    ctxH5, _fH5 = _lane_ctx(repos=(("/x/app", older_hook),), probe=(9, marker + "\n"))
+    try:
+        step_lane_marker(ctxH5, apply_it=False)
+        failures.append("lane-marker-one-hook-older-missing: the row held")
+    except Blocked as exc:
+        expect("lane-marker-one-hook-older-missing", exc.card_id == "CK-10"
+               and "/x/app" in exc.extra and "/x/kit" not in exc.extra,
+               "blocked saying %r" % exc.extra)
+    except Unknown as exc:
+        failures.append("lane-marker-one-hook-older-missing: Unknown (%s)" % exc)
+    # The older hook's marker is looked for under ITS pins root: an old marker under the
+    # default root does not cover a repository whose delivery.json names another.
+    cases += 1
+    ctxH6, _fH6 = _lane_ctx(
+        repos=(("/x/app", older_hook),),
+        extra=(("&& p=/x/app;", 0, json.dumps({"version": 1,
+                                               "dispatch": {"pinsRoot": "/srv/pins"}})),
+               (" /srv/pins", 9, "/srv/pins/dispatched-lane/%s\n" % conf["ROLE_ACCOUNT"])))
+    try:
+        step_lane_marker(ctxH6, apply_it=False)
+        failures.append("lane-marker-older-hook-own-root: the default root's marker held the "
+                        "row for a repository whose pins root has none")
+    except Blocked as exc:
+        expect("lane-marker-older-hook-own-root", exc.card_id == "CK-10"
+               and "/x/app" in exc.extra and "/srv/pins/dispatched-lane/" in exc.extra,
+               "blocked saying %r" % exc.extra)
+    except Unknown as exc:
+        failures.append("lane-marker-older-hook-own-root: Unknown (%s)" % exc)
+    # No kit hook on any trusted ref: it reads no marker at all. A note, not a block, even
+    # with no old marker; and the old marker, where it is, is not called one that adds
+    # nothing, since not every served repository's hook reads the system marker.
+    cases += 1
+    ctxH7, _fH7 = _lane_ctx(hook=(9, ""), probe=(9, marker + "\n"))
+    try:
+        okH7, _dH7, notesH7 = step_lane_marker(ctxH7, apply_it=False)
+        expect("lane-marker-no-hook", okH7 is True
+               and any("no kit hook" in n and "/x/kit" in n for n in notesH7),
+               "notes %s" % notesH7)
+    except (Blocked, Unknown) as exc:
+        failures.append("lane-marker-no-hook: a repository with no hook stopped the row (%s)"
+                        % exc)
+    cases += 1
+    ctxH8, _fH8 = _lane_ctx(repos=(("/x/app", (9, "")),))
+    try:
+        okH8, _dH8, notesH8 = step_lane_marker(ctxH8, apply_it=False)
+        expect("lane-marker-no-hook-not-every", okH8 is True
+               and any("no kit hook" in n and "/x/app" in n for n in notesH8)
+               and any("old lane marker" in n and "Leave it" in n for n in notesH8)
+               and not any("adds nothing" in n for n in notesH8), "notes %s" % notesH8)
+    except (Blocked, Unknown) as exc:
+        failures.append("lane-marker-no-hook-not-every: the row did not hold (%s)" % exc)
+    # A hook read that fails is not an older hook, and not a newer one: Unknown.
+    for label, hook in (("lane-marker-hook-unreadable", (1, "")),
+                        ("lane-marker-hook-read-failed", (8, "")),
+                        ("lane-marker-hook-not-a-clone", (7, "")),
+                        ("lane-marker-hook-garbled", (0, "fatal: bad object\n"))):
+        cases += 1
+        ctxX, _fX = _lane_ctx(hook=hook)
+        try:
+            step_lane_marker(ctxX, apply_it=False)
+            failures.append("%s: could not read the hook, and the step held" % label)
+        except Unknown as exc:
+            expect(label, "committed kit hook" in str(exc), "Unknown saying %s" % exc)
+        except Blocked as exc:
+            failures.append("%s: could not read the hook, and read it as older (%s)"
+                            % (label, exc.extra))
+
+    # …and the reader itself, EXECUTED against real repositories. The first trusted ref
+    # that holds the hook is the one read, in the hook's order (origin/main, origin/master,
+    # main, master). A hook that names only the old marker's folder is an older one. No
+    # hook on a trusted ref is exit 9, no clone exit 7, and a read that fails once the ref
+    # is found is exit 8, never "an older hook": a pipe would print 0 for it.
+    hook_sh = globals().get("HOOK_READ_SH")
+    import shutil as _shutil
+    real_git = _shutil.which("git")
+    cases += 1
+    expect("lane-marker-hook-reader-runs", isinstance(hook_sh, str) and bool(real_git),
+           "no hook reader (%s), or no git (%s)" % (type(hook_sh).__name__, real_git))
+    if isinstance(hook_sh, str) and real_git:
+        with tempfile.TemporaryDirectory() as tmpK:
+            # No GIT_* from around the selftest (a git hook sets GIT_DIR, GIT_INDEX_FILE and
+            # more): with them, `git -C <tmp repo>` would act on the outer repository. Read
+            # at each call, so a variable set later is dropped too.
+            def bare_env():
+                return dict((k, v) for k, v in os.environ.items()
+                            if not k.startswith("GIT_"))
+
+            def _gitK(*a, cwd=None):
+                return subprocess.run([real_git, "-c", "commit.gpgsign=false"] + list(a),
+                                      cwd=cwd, capture_output=True, text=True,
+                                      env=dict(bare_env(), GIT_AUTHOR_NAME="t",
+                                               GIT_AUTHOR_EMAIL="t@e",
+                                               GIT_COMMITTER_NAME="t",
+                                               GIT_COMMITTER_EMAIL="t@e"))
+
+            hook_rel = ".claude/hooks/pre-tool-use.py"
+            new_text = 'LANE_MARKER_SYSTEM_DIR = "%s"\n' % LANE_SYSTEM_DIR
+            old_text = 'LANE_MARKER_DIR = "dispatched-lane"\n'
+
+            def _repo(name, refs):
+                """A repository whose refs each hold one commit, with the given hook text
+                (or none)."""
+                d = os.path.join(tmpK, name)
+                _gitK("init", "-q", d)
+                os.makedirs(os.path.join(d, ".claude", "hooks"))
+                for ref, text in refs:
+                    _gitK("read-tree", "--empty", cwd=d)
+                    with open(os.path.join(d, "README.md"), "w") as fh:
+                        fh.write(ref + "\n")
+                    _gitK("add", "-f", "README.md", cwd=d)
+                    if text is not None:
+                        with open(os.path.join(d, hook_rel), "w") as fh:
+                            fh.write(text)
+                        _gitK("add", "-f", hook_rel, cwd=d)
+                    tree = _gitK("write-tree", cwd=d).stdout.strip()
+                    sha = _gitK("commit-tree", tree, "-m", ref, cwd=d).stdout.strip()
+                    _gitK("update-ref", "refs/" + ref, sha, cwd=d)
+                return d
+
+            def _read_hook(d, path=None):
+                env = dict(bare_env(), GIT_CEILING_DIRECTORIES=tmpK)
+                if path:
+                    env["PATH"] = path
+                res = subprocess.run(["/bin/sh", "-c", hook_sh % shlex.quote(d)],
+                                     capture_output=True, text=True, env=env)
+                return res.returncode, res.stdout.strip()
+
+            for n, (label, refs, want) in enumerate((
+                    ("origin/main first", (("remotes/origin/main", new_text),
+                                           ("heads/main", old_text)), (0, "1")),
+                    ("origin/main before main", (("heads/main", new_text),
+                                                 ("remotes/origin/main", old_text)), (0, "0")),
+                    ("origin/master before main", (("heads/main", old_text),
+                                                   ("remotes/origin/master", new_text)),
+                     (0, "1")),
+                    ("main before master", (("heads/master", new_text),
+                                            ("heads/main", old_text)), (0, "0")),
+                    ("master alone", (("heads/master", new_text),), (0, "1")),
+                    ("an older hook", (("heads/main", old_text),), (0, "0")),
+                    ("a comment-only mention", (("heads/main", "# the marker is at %s/<a>\n"
+                                                 % LANE_SYSTEM_DIR),), (0, "0")),
+                    ("an untrusted ref", (("heads/feature", new_text),), (9, "")),
+                    ("no hook", (("heads/main", None),), (9, "")))):
+                cases += 1
+                got = _read_hook(_repo("r%d" % n, refs))
+                expect("lane-marker-hook-reader " + label, got == want,
+                       "read %s, wanted %s" % (got, want))
+            cases += 1
+            planted = dict((k, os.environ.get(k)) for k in ("GIT_DIR", "GIT_WORK_TREE"))
+            os.environ["GIT_DIR"] = os.path.join(tmpK, "nowhere.git")
+            os.environ["GIT_WORK_TREE"] = os.path.join(tmpK, "nowhere")
+            try:
+                got = _read_hook(_repo("rplanted", (("heads/main", new_text),)))
+            finally:
+                for k, v in planted.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            expect("lane-marker-hook-reader ignores GIT_* around it", got == (0, "1"),
+                   "read %s" % (got,))
+            cases += 1
+            plain = os.path.join(tmpK, "plain")
+            os.makedirs(plain)
+            got = _read_hook(plain)
+            expect("lane-marker-hook-reader not a clone", got[0] == 7, "read %s" % (got,))
+            # A git that finds the ref and then fails to read it.
+            cases += 1
+            bindir = os.path.join(tmpK, "bin")
+            os.makedirs(bindir)
+            with open(os.path.join(bindir, "git"), "w") as fh:
+                fh.write('#!/bin/sh\ncase " $* " in *" cat-file -p "*) '
+                         'echo "simulated read failure" >&2; exit 3 ;; esac\n'
+                         'exec %s "$@"\n' % shlex.quote(real_git))
+            os.chmod(os.path.join(bindir, "git"), 0o755)
+            got = _read_hook(_repo("rfail", (("remotes/origin/main", new_text),)),
+                             path=bindir + os.pathsep + os.environ.get("PATH", ""))
+            expect("lane-marker-hook-reader a failed read", got[0] == 8, "read %s" % (got,))
+
     say("")
     if failures:
         for f in failures:
@@ -12408,7 +12805,9 @@ def _settled_ctx(conf):
         # root's, in root's /etc/claude-pipeline with every folder above it root's and
         # writable by no one else (the system probe, so before "dispatched-lane"); and
         # the old marker under the pins root, still there. First, so no broader needle
-        # answers them.
+        # answers them. The served repository's committed kit hook reads the system
+        # marker; its reader names the system folder too, so it goes first of all.
+        (".claude/hooks/pre-tool-use.py; p=", 0, "1\n"),
         ("git -C \"$p\" show", 0, json.dumps({"version": 1, "dispatch": {
             "pinsRoot": DEFAULT_PINS_ROOT}})),
         ("/etc/claude-pipeline", 0, "%s/%s\n0\n%s\n" % (
