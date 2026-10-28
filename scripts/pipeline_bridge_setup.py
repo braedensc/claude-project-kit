@@ -1083,19 +1083,23 @@ def selftest():
                and "sh -c 'rm ~/.stage-e/env.decoy-proof'" in _ck4), True)
         # KIT-227 review: the decoy is filled from ENV_FILE and is said to prove the rule
         # for the env file's sibling copies only. The env file's own rule is checked
-        # without reading it, by the chat lane's verify row that measures it. The only
-        # file the tech lead is asked to read is the decoy.
+        # without reading it, by the chat lane's verify row that measures it. The tech lead
+        # is asked to read decoys only: this one first, then the backups' and the state
+        # dir's, each from this env's own paths (KIT-262 review: the whole list, for every
+        # spelling here, not only the first read).
         import pipeline_chat_lane_setup as chat_lane
         for env in ("~/.stage-e/env", "/srv/role/bridge.env"):
             vconf, verrs = validate_conf(dict(values, ENV_FILE=env, DISPATCHER_ENV_FILE=""))
             card = cap(print_card, "CK-B4", vconf)[1]
             decoy = env + ".decoy-proof"
+            decoys = [decoy, os.path.dirname(env) + "/backups/decoy-proof",
+                      vconf["STATE_DIR"] + "/decoy-proof"]
             own, copies = chat_lane._path_rule(env), chat_lane._path_rule(env + ".*")
             asked = [a.rstrip(".,") for a in re.findall(r"ask the tech lead to read (\S+)",
                                                          card)]
             check("live-proofs-card-decoy-from-ENV_FILE:" + env,
-                  (verrs, asked[:1], "echo decoy > %s'" % decoy in card,
-                   "sh -c 'rm %s'" % decoy in card), ([], [decoy], True, True))
+                  (verrs, asked, "echo decoy > %s'" % decoy in card,
+                   "sh -c 'rm %s'" % decoy in card), ([], decoys, True, True))
             check("live-proofs-card-says-what-the-decoy-proves:" + env,
                   ("proves %s" % copies in card, "does not test %s" % own in card,
                    "same rule" in card), (True, True, False))
