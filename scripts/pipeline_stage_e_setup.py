@@ -5493,8 +5493,12 @@ DELIVERY_READ_SH = (
     'for r in origin/main origin/master main master; do '
     'git -C "$p" show "$r:delivery.json" 2>/dev/null && exit 0; done; exit 9')
 
+# The line by which a hook reads the system marker: the kit hook's own constant. A hook that
+# only mentions the folder (a comment, a docstring) does not read it.
+HOOK_SYSTEM_MARKER_LINE = 'LANE_MARKER_SYSTEM_DIR = "%s"' % LANE_SYSTEM_DIR
+
 # The committed kit hook, on the same refs in the same order: the first ref that holds
-# it is the one read. Prints 1 if it names the system marker's folder, 0 if not.
+# it is the one read. Prints 1 if it assigns the system marker's folder, 0 if not.
 # Exit 7: not a clone this account can read. Exit 9: no trusted ref holds the file.
 # Exit 8: a ref holds it and it could not be read. No pipe: a pipe's status is its last
 # command's, so a failed read would print 0 and read as "an older hook".
@@ -5503,8 +5507,8 @@ HOOK_READ_SH = (
     'for r in origin/main origin/master main master; do '
     'git -C "$p" cat-file -e "$r:$f" 2>/dev/null || continue; '
     'h=$(git -C "$p" cat-file -p "$r:$f") || exit 8; '
-    'case $h in *"%s"*) echo 1 ;; *) echo 0 ;; esac; exit 0; done; exit 9'
-    % (KIT_HOOK_PATH, LANE_SYSTEM_DIR))
+    'case $h in *%s*) echo 1 ;; *) echo 0 ;; esac; exit 0; done; exit 9'
+    % (KIT_HOOK_PATH, shlex.quote(HOOK_SYSTEM_MARKER_LINE)))
 
 # Prints the marker's path and its owner uid, then one line per folder above it up to /,
 # along the path as written and the path it resolves to: "<uid> <mode> <D|L> <folder>"
@@ -5648,10 +5652,10 @@ def step_lane_marker(ctx, apply_it):
     path, problems = _system_marker_problems(ctx)
     # The old marker, under each pins root. A served repository whose committed hook
     # predates the system marker reads only this one, so for it the old marker is
-    # required; for the rest it is reported for what it is. A look that fails hides
-    # nothing (the hook reads a marker it cannot look for as the lane), so it is a note,
-    # not an Unknown.
-    old, present, missing = [], {}, []
+    # required; for the rest it is reported for what it is. A look that fails is a note
+    # where the kit hook decides (it reads a marker it cannot look for as the lane), and
+    # Unknown where an older copy does, since how that copy treats it is not known.
+    old, present, missing, unread = [], {}, [], []
     for raw, repos in sorted(roots.items()):
         got = r.as_role(ctx.account, "/usr/bin/python3 -c %s %s"
                         % (shlex.quote(LANE_MARKER_PY), shlex.quote(raw.strip())))
@@ -5668,9 +5672,14 @@ def step_lane_marker(ctx, apply_it):
             continue
         owners = lines[1].split() if got.ok and len(lines) > 1 else []
         if len(owners) != 2:
-            notes.append("could not look for the old lane marker under %s as %s (exit %s); "
-                         "the hook counts a marker it cannot look for as the lane"
-                         % (raw, ctx.account, got.rc))
+            if raw in older:
+                unread.append("could not look for the old lane marker under %s as %s (exit "
+                              "%s), and the committed hook of %s reads only that one"
+                              % (raw, ctx.account, got.rc, ", ".join(older[raw])))
+            else:
+                notes.append("could not look for the old lane marker under %s as %s (exit "
+                             "%s); the hook counts a marker it cannot look for as the lane"
+                             % (raw, ctx.account, got.rc))
             continue
         old.append("%s (owner uids %s)" % (opath, " and ".join(owners)))
         present[raw] = old[-1]
@@ -5680,6 +5689,10 @@ def step_lane_marker(ctx, apply_it):
                             "root, whose folders the role account can rename"
                             % ", ".join(old))
         raise Blocked("CK-10", "; ".join(problems + missing))
+    if unread:
+        raise Unknown("; ".join(unread) + ", so whether its lane guards hold is not known",
+                      "Let the role account read that pins root, then run\n"
+                      "    python3 %s verify" % _self_path())
     every = not older and not no_hook
     for raw, o in sorted(present.items()):
         if raw in older:
@@ -12018,6 +12031,20 @@ def _selftest_body():
                and not any("adds nothing" in n for n in notesH2), "notes %s" % notesH2)
     except (Blocked, Unknown) as exc:
         failures.append("lane-marker-older-hook-kept: the row did not hold (%s)" % exc)
+    # A look for the old marker that fails, where an older hook reads only that one:
+    # Unknown, never a pass.
+    cases += 1
+    ctxH9, _fH9 = _lane_ctx(hook=older_hook,
+                            probe=(1, "Traceback (most recent call last)\n"))
+    try:
+        step_lane_marker(ctxH9, apply_it=False)
+        failures.append("lane-marker-older-hook-look-failed: the row held")
+    except Unknown as exc:
+        expect("lane-marker-older-hook-look-failed",
+               "/x/kit" in str(exc) and "reads only that one" in str(exc),
+               "Unknown %s" % exc)
+    except Blocked as exc:
+        failures.append("lane-marker-older-hook-look-failed: blocked (%s)" % exc.extra)
     # Every served repository's hook reads the system marker: only then "adds nothing".
     cases += 1
     ctxH3, fakeH3 = _lane_ctx(repos=(("/x/app", (0, "1\n")),))
@@ -12123,12 +12150,20 @@ def _selftest_body():
            "no hook reader (%s), or no git (%s)" % (type(hook_sh).__name__, real_git))
     if isinstance(hook_sh, str) and real_git:
         with tempfile.TemporaryDirectory() as tmpK:
-            genv = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e",
-                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e")
+            # No GIT_* from around the selftest (a git hook sets GIT_DIR, GIT_INDEX_FILE and
+            # more): with them, `git -C <tmp repo>` would act on the outer repository. Read
+            # at each call, so a variable set later is dropped too.
+            def bare_env():
+                return dict((k, v) for k, v in os.environ.items()
+                            if not k.startswith("GIT_"))
 
             def _gitK(*a, cwd=None):
                 return subprocess.run([real_git, "-c", "commit.gpgsign=false"] + list(a),
-                                      cwd=cwd, capture_output=True, text=True, env=genv)
+                                      cwd=cwd, capture_output=True, text=True,
+                                      env=dict(bare_env(), GIT_AUTHOR_NAME="t",
+                                               GIT_AUTHOR_EMAIL="t@e",
+                                               GIT_COMMITTER_NAME="t",
+                                               GIT_COMMITTER_EMAIL="t@e"))
 
             hook_rel = ".claude/hooks/pre-tool-use.py"
             new_text = 'LANE_MARKER_SYSTEM_DIR = "%s"\n' % LANE_SYSTEM_DIR
@@ -12155,7 +12190,7 @@ def _selftest_body():
                 return d
 
             def _read_hook(d, path=None):
-                env = dict(os.environ, GIT_CEILING_DIRECTORIES=tmpK)
+                env = dict(bare_env(), GIT_CEILING_DIRECTORIES=tmpK)
                 if path:
                     env["PATH"] = path
                 res = subprocess.run(["/bin/sh", "-c", hook_sh % shlex.quote(d)],
@@ -12174,12 +12209,28 @@ def _selftest_body():
                                             ("heads/main", old_text)), (0, "0")),
                     ("master alone", (("heads/master", new_text),), (0, "1")),
                     ("an older hook", (("heads/main", old_text),), (0, "0")),
+                    ("a comment-only mention", (("heads/main", "# the marker is at %s/<a>\n"
+                                                 % LANE_SYSTEM_DIR),), (0, "0")),
                     ("an untrusted ref", (("heads/feature", new_text),), (9, "")),
                     ("no hook", (("heads/main", None),), (9, "")))):
                 cases += 1
                 got = _read_hook(_repo("r%d" % n, refs))
                 expect("lane-marker-hook-reader " + label, got == want,
                        "read %s, wanted %s" % (got, want))
+            cases += 1
+            planted = dict((k, os.environ.get(k)) for k in ("GIT_DIR", "GIT_WORK_TREE"))
+            os.environ["GIT_DIR"] = os.path.join(tmpK, "nowhere.git")
+            os.environ["GIT_WORK_TREE"] = os.path.join(tmpK, "nowhere")
+            try:
+                got = _read_hook(_repo("rplanted", (("heads/main", new_text),)))
+            finally:
+                for k, v in planted.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            expect("lane-marker-hook-reader ignores GIT_* around it", got == (0, "1"),
+                   "read %s" % (got,))
             cases += 1
             plain = os.path.join(tmpK, "plain")
             os.makedirs(plain)
