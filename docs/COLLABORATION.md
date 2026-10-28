@@ -516,19 +516,24 @@ Stop hook between them:
      from the **dispatcher**, never the session — the pinned ticket and session
      mode from a pin file *outside* the worktree, config values from the committed
      copy on the default branch, states and labels compared by **ID** rather than
-     display name. They block: moving a
-     ticket into the `ready` state (**approving work is a human's action, with no
-     in-session exception** — only `epic/*` provenance auto-approves and only *out of
+     display name, and every git read made without the session's `GIT_*` variables
+     and without a global git config (a planted `GIT_DIR`, or a broken global config
+     at a planted `$HOME`, used to turn the pipeline off, KIT-240). They block:
+     moving a ticket into the `ready` state (**approving work is a human's action,
+     with no in-session exception** — only `epic/*` provenance auto-approves and only *out of
      session*, through `scripts/check_auto_approve.py`, which can read the epic;
      `autonomy.autoApproveProvenance` configures that out-of-session tier and is not
-     a permission a session holds); any tracker write **naming** a protected label —
-     `agent:*`, `blocked:*`, `provenance:*` or the exact `hooks-change` — which is
-     supervision or a human/executor signal and not the session's to edit (the same
+     a permission a session holds); in a pinned or dispatched session, a tracker
+     write that sets a state by anything but its ID (`state: "Ready"` is a state the
+     guard cannot tell from `ready`; the IDs are `linear.stateIds`); any tracker write
+     **naming** a protected label — `agent:*`, `blocked:*`, `provenance:*` or the
+     exact `hooks-change` — which is supervision or a human/executor signal and not the session's to edit (the same
      set the gh/Bash path refuses, enforced on the tracker-MCP path too); tracker
      writes outside the session's own ticket, including creating tickets directly in
      `ticket` mode (a finding is *requested* through the safe-outputs `ticket-create`
      kind instead, §8); editing the session's own
-     in-progress acceptance criteria; Edit/Write/Bash mutations of grader paths
+     in-progress acceptance criteria, a partial `patch` of its description included;
+     Edit/Write/Bash mutations of grader paths
      (`.github/workflows/**`, `delivery.json`, `autonomy.riskPaths`, **and the
      staging mirrors `templates/workflows/**` and `templates/hooks/**`** — the
      inert copies that *become* the guarded paths at bootstrap, so gating only
@@ -542,12 +547,15 @@ Stop hook between them:
      **closed**; checks that merely withhold autonomy from an *unpinned* session fail
      **open**, so a human's ad-hoc session in a configured repo is never bricked. A
      session on a dispatcher's lane that writes no pin is not ad-hoc: its account
-     carries a root-owned lane marker under the pins root (card CK-10), and with it the
+     carries a root-owned lane marker, `/etc/claude-pipeline/dispatched-lane/<account>`
+     in folders root owns all the way down (card CK-10; the older one under the pins
+     root still counts, but the role account can rename its folders), and with it the
      tracker guards apply as for a pinned `ticket` session, its own ticket read from
      the name of the session's worktree folder, or its parent (KIT-241). A marker the
-     hook cannot check for counts as there. `~` in the pins root is the account's
-     home from the account database, never `$HOME`, for the pin as for the marker;
-     and moving `delivery.json` out of the working tree leaves the pipeline on while
+     hook cannot check for counts as there, and with a marker no pin is read: none is
+     written for that account, so one found there was forged. `~` in the pins root is
+     the account's home from the account database, never `$HOME`, for the pin as
+     for the marker; and moving `delivery.json` out of the working tree leaves the pipeline on while
      a commit still holds it. An
      **expiry is not an absence**, though: a lapsed pin means a binding was issued
      and can no longer be verified, so reading it as "unpinned" would make waiting an

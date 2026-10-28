@@ -118,19 +118,29 @@ are all agent-mutable, so:
   holds while the **ref** is not model-movable either, which is what the universal
   config-anchor guard below is for;
 - states and labels are compared **by ID**, never by display name, so a rename in the
-  tracker UI cannot silently desync a guard.
+  tracker UI cannot silently desync a guard;
+- every git (and `gh`) call the hook makes runs **without the session's `GIT_*`
+  variables, and git reads no global config** (`GIT_CONFIG_GLOBAL` is the null device,
+  so a `$HOME` or `$XDG_CONFIG_HOME` the session moved names nothing it reads; the
+  account's own is not read either, since a dispatcher's sandbox denies reading home
+  folders and git stops on a config it is not permitted to read). The dispatcher loads a worktree's env file into the next session (KIT-240), and a
+  planted `GIT_DIR`, `GIT_OBJECT_DIRECTORY`, or malformed global git config used to make
+  every git read answer from elsewhere or fail: with `delivery.json` moved aside that read
+  as "the pipeline is off", and a planted `GIT_DIR` could hand the hook another
+  repository's branch or config. (The transcript-folder resolver is the one call left as
+  it was, because it must stay byte-identical in all three hooks.)
 
 | Guard | Active when | What it blocks |
 |---|---|---|
-| **State transition / self-approval** | configured | Any tracker write setting a ticket to the configured `ready` state — **an approval is a human's action, and there is no in-session exception.** Only `epic/*` provenance ever auto-approves, and only *out of session* (contract §2, §5); the gate is `scripts/check_auto_approve.py`, which can read the epic and re-derive every condition from sources a session cannot write. `autonomy.autoApproveProvenance` configures **that** tier (§11) — this hook does not read it, and two paired battery cases (one config listing `epic`, one empty, same payload, same block) pin that it reads it in neither direction |
-| **Protected-label** | configured + pinned, or on the dispatcher's lane (KIT-241) | Any tracker write **naming** a protected label — `agent:*`, `blocked:*`, `provenance:*`, or the exact `hooks-change` — matched by canonical key *and* by configured ID, in `add` and `remove` alike. **This is the same set the gh/Bash path refuses, now enforced on the tracker-MCP path too** (`mcp__linear__save_issue(labels=[…])` cannot set one where `gh issue edit --add-label` is already blocked). `agent:*`/`blocked:*` are dispatcher-owned supervision (§6); `provenance:*` is the origin class — a session setting `provenance:human` fakes a human's signal and `provenance:agent` is the safe-outputs executor's to apply (§5, §8); `hooks-change` is a human's guard-change acknowledgement. Whole-field-value matching, so *asking* for a label in a comment is untouched. Key matching is what keeps it failing closed when `linear.labels.ids` resolves nothing |
+| **State transition / self-approval** | configured | Any tracker write setting a ticket to the configured `ready` state — **an approval is a human's action, and there is no in-session exception.** Only `epic/*` provenance ever auto-approves, and only *out of session* (contract §2, §5); the gate is `scripts/check_auto_approve.py`, which can read the epic and re-derive every condition from sources a session cannot write. `autonomy.autoApproveProvenance` configures **that** tier (§11) — this hook does not read it, and two paired battery cases (one config listing `epic`, one empty, same payload, same block) pin that it reads it in neither direction. The `ready` ID matches whatever the case of its letters. **And because it is matched by ID, a supervised session sets states by ID:** pinned, or on the dispatcher's lane, a tracker issue write that sets a state by anything else — a name (`state: "Ready"`), a state type (`unstarted`) — is refused, since the guard cannot tell it from `ready`. The IDs are `linear.stateIds` in the committed `delivery.json`; nothing the kit tells a session to do sets a state by name (`/work` and `/ship` move the own ticket through a safe-outputs `ticket-state` request, `/plan-epic` files with `stateIds.raw`). A person's session is not asked, and a project's `state` (its status) is not an issue's |
+| **Protected-label** | configured + pinned, or on the dispatcher's lane (KIT-241) | Any tracker write **naming** a protected label — `agent:*`, `blocked:*`, `provenance:*`, or the exact `hooks-change` — matched by canonical key *and* by configured ID, in `add` and `remove` alike. A configured ID matches whatever the case of its letters, as the `ready` ID does. The label tools are tracker writes too: `create_issue_label`, `save_issue_label` and `save_project_label`, and the lifecycle verbs `retire_issue_label`, `restore_issue_label`, `retire_project_label` and `restore_project_label` — retiring `agent:blocked` takes it off the board as surely as removing it from a ticket. **This is the same set the gh/Bash path refuses, now enforced on the tracker-MCP path too** (`mcp__linear__save_issue(labels=[…])` cannot set one where `gh issue edit --add-label` is already blocked). `agent:*`/`blocked:*` are dispatcher-owned supervision (§6); `provenance:*` is the origin class — a session setting `provenance:human` fakes a human's signal and `provenance:agent` is the safe-outputs executor's to apply (§5, §8); `hooks-change` is a human's guard-change acknowledgement. Whole-field-value matching, so *asking* for a label in a comment is untouched. Key matching is what keeps it failing closed when `linear.labels.ids` resolves nothing |
 | **Own-ticket-only writes** | configured + pinned, or on the dispatcher's lane (KIT-241) | Tracker mutations outside the session's own ticket (decision table below) |
-| **AC integrity** | configured + pinned ticket, or on the dispatcher's lane (its own ticket) | Editing the session's **own in-progress** ticket's description / acceptance criteria / title. Review compares the PR against the snapshot taken at dispatch, so a session that can rewrite its own ACs can make scope creep look compliant — the ticket-layer twin of weakening a test assertion. Comments and status changes stay allowed |
+| **AC integrity** | configured + pinned ticket, or on the dispatcher's lane (its own ticket) | Editing the session's **own in-progress** ticket's description / acceptance criteria / title — a `patch` (the Linear MCP's partial edit of the description) included. Review compares the PR against the snapshot taken at dispatch, so a session that can rewrite its own ACs can make scope creep look compliant — the ticket-layer twin of weakening a test assertion. Comments and status changes stay allowed |
 | **Grader-path protection** | configured + pinned | Edit/Write **and** Bash mutations of `.github/workflows/**`, **`templates/workflows/**` and `templates/hooks/**`**, `delivery.json`, and every glob in `autonomy.riskPaths` — the machinery that decides whether the work is acceptable. Uses the *same* operator scaffold as self-protection (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/…`, any interpreter naming the path); reads and `git add` stay allowed. **Hook scripts and `settings*.json` remain blocked unconditionally, pipeline or not** — nothing here made that mode-conditional. **The staging mirrors are on the floor with the paths they mirror:** `templates/` holds the inert copies that *become* `.github/workflows/**` and `.claude/hooks/**` at bootstrap (`templates/README.md` is the activation table), so the staged bytes are the ones CI later runs holding repository secrets. Gating only the destination attaches the guard when a file becomes **visible** rather than when its contents are **decided**, and leaves the activation as a bare `git mv` that reads in review as "just a move". The rule, so the next mirror needs no patch: *for every floored path, its staging copy is floored with it.* `templates/README.md` and `templates/scripts/**` are not mirrors of a floored path and stay editable |
 | **Ticket-branch** | configured + `branch.requireTicketId` | Edit/Write/`git commit` on a branch whose ticket segment isn't the pinned ID. The branch regex is lower-case only, so tracker IDs **must** be lower-cased (`feat/eng-123-token-refresh`) and the comparison is case-**in**sensitive |
 | **Pin binding** | configured | A malformed pin, an unrecognized `pin_version`, a pin written for a **different worktree**, or — on a `ticket`-mode session — an **expired** one. A hard stop, not a warning. **An expiry is not an absence:** an absence means nothing ever bound this session (a human's ad-hoc session, which must not be bricked), while a lapse means a binding *was* issued for this worktree and its ticket, scope and branch can no longer be verified — §2 calls that broken. Reading a lapse as "unpinned" would switch five of six pipeline guards off and make **waiting** an escape. §2 scopes broken to `ticket` mode, so a lapsed `planning` pin keeps working — but the pin object is still read, so every constraint it carried stays on |
 | **Config anchor** | **always** (universal) | Writing a protected git ref — `git update-ref`, `branch -f/-D/-M main`, a fetch/pull **refspec** targeting `main`/`master`, `symbolic-ref`, `replace`, history rewriters — plus repointing `origin` (`remote set-url/remove/rename`, `git config remote.origin.url`) and any mutation of `.git/**` in Bash or Edit/Write. Guards deliberately read values from the default branch *because* the worktree is model-writable; that only holds while the ref is not, and one `git update-ref` would otherwise pick the `delivery.json` those guards then read — `dispatch.pinsRoot` included, which is a forged pin. Reads and a plain `git fetch` (the one honest writer of `origin/main`) stay allowed, as does `git remote add origin`, which cannot repoint a remote that already exists. Tamper-**evident**, not tamper-proof — same posture §3 states for the pin |
-| **Pins-root containment** | configured | A `dispatch.pinsRoot` that resolves inside the repo or any worktree, or isn't a string, or is a `~` path the account database gives no home for — **broken config**, not a silent default. It checks the path the pin is read from, so `~` is the account's home here too, whatever `$HOME` says. §7 makes it a validator hard-fail; the hook re-checks because it must not assume the validator ran, and because this is what a poisoned config would target first: a pins directory the session can write is a pin the session can forge |
+| **Pins-root containment** | configured | A `dispatch.pinsRoot` that resolves inside the repo or any worktree, or isn't a string, or does not resolve to an absolute path (a `~` path the account database gives no home for, a relative path, `~name` for no such account) — **broken config**, not a silent default. A relative path would be read from the hook's cwd, which a session moves with `cd`. It checks the path the pin is read from, so `~` is the account's home here too, whatever `$HOME` says. §7 makes it a validator hard-fail; the hook re-checks because it must not assume the validator ran, and because this is what a poisoned config would target first: a pins directory the session can write is a pin the session can forge |
 
 **Own-ticket-only writes — the decision table** (the approval guard above applies on top
 of every row):
@@ -138,7 +148,7 @@ of every row):
 | Session state | Own ticket | Another ticket | No resolvable target |
 |---|---|---|---|
 | pipeline off, or no pin and no lane marker (a human's ad-hoc session) | allow | allow | allow |
-| no pin, **lane marker** present, or the hook could not check for one (a dispatcher that binds by delegation, KIT-241) | allow (the ticket the worktree folder, or its parent, is named after) | **deny** | **deny** for issue writes and creates (fail closed); allow for comments |
+| **lane marker** present, or the hook could not check for one (a dispatcher that binds by delegation, KIT-241); a pin is then not read | allow (the ticket the worktree folder, or its parent, is named after) | **deny** | **deny** for issue writes and creates (fail closed); allow for comments |
 | …and the worktree folder names **no ticket** | — | **deny** any write naming a ticket | **deny** for issue writes and creates; allow for comments |
 | `ticket` mode | allow | **deny** | **deny** for issue writes (fail closed); allow for comments |
 | `ticket` mode, **create**-type call (no target) | — | — | **deny** — a session never creates a ticket *directly*. File a finding through the safe-outputs `ticket-create` request (contract §8), which a credential-holding executor applies into the backlog as `provenance:agent`, out of session |
@@ -147,20 +157,31 @@ of every row):
 
 **The dispatcher's lane (KIT-241).** A dispatcher that binds by a person's delegation
 writes no pin, so its sessions used to read as ad-hoc ones and these guards failed open
-for them. Its account now carries a **lane marker**, `<pinsRoot>/dispatched-lane/<OS
-account>`: a root-owned file under the pins root, outside every worktree, written by the
-Stage E installer's card CK-10 and measured by its `lane-marker` row. With it and no
-pin, protected labels and direct creates are refused, and writes must name the ticket
-the worktree folder is named after (the dispatcher cuts `<base>/<ISSUE-ID>`, or
+for them. Its account now carries a **lane marker**,
+`/etc/claude-pipeline/dispatched-lane/<OS account>`: a root-owned file in folders root
+owns all the way down, written by the Stage E installer's card CK-10 and measured by its
+`lane-marker` row (which checks every folder above it, up to `/`). The older marker,
+`<pinsRoot>/dispatched-lane/<OS account>`, still counts — either one makes the lane —
+but the role account created the pins root and can rename the folders under it, which
+takes that one out of sight; it cannot rename root's `/etc`. Looked for with `lstat`, so
+the entry counts, not what it points at. **The marker wins over a pin:** no dispatcher
+writes a pin for a marked account, so a pin found for one was forged (the pins root is
+that account's to write when its sandbox lets a write leave the worktree), and the hook
+does not read it at all — a forged maintenance pin used to switch the lane off. With the
+marker, protected labels and direct creates are refused, writes must name the ticket the
+worktree folder is named after (the dispatcher cuts `<base>/<ISSUE-ID>`, or
 `<base>/<ISSUE-ID>/<repo>` for several repositories; a grandparent folder does not
-count). Any team's key counts, so a Stage E review session in `REV-12` owns `REV-12`.
+count), and that ticket's description, acceptance criteria and title may not be
+rewritten, by a `patch` either (AC integrity). Any team's key counts, so a Stage E review
+session in `REV-12` owns `REV-12`.
 The folder is read from the session's own root, never from a subagent's widened one, so
 a subagent acting from a sibling worktree does not get that worktree's ticket. The
 account and its home are read from the account database, never `$USER`, `$LOGNAME` or
 `$HOME`, because the dispatcher loads a worktree's env file into the next session
 (KIT-240). **Could not check is not absent:** only "no such file" means no marker; any
 other error, or an account the database cannot name, counts as the lane. Grader-path
-protection stays pinned-only.
+protection stays pinned-only: turning it on changes what a live coding session may edit,
+so it is the owner's call, and two battery cases pin it off.
 
 **Fail direction is tested, not just asserted.** Write-blocking guards, state
 transitions and pin checks fail **closed**; checks that merely *withhold* autonomy from
@@ -182,13 +203,19 @@ the battery at the candidate with `HOOK_UNDER_TEST=/abs/path/<root>/.claude/hook
 npm run test:hooks`; the candidate must sit in a `<root>/.claude/hooks/` layout inside a
 git repo on a feature branch, because the battery derives each run's session root from
 the hook's own location exactly as production does. Unset in CI, so it can never change
-what CI verifies.
+what CI verifies. One line of each pipeline sandbox's copy differs from the hook under
+test: the system lane-marker folder (`/etc/claude-pipeline/dispatched-lane`), pointed at a
+folder of the sandbox's own, since no battery may write `/etc` and a machine running it
+may carry a real marker. A case checks the hook names that path exactly once.
 
 **Known limits** (documented rather than implied): the pin is *tamper-evident, not
 tamper-proof* — the session's shell runs as the same user, so `0444` and a path outside
 the repo raise the cost of deleting or rewriting a pin without making it impossible; a
 deleted pin degrades to the unpinned (fail-open-for-withholding) path, and the ledger is
-what makes that divergence visible. Tracker mutations are recognized by tool **verb**
+what makes that divergence visible. On the dispatcher's lane a pin is not read at all, so
+neither forging nor deleting one changes anything there. A comment or relation naming
+another ticket by an internal UUID passes on that lane, as the contract allows a target
+the guard cannot resolve (§4 reporting). Tracker mutations are recognized by tool **verb**
 plus self-identifying payload values (a configured state/label ID, or a
 `<teamKey>-<n>` identifier as a whole field value), deliberately *not* by MCP server
 name — Claude Code names servers however the user wired them. An unknown verb carrying a
