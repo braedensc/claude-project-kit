@@ -33,7 +33,8 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
     card      prints a checkpoint card: CK-C1 (create the chat app), CK-C2 (the front
               door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
               from a second device), CK-C5 (restart the dispatcher, only when it is
-              idle), CK-C6 (turn the lane off).
+              idle), CK-C6 (turn the lane off), CK-C7 (give the chat app groups:read,
+              before any dispatcher upgrade past 0.2.73).
 
 WHAT CHANGED ON 2026-09-24 (owner decision, KIT-197).  This file used to print and read
 only. The chat lane was then switched on by hand on a deployment, and three live-file
@@ -93,6 +94,9 @@ WHERE EVERY CLAIM COMES FROM.  The dispatcher's source at its installed version,
 cited as <package>/<file>:<line>. Package names drop the `cyrus-` prefix below where
 unambiguous. The Slack scope facts come from Slack's method and event reference pages;
 the permission-rule facts from Claude Code's permissions page; both read 2026-09-17.
+Piece 6 alone was read again at 0.2.73 (KIT-287, 2026-10-29): the five files it cites
+are byte for byte 0.2.69's, and its one EdgeWorker.js span moved. Its groups:read scope
+cites the 0.2.74 prerelease by name, and Slack's groups:read page, read that day.
 
 THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
 1. EVERY EFFECT OF CYRUS_HOST_EXTERNAL=true (all eleven reads, 0.2.69):
@@ -152,7 +156,9 @@ THREE THINGS SETTLED FROM SOURCE BEFORE COMPOSING
 3. MINIMAL SLACK SCOPES AND EVENTS — see SCOPE_CITES and EVENT_CITES below: every Web API
    method the transport, the chat adapter and the reaction service call, and every event
    type they consume. The Slack tool server the dispatcher also starts (edge-worker
-   McpConfigService.js:87-99) may want more; none is added.
+   McpConfigService.js:87-99) may want more; none is added. One scope is ahead of the
+   installed version: groups:read, which the 0.2.74 prerelease needs before it handles
+   any event (piece 6).
 """
 import argparse
 import contextlib
@@ -191,6 +197,9 @@ from pipeline_stage_e_setup import (  # noqa: E402
 from pipeline_stage_a_setup import PLANNING_BRIEF_FINGERPRINT  # noqa: E402
 
 SOURCE_VERSION = "0.2.69"
+# Piece 6, the chat app's Slack manifest, was read again at this version (KIT-287). The
+# rest of this file still cites SOURCE_VERSION.
+PIECE_6_SOURCE_VERSION = "0.2.73"
 ROOT = os.path.dirname(HERE)
 
 # --------------------------------------------------------------------------- #
@@ -867,6 +876,14 @@ def repo_deny_drift(settings):
 # (the token is read from the environment and never refreshed: SlackEventTransport.js:53-55,
 # SlackChatAdapter.js:63-65), Socket Mode (the transport is inbound HTTP only:
 # SlackEventTransport.js:84-89), and anything the Slack tool server might want.
+#
+# GROUPS:READ IS AHEAD OF THE INSTALLED VERSION (KIT-287). 0.2.73 never calls
+# conversations.info. The 0.2.74 prerelease calls it before it handles any Slack event,
+# and drops the event with a 200 and no log line when the call fails; in a private
+# channel the call needs groups:read. So without the scope the lane goes silent on that
+# upgrade. Card CK-C7 adds it to an app made before this; verify cannot read an app's
+# scopes, so it says NOT PROVEN. Read again at PIECE_6_SOURCE_VERSION: the files cited
+# here are byte for byte 0.2.69's, except EdgeWorker.js, whose one span below moved.
 # --------------------------------------------------------------------------- #
 SCOPE_CITES = {
     "app_mentions:read": (
@@ -879,6 +896,13 @@ SCOPE_CITES = {
         "conversations.replies in a private channel, for thread context "
         "(SlackMessageService.js:71-93; SlackChatAdapter.js:215-227); and the "
         "message.groups event, for follow-ups in a thread (SlackEventTransport.js:221-235)"),
+    "groups:read": (
+        "conversations.info on the private channel, which the 0.2.74 prerelease calls "
+        "before it handles any Slack event, dropping the event when the call fails "
+        "(slack-event-transport 0.2.74-cypack1546.0 SlackChannelPolicy.js:44-65, called "
+        "at SlackEventTransport.js:244-247; edge-worker 0.2.74-cypack1546.0 "
+        "SlackChatAdapter.js:55-64). 0.2.73 never calls it. An app made before piece 6 "
+        "asked for it gains it with card CK-C7"),
     "reactions:write": (
         "reactions.add and reactions.remove: the receipt and done reactions "
         "(SlackReactionService.js:18-30; SlackChatAdapter.js:314-319, 342-343)"),
@@ -890,7 +914,7 @@ EVENT_CITES = {
     "message.groups": (
         "a plain reply in a private-channel thread the bot is already bound to continues "
         "it (SlackEventTransport.js:221-235; SlackChatAdapter.js:88-99; thread following "
-        "is on unless turned off: EdgeWorker.js:664-673)"),
+        "is on unless turned off: EdgeWorker.js:692-701)"),
 }
 CHAT_APP_NAME = "Pipeline chat"
 CHAT_BOT_NAME = "pipeline-chat"
@@ -1570,7 +1594,8 @@ def _compose_piece_6(conf):
     for line in json.dumps(slack_manifest(conf), indent=2).splitlines():
         say("    " + line)
     say("")
-    say("  Each scope, and the dispatcher code that needs it:")
+    say("  Each scope, and the dispatcher code that needs it (read at %s):"
+        % PIECE_6_SOURCE_VERSION)
     for scope in sorted(SCOPE_CITES):
         say("    %s" % scope)
         para(SCOPE_CITES[scope], "      ")
@@ -1913,7 +1938,7 @@ CARDS = {
                "both at hidden prompts, once the port block is loaded, and writes them",
                "itself. Never paste either into a chat, a ticket, a pull request or a",
                "repository."],
-        "good": ("an app with exactly the four bot scopes of piece 6, no user scopes, "
+        "good": ("an app with exactly the five bot scopes of piece 6, no user scopes, "
                  "installed, and its two secrets still only in Slack"),
         "not": "the notifier's app or token used for this — two apps, two tokens",
     },
@@ -2107,6 +2132,48 @@ CARDS = {
                  "the port block still loaded"),
         "not": ("401 on the chat path — the door still forwards it; or no 401 on the "
                 "tracker path — tickets no longer arrive"),
+    },
+    # CK-C7 (KIT-287): groups:read for a chat app made before piece 6 asked for it. Only
+    # a person signed in to Slack can add a scope, and verify cannot read one, so this
+    # card is the check. env-names is in it because Slack's pages do not say whether a
+    # reinstall keeps the bot token: it says UNCHANGED when nothing changed.
+    "CK-C7": {
+        "title": "Give the chat app groups:read, before the dispatcher goes past 0.2.73",
+        "why": ("The dispatcher's 0.2.74 prerelease asks Slack about each message's channel "
+                "before it does anything with it. In a private channel, that question "
+                "needs the groups:read scope. Without it, the dispatcher drops every "
+                "message from the channel and says nothing: no reaction, no answer, no "
+                "log line. A chat app made before piece 6 asked for the scope does not "
+                "have it. Only you can add it, signed in to Slack, and verify cannot see "
+                "an app's scopes from here. On 0.2.73 nothing uses the scope yet, so "
+                "adding it now changes nothing you can see."),
+        "do": ["In Slack's app settings, open the chat lane's app: %s, unless you"
+               % CHAT_APP_NAME,
+               "renamed it. Its bot is @%s. Not the notifier's app, and not the"
+               % CHAT_BOT_NAME,
+               "bridge's.",
+               "Under OAuth & Permissions -> Scopes -> Bot Token Scopes, click Add an",
+               "OAuth Scope and pick groups:read.",
+               "Slack then shows a banner asking you to reinstall the app. Click it,",
+               "and Allow.",
+               "Back on OAuth & Permissions, Bot Token Scopes should list five:",
+               "    app_mentions:read, chat:write, groups:history, groups:read, "
+               "reactions:write",
+               "Slack's pages don't say whether a reinstall keeps the bot token, so",
+               "run this and paste the two values Slack shows now: the Bot User OAuth",
+               "Token on OAuth & Permissions, and the Signing Secret under Basic",
+               "Information:",
+               "    %s env-names" % ME,
+               "UNCHANGED means nothing changed, and there is nothing to restart. If it",
+               "wrote the file, restart with the card it prints, CK-C5.",
+               "Then mention the bot once in the private channel. It should react and",
+               "answer.",
+               "Do all of this before any dispatcher upgrade past 0.2.73."],
+        "good": ("Bot Token Scopes list five, groups:read among them, and the bot "
+                 "reacts to and answers a mention in the private channel"),
+        "not": ("a banner in the app's settings still asking you to reinstall: the new "
+                "scope counts only after the reinstall; or groups:read added to the "
+                "notifier's or the bridge's app instead of the chat lane's"),
     },
 }
 
@@ -3430,6 +3497,18 @@ def print_rows(rows):
                 para(line, "      ", 104)
 
 
+# KIT-287: the one thing the 0.2.74 prerelease needs that no row can read. A Slack
+# app's scopes live in Slack, and verify has no Slack access, so it says so on every
+# run, whatever the rows found. Not a row: one that could only ever read UNKNOWN would
+# make UNKNOWN this lane's normal state, and hide a real one behind it.
+GROUPS_READ_NOT_PROVEN = (
+    "NOT PROVEN: that the chat app holds groups:read. I can't see a Slack app's scopes "
+    "from here. An app made from piece 6 as it is now asks for it. If your app's Bot "
+    "Token Scopes list four, without groups:read, card CK-C7 walks you through adding "
+    "it. Do that before any dispatcher upgrade past 0.2.73: without it, the 0.2.74 "
+    "prerelease drops every message from the private channel and says nothing.")
+
+
 def cmd_verify(conf, runner, sudo):
     found = agent_env_markers_present()
     if found:
@@ -3464,6 +3543,7 @@ def cmd_verify(conf, runner, sudo):
     say("")
     say("No drift: every check measures as applied." if code == EX_OK else
         "Not clean (exit %d). Apply what the rows name, then run verify again." % code)
+    para(GROUPS_READ_NOT_PROVEN, "", 88)
     say("Not measured from here, so they are cards: the Slack app (CK-C1), the front door's "
         "answers from outside (CK-C2), the live session (CK-C3) and the port from a second "
         "device (CK-C4).")
@@ -5151,7 +5231,8 @@ def _selftest_body():
     manifest = slack_manifest(conf)
     scopes = manifest["oauth_config"]["scopes"]["bot"]
     expect("manifest-scopes-exact", sorted(scopes) == sorted(
-        ["app_mentions:read", "chat:write", "groups:history", "reactions:write"])
+        ["app_mentions:read", "chat:write", "groups:history", "groups:read",
+         "reactions:write"])
         and set(scopes) == set(SCOPE_CITES), scopes)
     expect("manifest-scopes-cited", all(".js:" in SCOPE_CITES.get(s, "") for s in scopes))
     events = manifest["settings"]["event_subscriptions"]["bot_events"]
@@ -5163,6 +5244,26 @@ def _selftest_body():
            manifest["settings"]["token_rotation_enabled"] is False
            and manifest["settings"]["socket_mode_enabled"] is False)
     expect("manifest-no-user-scopes", set(manifest["oauth_config"]["scopes"]) == {"bot"})
+    # KIT-287: groups:read, which the 0.2.74 prerelease's channel check needs, is cited to
+    # that check by file and line; piece 6 says which version it was read at, and its one
+    # EdgeWorker.js span is 0.2.73's.
+    cite = SCOPE_CITES.get("groups:read", "")
+    expect("manifest-groups-read-cites-the-channel-check", all(t in cite for t in (
+        "slack-event-transport 0.2.74-cypack1546.0 SlackChannelPolicy.js:44-65",
+        "SlackEventTransport.js:244-247",
+        "edge-worker 0.2.74-cypack1546.0 SlackChatAdapter.js:55-64",
+        ". 0.2.73 never calls it.", "CK-C7")), cite)
+    _rc, piece6 = _capture(_compose_piece_6, conf)
+    expect("piece-6-says-which-version-it-read",
+           "the dispatcher code that needs it (read at 0.2.73):" in piece6
+           and "SlackChannelPolicy.js:44-65" in " ".join(piece6.split()), piece6[-1500:])
+    expect("piece-6-thread-following-cite-is-0.2.73s",
+           "EdgeWorker.js:692-701" in EVENT_CITES["message.groups"]
+           and "664-673" not in EVENT_CITES["message.groups"], EVENT_CITES["message.groups"])
+    # Only piece 6 was read again. SOURCE_VERSION moves when every cite in this file has been.
+    expect("source-version-is-what-was-read", SOURCE_VERSION == "0.2.69"
+           and globals().get("PIECE_6_SOURCE_VERSION") == "0.2.73",
+           (SOURCE_VERSION, globals().get("PIECE_6_SOURCE_VERSION")))
 
     # -- 9. every conf error in one pass --------------------------------------
     bad = ("ROLE_ACCOUNT=bad account\n"
@@ -5336,6 +5437,25 @@ def _selftest_body():
         rc_v, printed, fake, sudo = verify_with(ran)
         outputs.append(printed)
         expect("verify-match-exit-0", rc_v == EX_OK, printed)
+        # KIT-287: a clean run still says the chat app's groups:read is NOT PROVEN, gives
+        # the owner a test he can do (four Bot Token Scopes) and card CK-C7, before the
+        # upgrade that needs it, wrapped like every other paragraph; and no row claims it:
+        # verify has no Slack access, so its rows are exactly CHECKS, and none of them is
+        # about the Slack app.
+        flat_v = " ".join(printed.split())
+        row_names = re.findall(r"^  ([a-z][a-z-]*) +(?:%s) " % "|".join(
+            re.escape(o) for o in _SEVERITY), printed, re.M)
+        not_proven = [ln for ln in printed.splitlines()
+                      if ln.startswith("NOT PROVEN: that the chat app holds groups:read")]
+        expect("verify-groups-read-not-proven-on-a-clean-run", rc_v == EX_OK
+               and "NOT PROVEN: that the chat app holds groups:read" in flat_v
+               and "If your app's Bot Token Scopes list four, without groups:read, card "
+               "CK-C7 walks you through adding it" in flat_v
+               and "before any dispatcher upgrade past 0.2.73" in flat_v
+               and len(not_proven) == 1 and len(not_proven[0]) <= 88
+               and row_names == list(CHECKS)
+               and not re.search(r"ALREADY-DONE[^\n]*groups:read", printed),
+               (row_names, printed[-900:]))
         expect("verify-no-writes", fake.writes == [], fake.writes)
         expect("verify-sudo-once", sudo.acquisitions == 1, sudo.acquisitions)
         argv = fake.argvs[0] if fake.argvs else []
@@ -5368,6 +5488,12 @@ def _selftest_body():
         outputs.append(printed)
         expect("verify-grant-mismatch", rc_v == EX_BLOCKED and "Monitor" in printed
                and re.search(r"grant\s+BLOCKED-ON-HUMAN", printed), printed)
+        # KIT-287: a drift run (exit 10) says it too. It is the state an "Already on" lane
+        # is in right after a pull, so an early return there would hide the line from the
+        # very owner who needs it.
+        expect("verify-groups-read-not-proven-on-a-drift-run", rc_v == EX_BLOCKED
+               and "NOT PROVEN: that the chat app holds groups:read"
+               in " ".join(printed.split()), printed[-600:])
         cfg_m = good_config()
         del cfg_m["slackAllowedTools"]
         rows = evaluate(facts_of(probe(cfg_m, good_env(), good_settings)), vconf)
@@ -5769,6 +5895,9 @@ def _selftest_body():
         fakes.append(fake_fail)
         outputs.append(printed)
         expect("verify-probe-failed-unknown", rc_v == EX_UNKNOWN, printed)
+        expect("verify-groups-read-not-proven-when-nothing-ran",
+               "NOT PROVEN: that the chat app holds groups:read" in " ".join(printed.split()),
+               printed[-600:])
 
         # every command verify ran, in every case above, is one of its five reads
         ran_argvs = [a for f in fakes for a in f.argvs]
@@ -5925,6 +6054,99 @@ def _selftest_body():
            "CK-C2 still assumes /status is refused")
     expect("card-unknown", _capture(main, ["card", "CK-9", "--conf", "/nonexistent"])[0]
            == EX_USAGE)
+    expect("card-c1-five-scopes", "exactly the five bot scopes" in CARDS["CK-C1"]["good"],
+           CARDS["CK-C1"]["good"])
+    # KIT-287: CK-C7, the one Slack step for an app made before groups:read. In order: the
+    # chat lane's app by its name (never the notifier's or the bridge's), the BOT scope (a
+    # user scope never reaches the bot token), the reinstall, the five-scope check,
+    # env-names for a token Slack may have changed, no restart when it is UNCHANGED, the
+    # restart otherwise, the live mention; and it comes before an upgrade past 0.2.73.
+    # Each case reads an empty card when there is none.
+    c7card = CARDS.get("CK-C7") or {"title": "", "good": "", "not": ""}
+    rc_c7, c7 = (_capture(print_card, "CK-C7", conf) if "CK-C7" in CARDS else (None, ""))
+    flat_c7 = " ".join(c7.split())
+    c7_steps = ("open the chat lane's app: %s, unless you renamed it" % CHAT_APP_NAME,
+                "Its bot is @%s." % CHAT_BOT_NAME,
+                "Not the notifier's app, and not the bridge's.",
+                "Bot Token Scopes, click Add an OAuth Scope and pick groups:read",
+                "reinstall the app",
+                "app_mentions:read, chat:write, groups:history, groups:read, reactions:write",
+                "%s env-names" % ME,
+                "UNCHANGED means nothing changed, and there is nothing to restart",
+                "If it wrote the file, restart with the card it prints, CK-C5",
+                "mention the bot once")
+    c7_at = [flat_c7.find(s) for s in c7_steps]
+    expect("card-c7-in-order", rc_c7 == EX_OK and "WHY THIS IS YOURS" in c7
+           and "${" not in c7 and all(a >= 0 for a in c7_at) and c7_at == sorted(c7_at),
+           list(zip(c7_steps, c7_at)))
+    expect("card-c7-before-the-upgrade", "past 0.2.73" in c7card["title"]
+           and "before any dispatcher upgrade past 0.2.73" in flat_c7, flat_c7[:600])
+    expect("card-c7-says-the-silence", all(t in flat_c7 for t in (
+        "drops every message", "no reaction, no answer, no log line",
+        "verify cannot see")), flat_c7[:900])
+    expect("card-c7-good-is-five-scopes-and-an-answer", "five" in c7card["good"]
+           and "groups:read" in c7card["good"] and "answers" in c7card["good"],
+           c7card["good"])
+    expect("card-c7-not-the-notifiers-app", "notifier" in c7card["not"]
+           and "bridge" in c7card["not"] and "reinstall" in c7card["not"], c7card["not"])
+
+    # KIT-287: the operator docs say what this file does, where the owner reads them. The
+    # update guide warns before the upgrade; the chat-lane guide's scope table is piece 6's,
+    # its verify line is the one verify prints, and a missing reaction sends you to the log
+    # before a second mention, which could pay for the same work twice.
+    def _doc(name):
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                                   "docs", name), encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def _between(text, start, end):
+        return text.split(start, 1)[1].split(end, 1)[0] if start in text else ""
+
+    release = " ".join(_between(_doc("UPDATE-OPERATOR.md"), "**Read the release first.**",
+                                "\n## ").split())
+    expect("doc-update-guide-warns-before-the-upgrade", all(t in release for t in (
+        "If you run the chat lane, give the chat app `groups:read` before any upgrade past "
+        "0.2.73", "card CK-C7", "The update does not check this for you.")), release[:900])
+    ops_doc = _doc("CHAT-LANE-OPERATOR.md")
+    step6 = _between(ops_doc, "\n### Step 6", "\n### ")
+    flat_step6 = " ".join(step6.split())
+    table = re.findall(r"^\| `([a-z_]+:[a-z_]+)` \|", step6, re.M)
+    n_scopes = {4: "four", 5: "five", 6: "six"}.get(len(SCOPE_CITES), str(len(SCOPE_CITES)))
+    expect("doc-scope-table-is-piece-6s", table == sorted(SCOPE_CITES)
+           and "except `groups:read`, which the 0.2.74 prerelease needs" in flat_step6
+           and "exactly %s bot scopes" % n_scopes in flat_step6
+           and "Good: an app with exactly those %s bot scopes" % n_scopes in flat_step6,
+           (table, step6[:700]))
+    flat_ops = " ".join(ops_doc.split())
+    said = "NOT PROVEN: that the chat app holds groups:read"
+    expect("doc-verify-line-is-what-verify-prints",
+           globals().get("GROUPS_READ_NOT_PROVEN", "").startswith(said)
+           and "ends with `NOT PROVEN" not in flat_ops
+           and flat_ops.count("Every full run of `verify` also prints `%s`" % said) == 2
+           and "and this line never changes its exit code" in flat_ops,
+           flat_ops.count(said))
+    # The log rule, both ways round: no Received line means resend; a Received line with
+    # no Processing line for its event ID means the check ran again and dropped it, so
+    # resend; both lines mean it may have run, so a second mention could pay twice.
+    expect("doc-resend-reads-the-log-first",
+           "may have been dropped this way: send it again" not in flat_ops
+           and "Before you mention the bot again, look in the dispatcher's log" in flat_ops
+           and "`Received app_mention webhook` or `Received message webhook`" in flat_ops
+           and "No line means the message was dropped before anything ran: send it again. "
+               "A line means it got through." in flat_ops
+           and "look for `Processing slack webhook: <that ID>` (`ChatSessionHandler.js:61`). "
+               "No such line means the check ran again and dropped it before anything ran: "
+               "send it again." in flat_ops
+           and "second mention could pay for the same work twice" in flat_ops,
+           flat_ops.count("send it again"))
+    already = _between(ops_doc, "\n### Already on? Add `groups:read`", "\n## ")
+    at = [already.find(s) for s in ("1. Pull this checkout.",
+                                    "python3 scripts/pipeline_chat_lane_setup.py card CK-C7",
+                                    "2. In Slack's app settings")]
+    expect("doc-already-on-pulls-first", all(a >= 0 for a in at) and at == sorted(at), at)
 
     # -- 11. the source: no write to a dispatcher path, no merge/label/state path
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:

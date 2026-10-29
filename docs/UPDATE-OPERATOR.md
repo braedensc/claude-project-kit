@@ -114,6 +114,11 @@ against the running one. The 0.2.69 → 0.2.73 comparison (KIT-235) found:
 
 None of these show up as a version number.
 
+**If you run the chat lane, give the chat app `groups:read` before any upgrade past
+0.2.73** (KIT-287): run `python3 scripts/pipeline_chat_lane_setup.py card CK-C7`.
+Without it, the 0.2.74 prerelease drops every message from the chat lane's private
+channel, and nothing says why. The update does not check this for you.
+
 ## Updating the rest
 
 The review prints the line for each:

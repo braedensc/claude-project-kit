@@ -22,6 +22,8 @@ hostnames, account names or ids from a real deployment. Keep the filled-in copy 
 private runbook.
 
 Every claim about the dispatcher cites its source at version 0.2.69 as `File.js:line`.
+Step 6's Slack app was read again at 0.2.73, and what this guide says about `groups:read`
+cites the 0.2.74 prerelease.
 
 ---
 
@@ -78,7 +80,7 @@ lists the problems first, prints the card without its commands, and exits 2.
 | `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
 | `chat-rules` | Piece 8, once `CHAT_RULES=on` (Step 14). Says what it would write and changes nothing. `chat-rules --apply` writes the chat bot's rules, as the role account. While `CHAT_RULES=off` it refuses. |
-| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off. |
+| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off, `CK-C7` give the chat app `groups:read` before a dispatcher upgrade past 0.2.73. |
 
 Every command exits like the Stage E installer's. Read the exit code, not the word on the
 line: a `REFUSED:` line can end in 10, 2 or 3.
@@ -154,6 +156,55 @@ Good: `chat-tools` says none of the tracker tools merges, reviews or writes a pu
 and `verify` exits 0.
 Not that: `chat-tools` still names a tool after step 5. Check that the thread was new, and
 that `user-settings` is clean.
+
+### Already on? Add `groups:read` before the dispatcher goes past 0.2.73 (KIT-287)
+
+A chat app made before this change has four bot scopes. The dispatcher's 0.2.74
+prerelease needs a fifth, `groups:read`, and the next release may too. **Add it before
+you upgrade the dispatcher past 0.2.73.**
+
+Why: the 0.2.74 prerelease asks Slack about each message's channel before it does anything
+else (`conversations.info`, `SlackChannelPolicy.js:44-65`, called at
+`SlackEventTransport.js:244-247`). In a private channel that call needs `groups:read`. When
+the call fails, the message is dropped: no reaction, no answer, no log line. Slack still
+gets a 200, so it sees nothing wrong either. 0.2.73 makes no such call, so adding the scope
+now changes nothing you can see.
+
+1. Pull this checkout. Card `CK-C7` comes with it:
+
+   ```sh
+   python3 scripts/pipeline_chat_lane_setup.py card CK-C7
+   ```
+
+2. In Slack's app settings, open the chat lane's app, **Pipeline chat** unless you renamed
+   it. Not the notifier's app, and not the bridge's. Add the bot scope `groups:read`, then
+   reinstall the app when Slack asks.
+3. Run `env-names` and paste the two values Slack shows now. Slack's pages don't say
+   whether a reinstall keeps the bot token. `UNCHANGED` means nothing changed, and there
+   is nothing to restart. If `env-names` writes the file, restart with card `CK-C5`.
+4. Mention the bot once in the private channel.
+
+Good: the app's Bot Token Scopes list five, `groups:read` among them, and the bot answers.
+
+`verify` can't see a Slack app's scopes. Every full run of `verify` also prints `NOT PROVEN:
+that the chat app holds groups:read`, whatever its rows say. The card is the check.
+
+Even with the scope, the new release asks Slack about every message first, and waits at
+most 1.5 seconds (`SlackChannelPolicy.js:11`). A slow or failed answer drops the message
+just as silently (`:50-65`). The same check runs again before each thing the bot then
+does in Slack: reading the thread, its first reaction, its answer, marking the message
+done, saying it is busy (`SlackChatAdapter.js:55-60`, called at `:204`, `:260`, `:304`,
+`:320`, `:334` and `:339`). So after that upgrade, any one of them can go missing on its
+own, even when the work was done.
+
+Before you mention the bot again, look in the dispatcher's log at that minute for a
+`Received app_mention webhook` or `Received message webhook` line with the channel's ID in
+it (`SlackEventTransport.js:267`). No line means the message was dropped before anything
+ran: send it again. A line means it got through. Copy the event ID from it (`Ev...`) and
+look for `Processing slack webhook: <that ID>` (`ChatSessionHandler.js:61`). No such line
+means the check ran again and dropped it before anything ran: send it again. With it, the
+work may have run, or still be running, so a second mention could pay for the same work
+twice.
 
 ---
 
@@ -493,13 +544,15 @@ python3 scripts/pipeline_chat_lane_setup.py card CK-C1
 ```
 
 In Slack's app settings, create a new app from the manifest `compose` printed. It asks for
-exactly four bot scopes, each needed by one dispatcher call:
+exactly five bot scopes. Each is needed by a dispatcher call today, except `groups:read`,
+which the 0.2.74 prerelease needs:
 
 | Scope | Why |
 |---|---|
 | `app_mentions:read` | The `app_mention` event, which starts a session (`SlackEventTransport.js:211`) |
 | `chat:write` | `chat.postMessage`: the reply (`SlackMessageService.js:17-31`) |
 | `groups:history` | `conversations.replies` for thread context (`SlackMessageService.js:71-93`), and the `message.groups` event for follow-ups in a private-channel thread (`SlackEventTransport.js:221-235`) |
+| `groups:read` | `conversations.info`, which the 0.2.74 prerelease calls before it handles any message, dropping the message silently when the call fails (`SlackChannelPolicy.js:44-65`). 0.2.73 never calls it. It lets the app see basic information about a private channel it has been added to |
 | `reactions:write` | The receipt reactions (`SlackReactionService.js:18-30`) |
 
 No public-channel or direct-message scopes. No token rotation: the dispatcher reads one fixed
@@ -512,7 +565,7 @@ If Slack says the request URL did not verify, carry on. Step 11 retries it.
 Install the app. Its bot token and signing secret **stay in Slack** until Step 7 asks for
 them. Copy them nowhere.
 
-Good: an app with exactly those four bot scopes and no user scopes.
+Good: an app with exactly those five bot scopes and no user scopes.
 
 ### Step 7 — Four names in the dispatcher's env file, then restart (piece 3)
 
@@ -729,6 +782,10 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
+
+Every full run of `verify` also prints `NOT PROVEN: that the chat app holds groups:read`.
+`verify` has no Slack access, so it can't read the app's scopes, and this line never
+changes its exit code. Card `CK-C7` is that check.
 
 On a fresh lane, `chat-tools` says `UNKNOWN` here, because no chat session has started yet,
 so `verify` exits 4. Run it again after the live check in Step 13. Good then: exit 0.
@@ -969,6 +1026,10 @@ These came out of reading the dispatcher's source for this build.
   on the source, not a live test (KIT-174).
 - That seeding an idea from the chat creates exactly one backlog ticket and starts nothing
   (KIT-117).
+- That the 0.2.74 channel check ships as read. It was read from a prerelease, which may
+  change before it is released (KIT-287).
+- Whether reinstalling the chat app keeps its bot token. Slack's pages don't say, so card
+  `CK-C7` has you run `env-names`, which says `UNCHANGED` or writes the new one (KIT-287).
 
 ---
 
