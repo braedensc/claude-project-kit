@@ -26,8 +26,12 @@ could post a question that looked like the bridge's.
               not load it either. It never loads the job: that is card CK-B2.
     verify    read-only: the config and plist are the composed ones, the env file names both
               credentials, the job's own dry run passes as the role account, launchd holds
-              the job, its heartbeat is fresh, and the notifier's pings file, in
-              NOTIFIER_STATE_DIR, is there and is the notifier's (KIT-224).
+              the job and runs it every INTERVAL_SECONDS, its heartbeat is fresh, and the
+              notifier's pings file, in NOTIFIER_STATE_DIR, is there and is the notifier's
+              (KIT-224). With NOTIFIER_JOB_LABEL set, its `notifier` row judges the
+              notifier's heartbeat by the job's own rule, checks the job runs often enough
+              to tell the Mac's sleep from a quiet notifier, and checks launchd runs the
+              notifier as its plist says; empty, it says the watch is off (KIT-285).
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
               CK-B4 prove it live.
 
@@ -76,6 +80,7 @@ TOKEN_RE = re.compile(r"^xoxb-[A-Za-z0-9-]{20,}$")
 LABEL_RE = re.compile(r"^[a-z][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*){2,}$")
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{0,31}$")
 PATH_RE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]+$")
+INTERVAL_MIN, INTERVAL_MAX = 15, 3600          # INTERVAL_SECONDS, in seconds
 # The bridge app's scopes: EXACTLY what pipeline_bridge.py calls, each cited.
 SCOPE_CITES = {
     "groups:history": "conversations.history and conversations.replies in a private "
@@ -116,6 +121,10 @@ CONF_KEYS = {
                                  "member ID). A reply under one of its pings that it did "
                                  "not record is then refused aloud, and `verify` needs the "
                                  "pings file"),
+    "NOTIFIER_JOB_LABEL": ("", "optional: the notifier's JOB_LABEL, as notifier.conf sets it. "
+                               "Set, each pass reads how often launchd runs the notifier from "
+                               "its plist, and says in Slack when it goes quiet or keeps "
+                               "failing (KIT-285). Empty: the watch is off"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -179,10 +188,20 @@ def validate_conf(values):
                       % conf["JOB_LABEL"])
     if conf["ACT"] not in ("yes", "no"):
         errors.append("ACT must be yes or no, got %r" % conf["ACT"])
-    if not conf["INTERVAL_SECONDS"].isdigit() or not 15 <= int(conf["INTERVAL_SECONDS"]) <= 3600:
-        errors.append("INTERVAL_SECONDS must be a whole number from 15 to 3600")
+    if (not conf["INTERVAL_SECONDS"].isdigit()
+            or not INTERVAL_MIN <= int(conf["INTERVAL_SECONDS"]) <= INTERVAL_MAX):
+        errors.append("INTERVAL_SECONDS must be a whole number from %d to %d"
+                      % (INTERVAL_MIN, INTERVAL_MAX))
     if not conf["EPIC_WIP"].isdigit() or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
+    # The notifier's own installer's rule for its JOB_LABEL, as Stage E's conf checks it.
+    label = conf["NOTIFIER_JOB_LABEL"]
+    if label and not se._RDNS_RE.match(label):
+        errors.append("NOTIFIER_JOB_LABEL must be the notifier's reverse-DNS JOB_LABEL, or "
+                      "empty, got %r" % label)
+    elif label and label == conf["JOB_LABEL"]:
+        errors.append("NOTIFIER_JOB_LABEL is the bridge's own JOB_LABEL. Set it to the "
+                      "JOB_LABEL in notifier.conf, or leave it empty")
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
     named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
@@ -198,7 +217,8 @@ def validate_conf(values):
 # The conf keys with a check of their own above, and the config key each is composed into.
 COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
-               "ACT": "act", "NOTIFIER_STATE_DIR": "pings_file"}
+               "ACT": "act", "NOTIFIER_STATE_DIR": "pings_file",
+               "INTERVAL_SECONDS": "run_interval_seconds"}
 
 
 def load_conf(path):
@@ -238,11 +258,27 @@ def compose_config(conf):
     }
     if conf["NOTIFIER_BOT_USER_ID"]:
         doc["notifier_bot_user_id"] = conf["NOTIFIER_BOT_USER_ID"]
+    # Composed only when set, so a config written before the key existed stays the same.
+    if conf["NOTIFIER_JOB_LABEL"]:
+        doc["notifier_plist"] = notifier_plist_path(conf)
+        doc["run_interval_seconds"] = (int(conf["INTERVAL_SECONDS"])
+                                       if conf["INTERVAL_SECONDS"].isdigit()
+                                       else conf["INTERVAL_SECONDS"])
     return doc
 
 
 def pings_file(conf):
     return bridge.notify.bridge_pings_path({"state_dir": conf["NOTIFIER_STATE_DIR"]})
+
+
+def notifier_plist_path(conf):
+    """The notifier's LaunchDaemon plist, where its installer writes it (KIT-285)."""
+    return "/Library/LaunchDaemons/%s.plist" % conf["NOTIFIER_JOB_LABEL"]
+
+
+def notifier_heartbeat(conf):
+    """The notifier's heartbeat, in its STATE_DIR beside the pings file, `~` kept."""
+    return bridge.notify.heartbeat_path({"state_dir": conf["NOTIFIER_STATE_DIR"]})
 
 
 def config_bytes(conf):
@@ -323,7 +359,8 @@ CARDS = {
        "`Bootstrap failed: 5`. The job is installed turned off, and CK-B3 turns it off "
        "again; until line 1 turns it on, the load fails. If line 1 ran, the job is already "
        "loaded, or was unloaded a moment ago. Run verify: if `loaded` passes, you are done. "
-       "If not, wait ten seconds and run lines 1 and 2 again."),
+       "If it says launchd still runs the bridge at another interval, run card CK-B3, then "
+       "this card again. If it is not loaded, wait ten seconds and run lines 1 and 2 again."),
     "CK-B4": ("Prove the bridge live (KIT-227)", [
         "Plan from Slack: in the chat channel, write \"I want\" and something small. Good: "
         "the tech lead files one idea and replies `plan <id>`; the bridge asks; after your "
@@ -462,7 +499,8 @@ def no_privilege(exc, resume):
 # read is wrapped; an error is reported by its class.
 FACTS_PY = r'''
 import hashlib, json, os, re, sys
-env_path, cfg_path, beat_path, pings_path = [os.path.expanduser(a) for a in sys.argv[1:5]]
+env_path, cfg_path, beat_path, pings_path, nbeat_path = [os.path.expanduser(a)
+                                                         for a in sys.argv[1:6]]
 out = {}
 try:
     names = []
@@ -501,6 +539,16 @@ except ValueError:
     out["pings_schema"] = None
 except Exception as exc:
     out["pings_error"] = type(exc).__name__
+try:
+    nbeat = json.load(open(nbeat_path))
+    if isinstance(nbeat, dict):
+        out["notifier_beat"] = dict((k, nbeat.get(k)) for k in ("schema", "at", "exit", "dry"))
+    else:
+        out["notifier_beat_error"] = "not a JSON object"
+except FileNotFoundError:
+    out["notifier_beat_missing"] = True
+except Exception as exc:
+    out["notifier_beat_error"] = type(exc).__name__
 print(json.dumps(out))
 '''
 
@@ -595,7 +643,8 @@ def home_of(runner, account):
 def read_facts(runner, conf):
     res = runner.as_role(conf["ROLE_ACCOUNT"], py(
         FACTS_PY, conf["ENV_FILE"], conf["BRIDGE_CONFIG"],
-        conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json", pings_file(conf)))
+        conf["STATE_DIR"].rstrip("/") + "/bridge-heartbeat.json", pings_file(conf),
+        notifier_heartbeat(conf)))
     if not res.ok:
         return None
     try:
@@ -793,8 +842,7 @@ def cmd_verify(conf, runner, sudo, now=None):
         rows.append(("dry-run", se.ALREADY_DONE if dry.rc == 0 else se.FAILED,
                      last or "the job printed nothing"))
         loaded = runner.as_root(["/bin/launchctl", "print", "system/%s" % conf["JOB_LABEL"]])
-        rows.append(("loaded", se.ALREADY_DONE if loaded.ok else se.BLOCKED,
-                     "launchd holds the job" if loaded.ok else "not loaded: card CK-B2"))
+        rows.append(loaded_row(conf, loaded))
         beat = facts.get("heartbeat") or {}
         age = None
         try:
@@ -820,6 +868,7 @@ def cmd_verify(conf, runner, sudo, now=None):
                           "its last pass was %ss ago with exit %s: %s"
                           % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
         rows.append(pings_row(conf, facts))
+        rows.append(notifier_row(conf, facts, runner, now or time.time()))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
     worst = [o for _c, o, _d in rows]
@@ -829,6 +878,95 @@ def cmd_verify(conf, runner, sudo, now=None):
             return code
     say("Good: the bridge is installed, loaded and passing.")
     return EX_OK
+
+
+def loaded_row(conf, loaded):
+    """launchd holds the job, at INTERVAL_SECONDS (KIT-285 review). `install --apply`
+    rewrites the plist and never reloads the job, and launchd keeps the interval it was
+    loaded with. The notifier watch reads a gap in the job's passes against the interval in
+    its config, so a job launchd runs less often reads every pass as a sleep and never says
+    a dead notifier. With the watch on, a print that names no interval is UNKNOWN."""
+    if not loaded.ok:
+        return ("loaded", se.BLOCKED, "not loaded: card CK-B2")
+    found = se._RUN_INTERVAL_RE.search(loaded.out or "")
+    want = int(conf["INTERVAL_SECONDS"])
+    if found and int(found.group(1)) != want:
+        return ("loaded", se.BLOCKED, "launchd still runs the bridge every %s s, not every %d "
+                "s (INTERVAL_SECONDS). Reload it: card CK-B3, then card CK-B2"
+                % (found.group(1), want))
+    if not found and conf["NOTIFIER_JOB_LABEL"]:
+        return ("loaded", se.UNKNOWN, "launchd holds the job, and its print names no run "
+                "interval, so whether it runs every %d s, as the notifier watch counts on, "
+                "could not be measured. Read it yourself: sudo launchctl print system/%s"
+                % (want, conf["JOB_LABEL"]))
+    return ("loaded", se.ALREADY_DONE, "launchd holds the job" + (
+        ", every %d s" % want if found else ""))
+
+
+def notifier_row(conf, facts, runner, now):
+    """KIT-285: the watch the job keeps on the notifier, judged by the job's own rule. Off is
+    said as off. A file that could not be read is UNKNOWN, never a healthy notifier (§13).
+    The plist is root:wheel 644, so it is read as any account reads it; the heartbeat, in
+    the facts, as the role account."""
+    if not conf["NOTIFIER_JOB_LABEL"]:
+        return ("notifier", se.SKIPPED, "off: NOTIFIER_JOB_LABEL is empty, so the bridge "
+                "watches no notifier")
+    path = notifier_plist_path(conf)
+    res = runner.read(["/bin/cat", path])
+    if res.ok:
+        interval, why = bridge.notifier_interval((res.out or "").encode("utf-8"))
+    else:
+        interval, why = None, "its plist %s could not be read (%s)" % (
+            path, (res.err or "").strip()[:80] or "exit %d" % res.rc)
+    if interval:
+        # The job judges the notifier by the plist on disk, and launchd keeps the interval
+        # it was loaded with. A notifier launchd runs less often than its plist says would
+        # read as quiet, then back, over and over (KIT-285 review).
+        held = runner.as_root(["/bin/launchctl", "print",
+                               "system/%s" % conf["NOTIFIER_JOB_LABEL"]])
+        found = se._RUN_INTERVAL_RE.search(held.out or "") if held.ok else None
+        if found and int(found.group(1)) != interval:
+            return ("notifier", se.BLOCKED, "launchd still runs the notifier every %s s, and "
+                    "its plist says %d s. The bridge judges it by the plist, so until the "
+                    "notifier is reloaded it may say quiet, then back, again and again. "
+                    "Reload it: the notifier installer's card CK-N3"
+                    % (found.group(1), interval))
+    if facts.get("notifier_beat_error"):
+        why = why or "its heartbeat %s could not be read (%s)" % (
+            notifier_heartbeat(conf), facts["notifier_beat_error"])
+    verdict, at, detail = bridge.judge_notifier(interval, why, facts.get("notifier_beat"), now)
+    if verdict == "ok":
+        # The job's run limit is not in bridge.conf, so the composed config has its default.
+        slowest = bridge.slowest_run_interval(interval, bridge.DEFAULT_RUN_TIMEOUT)
+        if slowest < INTERVAL_MIN:
+            # No INTERVAL_SECONDS the conf check takes is fast enough: the notifier's own
+            # interval is what must change (KIT-285 review).
+            need = interval
+            while bridge.slowest_run_interval(need, bridge.DEFAULT_RUN_TIMEOUT) < INTERVAL_MIN:
+                need += 1
+            return ("notifier", se.BLOCKED, "watched, but the notifier runs every %d s, too "
+                    "often for the bridge to tell the Mac's sleep from a quiet notifier: the "
+                    "bridge runs once every %d s at the fastest. Set INTERVAL_SECONDS in "
+                    "notifier.conf to %d or more, then run `python3 "
+                    "scripts/pipeline_notifier_setup.py run`" % (interval, INTERVAL_MIN, need))
+        if int(conf["INTERVAL_SECONDS"]) > slowest:
+            return ("notifier", se.BLOCKED, "watched, but the bridge runs every %s s, too "
+                    "seldom to tell the Mac's sleep from a quiet notifier that runs every %d "
+                    "s. Set INTERVAL_SECONDS to %d or less, run `install --apply`, then "
+                    "reload the job: card CK-B3, then card CK-B2"
+                    % (conf["INTERVAL_SECONDS"], interval, slowest))
+        return ("notifier", se.ALREADY_DONE, "watched: %s; quiet after %d s (%d x its %d s "
+                "interval + %d s)" % (detail, bridge.quiet_after(interval),
+                                      bridge.NOTIFIER_QUIET_INTERVALS, interval,
+                                      bridge.NOTIFIER_QUIET_SLACK))
+    if verdict == "quiet" and at is None:
+        return ("notifier", se.BLOCKED, "watched, and there is no heartbeat at %s. Is the "
+                "notifier loaded (its installer's card CK-N3), and is NOTIFIER_STATE_DIR its "
+                "STATE_DIR?" % notifier_heartbeat(conf))
+    if verdict in ("quiet", "failing"):
+        return ("notifier", se.FAILED, "%s: %s. Check it: python3 "
+                "scripts/pipeline_notifier_setup.py verify" % (verdict, detail))
+    return ("notifier", se.UNKNOWN, "%s: %s" % (verdict, detail))
 
 
 def pings_row(conf, facts):
@@ -878,13 +1016,15 @@ class _FakeSudo(object):
 
 class _RoleRunner(se.Runner):
     """Runs the role-account programs for real, through /bin/sh, with HOME a temp home;
-    root commands write into a temp tree; launchctl answers from `loaded`."""
+    root commands write into a temp tree; launchctl answers from `loaded`, or for a label in
+    `prints` with that text, as launchd prints a job it holds."""
 
     def __init__(self, home, root, loaded=False, job_rc=0,
-                 job_out="bridge: 0 message(s) examined (dry run)\n", job_err=""):
+                 job_out="bridge: 0 message(s) examined (dry run)\n", job_err="", prints=None):
         se.Runner.__init__(self)
         self.home, self.root, self.loaded, self.job_rc = home, root, loaded, job_rc
         self.job_out, self.job_err = job_out, job_err
+        self.prints = prints or {}
         self.stdins = []
 
     def _exec(self, argv, stdin, timeout, cwd=None):
@@ -900,6 +1040,9 @@ class _RoleRunner(se.Runner):
         if argv[:1] == ["sudo"]:
             argv = argv[1:]
         if argv[:2] == ["/bin/launchctl", "print"]:
+            label = argv[2].split("/", 1)[-1]
+            if label in self.prints:
+                return se.Result(0, self.prints[label], "")
             return se.Result(0 if self.loaded else 113, "", "")
         if argv[:1] == ["/usr/bin/tee"]:
             path = self.root + argv[1]
@@ -1355,6 +1498,173 @@ def selftest():
                               _FakeSudo(), now=at + 30)
                 check("verify-pings-file:" + name, bool(re.search(want_row, out)), True)
             os.remove(pings_path)
+            # KIT-285: the notifier row, judged by the job's own rule. Off is said as off,
+            # and a file that cannot be read is UNKNOWN, never a healthy notifier. Each case
+            # runs alone, so one that raises fails as itself.
+            def outcome(fn):
+                try:
+                    return fn()
+                except Exception as exc:                          # noqa: BLE001
+                    return "raised %s: %s" % (type(exc).__name__, exc)
+
+            nbeat = os.path.join(home, ".stage-e", "state", "notifier-heartbeat.json")
+            nplist = root + "/Library/LaunchDaemons/com.example.notifier.plist"
+            nconf = dict(conf, NOTIFIER_JOB_LABEL="com.example.notifier")
+            runs_it = {"Label": "com.example.notifier", "StartInterval": 300,
+                       "ProgramArguments": ["/bin/sh", "-c", "exec /usr/bin/python3 "
+                                            "$HOME/kit/scripts/pipeline_notify_local.py run"]}
+
+            def stamp(**over):
+                return json.dumps(dict({"schema": bridge.notify.HEARTBEAT_SCHEMA,
+                                        "at": "2026-10-10T12:00:00Z", "exit": 0,
+                                        "dry": False}, **over))
+
+            def notifier_row_says(row_conf, body, plist_doc=runs_it, prints=None):
+                for path, there in ((nbeat, body is not None), (nplist, plist_doc is not None)):
+                    if not there and os.path.exists(path):
+                        os.remove(path)
+                os.makedirs(os.path.dirname(nplist), exist_ok=True)
+                if plist_doc is not None:
+                    with open(nplist, "wb") as fh:
+                        plistlib.dump(plist_doc, fh)
+                if body is not None:
+                    with open(nbeat, "w") as fh:
+                        fh.write(body)
+                rc, out = cap(cmd_verify, row_conf, _RoleRunner(home, root, loaded=True,
+                                                                prints=prints),
+                              _FakeSudo(), now=at + 30)
+                found = re.search(r"^\s*notifier\s+(\S+)\s+(.*)$", out, re.M)
+                return rc, found.groups() if found else None
+
+            got = outcome(lambda: notifier_row_says(conf, "{not json"))
+            check("verify-notifier-row: no NOTIFIER_JOB_LABEL reads off, and nothing about the "
+                  "notifier's files", got[1] if isinstance(got, tuple) else got,
+                  ("SKIPPED", "off: NOTIFIER_JOB_LABEL is empty, so the bridge watches no "
+                              "notifier"))
+            for case, row_conf, beat_body, plist_doc, want_row, needle in (
+                    ("a fresh clean run is watched, with the bound it is judged by", nconf,
+                     stamp(), runs_it, "ALREADY-DONE", "quiet after 1020 s (3 x its 300 s "
+                                                       "interval + 120 s)"),
+                    ("an old heartbeat is quiet", nconf, stamp(at="2026-10-10T11:00:00Z"),
+                     runs_it, "FAILED", "quiet: nothing from it since 2026-10-10T11:00:00Z"),
+                    ("a run that failed is failing", nconf, stamp(exit=3), runs_it, "FAILED",
+                     "failing: its run at 2026-10-10T12:00:00Z exited 3"),
+                    ("no heartbeat yet blocks on loading it", nconf, None, runs_it,
+                     "BLOCKED-ON-HUMAN", "card CK-N3"),
+                    ("a heartbeat it cannot read is unknown", nconf, "{not json", runs_it,
+                     "UNKNOWN", "could not be read (JSONDecodeError)"),
+                    ("a heartbeat that is JSON but no object is unknown", nconf, "[1, 2]",
+                     runs_it, "UNKNOWN", "could not be read (not a JSON object)"),
+                    ("a rehearsal is unknown", nconf, stamp(dry=True), runs_it, "UNKNOWN",
+                     "--dry-run"),
+                    ("a plist that is not there is unknown", nconf, stamp(), None, "UNKNOWN",
+                     "its plist /Library/LaunchDaemons/com.example.notifier.plist could not "
+                     "be read"),
+                    ("a plist that runs another job is unknown", nconf, stamp(), dict(
+                        runs_it, ProgramArguments=["/bin/sh", "-c", "exec true"]), "UNKNOWN",
+                     "does not run pipeline_notify_local.py"),
+                    ("a bridge at half the notifier's interval is watched",
+                     dict(nconf, INTERVAL_SECONDS="150"), stamp(), runs_it, "ALREADY-DONE",
+                     "watched: its run at 2026-10-10T12:00:00Z exited 0"),
+                    ("a bridge too slow to tell a sleep from a quiet notifier blocks, and says "
+                     "to reload the job", dict(nconf, INTERVAL_SECONDS="151"), stamp(), runs_it,
+                     "BLOCKED-ON-HUMAN", "Set INTERVAL_SECONDS to 150 or less, run `install "
+                                         "--apply`, then reload the job: card CK-B3, then card "
+                                         "CK-B2"),
+                    # Review round 2: a notifier too fast for any interval the bridge takes
+                    # names the notifier's interval, never one the conf check refuses.
+                    ("a notifier too fast for the bridge names the notifier's interval to "
+                     "change", dict(nconf, INTERVAL_SECONDS="15"), stamp(),
+                     dict(runs_it, StartInterval=20), "BLOCKED-ON-HUMAN",
+                     "the notifier runs every 20 s, too often for the bridge to tell the Mac's "
+                     "sleep from a quiet notifier: the bridge runs once every 15 s at the "
+                     "fastest. Set INTERVAL_SECONDS in notifier.conf to 30 or more")):
+                got = outcome(lambda: notifier_row_says(row_conf, beat_body, plist_doc))
+                row = got[1] if isinstance(got, tuple) else None
+                check("verify-notifier-row: " + case,
+                      (row[0], needle in row[1]) if row else got, (want_row, True))
+            got = outcome(lambda: notifier_row_says(nconf, stamp(at="2026-10-10T11:00:00Z")))
+            check("verify-notifier-row: a quiet notifier fails verify",
+                  got[0] if isinstance(got, tuple) else got, EX_FAILED)
+            # Review round 2: launchd keeps the interval a job was loaded with, and the
+            # bridge judges the notifier by the plist on disk.
+            def row_of(got):
+                return (got[1][0], got[1][1]) if isinstance(got, tuple) and got[1] else got
+            check("verify-notifier-row: launchd running the notifier at another interval than "
+                  "its plist blocks, and says to reload it",
+                  outcome(lambda: [row_of(notifier_row_says(
+                      dict(nconf, INTERVAL_SECONDS="30"), stamp(), dict(runs_it,
+                                                                         StartInterval=60),
+                      {"com.example.notifier": "\trun interval = %d seconds\n" % every}))[0]
+                      for every in (300, 60)]),
+                  ["BLOCKED-ON-HUMAN", "ALREADY-DONE"])
+            got = outcome(lambda: notifier_row_says(
+                dict(nconf, INTERVAL_SECONDS="30"), stamp(), dict(runs_it, StartInterval=60),
+                {"com.example.notifier": "\trun interval = 300 seconds\n"}))
+            check("verify-notifier-row: the reload it names is the notifier's card CK-N3",
+                  row_of(got)[1] if isinstance(row_of(got), tuple) else got,
+                  "launchd still runs the notifier every 300 s, and its plist says 60 s. The "
+                  "bridge judges it by the plist, so until the notifier is reloaded it may say "
+                  "quiet, then back, again and again. Reload it: the notifier installer's card "
+                  "CK-N3")
+
+            def loaded_says(row_conf, printed):
+                rc, out = cap(cmd_verify, row_conf, _RoleRunner(
+                    home, root, loaded=True, prints={row_conf["JOB_LABEL"]: printed}),
+                    _FakeSudo(), now=at + 30)
+                found = re.search(r"^\s*loaded\s+(\S+)\s+(.*)$", out, re.M)
+                return found.groups() if found else None
+            check("verify-loaded: launchd running the bridge at another interval than "
+                  "INTERVAL_SECONDS blocks, and says how to reload it; with the watch on, a "
+                  "print with no interval is unknown",
+                  outcome(lambda: [loaded_says(c_, p_) for c_, p_ in (
+                      (dict(nconf, INTERVAL_SECONDS="150"), "\trun interval = 600 seconds\n"),
+                      (dict(nconf, INTERVAL_SECONDS="150"), "\trun interval = 150 seconds\n"),
+                      (nconf, "\tstate = running\n"),
+                      (conf, "\tstate = running\n"))]),
+                  [("BLOCKED-ON-HUMAN", "launchd still runs the bridge every 600 s, not every "
+                                        "150 s (INTERVAL_SECONDS). Reload it: card CK-B3, then "
+                                        "card CK-B2"),
+                   ("ALREADY-DONE", "launchd holds the job, every 150 s"),
+                   ("UNKNOWN", "launchd holds the job, and its print names no run interval, "
+                               "so whether it runs every 60 s, as the notifier watch counts "
+                               "on, could not be measured. Read it yourself: sudo launchctl "
+                               "print system/com.example.bridge"),
+                   ("ALREADY-DONE", "launchd holds the job")])
+            for path in (nbeat, nplist):
+                if os.path.exists(path):
+                    os.remove(path)
+            check("config: notifier_plist and run_interval_seconds are composed only with "
+                  "NOTIFIER_JOB_LABEL, from it and INTERVAL_SECONDS",
+                  outcome(lambda: [(doc.get("notifier_plist"), doc.get("run_interval_seconds"))
+                                   for doc in (compose_config(conf), compose_config(validate_conf(
+                                       dict(values, NOTIFIER_JOB_LABEL="com.example.notifier",
+                                            INTERVAL_SECONDS="90"))[0]))]),
+                  [(None, None), ("/Library/LaunchDaemons/com.example.notifier.plist", 90)])
+            check("conf: NOTIFIER_JOB_LABEL refused, by name, when it is no label or the "
+                  "bridge's own",
+                  outcome(lambda: [[e.split(" ")[0] for e in validate_conf(dict(
+                      values, NOTIFIER_JOB_LABEL=v))[1]] for v in ("notifier",
+                                                                 "com.example.bridge")]),
+                  [["NOTIFIER_JOB_LABEL"], ["NOTIFIER_JOB_LABEL"]])
+            def label_taken(v):
+                conf_v, errors = validate_conf(dict(values, NOTIFIER_JOB_LABEL=v))
+                return errors, compose_config(conf_v).get("notifier_plist")
+            check("conf: NOTIFIER_JOB_LABEL takes any label the notifier's installer takes",
+                  outcome(lambda: [label_taken(v) for v in ("local.notifier",
+                                                            "com.Example.Notifier")]),
+                  [([], "/Library/LaunchDaemons/local.notifier.plist"),
+                   ([], "/Library/LaunchDaemons/com.Example.Notifier.plist")])
+
+            def interval_named(v):
+                conf_v, errors = validate_conf(dict(
+                    values, NOTIFIER_JOB_LABEL="com.example.notifier", INTERVAL_SECONDS=v))
+                return ([e.split(" ")[0] for e in errors],
+                        compose_config(conf_v).get("run_interval_seconds"))
+            check("conf: with the watch on, INTERVAL_SECONDS goes into the job's config, and a "
+                  "bad one is named once, by its key",
+                  outcome(lambda: [interval_named(v) for v in ("abc", "45")]),
+                  [(["INTERVAL_SECONDS"], "abc"), ([], 45)])
             check("verify-reads-no-credential-value", ("k" * 30 in out, "b" * 30 in out),
                   (False, False))
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=False), _FakeSudo(),
