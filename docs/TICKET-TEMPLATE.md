@@ -120,9 +120,11 @@ Warnings (exit 0 by default, errors under `--strict`):
 
 - Out of scope or Test plan empty
 - No acceptance criterion contains an inline-code span (nothing mechanically checkable)
-- Pointers empty, or a pointer path does not exist in the working tree. Paths are
-  repo-relative: an absolute path or one that `..`-escapes the root counts as missing,
-  because a pointer names a file in *this* tree
+- Pointers empty, or a pointer path does not exist in the working tree. A line's first
+  backticked span is its pointer; a later span on the line is checked too when it is a
+  repo path written `dir/name.ext`. Paths are repo-relative: an absolute pointer or one
+  that `..`-escapes the root counts as missing, because a pointer names a file in *this*
+  tree. A file another ticket will create is not a pointer yet: name it in Context
 
 The gate refuses outright (exit 2) if `delivery.json` declares a contract `version` it
 does not implement — contract §1: a reader that does not recognize the version refuses

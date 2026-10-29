@@ -68,6 +68,8 @@ HEADING_RE = re.compile(r"^##\s+(\S.*?)\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 CHECKLIST_RE = re.compile(r"^\s*[-*]\s+\[[ xX]\]\s*(.*)$")
 BULLET_RE = re.compile(r"^\s*[-*]\s+(?!\[[ xX]\])(.*)$")
+# Any list item, bulleted or numbered, at any depth.
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 # Residue of an unfinished draft. The doubled-brace form is spelled with escapes
 # so this file never itself contains a placeholder token.
@@ -287,6 +289,19 @@ def code_spans(lines):
     return out
 
 
+def pointer_lines(lines):
+    """The lines, each indented continuation joined to the line above it, so a
+    bullet wrapped onto a second line is still one line with one pointer. A list
+    item starts its own line at any depth."""
+    out = []
+    for line in lines or []:
+        if out and line[:1].isspace() and not LIST_ITEM_RE.match(line):
+            out[-1] += " " + line.strip()
+        else:
+            out.append(line)
+    return out
+
+
 # Extensionless files that are ordinary, useful pointers.
 EXTENSIONLESS = {
     "brewfile", "codeowners", "changelog", "dockerfile", "gemfile", "justfile",
@@ -329,6 +344,18 @@ def looks_like_path(span):
         return True
     ext = re.search(r"\.([A-Za-z0-9]{1,6})$", span)
     return ext is not None and ext.group(1).lower() in PATH_EXTENSIONS
+
+
+def unmistakably_path(span):
+    """A span that can only be a repo path: a directory AND a known extension,
+    after any `#anchor` or `:line`, and neither absolute nor a URL, which no file
+    in this tree can be. check_pointers holds a line's later spans to this,
+    because those are usually prose about the line's pointer."""
+    if not looks_like_path(span) or span.startswith("/") or "://" in span:
+        return False
+    bare = re.sub(r":\d+(-\d+)?$", "", span.split("#", 1)[0])
+    ext = re.search(r"\.([A-Za-z0-9]{1,6})$", bare)
+    return "/" in bare and ext is not None and ext.group(1).lower() in PATH_EXTENSIONS
 
 
 def within(repo_root, path):
@@ -470,11 +497,16 @@ def check_pointers(sections, r, strict, repo_root):
     if lines is None:
         return
     # Existence is the authoritative signal; the heuristic only has to catch the
-    # paths that do NOT exist, which is the case worth reporting.
-    spans = [
-        s for s in code_spans(lines)
-        if looks_like_path(s) or path_exists(repo_root, s)
-    ]
+    # paths that do NOT exist, which is the case worth reporting. A line's first
+    # span is its pointer. A later one is usually prose about it, such as the class
+    # `ring-black/10` or `boot.js`, a file a sibling ticket creates, so it counts
+    # only when it is unmistakably a path (KIT-273).
+    spans = []
+    for line in pointer_lines(lines):
+        for k, s in enumerate(code_spans([line])):
+            judge = looks_like_path if k == 0 else unmistakably_path
+            if judge(s) or path_exists(repo_root, s):
+                spans.append(s)
     if not spans:
         (r.err if strict else r.warn)(
             "pointers",
@@ -1055,6 +1087,100 @@ def selftest():
             errs, warns = rules(check(t))
             if warns != ["pointers"]:
                 failures.append(f"missing pointer {bad!r} no longer reported: warnings={warns}")
+
+        # 9e. A Pointers line's FIRST span is its pointer; a later span is usually
+        #     prose about that file (KIT-273). A live plan was refused whole over
+        #     lines like the first four: Tailwind classes with an opacity modifier,
+        #     and a file that a sibling ticket creates.
+        for rel in ("src/components/Sheet.tsx", "src/features/grid/TouchSurface.tsx",
+                    "src/features/grid/Surface.tsx", "index.html"):
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            open(os.path.join(tmp, rel), "w").close()
+
+        def pointer_errors(line):
+            t = good_ticket()
+            t["description"] = t["description"].replace(
+                "- `session.ts` — the reactive refresh this replaces", line)
+            return [f["message"] for f in check(t, strict=True)["tickets"][0]["errors"]
+                    if f["rule"] == "pointers"]
+
+        no_path = ("'## Pointers' names no file path in backticks — nobody read the "
+                   "codebase to write this ticket")
+        gone = ["1 pointer path(s) do not exist: Gone.tsx"]
+        for name, line, want in (
+            ("pointers-later-class-name-is-prose",
+             "- `src/components/Sheet.tsx`: `bg-black/40` scrim example", []),
+            ("pointers-later-identifier-and-class-are-prose",
+             "- `src/features/grid/TouchSurface.tsx`: imperative `boxShadow` and "
+             "`ring-black/10`", []),
+            ("pointers-later-class-alone-is-prose",
+             "- `src/features/grid/Surface.tsx`: `ring-black/10`", []),
+            ("pointers-later-sibling-file-is-prose",
+             "- `index.html`: where `boot.js` is loaded", []),
+            ("pointers-later-dotted-method-is-prose",
+             "- `src/components/Sheet.tsx`: calls `api/conversations.list`", []),
+            ("pointers-later-command-is-prose",
+             "- `src/components/Sheet.tsx`: run `npm test -- src/gone.test.ts`", []),
+            # A later absolute path or URL can never be a file in this tree.
+            ("pointers-later-absolute-path-is-prose",
+             "- `index.html`: where `/boot.js` is loaded", []),
+            ("pointers-later-url-is-prose",
+             "- `index.html`: see `https://example.com/docs/setup.md`", []),
+            # A bullet wrapped onto an indented line is still one line, one pointer.
+            ("pointers-wrapped-line-continues-its-pointer",
+             "- `src/features/grid/TouchSurface.tsx`: imperative `boxShadow` and\n"
+             "  `ring-black/10`", []),
+            # ...and the narrowing keeps its teeth. Each line, nested or not, leads
+            # with its own pointer; only an indented non-item line continues one.
+            ("pointers-leading-missing-path-still-fails",
+             "- `src/components/Gone.tsx`: `bg-black/40` scrim example",
+             ["1 pointer path(s) do not exist: src/components/Gone.tsx"]),
+            ("pointers-second-line-leading-missing-file-still-fails",
+             "- `src/components/Sheet.tsx`: the sheet\n- `Gone.tsx`: the old one", gone),
+            ("pointers-nested-bullet-is-its-own-pointer",
+             "- `src/components/Sheet.tsx`: the sheet\n  - `Gone.tsx`: the old one", gone),
+            ("pointers-nested-numbered-item-is-its-own-pointer",
+             "1. `src/components/Sheet.tsx`: the sheet\n   1. `Gone.tsx`: the old one",
+             gone),
+            ("pointers-unindented-line-is-its-own-pointer",
+             "- `src/components/Sheet.tsx`: the sheet\n`Gone.tsx`: the old one", gone),
+            ("pointers-later-missing-path-still-fails",
+             "- `src/components/Sheet.tsx`: replaces `src/components/old/Sheet.tsx`",
+             ["1 pointer path(s) do not exist: src/components/old/Sheet.tsx"]),
+            # A sibling's file named by its full path is not excused: the gate cannot
+            # tell it from a made-up path. It belongs in Context, not Pointers.
+            ("pointers-later-sibling-file-by-full-path-still-fails",
+             "- `index.html`: where `public/boot.js` is loaded",
+             ["1 pointer path(s) do not exist: public/boot.js"]),
+            ("pointers-later-missing-path-with-line-still-fails",
+             "- `index.html`: loads `src/boot/theme.ts:12`",
+             ["1 pointer path(s) do not exist: src/boot/theme.ts:12"]),
+            ("pointers-later-missing-path-with-line-range-still-fails",
+             "- `index.html`: see `src/boot/theme.ts:10-20`",
+             ["1 pointer path(s) do not exist: src/boot/theme.ts:10-20"]),
+            ("pointers-later-missing-path-with-anchor-still-fails",
+             "- `index.html`: see `docs/gone.md#setup`",
+             ["1 pointer path(s) do not exist: docs/gone.md#setup"]),
+            ("pointers-later-missing-path-upper-case-extension-still-fails",
+             "- `index.html`: see `src/boot/Theme.TSX`",
+             ["1 pointer path(s) do not exist: src/boot/Theme.TSX"]),
+            # The first span is the pointer whatever it looks like, so a class name
+            # that leads a line is judged as before: a path, and a missing one.
+            ("pointers-leading-class-name-is-still-the-pointer",
+             "- `bg-black/40`: the scrim class",
+             ["1 pointer path(s) do not exist: bg-black/40"]),
+            # A later span that is a path still names one, so the section is not empty.
+            ("pointers-later-path-is-the-only-path",
+             "- `boxShadow` is set in `src/components/Sheet.tsx`", []),
+            ("pointers-later-existing-file-is-the-only-path",
+             "- `boxShadow` is set in `index.html`", []),
+            ("pointers-only-prose-names-no-path",
+             "- `boxShadow` and `ring-black/10`", [no_path]),
+        ):
+            note()
+            got = pointer_errors(line)
+            if got != want:
+                failures.append(f"{name}: expected {want}, got {got}")
 
     # 10. An unrecognized delivery.json version refuses; it does not guess.
     with tempfile.TemporaryDirectory() as tmp2:
