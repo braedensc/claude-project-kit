@@ -36,7 +36,11 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   project and blockers, a yes after any of them changed approves nothing, and a child
   added or changed after the yes (a session holds the tracker's write tools) is held and
   said once. Each start is said once in the thread, and so is a stall, a pause, a child
-  outside the plan at work, a hand-over that never started, and the end. One epic the
+  outside the plan at work, and the end. So is a hand-over still not started two hours
+  on, as its agent sessions show it (KIT-284): nothing while one runs; in one of
+  `handoff_states`, its pull request waiting for your merge, or on you when its review
+  ran out of rounds; its session ended early; no session the agent ever picked up; or,
+  when the session list was too long to read whole, that it could not tell. One epic the
   tracker will not read stops nothing else, and the pass still exits 1.
 
   Every question also records the settings its text states; a yes after they changed acts
@@ -172,6 +176,10 @@ STATE_SCHEMA = "pipeline-bridge-state/1"
 HEARTBEAT_SCHEMA = "pipeline-bridge-heartbeat/1"
 TRACKER_API = "https://api.linear.app/graphql"
 DEFAULT_STATE_DIR = "~/.stage-e/state"
+# The lane a child sits in while its pull request waits for the owner's merge: the
+# needs-approval lane (contract §1, `linear.stateIds.needsApproval`), named as setup-board
+# names it. Matched by name, like `plan_it_state` and `ready_state`.
+DEFAULT_HANDOFF_STATES = ["Needs Approval"]
 MAX_THREAD_PAGES = 10
 
 CONFIG_KEYS = {
@@ -205,6 +213,9 @@ CONFIG_KEYS = {
                        "epic's children are handed to; empty refuses every approve",
     "epic_wip": "how many children of one approved epic may be started and unfinished at "
                 "once (default 1, at most 10)",
+    "handoff_states": "the states, by name, a child sits in while its pull request waits "
+                      "for your merge (default %s, the lane setup-board makes)"
+                      % json.dumps(DEFAULT_HANDOFF_STATES),
     "pings_file": "the notifier's record of agent:blocked pings (default "
                   "<state_dir>/notifier-bridge-pings.json, where the notifier writes it)",
     "relay_max_chars": "a longer answer is refused, never cut (default the relay's, 1000)",
@@ -249,9 +260,20 @@ MAX_CHILDREN = 30
 # itself (0.2.73: the orchestrator prompts self-delegate sub-issues; a graphite child is cut
 # from its blocker's branch). Matched without regard to case.
 MODE_LABELS = ("orchestrator", "graphite")
-# How long a child handed over may sit unstarted before the bridge says its session may have
-# stopped. The dispatcher moves a ticket to a started state when its session begins.
+# How long a child handed over may sit unstarted before the bridge says why, as its agent
+# sessions show it (KIT-284). The dispatcher moves a ticket to a started state when its
+# session begins.
 STUCK_START_SECONDS = 2 * 3600
+# What a session's status says of a child two hours on. A hand-over always makes a session,
+# and what the tracker calls one nobody answered is not proven (docs/CATCH-UP.md): the
+# catch-up poller models it as pending, and it may turn stale. So a session is running only
+# once the agent has picked it up, and has ended only with a status the agent's own response
+# or error sets.
+SESSION_RUNNING = ("active", "awaitingInput")
+SESSION_RAN = ("complete", "error")
+# On a child in a hand-off lane, the label that says its review ran out of rounds with
+# findings still open (contract §1). Matched without regard to case.
+NEEDS_HUMAN_LABEL = "agent:needs-human"
 DONE, REFUSED = "done", "refused"
 
 
@@ -310,6 +332,7 @@ def validate_config(raw):
         "ready_state": raw.get("ready_state") or "Todo",
         "agent_user_name": raw.get("agent_user_name", ""),
         "epic_wip": raw.get("epic_wip", 1),
+        "handoff_states": raw.get("handoff_states", list(DEFAULT_HANDOFF_STATES)),
         "pings_file": raw.get("pings_file") or "",
         "relay_max_chars": raw.get("relay_max_chars", notify.DEFAULT_RELAY_MAX_CHARS),
         "relay_max_per_hour": raw.get("relay_max_per_hour", notify.DEFAULT_RELAY_MAX_PER_HOUR),
@@ -388,6 +411,18 @@ def validate_config(raw):
                       % (cfg["agent_user_name"],))
     if numbers_ok and cfg["epic_wip"] > 10:
         errors.append("config 'epic_wip' must be at most 10, got %d" % cfg["epic_wip"])
+    handoff = cfg["handoff_states"]
+    if not isinstance(handoff, list) or not handoff or not all(
+            isinstance(s, str) and s and s == s.strip() for s in handoff):
+        errors.append("config 'handoff_states' must be a non-empty list of state names, "
+                      "each spelled as the tracker shows it with no space around it, like "
+                      "%s, got %r" % (json.dumps(DEFAULT_HANDOFF_STATES), handoff))
+    else:
+        early = [s for s in handoff if s in (cfg["ready_state"], cfg["plan_it_state"])]
+        if early:
+            errors.append("config 'handoff_states' names %s, which is also 'ready_state' or "
+                          "'plan_it_state'. A child sits there before its work starts, never "
+                          "while it waits for your merge" % ", ".join(early))
     if notify._inside_git_worktree(cfg["state_dir"]):
         errors.append("config 'state_dir' (%s) is inside a git working tree — the record of "
                       "open questions must live outside every worktree, where no session "
@@ -675,6 +710,7 @@ class TrackerClient(object):
         self.key = key
         self.key_env = key_env
         self._sessions = None
+        self._sessions_error = ""
 
     def _query(self, query, variables):
         try:
@@ -726,14 +762,40 @@ class TrackerClient(object):
         return (data or {}).get("issue")
 
     def session_index(self):
-        """The workspace's recent agent sessions, read once a pass."""
+        """The workspace's recent agent sessions, read once a pass. A read that failed is
+        never kept as the list, not even the part that came back: each later ask this pass
+        fails the same way without reading again. So no ticket is ever said to have no
+        session because the list could not be read (KIT-284, contract §13)."""
+        if self._sessions_error:
+            raise BridgeError(self._sessions_error)
         if self._sessions is None:
-            self._sessions = poller.SessionIndex(self.linear)
+            index = poller.SessionIndex(self._session_page)
+            try:
+                index.nodes()
+            except BridgeError as exc:
+                self._sessions_error = "the agent sessions could not be read: %s" % exc
+                raise BridgeError(self._sessions_error)
+            self._sessions = index
         return self._sessions
+
+    def _session_page(self, query, variables):
+        """One page of the session list. An answer that holds no whole page, its list and
+        where the list goes on, is a read that failed, never an empty list."""
+        data = self._query(query, variables)
+        conn = (data or {}).get("agentSessions")
+        if not (isinstance(conn, dict) and isinstance(conn.get("nodes"), list)
+                and isinstance(conn.get("pageInfo"), dict)):
+            raise BridgeError("the tracker's answer held no list of agent sessions")
+        return data
 
     def sessions_on(self, issue_id):
         """Agent sessions on the ticket: the workspace's recent sessions, read once a pass."""
         return self.session_index().on_issue(issue_id)
+
+    def sessions_read_whole(self):
+        """True when this pass read the session list to its end. Only then does a ticket
+        with none in it have none: past the pages one pass reads, an older one may sit."""
+        return self.session_index().complete
 
     def agent_user(self, name):
         """(user id, None), or (None, why) unless exactly one active app user has that
@@ -1950,16 +2012,26 @@ class Pass(object):
                 self.note(rec, "running:" + k["id"], "%s is marked finished, but its session "
                           "is still running. It counts toward the limit of %d until the "
                           "session ends." % (k.get("identifier") or "?", self.cfg["epic_wip"]))
+        room = self.cfg["epic_wip"] - len(running)
+
+        def next_waits_on(k):
+            """True when an approved child can't start yet but will once k is done: it
+            waits on k alone, or on nothing while k holds the last slot. With more running
+            than the limit, k's end frees no slot. Nor does it while a session on k has not
+            ended, one the agent never picked up included: a child marked finished holds its
+            slot until then, by the rule above."""
+            mine = k["identifier"] + " ("
+            return room >= 0 and not self.live_session(k) and any(
+                q not in running and q["identifier"] not in rec["started"]
+                and fingerprint(q) == approved.get(q["id"])
+                and all(b.startswith(mine) for b in open_blockers(q))
+                and (room == 0 or open_blockers(q)) for q in unfinished)
         for k in running:
             since = (rec.get("started_at") or {}).get(k.get("identifier"))
             if (since and self.now - since > STUCK_START_SECONDS
                     and (k.get("state") or {}).get("type") in ("backlog", "triage",
                                                                "unstarted")):
-                self.note(rec, "stuck:" + k["id"], "%s was handed to the agent at %s and has "
-                          "not started. Its session may have stopped. It still counts toward "
-                          "the limit of %d: hand it over again yourself, or cancel it."
-                          % (k["identifier"], iso(since), self.cfg["epic_wip"]))
-        room = self.cfg["epic_wip"] - len(running)
+                self.not_started(rec, k, since, next_waits_on)
         waiting, started, held = [], 0, 0
         for k in unfinished:
             if k in running:
@@ -1991,6 +2063,49 @@ class Pass(object):
                 len(waiting) + held == len(unfinished):
             self.note(rec, "stall:" + "; ".join(waiting), "Nothing in %s can start: %s."
                       % (ticket, "; ".join(waiting)))
+
+    def not_started(self, rec, k, since, next_waits_on):
+        """A child handed over two hours ago and still not in a started state, said once as
+        its agent sessions show it (KIT-284). While one runs, nothing is said; one the agent
+        never picked up is not running. In a hand-off lane its pull request waits for you,
+        so it is never called not started, nor offered to be handed over again; while it
+        carries `agent:needs-human` it is never called ready to merge either, and that is
+        said even after the merge note. A session that ran and ended anywhere else stopped
+        short. Any other session, or none, never began, unless the list was too long to read
+        whole and holds none: then it is said as could not tell, never as no session
+        (contract §13). A list the tracker would not give fails the epic's pass before
+        anything is said."""
+        ident, wip = k["identifier"], self.cfg["epic_wip"]
+        lane = (k.get("state") or {}).get("name") or "?"
+        statuses = [(n or {}).get("status") for n in self.tracker.sessions_on(k["id"])]
+        if any(s in SESSION_RUNNING for s in statuses):
+            return
+        if lane in self.cfg["handoff_states"]:
+            if NEEDS_HUMAN_LABEL in set((n or "").lower() for n in label_names(k)):
+                self.note(rec, "needs-human:" + k["id"], "%s is marked as needing a person, "
+                          "and its pull request is waiting on you. That usually means its "
+                          "review ran out of rounds with findings still open. It's yours to "
+                          "fix and merge, or cancel. It still counts toward the limit of %d."
+                          % (ident, wip))
+            else:
+                self.note(rec, "handoff:" + k["id"], "%s's pull request is waiting for you "
+                          "to merge.%s" % (ident, " The next piece starts once it's merged."
+                                           if next_waits_on(k) else ""))
+        elif any(s in SESSION_RAN for s in statuses):
+            self.note(rec, "ended:" + k["id"], "%s's session ended before it finished, and "
+                      "it's in %s now. It still counts toward the limit of %d: hand it over "
+                      "again yourself, or cancel it." % (ident, lane, wip))
+        elif not statuses and not self.tracker.sessions_read_whole():
+            self.note(rec, "unsure:" + k["id"], "%s was handed to the agent at %s and is "
+                      "still in %s. I couldn't tell whether its session is running: the "
+                      "tracker holds more agent sessions than I can read at once. It still "
+                      "counts toward the limit of %d. Check it in the tracker before you "
+                      "hand it over again." % (ident, iso(since), lane, wip))
+        else:
+            self.note(rec, "stuck:" + k["id"], "%s was handed to the agent at %s and has "
+                      "not started. Its session may have stopped. It still counts toward "
+                      "the limit of %d: hand it over again yourself, or cancel it."
+                      % (ident, iso(since), wip))
 
     def start_child(self, rec, child, kids, agent_id):
         ident = child["identifier"]
@@ -2248,6 +2363,7 @@ class FakeTracker(object):
         self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo"}
         self.agents = {"Agent": "agent-1"}
         self.sessions = {}             # issue uuid -> sessions
+        self.sessions_whole = True     # False: more sessions than one pass reads (KIT-284)
         self.overflow = set()          # epics whose children run past one page
         self.blocker_overflow = set()  # children whose blockers run past one page
         self.epics = {}                # epic identifier -> child identifiers, in filing order
@@ -2275,6 +2391,9 @@ class FakeTracker(object):
 
     def sessions_on(self, issue_id):
         return list(self.sessions.get(issue_id, []))
+
+    def sessions_read_whole(self):
+        return self.sessions_whole
 
     def recorded_thread(self, ticket_id, thread_id, agent_id):
         self.thread_reads.append((ticket_id, thread_id, agent_id))
@@ -2902,6 +3021,53 @@ def selftest():
             once.sessions_on("w")
             check("wiring-live-work-reads-the-sessions-once-per-pass",
                   [op for op, _v in sent].count("PlanSessions") - before, 1)
+            # KIT-284: a session list the tracker did not give is never "no session". A
+            # read that failed is not kept, even in part: each later ask this pass fails
+            # too, and reads nothing more. An answer with no whole page in it (its list and
+            # where it ends) is a failed read, and a list past the pages one pass reads is
+            # said not to be whole.
+            def asks(client, *ids):
+                out = []
+                for i in ids:
+                    try:
+                        out.append(client.sessions_on(i))
+                    except BridgeError:
+                        out.append("could not read")
+                return out
+
+            def sessions_answer(answer):
+                def transport(url, headers, payload=None, timeout=20):
+                    sent.append(("PlanSessions", payload["variables"]))
+                    if answer is None:
+                        raise urllib.error.URLError("simulated")
+                    return {"data": answer}
+                return transport
+
+            def read_whole(client):
+                client.sessions_on("u")
+                return getattr(client, "sessions_read_whole", lambda: "no such ask")()
+            globals()["_http_json"] = sessions_answer(None)
+            before = len(sent)
+            check("wiring-a-session-list-that-failed-fails-every-ask-this-pass-and-is-read-once",
+                  (asks(TrackerClient("k"), "u", "v"), len(sent) - before),
+                  (["could not read", "could not read"], 1))
+            def no_list(answer):
+                globals()["_http_json"] = sessions_answer(answer)
+                return asks(TrackerClient("k"), "u")
+            check("wiring-an-answer-holding-no-session-list-is-a-failed-read",
+                  [no_list(answer) for answer in (
+                      {}, {"agentSessions": {}},
+                      {"agentSessions": {"nodes": None, "pageInfo": {"hasNextPage": False}}},
+                      {"agentSessions": {"nodes": [], "pageInfo": None}})],
+                  [["could not read"]] * 4)
+            globals()["_http_json"] = sessions_answer({"agentSessions": {
+                "nodes": [], "pageInfo": {"hasNextPage": False}}})
+            whole = read_whole(TrackerClient("k"))
+            globals()["_http_json"] = sessions_answer({"agentSessions": {
+                "nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "c"}}})
+            check("wiring-a-session-list-past-the-pages-one-pass-reads-is-not-whole",
+                  (whole, read_whole(TrackerClient("k"))), (True, False))
+            globals()["_http_json"] = by_operation
             tc.move("u", "st-plan-it")
             tc.comment("u", "who said yes")
             check("wiring-the-move-carries-stateId-only",
@@ -3741,6 +3907,189 @@ def selftest():
               (delegated(t), sum("PROD-51 was handed to the agent" in p for p in posted(s))),
               (["uuid-51"], 1))
 
+        # KIT-284: two hours on, a child not in a started lane is said as its agent
+        # sessions show it, once. A pull request waiting for your merge is never "not
+        # started", and never offered to be handed over again.
+        def two_hours_on(name, lane, sessions, whole=True, kids=None, after=None, between=None,
+                         **over):
+            """What the thread says of PROD-51 in two passes, three and four hours after it
+            was handed over (`between` runs between them); ["config refused: ..."] when the
+            config is."""
+            try:
+                c, s, t, _root = approved(name, kids=kids or (("PROD-51", ()),
+                                                              ("PROD-52", ("PROD-51",))),
+                                          **over)
+            except BridgeError as exc:
+                return ["config refused: %s" % exc]
+            t.issues["PROD-51"]["state"] = {"id": "st-lane", "name": lane, "type": "unstarted"}
+            t.sessions["uuid-51"] = sessions
+            t.sessions_whole = whole
+            if after:
+                after(c, t)
+            before = len(s.posts)
+            run(c, s, t, at=now + 3 * 3600)
+            if between:
+                between(c, t)
+            run(c, s, t, at=now + 4 * 3600)
+            return [p for p in posted(s)[before:] if p.startswith("PROD-51")]
+        ended = [{"id": "s-51", "status": "complete"}]
+        live = [{"id": "s-51", "status": "active"}]
+        waits = "PROD-51's pull request is waiting for you to merge."
+        then = waits + " The next piece starts once it's merged."
+        stuck = ("PROD-51 was handed to the agent at %s and has not started. Its session may "
+                 "have stopped. It still counts toward the limit of 1: hand it over again "
+                 "yourself, or cancel it." % iso(now))
+        check("a-child-waiting-for-your-merge-is-said-to-wait-on-you-once",
+              two_hours_on("handoff", "Needs Approval", ended), [then])
+        check("a-child-in-a-hand-off-lane-is-never-not-started-even-with-no-session-found",
+              (two_hours_on("handoff-none", "Needs Approval", []),
+               two_hours_on("handoff-cut", "Needs Approval", [], whole=False)),
+              ([then], [then]))
+        check("a-child-whose-session-still-runs-gets-no-note-in-any-lane",
+              (two_hours_on("live-todo", "Todo", live),
+               two_hours_on("asking-todo", "Todo", [{"id": "s-51", "status": "awaitingInput"}]),
+               two_hours_on("live-handoff", "Needs Approval", live)), ([], [], []))
+        ended_todo = ("PROD-51's session ended before it finished, and it's in Todo now. It "
+                      "still counts toward the limit of 1: hand it over again yourself, or "
+                      "cancel it.")
+        unsure = ("PROD-51 was handed to the agent at %s and is still in Todo. I couldn't tell "
+                  "whether its session is running: the tracker holds more agent sessions than "
+                  "I can read at once. It still counts toward the limit of 1. Check it in the "
+                  "tracker before you hand it over again." % iso(now))
+        check("a-child-whose-session-ended-elsewhere-is-said-to-have-stopped-short",
+              two_hours_on("ended-todo", "Todo", [{"id": "s-51", "status": "error"}]),
+              [ended_todo])
+        check("no-session-found-is-never-started-only-when-the-list-was-read-whole",
+              (two_hours_on("none-todo", "Todo", []),
+               two_hours_on("cut-todo", "Todo", [], whole=False)),
+              ([stuck], [unsure]))
+        # The change's review: a hand-over always makes a session, so one the agent never
+        # picked up is the never-started case, whatever the tracker calls it, and never a
+        # running one. Only a session that ran is said to have ended.
+        # The second review: in a hand-off lane such a session is not running either, but
+        # it holds the child's slot past the merge, so the next piece is not promised.
+        pending = [{"id": "s-51", "status": "pending"}]
+        stale = [{"id": "s-51", "status": "stale"}]
+        reprompted = ended + [{"id": "s-51b", "status": "pending"}]
+        check("a-session-the-agent-never-picked-up-is-not-a-running-one",
+              (two_hours_on("pending-todo", "Todo", pending),
+               two_hours_on("pending-cut", "Todo", pending, whole=False),
+               two_hours_on("stale-todo", "Todo", stale),
+               two_hours_on("pending-handoff", "Needs Approval", pending),
+               two_hours_on("reprompted-handoff", "Needs Approval", reprompted)),
+              ([stuck], [stuck], [stuck], [waits], [waits]))
+
+        # The second review: the promise is kept. Merged (Done, its sessions as they were),
+        # a child frees its slot only once no session on it is open, and then the next
+        # piece is handed over on the next pass; the promise is made exactly then.
+        def merged(name, sessions):
+            c, s, t, _root = approved(name, kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            t.issues["PROD-51"]["state"] = {"id": "st-lane", "name": "Needs Approval",
+                                            "type": "unstarted"}
+            t.sessions["uuid-51"] = sessions
+            before = len(s.posts)
+            run(c, s, t, at=now + 3 * 3600)
+            promised = then in posted(s)[before:]
+            t.set_state("PROD-51", "completed")
+            run(c, s, t, at=now + 4 * 3600)
+            return promised, "uuid-52" in delegated(t)
+        check("the-next-piece-is-promised-only-when-its-merge-frees-the-slot",
+              [merged("merged-" + name, sessions) for name, sessions in (
+                  ("ended", ended), ("stale", stale), ("pending", pending),
+                  ("reprompted", reprompted))],
+              [(True, True), (True, True), (False, False), (False, False)])
+
+        # The second review: each note has its own mark, so a child that moves on from one
+        # is said again as it is now, and the owner never keeps advice that no longer holds.
+        def moves_on(sessions, lane, whole=True):
+            def flip(_c, t):
+                t.sessions["uuid-51"] = sessions
+                t.sessions_whole = whole
+                t.issues["PROD-51"]["state"] = {"id": "st-next", "name": lane,
+                                                "type": "unstarted"}
+            return flip
+        check("a-lost-hand-over-said-again-once-it-moves-on",
+              (two_hours_on("lost-then-merge", "Todo", pending,
+                            between=moves_on(ended, "Needs Approval")),
+               two_hours_on("lost-then-ended", "Todo", pending,
+                            between=moves_on([{"id": "s-51", "status": "error"}], "Todo")),
+               two_hours_on("unsure-then-lost", "Todo", [], whole=False,
+                            between=moves_on(pending, "Todo"))),
+              ([stuck, then], [stuck, ended_todo], [unsure, stuck]))
+
+        # The change's review: in a hand-off lane, `agent:needs-human` is what says review ran
+        # out of rounds (contract §1). That pull request is never called ready to merge, and
+        # a label that lands after the merge note is said too.
+        def needs_human(label):
+            def add(_c, t):
+                t.issues["PROD-51"]["labels"].append(label)
+            return add
+        rounds = ("PROD-51 is marked as needing a person, and its pull request is waiting on "
+                  "you. That usually means its review ran out of rounds with findings still "
+                  "open. It's yours to fix and merge, or cancel. It still counts toward the "
+                  "limit of 1.")
+        check("a-pull-request-whose-review-ran-out-of-rounds-is-never-called-ready-to-merge",
+              (two_hours_on("rounds", "Needs Approval", ended,
+                            after=needs_human("agent:needs-human")),
+               two_hours_on("rounds-cased", "Needs Approval", ended,
+                            after=needs_human("Agent:Needs-Human")),
+               two_hours_on("rounds-later", "Needs Approval", ended,
+                            between=needs_human("agent:needs-human"))),
+              ([rounds], [rounds], [then, rounds]))
+        # The second review: outside a hand-off lane there may be no pull request at all, so
+        # the label changes nothing there.
+        check("the-needs-human-note-is-said-only-in-a-hand-off-lane",
+              two_hours_on("rounds-todo", "Todo", ended, after=needs_human("agent:needs-human")),
+              [ended_todo])
+        check("the-hand-off-lanes-are-the-configured-ones",
+              (two_hours_on("lane-named", "Ready to merge", ended,
+                            handoff_states=["Awaiting merge", "Ready to merge"]),
+               two_hours_on("lane-default", "Ready to merge", ended)),
+              ([then], ["PROD-51's session ended before it finished, and it's in Ready to "
+                        "merge now. It still counts toward the limit of 1: hand it over "
+                        "again yourself, or cancel it."]))
+
+        def outside_blocker(t):
+            # Named so it starts with PROD-51's own identifier: a blocker is matched whole.
+            t.issues["PROD-510"] = dict(t.issues["PROD-52"], id="uuid-510",
+                                        identifier="PROD-510", title="Outside", blocked_by=[],
+                                        parent=None, labels=[],
+                                        state={"id": "st-backlog", "name": "Backlog",
+                                               "type": "backlog"})
+            t.issues["PROD-52"]["blocked_by"].append("PROD-510")
+
+        def changed_52(_c, t):
+            t.issues["PROD-52"]["description"] = "Something else."
+
+        def started_52_once(c, _t):
+            st = json.load(open(state_path(c)))
+            st["epics"]["uuid-50"]["started"].append("PROD-52")
+            json.dump(st, open(state_path(c), "w"))
+
+        def extra_at_work(_c, t):
+            t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59", identifier="PROD-59",
+                                       title="Added", blocked_by=[], labels=[])
+            t.epics["PROD-50"].append("PROD-59")
+            t.set_state("PROD-59", "started")
+
+        def handed_52_by_hand(_c, t):
+            t.issues["PROD-52"]["delegate"] = {"id": "x"}
+
+        def second_done(_c, t):
+            t.set_state("PROD-52", "completed")
+        check("the-next-piece-is-promised-only-when-it-waits-for-this-merge",
+              [two_hours_on("next-" + name, "Needs Approval", ended, **over) for name, over in (
+                  ("last-piece", {"kids": (("PROD-51", ()),)}),
+                  ("other-blocker", {"setup": outside_blocker}),
+                  ("changed", {"after": changed_52}),
+                  ("started-once", {"after": started_52_once}),
+                  ("slots-held-by-more", {"after": extra_at_work}),
+                  ("handed-by-hand", {"wip": 2, "after": handed_52_by_hand}),
+                  ("can-start-without-it", {"wip": 2, "after": second_done, "kids": (
+                      ("PROD-51", ()), ("PROD-52", ()), ("PROD-53", ("PROD-52",)))}),
+                  ("waits-on-it-alone", {"wip": 2}))],
+              [[waits]] * 7 + [[then]])
+
         # 3 (MEDIUM): one epic that cannot be read does not stop the others, or the pass's
         # housekeeping; the pass still ends loud.
         c, s, t, root = approved("one-bad-epic", kids=(("PROD-51", ()), ("PROD-52", ())))
@@ -4355,6 +4704,21 @@ def selftest():
             errs = str(exc)
         check("config-caps-epic-wip", "'epic_wip' must be at most 10" in _config_error(
             dict(EXAMPLE_CONFIG, epic_wip=11, state_dir=os.path.join(tmp, "wip"))), True)
+        # KIT-284: the hand-off lanes are a list of names, the lane setup-board makes by
+        # default, and never a state a child sits in before its work starts.
+        check("config-handoff-states-default-to-the-lane-setup-board-makes",
+              (cfg_for("handoff-default").get("handoff_states"),
+               _config_error(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "hs"),
+                                  handoff_states=["Ready to merge", "Needs Approval"]))),
+              (["Needs Approval"], ""))
+        for name, value in (("a-bare-name", "Needs Approval"), ("an-empty-list", []),
+                            ("a-blank-name", [" "]), ("an-empty-name", [""]),
+                            ("a-padded-name", ["Needs Approval "]), ("a-number", [7]),
+                            ("the-ready-state", ["Todo"]), ("the-plan-it-state", ["Plan it"])):
+            check("config-handoff-states-refused:" + name,
+                  "config 'handoff_states'" in _config_error(dict(
+                      EXAMPLE_CONFIG, handoff_states=value, state_dir=os.path.join(tmp, "hs"))),
+                  True)
         # The pings file decides which session an answer reaches: it lives outside every
         # worktree too, where no session can write it (KIT-224 review).
         check("config-refuses-a-pings-file-inside-a-worktree",

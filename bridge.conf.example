@@ -58,6 +58,12 @@ BOT_USER_ID=U0123456789
 #EPIC_WIP=1
 # The to-do state an approved epic moves to.
 #READY_STATE=Todo
+# The state a child sits in while its pull request waits for your merge. It is
+# the lane a ticket moves to when review is done, and setup-board names it
+# Needs Approval. Spell it as the tracker shows it, comma-separated if your teams
+# name it differently. The bridge says a child there is waiting for you, and never
+# tells you to hand it over again.
+#HANDOFF_STATES=Needs Approval
 
 # Answering a stuck session (docs/BRIDGE-OPERATOR.md, Step 10). The notifier's
 # STATE_DIR, exactly as notifier.conf sets it: the bridge reads the pings the

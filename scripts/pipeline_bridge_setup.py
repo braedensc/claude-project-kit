@@ -109,6 +109,9 @@ CONF_KEYS = {
                             "epic's children are handed to; empty refuses every approve"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
     "READY_STATE": ("Todo", "the name of each team's to-do state an approved epic moves to"),
+    "HANDOFF_STATES": (", ".join(bridge.DEFAULT_HANDOFF_STATES),
+                       "the states, by name, a child sits in while its pull request waits "
+                       "for your merge, comma-separated"),
     "NOTIFIER_STATE_DIR": ("~/.stage-e/state", "the notifier's STATE_DIR, as notifier.conf "
                                                "sets it: the bridge reads the pings it "
                                                "records there (KIT-224)"),
@@ -236,6 +239,10 @@ def compose_config(conf):
         "epic_wip": int(conf["EPIC_WIP"]) if conf["EPIC_WIP"].isdigit() else conf["EPIC_WIP"],
         "pings_file": pings_file(conf),
     }
+    # Composed only when it is not the job's own default, so an install made before the
+    # key existed is still the composed one (KIT-284).
+    if split_list(conf["HANDOFF_STATES"]) != bridge.DEFAULT_HANDOFF_STATES:
+        doc["handoff_states"] = split_list(conf["HANDOFF_STATES"])
     if conf["NOTIFIER_BOT_USER_ID"]:
         doc["notifier_bot_user_id"] = conf["NOTIFIER_BOT_USER_ID"]
     return doc
@@ -981,6 +988,28 @@ def selftest():
         named, _e = validate_conf(dict(values, PLAN_IT_STATE="Ready to plan"))
         check("config-carries-the-plan-it-state-name",
               compose_config(named)["plan_it_state"], "Ready to plan")
+        # KIT-284: the hand-off lanes. The default is the job's own and composes no key, so
+        # an install made before the key existed is still the composed one. Names compose in
+        # order, and the job's own check refuses a state a child sits in before work starts.
+        check("conf-HANDOFF_STATES-defaults-to-the-jobs-own-and-composes-no-key",
+              (CONF_KEYS.get("HANDOFF_STATES", ("not a key",))[0],
+               getattr(bridge, "DEFAULT_HANDOFF_STATES", None),
+               "handoff_states" in compose_config(conf)),
+              ("Needs Approval", ["Needs Approval"], False))
+        lanes, lane_errs = validate_conf(dict(values,
+                                              HANDOFF_STATES="Ready to merge, Needs Approval"))
+        try:
+            loaded = bridge.validate_config(dict(compose_config(lanes),
+                                                 state_dir="/nonexistent-%s"
+                                                 % os.getpid()))["handoff_states"]
+        except (bridge.BridgeError, KeyError) as exc:
+            loaded = "refused: %s" % exc
+        check("conf-HANDOFF_STATES-composes-each-name-in-order",
+              (lane_errs, compose_config(lanes).get("handoff_states"), loaded),
+              ([], ["Ready to merge", "Needs Approval"], ["Ready to merge", "Needs Approval"]))
+        check("conf-HANDOFF_STATES-naming-READY_STATE-is-refused-in-one-line",
+              len([e for e in validate_conf(dict(values, HANDOFF_STATES="Todo"))[1]
+                   if "handoff_states" in e and "ready_state" in e]), 1)
         check("conf-ACT-must-be-yes-or-no",
               any("ACT must be yes or no" in e for e in validate_conf(dict(values,
                                                                           ACT="true"))[1]),
@@ -1331,6 +1360,12 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 30)
             check("verify-clean", (rc, "Good:" in out), (EX_OK, True))
+            # KIT-284: a hand-off lane named after the install is a config to write again.
+            rc, out = cap(cmd_verify, dict(conf, HANDOFF_STATES="Ready to merge"),
+                          _RoleRunner(home, root, loaded=True), _FakeSudo(), now=at + 30)
+            check("verify-asks-for-install-once-HANDOFF_STATES-changes",
+                  (rc, bool(re.search(r"config\s+BLOCKED-ON-HUMAN\s+run `install --apply`",
+                                      out))), (EX_BLOCKED, True))
             # The notifier's pings file (KIT-224 review): with none, the row says so; with
             # NOTIFIER_BOT_USER_ID set, the owner has turned pings on, so none blocks; a
             # file that is not the notifier's document fails; the notifier's own passes.
