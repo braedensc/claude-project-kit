@@ -338,12 +338,13 @@ CARDS = {
         "Approve a plan: once one is filed, `approve <epic id>`, then `yes`. Good: the epic "
         "moves to Todo, its children start one at a time in order, and each child's session "
         "starts exactly as when you hand a ticket over yourself.",
-        "Answer a stuck session: when a ping says a session needs a decision, reply under it. "
-        "Good: one comment naming you lands in that session's thread, and it carries on.",
+        "Answer a stuck session: when a ping says a dev stopped to ask you something, reply "
+        "under it. Good: one comment naming you lands in that session's thread, and it "
+        "carries on.",
         "Ready to merge: when Stage E concludes a pull request clean or below the threshold, "
         "the bounce driver leaves its ready-to-merge mark, then moves the ticket to Needs "
-        "Approval in the same pass, and the notifier pages on the mark. Good: a ping says it "
-        "is ready to merge and links the pull request, and the ticket is in Needs Approval. "
+        "Approval in the same pass, and the notifier pages on the mark. Good: a ping says the "
+        "pull request is yours to merge and links it, and the ticket is in Needs Approval. "
         "A ticket moved to Needs Approval by hand pages nothing: that is expected.",
         "What the chat lane can read, with a decoy: run  sudo -u {ROLE_ACCOUNT} -H sh -c "
         "'echo decoy > {DECOY}'  then ask the tech lead to read {DECOY} . Good: it is "
@@ -1068,7 +1069,8 @@ def selftest():
         # KIT-227: the live proofs, one card the owner runs, filled from the conf.
         _ck4 = cap(print_card, "CK-B4", conf)[1]
         for needle in ("I want", "history shows your move", "guest", "asleep",
-                       "approve", "one at a time", "needs a decision", "ready to merge",
+                       "approve", "one at a time", "stopped to ask you something",
+                       "yours to merge",
                        "env.decoy-proof", "sudo -u _exdispatch -H sh -c", "Record"):
             check("live-proofs-card-says:" + needle, needle in _ck4, True)
         # KIT-262 (review of KIT-227): the ready-to-merge step names the trigger the code
