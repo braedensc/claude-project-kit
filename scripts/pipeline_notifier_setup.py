@@ -611,6 +611,15 @@ def validate_conf(values, invoking_user=None):
                       "pass allowed the whole interval leaves no gap between passes"
                       % (ints["RUN_TIMEOUT_SECONDS"], ints["INTERVAL_SECONDS"]))
 
+    # THE CLONE STAGE E MOVES, AND NO OTHER (KIT-280). This installer never moves the clone.
+    # The Stage E installer's `code` step moves only its own, stopping this job around the
+    # move, so a job on any other clone would run the code it was installed with for good.
+    clone = conf.get("ROLE_KIT_CLONE") or ""
+    if clone and "ROLE_KIT_CLONE" not in malformed and clone.rstrip("/") != se.ROLE_KIT_CLONE_PATH:
+        errors.append("ROLE_KIT_CLONE is %r, not Stage E's clone, %s. Nothing moves any other "
+                      "clone, so a merged fix would never reach this job. Set it to %s"
+                      % (clone, se.ROLE_KIT_CLONE_PATH, se.ROLE_KIT_CLONE_PATH))
+
     errors.extend(path_problems(conf, ROLE_HOME_SENTINEL, skip=malformed))
     return conf, errors
 
@@ -3220,6 +3229,19 @@ def _selftest_body():
        and refused("LINEAR_KEY_ENV=A__B\n", "UPPER_SNAKE"))
     ok("refuse: ENV_FILE equal to DISPATCHER_ENV_FILE",
        refused("DISPATCHER_ENV_FILE=~/.stage-e/env\n", "the dispatcher's own env file"))
+    # KIT-280: the job runs from Stage E's clone, the one clone anything moves.
+    clone_errs = [e for e in validate_conf(parse_conf(good_text.replace(
+        "ROLE_KIT_CLONE=~/.stage-e/kit", "ROLE_KIT_CLONE=~/kit"))[0], person)[1]
+        if "ROLE_KIT_CLONE" in e]
+    malformed_errs = [e for e in validate_conf(parse_conf(good_text.replace(
+        "ROLE_KIT_CLONE=~/.stage-e/kit", "ROLE_KIT_CLONE=relative/kit"))[0], person)[1]
+        if "ROLE_KIT_CLONE" in e]
+    ok("refuse: a ROLE_KIT_CLONE that is not Stage E's clone, saying why (KIT-280)",
+       len(clone_errs) == 1 and "not Stage E's clone" in clone_errs[0]
+       and "never reach this job" in clone_errs[0] and len(malformed_errs) == 1
+       and validate_conf(parse_conf(good_text.replace(
+           "ROLE_KIT_CLONE=~/.stage-e/kit", "ROLE_KIT_CLONE=~/.stage-e/kit/"))[0], person)[1] == [],
+       "%r; a malformed one: %r" % (clone_errs, malformed_errs))
     ok("refuse: a notifier path under DISPATCHER_STATE_ROOT",
        refused("DISPATCHER_STATE_ROOT=~/.stage-e\n", "under DISPATCHER_STATE_ROOT"))
     ok("refuse: non-positive and non-integer numbers",

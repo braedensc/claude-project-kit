@@ -166,6 +166,15 @@ def validate_conf(values):
         if conf[key] and not PATH_RE.match(conf[key]):
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
                           % (key, conf[key]))
+    # THE CLONE STAGE E MOVES, AND NO OTHER (KIT-280). This installer never fetches or pulls.
+    # The Stage E installer's `code` step moves only its own clone, stopping this job around
+    # the move, so a job on any other clone would run the code it was installed with for good.
+    clone = conf["ROLE_KIT_CLONE"]
+    if clone and PATH_RE.match(clone) and clone.rstrip("/") != se.ROLE_KIT_CLONE_PATH:
+        errors.append("ROLE_KIT_CLONE is %r, not Stage E's clone, %s. Nothing moves any other "
+                      "clone, so a merged fix would never reach this job. Set it to %s; "
+                      "docs/BRIDGE-OPERATOR.md, Step 1, says how to move a job installed on "
+                      "another clone" % (clone, se.ROLE_KIT_CLONE_PATH, se.ROLE_KIT_CLONE_PATH))
     # The dispatcher hands its env file to every session it starts. The same file under
     # another spelling (`~/x` against an absolute path, or a link) is caught by the token
     # writer, which resolves both as the role account.
@@ -855,7 +864,7 @@ def pings_row(conf, facts):
 
 GOOD_CONF = """
 ROLE_ACCOUNT=_exdispatch
-ROLE_KIT_CLONE=~/kit
+ROLE_KIT_CLONE=~/.stage-e/kit
 CHANNEL_IDS=C0000000AA, C0000000BB
 OWNER_USER_ID=00000000-0000-4000-8000-000000000001
 TEAM_KEYS=PROD
@@ -1029,6 +1038,15 @@ def selftest():
         _c, errs = validate_conf(dict(values, DISPATCHER_ENV_FILE="~/.stage-e/./env"))
         check("conf-env-file-is-the-dispatchers-refused",
               any("ENV_FILE and DISPATCHER_ENV_FILE" in e for e in errs), True)
+        # KIT-280: the job runs from Stage E's clone, the one clone anything moves.
+        _c, errs = validate_conf(dict(values, ROLE_KIT_CLONE="~/kit"))
+        _c, errs_slash = validate_conf(dict(values, ROLE_KIT_CLONE="~/.stage-e/kit/"))
+        _c, errs_bad = validate_conf(dict(values, ROLE_KIT_CLONE="relative/kit"))
+        check("conf-refuses-a-clone-nothing-moves",
+              ([e for e in errs if "ROLE_KIT_CLONE" in e and "not Stage E's clone" in e
+                and "never reach this job" in e and "Step 1" in e] != [], errs_slash,
+               len([e for e in errs_bad if "ROLE_KIT_CLONE" in e])),
+              (True, [], 1))
         _v, perrs = parse_conf("NOPE=1\nbroken line\nTEAM_KEYS=A\nTEAM_KEYS=B\n"
                                "OWNER_USER_ID=xoxb-%s\n" % ("z" * 30))
         check("conf-parse-errors", len(perrs), 4)
@@ -1045,7 +1063,7 @@ def selftest():
         cmd = job_command(conf)
         check("job-sources-the-env-file-then-runs-the-bridge",
               cmd.startswith('set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 '
-                             '"$HOME/kit/scripts/pipeline_bridge.py" run --config '
+                             '"$HOME/.stage-e/kit/scripts/pipeline_bridge.py" run --config '
                              '"$HOME/.stage-e/bridge.json"'), True)
         plist = render_plist(conf, "/srv/role-home")
         check("plist-runs-as-the-role-account",

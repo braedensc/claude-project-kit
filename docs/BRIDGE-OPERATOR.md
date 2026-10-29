@@ -37,6 +37,8 @@ Every file here is generic. Keep your filled-in values in your private runbook.
   administrator password once, at the start. Then it reads and writes as the role account,
   and `install --apply` writes the job's file into `/Library/LaunchDaemons` as root.
   `verify` also asks launchd, as root, whether the job is loaded.
+- **The Stage E installer's `run` is the one exception.** When it moves the clone, it stops
+  a loaded bridge for those few seconds and loads it again.
 - **You run the `launchctl` lines that start and stop the job.** Cards CK-B2 and CK-B3
   print them. The installer never runs them.
 - **`compose` and `card` need no password.** They read nothing on the machine.
@@ -51,7 +53,11 @@ cp bridge.conf.example bridge.conf && chmod 600 bridge.conf && ${EDITOR:-nano} b
 
 Seven values are required: the role account, its kit clone, the channel id, your tracker
 user id, the team keys, a job label, and the bridge bot's member ID (Step 2). None of them is
-secret. Set `DISPATCHER_ENV_FILE` too, so `token` can refuse the chat bot's own token.
+secret. Set `ROLE_KIT_CLONE` to Stage E's clone, `~/.stage-e/kit`. The Stage E installer is
+the only thing that moves it, so the installer refuses any other clone.
+An older example said `~/kit`. If yours does, change it, run `install --apply`, then reload
+the job: `sudo launchctl bootout system/<label>`, wait ten seconds, then card CK-B2.
+Set `DISPATCHER_ENV_FILE` too, so `token` can refuse the chat bot's own token.
 It must be a different file from `ENV_FILE`. The dispatcher hands its env file to every
 session it starts, so the bridge's token must never go there. The installer refuses the
 same file.
@@ -380,6 +386,19 @@ bot", with no mention.
 
 ---
 
+## After a merge that changes the bridge
+
+Run the one command, `python3 scripts/pipeline_install.py`. Its Stage E check counts the
+role account's clone as behind when a file the bridge runs changed. Say yes, and the Stage
+E installer moves the clone. It stops the bridge just before the move and loads it again
+straight after.
+
+Good: the Stage E `code` row's note names `system/<label>`. Then this installer's `verify`
+says the job is loaded and its heartbeat is fresh.
+Not that: `A JOB THAT RUNS FROM THE CLONE IS OFF`. Run the line printed under it.
+
+---
+
 ## Turning it off
 
 ```sh
@@ -415,6 +434,8 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
 
 ## What is not proven
 
+- That the Stage E installer stops and reloads a loaded bridge around a real clone move.
+  The tests cover it with a faked launchd; no live run has (KIT-280).
 - That a live Slack marks guests and apps in `users.info` as its documentation says. The tests
   use the documented fields (KIT-227).
 - That `groups:history` alone reads a private channel's history and threads. A missing scope

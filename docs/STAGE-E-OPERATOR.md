@@ -124,10 +124,40 @@ moved, so `run` would only fast-forward and restart them; or the names of the fi
 did move; or, when it could not fetch or could not compare, that it does not know — which
 stops the pass with a remedy rather than guessing.
 
+**The notifier and the Slack bridge run from the same clone** (KIT-280). Their own
+installers never move it, so this one does, and both refuse any clone but `~/.stage-e/kit`.
+Before the clone moves, `run` looks in `/Library/LaunchDaemons` for every job that runs
+either of them from the clone as the role account. It stops each loaded one first, and waits
+until launchd has let it go. Then it stops the Stage E jobs, moves the clone, and loads each
+of the two again straight away. So each is off for seconds, not until `enable`, and its next
+pass runs the new code. A job you paused stays paused. A pass running at that moment is cut
+short, the same as a Stage E job's.
+
+Two things can go wrong, and each is said:
+- **launchd still holds one when the wait runs out.** Nothing moves and no Stage E job stops.
+  A job it already stopped is loaded again, and the row prints the line that stops the held
+  one by hand.
+- **launchd will not load one again.** The `code` row fails, but the run goes on and loads
+  the review jobs. The notice on the way out prints the line that loads it, and the line that
+  keeps it off on purpose. Every later `verify` names it, and every later `run` loads it
+  again, until launchd holds it or you disable it.
+
+`verify` and a dry run name these jobs in a note under the table. If the list cannot be
+read, the note says so, and `run` stops before it stops anything.
+
+Good: a note naming `system/<label>`, which `run` stops just before the move and loads again.
+Not: `code FAILED — system/<label> was told to stop and launchd still holds it`. Run the
+`bootout` line it prints, then `run` again.
+Not: `A JOB THAT RUNS FROM THE CLONE IS OFF`. Run the `bootstrap` line under it, or the
+`disable` line to keep it off.
+
 **`verify` reads `behind` only when a file the jobs run changed.** Those files are every
 script the five jobs load, their imports included, and `schemas/`, which a review and a
-telemetry row are judged against. A merge that touched none of them — a doc, an ADR,
-another project's script — leaves `verify` at `ALREADY-DONE`, naming both commits. `run`
+telemetry row are judged against. They include the notifier's and the Slack bridge's files
+on a machine that runs that job. A merge that touched none of them — a doc, an ADR,
+another project's script, a bridge file on a machine with no bridge — leaves `verify` at
+`ALREADY-DONE`, naming both commits. If the list of jobs cannot be read, every job's files
+count. `run`
 still fast-forwards whenever the commits differ, so the clone never drifts.
 
 Reading that costs one write: a read-only pass **fetches origin's objects into the role
@@ -136,7 +166,8 @@ working tree. It is the only write either read-only command makes.
 
 The step has four answers, not one:
 Good: `code ALREADY-DONE — every file the jobs run is identical at origin HEAD`. A dry run
-says instead that `run` would still fast-forward and restart the jobs.
+says instead that `run` would still fast-forward and restart the jobs, and a note under the
+table names any other job it would stop for the move.
 Not: `code WOULD-CHANGE — … changed there: scripts/…`, which names the files that moved.
 Run `run` when no session is in flight.
 Not: `code UNKNOWN`, which means the fetch or the comparison could not be made — never
@@ -1534,9 +1565,10 @@ until the clone moves. `run` moves it for you — it unloads the four jobs and t
 monitor, fast-forwards, reloads three at its `enable` step, the catch-up poller at its
 `catch-up` step and the monitor at its `heartbeat-monitor` step — and that is the only thing
 that does. The monitor runs from the
-same clone. Pull it by hand only with all five jobs unloaded, never under a running pass,
-and compare its `git rev-parse --short HEAD` against your own clone whenever behaviour
-surprises you. A stale daemon clone looks exactly like a bug.
+same clone, and so do the notifier and the Slack bridge, which `run` stops for the move and
+loads again. Pull it by hand only with every job that runs from it unloaded, never under a
+running pass, and compare its `git rev-parse --short HEAD` against your own clone whenever
+behaviour surprises you. A stale daemon clone looks exactly like a bug.
 
 **Set `HOME` explicitly.** A system daemon inherits no login environment, and both the env
 file and the config paths above are written relative to it.

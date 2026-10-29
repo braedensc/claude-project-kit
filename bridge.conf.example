@@ -21,8 +21,11 @@
 # 2026-10-10): its own Slack app keeps it apart from the chat bot.
 ROLE_ACCOUNT=_exampledispatch
 
-# That account's clone of this kit, which the job runs from.
-ROLE_KIT_CLONE=~/kit
+# That account's clone of this kit, which the job runs from: the one the Stage E
+# daemons exec from. The Stage E installer's `code` step is the only thing that
+# moves it, and stops this job while it does. The installer refuses any other
+# clone: nothing would ever move it.
+ROLE_KIT_CLONE=~/.stage-e/kit
 
 # The private channel(s) the bridge reads and answers in: the chat bot's
 # channel. Comma-separated. Invite the bridge app to each (card CK-B1).
