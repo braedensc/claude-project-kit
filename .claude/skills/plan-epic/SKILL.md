@@ -122,7 +122,8 @@ Subagent, model `sonnet`. Output is **draft ticket JSON**, matching the input sh
   unless each genuinely lands on its own.
 - Acceptance criteria are statements about the finished system, mechanically checkable
   wherever possible — name the command, path, or endpoint in backticks.
-- Pointers cite **paths verified to exist**. Check them; the gate will.
+- Pointers cite **paths verified to exist**. Check them; the gate will. A file another
+  ticket in this tree creates goes in that ticket's Context, never under Pointers.
 - `effort:` proposed from `budgets.perEffort` — a ticket that cannot fit `L` is not an
   `L`, it is two tickets. `track:` from the tracks that exist in `linear.labels.ids`.
 - Order the tree by dependency and say which tickets can run in parallel.
