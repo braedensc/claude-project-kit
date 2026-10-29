@@ -39,7 +39,8 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   outside the plan at work, and the end. So is a hand-over still not started two hours
   on, as its agent sessions show it (KIT-284): nothing while one runs; in one of
   `handoff_states`, its pull request waiting for your merge, or on you when its review
-  ran out of rounds; its session ended early; no session the agent ever picked up; or,
+  ran out of rounds; its newest session ended early, or the agent never picked it up,
+  two hours on from that session when you handed it over again; no session at all; or,
   when the session list was too long to read whole, that it could not tell. One epic the
   tracker will not read stops nothing else, and the pass still exits 1.
 
@@ -264,6 +265,8 @@ MODE_LABELS = ("orchestrator", "graphite")
 # sessions show it (KIT-284). The dispatcher moves a ticket to a started state when its
 # session begins.
 STUCK_START_SECONDS = 2 * 3600
+# A pass reads sessions after setting its clock, so one up to this far past it is just made.
+JUST_MADE_SECONDS = 600
 # What a session's status says of a child two hours on. A hand-over always makes a session,
 # and what the tracker calls one nobody answered is not proven (docs/CATCH-UP.md): the
 # catch-up poller models it as pending, and it may turn stale. So a session is running only
@@ -2070,14 +2073,17 @@ class Pass(object):
         never picked up is not running. In a hand-off lane its pull request waits for you,
         so it is never called not started, nor offered to be handed over again; while it
         carries `agent:needs-human` it is never called ready to merge either, and that is
-        said even after the merge note. A session that ran and ended anywhere else stopped
-        short. Any other session, or none, never began, unless the list was too long to read
-        whole and holds none: then it is said as could not tell, never as no session
-        (contract §13). A list the tracker would not give fails the epic's pass before
-        anything is said."""
+        said even after the merge note. Anywhere else, a child whose newest session ran and
+        ended stopped short. Any other never began: its newest session not picked up, or
+        none at all, unless the list was too long to read whole and holds none: then it is
+        said as could not tell, never as no session (contract §13). A newest session made
+        after the bridge's hand-over (its own, a hand-over again, or a mention) starts the
+        two hours, and the note names its time. A list the tracker would not give fails the
+        epic's pass before anything is said."""
         ident, wip = k["identifier"], self.cfg["epic_wip"]
         lane = (k.get("state") or {}).get("name") or "?"
-        statuses = [(n or {}).get("status") for n in self.tracker.sessions_on(k["id"])]
+        sessions = [n or {} for n in self.tracker.sessions_on(k["id"])]
+        statuses = [n.get("status") for n in sessions]
         if any(s in SESSION_RUNNING for s in statuses):
             return
         if lane in self.cfg["handoff_states"]:
@@ -2091,7 +2097,7 @@ class Pass(object):
                 self.note(rec, "handoff:" + k["id"], "%s's pull request is waiting for you "
                           "to merge.%s" % (ident, " The next piece starts once it's merged."
                                            if next_waits_on(k) else ""))
-        elif any(s in SESSION_RAN for s in statuses):
+        elif self.newest_ended(sessions):
             self.note(rec, "ended:" + k["id"], "%s's session ended before it finished, and "
                       "it's in %s now. It still counts toward the limit of %d: hand it over "
                       "again yourself, or cancel it." % (ident, lane, wip))
@@ -2102,10 +2108,55 @@ class Pass(object):
                       "counts toward the limit of %d. Check it in the tracker before you "
                       "hand it over again." % (ident, iso(since), lane, wip))
         else:
+            since = self.handed_at(sessions, since)
+            if self.now - since <= STUCK_START_SECONDS:
+                return
             self.note(rec, "stuck:" + k["id"], "%s was handed to the agent at %s and has "
                       "not started. Its session may have stopped. It still counts toward "
                       "the limit of %d: hand it over again yourself, or cancel it."
                       % (ident, iso(since), wip))
+
+    @staticmethod
+    def newest(sessions):
+        """The newest of a child's agent sessions, by each one's own `createdAt`, as the
+        planner orders them. On the same time, one that has not ended counts as the newer.
+        None when there is none, or when any carries no time: then they cannot be put in
+        order."""
+        if sessions and all(isinstance(n.get("createdAt"), str) and n["createdAt"]
+                            for n in sessions):
+            return max(sessions, key=lambda n: (n["createdAt"],
+                                                n.get("status") not in SESSION_RAN))
+        return None
+
+    @staticmethod
+    def newest_ended(sessions):
+        """True when the newest of a child's agent sessions ran and ended. A child handed
+        over again has a newer session, so the one that ended before it no longer says how
+        the child stands. When the sessions cannot be put in order, the child has ended only
+        when every session on it has."""
+        if not sessions:
+            return False
+        newest = Pass.newest(sessions)
+        if newest is not None:
+            return newest.get("status") in SESSION_RAN
+        return all(n.get("status") in SESSION_RAN for n in sessions)
+
+    def handed_at(self, sessions, since):
+        """When the two hours start for a child the bridge handed over at `since`, once its
+        newest session has not ended: at `since`, or at that session's own `createdAt` when
+        it was made later (the bridge's own session, a hand-over again, or a mention). A time
+        not in the tracker's own form, UTC ending in Z, never moves the clock (one with no
+        zone would be read as this machine's local time), and nor does one more than
+        JUST_MADE_SECONDS past this pass. One less far past it was made while this pass ran,
+        or by a clock a little ahead of this one, so it counts as just made and the pass waits."""
+        text = (self.newest(sessions) or {}).get("createdAt") or ""
+        if not text.endswith("Z"):
+            return since
+        try:
+            at = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return since
+        return at if since < at <= self.now + JUST_MADE_SECONDS else since
 
     def start_child(self, rec, child, kids, agent_id):
         ident = child["identifier"]
@@ -3978,6 +4029,132 @@ def selftest():
                two_hours_on("pending-handoff", "Needs Approval", pending),
                two_hours_on("reprompted-handoff", "Needs Approval", reprompted)),
               ([stuck], [stuck], [stuck], [waits], [waits]))
+        # Stage E's review: a child handed over again has a newer session than the one that
+        # ended, and only its newest session says how it stands, by the sessions' own
+        # creation time, in whichever order the tracker lists them. A newest one nobody
+        # picked up gets the note it would get alone; an ended one newer than it is ended.
+        def made(status, at, sid="s-51"):
+            """A session as the tracker lists it: its status and its own creation time, an
+            hour and minute of one day (None: the session carries no time)."""
+            node = {"id": sid, "status": status}
+            if at is not None:
+                node["createdAt"] = "2025-10-09T%s:00.000Z" % at
+            return node
+        def stuck_from(at):
+            """The not-started note of a child handed over again at `at`, an hour and minute
+            of that day: the two hours, and the time the note names, start from then."""
+            return stuck.replace(iso(now), "2025-10-09T%s:00Z" % at)
+        check("a-child-handed-over-again-is-said-as-its-newest-session-shows",
+              (two_hours_on("again-todo", "Todo",
+                            [made("complete", "09:00"), made("pending", "10:00", "s-51b")]),
+               two_hours_on("again-todo-newest-first", "Todo",
+                            [made("pending", "10:00", "s-51b"), made("error", "09:00")]),
+               two_hours_on("again-stale-todo", "Todo",
+                            [made("complete", "09:00"), made("stale", "10:00", "s-51b")]),
+               two_hours_on("again-ended-todo", "Todo",
+                            [made("pending", "09:00"), made("complete", "10:00", "s-51b")]),
+               two_hours_on("again-ended-todo-newest-first", "Todo",
+                            [made("error", "10:00", "s-51b"), made("pending", "09:00")]),
+               two_hours_on("again-handoff", "Needs Approval",
+                            [made("complete", "09:00"), made("pending", "10:00", "s-51b")]),
+               two_hours_on("again-ended-handoff", "Needs Approval",
+                            [made("pending", "09:00"), made("complete", "10:00", "s-51b")])),
+              ([stuck_from("10:00")], [stuck_from("10:00")], [stuck_from("10:00")],
+               [ended_todo], [ended_todo], [waits], [waits]))
+        # Sessions that cannot be put in order, one with no time, a blank one or one that is
+        # not the tracker's text, say a child ended only when every one of them did. On the
+        # same time, one that has not ended counts as the newer.
+        def timed(status, at, sid):
+            return {"id": sid, "status": status, "createdAt": at}
+        check("sessions-that-cannot-be-ordered-say-ended-only-when-every-one-did",
+              (two_hours_on("untimed-ended", "Todo",
+                            [made("complete", None), made("pending", "10:00", "s-51b")]),
+               two_hours_on("untimed-pending", "Todo",
+                            [made("complete", "09:00"), made("pending", None, "s-51b")]),
+               two_hours_on("blank-time", "Todo",
+                            [made("complete", "09:00"), timed("pending", "", "s-51b")]),
+               two_hours_on("number-time", "Todo",
+                            [timed("complete", 2, "s-51"), timed("pending", 1, "s-51b")]),
+               two_hours_on("same-time", "Todo",
+                            [made("complete", "09:00"), made("pending", "09:00", "s-51b")]),
+               two_hours_on("untimed-all-ended", "Todo",
+                            [made("complete", None), made("error", None, "s-51b")])),
+              ([stuck], [stuck], [stuck], [stuck], [stuck_from("09:00")], [ended_todo]))
+        # Round 4: the owner who follows the ended note hands the child over again, so its
+        # newest session is newer than the bridge's own hand-over. Nothing more is said until
+        # two hours after that session was made, and the not-started note then names its
+        # time, once. Stage E's own case: handed over again just before the two-hour check.
+        hour = 3600
+
+        def created(t):
+            """A time as the tracker's session list writes one."""
+            return iso(t)[:-1] + ".000Z"
+
+        def handed_again(name, first, again, times, seen=None):
+            """What the thread says of PROD-51, in Todo, on a pass at each of `times`,
+            seconds after the bridge handed it over: one list per pass. Its sessions are
+            `first`, and from `again` on also a newer one made then, that nobody has picked
+            up yet: the owner handed it over again. With `seen`, the passes list it from
+            then on: a pass that started at `seen`, before `again`, read the list after it."""
+            c, s, t, _root = approved(name, kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            t.issues["PROD-51"]["state"] = {"id": "st-lane", "name": "Todo", "type": "unstarted"}
+            t.sessions["uuid-51"] = list(first)
+            seen = again if seen is None else seen
+            said = []
+            for at in times:
+                if at >= seen and len(t.sessions["uuid-51"]) == len(first):
+                    t.sessions["uuid-51"].append({"id": "s-51b", "status": "pending",
+                                                  "createdAt": created(now + again)})
+                before = len(s.posts)
+                run(c, s, t, at=now + at)
+                said.append([p for p in posted(s)[before:] if p.startswith("PROD-51")])
+            return said
+        check("the-ended-note-followed-says-nothing-until-two-hours-after-the-new-hand-over",
+              handed_again("ended-then-again", [timed("error", created(now), "s-51")],
+                           3 * hour + 60, (3 * hour, 3 * hour + 120, 5 * hour + 60,
+                                           5 * hour + 120, 6 * hour)),
+              [[ended_todo], [], [], [stuck.replace(iso(now), iso(now + 3 * hour + 60))], []])
+        check("a-child-handed-over-again-before-the-two-hour-check-waits-two-hours-from-then",
+              handed_again("again-before-check", [timed("complete", created(now), "s-51")],
+                           2 * hour - 300, (2 * hour + 60, 3 * hour, 4 * hour - 300,
+                                            4 * hour - 240, 5 * hour)),
+              [[], [], [], [stuck.replace(iso(now), iso(now + 2 * hour - 300))], []])
+        # A newer time not written as the tracker writes one, one more than ten minutes past
+        # the pass, or one before the bridge's own hand-over never moves the clock: the note
+        # is as before.
+        check("a-time-that-cannot-start-the-two-hours-again-never-moves-the-clock",
+              tuple(two_hours_on(name, "Todo", [timed("complete", created(now), "s-51"),
+                                                timed("pending", at, "s-51b")])
+                    for name, at in (("offset-time", "2025-10-09T10:00:00.000+00:00"),
+                                     ("no-such-hour", "2025-10-09T25:00:00.000Z"),
+                                     ("later-than-the-pass", created(now + 10 * hour)))) +
+              (two_hours_on("before-the-hand-over", "Todo",
+                            [timed("pending", created(now - hour), "s-51")]),),
+              ([stuck], [stuck], [stuck], [stuck]))
+        # Round 5: a pass sets its clock when it starts and reads the sessions later, so a
+        # hand-over made in between is dated a moment past the pass. It counts as just made:
+        # that pass says nothing, and the note comes once, two hours after the hand-over.
+        check("a-hand-over-made-while-a-pass-runs-waits-two-hours-from-then",
+              handed_again("again-during-a-pass", [timed("error", created(now), "s-51")],
+                           3 * hour + 60, (3 * hour, 3 * hour + 59, 3 * hour + 120,
+                                           5 * hour + 60, 5 * hour + 120, 6 * hour),
+                           seen=3 * hour + 59),
+              [[ended_todo], [], [], [],
+               [stuck.replace(iso(now), iso(now + 3 * hour + 60))], []])
+        # Round 5: the hand-over most often made again, of a child the agent never picked
+        # up, before the two-hour check. Nothing until two hours after it, then the note once.
+        check("a-lost-hand-over-handed-over-again-before-the-check-waits-two-hours-from-then",
+              handed_again("lost-then-again", [timed("pending", created(now), "s-51")],
+                           2 * hour - 600, (2 * hour + 60, 3 * hour, 4 * hour - 540, 5 * hour)),
+              [[], [], [stuck.replace(iso(now), iso(now + 2 * hour - 600))], []])
+        # Round 5: both edges of the allowance. A session dated JUST_MADE_SECONDS past the
+        # pass counts as just made and waits; one dated a second further is refused.
+        check("a-session-up-to-ten-minutes-past-the-pass-is-just-made-and-no-further",
+              (two_hours_on("bound-in", "Todo", [timed("complete", created(now), "s-51"),
+                            timed("pending", created(now + 3 * hour + 600), "s-51b")]),
+               two_hours_on("bound-out", "Todo", [timed("complete", created(now), "s-51"),
+                            timed("pending", created(now + 3 * hour + 601), "s-51b")])),
+              ([], [stuck]))
 
         # The second review: the promise is kept. Merged (Done, its sessions as they were),
         # a child frees its slot only once no session on it is open, and then the next

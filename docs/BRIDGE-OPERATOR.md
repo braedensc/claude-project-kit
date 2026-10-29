@@ -269,8 +269,10 @@ start is said in the thread. When nothing can start, it says so once, and why.
     lets the next piece start, it says that too. If the child also carries
     `agent:needs-human`, its review usually ran out of rounds with findings still open.
     Then it says the pull request is yours to fix and merge, or cancel, instead;
-  - its session ended before it finished, and where the child is now;
-  - it has not started: no session on it ever began, or the agent never picked one up;
+  - its latest session ended before it finished, and where the child is now;
+  - it has not started: no session on it ever began, or the agent never picked up its
+    latest one. If you handed it over again yourself, it waits two hours from then, and
+    the note gives that time;
   - or it couldn't tell, because the tracker holds more agent sessions than it can read at
     once. Check the child in the tracker before you hand it over again.
 
@@ -455,6 +457,9 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
 - That merging moves a child to Done. `setup-board` wires it. Without it, a merged child
   keeps its slot, and the line that the next piece starts once it's merged is wrong
   (KIT-284).
+- That handing a child over again yourself makes a new session, dated then. The bridge
+  waits two hours from that date; the tests assume it. A date more than ten minutes ahead
+  of this Mac's clock is ignored, and the bridge times from its own hand-over (KIT-284).
 - That reading an epic with 30 children, every pass, fits the tracker's query and rate
   limits. The key is shared with Stage E. A refusal stops the pass with a named failure
   (KIT-227).
