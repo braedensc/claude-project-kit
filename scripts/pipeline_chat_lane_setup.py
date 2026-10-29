@@ -901,7 +901,7 @@ SCOPE_CITES = {
         "before it handles any Slack event, dropping the event when the call fails "
         "(slack-event-transport 0.2.74-cypack1546.0 SlackChannelPolicy.js:44-65, called "
         "at SlackEventTransport.js:244-247; edge-worker 0.2.74-cypack1546.0 "
-        "SlackChatAdapter.js:55-64). 0.2.73 never calls it. An app made before piece 6 "
+        "SlackChatAdapter.js:55-61). 0.2.73 never calls it. An app made before piece 6 "
         "asked for it gains it with card CK-C7"),
     "reactions:write": (
         "reactions.add and reactions.remove: the receipt and done reactions "
@@ -5251,7 +5251,7 @@ def _selftest_body():
     expect("manifest-groups-read-cites-the-channel-check", all(t in cite for t in (
         "slack-event-transport 0.2.74-cypack1546.0 SlackChannelPolicy.js:44-65",
         "SlackEventTransport.js:244-247",
-        "edge-worker 0.2.74-cypack1546.0 SlackChatAdapter.js:55-64",
+        "edge-worker 0.2.74-cypack1546.0 SlackChatAdapter.js:55-61",
         ". 0.2.73 never calls it.", "CK-C7")), cite)
     _rc, piece6 = _capture(_compose_piece_6, conf)
     expect("piece-6-says-which-version-it-read",
@@ -6147,6 +6147,73 @@ def _selftest_body():
                                     "python3 scripts/pipeline_chat_lane_setup.py card CK-C7",
                                     "2. In Slack's app settings")]
     expect("doc-already-on-pulls-first", all(a >= 0 for a in at) and at == sorted(at), at)
+    # A cite names its file, then one or more lines or ranges. "File.js:296-301, 351-356",
+    # the style SCOPE_CITES itself uses, is two cites, and each is read. A bare ":50-65"
+    # names no file, so nothing here reads it: no case can check part of a function
+    # without the package source.
+    def _cite_tokens(text):
+        return ["%s:%s" % (name, span) for name, spans in re.findall(
+            r"(\w+\.js):(\d+(?:-\d+)?(?:,\s*\d+(?:-\d+)?)*)", text)
+            for span in re.split(r",\s*", spans)]
+
+    def _cite_ranges(text):
+        return [(name, int(span.split("-")[0]), int(span.split("-")[1]))
+                for name, span in (c.split(":") for c in _cite_tokens(text)) if "-" in span]
+
+    # The guide and SCOPE_CITES cite the same channel check, and once gave two ranges for
+    # it (the Stage E review). Where the guide talks about it (the Already-on section and
+    # step 6's groups:read row), each range of SCOPE_CITES' groups:read cite is cited, and
+    # every file-named range there that overlaps it is that range. A range that does not
+    # overlap it is some other span, such as a log line.
+    def _check_cites(code, doc):
+        return {"%s:%d-%d" % (f, a, b): sorted({
+            "%s:%d-%d" % (g, x, y) for g, x, y in _cite_ranges(doc)
+            if g == f and x <= b and a <= y}) for f, a, b in _cite_ranges(code)}
+
+    # Every file:line a row of step 6's table cites is one SCOPE_CITES gives for that scope.
+    def _stray_cites(rows, cites):
+        stray = {}
+        for scope, cells in rows:
+            code_cites = set(_cite_tokens(cites.get(scope, "")))
+            extra = [c for c in _cite_tokens(cells) if c not in code_cites]
+            if extra:
+                stray[scope] = extra
+        return stray
+
+    check_text = already + "\n" + "\n".join(
+        re.findall(r"^\| `groups:read` \|.*$", step6, re.M))
+    check_cites = _check_cites(SCOPE_CITES.get("groups:read", ""), check_text)
+    expect("doc-channel-check-cites-are-scope-cites",
+           any(c.startswith("SlackChatAdapter.js:") for c in check_cites)
+           and all(got == [want] for want, got in check_cites.items()), check_cites)
+    stray_cites = _stray_cites(
+        re.findall(r"^\| `([a-z_]+:[a-z_]+)` \| (.*)$", step6, re.M), SCOPE_CITES)
+    expect("doc-scope-table-cites-are-scope-cites", bool(table) and not stray_cites,
+           stray_cites)
+    # Both ways round, on a list shaped like chat:write's cite: a wrong second range is
+    # caught, in the guide's text and in a table row, and a true second range is kept. A
+    # wrong range that starts on another line, such as :56-61 beside the true :55-61, is
+    # caught too, so the channel check does not compare start lines alone.
+    listed = {"chat:write": "(SlackMessageService.js:17-31; SlackChatAdapter.js:296-301, "
+                            "351-356)"}
+    caught = (_check_cites("SlackChatAdapter.js:55-61", "`SlackChatAdapter.js:55-61, 55-64`"),
+              _stray_cites([("chat:write", "`SlackChatAdapter.js:296-301, 296-302`")], listed),
+              _check_cites("SlackChatAdapter.js:55-61",
+                           "`SlackChatAdapter.js:55-61` and `SlackChatAdapter.js:56-61`"))
+    expect("doc-cites-catch-a-wrong-range-in-a-list", caught == (
+        {"SlackChatAdapter.js:55-61": ["SlackChatAdapter.js:55-61",
+                                       "SlackChatAdapter.js:55-64"]},
+        {"chat:write": ["SlackChatAdapter.js:296-302"]},
+        {"SlackChatAdapter.js:55-61": ["SlackChatAdapter.js:55-61",
+                                       "SlackChatAdapter.js:56-61"]}), caught)
+    kept = (_stray_cites([("chat:write", "`SlackChatAdapter.js:351-356`")], listed),
+            _stray_cites([("chat:write", "`SlackMessageService.js:17-31`; "
+                                         "`SlackChatAdapter.js:296-301, 351-356`")], listed),
+            _check_cites("SlackChatAdapter.js:296-301, 351-356",
+                         "`SlackChatAdapter.js:296-301` and `SlackChatAdapter.js:351-356`"))
+    expect("doc-cites-accept-a-true-range-in-a-list", kept == ({}, {}, {
+        "SlackChatAdapter.js:296-301": ["SlackChatAdapter.js:296-301"],
+        "SlackChatAdapter.js:351-356": ["SlackChatAdapter.js:351-356"]}), kept)
 
     # -- 11. the source: no write to a dispatcher path, no merge/label/state path
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:

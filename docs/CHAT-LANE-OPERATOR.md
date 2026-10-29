@@ -193,7 +193,7 @@ Even with the scope, the new release asks Slack about every message first, and w
 most 1.5 seconds (`SlackChannelPolicy.js:11`). A slow or failed answer drops the message
 just as silently (`:50-65`). The same check runs again before each thing the bot then
 does in Slack: reading the thread, its first reaction, its answer, marking the message
-done, saying it is busy (`SlackChatAdapter.js:55-60`, called at `:204`, `:260`, `:304`,
+done, saying it is busy (`SlackChatAdapter.js:55-61`, called at `:204`, `:260`, `:304`,
 `:320`, `:334` and `:339`). So after that upgrade, any one of them can go missing on its
 own, even when the work was done.
 
