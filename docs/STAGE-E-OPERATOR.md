@@ -136,14 +136,18 @@ short, the same as a Stage E job's.
 Two things can go wrong, and each is said:
 - **launchd still holds one when the wait runs out.** Nothing moves and no Stage E job stops.
   A job it already stopped is loaded again, and the row prints the line that stops the held
-  one by hand.
+  one by hand. Until a later `run` loads it again, `verify` names it: not off while launchd
+  still holds it (it may still be going, or was loaded again), and off once it has gone.
+  On a clone already level, the row fails and the run goes on.
 - **launchd will not load one again.** The `code` row fails, but the run goes on and loads
   the review jobs. The notice on the way out prints the line that loads it, and the line that
   keeps it off on purpose. Every later `verify` names it, and every later `run` loads it
   again, until launchd holds it or you disable it.
 
 `verify` and a dry run name these jobs in a note under the table. If the list cannot be
-read, the note says so, and `run` stops before it stops anything.
+read, the note says so, and `run` stops before it stops anything. A plist saved in binary
+form that names either job counts as one it cannot read. `sudo plutil -convert xml1
+<plist>` turns it back into text.
 
 Good: a note naming `system/<label>`, which `run` stops just before the move and loads again.
 Not: `code FAILED — system/<label> was told to stop and launchd still holds it`. Run the

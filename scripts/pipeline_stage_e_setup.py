@@ -2557,15 +2557,27 @@ def clone_jobs_sh(account, daemons="/Library/LaunchDaemons"):
     (KIT-280). A module-level function so the selftest can EXECUTE it over the plists the
     notifier's and the bridge's own installers render.
 
+    EACH PLIST IS MATCHED WITH ITS WHITESPACE TAKEN OUT (Stage E review). The account name and
+    the entry path hold none, so a plist that `plutil -convert xml1` or a hand edit laid out
+    over more lines is found as it was. One that names an entry script out of the clone but
+    holds no `<plist` at all is binary, and text cannot tell whose job it is: that is exit 9,
+    a plist it could not read, never one skipped. `LC_ALL=C`, because macOS's `tr` refuses a
+    binary plist's bytes in a UTF-8 locale, and every binary plist, anyone's, would read so.
+
     `END` closes a listing that ran to the end. Exit 9 is a plist it could not read, and a
     listing with no `END` did not finish: neither is ever "no such job" (contract §13)."""
     user = shlex.quote("<key>UserName</key><string>%s</string>" % account)
     runs = " ".join('case "$c" in *%s*) printf "%%s %%s\\n" %s "$f" ;; esac;'
                     % (shlex.quote(ROLE_KIT_CLONE_PATH[1:] + "/scripts/" + name),
                        shlex.quote(name)) for name in SIBLING_ENTRY_SCRIPTS)
-    return ('for f in {d}/*.plist; do [ -f "$f" ] || continue; c=$(cat "$f") || exit 9; '
-            'case "$c" in *{user}*) ;; *) continue ;; esac; {runs} done; echo END'
-            ).format(d=shlex.quote(daemons), user=user, runs=runs)
+    binary = " ".join('case "$c" in *%s*) echo "$f is binary. Make it text: sudo plutil '
+                      '-convert xml1 $f" >&2; exit 9 ;; esac;'
+                      % shlex.quote(ROLE_KIT_CLONE_PATH[1:] + "/scripts/" + name)
+                      for name in SIBLING_ENTRY_SCRIPTS)
+    return ('LC_ALL=C; export LC_ALL; for f in {d}/*.plist; do [ -f "$f" ] || continue; '
+            'c=$(tr -d "[:space:]" < "$f") || exit 9; case "$c" in *{user}*) ;; '
+            '*"<plist"*) continue ;; *) {binary} continue ;; esac; {runs} done; echo END'
+            ).format(d=shlex.quote(daemons), user=user, runs=runs, binary=binary)
 
 
 def clone_jobs(ctx):
@@ -2583,13 +2595,17 @@ def clone_jobs(ctx):
     if not res.ok or not lines or lines[-1] != "END" or any(
             len(f) != 2 or f[0] not in SIBLING_ENTRY_SCRIPTS or not f[1].endswith(".plist")
             for f in found):
+        # Exit 9 says the one plist it stopped at, and nothing else. It is never cut short:
+        # the line that makes a binary one text names that plist, and must name all of it.
+        said = (res.err or res.out).strip()
         raise Unknown(
             "could not list the jobs in /Library/LaunchDaemons that run from the role "
-            "account's clone (exit %d): %s" % (res.rc, (res.err or res.out).strip()[:160]),
-            "nothing has been stopped. `sudo ls -le /Library/LaunchDaemons` shows each plist's "
+            "account's clone (exit %d): %s" % (res.rc, said if res.rc == 9 else said[:160]),
+            "nothing has been stopped. A plist named above as binary is made text by the line "
+            "beside it. For any other, `sudo ls -le /Library/LaunchDaemons` shows each plist's "
             "owner and flags, and a plist root could not read is named above. Once root can "
-            "read them all, run the same command again: `run` must know which jobs run from "
-            "the clone before it stops any of them")
+            "read them all as text, run the same command again: `run` must know which jobs run "
+            "from the clone before it stops any of them")
     jobs = []
     for entry, path in found:
         label = os.path.basename(path)[:-len(".plist")]
@@ -2620,6 +2636,12 @@ def _named(labels):
 # and the next run starts with an empty ctx, so a list kept on ctx alone said nothing after one
 # more run. Every later `verify` names each one, and every later `run` loads it again, until
 # launchd holds it or it is disabled.
+#
+# ONE LAUNCHD WAS STILL LETTING GO when `run` gave up is {"held": what happened} (Stage E
+# review). While launchd holds it, it is not off. Whether it is still going or was loaded again
+# since, no look can tell, so seeing it held is no reason to drop it: it stays listed until a
+# run stops it and loads it again, or it is disabled. Once launchd lets it go, it is off, and
+# listed as any other. Every other entry is a plain string, the only shape a ledger held before.
 CLONE_JOBS_OFF_NOTE = "clone-jobs-left-off"
 NOT_HELD_BACK = ("\n  The review jobs are not held back for it: the steps after this one "
                  "still run.")
@@ -2634,13 +2656,15 @@ def _set_left_off(ctx, listed):
 
 
 def _clone_jobs_owed(ctx):
-    """{label: what happened}: the jobs an earlier run stopped for the clone's move and left
-    off, that launchd still does not hold. Each one launchd holds again comes off the list, and
-    so does each one disabled since: `launchctl disable` is how each job's own guide keeps it
-    off on purpose. Raises Unknown when launchd could not be asked."""
+    """({label: what happened}, {label: what happened}): the jobs an earlier run stopped for
+    the clone's move and left off, that launchd still does not hold, and the ones launchd was
+    still letting go when that run gave up, that it holds yet. Each off one launchd holds again
+    comes off the list, and so does each one disabled since: `launchctl disable` is how each
+    job's own guide keeps it off on purpose. A held one launchd has let go is owed like any
+    other. Raises Unknown when launchd could not be asked."""
     r = ctx.runner
     listed = dict((ctx.state.data.get("notes") or {}).get(CLONE_JOBS_OFF_NOTE) or {})
-    owed = {}
+    owed, held = {}, {}
     for label in sorted(listed):
         got = r.as_root(["launchctl", "print", "system/" + label])
         text = (got.out or "") + (got.err or "")
@@ -2650,19 +2674,28 @@ def _clone_jobs_owed(ctx):
                           % (label, got.rc, text.strip()[:160]),
                           "nothing has been stopped. `sudo launchctl print system/%s` shows "
                           "what launchd says; run this again once it answers" % label)
+        what = listed[label]
+        if isinstance(what, dict):
+            what = what.get("held", "")
+            if got.ok:
+                held[label] = what
+                continue
         if not got.ok:
-            owed[label] = listed[label]
-    if owed:
+            owed[label] = what
+    if owed or held:
         # Asked only whether each is disabled. A read that fails keeps them all listed, which
         # fails loud, never quiet.
         off = r.as_root(["launchctl", "print-disabled", "system"])
-        for label in list(owed):
+        for label in list(owed) + list(held):
             if off.ok and re.search(r'"%s"\s*=>\s*(disabled|true)\b' % re.escape(label),
                                     off.out or ""):
-                del owed[label]
-    if owed != listed:
-        _set_left_off(ctx, owed)
-    return owed
+                owed.pop(label, None)
+                held.pop(label, None)
+    ledger = dict(owed)
+    ledger.update((label, listed[label]) for label in held)
+    if ledger != listed:
+        _set_left_off(ctx, ledger)
+    return owed, held
 
 
 def _load_again(r, label):
@@ -2723,17 +2756,19 @@ def _refused_lines(refused):
                "\n".join("    sudo launchctl disable system/%s" % label for label in names)))
 
 
-def _stop_clone_jobs(ctx, labels):
+def _stop_clone_jobs(ctx, labels, moving=True):
     """Stop each of `labels` and wait until launchd has let it go (KIT-199): `bootout` returns
     before launchd lets a job go, and a pass still running would read some of its files from
     each side of the move. One launchd still holds at its bound stops the run HERE: nothing has
     moved and no Stage E job has stopped, the ones already stopped are loaded again, and the
-    sentence says so."""
+    sentence says so. On a level clone (`moving` False) nothing moves and no step after this one
+    waits on it, so that is a SoftFailed, said without a move (Stage E review)."""
     r = ctx.runner
     stopped = []
     for label in labels:
         out = r.as_root(["launchctl", "bootout", "system/" + label],
-                        why="stop %s while the clone moves under it" % label)
+                        why=("stop %s while the clone moves under it" if moving else
+                             "stop %s, which launchd still held, to load it again") % label)
         if out.skipped:
             continue
         gone, waited = _wait_until_gone(r, label, _exit_timeout(r, _dispatcher_plist(label))
@@ -2741,48 +2776,75 @@ def _stop_clone_jobs(ctx, labels):
         if gone:
             stopped.append(label)
             continue
-        # Listed too: if launchd lets it go later, it is off, and the next run must load it
+        # Listed too, as held: while launchd holds it, it is not off, and a `verify` then must
+        # not drop it. If launchd lets it go later, it is off, and the next run must load it
         # again rather than read it as paused.
         listed = dict((ctx.state.data.get("notes") or {}).get(CLONE_JOBS_OFF_NOTE) or {})
-        listed[label] = "launchd still held it %ds after it was told to stop" % waited
+        listed[label] = {"held": "launchd still held it %ds after it was told to stop" % waited}
         _set_left_off(ctx, listed)
         refused = _load_clone_jobs(ctx, stopped)
+        tail = "\n  " + _refused_lines(refused) if refused else ""
+        if not moving:
+            raise SoftFailed(
+                "the clone is level with origin, and system/%s was told to stop, to be loaded "
+                "again, and launchd still holds it %ds later. It stays listed.\n"
+                "  Stop it yourself, then run this again. That run loads it again:\n"
+                "    sudo launchctl bootout system/%s\n"
+                "  To keep it off on purpose instead, disable it; this installer then stops "
+                "loading it:\n    sudo launchctl disable system/%s%s"
+                % (label, waited, label, label, tail))
         raise SetupError(
             "system/%s was told to stop and launchd still holds it %ds later. Nothing moved, "
             "and no Stage E job was stopped.\n"
             "  Stop it yourself, then run this again. That run loads it again after the move:\n"
-            "    sudo launchctl bootout system/%s%s"
-            % (label, waited, label, "\n  " + _refused_lines(refused) if refused else ""))
+            "    sudo launchctl bootout system/%s%s" % (label, waited, label, tail))
 
 
-def _owed_detail(owed):
-    """The row's words for jobs an earlier run left off."""
-    names = sorted(owed)
-    one = len(names) == 1
-    return ("%s %s still off: an earlier run stopped %s for the clone's move. `run` loads %s "
-            "again" % (_named(names), "is" if one else "are", "it" if one else "them",
-                       "it" if one else "them"))
+def _owed_detail(owed, held=None):
+    """The row's words for jobs an earlier run left off, and for ones launchd still holds that
+    it was still letting go when that run gave up. Only what was measured: launchd holds it,
+    which says neither that it is still going nor that it was loaded again (Stage E review)."""
+    said = []
+    for names, words in ((sorted(owed), "%(n)s %(is)s still off: an earlier run stopped %(it)s "
+                                        "for the clone's move. `run` loads %(it)s again"),
+                         (sorted(held or {}), "%(n)s %(is)s not off: launchd still holds %(it)s, "
+                                              "as it did when an earlier run stopped %(it)s for "
+                                              "the clone's move and gave up waiting. `run` "
+                                              "stops and loads %(it)s again")):
+        if names:
+            one = len(names) == 1
+            said.append(words % {"n": _named(names), "is": "is" if one else "are",
+                                 "it": "it" if one else "them"})
+    return "; ".join(said)
 
 
-def _owed_notes(owed):
-    """One note per job an earlier run left off: what happened, and both ways out of it."""
+def _owed_notes(owed, held=None):
+    """One note per job an earlier run left off: what happened, and both ways out of it. One
+    per job launchd still holds that it was still letting go then, which is not off."""
     return ["system/%s is off: an earlier run stopped it for the clone's move, and %s. `run` "
             "loads it again, or load it yourself (`sudo launchctl bootstrap system %s`). To "
             "keep it off on purpose, disable it (`sudo launchctl disable system/%s`), and this "
             "installer stops loading it" % (label, owed[label], _dispatcher_plist(label), label)
-            for label in sorted(owed)]
+            for label in sorted(owed)] + [
+        "system/%s is not off: launchd still holds it. When an earlier run stopped it for the "
+        "clone's move, %s. It may still be going, or it was loaded again since. `run` stops it "
+        "and loads it again, after moving the clone if it is behind. To keep it off on purpose, "
+        "disable it (`sudo launchctl disable system/%s`), and this installer stops loading it"
+        % (label, held[label], label) for label in sorted(held or {})]
 
 
-def _clone_jobs_notes(jobs, unknown, owed):
+def _clone_jobs_notes(jobs, unknown, owed, held=None):
     """The notes a read-only `code` row carries when `run` would move the clone: the other
-    jobs it stops for the move, and any an earlier run left off. A list that could not be read
-    is said as that, never as none."""
+    jobs it stops for the move, and any an earlier run left off or launchd was still letting
+    go. A list that could not be read is said as that, never as none."""
     if jobs is None:
         return ["the other jobs that run from the clone are unknown: %s. So every file any of "
                 "them can run was compared. `run` reads them again before it stops anything, "
-                "and stops there if it still cannot tell" % unknown.what] + _owed_notes(owed)
-    on = [label for label, loaded, _entry in jobs if loaded]
-    off = [label for label, loaded, _entry in jobs if not loaded and label not in owed]
+                "and stops there if it still cannot tell" % unknown.what] + _owed_notes(owed,
+                                                                                         held)
+    on = [label for label, loaded, _entry in jobs if loaded and label not in (held or {})]
+    off = [label for label, loaded, _entry in jobs
+           if not loaded and label not in owed and label not in (held or {})]
     notes = []
     if on:
         notes.append("%s %s from the same clone. `run` stops %s just before the clone moves "
@@ -2793,7 +2855,7 @@ def _clone_jobs_notes(jobs, unknown, owed):
         notes.append("%s %s from the same clone too, and %s not loaded, so `run` leaves %s off"
                      % (_named(off), "runs" if len(off) == 1 else "run",
                         "is" if len(off) == 1 else "are", "it" if len(off) == 1 else "them"))
-    notes.extend(_owed_notes(owed))
+    notes.extend(_owed_notes(owed, held))
     return notes or ["no other job on this machine runs from the clone, so `run` restarts only "
                      "the Stage E jobs"]
 
@@ -2813,8 +2875,9 @@ def step_code(ctx, apply_it):
     differs, why_unknown = _clone_differs_from_origin(ctx)
     # A JOB AN EARLIER RUN STOPPED FOR THE MOVE AND LEFT OFF (KIT-280 review). No later step
     # loads it, so it is this step's own unfinished work, whether the clone is level or not.
-    owed = _clone_jobs_owed(ctx)
-    if not missing and differs is False and not owed:
+    # So is one launchd was still letting go when that run gave up (`held`).
+    owed, held = _clone_jobs_owed(ctx)
+    if not missing and differs is False and not owed and not held:
         return True, "clone at %s/kit is at %s, level with origin HEAD, all %d scripts " \
                      "present" % (ctx.stage_home, head.out.strip() or "?",
                                   len(REQUIRED_SCRIPTS)), []
@@ -2827,24 +2890,34 @@ def step_code(ctx, apply_it):
             "    sudo -u %s -H /bin/sh -c 'cd / && git -C %s/kit ls-remote origin HEAD'"
             % (ctx.account, ctx.stage_home))
     if not missing and differs is False:
-        # Level, and only a job left off is outstanding: `verify` names it, `run` loads it.
+        # Level, and only a job left off is outstanding: `verify` names it, `run` loads it. One
+        # launchd still holds is stopped first, so the load finds it gone. The ones left off
+        # are loaded BEFORE that stop: one launchd will not let go of keeps nothing else off.
         if not apply_it:
-            return False, "%s; the clone is level with origin HEAD" % _owed_detail(owed), \
-                _owed_notes(owed)
+            return False, "%s; the clone is level with origin HEAD" % _owed_detail(owed, held), \
+                _owed_notes(owed, held)
+        again = sorted(held) + sorted(owed)
         refused = _load_clone_jobs(ctx, sorted(owed))
+        try:
+            _stop_clone_jobs(ctx, sorted(held), moving=False)
+        except SoftFailed as exc:
+            raise SoftFailed(str(exc) + ("\n  " + _refused_lines(refused) if refused else "")
+                             + NOT_HELD_BACK)
+        refused.update(_load_clone_jobs(ctx, sorted(held)))
         if r.dry_run:
-            return False, "would load %s again" % _named(sorted(owed)), []
+            return False, "would %sload %s again" % ("stop %s and " % _named(sorted(held))
+                                                     if held else "", _named(again)), []
         if refused:
             raise SoftFailed("the clone is level with origin, and " + _refused_lines(refused)
                              + NOT_HELD_BACK)
         return False, "clone at %s/kit is level with origin HEAD; loaded %s again, which an " \
                       "earlier run stopped for the clone's move" % (ctx.stage_home,
-                                                                     _named(sorted(owed))), []
+                                                                     _named(again)), []
 
     if not apply_it:
         if missing:
             return False, "clone missing or %d script(s) absent: %s" % (
-                len(missing), ", ".join(missing)), _owed_notes(owed)
+                len(missing), ", ".join(missing)), _owed_notes(owed, held)
         here = head.out.strip() or "?"
         # WHICH JOBS RUN HERE decides what "behind" compares: a sibling's files count only
         # where it is installed. A listing that could not be read compares them all.
@@ -2869,7 +2942,7 @@ def step_code(ctx, apply_it):
                              "the daemons would go on exec'ing the old ones" if jobs is not None
                              else "which other jobs run from the clone is unknown, so every "
                                   "one's files were compared"), \
-                          _clone_jobs_notes(jobs, unknown, owed)
+                          _clone_jobs_notes(jobs, unknown, owed, held)
         same = ("every file the jobs run is identical at origin HEAD (%s): %d scripts and %s. "
                 "The clone's other files are older (%s), and no job reads them"
                 % (origin or "?", len(names), "/, ".join(RUNTIME_DATA_DIRS) + "/", here))
@@ -2878,9 +2951,10 @@ def step_code(ctx, apply_it):
             # whose HEAD differs — it restarts the jobs to do it. Saying ALREADY-DONE here
             # would hide that restart from the one command meant to show it.
             return False, "`run` would fast-forward the clone and restart the jobs, though %s" \
-                          % same[0].lower() + same[1:], _clone_jobs_notes(jobs, unknown, owed)
-        if owed:
-            return False, "%s. %s" % (_owed_detail(owed), same), _owed_notes(owed)
+                          % same[0].lower() + same[1:], _clone_jobs_notes(jobs, unknown, owed,
+                                                                          held)
+        if owed or held:
+            return False, "%s. %s" % (_owed_detail(owed, held), same), _owed_notes(owed, held)
         return True, same, []
 
     stop_labels = all_daemon_labels(conf)
@@ -2908,6 +2982,9 @@ def step_code(ctx, apply_it):
     # with no HEAD yet is one nothing runs from.
     paused = ([label for label, loaded, _entry in clone_jobs(ctx) if loaded]
               if head.ok and head.out.strip() else [])
+    # Each one launchd still held a moment ago too, whatever the listing found (Stage E review):
+    # `verify` said `run` stops it and loads it again. One that has gone since is stopped at once.
+    paused = paused + [label for label in sorted(held) if label not in paused]
     # …and stopped FIRST, each one gone before any Stage E job stops: one launchd will not let
     # go of stops the run with the clone where it was and every Stage E job still loaded.
     _stop_clone_jobs(ctx, paused)
@@ -10299,6 +10376,81 @@ def _selftest_body():
                 expect("KIT-280 clone-jobs-shell-finds-the-notifier-and-the-bridge",
                        none.rc == 0 and none.out.split() == ["END"],
                        "an empty folder: rc %s: %r" % (none.rc, none.out))
+                # The same plists as `plutil -convert xml1` lays them out, each key and its
+                # value on a tab-indented line of its own, are found as they are (Stage E
+                # review). A binary one that names a job run from the clone cannot be judged by
+                # its text, so it is a plist that could not be read; a binary one that names
+                # none is skipped. Root's shell under sudo keeps the caller's UTF-8 locale, and
+                # macOS's `tr` refuses a binary plist's bytes in one.
+                import plistlib
+                cases += 3
+                reJ, binJ = os.path.join(tmpJ, "re"), os.path.join(tmpJ, "bin")
+                # …and laid out as a hand edit does, with spaces and CRLF (Stage E review), and
+                # the bridge's own binary plist, under a label as long as a real one.
+                spJ, bin2J = os.path.join(tmpJ, "sp"), os.path.join(tmpJ, "bin2")
+                longB = "com.example.stage-e-slack-bridge-job"
+                for d in (reJ, binJ, spJ, bin2J):
+                    os.makedirs(d)
+                spread = []
+                for label in ("com.example.bridge", "com.example.notifier",
+                              "com.example.other-notifier", "com.example.own-clone-bridge"):
+                    with open(os.path.join(tmpJ, label + ".plist"), "rb") as fh:
+                        obj = plistlib.loads(fh.read())
+                    with open(os.path.join(reJ, label + ".plist"), "wb") as fh:
+                        fh.write(plistlib.dumps(obj))
+                    spread.append(b"<key>UserName</key>\n\t<string>" in plistlib.dumps(obj))
+                    with open(os.path.join(spJ, label + ".plist"), "wb") as fh:
+                        fh.write(plistlib.dumps(obj).replace(b"\t", b"    ").replace(
+                            b"</key>\n", b"</key>   \n").replace(b"\n", b"\r\n"))
+                    if label == "com.example.bridge":
+                        with open(os.path.join(bin2J, longB + ".plist"), "wb") as fh:
+                            fh.write(plistlib.dumps(dict(obj, Label=longB),
+                                                    fmt=plistlib.FMT_BINARY))
+                    if label == "com.example.notifier":
+                        with open(os.path.join(binJ, label + ".plist"), "wb") as fh:
+                            fh.write(plistlib.dumps(obj, fmt=plistlib.FMT_BINARY))
+                        # …and a Stage E daemon's, binary, which names neither job.
+                        with open(os.path.join(reJ, "com.example.binary.plist"), "wb") as fh:
+                            fh.write(plistlib.dumps(dict(obj, ProgramArguments=[
+                                "/bin/sh", "-c", DAEMON_EXEC
+                                + '"$HOME/.stage-e/kit/scripts/pipeline_review_poller.py" run']),
+                                fmt=plistlib.FMT_BINARY))
+                utf8 = ["/usr/bin/env", "LC_ALL=en_US.UTF-8", "/bin/sh", "-c"]
+                for d in (reJ, spJ):
+                    laid = Runner().read(utf8 + [finder(acct, d)])
+                    expect("KIT-280 clone-jobs-shell-finds-a-plist-laid-out-over-lines",
+                           spread and all(spread) and laid.rc == 0 and laid.out.splitlines() == [
+                               "pipeline_bridge.py " + os.path.join(d, "com.example.bridge.plist"),
+                               "pipeline_notify_local.py "
+                               + os.path.join(d, "com.example.notifier.plist"), "END"],
+                           "%s: rc %s: %r %r" % (os.path.basename(d), laid.rc, laid.out,
+                                                 laid.err[:200]))
+                for d, label in ((binJ, "com.example.notifier"), (bin2J, longB)):
+                    binary = Runner().read(utf8 + [finder(acct, d)])
+                    expect("KIT-280 clone-jobs-shell-cannot-judge-a-binary-plist",
+                           binary.rc == 9 and "END" not in binary.out.split()
+                           and os.path.join(d, label + ".plist") in binary.err
+                           and "plutil -convert xml1" in binary.err,
+                           "%s: rc %s: %r %r" % (label, binary.rc, binary.out, binary.err[:200]))
+                # …and what the owner then reads names the whole plist in the line that makes
+                # it text, however long its label, and says that line is the cure.
+
+                class _Listed(FakeRunner):
+                    def _exec(self, argv, stdin, timeout, cwd=None):
+                        return Runner().read(utf8 + [finder(acct, bin2J)])
+
+                ctxJ = _healthy_ctx(conf)[0]
+                ctxJ.runner = _Listed()
+                try:
+                    clone_jobs(ctxJ)
+                    whatJ, remedyJ = "no Unknown", ""
+                except Unknown as exc:
+                    whatJ, remedyJ = exc.what, exc.remedy
+                expect("KIT-280 a-binary-plist-is-named-whole-with-its-cure",
+                       whatJ.endswith("sudo plutil -convert xml1 "
+                                      + os.path.join(bin2J, longB + ".plist"))
+                       and "named above as binary is made text by the line beside it" in remedyJ,
+                       "%r || %r" % (whatJ, remedyJ))
                 if os.geteuid() != 0:
                     os.chmod(os.path.join(tmpJ, "com.example.stranger.plist"), 0)
                     bad = Runner().read(["/bin/sh", "-c", finder(acct, tmpJ)])
@@ -10326,11 +10478,14 @@ def _selftest_body():
             launchd's does. `refuse` is launchd's answer to each load of a label, the last
             repeating: "" loads it, and "LIE" exits 0 and loads nothing."""
 
-            def __init__(self, answers, loaded, refuse=None, broken=(), linger=None, pull=0):
+            def __init__(self, answers, loaded, refuse=None, broken=(), linger=None, pull=0,
+                         leaving=None):
                 FakeRunner.__init__(self, answers)
                 self.loaded, self.seq = dict(loaded), []
                 self.refuse = dict((k, list(v)) for k, v in (refuse or {}).items())
-                self.broken, self.linger, self.leaving = set(broken), dict(linger or {}), {}
+                self.broken, self.linger = set(broken), dict(linger or {})
+                # A job already on its way out: gone after that many more looks, no stop needed.
+                self.leaving = dict(leaving or {})
                 self.pull = pull
 
             def _exec(self, argv, stdin, timeout, cwd=None):
@@ -10521,6 +10676,135 @@ def _selftest_body():
                % (outS, _at(runS.seq, "pull --ff-only"), runS.loaded,
                   getattr(ctxS, "clone_jobs_off", None), ctxS.unloaded, _left_off(ctxS),
                   noticeS.strip()[:200]))
+        # …and the job it gave up on stays listed while launchd still holds it (Stage E review).
+        # A `verify` then says it is not off, behind or level, and keeps it. Once launchd lets
+        # it go, the next run loads it again after the move.
+        cases += 1
+        heldS = _left_off(ctxS).get(labN)
+        heldW = heldS.get("held", "") if isinstance(heldS, dict) else str(heldS)
+
+        def _held_ledger(**more):
+            ctxH0, _fH0, _aH0 = _healthy_ctx(conf)
+            ctxH0.state.data.setdefault("notes", {})[note_key] = dict({labN: heldS}, **more)
+            return ctxH0.state
+
+        fetch = "fetch --quiet --no-tags origin HEAD"
+        moved = {"extra": [(fetch, 0, "FETCH_HEAD beef00000000\n"
+                                      "scripts/pipeline_notify_local.py\n")]}
+        rowsH, keptH = {}, {}
+        for how, kw in (("behind", moved),
+                        ("behind, no file it runs moved",
+                         {"extra": [(fetch, 0, "FETCH_HEAD beef00000000\n")]}),
+                        ("level", {"behind": False})):
+            rowH, ctxH2, _rH2 = _behind_run({labN: True, labB: True}, state=ctxS.state,
+                                            apply_it=False, **kw)
+            rowsH[how], keptH[how] = rowH, _left_off(ctxH2).get(labN)
+        saidH = dict((how, [s for s in [row[1]] + list(row[2]) if "system/" + labN in s]
+                      if isinstance(row, tuple) else []) for how, row in rowsH.items())
+        goneH, ctxG, runG = _behind_run({labN: False, labB: True}, state=ctxS.state)
+        expect("KIT-280 a-job-still-being-let-go-stays-listed-until-a-run-loads-it",
+               heldS is not None and all(k == heldS for k in keptH.values())
+               and all(isinstance(row, tuple) and row[0] is False
+                       and len([n for n in row[2] if "system/" + labN in n]) == 1
+                       for row in rowsH.values())
+               and all(said and all("not off" in s and "loads it again" in s
+                                    and "is off" not in s and "still off" not in s
+                                    for s in said) for said in saidH.values())
+               and isinstance(goneH, tuple) and runG.loaded.get(labN) is True
+               and -1 < _at(runG.seq, "pull --ff-only")
+               < _at(runG.seq, "bootstrap system " + _dispatcher_plist(labN))
+               and _left_off(ctxG) == {},
+               "held %r; kept %r; rows %r || once gone: %r, launchd %r, ledger %r"
+               % (heldS, keptH, saidH, goneH, runG.loaded, _left_off(ctxG)))
+        # …and says only what it measured: launchd holds it, which is not "still being let go"
+        # (it may have been loaded again). Its note keeps both ways out, and so does the one
+        # once it has gone, in words, never the ledger's raw entry.
+        cases += 1
+        rowOff, _cOff, _rOff = _behind_run({labN: False, labB: True}, state=_held_ledger(),
+                                           apply_it=False, **moved)
+        offH = [n for n in (rowOff[2] if isinstance(rowOff, tuple) else []) if labN in n]
+        notesH = [s for how in ("behind", "level") for s in rowsH[how][2] if labN in s]
+        expect("KIT-280 a-held-job-is-said-as-held-and-never-as-being-let-go",
+               all("launchd still holds" in s and "being let go" not in s
+                   for said in saidH.values() for s in said)
+               and notesH and all(heldW in s and "{" not in s
+                                  and "sudo launchctl disable system/" + labN in s
+                                  for s in notesH)
+               and len(offH) == 1 and heldW in offH[0] and "{" not in offH[0]
+               and "is off" in offH[0] and "launchd still holds" not in offH[0]
+               and "sudo launchctl bootstrap system " + _dispatcher_plist(labN) in offH[0]
+               and "sudo launchctl disable system/" + labN in offH[0],
+               "while held %r || once gone %r" % (saidH, offH))
+        # …and a behind `run` stops and loads it whatever the listing found: one that left
+        # between the two looks, and one whose plist the listing no longer finds. `verify`
+        # never says `run` leaves the first one off.
+        cases += 1
+        racedV, _cRv, _rRv = _behind_run({labN: True, labB: True}, state=_held_ledger(),
+                                         apply_it=False, leaving={labN: 1}, **moved)
+        gotRL = {}
+        for how, kw in (("left between the looks", {"leaving": {labN: 1}}),
+                        ("not in the listing", {"found": (0, "pipeline_bridge.py /Library/"
+                                                             "LaunchDaemons/%s.plist\nEND\n"
+                                                             % labB)})):
+            outRL, ctxRL, runRL = _behind_run({labN: True, labB: True}, state=_held_ledger(), **kw)
+            gotRL[how] = (outRL, runRL.loaded.get(labN), _left_off(ctxRL),
+                          _at(runRL.seq, "launchctl bootout system/" + labN),
+                          _at(runRL.seq, "pull --ff-only"),
+                          _at(runRL.seq, "bootstrap system " + _dispatcher_plist(labN)))
+        expect("KIT-280 a-held-job-the-listing-misses-is-stopped-and-loaded-after-the-move",
+               all(isinstance(o, tuple) and loaded is True and ledger == {}
+                   and -1 < stop < pull < load and any(labN in n for n in o[2])
+                   for o, loaded, ledger, stop, pull, load in gotRL.values())
+               and isinstance(racedV, tuple)
+               and not any(labN in n and "leaves" in n for n in racedV[2])
+               and any(labN in n and "stops it and loads it again" in n for n in racedV[2]),
+               "%r || verify %r" % (gotRL, racedV))
+        # …on a level clone `run` stops it and loads it again, and one disabled comes off.
+        cases += 1
+
+        outLv, ctxLv, runLv = _behind_run({labN: True, labB: True}, behind=False,
+                                          state=_held_ledger())
+        disH, ctxDh, _rDh = _behind_run({labN: True, labB: True}, behind=False,
+                                        state=_held_ledger(), apply_it=False, extra=[(
+                                            "launchctl print-disabled system", 0,
+                                            '\tdisabled services = {\n\t\t"%s" => disabled\n\t}\n'
+                                            % labN)])
+        expect("KIT-280 a-job-still-being-let-go-on-a-level-clone-is-stopped-and-loaded",
+               isinstance(outLv, tuple) and outLv[0] is False and "system/" + labN in outLv[1]
+               and -1 < _at(runLv.seq, "launchctl bootout system/" + labN)
+               < _at(runLv.seq, "bootstrap system " + _dispatcher_plist(labN))
+               and runLv.loaded.get(labN) is True and _at(runLv.seq, "pull --ff-only") == -1
+               and _left_off(ctxLv) == {}
+               and isinstance(disH, tuple) and disH[0] is True and _left_off(ctxDh) == {},
+               "run %r, launchd %r, ledger %r || disabled %r, ledger %r"
+               % (outLv, runLv.loaded, _left_off(ctxLv), disH, _left_off(ctxDh)))
+        # …and on a level clone one that will not go is a soft failure, said without a move:
+        # the job left off beside it is loaded first, the steps after still run, and it stays
+        # listed as held. A dry run names the stop as well as the load.
+        cases += 1
+        offB = "launchd would not load it again: " + eio
+        outLs, ctxLs, runLs = _behind_run({labN: True, labB: False}, behind=False,
+                                          state=_held_ledger(**{labB: offB}), linger={labN: None})
+        dryLs, _cDl, _rDl = _behind_run({labN: True, labB: True}, behind=False,
+                                        state=_held_ledger(), dry=True)
+        refLs = _behind_run({labN: True, labB: False}, behind=False, linger={labN: None},
+                            state=_held_ledger(**{labB: offB}),
+                            refuse={labB: ["Bootstrap failed: 119: Service is disabled"]})[0]
+        expect("KIT-280 a-held-job-that-will-not-go-on-a-level-clone-is-soft",
+               bool(soft) and isinstance(refLs, soft) and "sudo launchctl bootstrap system "
+               + _dispatcher_plist(labB) in str(refLs) and "Service is disabled" in str(refLs),
+               "the job left off beside it refused too: %r" % (refLs,))
+        expect("KIT-280 a-held-job-that-will-not-go-on-a-level-clone-is-soft",
+               bool(soft) and isinstance(outLs, soft) and "level" in str(outLs).splitlines()[0]
+               and "after the move" not in str(outLs)
+               and all(s in str(outLs) for s in (
+                   "sudo launchctl bootout system/" + labN,
+                   "sudo launchctl disable system/" + labN, NOT_HELD_BACK.strip()))
+               and runLs.loaded.get(labB) is True and _at(runLs.seq, "pull --ff-only") == -1
+               and list(_left_off(ctxLs)) == [labN] and isinstance(_left_off(ctxLs)[labN], dict)
+               and isinstance(dryLs, tuple) and "would stop system/" + labN in dryLs[1],
+               "%r; launchd %r; ledger %r || dry run %r"
+               % (outLs, runLs.loaded, _left_off(ctxLs), dryLs))
         # …and one that takes a few looks to go is waited for, not given up on (L1).
         cases += 1
         outL, ctxL, runL = _behind_run({labN: True, labB: True}, linger={labN: 2})
