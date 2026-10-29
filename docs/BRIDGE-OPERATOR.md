@@ -153,7 +153,7 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command) |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
-| `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2 |
+| `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
 
@@ -372,16 +372,21 @@ What it says in Slack, and when:
 | Nothing new from the notifier for three of its intervals plus two minutes: 17 minutes at its default 300 s | *I haven't heard from the notifier since 7:02am, so you may be missing pages.* |
 | Two of its runs in a row did not finish cleanly | *The notifier is running, but its runs have been failing since 7:02am, so a page may not have reached you.* |
 | Its heartbeat or its plist can't be read | *I can't read the notifier's heartbeat or its schedule, so I can't tell whether your pages are going out.* |
-| Its next clean run, after either of the first two | *The notifier is back: its run at 7:20am finished cleanly.* |
-| Its next clean run, after the third | *I can read the notifier's heartbeat and its schedule again: its run at 7:20am finished cleanly.* |
+| Its next clean run, when the last thing it said was one of the first two | *The notifier is back: its run at 7:20am finished cleanly.* |
+| Its next clean run, when the last thing it said was the third | *I can read the notifier's heartbeat and its schedule again: its run at 7:20am finished cleanly.* |
 
 Each of the first three ends with the command that checks the notifier: *To check it, run
 `python3 scripts/pipeline_notifier_setup.py verify` in your kit checkout.*
 
 - **Once each.** It posts as the bridge, as a message of its own in the first channel in
   `CHANNEL_IDS`. It says each one once, even after a restart: it keeps what it said in a
-  file of its own, `bridge-notifier-watch.json` in its `STATE_DIR`. At most it says one
-  twice: when that file can't be read, or when a post is cut off as Slack takes it.
+  file of its own, `bridge-notifier-watch.json` in its `STATE_DIR`. If that file can't be
+  read, it starts again, and may say once more each problem it had already said. If the
+  notifier is back before the bridge says one again, the bridge doesn't say it is back. A
+  post cut off as Slack takes it may be said twice.
+- **A new problem is said too.** If the trouble changes, say from can't read to quiet, it
+  says the new one. Until a clean run it says each of the three at most once, however often
+  the trouble changes. Its message after the clean run answers the last thing it said.
 - **Back means a new run.** It says the notifier is back only after a clean run newer than
   the one it had seen when it spoke.
 - **One failed run is not said.** The notifier sends again what it could not send. A second

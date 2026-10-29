@@ -146,7 +146,9 @@ WATCHES THE NOTIFIER (KIT-285)
   again from this pass, so the step never holds it silent.
 
   A problem is said once, as this app, in a message of its own in the first of
-  `channel_ids`, and its end once more, after a clean run newer than the heartbeat it had
+  `channel_ids`, and so is a different one after it: until a clean run, each of the three
+  is said at most once, however often the notifier changes. Its end is said once more,
+  as the end of the problem it said last, after a clean run newer than the heartbeat it had
   when it spoke. What was said is in a record of its own, bridge-notifier-watch.json beside
   the state, written before the post, so no later pass and no restart says it again; a
   post that fails is put back, and the next pass says it. The record is not the state, so
@@ -603,7 +605,8 @@ def load_watch(cfg):
     """(record, note): what the notifier watch has said, and when it last looked (KIT-285).
     It is a file of its own, so the state file still means what it did: none is a first
     pass, which answers nothing already in the window. A record that cannot be read starts
-    again, and says so: at worst one message is said twice."""
+    again, and says so: each problem it had already said may be said once more, and a
+    notifier back before one is said again goes unsaid."""
     path, fresh = watch_path(cfg), {"schema": WATCH_SCHEMA}
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -616,6 +619,9 @@ def load_watch(cfg):
     if not isinstance(doc, dict) or doc.get("schema") != WATCH_SCHEMA:
         return fresh, "its record %s is not a %s document, so it starts again" % (
             path, WATCH_SCHEMA)
+    if not isinstance(doc.get("said_kinds", []), list):
+        return fresh, ("its record %s does not list what it has said, so it starts again"
+                       % path)
     return doc, None
 
 
@@ -1458,9 +1464,9 @@ class Pass(object):
     # -- the notifier (KIT-285) ----------------------------------------------------
     def watch_notifier(self):
         """Judge the notifier's heartbeat (judge_notifier). A problem is said once in the
-        first channel, and its end once more. Its record is a file of its own, written
-        through, so a pass that stops later keeps the watch's clock, and a first pass that
-        stops is still a first pass."""
+        first channel, and so is each other kind the first time it comes, and its end once
+        more. Its record is a file of its own, written through, so a pass that stops later
+        keeps the watch's clock, and a first pass that stops is still a first pass."""
         if not self.cfg["notifier_plist"]:
             self.notifier = "OFF (notifier_plist is unset, so no notifier is watched here)"
             return
@@ -1509,11 +1515,17 @@ class Pass(object):
         elif verdict == "ok":
             rec["bad_at"] = None
         # Back only after a clean run newer than the heartbeat it had when it said the
-        # problem: that one is from before, and says nothing about a comeback.
+        # problem: that one is from before, and says nothing about a comeback. Until then a
+        # kind not yet said is said when it first comes, and each of the three is said at
+        # most once, however often it changes.
         held, told = epoch(rec.get("said_beat")), ""
-        if verdict in NOTIFIER_PROBLEMS and not rec.get("said"):
+        if verdict in NOTIFIER_PROBLEMS and verdict not in rec.get("said_kinds", []):
+            was = rec.get("said")
             self.say_notifier(rec, verdict, beat, self.notifier_text(verdict, at, rec))
-            told = "; %s so in Slack" % ("would say" if self.dry else "said")
+            # What it said before, in the owner's words: quiet, failing or can't read.
+            after = ", after it said %s" % ("can't read" if was == "unreadable" else was)
+            told = "; %s so in Slack%s" % ("would say" if self.dry else "said",
+                                           after if was else "")
         elif verdict == "ok" and rec.get("said") and (held is None or at > held):
             readable = rec["said"] == "unreadable"
             self.say_notifier(rec, None, None, (NOTIFIER_READABLE if readable else
@@ -1547,15 +1559,18 @@ class Pass(object):
     def say_notifier(self, rec, said, beat, text):
         """Recorded, then posted: a record that cannot be written posts nothing, so a broken
         state dir can never post this on every pass. A post that fails, or that the deadline
-        cuts short, puts the record back, so the next pass says it: once more at worst."""
-        before = (rec.get("said"), rec.get("said_beat"))
+        cuts short, puts the record back, so the next pass says it: once more at worst.
+        `said` is the problem said, kept in `said_kinds` with each one said before it since
+        the last clean run; None is that run, which clears them."""
+        before = (rec.get("said"), rec.get("said_beat"), list(rec.get("said_kinds", [])))
         rec["said"] = said
         rec["said_beat"] = beat.get("at") if said and isinstance(beat, dict) else None
+        rec["said_kinds"] = before[2] + [said] if said else []
         self.record_watch(rec)
         try:
             self.post(self.cfg["channel_ids"][0], None, text)
         except (BridgeError, Deadline):
-            rec["said"], rec["said_beat"] = before
+            rec["said"], rec["said_beat"], rec["said_kinds"] = before
             self.record_watch(rec)
             raise
 
@@ -5030,6 +5045,105 @@ def selftest():
             check("watch: a post that fails makes the pass exit 1, and the next pass says it",
                   outcome(case_post_fails), (EXIT_ERROR, True, 1, EXIT_OK))
 
+            # Stage E review: a different problem after the first is said too, each kind at
+            # most once until a clean run, and the end is said as the end of the last one.
+            def failing_since(when):
+                return ("The notifier is running, but its runs have been failing since %s, so "
+                        "a page may not have reached you. " % when + check_line)
+
+            def quiet_since(when):
+                return ("I haven't heard from the notifier since %s, so you may be missing "
+                        "pages. " % when + check_line)
+
+            def back_at(when):
+                return "The notifier is back: its run at %s finished cleanly." % when
+
+            def readable_at(when):
+                return ("I can read the notifier's heartbeat and its schedule again: its run "
+                        "at %s finished cleanly." % when)
+
+            def drive(c, s, t, hb, plan, start, end, logs=None):
+                """The bridge every minute from now + start to now + end. Before a pass at an
+                offset in `plan`, the heartbeat becomes plan[offset]: (exit, its run's offset
+                from now), or None for one it cannot read. Each pass's exit code; with a list
+                for `logs`, each pass's log goes on it too."""
+                codes = []
+                for off in range(start, end + 1, 60):
+                    if off in plan and plan[off] is None:
+                        with open(hb, "w") as fh:
+                            fh.write("{not json")
+                    elif off in plan:
+                        beat(hb, now + plan[off][1], plan[off][0])
+                    code, out = run(c, s, t, at=now + off)
+                    codes.append(code)
+                    if logs is not None:
+                        logs.append(out)
+                return codes
+
+            def changed(slug, plan, end):
+                """What it posted, and each word its logs give for what it said before."""
+                c, s, t, hb = nworld("watch-then-" + slug)
+                logs, mark = [], "; said so in Slack, after it said "
+                drive(c, s, t, hb, plan, 0, end, logs)
+                return mine(s), [ln.split(mark, 1)[1].split(";")[0].split(" |")[0]
+                                 for out in logs for ln in out.splitlines() if mark in ln]
+            for name, slug, plan, end, want, first in (
+                    ("can't tell then quiet", "unreadable-quiet",
+                     {0: (0, 0), 60: None, 1260: (0, 0), 1500: (0, 1500)}, 1560,
+                     [unreadable_text, quiet_text, back_at("9:18am")], "can't read"),
+                    ("quiet then failing", "quiet-failing",
+                     {0: (0, 0), 1200: (3, 1200), 1500: (3, 1500), 1800: (0, 1800)}, 1860,
+                     [quiet_text, failing_since("9:13am"), back_at("9:23am")], "quiet"),
+                    ("failing then quiet", "failing-quiet",
+                     {0: (3, 0), 300: (3, 300), 1500: (0, 1500)}, 1560,
+                     [failing_since("8:53am"), quiet_since("8:58am"), back_at("9:18am")],
+                     "failing"),
+                    ("can't tell then failing", "unreadable-failing",
+                     {0: None, 300: (3, 300), 600: (3, 600), 900: (0, 900)}, 960,
+                     [unreadable_text, failing_since("8:58am"), back_at("9:08am")], "can't read"),
+                    ("quiet then can't tell", "quiet-unreadable",
+                     {0: (0, 0), 1200: None, 1500: (0, 1500)}, 1560,
+                     [quiet_text, unreadable_text, readable_at("9:18am")], "quiet")):
+                check("watch: %s: both said, once each, and the end matches the last; the log "
+                      "names the first in the owner's words" % name,
+                      outcome(lambda: changed(slug, plan, end)), (want, [first]))
+
+            def case_alternating():
+                c, s, t, hb = nworld("watch-alternating")
+                plan = dict((off, (0, -5000)) for off in range(0, 1021, 60))   # waiting
+                for k, off in enumerate(range(1080, 2821, 60)):     # thirty passes, then
+                    plan[off] = ((0, -5000), None, (3, off))[k % 3]  # quiet, can't, failing
+                drive(c, s, t, hb, plan, 0, 2820)
+                during = len(mine(s))
+                drive(c, s, t, hb, {2880: (0, 2880)}, 2880, 2940)
+                return during, mine(s)
+            check("watch: a problem that changes kind every pass is said at most once a kind "
+                  "until a clean run", outcome(case_alternating),
+                  (3, [quiet_since("7:30am"), unreadable_text, failing_since("9:13am"),
+                       back_at("9:41am")]))
+
+            def case_again():
+                c, s, t, hb = nworld("watch-again")
+                drive(c, s, t, hb, {0: (0, 0), 1200: (0, 1200)}, 0, 2280)
+                return mine(s)
+            check("watch: a problem that ends, then comes again, is said again",
+                  outcome(case_again),
+                  [quiet_text, back_at("9:13am"), quiet_since("9:13am")])
+
+            def case_second_post_fails():
+                c, s, t, hb = nworld("watch-second-post-fails")
+                plan = {0: None, 300: (3, 300), 600: (3, 600)}
+                drive(c, s, t, hb, plan, 0, 540)
+                s.fail.add("chat.postMessage")
+                codes = drive(c, s, t, hb, plan, 600, 600)
+                s.fail.discard("chat.postMessage")
+                code, out = run(c, s, t, at=now + 660)
+                return (codes + [code], mine(s),
+                        "; said so in Slack, after it said can't read" in out)
+            check("watch: a second problem whose post fails is said by the next pass, and its "
+                  "log names the first in the owner's words", outcome(case_second_post_fails),
+                  ([EXIT_ERROR, EXIT_OK], [unreadable_text, failing_since("8:58am")], True))
+
             # Review round 2. A record it cannot write is named as that: Slack was not called.
             def case_record_named():
                 c, s, t, hb = nworld("watch-record-named")
@@ -5282,7 +5396,10 @@ def selftest():
             for name, slug, record in (
                     ("is not JSON", "not-json", "{not json"),
                     ("is another document", "other", json.dumps({"schema": STATE_SCHEMA})),
-                    ("is a JSON list", "json-list", "[]")):
+                    ("is a JSON list", "json-list", "[]"),
+                    ("keeps what it said in no list", "said-kinds", json.dumps(
+                        {"schema": "pipeline-bridge-notifier-watch/1", "said": "quiet",
+                         "said_kinds": 5}))):
                 check("watch: a record of its own that %s starts again, and says so" % name,
                       outcome(lambda: record_starts_again(slug, record)), (EXIT_OK, True, []))
 

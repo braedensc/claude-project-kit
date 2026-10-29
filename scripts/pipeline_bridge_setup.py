@@ -28,10 +28,11 @@ could post a question that looked like the bridge's.
               credentials, the job's own dry run passes as the role account, launchd holds
               the job and runs it every INTERVAL_SECONDS, its heartbeat is fresh, and the
               notifier's pings file, in NOTIFIER_STATE_DIR, is there and is the notifier's
-              (KIT-224). With NOTIFIER_JOB_LABEL set, its `notifier` row judges the
-              notifier's heartbeat by the job's own rule, checks the job runs often enough
-              to tell the Mac's sleep from a quiet notifier, and checks launchd runs the
-              notifier as its plist says; empty, it says the watch is off (KIT-285).
+              (KIT-224). With NOTIFIER_JOB_LABEL set, a launchd interval that is not
+              INTERVAL_SECONDS blocks, and its `notifier` row judges the notifier's
+              heartbeat by the job's own rule, checks the job runs often enough to tell the
+              Mac's sleep from a quiet notifier, and checks launchd runs the notifier as its
+              plist says; empty, it says the watch is off (KIT-285).
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
               CK-B4 prove it live.
 
@@ -884,16 +885,22 @@ def loaded_row(conf, loaded):
     """launchd holds the job, at INTERVAL_SECONDS (KIT-285 review). `install --apply`
     rewrites the plist and never reloads the job, and launchd keeps the interval it was
     loaded with. The notifier watch reads a gap in the job's passes against the interval in
-    its config, so a job launchd runs less often reads every pass as a sleep and never says
-    a dead notifier. With the watch on, a print that names no interval is UNKNOWN."""
+    its config, so with the watch on, a job launchd runs less often reads every pass as a
+    sleep and never says a dead notifier: BLOCKED. With the watch off nothing counts on it,
+    so the row keeps the verdict it had before the watch, and still says it. With the watch
+    on, a print that names no interval is UNKNOWN."""
     if not loaded.ok:
         return ("loaded", se.BLOCKED, "not loaded: card CK-B2")
     found = se._RUN_INTERVAL_RE.search(loaded.out or "")
     want = int(conf["INTERVAL_SECONDS"])
-    if found and int(found.group(1)) != want:
+    if found and int(found.group(1)) != want and conf["NOTIFIER_JOB_LABEL"]:
         return ("loaded", se.BLOCKED, "launchd still runs the bridge every %s s, not every %d "
                 "s (INTERVAL_SECONDS). Reload it: card CK-B3, then card CK-B2"
                 % (found.group(1), want))
+    if found and int(found.group(1)) != want:
+        return ("loaded", se.ALREADY_DONE, "launchd holds the job, but runs it every %s s, "
+                "not every %d s (INTERVAL_SECONDS). To change that, reload it: card CK-B3, "
+                "then card CK-B2" % (found.group(1), want))
     if not found and conf["NOTIFIER_JOB_LABEL"]:
         return ("loaded", se.UNKNOWN, "launchd holds the job, and its print names no run "
                 "interval, so whether it runs every %d s, as the notifier watch counts on, "
@@ -1631,6 +1638,17 @@ def selftest():
                                "on, could not be measured. Read it yourself: sudo launchctl "
                                "print system/com.example.bridge"),
                    ("ALREADY-DONE", "launchd holds the job")])
+            # Stage E review: with the watch off nothing counts on the interval, so verify
+            # keeps the verdict it had before the watch, and still says the interval.
+            off_150 = dict(conf, INTERVAL_SECONDS="150")
+            check("verify-loaded: with the watch off, launchd running the bridge at another "
+                  "interval keeps its verdict, and says how to reload it",
+                  outcome(lambda: [loaded_says(off_150, "\trun interval = %d seconds\n" % v)
+                                   for v in (600, 150)]),
+                  [("ALREADY-DONE", "launchd holds the job, but runs it every 600 s, not "
+                                    "every 150 s (INTERVAL_SECONDS). To change that, reload "
+                                    "it: card CK-B3, then card CK-B2"),
+                   ("ALREADY-DONE", "launchd holds the job, every 150 s")])
             for path in (nbeat, nplist):
                 if os.path.exists(path):
                     os.remove(path)
