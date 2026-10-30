@@ -61,6 +61,7 @@ TEAM_KEYS=KIT
 TICKET_URL_TEMPLATE=https://linear.app/example-org/issue/{id}
 
 # The PRIVATE Slack channel's id (card CK-N1 says how to find it).
+# Leave it empty when DM_USER_IDS, at the end of this file, is set.
 CHAT_CHANNEL_ID=C0123456789
 
 # Who may author the four planning marks.  A comma list of tracker actor ids,
@@ -81,6 +82,8 @@ JOB_LABEL=com.example.notifier
 # from the dispatcher's environment, which is copied into every session.  The
 # notifier uses its own Slack app and its own token, under its own name, so a
 # token leaked from a session cannot post a ping that looks like the notifier's.
+# With DM_USER_IDS set, the pings go through the Slack bridge's app instead, and
+# this default stands for the bridge's own name, BRIDGE_SLACK_BOT_TOKEN.
 CHAT_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN
 
 # The NAME of the variable holding the tracker key.  The Stage E installer
@@ -162,3 +165,15 @@ BRIDGE_PINGS=no
 # Name people only, each a member of the private channel: a bot named here
 # could be woken by every ping.  Each id's shape is checked, not who owns it.
 MENTION_CHAT_USER_IDS=
+
+# Slack member ids whose direct messages every ping goes to, in place of the
+# channel (KIT-296).  A comma list, in the order to page them.  The pings then
+# go through the Slack bridge's app, so install the bridge first
+# (docs/BRIDGE-OPERATOR.md); its app needs chat:write and im:write.  Leave
+# CHAT_CHANNEL_ID empty: the installer refuses the two together, since every
+# ping would be posted twice.  Set the bridge's own DM_USER_IDS to the same ids
+# (KIT-295 or later), or it never sees an answer under a DM ping.  There is no
+# channel to sign for.  The notifier's own app can be retired.  Archive the old
+# channel only once CHANNEL_IDS in bridge.conf no longer lists it.
+# Empty, the default, keeps the channel, and the notifier's config stays as it was.
+DM_USER_IDS=
