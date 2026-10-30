@@ -872,6 +872,11 @@ Good: `verify`'s `chat-rules` row says ALREADY-DONE.
 Not that: FAILED, "not what this checkout composes". Either the kit changed the rules, so run
 `chat-rules --apply`, or someone edited the file. Find out who.
 
+**After a kit update.** An update can change the rules. The one that lets a member ask the
+tech lead from their DM added a paragraph about the bridge's mentions. After it, `verify`
+says FAILED on every install with `CHAT_RULES=on`, whether the bridge passes DM questions on
+or not. Run `chat-rules --apply` once.
+
 These are instructions, not a guard. What holds is that the dispatcher starts work only on
 your hand-over, and the bridge acts only on a member's yes to its own question.
 
