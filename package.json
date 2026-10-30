@@ -41,6 +41,7 @@
     "test:chat-lane-setup": "python3 scripts/pipeline_chat_lane_setup.py --selftest",
     "test:bridge": "python3 scripts/pipeline_bridge.py --selftest",
     "test:bridge-setup": "python3 scripts/pipeline_bridge_setup.py --selftest",
+    "test:voice": "python3 scripts/pipeline_voice.py --selftest",
     "test:telemetry-local": "python3 scripts/pipeline_telemetry_local.py --selftest",
     "test:review-poller": "python3 scripts/pipeline_review_poller.py --selftest",
     "test:finding-poller": "python3 scripts/pipeline_finding_poller.py --selftest",
