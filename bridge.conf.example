@@ -98,6 +98,19 @@ BOT_USER_ID=U0123456789
 # once the app has the new manifest (card CK-B1). Empty: no DM.
 #DM_USER_IDS=
 
+# The writer (docs/BRIDGE-OPERATOR.md, "The writer"; card CK-B5). yes: a model
+# with no tools writes each message as it is sent, on your Claude subscription.
+# What to type and what a yes does are never its words. no: plain words.
+#WRITER=no
+# The claude program's full path, as `command -v claude` prints it. Needed with
+# WRITER=yes: the job runs under launchd, whose PATH is short.
+#WRITER_BIN=
+# The model that writes them.
+#WRITER_MODEL=haiku
+# The NAME its token goes under. `writer-token` puts the token there, from
+# `claude setup-token`. A name of its own, never another key's.
+#WRITER_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
+
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
 # `token` also refuses the chat bot's token. It must be a different file from
 # ENV_FILE: the dispatcher hands this one to every session it starts.

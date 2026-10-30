@@ -113,7 +113,21 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   ping waiting on an answer is refused, and said, and so is one under a post of this app
   that neither job recorded.
   Anything else a member writes there gets one line on what the bridge can do, at most
-  once an hour; a bot's post gets nothing.
+  once an hour; a bot's post gets nothing. A member's DM that cannot be opened stops no
+  channel and no other DM: each one is named, and the pass exits 1 (KIT-297 review).
+
+  WRITTEN WHEN IT IS SENT (KIT-297). With `writer` on, every message goes through
+  `pipeline_voice.write`, a model with no tools, given that message's plain text and the
+  facts already in hand (ids, titles, counts), never a ticket's text or a comment. The
+  sentence saying what to type, where to answer or what a yes does is the BIND: it is
+  never given to the model to write, and follows its words verbatim. A question's bold
+  head is not given to it either, since the model may ask nothing. What a yes binds to is
+  unchanged: the recorded question, its fingerprint and its stated settings. Whenever the
+  writer cannot write a message, the plain one goes out, and once a day that is said after
+  it. The writer gets only the time the pass has left less the time to post plain, so a
+  slow one can never cost a message to the pass's deadline (KIT-297 review). A dry run
+  never calls it, and a tracker comment or an answer passed on to a session is never
+  written by it. With `writer` off, the default, every message is as before.
 
   THE BRIDGE KNOWS ITS OWN BOT. `bot_user_id` in the config is the bridge app's bot user,
   and a token that answers to anyone else is refused before anything is read: a pasted
@@ -192,7 +206,8 @@ WHAT IT NEVER DOES
   posts outside its configured channels and DMs, never posts a message's own text back,
   and never prints a credential: both are read from env vars the config NAMES (the job's
   wrapper sources the role account's env file), and every line it writes (the log, the
-  state file, a Slack post) is redacted against them. The state file is written mode 600.
+  state file, a Slack post) is redacted against them, and against the writer's token while
+  the writer is on. The state file is written mode 600.
 """
 import argparse
 import hashlib
@@ -218,6 +233,9 @@ import pipeline_notify_local as notify  # noqa: E402
 # The planner job's own rules for what is live work, and its own team query: the bridge
 # refuses exactly what the planner would, so it never moves a ticket the planner refuses.
 import pipeline_plan_poller as poller  # noqa: E402
+# The tech lead's voice (KIT-294): with `writer` on, each message is written by a model
+# with no tools when it is sent, and the plain text goes out whenever it is not.
+import pipeline_voice as voice  # noqa: E402
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED, EXIT_TIMEOUT = (
     notify.EXIT_OK, notify.EXIT_ERROR, notify.EXIT_USAGE, notify.EXIT_DECLINED,
@@ -245,12 +263,25 @@ DM_HELP = ("I can do `plan <ticket id>`, `approve <ticket id>` and yes or no her
 # or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
 # page is never vouched for between a question and a bare yes (KIT-295 review).
 DM_ASKING_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_INPUT, notify.ESC_AWAITING_APPROVAL)
-# A reply under a ping the bridge holds no record of, in a channel or a DM.
-UNRECORDED_PING = ("I can't pass that on to a session: this ping was not recorded for the "
-                   "bridge, so I can't tell which session is waiting. Pings sent before "
-                   "BRIDGE_PINGS=yes are not recorded, and neither is one the notifier failed "
-                   "to record (it pages that one again). Answer under the newer ping, or in "
-                   "the tracker.")
+# A reply under a ping the bridge holds no record of, in a channel or a DM. Its last
+# sentence says where to answer instead, so it is the bind, never written by the model.
+UNRECORDED_PING_SAYS = ("I can't pass that on to a session: this ping was not recorded for "
+                        "the bridge, so I can't tell which session is waiting. Pings sent "
+                        "before BRIDGE_PINGS=yes are not recorded, and neither is one the "
+                        "notifier failed to record (it pages that one again).")
+UNRECORDED_PING_BIND = "Answer under the newer ping, or in the tracker."
+UNRECORDED_PING = UNRECORDED_PING_SAYS + " " + UNRECORDED_PING_BIND
+# KIT-297: said after everything else, at most once a day, when the writer is on and a
+# message went out in its plain words.
+WRITER_NOTE = "(I couldn't reach my writer, so this one's the plain version.)"
+WRITER_NOTE_SECONDS = 24 * 3600
+# KIT-297 review: the writer waits only while the pass can still post the message plain
+# after it gives up: one Slack call at its own 20 s limit, and a little more. With less
+# than WRITER_MIN_SECONDS of that left, the plain message goes at once.
+WRITER_POST_SECONDS = 25
+WRITER_MIN_SECONDS = 10
+# A Slack mention. The writer may mention nobody, so it is given the member's name instead.
+_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
 
 CONFIG_KEYS = {
     "schema": "the config's schema id, %s" % CONFIG_SCHEMA,
@@ -272,7 +303,8 @@ CONFIG_KEYS = {
     "max_questions_per_hour": "how many requests the bridge looks up in the tracker in an "
                               "hour, found or not (default 20)",
     "max_history_pages": "how many pages of channel history one pass may read (default 10)",
-    "run_timeout_seconds": "wall clock for one pass (default 120)",
+    "run_timeout_seconds": "wall clock for one pass (default 120; with the writer on, at "
+                           "least writer_timeout_seconds + 25)",
     "act": "whether a verified yes acts in the tracker (default false: ask and record only)",
     "plan_it_state": "the name of each team's Plan it state (default Plan it)",
     "max_actions_per_hour": "how many actions the bridge takes in an hour, each child "
@@ -309,6 +341,8 @@ CONFIG_KEYS = {
                            "only with dm_user_ids set; outside every git worktree"
                            % NOTIFIER_DM_POSTS_NAME,
 }
+# KIT-297: the writer's own keys, as the writer documents and checks them (pipeline_voice).
+CONFIG_KEYS.update(voice.CONFIG_KEYS)
 
 EXAMPLE_CONFIG = {
     "schema": CONFIG_SCHEMA,
@@ -338,6 +372,8 @@ REQUEST_RE = re.compile(r"^(plan|approve)\s+(%s)$" % TICKET_RE, re.IGNORECASE)
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
+# A ticket id as a whole word: each one in a message the writer must keep (KIT-297).
+_TICKET_WORD_RE = re.compile(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % TICKET_RE)
 
 OPEN, CONFIRMED, DECLINED, EXPIRED = "open", "confirmed", "declined", "expired"
 FINISHED = ("completed", "canceled")
@@ -576,6 +612,34 @@ def validate_config(raw):
         errors.append("config 'notifier_posts_file' (%s) is inside a git working tree — it "
                       "decides which posts in a DM the bridge vouches for, so it must live "
                       "outside every worktree, where no session can write it" % posts_file)
+    # KIT-297: the writer's keys, by the writer's own rules, each one on its own so every
+    # bad one is named at once, and whether the writer is on or off.
+    cfg.update(voice.settings(raw)[0])
+    if "writer" in raw and not isinstance(raw["writer"], bool):
+        errors.append("config 'writer' must be true or false, got %r" % (raw["writer"],))
+    bad = [k for k in sorted(voice.DEFAULTS)
+           if k != "writer" and voice.settings({k: raw.get(k)})[1]]
+    for key in bad:
+        errors.append("config %r is not a valid writer setting, got %r: %s"
+                      % (key, raw.get(key), voice.CONFIG_KEYS[key]))
+    if cfg["writer"] and "writer_bin" not in bad and not os.path.isabs(cfg["writer_bin"]):
+        errors.append("config 'writer_bin' must be the claude CLI's full path while 'writer' "
+                      "is true, got %r: the job runs under launchd, whose PATH is short"
+                      % cfg["writer_bin"])
+    # KIT-297 review: a pass must have time to post a message plain after the writer gives
+    # up on it, or a slow writer would cost the message.
+    if cfg["writer"] and numbers_ok and "writer_timeout_seconds" not in bad:
+        room = cfg["run_timeout_seconds"] - WRITER_POST_SECONDS
+        if room < WRITER_MIN_SECONDS:
+            errors.append("config 'run_timeout_seconds' (%d) leaves the writer no time: it "
+                          "must be at least %d while 'writer' is true"
+                          % (cfg["run_timeout_seconds"], WRITER_MIN_SECONDS
+                             + WRITER_POST_SECONDS))
+        elif cfg["writer_timeout_seconds"] > room:
+            errors.append("config 'writer_timeout_seconds' (%g) must be at most %d while "
+                          "'run_timeout_seconds' is %d: a pass must still have time to post "
+                          "the message plain after the writer gives up"
+                          % (cfg["writer_timeout_seconds"], room, cfg["run_timeout_seconds"]))
     if errors:
         raise BridgeError("config problems:\n  - " + "\n  - ".join(errors), EXIT_USAGE)
     return cfg
@@ -596,6 +660,9 @@ def live_secrets(cfg):
     even when a transport was handed in."""
     values = [os.environ.get(cfg[k], "").strip() for k in ("slack_token_env",
                                                             "linear_key_env")]
+    # KIT-297: with the writer on, its subscription token is one of them.
+    if cfg.get("writer") is True and cfg.get("writer_token_env"):
+        values.append(os.environ.get(cfg["writer_token_env"], "").strip())
     return [v for v in values if v]
 
 
@@ -616,9 +683,11 @@ def new_state():
     # answers recorded before a post that never confirmed (KIT-224).
     # dms: each listed member's DM channel, opened once; stray_said: per DM, when the
     # bridge last said what it can do there (KIT-295).
+    # writer_note_at: when a message last said it went out in its plain words (KIT-297).
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
-            "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {}}
+            "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
+            "writer_note_at": 0}
 
 
 def load_state(cfg):
@@ -661,6 +730,12 @@ def load_state(cfg):
     if not isinstance(doc["dms"], dict) or not isinstance(doc["stray_said"], dict):
         raise BridgeError("the bridge's state %s has no readable record of its DMs. Nothing "
                           "was done" % path)
+    # KIT-297: only the once-a-day line hangs on it, so one that is not a time is no time:
+    # the line is said once more, and nothing else changes.
+    note_at = doc.get("writer_note_at")
+    if isinstance(note_at, bool) or not isinstance(note_at, (int, float)) \
+            or not 0 <= note_at < float("inf"):
+        doc["writer_note_at"] = 0
     return doc, False
 
 
@@ -1155,12 +1230,16 @@ def command_text(msg, own_user_id):
     return re.sub(r"\s+", " ", text)
 
 
+# The one reason that also says how to answer again: a line carrying it is all bind.
+EDITED_WHY = "it was edited after it was sent; send the answer again as a new reply"
+
+
 def message_refusal(msg, me):
     """Why this message cannot answer a question, from the message alone, or None."""
     if msg.get("bot_id") or msg.get("subtype"):
         return "it is a bot post or a %s message" % (msg.get("subtype") or "bot")
     if msg.get("edited"):
-        return "it was edited after it was sent; send the answer again as a new reply"
+        return EDITED_WHY
     if msg.get("files"):
         return "it carries a file"
     if not msg.get("user"):
@@ -1209,6 +1288,15 @@ def ticket_fingerprint(issue):
 
 
 def question_text(issue, requester, cfg, now, by_bot=False, dm=False):
+    head, body, bind, _facts = question_parts(issue, requester, cfg, now, by_bot, dm)
+    return head + body + "\n" + bind
+
+
+def question_parts(issue, requester, cfg, now, by_bot=False, dm=False):
+    """(head, body, bind, facts): a plan question in the pieces the writer needs (KIT-297).
+    The head asks, so the writer is never given it. The bind is what a yes agrees to, and
+    who asked: posted verbatim, never the model's. head + body + newline + bind is the
+    question as it always read."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -1224,11 +1312,14 @@ def question_text(issue, requester, cfg, now, by_bot=False, dm=False):
             "the bridge records it; acting is switched off here, so nothing moves")
     # In a DM the question is a message of its own, and a yes of its own answers it
     # (KIT-295). The terms a yes agrees to read the same in both.
-    return ("*Plan this?* %s “%s”: in %s on %s, filed by %s.\n"
-            "Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
+    body = ("%s “%s”: in %s on %s, filed by %s."
+            % (issue.get("identifier"), title, state, team, creator))
+    bind = ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
             "(Asked for by %s.)"
-            % (issue.get("identifier"), title, state, team, creator,
-               "here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+            % ("here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+    facts = {"ticket": issue.get("identifier"), "title": title, "state": state, "team": team,
+             "filed_by": creator, "needs": "his answer to the fixed line after this message"}
+    return "*Plan this?* ", body, bind, facts
 
 
 def blockers_of(child):
@@ -1360,6 +1451,13 @@ def epic_problems(epic, kids=None):
 
 
 def approve_text(epic, requester, cfg, by_bot=False, dm=False):
+    head, body, bind, _facts = approve_parts(epic, requester, cfg, by_bot, dm)
+    return head + body + "\n" + bind
+
+
+def approve_parts(epic, requester, cfg, by_bot=False, dm=False):
+    """(head, body, bind, facts): an approve question in the writer's pieces, as
+    question_parts (KIT-297). The bind states what a yes does, and that merging stays his."""
     kids = in_order(children_of(epic))
     listing = ", ".join("%s “%s”" % (k.get("identifier"), notify.safe_title(k.get("title")
                                                                           or ""))
@@ -1374,12 +1472,17 @@ def approve_text(epic, requester, cfg, by_bot=False, dm=False):
             "%d at a time, each once the tickets it waits on are Done. Merging stays yours"
             % (cfg["ready_state"], cfg["epic_wip"]) if cfg["act"] else
             "the bridge records it; acting is switched off here, so nothing moves or starts")
-    return ("*Approve this plan?* %s “%s” on %s: %d children, in this order: %s.\n"
-            "Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
+    title = notify.safe_title(epic.get("title") or "")
+    team = (epic.get("team") or {}).get("key") or "?"
+    body = ("%s “%s” on %s: %d children, in this order: %s."
+            % (epic.get("identifier"), title, team, len(kids), listing))
+    bind = ("Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
             "(Asked for by %s.)"
-            % (epic.get("identifier"), notify.safe_title(epic.get("title") or ""),
-               (epic.get("team") or {}).get("key") or "?", len(kids), listing,
-               "here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+            % ("here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+    facts = {"ticket": epic.get("identifier"), "title": title, "team": team,
+             "children": len(kids), "order": [k.get("identifier") for k in kids[:12]],
+             "needs": "his answer to the fixed line after this message"}
+    return "*Approve this plan?* ", body, bind, facts
 
 
 def iso(seconds):
@@ -1501,9 +1604,13 @@ def judge_notifier(interval, why, beat, now, since=None, real=None):
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 class Pass(object):
-    def __init__(self, cfg, slack, tracker, state, first, dry_run, now, out):
+    def __init__(self, cfg, slack, tracker, state, first, dry_run, now, out, writer=None,
+                 deadline=None):
         self.cfg, self.slack, self.tracker, self.state = cfg, slack, tracker, state
         self.first, self.dry, self.now, self.out = first, dry_run, now, out
+        self.writer = writer or voice.write    # KIT-297; the selftest hands in a fake
+        # When the pass's wall clock runs out, on `clock` (KIT-297 review); None: no alarm.
+        self.deadline, self.clock = deadline, time.monotonic
         self.me = None
         self.users = {}
         self.threads = {}                  # (channel, root ts) -> messages read this pass
@@ -1512,13 +1619,16 @@ class Pass(object):
         self.dm_channels = set()           # the members' DMs this pass reads (KIT-295)
         self.dm_posts = {}                 # the notifier's DM pages, "<channel>:<ts>"
         self.fresh_dms = {}                # DM channel -> member, opened for the first time
+        self.dm_errors = []                # each member whose DM could not be opened
         self.secrets = live_secrets(cfg)
         self.release_errors = []
         self.notifier = None               # the watch's line for the summary (KIT-285)
         self.watch_error = None
+        # written, fell_back: messages the writer wrote, and ones that went out plain while
+        # it was on (KIT-297).
         self.counts = {"examined": 0, "asked": 0, "confirmed": 0, "declined": 0,
                        "expired": 0, "refused": 0, "baseline": 0, "gave_up": 0, "acted": 0,
-                       "relayed": 0}
+                       "relayed": 0, "written": 0, "fell_back": 0}
 
     def clean(self, text):
         return notify.redact(text, self.secrets)
@@ -1531,19 +1641,86 @@ class Pass(object):
         if not self.dry:
             save_state(self.cfg, self.state)
 
-    def post(self, channel, thread_ts, text):
+    def post(self, channel, thread_ts, text, kind="", bind="", facts=None, join="\n\n",
+             plain=None):
+        """One message (KIT-297). `kind` names the moment. `bind` is what tells the member
+        what to type, where to answer or what a yes does: it is never the model's, and
+        `join` is what stands between it and `text` in the plain message, as each one has
+        always read. With the writer on, a kind given and no dry run, the writer writes the
+        text from `plain` (when the text itself asks something) or `text`, and from
+        `facts`, and the bind follows it verbatim. Otherwise, and whenever the writer cannot,
+        the plain message goes out, byte for byte as before the writer; with the writer on,
+        once a day, the line saying so follows it. The redaction runs on what is posted."""
         if channel in self.dm_channels:
             # In a DM every post is a message of its own (KIT-295): a thread reply notifies
             # only those who follow that thread, and the member reads the DM itself.
             thread_ts = None
-        text = self.clean(text)
+        message = (text + join + bind if text else bind) if bind else text
+        note = False
+        if kind and text and self.cfg.get("writer") is True and not self.dry:
+            written = self.written(kind, plain or text, bind, facts)
+            if written is not None:
+                message = written
+            elif self.now - self.state.get("writer_note_at", 0) >= WRITER_NOTE_SECONDS:
+                message, note = message + "\n\n" + WRITER_NOTE, True
+        text = self.clean(message)
         if self.dry:
             self.say("  [dry-run] would post in %s thread %s (%d chars)"
                      % (channel, thread_ts, len(text)))
             return "%.6f" % self.now
         ts = self.slack.post(channel, thread_ts, text)
         self.state["posted"][key_of(channel, ts)] = self.now
+        if note:
+            # Kept only once it is posted: a post that failed said nothing.
+            self.state["writer_note_at"] = self.now
         return ts
+
+    def written(self, kind, text, bind, facts):
+        """The writer's message, its words then the bind, or None for the plain one. It is
+        given the text redacted, with each mention turned into the member's name (it may
+        mention nobody), and must keep every ticket id and link in the text and the bind.
+        A writer that raises, or answers with no text, counts as one that fell back: a
+        message is never lost to it. Each fallback is counted and logged. The writer gets
+        only what writer_seconds allows, so the pass's deadline never cuts it off."""
+        plain = self.clean(_MENTION_RE.sub(lambda m: self.name_of(m.group(1)), text))
+        bind = self.clean(bind)
+        both = plain + "\n" + bind
+        keep = (sorted(set(_TICKET_WORD_RE.findall(both)))
+                + sorted(voice.fact_links([both])))
+        facts = dict(facts or {}, plain=plain)
+        # A link only the bind holds is one the model must keep, so it is a fact too.
+        extra = sorted(voice.fact_links([bind]) - voice.fact_links([plain]))
+        if extra:
+            facts["links"] = extra
+        cfg, seconds = self.cfg, self.writer_seconds()
+        if seconds < cfg["writer_timeout_seconds"]:
+            cfg = dict(cfg, writer_timeout_seconds=seconds)
+        if seconds < WRITER_MIN_SECONDS:
+            by, why = "fallback", "too little of this pass was left to wait for the writer"
+        else:
+            try:
+                res = self.writer(cfg, kind, facts, fallback=plain, keep=keep, bind=bind,
+                                  now=self.now)
+                out, by, why = res["text"], res["by"], res.get("why") or ""
+                if not isinstance(out, str) or not out.strip():
+                    raise ValueError("no text")
+            except Exception as exc:                               # noqa: BLE001
+                by, why = "fallback", "the writer failed (%s)" % type(exc).__name__
+        if by == "model":
+            self.counts["written"] += 1
+            return out
+        self.counts["fell_back"] += 1
+        self.say("  the writer fell back on %s: %s" % (kind, why))
+        return None
+
+    def writer_seconds(self):
+        """How long the writer may take on one message: its own timeout, cut to what is
+        left of this pass less WRITER_POST_SECONDS, the time to post the message plain if it
+        gives up (KIT-297 review). Whole seconds, so a cut one is never longer."""
+        limit = self.cfg["writer_timeout_seconds"]
+        if self.deadline is None:
+            return limit
+        return min(limit, int(self.deadline - self.clock() - WRITER_POST_SECONDS))
 
     def mark(self, channel, msg, what):
         # Redacted BEFORE it is cut short: a cut credential would no longer match.
@@ -1627,6 +1804,8 @@ class Pass(object):
             raise BridgeError("the tracker key belongs to %s, not owner_user_id. The bridge "
                               "acts as the owner, so it refuses to run with anyone else's "
                               "key" % (viewer or "nobody"), EXIT_USAGE)
+        # A member's DM that cannot be opened stops no channel and no other DM: it is said
+        # at the end, and the pass ends loud (KIT-297 review).
         for channel in self.cfg["channel_ids"] + self.open_dms():
             # A DM read for the first time is a baseline too, as the first pass is: turned
             # on for a bridge that has run before, it must not answer days of old messages.
@@ -1667,6 +1846,9 @@ class Pass(object):
                             o.get("ticket") or "?" for o in self.state["owed"])))
         if self.watch_error:
             loud.append(self.watch_error)
+        if self.dm_errors:
+            loud.append("%d member DM(s) could not be opened and were not read; every channel "
+                        "was. %s" % (len(self.dm_errors), "; ".join(self.dm_errors)))
         if loud:
             raise BridgeError("; ".join(loud))
 
@@ -1674,15 +1856,22 @@ class Pass(object):
         """Each listed member's DM with this app (KIT-295), opened once and kept in the
         state: Slack answers the same DM every time. An answer that is not a DM's id is
         refused, never read. A DM the state does not hold yet is read this pass as a
-        baseline, and kept once that is done (run)."""
+        baseline, and kept once that is done (run). One member's DM that cannot be opened
+        (a refusal, a missing im:write, an answer that is no DM) is kept in dm_errors, and
+        every other DM and every channel is still read (KIT-297 review)."""
         out = []
         for uid in self.cfg["dm_user_ids"]:
             channel = self.state["dms"].get(uid)
             if not (isinstance(channel, str) and DM_RE.match(channel)):
-                channel = self.slack.open_dm(uid)
-                if not (isinstance(channel, str) and DM_RE.match(channel)):
-                    raise BridgeError("Slack conversations.open named no DM with %s (it "
-                                      "answered %r), so no DM was read" % (uid, channel))
+                try:
+                    channel = self.slack.open_dm(uid)
+                    if not (isinstance(channel, str) and DM_RE.match(channel)):
+                        raise BridgeError("Slack conversations.open named no DM with %s (it "
+                                          "answered %r), so no DM was read" % (uid, channel))
+                except BridgeError as exc:
+                    self.dm_errors.append("%s: %s" % (uid, exc))
+                    self.say("  could not open the DM of %s: %s" % (uid, exc))
+                    continue
                 self.fresh_dms[channel] = uid
             if channel not in out:
                 out.append(channel)
@@ -1749,7 +1938,8 @@ class Pass(object):
         held, told = epoch(rec.get("said_beat")), ""
         if verdict in NOTIFIER_PROBLEMS and verdict not in rec.get("said_kinds", []):
             was = rec.get("said")
-            self.say_notifier(rec, verdict, beat, self.notifier_text(verdict, at, rec))
+            self.say_notifier(rec, verdict, beat, self.notifier_text(verdict, at, rec),
+                              bind=NOTIFIER_CHECK, kind="notifier-" + verdict)
             # What it said before, in the owner's words: quiet, failing or can't read.
             after = ", after it said %s" % ("can't read" if was == "unreadable" else was)
             told = "; %s so in Slack%s" % ("would say" if self.dry else "said",
@@ -1757,7 +1947,9 @@ class Pass(object):
         elif verdict == "ok" and rec.get("said") and (held is None or at > held):
             readable = rec["said"] == "unreadable"
             self.say_notifier(rec, None, None, (NOTIFIER_READABLE if readable else
-                                                NOTIFIER_BACK) % clock(at, self.now))
+                                                NOTIFIER_BACK) % clock(at, self.now),
+                              kind="notifier-readable" if readable else "notifier-back",
+                              fact="readable again" if readable else "back")
             told = "; %s in Slack that %s" % ("would say" if self.dry else "said",
                                               "it can read it again" if readable else
                                               "it is back")
@@ -1782,21 +1974,24 @@ class Pass(object):
             text = NOTIFIER_SAYS["never"] % clock(rec.get("since") or self.now, self.now)
         else:
             text = NOTIFIER_SAYS["unreadable"]
-        return text + NOTIFIER_CHECK
+        # The command to check it is the bind, after one space, as it always read (KIT-297).
+        return text.rstrip(" ")
 
-    def say_notifier(self, rec, said, beat, text):
+    def say_notifier(self, rec, said, beat, text, bind="", kind="", fact=None):
         """Recorded, then posted: a record that cannot be written posts nothing, so a broken
         state dir can never post this on every pass. A post that fails, or that the deadline
         cuts short, puts the record back, so the next pass says it: once more at worst.
         `said` is the problem said, kept in `said_kinds` with each one said before it since
-        the last clean run; None is that run, which clears them."""
+        the last clean run; None is that run, which clears them. `fact` is what the writer
+        is told of a clean run: after "can't read" it is never "back" (KIT-297 review)."""
         before = (rec.get("said"), rec.get("said_beat"), list(rec.get("said_kinds", [])))
         rec["said"] = said
         rec["said_beat"] = beat.get("at") if said and isinstance(beat, dict) else None
         rec["said_kinds"] = before[2] + [said] if said else []
         self.record_watch(rec)
         try:
-            self.post(self.cfg["channel_ids"][0], None, text)
+            self.post(self.cfg["channel_ids"][0], None, text, kind=kind, bind=bind,
+                      join=" ", facts={"notifier": said or fact or "back"})
         except (BridgeError, Deadline):
             rec["said"], rec["said_beat"], rec["said_kinds"] = before
             self.record_watch(rec)
@@ -1828,7 +2023,8 @@ class Pass(object):
             try:
                 self.post(channel, msg.get("thread_ts") or msg.get("ts"),
                           "I could not handle this message after %d tries, so I have "
-                          "stopped trying. Nothing was changed." % tries)
+                          "stopped trying. Nothing was changed." % tries, kind="gave-up",
+                          facts={"tries": tries})
             except BridgeError:
                 pass
 
@@ -1883,12 +2079,21 @@ class Pass(object):
         human = (msg.get("user") and msg.get("user") != "USLACKBOT" and not msg.get("bot_id")
                  and not msg.get("app_id") and not msg.get("subtype"))
         if human and self.state["stray_said"].get(channel, 0) <= self.now - 3600:
-            self.post(channel, None, DM_HELP)
+            self.post(channel, None, "", kind="stray-help", bind=DM_HELP)
             self.state["stray_said"][channel] = self.now
         self.mark(channel, msg, "ignored")
 
-    def refuse_request(self, channel, msg, thread, text, why):
-        self.post(channel, thread, text)
+    def post_refusal(self, channel, thread, line, why, kind, ticket):
+        """A refusal naming its reason (KIT-297). A reason that also says how to answer
+        again makes the whole line the bind: it goes out as it is, never the model's."""
+        if why == EDITED_WHY:
+            return self.post(channel, thread, "", kind=kind, bind=line)
+        return self.post(channel, thread, line, kind=kind, facts={"ticket": ticket})
+
+    def refuse_request(self, channel, msg, thread, text, why, bind="", ticket=""):
+        # `bind`, when given, is the sentence saying what to do next, after one space.
+        self.post(channel, thread, text, kind="request-refused", bind=bind, join=" ",
+                  facts={"ticket": ticket} if ticket else None)
         self.mark(channel, msg, "refused: %s" % why)
         self.counts["refused"] += 1
 
@@ -1906,7 +2111,8 @@ class Pass(object):
         if len(recent) >= self.cfg["max_questions_per_hour"]:
             if self.state["limit_said"].get(channel, 0) <= hour_ago:
                 self.post(channel, thread, "I have looked up %d tickets in the last hour, "
-                          "which is my limit. Ask again later." % len(recent))
+                          "which is my limit. Ask again later." % len(recent),
+                          kind="lookup-limit", facts={"looked_up": len(recent)})
                 self.state["limit_said"][channel] = self.now
             self.mark(channel, msg, "refused: rate limit")
             self.counts["refused"] += 1
@@ -1914,8 +2120,8 @@ class Pass(object):
         open_now = [q for q in self.state["questions"].values() if q.get("status") == OPEN]
         if len(open_now) >= self.cfg["max_open_questions"]:
             self.refuse_request(channel, msg, thread, "%d questions are already open, which "
-                                "is my limit. Answer one, or let it expire, then ask again."
-                                % len(open_now), "too many open")
+                                "is my limit." % len(open_now), "too many open",
+                                bind="Answer one, or let it expire, then ask again.")
             return
         for q in open_now:
             if q.get("ticket") == ident:
@@ -1924,8 +2130,9 @@ class Pass(object):
                 else:
                     where = ", in %s" % ("this thread" if q.get("thread") == thread
                                          else "another thread")
-                self.refuse_request(channel, msg, thread, "%s already has an open question%s. "
-                                    "Answer that one." % (ident, where), "already asked")
+                self.refuse_request(channel, msg, thread, "%s already has an open question%s."
+                                    % (ident, where), "already asked",
+                                    bind="Answer that one.", ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
         if kind == "approve":
@@ -1934,52 +2141,54 @@ class Pass(object):
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
-                                % ident, "not found")
+                                % ident, "not found", ticket=ident)
             return
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
             self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge plans only "
                                 "on %s." % (issue["identifier"], team or "no team",
                                             ", ".join(self.cfg["team_keys"])),
-                                "team not planned")
+                                "team not planned", ticket=issue["identifier"])
             return
         if (issue.get("state") or {}).get("name") == self.cfg["plan_it_state"]:
             # The yes path's own words: a ticket already there is not asked about.
             self.refuse_request(channel, msg, thread, "%s is already in %s."
                                 % (issue["identifier"], self.cfg["plan_it_state"]),
-                                "already in plan it")
+                                "already in plan it", ticket=issue["identifier"])
             return
         live = self.tracker.live_work(issue["id"])
         if live:
             self.refuse_request(channel, msg, thread, "%s looks like live work, so I won't "
                                 "ask about planning it: %s." % (issue["identifier"],
-                                                                "; ".join(live)), "live work")
+                                                                "; ".join(live)), "live work",
+                                ticket=issue["identifier"])
             return
         self.ask(channel, msg, thread, kind, issue, requester,
-                 question_text(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm))
+                 question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm))
 
     def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
         if not self.cfg["agent_user_name"].strip():
             self.refuse_request(channel, msg, thread, "This bridge names no agent user "
                                 "(agent_user_name), so it cannot start an epic's children. "
-                                "Nothing was asked.", "no agent user")
+                                "Nothing was asked.", "no agent user", ticket=ident)
             return
         epic = self.tracker.epic(ident)
         if not epic or not epic.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
-                                % ident, "not found")
+                                % ident, "not found", ticket=ident)
             return
         team = (epic.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
             self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge acts only "
                                 "on %s." % (epic["identifier"], team or "no team",
                                             ", ".join(self.cfg["team_keys"])),
-                                "team not planned")
+                                "team not planned", ticket=epic["identifier"])
             return
         if epic.get("id") in self.state["epics"]:
             self.refuse_request(channel, msg, thread, "%s is already approved, and I am "
                                 "starting its children. Nothing was asked."
-                                % epic["identifier"], "already approved")
+                                % epic["identifier"], "already approved",
+                                ticket=epic["identifier"])
             return
         problems = epic_problems(epic)
         if self.handed_over(epic):
@@ -1988,10 +2197,10 @@ class Pass(object):
         if problems:
             self.refuse_request(channel, msg, thread, "I won't ask about approving %s: %s."
                                 % (epic["identifier"], "; ".join(problems)),
-                                "not an idea-gate epic")
+                                "not an idea-gate epic", ticket=epic["identifier"])
             return
         self.ask(channel, msg, thread, "approve", epic, requester,
-                 approve_text(epic, requester, self.cfg, by_bot=by_bot, dm=dm),
+                 approve_parts(epic, requester, self.cfg, by_bot=by_bot, dm=dm),
                  children=fingerprints(epic))
 
     def handed_over(self, node):
@@ -2005,8 +2214,12 @@ class Pass(object):
         return any((n or {}).get("status") not in poller.SESSION_FINISHED
                    for n in self.tracker.sessions_on(node["id"]))
 
-    def ask(self, channel, msg, thread, kind, issue, requester, text, children=None):
-        posted = self.post(channel, thread, text)
+    def ask(self, channel, msg, thread, kind, issue, requester, parts, children=None):
+        # The head and body, then the bind on a line of its own, as a question always read.
+        # The writer is given the body only: the head asks, and only the bind may.
+        head, body, bind, facts = parts
+        posted = self.post(channel, thread, head + body, kind="question-" + kind, bind=bind,
+                           join="\n", plain=body, facts=facts)
         self.state["questions"][key_of(channel, posted)] = {
             "kind": kind, "ticket": issue["identifier"], "ticket_id": issue.get("id"),
             "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
@@ -2113,7 +2326,8 @@ class Pass(object):
         if not open_here:
             if here or dm:
                 self.post(channel, thread, "There is no open question%s %s to answer."
-                          % (" about %s" % hint if hint else "", where))
+                          % (" about %s" % hint if hint else "", where), kind="no-question",
+                          facts={"ticket": hint} if hint else None)
                 self.mark(channel, msg, "refused: no open question")
                 self.counts["refused"] += 1
             else:
@@ -2121,8 +2335,9 @@ class Pass(object):
             return
         word = "yes" if is_yes else "no"
         if len(open_here) > 1:
-            self.post(channel, thread, "%d questions are open %s. Reply `%s <ticket id>` to "
-                      "say which." % (len(open_here), where, word))
+            self.post(channel, thread, "%d questions are open %s." % (len(open_here), where),
+                      kind="ambiguous", bind="Reply `%s <ticket id>` to say which." % word,
+                      join=" ", facts={"open_questions": len(open_here)})
             self.mark(channel, msg, "refused: ambiguous")
             self.counts["refused"] += 1
             return
@@ -2131,16 +2346,24 @@ class Pass(object):
         # posted: a failed post leaves it open, and the next pass says it.
         closed = self.question_closed(channel, q)
         if closed:
-            self.post(channel, thread, "My question about %s %s, so I have closed it. Ask "
-                      "again with `%s %s`." % (q["ticket"], closed, q["kind"], q["ticket"]))
+            self.post(channel, thread, "My question about %s %s, so I have closed it."
+                      % (q["ticket"], closed), kind="question-closed",
+                      bind="Ask again with `%s %s`." % (q["kind"], q["ticket"]), join=" ",
+                      facts={"ticket": q["ticket"]})
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: question %s" % closed)
             self.counts["refused"] += 1
             return
         if not hint and self.foreign_post_after(channel, q, msg):
+            # The writer is told which question, since only the bind names it here.
             self.post(channel, thread, "Something other than me posted %s after my question, "
-                      "so I can't be sure which question you are answering. Reply `%s %s` to "
-                      "answer the one about %s." % (where, word, q["ticket"], q["ticket"]))
+                      "so I can't be sure which question you are answering." % where,
+                      kind="foreign-post", bind="Reply `%s %s` to answer the one about %s."
+                      % (word, q["ticket"], q["ticket"]), join=" ",
+                      facts={"ticket": q["ticket"]},
+                      plain="Something other than me posted %s after my question about %s, "
+                            "so I can't be sure which question you are answering."
+                            % (where, q["ticket"]))
             self.mark(channel, msg, "refused: something else posted after the question")
             self.counts["refused"] += 1
             return
@@ -2148,31 +2371,35 @@ class Pass(object):
         if why is None:
             why = account_refusal(self.account(msg["user"]), self.me, self.cfg)
         if why:
-            self.post(channel, thread, "I can't take that as an answer to the question about "
-                      "%s: %s." % (q["ticket"], why))
+            self.post_refusal(channel, thread, "I can't take that as an answer to the question "
+                              "about %s: %s." % (q["ticket"], why), why, "answer-refused",
+                              q["ticket"])
             self.mark(channel, msg, "refused: %s" % why)
             self.counts["refused"] += 1
             self.say("  refused an answer on %s: %s" % (q["ticket"], why))
             return
         # Judged by when the answer was SENT: a yes sent in time while the Mac slept counts.
         if ts_float(msg.get("ts")) - q["asked_at"] > self.cfg["question_ttl_hours"] * 3600:
-            self.post(channel, thread, "The question about %s has expired. Ask again with "
-                      "`%s %s`." % (q["ticket"], q["kind"], q["ticket"]))
+            self.post(channel, thread, "The question about %s has expired." % q["ticket"],
+                      kind="question-expired", bind="Ask again with `%s %s`."
+                      % (q["kind"], q["ticket"]), join=" ", facts={"ticket": q["ticket"]})
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
         if not is_yes:
             self.post(channel, thread, "OK, %s is not %s." % (
-                q["ticket"], "approved" if q["kind"] == "approve" else "planned"))
+                q["ticket"], "approved" if q["kind"] == "approve" else "planned"),
+                kind="declined", facts={"ticket": q["ticket"]})
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
             return
         if q.get("promised") != self.promised(q["kind"]):
             self.post(channel, thread, "My settings changed since I asked about %s, so this "
-                      "yes acts on nothing, and I have closed the question. Ask again with "
-                      "`%s %s`." % (q["ticket"], q["kind"], q["ticket"]))
+                      "yes acts on nothing, and I have closed the question." % q["ticket"],
+                      kind="settings-changed", bind="Ask again with `%s %s`."
+                      % (q["kind"], q["ticket"]), join=" ", facts={"ticket": q["ticket"]})
             q.update(status=REFUSED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "refused: settings changed since asked")
             self.counts["refused"] += 1
@@ -2180,7 +2407,8 @@ class Pass(object):
         self.counts["confirmed"] += 1
         if not self.cfg["act"]:
             self.post(channel, thread, "Confirmed by <@%s>. Acting is switched off here, so "
-                      "%s was not changed." % (msg["user"], q["ticket"]))
+                      "%s was not changed." % (msg["user"], q["ticket"]),
+                      kind="confirmed-acting-off", facts={"ticket": q["ticket"]})
             q.update(status=CONFIRMED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "confirmed: %s" % q["ticket"])
             self.say("  confirmed: %s %s by %s (acting is off)"
@@ -2200,7 +2428,9 @@ class Pass(object):
         if self.actions_left() > 0:
             return False
         self.post(channel, thread, "I have acted %d times in the last hour, which is my "
-                  "limit. Say yes again later." % self.cfg["max_actions_per_hour"])
+                  "limit." % self.cfg["max_actions_per_hour"], kind="action-limit",
+                  bind="Say yes again later.", join=" ",
+                  facts={"actions": self.cfg["max_actions_per_hour"]})
         self.mark(channel, msg, "refused: action limit")
         self.counts["refused"] += 1
         return True
@@ -2246,9 +2476,10 @@ class Pass(object):
         """Move the idea into its team's Plan it state, as the owner. Re-read first: the
         ticket may have changed since the question. Idempotent: a ticket already in Plan it
         is said and left alone, so a pass that crashed after the move never moves twice."""
-        def finish(status, text, what):
+        def finish(status, text, what, kind="plan-refused", bind=""):
             # Posted first: the status changes only after the reply saying so lands.
-            self.post(channel, thread, text)
+            self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
+                      facts={"ticket": q["ticket"]})
             q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, what)
         if self.refused_over_limit(channel, thread, msg):
@@ -2269,12 +2500,12 @@ class Pass(object):
             return
         if (issue.get("state") or {}).get("id") == state_id:
             finish(DONE, "%s is already in %s." % (q["ticket"], self.cfg["plan_it_state"]),
-                   "done: already")
+                   "done: already", kind="plan-already")
             return
         if ticket_fingerprint(issue) != q.get("fingerprint"):
             finish(REFUSED, "%s changed since I asked (its title, text, team, labels or "
-                   "state), so nothing was moved, and I have closed the question. Ask again "
-                   "with `plan %s`." % (q["ticket"], q["ticket"]), "refused: changed since asked")
+                   "state), so nothing was moved, and I have closed the question." % q["ticket"],
+                   "refused: changed since asked", bind="Ask again with `plan %s`." % q["ticket"])
             return
         live = self.tracker.live_work(issue["id"])
         if live:
@@ -2302,7 +2533,7 @@ class Pass(object):
                     "written; I will try again.")
         finish(DONE, "Moved %s to %s for <@%s>. The planner starts on it within a few "
                "minutes.%s" % (q["ticket"], self.cfg["plan_it_state"], msg["user"], owed),
-               "done: moved %s" % q["ticket"])
+               "done: moved %s" % q["ticket"], kind="plan-moved")
         self.counts["acted"] = self.counts.get("acted", 0) + 1
         self.say("  acted: moved %s to %s for %s" % (q["ticket"], self.cfg["plan_it_state"],
                                                      msg["user"]))
@@ -2310,9 +2541,10 @@ class Pass(object):
     def act_approve(self, channel, thread, q, msg):
         """Move the epic to its team's ready state, as the owner, and record it as approved,
         so every pass from now on starts its children in order. Re-read first."""
-        def finish(status, text, what):
+        def finish(status, text, what, kind="approve-refused", bind=""):
             # Posted first: the status changes only after the reply saying so lands.
-            self.post(channel, thread, text)
+            self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
+                      facts={"ticket": q["ticket"]})
             q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, what)
         if self.refused_over_limit(channel, thread, msg):
@@ -2328,14 +2560,14 @@ class Pass(object):
                    "was approved." % (q["ticket"], team or "no team"), "refused: team")
             return
         if epic["id"] in self.state["epics"]:
-            finish(DONE, "%s is already approved." % q["ticket"], "done: already")
+            finish(DONE, "%s is already approved." % q["ticket"], "done: already",
+                   kind="approve-already")
             return
         changed = changes_since(q.get("children") or {}, epic)
         if changed:
             finish(REFUSED, "%s's children changed since I asked (%s), so nothing was "
-                   "approved. Ask again with `approve %s`." % (q["ticket"], changed,
-                                                              q["ticket"]),
-                   "refused: changed since asked")
+                   "approved." % (q["ticket"], changed), "refused: changed since asked",
+                   bind="Ask again with `approve %s`." % q["ticket"])
             return
         problems = epic_problems(epic)
         if self.handed_over(epic):
@@ -2384,7 +2616,7 @@ class Pass(object):
         finish(DONE, "Approved %s for <@%s>. I'll hand its children to the agent in order, "
                "at most %d at a time, each once what it waits on is Done, and say here as "
                "each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
-               "done: approved %s" % q["ticket"])
+               "done: approved %s" % q["ticket"], kind="approve-done")
         self.counts["acted"] += 1
         self.say("  acted: approved %s for %s" % (q["ticket"], msg["user"]))
 
@@ -2393,9 +2625,15 @@ class Pass(object):
         that asked, passed on as one comment in that session's own thread (KIT-224)."""
         thread, ticket = msg["thread_ts"], ping.get("ticket_id") or "the ticket"
 
-        def refuse(why, what):
-            self.post(channel, thread, "I can't pass that on to %s's session: %s."
-                      % (ticket, why))
+        def refuse(why, what, how=""):
+            # `how`, when given, says where the answer goes instead: the bind, after a space.
+            if how:
+                self.post(channel, thread, "I can't pass that on to %s's session: %s."
+                          % (ticket, why), kind="ping-refused", bind=how, join=" ",
+                          facts={"ticket": ticket})
+            else:
+                self.post_refusal(channel, thread, "I can't pass that on to %s's session: %s."
+                                  % (ticket, why), why, "ping-refused", ticket)
             self.mark(channel, msg, "refused answer: %s" % what)
             self.counts["refused"] += 1
             self.say("  refused an answer for %s: %s" % (ticket, what))
@@ -2407,8 +2645,8 @@ class Pass(object):
             refuse(why, why)
             return
         if not self.cfg["act"]:
-            refuse("acting is switched off here, so it was not sent. Answer in the tracker",
-                   "acting is off")
+            refuse("acting is switched off here, so it was not sent", "acting is off",
+                   how="Answer in the tracker.")
             return
         if not self.cfg["agent_user_name"].strip():
             refuse("this bridge names no agent user (agent_user_name), so it cannot check "
@@ -2416,8 +2654,9 @@ class Pass(object):
             return
         typed = notify.decode_chat_entities(msg.get("text") or "")
         if len(typed) > self.cfg["relay_max_chars"]:
-            refuse("it is %d characters, over the limit of %d. A long answer belongs in the "
-                   "tracker" % (len(typed), self.cfg["relay_max_chars"]), "too long")
+            refuse("it is %d characters, over the limit of %d"
+                   % (len(typed), self.cfg["relay_max_chars"]), "too long",
+                   how="A long answer belongs in the tracker.")
             return
         text = notify.clean_relay_text(msg.get("text") or "")
         if not text:
@@ -2486,15 +2725,17 @@ class Pass(object):
         try:
             self.tracker.reply_in_thread(issue_uuid, thread_id, body)
         except Exception as exc:                                   # noqa: BLE001
-            self.post(channel, thread, "I could not confirm that your answer reached %s's "
-                      "session. I won't send it again: check the ticket, and answer there "
-                      "if it is missing." % ticket)
+            # It says where to answer inside its last sentence, so all of it is the bind.
+            self.post(channel, thread, "", kind="ping-unconfirmed", bind="I could not confirm "
+                      "that your answer reached %s's session. I won't send it again: check the "
+                      "ticket, and answer there if it is missing." % ticket)
             self.say("  UNCONFIRMED answer for %s: %s" % (ticket, str(exc)[:160]))
             return
         self.state["relay_pending"].pop(key, None)
         self.mark(channel, msg, "answered: %s" % ticket)
         self.post(channel, thread, "Sent to %s's session as <@%s>'s answer. It carries on "
-                  "when the dispatcher picks it up." % (ticket, uid))
+                  "when the dispatcher picks it up." % (ticket, uid), kind="ping-sent",
+                  facts={"ticket": ticket})
         self.counts["relayed"] += 1
         self.say("  answered: %s, from %s" % (ticket, uid))
 
@@ -2511,7 +2752,8 @@ class Pass(object):
         if message_refusal(msg, self.me) or account_refusal(self.account(msg["user"]),
                                                             self.me, self.cfg):
             return False
-        self.post(channel, thread, UNRECORDED_PING)
+        self.post(channel, thread, UNRECORDED_PING_SAYS, kind="ping-unrecorded",
+                  bind=UNRECORDED_PING_BIND, join=" ")
         self.mark(channel, msg, "refused answer: ping not recorded")
         self.counts["refused"] += 1
         self.say("  refused an answer under an unrecorded ping, thread %s" % thread)
@@ -2537,28 +2779,33 @@ class Pass(object):
                                                             self.me, self.cfg):
             return False
         if not paged:
-            self.post(channel, None, UNRECORDED_PING)
+            self.post(channel, None, UNRECORDED_PING_SAYS, kind="ping-unrecorded",
+                      bind=UNRECORDED_PING_BIND, join=" ")
             self.mark(channel, msg, "refused answer: ping not recorded")
             self.counts["refused"] += 1
             self.say("  refused an answer under an unrecorded post, thread %s" % thread)
             return True
         self.post(channel, None, "I can't pass that on to a session: that message is not "
-                  "waiting on an answer. To answer a dev, reply under the message saying it "
-                  "stopped to ask you something, or answer in the tracker.")
+                  "waiting on an answer.", kind="page-not-waiting", bind="To answer a dev, "
+                  "reply under the message saying it stopped to ask you something, or answer "
+                  "in the tracker.", join=" ")
         self.mark(channel, msg, "refused answer: page not waiting on an answer")
         self.counts["refused"] += 1
         self.say("  refused an answer under a page not waiting on one, thread %s" % thread)
         return True
 
     def note(self, rec, key, text):
-        """Say it in the epic's thread once, however many passes find it."""
+        """Say it in the epic's thread once, however many passes find it. The kind is the
+        note's key up to its first colon (KIT-297)."""
         if key in rec["noted"]:
             return
-        self.post(rec["channel"], rec["thread"], text)
+        self.post(rec["channel"], rec["thread"], text, kind="epic-" + key.split(":", 1)[0],
+                  facts={"epic": rec["ticket"]})
         rec["noted"] = (rec["noted"] + [key])[-200:]
 
     def drop(self, epic_id, rec, text):
-        self.post(rec["channel"], rec["thread"], text)
+        self.post(rec["channel"], rec["thread"], text, kind="epic-stopped",
+                  facts={"epic": rec["ticket"]})
         self.state["epics"].pop(epic_id, None)
         self.say("  stopped following %s" % rec["ticket"])
 
@@ -2832,10 +3079,13 @@ class Pass(object):
             owed = (" The hand-over was done, but the comment naming who approved it could "
                     "not be written; I will try again.")
         position = [k["id"] for k in kids].index(child["id"]) + 1
+        title = notify.safe_title(child.get("title") or "")
         self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
-            ident, notify.safe_title(child.get("title") or ""), position, len(kids),
+            ident, title, position, len(kids),
             ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
-            if after else "", owed))
+            if after else "", owed), kind="started-child",
+            facts={"ticket": ident, "title": title, "epic": rec["ticket"],
+                   "position": position, "of": len(kids), "waited_on": after})
         self.counts["acted"] += 1
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
 
@@ -2873,9 +3123,11 @@ class Pass(object):
                                  if u in self.cfg["dm_user_ids"])
 
 
-def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout):
+def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None,
+             deadline=None):
     state, first = load_state(cfg)
-    p = Pass(cfg, slack, tracker, state, first, dry_run, now or time.time(), out)
+    p = Pass(cfg, slack, tracker, state, first, dry_run, now or time.time(), out,
+             writer=writer, deadline=deadline)
     p.run()
     c = p.counts
     pending = sorted((v or {}).get("ticket") or "?" for v in p.state["relay_pending"].values())
@@ -2893,12 +3145,15 @@ def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout):
                     "notifier_bot_user_id is unset")
     if p.notifier:
         summary += " | notifier watch: %s" % p.notifier
+    if cfg.get("writer") is True:
+        summary += " | writer: %d written, %d went out plain" % (c["written"], c["fell_back"])
     out.write(summary + "\n")
     return dict(c, exit=EXIT_DECLINED if pending else EXIT_OK, dry=bool(dry_run),
                 summary=summary)
 
 
-def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout, now=None):
+def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout, now=None,
+                writer=None):
     import fcntl
 
     def _alarm(_signum, _frame):
@@ -2907,10 +3162,13 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
     armed = False
     secrets = live_secrets(cfg)
     lock = None
+    deadline = None
     if timeout and hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(int(timeout))
         armed = True
+        # The same moment on the clock the writer's time is measured on (KIT-297 review).
+        deadline = time.monotonic() + int(timeout)
     try:
         os.makedirs(cfg["state_dir"], exist_ok=True)
         lock = open(lock_path(cfg), "a")
@@ -2924,7 +3182,8 @@ def run_command(cfg, dry_run, timeout, slack=None, tracker=None, out=sys.stdout,
             key = credential(cfg, "linear_key_env")
             slack = slack or SlackClient(cfg, token)
             tracker = tracker or TrackerClient(key, cfg["linear_key_env"])
-        result = run_once(cfg, slack, tracker, dry_run, now=now, out=out)
+        result = run_once(cfg, slack, tracker, dry_run, now=now, out=out, writer=writer,
+                          deadline=deadline)
     except Deadline:
         result = {"exit": EXIT_TIMEOUT, "dry": bool(dry_run),
                   "summary": "FAIL: the %ds deadline passed; this pass is PARTIAL. Every "
@@ -6395,13 +6654,21 @@ def selftest():
               outcome(lambda: case_turned_on(True)),
               (EXIT_ERROR, EXIT_OK, [], [], True, {ALICE: DM}, 1))
 
+        # KIT-297 review: the refused DM is not read, and the channels still are, once each.
         def case_not_a_dm():
             c, s, t = world("dm-not-a-dm", dm_user_ids=[ALICE])
             s.dm_ids[ALICE] = CHAN
+            read, history = [], s.history
+
+            def reading(channel, oldest, pages):
+                read.append(channel)
+                return history(channel, oldest, pages)
+            s.history = reading
             code, out = run(c, s, t)
-            return code, "named no DM" in out, "conversations.history" in s.reads
-        check("dm-an-open-that-names-no-dm-is-refused-and-reads-nothing",
-              outcome(case_not_a_dm), (EXIT_ERROR, True, False))
+            return (code, "named no DM" in out, read,
+                    json.load(open(state_path(c))).get("dms"))
+        check("dm-an-open-that-names-no-dm-is-refused-and-reads-no-dm",
+              outcome(case_not_a_dm), (EXIT_ERROR, True, [CHAN], {}))
 
         def case_real_client(call):
             sent = []
@@ -6792,6 +7059,526 @@ def selftest():
                     json.load(open(state_path(c))).get("dms"))
         check("dm-off: with dm_user_ids empty a channel works as before, and no DM is opened",
               outcome(case_channel_only), (False, [(CHAN, True)], True, {}))
+
+        # 15b. ONE MEMBER'S DM THAT CANNOT BE OPENED (KIT-297 review) stops no channel and
+        #      no other member's DM. Each failure is named, and the pass ends loud: so does a
+        #      missing im:write, after the channels are answered.
+        def case_one_dm_fails(error, failing):
+            c, s, t = world("dm-open-fails-%d" % len(failing), dm_user_ids=[ALICE, BOB])
+            opened = s.open_dm
+
+            def open_dm(uid):
+                if uid in failing:
+                    raise BridgeError(error)
+                return opened(uid)
+            s.open_dm = open_dm
+            run(c, s, t)                                    # the first pass: a baseline
+            s.add(ALICE, "plan PROD-6")
+            s.add(ALICE, "plan PROD-5", channel=DM)
+            code, out = run(c, s, t)
+            return (code, sorted(set(ch for ch, _th, x in s.posts if "Plan this?" in x)),
+                    [u for u in failing if u in out], json.load(open(state_path(c))).get("dms"))
+        check("dm-one-member-whose-dm-cannot-be-opened-stops-no-channel-and-no-other-dm",
+              outcome(lambda: case_one_dm_fails("Slack conversations.open refused: "
+                                                "user_not_found", [BOB])),
+              (EXIT_ERROR, [CHAN, DM], [BOB], {ALICE: DM}))
+        scope = ("Slack conversations.open refused: missing_scope. The bridge app needs "
+                 "im:write to open a DM")
+        got = outcome(lambda: case_one_dm_fails(scope, [ALICE, BOB]))
+        check("dm-a-missing-im-write-still-answers-the-channels-then-stops-loud",
+              got if not isinstance(got, tuple) else (got[0], got[1], got[2], got[3]),
+              (EXIT_ERROR, [CHAN], [ALICE, BOB], {}))
+
+        def case_dm_line():
+            c, s, t = world("dm-open-fails-line", dm_user_ids=[ALICE, BOB])
+            opened = s.open_dm
+
+            def open_dm(uid):
+                if uid == BOB:
+                    raise BridgeError("Slack conversations.open refused: user_not_found")
+                return opened(uid)
+            s.open_dm = open_dm
+            return run(c, s, t)[1]
+        check("dm-the-failure-line-says-every-channel-was-read",
+              "1 member DM(s) could not be opened and were not read; every channel was. "
+              "U0BOB00001: Slack conversations.open refused: user_not_found"
+              in outcome(case_dm_line), True)
+
+        # 16. THE WRITER (KIT-297). With `writer` on, each message is written when it is
+        #     sent, from its plain text and facts, and the sentence saying what to type,
+        #     where to answer or what a yes does follows it verbatim: the model never writes
+        #     that. A fake writer stands in for the model, so no CLI ever starts here. With
+        #     the writer off, or in a dry run, nothing calls it.
+        writer_bin = "/opt/claude/bin/claude"
+        # The contract's line, word for word: said once a day after a message gone out plain.
+        plain_note = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
+
+        def written_as(keep):
+            return "I have news on %s." % ", ".join(keep) if keep else "I have news."
+
+        class FakeWriter(object):
+            """Stands in for voice.write: records each call, and answers with a rewrite that
+            keeps every id it must, or with the plain text, or raises, as told."""
+
+            def __init__(self, by="model", raises=None):
+                self.by, self.raises, self.calls = by, raises, []
+
+            def __call__(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None,
+                         now=None):
+                self.calls.append({"kind": kind, "facts": dict(facts), "fallback": fallback,
+                                   "keep": list(keep), "bind": bind, "now": now})
+                if self.raises is not None:
+                    raise self.raises
+                text = written_as(keep) if self.by == "model" else fallback
+                return {"text": text + ("\n\n" + bind if bind else ""), "by": self.by,
+                        "why": "" if self.by == "model" else "the writer exited 1",
+                        "cost_usd": None}
+
+            def kinds(self):
+                return [x["kind"] for x in self.calls]
+
+            def last(self, kind):
+                return [x for x in self.calls if x["kind"] == kind][-1]
+
+        audited = []                                  # every fake writer, for the audit
+
+        def wworld(name, **over):
+            kw = dict(writer=True, writer_bin=writer_bin)
+            kw.update(over)
+            c, s, t = world(name, **kw)
+            s.profiles[ALICE]["real_name"] = "Alice Example"
+            return c, s, t
+
+        def wrun(c, s, t, fw, dry=False, at=None):
+            if fw not in audited:
+                audited.append(fw)
+            out = io.StringIO()
+            try:
+                res = run_once(c, s, t, dry, now=at or now, out=out, writer=fw)
+                return res["exit"], out.getvalue()
+            except BridgeError as exc:
+                return exc.code, str(exc)
+
+        def wdm(name, fw, *requests, **over):
+            c, s, t = wworld(name, dm_user_ids=[ALICE], **over)
+            wrun(c, s, t, fw)                               # the first pass: a baseline
+            for line in requests:
+                s.add(ALICE, line, channel=DM)
+            if requests:
+                wrun(c, s, t, fw)
+            return c, s, t
+
+        plan_bind = ("Reply `yes` in this thread within 24 hours, and the bridge records it; "
+                     "acting is switched off here, so nothing moves. Reply `no` to drop it. "
+                     "(Asked for by <@%s>.)" % ALICE)
+        plan_body = "PROD-6 “Light mode”: in Backlog on PROD, filed by Chat bot."
+        # A message gone out plain while the writer is on is the writer-off one, exactly.
+        plan_text = "*Plan this?* " + plan_body + "\n" + plan_bind
+
+        # The question: the writer is given the body, never its head (it asks) nor its
+        # terms (the bind). What a yes binds to is unchanged, and a yes still answers it.
+        def case_question():
+            fw = FakeWriter()
+            c, s, t = wworld("w-question")
+            wrun(c, s, t, fw)
+            req = s.add(ALICE, "plan PROD-6")
+            wrun(c, s, t, fw)
+            asked = fw.last("question-plan")
+            q = list(json.load(open(state_path(c)))["questions"].values())[0]
+            s.add(ALICE, "yes", thread=req)
+            code, _o = wrun(c, s, t, fw)
+            said = fw.last("confirmed-acting-off")
+            return (asked["fallback"], asked["keep"], asked["bind"], asked["facts"]["title"],
+                    asked["facts"]["plain"] == plan_body, asked["now"], posted(s)[0],
+                    q["promised"], code, status_of(c), said["fallback"], posted(s)[-1])
+        check("writer-question: the body is written, and the terms follow verbatim",
+              outcome(case_question),
+              (plan_body, ["PROD-6"], plan_bind, "Light mode", True, now,
+               "I have news on PROD-6.\n\n" + plan_bind,
+               {"act": False, "question_ttl_hours": 24, "plan_it_state": "Plan it"},
+               EXIT_OK, [CONFIRMED],
+               "Confirmed by Alice Example. Acting is switched off here, so PROD-6 was not "
+               "changed.", "I have news on PROD-6."))
+
+        # An approve question, its yes, and the start that follows: each written; the
+        # writer keeps every child id in the order, and sees no ticket's description.
+        def case_epic():
+            fw = FakeWriter()
+            c, s, t = wdm("w-epic", fw, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            s.add(ALICE, "approve PROD-50", channel=DM)
+            wrun(c, s, t, fw)
+            s.add(ALICE, "yes", channel=DM)
+            wrun(c, s, t, fw)
+            t.set_state("PROD-50", "backlog")              # a note: paused
+            wrun(c, s, t, fw)
+            ask, started = fw.last("question-approve"), fw.last("started-child")
+            return (fw.kinds(), ask["keep"],
+                    ask["bind"].endswith("Merging stays yours. Reply `no` to leave it. (Asked "
+                                         "for by <@%s>.)" % ALICE),
+                    started["facts"]["title"], started["facts"]["epic"],
+                    [x for _th, x in in_dm(s)][1:], t.delegations)
+        check("writer-approve: the question, the approval, each start and each note are "
+              "written", outcome(case_epic),
+              (["question-approve", "approve-done", "started-child", "epic-paused"],
+               ["PROD-50", "PROD-51", "PROD-52"], True, "Child PROD-51", "PROD-50",
+               ["I have news on PROD-50.", "I have news on PROD-51.",
+                "I have news on PROD-50."], [("uuid-51", "agent-1")]))
+
+        # What to type next is the bind, after the written text, never in it.
+        def case_binds():
+            fw = FakeWriter()
+            c, s, t = wdm("w-binds", fw, "plan PROD-5", "plan PROD-6")
+            s.add(ALICE, "yes", channel=DM)                 # two open: which one
+            s.add(ALICE, "plan PROD-6", channel=DM)         # asked already
+            wrun(c, s, t, fw)
+            return ([(x["kind"], x["fallback"], x["bind"]) for x in fw.calls[2:]],
+                    [x for _th, x in in_dm(s)][2:])
+        check("writer-binds: which question to answer, and what to do instead",
+              outcome(case_binds),
+              ([("ambiguous", "2 questions are open here.",
+                 "Reply `yes <ticket id>` to say which."),
+                ("request-refused", "PROD-6 already has an open question here.",
+                 "Answer that one.")],
+               ["I have news.\n\nReply `yes <ticket id>` to say which.",
+                "I have news on PROD-6.\n\nAnswer that one."]))
+
+        def case_foreign():
+            fw = FakeWriter()
+            c, s, t = wdm("w-foreign", fw, "plan PROD-6")
+            s.add(ME, "*A pull request is ready for you to merge on PROD-9*", channel=DM,
+                  bot_id=BOT)
+            s.add(ALICE, "yes", channel=DM)
+            wrun(c, s, t, fw)
+            x = fw.last("foreign-post")
+            return x["fallback"], x["keep"], in_dm(s)[-1][1], status_of(c)
+        check("writer-foreign-post: the id only the bind names is still kept",
+              outcome(case_foreign),
+              ("Something other than me posted here after my question about PROD-6, so I "
+               "can't be sure which question you are answering.", ["PROD-6"],
+               "I have news on PROD-6.\n\nReply `yes PROD-6` to answer the one about PROD-6.",
+               [OPEN]))
+
+        def case_limit():
+            fw = FakeWriter()
+            c, s, t = wdm("w-limit", fw, "plan PROD-5", "plan PROD-6", act=True,
+                          max_actions_per_hour=1)
+            s.add(ALICE, "yes PROD-5", channel=DM)
+            s.add(ALICE, "yes PROD-6", channel=DM)
+            wrun(c, s, t, fw)
+            moved = fw.last("plan-moved")
+            return (moved["fallback"], fw.last("action-limit")["bind"], in_dm(s)[-1][1],
+                    t.moves)
+        check("writer-acting: a move is written with the member's name, never a mention, and "
+              "the limit's 'say yes' is the bind", outcome(case_limit),
+              ("Moved PROD-5 to Plan it for Alice Example. The planner starts on it within a "
+               "few minutes.", "Say yes again later.", "I have news.\n\nSay yes again later.",
+               [("uuid-5", "st-plan-it")]))
+
+        def case_changed():
+            fw = FakeWriter()
+            c, s, t = wdm("w-changed", fw, "plan PROD-6", act=True)
+            t.issues["PROD-6"]["title"] = "Light mode, changed"
+            s.add(ALICE, "yes", channel=DM)
+            wrun(c, s, t, fw)
+            x = fw.last("plan-refused")
+            return x["fallback"], x["bind"], in_dm(s)[-1][1], t.moves
+        check("writer-refused: 'ask again with' is the bind", outcome(case_changed),
+              ("PROD-6 changed since I asked (its title, text, team, labels or state), so "
+               "nothing was moved, and I have closed the question.",
+               "Ask again with `plan PROD-6`.",
+               "I have news on PROD-6.\n\nAsk again with `plan PROD-6`.", []))
+
+        def case_notifier():
+            fw = FakeWriter()
+            c, s, t = wworld("w-notifier", notifier_plist=os.path.join(tmp, "w-none.plist"))
+            wrun(c, s, t, fw)
+            x = fw.calls[0] if fw.calls else {}
+            return x.get("kind"), x.get("fallback"), x.get("bind"), s.posts
+        check("writer-notifier-watch: the command to check it is the bind",
+              outcome(case_notifier),
+              ("notifier-unreadable", "I can't read the notifier's heartbeat or its schedule, "
+                                      "so I can't tell whether your pages are going out.",
+               NOTIFIER_CHECK, [(CHAN, None, "I have news.\n\n" + NOTIFIER_CHECK)]))
+
+        def case_ping(act):
+            fw = FakeWriter()
+            c, s, t = wdm("w-ping-%s" % act, fw, act=act, agent_user_name="Agent",
+                          team_keys=["PROD", "TOD"])
+            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
+            pinged(c, page)
+            ledger(c, page, mark="agent:blocked")
+            s.add(ALICE, "use the second helper", thread=page, channel=DM)
+            wrun(c, s, t, fw)
+            x = fw.calls[-1] if fw.calls else {}
+            return (x.get("kind"), x.get("fallback"), x.get("bind"), in_dm(s)[-1][1],
+                    [b.endswith("\n\nuse the second helper") for _u, _th, b in t.thread_replies])
+        check("writer-ping: the answer passed on is the member's own words, and only the line "
+              "saying so is written", outcome(lambda: case_ping(True)),
+              ("ping-sent", "Sent to TOD-5's session as Alice Example's answer. It carries on "
+                            "when the dispatcher picks it up.", "", "I have news on TOD-5.",
+               [True]))
+        check("writer-ping: where to answer instead is the bind",
+              outcome(lambda: case_ping(False)),
+              ("ping-refused", "I can't pass that on to TOD-5's session: acting is switched "
+                               "off here, so it was not sent.", "Answer in the tracker.",
+               "I have news on TOD-5.\n\nAnswer in the tracker.", []))
+
+        # A line that is all instruction goes out as it is, with no model call.
+        def case_verbatim():
+            fw = FakeWriter()
+            c, s, t = wdm("w-verbatim", fw, "plan PROD-6")
+            s.add(ALICE, "yes", channel=DM, edited={"user": ALICE, "ts": "1"})
+            s.add(ALICE, "hello there", channel=DM)
+            wrun(c, s, t, fw)
+            return fw.kinds(), [x for _th, x in in_dm(s)][1:]
+        check("writer-verbatim: the help line and a re-send instruction are never written",
+              outcome(case_verbatim),
+              (["question-plan"],
+               ["I can't take that as an answer to the question about PROD-6: it was edited "
+                "after it was sent; send the answer again as a new reply.", DM_HELP]))
+
+        # Gone out plain while the writer is on: said once a day, after everything else,
+        # recorded only once posted, and counted in the summary and the heartbeat.
+        def case_note():
+            fw = FakeWriter(by="fallback")
+            c, s, t = wdm("w-note", fw, "plan PROD-6")
+            first = [x for _th, x in in_dm(s)]
+            noted = json.load(open(state_path(c))).get("writer_note_at")
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            out = io.StringIO()
+            code = run_command(c, False, 30, slack=s, tracker=t, out=out, now=now + 60,
+                               writer=fw)
+            beat = json.load(open(heartbeat_path(c)))
+            again = in_dm(s)[-1][1]
+            s.add(ALICE, "plan PROD-6", channel=DM, at=now + 86400)
+            wrun(c, s, t, fw, at=now + 86400 + 60)
+            return (first, noted, code, again, (beat.get("written"), beat.get("fell_back")),
+                    "| writer: 0 written, 1 went out plain" in out.getvalue(),
+                    in_dm(s)[-1][1].endswith(plain_note))
+        check("writer-plain-is-said-once-a-day", outcome(case_note),
+              ([plan_text.replace("in this thread", "here") + plain_note],
+               now, EXIT_OK, "PROD-6 already has an open question here. Answer that one.",
+               (0, 1), True, True))
+
+        def case_never():
+            fw = FakeWriter()
+            c, s, t = wworld("w-dry")
+            wrun(c, s, t, fw)
+            s.add(ALICE, "plan PROD-6")
+            wrun(c, s, t, fw, dry=True)
+            off = FakeWriter()
+            c2, s2, t2 = world("w-off")
+            wrun(c2, s2, t2, off)
+            s2.add(ALICE, "plan PROD-6")
+            code, out = wrun(c2, s2, t2, off)
+            return (fw.calls, s.posts, off.calls,
+                    posted(s2) == [question_text(t2.issues["PROD-6"], ALICE, c2, now)],
+                    "writer:" in out)
+        check("writer-a-dry-run-or-the-writer-off-calls-nothing", outcome(case_never),
+              ([], [], [], True, False))
+
+        def case_raises():
+            fw = FakeWriter(raises=RuntimeError("boom"))
+            c, s, t = wworld("w-raises")
+            wrun(c, s, t, fw)
+            s.add(ALICE, "plan PROD-6")
+            code, out = wrun(c, s, t, fw)
+            return code, posted(s), status_of(c), "the writer failed (RuntimeError)" in out
+        check("writer-that-raises-loses-no-message", outcome(case_raises),
+              (EXIT_OK, [plan_text + plain_note], [OPEN], True))
+
+        # The pass's own deadline bounds the writer (KIT-297 review). It gets what the pass
+        # has left, less the time to post the message plain, and with too little left it is
+        # not called: a slow writer can never cost a message, nor the pass that sends it.
+        class TimedWriter(FakeWriter):
+            """A FakeWriter that records how long it was given for each message."""
+
+            def __init__(self, *a, **kw):
+                FakeWriter.__init__(self, *a, **kw)
+                self.given = []
+
+            def __call__(self, cfg, *a, **kw):
+                self.given.append(cfg["writer_timeout_seconds"])
+                return FakeWriter.__call__(self, cfg, *a, **kw)
+
+        def case_bounded(timeout):
+            fw = TimedWriter()
+            c, s, t = wworld("w-bounded-%d" % timeout)
+            wrun(c, s, t, fw)                               # the first pass: a baseline
+            s.add(ALICE, "plan PROD-6")
+            out = io.StringIO()
+            code = run_command(c, False, timeout, slack=s, tracker=t, out=out, now=now + 60,
+                               writer=fw)
+            return (code, fw.given, posted(s),
+                    "too little of this pass was left to wait for the writer" in out.getvalue(),
+                    "| writer: %d written, %d went out plain" % (len(fw.given),
+                                                                  1 - len(fw.given))
+                    in out.getvalue())
+        got = outcome(lambda: case_bounded(60))
+        check("writer-time-is-cut-to-what-the-pass-has-left",
+              (got[0], [30 <= x <= 35 for x in got[1]]) + got[2:]
+              if isinstance(got, tuple) else got,
+              (EXIT_OK, [True], ["I have news on PROD-6.\n\n" + plan_bind], False, True))
+        check("writer-time-is-its-own-when-the-pass-has-room",
+              outcome(lambda: case_bounded(120)[:3]),
+              (EXIT_OK, [60], ["I have news on PROD-6.\n\n" + plan_bind]))
+        check("writer-not-called-with-too-little-of-the-pass-left",
+              outcome(lambda: case_bounded(30)),
+              (EXIT_OK, [], [plan_text + plain_note], True, True))
+
+        # The review's case: an approval pass has used `used` seconds of its 120 when
+        # "Started" is written, and the writer takes all the time it is given. Started and
+        # saved before the post, the child must still be said, now: no later pass says it.
+        def case_start_near_deadline(used):
+            ticks = [float(used)]
+            c, s, t = wworld("w-deadline-%d" % used, act=True, agent_user_name="Agent")
+            state = new_state()
+            state.setdefault("acted_at", [])
+            p = Pass(c, s, t, state, False, False, now, io.StringIO(),
+                     deadline=float(c["run_timeout_seconds"]))
+            p.clock = lambda: ticks[0]
+            given = []
+
+            def slow(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
+                given.append(cfg["writer_timeout_seconds"])
+                ticks[0] += cfg["writer_timeout_seconds"]
+                if ticks[0] >= p.deadline:
+                    raise Deadline()                        # the alarm cuts it off first
+                return {"text": fallback + ("\n\n" + bind if bind else ""), "by": "fallback",
+                        "why": "the writer took longer than %g seconds"
+                               % cfg["writer_timeout_seconds"], "cost_usd": None}
+            p.writer = slow
+            rec = {"channel": CHAN, "thread": "1760000000.000100", "ticket": "PROD-50",
+                   "started": [], "approved_name": "Alice Example", "approved_by": ALICE,
+                   "approved_at": "t"}
+            child = {"id": "uuid-51", "identifier": "PROD-51", "title": "Child PROD-51"}
+            try:
+                p.start_child(rec, child, [child], "agent-1")
+            except Deadline:
+                return "the deadline cut the writer off", given, posted(s), rec["started"]
+            return given, posted(s), rec["started"], p.counts["fell_back"]
+        started_plain = "Started PROD-51 “Child PROD-51” (1 of 1)." + plain_note
+        check("writer-near-the-deadline-still-says-the-start",
+              outcome(lambda: case_start_near_deadline(70)),
+              ([25], [started_plain], ["PROD-51"], 1))
+        check("writer-at-the-deadline-is-not-called-and-the-start-is-said",
+              outcome(lambda: case_start_near_deadline(100)),
+              ([], [started_plain], ["PROD-51"], 1))
+        check("config: the writer's timeout must leave a pass time to post plain",
+              outcome(lambda: (
+                  "'writer_timeout_seconds' (300) must be at most 95 while "
+                  "'run_timeout_seconds' is 120" in _config_error(dict(
+                      EXAMPLE_CONFIG, writer=True, writer_bin=writer_bin,
+                      writer_timeout_seconds=300, state_dir=os.path.join(tmp, "wd1"))),
+                  "'run_timeout_seconds' (30) leaves the writer no time: it must be at least "
+                  "35" in _config_error(dict(
+                      EXAMPLE_CONFIG, writer=True, writer_bin=writer_bin,
+                      run_timeout_seconds=30, state_dir=os.path.join(tmp, "wd2"))),
+                  _config_error(dict(EXAMPLE_CONFIG, writer=False, writer_timeout_seconds=300,
+                                     state_dir=os.path.join(tmp, "wd3"))),
+                  _config_error(dict(EXAMPLE_CONFIG, writer=True, writer_bin=writer_bin,
+                                     writer_timeout_seconds=95,
+                                     state_dir=os.path.join(tmp, "wd4"))))),
+              (True, True, "", ""))
+
+        # After "can't read", a clean run is told to the writer as readable again, never as
+        # the notifier being back: it may never have stopped (KIT-297 review).
+        def case_readable_fact():
+            fw = FakeWriter()
+            c, s, t, hb = nworld("w-readable", writer=True, writer_bin=writer_bin)
+            with open(hb, "w") as fh:
+                fh.write("{not json")
+            for at in range(int(now), int(now) + 361, 60):
+                if at == int(now) + 300:
+                    beat(hb, at, 0)
+                wrun(c, s, t, fw, at=float(at))
+            return [(x["kind"], x["facts"].get("notifier")) for x in fw.calls]
+        check("writer-readable-again-is-never-told-as-back", outcome(case_readable_fact),
+              [("notifier-unreadable", "unreadable"), ("notifier-readable", "readable again")])
+
+        # The real writer, with its token unset: it starts nothing, and the plain text goes.
+        def case_real_writer():
+            name = "BRIDGE_SELFTEST_WRITER_TOKEN"
+            os.environ.pop(name, None)
+            c, s, t = wworld("w-real", writer_token_env=name)
+            run(c, s, t)
+            s.add(ALICE, "plan PROD-6")
+            code, out = run(c, s, t)
+            p = Pass(c, s, t, new_state(), True, True, now, io.StringIO())
+            return (code, posted(s), "%s is not set" % name in out, p.writer is voice.write)
+        check("writer-the-real-one-with-no-token-starts-nothing", outcome(case_real_writer),
+              (EXIT_OK, [plan_text + plain_note], True, True))
+
+        def case_secrets():
+            name = "BRIDGE_SELFTEST_WRITER_TOKEN"
+            token = "sk-ant-oat01-" + "w" * 30
+            os.environ[name] = token
+            try:
+                on = cfg_for("w-secrets-on", writer=True, writer_bin=writer_bin,
+                             writer_token_env=name)
+                off = cfg_for("w-secrets-off", writer_token_env=name)
+
+                class Leaky(FakeWriter):
+                    def __call__(self, *a, **kw):
+                        res = FakeWriter.__call__(self, *a, **kw)
+                        return dict(res, text="%s %s" % (token, res["text"]))
+                fw = Leaky()
+                c, s, t = wworld("w-secrets", writer_token_env=name)
+                wrun(c, s, t, fw)
+                s.add(ALICE, "plan PROD-6")
+                wrun(c, s, t, fw)
+                return (token in live_secrets(on), token in live_secrets(off),
+                        token in posted(s)[-1], "«redacted»" in posted(s)[-1])
+            finally:
+                os.environ.pop(name, None)
+        check("writer-its-token-is-redacted-like-every-other-secret", outcome(case_secrets),
+              (True, False, False, True))
+
+        check("config: the writer's keys are the job's, by the writer's own rules, every bad "
+              "one named at once",
+              outcome(lambda: (
+                  sorted(k for k in voice.CONFIG_KEYS if k not in CONFIG_KEYS),
+                  "'writer' must be true or false" in _config_error(dict(
+                      EXAMPLE_CONFIG, writer="yes", state_dir=os.path.join(tmp, "wc1"))),
+                  [k for k in ("writer_model", "writer_max_chars", "writer_token_env")
+                   if "%r is not a valid writer setting" % k in _config_error(dict(
+                       EXAMPLE_CONFIG, writer_model="--bare", writer_max_chars=0,
+                       state_dir=os.path.join(tmp, "wc2")))],
+                  "'writer_bin' must be the claude CLI's full path" in _config_error(dict(
+                      EXAMPLE_CONFIG, writer=True, state_dir=os.path.join(tmp, "wc3"))),
+                  _config_error(dict(EXAMPLE_CONFIG, writer=False, writer_bin="claude",
+                                     state_dir=os.path.join(tmp, "wc4"))),
+                  [cfg_for("wc5", writer=True, writer_bin=writer_bin)[k]
+                   for k in ("writer", "writer_bin", "writer_model")])),
+              ([], True, ["writer_model", "writer_max_chars"], True, "",
+               [True, writer_bin, "haiku"]))
+
+        # THE AUDIT: every text handed to the writer above passes the checks the model's
+        # own text must pass (no question, no reply instruction, no mention, no stray id or
+        # link), so none of these messages falls back by its own words; and none carries a
+        # ticket's description.
+        def audit():
+            bad, kinds = [], set()
+            for fw in audited:
+                for x in fw.calls:
+                    kinds.add(x["kind"])
+                    why = voice.check_text(x["fallback"], 100000, x["keep"],
+                                           voice.fact_links(x["facts"]),
+                                           voice.fact_ids(x["facts"], x["keep"]))
+                    if why or "What PROD-" in json.dumps(x["facts"]):
+                        bad.append((x["kind"], why or "a description"))
+            return bad, sorted(kinds)
+        got = outcome(audit)
+        check("writer-audit: no text handed to the writer would fail its own checks",
+              got[0] if isinstance(got, tuple) else got, [])
+        check("writer-audit: covers each kind of message above",
+              [k for k in ("question-plan", "question-approve", "approve-done",
+                           "started-child", "epic-paused", "ambiguous", "request-refused",
+                           "foreign-post", "plan-moved", "action-limit", "plan-refused",
+                           "notifier-unreadable", "ping-sent", "ping-refused",
+                           "confirmed-acting-off")
+               if not isinstance(got, tuple) or k not in got[1]], [])
 
     # 14. EXACTLY THREE TRACKER WRITES (KIT-222, KIT-223): a state move carrying `stateId`
     #     only, a delegation carrying `delegateId` only, and a comment. No other mutation

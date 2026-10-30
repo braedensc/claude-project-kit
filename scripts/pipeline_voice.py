@@ -26,6 +26,10 @@ child runs in a fresh empty folder that is also its HOME and TMPDIR, so no CLAUD
 memory, settings or login of this account is read, and the folder is removed afterwards.
 `--bare` is not used: it accepts only an API key, never a subscription token.
 
+Give `writer_bin` as a full path. A LaunchAgent or LaunchDaemon runs with a short PATH, so
+a bare `claude` that a terminal finds may not be found there. `probe` looks a bare name up
+on the job's own PATH and says where it found it, or why the run could not start.
+
 WHAT IT GUARANTEES
 
   * ONE CREDENTIAL, BY NAME. The child's environment is exactly seven variables: PATH,
@@ -33,7 +37,9 @@ WHAT IT GUARANTEES
     names, a `claude setup-token` token) and the two switches that stop updates and other
     traffic. Nothing else is passed on, and never ANTHROPIC_API_KEY: in `-p` mode an API
     key wins over the subscription whenever it is present. A value with the shape of
-    another service's credential (the Slack bot token, the tracker key) is never sent.
+    another service's credential (the Slack bot token, the tracker key) is never sent,
+    and nor is any Anthropic key but a setup-token one (sk-ant-oat...): an API key is
+    refused before anything runs.
   * THE FACTS ARE DATA. They sit inside a <facts> fence, and a closing tag inside any
     value is escaped first, so no title or comment can end the fence early.
   * NOTHING UNCHECKED IS POSTED. The model's text is used only if it is not empty, fits
@@ -89,8 +95,9 @@ DEFAULTS = {
 
 CONFIG_KEYS = {
     "writer": "whether a model writes the message (default false: the plain text goes out)",
-    "writer_bin": "the claude CLI to run: a full path, or a bare name found on the job's "
-                  "PATH (default claude). A LaunchAgent's PATH is short, so give the full path",
+    "writer_bin": "the claude CLI's full path, as `command -v claude` prints it. The jobs "
+                  "refuse a bare name while the writer is on: under launchd their PATH is "
+                  "short (default claude, which only `probe` looks up)",
     "writer_model": "the model alias or name (default haiku)",
     "writer_token_env": "the NAME of the env var holding a `claude setup-token` token "
                         "(default CLAUDE_WRITER_OAUTH_TOKEN)",
@@ -108,6 +115,8 @@ LIMITS = {"writer_timeout_seconds": 300, "writer_max_chars": 4000,
 # The child's environment. The token goes in under the one name the CLI reads for a
 # subscription token; PATH falls back to the usual places when the job has none.
 CHILD_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+# The start of every token `claude setup-token` prints; the only Anthropic key sent.
+SETUP_TOKEN_PREFIX = "sk-ant-oat"
 DEFAULT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 DEFAULT_LANG = "en_US.UTF-8"
 
@@ -150,13 +159,20 @@ _MENTIONS = (("<@", "a mention"), ("<!", "a broadcast"), ("<#", "a channel link"
 # be in the facts or the keep list, so it cannot name a ticket it was never told about.
 _ID = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-[0-9]+(?![A-Za-z0-9])")
 # How to reply, or what a yes or a no does. Only the caller's bind may say that, so a bare
-# yes in the owner's DM can only ever answer the question the bind names.
+# yes in the owner's DM can only ever answer the question the bind names. So is a command
+# he could type (plan PROD-6), told or quoted, and a sentence that starts by telling him to
+# reply or respond in some way (KIT-297 review).
 _REPLY_ASK = re.compile(
     r"\b(?:reply|respond|answer|say|type|send|write)\b[^.!?,;\n]{0,40}?"
     r"\b(?:yes|no|ok|okay|approve|approved)\b"
     r"|\b(?:a|your)\s+(?:yes|no)\b(?![-'\w])"
     r"|\byes\s+or\s+no\b"
-    r"|[\"'“‘`*_]\s*(?:yes|no|ok|okay|approve)\s*[\"'”’`*_]",
+    r"|[\"'“‘`*_]\s*(?:yes|no|ok|okay|approve)\s*[\"'”’`*_]"
+    r"|\b(?:reply|respond|answer|say|type|send|write|post|use)\b[^.!?,;\n]{0,40}?"
+    r"\b(?:plan|approve)\s+[A-Z][A-Z0-9]*-[0-9]+"
+    r"|[\"'“‘`]\s*(?:plan|approve|yes|no)\s+[A-Z][A-Z0-9]*-[0-9]+"
+    r"|(?:^|[.!?:;]\s+|\n\s*)(?:please\s+|just\s+)?(?:reply|respond)\s+"
+    r"(?:with|in|here|under|below|by|when|on)\b",
     re.IGNORECASE)
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]\-]{0,79}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -314,9 +330,14 @@ def foreign_credential(token):
 
     The token goes to the model provider as a bearer token, so a config that names the
     wrong variable (the Slack bot token, the tracker key) must never send its value there.
+    Only a `claude setup-token` token passes (sk-ant-oat...). Any other Anthropic key, an
+    API key above all, is refused too: in `-p` mode it would bill per call, not the
+    subscription the owner chose (KIT-297 review).
     """
-    if token.startswith("sk-ant-"):
+    if token.startswith(SETUP_TOKEN_PREFIX):
         return ""
+    if token.startswith("sk-ant-"):
+        return "different Anthropic key, such as an API key"
     hits = notify.secret_hits(token)
     return hits[0] if hits else ""
 
@@ -476,6 +497,11 @@ def probe(path, runner=None, out=None):
 
     Prints the text, then a last line: `written by the model` or `fallback: <why>`. Exit 0
     only when the model wrote it.
+
+    A bare `writer_bin` is looked up on this job's PATH, the one the child gets, and the
+    path found is said first and run. Under launchd that PATH is short, so a name it does
+    not hold is said too, and a run that then cannot start says to give the full path
+    (KIT-297 review).
     """
     out = out or sys.stdout
     try:
@@ -489,13 +515,25 @@ def probe(path, runner=None, out=None):
         return EXIT_USAGE
     cfg = {key: raw[key] for key in DEFAULTS if key in raw}
     cfg["writer"] = True
+    hint = ""
+    name = cfg["writer_bin"] if cfg.get("writer_bin") is not None else DEFAULTS["writer_bin"]
+    if isinstance(name, str) and name.strip() and "/" not in name:
+        search = os.environ.get("PATH") or DEFAULT_PATH
+        found = shutil.which(name, path=search)
+        if found:
+            cfg["writer_bin"] = found
+            out.write("writer_bin %s is %s on this job's PATH\n" % (name, found))
+        else:
+            out.write("writer_bin %s is not on this job's PATH (%s)\n" % (name, search))
+            hint = "; %s is not on this job's PATH, so give writer_bin as a full path" % name
     res = write(cfg, PROBE_KIND, PROBE_FACTS, PROBE_FALLBACK, keep=PROBE_KEEP,
                 runner=runner)
     out.write(res["text"] + "\n")
     if res["by"] == "model":
         out.write("written by the model\n")
         return EXIT_OK
-    out.write("fallback: %s\n" % res["why"])
+    out.write("fallback: %s%s\n" % (res["why"], hint if res["why"].startswith(
+        "could not start") else ""))
     return EXIT_ERROR
 
 
@@ -732,6 +770,18 @@ def selftest():
         check("a-setup-token-shape-is-sent",
               (res["by"], r.calls[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == anthropic),
               ("model", True))
+        # KIT-297 review: only the setup-token shape passes. An API key would bill per
+        # call, so it, and any other Anthropic key, is refused before anything runs.
+        for kind in ("api03", "admin01", "sid01"):
+            other = "sk-ant-" + kind + "-" + "z" * 30
+            os.environ[TOKEN_VAR] = other
+            r = FakeRunner(reply(MODEL))
+            res = call(r)
+            check("an-anthropic-key-that-is-not-a-setup-token-is-never-sent:" + kind,
+                  (r.calls, res["by"], res["why"], other in res["why"]),
+                  ([], "fallback", "%s holds a different Anthropic key, such as an API key, "
+                                   "not a claude setup-token token, so I did not send it"
+                   % TOKEN_VAR, False))
         os.environ[TOKEN_VAR] = TOKEN
 
         # 7. A RUN THAT FAILS falls back, and says how.
@@ -795,6 +845,22 @@ def selftest():
         res = call(r, bind="")
         check("reply-ask-on-a-post-that-binds-nothing", (res["by"], res["why"], res["text"]),
               ("fallback", "the model's text tells him how to reply", PLAIN))
+        # A command he could type, told or quoted, and an order to reply in any words, are
+        # the bind's too (KIT-297 review).
+        for name, said in (
+                ("a-command-told", "PROD-6 is approved; send plan PROD-6 to re-plan it."),
+                ("a-command-quoted", "PROD-6 is blocked. `approve PROD-6` starts it."),
+                ("reply-in-any-words", "PROD-6 is blocked. Reply with a thumbs up on it."),
+                ("respond-in-any-words", "PROD-6 is blocked. Please respond in the thread.")):
+            fell_back("reply-ask-" + name, FakeRunner(reply(said)),
+                      "the model's text tells him how to reply")
+        for name, said in (
+                ("planning-is-prose", "The planner will plan PROD-6 within a few minutes."),
+                ("a-reply-sent-is-prose", "Reply sent to PROD-6's session. I need nothing."),
+                ("a-type-check-is-prose", "Type checks failed on PROD-6, so I stopped."),
+                ("an-id-in-backticks-is-prose", "`PROD-6` is blocked. I need nothing.")):
+            res = call(FakeRunner(reply(said)))
+            check(name, (res["by"], res["why"]), ("model", ""))
         fell_back("a-question", FakeRunner(reply("PROD-6 is blocked. Should I unblock it?")),
                   "the model's text asks him a question")
         fell_back("a-question-ending-in-a-link",
@@ -901,6 +967,43 @@ def selftest():
             finally:
                 sys.stderr = err
             check("probe-unreadable-config-is-a-usage-error", code, EXIT_USAGE)
+
+            # 10b. A BARE writer_bin under launchd (KIT-297 review): the probe looks it up
+            #      on the job's own PATH, says where, and runs that path. One that PATH does
+            #      not hold is said, and a run that cannot start says to give a full path.
+            here_bin, empty_bin = os.path.join(tmp, "bin"), os.path.join(tmp, "empty")
+            os.makedirs(here_bin)
+            os.makedirs(empty_bin)
+            full = os.path.join(here_bin, "claude")
+            with open(full, "w") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(full, 0o755)
+            os.environ["PATH"] = here_bin
+            r, out = FakeRunner(reply("TOD-1 is a sample. Nothing is needed from you.")), \
+                io.StringIO()
+            code = probe(path, runner=r, out=out)
+            check("probe-finds-a-bare-writer-bin-on-the-jobs-path-and-runs-that-path",
+                  (code, r.calls[0]["argv"][0] if r.calls else None,
+                   out.getvalue().splitlines()[0]),
+                  (EXIT_OK, full, "writer_bin claude is %s on this job's PATH" % full))
+            os.environ["PATH"] = empty_bin
+            r, out = FakeRunner(raises=FileNotFoundError(2, "No such file or directory")), \
+                io.StringIO()
+            code = probe(path, runner=r, out=out)
+            lines = out.getvalue().splitlines()
+            check("probe-a-bare-writer-bin-not-on-the-jobs-path-says-to-give-a-full-path",
+                  (code, lines[0], lines[-1]),
+                  (EXIT_ERROR, "writer_bin claude is not on this job's PATH (%s)" % empty_bin,
+                   "fallback: could not start claude: No such file or directory; claude is "
+                   "not on this job's PATH, so give writer_bin as a full path"))
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"writer_token_env": TOKEN_VAR, "writer_bin": full}, fh)
+            r, out = FakeRunner(reply("TOD-1 is a sample. Nothing is needed from you.")), \
+                io.StringIO()
+            code = probe(path, runner=r, out=out)
+            check("probe-runs-a-full-path-as-given-and-looks-nothing-up",
+                  (code, r.calls[0]["argv"][0], "on this job's PATH" in out.getvalue()),
+                  (EXIT_OK, full, False))
     finally:
         os.environ.clear()
         os.environ.update(saved)

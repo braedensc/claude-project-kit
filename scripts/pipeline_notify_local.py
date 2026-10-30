@@ -11,9 +11,11 @@ WHAT THIS IS
   poller's sibling: one scheduled, one-shot pass that reads the marks the pipeline ALREADY
   writes, and sends one short message per new event to a private chat channel.
 
-  It is deterministic code, not a session. No model, no prompt, no tokens — so there is
-  nothing here for an injection to steer, and a notification cannot be produced by anything
-  except a mark a pipeline component actually wrote.
+  It is deterministic code, not a session. Whether to page, and what a page claims, are
+  decided here with no model, no prompt and no tokens — so there is nothing here for an
+  injection to steer, and a notification cannot be produced by anything except a mark a
+  pipeline component actually wrote. With `writer` on (THE WRITER, below), a model with no
+  tools puts a page's facts into words at send time. It decides nothing.
 
   The marks are the producer-consumer contract (the ADR's own table, reproduced below). The
   notifier adds no second shape: it greps what the idea gate's executor, a stopped working
@@ -89,14 +91,34 @@ WHAT THIS IS
   skipped. A page that did not reach every person is declined and kept out of the seen-set,
   so the next pass tries the people it missed; its label is applied once anyone has it, so
   the board never waits on one person. A record is dropped after seven days only once its
-  page is in the seen-set: one still owed is kept, or the retry would page twice. A token
-  without `im:write` is said once and fails the pass. Never both a channel and DMs: with DMs
-  set, `chat_channel_id` is empty and `reply_relay` is off. The message itself is unchanged.
+  page is in the seen-set: one still owed is kept, or the retry would page twice. Not for
+  ever, though: at four weeks it is dropped anyway, and a later retry may page that person
+  again (KIT-297). The pass summary counts the records held past seven days, and the ones
+  dropped at four weeks. A token without `im:write` is said once and fails the pass. Never
+  both a channel and DMs: with DMs set, `chat_channel_id` is empty and `reply_relay` is off.
+  The message itself is unchanged, unless the writer is on (THE WRITER, below).
+
+  THE WRITER (KIT-297). Off by default. With `writer` true, a model writes each page's words
+  at send time, through scripts/pipeline_voice.py: one `claude -p` run with no tools, on the
+  owner's subscription token, which `writer_token_env` names. It sees `page_facts()` and
+  nothing else: the mark's fixed sentence, the ticket id, the cleaned title and the link. It
+  is called once per page, before any post, so everyone named gets the same words. Its text
+  is checked in pipeline_voice (the id and the link kept word for word, no mention, no
+  question, no credential shape) and scanned again here. A DM page that missed someone is
+  retried in the words it first went out with, which the DM ledger keeps: the writer is not
+  called for it again. Any failure posts the fixed text above, unchanged, and at most once a
+  day that page ends with a plain line saying so. So does a page with too little of the pass
+  left to wait for the writer: the alarm would end the pass with no seen-set saved, and the
+  next pass would page again. The @mentions stay this job's, outside the model's words, and
+  a page to direct messages carries none while the writer is on, since a DM notifies by
+  itself. A title with a credential shape is withheld before the model sees it. A dry run
+  never calls it.
 
 WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script asserts it)
 
   It never merges, never approves, never enables auto-merge, and never labels a pull request.
-  It moves no ticket state and creates no ticket. It launches no session and runs no model.
+  It moves no ticket state and creates no ticket. It launches no session. It runs no model,
+  except the writer above when `writer` is on: no tools, and only facts this job holds.
 
   With `reply_relay` OFF (the default), its ONLY tracker mutation is one label: the lifecycle
   label on the two marks decision 4 names, plus honouring the label a session's own
@@ -114,7 +136,8 @@ WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script as
   It never carries the question text off the tracker. `build_message()` takes the mark, the
   ticket id, the ticket title and a URL — and has NO parameter that could carry a comment
   body. Decision 2 is structural here, not a redaction rule that can miss. The @mentions
-  put in front of it come from this job's config alone.
+  put in front of it come from this job's config alone. `page_facts()`, everything the
+  writer is ever given, takes exactly the same four (KIT-297).
 
 WHERE IT RUNS, AND WHY THE CREDENTIAL RULES ARE WHAT THEY ARE
 
@@ -284,6 +307,7 @@ Exit:
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -317,6 +341,8 @@ RELAY_SCHEMA = "pipeline-notifier-relay/1"
 BRIDGE_PINGS_SCHEMA = "pipeline-notifier-bridge-pings/1"
 # KIT-296: every page posted to a direct message, keyed `<channel>:<ts>`. The bridge reads it.
 DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
+# KIT-297: when the writer's once-a-day line was last said. Read only with the writer on.
+WRITER_SCHEMA = "pipeline-notifier-writer/1"
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 
@@ -521,7 +547,27 @@ CONFIG_KEYS = {
                    "chat_channel_id (KIT-296). Each post is recorded in notifier-dm-posts.json "
                    "for the Slack bridge. Optional: absent or empty posts to the channel. Set, "
                    "chat_channel_id must be empty and reply_relay off",
+    # KIT-297: the writer's keys. scripts/pipeline_voice.py reads and judges them. They are
+    # spelled here because the loader refuses a key this table does not list, and because
+    # pipeline_voice imports this file at its top, so this file may import it only inside a
+    # function. The selftest pins these to pipeline_voice.CONFIG_KEYS, so the two cannot drift.
+    "writer": "true has a model with no tools write each page from its facts when it is sent; "
+              "false (the default) posts the fixed text. A dry run never calls it (KIT-297)",
+    "writer_bin": "the claude CLI's full path; required with the writer on, since a "
+                  "LaunchDaemon's PATH is short",
+    "writer_model": "the model alias or name (default haiku)",
+    "writer_token_env": "ENV VAR NAME holding a `claude setup-token` token (never the token "
+                        "itself; default CLAUDE_WRITER_OAUTH_TOKEN)",
+    "writer_timeout_seconds": "how long one page may take to write (default 60, at most 300). "
+                              "With the writer on, run_timeout_seconds must be at least twice "
+                              "this plus 60",
+    "writer_max_chars": "a longer page is refused, never cut (default 900, at most 4000)",
+    "writer_max_budget_usd": "the spend cap for one page (default 0.05, at most 1)",
 }
+
+# The writer's keys: the same set as pipeline_voice.CONFIG_KEYS, which §13 pins (KIT-297).
+WRITER_KEYS = ("writer", "writer_bin", "writer_model", "writer_token_env",
+               "writer_timeout_seconds", "writer_max_chars", "writer_max_budget_usd")
 
 # The reply relay's fixed limits and shapes. Not config: a lookback an operator could widen
 # would let a months-old ping become a target again.
@@ -542,6 +588,18 @@ RELAY_NAMED_CAP = 500
 RELAY_PENDING = "pending"
 RELAY_DONE = "done"
 RELAY_DROPPED = "dropped"
+# KIT-297: a DM ledger record whose page never reached everyone outlives the lookback, so the
+# retry never pages a person twice. Not for ever: at this age it is dropped whatever it is
+# owed, and a later retry may page that person once more. Four lookbacks, 28 days.
+DM_POSTS_MAX_AGE_SECONDS = 4 * RELAY_LOOKBACK_SECONDS
+# KIT-297: added after a page the writer could not write, at most once a day, after
+# everything else in it, so the owner knows why a page reads like the old fixed text.
+WRITER_FALLBACK_LINE = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
+WRITER_FALLBACK_EVERY_SECONDS = 24 * 3600
+# KIT-297 review: what a pass keeps back after one writer call, to post the page, label it
+# and save. The writer is not started when less than its own timeout and this is left before
+# the pass's deadline: a pass the alarm ends saves no seen-set, so it would page again.
+WRITER_ROOM_SECONDS = 30
 
 EXAMPLE_CONFIG = {
     "state_dir": DEFAULT_STATE_DIR,
@@ -773,6 +831,14 @@ def load_config(path):
                 "dispatcher's agent user id, whose session thread a relayed reply lands in; "
                 "without it no thread is ever ours, so nothing could be relayed")
 
+    # KIT-297: the writer's keys are carried only when the config names them, so a config
+    # written before they existed loads to exactly what it did, and never imports the writer.
+    named = [key for key in WRITER_KEYS if key in raw]
+    for key in named:
+        cfg[key] = raw[key]
+    if named:
+        errors.extend(writer_config_errors(cfg))
+
     dupes = sorted({k for k in cfg["team_keys"] if cfg["team_keys"].count(k) > 1})
     if dupes:
         errors.append("config 'team_keys' repeats %s — one pass would read it twice"
@@ -786,6 +852,87 @@ def load_config(path):
     if errors:
         raise NotifierError("config problems:\n  - " + "\n  - ".join(errors))
     return cfg
+
+
+def writer_config_errors(cfg):
+    """What is wrong with the writer's keys in `cfg`, as config errors, or [] (KIT-297).
+
+    pipeline_voice.settings() judges each key, so the bridge and this job hold one rule. Three
+    more are this job's own. `writer` is a JSON true or false: the string "false" is truthy,
+    and must never read as on or quietly as off. With it on, the CLI is named by its full
+    path, because a LaunchDaemon's PATH is short. And its token never shares a name with this
+    job's other two credentials, or one of them would be sent to the model provider.
+    """
+    try:
+        import pipeline_voice as voice
+    except Exception as exc:                                      # noqa: BLE001
+        return ["config names the writer's keys, but scripts/pipeline_voice.py could not be "
+                "loaded (%s: %s)" % (type(exc).__name__, exc)]
+    errors = []
+    if "writer" in cfg and not isinstance(cfg["writer"], bool):
+        errors.append("config 'writer' must be true or false, got %r" % (cfg["writer"],))
+    s, bad = voice.settings(cfg)
+    if bad == "writer_token_env":
+        errors.append("config 'writer_token_env' must be an ENV VAR NAME like %s — never put "
+                      "a credential value in the config" % voice.DEFAULTS["writer_token_env"])
+    elif bad:
+        errors.append("config %r is not valid, got %r — it is %s"
+                      % (bad, cfg.get(bad), voice.CONFIG_KEYS.get(bad, "a writer setting")))
+    elif s["writer"] and not os.path.isabs(s["writer_bin"]):
+        errors.append("config 'writer_bin' must be the claude CLI's full path while 'writer' is "
+                      "on, got %r — a LaunchDaemon's PATH is short, so a bare name may never be "
+                      "found" % (s["writer_bin"],))
+    for key in ("linear_key_env", "chat_token_env"):
+        if s["writer"] and s["writer_token_env"] == cfg.get(key):
+            errors.append("config 'writer_token_env' names the same variable as %r — the writer "
+                          "would send that credential to the model provider" % key)
+    # KIT-297 review: a pass too short for the writer would send every page plain. A bad
+    # run_timeout_seconds is named by its own check, so it is not compared here.
+    run_for = cfg.get("run_timeout_seconds")
+    if (s["writer"] and not bad and isinstance(run_for, int) and not isinstance(run_for, bool)
+            and run_for < least_run_timeout(s["writer_timeout_seconds"])):
+        errors.append("config 'run_timeout_seconds' (%d) is too short for the writer: a pass "
+                      "needs at least %d seconds, twice the writer's %g seconds plus %d, so it "
+                      "can read the board, write a page and still send it"
+                      % (run_for, least_run_timeout(s["writer_timeout_seconds"]),
+                         s["writer_timeout_seconds"], 2 * WRITER_ROOM_SECONDS))
+    return errors
+
+
+def least_run_timeout(writer_seconds):
+    """The shortest pass the writer may run in: twice its timeout and the room kept after it
+    (KIT-297 review). The installer holds RUN_TIMEOUT_SECONDS to the same rule."""
+    return int(math.ceil(2 * (writer_seconds + WRITER_ROOM_SECONDS)))
+
+
+def writer_has_time(cfg, deadline):
+    """Whether one writer call can finish, and the page still go out, before `deadline`, the
+    monotonic time the pass's alarm fires (KIT-297 review). None is no deadline. The alarm is
+    a BaseException that ends the pass with no seen-set saved, so a page sent before it would
+    go again next pass: better to send this one plain than to start a call that may not end."""
+    if deadline is None:
+        return True
+    import pipeline_voice as voice
+    need = voice.settings(cfg)[0]["writer_timeout_seconds"] + WRITER_ROOM_SECONDS
+    return _pass_clock() + need <= deadline
+
+
+def _pass_clock():
+    """The clock a pass's deadline is read on. A function, so the selftest can stand in."""
+    return time.monotonic()
+
+
+def writer_secret(cfg):
+    """The writer's token, in a list, when the writer is on and its variable is set, else [].
+
+    Read here only so it is redacted like this job's other two credentials (KIT-297).
+    pipeline_voice reads it again when it writes, and nothing else here ever uses it.
+    """
+    if cfg.get("writer") is not True:
+        return []
+    import pipeline_voice as voice
+    value = os.environ.get(voice.settings(cfg)[0]["writer_token_env"], "").strip()
+    return [value] if value else []
 
 
 def _inside_git_worktree(path):
@@ -1003,19 +1150,84 @@ def load_dm_posts(cfg):
 def save_dm_posts(cfg, dm_state, now, paged):
     """Save the DM ledger. A post older than the relay's lookback is dropped, as the bridge's
     pings are, but only once its page is in `paged`, the seen-set's sent half. A page still
-    owed to someone keeps its records however old they are: dropping one would let the retry
-    page that person a second time (KIT-296 review). A failure RAISES, like the bridge pings'
-    own save."""
+    owed to someone keeps its records past that: dropping one would let the retry page that
+    person a second time (KIT-296 review). But not for ever (KIT-297): a page that has missed
+    someone for DM_POSTS_MAX_AGE_SECONDS is stuck, and a ledger that kept it would only grow.
+    Its records are dropped then, and a later retry may page those people once more, the cost
+    accepted at that age. Each key dropped that way goes in `dm_state["expired"]`, which the
+    pass summary counts. A failure RAISES, like the bridge pings' own save."""
     horizon = now - RELAY_LOOKBACK_SECONDS
-    kept = dict((k, v) for k, v in dm_state["posts"].items()
-                if (_ts_seconds((v or {}).get("ts")) or 0) >= horizon
-                or (v or {}).get("event_key") not in paged)
+    hard = now - DM_POSTS_MAX_AGE_SECONDS
+    kept, expired = {}, []
+    for k, v in dm_state["posts"].items():
+        at = _ts_seconds((v or {}).get("ts")) or 0
+        owed = (v or {}).get("event_key") not in paged
+        if at >= horizon or (owed and at >= hard):
+            kept[k] = v
+        elif owed:
+            expired.append(k)
     dm_state["posts"] = kept
+    dm_state.setdefault("expired", set()).update(expired)
     try:
         _atomic_write_json(dm_posts_path(cfg), {"schema": DM_POSTS_SCHEMA, "posts": kept})
     except OSError as exc:
         raise NotifierError("could not save the DM ledger %s: %s"
                             % (dm_posts_path(cfg), exc), code=EXIT_ERROR)
+
+
+def writer_state_path(cfg):
+    return os.path.join(cfg["state_dir"], "notifier-writer.json")
+
+
+def load_writer_state(cfg):
+    """When the writer's once-a-day line was last said, and a note, or "" (KIT-297).
+
+    Read only with the writer on. Unlike every other state file here, a corrupt one does NOT
+    stop the pass: the most it can cost is that line said twice in one day. It is read as not
+    said yet, and the note says so in the pass summary.
+    """
+    path = writer_state_path(cfg)
+    if not os.path.exists(path):
+        return {}, ""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        at = doc.get("fallback_line_at") if isinstance(doc, dict) else None
+        if (isinstance(doc, dict) and doc.get("schema") == WRITER_SCHEMA
+                and isinstance(at, (int, float)) and not isinstance(at, bool)):
+            return {"fallback_line_at": float(at)}, ""
+        why = "it is not a %s document" % WRITER_SCHEMA
+    except (OSError, ValueError) as exc:
+        why = str(exc)
+    return {}, ("I could not read the writer's state %s (%s), so I treat its once-a-day line "
+                "as not said yet" % (path, why))
+
+
+def writer_line_due(writer_state, now):
+    """Whether the once-a-day line goes on the next page the writer could not write. A time
+    in the future, as after the clock moved back, or one that is not a time, counts as long
+    ago: a stuck value must never silence the line for good."""
+    at = writer_state.get("fallback_line_at")
+    return not (at is not None and 0 <= now - at < WRITER_FALLBACK_EVERY_SECONDS)
+
+
+def save_writer_state(cfg, writer_state):
+    """Save when the once-a-day line was last said. A failure RAISES OSError."""
+    _atomic_write_json(writer_state_path(cfg), {
+        "schema": WRITER_SCHEMA, "fallback_line_at": writer_state.get("fallback_line_at")})
+
+
+def writer_line_said(cfg, writer_state, now):
+    """Record that the once-a-day line reached someone now, and save it at once. Returns a
+    note for the pass summary when the save failed, else []. A failed save changes no exit
+    code: the most it costs is the line said again on the next page that falls back."""
+    writer_state["fallback_line_at"] = now
+    try:
+        save_writer_state(cfg, writer_state)
+    except OSError as exc:
+        return ["I could not save the writer's state %s (%s), so the next page that falls "
+                "back may say so again" % (writer_state_path(cfg), exc.strerror or exc)]
+    return []
 
 
 def save_relay(cfg, relay_state):
@@ -1071,6 +1283,12 @@ def write_heartbeat(cfg, result, now):
         "would_relay": result.get("relayed", 0) if dry else 0,
         "summary": result.get("summary", ""),
     }
+    # KIT-297: the writer's two counts, only on a pass that called it. Absent means the writer
+    # was off, or the pass was a dry run, or it ended before it counted. Added without a
+    # schema bump, as `capped` was, and for the same reason.
+    if "written" in result:
+        doc["written"] = result.get("written", 0)
+        doc["fell_back"] = result.get("fell_back", 0)
     try:
         _atomic_write_json(heartbeat_path(cfg), doc)
     except OSError as exc:
@@ -1230,6 +1448,49 @@ def build_message(mark, ticket_id, ticket_title, url):
     title = safe_title(_QUOTE_MARKS.sub(" ", ticket_title or ""))
     ticket = 'Ticket: "%s" (%s)' % (title, ticket_id) if title else "Ticket: %s" % ticket_id
     return "%s\n%s\n%s" % (MARKS[mark]["page"], ticket, url)
+
+
+def page_facts(mark, ticket_id, ticket_title, url):
+    """Everything the writer may put into words for one page, and nothing else (KIT-297).
+
+    Exactly build_message's four parameters, so decision 2 holds for the model by the same
+    construction: no comment body, question or diff can reach it. The moment is the mark's
+    own fixed sentence, and the title is cleaned exactly as the fixed page cleans it.
+    """
+    if mark not in MARKS:
+        raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
+    return {"moment": MARKS[mark]["page"], "ticket_id": ticket_id,
+            "title": safe_title(_QUOTE_MARKS.sub(" ", ticket_title or "")), "link": url}
+
+
+def write_page(cfg, writer, event, plain, deadline=None):
+    """One page's words from the writer: (text, by, why), `by` being "model" or "fallback".
+
+    Called once per page, before any post (KIT-297). The writer gets page_facts(), and the
+    fixed text as its fallback, and must keep the ticket id and the link word for word. It
+    never raises, by its own contract. One that does, or answers in a shape this job does not
+    know, costs only its words: the fixed text goes out. So does any fallback, whatever text
+    came with it, so a page the model did not write is always byte for byte the fixed one.
+    It is not started at all when the pass has too little time left (writer_has_time).
+    """
+    if writer is None:
+        return plain, "fallback", "the writer could not be loaded"
+    if not writer_has_time(cfg, deadline):
+        return plain, "fallback", "too little of this pass was left to wait for the writer"
+    try:
+        res = writer(cfg, event["mark"], page_facts(event["mark"], event["ticket_id"],
+                                                    event["ticket_title"], event["url"]),
+                     fallback=plain, keep=[event["ticket_id"], event["url"]])
+    except Exception as exc:                                      # noqa: BLE001
+        return plain, "fallback", "the writer failed (%s)" % type(exc).__name__
+    if not isinstance(res, dict) or res.get("by") not in ("model", "fallback"):
+        return plain, "fallback", "the writer answered in a shape I do not know"
+    if res["by"] == "fallback":
+        return plain, "fallback", str(res.get("why") or "")
+    text = res.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return plain, "fallback", "the writer said it wrote the page but gave no text"
+    return text, "model", ""
 
 
 def mention_prefix(mark, cfg):
@@ -2287,9 +2548,13 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
                                 "timestamp, so I could not record it — the next pass posts it "
                                 "again" % (tid, user_id))
                 continue
-            dm_state["posts"][dm_post_key(posted, ts)] = {
-                "channel": posted, "ts": ts, "ticket_id": tid, "mark": event["mark"],
-                "event_key": event["key"], "recorded_at": _iso_at(now)}
+            record = {"channel": posted, "ts": ts, "ticket_id": tid, "mark": event["mark"],
+                      "event_key": event["key"], "recorded_at": _iso_at(now)}
+            if cfg.get("writer") is True:
+                # KIT-297 review: the words this page went out with, so a retry sends the rest
+                # the same ones (held_words). Only with the writer on: off, a record is as it was.
+                record["text"] = text
+            dm_state["posts"][dm_post_key(posted, ts)] = record
             try:
                 save_dm_posts(cfg, dm_state, now, paged)
             except NotifierError as exc:
@@ -2319,12 +2584,31 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
     return landed, reached, problems, unrecorded
 
 
-def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
+def held_words(dm_state, event_key):
+    """The words a DM page went out with on an earlier pass, for a page that has not yet
+    reached everyone, or None when no one has it yet (KIT-297 review). A record made with the
+    writer off carries none, and its people read the fixed text, so this is "": the rest get
+    the fixed text too, and the writer is not called for them."""
+    for record in dm_state["posts"].values():
+        if (record or {}).get("event_key") == event_key:
+            text = record.get("text")
+            return text if isinstance(text, str) else ""
+    return None
+
+
+def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, writer=None,
+             deadline=None):
     """One scan-decide-send pass. Returns a result dict; never raises for one bad event.
 
     With `reply_relay` on, the relay state is loaded FIRST (a corrupt one refuses the whole
     run before anything is sent), an agent:blocked ping records its message as a target, and
     the relay step runs after the pings. With it off, none of that happens at all.
+
+    With `writer` on and not a dry run, `writer` writes each page (KIT-297): it stands in for
+    pipeline_voice.write, which is imported here only when the writer is on and none is given.
+    With it off, nothing about the writer runs, and every page is the fixed text. `deadline`
+    is the monotonic time run_command's alarm fires, or None: no writer call starts that
+    could run past it.
 
     THE SEEN-SET HAS TWO HALVES, and that is what makes a half-done event recoverable.
     `sent` records what has been paged; `labelled` records what has been marked on the
@@ -2359,6 +2643,24 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
     dm_state = load_dm_posts(cfg) if dm_on else None
     if dm_on and not dry_run and not os.path.exists(dm_posts_path(cfg)):
         save_dm_posts(cfg, dm_state, now, sent_keys)
+    # KIT-297: with the writer on, a model writes each page, but never in a dry run, which
+    # calls nothing. Its own small state says when its once-a-day line was last said.
+    writer_on = cfg.get("writer") is True
+    write_it = writer_on and not dry_run
+    written = fell_back = retried = 0
+    writer_whys, writer_notes = [], []
+    writer_state = None
+    if write_it:
+        writer_state, note = load_writer_state(cfg)
+        if note:
+            writer_notes.append(note)
+        if writer is None:
+            try:
+                import pipeline_voice
+                writer = pipeline_voice.write
+            except Exception as exc:                              # noqa: BLE001
+                writer_notes.append("I could not load the writer (%s), so every page went out "
+                                    "as its plain text" % type(exc).__name__)
     bridge_failures, dm_failures = [], []
     tickets, read_failures = [], []
     for team in cfg["team_keys"]:
@@ -2467,8 +2769,12 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                 labelled_keys.add(event["key"])
                 continue
 
-            text = mention_prefix(event["mark"], cfg) + build_message(
-                event["mark"], event["ticket_id"], event["ticket_title"], event["url"])
+            plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
+                                  event["url"])
+            # KIT-297: with the writer on, a page to direct messages carries no @mention, since
+            # a DM notifies by itself. With it off, every page keeps the mentions it always had.
+            prefix = "" if writer_on and dm_on else mention_prefix(event["mark"], cfg)
+            text = prefix + plain
             leaked = secret_hits(text)
             if leaked:
                 # A credential shape in a session-writable title must not be relayed to a
@@ -2477,6 +2783,40 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                 problems.append("%s: withheld — the title carries a %s shape"
                                 % (event["ticket_id"], ", ".join(leaked)))
                 continue
+
+            # KIT-297: the writer, once per page and before any post, so everyone named reads
+            # the same words. The fixed text was scanned above, so a title with a credential
+            # shape never reaches the model provider. Not while no DM can be opened: the page
+            # cannot go, and its words would be paid for and thrown away. The mentions stay
+            # outside the model's words, and the scan runs again on the final text.
+            line_due = False
+            if write_it and not (dm_on and dm_failures):
+                first = held_words(dm_state, event["key"]) if dm_on else None
+                if first is not None:
+                    # KIT-297 review: this page reached someone on an earlier pass, so the rest
+                    # get the words it went out with, kept in the DM ledger. No second call: it
+                    # would word the page differently, and be paid for again.
+                    text = first or text
+                    retried += 1
+                else:
+                    words, by, why = write_page(cfg, writer, event, plain, deadline)
+                    text = prefix + words
+                    if by == "model":
+                        written += 1
+                    else:
+                        fell_back += 1
+                        if why:
+                            writer_whys.append("%s: %s" % (event["ticket_id"],
+                                                           redact(why, secrets)))
+                        line_due = writer_line_due(writer_state, now)
+                        if line_due:
+                            text += WRITER_FALLBACK_LINE
+                leaked = secret_hits(text)
+                if leaked:
+                    declined += 1
+                    problems.append("%s: withheld — the written page carries a %s shape"
+                                    % (event["ticket_id"], ", ".join(leaked)))
+                    continue
 
             if dry_run:
                 if dm_on:
@@ -2511,6 +2851,10 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                     dm_failures.append(redact(str(exc), secrets))
                     continue
                 bridge_failures.extend(unrecorded)
+                # `reached` here is a post made this pass: the line is due only on a page no
+                # one had yet, since a retry takes its first words from the ledger (above).
+                if reached and line_due:
+                    writer_notes.extend(writer_line_said(cfg, writer_state, now))
                 if landed:
                     sent += 1
                     if not unrecorded:
@@ -2537,6 +2881,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                     continue
                 sent += 1
                 sent_keys.add(event["key"])
+                if line_due:
+                    writer_notes.extend(writer_line_said(cfg, writer_state, now))
 
             # Only with the switch on, and only for the agent:blocked mark: remember which
             # chat message this ping is, and which thread its mark sits in, so a reply under
@@ -2704,12 +3050,42 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         summary += (" | direct messages: ON, each page to %d person(s) through $%s; %d post(s) "
                     "in the DM ledger" % (len(cfg["dm_user_ids"]), cfg["chat_token_env"],
                                           len(dm_state["posts"])))
+        # KIT-297: a page that has missed someone for over seven days is stuck, and its records
+        # are held so the person it reached is not paged again. Named here, so a ledger that
+        # only grows is never silent; and so is each record dropped at four weeks.
+        stuck = [r for r in dm_state["posts"].values()
+                 if (_ts_seconds((r or {}).get("ts")) or 0) < now - RELAY_LOOKBACK_SECONDS
+                 and (r or {}).get("event_key") not in sent_keys]
+        if stuck:
+            summary += ("; %d of them held past seven days, for a page that has still not "
+                        "reached everyone (%s)"
+                        % (len(stuck), ", ".join(sorted({str((r or {}).get("ticket_id"))
+                                                         for r in stuck}))))
+        if dm_state.get("expired"):
+            summary += ("; %d dropped at four weeks, for a page that never reached everyone: "
+                        "a later retry may page those people again" % len(dm_state["expired"]))
         if dm_failures:
             # Could not do it, not a decline: nobody can be paged until the app has the
             # scope. It leads the summary, as the relay's own missing scope does.
             code = EXIT_ERROR
             summary = ("FAIL: I could not page anyone in their direct messages: %s | %s"
                        % ("; ".join(dm_failures), summary))
+    # KIT-297: the writer says what it did, only when it is on. A pass that called it says
+    # how many pages it wrote and how many fell back, and why each one fell back.
+    if writer_on:
+        if dry_run:
+            summary += (" | writer: ON, not called in a dry run, so each page above is its "
+                        "plain text")
+        else:
+            summary += (" | writer: ON, %d page(s) written, %d fell back to the plain text"
+                        % (written, fell_back))
+            if retried:
+                summary += (", %d retried in the words it first went out with, not written "
+                            "again" % retried)
+            if writer_whys:
+                summary += " (%s)" % "; ".join(writer_whys)
+        if writer_notes:
+            summary += " — " + "; ".join(redact(n, secrets) for n in writer_notes)
     # …and so do the daemon-health marks: on from which authors, or OFF and how many unpaged.
     if cfg.get("monitor_actor_ids"):
         summary += (" | daemon-health marks: ON, from %d monitor author id(s)"
@@ -2741,10 +3117,13 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         summary += " | " + "; ".join(problems)
 
     out.write(summary + "\n")
-    return {"exit": code, "examined": len(tickets), "sent": sent,
-            "declined": declined, "capped": capped, "labelled": labelled, "settled": settled,
-            "relayed": relay["relayed"] if relay else 0,
-            "dry": bool(dry_run), "summary": summary}
+    result = {"exit": code, "examined": len(tickets), "sent": sent,
+              "declined": declined, "capped": capped, "labelled": labelled, "settled": settled,
+              "relayed": relay["relayed"] if relay else 0,
+              "dry": bool(dry_run), "summary": summary}
+    if write_it:
+        result.update(written=written, fell_back=fell_back)
+    return result
 
 
 def _now_iso():
@@ -2756,22 +3135,27 @@ def run_command(cfg, dry_run, timeout, tracker=None, chat=None, out=sys.stdout):
     def _alarm(_signum, _frame):
         raise Deadline()
 
-    armed = False
+    armed, deadline = False, None
     if timeout and hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _alarm)
         signal.alarm(int(timeout))
         armed = True
+    if timeout:
+        # KIT-297 review: when the alarm fires, so no writer call starts that could outlast it.
+        deadline = _pass_clock() + int(timeout)
     try:
         secrets = []
         if tracker is None or chat is None:
             tracker_secret = credential(cfg, "linear_key_env")
             chat_secret = credential(cfg, "chat_token_env")
-            secrets = [tracker_secret, chat_secret]
+            # KIT-297: the writer's token, when it is on, is redacted like these two.
+            secrets = [tracker_secret, chat_secret] + writer_secret(cfg)
             if tracker is None:
                 tracker = TrackerClient(cfg, tracker_secret)
             if chat is None:
                 chat = ChatClient(cfg, chat_secret)
-        result = run_once(cfg, tracker, chat, dry_run, out=out, secrets=secrets)
+        result = run_once(cfg, tracker, chat, dry_run, out=out, secrets=secrets,
+                          deadline=deadline)
     except Deadline:
         result = {"exit": EXIT_TIMEOUT, "examined": 0, "sent": 0, "declined": 0,
                   "labelled": 0, "dry": bool(dry_run),
@@ -3773,6 +4157,9 @@ def selftest():
 
         # ── §12. Pages to direct messages, through the bridge's app (KIT-296) ─────────
         _dm_selftest(ok, tmp, good)
+
+        # ── §13. The writer (KIT-297), and the DM ledger's four-week limit ────────────
+        _writer_selftest(ok, tmp, good)
 
     # ── §10. What it never does — asserted against this file's own source ────────
     source = open(__file__, encoding="utf-8").read()
@@ -5104,6 +5491,626 @@ def _dm_selftest(ok, tmp, good):
             and "direct messages" not in res["summary"]), (calls, res and res["summary"])
     case("dm-channel-mode-byte-identical: with dm_user_ids empty, the one call is today's "
          "chat.postMessage and no DM is opened", channel_mode)
+
+
+def _writer_selftest(ok, tmp, good):
+    """§13 — KIT-297: with `writer` on, a model writes each page from page_facts() alone, once
+    per page, before any post. The writer is a fake in every case, or pipeline_voice.write with
+    its CLI faked: no real CLI is ever started. Also the DM ledger's four-week limit. Lives in
+    the span §10's own-source scan skips, like the relay's own selftest.
+
+    Each case runs through `case`: one that raises is a named failure, and the battery still
+    prints its count line."""
+    import inspect
+    import io
+    import pipeline_voice as voice
+    NOW = 1800000000.0
+    DAY = 86400
+    U1, U2 = "U0SYNTH0001", "W0SYNTH0002"
+    D1, D2 = "D0SYNTH0001", "D0SYNTH0002"
+    DMS = {U1: D1, U2: D2}
+    BIN = "/usr/local/bin/claude"
+    # The contract strings, spelled out and not read from the constants, as §4b spells pages.
+    LINE = "\n\n(I couldn't reach my writer, so this one's the plain version.)"
+    STATE_SCHEMA = "pipeline-notifier-writer/1"
+    # Built at runtime, never as a source literal, for the reason §6 gives.
+    TOKEN = "sk-" + "ant-oat01-" + "SELFTESTNOTAREALTOKEN0123456789"
+    TOKEN_ENV = "NOTIFY_SELFTEST_WRITER_TOKEN"
+
+    def case(name, fn):
+        try:
+            cond, detail = fn()
+        except Exception as exc:                                  # noqa: BLE001
+            cond, detail = False, "raised %r" % (exc,)
+        ok(name, cond, detail)
+
+    class FakeWriter:
+        """Stands in for pipeline_voice.write: records each call, and answers as told."""
+
+        def __init__(self, by="model", text=None, why="", raises=None):
+            self.by, self.text, self.why, self.raises = by, text, why, raises
+            self.calls = []
+
+        def __call__(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None,
+                     now=None):
+            self.calls.append({"kind": kind, "facts": facts, "fallback": fallback,
+                               "keep": list(keep), "bind": bind})
+            if self.raises is not None:
+                raise self.raises
+            if self.by == "model":
+                text = self.text or ("I need your answer on %s before work goes on: %s"
+                                     % (facts["ticket_id"], facts["link"]))
+                return {"text": text, "by": "model", "why": "", "cost_usd": 0.001}
+            return {"text": fallback if self.text is None else self.text, "by": self.by,
+                    "why": self.why, "cost_usd": None}
+
+    class _Done:
+        """A finished run, as subprocess.run returns one."""
+
+    class FakeCli:
+        """Stands in for the claude CLI under pipeline_voice.write: one finished run, its JSON
+        result carrying `result`. Records each command line; starts nothing."""
+
+        def __init__(self, result):
+            self.result, self.argv = result, []
+
+        def __call__(self, cmd, cwd=None, env=None, input=None, timeout=None):
+            self.argv.append(list(cmd))
+            done = _Done()
+            done.returncode, done.stderr = 0, ""
+            done.stdout = json.dumps({"type": "result", "subtype": "success",
+                                      "is_error": False, "result": self.result,
+                                      "total_cost_usd": 0.001})
+            return done
+
+    def marker(label):
+        return "<!-- pipeline-escalation: %s -->" % label
+
+    def ticket(tid, mark, cid, parent=None, title="T"):
+        return {"id": tid, "uuid": "u-" + tid, "title": title, "label_ids": [],
+                "comments": [{"id": cid, "body": marker(mark) + "\nwhich one?",
+                              "author_id": "a-session", "parent_id": parent}]}
+
+    def cfg_for(name, on=True, **over):
+        doc = dict(good, state_dir=os.path.join(tmp, "writer-" + name))
+        if on:
+            doc.update(writer=True, writer_bin=BIN)
+        doc.update(over)
+        return load_config_from(doc, tmp)
+
+    def dm_cfg(name, on=True, **over):
+        over.setdefault("dm_user_ids", [U1, U2])
+        return cfg_for(name, on, chat_channel_id="", **over)
+
+    def plain(cfg, mark, tid, title="T"):
+        return build_message(mark, tid, title, ticket_url(cfg, tid))
+
+    def read_json(path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def with_token(fn):
+        saved = os.environ.get(TOKEN_ENV)
+        os.environ[TOKEN_ENV] = TOKEN
+        try:
+            return fn()
+        finally:
+            if saved is None:
+                os.environ.pop(TOKEN_ENV, None)
+            else:
+                os.environ[TOKEN_ENV] = saved
+
+    def channel_run(cfg, tickets, writer, now=NOW, dry=False, secrets=(), chat=None):
+        chat, out = chat or _FakeChat(base_ts=now), io.StringIO()
+        res = run_once(cfg, _FakeTracker(tickets), chat, dry, out=out, secrets=secrets,
+                       now=now, writer=writer)
+        return res, chat.posts, out.getvalue()
+
+    def dm_run(cfg, tickets, writer, now=NOW, dry=False, scope=False, refuse=()):
+        """One pass through the real ChatClient, `_post_json` swapped for a recorder. Returns
+        (result, [(D id, text) per post], [API method per call]). A post to a D id in `refuse`
+        is refused, and not counted as a post."""
+        calls, out = [], io.StringIO()
+
+        def fake_post(url, payload, headers, timeout=20):
+            if payload.get("channel") in refuse:
+                return {"ok": False, "error": "channel_not_found"}
+            calls.append((url.rsplit("/", 1)[-1], dict(payload)))
+            if url.endswith("/conversations.open"):
+                if scope:
+                    return {"ok": False, "error": "missing_scope", "needed": "im:write",
+                            "provided": "chat:write"}
+                return {"ok": True, "channel": {"id": DMS[payload["users"]]}}
+            return {"ok": True, "channel": payload.get("channel"),
+                    "ts": "%.6f" % (now + len(calls))}
+
+        saved = _post_json
+        globals()["_post_json"] = fake_post
+        try:
+            res = run_once(cfg, _FakeTracker(tickets), ChatClient(cfg, "test-token"), dry,
+                           out=out, now=now, writer=writer)
+        finally:
+            globals()["_post_json"] = saved
+        posts = [(p.get("channel"), p.get("text")) for m, p in calls if m == "chat.postMessage"]
+        return res, posts, [m for m, _p in calls]
+
+    def refused(over, needle):
+        try:
+            cfg_for("refused", **over)
+            return False, "loaded"
+        except NotifierError as exc:
+            return needle in str(exc), str(exc)
+
+    # ── 13a. The writer's keys are pipeline_voice's, and its facts are the page's four ──────
+    case("writer-keys-are-pipeline-voice-keys: the loader lists exactly pipeline_voice's "
+         "writer keys, so the two cannot drift",
+         lambda: (set(WRITER_KEYS) == set(voice.CONFIG_KEYS) == set(voice.DEFAULTS)
+                  and len(WRITER_KEYS) == len(set(WRITER_KEYS))
+                  and {k for k in CONFIG_KEYS if k == "writer" or k.startswith("writer_")}
+                  == set(voice.CONFIG_KEYS), (WRITER_KEYS, sorted(voice.CONFIG_KEYS))))
+
+    # Decision 2 for the model, structurally, as §4 pins it for the page.
+    case("page-facts-takes-exactly-build-message-params: page_facts takes exactly (mark, "
+         "ticket_id, ticket_title, url), so no comment body can reach the writer",
+         lambda: (list(inspect.signature(page_facts).parameters)
+                  == ["mark", "ticket_id", "ticket_title", "url"]
+                  == list(inspect.signature(build_message).parameters),
+                  list(inspect.signature(page_facts).parameters)))
+
+    def facts_shape():
+        hostile = 'Fix <!channel> "now" & | it'
+        got = page_facts(ESC_BLOCKED, "KIT-80", hostile, "https://x/KIT-80")
+        line = build_message(ESC_BLOCKED, "KIT-80", hostile, "https://x/KIT-80").split("\n")[1]
+        return (set(got) == {"moment", "ticket_id", "title", "link"}
+                and got["moment"] == MARKS[ESC_BLOCKED]["page"] and got["ticket_id"] == "KIT-80"
+                and got["link"] == "https://x/KIT-80"
+                and line == 'Ticket: "%s" (KIT-80)' % got["title"]
+                and not any(c in got["title"] for c in '<>&|"')), got
+    case("page-facts-holds-four-facts: the mark's own sentence, the id, the title cleaned "
+         "exactly as the page cleans it, and the link; nothing else", facts_shape)
+
+    def one_call_site():
+        source = open(__file__, encoding="utf-8").read()
+        head, _, rest = source.partition("\ndef selftest():")
+        body_only = head + rest.partition("\ndef load_config_from")[2]
+        sites = re.findall(r"(?<!def )\bwrite_page\(", body_only)
+        calls = re.findall(r"(?<![\w.])writer\(", body_only)
+        return (len(sites) == 1 and "write_page(" in inspect.getsource(run_once)
+                and len(calls) == 1 and "writer(" in inspect.getsource(write_page)
+                and "write_page(" not in inspect.getsource(relay_replies)
+                and "write_page(" not in inspect.getsource(build_relay_comment)
+                and "writer_secret(cfg)" in inspect.getsource(run_command)), (sites, calls)
+    case("writer-only-for-pages: the writer is called from one place, for a page, and never "
+         "for the relay's tracker comment; run_command redacts its token", one_call_site)
+
+    # ── 13b. The config: off loads as before; on is judged by pipeline_voice's own rules ────
+    def off_unchanged():
+        absent = cfg_for("off", on=False)
+        explicit = cfg_for("off-false", on=False, writer=False)
+        return (not any(k in absent for k in WRITER_KEYS) and explicit.get("writer") is False
+                and writer_secret(absent) == [] and writer_secret(explicit) == []), (
+                    sorted(k for k in absent if k.startswith("writer")), explicit.get("writer"))
+    case("writer-off-config-unchanged: a config without the writer's keys loads with none of "
+         "them, and writer false is off", off_unchanged)
+
+    def on_loads():
+        cfg = cfg_for("on", writer_model="sonnet", writer_token_env=TOKEN_ENV)
+        return (cfg["writer"] is True and cfg["writer_bin"] == BIN
+                and cfg["writer_model"] == "sonnet" and cfg["writer_token_env"] == TOKEN_ENV), cfg
+    case("writer-on-config-loads: writer true with the CLI's full path loads, each key as "
+         "written", on_loads)
+
+    def refusals():
+        got = [
+            refused({"writer": "true"}, "config 'writer' must be true or false"),
+            refused({"writer_bin": "claude"},
+                    "config 'writer_bin' must be the claude CLI's full path"),
+            refused({"writer_bin": "bin/claude"}, "config 'writer_bin' is not valid"),
+            refused({"writer_model": "haiku; rm"}, "config 'writer_model' is not valid"),
+            refused({"writer_timeout_seconds": 600},
+                    "config 'writer_timeout_seconds' is not valid"),
+            refused({"writer_max_budget_usd": 50}, "config 'writer_max_budget_usd' is not valid"),
+            refused({"writer_token_env": good["chat_token_env"]},
+                    "names the same variable as 'chat_token_env'"),
+            refused({"writer_token_env": good["linear_key_env"]},
+                    "names the same variable as 'linear_key_env'"),
+            refused({"writer_temperature": 1}, "unknown config key(s): writer_temperature"),
+        ]
+        return all(g[0] for g in got), got
+    case("writer-config-refusals: a string switch, a bare or relative CLI, a bad model, a "
+         "number past its limit, a token name shared with another credential and an unknown "
+         "writer key are each refused by name", refusals)
+
+    def token_value_refused():
+        value = "xo" + "xb-" + "a-real-looking-value"
+        named, text = refused({"writer_token_env": value},
+                              "'writer_token_env' must be an ENV VAR NAME")
+        return named and value not in text, text
+    case("writer-token-value-refused-unechoed: a credential value where the token's NAME goes "
+         "is refused, and the value is not repeated", token_value_refused)
+
+    def secret_listed():
+        on = cfg_for("secret-on", writer_token_env=TOKEN_ENV)
+        off = cfg_for("secret-off", on=False, writer_token_env=TOKEN_ENV)
+        got = with_token(lambda: (writer_secret(on), writer_secret(off)))
+        return got == ([TOKEN], []), ["<%d chars>" % len(v) for g in got for v in g]
+    case("writer-token-redacted-when-on: with the writer on, its token is one of the values "
+         "redacted from every output; off, it is never read", secret_listed)
+
+    # ── 13c. One call per page, before any post: everyone gets the same words ──────────────
+    def dm_same_words():
+        w = FakeWriter()
+        cfg = dm_cfg("dm-same", mention_chat_user_ids=[U1])
+        res, posts, _m = dm_run(cfg, [ticket("KIT-80", ESC_BLOCKED, "w1", "root-80")], w)
+        url = ticket_url(cfg, "KIT-80")
+        want = "I need your answer on KIT-80 before work goes on: %s" % url
+        call = w.calls[0] if w.calls else {}
+        return (len(w.calls) == 1 and posts == [(D1, want), (D2, want)]
+                and call["kind"] == ESC_BLOCKED
+                and call["facts"] == page_facts(ESC_BLOCKED, "KIT-80", "T", url)
+                and call["fallback"] == plain(cfg, ESC_BLOCKED, "KIT-80")
+                and call["keep"] == ["KIT-80", url] and call["bind"] == ""
+                and res["exit"] == EXIT_OK and res.get("written") == 1
+                and res.get("fell_back") == 0
+                and "writer: ON, 1 page(s) written, 0 fell back" in res["summary"]), (
+                    w.calls, posts, res["summary"])
+    case("writer-once-per-page-same-text-every-dm: the writer is called once per page, with "
+         "the page's facts, the fixed text and the id and link to keep, before any post; each "
+         "DM gets the same words, with no @mention", dm_same_words)
+
+    def dm_off_keeps_mentions():
+        w = FakeWriter()
+        cfg = dm_cfg("dm-off", on=False, mention_chat_user_ids=[U1])
+        _r, posts, _m = dm_run(cfg, [ticket("KIT-81", ESC_BLOCKED, "w2", "root-81")], w)
+        want = mention_prefix(ESC_BLOCKED, cfg) + plain(cfg, ESC_BLOCKED, "KIT-81")
+        return (w.calls == [] and posts == [(D1, want), (D2, want)]
+                and want.startswith("<@%s> " % U1)), posts
+    case("writer-off-dm-byte-identical: with the writer off, a DM page is the fixed text with "
+         "its @mention, as before, and the writer is never called", dm_off_keeps_mentions)
+
+    def channel_mentions_outside():
+        w = FakeWriter()
+        cfg = cfg_for("channel-on", mention_chat_user_ids=[U1])
+        _r, posts, _o = channel_run(cfg, [ticket("KIT-82", ESC_BLOCKED, "w3", "root-82")], w)
+        return (len(w.calls) == 1 and posts == [
+            "<@%s> I need your answer on KIT-82 before work goes on: %s"
+            % (U1, ticket_url(cfg, "KIT-82"))]), posts
+    case("writer-channel-mentions-stay-outside: in a channel, the @mentions are this job's, "
+         "put in front of the model's words", channel_mentions_outside)
+
+    def channel_off():
+        w, got = FakeWriter(), []
+        for name, over in (("absent", {}), ("false", {"writer": False})):
+            cfg = cfg_for("channel-off-" + name, on=False, mention_chat_user_ids=[U1], **over)
+            res, posts, _o = channel_run(cfg, [ticket("KIT-83", ESC_NEEDS_HUMAN, "w4" + name)], w)
+            got.append((posts == [mention_prefix(ESC_NEEDS_HUMAN, cfg)
+                                  + plain(cfg, ESC_NEEDS_HUMAN, "KIT-83")],
+                        "writer" not in res["summary"], "written" not in res))
+        return w.calls == [] and all(all(g) for g in got), got
+    case("writer-off-channel-byte-identical: with the writer absent or false, a channel page "
+         "is the fixed text as before, the summary does not mention it, and it is never "
+         "called", channel_off)
+
+    # ── 13d. A fallback is the fixed text, and the plain line is said once a day ────────────
+    def daily_line():
+        w = FakeWriter(by="fallback", why="the writer exited 1")
+        cfg = cfg_for("line")
+        r1, p1, _o = channel_run(cfg, [ticket("KIT-84", ESC_BLOCKED, "w5", "root-84"),
+                                       ticket("KIT-85", ESC_NEEDS_HUMAN, "w6")], w)
+        s1 = read_json(writer_state_path(cfg))
+        r2, p2, _o = channel_run(cfg, [ticket("KIT-86", ESC_BLOCKED, "w7", "root-86")], w,
+                                 now=NOW + 23 * 3600)
+        r3, p3, _o = channel_run(cfg, [ticket("KIT-87", ESC_BLOCKED, "w8", "root-87")], w,
+                                 now=NOW + 25 * 3600)
+        s3 = read_json(writer_state_path(cfg))
+        plains = sorted([plain(cfg, ESC_BLOCKED, "KIT-84"), plain(cfg, ESC_NEEDS_HUMAN, "KIT-85")])
+        return (len(p1) == 2 and p1[0].endswith(LINE) and not p1[1].endswith(LINE)
+                and sorted([p1[0][:-len(LINE)], p1[1]]) == plains
+                and r1.get("fell_back") == 2 and r1.get("written") == 0
+                and "KIT-84: the writer exited 1" in r1["summary"]
+                and "writer: ON, 0 page(s) written, 2 fell back" in r1["summary"]
+                and s1 == {"schema": STATE_SCHEMA, "fallback_line_at": NOW}
+                and p2 == [plain(cfg, ESC_BLOCKED, "KIT-86")]
+                and p3 == [plain(cfg, ESC_BLOCKED, "KIT-87") + LINE]
+                and s3 == {"schema": STATE_SCHEMA, "fallback_line_at": NOW + 25 * 3600}
+                and r3["exit"] == EXIT_OK), (p1, p2, p3, s1, s3, r1["summary"])
+    case("writer-fallback-plain-text-and-daily-line: a page the writer could not write is the "
+         "fixed text; the first one in a day ends with the plain line, and no other does until "
+         "a day has passed", daily_line)
+
+    def line_needs_a_landed_page():
+        w = FakeWriter(by="fallback")
+        cfg = cfg_for("line-refused")
+        refusing = _FakeChat(ok=False, error="channel_not_found", base_ts=NOW)
+        r1, p1, _o = channel_run(cfg, [ticket("KIT-88", ESC_BLOCKED, "w9", "root-88")], w,
+                                 chat=refusing)
+        r2, p2, _o = channel_run(cfg, [ticket("KIT-89", ESC_BLOCKED, "w10", "root-89")], w,
+                                 now=NOW + 3600)
+        return (p1 and p1[0].endswith(LINE) and r1["exit"] == EXIT_DECLINED
+                and p2 == [plain(cfg, ESC_BLOCKED, "KIT-89") + LINE]), (p1, p2)
+    case("writer-line-said-only-when-a-page-lands: a page Slack refused does not count as the "
+         "day's line, so the next page that falls back says it", line_needs_a_landed_page)
+
+    case("writer-line-due-rules: due when never said, or said a day or more ago; a time in "
+         "the future, infinity or not-a-number never silences it",
+         lambda: ([writer_line_due(s, NOW) for s in (
+             {}, {"fallback_line_at": NOW - 3600}, {"fallback_line_at": NOW - 25 * 3600},
+             {"fallback_line_at": NOW + 3 * DAY}, {"fallback_line_at": float("inf")},
+             {"fallback_line_at": float("nan")})] == [True, False, True, True, True, True],
+                  "see the list"))
+
+    def corrupt_state():
+        w = FakeWriter(by="fallback")
+        cfg = cfg_for("corrupt")
+        os.makedirs(cfg["state_dir"], exist_ok=True)
+        with open(writer_state_path(cfg), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        res, posts, _o = channel_run(cfg, [ticket("KIT-90", ESC_BLOCKED, "w11", "root-90")], w)
+        return (res["exit"] == EXIT_OK and posts == [plain(cfg, ESC_BLOCKED, "KIT-90") + LINE]
+                and "I could not read the writer's state" in res["summary"]
+                and read_json(writer_state_path(cfg))
+                == {"schema": STATE_SCHEMA, "fallback_line_at": NOW}), res["summary"]
+    case("writer-corrupt-state-does-not-stop-the-pass: a writer state that cannot be read is "
+         "said in the summary and read as not said yet; the page still goes", corrupt_state)
+
+    def odd_writers():
+        got = []
+        for name, w in (("raises", FakeWriter(raises=RuntimeError("boom " + TOKEN))),
+                        ("shape", FakeWriter(by="maybe")),
+                        ("other-text", FakeWriter(by="fallback", text="something else")),
+                        ("blank", FakeWriter(text="   "))):
+            cfg = cfg_for("odd-" + name)
+            res, posts, _o = channel_run(cfg, [ticket("KIT-91", ESC_BLOCKED, "w12", "root-91")],
+                                         w)
+            got.append((name, posts == [plain(cfg, ESC_BLOCKED, "KIT-91") + LINE],
+                        res.get("fell_back") == 1, res["exit"] == EXIT_OK,
+                        TOKEN not in res["summary"]))
+        return all(all(g[1:]) for g in got), got
+    case("writer-faults-cost-only-words: a writer that raises, answers in an unknown shape, "
+         "falls back with other text or writes nothing posts the fixed text, never its own",
+         odd_writers)
+
+    def why_redacted():
+        w = FakeWriter(by="fallback", why="the CLI said " + TOKEN)
+        cfg = cfg_for("redact")
+        res, _p, _o = channel_run(cfg, [ticket("KIT-92", ESC_BLOCKED, "w13", "root-92")], w,
+                                  secrets=[TOKEN])
+        return TOKEN not in res["summary"] and "«redacted»" in res["summary"], res["summary"]
+    case("writer-why-redacted: a reason the writer gives passes the job's redaction before "
+         "it reaches the summary", why_redacted)
+
+    # ── 13e. What the writer never sees, and when it is never called ────────────────────────
+    def secret_title():
+        w = FakeWriter()
+        cfg = cfg_for("secret-title")
+        title = "rotate " + "xo" + "xb-" + "1234567890abcdefghij"
+        res, posts, _o = channel_run(cfg, [ticket("KIT-93", ESC_BLOCKED, "w14", "root-93",
+                                                  title=title)], w)
+        return (w.calls == [] and posts == [] and res["exit"] == EXIT_DECLINED
+                and "withheld" in res["summary"]), (w.calls, res["summary"])
+    case("writer-never-sees-a-secret-title: a title with a credential shape is withheld "
+         "before the writer is called, so it never reaches the model provider", secret_title)
+
+    def written_page_scanned():
+        cfg = cfg_for("scan-written")
+        shaped = "gh" + "p_" + "A" * 24
+        w = FakeWriter(text="KIT-94 holds %s now: %s" % (shaped, ticket_url(cfg, "KIT-94")))
+        res, posts, _o = channel_run(cfg, [ticket("KIT-94", ESC_BLOCKED, "w15", "root-94")], w)
+        return (posts == [] and res["exit"] == EXIT_DECLINED
+                and "withheld — the written page carries" in res["summary"]
+                and shaped not in res["summary"]), res["summary"]
+    case("writer-text-scanned-again: the model's words pass the credential scan before they "
+         "are posted, and a shape there is withheld", written_page_scanned)
+
+    def dry_never_calls():
+        w = FakeWriter()
+        cfg = dm_cfg("dry")
+        res, posts, methods = dm_run(cfg, [ticket("KIT-95", ESC_BLOCKED, "w16", "root-95")], w,
+                                     dry=True)
+        return (w.calls == [] and methods == [] and res["sent"] == 1 and "written" not in res
+                and "writer: ON, not called in a dry run" in res["summary"]
+                and not os.path.exists(writer_state_path(cfg))), (w.calls, res["summary"])
+    case("writer-dry-run-never-calls: a dry run calls no writer, writes no writer state, and "
+         "says so", dry_never_calls)
+
+    def scope_missing():
+        w = FakeWriter()
+        cfg = dm_cfg("scope")
+        res, posts, _m = dm_run(cfg, [ticket("KIT-96", ESC_BLOCKED, "w17", "root-96"),
+                                      ticket("KIT-97", ESC_NEEDS_HUMAN, "w18")], w, scope=True)
+        return (len(w.calls) == 1 and posts == [] and res["exit"] == EXIT_ERROR), (
+            len(w.calls), res["summary"])
+    case("writer-not-called-once-no-dm-can-open: after a token is found to lack im:write, no "
+         "page's words are written for nothing", scope_missing)
+
+    def heartbeat_counts():
+        w = FakeWriter(by="fallback")
+        on, off = cfg_for("beat"), cfg_for("beat-off", on=False)
+        r_on, _p, _o = channel_run(on, [ticket("KIT-98", ESC_BLOCKED, "w19", "root-98")], w)
+        r_off, _p, _o = channel_run(off, [ticket("KIT-98", ESC_BLOCKED, "w20", "root-98")], w)
+        write_heartbeat(on, r_on, "2026-01-01T00:00:00Z")
+        write_heartbeat(off, r_off, "2026-01-01T00:00:00Z")
+        beat_on, beat_off = read_json(heartbeat_path(on)), read_json(heartbeat_path(off))
+        return (beat_on.get("written") == 0 and beat_on.get("fell_back") == 1
+                and "written" not in beat_off and "fell_back" not in beat_off), (beat_on, beat_off)
+    case("writer-counts-in-heartbeat: a pass that called the writer records how many pages it "
+         "wrote and how many fell back; a pass without it records neither", heartbeat_counts)
+
+    # ── 13f. Through pipeline_voice itself, its CLI faked ───────────────────────────────────
+    def through_voice():
+        cfg = dm_cfg("voice", writer_token_env=TOKEN_ENV)
+        url97, url98 = ticket_url(cfg, "KIT-97"), ticket_url(cfg, "KIT-98")
+        said = ("A dev stopped work on KIT-97 and needs your answer to carry on. It is here: "
+                + url97)
+        cli_good, cli_bad = FakeCli(said), FakeCli("KIT-98 and KIT-999 need you: " + url98)
+
+        def run_both():
+            r1, p1, _m = dm_run(cfg, [ticket("KIT-97", ESC_BLOCKED, "w21", "root-97")],
+                                lambda *a, **k: voice.write(*a, runner=cli_good, **k))
+            r2, p2, _m = dm_run(cfg, [ticket("KIT-98", ESC_BLOCKED, "w22", "root-98")],
+                                lambda *a, **k: voice.write(*a, runner=cli_bad, **k))
+            return r1, p1, r2, p2
+        r1, p1, r2, p2 = with_token(run_both)
+        fixed = plain(cfg, ESC_BLOCKED, "KIT-98") + LINE
+        return (p1 == [(D1, said), (D2, said)] and r1.get("written") == 1
+                and len(cli_good.argv) == 1 and cli_good.argv[0][0] == BIN
+                and p2 == [(D1, fixed), (D2, fixed)] and r2.get("fell_back") == 1
+                and "KIT-999" in r2["summary"]), (p1, p2, r2["summary"])
+    case("writer-through-pipeline-voice: the real writer, its CLI faked, posts checked words "
+         "once to every DM, and falls back to the fixed text when the words name a ticket the "
+         "facts do not", through_voice)
+
+    # ── 13g. The DM ledger keeps an owed record past seven days, but not for ever ───────────
+    def four_weeks():
+        cfg = dm_cfg("four-weeks", on=False, dm_user_ids=[U1])
+        os.makedirs(cfg["state_dir"], exist_ok=True)
+        posts = {}
+        for tid, days in (("KIT-60", 29), ("KIT-61", 27), ("KIT-62", 8)):
+            ts = "%.6f" % (NOW - days * DAY)
+            posts["%s:%s" % (D1, ts)] = {"channel": D1, "ts": ts, "ticket_id": tid,
+                                         "mark": ESC_BLOCKED, "event_key": "comment:owed-" + tid,
+                                         "recorded_at": "2026-01-01T00:00:00Z"}
+        with open(dm_posts_path(cfg), "w", encoding="utf-8") as fh:
+            json.dump({"schema": "pipeline-notifier-dm-posts/1", "posts": posts}, fh)
+        res, _p, _m = dm_run(cfg, [ticket("KIT-63", ESC_BLOCKED, "w23", "root-63")], None)
+        kept = sorted(r["ticket_id"] for r in read_json(dm_posts_path(cfg))["posts"].values())
+        return (kept == ["KIT-61", "KIT-62", "KIT-63"] and res["exit"] == EXIT_OK
+                and "1 dropped at four weeks" in res["summary"]
+                and "2 of them held past seven days" in res["summary"]
+                and "(KIT-61, KIT-62)" in res["summary"]), (kept, res["summary"])
+    case("dm-ledger-owed-record-dropped-at-four-weeks: a record whose page never reached "
+         "everyone is kept past seven days but dropped at four weeks, and the summary counts "
+         "both", four_weeks)
+
+    # ── 13h. The deadline bounds the writer; a DM retry keeps its first words ───────────────
+    class WordedWriter(FakeWriter):
+        """Words each call differently, as a model would, so a second call shows."""
+
+        def __call__(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None,
+                     now=None):
+            self.text = "Version %d of the words for %s: %s" % (len(self.calls) + 1,
+                                                                facts["ticket_id"], facts["link"])
+            return FakeWriter.__call__(self, cfg, kind, facts, fallback, keep, bind, runner,
+                                       now)
+
+    def slow_writer_bounded():
+        clock = [0.0]
+        inner = FakeWriter(by="fallback", why="the writer took longer than 60 seconds")
+
+        def hangs(*a, **k):
+            clock[0] += 60                          # a CLI that runs to its timeout every time
+            return inner(*a, **k)
+        cfg = cfg_for("deadline")
+        tickets = [ticket("KIT-7%d" % i, ESC_NEEDS_HUMAN, "dl%d" % i) for i in range(4)]
+        saved = _pass_clock
+        globals()["_pass_clock"] = lambda: clock[0]
+        try:
+            chat = _FakeChat(base_ts=NOW)
+            r1 = run_once(cfg, _FakeTracker(tickets), chat, False, out=io.StringIO(), now=NOW,
+                          writer=hangs, deadline=240.0)
+            first = list(chat.posts)
+            r2 = run_once(cfg, _FakeTracker(tickets), chat, False, out=io.StringIO(),
+                          now=NOW + 300, writer=hangs, deadline=clock[0] + 240)
+        finally:
+            globals()["_pass_clock"] = saved
+        return (len(inner.calls) == 3 and len(first) == 4 and chat.posts == first
+                and first[3] == plain(cfg, ESC_NEEDS_HUMAN, "KIT-73")
+                and r1["exit"] == EXIT_OK and r1.get("fell_back") == 4
+                and "KIT-73: too little of this pass was left to wait for the writer"
+                in r1["summary"]
+                and len(load_seen(cfg)["sent"]) == 4 and r2["sent"] == 0), (
+                    len(inner.calls), first, r1["summary"], r2["summary"])
+    case("writer-not-started-past-the-deadline: a call that could outlast the pass is never "
+         "started; that page goes plain, the pass ends in time and saves its seen-set, and the "
+         "next pass pages nothing twice", slow_writer_bounded)
+
+    def run_command_deadline():
+        got = []
+        for name, timeout in (("short", 60), ("none", 0)):
+            w, out = FakeWriter(), io.StringIO()
+            cfg = cfg_for("rc-" + name)
+            real = globals()["run_once"]
+            globals()["run_once"] = lambda *a, **k: real(*a, writer=w, **k)
+            try:
+                code = run_command(cfg, False, timeout, out=out, chat=_FakeChat(base_ts=NOW),
+                                   tracker=_FakeTracker([ticket("KIT-77", ESC_BLOCKED, "rc" + name,
+                                                                "root-77")]))
+            finally:
+                globals()["run_once"] = real
+            got.append((code, len(w.calls), out.getvalue()))
+        return (got[0][:2] == (EXIT_OK, 0)
+                and "too little of this pass was left to wait for the writer" in got[0][2]
+                and got[1][:2] == (EXIT_OK, 1)), got
+    case("writer-run-command-passes-its-deadline: a 60-second pass never starts a 60-second "
+         "writer call; with no timeout the writer is called", run_command_deadline)
+
+    def pass_too_short():
+        got = [refused({"run_timeout_seconds": 179},
+                       "config 'run_timeout_seconds' (179) is too short for the writer: a pass "
+                       "needs at least 180 seconds"),
+               refused({"writer_timeout_seconds": 300},
+                       "config 'run_timeout_seconds' (240) is too short for the writer: a pass "
+                       "needs at least 660 seconds")]
+        fits = cfg_for("fits", run_timeout_seconds=180)
+        off = cfg_for("short-off", on=False, run_timeout_seconds=30)
+        return (all(g[0] for g in got) and least_run_timeout(60) == 180
+                and fits["run_timeout_seconds"] == 180 and off["run_timeout_seconds"] == 30), got
+    case("writer-config-pass-too-short: with the writer on, a pass shorter than twice the "
+         "writer's timeout and its room is refused by name; with it off, any pass loads",
+         pass_too_short)
+
+    def retry_same_words():
+        w = WordedWriter()
+        cfg = dm_cfg("retry-words")
+        tk = [ticket("KIT-78", ESC_BLOCKED, "rw1", "root-78")]
+        r1, p1, _m = dm_run(cfg, tk, w, refuse=(D2,))
+        r2, p2, _m = dm_run(cfg, tk, w, now=NOW + 3600)
+        ledger = list(read_json(dm_posts_path(cfg))["posts"].values())
+        first = "Version 1 of the words for KIT-78: %s" % ticket_url(cfg, "KIT-78")
+        return (len(w.calls) == 1 and p1 == [(D1, first)] and p2 == [(D2, first)]
+                and r1.get("written") == 1 and r2.get("written") == 0
+                and r2.get("fell_back") == 0 and r2["exit"] == EXIT_OK
+                and "1 retried in the words it first went out with" in r2["summary"]
+                and sorted(r.get("text") for r in ledger) == [first, first]), (
+                    len(w.calls), p1, p2, r2["summary"])
+    case("writer-dm-retry-keeps-its-first-words: a page that reached one person and missed "
+         "another goes to the second, on a later pass, in the same words, from the DM ledger; "
+         "the writer is not called again", retry_same_words)
+
+    def retry_after_writer_off():
+        cfg_off = dm_cfg("retry-off", on=False)
+        tk = [ticket("KIT-79", ESC_BLOCKED, "rw2", "root-79")]
+        _r, p1, _m = dm_run(cfg_off, tk, None, refuse=(D2,))
+        ledger = list(read_json(dm_posts_path(cfg_off))["posts"].values())
+        w = WordedWriter()
+        cfg_on = dm_cfg("retry-off")
+        r2, p2, _m = dm_run(cfg_on, tk, w, now=NOW + 3600)
+        fixed = plain(cfg_on, ESC_BLOCKED, "KIT-79")
+        return (p1 == [(D1, fixed)] and [sorted(r) for r in ledger] == [sorted(
+                    ("channel", "ts", "ticket_id", "mark", "event_key", "recorded_at"))]
+                and w.calls == [] and p2 == [(D2, fixed)] and r2["exit"] == EXIT_OK), (
+                    ledger, p2, r2["summary"])
+    case("writer-off-ledger-record-unchanged-and-retried-plain: with the writer off a DM "
+         "record holds no words; a page it began goes to the rest as the fixed text, the "
+         "writer uncalled, once the writer is on", retry_after_writer_off)
+
+    def held_reach_says_no_line():
+        w = WordedWriter()
+        cfg = dm_cfg("held-line")
+        k1 = ticket("KIT-70", ESC_BLOCKED, "hl1", "root-70")
+        k2 = ticket("KIT-71", ESC_BLOCKED, "hl2", "root-71")
+        dm_run(cfg, [k1], w, refuse=(D2,))                         # U1 has it, U2 refused
+        w.by = "fallback"
+        _r2, p2, _m = dm_run(cfg, [k1], w, now=NOW + 25 * 3600, refuse=(D2,))
+        said = os.path.exists(writer_state_path(cfg))
+        _r3, p3, _m = dm_run(cfg, [k1, k2], w, now=NOW + 26 * 3600)
+        first = "Version 1 of the words for KIT-70: %s" % ticket_url(cfg, "KIT-70")
+        line = plain(cfg, ESC_BLOCKED, "KIT-71") + LINE
+        return (p2 == [] and not said
+                and p3 == [(D2, first), (D1, line), (D2, line)]), (said, p2, p3)
+    case("writer-line-not-said-when-only-a-held-dm-reached: a pass whose only reach is a person "
+         "the ledger already held does not count as the day's line, so the next page that "
+         "falls back says it", held_reach_says_no_line)
 
 
 def load_config_from(doc, tmpdir):
