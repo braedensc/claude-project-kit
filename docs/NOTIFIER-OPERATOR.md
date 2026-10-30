@@ -18,8 +18,9 @@ Design: `docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md`.
 
 **It needs Stage E first.** The notifier runs as the dispatcher's role account, beside the
 Stage E daemons. It uses that account's clone of this kit and that account's env file,
-which must already hold the tracker key. Install Stage E before this
-(`docs/STAGE-E-OPERATOR.md`).
+which must already hold the tracker key. The clone is Stage E's, `~/.stage-e/kit`: the
+Stage E installer is the only thing that moves it, so this installer refuses any other.
+Install Stage E before this (`docs/STAGE-E-OPERATOR.md`).
 
 ---
 
@@ -541,8 +542,10 @@ A paused job has no heartbeat row to read: `enable` stops at "not loaded", BLOCK
 
 **After a merge that changes the notifier,** in this order:
 
-1. Pull this checkout, then run the Stage E installer's `run`. Its `code` step moves the
-   role account's clone.
+1. Run the one command, `python3 scripts/pipeline_install.py`. It pulls this checkout, and
+   its Stage E check counts the clone as behind when a file the notifier runs changed. Say
+   yes, and the Stage E installer's `code` step moves the clone. It stops the notifier just
+   before the move and loads it again straight after.
 2. Run this installer's `run`. Preflight compares the two again. If the merge changed the
    notifier's config, card `CK-N4` comes back: watch one ping again and sign it.
 
@@ -553,6 +556,8 @@ share. It stops there, before it changes anything: run the two again in the orde
 
 ## What is not proven
 
+- **That the Stage E installer stops and reloads the notifier around a real clone move.**
+  The selftest covers it with a faked launchd. No live run has yet (KIT-280).
 - **A dead notifier cannot page about itself.** The heartbeat monitor can watch its
   heartbeat (KIT-156), and a stopped notifier then becomes a comment on the monitor's ticket
   that says it pinged nobody. No ping goes out. Only a check off this machine closes that.

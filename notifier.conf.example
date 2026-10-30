@@ -50,6 +50,8 @@ ROLE_ACCOUNT=_exdispatch
 
 # That account's clone of this kit, the one the Stage E daemons exec from.
 # The installer checks the notifier script is in it; it never moves the clone.
+# The Stage E installer's `code` step does, and stops this job while it does. The
+# installer refuses any other clone: nothing would ever move it.
 ROLE_KIT_CLONE=~/.stage-e/kit
 
 # The tracker team keys whose tickets are scanned, comma-separated.

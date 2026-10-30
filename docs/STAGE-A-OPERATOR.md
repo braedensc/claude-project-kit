@@ -203,7 +203,9 @@ What it does, in order:
    replaces them.
 3. **Stage E**, when the machine has it (`stage-e.conf`). It runs the review installer's
    read-only check first. Only when something is outstanding does it warn you, ask, and run
-   the review installer. That can restart the dispatcher.
+   the review installer. That can restart the dispatcher. The check counts the role
+   account's clone as behind when a merge changed a file that any job on it runs: the
+   review jobs, the notifier or the Slack bridge.
 4. **The idea gate:**
    - **Settings.** On a first run it writes `stage-a.conf` for you. It takes the
      dispatcher's account, settings file and service, the agent's name, the kit's URL and
