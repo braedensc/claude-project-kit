@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Human-action notifier — one short ping per event that needs a person, to a chat channel.
+"""Human-action notifier — one short ping per event that needs a person, to a chat channel or to
+each named person's direct message.
 Implements docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md (Accepted
 2026-09-11; channel ratified as Slack).
 
@@ -77,6 +78,20 @@ WHAT THIS IS
   something opens with an @mention of each member id in `mention_chat_user_ids`, which is
   optional: empty, it mentions nobody. Which pages those are is decided by the MARK, never
   by the author (see MARKS).
+
+  DIRECT MESSAGES (KIT-296). With `dm_user_ids` set, each page goes to each named person's
+  direct message, top-level, in the order named, in place of the channel. The posts go
+  through the Slack bridge's app: `chat_token_env` names the bridge's token, and that app
+  opens each DM with `conversations.open`, which needs the `im:write` scope. Every DM post is
+  recorded in `notifier-dm-posts.json` beside the seen-set, keyed `<channel>:<ts>`, for two
+  reasons. The bridge reads it to tell which page a top-level answer follows. And a retried
+  page never reaches one person twice: a person the ledger already holds for that page is
+  skipped. A page that did not reach every person is declined and kept out of the seen-set,
+  so the next pass tries the people it missed; its label is applied once anyone has it, so
+  the board never waits on one person. A record is dropped after seven days only once its
+  page is in the seen-set: one still owed is kept, or the retry would page twice. A token
+  without `im:write` is said once and fails the pass. Never both a channel and DMs: with DMs
+  set, `chat_channel_id` is empty and `reply_relay` is off. The message itself is unchanged.
 
 WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script asserts it)
 
@@ -241,6 +256,9 @@ LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
     so its parent is the thread to answer in. Coded to require it: a mark with no parent is
     recorded with no thread, and a reply under that ping is declined by name rather than sent
     to whichever session the ticket has. Verify on the first real blocked session.
+  * Direct messages (only with `dm_user_ids` set): that `conversations.open` with the bridge
+    app's token answers a `D…` id once the app holds `im:write`, and that `chat:write` alone
+    then posts there. Coded to refuse anything but a `D…` id, and to name a missing scope.
 
 Usage:
   pipeline_notify_local.py run      --config FILE [--dry-run] [--timeout N]
@@ -291,9 +309,14 @@ EXIT_TIMEOUT = 4
 HEARTBEAT_SCHEMA = "pipeline-notifier-heartbeat/1"
 SEEN_SCHEMA = "pipeline-notifier-seen/1"
 RELAY_SCHEMA = "pipeline-notifier-relay/1"
-# KIT-224: the pings the Slack bridge may answer, recorded here because the bridge holds no
-# notifier token and the notifier holds no bridge token. The bridge reads this file.
+# KIT-224: the pings the Slack bridge may answer, recorded here because the bridge reads this
+# file and never asks the notifier. In channel mode each job holds only its own app's token.
+# In DM mode (KIT-296) `chat_token_env` names the bridge app's token: both jobs run as the same
+# role account, from the same env file, so the notifier holds nothing the bridge does not. A
+# post binds nothing either way: only the bridge's own recorded question takes a yes.
 BRIDGE_PINGS_SCHEMA = "pipeline-notifier-bridge-pings/1"
+# KIT-296: every page posted to a direct message, keyed `<channel>:<ts>`. The bridge reads it.
+DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
 
 DEFAULT_STATE_DIR = "~/.stage-e/state"
 
@@ -452,8 +475,10 @@ CONFIG_KEYS = {
     "linear_key_env": "ENV VAR NAME holding the tracker key (never the key itself)",
     "chat_token_env": "ENV VAR NAME holding the chat bot token (never the token itself); "
                       "chat:write to ping, and with reply_relay on ALSO groups:history to "
-                      "read the private channel's threads",
-    "chat_channel_id": "the private channel id the ping is posted to",
+                      "read the private channel's threads. With dm_user_ids set it names the "
+                      "Slack bridge app's token, which ALSO needs im:write to open each DM",
+    "chat_channel_id": "the private channel id the ping is posted to; empty when dm_user_ids "
+                       "is set",
     "chat_api_base": "chat API base URL; defaults to the Slack Web API",
     "team_keys": "tracker team keys whose tickets are scanned, e.g. ['KIT','TOD']",
     "ticket_url_template": "how a ticket id becomes a link, e.g. https://…/issue/{id}",
@@ -491,6 +516,11 @@ CONFIG_KEYS = {
     "mention_chat_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) "
                              "@mentioned at the start of every page that asks a person to do "
                              "something (KIT-281). Optional: absent or empty mentions nobody",
+    "dm_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) whose direct "
+                   "messages every page is posted to, top-level, in this order, in place of "
+                   "chat_channel_id (KIT-296). Each post is recorded in notifier-dm-posts.json "
+                   "for the Slack bridge. Optional: absent or empty posts to the channel. Set, "
+                   "chat_channel_id must be empty and reply_relay off",
 }
 
 # The reply relay's fixed limits and shapes. Not config: a lookback an operator could widen
@@ -505,6 +535,9 @@ OWNER_CHAT_USER_RE = re.compile(r"^U[A-Z0-9]{8,}$")
 # A Slack member id, whole: U, or W on an Enterprise Grid workspace, then capitals and digits.
 # Each one is put inside `<@…>` in a page, so nothing else may pass (KIT-281).
 MENTION_USER_RE = re.compile(r"^[UW][A-Z0-9]{8,}\Z")
+# A direct-message channel id, whole, as `conversations.open` answers it (KIT-296). Anything
+# else is not a DM, and a page is never posted to it.
+DM_CHANNEL_RE = re.compile(r"^D[A-Z0-9]{8,}\Z")
 RELAY_NAMED_CAP = 500
 RELAY_PENDING = "pending"
 RELAY_DONE = "done"
@@ -532,6 +565,7 @@ EXAMPLE_CONFIG = {
     "relay_max_per_hour": DEFAULT_RELAY_MAX_PER_HOUR,
     "dispatcher_agent_user_id": "<dispatcher agent user uuid>",
     "mention_chat_user_ids": [],
+    "dm_user_ids": [],
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -606,6 +640,7 @@ def load_config(path):
         "relay_max_per_hour": raw.get("relay_max_per_hour", DEFAULT_RELAY_MAX_PER_HOUR),
         "dispatcher_agent_user_id": raw.get("dispatcher_agent_user_id", ""),
         "mention_chat_user_ids": raw.get("mention_chat_user_ids", []),
+        "dm_user_ids": raw.get("dm_user_ids", []),
     }
 
     for key in ("linear_key_env", "chat_token_env"):
@@ -615,7 +650,30 @@ def load_config(path):
                 "config %r must be an ENV VAR NAME like SLACK_BOT_TOKEN, got %r — "
                 "never put a credential value in the config" % (key, name))
 
-    if not cfg["chat_channel_id"]:
+    # KIT-296: pages go to each named person's direct message, in place of the channel. Each
+    # id is a whole member id, the same shape a mention takes. Any value at all asks for DM
+    # mode, so a malformed one is named here and never read as "post to the channel".
+    dms = cfg["dm_user_ids"]
+    if not isinstance(dms, list) or not all(isinstance(u, str) and MENTION_USER_RE.match(u)
+                                            for u in dms):
+        errors.append(
+            "config 'dm_user_ids' must be a list of Slack member ids like U0123456789, or "
+            "absent to post to 'chat_channel_id', got %r" % (dms,))
+    elif len(set(dms)) != len(dms):
+        errors.append("config 'dm_user_ids' repeats an id — that person would get every page "
+                      "twice")
+    if dms:
+        if cfg["chat_channel_id"]:
+            errors.append(
+                "config sets both 'dm_user_ids' and 'chat_channel_id' — every page would be "
+                "posted twice. With 'dm_user_ids' set, pages go to those direct messages: "
+                "leave 'chat_channel_id' empty")
+        if cfg["reply_relay"] is True:
+            errors.append(
+                "config 'dm_user_ids' and 'reply_relay' are both on — the relay reads a "
+                "channel's threads, and the Slack bridge replaced it (KIT-224): turn "
+                "'reply_relay' off")
+    elif not cfg["chat_channel_id"]:
         errors.append("config needs 'chat_channel_id' — the private channel to post to")
     if not cfg["team_keys"] or not isinstance(cfg["team_keys"], list):
         errors.append("config needs 'team_keys' as a non-empty list of tracker team keys")
@@ -900,6 +958,64 @@ def save_bridge_pings(cfg, bridge_state, now):
     except OSError as exc:
         raise NotifierError("could not save the bridge pings %s: %s"
                             % (bridge_pings_path(cfg), exc), code=EXIT_ERROR)
+
+
+def dm_posts_path(cfg):
+    return os.path.join(cfg["state_dir"], "notifier-dm-posts.json")
+
+
+def dm_post_key(channel, ts):
+    """A DM post's key in the ledger: `<channel>:<ts>`, with no `chat:` in front. The Slack
+    bridge reads exactly this spelling (KIT-296)."""
+    return "%s:%s" % (channel, ts)
+
+
+def load_dm_posts(cfg):
+    """The pages posted to direct messages (KIT-296). Read ONLY with `dm_user_ids` set.
+
+    A MISSING file has recorded nothing yet. A CORRUPT one refuses the pass before anything is
+    sent: without it a retried page could reach a person twice, and the bridge could not tell
+    which page an answer follows."""
+    path = dm_posts_path(cfg)
+    if not os.path.exists(path):
+        return {"posts": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise NotifierError("could not read the DM ledger %s: %s — I am refusing to run, since "
+                            "a page sent now could reach someone twice and could not be "
+                            "recorded for the bridge" % (path, exc), code=EXIT_ERROR)
+    # Every record is checked too: one that is not a record would fail each page it is
+    # compared with, every pass, with no name for the cause (KIT-296 review).
+    posts = doc.get("posts") if isinstance(doc, dict) else None
+    if (not isinstance(doc, dict) or doc.get("schema") != DM_POSTS_SCHEMA
+            or not isinstance(posts, dict)
+            or not all(isinstance(r, dict) and all(isinstance(r.get(f), str)
+                                                   for f in ("channel", "ts", "event_key"))
+                       for r in posts.values())):
+        raise NotifierError("the DM ledger %s is not a %s document, or a record in it is "
+                            "broken — I am refusing to run" % (path, DM_POSTS_SCHEMA),
+                            code=EXIT_ERROR)
+    return {"posts": dict(posts)}
+
+
+def save_dm_posts(cfg, dm_state, now, paged):
+    """Save the DM ledger. A post older than the relay's lookback is dropped, as the bridge's
+    pings are, but only once its page is in `paged`, the seen-set's sent half. A page still
+    owed to someone keeps its records however old they are: dropping one would let the retry
+    page that person a second time (KIT-296 review). A failure RAISES, like the bridge pings'
+    own save."""
+    horizon = now - RELAY_LOOKBACK_SECONDS
+    kept = dict((k, v) for k, v in dm_state["posts"].items()
+                if (_ts_seconds((v or {}).get("ts")) or 0) >= horizon
+                or (v or {}).get("event_key") not in paged)
+    dm_state["posts"] = kept
+    try:
+        _atomic_write_json(dm_posts_path(cfg), {"schema": DM_POSTS_SCHEMA, "posts": kept})
+    except OSError as exc:
+        raise NotifierError("could not save the DM ledger %s: %s"
+                            % (dm_posts_path(cfg), exc), code=EXIT_ERROR)
 
 
 def save_relay(cfg, relay_state):
@@ -1643,16 +1759,59 @@ class ChatScopeError(NotifierError):
     """The chat token lacks a scope the relay needs. Named, and never an empty result."""
 
 
+class ChatDMScopeError(NotifierError):
+    """The chat token cannot open a direct message: the bridge's app lacks `im:write`
+    (KIT-296). Named, and never a page that looks sent."""
+
+
 class ChatClient:
     """The chat side. Posts pings; its ONE read is a ping's thread, for the reply relay.
 
-    With `reply_relay` off, `thread_replies` is never called — the selftest counts it.
+    With `reply_relay` off, `thread_replies` is never called — the selftest counts it. With
+    `dm_user_ids` set it also opens each person's direct message, once per client.
     """
 
     def __init__(self, cfg, token):
         self.base = cfg["chat_api_base"]
         self.channel = cfg["chat_channel_id"]
         self.token = token
+        self._dms = {}
+
+    def open_dm(self, user_id):
+        """The direct-message channel, a `D…` id, between the app's bot and `user_id` (KIT-296).
+
+        `conversations.open` needs the `im:write` scope, which the Slack bridge's app holds for
+        this. The answer is kept for this client's life, so one pass asks once per person.
+        Every `ok: false` is RAISED, like a thread read's: a page with nowhere to go is a page
+        that did not land, never one that did.
+        """
+        if user_id in self._dms:
+            return self._dms[user_id]
+        doc = _post_json("%s/conversations.open" % self.base, {"users": user_id},
+                         {"Authorization": "Bearer %s" % self.token,
+                          "Content-Type": "application/json; charset=utf-8"})
+        if not isinstance(doc, dict):
+            raise NotifierError("conversations.open returned no JSON object", code=EXIT_ERROR)
+        if not doc.get("ok"):
+            error = doc.get("error") or "no error named"
+            if error == "missing_scope":
+                raise ChatDMScopeError(
+                    "I could not open a direct message with %s: the chat token is missing a "
+                    "scope (needed: %s; provided: %s). The Slack bridge's app needs im:write "
+                    "to page a person directly. Add it to that app and reinstall the app. No "
+                    "page reached that person"
+                    % (user_id, doc.get("needed") or "im:write",
+                       doc.get("provided") or "unknown"), code=EXIT_ERROR)
+            raise NotifierError("I could not open a direct message with %s: Slack said %s"
+                                % (user_id, error), code=EXIT_ERROR)
+        channel = (doc.get("channel") or {}).get("id") if isinstance(doc.get("channel"),
+                                                                      dict) else None
+        if not isinstance(channel, str) or not DM_CHANNEL_RE.match(channel):
+            raise NotifierError("I could not open a direct message with %s: Slack answered "
+                                "with no direct-message id (got %r)" % (user_id, channel),
+                                code=EXIT_ERROR)
+        self._dms[user_id] = channel
+        return channel
 
     def thread_replies(self, channel, parent_ts):
         """Every message in the thread under `parent_ts`, the parent included.
@@ -1695,10 +1854,11 @@ class ChatClient:
                             "guess which were read" % (parent_ts, RELAY_MAX_THREAD_PAGES),
                             code=EXIT_ERROR)
 
-    def post_message(self, text):
+    def post_message(self, text, channel=None):
+        """One top-level post: to `channel` when given (a DM, KIT-296), else the config's."""
         return _post_json(
             "%s/chat.postMessage" % self.base,
-            {"channel": self.channel, "text": text, "unfurl_links": False,
+            {"channel": channel or self.channel, "text": text, "unfurl_links": False,
              "unfurl_media": False},
             {"Authorization": "Bearer %s" % self.token,
              "Content-Type": "application/json; charset=utf-8"},
@@ -2063,6 +2223,102 @@ def relay_replies(cfg, tracker, chat, relay_state, dry_run, now, out=sys.stdout,
     return result
 
 
+def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets=()):
+    """Post one page, top-level, to each person in `dm_user_ids`, in order (KIT-296).
+
+    Returns (landed, reached, problems, unrecorded). `landed` is True only when every person
+    has the page: posted now, or posted on an earlier pass and held in the DM ledger.
+    `reached` is True when anyone has it, so the label need not wait on the last person.
+    `problems` names each person it did not reach. `unrecorded` names each DM post that went
+    out but could not be recorded for the bridge; `bridge_state` is None with `bridge_pings`
+    off. `paged` is the seen-set's sent half, which the ledger's save prunes by.
+
+    A token without `im:write` RAISES ChatDMScopeError: every person would answer the same,
+    so the pass says it once and pages nobody after it.
+
+    THE LEDGER IS WHAT MAKES A RETRY SAFE. A person the ledger already holds for this event is
+    never posted to again, so the pass after a partial failure pages only the people it
+    missed. Each post is recorded and SAVED before the next person is tried: a record lost
+    between a post and a save at the end would page that person again on the retry. A post
+    Slack took but gave no timestamp for cannot be recorded, so it counts as not landed: the
+    retry may page that person twice, the cost the seen-set already accepts, never a miss.
+    """
+    tid = event["ticket_id"]
+    landed, reached, problems, unrecorded = True, False, [], []
+    for user_id in cfg["dm_user_ids"]:
+        try:
+            channel = chat.open_dm(user_id)
+        except (Deadline, ChatDMScopeError):
+            raise
+        except Exception as exc:                                  # noqa: BLE001
+            landed = False
+            problems.append("%s: %s" % (tid, redact(str(exc), secrets))
+                            if isinstance(exc, NotifierError) else
+                            "%s: I could not open a direct message with %s (%s)"
+                            % (tid, user_id, redact(str(exc), secrets)))
+            continue
+        held = [r for r in dm_state["posts"].values()
+                if (r or {}).get("channel") == channel
+                and (r or {}).get("event_key") == event["key"]]
+        if held:
+            # Posted on an earlier pass whose page did not reach everyone. Never again.
+            posted, ts = channel, held[0].get("ts")
+            reached = True
+        else:
+            try:
+                reply = chat.post_message(text, channel=channel) or {}
+            except Deadline:
+                raise
+            except Exception as exc:                              # noqa: BLE001
+                landed = False
+                problems.append("%s: the direct message to %s failed (%s)"
+                                % (tid, user_id, redact(str(exc), secrets)))
+                continue
+            if not reply.get("ok"):
+                landed = False
+                problems.append("%s: chat refused the direct message to %s (%s)"
+                                % (tid, user_id, redact(str(reply.get("error")), secrets)))
+                continue
+            reached = True              # this person has it, whatever happens to its record
+            posted, ts = reply.get("channel") or channel, reply.get("ts")
+            if not ts:
+                landed = False
+                problems.append("%s: Slack took the page for %s but gave back no message "
+                                "timestamp, so I could not record it — the next pass posts it "
+                                "again" % (tid, user_id))
+                continue
+            dm_state["posts"][dm_post_key(posted, ts)] = {
+                "channel": posted, "ts": ts, "ticket_id": tid, "mark": event["mark"],
+                "event_key": event["key"], "recorded_at": _iso_at(now)}
+            try:
+                save_dm_posts(cfg, dm_state, now, paged)
+            except NotifierError as exc:
+                # The record stays in memory, so a later save this pass can still keep it,
+                # and the pass tries one more save at its end (run_once).
+                dm_state["unsaved"] = True
+                landed = False
+                problems.append("%s: I paged %s, but could not record it in the DM ledger (%s) "
+                                "— I kept the page out of the seen-set, so the next pass tries "
+                                "again, and %s may see it twice"
+                                % (tid, user_id, redact(str(exc), secrets), user_id))
+                continue
+        # KIT-224's record for the bridge, once per DM post, in today's shape. A post the
+        # ledger held is checked too: a record whose save failed on an earlier pass is made now.
+        if (bridge_state is not None and is_relayable_mark(event["mark"])
+                and chat_message_key(posted, ts) not in bridge_state["messages"]):
+            recorded = record_relayable(bridge_state, posted, ts, event, _iso_at(now))
+            try:
+                save_bridge_pings(cfg, bridge_state, now)
+            except NotifierError as exc:
+                bridge_state["messages"].pop(recorded, None)
+                unrecorded.append(
+                    "%s: the page to %s was sent but could not be recorded for the bridge (%s) "
+                    "— its key is kept out of the seen-set, so the next pass records it, and "
+                    "the DM ledger stops a second page"
+                    % (tid, user_id, redact(str(exc), secrets)))
+    return landed, reached, problems, unrecorded
+
+
 def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
     """One scan-decide-send pass. Returns a result dict; never raises for one bad event.
 
@@ -2075,7 +2331,9 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
     board. An event whose ping landed but whose label write failed is in the first and not
     the second, so the NEXT pass retries the label alone — it neither re-pages the owner nor
     silently abandons the supervision hold. Recording one combined "done" would have made a
-    failed label permanent and invisible, which is how this was first written and wrong.
+    failed label permanent and invisible, which is how this was first written and wrong. In
+    DM mode a page that reached some people and missed others is the other way round:
+    labelled, and not yet sent, so the next pass pages only the people it missed.
 
     The retry itself arrives as a SETTLE event out of select_events(), which is the only
     place it can be built — see there. This function must not try to spot owed labels in
@@ -2094,7 +2352,14 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
         # installer's verify reads this file to see the switch is on (KIT-224 review). A
         # failed write refuses the pass before anything is sent.
         save_bridge_pings(cfg, bridge_state, now)
-    bridge_failures = []
+    # KIT-296: pages go to direct messages instead of the channel. The ledger is read FIRST, so
+    # a corrupt one refuses the pass before anything is sent, and written on the first pass,
+    # before any page, like the bridge pings. A dry run writes nothing.
+    dm_on = bool(cfg.get("dm_user_ids"))
+    dm_state = load_dm_posts(cfg) if dm_on else None
+    if dm_on and not dry_run and not os.path.exists(dm_posts_path(cfg)):
+        save_dm_posts(cfg, dm_state, now, sent_keys)
+    bridge_failures, dm_failures = [], []
     tickets, read_failures = [], []
     for team in cfg["team_keys"]:
         try:
@@ -2214,7 +2479,12 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                 continue
 
             if dry_run:
-                out.write("WOULD SEND  %s  %s\n" % (event["ticket_id"], event["mark"]))
+                if dm_on:
+                    out.write("WOULD SEND  %s  %s  to the direct messages of %s\n"
+                              % (event["ticket_id"], event["mark"],
+                                 ", ".join(cfg["dm_user_ids"])))
+                else:
+                    out.write("WOULD SEND  %s  %s\n" % (event["ticket_id"], event["mark"]))
                 out.write("            %s\n" % text.replace("\n", " | "))
                 if event["label"]:
                     out.write("WOULD LABEL %s  %s\n"
@@ -2222,15 +2492,51 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                 sent += 1
                 continue
 
-            reply = chat.post_message(text)
-            if not (reply or {}).get("ok"):
-                declined += 1
-                problems.append("%s: chat refused (%s)"
-                                % (event["ticket_id"],
-                                   redact(str((reply or {}).get("error")), secrets)))
-                continue
-            sent += 1
-            sent_keys.add(event["key"])
+            if dm_on:
+                # KIT-296: the same text to each person's DM. A page that missed anyone is
+                # declined and kept out of the seen-set; the ledger stops the retry paging
+                # anyone it already reached. A post the bridge could not record keeps the key
+                # out too, so the next pass records it — exactly as a channel ping does.
+                if dm_failures:
+                    # The token cannot open a DM, so this page cannot go either. Owed, not sent.
+                    declined += 1
+                    continue
+                try:
+                    landed, reached, dm_problems, unrecorded = page_dms(
+                        cfg, chat, dm_state, bridge_state if bridge_on else None, event, text,
+                        now, sent_keys, secrets)
+                except ChatDMScopeError as exc:
+                    # Every DM would answer the same: said once, and no DM is opened after it.
+                    declined += 1
+                    dm_failures.append(redact(str(exc), secrets))
+                    continue
+                bridge_failures.extend(unrecorded)
+                if landed:
+                    sent += 1
+                    if not unrecorded:
+                        sent_keys.add(event["key"])
+                else:
+                    declined += 1
+                    problems.extend(dm_problems)
+                    if not reached:
+                        continue
+                    # Someone has the page, so the board says so now: the label below is not
+                    # held back for the person it missed. The key stays out of the seen-set,
+                    # so the next pass pages that person alone (KIT-296 review).
+                if event["key"] in labelled_keys:
+                    # Labelled when this page first reached someone. Never again: a person
+                    # may have taken the label off since, as they can after a channel ping.
+                    continue
+            else:
+                reply = chat.post_message(text)
+                if not (reply or {}).get("ok"):
+                    declined += 1
+                    problems.append("%s: chat refused (%s)"
+                                    % (event["ticket_id"],
+                                       redact(str((reply or {}).get("error")), secrets)))
+                    continue
+                sent += 1
+                sent_keys.add(event["key"])
 
             # Only with the switch on, and only for the agent:blocked mark: remember which
             # chat message this ping is, and which thread its mark sits in, so a reply under
@@ -2264,8 +2570,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
 
             # KIT-224: the same record, kept for the Slack bridge instead, which answers in
             # the relay's place. Saved at once, and a failed save keeps the key out of the
-            # seen-set, exactly as the relay's own record does.
-            if bridge_on and is_relayable_mark(event["mark"]):
+            # seen-set, exactly as the relay's own record does. In DM mode page_dms records it.
+            if bridge_on and not dm_on and is_relayable_mark(event["mark"]):
                 recorded = record_relayable(
                     bridge_state,
                     (reply or {}).get("channel") or cfg["chat_channel_id"],
@@ -2311,6 +2617,15 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
             declined += 1
             problems.append("%s: %s" % (event.get("ticket_id"),
                                         redact(str(exc), secrets)))
+
+    if dm_on and not dry_run and dm_state.get("unsaved"):
+        # A DM ledger save above failed, and its record is still in memory. One more try
+        # keeps it, so the next pass does not page that person again. A second failure was
+        # already named on the page it held back, so it is not named twice.
+        try:
+            save_dm_posts(cfg, dm_state, now, sent_keys)
+        except NotifierError:
+            pass
 
     if not dry_run:
         save_seen(cfg, sent_keys, labelled_keys)
@@ -2385,6 +2700,16 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
             code = EXIT_ERROR
             summary = ("FAIL: a ping could not be recorded for the bridge: %s | %s"
                        % ("; ".join(bridge_failures), summary))
+    if dm_on:
+        summary += (" | direct messages: ON, each page to %d person(s) through $%s; %d post(s) "
+                    "in the DM ledger" % (len(cfg["dm_user_ids"]), cfg["chat_token_env"],
+                                          len(dm_state["posts"])))
+        if dm_failures:
+            # Could not do it, not a decline: nobody can be paged until the app has the
+            # scope. It leads the summary, as the relay's own missing scope does.
+            code = EXIT_ERROR
+            summary = ("FAIL: I could not page anyone in their direct messages: %s | %s"
+                       % ("; ".join(dm_failures), summary))
     # …and so do the daemon-health marks: on from which authors, or OFF and how many unpaged.
     if cfg.get("monitor_actor_ids"):
         summary += (" | daemon-health marks: ON, from %d monitor author id(s)"
@@ -3446,6 +3771,9 @@ def selftest():
         # ── §11z. Pings recorded for the Slack bridge (KIT-224) ──────────────────────
         _bridge_pings_selftest(ok, tmp, good)
 
+        # ── §12. Pages to direct messages, through the bridge's app (KIT-296) ─────────
+        _dm_selftest(ok, tmp, good)
+
     # ── §10. What it never does — asserted against this file's own source ────────
     source = open(__file__, encoding="utf-8").read()
     # Scan EVERYTHING except the selftest body: a prefix split left main() unscanned, so a
@@ -4336,6 +4664,446 @@ def _bridge_pings_selftest(ok, tmp, good):
     run_once(cfg_new, _FakeTracker(two), chat_again, False, out=buf, now=NOW)
     ok("…and its key stays out of the seen-set: the next pass pages it, and only it, again",
        len(chat_again.posts) == 1 and lost in chat_again.posts[0], (lost, chat_again.posts))
+
+
+def _dm_selftest(ok, tmp, good):
+    """§12 — KIT-296: each page goes to each named person's direct message, through the Slack
+    bridge's app. The REAL chat client runs every case, with `_post_json` swapped for a
+    recorder, so what Slack would be sent is what is checked. Lives in the span §10's
+    own-source scan skips, like the relay's own selftest.
+
+    Each case runs through `case`: one that raises is a named failure, and the battery still
+    prints its count line."""
+    import io
+    NOW = 1800000000.0
+    U1, U2 = "U0SYNTH0001", "W0SYNTH0002"
+    D1, D2 = "D0SYNTH0001", "D0SYNTH0002"
+    DMS = {U1: D1, U2: D2}
+    # The contract strings, spelled out and not read from the constants, as §1 spells the marks.
+    LEDGER_SCHEMA = "pipeline-notifier-dm-posts/1"
+    LEDGER_FIELDS = {"channel", "ts", "ticket_id", "mark", "event_key", "recorded_at"}
+    PING_FIELDS = {"channel", "ts", "ticket_id", "event_key", "comment_id", "thread_id", "mark",
+                   "recorded_at"}
+
+    def case(name, fn):
+        try:
+            cond, detail = fn()
+        except Exception as exc:                                  # noqa: BLE001
+            cond, detail = False, "raised %r" % (exc,)
+        ok(name, cond, detail)
+
+    def cfg_for(name, **over):
+        doc = dict(good, state_dir=os.path.join(tmp, "dm-" + name), chat_channel_id="",
+                   dm_user_ids=[U1])
+        doc.update(over)
+        return load_config_from(doc, tmp)
+
+    def marker(label):
+        return "<!-- pipeline-escalation: %s -->" % label
+
+    def ticket(tid, mark, cid, parent=None, title="T"):
+        return {"id": tid, "uuid": "u-" + tid, "title": title, "label_ids": [],
+                "comments": [{"id": cid, "body": marker(mark) + "\nwhich one?",
+                              "author_id": "a-session", "parent_id": parent}]}
+
+    def run(cfg, tickets, refuse=(), scope=False, dry=False, now=NOW, tracker=None):
+        """One pass through the real ChatClient. Returns (result, calls, out, raised). `refuse`
+        names the D ids whose post Slack refuses; `scope` makes every DM open answer
+        missing_scope. `now` is the pass's clock, and `tracker` a _FakeTracker to read the
+        labels back from. Each call is recorded as (url, payload, headers)."""
+        calls, out = [], io.StringIO()
+
+        def fake_post(url, payload, headers, timeout=20):
+            calls.append((url, dict(payload), dict(headers)))
+            if url.endswith("/conversations.open"):
+                if scope:
+                    return {"ok": False, "error": "missing_scope", "needed": "im:write",
+                            "provided": "chat:write"}
+                return {"ok": True, "channel": {"id": DMS[payload["users"]]}}
+            if payload.get("channel") in refuse:
+                return {"ok": False, "error": "channel_not_found"}
+            return {"ok": True, "channel": payload.get("channel"),
+                    "ts": "%.6f" % (now + len(calls))}
+
+        saved, res, raised = _post_json, None, None
+        globals()["_post_json"] = fake_post
+        try:
+            res = run_once(cfg, tracker if tracker is not None else _FakeTracker(tickets),
+                           ChatClient(cfg, "test-token"), dry, out=out, now=now)
+        except NotifierError as exc:
+            raised = exc
+        finally:
+            globals()["_post_json"] = saved
+        return res, calls, out.getvalue(), raised
+
+    def method(call):
+        return call[0].rsplit("/", 1)[-1]
+
+    def posted_to(calls):
+        return [c[1].get("channel") for c in calls if method(c) == "chat.postMessage"]
+
+    def read_json(path):
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def failing_once(name):
+        """Swap this module's function `name` for one whose first call fails, as a full disk
+        would, and whose later calls are the real one. Returns the undo."""
+        real, left = globals()[name], [1]
+
+        def once(*args, **kwargs):
+            if left[0]:
+                left[0] -= 1
+                raise NotifierError("the disk said no", code=EXIT_ERROR)
+            return real(*args, **kwargs)
+        globals()[name] = once
+        return lambda: globals().__setitem__(name, real)
+
+    # ── 12a. One page, one person: the DM is opened, and the page posted there, top-level ──
+    def top_level():
+        cfg = cfg_for("one")
+        res, calls, _out, raised = run(cfg, [ticket("KIT-50", ESC_BLOCKED, "d1", "root-50")])
+        post = calls[1][1] if len(calls) > 1 else {}
+        return (raised is None and [method(c) for c in calls]
+                == ["conversations.open", "chat.postMessage"]
+                and calls[0][1] == {"users": U1} and post.get("channel") == D1
+                and "thread_ts" not in post and res["sent"] == 1 and res["exit"] == EXIT_OK
+                and "direct messages: ON" in res["summary"]), (raised, calls, res)
+    case("dm-page-posted-top-level-to-D-id: the page opens the person's DM and is posted "
+         "there, top-level", top_level)
+
+    # ── 12b. Two people, two pages: each page to each DM, in order, one open per person ──
+    def two_users():
+        cfg = cfg_for("two", dm_user_ids=[U1, U2])
+        res, calls, _out, raised = run(cfg, [ticket("KIT-51", ESC_NEEDS_HUMAN, "d2"),
+                                             ticket("KIT-52", ESC_BLOCKED, "d3", "root-52")])
+        opens = [c[1].get("users") for c in calls if method(c) == "conversations.open"]
+        texts = [c[1].get("text") for c in calls if method(c) == "chat.postMessage"]
+        want = [mention_prefix(m, cfg) + build_message(m, t, "T", ticket_url(cfg, t))
+                for m, t in ((ESC_NEEDS_HUMAN, "KIT-51"), (ESC_BLOCKED, "KIT-52"))]
+        return (raised is None and opens == [U1, U2] and posted_to(calls) == [D1, D2, D1, D2]
+                and texts == [want[0], want[0], want[1], want[1]] and res["sent"] == 2
+                and res["exit"] == EXIT_OK), (raised, opens, posted_to(calls), texts)
+    case("dm-two-users-two-posts: the same text goes to each person's DM, in the order named, "
+         "and each DM is opened once a pass", two_users)
+
+    # ── 12c. The config refuses what would post twice, or answer twice ──────────────────────
+    def refused(over, needle):
+        try:
+            cfg_for("refused", **over)
+            return False, "loaded"
+        except NotifierError as exc:
+            return needle in str(exc), str(exc)
+    case("dm-with-chat-channel-refused: a channel and DMs together are refused, naming both",
+         lambda: refused({"chat_channel_id": "C0123456789"},
+                         "config sets both 'dm_user_ids' and 'chat_channel_id'"))
+    case("dm-with-reply-relay-refused: DMs with the reply relay on are refused",
+         lambda: refused({"reply_relay": True, "owner_chat_user_id": "U0OWNER001",
+                          "dispatcher_agent_user_id": "agent-1"},
+                         "config 'dm_user_ids' and 'reply_relay' are both on"))
+    def bad_ids():
+        got = [refused({"dm_user_ids": bad}, "'dm_user_ids' must be a list of Slack member ids")
+               for bad in (["@owner"], ["C0SYNTH0001"], ["u0synth0001"], U1)]
+        return all(g[0] for g in got), got
+    case("dm-ids-must-be-member-ids: a display name, a channel id, a lower-case id and a bare "
+         "string are each refused", bad_ids)
+    case("dm-repeated-id-refused: an id named twice is refused",
+         lambda: refused({"dm_user_ids": [U1, U1]}, "'dm_user_ids' repeats an id"))
+
+    # ── 12d. The ledger: its record shape, its first write, its pruning, its refusal ────────
+    def ledger_shape():
+        cfg = cfg_for("shape")
+        _res, _calls, _out, raised = run(cfg, [ticket("KIT-53", ESC_BLOCKED, "d4", "root-53")])
+        doc = read_json(dm_posts_path(cfg))
+        recs = list((doc.get("posts") or {}).items())
+        key, rec = recs[0] if recs else ("", {})
+        return (raised is None and doc.get("schema") == LEDGER_SCHEMA and len(recs) == 1
+                and key == "%s:%s" % (D1, rec.get("ts")) and set(rec) == LEDGER_FIELDS
+                and rec["channel"] == D1 and rec["ticket_id"] == "KIT-53"
+                and rec["mark"] == ESC_BLOCKED and rec["event_key"] == "comment:d4"
+                and rec["recorded_at"] == _iso_at(NOW)), doc
+    case("dm-ledger-written-with-record-shape: each DM post is recorded as "
+         "<channel>:<ts>, with no chat: in front", ledger_shape)
+
+    def first_pass():
+        cfg = cfg_for("first")
+        _r, dry_calls, _o, _e = run(cfg, [], dry=True)
+        dry_wrote = os.path.exists(dm_posts_path(cfg))
+        _r, calls, _o, raised = run(cfg, [])
+        doc = read_json(dm_posts_path(cfg))
+        return (raised is None and not dry_wrote and dry_calls == [] and calls == []
+                and doc == {"schema": LEDGER_SCHEMA, "posts": {}}), (dry_wrote, doc)
+    case("dm-ledger-empty-on-first-pass: the first pass writes an empty ledger before any "
+         "page, and a dry run writes none", first_pass)
+
+    def pruned():
+        cfg = cfg_for("prune")
+        os.makedirs(cfg["state_dir"], exist_ok=True)
+        old, young = "%.6f" % (NOW - 8 * 86400), "%.6f" % (NOW - 6 * 86400)
+        with open(dm_posts_path(cfg), "w", encoding="utf-8") as fh:
+            json.dump({"schema": LEDGER_SCHEMA, "posts": {
+                "%s:%s" % (D1, old): {"channel": D1, "ts": old, "ticket_id": "KIT-1",
+                                      "event_key": "comment:old"},
+                "%s:%s" % (D1, young): {"channel": D1, "ts": young, "ticket_id": "KIT-2",
+                                        "event_key": "comment:young"}}}, fh)
+        # Both pages reached everyone, so both keys are in the seen-set.
+        save_seen(cfg, {"comment:old", "comment:young"}, {"comment:old", "comment:young"})
+        _r, _c, _o, raised = run(cfg, [ticket("KIT-54", ESC_BLOCKED, "d5", "root-54")])
+        kept = sorted(r.get("ticket_id") for r in read_json(dm_posts_path(cfg))["posts"].values())
+        return raised is None and kept == ["KIT-2", "KIT-54"], kept
+    case("dm-ledger-pruned-after-7-days: a save drops posts older than seven days and keeps "
+         "the rest", pruned)
+
+    def owed_kept():
+        # The second person can never be reached. The first person's record of KIT-63 must
+        # outlive seven days, or a later save drops it and the retry pages them again.
+        cfg = cfg_for("owed-kept", dm_user_ids=[U1, U2])
+        first = ticket("KIT-63", ESC_BLOCKED, "d14", "root-63")
+        later = ticket("KIT-64", ESC_NEEDS_HUMAN, "d15")
+        _r, c0, _o, e0 = run(cfg, [first], refuse=(D2,))
+        _r, c8, _o, e8 = run(cfg, [first, later], refuse=(D2,), now=NOW + 8 * 86400)
+        r9, c9, _o, e9 = run(cfg, [first, later], refuse=(D2,), now=NOW + 8.01 * 86400)
+        kept = sorted(r["ticket_id"] for r in read_json(dm_posts_path(cfg))["posts"].values())
+        return (e0 is None and e8 is None and e9 is None and posted_to(c0) == [D1, D2]
+                and posted_to(c8) == [D2, D1, D2] and posted_to(c9) == [D2, D2]
+                and kept == ["KIT-63", "KIT-64"] and r9["exit"] == EXIT_DECLINED), (
+                    posted_to(c0), posted_to(c8), posted_to(c9), kept)
+    case("dm-owed-page-kept-past-7-days: a page still owed to someone keeps its ledger record "
+         "however old, so the person it reached is never paged again", owed_kept)
+
+    def corrupt():
+        seen = []
+        for name, body in (("garbage", "{not json"),
+                           ("schema", json.dumps({"schema": "pipeline-notifier-bridge-pings/1",
+                                                  "messages": {}}))):
+            cfg = cfg_for("corrupt-" + name)
+            os.makedirs(cfg["state_dir"], exist_ok=True)
+            with open(dm_posts_path(cfg), "w", encoding="utf-8") as fh:
+                fh.write(body)
+            _r, calls, _o, raised = run(cfg, [ticket("KIT-55", ESC_BLOCKED, "d6", "root-55")])
+            seen.append(isinstance(raised, NotifierError) and raised.code == EXIT_ERROR
+                        and "DM ledger" in str(raised) and calls == [])
+        return seen == [True, True], seen
+    case("dm-corrupt-ledger-refuses-pass-before-send: a ledger that is not JSON, or not this "
+         "schema, refuses the pass before any call to Slack", corrupt)
+
+    def broken_record():
+        seen = []
+        for name, doc in (("no-posts", {"schema": LEDGER_SCHEMA}),
+                          ("not-a-record", {"schema": LEDGER_SCHEMA, "posts": {"x": "no"}}),
+                          ("no-event-key", {"schema": LEDGER_SCHEMA, "posts": {
+                              "%s:1.0" % D1: {"channel": D1, "ts": "1.0"}}})):
+            cfg = cfg_for("broken-" + name)
+            os.makedirs(cfg["state_dir"], exist_ok=True)
+            with open(dm_posts_path(cfg), "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            _r, calls, _o, raised = run(cfg, [ticket("KIT-65", ESC_BLOCKED, "d16", "root-65")])
+            seen.append(isinstance(raised, NotifierError) and raised.code == EXIT_ERROR
+                        and "a record in it is broken" in str(raised) and calls == [])
+        return seen == [True, True, True], seen
+    case("dm-broken-ledger-record-refuses-pass-before-send: a ledger with no posts, or a record "
+         "that is not one, refuses the pass by name before any call to Slack", broken_record)
+
+    # ── 12e. A page that missed someone is retried, and nobody gets it twice ───────────────
+    def partial():
+        cfg = cfg_for("partial", dm_user_ids=[U1, U2])
+        page = [ticket("KIT-56", ESC_NEEDS_HUMAN, "d7")]
+        r1, c1, _o, e1 = run(cfg, page, refuse=(D2,))
+        sent1 = load_seen(cfg)["sent"]
+        r2, c2, _o, e2 = run(cfg, page)
+        sent2 = load_seen(cfg)["sent"]
+        r3, c3, _o, e3 = run(cfg, page)
+        return (e1 is None and e2 is None and e3 is None
+                and r1["exit"] == EXIT_DECLINED and U2 in r1["summary"]
+                and "comment:d7" not in sent1 and posted_to(c1) == [D1, D2]
+                and posted_to(c2) == [D2] and r2["exit"] == EXIT_OK and "comment:d7" in sent2
+                and posted_to(c3) == []), (r1 and r1["summary"], posted_to(c1), posted_to(c2),
+                                           posted_to(c3))
+    case("dm-partial-failure-retries-without-double-post: a person the page missed gets it on "
+         "the next pass, and a person it reached does not get it again", partial)
+
+    def partial_label():
+        cfg = cfg_for("partial-label", dm_user_ids=[U1, U2])
+        page = [ticket("KIT-66", ESC_BLOCKED, "d17", "root-66")]
+        tr = _FakeTracker(page)
+        res, calls, _o, raised = run(cfg, page, refuse=(D2,), tracker=tr)
+        seen = load_seen(cfg)
+        # The next pass finds the label gone, as when a person took it off. Not put back.
+        tr2 = _FakeTracker(page)
+        _r, c2, _o, e2 = run(cfg, page, refuse=(D2,), tracker=tr2)
+        return (raised is None and posted_to(calls) == [D1, D2] and tr.labels == [("u-KIT-66",
+                "L1")] and res["exit"] == EXIT_DECLINED and "comment:d17" in seen["labelled"]
+                and "comment:d17" not in seen["sent"] and e2 is None and posted_to(c2) == [D2]
+                and tr2.labels == []), (tr.labels, seen, res["summary"], tr2.labels)
+    case("dm-partial-page-applies-the-label: a page that reached one person but missed another "
+         "puts its label on the ticket once, and stays owed to the person it missed",
+         partial_label)
+
+    def ledger_save_fails():
+        cfg = cfg_for("save-fails", dm_user_ids=[U1, U2])
+        run(cfg, [])                                  # the first pass writes the empty ledger
+        page = [ticket("KIT-67", ESC_NEEDS_HUMAN, "d18")]
+        undo = failing_once("save_dm_posts")
+        try:
+            r1, c1, _o, e1 = run(cfg, page)
+        finally:
+            undo()
+        sent1 = load_seen(cfg)["sent"]
+        r2, c2, _o, e2 = run(cfg, page)
+        return (e1 is None and e2 is None and posted_to(c1) == [D1, D2]
+                and r1["exit"] == EXIT_DECLINED and "could not record it in the DM ledger"
+                in r1["summary"] and "comment:d18" not in sent1 and posted_to(c2) == []
+                and r2["exit"] == EXIT_OK and "comment:d18" in load_seen(cfg)["sent"]), (
+                    posted_to(c1), r1["summary"], posted_to(c2))
+    case("dm-ledger-save-failure-declines-and-skips-on-retry: a post whose record could not be "
+         "saved declines the page, and the retry pages nobody the ledger kept", ledger_save_fails)
+
+    def last_save_kept():
+        cfg = cfg_for("last-save")
+        run(cfg, [])
+        page = [ticket("KIT-68", ESC_NEEDS_HUMAN, "d19")]
+        undo = failing_once("save_dm_posts")
+        try:
+            r1, c1, _o, e1 = run(cfg, page)
+        finally:
+            undo()
+        r2, c2, _o, e2 = run(cfg, page)
+        return (e1 is None and e2 is None and posted_to(c1) == [D1]
+                and r1["exit"] == EXIT_DECLINED and posted_to(c2) == []
+                and r2["exit"] == EXIT_OK), (posted_to(c1), posted_to(c2))
+    case("dm-failed-ledger-save-tried-again-at-pass-end: when the only person's record could "
+         "not be saved, one more save at the end keeps it, and the retry does not page again",
+         last_save_kept)
+
+    # ── 12f. The bridge's record, once per DM post, carrying the DM's channel ──────────────
+    def bridge():
+        cfg = cfg_for("bridge", dm_user_ids=[U1, U2], bridge_pings=True)
+        res, calls, _o, raised = run(cfg, [ticket("KIT-57", ESC_BLOCKED, "d8", "root-57"),
+                                           ticket("KIT-58", ESC_NEEDS_HUMAN, "d9", "root-58")])
+        pings = read_json(bridge_pings_path(cfg))["messages"]
+        ledger = read_json(dm_posts_path(cfg))["posts"]
+        return (raised is None and res["exit"] == EXIT_OK
+                and sorted(r.get("channel") for r in pings.values()) == [D1, D2]
+                and all(set(r) == PING_FIELDS and r["ticket_id"] == "KIT-57"
+                        and r["thread_id"] == "root-57"
+                        and k == "chat:%s:%s" % (r["channel"], r["ts"])
+                        and "%s:%s" % (r["channel"], r["ts"]) in ledger
+                        for k, r in pings.items())), (pings, ledger)
+    case("dm-bridge-pings-record-carries-D-channel: with bridge pings on, an agent:blocked page "
+         "is recorded once per DM post, in today's shape, under the DM's channel", bridge)
+
+    def bridge_save_fails():
+        cfg = cfg_for("bridge-fails", bridge_pings=True)
+        run(cfg, [])                                  # the first pass writes both files
+        page = [ticket("KIT-69", ESC_BLOCKED, "d20", "root-69")]
+        undo = failing_once("save_bridge_pings")
+        try:
+            r1, c1, _o, e1 = run(cfg, page)
+        finally:
+            undo()
+        sent1 = load_seen(cfg)["sent"]
+        r2, c2, _o, e2 = run(cfg, page)
+        pings = read_json(bridge_pings_path(cfg))["messages"]
+        ledger = read_json(dm_posts_path(cfg))["posts"]
+        return (e1 is None and e2 is None and posted_to(c1) == [D1]
+                and r1["exit"] == EXIT_ERROR and "comment:d20" not in sent1
+                and posted_to(c2) == [] and r2["exit"] == EXIT_OK
+                and "comment:d20" in load_seen(cfg)["sent"] and len(ledger) == 1
+                and sorted(pings) == ["chat:" + k for k in ledger]), (
+                    r1["summary"], posted_to(c2), pings, ledger)
+    case("dm-bridge-save-failure-records-next-pass-without-repost: a DM post the bridge could "
+         "not record fails the pass, and the next pass records it without posting again",
+         bridge_save_fails)
+
+    # ── 12g. A token that cannot open a DM is named, and pages nobody ──────────────────────
+    def no_scope():
+        cfg = cfg_for("scope")
+        saved, raised = _post_json, None
+        globals()["_post_json"] = lambda url, payload, headers, timeout=20: {
+            "ok": False, "error": "missing_scope", "needed": "im:write",
+            "provided": "chat:write"}
+        try:
+            ChatClient(cfg, "test-token").open_dm(U1)
+        except ChatDMScopeError as exc:
+            raised = str(exc)
+        finally:
+            globals()["_post_json"] = saved
+        cfg = cfg_for("scope", dm_user_ids=[U1, U2])
+        res, calls, _o, err = run(cfg, [ticket("KIT-59", ESC_BLOCKED, "d10", "root-59"),
+                                        ticket("KIT-70", ESC_NEEDS_HUMAN, "d21")], scope=True)
+        sent = load_seen(cfg)["sent"]
+        return (raised is not None and "im:write" in raised and "groups:history" not in raised
+                and err is None and res["exit"] == EXIT_ERROR
+                and res["summary"].startswith("FAIL: ") and "im:write" in res["summary"]
+                and res["summary"].count("I could not open a direct message") == 1
+                and [method(c) for c in calls] == ["conversations.open"] and res["declined"] == 2
+                and "comment:d10" not in sent and "comment:d21" not in sent), (
+                    raised, calls, res and res["summary"])
+    case("dm-open-missing-scope-names-im-write: a token without im:write is said once, fails "
+         "the pass, and no page looks sent", no_scope)
+
+    def not_a_dm():
+        cfg = cfg_for("not-a-dm")
+        calls, saved, said = [], _post_json, []
+
+        def channel_answer(url, payload, headers, timeout=20):
+            calls.append(url.rsplit("/", 1)[-1])
+            return {"ok": True, "channel": {"id": "C0SYNTH0001"}}
+        globals()["_post_json"] = channel_answer
+        try:
+            client = ChatClient(cfg, "test-token")
+            for _ in range(2):          # twice: a refused answer is never kept as a DM
+                try:
+                    client.open_dm(U1)
+                    said.append(None)
+                except NotifierError as exc:
+                    said.append(str(exc))
+        finally:
+            globals()["_post_json"] = saved
+        return (calls == ["conversations.open", "conversations.open"]
+                and all(s and "no direct-message id" in s for s in said)), (calls, said)
+    case("dm-open-answer-that-is-not-a-DM-is-refused: an id that is not D… is never kept or "
+         "posted to", not_a_dm)
+
+    # ── 12h. Dry run, and a withheld title, behave as they do for a channel ────────────────
+    def dry():
+        cfg = cfg_for("dry", dm_user_ids=[U1, U2])
+        res, calls, out, raised = run(cfg, [ticket("KIT-60", ESC_BLOCKED, "d11", "root-60")],
+                                      dry=True)
+        return (raised is None and calls == [] and res["sent"] == 1 and res["dry"] is True
+                and "WOULD SEND  KIT-60  agent:blocked  to the direct messages of "
+                    "U0SYNTH0001, W0SYNTH0002" in out
+                and not os.path.exists(dm_posts_path(cfg))), out
+    case("dm-dry-run-names-the-people: a dry run names who it would page, and calls nothing",
+         dry)
+
+    def withheld():
+        cfg = cfg_for("secret")
+        title = "rotate " + "xo" + "xb-" + "1234567890abcdefghij"
+        res, calls, _o, raised = run(cfg, [ticket("KIT-61", ESC_BLOCKED, "d12", "root-61",
+                                                  title=title)])
+        return (raised is None and calls == [] and res["exit"] == EXIT_DECLINED
+                and "withheld" in res["summary"]), (calls, res and res["summary"])
+    case("dm-secret-title-withheld: a title with a credential shape is withheld before any DM "
+         "is opened", withheld)
+
+    # ── 12i. Channel mode, byte for byte: no DM opened, no ledger, today's one payload ─────
+    def channel_mode():
+        cfg = load_config_from(dict(good, state_dir=os.path.join(tmp, "dm-channel"),
+                                    dm_user_ids=[]), tmp)
+        res, calls, _o, raised = run(cfg, [ticket("KIT-62", ESC_BLOCKED, "d13", "root-62")])
+        text = mention_prefix(ESC_BLOCKED, cfg) + build_message(
+            ESC_BLOCKED, "KIT-62", "T", ticket_url(cfg, "KIT-62"))
+        return (raised is None and calls == [(
+            "https://slack.com/api/chat.postMessage",
+            {"channel": "C0123456789", "text": text, "unfurl_links": False,
+             "unfurl_media": False},
+            {"Authorization": "Bearer test-token",
+             "Content-Type": "application/json; charset=utf-8"})]
+            and not os.path.exists(dm_posts_path(cfg)) and res["exit"] == EXIT_OK
+            and "direct messages" not in res["summary"]), (calls, res and res["summary"])
+    case("dm-channel-mode-byte-identical: with dm_user_ids empty, the one call is today's "
+         "chat.postMessage and no DM is opened", channel_mode)
 
 
 def load_config_from(doc, tmpdir):

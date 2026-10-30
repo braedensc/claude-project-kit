@@ -2,7 +2,7 @@
 
 The tracker notifies you about everything the same way. The few events that need a
 decision drown in bookkeeping. The notifier separates them: one short ping per event, to
-one private Slack channel.
+one private Slack channel, or straight to your direct messages (*DM mode*, below).
 
 **Mechanism** ships in this kit as tested scripts. **Activation** is yours, at your own
 terminal. No session installs, loads or edits it. This file is generic on purpose: no
@@ -189,6 +189,52 @@ token included (KIT-171). A Stage E installer from before that fix rewrote the w
 file and dropped this token. If one of those changed Stage E's credentials, run this
 installer again.
 
+## DM mode — pings in your direct messages (KIT-296)
+
+Set `DM_USER_IDS` in `notifier.conf` to your Slack member id, and empty `CHAT_CHANNEL_ID`.
+Each ping then goes to your direct messages, as its own message, not to the channel. Name
+more than one id and each person gets the same ping, in the order you wrote them. The ping's
+words do not change.
+
+**It posts through the Slack bridge's app.** Install the bridge first
+(`docs/BRIDGE-OPERATOR.md`). Its card `CK-B1` makes the app, which needs `chat:write` and
+`im:write`. The token is then the bridge's, `BRIDGE_SLACK_BOT_TOKEN`: the example's
+`CHAT_TOKEN_ENV` line switches to it on its own. Name another, and the `slack-app` row warns
+you. It does not fail.
+
+**The bridge must work in your DM too.** That needs the bridge from KIT-295 or later. Set
+its own `DM_USER_IDS` to the same ids, as its guide's *Working in your DM* says. An older
+bridge does not read the DM ledger, so it never sees an answer under a DM ping.
+
+**One app is enough here.** Both jobs run as the same role account, from the same env file.
+So the notifier holds nothing the bridge does not. A ping binds nothing either: only the
+bridge's own recorded question takes a yes.
+
+**The DM ledger.** Each post is recorded in `notifier-dm-posts.json`, in `STATE_DIR`, keyed
+`<channel>:<ts>`. The bridge reads it to tell which ping an answer follows. It also stops a
+double ping: a ping that reached one person and missed another goes, on the next pass, only to
+the person it missed. The ticket gets its label as soon as anyone has the ping. Records older
+than seven days are dropped, but only once everyone named has the ping. A ledger that cannot
+be read, or holds a broken record, stops the pass before anything is sent.
+
+**What the installer does differently.** The `slack-app` row passes with a note: there is no
+channel, so there is nothing to sign, and `A-PRIVATE-CHANNEL` is refused. The config gets
+`dm_user_ids` and no `chat_channel_id`. The reply relay must stay off.
+
+**Switching over.** Run the one command, `python3 scripts/pipeline_install.py`, so the role
+account's clone knows the new key. Then run this installer's `run`. The config changes, so
+`CK-N4` comes back: watch one ping arrive in your direct messages, and sign it again.
+
+**The notifier's own app can be retired** once that ping lands. Delete it in Slack. Its
+token's line in the env file is then unused. The private channel is different: the bridge may
+still read it. Take its id out of `CHANNEL_IDS` in `bridge.conf` and run the bridge's install
+again first. Only then archive the channel.
+
+Good: the pass summary says `direct messages: ON`, and the ping is in your direct messages.
+Not that: `CHAT_CHANNEL_ID and DM_USER_IDS are both set`. Empty `CHAT_CHANNEL_ID`.
+Not that: `FAIL: I could not page anyone in their direct messages`. The bridge's app lacks
+`im:write`. Add it, reinstall the app, and the next pass sends what it held back.
+
 ---
 
 ## The installer: one command, repeated
@@ -245,7 +291,7 @@ nothing.
 | Step | What it does | What stops it |
 |---|---|---|
 | `preflight` | reads the conf, finds the role account's home, runs the notifier's own selftest from this checkout, and checks that account's clone holds every file the notifier runs **byte for byte as this checkout does** (sha256, read as that account) | any problem, all listed at once. A clone file that is missing, unreadable, or different is named |
-| `slack-app` | waits for your sign-off that the app is separate and the channel private | card `CK-N1` |
+| `slack-app` | waits for your sign-off that the app is separate and the channel private. In DM mode it passes with a note, and asks for nothing | card `CK-N1` |
 | `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer |
 | `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS`, `MONITOR_ACTOR_IDS`, `BOUNCE_ACTOR_IDS` and `FINDING_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
 | `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it, and after the notifier in the role account's clone is seen to know every key in it | a composition the notifier would refuse fails here, before anything is written. So does a key the clone's older notifier does not know |
@@ -653,6 +699,9 @@ share. It stops there, before it changes anything: run the two again in the orde
   `MENTION_CHAT_USER_IDS` set, is the test. (KIT-281)
 - **Whether `chat:write` alone posts to a private channel** the bot was invited to. The
   notifier is built for that one scope. The throwaway test settles it. (KIT-173)
+- **That a DM-mode ping reaches you.** The selftest drives a stubbed Slack: the bridge's app
+  opening your direct message with `im:write`, and posting there. No live run has yet. The
+  first ping in DM mode is its test. (KIT-296)
 - **Whether the tracker's editor keeps `<!--` intact** on a comment's first line. The API
   path above sidesteps it. (KIT-173)
 - **Whether the comment window is really newest-first.** The notifier asks for it, and names

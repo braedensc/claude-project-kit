@@ -30,7 +30,9 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
                  THIS checkout, and the notifier in the role account's clone: every file the
                  job runs, byte for byte this checkout's (sha256, read as that account). The
                  clone's HEAD may differ; the files the notifier runs may not
-    slack-app    CK-N1: a Slack app for the notifier alone, and a PRIVATE channel
+    slack-app    CK-N1: a Slack app for the notifier alone, and a PRIVATE channel. With
+                 DM_USER_IDS set there is neither (KIT-296): pages go to each person's
+                 direct message through the Slack bridge's app, and this row passes with a note
     credentials  the Slack token in the role account's env file — its shape measured in that
                  account's shell, its value never read into this process
     labels       agent:blocked and agent:needs-human resolved by exact name, every team key
@@ -136,6 +138,8 @@ TWO SIGN-OFFS ARE BOUND TO WHAT THEY SIGNED
   A-PRIVATE-CHANNEL records the channel id in the conf when it was signed; change the channel
   and CK-N1 comes back. A-FIRST-PING records the config the job ran under; change the config
   and CK-N4 comes back. A sign-off that outlives the thing it vouched for vouches for nothing.
+  With DM_USER_IDS set there is no channel, so A-PRIVATE-CHANNEL is neither asked for nor
+  accepted.
 """
 import argparse
 import atexit
@@ -212,6 +216,10 @@ FINDING_DEFAULT_KEY_ENV = "STAGE_E_LINEAR_API_KEY"
 # The name the dispatcher's own Slack lane reads out of the dispatcher's environment — which is
 # copied into every session. The notifier's token may never live under it (owner, 2026-09-17).
 DISPATCHER_CHAT_TOKEN_ENV = "SLACK_BOT_TOKEN"
+# The name the Slack bridge's installer stores its own token under (its SLACK_TOKEN_ENV
+# default). With DM_USER_IDS set the pages go through the bridge's app, so CHAT_TOKEN_ENV
+# names this (KIT-296). The selftest pins it against the bridge installer.
+BRIDGE_CHAT_TOKEN_ENV = "BRIDGE_SLACK_BOT_TOKEN"
 TOKEN_PREFIX = "xoxb-"
 TOKEN_MIN_LEN = 20
 _TOKEN_RE = re.compile(r"^xoxb-[A-Za-z0-9-]+$")
@@ -338,6 +346,10 @@ CONF_DEFAULTS = {
     # KIT-281: the Slack member ids @mentioned on every page that asks a person to do
     # something. Empty mentions nobody and composes no key, so the config stays as it was.
     "MENTION_CHAT_USER_IDS": "",
+    # KIT-296: Slack member ids whose direct messages every page goes to, through the Slack
+    # bridge's app, in place of CHAT_CHANNEL_ID. Empty keeps the channel and composes no key,
+    # so the config stays as it was.
+    "DM_USER_IDS": "",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose so an unedited copy of the example cannot run.
@@ -462,7 +474,17 @@ def validate_conf(values, invoking_user=None):
     conf = dict(CONF_DEFAULTS)
     conf.update(values)
     errors = []
+    # KIT-296: direct messages in place of the channel, through the Slack bridge's app. The
+    # token is then the bridge's, so the channel-mode default name, which every copy of the
+    # example spells out, stands for the bridge's name here.
+    dms = split_list(conf.get("DM_USER_IDS"))
+    if dms and conf.get("CHAT_TOKEN_ENV") == CONF_DEFAULTS["CHAT_TOKEN_ENV"]:
+        conf["CHAT_TOKEN_ENV"] = BRIDGE_CHAT_TOKEN_ENV
+    if dms:
+        conf.setdefault("CHAT_CHANNEL_ID", "")
     for key in CONF_REQUIRED:
+        if key == "CHAT_CHANNEL_ID" and dms:
+            continue
         if not conf.get(key):
             errors.append("%s is required and is missing or empty" % key)
     for key, placeholder in CONF_UNEDITED.items():
@@ -505,9 +527,21 @@ def validate_conf(values, invoking_user=None):
             errors.append("TICKET_URL_TEMPLATE must be an https URL (got %r)" % url)
 
     channel = conf.get("CHAT_CHANNEL_ID") or ""
-    if channel and not _CHANNEL_RE.match(channel):
+    if channel and dms:
+        errors.append("CHAT_CHANNEL_ID and DM_USER_IDS are both set. With DM_USER_IDS, every page "
+                      "goes to those people's direct messages, so a channel as well would post "
+                      "each page twice. Leave CHAT_CHANNEL_ID empty")
+    elif channel and not _CHANNEL_RE.match(channel):
         errors.append("CHAT_CHANNEL_ID %r is not a Slack channel id (C… or G…, upper-case "
                       "letters and digits)" % channel)
+    # The notifier's own member-id rule, imported, as for the mentions below.
+    for member in dms:
+        if not notify.MENTION_USER_RE.match(member):
+            errors.append("DM_USER_IDS entry %r is not a Slack member id: U or W, then capitals "
+                          "and digits. In Slack, open the person's profile, then ⋮, then Copy "
+                          "member ID" % member)
+    if len(set(dms)) != len(dms):
+        errors.append("DM_USER_IDS repeats an id — that person would get every page twice")
 
     actors = split_list(conf.get("EXECUTOR_ACTOR_IDS"))
     if conf.get("EXECUTOR_ACTOR_IDS") and not actors:
@@ -761,6 +795,12 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
     if mentions:
         doc["mention_chat_user_ids"] = mentions
+    # …and for the direct messages (KIT-296), which take the channel's place: no channel is
+    # composed beside them, and the notifier's own loader refuses the two together.
+    dms = split_list(conf.get("DM_USER_IDS"))
+    if dms:
+        doc["dm_user_ids"] = dms
+        doc.pop("chat_channel_id")
     return doc
 
 
@@ -982,7 +1022,16 @@ CARDS = {
                "account could not join\"",
                "   (YOUR initials, 2-4 letters. The placeholder is refused as typed.)",
                "   The sign-off records this channel id. Change the channel and this card",
-               "   comes back."],
+               "   comes back.",
+               "",
+               "DIRECT MESSAGES INSTEAD (KIT-296): set DM_USER_IDS in notifier.conf to your",
+               "Slack member id, and skip every step above. Pages then go to your direct",
+               "messages through the Slack bridge's app, which its card CK-B1 makes. That",
+               "app needs chat:write and im:write. Leave CHAT_CHANNEL_ID empty. The token is",
+               "then the bridge's, " + BRIDGE_CHAT_TOKEN_ENV + ", unless CHAT_TOKEN_ENV names",
+               "another. There is nothing to sign: the slack-app step passes on its own.",
+               "Set the bridge's own DM_USER_IDS to the same ids (KIT-295 or later). Before",
+               "you archive the old channel, take it out of CHANNEL_IDS in bridge.conf."],
         "good": "a private channel holding you and the notifier's bot, invisible to a second account",
         "attest": A_PRIVATE,
     },
@@ -1042,7 +1091,8 @@ CARDS = {
                "   Anything may follow on the lines below it.",
                "3. Wait one interval (${INTERVAL_SECONDS} s), and a little more.",
                "4. In the private channel: ONE ping naming that ticket. Open its link.",
-               "   It must open that ticket.",
+               "   It must open that ticket. (With DM_USER_IDS set, look in your direct",
+               "   messages instead: one ping for each id named there.)",
                "5. On the ticket: the agent:blocked label is there.",
                "6. Remove the label, then cancel the ticket.",
                "Nothing arrived? Open the comment. If the tracker's editor stored `<!--` as",
@@ -1569,6 +1619,24 @@ def step_preflight(ctx, apply_it):
 
 
 def step_slack_app(ctx, apply_it):
+    dms = split_list(ctx.conf.get("DM_USER_IDS"))
+    if dms:
+        # KIT-296: no app and no channel of the notifier's own to sign for. The pages go
+        # through the Slack bridge's app, to each person's direct message, so CK-N1's
+        # private-channel sign-off does not apply.
+        notes = ["Pages go to the direct messages of %s, through the Slack bridge's app. The "
+                 "bridge's card CK-B1 makes that app, and it needs chat:write and im:write. "
+                 "There is no channel, so there is no private-channel sign-off. Set the "
+                 "bridge's own DM_USER_IDS to the same ids (KIT-295 or later). The notifier's "
+                 "own app can be retired. Archive the old channel only once CHANNEL_IDS in "
+                 "bridge.conf no longer lists it." % ", ".join(dms)]
+        if ctx.conf["CHAT_TOKEN_ENV"] != BRIDGE_CHAT_TOKEN_ENV:
+            notes.append("CHAT_TOKEN_ENV is %s, not the bridge's own %s. The pages go through "
+                         "the bridge's app, so this should name the bridge's token. Leave it "
+                         "only if your bridge stores its token under that name."
+                         % (ctx.conf["CHAT_TOKEN_ENV"], BRIDGE_CHAT_TOKEN_ENV))
+        return True, ("DM mode: pages go through the Slack bridge's app (its card CK-B1); no "
+                      "channel to sign for"), notes
     rec = (ctx.state.data.get("attestations") or {}).get(A_PRIVATE)
     if not rec:
         raise Blocked("CK-N1")
@@ -1704,8 +1772,11 @@ def step_credentials(ctx, apply_it):
     say("  %s at mode 600 and keeps every other line. Never into the dispatcher's own env" % conf["ENV_FILE"])
     say("  file, which is copied unscrubbed into every session; never under the dispatcher's")
     say("  state root, where session readability is unmeasured. Nothing is echoed or kept here.")
-    val = (ctx.token_reader("  paste %s — the notifier's OWN bot token, xoxb-... (hidden): "
-                            % chat_env) or "").strip()
+    # KIT-296: in DM mode the token is the Slack bridge app's, which the pages go through.
+    whose = ("the Slack bridge app's bot token" if split_list(conf.get("DM_USER_IDS"))
+             else "the notifier's OWN bot token")
+    val = (ctx.token_reader("  paste %s — %s, xoxb-... (hidden): " % (chat_env, whose))
+           or "").strip()
     say("  %s: %d chars, %s" % (chat_env, len(val), "starts %s" % TOKEN_PREFIX
                                 if val.startswith(TOKEN_PREFIX) else "does NOT start %s" % TOKEN_PREFIX))
     if len(val) < TOKEN_MIN_LEN or not _TOKEN_RE.match(val):
@@ -2850,14 +2921,20 @@ def handover_lines(ctx):
     conf = ctx.conf
     # The interval launchd reported, never the conf's: the conf says what the file asks for,
     # and the two differ exactly when it matters.
-    loaded = {True: "LOADED — one pass every %s s as %s, paging channel %s"
+    dms = split_list(conf.get("DM_USER_IDS"))
+    target = ("the direct messages of %s" % ", ".join(dms) if dms
+              else "channel %s" % conf["CHAT_CHANNEL_ID"])
+    loaded = {True: "LOADED — one pass every %s s as %s, paging %s"
                     % (ctx.loaded_interval if ctx.loaded_interval else "%s (from the plist; launchd "
-                       "did not say)" % conf["INTERVAL_SECONDS"], ctx.account,
-                       conf["CHAT_CHANNEL_ID"]),
+                       "did not say)" % conf["INTERVAL_SECONDS"], ctx.account, target),
               False: "NOT loaded (card CK-N3)"}.get(ctx.loaded, "not measured on this pass")
     on = ["the notifier job system/%s: %s (KIT-116)" % (conf["JOB_LABEL"], loaded),
           "its only tracker write: %s, added on the marks that name them (KIT-116)"
           % " and ".join(LABEL_KEYS)]
+    if dms:
+        on.append("pages: by direct message to %s, through the Slack bridge's app. Each post "
+                  "is recorded in notifier-dm-posts.json for the bridge (KIT-296)"
+                  % ", ".join(dms))
     if conf.get("BRIDGE_PINGS") == "yes":
         on.append("replies: the notifier's own relay stays off. It records each agent:blocked "
                   "ping for the Slack bridge, which passes a member's reply under it to the "
@@ -3018,7 +3095,12 @@ def _banner(ctx, title):
     say("  conf          %s" % conf.get("__source__", DEFAULT_CONF))
     say("  role account  %s" % ctx.account)
     say("  job           system/%s (%s) — never loaded by this installer" % (conf["JOB_LABEL"], plist_path(conf)))
-    say("  channel       %s at %s" % (conf["CHAT_CHANNEL_ID"], conf["CHAT_API_BASE"]))
+    dms = split_list(conf.get("DM_USER_IDS"))
+    if dms:
+        say("  pages to      the direct messages of %s at %s, through the Slack bridge's app"
+            % (", ".join(dms), conf["CHAT_API_BASE"]))
+    else:
+        say("  channel       %s at %s" % (conf["CHAT_CHANNEL_ID"], conf["CHAT_API_BASE"]))
     say("  token         $%s, in %s as %s" % (conf["CHAT_TOKEN_ENV"], conf["ENV_FILE"], ctx.account))
     say("  tracker key   $%s from THIS command's environment, for the labels step only"
         % conf["LINEAR_KEY_ENV"])
@@ -3184,6 +3266,10 @@ def cmd_attest(state, aid, initials, note, conf=None, conf_problem=None, env=Non
         if conf is None:
             raise SetupError("%s records the channel id in your conf, and the conf did not load: %s"
                              % (aid, conf_problem or "fix it and sign again"))
+        if split_list(conf.get("DM_USER_IDS")):
+            raise SetupError("%s signs a private channel, and your conf pages direct messages "
+                             "instead (DM_USER_IDS). There is no channel to sign, so I recorded "
+                             "nothing." % aid)
         bound["channel_id"] = conf["CHAT_CHANNEL_ID"]
     if aid == A_FIRST_PING:
         sha = (state.data.get("notes") or {}).get(NOTE_CONFIG)
@@ -3373,6 +3459,76 @@ def _selftest_body():
     ok("refuse: MENTION_CHAT_USER_IDS repeating an id",
        refused("MENTION_CHAT_USER_IDS=U0SYNTH0001,U0SYNTH0001\n",
                "MENTION_CHAT_USER_IDS repeats an id"))
+    # KIT-296: pages to direct messages, through the Slack bridge's app. No case here asserts,
+    # so a refusal is data and a missing name is a named failure, never a stopped battery.
+    _dm_text = good_text.replace("CHAT_CHANNEL_ID=C0SYNTHETIC1\n", "")
+
+    def dm_conf(extra, text=None):
+        values, errors = parse_conf((_dm_text if text is None else text) + extra)
+        conf, more = validate_conf(values, person)
+        return conf, errors + more
+
+    def dm_case(name, fn):
+        try:
+            cond, detail = fn()
+        except Exception as exc:                                  # noqa: BLE001
+            cond, detail = False, "raised %r" % (exc,)
+        ok(name, cond, detail)
+
+    dm_case("conf: DM_USER_IDS defaults to empty, and empty composes no dm_user_ids and keeps "
+            "the channel (KIT-296)",
+            lambda: (CONF_DEFAULTS.get("DM_USER_IDS") == "" and "dm_user_ids" not in _bp_off
+                     and _bp_off.get("chat_channel_id") == "C0SYNTHETIC1",
+                     (CONF_DEFAULTS.get("DM_USER_IDS"), _bp_off)))
+
+    def _dm_composed():
+        got = []
+        for text in (_dm_text, _dm_text + "CHAT_CHANNEL_ID=\n"):
+            conf, errors = dm_conf("DM_USER_IDS=W0SYNTH0002, U0SYNTH0001\n", text)
+            doc = compose_config(conf, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                                 ["a-1"])
+            body = json.loads(validate_composed(doc, None))
+            got.append((errors, body.get("dm_user_ids"), "chat_channel_id" in body,
+                        body.get("chat_token_env")))
+        want = ([], ["W0SYNTH0002", "U0SYNTH0001"], False, "BRIDGE_SLACK_BOT_TOKEN")
+        return got == [want, want], got
+    dm_case("conf: DM_USER_IDS with no channel validates, composes dm_user_ids in order and no "
+            "chat_channel_id, names the bridge's token, and passes the notifier's own loader "
+            "(KIT-296)", _dm_composed)
+
+    def dm_refused(extra, fragment, text=None):
+        errors = dm_conf(extra, text)[1]
+        return any(fragment in e for e in errors), errors
+
+    dm_case("refuse: DM_USER_IDS beside CHAT_CHANNEL_ID, since each page would post twice "
+            "(KIT-296)",
+            lambda: dm_refused("DM_USER_IDS=U0SYNTH0001\n",
+                               "CHAT_CHANNEL_ID and DM_USER_IDS are both set", good_text))
+
+    def _dm_bad_ids():
+        got = [dm_refused("DM_USER_IDS=%s\n" % v, "DM_USER_IDS entry")
+               for v in ("@someone", "C0SYNTH0001", "u0synth0001", "U0SYNTH0001 W0SYNTH0002")]
+        return all(g[0] for g in got), got
+    dm_case("refuse: a DM_USER_IDS entry that is not a Slack member id (KIT-296)", _dm_bad_ids)
+    dm_case("refuse: DM_USER_IDS repeating an id (KIT-296)",
+            lambda: dm_refused("DM_USER_IDS=U0SYNTH0001,U0SYNTH0001\n",
+                               "DM_USER_IDS repeats an id"))
+
+    def _dm_token_names():
+        kept, kept_errors = dm_conf("DM_USER_IDS=U0SYNTH0001\nCHAT_TOKEN_ENV=MY_BRIDGE_TOKEN\n")
+        dispatcher = dm_refused("DM_USER_IDS=U0SYNTH0001\nCHAT_TOKEN_ENV=SLACK_BOT_TOKEN\n",
+                                "may not be SLACK_BOT_TOKEN")
+        return (kept_errors == [] and kept.get("CHAT_TOKEN_ENV") == "MY_BRIDGE_TOKEN"
+                and dispatcher[0]), (kept_errors, kept.get("CHAT_TOKEN_ENV"), dispatcher)
+    dm_case("conf: in DM mode another CHAT_TOKEN_ENV is kept, not refused, and SLACK_BOT_TOKEN "
+            "is still refused (KIT-296)", _dm_token_names)
+
+    def _dm_bridge_name():
+        import pipeline_bridge_setup as _bs
+        return (BRIDGE_CHAT_TOKEN_ENV == _bs.CONF_KEYS["SLACK_TOKEN_ENV"][0],
+                (BRIDGE_CHAT_TOKEN_ENV, _bs.CONF_KEYS["SLACK_TOKEN_ENV"][0]))
+    dm_case("conf: the DM-mode token name is the bridge installer's own default (KIT-296)",
+            _dm_bridge_name)
     ok("refuse: a BOUNCE_ACTOR_IDS entry that is no id",
        refused("BOUNCE_ACTOR_IDS=not an id!\n", "BOUNCE_ACTOR_IDS entry"))
     ok("refuse: FINDING_ACTOR_IDS left empty, naming `self` and `off`",
@@ -4149,6 +4305,34 @@ def _selftest_body():
         except Blocked as exc:
             ok("attest: a channel change brings CK-N1 back", exc.card_id == "CK-N1" and "C0SOMEOTHER9" in exc.extra)
 
+        # KIT-296: in DM mode there is no channel, so the slack-app step asks for no sign-off,
+        # and A-PRIVATE-CHANNEL is refused rather than signed for a channel that is not there.
+        def _dm_slack_app():
+            dm_c, dm_errors = dm_conf("DM_USER_IDS=U0SYNTH0001\n")
+            ctx_dm, _f = machine_ctx(os.path.join(tmp_root, "dm-slack-app"), conf=dm_c)
+            done, detail, notes = step_slack_app(ctx_dm, True)
+            ctx_o, _f = machine_ctx(os.path.join(tmp_root, "dm-slack-app-other"),
+                                    conf=dict(dm_c, CHAT_TOKEN_ENV="MY_BRIDGE_TOKEN"))
+            _d, _detail, other_notes = step_slack_app(ctx_o, True)
+            return (dm_errors == [] and done is True and "CK-B1" in detail and len(notes) == 1
+                    and "im:write" in notes[0]
+                    and any("MY_BRIDGE_TOKEN" in n and BRIDGE_CHAT_TOKEN_ENV in n
+                            for n in other_notes)), (dm_errors, detail, notes, other_notes)
+        dm_case("slack-app: in DM mode the step passes with a note, asks for no private-channel "
+                "sign-off, and warns when the token is not the bridge's (KIT-296)", _dm_slack_app)
+
+        def _dm_attest_refused():
+            dm_c, _errors = dm_conf("DM_USER_IDS=U0SYNTH0001\n")
+            st_dm = State(os.path.join(tmp_root, "dm-attest"))
+            try:
+                quiet(lambda: cmd_attest(st_dm, A_PRIVATE, "pq", "a note", conf=dm_c, env={}))
+                return False, "it was signed"
+            except SetupError as exc:
+                return ("no channel to sign" in str(exc)
+                        and not (st_dm.data.get("attestations") or {})), str(exc)
+        dm_case("attest: A-PRIVATE-CHANNEL is refused in DM mode, and nothing is recorded "
+                "(KIT-296)", _dm_attest_refused)
+
         # ── 11. the composition: accepted by the notifier's loader; a broken one never written ─
         ids = {"agent:blocked": "id-blocked-0001", "agent:needs-human": "id-needs-0002"}
         doc = compose_config(good_conf(), ids, ["actor-0001"])
@@ -4216,6 +4400,32 @@ def _selftest_body():
            refused_old and rows_off[0][1] == DONE
            and os.path.exists(os.path.join(f_off.home, ".stage-e", "notifier.json")),
            "%s\n%s\n--\n%s\n%s" % (rows_o, out_o[-500:], rows_off, out_off[-300:]))
+
+        # KIT-296: the same rule for dm_user_ids, which only a DM-mode conf composes.
+        def _dm_old_clone():
+            got = []
+            for text in (_dm_text + "DM_USER_IDS=U0SYNTH0001\n", good_text):
+                r_d = tempfile.mkdtemp(prefix="old-clone-dm.", dir=tmp_root)
+                c_d = validate_conf(parse_conf(text)[0], person)[0]
+                c_d["__source__"] = "notifier.conf"
+                ctx_d, f_d = machine_ctx(r_d, conf=c_d)
+                clone_notifier = os.path.join(f_d.home, ".stage-e", "kit", "scripts",
+                                              NOTIFIER_SCRIPT)
+                with open(clone_notifier, encoding="utf-8") as fh:
+                    older = fh.read().replace('"dm_user_ids"', '"(not known here)"')
+                with open(clone_notifier, "w", encoding="utf-8") as fh:
+                    fh.write(older)
+                ctx_d.ids = {"label_ids": ids, "executor_actor_ids": ["actor-0001"],
+                             "monitor_actor_ids": ["viewer-uuid-0001"],
+                             "bounce_actor_ids": ["viewer-uuid-0001"],
+                             "finding_actor_ids": ["viewer-uuid-0001"]}
+                (_c, rows_d), out_d = quiet(lambda: run_steps(ctx_d, True,
+                                                              steps=(("config", "", step_config),)))
+                got.append((rows_d[0][1], "dm_user_ids" in out_d,
+                            os.path.exists(os.path.join(f_d.home, ".stage-e", "notifier.json"))))
+            return got == [(FAILED, True, False), (DONE, False, True)], got
+        dm_case("config: a clone whose notifier does not know dm_user_ids fails a DM-mode config "
+                "before any write, and takes a channel-mode one (KIT-296)", _dm_old_clone)
 
         # ── 12. the plist ───────────────────────────────────────────────────────────────
         conf12 = good_conf()
