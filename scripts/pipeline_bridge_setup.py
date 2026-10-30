@@ -755,6 +755,23 @@ WRITER_TOKEN_WORDS = (
 WRITER_TOKEN_WRITER_PY = TOKEN_WRITER_PY
 for _bridge_words, _writer_words in WRITER_TOKEN_WORDS:
     WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_bridge_words, _writer_words)
+# One more refusal, the writer's own (Stage E review of #220): the env file is shared, so
+# WRITER_TOKEN_ENV may name a credential the bridge's conf does not know, such as the
+# notifier's Slack token. A name that already holds anything but a setup-token is never
+# overwritten.
+_OWN_NAME_PY = r'''
+for line in lines:
+    m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+    held = m.group(2).strip().strip("'\"") if m and m.group(1) == name else ""
+    if held and not held.startswith("sk-ant-oat"):
+        print("REFUSED: %s already holds another credential in %s, not a token from `claude "
+              "setup-token`, so it was left as it is. Give WRITER_TOKEN_ENV a name of its "
+              "own. Nothing was written." % (name, env_path))
+        sys.exit(3)
+'''
+_ANCHOR = "\nholds(lines, env_path, True)\n"
+assert WRITER_TOKEN_WRITER_PY.count(_ANCHOR) == 1
+WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_ANCHOR, _ANCHOR + _OWN_NAME_PY)
 
 # Writes the config from stdin, mode 600, creating its directory at 700.
 CONFIG_WRITER_PY = r'''
@@ -1885,6 +1902,24 @@ def selftest():
                   (got[0], "CLAUDE_WRITER_OAUTH_TOKEN" in got[1], "needs its own token"
                    in got[1], wtoken in got[1]) if isinstance(got, tuple) else got,
                   (EX_REFUSED, True, True, False))
+            # The env file is shared: a name that holds the notifier's Slack token is never
+            # overwritten by the writer's (Stage E review of #220).
+            with open(envp, "a") as fh:
+                fh.write("NOTIFIER_SLACK_BOT_TOKEN=xoxb-notifier-%s\n" % ("n" * 30))
+            got = outcome(lambda: writer_token(dict(conf,
+                                                    WRITER_TOKEN_ENV="NOTIFIER_SLACK_BOT_TOKEN"),
+                                               "sk-ant-oat01-" + "w" * 40))
+            env_text = open(envp).read()
+            check("writer-token-never-overwrites-another-credential-under-its-name",
+                  (got[0], "already holds another credential" in got[1], "n" * 30 in got[1],
+                   "xoxb-notifier-%s" % ("n" * 30) in env_text, "w" * 40 in env_text,
+                   "already holds another credential" in TOKEN_WRITER_PY)
+                  if isinstance(got, tuple) else got,
+                  (EX_REFUSED, True, False, True, False, False))
+            got = outcome(lambda: writer_token(value="sk-ant-oat01-" + "r" * 40))
+            check("writer-token-replaces-its-own-earlier-setup-token",
+                  (got[0], "r" * 40 in open(envp).read(), wtoken in open(envp).read())
+                  if isinstance(got, tuple) else got, (EX_OK, True, False))
             held = "sk-ant-oat01-" + "d" * 40
             with open(os.path.join(home, "dispatcher.env"), "a") as fh:
                 fh.write("CLAUDE_CODE_OAUTH_TOKEN=%s\n" % held)
