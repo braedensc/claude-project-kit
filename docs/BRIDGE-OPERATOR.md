@@ -230,7 +230,18 @@ shows the job failing.
 ## Step 9 — Let it start an approved plan
 
 Set `AGENT_USER_NAME` in `bridge.conf` to the dispatcher's app user, spelled as the tracker
-shows it. Leave `EPIC_WIP=1` at first, so one child runs at a time. Then:
+shows it. Leave `EPIC_WIP=1` at first, so one child runs at a time.
+
+Check `HANDOFF_STATES` too. It is the lane a child sits in while its pull request waits for
+your merge. If `setup-board` made your board, that is `Needs Approval`, the default. If not,
+open a ticket whose pull request is ready to merge and copy its status, spelled exactly as
+the tracker shows it. Its id is `linear.stateIds.needsApproval` in each project's
+`delivery.json`. If the Stage E driver's config sets `needs_approval_state_id`, it is that
+state instead. List more than one, comma-separated, if your teams name it differently. With a
+wrong name, a child waiting there is reported as one whose session ended, with the advice to
+hand it over again.
+
+Then:
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py install --apply
@@ -258,7 +269,21 @@ start is said in the thread. When nothing can start, it says so once, and why.
 - It refuses an epic where the epic or a child carries the `orchestrator` or `graphite`
   label. Those make the dispatcher hand out or stack children itself.
 - It says when a hold needs you: a child outside the plan is at work, or a child it handed
-  over has not started after two hours.
+  over is still not at work two hours later. Then it says once what that child's agent
+  sessions show:
+  - its pull request is waiting for you to merge, when the child sits in a lane
+    `HANDOFF_STATES` names. It never tells you to hand that one over again. When the merge
+    lets the next piece start, it says that too. If the child also carries
+    `agent:needs-human`, its review usually ran out of rounds with findings still open.
+    Then it says the pull request is yours to fix and merge, or cancel, instead;
+  - its latest session ended before it finished, and where the child is now;
+  - it has not started: no session on it ever began, or the agent never picked up its
+    latest one. If you handed it over again yourself, it waits two hours from then, and
+    the note gives that time;
+  - or it couldn't tell, because the tracker holds more agent sessions than it can read at
+    once. Check the child in the tracker before you hand it over again.
+
+  A child whose session is running gets no note.
 - A child someone already handed over counts toward `EPIC_WIP`. So does a child marked
   Done while its session still runs, until the session ends. The bridge says so once.
 - Your yes approves the terms the question stated. If `ACT`, `EPIC_WIP`, `READY_STATE` or
@@ -449,6 +474,14 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
 - That handing a child to the agent with your key starts a session, as the planner's
   hand-over at creation does. The dispatcher checks who handed it over; the tests cannot
   (KIT-227).
+- That the tracker gives a hand-over nobody answered the status `pending` or `stale`. Both
+  get the not-started note; the tests use those names (KIT-284).
+- That merging moves a child to Done. `setup-board` wires it. Without it, a merged child
+  keeps its slot, and the line that the next piece starts once it's merged is wrong
+  (KIT-284).
+- That handing a child over again yourself makes a new session, dated then. The bridge
+  waits two hours from that date; the tests assume it. A date more than ten minutes ahead
+  of this Mac's clock is ignored, and the bridge times from its own hand-over (KIT-284).
 - That reading an epic with 30 children, every pass, fits the tracker's query and rate
   limits. The key is shared with Stage E. A refusal stops the pass with a named failure
   (KIT-227).
