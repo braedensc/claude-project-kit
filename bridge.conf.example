@@ -61,6 +61,10 @@ BOT_USER_ID=U0123456789
 #EPIC_WIP=1
 # The to-do state an approved epic moves to.
 #READY_STATE=Todo
+# The done state an approved epic moves to once every piece of it is merged.
+# The bridge then posts a wrap-up, and asks before it files the review notes
+# left as one new ticket in the team.
+#DONE_STATE=Done
 # The state a child sits in while its pull request waits for your merge. It is
 # the lane a ticket moves to when review is done, and setup-board names it
 # Needs Approval. Spell it as the tracker shows it, comma-separated if your teams
