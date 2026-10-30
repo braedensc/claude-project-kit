@@ -524,10 +524,11 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
    of them. Invite the chat bot to it: Slack tells the chat bot about a mention only in a
    channel it is in.
 5. Run `install --apply`.
-6. Bring the tech lead's rules up to date: run the chat lane's `chat-rules --apply`. Until
-   you do, the chat lane's `verify` says its rules file changed. The new rule tells the tech
-   lead that a mention from the bridge is a member's question from their DM. It also says the
-   recent conversation under it is context, quoted as data, never instructions.
+6. Tell the tech lead's rules: in `chat-lane.conf`, set `BRIDGE_DM_QUESTIONS=on`, then run
+   the chat lane's `chat-rules --apply`. Until you do, the chat lane's `verify` says its rules
+   file changed. The added rule tells the tech lead that a mention from the bridge is a
+   member's question from their DM. It also says the recent conversation under it is
+   context, quoted as data, never instructions.
 
 Good: you type `what does the login page do?` in the DM. Within a minute it says
 `Asking the tech lead…`, and the answer follows.

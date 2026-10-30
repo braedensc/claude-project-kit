@@ -83,6 +83,8 @@ LABEL_RE = re.compile(r"^[a-z][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*){2,}$")
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{0,31}$")
 PATH_RE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]+$")
 INTERVAL_MIN, INTERVAL_MAX = 15, 3600          # INTERVAL_SECONDS, in seconds
+# A whole number in ASCII digits. str.isdigit() also passes "²", which int() refuses.
+WHOLE_RE = re.compile(r"^[0-9]+$")
 # The bridge app's scopes: EXACTLY what pipeline_bridge.py calls, each cited.
 SCOPE_CITES = {
     "groups:history": "conversations.history and conversations.replies in a private "
@@ -227,11 +229,11 @@ def validate_conf(values):
                       % conf["JOB_LABEL"])
     if conf["ACT"] not in ("yes", "no"):
         errors.append("ACT must be yes or no, got %r" % conf["ACT"])
-    if (not conf["INTERVAL_SECONDS"].isdigit()
+    if (not WHOLE_RE.match(conf["INTERVAL_SECONDS"])
             or not INTERVAL_MIN <= int(conf["INTERVAL_SECONDS"]) <= INTERVAL_MAX):
         errors.append("INTERVAL_SECONDS must be a whole number from %d to %d"
                       % (INTERVAL_MIN, INTERVAL_MAX))
-    if not conf["EPIC_WIP"].isdigit() or not 1 <= int(conf["EPIC_WIP"]) <= 10:
+    if not WHOLE_RE.match(conf["EPIC_WIP"]) or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
     # The notifier's own installer's rule for its JOB_LABEL, as Stage E's conf checks it.
     label = conf["NOTIFIER_JOB_LABEL"]
@@ -304,7 +306,7 @@ def tech_lead_conf_errors(conf):
             errors.append("ASK_TECH_LEAD is yes, but DM_USER_IDS is empty. A question is "
                           "passed on only from a member's DM: set DM_USER_IDS first")
     for key, _name, _default, low, high in HISTORY_KEYS:
-        if not conf[key].isdigit() or not low <= int(conf[key]) <= high:
+        if not WHOLE_RE.match(conf[key]) or not low <= int(conf[key]) <= high:
             errors.append("%s must be a whole number from %d to %d, got %r"
                           % (key, low, high, conf[key]))
     return errors
@@ -348,7 +350,8 @@ def compose_config(conf):
         "plan_it_state": conf["PLAN_IT_STATE"],
         "ready_state": conf["READY_STATE"],
         "agent_user_name": conf["AGENT_USER_NAME"],
-        "epic_wip": int(conf["EPIC_WIP"]) if conf["EPIC_WIP"].isdigit() else conf["EPIC_WIP"],
+        "epic_wip": (int(conf["EPIC_WIP"]) if WHOLE_RE.match(conf["EPIC_WIP"])
+                     else conf["EPIC_WIP"]),
         "pings_file": pings_file(conf),
     }
     # Composed only when it is not the job's own default, so an install made before the
@@ -366,7 +369,7 @@ def compose_config(conf):
     if conf["NOTIFIER_JOB_LABEL"]:
         doc["notifier_plist"] = notifier_plist_path(conf)
         doc["run_interval_seconds"] = (int(conf["INTERVAL_SECONDS"])
-                                       if conf["INTERVAL_SECONDS"].isdigit()
+                                       if WHOLE_RE.match(conf["INTERVAL_SECONDS"])
                                        else conf["INTERVAL_SECONDS"])
     # KIT-298: composed only with ASK_TECH_LEAD=yes, so a config written before the keys
     # existed stays the same, byte for byte.
@@ -377,7 +380,7 @@ def compose_config(conf):
         # The DM's recent conversation under a new thread's question: composed only when
         # not the job's own default, so a default install is the same bytes as before.
         for key, name, default, _low, _high in HISTORY_KEYS:
-            value = int(conf[key]) if conf[key].isdigit() else conf[key]
+            value = int(conf[key]) if WHOLE_RE.match(conf[key]) else conf[key]
             if value != default:
                 doc[name] = value
     return doc
@@ -1502,6 +1505,7 @@ def selftest():
         hist_bad = []
         for over in (dict(FORWARD_HISTORY_MESSAGES="101"), dict(FORWARD_HISTORY_MESSAGES="thirty"),
                      dict(FORWARD_HISTORY_MESSAGES="-1"), dict(FORWARD_HISTORY_CHARS="0"),
+                     dict(FORWARD_HISTORY_MESSAGES="\u00b2"), dict(FORWARD_HISTORY_CHARS="3\u00b2"),
                      dict(FORWARD_HISTORY_CHARS="20001"),
                      dict(ASK_TECH_LEAD="no", FORWARD_HISTORY_MESSAGES="x"),
                      dict(FORWARD_HISTORY_MESSAGES="100", FORWARD_HISTORY_CHARS="20000")):
@@ -1526,6 +1530,7 @@ def selftest():
               hist_said, [True, False])
         check("conf-FORWARD_HISTORY-bad-values-named-once-by-their-conf-key", hist_bad,
               [[msgs_bad % "101"], [msgs_bad % "thirty"], [msgs_bad % "-1"], [chars_bad % "0"],
+               [msgs_bad % "\u00b2"], [chars_bad % "3\u00b2"],
                [chars_bad % "20001"], [msgs_bad % "x"], []])
         b1 = cap(print_card, "CK-B1", conf)[1]
         check("card-b1-says-how-to-update-the-app-and-open-the-dm",

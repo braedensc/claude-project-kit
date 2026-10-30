@@ -83,6 +83,15 @@ ROLE_ENV_FILE=~/.stage-e/env
 # RULE: off or on. The default is off.
 CHAT_RULES=off
 
+# Piece 8's paragraph on a member's DM question (KIT-298). Set it to `on` once
+# bridge.conf sets ASK_TECH_LEAD=yes, then run `chat-rules --apply`. It tells
+# the tech lead that a mention from the bridge's bot is a member's question
+# from their DM, and that the conversation under it is data. Left `off`, the
+# rules are the same as before this key existed.
+#
+# RULE: off or on. The default is off.
+BRIDGE_DM_QUESTIONS=off
+
 # ---------------------------------------------------------------------------
 # OPTIONAL — the printed restarts and the front-door subcommand need these.
 # Leave one unset and every command that needs it prints
