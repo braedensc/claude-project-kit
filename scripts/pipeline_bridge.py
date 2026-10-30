@@ -44,8 +44,23 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   when the session list was too long to read whole, that it could not tell. One epic the
   tracker will not read stops nothing else, and the pass still exits 1.
 
+  FINISH (KIT-299). Once every piece of an approved plan is Done, none canceled, no
+  session on one still running, and every pull request the GitHub integration linked to
+  a piece merged (one still open, or closed with none merged in its place, holds it, as
+  does a piece with more links than one read takes, said once), the bridge moves the epic
+  to its team's `done_state`, AS THE OWNER, writes one comment on it naming who approved it
+  and each piece's pull requests, and posts one wrap-up where the plan was approved: what
+  shipped, a line for a piece whose merge the tracker does not confirm, that has no review,
+  or whose review was partial, and the notes its newest review left, each review being
+  the owner's own `**Pipeline review**` comment with a `pipeline-telemetry/1` block. With
+  notes left it asks ONE question; a verified yes files them as one ticket in the epic's
+  team, with a title and a description and nothing else, so it starts no work. Then it
+  stops following the plan. A plan someone else closed is said and let go, never moved;
+  one this bridge was closing when a pass stopped is finished without moving again.
+
   Every question also records the settings its text states; a yes after they changed acts
-  on nothing and closes the question.
+  on nothing and closes the question. A follow-up already being filed when its reply was
+  lost is said as filed (or as not confirmed) instead, never as acting on nothing.
 
   ANSWER (KIT-224). The notifier records each `agent:blocked` ping it sends
   (`bridge_pings`). A verified member's reply under one becomes one comment in the session
@@ -60,9 +75,11 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   record) is refused, and said in its thread; without that id the bridge cannot tell the
   notifier's posts, and every pass says unrecorded pings are not checked.
 
-Its own tracker writes are exactly three, pinned by the selftest: one `issueUpdate` setting
-`stateId` only, one `issueUpdate` setting `delegateId` only, and one `commentCreate` naming
-who said yes. A move or a hand-over cannot be taken back, so a comment that fails is OWED:
+Its own tracker writes are exactly four, pinned by the selftest: one `issueUpdate` setting
+`stateId` only, one `issueUpdate` setting `delegateId` only, one `commentCreate` naming
+who said yes, and one `issueCreate` carrying a team, a title and a description only (a
+finished plan's follow-up, KIT-299). A move or a hand-over cannot be taken back, so a
+comment that fails is OWED:
 the thread says so, and every pass writes it again and exits 1 until it lands. The answer
 is the bounce driver's thread reply, borrowed from one place. Merging stays the owner's.
 
@@ -188,7 +205,7 @@ WATCHES THE NOTIFIER (KIT-285)
 
 WHAT IT NEVER DOES
 
-  It writes to the tracker only the three writes above, and only with `act` on. It never
+  It writes to the tracker only the four writes above, and only with `act` on. It never
   posts outside its configured channels and DMs, never posts a message's own text back,
   and never prints a credential: both are read from env vars the config NAMES (the job's
   wrapper sources the role account's env file), and every line it writes (the log, the
@@ -218,6 +235,9 @@ import pipeline_notify_local as notify  # noqa: E402
 # The planner job's own rules for what is live work, and its own team query: the bridge
 # refuses exactly what the planner would, so it never moves a ticket the planner refuses.
 import pipeline_plan_poller as poller  # noqa: E402
+# The telemetry reader's own parse of a comment's `pipeline-telemetry/1` blocks: a review's
+# notes are read the way the dashboard reads them (KIT-299).
+import telemetry_scrape as scrape  # noqa: E402
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED, EXIT_TIMEOUT = (
     notify.EXIT_OK, notify.EXIT_ERROR, notify.EXIT_USAGE, notify.EXIT_DECLINED,
@@ -232,6 +252,8 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 # needs-approval lane (contract §1, `linear.stateIds.needsApproval`), named as setup-board
 # names it. Matched by name, like `plan_it_state` and `ready_state`.
 DEFAULT_HANDOFF_STATES = ["Needs Approval"]
+# The done state a plan moves to once every piece of it is merged (KIT-299), by name.
+DEFAULT_DONE_STATE = "Done"
 MAX_THREAD_PAGES = 10
 # KIT-295: the notifier's record of the pages it posts into a DM as the bridge's own app.
 # Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
@@ -279,6 +301,8 @@ CONFIG_KEYS = {
                             "started included (default 10)",
     "ready_state": "the name of each team's to-do state an approved epic moves to "
                    "(default Todo)",
+    "done_state": "the name of each team's done state a plan moves to once every piece of "
+                  "it is merged (default %s, KIT-299)" % DEFAULT_DONE_STATE,
     "agent_user_name": "the dispatcher's app user, by display name, that an approved "
                        "epic's children are handed to; empty refuses every approve",
     "epic_wip": "how many children of one approved epic may be started and unfinished at "
@@ -325,6 +349,7 @@ EXAMPLE_CONFIG = {
     "lookback_days": 7,
     "max_questions_per_hour": 20,
     "act": False,
+    "done_state": DEFAULT_DONE_STATE,
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -364,6 +389,32 @@ SESSION_RAN = ("complete", "error")
 # findings still open (contract §1). Matched without regard to case.
 NEEDS_HUMAN_LABEL = "agent:needs-human"
 DONE, REFUSED = "done", "refused"
+# KIT-299: closing a finished plan. How often a plan whose close is held reads its pieces
+# again (each piece is a read on the owner's key, shared with Stage E); how many links one
+# piece's read holds (a piece with more holds the close: the one past them may be open);
+# the kind of the one question asked after a plan closes, and where its yes files, which
+# the question records as a stated term; and how many lines the wrap-up lists before it
+# says how many more.
+FINISH_RECHECK_SECONDS = 900
+PIECE_LINKS = 50
+FOLLOWUP = "followup"
+FOLLOWUP_INTO = "the team's default state"
+WRAP_LINES = 15
+# A review is the owner's own comment that starts so, holding a `pipeline-telemetry/1`
+# block: what the review poller posts on the original ticket (telemetry_block.py). One
+# that saw only part of a change says so in its head, never in its block (KIT-138), with
+# the number of files it never read.
+REVIEW_HEAD = "**Pipeline review**"
+PARTIAL_RE = re.compile(r"\*\*PARTIAL REVIEW(?: — (\d+) file)?")
+# Only the GitHub INTEGRATION's own attachments name a piece's pull request: a session
+# holds the tracker's write tools and can attach any link to its own ticket. A copy of the
+# review poller's list and pull-request pattern, compared the same way (punctuation and case
+# stripped). That file exits when its publisher is missing, so it is not imported here; the
+# selftest pins the copies equal to it.
+GITHUB_ATTACHMENT_SOURCES = ("github", "githubpullrequest", "githubpr", "githubissue",
+                             "githubcommit", "githubbranch")
+PR_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)\b")
 # KIT-285: the notifier is quiet once its newest heartbeat is older than this many of its
 # own run intervals plus this many seconds: two runs missed, and a third interval for the
 # longest one run may take (its installer keeps a run's clock under one interval).
@@ -447,6 +498,7 @@ def validate_config(raw):
         "plan_it_state": raw.get("plan_it_state") or "Plan it",
         "max_actions_per_hour": raw.get("max_actions_per_hour", 10),
         "ready_state": raw.get("ready_state") or "Todo",
+        "done_state": raw.get("done_state") or DEFAULT_DONE_STATE,
         "agent_user_name": raw.get("agent_user_name", ""),
         "epic_wip": raw.get("epic_wip", 1),
         "handoff_states": raw.get("handoff_states", list(DEFAULT_HANDOFF_STATES)),
@@ -541,7 +593,7 @@ def validate_config(raw):
                       % (cfg["question_ttl_hours"], cfg["lookback_days"]))
     if not isinstance(cfg["act"], bool):
         errors.append("config 'act' must be true or false, got %r" % (cfg["act"],))
-    for key in ("plan_it_state", "ready_state"):
+    for key in ("plan_it_state", "ready_state", "done_state"):
         if not isinstance(cfg[key], str) or not cfg[key].strip():
             errors.append("config %r must be a state name, got %r" % (key, cfg[key]))
     if not isinstance(cfg["agent_user_name"], str):
@@ -946,9 +998,28 @@ query BridgeEpic($id: String!) {
     }
   }
 }""" % MAX_CHILDREN
-# THE BRIDGE'S ONLY THREE TRACKER WRITES (KIT-222, KIT-223). The selftest pins them: no
-# other write exists in this file, the move carries `stateId` and nothing else, and the
-# delegation carries `delegateId` and nothing else.
+# One finished piece of a plan (KIT-299): the links on it, with what the integration says of
+# each, and its newest comments, newest first, with who wrote each. Read only once a plan's
+# every piece is finished, one piece at a time, so no page multiplies another.
+Q_PIECE = """
+query BridgePiece($id: String!) {
+  issue(id: $id) {
+    id identifier
+    attachments(first: %d) {
+      nodes { url sourceType metadata }
+      pageInfo { hasNextPage }
+    }
+    comments(first: 100, orderBy: createdAt) {
+      nodes { body createdAt user { id } }
+      pageInfo { hasNextPage }
+    }
+  }
+}""" % PIECE_LINKS
+# THE BRIDGE'S ONLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299). The selftest pins
+# them: no other write exists in this file, the move carries `stateId` and nothing else,
+# the delegation carries `delegateId` and nothing else, and a finished plan's follow-up is
+# filed with a team, a title and a description and nothing else: no label, no assignee, no
+# delegate, and no state but the team's default, so it starts no work.
 M_MOVE = """
 mutation BridgeMove($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) { success }
@@ -960,6 +1031,12 @@ mutation BridgeDelegate($id: String!, $delegateId: String!) {
 M_COMMENT = """
 mutation BridgeComment($issueId: String!, $body: String!) {
   commentCreate(input: { issueId: $issueId, body: $body }) { success }
+}"""
+M_FOLLOWUP = """
+mutation BridgeFollowUp($teamId: String!, $title: String!, $description: String!) {
+  issueCreate(input: { teamId: $teamId, title: $title, description: $description }) {
+    success issue { id identifier url }
+  }
 }"""
 
 
@@ -1103,9 +1180,10 @@ class TrackerClient(object):
         if not (data.get("issueUpdate") or {}).get("success"):
             raise BridgeError("the tracker would not hand the ticket to the agent")
 
-    def team_state(self, team_key, name):
+    def team_state(self, team_key, name, kind="unstarted"):
         """(state id, None), or (None, why) unless the team has exactly one state of that
-        name and it is a to-do (unstarted) state, as the planner requires."""
+        name and it is of that kind: a to-do (unstarted) state, as the planner requires, or
+        a done (completed) one for a finished plan (KIT-299)."""
         nodes = ((self.linear(poller.Q_TEAM, {"key": team_key}).get("teams") or {})
                  .get("nodes")) or []
         if len(nodes) != 1:
@@ -1114,9 +1192,35 @@ class TrackerClient(object):
                   if (s.get("name") or "") == name]
         if len(states) != 1:
             return None, "%s has %d states named %r" % (team_key, len(states), name)
-        if states[0].get("type") != "unstarted":
-            return None, "%s's %r state is not a to-do state" % (team_key, name)
+        if states[0].get("type") != kind:
+            return None, "%s's %r state is not a %s state" % (
+                team_key, name, "done" if kind == "completed" else "to-do")
         return states[0]["id"], None
+
+    def team_id(self, team_key):
+        """(team id, None), or (None, why) unless exactly one team has the key: the planner's
+        own team query, read for a follow-up's team (KIT-299)."""
+        nodes = ((self.linear(poller.Q_TEAM, {"key": team_key}).get("teams") or {})
+                 .get("nodes")) or []
+        if len(nodes) != 1 or not nodes[0].get("id"):
+            return None, "%d teams have the key %s" % (len(nodes), team_key)
+        return nodes[0]["id"], None
+
+    def piece(self, issue_id):
+        """One finished piece of a plan: its links and its newest comments (KIT-299)."""
+        data = self._query(Q_PIECE, {"id": issue_id})
+        return (data or {}).get("issue")
+
+    def file_followup(self, team_id, title, description):
+        """The follow-up a finished plan's review notes become, on a member's yes (KIT-299):
+        a team, a title and a description, and nothing else. The new ticket's id, key and
+        link; an answer that names none raises, and the caller never files again."""
+        data = self._query(M_FOLLOWUP, {"teamId": team_id, "title": title,
+                                        "description": description}) or {}
+        made = data.get("issueCreate") or {}
+        if not made.get("success") or not (made.get("issue") or {}).get("identifier"):
+            raise BridgeError("the tracker would not file the follow-up ticket")
+        return made["issue"]
 
     def move(self, issue_id, state_id):
         data = self._query(M_MOVE, {"id": issue_id, "stateId": state_id}) or {}
@@ -1380,6 +1484,266 @@ def approve_text(epic, requester, cfg, by_bot=False, dm=False):
             % (epic.get("identifier"), notify.safe_title(epic.get("title") or ""),
                (epic.get("team") or {}).get("key") or "?", len(kids), listing,
                "here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
+
+
+# -- A finished plan (KIT-299) ----------------------------------------------------------
+
+def _source_key(value):
+    """An attachment's source type, compared as the review poller compares it."""
+    return re.sub(r"[^a-z0-9]", "", (value if isinstance(value, str) else "").lower())
+
+
+def piece_prs(piece):
+    """The pull requests the GitHub INTEGRATION linked to a piece, each as its repo,
+    number, link and status: lower case, or None when the link carries no status. A link
+    of any other source is a value a session could have written, so it is passed over, as
+    the review poller passes it over."""
+    out = []
+    for att in (((piece or {}).get("attachments") or {}).get("nodes")) or []:
+        att = att if isinstance(att, dict) else {}
+        m = PR_URL_RE.search(att.get("url") if isinstance(att.get("url"), str) else "")
+        if not m or _source_key(att.get("sourceType")) not in GITHUB_ATTACHMENT_SOURCES:
+            continue
+        repo, number = "%s/%s" % (m.group(1), m.group(2)), int(m.group(3))
+        if any(p["repo"] == repo and p["number"] == number for p in out):
+            continue
+        meta = att.get("metadata") if isinstance(att.get("metadata"), dict) else {}
+        status = meta.get("status")
+        out.append({"repo": repo, "number": number, "url": m.group(0),
+                    "status": (status.strip().lower() if isinstance(status, str)
+                               and status.strip() else None)})
+    return out
+
+
+def piece_merge(prs):
+    """How a finished piece's pull requests stand: (why it holds its plan open, or None;
+    the merged ones; the ones the tracker names no status for). One still open holds it,
+    and so does one closed unmerged, unless one in the same repository was merged: that
+    one replaced it. A link with no status beside it replaces nothing."""
+    merged = [p for p in prs if p["status"] == "merged"]
+    unknown = [p for p in prs if p["status"] is None]
+    still_open = [p for p in prs if p["status"] not in (None, "merged", "closed")]
+    closed = [p for p in prs if p["status"] == "closed"
+              and not any(m["repo"] == p["repo"] for m in merged)]
+    if still_open:
+        return ("#%d is %s, not merged" % (still_open[0]["number"],
+                                           notify.safe_title(still_open[0]["status"])),
+                merged, unknown)
+    if closed:
+        return "#%d was closed without being merged" % closed[0]["number"], merged, unknown
+    return None, merged, unknown
+
+
+def piece_hold(piece):
+    """Why a finished piece holds its plan open, or None: a pull request not merged, or
+    more links than one read holds, since one past them may be open."""
+    if piece.get("links_over"):
+        return ("%s has more than %d links, and I read only those, so I can't tell its pull "
+                "requests are all merged" % (piece["ident"], PIECE_LINKS))
+    why = piece_merge(piece["prs"])[0]
+    return "%s's pull request %s" % (piece["ident"], why) if why else None
+
+
+def piece_review(piece, author_id):
+    """What a piece's newest review left: (its notes, or None when there are none to read;
+    how many files it never read when it says it was partial, else None; True when it
+    could not be read). A review is a comment by `author_id`, the owner's key the review
+    poller posts with, whose body starts with REVIEW_HEAD. A comment by anyone else is
+    never one: a session posts as the dispatcher's app, and could write a look-alike. The
+    NEWEST review is the one read: when its `pipeline-telemetry/1` block does not parse, or
+    its findings are not a list, the piece has no notes, never an older review's, which
+    after a bounce are about code since fixed. A review with no findings left no notes; a
+    partial one left none only on the files it read."""
+    best = None
+    for c in (((piece or {}).get("comments") or {}).get("nodes")) or []:
+        c = c if isinstance(c, dict) else {}
+        user = c.get("user") if isinstance(c.get("user"), dict) else {}
+        body = c.get("body") if isinstance(c.get("body"), str) else ""
+        if not author_id or user.get("id") != author_id \
+                or not body.lstrip().startswith(REVIEW_HEAD):
+            continue
+        at = c.get("createdAt") if isinstance(c.get("createdAt"), str) else ""
+        if best is None or at > best[0]:
+            best = (at, body)
+    if best is None:
+        return None, None, False
+    part = PARTIAL_RE.search(best[1].split("```", 1)[0])
+    partial = (int(part.group(1)) if part.group(1) else 0) if part else None
+    blocks, _malformed = scrape.telemetry_blocks(best[1])
+    found = blocks[0].get("review_findings", []) if blocks else None
+    if not isinstance(found, list):
+        return None, partial, True
+    notes = []
+    for f in found:
+        if not isinstance(f, dict) or not str(f.get("summary") or "").strip():
+            continue
+        line, pr = f.get("line"), f.get("pr_number")
+        notes.append({"severity": str(f.get("severity") or "unrated").strip(),
+                      "summary": str(f.get("summary")).strip(),
+                      "file": str(f.get("file") or "").strip(),
+                      "line": line if isinstance(line, int) and not isinstance(line, bool)
+                      else None,
+                      "pr": pr if isinstance(pr, int) and not isinstance(pr, bool) else None})
+    return notes, partial, False
+
+
+def notes_of(pieces):
+    """Every note left on a plan's pieces, in plan order, each naming its piece, and its
+    pull request: the one the review names, or else the piece's first."""
+    out = []
+    for p in pieces:
+        first = (p["prs"][0]["number"] if p["prs"] else None)
+        for n in p["review"] or []:
+            out.append(dict(n, piece=p["ident"], pr=n["pr"] or first))
+    return out
+
+
+def notes_fingerprint(notes):
+    """What a follow-up question showed: the exact notes. A yes files them only while this
+    still matches."""
+    text = json.dumps([[n["piece"], n["severity"], n["file"], n["line"], n["pr"],
+                        n["summary"]] for n in notes])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _plain(text, cap):
+    """Relayed text for the tracker: no angle bracket, one line, cut to `cap`."""
+    out = re.sub(r"\s+", " ", re.sub(r"[<>]", " ", str(text or ""))).strip()
+    return out if len(out) <= cap else out[:cap - 1] + "…"
+
+
+def _relayed(text, cap):
+    """Relayed text for a ticket the dispatcher may read once someone hands it over: the
+    relay's own cleaner first, so a routing tag (`repo=`, `model=`, `agent=`) a session or a
+    review wrote reaches it inert, as every other copied body does; then plain."""
+    return _plain(notify.clean_relay_text(str(text or "")), cap)
+
+
+def _partial(files):
+    """What a partial review is said as: how many files it never read, when it names it."""
+    return "its review was partial" + (": %d file%s never read" % (
+        files, " was" if files == 1 else "s were") if files else "")
+
+
+def _where(note):
+    if not note["file"]:
+        return "no file named"
+    return note["file"] + (":%d" % note["line"] if note["line"] is not None else "")
+
+
+def _numbers(prs):
+    return ", ".join("#%d" % p["number"] for p in prs)
+
+
+def piece_lines(pieces):
+    """One line for each piece with something worth saying: no pull request linked, a
+    merge the tracker does not confirm, no review found, a newest review that could not be
+    read, or a partial one."""
+    lines = []
+    for p in pieces:
+        _why, merged, unknown = piece_merge(p["prs"])
+        said = []
+        if not p["prs"]:
+            said.append("no pull request linked")
+        elif not merged and unknown:
+            said.append("merge not confirmed by the tracker (%s)" % _numbers(unknown))
+        if p["review"] is None and p.get("unreadable"):
+            said.append("its newest review could not be read")
+        elif p["review"] is None:
+            said.append("no review found" + (" in the 100 comments I read" if p["more"]
+                                             else ""))
+        if p.get("partial") is not None:
+            said.append(_partial(p["partial"]))
+        if said:
+            lines.append("• %s: %s." % (p["ident"], "; ".join(said)))
+    return lines
+
+
+def wrap_up_text(epic, pieces, notes, done_name):
+    """The one message a finished plan gets: what shipped, a line for each piece worth one,
+    and the review notes left, at most WRAP_LINES lines and how many more."""
+    title = notify.safe_title(epic.get("title") or "")
+    merged = [m for p in pieces for m in piece_merge(p["prs"])[1]]
+    every = bool(pieces) and all(piece_merge(p["prs"])[1] for p in pieces)
+    shipped = (" — %s" % _numbers(merged)) if merged else ""
+    head = "All %d children of %s “%s” are finished%s%s. I've marked the plan %s." % (
+        len(pieces), epic.get("identifier"), title, " and merged" if every else "", shipped,
+        notify.safe_title(done_name))
+    lines = piece_lines(pieces)
+    if notes:
+        lines.append("%d review note%s left:" % (len(notes), " is" if len(notes) == 1
+                                                 else "s are"))
+        lines += ["• %s, %s, %s: %s" % (n["piece"], notify.safe_title(n["severity"])[:20],
+                                        notify.safe_title(_where(n))[:80],
+                                        notify.safe_title(n["summary"])) for n in notes]
+    elif any(p["review"] is not None for p in pieces):
+        # A partial review's "no notes" covers only the files it read (KIT-138).
+        lines.append("Its reviews left no notes%s." % (
+            " on the files they read" if any(p.get("partial") is not None for p in pieces)
+            else ""))
+    if len(lines) > WRAP_LINES:
+        lines = lines[:WRAP_LINES] + ["…and %d more." % (len(lines) - WRAP_LINES)]
+    return "\n".join([head] + lines)
+
+
+def closing_comment(rec, pieces, done_name, now):
+    """The comment on a plan the bridge closes: who approved it, when it finished, and each
+    piece with its pull requests. Names and titles are relayed text."""
+    lines = ["Marked %s by the Slack bridge at %s: every piece of this plan is finished. "
+             "**%s** (Slack user %s) approved it in Slack at %s."
+             % (done_name, iso(now), _relayed(rec.get("approved_name"), 120) or "?",
+                rec.get("approved_by") or "?", rec.get("approved_at") or "?"), ""]
+    for p in pieces:
+        _why, merged, unknown = piece_merge(p["prs"])
+        if merged:
+            how = "%s, merged" % ", ".join(m["url"] for m in merged)
+        elif unknown:
+            how = "%s, merge not confirmed by the tracker" % ", ".join(m["url"] for m in unknown)
+        else:
+            how = "no pull request linked"
+        lines.append("- %s “%s”: %s" % (p["ident"], _relayed(p["title"], 120), how))
+    return "\n".join(lines)
+
+
+def followup_text(ticket, count, team, cfg, dm=False):
+    """The one question a closed plan with notes left asks. Its terms are fixed: what a yes
+    files, where, and that it starts nothing."""
+    return ("*File the review notes from %s?* Say `yes` %s within %d hours and I'll file "
+            "%s as one follow-up ticket in %s. It starts no work. Say `no` to "
+            "leave %s."
+            % (ticket, "here" if dm else "in this thread", cfg["question_ttl_hours"],
+               "this note" if count == 1 else "these %d notes" % count, team,
+               "it" if count == 1 else "them"))
+
+
+def followup_title(epic):
+    """The follow-up's title. The plan's title is relayed text: a session can edit it."""
+    return _relayed("Follow-ups from %s" % (epic.get("title") or epic.get("identifier")
+                                            or "a plan"), 120)
+
+
+def followup_description(epic, notes, name, uid, when, pieces=()):
+    """The follow-up's text: where the notes came from, who said yes, each note with its
+    piece and pull request, and each piece whose review was partial. Every relayed field
+    (the plan's title, the member's name, each note's parts) goes through the relay's
+    cleaner: this ticket is filed as the owner, and the dispatcher reads routing tags out
+    of a description once someone hands it over."""
+    lines = ["Review notes left on the pieces of %s “%s” when every piece was finished. Filed "
+             "by the Slack bridge for **%s** (Slack user %s), who said yes in Slack at %s. "
+             "Nothing starts on this ticket until someone hands it over."
+             % (epic.get("identifier") or "?", _relayed(epic.get("title"), 120),
+                _relayed(name, 120) or uid, uid, when), ""]
+    for n in notes[:100]:
+        lines.append("- %s%s, %s, %s: %s" % (
+            n["piece"], " (#%d)" % n["pr"] if n["pr"] else "", _relayed(n["severity"], 20),
+            _relayed(_where(n), 200), _relayed(n["summary"], 500)))
+    if len(notes) > 100:
+        lines.append("- …and %d more, in each piece's review comment." % (len(notes) - 100))
+    partial = [p for p in pieces if p.get("partial") is not None]
+    if partial:
+        lines += [""] + ["- %s: %s, so those files have no notes here."
+                         % (p["ident"], _partial(p["partial"])) for p in partial]
+    return "\n".join(lines)
 
 
 def iso(seconds):
@@ -2127,12 +2491,17 @@ class Pass(object):
             self.counts["refused"] += 1
             return
         qkey, q = open_here[0]
+        if q.get("kind") == FOLLOWUP and q.get("filing"):
+            # A follow-up already being filed, its reply lost: say what was filed, or that it
+            # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
+            self.act_followup(channel, thread, q, msg)
+            return
         # From here on a question's status changes only AFTER the reply saying so is
         # posted: a failed post leaves it open, and the next pass says it.
         closed = self.question_closed(channel, q)
         if closed:
-            self.post(channel, thread, "My question about %s %s, so I have closed it. Ask "
-                      "again with `%s %s`." % (q["ticket"], closed, q["kind"], q["ticket"]))
+            self.post(channel, thread, "My question about %s %s, so I have closed it. %s"
+                      % (q["ticket"], closed, self.again(q)))
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: question %s" % closed)
             self.counts["refused"] += 1
@@ -2156,23 +2525,24 @@ class Pass(object):
             return
         # Judged by when the answer was SENT: a yes sent in time while the Mac slept counts.
         if ts_float(msg.get("ts")) - q["asked_at"] > self.cfg["question_ttl_hours"] * 3600:
-            self.post(channel, thread, "The question about %s has expired. Ask again with "
-                      "`%s %s`." % (q["ticket"], q["kind"], q["ticket"]))
+            self.post(channel, thread, "The question about %s has expired. %s"
+                      % (q["ticket"], self.again(q)))
             q["status"] = EXPIRED
             self.mark(channel, msg, "refused: expired")
             self.counts["expired"] += 1
             return
         if not is_yes:
-            self.post(channel, thread, "OK, %s is not %s." % (
-                q["ticket"], "approved" if q["kind"] == "approve" else "planned"))
+            self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
+                      if q["kind"] == FOLLOWUP else "OK, %s is not %s." % (
+                          q["ticket"], "approved" if q["kind"] == "approve" else "planned"))
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
             self.counts["declined"] += 1
             return
-        if q.get("promised") != self.promised(q["kind"]):
+        if q.get("promised") != self.promised(q["kind"], q.get("team")):
             self.post(channel, thread, "My settings changed since I asked about %s, so this "
-                      "yes acts on nothing, and I have closed the question. Ask again with "
-                      "`%s %s`." % (q["ticket"], q["kind"], q["ticket"]))
+                      "yes acts on nothing, and I have closed the question. %s"
+                      % (q["ticket"], self.again(q)))
             q.update(status=REFUSED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "refused: settings changed since asked")
             self.counts["refused"] += 1
@@ -2188,8 +2558,18 @@ class Pass(object):
             return
         if q["kind"] == "approve":
             self.act_approve(channel, thread, q, msg)
+        elif q["kind"] == FOLLOWUP:
+            self.act_followup(channel, thread, q, msg)
         else:
             self.act_plan(channel, thread, q, msg)
+
+    @staticmethod
+    def again(q):
+        """What to do after a question closed unanswered: ask again, for a request. A closed
+        plan's follow-up question has no request to repeat (KIT-299)."""
+        if q.get("kind") == FOLLOWUP:
+            return "The notes stay in my wrap-up; file them yourself if you want them."
+        return "Ask again with `%s %s`." % (q["kind"], q["ticket"])
 
     def actions_left(self):
         hour_ago = self.now - 3600
@@ -2210,13 +2590,16 @@ class Pass(object):
         return notify.safe_title(profile.get("real_name") or
                                  (profile.get("profile") or {}).get("display_name") or uid)
 
-    def promised(self, kind):
+    def promised(self, kind, team=None):
         """The settings a question's text states, as they are now. Recorded when it is
         asked: a yes acts only on the terms the member read."""
         terms = {"act": self.cfg["act"], "question_ttl_hours": self.cfg["question_ttl_hours"]}
         if kind == "approve":
             terms.update(ready_state=self.cfg["ready_state"], epic_wip=self.cfg["epic_wip"],
                          agent_user_name=self.cfg["agent_user_name"])
+        elif kind == FOLLOWUP:
+            # The team whose backlog the follow-up is filed in, and where in it (KIT-299).
+            terms.update(team=team, files_into=FOLLOWUP_INTO)
         else:
             terms.update(plan_it_state=self.cfg["plan_it_state"])
         return terms
@@ -2600,6 +2983,8 @@ class Pass(object):
                       "its children." % ticket)
             return
         state = epic.get("state") or {}
+        if state.get("type") == "completed" and self.closed_already(epic_id, rec, epic):
+            return
         if state.get("type") in FINISHED:
             self.drop(epic_id, rec, "%s is %s, so I've stopped starting its children."
                       % (ticket, state.get("name") or "closed"))
@@ -2648,8 +3033,7 @@ class Pass(object):
             rec["noted"] += ["added:" + k["id"] for k in fresh[1:]]
         unfinished = [k for k in kids if live(k)]
         if not unfinished:
-            self.drop(epic_id, rec, "All %d children of %s are finished. Merging each one "
-                      "stays yours." % (len(kids), ticket))
+            self.finish_epic(epic_id, rec, epic, kids)
             return
         running += [k for k in unfinished if self.handed_over(k)
                     or (k.get("state") or {}).get("type") == "started"]
@@ -2838,6 +3222,242 @@ class Pass(object):
             if after else "", owed))
         self.counts["acted"] += 1
         self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
+
+    # -- a finished plan (KIT-299) -------------------------------------------------
+    def finish_epic(self, epic_id, rec, epic, kids):
+        """Every approved piece is finished: close the plan, once every child of it is Done
+        (an extra one included: a plan is not done while any piece of it is open), none was
+        canceled, no session on one still runs, and no pull request the GitHub integration
+        linked is still open, or closed with none merged. Each hold is said once, and the
+        plan is still followed; one held once its pieces were read (by a pull request, a
+        done state the team lacks, the action limit) reads them again at most every
+        FINISH_RECHECK_SECONDS. `kids` are the approved pieces, all finished here."""
+        ticket, done = rec["ticket"], self.cfg["done_state"]
+        pieces = in_order(children_of(epic)) or kids
+        for k in pieces:
+            ident, kind = k.get("identifier") or "?", (k.get("state") or {}).get("type")
+            if kind == "canceled":
+                self.note(rec, "canceled:" + k["id"], "%s was canceled, so not every piece of "
+                          "%s shipped, and I won't mark it %s. Close it yourself when you're "
+                          "happy with it." % (ident, ticket, done))
+                return
+            if kind != "completed":
+                self.note(rec, "open:" + k["id"], "%s is still %s, so I'll mark %s %s once "
+                          "it's finished too." % (ident, (k.get("state") or {}).get("name")
+                                                  or "open", ticket, done))
+                return
+        for k in pieces:
+            if self.live_session(k):
+                self.note(rec, "ending:" + k["id"], "%s is marked finished, but its session "
+                          "is still running. I'll mark %s %s once it ends."
+                          % (k.get("identifier") or "?", ticket, done))
+                return
+        if self.now - rec.get("finish_read", 0) < FINISH_RECHECK_SECONDS:
+            return
+        # Recorded before the read, so whatever holds the close after it, the pieces are
+        # read again only that much later.
+        rec["finish_read"] = self.now
+        read = self.read_pieces(pieces)
+        held = [(p, piece_hold(p)) for p in read]
+        held = [(p, why) for p, why in held if why]
+        if held:
+            for p, why in held:
+                self.note(rec, "unmerged:%s:%s" % (p["id"], why), "%s, so I haven't marked "
+                          "%s %s. I'll look again." % (why, ticket, done))
+            return
+        self.close_epic(epic_id, rec, epic, read, move=True)
+
+    def read_pieces(self, kids):
+        """Each piece as the tracker shows it now: its pull requests, from the GitHub
+        integration's own links, whether it has more links than one read holds, and what
+        its newest review left. One read a piece."""
+        out = []
+        for k in kids:
+            node = self.tracker.piece(k["id"]) or {}
+            review, partial, unreadable = piece_review(node, self.cfg["owner_user_id"])
+            out.append({"id": k["id"], "ident": k.get("identifier") or "?",
+                        "title": k.get("title") or "", "prs": piece_prs(node),
+                        "links_over": bool((((node.get("attachments") or {}).get("pageInfo"))
+                                            or {}).get("hasNextPage")),
+                        "review": review, "partial": partial, "unreadable": unreadable,
+                        "more": bool((((node.get("comments") or {}).get("pageInfo"))
+                                      or {}).get("hasNextPage"))})
+        return out
+
+    def closed_already(self, epic_id, rec, epic):
+        """The plan is in a done state. One this bridge was closing when a pass stopped
+        after the move is finished now, never moved again. One someone else closed once
+        every piece was finished is said and let go, with no move. False otherwise: a plan
+        closed before its pieces were finished is said as before."""
+        kids = children_of(epic)
+        if rec.get("closing"):
+            self.close_epic(epic_id, rec, epic, self.read_pieces(in_order(kids)), move=False)
+            return True
+        if kids and all((k.get("state") or {}).get("type") == "completed" for k in kids):
+            self.drop(epic_id, rec, "%s is already %s, and every piece of it is finished, so "
+                      "there's nothing left for me to close. I've stopped following it."
+                      % (rec["ticket"], (epic.get("state") or {}).get("name") or "done"))
+            return True
+        return False
+
+    def close_epic(self, epic_id, rec, epic, read, move):
+        """Move the plan to its team's done state, as the owner, comment on it, post the
+        wrap-up, ask about the notes left, and stop following it. Each step is recorded as
+        it lands: `closing` before the move, so a pass that stops after it is finished by
+        closed_already without moving again, then `closed_at`, `commented`, `wrapped` and
+        `asked`, so no pass after one that stopped repeats a step. The question is recorded
+        before the plan is let go, and needs nothing in its record."""
+        ticket = rec["ticket"]
+        team = (epic.get("team") or {}).get("key") or rec.get("team")
+        done = (self.cfg["done_state"] if move
+                else (epic.get("state") or {}).get("name") or self.cfg["done_state"])
+        if move and not rec.get("closed_at"):
+            done_id, why = self.tracker.team_state(team, done, "completed")
+            if not done_id:
+                self.note(rec, "nodone:" + why, "Every piece of %s is finished, but I can't "
+                          "mark it %s: %s." % (ticket, done, why))
+                return
+            if self.actions_left() <= 0:
+                self.say("  action limit: closing %s waits for the next hour" % ticket)
+                return
+            if self.dry:
+                self.say("  [dry-run] would mark %s %s and post its wrap-up" % (ticket, done))
+                return
+            rec["closing"] = self.now
+            self.save()
+            if (epic.get("state") or {}).get("id") != done_id:
+                self.tracker.move(epic["id"], done_id)
+                self.state["acted_at"].append(self.now)
+            rec["closed_at"] = self.now
+            self.save()
+        elif self.dry:
+            self.say("  [dry-run] would finish closing %s" % ticket)
+            return
+        if not rec.get("commented"):
+            body = closing_comment(rec, read, done, self.now)
+            try:
+                self.tracker.comment(epic["id"], body)
+            except BridgeError as exc:
+                # The move stands: it cannot be taken back. The record of it is owed.
+                self.say("  NOTE: %s was closed, but its comment failed: %s" % (ticket, exc))
+                self.owe(epic["id"], ticket, body)
+            rec["commented"] = True
+            self.save()
+        notes = notes_of(read)
+        if not rec.get("wrapped"):
+            self.post(rec["channel"], rec["thread"], wrap_up_text(epic, read, notes, done))
+            rec["wrapped"] = True
+            self.save()
+        if notes and not rec.get("asked"):
+            self.ask_followup(rec, epic, team, notes)
+            rec["asked"] = True
+            self.save()
+        self.state["epics"].pop(epic_id, None)
+        self.save()
+        self.counts["acted"] += 1
+        self.say("  acted: closed %s as %s, %d review note(s) left" % (ticket, done,
+                                                                        len(notes)))
+
+    def ask_followup(self, rec, epic, team, notes):
+        """ONE question once a plan closes with review notes left, built like the others: a
+        yes binds to these exact notes and to the terms the text states, never to the
+        epic's record, which is let go once it is asked."""
+        channel = rec["channel"]
+        dm = channel in self.dm_channels
+        thread = None if dm else rec["thread"]
+        posted = self.post(channel, thread, followup_text(rec["ticket"], len(notes), team,
+                                                          self.cfg, dm=dm))
+        self.state["questions"][key_of(channel, posted)] = {
+            "kind": FOLLOWUP, "ticket": rec["ticket"], "ticket_id": epic.get("id"),
+            "channel": channel, "thread": thread, "ts": posted, "asked_at": self.now,
+            "asked_for": rec.get("approved_by") or "", "status": OPEN,
+            "fingerprint": notes_fingerprint(notes), "promised": self.promised(FOLLOWUP, team),
+            "team": team, "notes": len(notes)}
+        self.counts["asked"] += 1
+        self.say("  asked: followup %s (%d notes)" % (rec["ticket"], len(notes)))
+
+    def act_followup(self, channel, thread, q, msg):
+        """File the notes a closed plan's reviews left as ONE ticket in its team, as the
+        owner: a title and a description, and nothing else, so it starts no work. Re-read
+        first: a yes after the notes changed files nothing. At most once: recorded before
+        the write, so a pass that stops after it never files twice."""
+        def finish(status, text, what):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text)
+            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, what)
+        if q.get("filing") and not q.get("filed"):
+            finish(REFUSED, "I started filing the notes from %s, but I can't confirm the "
+                   "ticket was made, so I won't file it again. Look for “Follow-ups from” in "
+                   "%s's tickets." % (q["ticket"], q.get("team") or "the team"),
+                   "refused: filing not confirmed")
+            return
+        if not q.get("filed"):
+            if self.refused_over_limit(channel, thread, msg):
+                return
+            epic = self.tracker.epic(q.get("ticket_id") or q["ticket"])
+            if not epic or not epic.get("id"):
+                finish(REFUSED, "I can't find %s in the tracker any more, so nothing was "
+                       "filed." % q["ticket"], "refused: gone")
+                return
+            team = (epic.get("team") or {}).get("key")
+            if team != q.get("team") or team not in self.cfg["team_keys"]:
+                finish(REFUSED, "%s is now on %s, so nothing was filed, and I have closed the "
+                       "question." % (q["ticket"], team or "no team"), "refused: team")
+                return
+            read = self.read_pieces(in_order(children_of(epic)))
+            notes = notes_of(read)
+            if notes_fingerprint(notes) != q.get("fingerprint"):
+                finish(REFUSED, "The review notes on %s's pieces changed since I asked, so "
+                       "nothing was filed, and I have closed the question." % q["ticket"],
+                       "refused: changed since asked")
+                return
+            team_id, why = self.tracker.team_id(team)
+            if not team_id:
+                finish(REFUSED, "I can't file the notes from %s: %s." % (q["ticket"], why),
+                       "refused: no team")
+                return
+            if self.dry:
+                self.say("  [dry-run] would file %d notes from %s" % (len(notes), q["ticket"]))
+                return
+            # The name is the member's own to set: relayed text, like the answer's (KIT-224).
+            name = _relayed(self.name_of(msg["user"]), 120) or msg["user"]
+            when = iso(ts_float(msg.get("ts")))
+            q["filing"] = self.now
+            self.save()
+            made = self.tracker.file_followup(team_id, followup_title(epic),
+                                              followup_description(epic, notes, name,
+                                                                   msg["user"], when, read))
+            self.state["acted_at"].append(self.now)
+            q.update(filed=made.get("identifier"), filed_url=made.get("url") or "",
+                     filed_title=followup_title(epic), filed_notes=len(notes),
+                     epic_id=epic["id"], filed_body=(
+                         "Follow-ups from this plan's reviews are in %s%s: %d note(s) from "
+                         "its pieces, filed by the Slack bridge for **%s** (Slack user %s), "
+                         "who said yes in Slack at %s."
+                         % (made.get("identifier"), " (%s)" % made["url"] if made.get("url")
+                            else "", len(notes), name, msg["user"], when)))
+            self.save()
+        owed = ""
+        if not q.get("linked"):
+            try:
+                self.tracker.comment(q["epic_id"], q["filed_body"])
+            except BridgeError as exc:
+                # The ticket stands: it cannot be taken back. The link to it is owed.
+                self.say("  NOTE: %s was filed, but the comment on %s failed: %s"
+                         % (q["filed"], q["ticket"], exc))
+                self.owe(q["epic_id"], q["ticket"], q["filed_body"])
+                owed = (" The ticket was filed, but the comment on %s linking it could not be "
+                        "written; I will try again." % q["ticket"])
+            q["linked"] = True
+            self.save()
+        finish(DONE, "Filed %s “%s” in %s for <@%s>, with %d note%s. Nothing starts "
+               "on it until someone hands it over.%s"
+               % (q["filed"], notify.safe_title(q["filed_title"]), q.get("team") or "?",
+                  msg["user"], q["filed_notes"], "" if q["filed_notes"] == 1 else "s", owed),
+               "done: filed %s" % q["filed"])
+        self.counts["acted"] += 1
+        self.say("  acted: filed %s from %s for %s" % (q["filed"], q["ticket"], msg["user"]))
 
     # -- housekeeping --------------------------------------------------------------
     def expire(self):
@@ -3080,7 +3700,15 @@ class FakeTracker(object):
         self.reads = 0
         self.fail = False
         self.live = {}                 # issue uuid -> reasons
-        self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo"}
+        self.team_states = {("PROD", "Plan it"): "st-plan-it", ("PROD", "Todo"): "st-todo",
+                            ("PROD", "Done"): "st-done"}
+        self.state_kinds = {"st-done": "completed"}   # any other: a to-do state (KIT-299)
+        # KIT-299: what a finished piece carries. Links by ticket, as the tracker lists them;
+        # comments by ticket, each {body, createdAt, user: {id}}; the follow-ups filed.
+        self.links, self.notes_on, self.more_comments = {}, {}, set()
+        self.more_links = set()        # pieces whose links run past one read
+        self.team_ids = {"PROD": "team-prod"}
+        self.filed, self.file_raises, self.piece_reads = [], None, 0
         self.agents = {"Agent": "agent-1"}
         self.sessions = {}             # issue uuid -> sessions
         self.sessions_whole = True     # False: more sessions than one pass reads (KIT-284)
@@ -3100,10 +3728,38 @@ class FakeTracker(object):
     def live_work(self, issue_id):
         return list(self.live.get(issue_id, []))
 
-    def team_state(self, team_key, name):
+    def team_state(self, team_key, name, kind="unstarted"):
         sid = self.team_states.get((team_key, name))
+        if sid and self.state_kinds.get(sid, "unstarted") != kind:
+            return None, "%s's %r state is not a %s state" % (
+                team_key, name, "done" if kind == "completed" else "to-do")
         return (sid, None) if sid else (None, "%s has no single to-do state named %r"
                                         % (team_key, name))
+
+    def team_id(self, team_key):
+        tid = self.team_ids.get(team_key)
+        return (tid, None) if tid else (None, "0 teams have the key %s" % team_key)
+
+    def piece(self, issue_id):
+        self.piece_reads += 1
+        if self.fail:
+            raise BridgeError("the tracker could not be read (simulated)")
+        i = next((x for x in self.issues.values() if x["id"] == issue_id), None)
+        if not i:
+            return None
+        ident = i["identifier"]
+        return {"id": issue_id, "identifier": ident,
+                "attachments": {"nodes": list(self.links.get(ident, [])),
+                                "pageInfo": {"hasNextPage": ident in self.more_links}},
+                "comments": {"nodes": list(self.notes_on.get(ident, [])),
+                             "pageInfo": {"hasNextPage": ident in self.more_comments}}}
+
+    def file_followup(self, team_id, title, description):
+        self.filed.append({"teamId": team_id, "title": title, "description": description})
+        if self.file_raises is not None:
+            raise self.file_raises
+        return {"id": "uuid-900", "identifier": "PROD-900",
+                "url": "https://linear.app/example/issue/PROD-900"}
 
     def agent_user(self, name):
         aid = self.agents.get(name)
@@ -3128,11 +3784,11 @@ class FakeTracker(object):
 
     def move(self, issue_id, state_id):
         self.moves.append((issue_id, state_id))
-        names = {"st-plan-it": "Plan it", "st-todo": "Todo"}
+        names = {"st-plan-it": "Plan it", "st-todo": "Todo", "st-done": "Done"}
         for i in self.issues.values():
             if i["id"] == issue_id:
                 i["state"] = {"id": state_id, "name": names.get(state_id, state_id),
-                              "type": "unstarted"}
+                              "type": self.state_kinds.get(state_id, "unstarted")}
 
     def delegate(self, issue_id, agent_id):
         self.delegations.append((issue_id, agent_id))
@@ -6793,22 +7449,587 @@ def selftest():
         check("dm-off: with dm_user_ids empty a channel works as before, and no DM is opened",
               outcome(case_channel_only), (False, [(CHAN, True)], True, {}))
 
-    # 14. EXACTLY THREE TRACKER WRITES (KIT-222, KIT-223): a state move carrying `stateId`
-    #     only, a delegation carrying `delegateId` only, and a comment. No other mutation
-    #     anywhere above the tests.
+        # 15. A FINISHED PLAN CLOSES ITSELF (KIT-299). Every child Done, every pull request
+        #     the GitHub integration linked merged: the epic moves to the done state, one
+        #     comment, one wrap-up where it was approved, and the plan is let go. The notes its
+        #     reviews left get ONE question; a yes files them as one ticket with a team, a
+        #     title and a description only. Each case runs alone, so one that raises fails as
+        #     itself.
+        pr_link = "https://github.com/acme/app/pull/%d"
+
+        def link(t, ident, number, status="merged", source="github", meta=True):
+            att = {"url": pr_link % number, "sourceType": source}
+            if meta:
+                att["metadata"] = {"status": status} if status is not None else {"number": number}
+            t.links.setdefault(ident, []).append(att)
+
+        def finding(summary, sev="low", path="src/app.py", line=12, pr=None):
+            return {"severity": sev, "summary": summary, "file": path, "line": line,
+                    "pr_number": pr, "category": "general", "at": "2026-10-30T10:00:00Z"}
+
+        def review(t, ident, findings, author=OWNER, at="2026-10-30T10:00:00Z", raw=None):
+            block = {"schema": "pipeline-telemetry/1", "runs": [], "ticket_events": []}
+            if findings:
+                block["review_findings"] = findings
+            body = raw if raw is not None else (
+                "**Pipeline review** — PR #1\n\nA summary.\n\n```json\n%s\n```\n"
+                % json.dumps(block, indent=2))
+            t.notes_on.setdefault(ident, []).append({"body": body, "createdAt": at,
+                                                     "user": {"id": author}})
+
+        def finished(name, kids=None, setup=None, links=True, **over):
+            """An approved plan with each child Done and its pull request merged, then one
+            pass. `setup` changes the world before that pass."""
+            c, s, t, root = approved(name, kids=kids or (("PROD-51", ()),
+                                                         ("PROD-52", ("PROD-51",))), **over)
+            for n, k in enumerate(t.epics["PROD-50"]):
+                if links:
+                    link(t, k, 437 + n)
+                t.set_state(k, "completed")
+            if setup:
+                setup(t)
+            code, _out = run(c, s, t)
+            return c, s, t, root, code
+
+        def done_moves(t):
+            return [m for m in t.moves if m[1] == "st-done"]
+
+        def wraps(s):
+            return [(ch, th, x) for ch, th, x in s.posts if "children of PROD-50" in x]
+
+        def asked_followup(s):
+            return [(ch, th, x) for ch, th, x in s.posts if "*File the review notes" in x]
+
+        def closing(t):
+            return [b for i, b in t.comments if i == "uuid-50" and b.startswith("Marked ")]
+
+        def case_closes():
+            c, s, t, root, code = finished("fin-closes")
+            wrap = wraps(s)
+            return (code, done_moves(t), len(closing(t)),
+                    BOB in (closing(t) or [""])[0] and pr_link % 437 in (closing(t) or [""])[0],
+                    len(wrap), [n for n in ("#437", "#438", "and merged", "marked the plan Done")
+                                if wrap and n not in wrap[0][2]],
+                    followed(c), asked_followup(s))
+        check("all-merged-closes-the-plan: one stateId move to Done, one comment, one wrap-up "
+              "naming every PR, let go, no question", outcome(case_closes),
+              (EXIT_OK, [("uuid-50", "st-done")], 1, True, 1, [], [], []))
+
+        def case_where_channel():
+            c, s, t, root, _code = finished("fin-channel")
+            return [(ch, th == root, "#437, #438" in x and "marked the plan Done" in x)
+                    for ch, th, x in wraps(s)]
+        check("the wrap-up goes in the approval's thread when approved in a channel",
+              outcome(case_where_channel), [(CHAN, True, True)])
+
+        def case_where_dm():
+            c, s, t = dmworld("fin-dm", act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            s.add(ALICE, "approve PROD-50", channel=DM)
+            run(c, s, t)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            for n, k in enumerate(t.epics["PROD-50"]):
+                link(t, k, 437 + n)
+                t.set_state(k, "completed")
+            review(t, "PROD-51", [finding("Name the timeout")])
+            run(c, s, t)
+            q = [x for x in asked_followup(s)]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            return ([(ch, th) for ch, th, _x in wraps(s) + q],
+                    "Say `yes` here within 24 hours" in (q or [("", "", "")])[0][2],
+                    len(t.filed), [th for ch, th, x in s.posts if "Filed PROD-900" in x])
+        check("the wrap-up and its question are top-level when approved in a DM, and a yes "
+              "there files", outcome(case_where_dm), ([(DM, None), (DM, None)], True, 1, [None]))
+
+        def case_canceled():
+            c, s, t, root, _code = finished(
+                "fin-canceled", setup=lambda t: t.set_state("PROD-52", "canceled"))
+            run(c, s, t)
+            return (done_moves(t), sum("PROD-52 was canceled" in p for p in posted(s)),
+                    wraps(s), followed(c))
+        check("a canceled child blocks the close, said once, and the plan is still followed",
+              outcome(case_canceled), ([], 1, [], ["uuid-50"]))
+
+        def case_closed_pr():
+            def closed_52(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status="Closed")
+            c, s, t, root, _code = finished("fin-closed-pr", setup=closed_52)
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            held = [p for p in posted(s) if "#438 was closed without being merged" in p]
+            reads = t.piece_reads
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 60)
+            return (done_moves(t), len(held), wraps(s), followed(c),
+                    t.piece_reads == reads)
+        check("a pull request closed without a merge blocks the close, said once, read again "
+              "at most every FINISH_RECHECK_SECONDS", outcome(case_closed_pr),
+              ([], 1, [], ["uuid-50"], True))
+
+        def case_closed_beside():
+            def beside_unknown(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status="closed")
+                link(t, "PROD-52", 439, status=None)
+
+            def beside_other_repo(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status="closed")
+                t.links["PROD-52"].append({"url": "https://github.com/acme/other/pull/9",
+                                           "sourceType": "github",
+                                           "metadata": {"status": "merged"}})
+            got = []
+            for name, setup in (("fin-beside-unknown", beside_unknown),
+                                ("fin-beside-other", beside_other_repo)):
+                c, s, t, root, _code = finished(name, setup=setup)
+                got.append((done_moves(t), sum("#438 was closed without being merged" in p
+                                               for p in posted(s)), wraps(s), followed(c)))
+            return got
+        check("a closed pull request holds the close beside a link with no status, or beside "
+              "one merged in another repository", outcome(case_closed_beside),
+              [([], 1, [], ["uuid-50"])] * 2)
+
+        def case_links_over():
+            c, s, t, root, _code = finished(
+                "fin-links-over", setup=lambda t: t.more_links.add("PROD-52"))
+            return (done_moves(t), sum("PROD-52 has more than 50 links" in p
+                                       for p in posted(s)), wraps(s), followed(c))
+        check("a piece with more links than one read takes holds the close, said once",
+              outcome(case_links_over), ([], 1, [], ["uuid-50"]))
+
+        def case_reopened(back_to):
+            # The bridge handed PROD-52 over, it went Done, and the close waits on its pull
+            # request. Then it is reopened: by the next look the PR is merged, but the piece
+            # is live again. The plan stays open and followed, the piece is never handed
+            # over twice, and it is said only as any handed-over piece is (KIT-284).
+            c, s, t, root = approved("fin-reopened-" + back_to,
+                                     kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            t.set_state("PROD-51", "completed")
+            run(c, s, t)
+            link(t, "PROD-51", 437)
+            link(t, "PROD-52", 438, status="Closed")
+            t.set_state("PROD-52", "completed")
+            run(c, s, t)
+            held = sum("#438 was closed without being merged" in p for p in posted(s))
+            t.set_state("PROD-52", back_to)
+            t.links["PROD-52"] = []
+            link(t, "PROD-52", 438)
+            before = len(s.posts)
+            for later in (FINISH_RECHECK_SECONDS + 1, STUCK_START_SECONDS + 60,
+                          STUCK_START_SECONDS + 120):
+                run(c, s, t, at=now + later)
+            said = [x for _ch, _th, x in s.posts[before:]]
+            return (held, delegated(t), done_moves(t), wraps(s), followed(c),
+                    asked_followup(s), [("has not started" in x) for x in said])
+        check("a piece reopened before the close holds it: no move, no wrap-up, still "
+              "followed, never handed over again, and a piece at work again is not called "
+              "stuck", outcome(lambda: case_reopened("started")),
+              (1, ["uuid-51", "uuid-52"], [], [], ["uuid-50"], [], []))
+        check("a piece reopened to Todo holds the close, and after two hours that it has not "
+              "started is said once over two passes", outcome(lambda: case_reopened("unstarted")),
+              (1, ["uuid-51", "uuid-52"], [], [], ["uuid-50"], [], [True]))
+
+        def case_extra_open():
+            def extra(t):
+                t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59",
+                                           identifier="PROD-59", title="Added by a session",
+                                           blocked_by=[], labels=[])
+                t.epics["PROD-50"].append("PROD-59")
+                t.set_state("PROD-59", "unstarted")
+            c, s, t, root, _code = finished("fin-extra-open", setup=extra)
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            held = (done_moves(t), wraps(s), followed(c),
+                    sum("PROD-59 is still Todo" in p for p in posted(s)),
+                    sum("PROD-59 was added after" in p for p in posted(s)))
+            link(t, "PROD-59", 440)
+            t.set_state("PROD-59", "completed")
+            run(c, s, t, at=now + 2 * FINISH_RECHECK_SECONDS + 2)
+            return held, (done_moves(t), len(wraps(s)), followed(c))
+        check("a piece added after the approval and left open holds the close, said once; "
+              "once it is Done the plan closes", outcome(case_extra_open),
+              (([], [], ["uuid-50"], 1, 1), ([("uuid-50", "st-done")], 1, [])))
+
+        def case_reads_bounded():
+            c, s, t, root, _code = finished("fin-reads", done_state="Shipped")
+            first = t.piece_reads
+            run(c, s, t, at=now + 60)
+            run(c, s, t, at=now + 120)
+            again = t.piece_reads
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            return first, again - first, t.piece_reads - again
+        check("a close held by anything reads its pieces again at most every "
+              "FINISH_RECHECK_SECONDS", outcome(case_reads_bounded), (2, 0, 2))
+
+        def case_open_pr():
+            def open_52(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status="open")
+            c, s, t, root, _code = finished("fin-open-pr", setup=open_52)
+            held = sum("#438 is open, not merged" in p for p in posted(s))
+            t.links["PROD-52"] = []
+            link(t, "PROD-52", 438, status="MERGED")
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            return (held, done_moves(t), len(wraps(s)), followed(c))
+        check("an open pull request holds the close until it is merged, then it closes",
+              outcome(case_open_pr), (1, [("uuid-50", "st-done")], 1, []))
+
+        def case_replaced_pr():
+            def replaced(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status="closed")
+                link(t, "PROD-52", 439, status="merged")
+            c, s, t, root, _code = finished("fin-replaced", setup=replaced)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            return (done_moves(t), "#439" in wrap, "#438" in wrap)
+        check("a closed pull request beside a merged one was replaced, and does not hold it",
+              outcome(case_replaced_pr), ([("uuid-50", "st-done")], True, False))
+
+        def case_no_status():
+            def unstated(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status=None)
+            c, s, t, root, _code = finished("fin-no-status", setup=unstated)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            return (done_moves(t), "PROD-52: merge not confirmed by the tracker (#438)" in wrap,
+                    "and merged" in wrap, "PROD-51: merge not confirmed" in wrap, followed(c))
+        check("a link with no status closes, and the wrap-up says the merge is not confirmed "
+              "for that piece", outcome(case_no_status),
+              ([("uuid-50", "st-done")], True, False, False, []))
+
+        def case_session_link():
+            def forged(t):
+                t.links["PROD-52"] = []
+                link(t, "PROD-52", 438, status="closed", source="api")
+            c, s, t, root, _code = finished("fin-forged", setup=forged)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            return done_moves(t), "PROD-52: no pull request linked" in wrap, "#438" in wrap
+        check("a link the integration did not write is passed over, never read as a PR",
+              outcome(case_session_link), ([("uuid-50", "st-done")], True, False))
+
+        def case_reviews():
+            def reviews(t):
+                review(t, "PROD-51", [finding("From the dispatcher's app")], author="app-user",
+                       at="2026-10-30T13:00:00Z")
+                review(t, "PROD-51", [finding("Older note")], at="2026-10-29T10:00:00Z")
+                review(t, "PROD-51", [finding("Newest note")], at="2026-10-30T11:00:00Z")
+                # PROD-52's newest review does not parse: an older one's notes are about
+                # code a bounce may have fixed since, so none are offered.
+                review(t, "PROD-52", [finding("Fixed in the bounce")],
+                       at="2026-10-30T08:00:00Z")
+                review(t, "PROD-52", None, at="2026-10-30T12:00:00Z",
+                       raw="**Pipeline review** — PR #2\n\n```json\n{\"schema\": "
+                           "\"pipeline-telemetry/1\", \"review_findings\": [\n```\n")
+            c, s, t, root, _code = finished(
+                "fin-reviews", setup=reviews,
+                kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",)), ("PROD-53", ("PROD-52",))))
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            return ([n for n in ("Newest note", "Older note", "dispatcher's app",
+                                 "Fixed in the bounce") if n in wrap],
+                    "PROD-52: its newest review could not be read." in wrap,
+                    "PROD-53: no review found." in wrap, "1 review note is left:" in wrap)
+        check("reviews: another author's is ignored even when newer, the newest wins, a newest "
+              "one that does not parse leaves no notes (never an older one's), and a piece "
+              "with none says no review found", outcome(case_reviews),
+              (["Newest note"], True, True, True))
+
+        def with_notes(t):
+            review(t, "PROD-51", [finding("Name the <!channel> timeout", sev="medium"),
+                                  finding("Log the retry", path="src/net.py", line=None)])
+            review(t, "PROD-52", [], at="2026-10-30T09:00:00Z")
+
+        def case_question():
+            c, s, t, root, _code = finished("fin-question", setup=with_notes)
+            q = asked_followup(s)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            st = json.load(open(state_path(c)))
+            rec = [v for v in st["questions"].values() if v.get("kind") == "followup"]
+            return (len(q), [(ch, th == root) for ch, th, _x in q],
+                    [n for n in ("Say `yes` in this thread within 24 hours", "these 2 notes",
+                                 "ticket in PROD.", "It starts no work", "Say `no`")
+                     if q and n not in q[0][2]],
+                    "<!channel>" in wrap, "PROD-51, medium, src/app.py:12: Name the" in wrap,
+                    "PROD-51, low, src/net.py: Log the retry" in wrap,
+                    [sorted(r["promised"]) for r in rec], followed(c), t.filed)
+        check("notes left: one question in the same place, with its terms fixed and recorded, "
+              "and the plan let go", outcome(case_question),
+              (1, [(CHAN, True)], [], False, True, True,
+               [["act", "files_into", "question_ttl_hours", "team"]], [], []))
+
+        def answered(name, word="yes", before=None, setup=with_notes, **over):
+            c, s, t, root, _code = finished(name, setup=setup, **over)
+            if before:
+                before(c, s, t)
+            s.add(BOB, word, thread=root)
+            code, _out = run(c, s, t)
+            run(c, s, t)
+            return c, s, t, root, code
+
+        def case_yes():
+            c, s, t, root, code = answered("fin-yes")
+            filed = t.filed
+            link_comment = [b for i, b in t.comments if i == "uuid-50" and "PROD-900" in b]
+            said = [(ch, th == root) for ch, th, x in s.posts if x.startswith("Filed PROD-900")]
+            desc = (filed or [{}])[0].get("description", "")
+            return (code, len(filed), [sorted(f) for f in filed],
+                    (filed or [{}])[0].get("title"), (filed or [{}])[0].get("teamId"),
+                    "#437" in desc and "Log the retry" in desc and "<" not in desc,
+                    len(link_comment), said, done_moves(t))
+        check("yes files exactly one issueCreate with teamId, title and description only, "
+              "then the epic comment linking it, then the confirmation", outcome(case_yes),
+              (EXIT_OK, 1, [["description", "teamId", "title"]],
+               "Follow-ups from Epic PROD-50", "team-prod", True, 1, [(CHAN, True)],
+               [("uuid-50", "st-done")]))
+
+        def case_partial():
+            import telemetry_block as tb
+
+            def partial_review(t, ident):
+                block = {"schema": "pipeline-telemetry/1", "runs": [], "ticket_events": []}
+                review(t, ident, None, raw=tb.review_comment(
+                    {"pr": 437, "coverage": "partial", "withheld_files": ["a.py", "b.py"]},
+                    block))
+
+            def partial_clean(t):
+                partial_review(t, "PROD-51")
+                review(t, "PROD-52", [])
+            c, s, t, root, _code = finished("fin-partial", setup=partial_clean)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+
+            def partial_noted(t):
+                partial_review(t, "PROD-51")
+                review(t, "PROD-52", [finding("Log the retry")])
+            c2, s2, t2, root2, _code2 = answered("fin-partial-yes", setup=partial_noted)
+            desc = (t2.filed or [{}])[0].get("description", "")
+            return ("PROD-51: its review was partial: 2 files were never read." in wrap,
+                    "Its reviews left no notes." in wrap,
+                    "Its reviews left no notes on the files they read." in wrap,
+                    "PROD-51: its review was partial: 2 files were never read, so those files "
+                    "have no notes here." in desc)
+        check("a partial review is said as partial in the wrap-up and the follow-up, never as "
+              "no notes", outcome(case_partial), (True, False, True, True))
+
+        def case_no():
+            c, s, t, root, code = answered("fin-no", word="no")
+            return (t.filed, sum("won't file the notes from PROD-50" in p for p in posted(s)))
+        check("no files nothing, and says so once", outcome(case_no), ([], 1))
+
+        def case_changed():
+            def another_note(_c, _s, t):
+                review(t, "PROD-52", [finding("A note added after the question")],
+                       at="2026-10-30T13:00:00Z")
+            c, s, t, root, code = answered("fin-changed", before=another_note)
+            st = json.load(open(state_path(c)))
+            return (t.filed, sum("changed since I asked, so nothing was filed" in p
+                                 for p in posted(s)),
+                    [v["status"] for v in st["questions"].values() if v.get("kind") == "followup"])
+        check("a yes after a note changed files nothing and closes the question",
+              outcome(case_changed), ([], 1, [REFUSED]))
+
+        def case_act_off():
+            def acting_off(c, _s, _t):
+                c["act"] = False
+            c, s, t, root, code = answered("fin-act-off", before=acting_off)
+            said = sum("settings changed since I asked about PROD-50" in p for p in posted(s))
+            # A plan finishing while acting is off moves nothing and asks nothing.
+            c2, s2, t2, root2 = approved("fin-act-off-early")
+            c2["act"] = False
+            for k in t2.epics["PROD-50"]:
+                link(t2, k, 437)
+                t2.set_state(k, "completed")
+            _code, out = run(c2, s2, t2)
+            return (t.filed, said, done_moves(t2), wraps(s2), followed(c2),
+                    "acting is off: 1 approved epic(s) wait" in out)
+        check("act off: nothing moved or filed, and a yes after it is said once",
+              outcome(case_act_off), ([], 1, [], [], ["uuid-50"], True))
+
+        def case_no_notes():
+            def clean(t):
+                review(t, "PROD-51", [])
+                review(t, "PROD-52", [])
+            c, s, t, root, _code = finished("fin-clean", setup=clean)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            return asked_followup(s), "Its reviews left no notes." in wrap, followed(c)
+        check("no notes left: no question", outcome(case_no_notes), ([], True, []))
+
+        def case_by_hand():
+            def closed_by_hand(t):
+                t.set_state("PROD-50", "completed")
+            c, s, t, root, _code = finished("fin-by-hand", setup=closed_by_hand)
+            run(c, s, t)
+            return (done_moves(t), t.piece_reads,
+                    sum("PROD-50 is already Done" in p for p in posted(s)), wraps(s),
+                    followed(c))
+        check("a plan already Done by hand: no move, said, let go", outcome(case_by_hand),
+              ([], 0, 1, [], []))
+
+        def case_twice():
+            c, s, t, root, _code = finished("fin-twice", setup=with_notes)
+            first = (done_moves(t), len(closing(t)), len(wraps(s)), len(asked_followup(s)),
+                     followed(c))
+            before = (len(t.moves), len(s.posts), len(t.comments), t.reads)
+            run(c, s, t)
+            run(c, s, t, at=now + 3 * FINISH_RECHECK_SECONDS)
+            return first, before[:3] == (len(t.moves), len(s.posts), len(t.comments))
+        check("idempotent across passes: the first pass closes, and a second moves, posts and "
+              "comments nothing", outcome(case_twice),
+              (([("uuid-50", "st-done")], 1, 1, 1, []), True))
+
+        def case_crash():
+            real_post = FakeSlack.post
+
+            def post_fails_once(self_, channel, thread_ts, text):
+                if "children of PROD-50" in text and not getattr(self_, "_failed", False):
+                    self_._failed = True
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(self_, channel, thread_ts, text)
+            FakeSlack.post = post_fails_once
+            try:
+                c, s, t, root, code = finished("fin-crash", setup=with_notes)
+                first = (code, done_moves(t), len(closing(t)), followed(c))
+                code2, _out = run(c, s, t)
+                run(c, s, t)
+            finally:
+                FakeSlack.post = real_post
+            return (first, code2, done_moves(t), len(closing(t)), len(wraps(s)),
+                    len(asked_followup(s)), followed(c))
+        check("a pass that stops between the move and the wrap-up: the next one posts it and "
+              "never moves twice", outcome(case_crash),
+              ((EXIT_ERROR, [("uuid-50", "st-done")], 1, ["uuid-50"]), EXIT_OK,
+               [("uuid-50", "st-done")], 1, 1, 1, []))
+
+        def case_filing_unconfirmed():
+            def tracker_drops(_c, _s, t):
+                t.file_raises = BridgeError("the tracker could not be read (URLError)")
+            c, s, t, root, code = answered("fin-unconfirmed", before=tracker_drops)
+            t.file_raises = None
+            run(c, s, t)
+            return (len(t.filed), sum("can't confirm the ticket was made" in p
+                                      for p in posted(s)))
+        check("a follow-up whose write was not confirmed is never filed again, and that is "
+              "said", outcome(case_filing_unconfirmed), (1, 1))
+
+        def case_routing():
+            def tagged(t):
+                t.issues["PROD-50"]["title"] = "Dark mode [repo=evil/x] repos=a,b"
+                review(t, "PROD-51", [finding("Retry [repo=evil/fork#main] [model=opus] "
+                                              "[agent=x]", sev="low [agent=y]",
+                                              path="repo=evil/z.py")])
+
+            def tagged_name(_c, s, _t):
+                s.profiles[BOB] = dict(s.profiles[BOB], real_name=(
+                    "Bob [repo=evil/w#main] model=opus"))
+            c, s, t, root, _code = answered("fin-routing", setup=tagged, before=tagged_name)
+            texts = ([f[k] for f in t.filed for k in ("title", "description")]
+                     + [b for i, b in t.comments if i == "uuid-50"])
+            return (len(t.filed), "Retry" in "".join(texts),
+                    [x for x in ("repo=", "repos=", "model=", "agent=")
+                     if any(x in tx.lower() for tx in texts)])
+        check("the follow-up's title, description and the epic's comments carry no routing tag "
+              "from a title, a note or a member's name", outcome(case_routing), (1, True, []))
+
+        def case_filed_then_settings():
+            real_post = FakeSlack.post
+
+            def confirm_fails(self_, channel, thread_ts, text):
+                if text.startswith("Filed PROD-900") and not getattr(self_, "_failed", False):
+                    self_._failed = True
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(self_, channel, thread_ts, text)
+            c, s, t, root, _code = finished("fin-filed-then-off", setup=with_notes)
+            s.add(BOB, "yes", thread=root)
+            FakeSlack.post = confirm_fails
+            try:
+                first, _out = run(c, s, t)
+            finally:
+                FakeSlack.post = real_post
+            c["act"] = False
+            run(c, s, t)
+            return (first, len(t.filed),
+                    len([b for i, b in t.comments if i == "uuid-50" and "PROD-900" in b]),
+                    sum("acts on nothing" in p for p in posted(s)),
+                    [th == root for ch, th, x in s.posts if x.startswith("Filed PROD-900")])
+        check("a follow-up filed before its reply was lost is said as filed, even after the "
+              "settings changed", outcome(case_filed_then_settings),
+              (EXIT_ERROR, 1, 1, 0, [True]))
+
+        def case_done_state():
+            c, s, t, root, _code = finished("fin-not-done", done_state="Shipped")
+            run(c, s, t)
+            named = finished("fin-named", done_state="Todo")
+            return (done_moves(t), sum("can't mark it Shipped" in p for p in posted(s)),
+                    followed(c), done_moves(named[2]),
+                    sum("is not a done state" in p for p in posted(named[1])),
+                    cfg_for("fin-default")["done_state"],
+                    "done_state" in _config_error(dict(EXAMPLE_CONFIG, channel_ids=[CHAN],
+                                                       owner_user_id=OWNER, bot_user_id=ME,
+                                                       done_state=5,
+                                                       state_dir=os.path.join(tmp, "fin-x"))))
+        check("done_state: Done by default, a name the team lacks or one not a done state is "
+              "said once and moves nothing", outcome(case_done_state),
+              ([], 1, ["uuid-50"], [], 1, "Done", True))
+
+        def case_dry():
+            c, s, t, root = approved("fin-dry")
+            for n, k in enumerate(t.epics["PROD-50"]):
+                link(t, k, 437 + n)
+                t.set_state(k, "completed")
+            _code, out = run(c, s, t, dry=True)
+            return (done_moves(t), wraps(s), followed(c),
+                    "[dry-run] would mark PROD-50 Done" in out)
+        check("a dry run says it would close, and moves and posts nothing", outcome(case_dry),
+              ([], [], ["uuid-50"], True))
+
+        def case_cap():
+            def many(t):
+                review(t, "PROD-51", [finding("Note %d" % i) for i in range(20)])
+            c, s, t, root, _code = finished("fin-cap", setup=many)
+            wrap = (wraps(s) or [("", "", "")])[0][2]
+            lines = wrap.splitlines()
+            return (len(lines), lines[-1], "Note 12" in wrap, "Note 13" in wrap,
+                    "these 20 notes" in (asked_followup(s) or [("", "", "")])[0][2])
+        check("the wrap-up lists at most 15 lines and says how many more",
+              outcome(case_cap), (17, "…and 7 more.", True, False, True))
+
+        def case_copies():
+            import pipeline_review_poller as rp
+            mine = globals().get("GITHUB_ATTACHMENT_SOURCES")
+            pattern = getattr(globals().get("PR_URL_RE"), "pattern", None)
+            return (mine == rp.GITHUB_ATTACHMENT_SOURCES, pattern == rp._PR_URL_RE.pattern,
+                    [globals()["_source_key"](v) == rp._source_key(v)
+                     for v in ("GitHub_PR", "github-pull-request", None, "Api")])
+        check("the integration's source list and PR pattern are the review poller's own",
+              outcome(case_copies), (True, True, [True, True, True, True]))
+
+    # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
+    #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
+    #     `delegateId` only, a comment, and a finished plan's follow-up carrying a team, a
+    #     title and a description only. No other mutation anywhere above the tests.
     mutations = re.findall(r"\bmutation\s+(\w+)", body)
-    check("only-three-tracker-writes", sorted(mutations),
-          ["BridgeComment", "BridgeDelegate", "BridgeMove"])
+    check("only-four-tracker-writes", sorted(mutations),
+          ["BridgeComment", "BridgeDelegate", "BridgeFollowUp", "BridgeMove"])
     check("the-move-sets-stateId-only",
           re.search(r"issueUpdate\(id: \$id, input: \{ stateId: \$stateId \}\)", body)
           is not None, True)
     check("the-delegation-sets-delegateId-only",
           re.search(r"issueUpdate\(id: \$id, input: \{ delegateId: \$delegateId \}\)",
                     body) is not None and body.count("issueUpdate(") == 2, True)
-    check("no-other-write-verb", [v for v in ("issueCreate", "issueDelete", "issueArchive",
+    # KIT-299: one site, and its input exactly a team, a title and a description: no label,
+    # no assignee, no delegate, no state, no parent, so the ticket starts no work.
+    check("the-follow-up-sets-teamId-title-description-only",
+          (re.search(r"issueCreate\(input: \{ teamId: \$teamId, title: \$title, "
+                     r"description: \$description \}\)", body) is not None,
+           body.count("issueCreate(")), (True, 1))
+    check("the-move-and-the-follow-up-are-the-only-callers",
+          (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
+           len(re.findall(r"_query\(M_FOLLOWUP", body))), (3, 1, 1))
+    check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
-                                              "agentSessionCreate", "assigneeId",
-                                              "labelIds", "parentId")
+                                              "issueBatchCreate", "agentSessionCreate",
+                                              "assigneeId", "labelIds", "parentId",
+                                              "delegateId: $delegateId, ",
+                                              "stateId: $stateId, ", "subscriberIds",
+                                              "projectId", "templateId")
                                   if v in body], [])
     check("tracker-endpoint-fixed", body.count("https://api.linear.app/graphql"), 1)
     # KIT-224: the one borrowed write is the bounce driver's thread reply, from one place.
