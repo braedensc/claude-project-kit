@@ -160,8 +160,9 @@ python3 scripts/pipeline_bridge_setup.py verify
 | `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command) |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
-| `loaded` | launchd holds the job |
+| `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
+| `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
 
 Good: `Good: the bridge is installed, loaded and passing.` and exit 0.
 Not that: `heartbeat FAILED`. Read the job's log, beside its config (`bridge.log`).
@@ -353,6 +354,96 @@ answer twice.
 
 ---
 
+## Step 11 — Let it watch the notifier
+
+The notifier is the only job that pages you. If it stops, nothing else tells you. Once this
+step is done, the bridge reads the notifier's heartbeat every pass and tells you in Slack
+when something is wrong.
+
+Do this step only once the role account's clone has this version of the bridge. The job
+runs from that clone, and an older bridge refuses the two settings this step adds, so every
+pass would stop: planning, approving and answering too, not only the watch.
+
+1. In `bridge.conf`, set `NOTIFIER_JOB_LABEL` to the `JOB_LABEL` in `notifier.conf`. The
+   bridge reads how often the notifier runs from that job's plist.
+2. Check that `NOTIFIER_STATE_DIR` is the `STATE_DIR` in `notifier.conf`, as in Step 10.
+   The notifier's heartbeat is there.
+3. Keep the bridge's `INTERVAL_SECONDS` at most half the notifier's: 150 or less at its
+   default 300. A bridge that runs less often can't tell the Mac's sleep from a quiet
+   notifier. If you change it, reload the job after item 4: card CK-B3, then card CK-B2.
+   launchd keeps the interval the job was loaded with.
+4. Install it, and check it:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py install --apply
+python3 scripts/pipeline_bridge_setup.py verify
+```
+
+Good: the `notifier` row reads `ALREADY-DONE`. It says when the notifier last ran, and when
+the bridge would call it quiet.
+Not that: `notifier SKIPPED off`. `NOTIFIER_JOB_LABEL` is still empty.
+Not that: `notifier FAILED`. The notifier is quiet or failing. Run the command the row names.
+Not that: `notifier UNKNOWN`. The row names the file it could not read. A heartbeat from a
+dry run says nothing about the real runs, so read the row again after the next one.
+Not that: `notifier BLOCKED`. The row says which. There is no heartbeat where the bridge
+looks: load the notifier with its installer's card CK-N3, or fix item 2. Or the bridge runs
+too seldom: set `INTERVAL_SECONDS` to the number the row names, then reload it (item 3). Or
+launchd still runs the notifier at an interval its plist no longer says: reload the notifier
+with its card CK-N3. Or the notifier runs too often for any bridge: the row names the
+notifier's own `INTERVAL_SECONDS` to set.
+Not that: `loaded BLOCKED launchd still runs the bridge every …`. The job was not reloaded
+after `INTERVAL_SECONDS` changed. Run card CK-B3, then card CK-B2.
+Not that: `dry-run FAILED` naming `unknown config key(s)`. The role account's clone has an
+older bridge. Empty `NOTIFIER_JOB_LABEL`, run `install --apply`, and come back once the
+clone has moved.
+
+What it says in Slack, and when:
+
+| When | It says |
+|---|---|
+| Nothing new from the notifier for three of its intervals plus two minutes: 17 minutes at its default 300 s | *I haven't heard from the notifier since 7:02am, so you may be missing pages.* |
+| Two of its runs in a row did not finish cleanly | *The notifier is running, but its runs have been failing since 7:02am, so a page may not have reached you.* |
+| Its heartbeat or its plist can't be read | *I can't read the notifier's heartbeat or its schedule, so I can't tell whether your pages are going out.* |
+| Its next clean run, when the last thing it said was one of the first two | *The notifier is back: its run at 7:20am finished cleanly.* |
+| Its next clean run, when the last thing it said was the third | *I can read the notifier's heartbeat and its schedule again: its run at 7:20am finished cleanly.* |
+
+Each of the first three ends with the command that checks the notifier: *To check it, run
+`python3 scripts/pipeline_notifier_setup.py verify` in your kit checkout.*
+
+- **Once each.** It posts as the bridge, as a message of its own in the first channel in
+  `CHANNEL_IDS`. It says each one once, even after a restart: it keeps what it said in a
+  file of its own, `bridge-notifier-watch.json` in its `STATE_DIR`. If that file can't be
+  read, it starts again, and may say once more each problem it had already said. If the
+  notifier is back before the bridge says one again, the bridge doesn't say it is back. A
+  post cut off as Slack takes it may be said twice.
+- **A new problem is said too.** If the trouble changes, say from can't read to quiet, it
+  says the new one. Until a clean run it says each of the three at most once, however often
+  the trouble changes. Its message after the clean run answers the last thing it said.
+- **Back means a new run.** It says the notifier is back only after a clean run newer than
+  the one it had seen when it spoke.
+- **One failed run is not said.** The notifier sends again what it could not send. A second
+  failed run in a row is said.
+- **A broken token shows late.** The notifier only talks to Slack when it has a page to
+  send. A revoked token or a lost channel shows once two runs in a row fail to send one.
+- **A burst reads as failing.** When two runs in a row each find more pages than one run may
+  send (`MAX_EVENTS_PER_PASS`), it says failing. Those pages go out on the next runs; the
+  notifier's own `verify` says it was the cap.
+- **Sleep is not silence.** A gap in the bridge's own passes of more than two of its
+  intervals plus its 120 s run limit (4 minutes at 60 s) means the Mac slept or the bridge
+  was stopped. It then waits for the notifier's next run before it judges it.
+- **A rehearsal is not a run.** A notifier `--dry-run` writes a heartbeat too. The bridge
+  goes on counting from the last scheduled run, and names that one.
+- **A paused notifier is quiet too.** A pause with card CK-N5 that outlasts the quiet time
+  gets one message. Its first clean run after you resume it gets one more.
+- **It mentions nobody.** To get it on your phone, set that channel's notifications to
+  every new message.
+- **Times are the Mac's clock.** No ticket's text is ever in these messages.
+
+With `NOTIFIER_JOB_LABEL` empty there is nothing to watch. Each pass's log line says
+`notifier watch: OFF`, and `verify` says off.
+
+---
+
 ## Prove it live — card CK-B4
 
 Every action above is tested against stand-ins until you run them for real. The card lists
@@ -439,6 +530,9 @@ out.
 
 To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disable` here.
 
+With Step 11 done, this also stops the bridge's watch on the notifier. While the bridge is
+off, nothing tells you in Slack that the notifier is down.
+
 ---
 
 ## What a deployment accepts when it turns this on
@@ -489,3 +583,7 @@ To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disab
   child's slot after Done, and the thread says so once (KIT-227).
 - That an answer passed on by the bridge resumes the session as the notifier's relay did.
   The route is the one proven on 2026-09-08; this caller is not (KIT-227).
+- That a message of the bridge's own, outside any thread, starts no chat session. The
+  dispatcher's source says a bot's post starts none; no live run has checked (KIT-285).
+- That the role account can read the notifier's plist on a live Mac. Its installer writes it
+  root:wheel 644; the tests use a stand-in (KIT-285).

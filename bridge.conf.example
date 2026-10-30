@@ -76,6 +76,18 @@ BOT_USER_ID=U0123456789
 #NOTIFIER_STATE_DIR=~/.stage-e/state
 #NOTIFIER_BOT_USER_ID=
 
+# Watching the notifier (docs/BRIDGE-OPERATOR.md, Step 11). The notifier's
+# JOB_LABEL, exactly as notifier.conf sets it. Each pass then reads how often
+# launchd runs the notifier, from its plist, and its heartbeat in
+# NOTIFIER_STATE_DIR. When the notifier is quiet for three of its intervals plus
+# two minutes, keeps failing, or can't be read, the bridge says so once in the
+# first channel, and once more when it is back. Keep INTERVAL_SECONDS at most
+# half the notifier's, or `verify` says BLOCKED. launchd keeps the interval the
+# job was loaded with, so after changing INTERVAL_SECONDS, reload the job: card
+# CK-B3, then card CK-B2. Empty: the watch is off. Leave it empty only on a
+# machine with no notifier.
+#NOTIFIER_JOB_LABEL=
+
 # The only Slack user ids who may answer a question. Empty means any full
 # member of the workspace: guests, bots and other workspaces are always refused.
 #ALLOWED_SLACK_USERS=
