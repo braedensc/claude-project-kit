@@ -348,6 +348,16 @@ jobs:
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
+      # The tech lead's voice (KIT-294): the notifier and the bridge may have a model
+      # rewrite a message they already wrote. One tool-less `claude -p` run, its command
+      # line and its seven-variable environment pinned (one subscription token, never an
+      # API key), the facts fenced on stdin, a fresh folder as its home and removed after.
+      # Its text is posted only with every keep string, no link outside the facts, no
+      # mention, no code block and no credential shape; any failure posts the plain text.
+      # The CLI is faked: no model is called in CI.
+      - name: Tech lead voice selftest (pinned argv and env, fenced facts, checked text)
+        run: python3 scripts/pipeline_voice.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 
