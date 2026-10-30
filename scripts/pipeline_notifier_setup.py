@@ -52,7 +52,8 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
                  The daemon-health page is measured at BOTH ends: this notifier's config, and
                  the heartbeat monitor's, which is READ as the role account and never
                  written — the Stage E installer owns that file whole. So is the
-                 ready-to-merge page (KIT-225), against the bounce driver's config
+                 ready-to-merge page (KIT-225), against the bounce driver's config. It
+                 also says who a page that needs a person @mentions (KIT-281)
 
 SUBCOMMANDS
 
@@ -334,6 +335,9 @@ CONF_DEFAULTS = {
     # KIT-224: record each agent:blocked ping for the Slack bridge, which answers a member's
     # reply under it in the session's own thread. The notifier's own relay stays off.
     "BRIDGE_PINGS": "no",
+    # KIT-281: the Slack member ids @mentioned on every page that asks a person to do
+    # something. Empty mentions nobody and composes no key, so the config stays as it was.
+    "MENTION_CHAT_USER_IDS": "",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose so an unedited copy of the example cannot run.
@@ -561,6 +565,16 @@ def validate_conf(values, invoking_user=None):
         errors.append("FINDING_ACTOR_IDS repeats an entry")
     if conf.get("BRIDGE_PINGS", "no") not in ("yes", "no"):
         errors.append("BRIDGE_PINGS must be yes or no, got %r" % conf.get("BRIDGE_PINGS"))
+    # The notifier's own member-id rule, imported: each id goes inside `<@…>` in a page.
+    mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
+    for member in mentions:
+        if not notify.MENTION_USER_RE.match(member):
+            errors.append("MENTION_CHAT_USER_IDS entry %r is not a Slack member id: U or W, then "
+                          "capitals and digits. In Slack, open the person's profile, then ⋮, "
+                          "then Copy member ID" % member)
+    if len(set(mentions)) != len(mentions):
+        errors.append("MENTION_CHAT_USER_IDS repeats an id — that person would be mentioned "
+                      "twice on every page")
 
     for key in ENV_NAME_KEYS:
         if not _UPPER_SNAKE.match(conf.get(key) or ""):
@@ -743,6 +757,10 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     # and an older clone is never handed a key it does not know.
     if conf.get("BRIDGE_PINGS") == "yes":
         doc["bridge_pings"] = True
+    # The same rule for the @mentions (KIT-281): composed only when someone is named.
+    mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
+    if mentions:
+        doc["mention_chat_user_ids"] = mentions
     return doc
 
 
@@ -2776,6 +2794,58 @@ def finding_filed_lines(ctx):
     return on, off, unproven
 
 
+def mention_lines(ctx):
+    """(on, off, unproven) for who a page that needs a person @mentions (KIT-281).
+
+    THIS END IS THE FILE THE JOB READS, as in notifier_end. When the `config` row composed
+    this pass and found the file identical, the composition is the file. Otherwise an empty
+    conf proves nothing: a file an earlier `run` wrote still @mentions the ids it holds, so
+    that file is read as the role account before anything is called OFF."""
+    conf = ctx.conf
+    named = split_list(conf.get("MENTION_CHAT_USER_IDS"))
+    if not named:
+        if not (ctx.config_current and ctx.composed):
+            try:
+                have, _mode = _read_config_file(ctx)
+            except Unknown as exc:
+                return [], [], ["mentions: MENTION_CHAT_USER_IDS is empty, but the notifier's "
+                                "config %s was not composed on this pass and could not be "
+                                "read, so whether its pages still @mention anyone is not "
+                                "proven: %s (KIT-281)" % (conf["NOTIFIER_CONFIG"], exc.what)]
+            remedy = ("Run this installer's `run` with $%s set in your shell to rewrite it"
+                      % conf["LINEAR_KEY_ENV"])
+            try:
+                installed = json.loads(have) if have is not None else {}
+            except ValueError:
+                installed = None
+            if not isinstance(installed, dict):
+                return [], [], ["mentions: MENTION_CHAT_USER_IDS is empty, but the notifier's "
+                                "config %s is not a JSON object, so who its pages @mention is "
+                                "not proven. %s (KIT-281)" % (conf["NOTIFIER_CONFIG"], remedy)]
+            left = installed.get("mention_chat_user_ids")
+            if left:
+                return [], [], ["mentions: MENTION_CHAT_USER_IDS is empty, but the notifier's "
+                                "config %s still @mentions %s on every page that needs a "
+                                "person. %s (KIT-281)"
+                                % (conf["NOTIFIER_CONFIG"],
+                                   ", ".join(map(str, left)) if isinstance(left, list)
+                                   else repr(left), remedy)]
+        return [], ["mentions: MENTION_CHAT_USER_IDS is empty, so no page @mentions anyone. "
+                    "Whether a page reaches your phone then depends on your Slack settings "
+                    "for the channel (KIT-281)"], []
+    composed = (json.loads(ctx.composed["body"]).get("mention_chat_user_ids")
+                if ctx.config_current and ctx.composed else None)
+    if composed != named:
+        return [], [], ["mentions: the notifier's config %s is not the one this pass composed "
+                        "(see the `config` row), so whether its pages @mention %s is not "
+                        "proven on this pass (KIT-281)"
+                        % (conf["NOTIFIER_CONFIG"], ", ".join(named))]
+    return (["mentions: every page that needs a person opens by @mentioning %s (KIT-281)"
+             % ", ".join(named)], [],
+            ["that each id MENTION_CHAT_USER_IDS names is a person in the channel: only its "
+             "shape is checked, and a bot named there could be woken by every page (KIT-281)"])
+
+
 def handover_lines(ctx):
     conf = ctx.conf
     # The interval launchd reported, never the conf's: the conf says what the file asks for,
@@ -2802,8 +2872,9 @@ def handover_lines(ctx):
     h_on, h_off, h_unproven = daemon_health_lines(ctx)
     r_on, r_off, r_unproven = ready_to_merge_lines(ctx)
     f_on, f_off, f_unproven = finding_filed_lines(ctx)
-    return (on + h_on + r_on + f_on, h_off + r_off + f_off + off,
-            h_unproven + r_unproven + f_unproven + unproven)
+    m_on, m_off, m_unproven = mention_lines(ctx)
+    return (on + h_on + r_on + f_on + m_on, h_off + r_off + f_off + m_off + off,
+            h_unproven + r_unproven + f_unproven + m_unproven + unproven)
 
 
 def step_handover(ctx, apply_it):
@@ -3269,6 +3340,39 @@ def _selftest_body():
     ok("config: BRIDGE_PINGS=yes composes bridge_pings, and the default composes no such key "
        "(KIT-224)", _bp_on.get("bridge_pings") is True and "bridge_pings" not in _bp_off,
        (_bp_on, _bp_off))
+    # KIT-281: who a page that asks something of a person @mentions. Empty by default, and
+    # then the composed config is byte for byte what it was before the key existed.
+    ok("conf: MENTION_CHAT_USER_IDS defaults to empty, and empty composes no key (KIT-281)",
+       CONF_DEFAULTS.get("MENTION_CHAT_USER_IDS") == ""
+       and "mention_chat_user_ids" not in _bp_off,
+       (CONF_DEFAULTS.get("MENTION_CHAT_USER_IDS"), _bp_off))
+    # Written out of sorted order, so "in order" means the order the owner wrote.
+    _mv, _me = parse_conf(good_text + "MENTION_CHAT_USER_IDS=W0SYNTH0002, U0SYNTH0001\n")
+    _mc, _mm = validate_conf(_mv, person)
+    _m_doc = compose_config(_mc, {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"},
+                            ["a-1"])
+    ok("conf: MENTION_CHAT_USER_IDS names member ids, which compose in order (KIT-281)",
+       _me + _mm == [] and _m_doc.get("mention_chat_user_ids") == ["W0SYNTH0002", "U0SYNTH0001"],
+       (_me + _mm, _m_doc))
+    try:
+        _m_body = validate_composed(_m_doc, None)
+        ok("config: a composition with mentions passes the notifier's own loader (KIT-281)",
+           json.loads(_m_body).get("mention_chat_user_ids") == ["W0SYNTH0002", "U0SYNTH0001"],
+           _m_body)
+    except SetupError as exc:
+        ok("config: a composition with mentions passes the notifier's own loader (KIT-281)",
+           False, str(exc))
+    ok("refuse: a MENTION_CHAT_USER_IDS entry that is not a Slack member id",
+       refused("MENTION_CHAT_USER_IDS=@someone\n", "MENTION_CHAT_USER_IDS entry")
+       and refused("MENTION_CHAT_USER_IDS=u0synth0001\n", "MENTION_CHAT_USER_IDS entry")
+       and refused("MENTION_CHAT_USER_IDS=U0SYNTH0001 W0SYNTH0002\n",
+                   "MENTION_CHAT_USER_IDS entry"))
+    ok("refuse: a MENTION_CHAT_USER_IDS entry that is a channel id or a bot id",
+       refused("MENTION_CHAT_USER_IDS=C0SYNTH0001\n", "MENTION_CHAT_USER_IDS entry")
+       and refused("MENTION_CHAT_USER_IDS=B0SYNTH0001\n", "MENTION_CHAT_USER_IDS entry"))
+    ok("refuse: MENTION_CHAT_USER_IDS repeating an id",
+       refused("MENTION_CHAT_USER_IDS=U0SYNTH0001,U0SYNTH0001\n",
+               "MENTION_CHAT_USER_IDS repeats an id"))
     ok("refuse: a BOUNCE_ACTOR_IDS entry that is no id",
        refused("BOUNCE_ACTOR_IDS=not an id!\n", "BOUNCE_ACTOR_IDS entry"))
     ok("refuse: FINDING_ACTOR_IDS left empty, naming `self` and `off`",
@@ -4411,13 +4515,16 @@ def _selftest_body():
         def handover_with(monitor_doc, extra="", ids_m=("viewer-uuid-0001",), env=None,
                           beat=30, beat_result="ok", beat_dry=False, notifier_end="current",
                           bounce_doc=bounce_cfg, ids_b=("viewer-uuid-0001",),
-                          finding_doc=finding_cfg, ids_f=("viewer-uuid-0001",)):
+                          finding_doc=finding_cfg, ids_f=("viewer-uuid-0001",),
+                          notifier_file=None):
             """The handover's daemon-health lines over one machine. `beat` is the age of the
             MONITOR's own heartbeat in seconds (None: it has written none; "garbage": not
             JSON). `notifier_end` is this end: "current" is a config row that composed and
             matched the file, with `ids_m` as its monitor ids and `ids_b` as its bounce-driver
             ids; "pre-kit156" is a pass that composed nothing, over the file an older installer
-            wrote. `bounce_doc` is the bounce driver's config (None: absent)."""
+            wrote. `bounce_doc` is the bounce driver's config (None: absent). `notifier_file`
+            is what the notifier's config file holds instead: a dict merged into the
+            composition, or a string written as it is (KIT-281)."""
             r = os.path.join(tmp_root, "handover-%d" % len(checks))
             os.makedirs(r)
             values, _e = parse_conf(good_text + extra)
@@ -4434,6 +4541,10 @@ def _selftest_body():
                 ctx.config_current = True
             else:
                 body_h = validate_composed(compose_config(c, ids, ["actor-0001"]), f.home)
+            if isinstance(notifier_file, dict):
+                body_h = json.dumps(dict(json.loads(body_h), **notifier_file))
+            elif notifier_file is not None:
+                body_h = notifier_file
             with open(os.path.join(f.home, ".stage-e", "notifier.json"), "w",
                       encoding="utf-8") as fh:
                 fh.write(body_h)
@@ -4478,6 +4589,48 @@ def _selftest_body():
         ok("handover: …and who can really write the mark is said, by key name",
            "NOT PROVEN: that only the heartbeat monitor writes" in text
            and "$STAGE_E_LINEAR_API_KEY" in text, text)
+        ok("handover: no MENTION_CHAT_USER_IDS — OFF, saying no page @mentions anyone (KIT-281)",
+           "OFF: mentions: MENTION_CHAT_USER_IDS is empty" in text
+           and "ON: mentions" not in text, text)
+        text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n")
+        ok("handover: mentions named and composed — ON, naming who, with the shape-only check "
+           "NOT PROVEN (KIT-281)",
+           "ON: mentions: every page that needs a person opens by @mentioning U0SYNTH0001"
+           in text and "NOT PROVEN: that each id MENTION_CHAT_USER_IDS names" in text
+           and "OFF: mentions" not in text, text)
+        text = handover_with(mon_doc, extra="MENTION_CHAT_USER_IDS=U0SYNTH0001\n",
+                             notifier_end="pre-kit156")
+        ok("handover: mentions named, but the config was not composed this pass — NOT PROVEN, "
+           "never ON (KIT-281)",
+           "NOT PROVEN: mentions:" in text and "U0SYNTH0001" in text
+           and "|| ON: mentions" not in text and not text.startswith("ON: mentions"), text)
+        # An empty conf over a file an earlier `run` wrote with ids: the job still mentions
+        # them, so the row reads the file before it says OFF (the review of KIT-281).
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             notifier_file={"mention_chat_user_ids": ["U0SYNTH0001"]})
+        ok("handover: MENTION_CHAT_USER_IDS emptied, but the config file still @mentions "
+           "someone — NOT PROVEN, naming who, never OFF (KIT-281)",
+           "NOT PROVEN: mentions: MENTION_CHAT_USER_IDS is empty, but the notifier's config"
+           in text and "still @mentions U0SYNTH0001" in text
+           and "OFF: mentions" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156", notifier_file="{not json")
+        _rows = [r for r in text.split(" || ") if r.startswith("NOT PROVEN: mentions:")]
+        ok("handover: MENTION_CHAT_USER_IDS empty over a config file that is not JSON — NOT "
+           "PROVEN, never OFF (KIT-281)",
+           len(_rows) == 1 and "is not a JSON object" in _rows[0]
+           and "OFF: mentions" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156")
+        ok("handover: MENTION_CHAT_USER_IDS empty, not composed this pass, and the config file "
+           "names nobody — OFF (KIT-281)",
+           "OFF: mentions: MENTION_CHAT_USER_IDS is empty" in text
+           and "NOT PROVEN: mentions" not in text, text)
+        text = handover_with(mon_doc, notifier_end="pre-kit156",
+                             env={"STAGE_E_LINEAR_API_KEY": key, sorted(AGENT_ENV_MARKERS)[0]: "1"})
+        _rows = [r for r in text.split(" || ") if r.startswith("NOT PROVEN: mentions:")]
+        ok("handover: MENTION_CHAT_USER_IDS empty, and under a model the config file cannot be "
+           "read — NOT PROVEN, never OFF (KIT-281)",
+           len(_rows) == 1 and "could not be read" in _rows[0]
+           and "OFF: mentions" not in text, text)
         text = handover_with(None)
         ok("handover: no heartbeat monitor config — the page is OFF, naming the file",
            "OFF: the daemon-health page" in text and "monitor.json" in text

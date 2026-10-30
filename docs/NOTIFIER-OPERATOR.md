@@ -31,22 +31,42 @@ One pass every few minutes, as the role account:
 1. It reads recent comments on the tickets of the teams you name.
 2. It looks for an escalation mark on a comment's **first line**. The pipeline already
    writes these marks. A mark anywhere else is skipped, never paged.
-3. For each new mark, it posts one message: what happened, the ticket id, its title, and a
-   link. Nothing else.
+3. For each new mark, it posts one message of three lines: a sentence or two in plain
+   words saying what happened and what, if anything, you need to do; the ticket's title and
+   id; and a link. Nothing else.
 4. For `agent:blocked` and `agent:needs-human`, it also adds that label to the ticket.
 
-| Mark | Who writes it | The ping | Label added |
+| Mark | Who writes it | What the ping says | Label added |
 |---|---|---|---|
-| `epic-awaiting-approval` | the plan executor | a plan is ready to approve | none |
-| `planning-needs-input` | the plan executor | planning needs your input | `agent:blocked` |
-| `planning-no-output` | the plan executor | a planning run produced nothing | `agent:blocked` |
-| `planning-rejected` | the plan executor | a plan was refused | none |
-| `agent:blocked` | a stopped session | a session needs a decision | `agent:blocked` |
-| `agent:needs-human` | a stopped session, or the bounce driver when a fix budget is spent | a session is terminal until you act | `agent:needs-human` |
-| `daemon-health-incident` | the heartbeat monitor | a watched Stage E daemon needs a look | none |
-| `daemon-health-recovered` | the heartbeat monitor | the watched daemons are reporting again | none |
-| `ready-to-merge` | the bounce driver | a pull request is ready for you to merge, with its link | none |
-| `finding-filed` | the finding job | a session's finding was filed for you, with its link | none |
+| `epic-awaiting-approval` | the plan executor | a plan is filed and waiting for your approval | none |
+| `planning-needs-input` | the plan executor | the planner stopped to ask you something, and filed no plan | `agent:blocked` |
+| `planning-no-output` | the plan executor | a planning run ended without a plan, so nothing was filed | `agent:blocked` |
+| `planning-rejected` | the plan executor | a plan couldn't be filed; the ticket says why | none |
+| `agent:blocked` | a stopped session | a dev stopped to ask you something | `agent:blocked` |
+| `agent:needs-human` | a stopped session, the planner job on a planning ticket it could not route, or the bounce driver when a fix budget is spent | work has stopped and needs a person; the ticket says why | `agent:needs-human` |
+| `daemon-health-incident` | the heartbeat monitor | one or more watched jobs need a look | none |
+| `daemon-health-recovered` | the heartbeat monitor | every watched job is checking in again; nothing more is needed | none |
+| `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link | none |
+| `finding-filed` | the finding job | a dev's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
+
+A ping reads like this:
+
+```text
+A dev stopped work on this to ask you something, and needs your answer to carry on. The question is on the ticket.
+Ticket: "Refresh tokens" (KIT-777)
+https://linear.app/example-org/issue/KIT-777
+```
+
+**The words for each mark are in `MARKS` in `scripts/pipeline_notify_local.py`,** and its
+selftest pins every one, word for word. Each ping says only what its mark means. The
+notifier never reads the rest of the comment, so it never guesses. That is why the
+`agent:needs-human` ping does not say which of its three causes it was: the comment on the
+ticket does.
+
+**The title always sits on its own line, in quotes.** It loses its double quote marks, the
+characters that look like one, and any pair of single quote marks, so none of them can end
+its quotes early. Anyone who can edit a ticket writes its title, so it is never part of the
+sentence.
 
 **The four planning marks count only from the executor's author ids** (`EXECUTOR_ACTOR_IDS`).
 A session that can comment could otherwise forge one. A planning mark from anyone else is
@@ -77,13 +97,40 @@ It pings once per finding ticket, even if the job wrote the mark twice
 **Each event pings once.** The notifier keeps a seen-set. A restart or a missed interval
 re-sends nothing.
 
+**A ping that needs you can @mention you (KIT-281).** Set `MENTION_CHAT_USER_IDS` in
+`notifier.conf` to a comma list of Slack member ids. To find one, open the person's profile
+in Slack, then `⋮`, then **Copy member ID**. Every ping that asks something of you then opens
+with an @mention of each of them, so Slack alerts them as it does for any mention of them.
+That is every mark above except `daemon-health-recovered` and `finding-filed`. The mark
+decides, never who wrote it: one tracker key writes several jobs' marks.
+
+Empty, the default, mentions nobody, and the notifier's config stays exactly as it was.
+Whether a ping with no mention reaches your phone is up to your Slack settings for the
+channel.
+
+- Name people only, each a member of the private channel. A bot named here could be woken by
+  every ping.
+- The installer checks each id's shape. It never asks Slack whose id it is.
+- A mention makes a forged mark louder too. The `agent:*` marks are accepted from any author,
+  so a session that writes many of them buzzes your phone for each, up to
+  `MAX_EVENTS_PER_PASS` a pass.
+- Setting it changes the notifier's config, so `CK-N4` comes back. After the merge that
+  brings it, follow *After a merge that changes the notifier*, below.
+- To stop the mentions, empty it and run `run`. Until `run` rewrites the config, the job
+  still mentions the old ids, and the `handover` row says so.
+
+Good: `MENTION_CHAT_USER_IDS=U0123456789`, and the next ping that needs you opens with your
+name. The `handover` row says `ON: mentions`.
+Not: `MENTION_CHAT_USER_IDS=@yourname`. The installer refuses a display name.
+
 ## What it never does
 
 - It never merges, approves, or labels a pull request.
 - It never moves a ticket, creates a ticket, or posts a comment. Its one tracker write is
   adding one of the two labels above.
-- It never carries the comment text off the tracker. The ping holds the ticket id, the
-  title and a link. The question stays in the tracker, where you are signed in.
+- It never carries the comment text off the tracker. The ping holds a fixed sentence for its
+  mark, the ticket id, the title and a link. The question stays in the tracker, where you
+  are signed in.
 - It reads nothing from the channel. A reply there reaches nobody. Answer in the tracker
   (KIT-118).
 - It runs no model and starts no session.
@@ -206,7 +253,7 @@ nothing.
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
 | `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
-| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on. It reads the bounce driver's config the same way, to say whether the ready-to-merge page is on, and the finding job's, for the finding-filed page | — |
+| `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on. It reads the bounce driver's config the same way, to say whether the ready-to-merge page is on, and the finding job's, for the finding-filed page. It also says who a ping that needs you @mentions | — |
 
 **The clone must run the code this checkout tested.** Preflight runs the notifier's
 selftest here. Then it hashes, as the role account, each file the notifier runs in that
@@ -464,7 +511,7 @@ notifier does not page on them yet. Any it posts in that gap ping late, when ste
 oldest first. The same goes for switching `MONITOR_ACTOR_IDS` from `off` to on later.
 
 **Answering a stuck session from Slack (KIT-224).** The notifier's own reply relay stays
-off. Set `BRIDGE_PINGS=yes` and run `run`: the notifier then records each "session stopped"
+off. Set `BRIDGE_PINGS=yes` and run `run`: the notifier then records each `agent:blocked`
 ping where the Slack bridge can read it, and the bridge passes a member's reply under it to
 the session. `docs/BRIDGE-OPERATOR.md`, Step 10, has the rest. The two cannot both be on.
 
@@ -573,10 +620,11 @@ share. It stops there, before it changes anything: run the two again in the orde
   `FINDING_ACTOR_IDS=self` and the finding-filed mark: a forged one costs one ping that
   links a ticket. (KIT-243)
 - **A forged ready-to-merge mark asks you to merge.** `BOUNCE_ACTOR_IDS=self` has the same
-  gap: anything holding that key can write the mark. Its ping says a pull request is ready
-  to merge. The comment says its checks passed and its review came back clean. Stage E may
-  never have concluded that pull request. So before you merge on that page, open the pull
-  request. Read Stage E's review comment and the checks there: no tracker key can write
+  gap: anything holding that key can write the mark. Its ping says the review found nothing
+  worth sending back, and the pull request is yours to merge. The comment says its checks
+  passed and its review came back clean. Stage E may never have concluded that pull
+  request. So before you merge on that page, open the pull request. Read Stage E's review
+  comment and the checks there: no tracker key can write
   those. The ticket's move to the needs-approval lane is a weaker sign, because that key can
   move a ticket too. The page itself merges nothing. (KIT-225, KIT-263)
 - **That a live ready-to-merge comment pages and links the pull request.** The selftests
@@ -600,6 +648,9 @@ share. It stops there, before it changes anything: run the two again in the orde
   this env file included — is readable by a session through a tool server the dispatcher
   provides, whatever the sandbox denies. Moving the file does not help: every daemon runs as
   the same account. (KIT-162)
+- **That an @mention reaches a phone.** Slack's own settings decide that, do-not-disturb
+  included, and nothing here reads them. The first ping that needs you, with
+  `MENTION_CHAT_USER_IDS` set, is the test. (KIT-281)
 - **Whether `chat:write` alone posts to a private channel** the bot was invited to. The
   notifier is built for that one scope. The throwaway test settles it. (KIT-173)
 - **Whether the tracker's editor keeps `<!--` intact** on a comment's first line. The API

@@ -382,6 +382,25 @@ notifier cannot page on never exists silently.
 > `agent:needs-human` row as applying **`agent:needs-human`**, for the reason in the note above
 > (KIT-115).
 
+> **Note, 2026-10-29: what each page says (KIT-281).** "The human moment" above is what a
+> mark means, not the words a person reads. Each page now opens with a sentence or two of
+> plain words per mark, saying what happened and what, if anything, is needed. Then comes
+> the ticket on a line of its own, `Ticket: "<title>" (<id>)`, then the link. Decision 2
+> holds: `build_message` still takes the mark, the id, the title and the link, and nothing
+> else. The words claim only what the mark means, since the notifier never reads the
+> comment's body. The title is never part of them: anyone who can edit a ticket writes its
+> title, so it keeps its own field and loses its double quote marks, the characters that
+> look like one, and any pair of single ones. A page that asks a person to do something
+> opens with an @mention of each id in `mention_chat_user_ids`, empty by default. Which
+> pages those are is chosen by the mark, never the author: on a one-key install one author
+> id writes the executor's, the monitor's, the bounce driver's and the finding job's marks.
+> Two gaps stay open. The `agent:needs-human` mark still stands for three causes, so its
+> page names none of them and the comment on the ticket says which; telling them apart
+> needs each producer to write a mark of its own per cause. And the installer checks only
+> each mention id's shape: it cannot refuse the chat bot's own id, because it does not know
+> it. The words live in `MARKS` in `scripts/pipeline_notify_local.py`, and its selftest
+> pins each one.
+
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 
 Five owner decisions, taken after the dispatcher's source was read at the installed version,

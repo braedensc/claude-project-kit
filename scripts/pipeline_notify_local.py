@@ -69,6 +69,15 @@ WHAT THIS IS
   names and links the finding. It pages ONCE PER FINDING TICKET, keyed on the ticket and not
   the comment: a mark the job wrote twice still pages once.
 
+  WHAT A PAGE SAYS (KIT-281). Three lines, the way a colleague would put it: a sentence or
+  two in plain words saying what happened and what, if anything, a person needs to do;
+  then the ticket, its title in quotes; then the link. The words are fixed per mark (`page`
+  in MARKS) and claim only what the mark itself means, because this job never reads the
+  comment's body. A title is never part of them. A page that asks a person to do
+  something opens with an @mention of each member id in `mention_chat_user_ids`, which is
+  optional: empty, it mentions nobody. Which pages those are is decided by the MARK, never
+  by the author (see MARKS).
+
 WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script asserts it)
 
   It never merges, never approves, never enables auto-merge, and never labels a pull request.
@@ -89,7 +98,8 @@ WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script as
 
   It never carries the question text off the tracker. `build_message()` takes the mark, the
   ticket id, the ticket title and a URL — and has NO parameter that could carry a comment
-  body. Decision 2 is structural here, not a redaction rule that can miss.
+  body. Decision 2 is structural here, not a redaction rule that can miss. The @mentions
+  put in front of it come from this job's config alone.
 
 WHERE IT RUNS, AND WHY THE CREDENTIAL RULES ARE WHAT THEY ARE
 
@@ -291,6 +301,18 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 #
 # `label` is the lifecycle label this job applies, or None.
 #
+# `page` is what a person reads for that mark, a sentence or two (KIT-281): what happened,
+# and what, if anything, they need to do. It claims only what the mark itself means. This
+# job never reads the comment's body, so words true for only some bodies are words that are
+# sometimes false. That is why the agent:needs-human page names none of its three causes: a
+# stopped session, a planning ticket the planner job could not route, and a spent fix budget
+# all write that one mark, and the comment on the ticket says which.
+#
+# `needs_you` is True when the page asks a person to do something, and only those pages carry
+# the @mentions. It is the MARK's, never the author's: on a one-key install the same author
+# id writes the executor's, the monitor's, the bounce driver's and the finding job's marks, so
+# an author cannot say which kind of page a comment is (KIT-281).
+#
 # Decision 4 names agent:blocked for the two planning marks that mean "the run needs the
 # owner" (planning-needs-input, planning-no-output), and no label for the other two
 # (epic-awaiting-approval is an approval, planning-rejected is already a loud comment).
@@ -335,52 +357,73 @@ PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pu
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
-        "moment": "A plan is ready for you to approve",
+        "page": "A plan for this idea is filed and waiting for your approval. The ticket "
+                "lists its pieces and how to approve it.",
+        "needs_you": True,
         "label": None,
         "why_no_label": "an approval, not a block",
     },
     ESC_NEEDS_INPUT: {
-        "moment": "Planning needs your input",
+        "page": "The planner stopped to ask you something about this idea, so no plan was "
+                "filed. Its question is on the ticket.",
+        "needs_you": True,
         "label": "agent:blocked",
         "why_no_label": None,
     },
     ESC_NO_OUTPUT: {
-        "moment": "A planning run produced nothing",
+        "page": "A planning run on this idea ended without a plan, so nothing was filed. "
+                "The ticket says what to try next.",
+        "needs_you": True,
         "label": "agent:blocked",
         "why_no_label": None,
     },
     ESC_REJECTED: {
-        "moment": "A plan was refused; it needs re-planning",
+        "page": "A plan for this idea couldn't be filed. The ticket says why, and what to "
+                "do next.",
+        "needs_you": True,
         "label": None,
         "why_no_label": "a loud, self-explaining comment already carries its own cue",
     },
     ESC_BLOCKED: {
-        "moment": "A session stopped and needs a decision",
+        "page": "A dev stopped work on this to ask you something, and needs your answer to "
+                "carry on. The question is on the ticket.",
+        "needs_you": True,
         "label": "agent:blocked",
         "why_no_label": None,
     },
     ESC_NEEDS_HUMAN: {
-        "moment": "A session is terminal until you act",
+        "page": "Work on this has stopped, and it needs a person to take it from here. The "
+                "note on the ticket says why.",
+        "needs_you": True,
         "label": "agent:needs-human",
         "why_no_label": None,
     },
     ESC_HEALTH_INCIDENT: {
-        "moment": "A watched daemon needs a look",
+        "page": "The pipeline's health check says one or more of its jobs need a look. The "
+                "ticket names them and what the check saw.",
+        "needs_you": True,
         "label": None,
         "why_no_label": "daemon health is not a ticket's lifecycle",
     },
     ESC_HEALTH_RECOVERED: {
-        "moment": "The watched daemons are reporting again",
+        "page": "Every job the pipeline's health check watches is checking in again, and "
+                "none reports a problem. Nothing more is needed from you on this.",
+        "needs_you": False,
         "label": None,
         "why_no_label": "daemon health is not a ticket's lifecycle",
     },
     ESC_READY_TO_MERGE: {
-        "moment": "A pull request is ready for you to merge",
+        "page": "The review is done and found nothing it thought worth sending back, so "
+                "this pull request is yours to merge. If GitHub still blocks the merge, "
+                "the pull request says what it's waiting for.",
+        "needs_you": True,
         "label": None,
         "why_no_label": "a merge is a person's act, not a block",
     },
     ESC_FINDING_FILED: {
-        "moment": "A session's finding was filed for you",
+        "page": "A dev asked for this follow-up while working on another ticket, and it was "
+                "filed in the backlog. Nothing is needed from you unless you want it done.",
+        "needs_you": False,
         "label": None,
         "why_no_label": "a backlog ticket for a person to read, not a block",
     },
@@ -445,6 +488,9 @@ CONFIG_KEYS = {
                           "(default 6)",
     "dispatcher_agent_user_id": "the dispatcher's agent user id, whose session thread a "
                                 "reply lands in; required only with reply_relay on",
+    "mention_chat_user_ids": "Slack member ids (U or W, then 8 or more capitals/digits) "
+                             "@mentioned at the start of every page that asks a person to do "
+                             "something (KIT-281). Optional: absent or empty mentions nobody",
 }
 
 # The reply relay's fixed limits and shapes. Not config: a lookback an operator could widen
@@ -456,6 +502,9 @@ RELAY_MAX_THREAD_PAGES = 10
 DEFAULT_RELAY_MAX_CHARS = 1000
 DEFAULT_RELAY_MAX_PER_HOUR = 6
 OWNER_CHAT_USER_RE = re.compile(r"^U[A-Z0-9]{8,}$")
+# A Slack member id, whole: U, or W on an Enterprise Grid workspace, then capitals and digits.
+# Each one is put inside `<@…>` in a page, so nothing else may pass (KIT-281).
+MENTION_USER_RE = re.compile(r"^[UW][A-Z0-9]{8,}\Z")
 RELAY_NAMED_CAP = 500
 RELAY_PENDING = "pending"
 RELAY_DONE = "done"
@@ -482,6 +531,7 @@ EXAMPLE_CONFIG = {
     "relay_max_chars": DEFAULT_RELAY_MAX_CHARS,
     "relay_max_per_hour": DEFAULT_RELAY_MAX_PER_HOUR,
     "dispatcher_agent_user_id": "<dispatcher agent user uuid>",
+    "mention_chat_user_ids": [],
 }
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -555,6 +605,7 @@ def load_config(path):
         "relay_max_chars": raw.get("relay_max_chars", DEFAULT_RELAY_MAX_CHARS),
         "relay_max_per_hour": raw.get("relay_max_per_hour", DEFAULT_RELAY_MAX_PER_HOUR),
         "dispatcher_agent_user_id": raw.get("dispatcher_agent_user_id", ""),
+        "mention_chat_user_ids": raw.get("mention_chat_user_ids", []),
     }
 
     for key in ("linear_key_env", "chat_token_env"):
@@ -618,6 +669,19 @@ def load_config(path):
         errors.append(
             "config 'finding_actor_ids' must be a list of the finding job's tracker author "
             "id(s), or absent to leave the finding-filed mark OFF, got %r" % (finders,))
+
+    # KIT-281: who a page that asks something of a person @mentions. Each id goes inside
+    # `<@…>` in the chat text, so anything but a whole member id is refused: a value like
+    # `U0123456789> <!channel` would otherwise turn one page into a room-wide alert.
+    mentions = cfg["mention_chat_user_ids"]
+    if not isinstance(mentions, list) or not all(isinstance(u, str) and MENTION_USER_RE.match(u)
+                                                 for u in mentions):
+        errors.append(
+            "config 'mention_chat_user_ids' must be a list of Slack member ids like "
+            "U0123456789, or absent to mention nobody, got %r" % (mentions,))
+    elif len(set(mentions)) != len(mentions):
+        errors.append("config 'mention_chat_user_ids' repeats an id — that person would be "
+                      "mentioned twice on every page")
 
     # KIT-224: the bridge answers stuck sessions in the relay's place. Two jobs answering
     # the same ping would post the same answer twice, so the two switches never both hold.
@@ -981,6 +1045,15 @@ def redact(text, secrets):
 
 
 _SLACK_UNSAFE = re.compile(r"[<>&|]")
+# What a title loses so it cannot end the quotes it is shown in early (KIT-281): every double
+# quote mark and each character that reads as one, and any run of two or more single quote
+# marks, which reads as one too. A list, because no Unicode category holds them all: U+201E
+# is opening punctuation, U+2033 other punctuation, U+02BA a letter, U+301E closing. One
+# single quote mark stays, since U+2019 is also the apostrophe in "don't".
+_QUOTE_MARKS = re.compile(
+    '["\u00ab\u00bb\u02ba\u02dd\u02ee\u05f4\u201c-\u201f\u2033\u2036\u275d\u275e\u2760'
+    '\u2e42\u3003\u301d-\u301f\uff02\U0001f676-\U0001f678]'
+    "|['`\u02b9\u02bc\u2018-\u201b\u2032\u2035\uff07]{2,}")
 
 
 def safe_title(title):
@@ -1023,20 +1096,36 @@ def resolve_marks(bodies):
 
 
 def build_message(mark, ticket_id, ticket_title, url):
-    """The outbound text. Title and link only — decision 2, structurally.
+    """The outbound text: the mark's sentence, the ticket, the link. Decision 2, structurally.
 
     There is no parameter here that could carry a comment body, a question, or a diff. That
     is the point: the content stays in the tracker, where the owner is authenticated, and it
     cannot leak through a redaction rule that misses a case.
+
+    THE TITLE IS A FIELD, NEVER PART OF THE SENTENCE (KIT-281). Anyone who can edit a ticket
+    writes its title, so a title woven into the sentence would speak in this job's voice. It
+    goes on its own line after `Ticket:`, in quotes. It loses every mark _QUOTE_MARKS lists,
+    so none of them can end those quotes early, and safe_title removes every line break, so
+    it can never start a line of its own. The caller's credential scan covers the whole text,
+    this line included.
     """
     if mark not in MARKS:
         raise NotifierError("unknown mark %r — not in the ADR's table" % mark)
-    moment = MARKS[mark]["moment"]
-    title = safe_title(ticket_title)
-    head = "*%s on %s*" % (moment, ticket_id)
-    if title:
-        head += " — %s" % title
-    return "%s\n%s" % (head, url)
+    title = safe_title(_QUOTE_MARKS.sub(" ", ticket_title or ""))
+    ticket = 'Ticket: "%s" (%s)' % (title, ticket_id) if title else "Ticket: %s" % ticket_id
+    return "%s\n%s\n%s" % (MARKS[mark]["page"], ticket, url)
+
+
+def mention_prefix(mark, cfg):
+    """The @mentions a page opens with, or "" (KIT-281).
+
+    Only a page whose mark asks something of a person carries them, and the choice is the
+    MARK's: there is no author here to choose by. The ids are the config's, each one checked
+    by the loader to be a whole member id, so nothing a ticket holds can reach a mention.
+    """
+    if not MARKS[mark]["needs_you"]:
+        return ""
+    return "".join("<@%s> " % uid for uid in cfg.get("mention_chat_user_ids") or [])
 
 
 def label_for(mark):
@@ -2113,8 +2202,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None):
                 labelled_keys.add(event["key"])
                 continue
 
-            text = build_message(event["mark"], event["ticket_id"],
-                                 event["ticket_title"], event["url"])
+            text = mention_prefix(event["mark"], cfg) + build_message(
+                event["mark"], event["ticket_id"], event["ticket_title"], event["url"])
             leaked = secret_hits(text)
             if leaked:
                 # A credential shape in a session-writable title must not be relayed to a
@@ -2508,10 +2597,91 @@ def selftest():
     params = list(inspect.signature(build_message).parameters)
     ok("build_message takes exactly (mark, ticket_id, ticket_title, url)",
        params == ["mark", "ticket_id", "ticket_title", "url"], repr(params))
-    msg = build_message(ESC_NEEDS_INPUT, "KIT-777", "Refresh tokens", "https://x/KIT-777")
-    ok("the message carries the id, the moment and the link",
-       "KIT-777" in msg and "Planning needs your input" in msg and "https://x/KIT-777" in msg)
-    ok("the message is two lines", len(msg.split("\n")) == 2)
+
+    # ── §4b. Every mark's page, word for word (KIT-281) ───────────────────────────
+    # Spelled out here and not read from MARKS, so a reworded page is a diff in two places:
+    # no page reaches the owner without a reviewer reading its words here. Each one claims
+    # only what its mark means, since this job never reads the comment's body.
+    pages = {
+        "epic-awaiting-approval":
+            "A plan for this idea is filed and waiting for your approval. The ticket lists "
+            "its pieces and how to approve it.",
+        "planning-needs-input":
+            "The planner stopped to ask you something about this idea, so no plan was "
+            "filed. Its question is on the ticket.",
+        "planning-no-output":
+            "A planning run on this idea ended without a plan, so nothing was filed. The "
+            "ticket says what to try next.",
+        "planning-rejected":
+            "A plan for this idea couldn't be filed. The ticket says why, and what to do "
+            "next.",
+        "agent:blocked":
+            "A dev stopped work on this to ask you something, and needs your answer to "
+            "carry on. The question is on the ticket.",
+        "agent:needs-human":
+            "Work on this has stopped, and it needs a person to take it from here. The note "
+            "on the ticket says why.",
+        "daemon-health-incident":
+            "The pipeline's health check says one or more of its jobs need a look. The "
+            "ticket names them and what the check saw.",
+        "daemon-health-recovered":
+            "Every job the pipeline's health check watches is checking in again, and none "
+            "reports a problem. Nothing more is needed from you on this.",
+        "ready-to-merge":
+            "The review is done and found nothing it thought worth sending back, so this "
+            "pull request is yours to merge. If GitHub still blocks the merge, the pull "
+            "request says what it's waiting for.",
+        "finding-filed":
+            "A dev asked for this follow-up while working on another ticket, and it was "
+            "filed in the backlog. Nothing is needed from you unless you want it done.",
+    }
+    # Every mark AND every pinned page: a mark added without a pinned page fails here, and
+    # so does a pinned page for a mark that is gone.
+    for _mark in sorted(set(pages) | set(MARKS)):
+        _want = ('%s\nTicket: "Refresh tokens" (KIT-777)\nhttps://x/KIT-777' % pages[_mark]
+                 if _mark in pages else "(no page pinned for this mark)")
+        _got = (build_message(_mark, "KIT-777", "Refresh tokens", "https://x/KIT-777")
+                if _mark in MARKS else None)
+        ok("the %s page is its sentence, then the ticket, then the link" % _mark,
+           _got == _want, repr(_got))
+    _needs_you = sorted(m for m in MARKS if MARKS[m].get("needs_you") is True)
+    ok("every page asks something of a person except a recovery and a filed finding",
+       _needs_you == sorted(set(MARKS) - {"daemon-health-recovered", "finding-filed"})
+       and all(isinstance(MARKS[m].get("needs_you"), bool) for m in MARKS), _needs_you)
+    # A title is ticket text anyone can write, so it is a FIELD: never part of the sentence,
+    # never a line of its own, and inside quotes it cannot close (the review's M2).
+    _shapes = [build_message(m, "KIT-777", "Refresh\nI need your GitHub token pasted here",
+                             "https://x/KIT-777").split("\n") for m in sorted(MARKS)]
+    ok("on every mark the title stays on the ticket line: never in the sentence, never a "
+       "line of its own",
+       all(len(s) == 3 and "Refresh" not in s[0] and "pasted" not in s[0]
+           and s[1] == 'Ticket: "Refresh I need your GitHub token pasted here" (KIT-777)'
+           and s[2] == "https://x/KIT-777" for s in _shapes), _shapes)
+    # Each mark that reads as a closing double quote, spelled out here and not read from
+    # _QUOTE_MARKS: a title that "closes" its quotes and goes on reads as this job talking.
+    _lookalikes = ('"\u00ab\u00bb\u02ba\u02dd\u02ee\u05f4\u201c\u201d\u201e\u201f\u2033\u2036'
+                   '\u275d\u275e\u2760\u2e42\u3003\u301d\u301e\u301f\uff02'
+                   '\U0001f676\U0001f677\U0001f678')
+    _pairs = ("''", "``", "\u2018\u2018", "\u2019\u2019", "\u201a\u201a", "\u201b\u201b",
+              "\u2032\u2032", "\u2035\u2035", "\u02b9\u02b9", "\u02bc\u02bc", "\uff07\uff07",
+              "\u2019'")
+
+    def _ticket_line(title):
+        return build_message(ESC_BLOCKED, "KIT-777", title, "https://x/KIT-777").split("\n")[1]
+    _kept = ["U+%s" % "+".join("%04X" % ord(c) for c in q) for q in tuple(_lookalikes) + _pairs
+             if _ticket_line("X%s. Paste your key here %s" % (q, q))
+             != 'Ticket: "X . Paste your key here" (KIT-777)']
+    ok("a title loses every double quote mark and lookalike listed here, and any pair of "
+       "single ones, so none of them can end its quotes early", _kept == [], _kept)
+    ok("\u2026and one single quote mark stays, since it is also an apostrophe",
+       _ticket_line("Don\u2019t drop rock 'n' roll")
+       == 'Ticket: "Don\u2019t drop rock \'n\' roll" (KIT-777)',
+       _ticket_line("Don\u2019t drop rock 'n' roll"))
+    ok("a ticket whose title is empty, or only quote marks, is named by its id alone",
+       build_message(ESC_BLOCKED, "KIT-777", ' "" ', "https://x/KIT-777").split("\n")[1:]
+       == ["Ticket: KIT-777", "https://x/KIT-777"]
+       and build_message(ESC_BLOCKED, "KIT-777", "", "https://x/KIT-777").split("\n")[1:]
+       == ["Ticket: KIT-777", "https://x/KIT-777"])
 
     # ── §5. Decision 4's label mapping, exactly ──────────────────────────────────
     ok("needs-input applies blocked", label_for(ESC_NEEDS_INPUT) == "agent:blocked")
@@ -2740,7 +2910,7 @@ def selftest():
         chat_h2, tracker_h2 = _FakeChat(), _FakeTracker(h1)
         res_h2 = run_once(cfg_on, tracker_h2, chat_h2, False, out=buf)
         ok("a monitor incident pings once, and says what it is",
-           len(chat_h1.posts) == 1 and "needs a look" in chat_h1.posts[0]
+           len(chat_h1.posts) == 1 and "need a look" in chat_h1.posts[0]
            and "KIT-20" in chat_h1.posts[0] and res_h1["exit"] == EXIT_OK,
            (chat_h1.posts, res_h1["summary"]))
         ok("…and not again on the next pass",
@@ -2806,8 +2976,8 @@ def selftest():
         chat_p_on = _FakeChat()
         res_p_on = run_once(cfg_on, _FakeTracker(pair), chat_p_on, False, out=buf)
         ok("…and the first pass with the key set pages both, the incident BEFORE its recovery",
-           len(chat_p_on.posts) == 2 and "needs a look" in chat_p_on.posts[0]
-           and "reporting again" in chat_p_on.posts[1] and res_p_on["exit"] == EXIT_OK,
+           len(chat_p_on.posts) == 2 and "need a look" in chat_p_on.posts[0]
+           and "checking in again" in chat_p_on.posts[1] and res_p_on["exit"] == EXIT_OK,
            (chat_p_on.posts, res_p_on["summary"]))
 
         # ── §7i. The bounce driver's ready-to-merge mark (KIT-225) ──────────────────
@@ -2838,7 +3008,7 @@ def selftest():
                           False, out=buf)
         ok("a ready-to-merge mark from the bounce driver pings once, names the ticket and "
            "links the pull request",
-           len(chat_r1.posts) == 1 and "ready for you to merge" in chat_r1.posts[0]
+           len(chat_r1.posts) == 1 and "yours to merge" in chat_r1.posts[0]
            and "KIT-30" in chat_r1.posts[0] and pr in chat_r1.posts[0]
            and res_r1["exit"] == EXIT_OK and res_r2["sent"] == 0,
            (chat_r1.posts, res_r1["summary"]))
@@ -2903,7 +3073,7 @@ def selftest():
                           False, out=buf)
         ok("a finding-filed mark from the finding job pings once, names the finding and "
            "links it",
-           len(chat_f1.posts) == 1 and "finding was filed" in chat_f1.posts[0]
+           len(chat_f1.posts) == 1 and "filed in the backlog" in chat_f1.posts[0]
            and "KIT-40" in chat_f1.posts[0]
            and "https://linear.app/example/issue/KIT-40" in chat_f1.posts[0]
            and res_f1["exit"] == EXIT_OK and res_f2["sent"] == 0,
@@ -2949,6 +3119,102 @@ def selftest():
            and not any(is_authorised(m, FINDER, cfg_f)
                        for m in planning + (HEALTH_IN, READY)),
            [(m, is_authorised(m, FINDER, cfg_f)) for m in planning])
+
+        # ── §7k. Who a page @mentions (KIT-281) ─────────────────────────────────────
+        # A page that asks something of a person opens with the configured member ids; the
+        # others mention nobody. The MARK decides, never the author: below, ONE author id
+        # writes the planning, health, ready-to-merge and finding marks, as one owner key
+        # does on a one-key install, and the pages still differ by mark (the review's M3).
+        PEOPLE = ["U0SYNTH0001", "W0SYNTH0002"]
+        LEAD = "<@U0SYNTH0001> <@W0SYNTH0002> "
+        chat_d0 = _FakeChat()
+        run_once(cfg, _FakeTracker([tkt("KIT-57", ESC_BLOCKED, "m8", author="s")]), chat_d0,
+                 False, out=buf)
+        ok("with no mention list the loader reads an empty one, and a page that needs you "
+           "mentions nobody",
+           cfg.get("mention_chat_user_ids") == []
+           and chat_d0.posts == [build_message(ESC_BLOCKED, "KIT-57", "A",
+                                               "https://linear.app/example/issue/KIT-57")],
+           (cfg.get("mention_chat_user_ids"), chat_d0.posts))
+        try:
+            cfg_m = load_config_from(dict(good, mention_chat_user_ids=PEOPLE), tmp)
+            ok("mention_chat_user_ids is a config key the loader accepts", True)
+        except NotifierError as exc:
+            cfg_m = dict(cfg, mention_chat_user_ids=PEOPLE)
+            ok("mention_chat_user_ids is a config key the loader accepts", False, str(exc))
+        ONE = "owner-key-user-1"
+        cfg_one = dict(cfg_m, executor_actor_ids=[ONE], monitor_actor_ids=[ONE],
+                       bounce_actor_ids=[ONE], finding_actor_ids=[ONE])
+        one_key = [tkt("KIT-50", ESC_AWAITING_APPROVAL, "m1", author=ONE),
+                   tkt("KIT-51", "daemon-health-incident", "m2", author=ONE),
+                   tkt("KIT-52", "daemon-health-recovered", "m3", author=ONE),
+                   tkt("KIT-53", "ready-to-merge", "m4", author=ONE),
+                   tkt("KIT-54", "finding-filed", "m5", author=ONE),
+                   tkt("KIT-55", ESC_BLOCKED, "m6", author="a-session")]
+        chat_m = _FakeChat()
+        run_once(cfg_one, _FakeTracker(one_key), chat_m, False, out=buf)
+
+        def mentioned(tid):
+            post = next((p for p in chat_m.posts if p.endswith("/" + tid)), "")
+            if post.startswith(LEAD):
+                return "mentioned"
+            return "none" if post and "<@" not in post else "missing or partial"
+        _got = dict((t, mentioned(t)) for t in
+                    ("KIT-50", "KIT-51", "KIT-52", "KIT-53", "KIT-54", "KIT-55"))
+        ok("one author id writing five kinds of mark: each page that needs a person @mentions "
+           "the list, and the recovery and the finding mention nobody",
+           _got == {"KIT-50": "mentioned", "KIT-51": "mentioned", "KIT-52": "none",
+                    "KIT-53": "mentioned", "KIT-54": "none", "KIT-55": "mentioned"},
+           (_got, chat_m.posts))
+        ok("…and a page that needs you is the mentions, then the page, and nothing else",
+           LEAD + build_message(ESC_BLOCKED, "KIT-55", "A",
+                                "https://linear.app/example/issue/KIT-55") in chat_m.posts,
+           chat_m.posts)
+        _mp = globals().get("mention_prefix")
+        ok("who is mentioned comes from the mark and the config alone: no author reaches it",
+           _mp is not None and list(inspect.signature(_mp).parameters) == ["mark", "cfg"],
+           _mp and list(inspect.signature(_mp).parameters))
+        chat_nm = _FakeChat()
+        run_once(cfg_m, _FakeTracker([tkt("KIT-56", ESC_BLOCKED, "m7", author="s",
+                                          title="<!channel> <@U0EVIL00001> hi")]),
+                 chat_nm, False, out=buf)
+        ok("with mentions on, the only <…> in a page are the configured ones: a title adds none",
+           len(chat_nm.posts) == 1
+           and re.findall(r"<[^>]*>", chat_nm.posts[0]) == ["<@U0SYNTH0001>", "<@W0SYNTH0002>"],
+           chat_nm.posts)
+        for _bad, _why in (("U0SYNTH0001", "a bare string, not a list"),
+                           ("", "an empty string, not a list"),
+                           (["u0synth0001"], "an id in lower case"),
+                           (["U0SYNTH0001> <!channel"], "an id that would break out of its "
+                                                        "mention"),
+                           (["U0SYNTH0001\n"], "an id with a line break after it"),
+                           (["@someone"], "a display name"),
+                           (["C0SYNTH0001"], "a channel id"),
+                           (["B0SYNTH0001"], "a bot id"),
+                           ([123], "an entry that is a number"),
+                           ([None], "an entry that is null"),
+                           (["U0SYNTH1"], "an id one character too short to be one")):
+            try:
+                load_config_from(dict(good, mention_chat_user_ids=_bad), tmp)
+                ok("mention_chat_user_ids refuses %s" % _why, False)
+            except Exception as exc:   # a crash is a miss too, so it is caught and named here
+                ok("mention_chat_user_ids refuses %s" % _why,
+                   isinstance(exc, NotifierError)
+                   and "'mention_chat_user_ids' must be a list of Slack member ids" in str(exc),
+                   repr(exc))
+        try:
+            ok("mention_chat_user_ids accepts the shortest member id, U and eight more",
+               load_config_from(dict(good, mention_chat_user_ids=["U0SYNTH12"]),
+                                tmp)["mention_chat_user_ids"] == ["U0SYNTH12"])
+        except NotifierError as exc:
+            ok("mention_chat_user_ids accepts the shortest member id, U and eight more", False,
+               str(exc))
+        try:
+            load_config_from(dict(good, mention_chat_user_ids=[PEOPLE[0], PEOPLE[0]]), tmp)
+            ok("mention_chat_user_ids refuses a repeated id", False)
+        except NotifierError as exc:
+            ok("mention_chat_user_ids refuses a repeated id",
+               "'mention_chat_user_ids' repeats" in str(exc), str(exc))
 
         # The REAL tracker read asks for each comment's time and keeps it, so that order is
         # the tracker's own and not a fixture's.

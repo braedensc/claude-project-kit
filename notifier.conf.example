@@ -152,3 +152,13 @@ FINDING_ACTOR_IDS=self
 # a reply there reaches nobody; answer in the tracker. The notifier's own reply
 # relay stays off either way: the bridge replaces it.
 BRIDGE_PINGS=no
+
+# Slack member ids to @mention on every ping that asks something of you, so
+# Slack alerts each of them as it does for any mention (KIT-281).  That is every
+# ping except the two that need nothing: a watched job recovered, and a finding
+# filed.  A comma list.  To find one: open the person's profile in Slack, then
+# ⋮, then Copy member ID.
+# Empty, the default, mentions nobody, and the notifier's config stays as it was.
+# Name people only, each a member of the private channel: a bot named here
+# could be woken by every ping.  Each id's shape is checked, not who owns it.
+MENTION_CHAT_USER_IDS=

@@ -4037,12 +4037,21 @@ def selftest():
             with open(c["pings_file"], "w") as fh:
                 json.dump(doc, fh)
 
+        def ping_text(ticket="TOD-5", title="Stuck", mentions=()):
+            """What the notifier posts for one agent:blocked ping, made by its own builders,
+            so these pings say what it says and cannot drift from it (KIT-281)."""
+            ncfg = dict(notify.EXAMPLE_CONFIG, mention_chat_user_ids=list(mentions))
+            return notify.mention_prefix(notify.ESC_BLOCKED, ncfg) + notify.build_message(
+                notify.ESC_BLOCKED, ticket, title, notify.ticket_url(ncfg, ticket))
+
+        ping_worlds = []                                     # every pinged() world's Slack
+
         def pinged(name, **over):
             kw = dict(act=True, agent_user_name="Agent", team_keys=["PROD", "TOD"])
             kw.update(over)
             c, s_, t_ = world(name, **kw)
-            ping_ts = s_.add(NOTIFIER, "*A session stopped and needs a decision on TOD-5*",
-                             bot_id="B0NOTIFIER")
+            ping_worlds.append(s_)
+            ping_ts = s_.add(NOTIFIER, ping_text(mentions=[BOB]), bot_id="B0NOTIFIER")
             record_ping(c, ping_ts)
             run(c, s_, t_)                                   # the first pass: a baseline
             return c, s_, t_, ping_ts
@@ -4246,7 +4255,7 @@ def selftest():
         # Every answer passed on counts toward the hourly limit.
         c, s, t, P = pinged("ping-rate2", relay_max_per_hour=1)
         t.live_threads["TOD-5"] = ["root-5", "root-6"]
-        P2 = s.add(NOTIFIER, "*A second session stopped*", bot_id="B0NOTIFIER")
+        P2 = s.add(NOTIFIER, ping_text(), bot_id="B0NOTIFIER")
         record_ping(c, P2, thread="root-6")
         s.add(BOB, "first answer", thread=P)
         s.add(BOB, "second answer", thread=P2)
@@ -4269,16 +4278,14 @@ def selftest():
         c, s, t, P = pinged("ping-team")
         t.issues["OPS-9"] = dict(t.issues["OPS-1"], id="uuid-o9", identifier="OPS-9")
         t.live_threads["OPS-9"] = ["root-9"]
-        P2 = s.add(NOTIFIER, "*A session stopped and needs a decision on OPS-9*",
-                   bot_id="B0NOTIFIER")
+        P2 = s.add(NOTIFIER, ping_text("OPS-9", "Other team"), bot_id="B0NOTIFIER")
         record_ping(c, P2, ticket="OPS-9", thread="root-9")
         s.add(BOB, "go ahead", thread=P2)
         run(c, s, t)
         check("an answer for a ticket on a team the bridge does not act in is refused and "
               "said", (t.thread_replies, "OPS" in posted(s)[-1], "PROD" in posted(s)[-1]),
               ([], True, True))
-        P3 = s.add(NOTIFIER, "*A session stopped and needs a decision on TOD-404*",
-                   bot_id="B0NOTIFIER")
+        P3 = s.add(NOTIFIER, ping_text("TOD-404"), bot_id="B0NOTIFIER")
         record_ping(c, P3, ticket="TOD-404", thread="root-404")
         s.add(BOB, "go ahead", thread=P3)
         run(c, s, t)
@@ -4288,8 +4295,7 @@ def selftest():
         # A ping the notifier records while the pass runs is found: the file is read when
         # a reply is handled, not once a pass.
         c, s, t, P = pinged("ping-race")
-        P2 = s.add(NOTIFIER, "*A session stopped and needs a decision on TOD-5*",
-                   bot_id="B0NOTIFIER")
+        P2 = s.add(NOTIFIER, ping_text(), bot_id="B0NOTIFIER")
         s.add(BOB, "go ahead", thread=P2)
         orig_history = s.history
 
@@ -4303,8 +4309,7 @@ def selftest():
         # A reply under a notifier ping the file does not hold is never silent. With the
         # notifier's bot user named, a member is told why, once, and it is marked refused.
         c, s, t, P = pinged("ping-unrecorded", notifier_bot_user_id=NOTIFIER)
-        P2 = s.add(NOTIFIER, "*A session stopped and needs a decision on TOD-6*",
-                   bot_id="B0NOTIFIER")
+        P2 = s.add(NOTIFIER, ping_text("TOD-6"), bot_id="B0NOTIFIER")
         s.add(BOB, "use the second helper", thread=P2)
         s.add(GUEST, "me too", thread=P2)
         code, out = run(c, s, t)
@@ -4330,7 +4335,7 @@ def selftest():
               [x for _c, th, x in s.posts if th == root], [])
         # Without it, the bridge cannot tell the notifier's posts, and every pass says so.
         c, s, t, P = pinged("ping-unchecked")
-        P2 = s.add(NOTIFIER, "*A session stopped*", bot_id="B0NOTIFIER")
+        P2 = s.add(NOTIFIER, ping_text(), bot_id="B0NOTIFIER")
         s.add(BOB, "ok", thread=P2)
         code, out = run(c, s, t)
         check("without notifier_bot_user_id each pass says unrecorded pings are not checked",
@@ -4342,6 +4347,32 @@ def selftest():
                "bridge's own" in _config_error(dict(
                    EXAMPLE_CONFIG, notifier_bot_user_id=EXAMPLE_CONFIG["bot_user_id"],
                    state_dir=os.path.join(tmp, "nb2")))), (True, True))
+        # Every ping posted in a pinged() world above is the notifier's page, word for word:
+        # read back from its own ticket line and built again by the notifier's builders, not
+        # by ping_text. A ping in any words but the page the notifier builds today fails, so
+        # one typed here by hand fails the day the notifier's words change (KIT-281).
+        def as_built(text):
+            line = re.search(r'^Ticket: (?:"(.*)" \((.+)\)|(.+))$', text, re.M)
+            if not line:
+                return None
+            ticket = line.group(2) or line.group(3)
+            ncfg = dict(notify.EXAMPLE_CONFIG,
+                        mention_chat_user_ids=re.findall(r"<@(\w+)> ", text))
+            return notify.mention_prefix(notify.ESC_BLOCKED, ncfg) + notify.build_message(
+                notify.ESC_BLOCKED, ticket, line.group(1) or "", notify.ticket_url(ncfg, ticket))
+
+        pings = [m["text"] for w in ping_worlds for m in w.messages
+                 if m.get("user") == NOTIFIER]
+        check("every notifier ping these cases post is the page its build_message makes",
+              (bool(pings), [p for p in pings if p != as_built(p)]), (True, []))
+        # A page the notifier's builders make here, not a fixture: when as_built cannot read
+        # it back, the red above is a ticket line the reader no longer parses, not drift.
+        _page = notify.mention_prefix(notify.ESC_BLOCKED, dict(
+            notify.EXAMPLE_CONFIG, mention_chat_user_ids=[BOB])) + notify.build_message(
+            notify.ESC_BLOCKED, "TOD-5", "Stuck",
+            notify.ticket_url(notify.EXAMPLE_CONFIG, "TOD-5"))
+        check("…and that check can read the notifier's page back, so its red is drift, not a "
+              "ticket line it no longer parses", as_built(_page) == _page, True)
 
         # 12. CONFIG: every problem at once; the chat bot's token name and `act` refused.
         os.makedirs(os.path.join(tmp, "in-a-repo", ".git"))

@@ -13,8 +13,9 @@ checks with Slack itself who said yes.
   planner starts on it;
 - a verified "yes" to `approve <epic id>` moves the epic to Todo. Then it hands the children
   to the agent, as you, in the order the plan needs them;
-- a verified member's reply under a "session stopped and needs a decision" ping goes to that
-  session's own thread, as your answer, and the session carries on (KIT-224).
+- a verified member's reply under an `agent:blocked` ping, the one saying a dev stopped to ask
+  you something, goes to that session's own thread, as your answer, and the session carries
+  on (KIT-224).
 
 With `ACT=no`, the default, it asks and records, and nothing in the tracker changes.
 
