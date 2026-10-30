@@ -435,9 +435,9 @@ CARDS = {
         "Finish a plan: wait until every piece of an approved plan is merged. Good: within a "
         "few minutes the epic moves to {DONE_STATE} with one comment naming who approved it, "
         "and one wrap-up names each pull request. If its reviews left notes, one question "
-        "asks first; after your `yes`, one ticket lands in the team's backlog with no labels, "
-        "and nothing starts on it. Record whether the wrap-up called each pull request "
-        "merged: that the tracker's link says so is not proven (KIT-299).",
+        "asks first; after your `yes`, one new ticket lands in the team with no labels, and "
+        "nothing starts on it. Record whether the wrap-up called each pull request merged, "
+        "and whether the ticket landed in Backlog or Triage: neither is proven (KIT-299).",
         "Answer a stuck session: when a ping says a dev stopped to ask you something, reply "
         "under it. Good: one comment naming you lands in that session's thread, and it "
         "carries on.",
@@ -754,8 +754,8 @@ def cmd_compose(conf, conf_path):
                 "Merging stays yours." % (conf["READY_STATE"], conf["AGENT_USER_NAME"],
                                           conf["EPIC_WIP"]))
             say("  Once every piece of it is merged, it moves the epic to %s, posts a "
-                "wrap-up, and asks before it files the review notes left as one ticket in "
-                "the backlog (KIT-299)." % conf["DONE_STATE"])
+                "wrap-up, and asks before it files the review notes left as one new ticket "
+                "in the team (KIT-299)." % conf["DONE_STATE"])
         else:
             say("  AGENT_USER_NAME is empty, so every `approve` is refused.")
     else:

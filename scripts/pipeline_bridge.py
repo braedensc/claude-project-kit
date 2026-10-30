@@ -1709,7 +1709,7 @@ def followup_text(ticket, count, team, cfg, dm=False):
     """The one question a closed plan with notes left asks. Its terms are fixed: what a yes
     files, where, and that it starts nothing."""
     return ("*File the review notes from %s?* Say `yes` %s within %d hours and I'll file "
-            "%s as one follow-up ticket in %s's backlog. It starts no work. Say `no` to "
+            "%s as one follow-up ticket in %s. It starts no work. Say `no` to "
             "leave %s."
             % (ticket, "here" if dm else "in this thread", cfg["question_ttl_hours"],
                "this note" if count == 1 else "these %d notes" % count, team,
@@ -3389,7 +3389,7 @@ class Pass(object):
         if q.get("filing") and not q.get("filed"):
             finish(REFUSED, "I started filing the notes from %s, but I can't confirm the "
                    "ticket was made, so I won't file it again. Look for “Follow-ups from” in "
-                   "%s's backlog." % (q["ticket"], q.get("team") or "the team"),
+                   "%s's tickets." % (q["ticket"], q.get("team") or "the team"),
                    "refused: filing not confirmed")
             return
         if not q.get("filed"):
@@ -3451,7 +3451,7 @@ class Pass(object):
                         "written; I will try again." % q["ticket"])
             q["linked"] = True
             self.save()
-        finish(DONE, "Filed %s “%s” in %s's backlog for <@%s>, with %d note%s. Nothing starts "
+        finish(DONE, "Filed %s “%s” in %s for <@%s>, with %d note%s. Nothing starts "
                "on it until someone hands it over.%s"
                % (q["filed"], notify.safe_title(q["filed_title"]), q.get("team") or "?",
                   msg["user"], q["filed_notes"], "" if q["filed_notes"] == 1 else "s", owed),
@@ -7598,6 +7598,58 @@ def selftest():
         check("a piece with more links than one read takes holds the close, said once",
               outcome(case_links_over), ([], 1, [], ["uuid-50"]))
 
+        def case_reopened(back_to):
+            # The bridge handed PROD-52 over, it went Done, and the close waits on its pull
+            # request. Then it is reopened: by the next look the PR is merged, but the piece
+            # is live again. The plan stays open and followed, the piece is never handed
+            # over twice, and it is said only as any handed-over piece is (KIT-284).
+            c, s, t, root = approved("fin-reopened-" + back_to,
+                                     kids=(("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            t.set_state("PROD-51", "completed")
+            run(c, s, t)
+            link(t, "PROD-51", 437)
+            link(t, "PROD-52", 438, status="Closed")
+            t.set_state("PROD-52", "completed")
+            run(c, s, t)
+            held = sum("#438 was closed without being merged" in p for p in posted(s))
+            t.set_state("PROD-52", back_to)
+            t.links["PROD-52"] = []
+            link(t, "PROD-52", 438)
+            before = len(s.posts)
+            for later in (FINISH_RECHECK_SECONDS + 1, STUCK_START_SECONDS + 60,
+                          STUCK_START_SECONDS + 120):
+                run(c, s, t, at=now + later)
+            said = [x for _ch, _th, x in s.posts[before:]]
+            return (held, delegated(t), done_moves(t), wraps(s), followed(c),
+                    asked_followup(s), [("has not started" in x) for x in said])
+        check("a piece reopened before the close holds it: no move, no wrap-up, still "
+              "followed, never handed over again, and a piece at work again is not called "
+              "stuck", outcome(lambda: case_reopened("started")),
+              (1, ["uuid-51", "uuid-52"], [], [], ["uuid-50"], [], []))
+        check("a piece reopened to Todo holds the close, and after two hours that it has not "
+              "started is said once over two passes", outcome(lambda: case_reopened("unstarted")),
+              (1, ["uuid-51", "uuid-52"], [], [], ["uuid-50"], [], [True]))
+
+        def case_extra_open():
+            def extra(t):
+                t.issues["PROD-59"] = dict(t.issues["PROD-52"], id="uuid-59",
+                                           identifier="PROD-59", title="Added by a session",
+                                           blocked_by=[], labels=[])
+                t.epics["PROD-50"].append("PROD-59")
+                t.set_state("PROD-59", "unstarted")
+            c, s, t, root, _code = finished("fin-extra-open", setup=extra)
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            held = (done_moves(t), wraps(s), followed(c),
+                    sum("PROD-59 is still Todo" in p for p in posted(s)),
+                    sum("PROD-59 was added after" in p for p in posted(s)))
+            link(t, "PROD-59", 440)
+            t.set_state("PROD-59", "completed")
+            run(c, s, t, at=now + 2 * FINISH_RECHECK_SECONDS + 2)
+            return held, (done_moves(t), len(wraps(s)), followed(c))
+        check("a piece added after the approval and left open holds the close, said once; "
+              "once it is Done the plan closes", outcome(case_extra_open),
+              (([], [], ["uuid-50"], 1, 1), ([("uuid-50", "st-done")], 1, [])))
+
         def case_reads_bounded():
             c, s, t, root, _code = finished("fin-reads", done_state="Shipped")
             first = t.piece_reads
@@ -7694,7 +7746,7 @@ def selftest():
             rec = [v for v in st["questions"].values() if v.get("kind") == "followup"]
             return (len(q), [(ch, th == root) for ch, th, _x in q],
                     [n for n in ("Say `yes` in this thread within 24 hours", "these 2 notes",
-                                 "PROD's backlog", "It starts no work", "Say `no`")
+                                 "ticket in PROD.", "It starts no work", "Say `no`")
                      if q and n not in q[0][2]],
                     "<!channel>" in wrap, "PROD-51, medium, src/app.py:12: Name the" in wrap,
                     "PROD-51, low, src/net.py: Log the retry" in wrap,

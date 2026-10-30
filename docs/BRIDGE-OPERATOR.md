@@ -348,7 +348,7 @@ said as partial, so "no notes" never stands for files it did not read.
   `ACT` changed, nothing is filed and the question closes. Say `no` to leave them.
 - **Never twice.** If a pass stops after the move, the next one posts the wrap-up without
   moving again. If a follow-up's write cannot be confirmed, it is never filed again; the
-  bridge says to look for it in the backlog. If the ticket was filed and only the reply was
+  bridge says to look for it in the team's tickets. If the ticket was filed and only the reply was
   lost, the next pass says it was filed, even if a setting changed in between.
 
 The close and the follow-up each count toward the 10 actions an hour.
@@ -651,7 +651,7 @@ off, nothing tells you in Slack that the notifier is down.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
   most `EPIC_WIP` at once. Move the epic back to Backlog to pause it.
 - **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
-  `DONE_STATE` with your key. Its review notes become a backlog ticket only after a
+  `DONE_STATE` with your key. Its review notes become one new ticket only after a
   member's "yes", and that ticket starts no work.
 - **The bridge's token and records sit in the dispatcher's account,** beside your tracker key.
   Any session holding the dispatcher's tool server can read them (KIT-162). With the token,
