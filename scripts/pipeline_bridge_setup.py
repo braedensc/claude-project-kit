@@ -9,8 +9,9 @@
     python3 scripts/pipeline_bridge_setup.py --selftest
 
 WHAT IT INSTALLS (KIT-220, KIT-221). One job, run by launchd every INTERVAL_SECONDS as the
-dispatcher's own role account (owner decision, 2026-10-10): it reads the chat channels,
-checks each sender with Slack itself, and asks its own questions. It acts only with ACT=yes,
+dispatcher's own role account (owner decision, 2026-10-10): it reads the chat channels, and
+with DM_USER_IDS each listed member's DM with its app (KIT-295), checks each sender with
+Slack itself, and asks its own questions. It acts only with ACT=yes,
 the default being no. It needs its OWN Slack app: if it posted as the chat bot, the chat bot
 could post a question that looked like the bridge's.
 
@@ -88,6 +89,11 @@ SCOPE_CITES = {
                       "channel (SlackClient.history, SlackClient.replies)",
     "users:read": "users.info, the sender check (SlackClient.user)",
     "chat:write": "chat.postMessage, its questions and answers (SlackClient.post)",
+    "im:history": "conversations.history and conversations.replies in a member's DM with "
+                  "the app, with DM_USER_IDS set (SlackClient.history, SlackClient.replies, "
+                  "read for each DM Pass.open_dms opens; KIT-295)",
+    "im:write": "conversations.open, which names a member's DM with the app "
+                "(SlackClient.open_dm, called by Pass.open_dms; KIT-295)",
 }
 
 CONF_KEYS = {
@@ -125,6 +131,9 @@ CONF_KEYS = {
                                  "member ID). A reply under one of its pings that it did "
                                  "not record is then refused aloud, and `verify` needs the "
                                  "pings file"),
+    "DM_USER_IDS": ("", "optional: the Slack user ids whose DM with the bridge app it also "
+                        "reads and answers in, comma-separated (KIT-295). Each message there "
+                        "is one of its own, so it notifies. Empty: no DM"),
     "NOTIFIER_JOB_LABEL": ("", "optional: the notifier's JOB_LABEL, as notifier.conf sets it. "
                                "Set, each pass reads how often launchd runs the notifier from "
                                "its plist, and says in Slack when it goes quiet or keeps "
@@ -215,6 +224,14 @@ def validate_conf(values):
     elif label and label == conf["JOB_LABEL"]:
         errors.append("NOTIFIER_JOB_LABEL is the bridge's own JOB_LABEL. Set it to the "
                       "JOB_LABEL in notifier.conf, or leave it empty")
+    # KIT-295: each a member's own user id, named once. The job checks the same.
+    dms = split_list(conf["DM_USER_IDS"])
+    bad = [u for u in dms if not bridge.SLACK_USER_RE.match(u)]
+    if bad:
+        errors.append("DM_USER_IDS must list Slack user ids like U0123456789, each a member's "
+                      "own (their profile, then Copy member ID), got %s" % ", ".join(bad))
+    elif len(set(dms)) != len(dms):
+        errors.append("DM_USER_IDS names a member twice")
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
     named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
@@ -231,7 +248,7 @@ def validate_conf(values):
 COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
                "ACT": "act", "NOTIFIER_STATE_DIR": "pings_file",
-               "INTERVAL_SECONDS": "run_interval_seconds"}
+               "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids"}
 
 
 def load_conf(path):
@@ -275,6 +292,11 @@ def compose_config(conf):
         doc["handoff_states"] = split_list(conf["HANDOFF_STATES"])
     if conf["NOTIFIER_BOT_USER_ID"]:
         doc["notifier_bot_user_id"] = conf["NOTIFIER_BOT_USER_ID"]
+    # KIT-295: composed only when set, so a config written before the key existed stays
+    # the same. The notifier's record of its DM pages is beside its pings, in its STATE_DIR.
+    if split_list(conf["DM_USER_IDS"]):
+        doc["dm_user_ids"] = split_list(conf["DM_USER_IDS"])
+        doc["notifier_posts_file"] = dm_posts_file(conf)
     # Composed only when set, so a config written before the key existed stays the same.
     if conf["NOTIFIER_JOB_LABEL"]:
         doc["notifier_plist"] = notifier_plist_path(conf)
@@ -286,6 +308,11 @@ def compose_config(conf):
 
 def pings_file(conf):
     return bridge.notify.bridge_pings_path({"state_dir": conf["NOTIFIER_STATE_DIR"]})
+
+
+def dm_posts_file(conf):
+    """The notifier's record of the pages it posts into a DM as the bridge's app (KIT-295)."""
+    return os.path.join(conf["NOTIFIER_STATE_DIR"], bridge.NOTIFIER_DM_POSTS_NAME)
 
 
 def notifier_plist_path(conf):
@@ -305,7 +332,10 @@ def config_bytes(conf):
 def manifest(conf):
     return {
         "display_information": {"name": conf["APP_NAME"]},
-        "features": {"bot_user": {"display_name": conf["APP_NAME"], "always_online": False}},
+        "features": {"bot_user": {"display_name": conf["APP_NAME"], "always_online": False},
+                     # KIT-295: the Messages tab, so a member can write to the app in its DM.
+                     "app_home": {"home_tab_enabled": False, "messages_tab_enabled": True,
+                                  "messages_tab_read_only_enabled": False}},
         "oauth_config": {"scopes": {"bot": sorted(SCOPE_CITES)}},
         "settings": {"org_deploy_enabled": False, "socket_mode_enabled": False,
                      "token_rotation_enabled": False},
@@ -365,6 +395,11 @@ CARDS = {
         "Click the app's name in the channel, open its profile, and Copy member ID. Put it "
         "in the conf as BOT_USER_ID: the job refuses any token that is not this bot's.",
         "Then put the token in place, at a hidden prompt:  python3 {SELF} token --conf {CONF}",
+        "Made the app before? Update it instead of lines 1 and 2: open the app's Slack settings "
+        "-> App Manifest -> paste the manifest `compose` prints -> Save Changes -> Reinstall "
+        "to Workspace. If its Bot User OAuth Token changed, run line 5 again.",
+        "With DM_USER_IDS set: find the app in Slack and open its Messages tab once. That is "
+        "your DM with the bridge. Each member it names does the same.",
     ], "token prints the env var name and the token's length, and nothing else.",
        "the chat bot's own app, or the notifier's. The bridge needs its own bot identity, "
        "or the chat bot could post a question that looks like the bridge's."),
@@ -712,6 +747,10 @@ def cmd_compose(conf, conf_path):
     else:
         say("ACT=no: a verified yes is recorded and said, and nothing in the tracker changes. "
             "Set ACT=yes and run `install --apply` to let it act.")
+    if split_list(conf["DM_USER_IDS"]):
+        say("DM_USER_IDS: it also reads and answers in the DM of %s, always as messages of "
+            "their own. An app made before needs the manifest again: card CK-B1."
+            % ", ".join(split_list(conf["DM_USER_IDS"])))
     return EX_OK
 
 
@@ -1236,10 +1275,54 @@ def selftest():
               and not any("z" * 30 in e for e in perrs), True)
         m = manifest(conf)
         check("manifest-scopes-exact", m["oauth_config"]["scopes"]["bot"],
-              ["chat:write", "groups:history", "users:read"])
+              ["chat:write", "groups:history", "im:history", "im:write", "users:read"])
         check("manifest-no-events-no-socket", ("event_subscriptions" in m["settings"],
                                                m["settings"]["socket_mode_enabled"]),
               (False, False))
+        # KIT-295: a member's DM with the app. Reading it needs im:history, opening it
+        # im:write, and a member can write to the app only with its Messages tab on. Each
+        # scope is cited to the code that calls it.
+        check("manifest-scopes-read-and-open-a-dm",
+              [sc for sc in ("im:history", "im:write")
+               if sc not in m["oauth_config"]["scopes"]["bot"]], [])
+        check("manifest-scopes-cite-the-dm-code",
+              ("SlackClient.open_dm" in SCOPE_CITES.get("im:write", ""),
+               "Pass.open_dms" in SCOPE_CITES.get("im:history", ""),
+               hasattr(bridge.SlackClient, "open_dm"), hasattr(bridge.Pass, "open_dms")),
+              (True, True, True, True))
+        check("manifest-messages-tab-on", m["features"].get("app_home"),
+              {"home_tab_enabled": False, "messages_tab_enabled": True,
+               "messages_tab_read_only_enabled": False})
+        dm_conf, dm_errs = validate_conf(dict(values, DM_USER_IDS="U0ALICE001, U0BOB00001",
+                                              NOTIFIER_STATE_DIR="/srv/notifier/state"))
+        composed = compose_config(dm_conf)
+        try:
+            loaded = bridge.validate_config(dict(composed, state_dir="/nonexistent-%s"
+                                                 % os.getpid()))["dm_user_ids"]
+        except (bridge.BridgeError, KeyError) as exc:
+            loaded = "refused: %s" % exc
+        check("conf-DM_USER_IDS-composed-only-when-set",
+              (dm_errs, composed.get("dm_user_ids"), composed.get("notifier_posts_file"),
+               loaded, [k for k in ("dm_user_ids", "notifier_posts_file")
+                        if k in compose_config(conf)]),
+              ([], ["U0ALICE001", "U0BOB00001"],
+               "/srv/notifier/state/notifier-dm-posts.json", ["U0ALICE001", "U0BOB00001"],
+               []))
+        for name, value in (("a-name", "alice"), ("a-channel", "C0000000AA"),
+                            ("a-dm-channel", "D0ALICE001")):
+            _c, errs = validate_conf(dict(values, DM_USER_IDS="U0ALICE001, " + value))
+            check("conf-DM_USER_IDS-bad-id-refused:" + name,
+                  [e.split(" ")[0] for e in errs if "DM_USER_IDS" in e or "dm_user_ids" in e],
+                  ["DM_USER_IDS"])
+        _c, errs = validate_conf(dict(values, DM_USER_IDS="U0ALICE001, U0ALICE001"))
+        check("conf-DM_USER_IDS-duplicate-refused",
+              [e for e in errs if "DM_USER_IDS" in e or "dm_user_ids" in e],
+              ["DM_USER_IDS names a member twice"])
+        b1 = cap(print_card, "CK-B1", conf)[1]
+        check("card-b1-says-how-to-update-the-app-and-open-the-dm",
+              [n for n in ("App Manifest", "Save Changes", "Reinstall to Workspace",
+                           "Bot User OAuth Token changed", "Messages tab")
+               if n not in b1], [])
         cmd = job_command(conf)
         check("job-sources-the-env-file-then-runs-the-bridge",
               cmd.startswith('set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 '

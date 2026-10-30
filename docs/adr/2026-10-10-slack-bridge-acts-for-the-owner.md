@@ -3,7 +3,8 @@
 - **Status:** Accepted (owner, 2026-10-10, KIT-220). Built in steps: KIT-221 (this ADR's first
   build: read, verify, ask, act on nothing), then KIT-222 (plan an idea), KIT-223 (approve an
   epic and start its children in order), KIT-224 (answer a stuck session; replaces the reply
-  relay), KIT-225 (ready-to-merge pings), KIT-226 (the chat bot's instructions).
+  relay), KIT-225 (ready-to-merge pings), KIT-226 (the chat bot's instructions), KIT-295 (the
+  owner's DM; see its update below, which changes where a yes may bind).
 - **Date:** 2026-10-10
 - **Supersedes, in part:** `2026-09-06-human-action-notifier-and-reply-relay.md`, where it says
   approve, label and state "never transit the channel". A state move into Plan it, an epic's
@@ -219,3 +220,43 @@ chat message, ticket and session thread to a file beside its seen-set, and the b
 that file. Neither job holds the other's token. The two switches never both hold, so no ping
 can be answered twice. The answer is the bounce driver's thread reply, borrowed from one
 place, which is the route proven to resume a session on 2026-09-08.
+
+## Update 2026-10-30 — the owner's DM (KIT-295)
+
+With `dm_user_ids` set, the bridge also reads each listed member's DM with its app. Everything
+it posts there is a message of its own, so each one notifies. This changes the binding rule
+above in one place, and adds one trust input.
+
+**A bare yes in a DM.** A DM has no question thread, so there a `yes` or `no` sent as a
+message of its own answers the one open question in that DM asked before it. With two open,
+`yes <ticket id>` is asked for. A yes in the thread under a question answers that one; a yes
+in any other thread answers nothing. A yes in a DM never answers a question asked in a
+channel or in another DM. Every other check is the channel's, in the same order: an edited or
+deleted question, anything posted between the question and a bare yes that the bridge cannot
+vouch for (scanned over the DM's own messages), the sender, the time limit, the settings the
+question stated, and the action limit.
+
+**The notifier's ledger is a new trust input.** In a DM the notifier posts as the bridge's
+own app, so its pages look like the bridge's own posts. The notifier records each one in
+`notifier-dm-posts.json` in its state directory, which must be outside any git worktree. The
+bridge reads it every pass, and again for each reply under a post of the app. A page recorded
+there for that same DM is not a post the bridge cannot vouch for, unless it asks the member
+something: a stuck dev's ping, a planner's question, or a plan waiting for approval, told by
+its mark or because the pings file holds it. A bare yes typed after one of those may be meant
+for it, so `yes <ticket id>` is asked for. The ledger vouches for nothing in a channel. A
+ledger that cannot be read stops the pass, as the pings file does. The file is the notifier's
+own, and in a DM the notifier already posts with the bridge app's token, so it grants the
+notifier nothing it did not have.
+
+**The first read of a DM is a baseline.** As on the very first pass, what is already in a DM
+the first time the bridge reads it is passed over, answered none. The DM is kept in the state
+only once that is done, so a pass that stops first baselines it again.
+
+**Replies under a page.** A reply under a page the pings file holds goes to the session, as in
+the channel. A verified member's reply under any other page the ledger holds, or under a post
+of the app that neither job recorded, is refused and said, never silently ignored.
+
+These follow the review of KIT-295 (2026-10-30). Two residuals are accepted and named. The
+app's manifest asks for `im:history` and `im:write`, and turns on its Messages tab, even when
+no DM is listed. And a channel added to `channel_ids` later still has no first-read baseline
+of its own.

@@ -95,6 +95,26 @@ THE BRIDGE ASKS, A MEMBER ANSWERS
   bridge's reply saying so is posted. A tricked chat bot can make the bridge ask; it cannot
   make it act.
 
+  IN A MEMBER'S DM (KIT-295). With `dm_user_ids` set, each pass also reads each listed
+  member's DM with the bridge app, opened once with `conversations.open` and kept in the
+  state. The first pass that reads a DM is a baseline for it: what was already there is
+  passed over. Everything the bridge posts there is a message of its own, never a thread
+  reply, so every message notifies. A request there is one line of its own, and so is its
+  question. A `yes` or `no` of its own answers the one open question in that DM asked
+  before it; with two open, a bare `yes` is refused and `yes <ticket id>` is asked for. A
+  `yes` in the thread under a question answers that one. Every other check is the
+  channel's: the sender, an edited or deleted question, anything posted between the
+  question and a bare yes that the bridge cannot vouch for, the time limit, the settings
+  stated and the action limit. The notifier posts its pages into that DM as this app, and
+  records each one in its ledger (`notifier_posts_file`): a page it recorded for that DM is
+  not a post the bridge cannot vouch for, unless it asks the member something (a ping, a
+  planner's question, a plan waiting for approval), since a bare yes may be meant for it.
+  A ledger that cannot be read stops the pass. A reply under a recorded page that is not a
+  ping waiting on an answer is refused, and said, and so is one under a post of this app
+  that neither job recorded.
+  Anything else a member writes there gets one line on what the bridge can do, at most
+  once an hour; a bot's post gets nothing.
+
   THE BRIDGE KNOWS ITS OWN BOT. `bot_user_id` in the config is the bridge app's bot user,
   and a token that answers to anyone else is refused before anything is read: a pasted
   chat-bot token would otherwise make the chat bot's posts look like the bridge's.
@@ -169,10 +189,10 @@ WATCHES THE NOTIFIER (KIT-285)
 WHAT IT NEVER DOES
 
   It writes to the tracker only the three writes above, and only with `act` on. It never
-  posts outside its configured channels, never posts a message's own text back, and never
-  prints a credential: both are read from env vars the config NAMES (the job's wrapper
-  sources the role account's env file), and every line it writes (the log, the state file,
-  a Slack post) is redacted against them. The state file is written mode 600.
+  posts outside its configured channels and DMs, never posts a message's own text back,
+  and never prints a credential: both are read from env vars the config NAMES (the job's
+  wrapper sources the role account's env file), and every line it writes (the log, the
+  state file, a Slack post) is redacted against them. The state file is written mode 600.
 """
 import argparse
 import hashlib
@@ -213,6 +233,24 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 # names it. Matched by name, like `plan_it_state` and `ready_state`.
 DEFAULT_HANDOFF_STATES = ["Needs Approval"]
 MAX_THREAD_PAGES = 10
+# KIT-295: the notifier's record of the pages it posts into a DM as the bridge's own app.
+# Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
+NOTIFIER_DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
+NOTIFIER_DM_POSTS_NAME = "notifier-dm-posts.json"
+# What the bridge says to anything else a member writes in its DM, at most once an hour.
+DM_HELP = ("I can do `plan <ticket id>`, `approve <ticket id>` and yes or no here. To "
+           "answer a dev, reply in the thread under its message. For anything else, ask "
+           "the tech lead in the chat channel for now.")
+# The notifier's pages that ask the member something: a dev or the planner stopped to ask,
+# or a plan waits for approval. A bare yes typed after one may be meant for it, so such a
+# page is never vouched for between a question and a bare yes (KIT-295 review).
+DM_ASKING_MARKS = (notify.ESC_BLOCKED, notify.ESC_NEEDS_INPUT, notify.ESC_AWAITING_APPROVAL)
+# A reply under a ping the bridge holds no record of, in a channel or a DM.
+UNRECORDED_PING = ("I can't pass that on to a session: this ping was not recorded for the "
+                   "bridge, so I can't tell which session is waiting. Pings sent before "
+                   "BRIDGE_PINGS=yes are not recorded, and neither is one the notifier failed "
+                   "to record (it pages that one again). Answer under the newer ping, or in "
+                   "the tracker.")
 
 CONFIG_KEYS = {
     "schema": "the config's schema id, %s" % CONFIG_SCHEMA,
@@ -263,6 +301,13 @@ CONFIG_KEYS = {
                             "StartInterval (default 60). The notifier watch reads a gap in "
                             "its own passes of over twice this plus run_timeout_seconds as "
                             "the Mac asleep (KIT-285)",
+    "dm_user_ids": "optional: the Slack user ids whose DM with the bridge app it also reads "
+                   "and answers in, always as messages of their own, so each one notifies "
+                   "(KIT-295). Empty, the default: no DM is read",
+    "notifier_posts_file": "the notifier's record of the pages it posts into a DM as this "
+                           "app (default <state_dir>/%s, where the notifier writes it). Read "
+                           "only with dm_user_ids set; outside every git worktree"
+                           % NOTIFIER_DM_POSTS_NAME,
 }
 
 EXAMPLE_CONFIG = {
@@ -275,6 +320,7 @@ EXAMPLE_CONFIG = {
     "bot_user_id": "U0123456789",
     "team_keys": ["PROD"],
     "allowed_slack_users": [],
+    "dm_user_ids": [],
     "question_ttl_hours": 24,
     "lookback_days": 7,
     "max_questions_per_hour": 20,
@@ -283,6 +329,7 @@ EXAMPLE_CONFIG = {
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 CHANNEL_RE = re.compile(r"^[CG][A-Z0-9]{8,}$")
+DM_RE = re.compile(r"^D[A-Z0-9]{8,}$")          # a member's DM with the app (KIT-295)
 SLACK_USER_RE = re.compile(r"^[UW][A-Z0-9]{8,}$")
 TEAM_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
 TICKET_RE = r"[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}"
@@ -409,11 +456,18 @@ def validate_config(raw):
         "notifier_bot_user_id": raw.get("notifier_bot_user_id") or "",
         "notifier_plist": raw.get("notifier_plist") or "",
         "run_interval_seconds": raw.get("run_interval_seconds", DEFAULT_RUN_INTERVAL),
+        "dm_user_ids": raw.get("dm_user_ids", []),
+        "notifier_posts_file": raw.get("notifier_posts_file") or "",
     }
     if not cfg["pings_file"]:
         cfg["pings_file"] = os.path.join(cfg["state_dir"], "notifier-bridge-pings.json")
     else:
         cfg["pings_file"] = os.path.realpath(os.path.expanduser(cfg["pings_file"]))
+    if not cfg["notifier_posts_file"]:
+        cfg["notifier_posts_file"] = os.path.join(cfg["state_dir"], NOTIFIER_DM_POSTS_NAME)
+    elif isinstance(cfg["notifier_posts_file"], str):
+        cfg["notifier_posts_file"] = os.path.realpath(
+            os.path.expanduser(cfg["notifier_posts_file"]))
     if cfg["schema"] != CONFIG_SCHEMA:
         errors.append("config 'schema' must be %r, got %r" % (CONFIG_SCHEMA, cfg["schema"]))
     for key in ("slack_token_env", "linear_key_env"):
@@ -464,6 +518,13 @@ def validate_config(raw):
             isinstance(u, str) and SLACK_USER_RE.match(u) for u in allowed):
         errors.append("config 'allowed_slack_users' must be a list of Slack user ids like "
                       "U0123456789 (empty for any full member), got %r" % (allowed,))
+    dms = cfg["dm_user_ids"]
+    if not isinstance(dms, list) or not all(
+            isinstance(u, str) and SLACK_USER_RE.match(u) for u in dms):
+        errors.append("config 'dm_user_ids' must be a list of Slack user ids like "
+                      "U0123456789 (empty for no DM), got %r" % (dms,))
+    elif len(set(dms)) != len(dms):
+        errors.append("config 'dm_user_ids' repeats a member")
     numbers_ok = True
     for key in ("question_ttl_hours", "lookback_days", "max_questions_per_hour",
                 "max_history_pages", "run_timeout_seconds", "max_open_questions",
@@ -508,6 +569,13 @@ def validate_config(raw):
         errors.append("config 'pings_file' (%s) is inside a git working tree — it decides "
                       "which session an answer reaches, so it must live outside every "
                       "worktree, where no session can write it" % cfg["pings_file"])
+    posts_file = cfg["notifier_posts_file"]
+    if not isinstance(posts_file, str):
+        errors.append("config 'notifier_posts_file' must be a path, got %r" % (posts_file,))
+    elif notify._inside_git_worktree(os.path.dirname(posts_file)):
+        errors.append("config 'notifier_posts_file' (%s) is inside a git working tree — it "
+                      "decides which posts in a DM the bridge vouches for, so it must live "
+                      "outside every worktree, where no session can write it" % posts_file)
     if errors:
         raise BridgeError("config problems:\n  - " + "\n  - ".join(errors), EXIT_USAGE)
     return cfg
@@ -546,9 +614,11 @@ def new_state():
     # epics: each approved epic the bridge is starting the children of (KIT-223).
     # relays, relay_pending: answers passed on to a session in the last hour, and the
     # answers recorded before a post that never confirmed (KIT-224).
+    # dms: each listed member's DM channel, opened once; stray_said: per DM, when the
+    # bridge last said what it can do there (KIT-295).
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
             "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
-            "epics": {}, "relays": [], "relay_pending": {}}
+            "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {}}
 
 
 def load_state(cfg):
@@ -586,6 +656,11 @@ def load_state(cfg):
     if not isinstance(doc["epics"], dict):
         raise BridgeError("the bridge's state %s has no readable list of approved epics. "
                           "Nothing was done" % path)
+    doc.setdefault("dms", {})
+    doc.setdefault("stray_said", {})
+    if not isinstance(doc["dms"], dict) or not isinstance(doc["stray_said"], dict):
+        raise BridgeError("the bridge's state %s has no readable record of its DMs. Nothing "
+                          "was done" % path)
     return doc, False
 
 
@@ -607,6 +682,27 @@ def load_pings(cfg):
         raise BridgeError("the notifier's pings file %s is not a %s document"
                           % (path, notify.BRIDGE_PINGS_SCHEMA))
     return doc["messages"]
+
+
+def load_dm_posts(cfg):
+    """The notifier's record of the pages it posted into a DM as this app (KIT-295), keyed
+    "<channel>:<ts>"; {} when it has recorded none yet. Its pages look like the bridge's own
+    posts there. A file that cannot be read stops the pass, as the pings file does: a yes
+    is never judged against a guess at what the notifier posted."""
+    path = cfg["notifier_posts_file"]
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise BridgeError("the notifier's record of its DM pages %s cannot be read (%s). "
+                          "Nothing was done" % (path, type(exc).__name__))
+    if (not isinstance(doc, dict) or doc.get("schema") != NOTIFIER_DM_POSTS_SCHEMA
+            or not isinstance(doc.get("posts"), dict)):
+        raise BridgeError("the notifier's record of its DM pages %s is not a %s document. "
+                          "Nothing was done" % (path, NOTIFIER_DM_POSTS_SCHEMA))
+    return doc["posts"]
 
 
 def notifier_heartbeat_path(cfg):
@@ -770,6 +866,28 @@ class SlackClient(object):
 
     def user(self, user_id):
         return self._get("users.info", {"user": user_id}).get("user") or {}
+
+    def open_dm(self, user_id):
+        """The id of a member's DM with this app, from `conversations.open` (KIT-295). It
+        answers the same DM every time. It needs `im:write`; without it the refusal names
+        the scope, so a missing one is never read as a member with no DM."""
+        try:
+            doc = _http_json("%s/conversations.open" % self.base,
+                             {"Authorization": "Bearer %s" % self.token,
+                              "Content-Type": "application/json; charset=utf-8"},
+                             {"users": user_id})
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise BridgeError("Slack conversations.open failed (%s)" % type(exc).__name__)
+        if not isinstance(doc, dict) or not doc.get("ok"):
+            error = (doc or {}).get("error") if isinstance(doc, dict) else "no JSON"
+            if error == "missing_scope":
+                raise BridgeError("Slack conversations.open refused: missing_scope. The "
+                                  "bridge app needs im:write to open a DM: paste the "
+                                  "manifest `compose` prints into the app and reinstall it "
+                                  "(card CK-B1)")
+            raise BridgeError("Slack conversations.open refused: %s" % error)
+        channel = doc.get("channel")
+        return channel.get("id") if isinstance(channel, dict) else None
 
     def post(self, channel, thread_ts, text):
         payload = {"channel": channel, "text": text, "unfurl_links": False,
@@ -1090,7 +1208,7 @@ def ticket_fingerprint(issue):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def question_text(issue, requester, cfg, now, by_bot=False):
+def question_text(issue, requester, cfg, now, by_bot=False, dm=False):
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -1104,11 +1222,13 @@ def question_text(issue, requester, cfg, now, by_bot=False):
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = ("the bridge moves it to %s for you" % cfg["plan_it_state"] if cfg["act"] else
             "the bridge records it; acting is switched off here, so nothing moves")
+    # In a DM the question is a message of its own, and a yes of its own answers it
+    # (KIT-295). The terms a yes agrees to read the same in both.
     return ("*Plan this?* %s “%s”: in %s on %s, filed by %s.\n"
-            "Reply `yes` in this thread within %d hours, and %s. Reply `no` to drop it. "
+            "Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
             "(Asked for by %s.)"
             % (issue.get("identifier"), title, state, team, creator,
-               cfg["question_ttl_hours"], then, who))
+               "here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
 
 
 def blockers_of(child):
@@ -1239,7 +1359,7 @@ def epic_problems(epic, kids=None):
     return problems
 
 
-def approve_text(epic, requester, cfg, by_bot=False):
+def approve_text(epic, requester, cfg, by_bot=False, dm=False):
     kids = in_order(children_of(epic))
     listing = ", ".join("%s “%s”" % (k.get("identifier"), notify.safe_title(k.get("title")
                                                                           or ""))
@@ -1255,11 +1375,11 @@ def approve_text(epic, requester, cfg, by_bot=False):
             % (cfg["ready_state"], cfg["epic_wip"]) if cfg["act"] else
             "the bridge records it; acting is switched off here, so nothing moves or starts")
     return ("*Approve this plan?* %s “%s” on %s: %d children, in this order: %s.\n"
-            "Reply `yes` in this thread within %d hours, and %s. Reply `no` to leave it. "
+            "Reply `yes` %s within %d hours, and %s. Reply `no` to leave it. "
             "(Asked for by %s.)"
             % (epic.get("identifier"), notify.safe_title(epic.get("title") or ""),
                (epic.get("team") or {}).get("key") or "?", len(kids), listing,
-               cfg["question_ttl_hours"], then, who))
+               "here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
 
 
 def iso(seconds):
@@ -1387,7 +1507,11 @@ class Pass(object):
         self.me = None
         self.users = {}
         self.threads = {}                  # (channel, root ts) -> messages read this pass
+        self.tops = {}                     # channel -> its own top-level messages, this pass
         self.unrecorded = {}               # thread key -> latest_reply, once all handled
+        self.dm_channels = set()           # the members' DMs this pass reads (KIT-295)
+        self.dm_posts = {}                 # the notifier's DM pages, "<channel>:<ts>"
+        self.fresh_dms = {}                # DM channel -> member, opened for the first time
         self.secrets = live_secrets(cfg)
         self.release_errors = []
         self.notifier = None               # the watch's line for the summary (KIT-285)
@@ -1408,6 +1532,10 @@ class Pass(object):
             save_state(self.cfg, self.state)
 
     def post(self, channel, thread_ts, text):
+        if channel in self.dm_channels:
+            # In a DM every post is a message of its own (KIT-295): a thread reply notifies
+            # only those who follow that thread, and the member reads the DM itself.
+            thread_ts = None
         text = self.clean(text)
         if self.dry:
             self.say("  [dry-run] would post in %s thread %s (%d chars)"
@@ -1440,6 +1568,9 @@ class Pass(object):
         older than the window is never handled, wherever it was found."""
         oldest = self.now - self.cfg["lookback_days"] * 86400
         tops = self.slack.history(channel, oldest, self.cfg["max_history_pages"])
+        # Kept for a question asked as a message of its own, in a DM: the DM's history is
+        # where it lives, and where anything posted after it shows (KIT-295).
+        self.tops[channel] = tops
         msgs = list(tops)
         for m in tops:
             root = m.get("ts")
@@ -1453,9 +1584,10 @@ class Pass(object):
             # failure or the deadline leaves it unrecorded, so the next pass reads it again.
             self.unrecorded[key_of(channel, root)] = m.get("latest_reply")
         # The thread of every OPEN question is read whatever the window says: its root
-        # may be older than the window, and its answer must still be heard.
+        # may be older than the window, and its answer must still be heard. A question in a
+        # DM has no thread: it is a message of its own, read with the DM's history.
         for q in self.state["questions"].values():
-            if (q.get("status") == OPEN and q.get("channel") == channel
+            if (q.get("status") == OPEN and q.get("channel") == channel and q.get("thread")
                     and (channel, q.get("thread")) not in self.threads):
                 msgs.extend(self.read_thread(channel, q["thread"]))
         unique = {}
@@ -1487,18 +1619,24 @@ class Pass(object):
             self.watch_error = ("could not post in Slack what the notifier's heartbeat shows "
                                 "(%s); the next pass tries again" % exc)
         load_pings(self.cfg)               # one that cannot be read stops the pass first
+        if self.cfg["dm_user_ids"]:
+            # Read once a pass, and stops it the same way (KIT-295).
+            self.dm_posts = load_dm_posts(self.cfg)
         viewer = self.tracker.viewer_id()
         if viewer != self.cfg["owner_user_id"]:
             raise BridgeError("the tracker key belongs to %s, not owner_user_id. The bridge "
                               "acts as the owner, so it refuses to run with anyone else's "
                               "key" % (viewer or "nobody"), EXIT_USAGE)
-        for channel in self.cfg["channel_ids"]:
+        for channel in self.cfg["channel_ids"] + self.open_dms():
+            # A DM read for the first time is a baseline too, as the first pass is: turned
+            # on for a bridge that has run before, it must not answer days of old messages.
+            fresh = channel in self.fresh_dms
             for msg in self.gather(channel):
                 k = key_of(channel, msg.get("ts"))
                 if k in self.state["handled"]:
                     continue
                 self.counts["examined"] += 1
-                if self.first:
+                if self.first or fresh:
                     self.mark(channel, msg, "baseline")
                     self.counts["baseline"] += 1
                     continue
@@ -1506,6 +1644,12 @@ class Pass(object):
                 self.save()
             self.state["threads"].update(self.unrecorded)
             self.unrecorded = {}
+            if fresh:
+                # Kept only now: a pass that stops before this point opens it, and
+                # baselines it, again.
+                self.state["dms"][self.fresh_dms[channel]] = channel
+                self.say("  first read of the DM with %s: what was already there is passed "
+                         "over, answered none" % self.fresh_dms[channel])
             self.save()
         self.release()
         self.pay_owed()
@@ -1525,6 +1669,25 @@ class Pass(object):
             loud.append(self.watch_error)
         if loud:
             raise BridgeError("; ".join(loud))
+
+    def open_dms(self):
+        """Each listed member's DM with this app (KIT-295), opened once and kept in the
+        state: Slack answers the same DM every time. An answer that is not a DM's id is
+        refused, never read. A DM the state does not hold yet is read this pass as a
+        baseline, and kept once that is done (run)."""
+        out = []
+        for uid in self.cfg["dm_user_ids"]:
+            channel = self.state["dms"].get(uid)
+            if not (isinstance(channel, str) and DM_RE.match(channel)):
+                channel = self.slack.open_dm(uid)
+                if not (isinstance(channel, str) and DM_RE.match(channel)):
+                    raise BridgeError("Slack conversations.open named no DM with %s (it "
+                                      "answered %r), so no DM was read" % (uid, channel))
+                self.fresh_dms[channel] = uid
+            if channel not in out:
+                out.append(channel)
+        self.dm_channels = set(out)
+        return out
 
     # -- the notifier (KIT-285) ----------------------------------------------------
     def watch_notifier(self):
@@ -1676,7 +1839,8 @@ class Pass(object):
             self.mark(channel, msg, "own")
             return
         thread = msg.get("thread_ts")
-        if thread and thread != msg.get("ts"):
+        reply = bool(thread and thread != msg.get("ts"))
+        if reply:
             # Read as each reply is handled, not once a pass: a ping the notifier records
             # while this pass runs is still found.
             pings = load_pings(self.cfg)
@@ -1701,9 +1865,26 @@ class Pass(object):
             self.request(channel, msg, req.group(1).lower(), req.group(2).upper())
             return
         yes, no = YES_RE.match(text), NO_RE.match(text)
-        if (yes or no) and msg.get("thread_ts") and msg.get("thread_ts") != msg.get("ts"):
+        dm = channel in self.dm_channels
+        # In a channel only a reply in a question's thread answers it. In a DM a question
+        # is a message of its own, so an answer of its own counts there too (KIT-295).
+        if (yes or no) and (reply or dm):
             self.answer(channel, msg, bool(yes), ((yes or no).group(1) or "").upper())
             return
+        if dm and not reply:
+            self.stray(channel, msg)
+            return
+        self.mark(channel, msg, "ignored")
+
+    def stray(self, channel, msg):
+        """Anything else a member writes in a DM: one line on what the bridge does there, at
+        most once an hour in each DM, so a chat with it is never silent and never a flood
+        (KIT-295). A bot's post, or any special message type, is passed over in silence."""
+        human = (msg.get("user") and msg.get("user") != "USLACKBOT" and not msg.get("bot_id")
+                 and not msg.get("app_id") and not msg.get("subtype"))
+        if human and self.state["stray_said"].get(channel, 0) <= self.now - 3600:
+            self.post(channel, None, DM_HELP)
+            self.state["stray_said"][channel] = self.now
         self.mark(channel, msg, "ignored")
 
     def refuse_request(self, channel, msg, thread, text, why):
@@ -1712,7 +1893,9 @@ class Pass(object):
         self.counts["refused"] += 1
 
     def request(self, channel, msg, kind, ident):
-        thread = msg.get("thread_ts") or msg.get("ts")
+        # In a DM the question is a message of its own, so it notifies (KIT-295).
+        dm = channel in self.dm_channels
+        thread = None if dm else (msg.get("thread_ts") or msg.get("ts"))
         requester = msg.get("user") or msg.get("bot_id") or ""
         by_bot = bool(msg.get("bot_id") or msg.get("app_id"))
         # Every request that would read the tracker counts, found or not: the key is the
@@ -1736,15 +1919,17 @@ class Pass(object):
             return
         for q in open_now:
             if q.get("ticket") == ident:
-                self.refuse_request(channel, msg, thread, "%s already has an open question, "
-                                    "in %s. Answer that one." % (ident, "this thread" if
-                                                               q.get("thread") == thread
-                                                               else "another thread"),
-                                    "already asked")
+                if dm:
+                    where = " here" if q.get("channel") == channel else " elsewhere"
+                else:
+                    where = ", in %s" % ("this thread" if q.get("thread") == thread
+                                         else "another thread")
+                self.refuse_request(channel, msg, thread, "%s already has an open question%s. "
+                                    "Answer that one." % (ident, where), "already asked")
                 return
         self.state["asked_at"].append(self.now)
         if kind == "approve":
-            self.request_approve(channel, msg, thread, requester, ident, by_bot)
+            self.request_approve(channel, msg, thread, requester, ident, by_bot, dm)
             return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
@@ -1771,9 +1956,9 @@ class Pass(object):
                                                                 "; ".join(live)), "live work")
             return
         self.ask(channel, msg, thread, kind, issue, requester,
-                 question_text(issue, requester, self.cfg, self.now, by_bot=by_bot))
+                 question_text(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm))
 
-    def request_approve(self, channel, msg, thread, requester, ident, by_bot=False):
+    def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
         if not self.cfg["agent_user_name"].strip():
             self.refuse_request(channel, msg, thread, "This bridge names no agent user "
                                 "(agent_user_name), so it cannot start an epic's children. "
@@ -1806,7 +1991,7 @@ class Pass(object):
                                 "not an idea-gate epic")
             return
         self.ask(channel, msg, thread, "approve", epic, requester,
-                 approve_text(epic, requester, self.cfg, by_bot=by_bot),
+                 approve_text(epic, requester, self.cfg, by_bot=by_bot, dm=dm),
                  children=fingerprints(epic))
 
     def handed_over(self, node):
@@ -1838,21 +2023,34 @@ class Pass(object):
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
                                                        requester or "?"))
 
+    def around(self, channel, q, msg):
+        """What was posted where this answer was given, as read this pass: the question's
+        thread in a channel. A question in a DM is a message of its own (KIT-295): the DM's
+        own messages, or the thread under the question when the answer is a reply in it."""
+        if q.get("thread"):
+            return self.threads.get((channel, q["thread"]), [])
+        if msg.get("thread_ts") and msg.get("thread_ts") != msg.get("ts"):
+            return self.threads.get((channel, msg["thread_ts"]), [])
+        return self.tops.get(channel, [])
+
     def foreign_post_after(self, channel, q, msg):
-        """True when anything the bridge cannot vouch for posted in the question's thread
-        between the question and this answer: a bot or an app, Slackbot, an account that
-        could not answer itself (a guest, another workspace, no sender named), or the
+        """True when anything the bridge cannot vouch for posted where the answer was
+        given, between the question and this answer: a bot or an app, Slackbot, an account
+        that could not answer itself (a guest, another workspace, no sender named), or the
         bridge's own account posting something it has no record of. Any of them could be a
-        look-alike question. A verified member's post is not."""
+        look-alike question. A verified member's post is not, and neither is a page the
+        notifier posted into a DM as this app and recorded that asks nothing (vouched_page,
+        KIT-295)."""
         lo, hi = ts_float(q.get("ts")), ts_float(msg.get("ts"))
-        for m in self.threads.get((channel, q.get("thread")), []):
+        for m in self.around(channel, q, msg):
             t = ts_float(m.get("ts"))
             if not lo < t < hi:
                 continue
             ours = (m.get("user") == self.me["user_id"]
                     or (self.me.get("bot_id") and m.get("bot_id") == self.me["bot_id"]))
             if ours:
-                if key_of(channel, m.get("ts")) not in self.state["posted"]:
+                if (key_of(channel, m.get("ts")) not in self.state["posted"]
+                        and not self.vouched_page(channel, m.get("ts"))):
                     return True
                 continue
             if m.get("bot_id") or m.get("app_id") or m.get("subtype") == "bot_message":
@@ -1864,26 +2062,58 @@ class Pass(object):
                 return True
         return False
 
+    def vouched_page(self, channel, ts):
+        """True for a page the notifier posted into this DM as this app, recorded in its
+        ledger for this DM, that waits on no answer (KIT-295). A page that asks something,
+        by its mark or because the pings file holds it, is never vouched for: a bare yes
+        typed after it may be meant for it. Nothing in a channel is vouched for this way."""
+        rec = self.dm_posts.get(key_of(channel, ts))
+        if (channel not in self.dm_channels or not isinstance(rec, dict)
+                or rec.get("channel") != channel or rec.get("ts") != ts):
+            return False
+        if rec.get("mark") not in notify.MARKS or rec.get("mark") in DM_ASKING_MARKS:
+            return False
+        return notify.chat_message_key(channel, ts) not in load_pings(self.cfg)
+
     def question_closed(self, channel, q):
         """Why the question can no longer be answered as asked, or None. A question gone
-        from its thread (deleted) is closed, never taken as unchanged."""
-        for m in self.threads.get((channel, q.get("thread")), []):
+        from where it was asked (deleted) is closed, never taken as unchanged. One in a DM
+        is a message of its own, judged from the DM's own messages (KIT-295)."""
+        if q.get("thread"):
+            seen = self.threads.get((channel, q["thread"]), [])
+            gone = "is no longer in this thread"
+        else:
+            seen, gone = self.tops.get(channel, []), "is no longer here"
+        for m in seen:
             if m.get("ts") == q.get("ts"):
                 return "was changed after I asked it" if m.get("edited") else None
-        return "is no longer in this thread"
+        return gone
 
     def answer(self, channel, msg, is_yes, hint):
-        thread = msg["thread_ts"]
-        here = [(k, q) for k, q in self.state["questions"].items()
-                if q.get("channel") == channel and q.get("thread") == thread
-                and ts_float(q.get("ts")) < ts_float(msg.get("ts"))]
+        """A yes or no. In a channel it answers the open question in its thread. In a DM a
+        question is a message of its own (KIT-295): an answer of its own answers the open
+        question there asked before it, and a reply under a question answers that one.
+        Every check after that is the same in both."""
+        thread = msg.get("thread_ts") if msg.get("thread_ts") != msg.get("ts") else None
+        dm = channel in self.dm_channels
+        if dm:
+            where = "in that thread" if thread else "here"
+            here = [(k, q) for k, q in self.state["questions"].items()
+                    if q.get("channel") == channel and (not thread or q.get("ts") == thread)
+                    and ts_float(q.get("ts")) < ts_float(msg.get("ts"))]
+            thread = None                         # every post in a DM is one of its own
+        else:
+            where = "in this thread"
+            here = [(k, q) for k, q in self.state["questions"].items()
+                    if q.get("channel") == channel and q.get("thread") == thread
+                    and ts_float(q.get("ts")) < ts_float(msg.get("ts"))]
         open_here = [(k, q) for k, q in here if q.get("status") == OPEN]
         if hint:
             open_here = [(k, q) for k, q in open_here if q.get("ticket") == hint]
         if not open_here:
-            if here:
-                self.post(channel, thread, "There is no open question%s in this thread to "
-                          "answer." % (" about %s" % hint if hint else ""))
+            if here or dm:
+                self.post(channel, thread, "There is no open question%s %s to answer."
+                          % (" about %s" % hint if hint else "", where))
                 self.mark(channel, msg, "refused: no open question")
                 self.counts["refused"] += 1
             else:
@@ -1891,8 +2121,8 @@ class Pass(object):
             return
         word = "yes" if is_yes else "no"
         if len(open_here) > 1:
-            self.post(channel, thread, "%d questions are open in this thread. Reply `%s "
-                      "<ticket id>` to say which." % (len(open_here), word))
+            self.post(channel, thread, "%d questions are open %s. Reply `%s <ticket id>` to "
+                      "say which." % (len(open_here), where, word))
             self.mark(channel, msg, "refused: ambiguous")
             self.counts["refused"] += 1
             return
@@ -1908,10 +2138,9 @@ class Pass(object):
             self.counts["refused"] += 1
             return
         if not hint and self.foreign_post_after(channel, q, msg):
-            self.post(channel, thread, "Something other than me posted in this thread after "
-                      "my question, so I can't be sure which question you are answering. "
-                      "Reply `%s %s` to answer the one about %s." % (word, q["ticket"],
-                                                                     q["ticket"]))
+            self.post(channel, thread, "Something other than me posted %s after my question, "
+                      "so I can't be sure which question you are answering. Reply `%s %s` to "
+                      "answer the one about %s." % (where, word, q["ticket"], q["ticket"]))
             self.mark(channel, msg, "refused: something else posted after the question")
             self.counts["refused"] += 1
             return
@@ -2243,8 +2472,9 @@ class Pass(object):
         # tag or a bounce marker in it reaches the session inert.
         name = notify.clean_relay_text(self.name_of(uid)) or uid
         body = ("This is an answer from **%s** (Slack user %s), passed on by the Slack bridge "
-                "from the pings channel; they sent it at %s.\n\n%s"
-                % (name, uid, iso(ts_float(msg.get("ts"))), text))
+                "from %s; they sent it at %s.\n\n%s"
+                % (name, uid, "their DM with it" if channel in self.dm_channels
+                   else "the pings channel", iso(ts_float(msg.get("ts"))), text))
         # AT MOST ONCE: recorded and saved as pending before the post, so a post whose
         # answer never came back is never sent twice; it is named instead.
         key = key_of(channel, msg.get("ts"))
@@ -2271,6 +2501,8 @@ class Pass(object):
     def unrecorded_ping(self, channel, msg, thread):
         """A verified member's reply under a post of the notifier's own bot that the pings
         file does not hold: refused and said, never silently ignored. True when handled."""
+        if channel in self.dm_channels:
+            return self.unwaited_page(channel, msg, thread)
         notifier = self.cfg["notifier_bot_user_id"]
         root = next((m for m in self.threads.get((channel, thread), [])
                      if m.get("ts") == thread), None)
@@ -2279,14 +2511,43 @@ class Pass(object):
         if message_refusal(msg, self.me) or account_refusal(self.account(msg["user"]),
                                                             self.me, self.cfg):
             return False
-        self.post(channel, thread, "I can't pass that on to a session: this ping was not "
-                  "recorded for the bridge, so I can't tell which session is waiting. Pings "
-                  "sent before BRIDGE_PINGS=yes are not recorded, and neither is one the "
-                  "notifier failed to record (it pages that one again). Answer under the "
-                  "newer ping, or in the tracker.")
+        self.post(channel, thread, UNRECORDED_PING)
         self.mark(channel, msg, "refused answer: ping not recorded")
         self.counts["refused"] += 1
         self.say("  refused an answer under an unrecorded ping, thread %s" % thread)
+        return True
+
+    def unwaited_page(self, channel, msg, thread):
+        """In a DM the notifier posts as this app (KIT-295), so its pages are told apart by
+        its ledger, not by a bot of its own. A verified member's reply under a page it
+        recorded that the pings file does not hold reaches no session, and neither does one
+        under a post of this app that neither job recorded (a page the notifier failed to
+        record): refused and said, never silently ignored. True when handled."""
+        root = next((m for m in self.threads.get((channel, thread), [])
+                     if m.get("ts") == thread), None)
+        if not root or root.get("user") != self.me["user_id"]:
+            return False
+        # Read as each reply is handled, as the pings file is: a page the notifier records
+        # while this pass runs is still found.
+        self.dm_posts = load_dm_posts(self.cfg)
+        paged = key_of(channel, thread) in self.dm_posts
+        if not paged and key_of(channel, thread) in self.state["posted"]:
+            return False
+        if message_refusal(msg, self.me) or account_refusal(self.account(msg["user"]),
+                                                            self.me, self.cfg):
+            return False
+        if not paged:
+            self.post(channel, None, UNRECORDED_PING)
+            self.mark(channel, msg, "refused answer: ping not recorded")
+            self.counts["refused"] += 1
+            self.say("  refused an answer under an unrecorded post, thread %s" % thread)
+            return True
+        self.post(channel, None, "I can't pass that on to a session: that message is not "
+                  "waiting on an answer. To answer a dev, reply under the message saying it "
+                  "stopped to ask you something, or answer in the tracker.")
+        self.mark(channel, msg, "refused answer: page not waiting on an answer")
+        self.counts["refused"] += 1
+        self.say("  refused an answer under a page not waiting on one, thread %s" % thread)
         return True
 
     def note(self, rec, key, text):
@@ -2605,6 +2866,11 @@ class Pass(object):
                                 if isinstance(t, (int, float)) and t > self.now - 3600]
         self.state["relay_pending"] = dict(
             (k, v) for k, v in self.state.get("relay_pending", {}).items() if fresh(k))
+        # KIT-295: the hourly line in each DM, and the DMs of members no longer listed.
+        self.state["stray_said"] = dict((c, t) for c, t in self.state["stray_said"].items()
+                                        if t > self.now - 3600)
+        self.state["dms"] = dict((u, c) for u, c in self.state["dms"].items()
+                                 if u in self.cfg["dm_user_ids"])
 
 
 def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout):
@@ -2696,6 +2962,12 @@ ALICE, BOB, GUEST, GONE, OTHERWS, CHATBOT = ("U0ALICE001", "U0BOB00001", "U0GUES
                                              "U0GONE0001", "U0OTHER001", "U0CHATBOT1")
 APPUSER, UGUEST, NOTEAM = "U0APPUSER1", "U0UGUEST01", "U0NOTEAM01"
 NOTIFIER = "U0NOTIFY01"                   # the notifier app's own bot user
+DM = "D0ALICE001"                         # ALICE's DM with the bridge app (KIT-295)
+
+
+def _chan(m):
+    """The channel a fake message is in: CHAN unless it was put elsewhere (KIT-295)."""
+    return m.get("_channel", CHAN)
 
 
 class FakeSlack(object):
@@ -2705,6 +2977,7 @@ class FakeSlack(object):
         self.posts = []
         self.fail = set()
         self.reads = []
+        self.dm_ids = {}                  # user -> what conversations.open answers
         self.profiles = {
             ALICE: {"id": ALICE, "team_id": TEAM},
             BOB: {"id": BOB, "team_id": TEAM},
@@ -2720,7 +2993,7 @@ class FakeSlack(object):
         }
         self._clock = 0
 
-    def add(self, user, text, thread=None, at=None, **extra):
+    def add(self, user, text, thread=None, at=None, channel=CHAN, **extra):
         self._clock += 1
         ts = "%.6f" % (at if at is not None else self.now - 10000 + self._clock)
         m = dict({"ts": ts, "text": text}, **extra)
@@ -2728,6 +3001,8 @@ class FakeSlack(object):
             m["user"] = user
         if thread:
             m["thread_ts"] = thread
+        if channel != CHAN:
+            m["_channel"] = channel
         self.messages.append(m)
         return ts
 
@@ -2740,14 +3015,14 @@ class FakeSlack(object):
         self._check("auth.test")
         return {"user_id": ME, "team_id": TEAM, "bot_id": BOT}
 
-    def _tops(self):
+    def _tops(self, channel):
         out = []
         for m in self.messages:
-            if m.get("thread_ts") and m["thread_ts"] != m["ts"]:
+            if _chan(m) != channel or (m.get("thread_ts") and m["thread_ts"] != m["ts"]):
                 continue
             top = dict(m)
             kids = [r for r in self.messages if r.get("thread_ts") == m["ts"]
-                    and r["ts"] != m["ts"]]
+                    and r["ts"] != m["ts"] and _chan(r) == channel]
             if kids:
                 top["reply_count"] = len(kids)
                 top["latest_reply"] = max(r["ts"] for r in kids)
@@ -2756,11 +3031,16 @@ class FakeSlack(object):
 
     def history(self, channel, oldest, max_pages):
         self._check("conversations.history")
-        return [m for m in self._tops() if float(m["ts"]) >= oldest]
+        return [m for m in self._tops(channel) if float(m["ts"]) >= oldest]
 
     def replies(self, channel, ts):
         self._check("conversations.replies")
-        return [m for m in self.messages if m["ts"] == ts or m.get("thread_ts") == ts]
+        return [m for m in self.messages if _chan(m) == channel
+                and (m["ts"] == ts or m.get("thread_ts") == ts)]
+
+    def open_dm(self, uid):
+        self._check("conversations.open")
+        return self.dm_ids.get(uid, "D" + uid[1:])
 
     def user(self, uid):
         self._check("users.info")
@@ -2771,8 +3051,10 @@ class FakeSlack(object):
         self._clock += 1
         ts = "%.6f" % (self.now - 10000 + self._clock)
         self.posts.append((channel, thread_ts, text))
-        self.messages.append({"ts": ts, "thread_ts": thread_ts, "text": text,
-                              "user": ME, "bot_id": BOT})
+        m = {"ts": ts, "thread_ts": thread_ts, "text": text, "user": ME, "bot_id": BOT}
+        if channel != CHAN:
+            m["_channel"] = channel
+        self.messages.append(m)
         return ts
 
 
@@ -6018,6 +6300,498 @@ def selftest():
             else:
                 os.environ["TZ"] = saved_tz
             time.tzset()
+
+        # 15. ONE DM (KIT-295). With dm_user_ids set, each listed member's DM with the bridge
+        #     app is read as a channel is, and everything posted there is a message of its
+        #     own, so it notifies. Commands and yes or no work there with no thread; a bare
+        #     yes binds only when one question is open in that DM, after every check a
+        #     channel makes. Each case runs alone, so one that raises fails as itself.
+        dm_help = ("I can do `plan <ticket id>`, `approve <ticket id>` and yes or no here. To "
+                   "answer a dev, reply in the thread under its message. For anything else, "
+                   "ask the tech lead in the chat channel for now.")
+        unrecorded_ping = ("I can't pass that on to a session: this ping was not recorded for "
+                           "the bridge, so I can't tell which session is waiting. Pings sent "
+                           "before BRIDGE_PINGS=yes are not recorded, and neither is one the "
+                           "notifier failed to record (it pages that one again). Answer under "
+                           "the newer ping, or in the tracker.")
+
+        def dmworld(name, **over):
+            c, s, t = world(name, dm_user_ids=[ALICE], **over)
+            run(c, s, t)                                    # the first pass: a baseline
+            return c, s, t
+
+        def in_dm(s, channel=DM):
+            return [(th, x) for ch, th, x in s.posts if ch == channel]
+
+        def ledger(c, *pages, **kw):
+            """What the notifier writes for the pages it posts into the DM (KIT-296)."""
+            os.makedirs(os.path.dirname(c["notifier_posts_file"]), exist_ok=True)
+            with open(c["notifier_posts_file"], "w") as fh:
+                fh.write(kw.get("raw") or json.dumps({
+                    "schema": "pipeline-notifier-dm-posts/1",
+                    "posts": dict((key_of(DM, ts), {"channel": DM, "ts": ts,
+                                                    "mark": kw.get("mark", "ready-to-merge")})
+                                  for ts in pages)}))
+
+        def pinged(c, page, channel=DM):
+            """What the notifier writes for an agent:blocked ping it can relay (KIT-224)."""
+            os.makedirs(os.path.dirname(c["pings_file"]), exist_ok=True)
+            with open(c["pings_file"], "w") as fh:
+                json.dump({"schema": notify.BRIDGE_PINGS_SCHEMA, "messages": {
+                    notify.chat_message_key(channel, page): {
+                        "channel": channel, "ts": page, "ticket_id": "TOD-5",
+                        "thread_id": "root-5", "event_key": "comment:m5",
+                        "comment_id": "m5", "mark": "agent:blocked"}}}, fh)
+
+        def asked_in_dm(name, *requests, **over):
+            c, s, t = dmworld(name, **over)
+            for line in requests:
+                s.add(ALICE, line, channel=DM)
+            run(c, s, t)
+            return c, s, t
+
+        def case_opened():
+            c, s, t = world("dm-open", dm_user_ids=[ALICE])
+            run(c, s, t)
+            run(c, s, t)
+            return (s.reads.count("conversations.open"),
+                    json.load(open(state_path(c))).get("dms"))
+        check("dm-opened-and-cached", outcome(case_opened), (1, {ALICE: DM}))
+
+        # DMs turned on for a bridge that has run before: the first pass that reads the DM
+        # is a baseline for it, so days-old replies and answers there are passed over. A
+        # pass that stops before the DM is read keeps no record of it, so the next pass
+        # still baselines it.
+        def case_turned_on(stops):
+            over = dict(act=True, agent_user_name="Agent", team_keys=["PROD", "TOD"])
+            c, s, t = world("dm-turned-on-%s" % stops, **over)
+            run(c, s, t)                                    # channels only, for a while
+            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT, at=now - 3 * 86400)
+            s.add(ALICE, "use the old helper", thread=page, channel=DM, at=now - 3 * 86400 + 60)
+            s.add(ALICE, "no", channel=DM, at=now - 3 * 86400 + 120)
+            s.add(ALICE, "plan PROD-6", channel=DM, at=now - 3 * 86400 + 180)
+            c = cfg_for("dm-turned-on-%s" % stops, dm_user_ids=[ALICE], **over)
+            pinged(c, page)
+            ledger(c, page, mark="agent:blocked")
+            if stops:
+                history = s.history
+
+                def dm_refused(channel, oldest, pages):
+                    if channel == DM:
+                        raise BridgeError("Slack conversations.history refused: simulated")
+                    return history(channel, oldest, pages)
+                s.history = dm_refused
+                stopped = run(c, s, t)[0]
+                s.history = history
+            code, out = run(c, s, t)
+            first = (code, list(s.posts), t.thread_replies, "first read of the DM" in out,
+                     json.load(open(state_path(c))).get("dms"))
+            s.add(ALICE, "plan PROD-5", channel=DM)
+            run(c, s, t)
+            return ((stopped,) if stops else ()) + first + (len(in_dm(s)),)
+        check("dm-first-read-is-a-baseline", outcome(lambda: case_turned_on(False)),
+              (EXIT_OK, [], [], True, {ALICE: DM}, 1))
+        check("dm-first-read-is-a-baseline: a pass that stops first keeps no record of it",
+              outcome(lambda: case_turned_on(True)),
+              (EXIT_ERROR, EXIT_OK, [], [], True, {ALICE: DM}, 1))
+
+        def case_not_a_dm():
+            c, s, t = world("dm-not-a-dm", dm_user_ids=[ALICE])
+            s.dm_ids[ALICE] = CHAN
+            code, out = run(c, s, t)
+            return code, "named no DM" in out, "conversations.history" in s.reads
+        check("dm-an-open-that-names-no-dm-is-refused-and-reads-nothing",
+              outcome(case_not_a_dm), (EXIT_ERROR, True, False))
+
+        def case_real_client(call):
+            sent = []
+
+            def answer(payload):
+                sent.append(payload)
+                return ({"ok": True, "channel": {"id": DM}} if "users" in (payload or {})
+                        else {"ok": True, "ts": "1.000001"})
+            client = SlackClient(cfg_for("dm-real-client"), "slack-test-token")
+            return through(answer, lambda: call(client)), sent
+        check("dm-opened-through-the-real-client",
+              outcome(lambda: case_real_client(lambda cl: cl.open_dm(ALICE))),
+              (DM, [{"users": ALICE}]))
+        # The client already left thread_ts out when it was empty (KIT-285); this pins it,
+        # since every post in a DM now relies on it.
+        check("top-level-post-omits-thread_ts",
+              outcome(lambda: case_real_client(lambda cl: cl.post(DM, None, "on its own"))),
+              ("1.000001", [{"channel": DM, "text": "on its own", "unfurl_links": False,
+                             "unfurl_media": False}]))
+
+        def case_real_scope():
+            client = SlackClient(cfg_for("dm-real-scope"), "slack-test-token")
+            got = through(lambda _p: {"ok": False, "error": "missing_scope",
+                                      "needed": "im:write"}, lambda: client.open_dm(ALICE))
+            return str(got).startswith("BridgeError"), "im:write" in str(got)
+        check("dm-open-without-im-write-names-the-scope", outcome(case_real_scope),
+              (True, True))
+
+        def case_plan():
+            c, s, t = asked_in_dm("dm-plan", "plan PROD-6")
+            qs = json.load(open(state_path(c)))["questions"].values()
+            return ([(ch, th) for ch, th, _x in s.posts],
+                    [(q["channel"], q["thread"], q["status"]) for q in qs],
+                    "Plan this?" in posted(s)[-1])
+        check("dm-plan-asks-top-level", outcome(case_plan),
+              ([(DM, None)], [(DM, None, OPEN)], True))
+
+        def case_here():
+            _c, s, _t = asked_in_dm("dm-here", "plan PROD-6")
+            return "Reply `yes` here within" in posted(s)[-1], "thread" in posted(s)[-1]
+        check("dm-question-says-here", outcome(case_here), (True, False))
+
+        def case_yes(act):
+            c, s, t = asked_in_dm("dm-yes-%s" % act, "plan PROD-6", act=act)
+            s.add(ALICE, "yes", channel=DM)
+            code, _o = run(c, s, t)
+            return code, status_of(c), t.moves, in_dm(s)[-1]
+        check("dm-bare-yes-with-one-open-acts", outcome(lambda: case_yes(True)),
+              (EXIT_OK, [DONE], [("uuid-6", "st-plan-it")],
+               (None, "Moved PROD-6 to Plan it for <@%s>. The planner starts on it within a "
+                      "few minutes." % ALICE)))
+        check("dm-bare-yes-with-one-open-acts: with acting off it confirms",
+              outcome(lambda: case_yes(False)),
+              (EXIT_OK, [CONFIRMED], [],
+               (None, "Confirmed by <@%s>. Acting is switched off here, so PROD-6 was not "
+                      "changed." % ALICE)))
+
+        def case_two():
+            c, s, t = asked_in_dm("dm-two", "plan PROD-5", "plan PROD-6")
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            bare = (status_of(c), in_dm(s)[-1])
+            s.add(ALICE, "yes prod-6", channel=DM)
+            run(c, s, t)
+            qs = json.load(open(state_path(c)))["questions"].values()
+            return bare, sorted((q["ticket"], q["status"]) for q in qs)
+        two = outcome(case_two)
+        check("dm-two-open-asks-for-id", two[0] if isinstance(two, tuple) else two,
+              ([OPEN, OPEN], (None, "2 questions are open here. Reply `yes <ticket id>` to "
+                                    "say which.")))
+        check("dm-yes-with-id-picks-one", two[1] if isinstance(two, tuple) else two,
+              [("PROD-5", OPEN), ("PROD-6", CONFIRMED)])
+
+        def case_own_post(recorded):
+            c, s, t = asked_in_dm("dm-own-post-%s" % recorded, "plan PROD-6")
+            page = s.add(ME, "*A pull request is ready for you to merge on PROD-9*",
+                         channel=DM, bot_id=BOT)
+            if recorded:
+                ledger(c, page)
+            s.add(ALICE, "yes", channel=DM)
+            code, _o = run(c, s, t)
+            return code, status_of(c), in_dm(s)[-1]
+        check("dm-unrecorded-own-post-refuses-bare-yes", outcome(lambda: case_own_post(False)),
+              (EXIT_OK, [OPEN], (None, "Something other than me posted here after my "
+                                       "question, so I can't be sure which question you are "
+                                       "answering. Reply `yes PROD-6` to answer the one "
+                                       "about PROD-6.")))
+        check("dm-ledger-recorded-notifier-post-allows-bare-yes",
+              outcome(lambda: case_own_post(True)),
+              (EXIT_OK, [CONFIRMED], (None, "Confirmed by <@%s>. Acting is switched off "
+                                            "here, so PROD-6 was not changed." % ALICE)))
+
+        # A recorded page that asks the member something is a real question in the same
+        # place: a bare yes after it may be meant for it, so it acts on nothing. Asking by
+        # its mark, or held in the pings file; a record with no mark is not vouched for.
+        def case_asking_page(mark, in_pings):
+            c, s, t = asked_in_dm("dm-asking-%s-%s" % (mark, in_pings), "plan PROD-6",
+                                  act=True)
+            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
+            ledger(c, page, mark=mark)
+            if in_pings:
+                pinged(c, page)
+            s.add(ALICE, "yes", channel=DM)
+            code, _o = run(c, s, t)
+            return (code, status_of(c), t.moves,
+                    in_dm(s)[-1][1].startswith("Something other than me posted here"))
+        check("dm-a-page-asking-something-is-not-vouched-for",
+              [outcome(lambda: case_asking_page(mark, in_pings)) for mark, in_pings in (
+                  ("agent:blocked", True), ("agent:blocked", False),
+                  ("planning-needs-input", False), ("epic-awaiting-approval", False),
+                  ("ready-to-merge", True), (None, False))],
+              [(EXIT_OK, [OPEN], [], True)] * 6)
+
+        # The ledger vouches only for its own DM: a record keyed in a channel, or one whose
+        # channel is not the DM it is keyed in, vouches for nothing.
+        def case_ledger_elsewhere(home):
+            c, s, t = dmworld("dm-ledger-" + home)
+            req = s.add(ALICE, "plan PROD-6", channel=home)
+            run(c, s, t)
+            thread = req if home == CHAN else None
+            look = s.add(ME, "*Plan this?* PROD-7", thread=thread, channel=home, bot_id=BOT)
+            ledger(c, raw=json.dumps({"schema": "pipeline-notifier-dm-posts/1", "posts": {
+                key_of(home, look): {"channel": CHAN, "ts": look, "mark": "ready-to-merge"}}}))
+            s.add(ALICE, "yes", thread=thread, channel=home)
+            code, _o = run(c, s, t)
+            return code, status_of(c), posted(s)[-1].startswith("Something other than me")
+        check("dm-the-ledger-vouches-for-nothing-outside-its-own-dm",
+              [outcome(lambda: case_ledger_elsewhere(home)) for home in (CHAN, DM)],
+              [(EXIT_OK, [OPEN], True)] * 2)
+
+        def case_corrupt(raw):
+            c, s, t = asked_in_dm("dm-corrupt-%d" % len(raw), "plan PROD-6")
+            ledger(c, raw=raw)
+            s.add(ALICE, "yes", channel=DM)
+            before = len(s.posts)
+            code, out = run(c, s, t)
+            return code, len(s.posts) - before, status_of(c), "Nothing was done" in out
+        check("dm-corrupt-ledger-refuses-pass",
+              [outcome(lambda: case_corrupt(raw)) for raw in (
+                  "{not json", json.dumps({"schema": "pipeline-notifier-dm-posts/0",
+                                           "posts": {}}),
+                  json.dumps({"schema": "pipeline-notifier-dm-posts/1", "posts": []}))],
+              [(EXIT_ERROR, 0, [OPEN], True)] * 3)
+
+        def case_closed(how):
+            c, s, t = asked_in_dm("dm-question-" + how, "plan PROD-6")
+            for m in list(s.messages):
+                if _chan(m) == DM and m.get("user") == ME and "Plan this?" in m["text"]:
+                    if how == "edited":
+                        m["edited"] = {"user": ME, "ts": "1"}
+                    else:
+                        s.messages.remove(m)
+            s.add(ALICE, "yes", channel=DM)
+            code, _o = run(c, s, t)
+            return code, status_of(c), in_dm(s)[-1]
+        check("dm-edited-question-closes", outcome(lambda: case_closed("edited")),
+              (EXIT_OK, [EXPIRED], (None, "My question about PROD-6 was changed after I "
+                                          "asked it, so I have closed it. Ask again with "
+                                          "`plan PROD-6`.")))
+        check("dm-deleted-question-closes", outcome(lambda: case_closed("deleted")),
+              (EXIT_OK, [EXPIRED], (None, "My question about PROD-6 is no longer here, so I "
+                                          "have closed it. Ask again with `plan PROD-6`.")))
+
+        def case_guest():
+            guest_dm = "D" + GUEST[1:]
+            c, s, t = world("dm-guest", dm_user_ids=[GUEST])
+            run(c, s, t)
+            s.add(GUEST, "plan PROD-6", channel=guest_dm)
+            run(c, s, t)
+            s.add(GUEST, "yes", channel=guest_dm)
+            code, _o = run(c, s, t)
+            th, last = in_dm(s, guest_dm)[-1]
+            return code, status_of(c), th, "guest" in last
+        check("dm-guest-answer-refused", outcome(case_guest), (EXIT_OK, [OPEN], None, True))
+
+        def case_bot():
+            c, s, t = asked_in_dm("dm-bot", "plan PROD-6")
+            s.add(CHATBOT, "yes", channel=DM, bot_id="B0CHATBOT1")
+            code, _o = run(c, s, t)
+            th, last = in_dm(s)[-1]
+            return code, status_of(c), th, "bot post" in last
+        check("dm-bot-yes-refused", outcome(case_bot), (EXIT_OK, [OPEN], None, True))
+
+        def case_thread_yes():
+            c, s, t = asked_in_dm("dm-thread-yes", "plan PROD-6")
+            q_ts = [q["ts"] for q in json.load(open(state_path(c)))["questions"].values()]
+            s.add(ALICE, "yes", thread=q_ts[0], channel=DM)
+            code, _o = run(c, s, t)
+            return code, status_of(c), in_dm(s)[-1][0]
+        check("dm-a-yes-in-the-thread-under-a-question-answers-it", outcome(case_thread_yes),
+              (EXIT_OK, [CONFIRMED], None))
+
+        def case_cross():
+            c, s, t = dmworld("dm-cross")
+            s.add(ALICE, "plan PROD-6")                     # asked in the channel
+            run(c, s, t)
+            s.add(ALICE, "yes", channel=DM)
+            code, _o = run(c, s, t)
+            return code, status_of(c), in_dm(s)
+        check("dm-a-yes-there-never-answers-a-channels-question", outcome(case_cross),
+              (EXIT_OK, [OPEN], [(None, "There is no open question here to answer.")]))
+
+        def case_ping():
+            c, s, t = dmworld("dm-ping", act=True, agent_user_name="Agent",
+                              team_keys=["PROD", "TOD"])
+            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
+            pinged(c, page)
+            ledger(c, page, mark="agent:blocked")
+            s.add(ALICE, "use the second helper", thread=page, channel=DM)
+            code, _o = run(c, s, t)
+            sent = t.thread_replies
+            return (code, [(u, th) for u, th, _b in sent],
+                    bool(sent) and "their DM" in sent[0][2], in_dm(s))
+        check("dm-ping-answered-in-thread-relays", outcome(case_ping),
+              (EXIT_OK, [("u-TOD-5", "root-5")], True,
+               [(None, "Sent to TOD-5's session as <@%s>'s answer. It carries on when the "
+                       "dispatcher picks it up." % ALICE)]))
+
+        def case_unwaited():
+            c, s, t = dmworld("dm-unwaited", act=True, agent_user_name="Agent")
+            page = s.add(ME, "*A pull request is ready for you to merge on PROD-9*",
+                         channel=DM, bot_id=BOT)
+            ledger(c, page)
+            s.add(ALICE, "thanks, merging now", thread=page, channel=DM)
+            code, _o = run(c, s, t)
+            return code, t.thread_replies, [(th, "not waiting on an answer" in x)
+                                            for th, x in in_dm(s)]
+        check("dm-a-reply-under-a-page-not-waiting-on-one-is-refused-and-said",
+              outcome(case_unwaited), (EXIT_OK, [], [(None, True)]))
+
+        # A page the notifier posted as this app but failed to record is in neither file:
+        # a reply under it reaches no session, and is refused aloud as in a channel.
+        def case_unrecorded_page():
+            c, s, t = dmworld("dm-unrecorded-page", act=True, agent_user_name="Agent",
+                              team_keys=["PROD", "TOD"])
+            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
+            ledger(c)
+            s.add(ALICE, "use the second helper", thread=page, channel=DM)
+            code, _o = run(c, s, t)
+            return code, t.thread_replies, [(th, x == unrecorded_ping) for th, x in in_dm(s)]
+        check("dm-a-reply-under-an-unrecorded-post-is-refused-and-said",
+              outcome(case_unrecorded_page), (EXIT_OK, [], [(None, True)]))
+
+        # The ledger is read again for each reply, as the pings file is: a page recorded
+        # while this pass runs is told apart from one never recorded.
+        def case_recorded_mid_pass():
+            c, s, t = dmworld("dm-recorded-mid-pass", act=True, agent_user_name="Agent")
+            page = s.add(ME, "*A pull request is ready for you to merge on PROD-9*",
+                         channel=DM, bot_id=BOT)
+            s.add(ALICE, "thanks, merging now", thread=page, channel=DM)
+            ledger(c)
+            replies = s.replies
+
+            def recorded_now(channel, ts):
+                ledger(c, page)                    # the notifier records it, mid-pass
+                return replies(channel, ts)
+            s.replies = recorded_now
+            code, _o = run(c, s, t)
+            return code, [(th, "not waiting on an answer" in x) for th, x in in_dm(s)]
+        check("dm-a-page-recorded-during-the-pass-is-found", outcome(case_recorded_mid_pass),
+              (EXIT_OK, [(None, True)]))
+
+        def case_stray():
+            c, s, t = dmworld("dm-stray")
+            s.add(CHATBOT, "beep", channel=DM, bot_id="B0CHATBOT1")
+            s.add(ALICE, "hello there", channel=DM)
+            s.add(ALICE, "anyone?", channel=DM)
+            run(c, s, t)
+            seen = [len(in_dm(s))]
+            s.add(ALICE, "still there?", channel=DM)
+            run(c, s, t, at=now + 600)
+            seen.append(len(in_dm(s)))
+            s.add(ALICE, "hi again", channel=DM)
+            run(c, s, t, at=now + 3700)
+            seen.append(len(in_dm(s)))
+            return seen, sorted(set(in_dm(s)))
+        check("dm-stray-text-gets-one-line-an-hour", outcome(case_stray),
+              ([1, 1, 2], [(None, dm_help)]))
+
+        def case_bot_alone():
+            c, s, t = dmworld("dm-bot-alone")
+            s.add(CHATBOT, "beep", channel=DM, bot_id="B0CHATBOT1")
+            s.add("USLACKBOT", "a reminder", channel=DM)
+            s.add(ALICE, "joined", channel=DM, subtype="channel_join")
+            code, _o = run(c, s, t)
+            return code, in_dm(s)
+        check("dm-a-bot-post-alone-gets-no-help-line", outcome(case_bot_alone), (EXIT_OK, []))
+
+        # A yes sent before the question was asked binds to nothing, in that pass or later.
+        def case_yes_first():
+            c, s, t = dmworld("dm-yes-first", act=True)
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            run(c, s, t)
+            return status_of(c), t.moves, in_dm(s)[-1]
+        check("dm-yes-before-the-question-binds-nothing", outcome(case_yes_first),
+              ([OPEN], [], (None, "There is no open question here to answer.")))
+
+        # A yes in a thread under anything but a question answers nothing: under the
+        # member's own message, or under a post of this app that neither job recorded.
+        def case_other_thread(root):
+            c, s, t = asked_in_dm("dm-other-thread-" + root, "plan PROD-6", act=True)
+            under = ([m["ts"] for m in s.messages if m.get("text") == "plan PROD-6"][0]
+                     if root == "own" else s.add(ME, "*Plan this?* PROD-6", channel=DM,
+                                                 bot_id=BOT))
+            s.add(ALICE, "yes", thread=under, channel=DM)
+            code, _o = run(c, s, t)
+            return code, status_of(c), t.moves, in_dm(s)[-1][1]
+        check("dm-yes-in-another-thread-binds-nothing",
+              [outcome(lambda: case_other_thread(root)) for root in ("own", "unrecorded")],
+              [(EXIT_OK, [OPEN], [], "There is no open question in that thread to answer."),
+               (EXIT_OK, [OPEN], [], unrecorded_ping)])
+
+        # Only a verified member's reply under a page is told where it went: a guest's or a
+        # bot's gets no line, under a recorded page or an unrecorded one.
+        def case_guest_under_page(recorded):
+            guest_dm = "D" + GUEST[1:]
+            c, s, t = world("dm-guest-page-%s" % recorded, dm_user_ids=[GUEST])
+            run(c, s, t)
+            page = s.add(ME, "*A pull request is ready for you to merge on PROD-9*",
+                         channel=guest_dm, bot_id=BOT)
+            os.makedirs(os.path.dirname(c["notifier_posts_file"]), exist_ok=True)
+            with open(c["notifier_posts_file"], "w") as fh:
+                json.dump({"schema": "pipeline-notifier-dm-posts/1", "posts": dict(
+                    [(key_of(guest_dm, page), {"channel": guest_dm, "ts": page,
+                                               "mark": "ready-to-merge"})]
+                    if recorded else [])}, fh)
+            s.add(GUEST, "thanks", thread=page, channel=guest_dm)
+            s.add(CHATBOT, "noted", thread=page, channel=guest_dm, bot_id="B0CHATBOT1")
+            code, _o = run(c, s, t)
+            return code, in_dm(s, guest_dm)
+        check("dm-guest-reply-under-a-page-gets-no-line",
+              [outcome(lambda: case_guest_under_page(r)) for r in (True, False)],
+              [(EXIT_OK, [])] * 2)
+
+        def case_epic():
+            c, s, t = dmworld("dm-epic", act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            s.add(ALICE, "approve PROD-50", channel=DM)
+            run(c, s, t)
+            asked = posted(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t)
+            rec = json.load(open(state_path(c)))["epics"].get("uuid-50") or {}
+            t.set_state("PROD-50", "backlog")
+            run(c, s, t)
+            return ("Reply `yes` here within" in asked, rec.get("channel"), rec.get("thread"),
+                    sorted(set((ch, th) for ch, th, _x in s.posts)),
+                    [n for n in ("Approved PROD-50", "Started PROD-51", "paused starting")
+                     if not any(n in x for _th, x in in_dm(s))])
+        check("dm-epic-notes-top-level", outcome(case_epic),
+              (True, DM, None, [(DM, None)], []))
+
+        def case_bad_state():
+            c, s, t = world("dm-bad-state", dm_user_ids=[ALICE])
+            os.makedirs(c["state_dir"], exist_ok=True)
+            with open(state_path(c), "w") as fh:
+                json.dump(dict(new_state(), dms=[]), fh)
+            code, out = run(c, s, t)
+            return code, "record of its DMs" in out, s.posts
+        check("dm-a-state-with-no-readable-record-of-its-dms-is-refused",
+              outcome(case_bad_state), (EXIT_ERROR, True, []))
+
+        check("config: dm_user_ids must be a list of Slack user ids, each named once",
+              outcome(lambda: ["'dm_user_ids'" in _config_error(dict(
+                  EXAMPLE_CONFIG, dm_user_ids=v, state_dir=os.path.join(tmp, "dmu%d" % i)))
+                  for i, v in enumerate((ALICE, ["alice"], [7], [ALICE, ALICE], "",
+                                         [ALICE, BOB], []))]),
+              [True, True, True, True, True, False, False])
+        check("config: notifier_posts_file is refused inside a worktree, and defaults beside "
+              "the state", outcome(lambda: (
+                  "'notifier_posts_file'" in _config_error(dict(
+                      EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "np-state"),
+                      notifier_posts_file=os.path.join(tmp, "in-a-repo", "posts.json"))),
+                  cfg_for("np-default")["notifier_posts_file"])),
+              (True, os.path.join(os.path.realpath(os.path.join(tmp, "np-default")),
+                                  "notifier-dm-posts.json")))
+
+        def case_channel_only():
+            c, s, t = world("dm-off")
+            run(c, s, t)
+            req = s.add(ALICE, "plan PROD-6")
+            run(c, s, t)
+            return ("conversations.open" in s.reads,
+                    [(ch, th == req) for ch, th, _x in s.posts],
+                    "Reply `yes` in this thread" in posted(s)[-1],
+                    json.load(open(state_path(c))).get("dms"))
+        check("dm-off: with dm_user_ids empty a channel works as before, and no DM is opened",
+              outcome(case_channel_only), (False, [(CHAN, True)], True, {}))
 
     # 14. EXACTLY THREE TRACKER WRITES (KIT-222, KIT-223): a state move carrying `stateId`
     #     only, a delegation carrying `delegateId` only, and a comment. No other mutation
