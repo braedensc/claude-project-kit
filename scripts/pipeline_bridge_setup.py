@@ -121,6 +121,8 @@ CONF_KEYS = {
                             "epic's children are handed to; empty refuses every approve"),
     "EPIC_WIP": ("1", "how many children of one approved epic may run at once, 1 to 10"),
     "READY_STATE": ("Todo", "the name of each team's to-do state an approved epic moves to"),
+    "DONE_STATE": (bridge.DEFAULT_DONE_STATE, "the name of each team's done state a plan moves "
+                                              "to once every piece of it is merged (KIT-299)"),
     "HANDOFF_STATES": (", ".join(bridge.DEFAULT_HANDOFF_STATES),
                        "the states, by name, a child sits in while its pull request waits "
                        "for your merge, comma-separated"),
@@ -290,6 +292,9 @@ def compose_config(conf):
     # key existed is still the composed one (KIT-284).
     if split_list(conf["HANDOFF_STATES"]) != bridge.DEFAULT_HANDOFF_STATES:
         doc["handoff_states"] = split_list(conf["HANDOFF_STATES"])
+    # KIT-299: the same, so a config written before the key existed stays the same.
+    if conf["DONE_STATE"] != bridge.DEFAULT_DONE_STATE:
+        doc["done_state"] = conf["DONE_STATE"]
     if conf["NOTIFIER_BOT_USER_ID"]:
         doc["notifier_bot_user_id"] = conf["NOTIFIER_BOT_USER_ID"]
     # KIT-295: composed only when set, so a config written before the key existed stays
@@ -427,6 +432,12 @@ CARDS = {
         "Approve a plan: once one is filed, `approve <epic id>`, then `yes`. Good: the epic "
         "moves to Todo, its children start one at a time in order, and each child's session "
         "starts exactly as when you hand a ticket over yourself.",
+        "Finish a plan: wait until every piece of an approved plan is merged. Good: within a "
+        "few minutes the epic moves to {DONE_STATE} with one comment naming who approved it, "
+        "and one wrap-up names each pull request. If its reviews left notes, one question "
+        "asks first; after your `yes`, one ticket lands in the team's backlog with no labels, "
+        "and nothing starts on it. Record whether the wrap-up called each pull request "
+        "merged: that the tracker's link says so is not proven (KIT-299).",
         "Answer a stuck session: when a ping says a dev stopped to ask you something, reply "
         "under it. Good: one comment naming you lands in that session's thread, and it "
         "carries on.",
@@ -501,7 +512,7 @@ def card_values(conf, conf_path):
             "BRIDGE_CONFIG": conf["BRIDGE_CONFIG"], "STATE_DIR": conf["STATE_DIR"],
             "LOG": os.path.dirname(conf["BRIDGE_CONFIG"]) + "/" + LOG_NAME,
             "STATE_DECOY": conf["STATE_DIR"].rstrip("/") + "/decoy-proof",
-            "PINGS": pings_file(conf)}
+            "PINGS": pings_file(conf), "DONE_STATE": conf["DONE_STATE"]}
 
 
 def print_card(cid, conf=None, conf_path=DEFAULT_CONF):
@@ -742,6 +753,9 @@ def cmd_compose(conf, conf_path):
                 "children to %s, as the owner, in dependency order, at most %s at a time. "
                 "Merging stays yours." % (conf["READY_STATE"], conf["AGENT_USER_NAME"],
                                           conf["EPIC_WIP"]))
+            say("  Once every piece of it is merged, it moves the epic to %s, posts a "
+                "wrap-up, and asks before it files the review notes left as one ticket in "
+                "the backlog (KIT-299)." % conf["DONE_STATE"])
         else:
             say("  AGENT_USER_NAME is empty, so every `approve` is refused.")
     else:
@@ -1209,6 +1223,27 @@ def selftest():
         check("conf-HANDOFF_STATES-naming-READY_STATE-is-refused-in-one-line",
               len([e for e in validate_conf(dict(values, HANDOFF_STATES="Todo"))[1]
                    if "handoff_states" in e and "ready_state" in e]), 1)
+        # KIT-299: the done state a finished plan moves to. The default is the job's own and
+        # composes no key, so an install made before the key existed is still the composed
+        # one; another name composes, and the job's own loader takes it.
+        shipped, ship_errs = validate_conf(dict(values, DONE_STATE="Shipped"))
+        try:
+            ship_loaded = bridge.validate_config(dict(compose_config(shipped),
+                                                      state_dir="/nonexistent-%s"
+                                                      % os.getpid()))["done_state"]
+        except (bridge.BridgeError, KeyError) as exc:
+            ship_loaded = "refused: %s" % exc
+        check("conf-DONE_STATE-defaults-to-the-jobs-own-and-composes-no-key",
+              (CONF_KEYS.get("DONE_STATE", ("not a key",))[0],
+               getattr(bridge, "DEFAULT_DONE_STATE", None), "done_state" in compose_config(conf),
+               config_bytes(conf) == config_bytes(dict(conf, DONE_STATE="Done"))),
+              ("Done", "Done", False, True))
+        check("conf-DONE_STATE-composes-another-name",
+              (ship_errs, compose_config(shipped).get("done_state"), ship_loaded),
+              ([], "Shipped", "Shipped"))
+        check("live-proofs-card-says-how-a-plan-finishes",
+              [n for n in ("Finish a plan", "moves to Shipped", "no labels", "not proven")
+               if n not in cap(print_card, "CK-B4", shipped)[1]], [])
         check("conf-ACT-must-be-yes-or-no",
               any("ACT must be yes or no" in e for e in validate_conf(dict(values,
                                                                           ACT="true"))[1]),

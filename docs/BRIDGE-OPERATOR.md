@@ -299,6 +299,60 @@ start is said in the thread. When nothing can start, it says so once, and why.
 
 Each child counts toward the 10 actions an hour. Merging each pull request stays yours.
 
+### When a plan finishes
+
+Once you have merged every piece, the bridge closes the plan for you. It checks that every
+child of the epic is Done, none was canceled, and no session on one is still running. It
+reads each child's pull request from the links the GitHub integration made, and only those:
+a session can attach any link to its own ticket.
+
+Then, in one pass:
+
+1. It moves the epic to `DONE_STATE` (`Done` by default), with your key.
+2. It writes one comment on the epic: who approved the plan, when it finished, and each
+   piece with its pull request.
+3. It posts one wrap-up where you approved the plan. In your DM that is a message of its
+   own, so it notifies. In a channel it is in the approval's thread. The wrap-up names each
+   pull request, adds a line for a piece the tracker does not show as merged, that has no
+   review, whose newest review it could not read, or whose review was partial, and lists the
+   review notes left over: at most 15 lines, then how many more.
+4. If notes are left, it asks one question: say `yes` within 24 hours and it files them as
+   one ticket in the epic's team. Then it stops following the plan.
+
+Good: *All 7 children of PROD-135 “Dark mode” are finished and merged — #437, #438, … I've
+marked the plan Done.*
+Not that: *PROD-136's pull request #438 was closed without being merged, so I haven't marked
+PROD-135 Done.* Merge it, or close the plan yourself.
+
+The notes come from each piece's newest review: your own `**Pipeline review**` comment, the
+one Stage E's review poller posts with your key. A comment by anyone else is never read as a
+review, since a session could write a look-alike. If the newest review can't be read, that
+piece has no notes: an older review's may be about code since fixed. A partial review is
+said as partial, so "no notes" never stands for files it did not read.
+
+- **What holds it open.** A canceled child, a child still open, a session still running,
+  a pull request still open, or one closed without a merge (unless one in the same repo was
+  merged in its place). A piece with more than 50 links holds it too, since one it did not
+  read may be open. Each is said once, and the plan stays followed. Once it has read the
+  pieces, it reads them again at most every 15 minutes, whatever holds the close.
+- **What does not hold it.** A link with no merge status. The wrap-up says the merge is not
+  confirmed for that piece. A piece with no pull request linked at all does not hold it
+  either: the wrap-up and the epic's comment say "no pull request linked", so check that
+  piece yourself. A piece with no review says so too.
+- **A plan you closed yourself.** It says so, moves nothing, and stops following it.
+- **The follow-up ticket** carries a title, `Follow-ups from <plan title>`, and a
+  description listing each note and its pull request. It has no labels, no assignee and no
+  delegate, and lands in the team's default state. Nothing starts on it until you hand it
+  over. Text copied into it (the plan's title, each note, your name) has its routing tags
+  made inert, as every relayed text is, so handing it over cannot re-route the session. Your yes binds to the notes and terms the question showed: if a review changed, or
+  `ACT` changed, nothing is filed and the question closes. Say `no` to leave them.
+- **Never twice.** If a pass stops after the move, the next one posts the wrap-up without
+  moving again. If a follow-up's write cannot be confirmed, it is never filed again; the
+  bridge says to look for it in the backlog. If the ticket was filed and only the reply was
+  lost, the next pass says it was filed, even if a setting changed in between.
+
+The close and the follow-up each count toward the 10 actions an hour.
+
 ---
 
 ## Step 10 — Answer a stuck session from Slack
@@ -596,6 +650,9 @@ off, nothing tells you in Slack that the notifier is down.
 - **Any full member acts with your reach.** That is the access rule, by design.
 - **One approval starts paid sessions.** A single "yes" hands over every child in turn, at
   most `EPIC_WIP` at once. Move the epic back to Backlog to pause it.
+- **Your merges close the plan.** Once every piece is merged, the bridge moves the epic to
+  `DONE_STATE` with your key. Its review notes become a backlog ticket only after a
+  member's "yes", and that ticket starts no work.
 - **The bridge's token and records sit in the dispatcher's account,** beside your tracker key.
   Any session holding the dispatcher's tool server can read them (KIT-162). With the token,
   someone could read the channel and post as the bridge. Such a post binds nothing: only
@@ -633,6 +690,9 @@ off, nothing tells you in Slack that the notifier is down.
 - That merging moves a child to Done. `setup-board` wires it. Without it, a merged child
   keeps its slot, and the line that the next piece starts once it's merged is wrong
   (KIT-284).
+- That the GitHub integration's link on a ticket carries the pull request's status. The
+  bridge reads `merged` as merged. With no status, it closes the plan anyway, and the
+  wrap-up says the merge is not confirmed for each such piece (KIT-299).
 - That handing a child over again yourself makes a new session, dated then. The bridge
   waits two hours from that date; the tests assume it. A date more than ten minutes ahead
   of this Mac's clock is ignored, and the bridge times from its own hand-over (KIT-284).

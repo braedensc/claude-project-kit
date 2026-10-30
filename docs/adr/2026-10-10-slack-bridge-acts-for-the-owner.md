@@ -4,7 +4,8 @@
   build: read, verify, ask, act on nothing), then KIT-222 (plan an idea), KIT-223 (approve an
   epic and start its children in order), KIT-224 (answer a stuck session; replaces the reply
   relay), KIT-225 (ready-to-merge pings), KIT-226 (the chat bot's instructions), KIT-295 (the
-  owner's DM; see its update below, which changes where a yes may bind).
+  owner's DM; see its update below, which changes where a yes may bind), KIT-299 (a finished
+  plan closes itself; two new writes, see its update below).
 - **Date:** 2026-10-10
 - **Supersedes, in part:** `2026-09-06-human-action-notifier-and-reply-relay.md`, where it says
   approve, label and state "never transit the channel". A state move into Plan it, an epic's
@@ -260,3 +261,69 @@ These follow the review of KIT-295 (2026-10-30). Two residuals are accepted and 
 app's manifest asks for `im:history` and `im:write`, and turns on its Messages tab, even when
 no DM is listed. And a channel added to `channel_ids` later still has no first-read baseline
 of its own.
+
+## Update 2026-10-30 — a finished plan closes itself (KIT-299)
+
+Found live on 2026-10-30: every child of an approved plan was merged and Done, but the epic
+stayed in Todo. The bridge's only finish was one line in a thread the owner does not follow,
+and ten review notes below the bar, across seven pull requests, were collected nowhere.
+
+With `act` on, once every child of an approved epic is Done, none canceled, no session on
+one still running, and every pull request the GitHub integration linked to a piece merged,
+the bridge closes the plan. It reads each piece's pull request from the integration's own
+links only, compared as the review poller compares them, since a session can attach any
+link to its own ticket. It reads each piece's newest review only from comments written
+with the owner's key, the account the review poller posts as, since a session posts as the
+dispatcher's app and could write a look-alike. When the newest review cannot be read, the
+piece has no notes, never an older review's; a partial review is said as partial. A
+canceled child, an open pull request, one closed with none merged in the same repository,
+or a piece with more links than one read takes holds the plan open; each is said once, and
+the plan stays followed. A plan someone else closed is said and let go, with no move.
+
+**What does not hold it.** A piece with no pull request linked at all, and a link with no
+merge status. A session can move its own ticket to Done with no pull request, so for such a
+piece the close does not rest on the owner's merge; the wrap-up and the epic's comment name
+it ("no pull request linked"), and the owner can move the epic back. Holding instead would
+leave every plan with a piece done by hand open for good. Nor does a session list read only
+in part: it is read most recently updated first (as the review poller assumes, not
+proven), so a running session is among the first read, and holding on a list a busy
+workspace never reads whole would hold every plan.
+
+**Two new writes, pinned by the selftest.**
+
+- The epic's move to its team's `done_state` (default Done), with the existing move: one
+  `issueUpdate` setting `stateId` and nothing else. One comment on the epic names who
+  approved it, when it finished, and each piece's pull requests. A comment that fails is
+  owed, as the others are.
+- One `issueCreate` into the epic's team, carrying `teamId`, `title` and `description` and
+  nothing else: no label, no assignee, no delegate, no state but the team's default. It
+  files the review notes left as one follow-up ticket, only after a member's yes to the
+  bridge's own question.
+
+**Why they are safe.** The owner's merges were the decision; the move records what he
+already did, and only after the tracker shows every piece Done and every linked pull
+request merged. The follow-up is filed only on a verified yes to a question that records a
+fingerprint of the exact notes and the terms its text states (`act`, the team, where it
+files, `question_ttl_hours`); a yes after either changed files nothing and closes the
+question. Every relayed field in it (the plan's title, each note, the member's name) goes
+through the relay's cleaner first, so a routing tag a session or a review wrote reaches the
+dispatcher inert once someone hands the ticket over. The ticket starts no work, since the
+dispatcher starts a session only on the owner's delegation, and it carries no protected
+label (`agent:*`, `blocked:*`, `provenance:*`, `hooks-change`), since it carries no label at
+all.
+
+**Never twice.** The bridge records that it is closing before the move, so a pass that
+stops after it finishes the close without moving again. A follow-up is recorded as being
+filed before the write; one that cannot be confirmed is never filed again, and that is
+said.
+
+The wrap-up is posted where the plan was approved: a message of its own in a DM, so it
+notifies, or in the approval's thread in a channel.
+
+**Not proven:** that Linear's GitHub attachment metadata carries status. With no status,
+the bridge closes the plan and says, for each such piece, that the tracker does not confirm
+its merge. Also not proven: that a review comment is among a piece's newest 100 comments
+(the wrap-up says when more were not read), and that a ticket made by `issueCreate` with no
+state lands in the backlog rather than triage, for a team with triage turned on. Nor which
+way `comments(orderBy: createdAt)` runs: on a piece with more than 100 comments, read
+oldest first, an older review could be read as the newest.
