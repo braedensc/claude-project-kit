@@ -92,6 +92,12 @@ BOT_USER_ID=U0123456789
 # member of the workspace: guests, bots and other workspaces are always refused.
 #ALLOWED_SLACK_USERS=
 
+# Working in your DM (docs/BRIDGE-OPERATOR.md, "Working in your DM"). The Slack
+# user ids whose DM with the bridge app it also reads and answers in, with
+# messages of their own, so each one notifies. Comma-separated. Set it only
+# once the app has the new manifest (card CK-B1). Empty: no DM.
+#DM_USER_IDS=
+
 # The dispatcher's own env file, where the chat bot's token lives. With it set,
 # `token` also refuses the chat bot's token. It must be a different file from
 # ENV_FILE: the dispatcher hands this one to every session it starts.

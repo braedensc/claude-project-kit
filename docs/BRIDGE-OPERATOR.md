@@ -1,7 +1,8 @@
 # Slack bridge — operator steps
 
 *Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, planning an idea; KIT-223,
-approving a plan). Design: `docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
+approving a plan) and 2026-10-30 (KIT-295, working in your DM). Design:
+`docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
 
 The bridge lets a trusted member of your Slack workspace act as you, from the chat. Someone
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
@@ -89,8 +90,9 @@ Good: the app shows in the channel's member list.
 Not that: reusing the chat bot's app, or the notifier's. The bridge needs its own bot identity.
 Otherwise the chat bot could post a question that looks like the bridge's.
 
-**Don't:** give the app more scopes than the manifest lists. It needs three:
-`groups:history`, `users:read` and `chat:write`.
+**Don't:** give the app more scopes than the manifest lists. It needs five:
+`groups:history`, `users:read` and `chat:write` for the channel, and `im:history` and
+`im:write` for your DM.
 
 ---
 
@@ -444,6 +446,58 @@ With `NOTIFIER_JOB_LABEL` empty there is nothing to watch. Each pass's log line 
 
 ---
 
+## Working in your DM
+
+With `DM_USER_IDS` set, the bridge also works in your direct message with its app. Every
+message it posts there is one of its own, never a thread reply, so each one notifies you.
+
+1. Update the app first. Run `compose`, then follow card CK-B1's line for an app you made
+   before: paste the manifest into its App Manifest page, save, and reinstall it. The
+   manifest adds `im:history` and `im:write`, and turns on the app's Messages tab.
+2. If the Bot User OAuth Token changed after the reinstall, run `token` again (Step 3).
+3. Find the app in Slack and open its Messages tab once. That is your DM with the bridge.
+4. In `bridge.conf`, set `DM_USER_IDS` to your own member ID, from your Slack profile. List
+   more members comma-separated.
+5. Run `install --apply`.
+
+The first pass that reads your DM answers nothing already there. It marks it as seen, as the
+very first pass does, so old replies and old `yes` or `no` lines are never acted on late.
+
+Good: type `plan <ticket id>` in the DM. Within a minute the bridge asks *Plan this?* there,
+as a message of its own.
+Not that: `FAIL: Slack conversations.open refused: missing_scope`. The app still has the old
+manifest. Do item 1.
+
+What works in the DM:
+
+- `plan <ticket id>` and `approve <epic id>`, each as a line of its own.
+- `yes` or `no` as a line of its own. It answers the one open question in that DM. With two
+  open, the bridge asks you for `yes <ticket id>`.
+- `yes` in the thread under a question answers that question.
+- To answer a dev who stopped to ask you something, reply in the thread under its page. The
+  bridge says in the DM where your answer went.
+- Anything else gets one line on what the bridge can do there, at most once an hour.
+
+Every check the channel makes still applies: who answered, an edited or deleted question,
+the 24 hours, the settings the question stated, and the action limit. The chat channel keeps
+working as before.
+
+**The notifier's pages.** A notifier that pages into DMs (KIT-296) posts as the bridge's app,
+so its pages look like the bridge's own posts. It records each one in
+`notifier-dm-posts.json`, in its `STATE_DIR`, and the bridge reads that file every pass. A
+notifier without KIT-296 writes no such file. Then every page of its in the DM counts as a
+post neither job recorded.
+
+- A recorded page between a question and your bare `yes` is fine, unless it asks you
+  something: a dev or the planner stopped to ask, or a plan waits for your approval. Your
+  `yes` may be meant for that page, so the bridge asks for `yes <ticket id>`.
+- A post by the bridge's app that neither job recorded makes it ask for `yes <ticket id>`.
+- A file it cannot read stops the pass, and `verify` shows the job failing.
+- A reply under a page that is not waiting on an answer is refused, and the bridge says so.
+  So is a reply under a post of the app that neither job recorded.
+
+---
+
 ## Prove it live — card CK-B4
 
 Every action above is tested against stand-ins until you run them for real. The card lists
@@ -483,10 +537,12 @@ The bridge checks every answer with Slack's own records. It refuses:
   one Slack names no workspace for;
 - a bot post, an edited message, a message with a file, or any special message type;
 - a "yes" to a question it did not ask, in another thread, or older than the question;
-- a bare "yes" when two questions are open in one thread (it asks for `yes <ticket id>`);
+- a bare "yes" when two questions are open in one thread, or in one DM (it asks for
+  `yes <ticket id>`);
 - a bare "yes" when anything but the bridge or a member posted in the thread after the
   question (a bot, an app, Slackbot or a guest), since a look-alike question could have
-  misled you (it asks for `yes <ticket id>`);
+  misled you (it asks for `yes <ticket id>`). In a DM the same goes for a post of the app
+  that neither job recorded, and for a notifier page that asks you something;
 - any answer to a question that was edited or deleted after it was posted (it closes the
   question);
 - a "yes" sent more than 24 hours after the question. A "yes" sent in time still counts if
@@ -560,6 +616,10 @@ off, nothing tells you in Slack that the notifier is down.
   use the documented fields (KIT-227).
 - That `groups:history` alone reads a private channel's history and threads. A missing scope
   stops the pass with a named failure (KIT-227).
+- That `im:history` and `im:write` alone open and read a DM with the app. A missing scope
+  stops the pass with a named failure (KIT-295).
+- That a reinstall after the new manifest keeps the bridge's token. If it changed, run
+  `token` again (KIT-295).
 - That a "yes" sent while the Mac sleeps is acted on after it wakes. The tests cover it; no
   live run has (KIT-227).
 - That an idea the chat bot filed, moved by the bridge with your key, enters its history
