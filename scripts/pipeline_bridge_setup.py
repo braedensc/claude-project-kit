@@ -93,6 +93,8 @@ ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{0,31}$")
 PATH_RE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]+$")
 ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 INTERVAL_MIN, INTERVAL_MAX = 15, 3600          # INTERVAL_SECONDS, in seconds
+# A whole number in ASCII digits. str.isdigit() also passes "²", which int() refuses.
+WHOLE_RE = re.compile(r"^[0-9]+$")
 # The bridge app's scopes: EXACTLY what pipeline_bridge.py calls, each cited.
 SCOPE_CITES = {
     "groups:history": "conversations.history and conversations.replies in a private "
@@ -101,7 +103,8 @@ SCOPE_CITES = {
     "chat:write": "chat.postMessage, its questions and answers (SlackClient.post)",
     "im:history": "conversations.history and conversations.replies in a member's DM with "
                   "the app, with DM_USER_IDS set (SlackClient.history, SlackClient.replies, "
-                  "read for each DM Pass.open_dms opens; KIT-295)",
+                  "read for each DM Pass.open_dms opens; KIT-295; and SlackClient.recent, the "
+                  "DM's recent conversation under a question for the tech lead; KIT-298)",
     "im:write": "conversations.open, which names a member's DM with the app "
                 "(SlackClient.open_dm, called by Pass.open_dms; KIT-295)",
 }
@@ -157,6 +160,22 @@ CONF_KEYS = {
     "WRITER_MODEL": (bridge.voice.DEFAULTS["writer_model"], "the model that writes them"),
     "WRITER_TOKEN_ENV": (bridge.voice.DEFAULTS["writer_token_env"],
                          "the NAME the writer's token goes under, at `writer-token`"),
+    "ASK_TECH_LEAD": ("no", "yes: what a member writes in their DM, other than a command or a "
+                            "yes or no, goes to the dispatcher's chat bot in "
+                            "BACK_ROOM_CHANNEL_ID, and its answer comes back to the DM "
+                            "(KIT-298). Needs DM_USER_IDS. no: that text gets one line on what "
+                            "the bridge can do"),
+    "CHAT_BOT_USER_ID": ("", "the dispatcher's chat bot's Slack user id (its member ID); "
+                             "required with ASK_TECH_LEAD=yes"),
+    "BACK_ROOM_CHANNEL_ID": ("", "the channel, one of CHANNEL_IDS, where a DM question is "
+                                 "passed to the chat bot; empty: the first of CHANNEL_IDS. The "
+                                 "chat bot must be a member, and everyone there reads each "
+                                 "question and answer"),
+    "FORWARD_HISTORY_MESSAGES": ("30", "how many of the DM's newest messages, whatever their age, "
+                                       "go under a question that starts a new thread with the "
+                                       "tech lead, 0 to 100; 0: none"),
+    "FORWARD_HISTORY_CHARS": ("8000", "that block's size in characters, 1 to 20000; its oldest "
+                                      "lines go first"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -229,11 +248,11 @@ def validate_conf(values):
                       % conf["JOB_LABEL"])
     if conf["ACT"] not in ("yes", "no"):
         errors.append("ACT must be yes or no, got %r" % conf["ACT"])
-    if (not conf["INTERVAL_SECONDS"].isdigit()
+    if (not WHOLE_RE.match(conf["INTERVAL_SECONDS"])
             or not INTERVAL_MIN <= int(conf["INTERVAL_SECONDS"]) <= INTERVAL_MAX):
         errors.append("INTERVAL_SECONDS must be a whole number from %d to %d"
                       % (INTERVAL_MIN, INTERVAL_MAX))
-    if not conf["EPIC_WIP"].isdigit() or not 1 <= int(conf["EPIC_WIP"]) <= 10:
+    if not WHOLE_RE.match(conf["EPIC_WIP"]) or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
     # The notifier's own installer's rule for its JOB_LABEL, as Stage E's conf checks it.
     label = conf["NOTIFIER_JOB_LABEL"]
@@ -252,6 +271,7 @@ def validate_conf(values):
     elif len(set(dms)) != len(dms):
         errors.append("DM_USER_IDS names a member twice")
     errors.extend(writer_problems(conf))
+    errors.extend(tech_lead_conf_errors(conf))
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
     named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
@@ -303,6 +323,53 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
                "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
                "WRITER_TOKEN_ENV": "writer_token_env"}
+# KIT-298: the tech lead's keys, each checked above by its conf name.
+COMPOSED_AS.update({"ASK_TECH_LEAD": "ask_tech_lead", "CHAT_BOT_USER_ID": "chat_bot_user_id",
+                    "BACK_ROOM_CHANNEL_ID": "back_room_channel_id",
+                    "FORWARD_HISTORY_MESSAGES": "forward_history_messages",
+                    "FORWARD_HISTORY_CHARS": "forward_history_chars"})
+# The job's own default for each, composed only when the conf says otherwise.
+HISTORY_KEYS = (("FORWARD_HISTORY_MESSAGES", "forward_history_messages", 30, 0,
+                 bridge.FORWARD_HISTORY_MESSAGES_MAX),
+                ("FORWARD_HISTORY_CHARS", "forward_history_chars", 8000, 1,
+                 bridge.FORWARD_HISTORY_CHARS_MAX))
+
+
+def tech_lead_conf_errors(conf):
+    """KIT-298: the keys that pass a DM question to the dispatcher's tech lead. The job
+    checks the same; these name each problem by its conf key."""
+    errors = []
+    if conf["ASK_TECH_LEAD"] not in ("yes", "no"):
+        errors.append("ASK_TECH_LEAD must be yes or no, got %r" % conf["ASK_TECH_LEAD"])
+    bot = conf["CHAT_BOT_USER_ID"]
+    if bot and not bridge.SLACK_USER_RE.match(bot):
+        errors.append("CHAT_BOT_USER_ID must be the chat bot's member ID, like U0123456789 "
+                      "(its profile in Slack, then Copy member ID), got %r" % bot)
+    elif bot and bot in (conf["BOT_USER_ID"], conf["NOTIFIER_BOT_USER_ID"]):
+        errors.append("CHAT_BOT_USER_ID is the bridge's or the notifier's own bot. Set it to "
+                      "the dispatcher's chat bot's member ID")
+    room = conf["BACK_ROOM_CHANNEL_ID"]
+    if room and room not in split_list(conf["CHANNEL_IDS"]):
+        errors.append("BACK_ROOM_CHANNEL_ID must be one of CHANNEL_IDS, got %r: the bridge "
+                      "reads only those, so it would never see the answer" % room)
+    if conf["ASK_TECH_LEAD"] == "yes":
+        if not bot:
+            errors.append("CHAT_BOT_USER_ID is required with ASK_TECH_LEAD=yes: the "
+                          "dispatcher's chat bot's member ID, from its profile in Slack")
+        if not split_list(conf["DM_USER_IDS"]):
+            errors.append("ASK_TECH_LEAD is yes, but DM_USER_IDS is empty. A question is "
+                          "passed on only from a member's DM: set DM_USER_IDS first")
+    for key, _name, _default, low, high in HISTORY_KEYS:
+        if not WHOLE_RE.match(conf[key]) or not low <= int(conf[key]) <= high:
+            errors.append("%s must be a whole number from %d to %d, got %r"
+                          % (key, low, high, conf[key]))
+    return errors
+
+
+def back_room(conf):
+    """The channel a DM question is passed on in: BACK_ROOM_CHANNEL_ID, else the first of
+    CHANNEL_IDS (KIT-298)."""
+    return conf["BACK_ROOM_CHANNEL_ID"] or (split_list(conf["CHANNEL_IDS"]) or [""])[0]
 
 
 def load_conf(path):
@@ -337,7 +404,8 @@ def compose_config(conf):
         "plan_it_state": conf["PLAN_IT_STATE"],
         "ready_state": conf["READY_STATE"],
         "agent_user_name": conf["AGENT_USER_NAME"],
-        "epic_wip": int(conf["EPIC_WIP"]) if conf["EPIC_WIP"].isdigit() else conf["EPIC_WIP"],
+        "epic_wip": (int(conf["EPIC_WIP"]) if WHOLE_RE.match(conf["EPIC_WIP"])
+                     else conf["EPIC_WIP"]),
         "pings_file": pings_file(conf),
     }
     # Composed only when it is not the job's own default, so an install made before the
@@ -358,13 +426,25 @@ def compose_config(conf):
     if conf["NOTIFIER_JOB_LABEL"]:
         doc["notifier_plist"] = notifier_plist_path(conf)
         doc["run_interval_seconds"] = (int(conf["INTERVAL_SECONDS"])
-                                       if conf["INTERVAL_SECONDS"].isdigit()
+                                       if WHOLE_RE.match(conf["INTERVAL_SECONDS"])
                                        else conf["INTERVAL_SECONDS"])
     # KIT-297: the writer, composed only with WRITER=yes, so a config written before the
     # writer existed is still, byte for byte, the composed one.
     if conf["WRITER"] == "yes":
         doc.update(writer=True, writer_bin=conf["WRITER_BIN"],
                    writer_model=conf["WRITER_MODEL"], writer_token_env=conf["WRITER_TOKEN_ENV"])
+    # KIT-298: composed only with ASK_TECH_LEAD=yes, so a config written before the keys
+    # existed stays the same, byte for byte.
+    if conf["ASK_TECH_LEAD"] == "yes":
+        doc["ask_tech_lead"] = True
+        doc["chat_bot_user_id"] = conf["CHAT_BOT_USER_ID"]
+        doc["back_room_channel_id"] = back_room(conf)
+        # The DM's recent conversation under a new thread's question: composed only when
+        # not the job's own default, so a default install is the same bytes as before.
+        for key, name, default, _low, _high in HISTORY_KEYS:
+            value = int(conf[key]) if WHOLE_RE.match(conf[key]) else conf[key]
+            if value != default:
+                doc[name] = value
     return doc
 
 
@@ -880,6 +960,20 @@ def cmd_compose(conf, conf_path):
     else:
         say("WRITER=no: every message goes out in its plain words. Card CK-B5 turns the "
             "writer on.")
+    if conf["ASK_TECH_LEAD"] == "yes":
+        say("ASK_TECH_LEAD=yes: anything else written in those DMs goes to the chat bot %s in "
+            "%s, and its answer comes back to the DM. Each question is a tech-lead turn. The "
+            "chat bot must be a member of %s, or it never hears the question; everyone in "
+            "that channel reads each question and its answer."
+            % (conf["CHAT_BOT_USER_ID"], back_room(conf), back_room(conf)))
+        if conf["FORWARD_HISTORY_MESSAGES"] != "0":
+            say("  A question that starts a new thread there carries the DM's newest %s "
+                "messages under it, so that channel reads those too (FORWARD_HISTORY_MESSAGES; "
+                "0 turns it off)." % conf["FORWARD_HISTORY_MESSAGES"])
+        # The chat lane cannot see this file, so only this line says its key is due.
+        say("  Also set BRIDGE_DM_QUESTIONS=on in chat-lane.conf and run its chat-rules "
+            "--apply, so the tech lead knows a mention from this bridge is a member's question "
+            "from their DM.")
     return EX_OK
 
 
@@ -1618,6 +1712,132 @@ def selftest():
                   "full path", "WRITER=yes", "WRITER_BIN", "install --conf bridge.conf --apply",
                   "verify --conf bridge.conf", "sudo -u _exdispatch -H", "sk-ant-api")
                   if n not in cap(print_card, "CK-B5", conf)[1]]), [])
+        # KIT-298: asking the tech lead from the DM. Composed only with ASK_TECH_LEAD=yes,
+        # so a config written before the keys existed is the same bytes; the back room is
+        # the first of CHANNEL_IDS unless named; every bad value named once, by its key.
+        tl_keys = ("ask_tech_lead", "chat_bot_user_id", "back_room_channel_id")
+        try:
+            tl_base = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1")
+            tl_conf, tl_errs = validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))
+            tl_doc = compose_config(tl_conf)
+            tl_loaded = bridge.validate_config(dict(tl_doc, state_dir="/nonexistent-%s"
+                                                    % os.getpid()))
+            tl_got = (tl_errs, [tl_doc.get(k) for k in tl_keys],
+                      [tl_loaded.get(k) for k in tl_keys],
+                      [k for k in tl_keys if k in compose_config(conf)],
+                      config_bytes(validate_conf(tl_base)[0])
+                      == config_bytes(validate_conf(dict(tl_base, CHAT_BOT_USER_ID=""))[0]),
+                      compose_config(validate_conf(dict(
+                          tl_base, ASK_TECH_LEAD="yes",
+                          BACK_ROOM_CHANNEL_ID="C0000000BB"))[0])["back_room_channel_id"])
+        except Exception as exc:                                   # noqa: BLE001
+            tl_got = "raised %s: %s" % (type(exc).__name__, exc)
+        check("conf-ASK_TECH_LEAD-composed-only-when-yes-the-back-room-the-first-channel",
+              tl_got, ([], [True, "U0CHATBOT1", "C0000000AA"], [True, "U0CHATBOT1", "C0000000AA"],
+                       [], True, "C0000000BB"))
+
+        def tl_errors(**over):
+            tl_values = dict(values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
+                             ASK_TECH_LEAD="yes")
+            tl_values.update(over)
+            return [e for e in validate_conf(tl_values)[1]
+                    if any(w in e.lower() for w in ("ask_tech_lead", "chat_bot", "back_room",
+                                                    "dm_user_ids"))]
+        for name, over, want in (
+                ("not-yes-or-no", dict(ASK_TECH_LEAD="true"),
+                 ["ASK_TECH_LEAD must be yes or no, got 'true'"]),
+                ("needs-the-chat-bot", dict(CHAT_BOT_USER_ID=""),
+                 ["CHAT_BOT_USER_ID is required with ASK_TECH_LEAD=yes: the dispatcher's chat "
+                  "bot's member ID, from its profile in Slack"]),
+                ("needs-a-dm", dict(DM_USER_IDS=""),
+                 ["ASK_TECH_LEAD is yes, but DM_USER_IDS is empty. A question is passed on only "
+                  "from a member's DM: set DM_USER_IDS first"]),
+                ("back-room-not-read", dict(BACK_ROOM_CHANNEL_ID="C0000000CC"),
+                 ["BACK_ROOM_CHANNEL_ID must be one of CHANNEL_IDS, got 'C0000000CC': the "
+                  "bridge reads only those, so it would never see the answer"]),
+                ("chat-bot-is-the-bridge", dict(CHAT_BOT_USER_ID="U0BRIDGE01"),
+                 ["CHAT_BOT_USER_ID is the bridge's or the notifier's own bot. Set it to the "
+                  "dispatcher's chat bot's member ID"]),
+                ("a-good-one", {}, [])):
+            try:
+                got = tl_errors(**over)
+            except Exception as exc:                               # noqa: BLE001
+                got = "raised %s: %s" % (type(exc).__name__, exc)
+            check("conf-ASK_TECH_LEAD-named-once:" + name, got, want)
+        try:
+            tl_said = (cap(cmd_compose, validate_conf(dict(
+                values, DM_USER_IDS="U0ALICE001", CHAT_BOT_USER_ID="U0CHATBOT1",
+                ASK_TECH_LEAD="yes"))[0], "bridge.conf")[1], cap(cmd_compose, conf,
+                                                                 "bridge.conf")[1])
+            tl_said = ("ASK_TECH_LEAD=yes: anything else written in those DMs goes to the chat "
+                       "bot U0CHATBOT1 in C0000000AA" in tl_said[0]
+                       and "The chat bot must be a member of C0000000AA, or it never hears the "
+                           "question; everyone in that channel reads each question and its "
+                           "answer." in tl_said[0]
+                       and "Also set BRIDGE_DM_QUESTIONS=on in chat-lane.conf" in tl_said[0],
+                       "ASK_TECH_LEAD" in tl_said[1] or "BRIDGE_DM_QUESTIONS" in tl_said[1])
+        except Exception as exc:                                   # noqa: BLE001
+            tl_said = "raised %s: %s" % (type(exc).__name__, exc)
+        check("compose-says-ASK_TECH_LEAD-only-when-yes", tl_said, (True, False))
+        # KIT-298, the owner's decision: the DM's recent conversation under a new thread's
+        # question. Its two keys are composed only with ASK_TECH_LEAD=yes AND a value that is
+        # not the job's default, so a default install composes the same bytes as before.
+        hist_keys = ("forward_history_messages", "forward_history_chars")
+
+        def hist_doc(**over):
+            return compose_config(validate_conf(dict(tl_base, **over))[0])
+        try:
+            hist_got = (
+                [k for k in hist_keys if k in hist_doc(ASK_TECH_LEAD="yes")],
+                config_bytes(validate_conf(dict(tl_base, ASK_TECH_LEAD="yes"))[0])
+                == config_bytes(validate_conf(dict(
+                    tl_base, ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="30",
+                    FORWARD_HISTORY_CHARS="8000"))[0]),
+                [hist_doc(ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="0").get(k)
+                 for k in hist_keys],
+                [hist_doc(ASK_TECH_LEAD="yes", FORWARD_HISTORY_CHARS="12000").get(k)
+                 for k in hist_keys],
+                [k for k in hist_keys if k in hist_doc(FORWARD_HISTORY_MESSAGES="5")],
+                validate_conf(dict(tl_base, ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="0",
+                                   FORWARD_HISTORY_CHARS="12000"))[1],
+                [bridge.validate_config(dict(hist_doc(
+                    ASK_TECH_LEAD="yes", FORWARD_HISTORY_MESSAGES="0",
+                    FORWARD_HISTORY_CHARS="12000"), state_dir="/nonexistent-%s"
+                    % os.getpid()))[k] for k in hist_keys])
+        except Exception as exc:                                   # noqa: BLE001
+            hist_got = "raised %s: %s" % (type(exc).__name__, exc)
+        check("conf-FORWARD_HISTORY-composed-only-with-ASK_TECH_LEAD-yes-and-not-the-default",
+              hist_got, ([], True, [0, None], [None, 12000], [], [], [0, 12000]))
+        hist_bad = []
+        for over in (dict(FORWARD_HISTORY_MESSAGES="101"), dict(FORWARD_HISTORY_MESSAGES="thirty"),
+                     dict(FORWARD_HISTORY_MESSAGES="-1"), dict(FORWARD_HISTORY_CHARS="0"),
+                     dict(FORWARD_HISTORY_MESSAGES="\u00b2"), dict(FORWARD_HISTORY_CHARS="3\u00b2"),
+                     dict(FORWARD_HISTORY_CHARS="20001"),
+                     dict(ASK_TECH_LEAD="no", FORWARD_HISTORY_MESSAGES="x"),
+                     dict(FORWARD_HISTORY_MESSAGES="100", FORWARD_HISTORY_CHARS="20000")):
+            try:
+                hist_values = dict(values, DM_USER_IDS="U0ALICE001",
+                                   CHAT_BOT_USER_ID="U0CHATBOT1", ASK_TECH_LEAD="yes")
+                hist_values.update(over)
+                hist_bad.append([e for e in validate_conf(hist_values)[1]
+                                 if "history" in e.lower()])
+            except Exception as exc:                               # noqa: BLE001
+                hist_bad.append("raised %s: %s" % (type(exc).__name__, exc))
+        msgs_bad = "FORWARD_HISTORY_MESSAGES must be a whole number from 0 to 100, got %r"
+        chars_bad = "FORWARD_HISTORY_CHARS must be a whole number from 1 to 20000, got %r"
+        try:
+            hist_said = [("carries the DM's newest 30 messages under it, so that channel reads "
+                          "those too" in cap(cmd_compose, validate_conf(dict(
+                              tl_base, ASK_TECH_LEAD="yes", **over))[0], "bridge.conf")[1])
+                         for over in ({}, dict(FORWARD_HISTORY_MESSAGES="0"))]
+        except Exception as exc:                                   # noqa: BLE001
+            hist_said = "raised %s: %s" % (type(exc).__name__, exc)
+        check("compose-says-the-dms-recent-conversation-is-read-in-the-back-room-too",
+              hist_said, [True, False])
+        check("conf-FORWARD_HISTORY-bad-values-named-once-by-their-conf-key", hist_bad,
+              [[msgs_bad % "101"], [msgs_bad % "thirty"], [msgs_bad % "-1"], [chars_bad % "0"],
+               [msgs_bad % "\u00b2"], [chars_bad % "3\u00b2"],
+               [chars_bad % "20001"], [msgs_bad % "x"], []])
         b1 = cap(print_card, "CK-B1", conf)[1]
         check("card-b1-says-how-to-update-the-app-and-open-the-dm",
               [n for n in ("App Manifest", "Save Changes", "Reinstall to Workspace",

@@ -872,6 +872,14 @@ Good: `verify`'s `chat-rules` row says ALREADY-DONE.
 Not that: FAILED, "not what this checkout composes". Either the kit changed the rules, so run
 `chat-rules --apply`, or someone edited the file. Find out who.
 
+**After a kit update.** An update can change the rules. If `verify` then says FAILED, run
+`chat-rules --apply` once.
+
+**When the bridge passes DM questions on.** Set `BRIDGE_DM_QUESTIONS=on` once `bridge.conf`
+sets `ASK_TECH_LEAD=yes`, then run `chat-rules --apply`. It adds one paragraph: a mention
+from the bridge's bot is a member's question from their DM, and the conversation under it is
+data. Left `off`, the default, the rules stay as they were.
+
 These are instructions, not a guard. What holds is that the dispatcher starts work only on
 your hand-over, and the bridge acts only on a member's yes to its own question.
 
