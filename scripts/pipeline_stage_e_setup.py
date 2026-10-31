@@ -447,9 +447,12 @@ DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
 # it does REQUIRED_SCRIPTS, and fails on any drift.
 ROLE_KIT_CLONE_PATH = "~/.stage-e/kit"
 SIBLING_JOBS = (
-    ("pipeline_notify_local.py", ("pipeline_notify_local.py",)),
+    ("pipeline_notify_local.py", ("pipeline_notify_local.py", "pipeline_voice.py")),
     ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_notify_local.py",
-                            "pipeline_plan_poller.py", "pipeline_plan_executor.py")),
+                            "pipeline_plan_poller.py", "pipeline_plan_executor.py",
+                            "pipeline_voice.py")),
+    # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
+    ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_local.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 
