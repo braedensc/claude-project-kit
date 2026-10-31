@@ -1700,6 +1700,9 @@ If you cannot read the file, say so, and ask the owner to run
 ## When you are not sure
 
 Ask the member. Never guess a ticket id, and never file a second idea for the same request.
+
+If you can't see something, such as GitHub or a file you can't read, say so and stop. Never
+guess what it does or what it changed.
 """
 
 
@@ -6559,6 +6562,10 @@ def _selftest_kit226_body(expect, conf):
     for needle in ("When a health alert fires", "Never run it", "pipeline_watch.py status",
                    "could not check", "written_at"):
         expect("chat-rules-say:" + needle, needle in text, text[-600:])
+    # KIT-299: what it cannot see, it says and stops at, never guesses.
+    for needle in ("If you can't see something, such as GitHub or a file you can't read, say "
+                   "so and stop.", "Never\nguess what it does"):
+        expect("chat-rules-say:" + needle, needle in text, text[-300:])
     healthy = chat_rules_text(dict(conf, HEALTH_STATUS_FILE="/srv/health/status.json"))
     expect("chat-rules-name-the-status-file-when-set",
            "`cat /srv/health/status.json`" in healthy and "/srv/health" not in text,
