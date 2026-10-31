@@ -108,7 +108,8 @@ MAX_EVENTS_PER_PASS=25
 # How many recent comments per ticket one pass reads.
 LOOKBACK_COMMENTS=20
 
-# Wall clock for one pass.  Must be shorter than INTERVAL_SECONDS.
+# Wall clock for one pass.  Must be shorter than INTERVAL_SECONDS.  With
+# WRITER=yes, at least 180, so a pass has time to write a ping and send it.
 RUN_TIMEOUT_SECONDS=240
 
 # The chat API base URL.  https only.
@@ -177,3 +178,25 @@ MENTION_CHAT_USER_IDS=
 # channel only once CHANNEL_IDS in bridge.conf no longer lists it.
 # Empty, the default, keeps the channel, and the notifier's config stays as it was.
 DM_USER_IDS=
+
+# The writer (KIT-297).  yes: a model with no tools writes each ping's words
+# when it is sent, from the ping's facts alone: what happened, the ticket id,
+# its title and the link.  If it cannot be reached, or its words fail a check,
+# the ping goes out in the fixed words, and once a day that ping says so.  It
+# runs the claude CLI on your Claude subscription.  A dry run never calls it.
+# no, the default: the fixed words, and the notifier's config stays as it was.
+WRITER=no
+
+# The claude CLI's full path, as the role account runs it.  Required when
+# WRITER=yes.  A LaunchDaemon's PATH is short, so a bare name is refused.
+WRITER_BIN=
+
+# The model alias or name.
+WRITER_MODEL=haiku
+
+# The NAME of the variable holding the writer's token, from `claude
+# setup-token`.  The Slack bridge's writer uses the same one: the bridge
+# installer's writer-token step writes it into the env file both jobs share.
+# This installer checks only that the name is there, and never asks for it.
+# Never the name of another credential in this file.
+WRITER_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN

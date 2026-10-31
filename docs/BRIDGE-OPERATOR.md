@@ -1,8 +1,9 @@
 # Slack bridge — operator steps
 
 *Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, planning an idea; KIT-223,
-approving a plan) and 2026-10-30 (KIT-295, working in your DM). Design:
-`docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md`.*
+approving a plan) and 2026-10-30 (KIT-295, working in your DM; KIT-297, the writer). Design:
+`docs/adr/2026-10-10-slack-bridge-acts-for-the-owner.md` and
+`docs/adr/2026-10-30-one-dm-tech-lead-voice.md`.*
 
 The bridge lets a trusted member of your Slack workspace act as you, from the chat. Someone
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
@@ -35,8 +36,8 @@ Every file here is generic. Keep your filled-in values in your private runbook.
 
 ### What runs `sudo`, and what you run
 
-- **`token`, `install` and `verify` run `sudo` themselves.** Each asks for your
-  administrator password once, at the start. Then it reads and writes as the role account,
+- **`token`, `writer-token`, `install` and `verify` run `sudo` themselves.** Each asks for
+  your administrator password once, at the start. Then it reads and writes as the role account,
   and `install --apply` writes the job's file into `/Library/LaunchDaemons` as root.
   `verify` also asks launchd, as root, whether the job is loaded.
 - **The Stage E installer's `run` is the one exception.** When it moves the clone, it stops
@@ -159,12 +160,13 @@ python3 scripts/pipeline_bridge_setup.py verify
 | Check | Passes when |
 |---|---|
 | `config` | the job's config is the composed one |
-| `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command) |
+| `credentials` | the env file names both the bridge's token and the tracker key (by name; no value is read into the command). With `WRITER=yes`, the writer's token too |
 | `plist` | the LaunchDaemon file is the composed one |
 | `dry-run` | the job's own dry run, as the role account, exits 0. If it fails, the row shows the job's last line, or its error |
 | `loaded` | launchd holds the job, and runs it every `INTERVAL_SECONDS`. launchd keeps the interval it was loaded with: after you change it, reload the job with card CK-B3, then card CK-B2. Another interval is `BLOCKED` only once the bridge watches the notifier (Step 11). Before that, the row still reads `ALREADY-DONE`, and names the interval and the reload |
 | `heartbeat` | the job's last real pass was recent and exited 0 |
 | `notifier` | the notifier's last run was recent and exited 0 (Step 11). With `NOTIFIER_JOB_LABEL` empty it reads `SKIPPED`: the watch is off |
+| `writer` | the writer writes one sample message, as the job would ("The writer", below). With `WRITER=no` it reads `SKIPPED`: the writer is off |
 
 Good: `Good: the bridge is installed, loaded and passing.` and exit 0.
 Not that: `heartbeat FAILED`. Read the job's log, beside its config (`bridge.log`).
@@ -519,8 +521,9 @@ very first pass does, so old replies and old `yes` or `no` lines are never acted
 
 Good: type `plan <ticket id>` in the DM. Within a minute the bridge asks *Plan this?* there,
 as a message of its own.
-Not that: `FAIL: Slack conversations.open refused: missing_scope`. The app still has the old
-manifest. Do item 1.
+Not that: a `FAIL:` line naming `conversations.open refused: missing_scope`. The app still
+has the old manifest. Do item 1. The channels are still answered meanwhile: a DM that cannot
+be opened stops no channel and no other member's DM, and each one is named.
 
 What works in the DM:
 
@@ -549,6 +552,54 @@ post neither job recorded.
 - A file it cannot read stops the pass, and `verify` shows the job failing.
 - A reply under a page that is not waiting on an answer is refused, and the bridge says so.
   So is a reply under a post of the app that neither job recorded.
+
+---
+
+## The writer
+
+The writer makes the bridge's messages read like a colleague wrote them. With it on, a model
+writes each message as it is sent. It works from that message's facts: ticket ids, titles,
+counts and times. It never sees a ticket's text or a comment.
+
+It is off by default. Off, every message reads exactly as before.
+
+What it never writes:
+
+- the sentence that says what to type, where to answer, or what a yes does. That sentence
+  follows its words unchanged, so a yes always agrees to fixed terms;
+- a tracker comment, or an answer passed on to a session;
+- anything in a dry run.
+
+When it can't write a message, the plain one goes out. The first time that happens each day,
+the message ends with *(I couldn't reach my writer, so this one's the plain version.)* It
+also goes out plain when the pass is nearly out of time, so a slow writer never holds a
+message back.
+
+**Cost:** one short model call per message, on your Claude subscription. It counts toward
+your plan's limits. It never uses an API key, and `writer-token` refuses one.
+
+To turn it on, follow card CK-B5:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py card CK-B5
+```
+
+1. In your own terminal, run `claude setup-token`. It prints a token that starts
+   `sk-ant-oat`.
+2. Run `python3 scripts/pipeline_bridge_setup.py writer-token` and paste it at the hidden
+   prompt.
+3. Run `command -v claude`. In `bridge.conf`, set `WRITER_BIN` to the full path it prints,
+   and set `WRITER=yes`. The job runs under launchd, whose PATH is short, so a bare
+   `claude` will not do.
+4. Run `install --apply`, then `verify`.
+
+Good: `verify`'s `writer` row says a sample message was written by the model.
+Not that: `writer FAILED fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set`. Do step 2 again.
+Not that: `could not start`. `WRITER_BIN` is not a path the role account can run. A path in
+your own home folder will not do: install claude where every account can run it. Then do
+step 3 again.
+
+To turn it off, set `WRITER=no` and run `install --apply`.
 
 ---
 
@@ -659,6 +710,8 @@ off, nothing tells you in Slack that the notifier is down.
   questions in the bridge's own records count, an edited question is refused, and a bare
   "yes" after a post the bridge has no record of is refused too. Today no session can write
   the records, which is what keeps them from being forged.
+- **With the writer on, its token sits in the same env file** (KIT-297). It can run model
+  calls on your subscription, and nothing else.
 - **The chat lane can read the bridge's config, log and records.** No deny rule names them.
   They hold ids, questions, a heartbeat and ping records, and no credential. Card CK-B4
   checks this with a decoy.
@@ -673,8 +726,10 @@ off, nothing tells you in Slack that the notifier is down.
   use the documented fields (KIT-227).
 - That `groups:history` alone reads a private channel's history and threads. A missing scope
   stops the pass with a named failure (KIT-227).
+- That `claude -p` runs as the role account under launchd with your setup token. `verify`'s
+  `writer` row settles it on your Mac (KIT-297).
 - That `im:history` and `im:write` alone open and read a DM with the app. A missing scope
-  stops the pass with a named failure (KIT-295).
+  is named, and the pass ends with a failure once the channels are answered (KIT-295).
 - That a reinstall after the new manifest keeps the bridge's token. If it changed, run
   `token` again (KIT-295).
 - That a "yes" sent while the Mac sleeps is acted on after it wakes. The tests cover it; no

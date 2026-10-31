@@ -163,6 +163,11 @@ structural: the two values can never be the same variable by accident.
 Good: `CHAT_TOKEN_ENV=NOTIFIER_SLACK_BOT_TOKEN`, and a bot token from the notifier's own app.
 Not: the dispatcher's bot token, under any name.
 
+**In DM mode the rule still holds.** The notifier then posts through the Slack bridge's app
+(*DM mode*, below). That app is not the dispatcher's either. Its token lives under the
+bridge's own name, `BRIDGE_SLACK_BOT_TOKEN`, and the installer still refuses
+`CHAT_TOKEN_ENV=SLACK_BOT_TOKEN`.
+
 **Nothing compares the two values.** The installer refuses the *name*; which token you paste
 at the hidden prompt is yours to get right, and card `CK-N1` is where you sign that the
 notifier has an app of its own. The run banner prints the channel and the API base the token
@@ -194,7 +199,7 @@ installer again.
 Set `DM_USER_IDS` in `notifier.conf` to your Slack member id, and empty `CHAT_CHANNEL_ID`.
 Each ping then goes to your direct messages, as its own message, not to the channel. Name
 more than one id and each person gets the same ping, in the order you wrote them. The ping's
-words do not change.
+words do not change, unless the writer is on (*The writer*, below).
 
 **It posts through the Slack bridge's app.** Install the bridge first
 (`docs/BRIDGE-OPERATOR.md`). Its card `CK-B1` makes the app, which needs `chat:write` and
@@ -214,8 +219,11 @@ bridge's own recorded question takes a yes.
 `<channel>:<ts>`. The bridge reads it to tell which ping an answer follows. It also stops a
 double ping: a ping that reached one person and missed another goes, on the next pass, only to
 the person it missed. The ticket gets its label as soon as anyone has the ping. Records older
-than seven days are dropped, but only once everyone named has the ping. A ledger that cannot
-be read, or holds a broken record, stops the pass before anything is sent.
+than seven days are dropped, but only once everyone named has the ping. A ping that has still
+not reached everyone after four weeks is dropped anyway, so the ledger cannot grow for good. A
+later retry may then ping the person it did reach once more. The pass summary counts both: the
+records held past seven days, and the ones dropped at four weeks. A ledger that cannot be
+read, or holds a broken record, stops the pass before anything is sent.
 
 **What the installer does differently.** The `slack-app` row passes with a note: there is no
 channel, so there is nothing to sign, and `A-PRIVATE-CHANNEL` is refused. The config gets
@@ -234,6 +242,49 @@ Good: the pass summary says `direct messages: ON`, and the ping is in your direc
 Not that: `CHAT_CHANNEL_ID and DM_USER_IDS are both set`. Empty `CHAT_CHANNEL_ID`.
 Not that: `FAIL: I could not page anyone in their direct messages`. The bridge's app lacks
 `im:write`. Add it, reinstall the app, and the next pass sends what it held back.
+
+## The writer — pings in plain words (KIT-297)
+
+**Off by default.** Set `WRITER=yes` in `notifier.conf`, and a model writes each ping's
+words when it is sent. Whether to ping, and who gets it, never depend on it.
+
+**What it sees: four facts, nothing else.** What happened (the mark's fixed sentence), the
+ticket id, the cleaned title and the link. Never a comment, a question or a diff. A title
+with a credential shape is held back before the model sees it.
+
+**How it runs.** The `claude` CLI, with no tools, one turn and a spend cap, on your Claude
+subscription. Set `WRITER_BIN` to its full path, as the role account runs it. A
+LaunchDaemon's PATH is short, so a bare `claude` is refused.
+
+**Its token is the bridge's writer token.** One token from `claude setup-token` serves both
+jobs, which share the env file. The bridge installer's `writer-token` step writes it, under
+`WRITER_TOKEN_ENV` (default `CLAUDE_WRITER_OAUTH_TOKEN`). This installer never asks for it:
+its `credentials` row checks only that the name is in the file.
+
+**When it cannot write, you get the fixed words.** A missing token, a timeout, or words that
+fail a check all send the old fixed ping, unchanged. Once a day at most, that ping ends with
+`(I couldn't reach my writer, so this one's the plain version.)` The pass summary says why
+each one fell back.
+
+**It never holds up a pass.** A writer call can take up to a minute. When too little of the
+pass is left for one, the ping goes out in the fixed words instead. A pass cut off by its
+time limit would ping you again next time. So with `WRITER=yes`, `RUN_TIMEOUT_SECONDS` must
+be at least 180. The default, 240, is fine.
+
+**A retried ping keeps its words.** In DM mode, a ping that missed one person goes to them
+later in the same words the others got. The DM ledger keeps those words. The writer is not
+asked again.
+
+**The @mentions stay outside its words.** In a channel they go in front, as before. In your
+DMs a ping carries none while the writer is on: a DM notifies you anyway. A dry run never
+calls the writer.
+
+Good: the pass summary says `writer: ON, 1 page(s) written, 0 fell back to the plain text`.
+Not that: `WRITER_BIN is required when WRITER=yes`. Set the CLI's full path.
+Not that: `CLAUDE_WRITER_OAUTH_TOKEN is not in ~/.stage-e/env`. Run the bridge installer's
+`writer-token` step first.
+Not that: `RUN_TIMEOUT_SECONDS (120) is too short for the writer`. Set it to 180 or more,
+still below `INTERVAL_SECONDS`.
 
 ---
 
@@ -292,7 +343,7 @@ nothing.
 |---|---|---|
 | `preflight` | reads the conf, finds the role account's home, runs the notifier's own selftest from this checkout, and checks that account's clone holds every file the notifier runs **byte for byte as this checkout does** (sha256, read as that account) | any problem, all listed at once. A clone file that is missing, unreadable, or different is named |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private. In DM mode it passes with a note, and asks for nothing | card `CK-N1` |
-| `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer |
+| `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line. With `WRITER=yes`, it also checks the writer's token is there, by name only | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer. No writer token: a failure naming the bridge installer's `writer-token` step |
 | `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS`, `MONITOR_ACTOR_IDS`, `BOUNCE_ACTOR_IDS` and `FINDING_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
 | `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it, and after the notifier in the role account's clone is seen to know every key in it | a composition the notifier would refuse fails here, before anything is written. So does a key the clone's older notifier does not know |
 | `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
@@ -702,6 +753,12 @@ share. It stops there, before it changes anything: run the two again in the orde
 - **That a DM-mode ping reaches you.** The selftest drives a stubbed Slack: the bridge's app
   opening your direct message with `im:write`, and posting there. No live run has yet. The
   first ping in DM mode is its test. (KIT-296)
+- **That the writer runs for the role account under launchd.** The selftest fakes the CLI.
+  The writer's own probe settles it for both jobs. Run it as the job does, with the env file
+  loaded, or it reports a missing token:
+  `sudo -u <role-account> -H /bin/sh -c 'cd / && set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 "$HOME/.stage-e/kit/scripts/pipeline_voice.py" probe --config "$HOME/.stage-e/notifier.json"'`.
+  The last line says `written by the model`, or why it fell back. No notifier pass has
+  called it live yet. (KIT-297)
 - **Whether the tracker's editor keeps `<!--` intact** on a comment's first line. The API
   path above sidesteps it. (KIT-173)
 - **Whether the comment window is really newest-first.** The notifier asks for it, and names

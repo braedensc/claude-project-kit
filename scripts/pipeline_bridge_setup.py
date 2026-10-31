@@ -3,6 +3,7 @@
 
     python3 scripts/pipeline_bridge_setup.py compose  [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py token    [--conf bridge.conf]
+    python3 scripts/pipeline_bridge_setup.py writer-token [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py install  [--conf bridge.conf] [--apply]
     python3 scripts/pipeline_bridge_setup.py verify   [--conf bridge.conf]
     python3 scripts/pipeline_bridge_setup.py card CK-B1
@@ -22,6 +23,8 @@ could post a question that looked like the bridge's.
               token that is already in that file under another name (the chat bot's or the
               notifier's), and refuses the dispatcher's env file as ENV_FILE. Prints names
               and lengths only.
+    writer-token  the same, for the writer's token (KIT-297): the one `claude setup-token`
+              prints, under WRITER_TOKEN_ENV. Refuses anything else, an API key included.
     install   writes the config (as the role account) and the plist (as root). Dry run by
               default; `--apply` writes. The plist is installed disabled, so a restart does
               not load it either. It never loads the job: that is card CK-B2.
@@ -33,20 +36,23 @@ could post a question that looked like the bridge's.
               INTERVAL_SECONDS blocks, and its `notifier` row judges the notifier's
               heartbeat by the job's own rule, checks the job runs often enough to tell the
               Mac's sleep from a quiet notifier, and checks launchd runs the notifier as its
-              plist says; empty, it says the watch is off (KIT-285).
+              plist says; empty, it says the watch is off (KIT-285). With WRITER=yes its
+              `writer` row has the writer write one sample message, as the job would; with
+              WRITER=no it says the writer is off (KIT-297).
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
-              CK-B4 prove it live.
+              CK-B4 prove it live, CK-B5 turn the writer on.
 
-WHO RUNS SUDO. `token`, `install` and `verify` ask for the administrator password once,
-then run sudo themselves: as the role account (`sudo -u`), and as root to write the plist
-and to ask launchd whether the job is loaded. None of them starts or stops the job. The
-`launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person to run.
+WHO RUNS SUDO. `token`, `writer-token`, `install` and `verify` ask for the administrator
+password once, then run sudo themselves: as the role account (`sudo -u`), and as root to
+write the plist and to ask launchd whether the job is loaded. None of them starts or stops
+the job. The `launchctl` lines that do (cards CK-B2 and CK-B3) are printed for the person
+to run.
 
-REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `install` and `verify`.
-`verify` runs the job's own dry run, which reads the owner's tracker key; a model has no
-business running it. `compose` and `card` print and read nothing live, so they are allowed.
-The markers are environment variables a session could unset: tamper-evident, not
-tamper-proof, as everywhere else in this kit.
+REFUSES IN AN AGENT ENVIRONMENT, before the conf is read: `token`, `writer-token`, `install`
+and `verify`. `verify` runs the job's own dry run, which reads the owner's tracker key; a
+model has no business running it. `compose` and `card` print and read nothing live, so they
+are allowed. The markers are environment variables a session could unset: tamper-evident,
+not tamper-proof, as everywhere else in this kit.
 
 EXIT CODES — the Stage E installer's (contract §13): 0 done or nothing to do, 1 failed,
 2 usage or conf, 3 refused for safety, 4 could not measure, 5 no administrator access,
@@ -77,11 +83,15 @@ say = se.say
 
 DEFAULT_CONF = "bridge.conf"
 BRIDGE_SCRIPT = "pipeline_bridge.py"
+VOICE_SCRIPT = "pipeline_voice.py"
 LOG_NAME = "bridge.log"
 TOKEN_RE = re.compile(r"^xoxb-[A-Za-z0-9-]{20,}$")
+# A token `claude setup-token` prints (KIT-297). An API key (sk-ant-api...) never matches.
+WRITER_TOKEN_RE = re.compile(r"^sk-ant-oat[0-9]{2}-[A-Za-z0-9_-]{20,}$")
 LABEL_RE = re.compile(r"^[a-z][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*){2,}$")
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{0,31}$")
 PATH_RE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]+$")
+ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
 INTERVAL_MIN, INTERVAL_MAX = 15, 3600          # INTERVAL_SECONDS, in seconds
 # The bridge app's scopes: EXACTLY what pipeline_bridge.py calls, each cited.
 SCOPE_CITES = {
@@ -140,6 +150,13 @@ CONF_KEYS = {
                                "Set, each pass reads how often launchd runs the notifier from "
                                "its plist, and says in Slack when it goes quiet or keeps "
                                "failing (KIT-285). Empty: the watch is off"),
+    "WRITER": ("no", "yes: a model with no tools writes each message as it is sent, on your "
+                     "Claude subscription (KIT-297; card CK-B5). no: the plain words go out"),
+    "WRITER_BIN": ("", "the claude CLI's full path, as `command -v claude` prints it; "
+                       "required with WRITER=yes"),
+    "WRITER_MODEL": (bridge.voice.DEFAULTS["writer_model"], "the model that writes them"),
+    "WRITER_TOKEN_ENV": (bridge.voice.DEFAULTS["writer_token_env"],
+                         "the NAME the writer's token goes under, at `writer-token`"),
 }
 REQUIRED = ("ROLE_ACCOUNT", "ROLE_KIT_CLONE", "CHANNEL_IDS", "OWNER_USER_ID", "TEAM_KEYS",
             "JOB_LABEL", "BOT_USER_ID")
@@ -234,23 +251,58 @@ def validate_conf(values):
                       "own (their profile, then Copy member ID), got %s" % ", ".join(bad))
     elif len(set(dms)) != len(dms):
         errors.append("DM_USER_IDS names a member twice")
+    errors.extend(writer_problems(conf))
     # The job's own check runs whatever the checks above found, so every bad value is
     # named in one pass. A value both refuse is named once, by its conf key.
     named = [k for k in COMPOSED_AS if any(e.startswith(k + " ") for e in errors)]
+    hidden = ["'%s'" % key for k in named for key in (
+        (COMPOSED_AS[k],) if isinstance(COMPOSED_AS[k], str) else COMPOSED_AS[k])]
     try:
         bridge.validate_config(dict(compose_config(conf),
                                     state_dir="/nonexistent-%s" % os.getpid()))
     except bridge.BridgeError as exc:
         errors.extend(e for e in str(exc).split("\n  - ")[1:] or [str(exc)]
-                      if not any("'%s'" % COMPOSED_AS[k] in e for k in named))
+                      if not any(h in e for h in hidden))
     return conf, errors
 
 
-# The conf keys with a check of their own above, and the config key each is composed into.
+def writer_problems(conf):
+    """KIT-297: the writer's keys. Each is checked whether WRITER is yes or no, so a typo is
+    said when it is made, not on the day the writer is turned on."""
+    errors = []
+    if conf["WRITER"] not in ("yes", "no"):
+        errors.append("WRITER must be yes or no, got %r" % conf["WRITER"])
+    if conf["WRITER"] == "yes" and not conf["WRITER_BIN"]:
+        errors.append("WRITER_BIN is required with WRITER=yes: the claude CLI's full path, as "
+                      "`command -v claude` prints it (card CK-B5)")
+    elif conf["WRITER_BIN"] and not ABS_PATH_RE.match(conf["WRITER_BIN"]):
+        errors.append("WRITER_BIN must be the claude CLI's full path, starting with /, of plain "
+                      "characters, got %r. The job runs under launchd, whose PATH is short, "
+                      "so a bare name may not be found" % conf["WRITER_BIN"])
+    if bridge.voice.settings({"writer_model": conf["WRITER_MODEL"]})[1]:
+        errors.append("WRITER_MODEL must be a model alias or name like haiku or sonnet, got %r"
+                      % conf["WRITER_MODEL"])
+    name = conf["WRITER_TOKEN_ENV"]
+    if not bridge.ENV_NAME_RE.match(name):
+        errors.append("WRITER_TOKEN_ENV must be an env var NAME like %s, got %r"
+                      % (bridge.voice.DEFAULTS["writer_token_env"], name))
+    else:
+        taken = [k for k in ("SLACK_TOKEN_ENV", "LINEAR_KEY_ENV") if conf[k] == name]
+        if taken:
+            errors.append("WRITER_TOKEN_ENV is %s, the name %s already uses. The writer's "
+                          "token needs a name of its own" % (name, " and ".join(taken)))
+    return errors
+
+
+# The conf keys with a check of their own above, and the config key (or keys) each is
+# composed into. NOTIFIER_STATE_DIR makes two: the pings file, and with DM_USER_IDS the
+# notifier's record of its DM pages (KIT-297 review).
 COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
-               "ACT": "act", "NOTIFIER_STATE_DIR": "pings_file",
-               "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids"}
+               "ACT": "act", "NOTIFIER_STATE_DIR": ("pings_file", "notifier_posts_file"),
+               "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
+               "WRITER": "writer", "WRITER_BIN": "writer_bin", "WRITER_MODEL": "writer_model",
+               "WRITER_TOKEN_ENV": "writer_token_env"}
 
 
 def load_conf(path):
@@ -308,6 +360,11 @@ def compose_config(conf):
         doc["run_interval_seconds"] = (int(conf["INTERVAL_SECONDS"])
                                        if conf["INTERVAL_SECONDS"].isdigit()
                                        else conf["INTERVAL_SECONDS"])
+    # KIT-297: the writer, composed only with WRITER=yes, so a config written before the
+    # writer existed is still, byte for byte, the composed one.
+    if conf["WRITER"] == "yes":
+        doc.update(writer=True, writer_bin=conf["WRITER_BIN"],
+                   writer_model=conf["WRITER_MODEL"], writer_token_env=conf["WRITER_TOKEN_ENV"])
     return doc
 
 
@@ -486,6 +543,27 @@ CARDS = {
         "sudo launchctl disable system/{JOB_LABEL}",
     ], "`launchctl print system/{JOB_LABEL}` says it could not find the service.",
        "removing the plist alone: launchd keeps a loaded job until it is booted out."),
+    "CK-B5": ("Turn the writer on (KIT-297)", [
+        "In your own terminal, as yourself, run:  claude setup-token . Sign in when it asks. "
+        "It prints a long token that starts sk-ant-oat. It runs on your Claude "
+        "subscription, not an API key.",
+        "Put it in place, at a hidden prompt:  python3 {SELF} writer-token --conf {CONF} . "
+        "Paste the token there. It is never printed.",
+        "Find the claude program:  command -v claude . It prints a full path, such as "
+        "/opt/homebrew/bin/claude. The job runs under launchd, whose PATH is short, so it "
+        "needs that full path, not the bare name. Check the job's account can run it:  sudo "
+        "-u {ROLE_ACCOUNT} -H <that path> --version . A path inside your own home folder "
+        "will not do. If that is where yours is, install claude somewhere every account "
+        "can run it, such as /opt/homebrew/bin or /usr/local/bin, and use that path.",
+        "In the conf, set WRITER=yes and WRITER_BIN=<that path>.",
+        "Write the config:  python3 {SELF} install --conf {CONF} --apply . The job reads it "
+        "on its next pass.",
+        "Then:  python3 {SELF} verify --conf {CONF} . Its writer row has the writer write one "
+        "sample message, as the job would.",
+        "To turn it off again, set WRITER=no and run line 5.",
+    ], "verify's writer row says a sample message was written by the model.",
+       "an API key (it starts sk-ant-api). `writer-token` refuses it: it would bill each "
+       "message, and your subscription is what pays here."),
 }
 
 
@@ -677,6 +755,35 @@ os.chmod(env_path, 0o600)
 print("wrote %s (%d characters) into %s, mode 600" % (name, len(token), env_path))
 '''
 
+# KIT-297: the writer's token goes in by the same program, in its own words: the same
+# refusals (the dispatcher's env file, a value another name already holds there or in
+# DISPATCHER_ENV_FILE), the same backups, mode 600, the value on stdin only.
+WRITER_TOKEN_WORDS = (
+    ("The bridge's token ", "The writer's token "),
+    ("The bridge needs its own ", "The writer needs its own "),
+    ("Slack app's token.", "token, from `claude setup-token`."),
+    ("the chat bot's. Nothing", "the dispatcher's. Nothing"))
+WRITER_TOKEN_WRITER_PY = TOKEN_WRITER_PY
+for _bridge_words, _writer_words in WRITER_TOKEN_WORDS:
+    WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_bridge_words, _writer_words)
+# One more refusal, the writer's own (Stage E review of #220): the env file is shared, so
+# WRITER_TOKEN_ENV may name a credential the bridge's conf does not know, such as the
+# notifier's Slack token. A name that already holds anything but a setup-token is never
+# overwritten.
+_OWN_NAME_PY = r'''
+for line in lines:
+    m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+    held = m.group(2).strip().strip("'\"") if m and m.group(1) == name else ""
+    if held and not held.startswith("sk-ant-oat"):
+        print("REFUSED: %s already holds another credential in %s, not a token from `claude "
+              "setup-token`, so it was left as it is. Give WRITER_TOKEN_ENV a name of its "
+              "own. Nothing was written." % (name, env_path))
+        sys.exit(3)
+'''
+_ANCHOR = "\nholds(lines, env_path, True)\n"
+assert WRITER_TOKEN_WRITER_PY.count(_ANCHOR) == 1
+WRITER_TOKEN_WRITER_PY = WRITER_TOKEN_WRITER_PY.replace(_ANCHOR, _ANCHOR + _OWN_NAME_PY)
+
 # Writes the config from stdin, mode 600, creating its directory at 700.
 CONFIG_WRITER_PY = r'''
 import os, sys
@@ -765,6 +872,14 @@ def cmd_compose(conf, conf_path):
         say("DM_USER_IDS: it also reads and answers in the DM of %s, always as messages of "
             "their own. An app made before needs the manifest again: card CK-B1."
             % ", ".join(split_list(conf["DM_USER_IDS"])))
+    if conf["WRITER"] == "yes":
+        say("WRITER=yes: %s, with no tools, writes each message as it is sent, from the "
+            "token under %s (`writer-token`). What to type and what a yes does are never its "
+            "words. One short call a message, on your subscription. `verify` writes a sample."
+            % (conf["WRITER_MODEL"], conf["WRITER_TOKEN_ENV"]))
+    else:
+        say("WRITER=no: every message goes out in its plain words. Card CK-B5 turns the "
+            "writer on.")
     return EX_OK
 
 
@@ -805,6 +920,53 @@ def cmd_token(conf, runner, sudo, reader=None, tty=None):
         say("FAILED: the token could not be written into %s, as %s (%s)."
             % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"], last[:200]))
         return EX_FAILED
+    return EX_OK
+
+
+def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
+    """The writer's token, as `token` puts the bridge's (KIT-297): a person at a terminal,
+    a hidden prompt, the role account writing it, nothing printed but its name and length."""
+    found = agent_markers_present()
+    if found:
+        return refused(found)
+    if not (tty if tty is not None else sys.stdin.isatty()):
+        say("BLOCKED: `writer-token` asks at a hidden prompt, and this is not a terminal.")
+        return EX_BLOCKED
+    try:
+        sudo.acquire("`writer-token` writes the writer's token into %s as %s."
+                     % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"]), "writer-token")
+    except se.NoPrivilege as exc:
+        return no_privilege(exc, "writer-token")
+    value = (reader or getpass.getpass)(
+        "First run `claude setup-token` in your own terminal, then paste the token it prints "
+        "(hidden): ")
+    value = (value or "").strip()
+    if not WRITER_TOKEN_RE.match(value):
+        say("REFUSED: that is not a token from `claude setup-token` (it starts sk-ant-oat). An "
+            "API key is refused too: it would bill each message. Nothing was written.")
+        return EX_USAGE
+    runner.dry_run = False
+    res = runner.as_role(conf["ROLE_ACCOUNT"],
+                         py(WRITER_TOKEN_WRITER_PY, conf["ENV_FILE"], conf["WRITER_TOKEN_ENV"],
+                            conf["DISPATCHER_ENV_FILE"]),
+                         stdin=value + "\n", why="write %s into %s"
+                         % (conf["WRITER_TOKEN_ENV"], conf["ENV_FILE"]), secret_stdin=True)
+    for line in (res.out or "").splitlines():
+        say("  " + line)
+    if res.rc == 3:
+        return EX_REFUSED
+    if not res.ok:
+        # As `token`: the error is on stderr, and a line shaped like a credential is never
+        # shown, since stdin carried the token.
+        last = ((res.err or "").strip().splitlines() or ["it printed no error"])[-1]
+        if bridge.notify.secret_hits(last):
+            last = "its last line is shaped like a credential, so it is not shown"
+        say("FAILED: the writer's token could not be written into %s, as %s (%s)."
+            % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"], last[:200]))
+        return EX_FAILED
+    if conf["WRITER"] != "yes":
+        say("The writer is still off. Set WRITER=yes and WRITER_BIN in the conf, then "
+            "`install --apply` (card CK-B5).")
     return EX_OK
 
 
@@ -889,12 +1051,18 @@ def cmd_verify(conf, runner, sudo, now=None):
                          == sha(config_bytes(conf)) else "run `install --apply`"))
         names = facts.get("env_names") or []
         missing = [n for n in (conf["SLACK_TOKEN_ENV"], conf["LINEAR_KEY_ENV"]) if n not in names]
+        # KIT-297: with the writer on, its token is named there too, put by `writer-token`.
+        writer_missing = (conf["WRITER"] == "yes" and conf["WRITER_TOKEN_ENV"] not in names)
+        how = "; ".join((["missing by name: %s; run `token`" % ", ".join(missing)]
+                         if missing else []) +
+                        (["missing by name: %s; run `writer-token`" % conf["WRITER_TOKEN_ENV"]]
+                         if writer_missing else []))
         rows.append(("credentials", se.UNKNOWN if facts.get("env_error") else
-                     (se.BLOCKED if missing else se.ALREADY_DONE),
+                     (se.BLOCKED if how else se.ALREADY_DONE),
                      "the env file could not be read (%s)" % facts.get("env_error")
-                     if facts.get("env_error") else ("missing by name: %s; run `token`"
-                                                     % ", ".join(missing) if missing else
-                                                     "both credentials are named")))
+                     if facts.get("env_error") else (how or (
+                         "all three credentials are named" if conf["WRITER"] == "yes"
+                         else "both credentials are named"))))
         plist_now = runner.read(["/bin/cat", plist_path(conf)])
         rows.append(("plist", se.ALREADY_DONE if plist_now.ok and plist_now.out ==
                      render_plist(conf, home) else se.BLOCKED,
@@ -940,6 +1108,7 @@ def cmd_verify(conf, runner, sudo, now=None):
                           % (int(age), beat.get("exit"), (beat.get("summary") or "")[:160]))))
         rows.append(pings_row(conf, facts))
         rows.append(notifier_row(conf, facts, runner, now or time.time()))
+        rows.append(writer_row(conf, runner))
     for check, outcome, detail in rows:
         say("  %-13s %-17s %s" % (check, outcome, detail))
     worst = [o for _c, o, _d in rows]
@@ -949,6 +1118,34 @@ def cmd_verify(conf, runner, sudo, now=None):
             return code
     say("Good: the bridge is installed, loaded and passing.")
     return EX_OK
+
+
+def writer_command(conf):
+    """The writer's probe, as the job would run it (KIT-297): the job's PATH, the env file
+    sourced as job_command sources it, Apple's interpreter, and the job's own config."""
+    script = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + VOICE_SCRIPT
+    return ('PATH=%s; export PATH; set -a; . "%s"; set +a; exec /usr/bin/python3 "%s" probe '
+            '--config "%s"' % (shlex.quote(se.DAEMON_PATH), sh_path(conf["ENV_FILE"]),
+                               sh_path(script), sh_path(conf["BRIDGE_CONFIG"])))
+
+
+def writer_row(conf, runner):
+    """KIT-297: with WRITER=yes, the writer writes one sample message as the role account,
+    as the job would. Good only when it says the model wrote it; anything else is FAILED,
+    with the probe's last line (a line shaped like a credential is never shown). It reads
+    the installed config: until `install --apply` writes WRITER=yes there, the config row
+    says so."""
+    if conf["WRITER"] != "yes":
+        return ("writer", se.SKIPPED, "off: WRITER is no, so every message goes out in its "
+                "plain words")
+    res = runner.as_role(conf["ROLE_ACCOUNT"], writer_command(conf))
+    said = ((res.out or "").strip() or (res.err or "").strip()).splitlines() or [""]
+    last = said[-1].strip()
+    if bridge.notify.secret_hits(last):
+        last = "its last line is shaped like a credential, so it is not shown"
+    if res.rc == 0 and last == "written by the model":
+        return ("writer", se.ALREADY_DONE, "a sample message was written by the model")
+    return ("writer", se.FAILED, last[:200] or "the probe printed nothing")
 
 
 def loaded_row(conf, loaded):
@@ -1097,12 +1294,15 @@ class _RoleRunner(se.Runner):
     `prints` with that text, as launchd prints a job it holds."""
 
     def __init__(self, home, root, loaded=False, job_rc=0,
-                 job_out="bridge: 0 message(s) examined (dry run)\n", job_err="", prints=None):
+                 job_out="bridge: 0 message(s) examined (dry run)\n", job_err="", prints=None,
+                 probe_rc=0, probe_out="A sample.\nwritten by the model\n"):
         se.Runner.__init__(self)
         self.home, self.root, self.loaded, self.job_rc = home, root, loaded, job_rc
         self.job_out, self.job_err = job_out, job_err
         self.prints = prints or {}
         self.stdins = []
+        # The writer's probe (KIT-297): answered as told, never run, so no CLI starts here.
+        self.probe_rc, self.probe_out, self.probes = probe_rc, probe_out, []
 
     def _exec(self, argv, stdin, timeout, cwd=None):
         import subprocess
@@ -1111,6 +1311,9 @@ class _RoleRunner(se.Runner):
             script = argv[-1]
             if "pipeline_bridge.py" in script and "--dry-run" in script:
                 return se.Result(self.job_rc, self.job_out, self.job_err)
+            if "pipeline_voice.py" in script and " probe " in script:
+                self.probes.append(script)
+                return se.Result(self.probe_rc, self.probe_out, "")
             p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True,
                                text=True, env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
             return se.Result(p.returncode, p.stdout, p.stderr)
@@ -1153,6 +1356,13 @@ def selftest():
         with contextlib.redirect_stdout(buf):
             rc = fn(*a, **kw)
         return rc, buf.getvalue()
+
+    def outcome(fn):
+        """One case run alone, so one that raises fails as itself."""
+        try:
+            return fn()
+        except Exception as exc:                                  # noqa: BLE001
+            return "raised %s: %s" % (type(exc).__name__, exc)
 
     saved = dict(os.environ)
     for m in AGENT_ENV_MARKERS:
@@ -1353,6 +1563,61 @@ def selftest():
         check("conf-DM_USER_IDS-duplicate-refused",
               [e for e in errs if "DM_USER_IDS" in e or "dm_user_ids" in e],
               ["DM_USER_IDS names a member twice"])
+        # KIT-297 review: with DM_USER_IDS set, NOTIFIER_STATE_DIR is composed twice (the
+        # pings file, and the notifier's record of its DM pages). A bad one is still named
+        # once, by its conf key.
+        with tempfile.TemporaryDirectory() as gtmp:
+            os.makedirs(os.path.join(gtmp, ".git"))
+            _c, errs = validate_conf(dict(values, DM_USER_IDS="U0ALICE001",
+                                          NOTIFIER_STATE_DIR=gtmp + "/state dir"))
+            check("conf-a-refused-notifier-state-dir-named-once-with-DM_USER_IDS-too",
+                  [e.split(" ")[0] for e in errs], ["NOTIFIER_STATE_DIR"])
+        # KIT-297: the writer. Off by default, and then composed into nothing, so a config
+        # written before it is still the composed one. On, its four keys are composed and
+        # the job's own loader takes them. Each bad value is named once, by its conf key.
+        check("conf-WRITER-off-by-default-composes-no-writer-key",
+              outcome(lambda: (conf["WRITER"], [k for k in compose_config(conf)
+                                                if k.startswith("writer")])), ("no", []))
+        wbin = "/opt/claude/bin/claude"
+        wconf, werrs = validate_conf(dict(values, WRITER="yes", WRITER_BIN=wbin))
+
+        def writer_composed():
+            doc = compose_config(wconf)
+            job = bridge.validate_config(dict(doc, state_dir="/nonexistent-%s" % os.getpid()))
+            return (werrs, dict((k, v) for k, v in doc.items() if k.startswith("writer")),
+                    [job[k] for k in ("writer", "writer_bin", "writer_model",
+                                      "writer_token_env")])
+        check("conf-WRITER-yes-composes-the-writer-and-the-job-takes-it",
+              outcome(writer_composed),
+              ([], {"writer": True, "writer_bin": wbin, "writer_model": "haiku",
+                    "writer_token_env": "CLAUDE_WRITER_OAUTH_TOKEN"},
+               [True, wbin, "haiku", "CLAUDE_WRITER_OAUTH_TOKEN"]))
+        for name, over, key in (
+                ("WRITER-not-yes-or-no", {"WRITER": "true"}, "WRITER"),
+                ("WRITER_BIN-required-with-WRITER-yes", {"WRITER": "yes"}, "WRITER_BIN"),
+                ("WRITER_BIN-a-bare-name", {"WRITER": "yes", "WRITER_BIN": "claude"},
+                 "WRITER_BIN"),
+                ("WRITER_BIN-with-shell-after-it", {"WRITER_BIN": wbin + '"; id; "'},
+                 "WRITER_BIN"),
+                ("WRITER_MODEL-a-flag", {"WRITER": "yes", "WRITER_BIN": wbin,
+                                         "WRITER_MODEL": "--bare"}, "WRITER_MODEL"),
+                ("WRITER_TOKEN_ENV-not-a-name", {"WRITER_TOKEN_ENV": "claude token"},
+                 "WRITER_TOKEN_ENV"),
+                ("WRITER_TOKEN_ENV-the-bridge-tokens-name",
+                 {"WRITER_TOKEN_ENV": "BRIDGE_SLACK_BOT_TOKEN"}, "WRITER_TOKEN_ENV"),
+                ("WRITER_TOKEN_ENV-the-tracker-keys-name",
+                 {"WRITER": "yes", "WRITER_BIN": wbin,
+                  "WRITER_TOKEN_ENV": "STAGE_E_LINEAR_API_KEY"}, "WRITER_TOKEN_ENV")):
+            check("conf-%s-refused-once-by-its-key" % name,
+                  outcome(lambda: [e.split(" ")[0] for e in validate_conf(dict(values,
+                                                                               **over))[1]]),
+                  [key])
+        check("card-b5-turns-the-writer-on-step-by-step",
+              outcome(lambda: [n for n in (
+                  "claude setup-token", "writer-token --conf bridge.conf", "command -v claude",
+                  "full path", "WRITER=yes", "WRITER_BIN", "install --conf bridge.conf --apply",
+                  "verify --conf bridge.conf", "sudo -u _exdispatch -H", "sk-ant-api")
+                  if n not in cap(print_card, "CK-B5", conf)[1]]), [])
         b1 = cap(print_card, "CK-B1", conf)[1]
         check("card-b1-says-how-to-update-the-app-and-open-the-dm",
               [n for n in ("App Manifest", "Save Changes", "Reinstall to Workspace",
@@ -1482,6 +1747,11 @@ def selftest():
         rc, out = cap(cmd_compose, conf, "bridge.conf")
         check("compose-prints-every-piece", (rc, all(p in out for p in (
             "PIECE 1", "PIECE 2", "PIECE 3", "ACT=no"))), (EX_OK, True))
+        check("compose-says-whether-the-writer-is-on", outcome(lambda: (
+            "WRITER=no:" in out, "Card CK-B5" in out) + tuple(
+                needle in cap(cmd_compose, wconf, "bridge.conf")[1]
+                for needle in ("WRITER=yes:", "CLAUDE_WRITER_OAUTH_TOKEN", '"writer": true'))),
+              (True, True, True, True, True))
 
         with tempfile.TemporaryDirectory() as tmp:
             home, root = os.path.join(tmp, "home"), os.path.join(tmp, "root")
@@ -1604,6 +1874,114 @@ def selftest():
                   (rc, "FAILED: the token could not be written" in out, good in out,
                    "b" * 30 in out), (EX_FAILED, True, False, False))
 
+            # KIT-297: writer-token puts the writer's token in place as `token` puts the
+            # bridge's: refused under a model, only at a terminal, only a token `claude
+            # setup-token` prints (never an API key), with the same refusals and backups,
+            # and never printed. Each case runs alone.
+            prompts = []
+
+            def typed(value):
+                def reader(prompt):
+                    prompts.append(prompt)
+                    return value
+                return reader
+
+            def writer_token(c_=conf, value="x", tty=True, sudo=None, runner=None):
+                return cap(cmd_writer_token, c_, runner or r, sudo or _FakeSudo(),
+                           typed(value), tty)
+            os.environ[AGENT_ENV_MARKERS[0]] = ""
+            r = _RoleRunner(home, root)
+            check("writer-token-refused-under-a-model",
+                  outcome(lambda: (writer_token()[0], r.writes)), (EX_REFUSED, []))
+            os.environ.pop(AGENT_ENV_MARKERS[0])
+            check("writer-token-needs-a-terminal", outcome(lambda: writer_token(tty=False)[0]),
+                  EX_BLOCKED)
+            before = open(envp).read()
+            for name, value in (("an-api-key", "sk-ant-api03-" + "a" * 40),
+                                ("a-slack-token", "xoxb-" + "a" * 30),
+                                ("shell-after-it", "sk-ant-oat01-%s $(id)" % ("a" * 30))):
+                got = outcome(lambda: writer_token(value=value))
+                check("writer-token-refuses:" + name,
+                      (got[0], open(envp).read() == before, "a" * 30 in got[1])
+                      if isinstance(got, tuple) else got, (EX_USAGE, True, False))
+            wtoken = "sk-ant-oat01-" + "t" * 40
+            # Three older backups in place (KIT-297 review): the run must add its own and
+            # prune the oldest, so a writer that skips either one fails the count or the name.
+            bdir = os.path.join(home, ".stage-e", "backups")
+            for n in os.listdir(bdir):
+                if n.startswith("env.bridge-setup."):
+                    os.remove(os.path.join(bdir, n))
+            older = ["env.bridge-setup.20000101T00000%dZ.1" % i for i in range(3)]
+            for n in older:
+                with open(os.path.join(bdir, n), "w") as fh:
+                    fh.write("an older backup\n")
+            got = outcome(lambda: writer_token(value=wtoken))
+            after = sorted(n for n in os.listdir(bdir) if n.startswith("env.bridge-setup."))
+            env_text = open(envp).read()
+            check("writer-token-written",
+                  (got[0], "CLAUDE_WRITER_OAUTH_TOKEN=%s" % wtoken in env_text,
+                   "BRIDGE_SLACK_BOT_TOKEN=" in env_text, oct(os.stat(envp).st_mode & 0o777))
+                  if isinstance(got, tuple) else got, (EX_OK, True, True, "0o600"))
+            check("writer-token-never-printed-nor-in-argv",
+                  (wtoken in str(got), any(wtoken in " ".join(w["argv"]) for w in r.writes)),
+                  (False, False))
+            check("writer-token-keeps-three-backups",
+                  (len(after), after[:2] == older[1:], after[-1] not in older,
+                   after[-1] in str(got)), (3, True, True, True))
+            check("writer-token-asks-for-the-setup-token-first-and-says-the-writer-is-off",
+                  (bool(prompts) and "run `claude setup-token` in your own terminal"
+                   in prompts[-1], "Set WRITER=yes" in str(got)), (True, True))
+            got = outcome(lambda: writer_token(dict(conf, WRITER_TOKEN_ENV="OTHER_WRITER_TOKEN"),
+                                               wtoken))
+            check("writer-token-already-held-by-another-name",
+                  (got[0], "CLAUDE_WRITER_OAUTH_TOKEN" in got[1], "needs its own token"
+                   in got[1], wtoken in got[1]) if isinstance(got, tuple) else got,
+                  (EX_REFUSED, True, True, False))
+            # The env file is shared: a name that holds the notifier's Slack token is never
+            # overwritten by the writer's (Stage E review of #220).
+            with open(envp, "a") as fh:
+                fh.write("NOTIFIER_SLACK_BOT_TOKEN=xoxb-notifier-%s\n" % ("n" * 30))
+            got = outcome(lambda: writer_token(dict(conf,
+                                                    WRITER_TOKEN_ENV="NOTIFIER_SLACK_BOT_TOKEN"),
+                                               "sk-ant-oat01-" + "w" * 40))
+            env_text = open(envp).read()
+            check("writer-token-never-overwrites-another-credential-under-its-name",
+                  (got[0], "already holds another credential" in got[1], "n" * 30 in got[1],
+                   "xoxb-notifier-%s" % ("n" * 30) in env_text, "w" * 40 in env_text,
+                   "already holds another credential" in TOKEN_WRITER_PY)
+                  if isinstance(got, tuple) else got,
+                  (EX_REFUSED, True, False, True, False, False))
+            got = outcome(lambda: writer_token(value="sk-ant-oat01-" + "r" * 40))
+            check("writer-token-replaces-its-own-earlier-setup-token",
+                  (got[0], "r" * 40 in open(envp).read(), wtoken in open(envp).read())
+                  if isinstance(got, tuple) else got, (EX_OK, True, False))
+            held = "sk-ant-oat01-" + "d" * 40
+            with open(os.path.join(home, "dispatcher.env"), "a") as fh:
+                fh.write("CLAUDE_CODE_OAUTH_TOKEN=%s\n" % held)
+            got = outcome(lambda: writer_token(value=held))
+            check("writer-token-the-dispatchers-own-refused",
+                  (got[0], "CLAUDE_CODE_OAUTH_TOKEN" in got[1], "d" * 40 in got[1],
+                   "d" * 40 in open(envp).read()) if isinstance(got, tuple) else got,
+                  (EX_REFUSED, True, False, False))
+            got = outcome(lambda: writer_token(dict(conf,
+                                                    DISPATCHER_ENV_FILE="~/dispatcher-link.env"),
+                                               "sk-ant-oat01-" + "s" * 40))
+            check("writer-token-dispatcher-env-is-the-same-file-refused",
+                  (got[0], "DISPATCHER_ENV_FILE" in got[1], "The writer's token goes" in got[1],
+                   "s" * 40 in open(envp).read()) if isinstance(got, tuple) else got,
+                  (EX_REFUSED, True, True, False))
+            got = outcome(lambda: writer_token(value=wtoken,
+                                               sudo=se.SudoSession(validate=lambda: 1)))
+            check("no-sudo-says-why:writer-token",
+                  (got[0], "NO ADMINISTRATOR ACCESS" in got[1],
+                   "pipeline_bridge_setup.py writer-token" in got[1])
+                  if isinstance(got, tuple) else got, (EX_NOPRIV, True, True))
+            check("writer-token-program-is-tokens-in-its-own-words", outcome(lambda: (
+                [w for w, _x in WRITER_TOKEN_WORDS if w not in TOKEN_WRITER_PY],
+                [w for w, _x in WRITER_TOKEN_WORDS if w in WRITER_TOKEN_WRITER_PY],
+                [x for _w, x in WRITER_TOKEN_WORDS if x not in WRITER_TOKEN_WRITER_PY])),
+                  ([], [], []))
+
             # Before install, a config that is not there yet is a step to take, not a
             # failed read.
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root), _FakeSudo())
@@ -1648,6 +2026,47 @@ def selftest():
             rc, out = cap(cmd_verify, conf, _RoleRunner(home, root, loaded=True), _FakeSudo(),
                           now=at + 30)
             check("verify-clean", (rc, "Good:" in out), (EX_OK, True))
+            # KIT-297: the writer row. Off, it says so and passes. On, its token's name must
+            # be in the env file, and the writer writes one sample as the job would run it:
+            # the job's PATH, the env file sourced as the job sources it, the job's config.
+            check("verify-writer-row-off-passes",
+                  bool(re.search(r"^\s*writer\s+SKIPPED\s+off: WRITER is no", out, re.M)), True)
+
+            def writer_rows(c_, probe_rc=0, probe_out="A sample.\nwritten by the model\n"):
+                rr = _RoleRunner(home, root, loaded=True, probe_rc=probe_rc,
+                                 probe_out=probe_out)
+                rc_, out_ = cap(cmd_verify, c_, rr, _FakeSudo(), now=at + 30)
+                rows = dict((m.group(1), (m.group(2), m.group(3))) for m in re.finditer(
+                    r"^\s*(credentials|writer)\s+(\S+)\s+(.*)$", out_, re.M))
+                return rc_, rows.get("credentials"), rows.get("writer"), rr.probes
+            def as_the_job():
+                _rc, creds, row, probes = writer_rows(wconf)
+                return creds, row, probes == ["cd / && " + writer_command(wconf)]
+            check("verify-writer-row-on: a sample written by the model passes, run as the job",
+                  outcome(as_the_job),
+                  (("ALREADY-DONE", "all three credentials are named"),
+                   ("ALREADY-DONE", "a sample message was written by the model"), True))
+            check("verify-writer-command-is-the-jobs-own-way-in", outcome(lambda: (
+                writer_command(wconf).startswith("PATH=%s; export PATH; " % se.DAEMON_PATH),
+                job_command(wconf).split('"$HOME/.stage-e/kit')[0] in writer_command(wconf),
+                writer_command(wconf).endswith(
+                    '"$HOME/.stage-e/kit/scripts/pipeline_voice.py" probe --config '
+                    '"$HOME/.stage-e/bridge.json"'))), (True, True, True))
+            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nfallback: "
+                                                        "CLAUDE_WRITER_OAUTH_TOKEN is not set\n"))
+            check("verify-writer-row-on: a fallback fails, with the probe's last line",
+                  (got[0], got[2]) if isinstance(got, tuple) else got,
+                  (EX_FAILED, ("FAILED", "fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set")))
+            got = outcome(lambda: writer_rows(wconf, 1, "fallback: %s\n"
+                                              % ("sk-ant-oat01-" + "q" * 40)))
+            check("verify-writer-row-on: a last line shaped like a credential is never shown",
+                  (got[2][0], "q" * 40 in got[2][1]) if isinstance(got, tuple) and got[2]
+                  else got, ("FAILED", False))
+            got = outcome(lambda: writer_rows(dict(wconf, WRITER_TOKEN_ENV="NOT_THERE_TOKEN")))
+            check("verify-writer-row-on: the credentials row needs the writer's token by name",
+                  (got[0], got[1]) if isinstance(got, tuple) else got,
+                  (EX_BLOCKED, ("BLOCKED-ON-HUMAN", "missing by name: NOT_THERE_TOKEN; run "
+                                                    "`writer-token`")))
             # KIT-284: a hand-off lane named after the install is a config to write again.
             rc, out = cap(cmd_verify, dict(conf, HANDOFF_STATES="Ready to merge"),
                           _RoleRunner(home, root, loaded=True), _FakeSudo(), now=at + 30)
@@ -1680,13 +2099,7 @@ def selftest():
             os.remove(pings_path)
             # KIT-285: the notifier row, judged by the job's own rule. Off is said as off,
             # and a file that cannot be read is UNKNOWN, never a healthy notifier. Each case
-            # runs alone, so one that raises fails as itself.
-            def outcome(fn):
-                try:
-                    return fn()
-                except Exception as exc:                          # noqa: BLE001
-                    return "raised %s: %s" % (type(exc).__name__, exc)
-
+            # runs alone (outcome), so one that raises fails as itself.
             nbeat = os.path.join(home, ".stage-e", "state", "notifier-heartbeat.json")
             nplist = root + "/Library/LaunchDaemons/com.example.notifier.plist"
             nconf = dict(conf, NOTIFIER_JOB_LABEL="com.example.notifier")
@@ -1951,7 +2364,8 @@ def selftest():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Install the Slack bridge.")
     parser.add_argument("command", nargs="?",
-                        choices=("compose", "token", "install", "verify", "card"))
+                        choices=("compose", "token", "writer-token", "install", "verify",
+                                 "card"))
     parser.add_argument("card_id", nargs="?")
     parser.add_argument("--conf", default=DEFAULT_CONF)
     parser.add_argument("--apply", action="store_true")
@@ -1959,7 +2373,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.selftest:
         return selftest()
-    if args.command in ("token", "install", "verify"):
+    if args.command in ("token", "writer-token", "install", "verify"):
         found = agent_markers_present()
         if found:
             return refused(found)
@@ -1984,6 +2398,8 @@ def main(argv=None):
     runner, sudo = se.Runner(), se.SudoSession()
     if args.command == "token":
         return cmd_token(conf, runner, sudo)
+    if args.command == "writer-token":
+        return cmd_writer_token(conf, runner, sudo)
     if args.command == "install":
         return cmd_install(conf, runner, sudo, args.apply)
     return cmd_verify(conf, runner, sudo)
