@@ -182,7 +182,7 @@ MEASURED_SPELLINGS = (
 UNTOUCHED = (
     "a regex `\\d+\\.\\d+` and \\\\ and &amp; and &lt;b&gt;",
     "```\nre.compile(r\"\\[x\\]=\\d\")\n```",
-    "email a@b.com, AT&T, 5 &lt; 6", "[model] [agent] [repo] model=opus",
+    "email a@example.com, AT&T, 5 &lt; 6", "[model] [agent] [repo] model=opus",
     "a repository=foo field", "nested [[x]] and \\[not a tag\\]", "",
     "unicode \uff3bagent\uff1dcodex\uff3d and agent\u200b=x",
     "[agent<span></span>=codex] and [ag&shy;ent=codex]",
