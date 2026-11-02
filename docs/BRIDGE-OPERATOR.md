@@ -590,7 +590,9 @@ python3 scripts/pipeline_bridge_setup.py card CK-B5
 1. In your own terminal, run `claude setup-token`. It prints a token that starts
    `sk-ant-oat`.
 2. Run `python3 scripts/pipeline_bridge_setup.py writer-token` and paste it at the hidden
-   prompt.
+   prompt. If the token wrapped onto a second line, paste it one line at a time, and press
+   Return only after the last. The prompt stops at a line break, and a token cut short is
+   refused. Then it tries the token once.
 3. Run `command -v claude`. In `bridge.conf`, set `WRITER_BIN` to the full path it prints,
    and set `WRITER=yes`. The job runs under launchd, whose PATH is short, so a bare
    `claude` will not do.
@@ -598,6 +600,10 @@ python3 scripts/pipeline_bridge_setup.py card CK-B5
 
 Good: `verify`'s `writer` row says a sample message was written by the model.
 Not that: `writer FAILED fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set`. Do step 2 again.
+Not that: `fallback: the writer exited 1: Anthropic refused the token`. The token is wrong,
+expired or revoked. Run `claude setup-token` again, then step 2.
+Not that: `… a usage limit was reached` or `… could not reach Anthropic`. The token is fine.
+Wait for the limit to reset, or check this Mac's connection.
 Not that: `could not start`. `WRITER_BIN` is not a path the role account can run. A path in
 your own home folder will not do: install claude where every account can run it. Then do
 step 3 again.

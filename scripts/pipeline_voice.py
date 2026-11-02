@@ -50,7 +50,10 @@ WHAT IT GUARANTEES
     passes the notifier's own credential scan. Anything else falls back, and says which
     check failed.
   * THE CLI'S OWN WORDS NEVER GO OUT. When the run fails, or its JSON says `is_error`, its
-    `result` is dropped unread: an auth error must not land in Slack.
+    `result` is read only to name the refusal in fixed words in `why` ("Anthropic refused
+    the token", "a usage limit was reached"; KIT-301): an auth error must not land in
+    Slack. The words themselves reach only `probe`, on the owner's own terminal, with the
+    token cut out and the credential scan run, and only when it asks (`explain`).
   * IT NEVER RAISES for any of this. A missing binary, a timeout, a non-zero exit, output
     that is not JSON, every failed check and any other fault in the writer itself each
     come back as the fallback with a reason.
@@ -435,37 +438,77 @@ def _attempt(cfg, kind, facts, fallback, keep, runner, now):
     return _read(result, s, keep, facts, token)
 
 
+# The claude CLI's refusals, as measured on 2.1.287 (KIT-301): it exits 1 and gives its
+# reason in the JSON `result`, with stderr empty. Each is named here in fixed words, first
+# match wins, so `why` says what to fix without carrying a word of the CLI's own.
+REFUSAL_REASONS = (
+    (re.compile(r"\b40[13]\b|authenticat|oauth|unauthori|token (?:is )?(?:invalid|expired|"
+                r"revoked)", re.IGNORECASE), "Anthropic refused the token"),
+    (re.compile(r"not logged in|/login\b", re.IGNORECASE),
+     "the claude CLI is not logged in, so no token reached it"),
+    (re.compile(r"usage limit|rate.?limit|\b429\b|limit reached", re.IGNORECASE),
+     "a usage limit was reached"),
+    (re.compile(r"overloaded|\b529\b", re.IGNORECASE), "Anthropic is overloaded"),
+    (re.compile(r"connect|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network|certificate|socket|"
+                r"getaddrinfo|fetch failed", re.IGNORECASE),
+     "the claude CLI could not reach Anthropic"),
+)
+
+
+def refusal_reason(said):
+    """The fixed words for a refusal the CLI described, or "" when none fits."""
+    for pattern, reason in REFUSAL_REASONS:
+        if pattern.search(said or ""):
+            return reason
+    return ""
+
+
 def _read(result, s, keep, facts, token):
-    """The model's text out of one finished run, or the reason it cannot be used."""
+    """(text or None, why, cost, said): the model's text out of one finished run, or the
+    reason it cannot be used. On a refusal `why` names it in fixed words, and `said` holds
+    the CLI's own words with the token cut out, for `probe` alone (KIT-301)."""
     code = getattr(result, "returncode", None)
-    if code != 0:
-        return None, "the writer exited %s" % code, None
     try:
         doc = json.loads(getattr(result, "stdout", None) or "")
     except ValueError:
-        return None, "the writer's output was not JSON", None
+        doc = None
+    said = ""
+    if isinstance(doc, dict) and isinstance(doc.get("result"), str) and (
+            code != 0 or doc.get("is_error") is not False):
+        said = doc["result"]
+    elif code != 0:
+        said = ((getattr(result, "stderr", None) or "").strip().splitlines() or [""])[-1]
+    if token and token.strip():
+        said = said.replace(token.strip(), "[the token]")
+    said = " ".join(said.split())[:300]
+    if code != 0:
+        reason = refusal_reason(said)
+        return None, ("the writer exited %s: %s" % (code, reason) if reason
+                      else "the writer exited %s" % code), None, said
     if not isinstance(doc, dict):
-        return None, "the writer's output was not JSON", None
+        return None, "the writer's output was not JSON", None, ""
     cost = doc.get("total_cost_usd")
     cost = float(cost) if _number(cost) else None
     # The measured auth failure says `subtype: success` beside `is_error: true`, so the
-    # subtype alone never passes a run. Its `result` is the CLI's error text: never used.
+    # subtype alone never passes a run. Its `result` is the CLI's error text: never posted.
     subtype = doc.get("subtype")
     if doc.get("is_error") is not False or (isinstance(subtype, str)
                                             and subtype.startswith("error")):
-        return None, "the writer reported an error", cost
+        reason = refusal_reason(said)
+        return None, ("the writer reported an error: %s" % reason if reason
+                      else "the writer reported an error"), cost, said
     text = doc.get("result")
     if not isinstance(text, str) or not text:
-        return None, "the writer returned no text", cost
+        return None, "the writer returned no text", cost, ""
     text = text.strip()
     why = check_text(text, s["writer_max_chars"], keep, fact_links(facts),
                      fact_ids(facts, keep), token)
     if why:
-        return None, why, cost
-    return text, "", cost
+        return None, why, cost, ""
+    return text, "", cost, ""
 
 
-def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
+def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None, explain=False):
     """One message: the model's text when it passes every check, else `fallback`.
 
     `kind` names the message ("blocked", "approve", ...). `facts` is everything the model
@@ -474,7 +517,10 @@ def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
     given (epoch seconds), is put in the prompt so times in the facts read correctly.
     `runner` stands in for subprocess.run in the selftest.
 
-    Returns {"text", "by", "why", "cost_usd"} and never raises for a writer failure.
+    Returns {"text", "by", "why", "cost_usd"} and never raises for a writer failure. With
+    `explain` (the probe only, never a caller that posts) it also returns "said": what the
+    CLI said when it refused, with the token cut out, or a note that it was hidden because
+    it was shaped like a credential (KIT-301).
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     fallback = "" if fallback is None else str(fallback)
@@ -482,14 +528,23 @@ def write(cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
         if isinstance(keep, str):
             keep = [keep]
         keep = [str(item) for item in (keep or ()) if str(item)]
-        text, why, cost = _attempt(cfg, kind, facts, fallback, keep, runner or run, now)
+        got = _attempt(cfg, kind, facts, fallback, keep, runner or run, now)
+        text, why, cost = got[:3]
+        said = got[3] if len(got) > 3 else ""
     except Exception as exc:  # noqa: BLE001 — a fault in the writer never costs the message
-        text, why, cost = None, "the writer failed (%s)" % type(exc).__name__, None
+        text, why, cost, said = None, "the writer failed (%s)" % type(exc).__name__, None, ""
     by = "model" if text is not None else "fallback"
     out = text if text is not None else fallback
     if bind:
         out += "\n\n" + str(bind)
-    return {"text": out, "by": by, "why": why, "cost_usd": cost}
+    res = {"text": out, "by": by, "why": why, "cost_usd": cost}
+    if explain:
+        try:
+            hidden = bool(said) and bool(notify.secret_hits(said))
+        except Exception:  # noqa: BLE001 — a scan that can't run shows nothing
+            hidden = bool(said)
+        res["said"] = ("(not shown: it is shaped like a credential)" if hidden else said)
+    return res
 
 
 def probe(path, runner=None, out=None):
@@ -527,11 +582,15 @@ def probe(path, runner=None, out=None):
             out.write("writer_bin %s is not on this job's PATH (%s)\n" % (name, search))
             hint = "; %s is not on this job's PATH, so give writer_bin as a full path" % name
     res = write(cfg, PROBE_KIND, PROBE_FACTS, PROBE_FALLBACK, keep=PROBE_KEEP,
-                runner=runner)
+                runner=runner, explain=True)
     out.write(res["text"] + "\n")
     if res["by"] == "model":
         out.write("written by the model\n")
         return EXIT_OK
+    if res.get("said"):
+        # The CLI's own words, for the owner reading this terminal (KIT-301). The fallback
+        # line stays last: the installers' verify reads it.
+        out.write("the claude CLI said: %s\n" % res["said"])
     out.write("fallback: %s%s\n" % (res["why"], hint if res["why"].startswith(
         "could not start") else ""))
     return EXIT_ERROR
@@ -556,8 +615,9 @@ AUTH_ERROR = "Failed to authenticate: OAuth session expired and could not be ref
 class FakeRunner:
     """Stands in for subprocess.run: records each call and answers with a canned result."""
 
-    def __init__(self, stdout="", returncode=0, raises=None):
+    def __init__(self, stdout="", returncode=0, raises=None, stderr=""):
         self.stdout, self.returncode, self.raises = stdout, returncode, raises
+        self.stderr = stderr
         self.calls = []
 
     def __call__(self, cmd, cwd=None, env=None, input=None, timeout=None):
@@ -566,7 +626,7 @@ class FakeRunner:
                            "cwd_existed": bool(cwd) and os.path.isdir(cwd)})
         if self.raises is not None:
             raise self.raises
-        return subprocess.CompletedProcess(cmd, self.returncode, self.stdout, "")
+        return subprocess.CompletedProcess(cmd, self.returncode, self.stdout, self.stderr)
 
 
 def reply(text, is_error=False, cost=0.0012, subtype="success"):
@@ -793,9 +853,43 @@ def selftest():
         fell_back("non-zero-exit", FakeRunner(reply(MODEL), returncode=1),
                   "the writer exited 1")
         res = fell_back("is-error", FakeRunner(reply(AUTH_ERROR, is_error=True, cost=0)),
-                        "the writer reported an error")
-        check("is-error-result-is-never-posted",
-              (AUTH_ERROR in res["text"], "authenticate" in res["why"]), (False, False))
+                        "the writer reported an error: Anthropic refused the token")
+        check("is-error-result-is-never-posted, and is named in fixed words (KIT-301)",
+              (AUTH_ERROR in res["text"], "authenticate" in res["why"], "said" in res),
+              (False, False, False))
+        # KIT-301: each refusal the CLI gave on 2.1.287, as measured on 31 Oct: exit 1, the
+        # reason in its JSON `result`, stderr empty. `why` names it; the words stay out.
+        for name, said, reason in (
+                ("a-401", "Failed to authenticate. API Error: 401 OAuth access token is "
+                          "invalid.", "Anthropic refused the token"),
+                ("not-logged-in", "Not logged in · Please run /login",
+                 "the claude CLI is not logged in, so no token reached it"),
+                ("a-usage-limit", "Claude AI usage limit reached|1761000000",
+                 "a usage limit was reached"),
+                ("no-connection", "API Error: Connection error.",
+                 "the claude CLI could not reach Anthropic")):
+            res = fell_back("refusal-named:" + name, FakeRunner(json.dumps(
+                {"type": "result", "subtype": "success", "is_error": True, "result": said}),
+                returncode=1), "the writer exited 1: " + reason)
+            check("refusal-words-stay-out:" + name, said in res["why"] or said in res["text"],
+                  False)
+        fell_back("refusal-on-stderr-only", FakeRunner(
+            "", returncode=1, stderr="Error: getaddrinfo ENOTFOUND api.anthropic.com\n"),
+            "the writer exited 1: the claude CLI could not reach Anthropic")
+        # Only `explain` (the probe) gets the CLI's words, with the token cut out, and a
+        # credential-shaped answer hidden whole.
+        echoed = FakeRunner(json.dumps({"is_error": True, "result": "bad token %s" % TOKEN}),
+                            returncode=1)
+        res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=echoed,
+                    explain=True)
+        check("explain-cuts-the-token-out", (res["said"], TOKEN in json.dumps(res)),
+              ("bad token [the token]", False))
+        leaky = FakeRunner(json.dumps({"is_error": True, "result": "xoxb-" + "z" * 30}),
+                           returncode=1)
+        res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=leaky,
+                    explain=True)
+        check("explain-hides-a-credential-shape", ("z" * 30 in json.dumps(res), res["said"]),
+              (False, "(not shown: it is shaped like a credential)"))
         fell_back("error-subtype", FakeRunner(reply(MODEL, subtype="error_max_turns")),
                   "the writer reported an error")
         fell_back("bad-json", FakeRunner("Failed to authenticate\n"),
@@ -958,9 +1052,12 @@ def selftest():
                   (EXIT_OK, "written by the model", "sonnet", True))
             out = io.StringIO()
             code = probe(path, runner=FakeRunner(reply(AUTH_ERROR, is_error=True)), out=out)
-            check("probe-fallback-exits-1",
-                  (code, out.getvalue().splitlines()[-1], AUTH_ERROR in out.getvalue()),
-                  (EXIT_ERROR, "fallback: the writer reported an error", False))
+            lines = out.getvalue().splitlines()
+            check("probe-fallback-exits-1: the fixed reason is last, the CLI's words on a line "
+                  "before it (KIT-301)",
+                  (code, lines[-1], AUTH_ERROR in lines[-1], lines[-2]),
+                  (EXIT_ERROR, "fallback: the writer reported an error: Anthropic refused the "
+                               "token", False, "the claude CLI said: " + AUTH_ERROR))
             err, sys.stderr = sys.stderr, io.StringIO()
             try:
                 code = probe(os.path.join(tmp, "missing.json"), runner=FakeRunner())
