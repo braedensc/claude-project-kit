@@ -860,6 +860,52 @@ def check_minor(config, r):
         )
 
 
+def glob_to_re(pat):
+    """A riskPaths glob as a regex over a '/'-separated repo-relative path: the same rule as
+    scripts/check_auto_approve.py's, held equal by the selftest. A copy, not an import, since
+    that gate imports the readiness gate, which reads this file's section."""
+    out, i = [], 0
+    while i < len(pat):
+        if pat.startswith("**/", i):
+            out.append(r"(?:[^/]+/)*"); i += 3
+        elif pat.startswith("**", i):
+            out.append(r".*"); i += 2
+        elif pat[i] == "*":
+            out.append(r"[^/]*"); i += 1
+        elif pat[i] == "?":
+            out.append(r"[^/]"); i += 1
+        else:
+            out.append(re.escape(pat[i])); i += 1
+    return "^" + "".join(out) + "$"
+
+
+def check_acceptance(config, r):
+    """§1 `acceptance`: what its schema cannot say, at the same WARNING tier (KIT-302). The
+    section gates no autonomy, it can only hold a plan's close, so a mistake here never makes
+    delivery.json broken; its consumers refuse a malformed one where they read it."""
+    acceptance = config.get("acceptance", MISSING)
+    if not isinstance(acceptance, dict):
+        return
+    serve = acceptance.get("serve") if isinstance(acceptance.get("serve"), dict) else {}
+    if "build" in acceptance and acceptance["build"] is None and serve.get("mode") != "command":
+        r.warn("acceptance",
+               "acceptance.build is null, but acceptance.serve.mode is not `command`, so "
+               "nothing would build what `serve` serves (§1 `acceptance`).")
+    fake = acceptance.get("fakeBackend")
+    if isinstance(fake, str) and fake.strip():
+        if not acceptance.get("scenarios"):
+            r.warn("acceptance",
+                   "acceptance.fakeBackend is set, but acceptance.scenarios names no data set "
+                   "for it to serve (§1 `acceptance`).")
+        risk = dig(config, "autonomy", "riskPaths")
+        globs = [g for g in risk if isinstance(g, str)] if isinstance(risk, list) else []
+        if not any(re.match(glob_to_re(g), fake) for g in globs):
+            r.warn("acceptance",
+                   f"acceptance.fakeBackend {fake} is not in autonomy.riskPaths, so a coding "
+                   f"session could change the fake it is judged against in its own pull "
+                   f"request without a person's review (§1 `acceptance`).")
+
+
 # --------------------------------------------------------------------------- #
 # Run
 # --------------------------------------------------------------------------- #
@@ -877,6 +923,7 @@ def run(config, source, repo_root, roots, schema, strict=False,
         check_commands(config, r)
         check_budgets(config, r)
         check_autonomy(config, r)
+        check_acceptance(config, r)
         check_dispatch(config, r, repo_root, roots)
         check_minor(config, r)
 
@@ -1471,6 +1518,63 @@ def selftest():
                     f"{name}: expected a warning on [{rule}], got "
                     f"{sorted({f['rule'] for f in result['warnings']})}"
                 )
+
+        # 2b'. §1 `acceptance` (KIT-302): absent or valid is clean, and every mistake in it
+        #      WARNS and never errors, so the section can never make delivery.json broken.
+        def accepting(**over):
+            section = {"build": "npm run build",
+                       "serve": {"mode": "files", "dir": "dist", "fallback": "index.html"},
+                       "fakeBackend": "tests/look/fake-backend.mjs",
+                       "scenarios": ["signed-in", "signed-out"],
+                       "viewports": {"desktop": {"width": 1280, "height": 800},
+                                     "phone": {"width": 390, "height": 844, "mobile": True}},
+                       "modes": {"dark": {"colorScheme": "dark"}},
+                       "uiPaths": ["src/**"]}
+            section.update(over)
+            config = good_config()
+            config["acceptance"] = {k: v for k, v in section.items() if v is not MISSING}
+            config["autonomy"]["riskPaths"] = (list(config["autonomy"]["riskPaths"])
+                                               + ["tests/look/**"])
+            result = run(config, "delivery.json", repo, roots, schema,
+                         live_types=live_types, live_source=HOOK_FILE)
+            return (sorted({f["rule"] for f in result["errors"]}),
+                    " ".join(f["message"] for f in result["warnings"]))
+        for name, over, want in (
+                ("valid", {}, ""),
+                ("an-absolute-build-folder", {"serve": {"mode": "files", "dir": "/tmp/dist"}},
+                 "acceptance.serve"),
+                ("a-key-it-does-not-know", {"timeout": 5}, "acceptance"),
+                ("a-remote-server", {"serve": {"mode": "command", "command": "npm start",
+                                               "url": "http://example.com:3000"}},
+                 "acceptance.serve"),
+                ("nothing-builds-what-files-mode-serves", {"build": None},
+                 "nothing would build what `serve` serves"),
+                ("a-fake-backend-serving-no-scenario", {"scenarios": MISSING},
+                 "names no data set for it to serve"),
+                ("a-fake-backend-outside-riskpaths",
+                 {"fakeBackend": "src/fake.mjs"}, "is not in autonomy.riskPaths"),
+                ("the-built-in-default-mode-redefined", {"modes": {"default": {}}},
+                 "acceptance.modes"),
+                ("no-ui-paths", {"uiPaths": MISSING}, "uiPaths")):
+            note()
+            errors, warned = accepting(**over)
+            if errors:
+                failures.append(f"acceptance/{name}: the section must never error, got {errors}")
+            if want and want not in warned:
+                failures.append(f"acceptance/{name}: expected a warning naming {want!r}, got "
+                                f"{warned!r}")
+            if not want and warned:
+                failures.append(f"acceptance/{name}: expected a clean section, got {warned!r}")
+        note()
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check_auto_approve as approve
+        for glob in ("tests/look/**", "src/*.mjs", "**/fake?.js", "a/**/b.mjs", "x.y"):
+            for path in ("tests/look/fake-backend.mjs", "src/fake.mjs", "src/a/fake.mjs",
+                         "deep/fake1.js", "a/b.mjs", "a/c/d/b.mjs", "x.y", "xzy"):
+                if bool(re.match(glob_to_re(glob), path)) != bool(
+                        re.match(approve.glob_to_re(glob), path)):
+                    failures.append(f"glob_to_re differs from check_auto_approve's on "
+                                    f"{glob!r} against {path!r}")
 
         # 2c. A staging-mirror violation must SAY WHY. The rule name alone reads
         #     as bureaucracy — "you omitted a glob" — when the actual finding is

@@ -368,6 +368,51 @@
         "schema": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "SQL schema the tables live in. Default pipeline. Must be a plain identifier — it is interpolated into SQL, so a placeholder token is not acceptable here even in the shipped example."},
         "lookbackDays": {"type": "integer", "minimum": 1, "description": "How far back a sweep reads. Default 30; the sweep is idempotent (§10), so overlap is free and a gap is not."}
       }
+    },
+
+    "acceptance": {
+      "type": "object",
+      "required": ["build", "serve", "uiPaths"],
+      "additionalProperties": false,
+      "x-rule": "acceptance",
+      "x-tier": "warning",
+      "description": "OPTIONAL. Absent ⇒ the acceptance check is off: a finished plan closes as before, and the readiness gate skips (and names) its browser-check rules. How a session runs this app for a browser check with no real services (§1 `acceptance`, §15). Judged at the WARNING tier only: it gates no autonomy, it can only hold a plan's close, so a typo here never makes delivery.json broken. Its consumers refuse a malformed one loudly at the point of use (§13).",
+      "x-fix": "§1 `acceptance`, §15. Delete the whole block to keep the acceptance check off.",
+      "properties": {
+        "setup": {"type": ["string", "null"], "pattern": "\\S", "description": "Run once on the fresh checkout before `build`, e.g. `npm ci`. null when the checkout needs nothing. Default null."},
+        "build": {"type": ["string", "null"], "pattern": "\\S", "description": "Run from the repo root on a fresh checkout of the pull request being checked; produces what `serve` serves. No secret in its environment: dummy service settings belong in the project's own script. null only with serve.mode `command`."},
+        "serve": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["mode", "dir"],
+              "additionalProperties": false,
+              "properties": {
+                "mode": {"const": "files"},
+                "dir": {"type": "string", "pattern": "^(?![/~])(?!.*(^|/)\\.\\.(/|$))\\S+$", "description": "Repo-relative folder `build` writes. The browser's requests to `origin` are answered from it: no port, no server process."},
+                "fallback": {"type": ["string", "null"], "pattern": "\\S", "description": "The file served for a path with no file. Default index.html; null answers 404."},
+                "origin": {"type": "string", "pattern": "^http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?$", "description": "The origin the app loads at. Default http://127.0.0.1:9: a loopback origin is a secure context, and Chromium refuses port 9 outright, so a request that escapes interception reaches nothing."}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["mode", "command", "url"],
+              "additionalProperties": false,
+              "properties": {
+                "mode": {"const": "command"},
+                "command": {"type": "string", "pattern": "\\S", "description": "Starts the app with its own fakes for every service. The runner stops its whole process group when the check ends."},
+                "url": {"type": "string", "pattern": "^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):[0-9]{1,5}(/\\S*)?$", "description": "Where the server answers. Loopback only."},
+                "readySeconds": {"type": "integer", "minimum": 1, "maximum": 600, "description": "How long to wait for `url` before the run is could-not-run. Default 120."}
+              }
+            }
+          ]
+        },
+        "fakeBackend": {"type": ["string", "null"], "pattern": "^(?![/~])(?!.*(^|/)\\.\\.(/|$))\\S+$", "description": "Repo-relative path of the project's fake-backend module (§15). null: no module, and every request to anything but the app's origin is aborted and listed."},
+        "scenarios": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"}, "description": "The data sets the fake backend serves, by name. A check names one; the first is the default."},
+        "viewports": {"type": "object", "minProperties": 1, "maxProperties": 6, "propertyNames": {"pattern": "^[a-z0-9][a-z0-9-]{0,39}$"}, "additionalProperties": {"$ref": "#/$defs/acceptanceViewport"}, "description": "Named screen sizes. Default desktop 1280×800 and phone 390×844 mobile."},
+        "modes": {"type": "object", "maxProperties": 12, "propertyNames": {"pattern": "^(?!default$)[a-z0-9][a-z0-9-]{0,39}$"}, "additionalProperties": {"$ref": "#/$defs/acceptanceMode"}, "description": "Named app states (a theme, a locale, reduced motion). `default` is built in and cannot be redefined."},
+        "uiPaths": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "\\S"}, "description": "Globs, in riskPaths syntax. A ticket whose Pointers or acceptance criteria name a matching path is a UI ticket (§15)."}
+      }
     }
   },
 
@@ -389,6 +434,28 @@
         },
         "maxUsd": {"type": "number", "exclusiveMinimum": 0, "x-tier": "warning"},
         "maxMinutes": {"type": "number", "exclusiveMinimum": 0, "x-tier": "warning"}
+      }
+    },
+    "acceptanceViewport": {
+      "type": "object",
+      "required": ["width", "height"],
+      "additionalProperties": false,
+      "properties": {
+        "width": {"type": "integer", "minimum": 240, "maximum": 3840},
+        "height": {"type": "integer", "minimum": 240, "maximum": 3840},
+        "mobile": {"type": "boolean", "description": "Touch, a mobile user agent and device pixel ratio 2. Default false."}
+      }
+    },
+    "acceptanceMode": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Kept equal to schemas/browser-check.schema.json $defs/mode; scripts/check_schemas.py --selftest asserts it.",
+      "properties": {
+        "colorScheme": {"enum": ["light", "dark", "no-preference"]},
+        "reducedMotion": {"enum": ["reduce", "no-preference"]},
+        "locale": {"type": "string", "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$"},
+        "timezoneId": {"type": "string", "pattern": "^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$"},
+        "localStorage": {"type": "object", "maxProperties": 20, "additionalProperties": {"type": "string", "maxLength": 2000}}
       }
     }
   }

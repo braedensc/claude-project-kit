@@ -1,0 +1,551 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/browser-check.schema.json",
+  "title": "Browser check block",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §15: a ticket's machine-runnable browser checks, one fenced json block in its `## Test plan`, or in an epic's `## How we will know it works`. Data only: every step is one verb from a closed list, interpreted by the acceptance runner, and nothing in it is evaluated as code. Shape lives here; names (viewports, modes, scenarios), criterion ranges and the one-assertion rule live in scripts/check_ticket_dor.py.",
+  "type": "object",
+  "required": [
+    "schema",
+    "checks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "pipeline-browser-check/1"
+    },
+    "modes": {
+      "type": "object",
+      "maxProperties": 6,
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/mode"
+      },
+      "description": "App states this ticket's checks may name, beyond delivery.json's acceptance.modes. A name may not repeat one delivery.json declares."
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": {
+        "$ref": "#/$defs/check"
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^/([^/\\s][^\\s]*)?$",
+      "maxLength": 300,
+      "description": "A path on the app's own origin. Never a URL, never protocol-relative."
+    },
+    "only": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/name"
+      },
+      "description": "Run this step only on these viewports (a phone menu that a desktop does not have)."
+    },
+    "mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "colorScheme": {
+          "enum": [
+            "light",
+            "dark",
+            "no-preference"
+          ]
+        },
+        "reducedMotion": {
+          "enum": [
+            "reduce",
+            "no-preference"
+          ]
+        },
+        "locale": {
+          "type": "string",
+          "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$"
+        },
+        "timezoneId": {
+          "type": "string",
+          "pattern": "^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$"
+        },
+        "localStorage": {
+          "type": "object",
+          "maxProperties": 20,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 2000
+          }
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "placeholder": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "testId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "css": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "exact": {
+          "type": "boolean"
+        },
+        "nth": {
+          "type": "integer",
+          "minimum": -1,
+          "maximum": 50
+        },
+        "within": {
+          "$ref": "#/$defs/target"
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "required": [
+        "id",
+        "viewports",
+        "modes",
+        "open",
+        "steps"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "1-based positions of the acceptance criteria this check proves. Child tickets only."
+        },
+        "scenario": {
+          "$ref": "#/$defs/name"
+        },
+        "viewports": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/name"
+          }
+        },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/name"
+          }
+        },
+        "open": {
+          "$ref": "#/$defs/path"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 25,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        },
+        "look": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 400,
+          "description": "What a person would judge in this check's screenshots, in plain words. The reviewing session judges it; the runner never does."
+        }
+      }
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "on"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "click"
+            },
+            "on": {
+              "$ref": "#/$defs/target"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "on"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "hover"
+            },
+            "on": {
+              "$ref": "#/$defs/target"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "on",
+            "text"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "fill"
+            },
+            "on": {
+              "$ref": "#/$defs/target"
+            },
+            "text": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "key"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "press"
+            },
+            "key": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9+]{1,40}$"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "reload"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "path"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "goto"
+            },
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "wait"
+            },
+            "for": {
+              "$ref": "#/$defs/target"
+            },
+            "ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "emulate"
+            },
+            "colorScheme": {
+              "enum": [
+                "light",
+                "dark",
+                "no-preference"
+              ]
+            },
+            "reducedMotion": {
+              "enum": [
+                "reduce",
+                "no-preference"
+              ]
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "on",
+            "class"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "enum": [
+                "addClass",
+                "removeClass"
+              ]
+            },
+            "on": {
+              "$ref": "#/$defs/target"
+            },
+            "class": {
+              "type": "string",
+              "pattern": "^[A-Za-z_-][A-Za-z0-9_-]{0,60}$"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "values"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "setStorage"
+            },
+            "values": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 10,
+              "additionalProperties": {
+                "type": "string",
+                "maxLength": 2000
+              }
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "name"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "screenshot"
+            },
+            "name": {
+              "$ref": "#/$defs/name"
+            },
+            "on": {
+              "$ref": "#/$defs/target"
+            },
+            "full": {
+              "type": "boolean"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "on"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "expect"
+            },
+            "on": {
+              "$ref": "#/$defs/target"
+            },
+            "at": {
+              "enum": [
+                "first-paint"
+              ]
+            },
+            "part": {
+              "enum": [
+                "placeholder",
+                "before",
+                "after",
+                "marker"
+              ]
+            },
+            "visible": {
+              "type": "boolean"
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 500
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "hasClass": {
+              "type": "string",
+              "pattern": "^[A-Za-z_-][A-Za-z0-9_-]{0,60}$"
+            },
+            "lacksClass": {
+              "type": "string",
+              "pattern": "^[A-Za-z_-][A-Za-z0-9_-]{0,60}$"
+            },
+            "attr": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 4,
+              "propertyNames": {
+                "pattern": "^[a-z][a-z0-9-]{0,40}$"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "maxLength": 200
+              }
+            },
+            "css": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 4,
+              "propertyNames": {
+                "pattern": "^[a-z][a-z-]{0,40}$"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            },
+            "contrast": {
+              "type": "object",
+              "required": [
+                "min"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "min": {
+                  "type": "number",
+                  "minimum": 1,
+                  "maximum": 21
+                }
+              }
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$comment": "PLANNER-AUTHORED ⇒ DATA, NEVER AUTHORITY. A block that conforms earns a plan nothing: it tells the acceptance session what to look at, and the look tool runs it under the kit's own sandbox. A step verb outside the closed list is refused, never guessed at."
+}
