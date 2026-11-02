@@ -13085,6 +13085,12 @@ def _selftest_body():
                os.path.basename(hbm.heartbeat_path(_mcfg)) == os.path.basename(MONITOR_HEARTBEAT)
                and _mcfg["monitor_state_dir"] == _mcfg["state_dir"]
                and MONITOR_HEARTBEAT.startswith("state/"), "heartbeat path drifted")
+        # KIT-300 review: the step reads the monitor's awake marks from this file, so a
+        # rename on either side would quietly bring back the after-sleep false alarm.
+        expect("monitor-names-agree",
+               os.path.dirname(hbm.state_path(_mcfg)) == _mcfg["monitor_state_dir"]
+               and os.path.basename(hbm.state_path(_mcfg)) == os.path.basename(MONITOR_STATE)
+               and MONITOR_STATE.startswith("state/"), "monitor state path drifted")
     except hbm.MonitorError as exc:
         failures.append("monitor-config-accepted: the monitor refused this file's config: %s" % exc)
     expect("monitor-names-agree",
@@ -13366,7 +13372,11 @@ def _selftest_body():
         def _awake_monitor(beat_age, awake_since, marks=True):
             ctx_a, fake_a = _monitor_ctx(beat_age=beat_age)
             clock_now, now_wall = 100000.0, time.time()
-            state = {"awake_marks": [[now_wall - beat_age, clock_now - awake_since]]}
+            # The mark is taken at the beat's own recorded time, which is cut to the whole
+            # second, so the awake age is exactly `awake_since` (KIT-300 review: a mark from
+            # a fresh clock reading sat up to a second later, and the age could read 1501).
+            beat_doc = json.loads(next(a[2] for a in fake_a.answers if a[0] == MONITOR_HEARTBEAT))
+            state = {"awake_marks": [[_heartbeat_epoch(beat_doc), clock_now - awake_since]]}
             if marks:
                 fake_a.answers = [(MONITOR_STATE, 0, json.dumps(state))] + list(fake_a.answers)
             saved = (hbm._awake_clock, hbm._boot_wall)
