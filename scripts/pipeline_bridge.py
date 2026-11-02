@@ -503,6 +503,9 @@ REQUEST_RE = re.compile(r"^(plan|replan|approve)\s+(%s)$" % TICKET_RE, re.IGNORE
 # into Plan it this recent with no run yet may be the one the planner is starting on now.
 REPLAN_RUN_ENDED = ("completed", "canceled")
 REPLAN_SETTLE_SECONDS = 15 * 60
+# Said after a re-plan's outcome while its attribution comment is still owed (KIT-244).
+REPLAN_COMMENT_OWED = (" The idea was moved, but the comment naming who approved it could not "
+                       "be written; I will try again.")
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
@@ -3403,31 +3406,13 @@ class Pass(object):
 
         A run and a plan count only when the owner's key filed them, as the planner and the
         executor do: a session can write a ticket that looks like either."""
-        ident, plan_it, owner = (issue["identifier"], self.cfg["plan_it_state"],
-                                 self.cfg["owner_user_id"])
+        ident, plan_it = issue["identifier"], self.cfg["plan_it_state"]
         if (issue.get("state") or {}).get("name") != plan_it:
             return ("%s isn't in %s, so there is no planning to repeat." % (ident, plan_it),
                     "To plan it, type `plan %s`." % ident, "not in plan it"), [], None
-        live = self.tracker.live_work(issue["id"])
-        if live:
-            return ("%s looks like live work, so I won't plan it again: %s."
-                    % (ident, "; ".join(live)), "", "live work"), [], None
-        runs = self.tracker.planning_runs(team, ident, owner)
-        going = sorted((r["identifier"] for r in runs if ((r.get("state") or {}).get("type"))
-                        not in REPLAN_RUN_ENDED), key=ticket_number)
-        if going:
-            return ("%s is still being planned, in %s." % (ident, ", ".join(going)),
-                    "Ask again once that run has finished.", "run open"), runs, None
-        names = [r["identifier"] for r in runs]
-        standing = sorted((p for p in self.tracker.filed_plans(team, names, owner)
-                           if ((p.get("state") or {}).get("type")) != "canceled"),
-                          key=lambda p: ticket_number(p.get("identifier")))
-        if standing:
-            return ("%s already has a plan: %s." % (ident, ", ".join(
-                "%s (%s)" % (p.get("identifier") or "?", (p.get("state") or {}).get("name")
-                             or "?") for p in standing)),
-                    "Approve that plan, or cancel it before you plan the idea again.",
-                    "plan filed"), runs, None
+        refusal, runs = self.replan_work_refusal(issue, team)
+        if refusal:
+            return refusal, runs, None
         state_id, why = self.tracker.team_state(team, plan_it)
         if not state_id:
             return ("I can't plan %s again: %s." % (ident, why), "", "no state"), runs, None
@@ -3444,6 +3429,34 @@ class Pass(object):
                         "Give it %d minutes, then ask again." % (REPLAN_SETTLE_SECONDS // 60),
                         "planner not started"), runs, None
         return None, runs, (newest or {}).get("id")
+
+    def replan_work_refusal(self, issue, team):
+        """((text, bind, why) or None, the idea's planning runs): live work, a planning run
+        still going, or a plan that stands. Read before a fresh re-plan moves anything, and
+        again before a re-plan under way moves its idea back into Plan it, since any of them
+        may have appeared since its yes (KIT-358)."""
+        ident, owner = issue["identifier"], self.cfg["owner_user_id"]
+        live = self.tracker.live_work(issue["id"])
+        if live:
+            return ("%s looks like live work, so I won't plan it again: %s."
+                    % (ident, "; ".join(live)), "", "live work"), []
+        runs = self.tracker.planning_runs(team, ident, owner)
+        going = sorted((r["identifier"] for r in runs if ((r.get("state") or {}).get("type"))
+                        not in REPLAN_RUN_ENDED), key=ticket_number)
+        if going:
+            return ("%s is still being planned, in %s." % (ident, ", ".join(going)),
+                    "Ask again once that run has finished.", "run open"), runs
+        names = [r["identifier"] for r in runs]
+        standing = sorted((p for p in self.tracker.filed_plans(team, names, owner)
+                           if ((p.get("state") or {}).get("type")) != "canceled"),
+                          key=lambda p: ticket_number(p.get("identifier")))
+        if standing:
+            return ("%s already has a plan: %s." % (ident, ", ".join(
+                "%s (%s)" % (p.get("identifier") or "?", (p.get("state") or {}).get("name")
+                             or "?") for p in standing)),
+                    "Approve that plan, or cancel it before you plan the idea again.",
+                    "plan filed"), runs
+        return None, runs
 
     def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
         if not self.cfg["agent_user_name"].strip():
@@ -3589,6 +3602,40 @@ class Pass(object):
                 return "was changed after I asked it" if m.get("edited") else None
         return gone
 
+    def refused_foreign(self, channel, thread, q, msg, where, word):
+        """True, having said so, when something the bridge can't vouch for posted between
+        the question and this bare answer: it may be answering that instead."""
+        if not self.foreign_post_after(channel, q, msg):
+            return False
+        # The writer is told which question, since only the bind names it here.
+        self.post(channel, thread, "Something other than me posted %s after my question, "
+                  "so I can't be sure which question you are answering." % where,
+                  kind="foreign-post", bind="Reply `%s %s` to answer the one about %s."
+                  % (word, q["ticket"], q["ticket"]), join=" ",
+                  facts={"ticket": q["ticket"]},
+                  plain="Something other than me posted %s after my question about %s, "
+                        "so I can't be sure which question you are answering."
+                        % (where, q["ticket"]))
+        self.mark(channel, msg, "refused: something else posted after the question")
+        self.counts["refused"] += 1
+        return True
+
+    def refused_sender(self, channel, thread, q, msg):
+        """True, having said so, when the message or its sender can't answer: a bot, an
+        app, a guest, an edited message, a member not listed."""
+        why = message_refusal(msg, self.me)
+        if why is None:
+            why = account_refusal(self.account(msg["user"]), self.me, self.cfg)
+        if not why:
+            return False
+        self.post_refusal(channel, thread, "I can't take that as an answer to the question "
+                          "about %s: %s." % (q["ticket"], why), why, "answer-refused",
+                          q["ticket"])
+        self.mark(channel, msg, "refused: %s" % why)
+        self.counts["refused"] += 1
+        self.say("  refused an answer on %s: %s" % (q["ticket"], why))
+        return True
+
     def answer(self, channel, msg, is_yes, hint):
         """A yes or no. In a channel it answers the open question in its thread. In a DM a
         question is a message of its own (KIT-295): an answer of its own answers the open
@@ -3634,11 +3681,12 @@ class Pass(object):
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
             self.act_followup(channel, thread, q, msg)
             return
-        if q.get("kind") == "replan" and q.get("replanning"):
-            # A re-plan under way, its pass cut (KIT-244 review): the idea may wait outside
-            # Plan it, so no check below may close or refuse it first. The yes that began it
-            # was judged then, and act_replan finishes it from where it stopped.
-            self.act_replan(channel, thread, q, msg)
+        if q.get("kind") == "replan" and q.get("replanning") and self.settle_replan(q):
+            # A re-plan under way, its pass cut (KIT-244 review): its idea may wait outside
+            # Plan it, so nothing here may CLOSE it. Only the yes that began it skips the
+            # checks below, and a `no` never moves it (KIT-358). One whose first move never
+            # landed is an ordinary question again, and is judged below like any other.
+            self.answer_replan_under_way(channel, thread, q, msg, is_yes, hint, where, word)
             return
         # From here on a question's status changes only AFTER the reply saying so is
         # posted: a failed post leaves it open, and the next pass says it.
@@ -3651,29 +3699,9 @@ class Pass(object):
             self.mark(channel, msg, "refused: question %s" % closed)
             self.counts["refused"] += 1
             return
-        if not hint and self.foreign_post_after(channel, q, msg):
-            # The writer is told which question, since only the bind names it here.
-            self.post(channel, thread, "Something other than me posted %s after my question, "
-                      "so I can't be sure which question you are answering." % where,
-                      kind="foreign-post", bind="Reply `%s %s` to answer the one about %s."
-                      % (word, q["ticket"], q["ticket"]), join=" ",
-                      facts={"ticket": q["ticket"]},
-                      plain="Something other than me posted %s after my question about %s, "
-                            "so I can't be sure which question you are answering."
-                            % (where, q["ticket"]))
-            self.mark(channel, msg, "refused: something else posted after the question")
-            self.counts["refused"] += 1
+        if not hint and self.refused_foreign(channel, thread, q, msg, where, word):
             return
-        why = message_refusal(msg, self.me)
-        if why is None:
-            why = account_refusal(self.account(msg["user"]), self.me, self.cfg)
-        if why:
-            self.post_refusal(channel, thread, "I can't take that as an answer to the question "
-                              "about %s: %s." % (q["ticket"], why), why, "answer-refused",
-                              q["ticket"])
-            self.mark(channel, msg, "refused: %s" % why)
-            self.counts["refused"] += 1
-            self.say("  refused an answer on %s: %s" % (q["ticket"], why))
+        if self.refused_sender(channel, thread, q, msg):
             return
         # Judged by when the answer was SENT: a yes sent in time while the Mac slept counts.
         if ts_float(msg.get("ts")) - q["asked_at"] > self.cfg["question_ttl_hours"] * 3600:
@@ -3852,6 +3880,143 @@ class Pass(object):
         self.say("  acted: moved %s to %s for %s" % (q["ticket"], self.cfg["plan_it_state"],
                                                      msg["user"]))
 
+    def settle_replan(self, q):
+        """True when a re-plan under way may have its idea outside Plan it: its first move
+        was recorded, or the tracker shows the idea where that move sent it (the move landed
+        and its record was cut, so the record is healed). False when the first move never
+        landed: the record is dropped, and the question is an ordinary one again, judged
+        like any other (KIT-358). A tracker that can't be read raises, so the caller says
+        so rather than guess."""
+        rec = q.get("replanning") or {}
+        if rec.get("parked"):
+            return True
+        state = ((self.tracker.issue(q["ticket"]) or {}).get("state") or {})
+        if state.get("id") == rec.get("park"):
+            rec["parked"] = True
+            return True
+        if state.get("name") == self.cfg["plan_it_state"]:
+            q.pop("replanning", None)
+            return False
+        # Moved on, or gone: whether the first move landed can't be told, so the re-plan
+        # stays, and what comes next says where the idea is (KIT-358 review).
+        return True
+
+    def explain_replan_move(self, issue, q):
+        """The comment naming who said yes, for a re-plan whose first move landed while its
+        reply was lost, so the comment was never written (KIT-358 review). Written as soon
+        as the bridge learns the move landed, or owed like any attribution. Its words claim
+        no move back: that may never come. True when the record changed; the caller saves
+        it at once, so a pass cut later never writes it twice."""
+        rec = q.get("replanning") or {}
+        if (not rec.get("parked") or rec.get("commented") or not (issue or {}).get("id")
+                or self.dry):
+            return False
+        by = rec.get("by")
+        name = self.name_of(by)
+        who = "**%s** (Slack user %s)" % (name, by) if name != by else "Slack user %s" % by
+        body = ("The Slack bridge moved this idea out of %s to %s for %s, who said yes in "
+                "Slack at %s, to plan it again."
+                % (self.cfg["plan_it_state"], rec.get("park_name") or "the backlog", who,
+                   iso(ts_float(rec.get("said_at")))))
+        try:
+            self.tracker.comment(issue["id"], body)
+        except BridgeError as exc:
+            self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
+                     % (q["ticket"], exc))
+            self.owe(issue["id"], q["ticket"], body)
+        rec["commented"] = True
+        return True
+
+    def stranded_line(self, q):
+        """What every pass says of a re-plan left unfinished: what is true, and the answer
+        that can end it now (KIT-358 review). With acting off, or the settings changed since
+        it began, no yes can finish it, so only a `no` is offered."""
+        ticket = q["ticket"]
+        head = ("%s: a re-plan began for a yes and has not finished, and the idea may be "
+                "waiting in %s." % (ticket, q["replanning"].get("park_name") or "the backlog"))
+        if not self.cfg["act"]:
+            return head + (" Acting is switched off, so reply `no %s` where it was asked to "
+                           "leave it there, or switch acting on and reply `yes %s`"
+                           % (ticket, ticket))
+        if q.get("promised") != self.promised(q["kind"], q.get("team")):
+            return head + (" My settings changed since it began, so reply `no %s` where it "
+                           "was asked to leave it there; then, to plan it, type `plan %s`"
+                           % (ticket, ticket))
+        if q["replanning"].get("blocked"):
+            return head + (" I can't move it back into %s: %s. Fix that, then reply `yes %s` "
+                           "where it was asked, or `no %s` to leave it there"
+                           % (self.cfg["plan_it_state"], q["replanning"]["blocked"], ticket,
+                              ticket))
+        return head + (" Reply `yes %s` where it was asked to finish it, or `no %s` to leave "
+                       "it there" % (ticket, ticket))
+
+    def answer_replan_under_way(self, channel, thread, q, msg, is_yes, hint, where, word):
+        """An answer to a re-plan a yes began and a pass left unfinished, its idea maybe
+        waiting outside Plan it (KIT-244). The yes that began it, read again, finishes it:
+        it was judged when it began. Any other message is judged now, as an answer to any
+        question is (KIT-358). A refusal leaves the re-plan open and loud, never closed. A
+        `no` never moves the idea, and acting switched off moves nothing."""
+        rec = q["replanning"]
+        began_it = (msg.get("user") == rec.get("by")
+                    and msg.get("ts") == rec.get("said_at"))
+        if not began_it:
+            if not hint and self.refused_foreign(channel, thread, q, msg, where, word):
+                return
+            if self.refused_sender(channel, thread, q, msg):
+                return
+        park_name = rec.get("park_name") or "the backlog"
+        plan_it_name = self.cfg["plan_it_state"]
+        issue = self.tracker.issue(q["ticket"]) or {}
+        if self.explain_replan_move(issue, q):
+            self.save()
+        if not is_yes:
+            # Never a move: a `no` leaves the idea where it is now, and says where.
+            where_now = issue.get("state") or {}
+            if where_now.get("id") == rec.get("park"):
+                text = ("OK, I won't move %s back into %s. It stays in %s, where this re-plan "
+                        "put it, so no planning run starts."
+                        % (q["ticket"], plan_it_name, park_name))
+                bind = "To plan it again, type `plan %s`." % q["ticket"]
+            else:
+                text = "OK, I won't do anything more on %s. It's in %s now." % (
+                    q["ticket"], notify.safe_title(where_now.get("name") or "another state"))
+                bind = ""
+            self.post(channel, thread, text, kind="declined", bind=bind, join=" ",
+                      facts={"ticket": q["ticket"]})
+            q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, "declined: %s mid re-plan" % q["ticket"])
+            self.counts["declined"] += 1
+            return
+        # A yes: act_replan decides on its own read of the idea, the read any move would
+        # follow, so acting off or changed settings are judged against where the idea is
+        # then, never against this earlier read (KIT-358 review, round 3).
+        self.act_replan(channel, thread, q, msg)
+
+    def replan_waits(self, channel, thread, q, msg):
+        """A yes to a re-plan whose idea waits in the park state, while acting is off or the
+        settings changed since it began: nothing moves, and the re-plan stays open, so
+        every pass says it until a yes with acting on finishes it, or a `no` ends it. A move
+        by hand is never offered: a later yes would read it as the bridge's own. True when
+        it refused."""
+        if not self.cfg["act"]:
+            why = "acting is switched off here"
+            bind = ("Switch acting on and reply `yes %s` to finish it, or reply `no %s` to "
+                    "leave it there." % (q["ticket"], q["ticket"]))
+        elif q.get("promised") != self.promised(q["kind"], q.get("team")):
+            why = "my settings changed since this re-plan began"
+            bind = ("Reply `no %s` to leave it there; then, to plan it, type `plan %s`."
+                    % (q["ticket"], q["ticket"]))
+        else:
+            return False
+        self.post(channel, thread, "I can't finish planning %s again: %s, so I moved nothing. "
+                  "It may be waiting in %s." % (q["ticket"], why,
+                                                q["replanning"].get("park_name")
+                                                or "the backlog"),
+                  kind="replan-waits", bind=bind, join=" ", facts={"ticket": q["ticket"]})
+        self.mark(channel, msg, "refused: %s, mid re-plan" % why)
+        self.counts["refused"] += 1
+        return True
+
     def act_replan(self, channel, thread, q, msg):
         """Move the idea out of Plan it to its team's first backlog state and straight back
         in, as the owner, so the planner sees a new move and starts a new run (KIT-244).
@@ -3889,11 +4054,31 @@ class Pass(object):
                                   "more was" if under_way else "was"), "refused: team")
             return
         plan_it, why = self.tracker.team_state(team, plan_it_name)
-        if not plan_it:
+        parked_now = (issue.get("state") or {}).get("id") == (under_way or {}).get("park")
+        if under_way and parked_now and self.replan_waits(channel, thread, q, msg):
+            # Judged on this read, the one the move back would follow (KIT-358 review).
+            return
+        if not plan_it and under_way and parked_now:
+            # Its idea waits outside Plan it: said, and kept open and loud, never closed
+            # quietly. The pass's line names the cause until it is fixed (KIT-358).
+            under_way["blocked"] = why
+            self.save()
+            self.post(channel, thread, "I can't move %s back into %s: %s. It may be waiting in "
+                      "%s." % (q["ticket"], plan_it_name, why,
+                               under_way.get("park_name") or "the backlog"),
+                      kind="replan-waits", bind="Fix that, then reply `yes %s`, or reply `no %s` "
+                      "to leave it there." % (q["ticket"], q["ticket"]), join=" ",
+                      facts={"ticket": q["ticket"]})
+            self.mark(channel, msg, "refused: no state, mid re-plan")
+            self.counts["refused"] += 1
+            return
+        if not plan_it and not under_way:
             finish(REFUSED, "I can't move %s: %s." % (q["ticket"], why), "refused: no state")
             return
         if under_way:
-            self.resume_replan(issue, plan_it, q, msg, finish)
+            # Its idea elsewhere needs no Plan it state: resume_replan leaves it where it is.
+            under_way.pop("blocked", None)
+            self.resume_replan(issue, team, plan_it, q, msg, finish)
             return
         if ticket_fingerprint(issue) != q.get("fingerprint"):
             finish(REFUSED, "%s changed since I asked (its title, text, team, labels or "
@@ -3945,7 +4130,10 @@ class Pass(object):
         words say what this yes does, so they hold however the move back turns out."""
         rec = q["replanning"]
         if rec.get("commented"):
-            return ""
+            # Written earlier, or owed: say so while it is still owed (KIT-358 review), since
+            # explain_replan_move may have owed it before this pass got here.
+            return REPLAN_COMMENT_OWED if any(
+                o.get("ticket") == q["ticket"] for o in self.state["owed"]) else ""
         by, said_at = replan_yes(q, msg)
         body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
                 "who said yes in Slack at %s. It moves the idea out of %s to %s and straight "
@@ -3960,8 +4148,7 @@ class Pass(object):
             self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
                      % (q["ticket"], exc))
             self.owe(issue["id"], q["ticket"], body)
-            owed = (" The idea was moved, but the comment naming who approved it could not "
-                    "be written; I will try again.")
+            owed = REPLAN_COMMENT_OWED
         rec["commented"] = True
         self.save()
         return owed
@@ -4000,9 +4187,11 @@ class Pass(object):
             # It landed, and only the reply was lost: the history says the rest.
         self.replan_verify(issue, plan_it, q, msg, finish, owed)
 
-    def replan_verify(self, issue, plan_it, q, msg, finish, owed):
+    def replan_verify(self, issue, plan_it, q, msg, finish, owed, acted=True):
         """The planner starts a run only on a move its own reading of the history shows: a
-        new move into Plan it, by the owner, since the one the question stood on."""
+        new move into Plan it, by the owner, since the one the question stood on. `acted` is
+        whether this pass made the move back: a pass that only reads it counts no action
+        (KIT-358 review, round 3)."""
         rec, plan_it_name = q["replanning"], self.cfg["plan_it_state"]
         by = replan_yes(q, msg)[0]
         unseen = ""
@@ -4024,14 +4213,34 @@ class Pass(object):
             finish(DONE, "Moved %s out of %s and back in for <@%s>. The planner starts a new "
                    "run within a few minutes.%s" % (q["ticket"], plan_it_name, by, owed),
                    "done: replanned %s" % q["ticket"], kind="replan-moved")
-        self.counts["acted"] = self.counts.get("acted", 0) + 1
-        self.say("  acted: moved %s out of %s and back in for %s"
-                 % (q["ticket"], plan_it_name, by))
+        if acted:
+            self.counts["acted"] = self.counts.get("acted", 0) + 1
+            self.say("  acted: moved %s out of %s and back in for %s"
+                     % (q["ticket"], plan_it_name, by))
 
-    def resume_replan(self, issue, plan_it, q, msg, finish):
-        """Finish a re-plan an earlier pass began and did not end (KIT-244). The yes was
-        recorded as under way before the first move, so it is never judged again as a fresh
-        question: where the idea is now says where that pass stopped."""
+    def replan_changed(self, issue, plan_it, q, runs):
+        """(text, bind, why) or None: what the question showed, changed since it was asked,
+        checked before a re-plan under way moves its idea back (KIT-358 review): the idea's
+        title, text, team and labels, read as if it were still in Plan it, since this
+        re-plan moved it out; its newest planning run; and a move into Plan it since. A
+        question stood on its creation when the idea was made in Plan it, and after this
+        re-plan's own move out the history names no such trigger, which is no new move."""
+        if ticket_fingerprint(dict(issue, state={"id": plan_it})) != q.get("fingerprint"):
+            return ("%s changed since I asked (its title, text, team or labels)."
+                    % q["ticket"], "", "changed since asked")
+        newest = self.tracker.plan_trigger(issue["id"], plan_it)
+        moved_in = bool(newest and not newest.get("creation")
+                        and newest.get("id") != q.get("newest_move"))
+        if moved_in or newest_run(runs) != q.get("last_run"):
+            return ("%s's planning changed since I asked (a new run or a new move)."
+                    % q["ticket"], "", "planning changed since asked")
+        return None
+
+    def resume_replan(self, issue, team, plan_it, q, msg, finish):
+        """Finish a re-plan an earlier pass began and did not end (KIT-244). Its first move
+        landed (settle_replan), so where the idea is now says where that pass stopped. Before
+        the idea goes back into Plan it, the checks a fresh yes gets on the idea's work run
+        again: a run or a plan since the yes would make a second (KIT-358)."""
         rec = q["replanning"]
         where = (issue.get("state") or {})
         if where.get("id") not in (rec.get("park"), plan_it):
@@ -4041,18 +4250,34 @@ class Pass(object):
                    "done: %s moved elsewhere mid re-plan" % q["ticket"], kind="replan-partial",
                    bind="To plan it, type `plan %s`." % q["ticket"])
             return
+        if where.get("id") == plan_it and not rec.get("parked"):
+            # Not reached through answer(), which drops a record whose first move never
+            # landed: never two moves on a yes that no check has judged now (KIT-358).
+            q.pop("replanning", None)
+            finish(REFUSED, "Nothing has moved %s yet, so I've closed this re-plan."
+                   % q["ticket"], "refused: nothing under way",
+                   bind="Ask again with `replan %s`." % q["ticket"])
+            return
+        if where.get("id") == rec.get("park"):
+            refusal, runs = self.replan_work_refusal(issue, team)
+            if not refusal:
+                refusal = self.replan_changed(issue, plan_it, q, runs)
+            if refusal:
+                text, bind, why = refusal
+                finish(REFUSED, "%s So I've left %s in %s, where this re-plan put it." % (
+                    text, q["ticket"], rec.get("park_name") or "the backlog"),
+                    "refused mid re-plan: " + why,
+                    bind=bind or "To plan it again, type `plan %s`." % q["ticket"])
+                return
         if self.dry:
             self.say("  [dry-run] would finish planning %s again" % q["ticket"])
-            return
-        if where.get("id") == plan_it and not rec.get("parked"):
-            # The first move never landed: do both now.
-            self.replan_moves(issue, plan_it, q, msg, finish)
             return
         owed = self.replan_attribution(issue, q, msg)
         if where.get("id") == rec.get("park"):
             self.replan_back(issue, plan_it, q, msg, finish, owed)
         else:
-            self.replan_verify(issue, plan_it, q, msg, finish, owed)
+            # Both moves landed in an earlier pass: this one only reads the history.
+            self.replan_verify(issue, plan_it, q, msg, finish, owed, acted=False)
 
     def act_approve(self, channel, thread, q, msg):
         """Move the epic to its team's ready state, as the owner, and record it as approved,
@@ -4867,24 +5092,173 @@ class Pass(object):
     def expire(self):
         ttl = self.cfg["question_ttl_hours"] * 3600
         for q in self.state["questions"].values():
-            # A re-plan under way is never closed by the clock: its idea may wait outside
-            # Plan it. run() says it each pass until a yes finishes it (KIT-244 review).
-            if q.get("status") == OPEN and not q.get("replanning") and (
-                    self.now - q.get("asked_at", 0) > ttl):
-                q["status"] = EXPIRED
-                self.counts["expired"] += 1
+            if q.get("status") != OPEN or self.now - q.get("asked_at", 0) <= ttl:
+                continue
+            # A re-plan under way whose idea may wait outside Plan it is never closed by the
+            # clock: run() says it each pass until a yes or a `no` ends it (KIT-244 review).
+            # One whose first move never landed is an ordinary question (KIT-358).
+            if q.get("replanning") and self.replan_may_wait(q):
+                continue
+            q["status"] = EXPIRED
+            self.counts["expired"] += 1
+
+    def replan_may_wait(self, q):
+        """settle_replan for the end of a pass: a tracker that can't be read counts as the
+        idea maybe waiting outside Plan it, which keeps the re-plan and the pass loud."""
+        try:
+            return self.settle_replan(q)
+        except BridgeError as exc:
+            self.say("  could not read %s to settle its re-plan: %s" % (q.get("ticket"), exc))
+            return True
+
+    def watched(self, channel):
+        """True for a channel this bridge reads: a listed channel, or a listed member's DM."""
+        return (channel in self.cfg["channel_ids"] or channel in self.dm_channels
+                or channel in self.state["dms"].values())
 
     def stranded_replans(self):
         """Re-plans begun for a yes and not finished by the end of this pass: their yes
         was cut short, deleted, or is past the window read (KIT-244 review). The idea may
-        wait outside Plan it, so each keeps the pass loud until a yes finishes it."""
+        wait outside Plan it, so each keeps the pass loud until a yes finishes it or a `no`
+        ends it (KIT-358). One whose first move never landed waits for nothing. One whose
+        idea is back in Plan it, moved on or gone has nothing left to do, and is ended,
+        said once. One asked where this bridge no longer reads can't be answered there, so
+        it is ended, and said in Slack where the notifier watch speaks, for a lasting
+        trace (KIT-358 review)."""
+        changed = False
         for q in self.state["questions"].values():
-            if q.get("kind") == "replan" and q.get("replanning") and q.get("status") == OPEN:
+            if not (q.get("kind") == "replan" and q.get("replanning")
+                    and q.get("status") == OPEN):
+                continue
+            had = dict(q["replanning"])
+            if not self.replan_may_wait(q):
+                changed = True
+                continue
+            changed = changed or q.get("replanning") != had
+            ticket, park = q["ticket"], q["replanning"].get("park_name") or "the backlog"
+            try:
+                issue = self.tracker.issue(ticket) or {}
+            except BridgeError as exc:
                 self.replan_errors.append(
-                    "%s: a re-plan began for a yes and has not finished, and the idea may be "
-                    "waiting in %s. Reply `yes %s` where it was asked to finish it"
-                    % (q["ticket"], q["replanning"].get("park_name") or "the backlog",
-                       q["ticket"]))
+                    "%s: a re-plan began for a yes and has not finished, and I could not read "
+                    "where the idea is (%s)" % (ticket, exc))
+                continue
+            parked = (issue.get("state") or {}).get("id") == q["replanning"].get("park")
+            if self.dry:
+                # A rehearsal says what this pass would do, and does none of it.
+                self.replan_errors.append(
+                    "%s: [dry-run] would close the re-plan, since its idea has left %s"
+                    % (ticket, park) if not parked else
+                    "%s: [dry-run] would close the re-plan and say so in Slack, since it was "
+                    "asked where this bridge no longer reads" % ticket
+                    if not self.watched(q.get("channel")) else self.stranded_line(q))
+                continue
+            # Each change is saved as it is made: a pass cut later in this loop must never
+            # write the comment, or post the note, twice (KIT-358 review).
+            if self.explain_replan_move(issue, q):
+                self.save()
+            if not parked:
+                try:
+                    self.end_stranded_replan(q, issue)
+                except BridgeError as exc:
+                    self.replan_errors.append(
+                        "%s: a re-plan began for a yes, its idea has left %s, and I could not "
+                        "close it (%s)" % (ticket, park, exc))
+                    continue
+                self.save()
+                continue
+            if q["replanning"].get("blocked"):
+                # Named until it is fixed: read again, so a fix ends the line (KIT-358 review).
+                team = (issue.get("team") or {}).get("key")
+                try:
+                    found = team and self.tracker.team_state(team, self.cfg["plan_it_state"])[0]
+                except BridgeError:
+                    found = None
+                if found:
+                    q["replanning"].pop("blocked", None)
+                    self.save()
+            if not self.watched(q.get("channel")):
+                # Said once in each place the notifier watch speaks, each recorded as it is
+                # said. Closed once any place has heard it; a place that refuses is named.
+                told = q["replanning"].setdefault("told", [])
+                refused = []
+                for channel in self.watch_destinations():
+                    if channel in told:
+                        continue
+                    try:
+                        self.post(channel, None, "I closed the re-plan of %s: it was asked "
+                                  "where I no longer read, so nobody can answer it there. It "
+                                  "may be waiting in %s." % (ticket, park), kind="replan-closed",
+                                  bind="To plan it, type `plan %s`." % ticket, join=" ",
+                                  facts={"ticket": ticket})
+                    except BridgeError as exc:
+                        refused.append("%s (%s)" % (channel, exc))
+                        continue
+                    told.append(channel)
+                    self.save()
+                if not told:
+                    self.replan_errors.append(
+                        "%s: a re-plan was asked where this bridge no longer reads, and I could "
+                        "not say so in Slack: %s" % (ticket, "; ".join(refused)))
+                    continue
+                q["status"] = EXPIRED
+                self.save()
+                self.replan_errors.append(
+                    "%s: a re-plan began for a yes and can't be finished: it was asked where "
+                    "this bridge no longer reads, so I have closed it and said so in Slack%s. "
+                    "The idea may be waiting in %s. To plan it, type `plan %s`"
+                    % (ticket, " (not in %s)" % "; ".join(refused) if refused else "", park,
+                       ticket))
+                continue
+            self.replan_errors.append(self.stranded_line(q))
+        if changed:
+            self.save()
+
+    def end_stranded_replan(self, q, issue):
+        """End a re-plan whose idea is no longer where it moved it (KIT-358 review), saying
+        so where it was asked, or where the notifier watch speaks when that is no longer
+        read. Back in Plan it, the history is read the planner's way, as the yes that
+        finishes it would read it: the bridge's own move back, its pass cut, and a person's
+        move by hand look alike, and either starts a run only if the history shows it.
+        Moved on, or gone, the idea is left where it is."""
+        rec, ticket = q["replanning"], q["ticket"]
+        if self.watched(q.get("channel")):
+            places = [(q["channel"], q.get("thread"))]
+        else:
+            # Each place the notifier watch speaks, in turn, until one takes it.
+            places = [(channel, None) for channel in self.watch_destinations()]
+        began = {"user": rec.get("by"), "ts": rec.get("said_at")}
+
+        def finish(status, text, what, kind="replan-refused", bind=""):
+            last = None
+            for channel, thread in places:
+                try:
+                    self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
+                              facts={"ticket": ticket})
+                    break
+                except BridgeError as exc:
+                    last = exc
+            else:
+                raise last or BridgeError("there is nowhere to say it")
+            by, said_at = replan_yes(q, began)
+            q.update(status=status, answered_by=by, answered_ts=said_at)
+            self.say("  %s, mid re-plan" % what)
+        if not issue.get("id"):
+            finish(REFUSED, "I can't find %s in the tracker any more, so I've closed this "
+                   "re-plan." % ticket, "refused: gone")
+            return
+        team = (issue.get("team") or {}).get("key")
+        plan_it = self.tracker.team_state(team, self.cfg["plan_it_state"])[0] if team else None
+        state = issue.get("state") or {}
+        if plan_it and state.get("id") == plan_it and rec.get("parked"):
+            # This pass made no move: it only reads the history.
+            self.replan_verify(issue, plan_it, q, began, finish,
+                               self.replan_attribution(issue, q, began), acted=False)
+            return
+        finish(DONE, "%s is in %s now, so I've closed this re-plan and left it there."
+               % (ticket, notify.safe_title(state.get("name") or "another state")),
+               "done: %s moved elsewhere" % ticket, kind="replan-partial",
+               bind="To plan it, type `plan %s`." % ticket)
 
     def prune(self):
         horizon = self.now - (self.cfg["lookback_days"] + 1) * 86400
@@ -11352,6 +11726,454 @@ def selftest():
             return code, len(t.comments), BOB in said, ALICE in said, posted(s)[-1]
         check("replan-resumed-by-another-yes-names-who-said-yes-first",
               outcome(case_rp_named_on_resume), (EXIT_OK, 1, True, False, moved_ok))
+
+        # KIT-358, the review of #223's last commit: only the yes that began a re-plan skips
+        # the checks. A `no` never moves the idea, acting switched off moves nothing, any
+        # other yes is judged now (its sender, and the work checks before the move back), a
+        # re-plan whose first move never landed is an ordinary question, and one asked where
+        # the bridge no longer reads is ended, loudly, once.
+        parked = [("uuid-6", "st-backlog")]
+
+        def rp_unlanded(name):
+            # The first move refused, and nothing moved: the yes that began it is then gone.
+            c, s, t, root = rp_ask(name)
+            t.move_fail = (1, False, BridgeError("simulated"), None)
+            s.add(BOB, "yes", thread=root)
+            first = run(c, s, t)[0]
+            t.move_fail = None
+            return c, s, t, root, first
+
+        def case_rp_act_off_midway():
+            c, s, t, _root = rp_cut_then("rp-act-off-midway", lambda s: None)
+            c["act"] = False
+            code, _out = run(c, s, t, at=now + 60)
+            return code, t.moves, "acting is switched off here" in posted(s)[-1], status_of(c)
+        check("replan-under-way-with-acting-switched-off-moves-nothing-and-stays-loud",
+              outcome(case_rp_act_off_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def case_rp_act_off_unlanded():
+            c, s, t, _root, first = rp_unlanded("rp-act-off-unlanded")
+            c["act"] = False
+            code, _out = run(c, s, t, at=now + 60)
+            return first, code, t.moves, "acts on nothing" in posted(s)[-1], status_of(c)
+        check("replan-whose-first-move-never-landed-then-acting-off: its yes acts on nothing",
+              outcome(case_rp_act_off_unlanded), (EXIT_ERROR, EXIT_OK, [], True, [REFUSED]))
+
+        def case_rp_no_midway():
+            c, s, t, root = rp_cut_then("rp-no-midway", delete_bobs_yes)
+            s.add(BOB, "no", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return code, again, t.moves, posted(s)[-1], status_of(c)
+        check("replan-a-no-to-a-re-plan-under-way-moves-nothing, says where it is, and ends it",
+              outcome(case_rp_no_midway),
+              (EXIT_OK, EXIT_OK, parked,
+               "OK, I won't move PROD-6 back into Plan it. It stays in Backlog, where this "
+               "re-plan put it, so no planning run starts. To plan it again, type "
+               "`plan PROD-6`.", [DECLINED]))
+
+        def case_rp_no_unlanded():
+            c, s, t, root, _first = rp_unlanded("rp-no-unlanded")
+            delete_bobs_yes(s)
+            s.add(BOB, "no", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-a-no-after-a-first-move-that-never-landed-is-a-plain-no",
+              outcome(case_rp_no_unlanded),
+              (EXIT_OK, [], "OK, PROD-6 is not planned again.", [DECLINED]))
+
+        def case_rp_bare_no_after_foreign():
+            c, s, t, root = rp_cut_then("rp-foreign-no", delete_bobs_yes)
+            s.add(CHATBOT, "Want me to re-run it?", thread=root, bot_id="B0CHATBOT1",
+                  at=now + 20)
+            s.add(BOB, "no", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "Something other than me posted" in posted(s)[-1],
+                    status_of(c))
+        check("replan-a-bare-no-after-a-foreign-post-is-refused, and the re-plan stays open",
+              outcome(case_rp_bare_no_after_foreign), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def case_rp_bot_yes_midway():
+            c, s, t, root = rp_cut_then("rp-bot-yes", delete_bobs_yes)
+            s.add(CHATBOT, "yes PROD-6", thread=root, bot_id="B0CHATBOT1", at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "can't take that as an answer" in posted(s)[-1],
+                    status_of(c))
+        check("replan-a-bots-yes-to-a-re-plan-under-way-is-refused-aloud, and it stays open",
+              outcome(case_rp_bot_yes_midway), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def case_rp_late_yes_plan_since():
+            c, s, t, root = rp_cut_then("rp-late-plan", delete_bobs_yes)
+            t.plans["PROD-50"] = [plan_70]
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 3 * 86400)
+            code, _out = run(c, s, t, at=now + 3 * 86400 + 60)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-a-late-yes-after-a-plan-was-filed-leaves-the-idea-parked-and-says-so",
+              outcome(case_rp_late_yes_plan_since),
+              (EXIT_OK, parked,
+               "PROD-6 already has a plan: PROD-70 (Todo). So I've left PROD-6 in Backlog, "
+               "where this re-plan put it. Approve that plan, or cancel it before you plan "
+               "the idea again.", [REFUSED]))
+
+        def case_rp_late_yes_unlanded():
+            c, s, t, root, _first = rp_unlanded("rp-late-unlanded")
+            delete_bobs_yes(s)
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 5 * 86400)
+            code, _out = run(c, s, t, at=now + 5 * 86400 + 60)
+            return code, t.moves, status_of(c)
+        check("replan-whose-first-move-never-landed-expires-like-any-question",
+              outcome(case_rp_late_yes_unlanded), (EXIT_OK, [], [EXPIRED]))
+
+        def case_rp_no_state_midway():
+            c, s, t, _root = rp_cut_then("rp-no-state", lambda s: None)
+            t.team_states.pop(("PROD", "Plan it"), None)
+            code, out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "back into Plan it" in posted(s)[-1], status_of(c),
+                    out.count("PROD-6: "), "I can't move it back into Plan it" in out)
+        check("replan-under-way-whose-plan-it-state-is-gone-stays-open-and-loud, said once, "
+              "with its cause", outcome(case_rp_no_state_midway),
+              (EXIT_ERROR, parked, True, [OPEN], 1, True))
+
+        def case_rp_unwatched():
+            c, s, t, _root = rp_cut_then("rp-unwatched", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)[0]
+            c["channel_ids"] = ["C0OTHER001"]
+            code, out = run(c, s, t, at=now + 120)
+            again = run(c, s, t, at=now + 180)[0]
+            return (first, code, "no longer reads" in out, again, status_of(c), t.moves,
+                    any(ch == "C0OTHER001" and "I closed the re-plan of PROD-6" in x
+                        for ch, _th, x in s.posts))
+        check("replan-asked-where-the-bridge-no-longer-reads-is-ended-once, and said in Slack",
+              outcome(case_rp_unwatched),
+              (EXIT_ERROR, EXIT_ERROR, True, EXIT_OK, [EXPIRED], parked, True))
+
+        # KIT-358, the review of the fix: a later yes is judged against what the question
+        # showed, the owner's move out of Plan it is always explained, an ending that needs
+        # no answer is closed once, and no reply offers a move by hand as a way out.
+        def rp_later_yes(name, change):
+            c, s, t, root = rp_cut_then(name, delete_bobs_yes)
+            change(t)
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 7200)
+            code, _out = run(c, s, t, at=now + 7260)
+            return code, t.moves, posted(s)[-1], status_of(c)
+
+        def retitle(t):
+            t.issues["PROD-6"]["title"] = "Something else entirely"
+        check("replan-a-later-yes-after-the-idea-was-rewritten-moves-nothing-back",
+              outcome(lambda: rp_later_yes("rp-later-rewritten", retitle)),
+              (EXIT_OK, parked, "PROD-6 changed since I asked (its title, text, team or "
+               "labels). So I've left PROD-6 in Backlog, where this re-plan put it. To plan it "
+               "again, type `plan PROD-6`.", [REFUSED]))
+        check("replan-a-later-yes-after-a-newer-run-moves-nothing-back",
+              outcome(lambda: rp_later_yes("rp-later-new-run", lambda t: t.add_run(
+                  "PROD-6", "PROD-51", "completed", trigger="T2"))),
+              (EXIT_OK, parked, "PROD-6's planning changed since I asked (a new run or a new "
+               "move). So I've left PROD-6 in Backlog, where this re-plan put it. To plan it "
+               "again, type `plan PROD-6`.", [REFUSED]))
+
+        def case_rp_made_in_plan_it_resumes():
+            # The question stood on the idea's creation, and after the bridge's own move out
+            # the history names no trigger at all: that is no new move, so a later yes ends
+            # the re-plan as asked.
+            c, s, t = world("rp-made-in-plan-it", act=True)
+            run(c, s, t)
+            t.in_plan_it("PROD-6", trigger="created-uuid-6")
+            t.triggers["uuid-6"][-1]["creation"] = True
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="created-uuid-6")
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            t.move_fail = (2, False, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            t.triggers["uuid-6"] = []
+            delete_bobs_yes(s)
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 600)
+            code, _out = run(c, s, t, at=now + 660)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-of-an-idea-made-in-plan-it-is-finished-by-a-later-yes",
+              outcome(case_rp_made_in_plan_it_resumes), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_lost_reply_then_no():
+            # The first move lands, its reply is lost, and the pass is cut before anything
+            # records it: the `no` that ends the re-plan still explains the owner's move.
+            c, s, t, root = rp_cut_then("rp-lost-then-no", delete_bobs_yes,
+                                        cut=(1, True, Deadline(), None))
+            s.add(ALICE, "no PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            said = t.comments[-1][1] if t.comments else ""
+            return (code, t.moves, len(t.comments), BOB in said,
+                    "moved this idea out of Plan it to Backlog" in said, status_of(c))
+        check("replan-a-no-after-a-lost-first-reply-still-explains-the-move",
+              outcome(case_rp_lost_reply_then_no), (EXIT_OK, parked, 1, True, True, [DECLINED]))
+
+        def case_rp_lost_reply_explained_at_pass_end():
+            # The failed message stops its own pass; the next pass finds the move and
+            # explains it, and the one after writes nothing more.
+            c, s, t, _root = rp_cut_then("rp-lost-pass-end", delete_bobs_yes,
+                                         cut=(1, True, BridgeError("simulated"), None))
+            first = len(t.comments)
+            code, _out = run(c, s, t, at=now + 60)
+            found = len(t.comments)
+            run(c, s, t, at=now + 120)
+            return first, found, len(t.comments), code, status_of(c)
+        check("replan-a-lost-first-reply-is-explained-by-the-pass-that-finds-it, once",
+              outcome(case_rp_lost_reply_explained_at_pass_end),
+              (0, 1, 1, EXIT_ERROR, [OPEN]))
+
+        def case_rp_act_off_offers_no_hand_move():
+            c, s, t, _root = rp_cut_then("rp-act-off-words", lambda s: None)
+            c["act"] = False
+            _code, out = run(c, s, t, at=now + 60)
+            return ("Switch acting on" in posted(s)[-1], "by hand" in posted(s)[-1],
+                    "Acting is switched off, so reply `no PROD-6`" in out)
+        check("replan-with-acting-off-offers-a-no-and-acting-on, never a move by hand",
+              outcome(case_rp_act_off_offers_no_hand_move), (True, False, True))
+
+        def case_rp_back_in_plan_it_by_hand():
+            # Back in Plan it by hand: the history is read as a finishing yes would read it,
+            # and the thread says what it shows (KIT-358 review, round 2).
+            c, s, t, _root = rp_cut_then("rp-back-by-hand", delete_bobs_yes)
+            t.in_plan_it("PROD-6", trigger="T5")
+            code, out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return code, posted(s)[-1], again, status_of(c), "acted: moved" in out
+        check("replan-whose-idea-is-back-in-plan-it-is-closed-once, its history read, and no "
+              "action counted", outcome(case_rp_back_in_plan_it_by_hand),
+              (EXIT_OK, moved_ok, EXIT_OK, [DONE], False))
+
+        def rp_cut_after_both(name, history=True):
+            # Both moves land, and the pass is cut before it says so; the yes is then gone.
+            c, s, t, root = rp_ask(name)
+            if not history:
+                t.history_drops.add("uuid-6")
+            t.move_fail = (2, True, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            return c, s, t, root
+
+        def case_rp_own_move_back_cut():
+            c, s, t, _root = rp_cut_after_both("rp-own-back-cut")
+            delete_bobs_yes(s)
+            code, _out = run(c, s, t, at=now + 60)
+            return code, t.moves, posted(s)[-1], status_of(c)
+        check("replan-its-own-move-back-cut: the next pass reads the history and says it",
+              outcome(case_rp_own_move_back_cut), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_own_move_back_unseen():
+            c, s, t, _root = rp_cut_after_both("rp-own-back-unseen", history=False)
+            delete_bobs_yes(s)
+            code, _out = run(c, s, t, at=now + 60)
+            return code, "its history does not show the move back in" in posted(s)[-1], \
+                status_of(c)
+        check("replan-its-own-move-back-cut-and-unseen-in-the-history-is-said, loudly",
+              outcome(case_rp_own_move_back_unseen), (EXIT_ERROR, True, [DONE]))
+
+        def case_rp_own_move_back_then_act_off():
+            # Both moves landed: with acting switched off, the yes read again moves nothing
+            # and says where the idea is, never "it may be waiting in Backlog".
+            c, s, t, _root = rp_cut_after_both("rp-own-back-act-off")
+            c["act"] = False
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, posted(s)[-1], "may be waiting" in " ".join(posted(s)),
+                    status_of(c))
+        check("replan-both-moves-landed-then-acting-off: the history is read, nothing moves",
+              outcome(case_rp_own_move_back_then_act_off),
+              (EXIT_OK, both, moved_ok, False, [DONE]))
+
+        def case_rp_note_once_per_dm():
+            # In DM mode the closing note goes to each listed DM once, each recorded as said:
+            # a DM that keeps refusing never makes the others hear it again.
+            c, s, t = world("rp-note-dms", act=True, dm_user_ids=[ALICE, BOB])
+            run(c, s, t)                                    # the first pass: baselines
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            t.move_fail = (2, False, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            delete_bobs_yes(s)
+            c["channel_ids"] = ["C0OTHER001"]
+            real_post = s.post
+
+            def bobs_dm_refuses(channel, thread_ts, text):
+                if channel == "D0BOB00001":
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = bobs_dm_refuses
+            for k in range(3):
+                run(c, s, t, at=now + 60 * (k + 1))
+            noted = [ch for ch, _th, x in s.posts if "I closed the re-plan of PROD-6" in x]
+            still = status_of(c)
+            s.post = real_post
+            run(c, s, t, at=now + 300)
+            return (noted, still, [ch for ch, _th, x in s.posts
+                                   if "I closed the re-plan of PROD-6" in x], status_of(c))
+        check("replan-closing-note-is-said-once-and-closes-once-a-place-has-heard-it",
+              outcome(case_rp_note_once_per_dm),
+              (["D0ALICE001"], [EXPIRED], ["D0ALICE001"], [EXPIRED]))
+
+        # KIT-358 review, round 3: acting off is judged on the read the move would follow;
+        # each closure tries every place the watch speaks; a rehearsal says what it would do;
+        # a fixed Plan it state ends its line; a pass that only reads counts no action.
+        def case_rp_race_act_off():
+            c, s, t, root = rp_cut_then("rp-race-act-off", delete_bobs_yes)
+            c["act"] = False
+            real_issue, reads = t.issue, []
+
+            def racing(ident):
+                got = real_issue(ident)
+                if ident == "PROD-6" and got:
+                    reads.append(1)
+                    if len(reads) == 1:      # a person had it in Todo for this one read
+                        got = dict(got, state={"id": "st-todo", "name": "Todo",
+                                               "type": "unstarted"})
+                return got
+            t.issue = racing
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            return (code, t.moves, "acting is switched off here" in posted(s)[-1],
+                    status_of(c))
+        check("replan-a-yes-with-acting-off-moves-nothing-whatever-an-earlier-read-said",
+              outcome(case_rp_race_act_off), (EXIT_ERROR, parked, True, [OPEN]))
+
+        def dm_stranded(name, between, dm_users):
+            c, s, t = world(name, act=True, dm_user_ids=dm_users)
+            run(c, s, t)                                    # the first pass: baselines
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            root = s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            t.move_fail = (2, False, Deadline(), None)
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            delete_bobs_yes(s)
+            between(c, s, t)
+            real_post = s.post
+
+            def bobs_dm_refuses(channel, thread_ts, text):
+                if channel == "D0BOB00001":
+                    raise BridgeError("Slack chat.postMessage refused: simulated")
+                return real_post(channel, thread_ts, text)
+            s.post = bobs_dm_refuses
+            code, out = run(c, s, t, at=now + 60)
+            return c, s, t, code, out
+
+        def unread_and_todo(c, _s, t):
+            c["channel_ids"] = ["C0OTHER001"]
+            t.set_state("PROD-6", "unstarted")
+
+        def case_rp_closure_tries_each_place():
+            c, s, t, code, out = dm_stranded("rp-closure-places", unread_and_todo,
+                                             [BOB, ALICE])
+            said = [ch for ch, _th, x in s.posts if "PROD-6 is in Todo now" in x]
+            return code, said, status_of(c), "acted:" in out
+        check("replan-a-closure-tries-each-place-until-one-takes-it, and counts no action",
+              outcome(case_rp_closure_tries_each_place),
+              (EXIT_OK, ["D0ALICE001"], [DONE], False))
+
+        def case_rp_note_past_a_refusing_place():
+            c, s, t, code, out = dm_stranded(
+                "rp-note-past-refusing",
+                lambda c, _s, _t: c.__setitem__("channel_ids", ["C0OTHER001"]), [BOB, ALICE])
+            said = [ch for ch, _th, x in s.posts if "I closed the re-plan of PROD-6" in x]
+            return code, said, status_of(c), "(not in D0BOB00001" in out
+        check("replan-the-closing-note-goes-past-a-place-that-refuses, and names it",
+              outcome(case_rp_note_past_a_refusing_place),
+              (EXIT_ERROR, ["D0ALICE001"], [EXPIRED], True))
+
+        def case_rp_dry_run_says_what_it_would_do():
+            c, s, t, _root = rp_cut_then("rp-dry-closure", delete_bobs_yes)
+            t.set_state("PROD-6", "unstarted")
+            _code, out = run(c, s, t, dry=True, at=now + 60)
+            return ("[dry-run] would close the re-plan" in out, "Reply `yes PROD-6`" in out,
+                    status_of(c), s.posts[-1][2].startswith("PROD-6 is in Todo"))
+        check("replan-a-dry-run-says-it-would-close, and closes nothing",
+              outcome(case_rp_dry_run_says_what_it_would_do), (True, False, [OPEN], False))
+
+        def case_rp_blocked_line_ends_when_fixed():
+            c, s, t, _root = rp_cut_then("rp-blocked-fixed", lambda s: None)
+            saved = t.team_states.pop(("PROD", "Plan it"))
+            first = run(c, s, t, at=now + 60)[1]
+            t.team_states[("PROD", "Plan it")] = saved
+            later = run(c, s, t, at=now + 120)[1]
+            return ("I can't move it back into Plan it" in first,
+                    "I can't move it back into Plan it" in later, "Reply `yes PROD-6`" in later)
+        check("replan-a-missing-plan-it-state-is-named-until-it-is-fixed, then not",
+              outcome(case_rp_blocked_line_ends_when_fixed), (True, False, True))
+
+        def case_rp_cut_mid_closure_writes_once():
+            # A pass cut while saying the closing note keeps the comment it already wrote.
+            c, s, t, _root = rp_cut_then("rp-cut-mid-closure", delete_bobs_yes,
+                                         cut=(1, True, Deadline(), None))
+            c["channel_ids"] = ["C0OTHER001"]
+            real_post = s.post
+            cut = []
+
+            def cut_once(channel, thread_ts, text):
+                if "I closed the re-plan" in text and not cut:
+                    cut.append(1)
+                    raise Deadline()
+                return real_post(channel, thread_ts, text)
+            s.post = cut_once
+            try:
+                run(c, s, t, at=now + 60)
+            except Deadline:
+                pass
+            run(c, s, t, at=now + 120)
+            return len(t.comments), status_of(c)
+        check("replan-a-pass-cut-mid-closure-never-writes-the-comment-twice",
+              outcome(case_rp_cut_mid_closure_writes_once), (1, [EXPIRED]))
+
+        def case_rp_owed_comment_is_said():
+            # The explanation comment fails and is owed: the yes that finishes the re-plan
+            # still says the comment is owed, as it always has.
+            c, s, t, root = rp_cut_then("rp-owed-said", delete_bobs_yes,
+                                        cut=(1, True, Deadline(), None))
+
+            def refuse(_issue_id, _body):
+                raise BridgeError("the tracker would not comment (simulated)")
+            t.comment = refuse
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            run(c, s, t, at=now + 60)
+            return "I will try again" in posted(s)[-1], len(json.load(open(state_path(c)))[
+                "owed"])
+        check("replan-a-finish-says-an-owed-comment-is-owed",
+              outcome(case_rp_owed_comment_is_said), (True, 1))
+
+        def case_rp_moved_on_unlanded():
+            # The first move is refused while a person moves the idea to Todo: whether the
+            # bridge's move landed can't be told, so the re-plan is kept, then closed once.
+            c, s, t, root = rp_ask("rp-moved-on")
+            t.move_fail = (1, False, BridgeError("simulated"),
+                           lambda: t.set_state("PROD-6", "unstarted"))
+            s.add(BOB, "yes", thread=root)
+            first = run(c, s, t)[0]                 # the failed message stops this pass
+            t.move_fail = None
+            delete_bobs_yes(s)
+            code, _out = run(c, s, t, at=now + 60)
+            again = run(c, s, t, at=now + 120)[0]
+            return first, code, posted(s)[-1], again, t.moves, status_of(c)
+        check("replan-whose-idea-moved-on-before-its-first-move-landed-is-closed-once",
+              outcome(case_rp_moved_on_unlanded),
+              (EXIT_ERROR, EXIT_OK, "PROD-6 is in Todo now, so I've closed this re-plan and "
+               "left it there. To plan it, type `plan PROD-6`.", EXIT_OK, [], [DONE]))
 
         def case_rp_partial_is_explained():
             # The comment naming who said yes lands as soon as the idea leaves Plan it, so a

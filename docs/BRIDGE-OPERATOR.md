@@ -255,12 +255,34 @@ Not that: *… planning changed since I asked …*. A run or a move came after t
 Ask again, so you see where it stands now.
 
 Every check runs again before the move. If a pass stops halfway, the next pass finishes the
-same yes from where it stopped. An edited question, or a later post, never stops it then.
+same yes from where it stopped. An edited question, or a later post, never stops that yes.
 If that yes is gone, every pass exits 1 and says so, and the idea may wait in the backlog
 state. Reply `yes <ticket id>` where it was asked, and the next pass finishes it, for whoever
-said yes first. Afterwards the bridge reads the idea's history the way the planner does. If
-the move back in doesn't show there, the move back failed, or the bridge can't tell whether
-it landed, the thread says what to do, and that pass exits 1.
+said yes first. Reply `no <ticket id>` instead to leave the idea where it is.
+
+A later answer is judged like any answer (KIT-358):
+- A bot's or a guest's yes is refused, and so is a bare one after a post the bridge can't vouch for.
+- Before the move back, the bridge checks again. A planning run or a plan may have appeared, or
+  a newer move into Plan it. The idea's title, text, team or labels may have changed. If any
+  of those happened, the idea stays in the backlog state, and the thread says why.
+- A `no` never moves the idea.
+- With `ACT=no`, nothing moves. The re-plan waits, and every pass says so. Reply `no` to end it,
+  or switch acting on and reply `yes`.
+- If the first move never landed and the idea is still in Plan it, nothing waits outside Plan
+  it. The question is an ordinary one again, and it expires like one.
+- If the idea is back in Plan it, moved on, or gone, the next pass closes the re-plan and says
+  so where it was asked. Back in Plan it, it first reads the history, as below.
+- If the Plan it state can't be found, every pass names that as the cause until it is fixed.
+- If the question was asked where the bridge no longer reads, the next pass closes it. It says
+  so in Slack where the notifier watch speaks, once in each place. It closes once any place
+  has heard it, and the pass's line names a place that refused. That covers a channel taken
+  off `CHANNEL_IDS`, and a member taken off `DM_USER_IDS`.
+- The comment naming who said yes is written as soon as the bridge knows the idea left Plan
+  it, even when the reply to that move was lost.
+
+Afterwards the bridge reads the idea's history the way the planner does. If the move back in
+doesn't show there, the move back failed, or the bridge can't tell whether it landed, the
+thread says what to do, and that pass exits 1.
 
 ---
 
