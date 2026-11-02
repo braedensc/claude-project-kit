@@ -1455,7 +1455,7 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
 # collect — the read-back
 # --------------------------------------------------------------------------- #
 FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awaiting your approval, questions for you, or a note that no plan came back."
-FINISHED_REJECTED = "The planning run **%s** finished, and its plan was refused. The reasons are on %s. Nothing was filed."
+FINISHED_REJECTED = "The planning run **%s** finished, and its plan was refused. The reasons are on %s. Nothing was filed. Move the idea out of %s and back in to plan it again."
 GAVE_UP = "### Filing this idea's plan failed\n\nThe planning run **%s** finished, but filing its result failed %d times. The planner job's log has the reason. Move the idea out of %s and back in to plan it again."
 TIMED_OUT = "### The planning run timed out\n\nThe planning run **%s** did not finish within %d hours, so it was closed and nothing was filed. Move the idea out of %s and back in to plan it again."
 TEAM_MISMATCH = ("### This idea's plan was not filed\n\nThe planning run **%s** finished, but %s's "
@@ -1648,8 +1648,11 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 continue
             if code in (executor.EXIT_OK, executor.EXIT_REJECTED):
                 stats["collected"] += 1
-                note = (FINISHED_OK if code == executor.EXIT_OK else FINISHED_REJECTED) % (
-                    rec["run_ticket"], rec["run_ticket"])
+                # A refusal says how to plan again, like a give-up or a time-out (KIT-304):
+                # the page that points here promises "what to do next".
+                note = (FINISHED_OK % (rec["run_ticket"], rec["run_ticket"])
+                        if code == executor.EXIT_OK else FINISHED_REJECTED % (
+                            rec["run_ticket"], rec["run_ticket"], cfg["plan_it_state"]))
                 _finish_run(cfg, linear, teams, seen, tid, rec, note, dry_run, stats, exit=code,
                             checkout_sha=sha, verdict="filed-or-reported"
                             if code == executor.EXIT_OK else "rejected")
@@ -2932,6 +2935,9 @@ def selftest():
         f.finish(runs(f)[0]["id"], "no plan")
         code, _ = one_pass(cj, f, runner=fake_executor(3))
         check("rejected-is-an-answer", (code, len(f.moves)), (EXIT_OK, 1))
+        check("rejected-says-how-to-plan-again (KIT-304)",
+              comments_on(f, "idea-75", "Move the idea out of Plan it and back in to plan it "
+                                        "again") != [], True)
         del calls[:]
         f = FakeLinear(FakeClock())
         f.add_idea(76)
