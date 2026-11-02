@@ -137,6 +137,9 @@ and it cannot merge.
   an agent session, carries a `provenance:*` or `agent:*` label, has a parent or children, or
   has a pull request attached.
 - Starts at most a few runs a pass, and at most `MAX_RUNS_PER_DAY` a day across every team.
+- Runs one planning run per idea at a time. A new move into Plan it while a run for that idea
+  is still going waits, with one note on the idea. It starts when that run ends, if it is still
+  the newest move.
 - Starts nothing while planning is stopped, while the dispatcher's version is not the
   probe's, or while any team's Plan it state, routing label or cancel state is wrong. A Plan
   it typed **started** is the worst case: the dispatcher moves every session's ticket into the

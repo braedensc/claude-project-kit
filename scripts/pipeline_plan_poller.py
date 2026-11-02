@@ -1239,6 +1239,14 @@ REFUSED_UNSAFE = ("### Planning was not started\n\nThis idea's text could not be
 REFUSED_LIVE = ("### Planning was not started: this looks like live work\n\nThis ticket is in "
                 "%s, but %s. Plan it only works on a fresh idea, so nothing was started. If it "
                 "really is an idea, copy it into a new ticket and move that one to %s.")
+# One planning run per idea at a time (KIT-328): a newer move into Plan it while a run for the
+# same idea is in flight waits for that run, and is started once it ends if it is still the
+# newest move. Said once per move, never a silent skip.
+RUN_IN_FLIGHT = ("pending", "close-pending", "misrouted")
+WAITING_RUN = ("### The new planning run waits\n\nThis idea was moved to %s again while its "
+               "planning run **%s** is still going. Two runs at once would mean two paid sessions "
+               "and maybe two plans, so the new one starts when that run ends, if this is still "
+               "the newest move. There is nothing to do.")
 WAITING_DAILY = ("### Planning waits until tomorrow\n\nThe limit of %d planning runs a day is "
                  "reached, so this idea starts on the first pass after midnight UTC. There is "
                  "nothing to do.")
@@ -1367,6 +1375,19 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             if done:
                 continue
             return created, False
+        busy = sorted(r.get("run_ticket") or "?" for r in seen["triggers"].values()
+                      if r.get("idea_id") == idea["id"] and r.get("status") in RUN_IN_FLIGHT)
+        if busy:
+            # Not settled: a later pass looks again, and starts this move once the run ends.
+            stats["waiting_run"] += 1
+            if memo.get("run_wait_noted") != tid:
+                post_comment(linear, idea["id"], WAITING_RUN % (cfg["plan_it_state"],
+                                                                ", ".join(busy)), dry_run)
+                seen["ideas"][idea["id"]] = dict(memo, run_wait_noted=tid)
+                save_seen(cfg["state_dir"], seen, dry_run)
+            log("NOTE: %s waits: its planning run %s is still going"
+                % (idea["identifier"], ", ".join(busy)))
+            continue
         if created >= cfg["max_new_runs"]:
             stats["waiting_cap"] += 1
             log("NOTE: %s waits for a later pass — this pass already started %d planning "
@@ -1843,8 +1864,10 @@ def run_once(cfg, linear, dry_run, stats, checkout=prepare_checkout,
                           stats["collected"], stats["waiting"], stats["refused"],
                           stats["refused_live"], stats["timed_out"], stats["gave_up"],
                           stats["direct_warned"], stats["errors"],
-                          "; PLANNING IS BLOCKED — the log says why"
-                          if stats["planning_blocked"] else ""))
+                          ("; %d new move(s) waiting on a run in flight" % stats["waiting_run"]
+                           if stats["waiting_run"] else "")
+                          + ("; PLANNING IS BLOCKED — the log says why"
+                             if stats["planning_blocked"] else "")))
     return EXIT_ERROR if (stats["errors"] or stats["gave_up"] or stats["planning_blocked"]
                           or stats["misrouted"]) else EXIT_OK
 
@@ -1857,8 +1880,8 @@ def new_stats():
     return dict.fromkeys(("ideas_in_plan_it", "started", "routing_ok", "misrouted",
                           "collected", "waiting", "refused", "refused_live", "timed_out",
                           "gave_up", "direct_warned", "errors", "waiting_cap",
-                          "waiting_daily_cap", "waiting_budget", "planning_blocked",
-                          "message_chars_max"), 0)
+                          "waiting_daily_cap", "waiting_budget", "waiting_run",
+                          "planning_blocked", "message_chars_max"), 0)
 
 
 def write_heartbeat(state_dir, code, started_at, started_mono, stats, dry_run, error=""):
@@ -2406,7 +2429,19 @@ def selftest():
                                                 "toStateId": "prod-plan-it"})
         fake.ideas["idea-7"]["updatedAt"] = "u2"
         one_pass(cfg, fake)
-        check("new-move-new-run", len(fake.issues), 2)
+        # KIT-328: while the first run is going, the new move WAITS, and says so once.
+        waits = [b for i, b in fake.comments if i == "idea-7" and "still going" in b]
+        check("new-move-waits-for-the-run-in-flight (KIT-328)", (len(fake.issues), len(waits)),
+              (1, 1))
+        fake.ideas["idea-7"]["updatedAt"] = "u3"           # the note itself moved updatedAt
+        one_pass(cfg, fake)
+        check("new-move-waits-and-is-said-once", (len(fake.issues), len(
+            [b for i, b in fake.comments if i == "idea-7" and "still going" in b])), (1, 1))
+        fake.finish(runs(fake)[0]["id"], final_message(synthetic_plan(
+            runs(fake)[0]["identifier"], 1)))
+        one_pass(cfg, fake)                                # collect ends the first run
+        one_pass(cfg, fake)                                # and the waiting move starts
+        check("new-move-new-run once the first has ended", len(runs(fake)), 2)
 
         # 6. ONLY THE OWNER STARTS A RUN.
         fake2 = FakeLinear(FakeClock())
@@ -2473,6 +2508,12 @@ def selftest():
                                                   "fromStateId": "prod-backlog",
                                                   "toStateId": "prod-plan-it"})
         fake3.ideas["idea-10"]["updatedAt"] = "u9"
+        one_pass(cfg3, fake3)
+        check("move-after-creation-run-waits-while-it-runs (KIT-328)",
+              planned(fake3).count("PROD-10"), 1)
+        first10 = [r for r in runs(fake3) if "PROD-10" in r["title"]][0]
+        fake3.finish(first10["id"], final_message(synthetic_plan(first10["identifier"], 1)))
+        one_pass(cfg3, fake3)
         one_pass(cfg3, fake3)
         check("move-after-creation-run-new-run", planned(fake3).count("PROD-10"), 2)
         # An idea someone else created starts when the OWNER moves it in: the move decides.
