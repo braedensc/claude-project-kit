@@ -2933,6 +2933,28 @@ def step_kit_clone(ctx, apply_it):
     return False, "clone placed and level with origin", []
 
 
+def ticket_model_refusal(ctx, want=None):
+    """Why the planner job's config must not carry ticket_model here, or None (KIT-379). A
+    planner from before the key refuses the WHOLE config as an unknown key, and then plans
+    nothing. The `kit-clone` step moves the clone only as far as origin, so a checkout ahead
+    of origin, or `drill` alone, can meet an older planner."""
+    want = poller_config(ctx) if want is None else want
+    if '"ticket_model"' not in want:
+        return None
+    code = ctx.host.read_role_file(ctx.conf["ROLE_ACCOUNT"],
+                                   ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py")
+    if code is None:
+        raise Unknown("could not read the planner job's own code, to see whether it knows "
+                      "TICKET_MODEL", "run this from a terminal as yourself")
+    if '"ticket_model"' in code:
+        return None
+    return ("TICKET_MODEL is set, but the role account's clone runs a planner from before "
+            "that key, which would refuse its whole config and plan nothing. The one command "
+            "moves the clone only as far as origin: leave TICKET_MODEL empty until origin "
+            "carries the change, then run the one command, `python3 "
+            "scripts/pipeline_install.py`.")
+
+
 def step_poller_config(ctx, apply_it):
     """The planner job's config, under the role account. It holds no credential —
     only the NAME of the variable each one lives in."""
@@ -2944,24 +2966,15 @@ def step_poller_config(ctx, apply_it):
                       "run this from a terminal as yourself")
     if got == want:
         return True, "the planner job's config matches this conf", []
-    if '"ticket_model"' in want:
-        # KIT-379: a planner from before the key refuses the WHOLE config as an unknown key,
-        # and then plans nothing. The one command moves the clone first; `drill` alone, or a
-        # checkout ahead of origin, does not.
-        code = ctx.host.read_role_file(account, ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py")
-        if code is None:
-            raise Unknown("could not read the planner job's own code, to see whether it knows "
-                          "TICKET_MODEL", "run this from a terminal as yourself")
-        if '"ticket_model"' not in code:
-            raise SetupError("TICKET_MODEL is set, but the role account's clone runs a planner "
-                             "from before that key, which would refuse the whole config and "
-                             "plan nothing. Nothing was written. Run the one command, "
-                             "`python3 scripts/pipeline_install.py`, so it moves the clone "
-                             "first, or leave TICKET_MODEL empty until then.")
     if not apply_it:
+        # A check run comes before the `kit-clone` step moves the clone, so an older clone
+        # here is not yet a fault: the write below re-checks once the clone has moved.
         return False, ("would write the planner job's config" if not got
                        else "would rewrite the planner job's config: this conf has moved "
                             "since it was written"), []
+    refusal = ticket_model_refusal(ctx, want)
+    if refusal:
+        raise SetupError(refusal + " Nothing was written.")
     ctx.runner.do("write the planner job's config", lambda: ctx.host.write_role_file(
         account, ROLE_POLLER_CONFIG, want))
     return False, "wrote the planner job's config (mode 600)", []
@@ -4273,6 +4286,11 @@ def run_drill(ctx):
     reason, _hard = probe_needed(ctx, rows)
     if reason is not None:
         raise SetupError("the drill needs a probe that still holds, and %s" % reason)
+    # KIT-379: the drill ends by writing the planner job's config. Refused here, before it
+    # breaks anything, rather than after it has stopped planning.
+    refusal = ticket_model_refusal(ctx)
+    if refusal:
+        raise SetupError(refusal + " The drill did not start, and nothing was changed.")
     step_enable(ctx, False)                  # loaded, and its last pass reported ok
     entries = compose_entries(ctx, rows)
     have = read_planning_entries(ctx)
@@ -6377,6 +6395,32 @@ def _drill_cases(check, drill_world):
     check("drill-failure-records-no-pass", "drill" in (df.state.data["ids"] or {}), False)
     dn, restarts_n = drill_world("drill-declined", answers=("y", "y", "bc", "no"))
     check("drill-declined-changes-nothing", (run_drill(dn), restarts_n), (None, []))
+    # KIT-379: with TICKET_MODEL set, a planner from before the key stops the drill BEFORE it
+    # breaks anything, not after it has stopped planning; with one that knows the key, the
+    # drill runs, and the probe it signs again files its tickets with the tag.
+    dt, restarts_t = drill_world("drill-ticket-model-old")
+    dt.conf["TICKET_MODEL"] = "opus"
+    dt.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = 'KEYS = ("probe",)\n'
+    try:
+        run_drill(dt)
+        got_t = "ran"
+    except SetupError as exc:
+        got_t = str(exc)
+    check("drill-ticket-model-old-planner-refused-first",
+          ("The drill did not start" in got_t, restarts_t,
+           [i for i, r in dt.tracker.issues.items() if r["input"]["title"] == DRILL_TITLE]),
+          (True, [], []))
+    dm, _restarts_m = drill_world("drill-ticket-model-new")
+    dm.conf["TICKET_MODEL"] = "opus"
+    dm.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = (
+        'KEYS = ("probe", "ticket_model")\n')
+    before_m = set(dm.tracker.issues)
+    check("drill-ticket-model-new-planner-runs", run_drill(dm), True)
+    probes = [r["input"].get("description") or "" for i, r in dm.tracker.issues.items()
+              if i not in before_m
+              and r["input"]["title"] in (PROBE_TITLE_TOOLS, PROBE_TITLE_LABEL)]
+    check("probe-tickets-carry-the-model-tag",
+          (len(probes) >= 2, all("[model=opus]" in d for d in probes)), (True, True))
 
     # KIT-209, KIT-164. THE JOB'S FRONT DOOR FIRST: the owner's creation counts as the move,
     # so the idea is filed straight into Plan it, and the job is woken only once the idea
@@ -7621,6 +7665,27 @@ def selftest():
                       (refused is not None and "plan nothing" in refused,
                        "ticket_model" in (oc.host.files.get(ROLE_POLLER_CONFIG) or "")),
                       (label == "old-clone", label == "new-clone"))
+            # A check run comes before the clone moves: an older clone there is WOULD-CHANGE,
+            # not a failure. Code that can't be read is UNKNOWN. And the literal the check
+            # looks for is in the real planner, so a respelling there fails here.
+            oq = _ctx(os.path.join(tmp, "ticket-model-check-run"),
+                      conf=dict(GOOD_CONF, TICKET_MODEL="opus"), tracker=_ready_tracker())
+            oq.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = 'KEYS = ()\n'
+            check("poller-config-ticket-model-check-run-would-write",
+                  step_poller_config(oq, False)[:2],
+                  (False, "would write the planner job's config"))
+            oq.host.locked = True
+            try:
+                ticket_model_refusal(oq, '{"ticket_model": "opus"}')
+                unread = "no refusal"
+            except Unknown as exc:
+                unread = str(exc)
+            check("ticket-model-check-unreadable-code-is-unknown",
+                  "could not read the planner job's own code" in unread, True)
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "pipeline_plan_poller.py"), encoding="utf-8") as fh:
+                check("ticket-model-check-matches-the-real-planner",
+                      '"ticket_model"' in fh.read(), True)
             # The probe's tickets are shaped like the job's own: the model tag where the job
             # puts it, and with no model, exactly the bodies the probe was signed on before.
             check("probe-bodies-carry-the-model-tag",
