@@ -561,6 +561,16 @@ VALID_BROWSER_CHECK = {
 }
 
 
+def _validating(node):
+    """A schema node with its words for people (description, $comment) taken out at every
+    depth, so two copies of one definition compare on what they enforce."""
+    if isinstance(node, dict):
+        return {k: _validating(v) for k, v in node.items() if k not in ("description", "$comment")}
+    if isinstance(node, list):
+        return [_validating(v) for v in node]
+    return node
+
+
 def _without(document, *keys):
     copy = json.loads(json.dumps(document))
     node = copy
@@ -716,6 +726,29 @@ FIXTURES = [
      _without(VALID_BROWSER_CHECK, "checks", 0, "modes"), False, "required"),
     ("browser-check", "contrast-past-21",
      _with(VALID_BROWSER_CHECK, "checks.1.steps.2.contrast", {"min": 22}), False, "maximum"),
+    # A `wait` or `emulate` that names nothing would do nothing, so it is refused (KIT-322
+    # review). A wait names `for` or `ms`, one of them; an emulate names one or both.
+    ("browser-check", "a-wait-for-nothing",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait"}), False, "required"),
+    ("browser-check", "a-wait-on-a-viewport-only",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait", "only": ["phone"]}), False,
+     "required"),
+    ("browser-check", "a-wait-for-a-target-and-a-pause",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0",
+           {"do": "wait", "for": {"css": "main"}, "ms": 200}), False, "additionalProperties"),
+    ("browser-check", "a-wait-for-a-target",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait", "for": {"css": "main"}}),
+     True, None),
+    ("browser-check", "a-pause",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait", "ms": 200}), True, None),
+    ("browser-check", "an-emulate-of-nothing",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate"}), False, "required"),
+    ("browser-check", "an-emulate-of-both",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0",
+           {"do": "emulate", "colorScheme": "dark", "reducedMotion": "reduce"}), True, None),
+    ("browser-check", "an-emulate-of-motion-alone",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate", "reducedMotion": "reduce"}),
+     True, None),
 ]
 
 
@@ -735,10 +768,13 @@ def selftest():
 
     # A mode a check names is the same shape in delivery.json (§1 `acceptance.modes`) and
     # in a ticket's own block (§15): one definition, two places, held equal here.
+    # Every keyword is compared, not only `properties`, so a side that drops
+    # `additionalProperties: false` or adds `required` goes red (KIT-322 review). Only the
+    # words a person reads are left out.
     note()
     try:
-        in_delivery = load_schema("delivery")["$defs"]["acceptanceMode"]["properties"]
-        in_block = load_schema("browser-check")["$defs"]["mode"]["properties"]
+        in_delivery = _validating(load_schema("delivery")["$defs"]["acceptanceMode"])
+        in_block = _validating(load_schema("browser-check")["$defs"]["mode"])
     except (OSError, ValueError, KeyError) as e:
         failures.append(f"acceptance modes: cannot compare — {e}")
     else:

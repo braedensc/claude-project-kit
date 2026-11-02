@@ -1778,9 +1778,9 @@ Each step is `{"do": <verb>, …}`. The verbs: `click`, `hover`, `fill`, `press`
 | `text` | string | `fill`: what to type. `expect`: the text the target holds. |
 | `key` | string | `press`: a key, such as `Enter` or `Shift+Tab`. |
 | `path` | string | `goto`: a path on the app's origin, as `open`. |
-| `for` | target | `wait`: until this target is visible. |
+| `for` | target | `wait`: until this target is visible. A `wait` names `for` or `ms`, not both. |
 | `ms` | integer | `wait`: a pause, at most 2000. |
-| `colorScheme` | string | `emulate`: `light`, `dark` or `no-preference`. |
+| `colorScheme` | string | `emulate`: `light`, `dark` or `no-preference`. An `emulate` names this, `reducedMotion`, or both. |
 | `reducedMotion` | string | `emulate`: `reduce` or `no-preference`. |
 | `class` | string | `addClass`, `removeClass`: one class name. |
 | `values` | object | `setStorage`: localStorage keys and string values, then a reload. |

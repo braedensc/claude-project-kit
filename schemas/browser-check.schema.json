@@ -293,6 +293,97 @@
         {
           "type": "object",
           "required": [
+            "do",
+            "for"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "wait"
+            },
+            "for": {
+              "$ref": "#/$defs/target"
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "ms"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "wait"
+            },
+            "ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "colorScheme"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "emulate"
+            },
+            "colorScheme": {
+              "enum": [
+                "light",
+                "dark",
+                "no-preference"
+              ]
+            },
+            "reducedMotion": {
+              "enum": [
+                "reduce",
+                "no-preference"
+              ]
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "do",
+            "reducedMotion"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "do": {
+              "const": "emulate"
+            },
+            "reducedMotion": {
+              "enum": [
+                "reduce",
+                "no-preference"
+              ]
+            },
+            "only": {
+              "$ref": "#/$defs/only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
             "do"
           ],
           "additionalProperties": false,
@@ -318,57 +409,6 @@
             },
             "path": {
               "$ref": "#/$defs/path"
-            },
-            "only": {
-              "$ref": "#/$defs/only"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "do"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "do": {
-              "const": "wait"
-            },
-            "for": {
-              "$ref": "#/$defs/target"
-            },
-            "ms": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 2000
-            },
-            "only": {
-              "$ref": "#/$defs/only"
-            }
-          }
-        },
-        {
-          "type": "object",
-          "required": [
-            "do"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "do": {
-              "const": "emulate"
-            },
-            "colorScheme": {
-              "enum": [
-                "light",
-                "dark",
-                "no-preference"
-              ]
-            },
-            "reducedMotion": {
-              "enum": [
-                "reduce",
-                "no-preference"
-              ]
             },
             "only": {
               "$ref": "#/$defs/only"
