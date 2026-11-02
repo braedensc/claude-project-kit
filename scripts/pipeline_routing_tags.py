@@ -206,9 +206,11 @@ def _replaced(text, spans, mark):
 def without_equals(text):
     """`text` with every `=` it reads as, however spelt, replaced by EQUALS_MARK. No
     directive can be read without one, and the mark holds none."""
-    view, rounds, _unsettled = stored_view(text)
-    return _replaced(text, [original_slice(rounds, i, i + 1)
-                            for i, ch in enumerate(view) if ch == "="], EQUALS_MARK)
+    view, rounds, unsettled = stored_view(text)
+    return _replaced(text, sorted([original_slice(rounds, i, i + 1)
+                                   for i, ch in enumerate(view) if ch == "="]
+                                  + [original_slice(rounds, a, b) for a, b in unsettled]),
+                     EQUALS_MARK)
 
 
 def neutralize_routing(text):
@@ -216,11 +218,13 @@ def neutralize_routing(text):
     replaced with ROUTING_TAG_MARK. The mark holds none, so the result can be asserted
     clean, and text with no directive comes back byte for byte.
 
-    One pass settles it: a tag found inside another is inside that one's match, since
-    neither pattern lets a match span a newline or a `]` (review of KIT-381: a newline
-    after each nested `[` once took one pass per level). The passes after the first are a
-    guard only, and it never raises: a job that raised here would fail its whole pass on
-    one crafted text. Past them, every `=` goes, and with it every directive."""
+    Every tag the dispatcher could read settles in one pass: a tag found inside another
+    is inside that one's match, since neither pattern lets a match span a newline or a `]`
+    (review of KIT-381: a newline after each nested `[` once took one pass per level). The
+    kit's wider patterns can need a second: a mark set next to a `repo=`, or after a `\`
+    that only the last decode makes. Past SETTLE_PASSES it never raises, because a job that
+    raised here would fail its whole pass on one crafted text: every `=` goes instead, with
+    every span still decoding, and with them every directive."""
     if not text:
         return text
     out = str(text)
@@ -238,18 +242,18 @@ def neutralize_routing(text):
 # The dispatcher's own patterns, copied from cyrus 0.2.73, to judge the output by: the
 # description tags (RunnerSelectionService.js:90-95, case-insensitive) and the repo tags
 # (RepositoryRouter.js parseRepoTagsFromDescription, case-sensitive).
-_DISPATCHER_TAG_RE = re.compile(r"\\?\[(agent|model)=([a-zA-Z0-9_.:/-]+)\\?\]", re.IGNORECASE)
-_DISPATCHER_REPO_RE = re.compile(r"\\?\[repo=([a-zA-Z0-9_\-/.#]+)\\?\]")
+DISPATCHER_TAG_RE = re.compile(r"\\?\[(agent|model)=([a-zA-Z0-9_.:/-]+)\\?\]", re.IGNORECASE)
+DISPATCHER_REPO_RE = re.compile(r"\\?\[repo=([a-zA-Z0-9_\-/.#]+)\\?\]")
 # JavaScript's \s also holds U+FEFF, and Python's does not (review of KIT-381).
-_DISPATCHER_BARE_RE = re.compile(r"(?:^|[\s\n\ufeff])repos?=([a-zA-Z0-9_\-/.#,]+)",
+DISPATCHER_BARE_RE = re.compile(r"(?:^|[\s\n\ufeff])repos?=([a-zA-Z0-9_\-/.#,]+)",
                                  re.MULTILINE)
 
 
 def dispatcher_reads(stored):
     """Every directive the dispatcher parses out of a stored description."""
-    return ([m.group(0) for m in _DISPATCHER_TAG_RE.finditer(stored)]
-            + [m.group(0) for m in _DISPATCHER_REPO_RE.finditer(stored)]
-            + [m.group(0).strip() for m in _DISPATCHER_BARE_RE.finditer(stored)])
+    return ([m.group(0) for m in DISPATCHER_TAG_RE.finditer(stored)]
+            + [m.group(0) for m in DISPATCHER_REPO_RE.finditer(stored)]
+            + [m.group(0).strip() for m in DISPATCHER_BARE_RE.finditer(stored)])
 
 
 def decoded(text, rounds=1):
@@ -319,23 +323,41 @@ def selftest_cases():
     # Nested tags settle in one pass and never raise (review of KIT-381: with a newline
     # allowed after `[`, each level took a pass of its own, and eight levels raised, which
     # failed every pass of the job that met them).
+    real_spans = globals()["directive_spans"]
     for opener in ("[ agent=", "[\nagent=", "[agent\n=", "[&#10;agent=", "\\[ model\t="):
         for depth in (1, 8, 300):
             text = opener * depth + "x" + "]" * depth
+            scans = [0]
+
+            def counted(t, _real=real_spans, _scans=scans):
+                _scans[0] += 1
+                return _real(t)
+            globals()["directive_spans"] = counted
             try:
                 out = neutralize_routing(text)
             except Exception as exc:  # noqa: BLE001 - the case is that it never raises
                 out = "raised %r" % exc
+            finally:
+                globals()["directive_spans"] = real_spans
             left = [r for rounds in range(4) for r in dispatcher_reads(decoded(out, rounds))]
+            # A tag opener without a newline is one tag, up to the first `]`, found in the
+            # first scan; with a newline after `[`, it is no tag at all, left as written.
+            want = (ROUTING_TAG_MARK + "]" * (depth - 1)
+                    if "\n" not in opener and "&#10;" not in opener else text)
             check("nested:%r:%d" % (opener, depth),
-                  not left and directive_spans(out) == [] and not out.startswith("raised"),
-                  (out[:80], left))
+                  not left and directive_spans(out) == [] and out == want
+                  and scans[0] <= 2, (out[:80], left, scans[0]))
     # The guard past the passes: with no `=` left in how the text reads, nothing is a
     # directive, however the `=` was spelt.
     stripped = without_equals("a [agent\\=x] b repo&#61;y c [model&amp;#61;z] d = e")
     check("fallback-leaves-no-equals-sign",
           directive_spans(stripped) == [] and "=" not in decoded(stripped, DECODE_ROUNDS)
           and stripped.count(EQUALS_MARK) == 4, stripped)
+    deep_equals = without_equals("[agent&" + "amp;" * (DECODE_ROUNDS + 4) + "#61;codex]")
+    check("fallback-takes-an-equals-spelt-past-the-rounds",
+          not [r for rounds in range(DECODE_ROUNDS + 8)
+               for r in dispatcher_reads(decoded(deep_equals, rounds))]
+          and EQUALS_MARK in deep_equals, deep_equals)
     # …and neutralize_routing reaches it, rather than raising, when the passes run out.
     global SETTLE_PASSES
     passes, SETTLE_PASSES = SETTLE_PASSES, 0
@@ -357,7 +379,13 @@ def selftest_cases():
     check("deeper-spelling-is-not-left-for-later-saves",
           not [r for rounds in range(DECODE_ROUNDS + 8)
                for r in dispatcher_reads(decoded(out, rounds))]
-          and ROUTING_TAG_MARK in out, out)
+          and out == "[agent" + ROUTING_TAG_MARK + "amp;amp;#61;codex]", out)
+    # …and the part cut is mapped back through every round: text that decodes in front of
+    # it comes back byte for byte.
+    out = neutralize_routing("&lt;" * 10 + " " + deeper + " &amp; tail")
+    check("deeper-spelling-maps-back-past-decoded-text",
+          out == "&lt;" * 10 + " [agent" + ROUTING_TAG_MARK + "amp;amp;#61;codex] &amp; tail",
+          out)
     check("a-byte-order-mark-before-repo",
           neutralize_routing("\ufeffrepo=x") == "\ufeff" + ROUTING_TAG_MARK
           and dispatcher_reads("\ufeffrepo=x") == ["\ufeffrepo=x"],
@@ -365,27 +393,33 @@ def selftest_cases():
     # Linear in the text's size: the review poller runs this over a whole diff (review of
     # KIT-381: a per-character map cost gigabytes on a large one, and replacing each tag in
     # turn was quadratic).
+    # Sized so that replacing each tag in turn costs minutes even on a fast machine, while
+    # the real code takes about a second.
     import time
-    started = time.time()
+    started = time.perf_counter()
     plain = "+    x = compute(a, b)  # an ordinary line of a large diff\n" * 40000
-    tagged = "+[repo=x] repo=y [agent\\=z]\n" * 30000
+    tagged = "+[repo=x] repo=y [agent\\=z]\n" * 90000
     unclosed = "+" + "[agent=" * 50000 + "\n+ x]\n"
     same = neutralize_routing(plain) == plain and neutralize_routing(unclosed) == unclosed
     marks = neutralize_routing(tagged).count(ROUTING_TAG_MARK)
-    took = time.time() - started
-    check("large-texts-in-linear-time", same and marks == 90000 and took < 10,
+    took = time.perf_counter() - started
+    check("large-texts-in-linear-time", same and marks == 270000 and took < 10,
           (same, marks, round(took, 2)))
     import tracemalloc
     tracing = tracemalloc.is_tracing()
     if not tracing:
         tracemalloc.start()
-    if hasattr(tracemalloc, "reset_peak"):
-        tracemalloc.reset_peak()
-    neutralize_routing(plain)
-    peak = tracemalloc.get_traced_memory()[1]
+    peaks = []
+    for text in (plain, tagged[:len(tagged) // 3]):
+        if hasattr(tracemalloc, "reset_peak"):
+            tracemalloc.reset_peak()
+        base = tracemalloc.get_traced_memory()[0]
+        neutralize_routing(text)
+        peaks.append(tracemalloc.get_traced_memory()[1] - base)
     if not tracing:
         tracemalloc.stop()
-    check("large-texts-in-little-memory", peak < (64 << 20), "%d MB" % (peak >> 20))
+    check("large-texts-in-little-memory", max(peaks) < (64 << 20),
+          ["%d MB" % (p >> 20) for p in peaks])
     rng = random.Random(381)
     # The stretch-by-stretch search finds exactly what `finditer` would.
     bits = ["[", "]", "\\", "\n", " ", "\t", "agent", "model", "repo", "=", "x", "[agent=",
@@ -419,8 +453,11 @@ def selftest_cases():
     import os
     import shutil
     import tempfile
-    copies = copies_in(os.path.dirname(os.path.abspath(__file__)))
+    here = os.path.dirname(os.path.abspath(__file__))
+    copies = copies_in(here)
     check("no-other-script-keeps-a-copy", copies == [], copies)
+    check("every-allowance-still-excuses-a-scrub", stale_allowances(here) == [],
+          stale_allowances(here))
     planted = tempfile.mkdtemp(prefix="routing-tags-selftest-")
     try:
         for name, src in (("pipeline_routing_tags.py", 'X = r"%s"\n' % BRACKET_TAG_RE.pattern),
@@ -428,40 +465,67 @@ def selftest_cases():
                           ("b_copy.py", 'Y = r"%s"\n' % UNBRACKETED_REPO_RE.pattern),
                           ("c_reordered.py",
                            'Z = re.compile(r"\\[\\s*(?:agent|model|repos?)\\s*=", re.I)\n'),
-                          ("pipeline_bounce_local.py", 'B = re.compile(r"(repos?|model|agent)=")\n'),
+                          ("pipeline_bounce_local.py", 'B = re.compile(r"(repos?|model|agent)=")\n'
+                           'V = r"%s"\n' % BRACKET_TAG_RE.pattern),
+                          ("unrelated.py", 'R = re.compile(r"^(report|modeling|reagent):")\n'),
                           ("clean.py", "Z = 1\n"), ("notes.txt", BRACKET_TAG_RE.pattern)):
             with open(os.path.join(planted, name), "w", encoding="utf-8") as fh:
                 fh.write(src)
         check("a-planted-copy-is-found",
-              copies_in(planted) == ["a_copy.py", "b_copy.py", "c_reordered.py"],
-              copies_in(planted))
+              copies_in(planted) == ["a_copy.py", "b_copy.py", "c_reordered.py",
+                                     "pipeline_bounce_local.py"], copies_in(planted))
+        check("an-allowance-goes-stale-with-its-scrub",
+              stale_allowances(os.path.join(planted, "nowhere")) == sorted(OWN_SCRUB_UNTIL),
+              stale_allowances(os.path.join(planted, "nowhere")))
     finally:
         shutil.rmtree(planted, ignore_errors=True)
     return cases[0], failures
 
 
 # Scripts that still keep a routing scrub of their own, each with the ticket that ends it.
+# Only the one-line rule below is waived for them, and the selftest fails once the scrub it
+# excuses is gone, so the entry is deleted with it.
 OWN_SCRUB_UNTIL = {"pipeline_bounce_local.py": "KIT-384"}
+_COPY_WORDS = tuple(re.compile(w, re.IGNORECASE)
+                    for w in (r"\brepos?\b", r"\bmodel\b", r"\bagent\b"))
+
+
+def _one_line_copies(src):
+    """Lines compiling a pattern that names repo, model and agent as words: a heuristic for
+    a reordered copy. A copy spread over lines, or written inline in a sub(), passes it."""
+    return [line for line in src.splitlines()
+            if "re.compile(" in line and all(w.search(line) for w in _COPY_WORDS)]
 
 
 def copies_in(directory):
     """The scripts in `directory`, other than this one, that carry a copy of either pattern:
-    its distinctive source text, or a compiled pattern naming repo, model and agent on one
-    line, as a reordered copy would. OWN_SCRUB_UNTIL is left out."""
+    its distinctive source text, or (outside OWN_SCRUB_UNTIL) a one-line copy."""
     import os
     found = []
     for name in sorted(os.listdir(directory)):
-        if (not name.endswith(".py") or name == "pipeline_routing_tags.py"
-                or name in OWN_SCRUB_UNTIL):
+        if not name.endswith(".py") or name == "pipeline_routing_tags.py":
             continue
         with open(os.path.join(directory, name), encoding="utf-8") as fh:
             src = fh.read()
         if ("(?:repos?|model|agent)" in src or "repos?=[A-Za-z0-9_" in src
-                or any("re.compile(" in line
-                       and all(word in line.lower() for word in ("repo", "model", "agent"))
-                       for line in src.splitlines())):
+                or (name not in OWN_SCRUB_UNTIL and _one_line_copies(src))):
             found.append(name)
     return found
+
+
+def stale_allowances(directory):
+    """OWN_SCRUB_UNTIL entries whose file no longer keeps the scrub they excuse."""
+    import os
+    stale = []
+    for name in sorted(OWN_SCRUB_UNTIL):
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                src = fh.read()
+        except OSError:
+            src = ""
+        if not _one_line_copies(src):
+            stale.append(name)
+    return stale
 
 
 def selftest():

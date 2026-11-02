@@ -941,10 +941,12 @@ TICKET_TEXT_PREAMBLE = (
 
 
 def _one_line(text):
-    """A copied ticket string as ONE bullet: sanitized, then every run of whitespace
-    (newlines included) collapsed, so a criterion can never start a new markdown line —
-    and so never a new section of the reviewer's brief."""
-    return " ".join(sanitize_text(text).split())
+    """A copied ticket string as ONE bullet: every run of whitespace (newlines included)
+    collapsed, so a criterion can never start a new markdown line, and so never a new
+    section of the reviewer's brief; then sanitized. Collapsed FIRST: a newline inside a
+    bracket keeps it from being a tag, and a collapse after the scrub would make one
+    (review of KIT-381)."""
+    return sanitize_text(" ".join(str(text or "").split()))
 
 
 def _criteria_changed_line(flag, basis_tier=None):
@@ -3587,6 +3589,19 @@ def selftest():
           [r for rounds in range(4)
            for r in routing.dispatcher_reads(routing.decoded(esc_body, rounds))],
           ["[repo=reviews-r]"] * 4)
+    # A newline inside a bracket is no tag, until a collapse makes it one: a withheld path
+    # or a criterion is collapsed first, then scrubbed, so the body still files.
+    check("a collapsed line is scrubbed after the collapse",
+          routing_directives_in(_one_line("x [\nagent=evil] and [agent=\nevil] y")), [])
+    try:
+        newline_body = build_review_body("o/r", fixture[4], "KIT-5", basis, "high", diff,
+                                         withheld=["[\nagent=x].txt"], shown_count=1)
+        newline_refused = False
+    except PollerError:
+        newline_body, newline_refused = "", True
+    check("a withheld path with a newline in a bracket still files",
+          (newline_refused, [newline_body[a:b] for a, b in routing_directives_in(newline_body)]),
+          (False, ["[repo=reviews-r]"]))
     check("a word ending in repo= is not a directive", routing_directives_in("myrepo=1"), [])
     check("a spaced assignment is not a directive", routing_directives_in("repo = get()"), [])
 
