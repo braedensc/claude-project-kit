@@ -262,14 +262,21 @@ said yes first. Reply `no <ticket id>` instead to leave the idea where it is.
 
 A later answer is judged like any answer (KIT-358):
 - A bot's or a guest's yes is refused, and so is a bare one after a post the bridge can't vouch for.
-- Before the move back, the bridge checks again for a planning run or a plan. If one appeared,
-  the idea stays in the backlog state, and the thread says why.
+- Before the move back, the bridge checks again. A planning run or a plan may have appeared, or
+  a newer move into Plan it. The idea's title, text, team or labels may have changed. If any
+  of those happened, the idea stays in the backlog state, and the thread says why.
 - A `no` never moves the idea.
-- With `ACT=no`, nothing moves. The re-plan waits, and every pass says so.
+- With `ACT=no`, nothing moves. The re-plan waits, and every pass says so. Reply `no` to end it,
+  or switch acting on and reply `yes`.
 - If the first move never landed, nothing waits outside Plan it. The question is an ordinary
   one again, and it expires like one.
-- If the question was asked where the bridge no longer reads, the next pass closes it and says
-  so once. That covers a channel taken off `CHANNEL_IDS`, and a member taken off `DM_USER_IDS`.
+- If the idea is back in Plan it, moved on, or gone, the next pass closes the re-plan and says
+  so once.
+- If the question was asked where the bridge no longer reads, the next pass closes it, and says
+  so in Slack where the notifier watch speaks. That covers a channel taken off `CHANNEL_IDS`,
+  and a member taken off `DM_USER_IDS`.
+- The comment naming who said yes is written as soon as the bridge knows the idea left Plan
+  it, even when the reply to that move was lost.
 
 Afterwards the bridge reads the idea's history the way the planner does. If the move back in
 doesn't show there, the move back failed, or the bridge can't tell whether it landed, the
