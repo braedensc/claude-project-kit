@@ -139,3 +139,10 @@ DISPATCHER_ROUTER_FILE=
 # of each planned repository. Asked for at a hidden prompt and stored in
 # ~/.stage-a/env under the role account. Leave empty when every one is public.
 GITHUB_TOKEN_ENV=
+
+# OPTIONAL. The model each planning ticket, and each piece of an approved plan, runs on:
+# fable, opus, sonnet, haiku or a claude- model name. The job writes it as a
+# `[model=...]` line near the top of each ticket. The dispatcher's default model also
+# runs the chat bot, so set this BEFORE moving that default, or planning and coding move
+# with it. Leave empty to run them on the dispatcher's default.
+TICKET_MODEL=

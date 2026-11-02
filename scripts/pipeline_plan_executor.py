@@ -94,7 +94,8 @@ Usage:
     pipeline_plan_executor.py --requests F --pinned TEAM-123
                               --config <planned repo>/delivery.json
                               --repo-root <planned repo checkout>
-                              [--idea TEAM-122] [--key-env NAME] [--dry-run]
+                              [--idea TEAM-122] [--key-env NAME] [--model-tag MODEL]
+                              [--dry-run]
     pipeline_plan_executor.py --selftest
 
   WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
@@ -118,6 +119,11 @@ Usage:
                  tracker. Its LAST fenced pipeline-safe-outputs/1 block is the
                  proposal; none is an empty run, one that does not parse is a
                  rejection (`extract_proposal`).
+    --model-tag  the model each child runs on (KIT-379), the planner job's
+                 TICKET_MODEL. It becomes a `[model=…]` line opening each child's
+                 description: the dispatcher's default model also runs the tech
+                 lead, so a deployment that moves that default keeps its coding
+                 sessions on the model it chose. Absent, nothing changes.
   The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150).
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
@@ -235,6 +241,32 @@ _BRACKET_TAG_RE = re.compile(r"\\?\[\s*(?:repos?|model|agent)\s*=[^\]\n]*\\?\]",
 _UNBRACKETED_REPO_RE = re.compile(r"(^|[^A-Za-z0-9_])repos?=[A-Za-z0-9_\-/.#,]+",
                                   re.IGNORECASE | re.MULTILINE)
 ROUTING_TAG_MARK = "(removed-routing-tag)"
+# KIT-379: the one `[model=…]` tag this executor writes itself, on the first line of each
+# child it files, so the child runs on the model the deployment chose (TICKET_MODEL) and not
+# on the dispatcher's default model, which the tech lead also runs on. The dispatcher takes
+# the FIRST `[model=<name>]` anywhere in a description and never reads an entry's own model
+# (cyrus 0.2.73 RunnerSelectionService.js:90-95, 283-299; KIT-377), and every tag in
+# session-written text is neutralised above. A name is one of the dispatcher's own Claude
+# names, in the charset its tag reader accepts.
+MODEL_TAG_RE = re.compile(r"^(?:fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,60})\Z")
+
+
+def model_tag(model):
+    """The tag line for `model`, which MODEL_TAG_RE has already accepted."""
+    return "[model=%s]" % model
+
+
+_DISPATCHER_MODEL_TAG_RE = re.compile(r"\\?\[model=([a-zA-Z0-9_.:/-]+)\\?\]", re.IGNORECASE)
+
+
+def dispatcher_model(description, default):
+    """The model the dispatcher runs a ticket on, by its own rule (cyrus 0.2.73
+    RunnerSelectionService.js:90-95, 297-299): the first `[model=<name>]` anywhere in the
+    description, Linear's escapes allowed, else its default model. Labels are left out:
+    nothing this executor or the planner job files carries a model label. The selftests
+    judge each filed description by it."""
+    found = _DISPATCHER_MODEL_TAG_RE.search(description or "")
+    return found.group(1) if found else default
 
 
 def neutralize_routing(text):
@@ -658,7 +690,7 @@ def validate_plan(plan, pinned_id, finding_configured):
     return errors
 
 
-def build_child_tickets(plan, team_key, landing_state_id):
+def build_child_tickets(plan, team_key, landing_state_id, model=None):
     """The ticket objects the DoR gate judges — one per proposed child.
 
     Each carries a PENDING epic reference (parent + provenance + a placeholder
@@ -681,7 +713,7 @@ def build_child_tickets(plan, team_key, landing_state_id):
             "title": child["title"],
             "description": child_description(
                 pending, plan["epic"]["title"], children, i,
-                {j: pending for j in range(len(children))}),
+                {j: pending for j in range(len(children))}, model),
             "labels": labels,
             "projectId": PENDING_PROJECT,
             "parentId": pending_epic,
@@ -926,10 +958,12 @@ def child_context_block(epic, epic_title, children, i, created):
     return "\n>\n".join(lines)
 
 
-def child_description(epic, epic_title, children, i, created):
-    """Child i's description: its opening block, then the planner's body unchanged.
-    The one spelling both the gate and the create use."""
-    return (child_context_block(epic, epic_title, children, i, created) + "\n\n"
+def child_description(epic, epic_title, children, i, created, model=None):
+    """Child i's description: its model tag when a model is given (KIT-379), its opening
+    block, then the planner's body unchanged. The one spelling both the gate and the
+    create use."""
+    return ((model_tag(model) + "\n\n" if model else "")
+            + child_context_block(epic, epic_title, children, i, created) + "\n\n"
             + children[i]["body"])
 
 
@@ -1289,7 +1323,8 @@ def materialise(args, client=None):
         # ordered is refused before the epic exists, never partway through (KIT-263).
         creation_order(children)
         child_tickets = build_child_tickets(plan, team_key,
-                                            _landing_state_or_placeholder(cfg, finding_cfg))
+                                            _landing_state_or_placeholder(cfg, finding_cfg),
+                                            getattr(args, "model_tag", None))
         ok, reports = run_dor(child_tickets, config_path, args.repo_root)
     except ExecutorError as exc:
         print("::error:: %s" % exc, file=sys.stderr)
@@ -1316,7 +1351,7 @@ def materialise(args, client=None):
         return EXIT_ERRORED
 
     return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments,
-                   idea=getattr(args, "idea", None))
+                   idea=getattr(args, "idea", None), model=getattr(args, "model_tag", None))
 
 
 def _landing_state_or_placeholder(cfg, finding_cfg):
@@ -1423,7 +1458,7 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
 
 
 def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None,
-            idea=None):
+            idea=None, model=None):
     """The only path that mutates. Any failure here is `errored`, never
     `rejected` — the tree was accepted; the tracker is what failed, and it may be
     partly written (§8, §13).
@@ -1542,7 +1577,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             label_ids = [forced["prov_epic"]] + [
                 forced["label_ids"][k] for k in (child.get("labels") or [])]
             body = child_description(epic, plan["epic"]["title"], plan["children"], i,
-                                     by_index)
+                                     by_index, model)
             issue = client.create_issue(
                 team_id, child["title"], body, forced["landing_state"],
                 label_ids, parent_id=epic["id"], project_id=project_id)
@@ -1804,6 +1839,68 @@ def selftest():
               all("read the epic's description" in h for h in heads), True)
         check("child-body-follows-unchanged",
               all(k["description"].endswith("\n\n" + _GOOD_CHILD_BODY) for k in kids), True)
+        # KIT-379: given a model, each child OPENS with that model's tag and is otherwise
+        # the same; the epic carries none; and a tag the planner wrote is neutralised, so
+        # the dispatcher's own first-match rule picks the executor's. Without a model, the
+        # checks above stand unchanged.
+        tagged_tree = _tree()
+        tagged_tree["requests"][0]["children"][0]["body"] = _GOOD_CHILD_BODY.replace(
+            "## Context\n\n", "## Context\n\nRun this one on [model=haiku], it is small.\n\n",
+            1)
+        tag_req = os.path.join(tmp, "tagged.json")
+        json.dump(tagged_tree, open(tag_req, "w"))
+        fake_t = FakeLinear()
+        gate_saw, real_dor = [], run_dor
+
+        def spy_dor(child_tickets, config_path, repo_root):
+            gate_saw.append([t["description"] for t in child_tickets])
+            return real_dor(child_tickets, config_path, repo_root)
+        globals()["run_dor"] = spy_dor
+        try:
+            check("model-tag-exit", materialise(argparse.Namespace(
+                requests=tag_req, config=cfg_path, repo_root=tmp, dry_run=False,
+                pinned="KIT-777", model_tag="opus"), client=fake_t), EXIT_OK)
+        finally:
+            globals()["run_dor"] = real_dor
+        kids_t = fake_t.issues[1:]
+        check("model-tag-the-gate-judged-it",
+              [d.split("\n", 1)[0] for d in (gate_saw[0] if gate_saw else [])],
+              ["[model=opus]"] * 2)
+        check("model-tag-opens-each-child",
+              [k["description"].split("\n", 1)[0] for k in kids_t], ["[model=opus]"] * 2)
+        check("model-tag-rest-of-child-unchanged",
+              kids_t[1]["description"], "[model=opus]\n\n" + kids[1]["description"])
+        check("model-tag-not-on-the-epic", "[model=" in fake_t.issues[0]["description"],
+              False)
+        check("model-tag-wins-the-dispatchers-rule",
+              [dispatcher_model(k["description"], "sonnet") for k in kids_t],
+              ["opus", "opus"])
+        check("model-tag-a-planners-tag-is-neutralised",
+              ("[model=haiku]" in kids_t[0]["description"],
+               ROUTING_TAG_MARK in kids_t[0]["description"]), (False, True))
+        check("model-tag-untagged-child-runs-the-default",
+              [dispatcher_model(k["description"], "sonnet") for k in kids],
+              ["sonnet", "sonnet"])
+        check("model-tag-dispatcher-rule-takes-linear-escapes",
+              (dispatcher_model("x \\[model=opus\\] y", "sonnet"),
+               dispatcher_model("[model=opus] then [model=haiku]", "sonnet"),
+               dispatcher_model("[ model=opus ]", "sonnet")), ("opus", "opus", "sonnet"))
+        check("model-tag-names",
+              [bool(MODEL_TAG_RE.match(m)) for m in (
+                  "opus", "sonnet", "haiku", "fable", "claude-sonnet-5-5",
+                  "claude-3-5-sonnet-20241022", "Opus", "gpt-5", "opus[1m]", "claude-",
+                  "opus\n", "")],
+              [True] * 6 + [False] * 6)
+        import contextlib
+        import io
+        for bad in ("gpt-5", "Opus", "opus[1m]", "sonnet "):
+            refused = None
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    main(["--message", tag_req, "--model-tag", bad])
+                except SystemExit as exc:
+                    refused = exc.code
+            check("model-tag-refused:%s" % bad.strip(), refused, 2)
         def as_filed(tree, issues):
             """The gate's view of the children exactly as the tracker holds them."""
             tickets = build_child_tickets(tree["requests"][0], "KIT", "state-raw")
@@ -2582,6 +2679,10 @@ def main(argv=None):
     ap.add_argument("--key-env", default=DEFAULT_KEY_ENV,
                     help="the NAME of the environment variable holding the tracker key "
                          "(default %s)" % DEFAULT_KEY_ENV)
+    ap.add_argument("--model-tag",
+                    help="the model each child runs on, written as a `[model=…]` tag on the "
+                         "first line of its description (KIT-379): fable, opus, sonnet, "
+                         "haiku or a claude- model name. Absent, no tag is written")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and DoR-gate, but create nothing")
     ap.add_argument("--selftest", action="store_true", help="run built-in fixtures and exit")
@@ -2592,6 +2693,9 @@ def main(argv=None):
         ap.error("give exactly one of --requests or --message (or use --selftest)")
     if not KEY_ENV_RE.match(args.key_env or ""):
         ap.error("--key-env takes a variable NAME (UPPER_SNAKE), never a value")
+    if args.model_tag is not None and not MODEL_TAG_RE.match(args.model_tag):
+        ap.error("--model-tag takes fable, opus, sonnet, haiku or a claude- model name "
+                 "in lower case")
     return materialise(args)
 
 

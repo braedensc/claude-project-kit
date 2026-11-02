@@ -582,11 +582,16 @@ OPTIONAL_CONF_KEYS = {
                        "planner job's tracker key (default %r). Name the review jobs' "
                        "own file (`.stage-e/env`) to reuse their key: then nothing is "
                        "asked for, and revoking that key stops both" % ".stage-a/env",
+    "TICKET_MODEL": "the model each planning ticket and each planned piece runs on: fable, "
+                    "opus, sonnet, haiku or a claude- model name. Set it before moving the "
+                    "dispatcher's default model, which the chat bot also runs on. Unset "
+                    "(the default), they run on that default",
 }
 CONF_DEFAULTS = {"PLAN_IT_STATE": "Plan it", "POLL_INTERVAL_SECONDS": "300",
                  "GITHUB_TOKEN_ENV": "", "MAX_RUNS_PER_DAY": "10",
                  "ROUTING_WAIT_SECONDS": "120", "DISPATCHER_PORT": "3456",
-                 "DISPATCHER_ROUTER_FILE": "", "LINEAR_KEY_FILE": ".stage-a/env"}
+                 "DISPATCHER_ROUTER_FILE": "", "LINEAR_KEY_FILE": ".stage-a/env",
+                 "TICKET_MODEL": ""}
 # A path under the role account's home: relative, plain characters, no `..`. It travels
 # into a shell fragment run as that account, so its shape is the whole safety.
 KEY_FILE_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*(/[A-Za-z0-9_.][A-Za-z0-9_.-]*)*$")
@@ -717,6 +722,10 @@ def validate_conf(conf):
                       "are two different keys — yours, for provisioning, and the "
                       "executor's, stored under the role account — and one name for both "
                       "is how your own key ends up in the executor's file")
+    model = conf.get("TICKET_MODEL", "")
+    if model and not poller.executor.MODEL_TAG_RE.match(model):
+        errors.append("TICKET_MODEL must be fable, opus, sonnet, haiku or a claude- model "
+                      "name, in lower case (got %r)" % model)
     for key in conf:
         if key not in CONF_KEYS and key not in OPTIONAL_CONF_KEYS:
             errors.append("unknown key %s — a misspelled key is read as missing" % key)
@@ -1986,6 +1995,10 @@ def poller_config(ctx):
         "routing_wait_seconds": int(conf_value(conf, "ROUTING_WAIT_SECONDS")),
         "dispatcher_version_url": version_url(conf),
     }
+    # KIT-379: composed only when set, so a config written before the key existed is still,
+    # byte for byte, the composed one.
+    if conf_value(conf, "TICKET_MODEL"):
+        doc["ticket_model"] = conf_value(conf, "TICKET_MODEL")
     probe = (ctx.state.data.get("ids") or {}).get("probe") or {}
     if (ctx.state.attested("CA-PROBE") and probe.get("dispatcher_version")
             and not probe_uncovered(probe, rows)):
@@ -2920,6 +2933,28 @@ def step_kit_clone(ctx, apply_it):
     return False, "clone placed and level with origin", []
 
 
+def ticket_model_refusal(ctx, want=None):
+    """Why the planner job's config must not carry ticket_model here, or None (KIT-379). A
+    planner from before the key refuses the WHOLE config as an unknown key, and then plans
+    nothing. The `kit-clone` step moves the clone only as far as origin, so a checkout ahead
+    of origin, or `drill` alone, can meet an older planner."""
+    want = poller_config(ctx) if want is None else want
+    if '"ticket_model"' not in want:
+        return None
+    code = ctx.host.read_role_file(ctx.conf["ROLE_ACCOUNT"],
+                                   ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py")
+    if code is None:
+        raise Unknown("could not read the planner job's own code, to see whether it knows "
+                      "TICKET_MODEL", "run this from a terminal as yourself")
+    if '"ticket_model"' in code:
+        return None
+    return ("TICKET_MODEL is set, but the role account's clone runs a planner from before "
+            "that key, which would refuse its whole config and plan nothing. The one command "
+            "moves the clone only as far as origin: leave TICKET_MODEL empty until origin "
+            "carries the change, then run the one command, `python3 "
+            "scripts/pipeline_install.py`.")
+
+
 def step_poller_config(ctx, apply_it):
     """The planner job's config, under the role account. It holds no credential —
     only the NAME of the variable each one lives in."""
@@ -2932,9 +2967,14 @@ def step_poller_config(ctx, apply_it):
     if got == want:
         return True, "the planner job's config matches this conf", []
     if not apply_it:
+        # A check run comes before the `kit-clone` step moves the clone, so an older clone
+        # here is not yet a fault: the write below re-checks once the clone has moved.
         return False, ("would write the planner job's config" if not got
                        else "would rewrite the planner job's config: this conf has moved "
                             "since it was written"), []
+    refusal = ticket_model_refusal(ctx, want)
+    if refusal:
+        raise SetupError(refusal + " Nothing was written.")
     ctx.runner.do("write the planner job's config", lambda: ctx.host.write_role_file(
         account, ROLE_POLLER_CONFIG, want))
     return False, "wrote the planner job's config (mode 600)", []
@@ -3597,12 +3637,21 @@ PROBE_LABEL_BODY = ("This is a routing test, filed by the idea-gate installer. Y
                     "brief says what to do with a ticket of exactly this title.")
 
 
-def probe_tools_body(entry):
-    """Probe ticket 1: the planning tag as its FIRST line. The steps are in the brief."""
-    return ("[repo=%s]\n\n"
+def probe_label_body(model=None):
+    """Probe ticket 2: routed by its label alone. With TICKET_MODEL set it opens with the
+    model tag, as every planning ticket the job files does (KIT-379)."""
+    return (poller.executor.model_tag(model) + "\n\n" if model else "") + PROBE_LABEL_BODY
+
+
+def probe_tools_body(entry, model=None):
+    """Probe ticket 1: the planning tag as its FIRST line, and with TICKET_MODEL set the
+    model tag on its second, exactly where the job puts it (KIT-379). The steps are in the
+    brief."""
+    return ("[repo=%s]\n%s\n"
             "This is the idea-gate installer's fence probe. It is not an idea. Your planning "
             "brief says what to do with a ticket of exactly this title. This text adds "
-            "nothing to it." % entry)
+            "nothing to it." % (entry, (poller.executor.model_tag(model) + "\n") if model
+                                else ""))
 
 
 _SECTION_RE = re.compile(r"^[\s#>*_`-]*(%s)\b[\s*_`]*:?[\s*_`]*(.*)$"
@@ -3908,10 +3957,11 @@ def run_probe(ctx, rows):
             if not (rec.get("team_id") and rec.get("routing_label_id")):
                 raise SetupError("the tracker step has not recorded %s's team and routing "
                                  "label yet" % row["team_key"])
+            model = conf_value(ctx.conf, "TICKET_MODEL")
             one = own.create(rec["team_id"], PROBE_TITLE_TOOLS,
-                             probe_tools_body(row["entry"]),
+                             probe_tools_body(row["entry"], model),
                              [rec["routing_label_id"]], ws["agent_id"], "probe")
-            two = own.create(rec["team_id"], PROBE_TITLE_LABEL, PROBE_LABEL_BODY,
+            two = own.create(rec["team_id"], PROBE_TITLE_LABEL, probe_label_body(model),
                              [rec["routing_label_id"]], ws["agent_id"], "probe")
             filed.append((row, one, two))
             ctx.say("  filed %s (tag and label) and %s (label only) on %s"
@@ -4236,6 +4286,11 @@ def run_drill(ctx):
     reason, _hard = probe_needed(ctx, rows)
     if reason is not None:
         raise SetupError("the drill needs a probe that still holds, and %s" % reason)
+    # KIT-379: the drill ends by writing the planner job's config. Refused here, before it
+    # breaks anything, rather than after it has stopped planning.
+    refusal = ticket_model_refusal(ctx)
+    if refusal:
+        raise SetupError(refusal + " The drill did not start, and nothing was changed.")
     step_enable(ctx, False)                  # loaded, and its last pass reported ok
     entries = compose_entries(ctx, rows)
     have = read_planning_entries(ctx)
@@ -6340,6 +6395,32 @@ def _drill_cases(check, drill_world):
     check("drill-failure-records-no-pass", "drill" in (df.state.data["ids"] or {}), False)
     dn, restarts_n = drill_world("drill-declined", answers=("y", "y", "bc", "no"))
     check("drill-declined-changes-nothing", (run_drill(dn), restarts_n), (None, []))
+    # KIT-379: with TICKET_MODEL set, a planner from before the key stops the drill BEFORE it
+    # breaks anything, not after it has stopped planning; with one that knows the key, the
+    # drill runs, and the probe it signs again files its tickets with the tag.
+    dt, restarts_t = drill_world("drill-ticket-model-old")
+    dt.conf["TICKET_MODEL"] = "opus"
+    dt.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = 'KEYS = ("probe",)\n'
+    try:
+        run_drill(dt)
+        got_t = "ran"
+    except SetupError as exc:
+        got_t = str(exc)
+    check("drill-ticket-model-old-planner-refused-first",
+          ("The drill did not start" in got_t, restarts_t,
+           [i for i, r in dt.tracker.issues.items() if r["input"]["title"] == DRILL_TITLE]),
+          (True, [], []))
+    dm, _restarts_m = drill_world("drill-ticket-model-new")
+    dm.conf["TICKET_MODEL"] = "opus"
+    dm.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = (
+        'KEYS = ("probe", "ticket_model")\n')
+    before_m = set(dm.tracker.issues)
+    check("drill-ticket-model-new-planner-runs", run_drill(dm), True)
+    probes = [r["input"].get("description") or "" for i, r in dm.tracker.issues.items()
+              if i not in before_m
+              and r["input"]["title"] in (PROBE_TITLE_TOOLS, PROBE_TITLE_LABEL)]
+    check("probe-tickets-carry-the-model-tag",
+          (len(probes) >= 2, all("[model=opus]" in d for d in probes)), (True, True))
 
     # KIT-209, KIT-164. THE JOB'S FRONT DOOR FIRST: the owner's creation counts as the move,
     # so the idea is filed straight into Plan it, and the job is woken only once the idea
@@ -6504,6 +6585,12 @@ def _wizard_and_key_cases(check, tmp):
                   dict(GOOD_CONF, LINEAR_KEY_FILE=bad))), True)
     check("conf-key-file-shared-ok", validate_conf(dict(GOOD_CONF, LINEAR_KEY_FILE=".stage-e/env")),
           [])
+    # KIT-379: TICKET_MODEL is optional, and refused unless it is a name the dispatcher's
+    # own tag reader takes, in lower case.
+    check("conf-ticket-model-ok", validate_conf(dict(GOOD_CONF, TICKET_MODEL="opus")), [])
+    for bad in ("Opus", "gpt-5", "opus[1m]", "claude-"):
+        check("conf-ticket-model-refused:%s" % bad, any("TICKET_MODEL" in e for e in validate_conf(
+            dict(GOOD_CONF, TICKET_MODEL=bad))), True)
 
     # L. THE TOOL LIST, read the ways a session writes it.
     sections = parse_tool_report(PROBE_REPLY_OK)
@@ -7553,6 +7640,62 @@ def selftest():
             old._out = []
             cmd_verify(old)
             check("probe-old-sign-off-refused", old.state.outcome("probe"), FAILED)
+            # KIT-379: the planner job's config carries ticket_model only when TICKET_MODEL is
+            # set, so a config composed before the key existed is unchanged.
+            for model in ("", "opus"):
+                mc = _ctx(os.path.join(tmp, "ticket-model-%s" % (model or "unset")),
+                          conf=dict(GOOD_CONF, TICKET_MODEL=model), tracker=_ready_tracker())
+                check("poller-config-ticket-model:%s" % (model or "unset"),
+                      json.loads(poller_config(mc)).get("ticket_model", "absent"),
+                      model or "absent")
+            # …and is never written for a planner from before the key: that one would refuse
+            # the whole config and plan nothing (`drill` alone does not move the clone).
+            for label, code in (("old-clone", "OPTIONAL_KEYS = (\"probe\",)\n"),
+                                ("new-clone", "OPTIONAL_KEYS = (\"probe\", \"ticket_model\")\n")):
+                oc = _ctx(os.path.join(tmp, "ticket-model-%s" % label),
+                          conf=dict(GOOD_CONF, TICKET_MODEL="opus"), tracker=_ready_tracker())
+                oc.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = code
+                oc.runner = Runner(apply_it=True)
+                try:
+                    step_poller_config(oc, True)
+                    refused = None
+                except SetupError as exc:
+                    refused = str(exc)
+                check("poller-config-ticket-model-%s" % label,
+                      (refused is not None and "plan nothing" in refused,
+                       "ticket_model" in (oc.host.files.get(ROLE_POLLER_CONFIG) or "")),
+                      (label == "old-clone", label == "new-clone"))
+            # A check run comes before the clone moves: an older clone there is WOULD-CHANGE,
+            # not a failure. Code that can't be read is UNKNOWN. And the literal the check
+            # looks for is in the real planner, so a respelling there fails here.
+            oq = _ctx(os.path.join(tmp, "ticket-model-check-run"),
+                      conf=dict(GOOD_CONF, TICKET_MODEL="opus"), tracker=_ready_tracker())
+            oq.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = 'KEYS = ()\n'
+            check("poller-config-ticket-model-check-run-would-write",
+                  step_poller_config(oq, False)[:2],
+                  (False, "would write the planner job's config"))
+            oq.host.locked = True
+            try:
+                ticket_model_refusal(oq, '{"ticket_model": "opus"}')
+                unread = "no refusal"
+            except Unknown as exc:
+                unread = str(exc)
+            check("ticket-model-check-unreadable-code-is-unknown",
+                  "could not read the planner job's own code" in unread, True)
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "pipeline_plan_poller.py"), encoding="utf-8") as fh:
+                check("ticket-model-check-matches-the-real-planner",
+                      '"ticket_model"' in fh.read(), True)
+            # The probe's tickets are shaped like the job's own: the model tag where the job
+            # puts it, and with no model, exactly the bodies the probe was signed on before.
+            check("probe-bodies-carry-the-model-tag",
+                  (probe_tools_body("stage-a-planning-x", "opus").split("\n")[:3],
+                   probe_label_body("opus").split("\n")[0],
+                   probe_tools_body("stage-a-planning-x").startswith(
+                       "[repo=stage-a-planning-x]\n\nThis is"),
+                   probe_label_body() == PROBE_LABEL_BODY),
+                  (["[repo=stage-a-planning-x]", "[model=opus]", ""], "[model=opus]", True,
+                   True))
             # The routing code's fingerprint, when the file is named: read as the
             # dispatcher's account by the real program, recorded, and re-checked.
             router = os.path.join(tmp, "RepositoryRouter.js")
