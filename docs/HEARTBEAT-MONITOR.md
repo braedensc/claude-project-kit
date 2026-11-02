@@ -191,6 +191,9 @@ out how much of the beat's age the machine was awake, and judges that against th
 - A beat older than every mark falls back to the wall clock for that stretch, as before.
   So does a machine with no such clock.
 - A mark from before a reboot is ignored: the clock restarts at boot.
+- A beat's time is cut to the whole second, so a mark in that same second counts as before
+  it. The monitor marks a pass as it starts and stamps its own beat as it ends. Its own last
+  pass is therefore aged from its own mark, never from the pass before a sleep (KIT-361).
 
 The row says so when sleep was discounted, for example "5m of it awake".
 

@@ -647,7 +647,12 @@ def awake_age(beat_at, now, clock_now, marks, boot_at=None):
     if not valid:
         # Every mark predates a reboot: the machine has been awake at most since boot.
         return max(0.0, min(wall_age, clock_now)) if boot_at is not None else None
-    before = [m for m in valid if m[0] <= beat_at]
+    # A beat's time is cut to the whole second, so a mark in that same second may come
+    # before the real beat: the monitor marks a pass as it starts and stamps its own beat as
+    # it ends. Taken as after the beat, the monitor's own last mark was passed over for the
+    # pass before it, and any sleep between the two was subtracted from the beat's age, so
+    # a monitor that stopped right after a pass that followed a sleep read on time (KIT-361).
+    before = [m for m in valid if m[0] < beat_at + 1.0]
     if before:
         w, c = max(before)
         est = (clock_now - c) - (beat_at - w)
@@ -1781,6 +1786,20 @@ def selftest():
            aa(nap_beat, T, 300.0, mark) is None)
         ok("malformed marks are ignored, never trusted",
            aa(nap_beat, T, clock, [["x", 1], [True, 2.0], [T - 1800]]) is None)
+        # KIT-361: the monitor's own beat. Its pass marks [start, clock] as it starts, and
+        # stamps the beat as it ends, cut to the whole second: the mark is a fraction after
+        # the beat's time. The pass before it came before a sleep.
+        def own(slept_before, awake_after):
+            beat_at = T - awake_after
+            last = [beat_at + 0.35, 100000.0]
+            prev = [beat_at - 800 - slept_before - 1000, 100000.0 - 1800]
+            return round(aa(beat_at, T, 100000.0 + awake_after - 0.35, [prev, last]))
+        ok("KIT-361: stopped after a pass that followed an 8-hour sleep: 7200 s awake, not 0",
+           own(8 * 3600, 7200) == 7200, own(8 * 3600, 7200))
+        ok("KIT-361: a 30-minute nap before the last pass is not taken off its age",
+           own(1800, 4500) == 4500, own(1800, 4500))
+        ok("KIT-361: healthy, read 20 minutes after its first pass after a sleep: 1200 s",
+           own(1200, 1200) == 1200, own(1200, 1200))
 
         def rp(ts):
             return beat("review-poller", result="ok", ended_at=_iso(ts))
