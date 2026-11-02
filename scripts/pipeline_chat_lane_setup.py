@@ -2842,22 +2842,24 @@ def chat_turns(logs):
             for t in found:
                 total, zeroed = t.pop("total"), t.pop("zeroed")
                 t.pop("answered")
-                if total is None or zeroed or (prev is not None and total < prev):
-                    # A total only grows within a session: a zeroed one, or one below the
-                    # last, says nothing about this turn and is never the next one's base.
+                if total is None or zeroed:
+                    # A crash's zeroed total says nothing about this turn, and is never the
+                    # next one's base (sdk.d.ts 5563).
                     t["cost"], t["costNote"] = None, "unknown"
                     unpriced += 1
-                elif prev is None:
-                    # The session's first turn costs exactly its total; a total met first
-                    # past the window's edge holds the turns before it too.
-                    first = (start, path) == files[0] and not unpriced
+                elif prev is None or total < prev:
+                    # The session's first turn costs exactly its total. A total met first
+                    # past the window's edge holds the turns before it too, and so does one
+                    # below the last: its running total started again (a /clear, or a
+                    # resume with no saved total, sdk.d.ts 5563-5565).
+                    first = prev is None and (start, path) == files[0] and not unpriced
                     t["cost"], t["costNote"] = total, "exact" if first else "so-far"
                 else:
                     # Exact unless a turn since the last priced one logged no cost: its
                     # spend is in this difference too.
                     t["cost"] = round(total - prev, 6)
                     t["costNote"] = "with-%d" % unpriced if unpriced else "exact"
-                if total is not None and not zeroed and (prev is None or total >= prev):
+                if total is not None and not zeroed:
                     prev, unpriced = total, 0
                 t["run"] = start
                 t["open"] = False
@@ -3591,13 +3593,36 @@ def bare_model(name):
     return re.sub(r"(\[[12]m\])+$", "", name or "", flags=re.I)
 
 
+_FULL_ID_RE = re.compile(r"claude-(?:(\d{1,2}(?:-\d{1,2})?)-)?(fable|opus|sonnet|haiku)"
+                         r"(?:-(\d{1,2}(?:-\d{1,2})?)(?![0-9]))?")
+
+
+def model_key(name):
+    """(family, version) for a model's name: `('sonnet', None)` for the alias, `('sonnet',
+    '5-5')` for `claude-sonnet-5-5[1m]`, and the same inside a provider's id such as
+    `us.anthropic.claude-sonnet-5-5-20260101-v1:0` or the older `claude-3-5-sonnet-…`.
+    (None, None) when it can't tell, as for `opusplan` or `best`."""
+    n = bare_model(name).lower()
+    if n in MODEL_FAMILIES:
+        return n, None
+    found = _FULL_ID_RE.search(n)
+    if not found:
+        return None, None
+    return found.group(2), found.group(1) or found.group(3)
+
+
 def model_family(name):
     """`sonnet` for `sonnet` and for `claude-sonnet-5-5[1m]`; None when it can't tell."""
-    n = bare_model(name).lower()
-    for family in MODEL_FAMILIES:
-        if n == family or (n.startswith("claude") and family in n):
-            return family
-    return None
+    return model_key(name)[0]
+
+
+def same_model(a, b):
+    """True or False when the two names can be compared, None when either can't be read:
+    the versions must agree when both names carry one, else the families."""
+    (fa, va), (fb, vb) = model_key(a), model_key(b)
+    if not (fa and fb):
+        return None
+    return fa == fb and (va == vb if va and vb else True)
 
 
 def chat_model_pair(models):
@@ -3725,19 +3750,34 @@ def check_chat_model(cfg, env_facts, ct):
         return _row("chat-model", UNKNOWN,
                     "chat turns start on %s, with %s as the backup, but no chat turn is "
                     "logged yet, so none has been seen running on it" % (model, backup), lines)
-    newest = turns[0].get("model")
-    ran, wants = model_family(newest), model_family(model)
-    if newest and (ran != wants if ran and wants else bare_model(newest) != bare_model(model)):
+    # The newest turn that NAMES a model: a run that failed at start writes a result with no
+    # init, which shows nothing about the pair.
+    named = next((t for t in turns if t.get("model") and t.get("model") != "unreadable"),
+                 None)
+    if named is None:
         return _row("chat-model", UNKNOWN,
-                    "chat turns start on %s, with %s as the backup, but the newest turn, %s, "
-                    "ran on %s: it started before a change, or the running dispatcher holds "
-                    "another value than its config file" % (model, backup,
-                                                              _turn_when(turns[0].get("at")),
-                                                              newest),
+                    "chat turns start on %s, with %s as the backup, but no logged chat turn "
+                    "names the model it ran on" % (model, backup), lines)
+    newest, when = named["model"], _turn_when(named.get("at"))
+    same = same_model(newest, model)
+    if same is False:
+        if same_model(newest, backup):
+            cause = ("its backup: the model was refused or unavailable, and the session "
+                     "moved to the backup, or the running dispatcher holds another pair "
+                     "than its config file")
+        else:
+            cause = ("it started before a change, or the running dispatcher holds another "
+                     "value than its config file")
+        return _row("chat-model", UNKNOWN,
+                    "chat turns start on %s, with %s as the backup, but the newest turn that "
+                    "names its model, %s, ran on %s: %s" % (model, backup, when, newest, cause),
                     ["ask the bot one question in a NEW thread, then run verify again. If the "
                      "newest turn still runs on %s, restart the dispatcher when it is idle "
                      "(card CK-C5)" % newest] + lines)
     notes = []
+    if same is None:
+        notes.append("the model the newest turn ran on, %s, could not be compared with %s, "
+                     "so whether it runs on the pair is not judged" % (newest, model))
     if model_family(model) and model_family(model) == model_family(backup):
         notes.append("the backup, %s, is in the same family as %s, so it may be the same "
                      "model and back up nothing" % (backup, model))
@@ -6405,7 +6445,7 @@ def _selftest_body():
         # A difference across a turn that logged no cost holds that turn's spend too, and
         # says so.
         expect("chat-model-zeroed-result-is-not-a-base",
-               costs == [("14", 0.05, "with-1"), ("13", None, "unknown"),
+               costs == [("14", 0.6, "exact"), ("13", 0.9, "so-far"),
                          ("12", 0.25, "with-1"), ("11", None, "unknown"),
                          ("10", 1.2, "exact")], costs)
         expect("chat-model-a-difference-across-an-unpriced-turn-says-so",
@@ -6556,17 +6596,53 @@ def _selftest_body():
                         "files": 1, "silent": 0}
         for label, ct_in, want, needle in (
                 ("no-turn-yet", {"turns": [], "files": 0, "silent": 0}, UNKNOWN,
-                 "no chat turn is logged yet"),
+                 "so none has been seen running on it"),
                 ("logs-unreadable", {"error": "unreadable"}, UNKNOWN, "so no turn shows it"),
-                ("newest-on-another-model", on("claude-opus-5-5"), UNKNOWN,
-                 "ran on claude-opus-5-5: it started before a change"),
+                ("newest-on-another-model", on("claude-haiku-4-5"), UNKNOWN,
+                 "ran on claude-haiku-4-5: it started before a change"),
+                ("newest-on-the-backup", on("claude-opus-5-5"), UNKNOWN,
+                 "ran on claude-opus-5-5: its backup"),
                 ("newest-on-the-pair", on("claude-sonnet-5-5"), ALREADY_DONE,
                  "chat turns start on sonnet"),
                 ("newest-on-the-pair-1m", on("claude-sonnet-5-5[1m]"), ALREADY_DONE,
-                 "chat turns start on sonnet")):
+                 "chat turns start on sonnet"),
+                ("newest-on-a-providers-id", on("us.anthropic.claude-sonnet-5-5-v1:0"),
+                 ALREADY_DONE, "chat turns start on sonnet"),
+                # a failed start writes a result with no init: the newest turn that names a
+                # model is judged, and none naming one shows nothing
+                ("newest-names-no-model", {"turns": [
+                    {"model": None, "outcome": "error_during_execution", "isError": True},
+                    on("claude-opus-5-5")["turns"][0]], "files": 2, "silent": 0}, UNKNOWN,
+                 "ran on claude-opus-5-5"),
+                ("no-turn-names-a-model", {"turns": [
+                    {"model": None, "outcome": "error_during_execution", "isError": True}],
+                    "files": 1, "silent": 0}, UNKNOWN, "no logged chat turn names")):
             r = check_chat_model(pair, {"names": []}, ct_in)
             expect("chat-model-seen-running:" + label,
                    r["outcome"] == want and needle in _row_text(r), r)
+        # Full ids are compared by version as well as family; an alias by family alone; a
+        # name neither can read is not judged, and says so.
+        full = {"models": {"claudeDefaultModel": "claude-sonnet-5-5",
+                           "claudeDefaultFallbackModel": "claude-opus-5-5"}}
+        for label, cfg_in, ran, want, needle in (
+                ("other-version-of-the-family", full, "claude-sonnet-4-5", UNKNOWN,
+                 "ran on claude-sonnet-4-5: it started before a change"),
+                ("same-version", full, "claude-sonnet-5-5[1m]", ALREADY_DONE,
+                 "start on claude-sonnet-5-5"),
+                ("alias-against-a-dated-id", pair, "claude-sonnet-4-5-20250929", ALREADY_DONE,
+                 "start on sonnet"),
+                ("an-alias-it-cannot-read", {"models": {"claudeDefaultModel": "opusplan"}},
+                 "claude-sonnet-5-5", ALREADY_DONE, "could not be compared with opusplan")):
+            r = check_chat_model(cfg_in, {"names": []}, on(ran))
+            expect("chat-model-compared:" + label,
+                   r["outcome"] == want and needle in _row_text(r), r)
+        keys = [model_key(n) for n in (
+            "sonnet", "claude-sonnet-5-5[1m]", "claude-3-5-sonnet-20241022",
+            "us.anthropic.claude-opus-4-1-20250805-v1:0", "claude-haiku-4-5-20251001",
+            "opusplan", "gpt-5", None)]
+        expect("chat-model-keys", keys == [
+            ("sonnet", None), ("sonnet", "5-5"), ("sonnet", "3-5"), ("opus", "4-1"),
+            ("haiku", "4-5"), (None, None), (None, None), (None, None)], keys)
         expect("chat-model-env-override-says-restart",
                "card CK-C5" in _row_text(check_chat_model(
                    {}, {"names": ["CYRUS_CLAUDE_DEFAULT_FALLBACK_MODEL"]}, None)))
