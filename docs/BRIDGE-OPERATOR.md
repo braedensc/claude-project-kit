@@ -846,9 +846,20 @@ passed over, so one bad message cannot stall it.
 
 A request (`plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`) can come from
 anyone, the chat bot included. Asking is harmless; only the answer acts. It looks up at most
-300 requests an hour, found or not, and asks one question per ticket at a time. Past that limit it refuses requests
-without reading them, and says so once an hour. A request from the chat bot credits "the chat
-bot", with no mention.
+300 requests an hour, found or not, and asks one question per ticket at a time. Past that
+limit it refuses requests without reading them, and says so once an hour. A request from the
+chat bot credits "the chat bot", with no mention.
+
+The hourly limits only stop a runaway. Each one is a key in the job's config, `bridge.json`:
+
+- `max_questions_per_hour`: 300 requests looked up;
+- `max_actions_per_hour`: 90 actions;
+- `relay_max_per_hour`: 90 answers passed on to devs;
+- `forward_max_per_hour`: 100 questions passed on to the tech lead.
+
+The installer writes none of these keys, so the job uses these defaults. A value set by hand
+in `bridge.json` wins over its default. If yours says `"max_actions_per_hour": 10`, the
+bridge stops at 10 an hour.
 
 ---
 
