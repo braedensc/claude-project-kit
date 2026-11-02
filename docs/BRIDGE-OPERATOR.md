@@ -227,7 +227,8 @@ plan it again, with `replan`.
 Before it moves anything, the bridge reads the ticket again. One already in Plan it is said
 and left alone. One that moved to another team is refused. One whose title, text, team,
 labels or state changed since the question moves nothing: the bridge closes the question and
-asks you to ask again. It acts at most 10 times an hour.
+asks you to ask again. It acts at most 90 times an hour, a limit that only stops a
+runaway.
 
 If the comment naming who said yes cannot be written, the move still stands. The thread says
 so, and every pass tries the comment again. Until it lands, each pass exits 1 and `verify`
@@ -353,7 +354,7 @@ start is said in the thread. When nothing can start, it says so once, and why.
 - Move the epic back to Backlog to pause. Move it to Todo and it goes on.
 - Cancel the epic to stop for good.
 
-Each child counts toward the 10 actions an hour. Merging each pull request stays yours.
+Each child counts toward the 90 actions an hour. Merging each pull request stays yours.
 
 ### When a plan finishes
 
@@ -407,7 +408,7 @@ said as partial, so "no notes" never stands for files it did not read.
   bridge says to look for it in the team's tickets. If the ticket was filed and only the reply was
   lost, the next pass says it was filed, even if a setting changed in between.
 
-The close and the follow-up each count toward the 10 actions an hour.
+The close and the follow-up each count toward the 90 actions an hour.
 
 ---
 
@@ -472,7 +473,7 @@ on. With `NOTIFIER_BOT_USER_ID` set, the bridge says so in that thread. Answer t
 tracker. Without it, the bridge cannot tell the notifier's pings apart, and its log says on
 every pass that such replies are not checked.
 
-It passes on at most 6 answers an hour, and never one longer than 1,000 characters: a long
+It passes on at most 90 answers an hour, and never one longer than 1,000 characters: a long
 answer belongs in the tracker. Angle brackets are removed, so nothing you paste can turn into
 a mark. If the tracker never confirms a post, it says so in the thread and never sends that
 answer twice.
@@ -870,10 +871,21 @@ A message the bridge cannot handle three passes running is given up on, said onc
 passed over, so one bad message cannot stall it.
 
 A request (`plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`) can come from
-anyone, the chat bot included. Asking is harmless; only the answer acts. It looks up at most 20 requests an hour,
-found or not, and asks one question per ticket at a time. Past that limit it refuses requests
-without reading them, and says so once an hour. A request from the chat bot credits "the chat
-bot", with no mention.
+anyone, the chat bot included. Asking is harmless; only the answer acts. It looks up at most
+300 requests an hour, found or not, and asks one question per ticket at a time. Past that
+limit it refuses requests without reading them, and says so once an hour. A request from the
+chat bot credits "the chat bot", with no mention.
+
+The hourly limits only stop a runaway. Each one is a key in the job's config, `bridge.json`:
+
+- `max_questions_per_hour`: 300 requests looked up;
+- `max_actions_per_hour`: 90 actions;
+- `relay_max_per_hour`: 90 answers passed on to devs;
+- `forward_max_per_hour`: 100 questions passed on to the tech lead.
+
+The installer writes none of these keys, so the job uses these defaults. A value set by hand
+in `bridge.json` wins over its default. If yours says `"max_actions_per_hour": 10`, the
+bridge stops at 10 an hour.
 
 ---
 

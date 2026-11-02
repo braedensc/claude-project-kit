@@ -309,6 +309,12 @@ DEFAULT_STATE_DIR = "~/.stage-e/state"
 DEFAULT_HANDOFF_STATES = ["Needs Approval"]
 # The done state a plan moves to once every piece of it is merged (KIT-299), by name.
 DEFAULT_DONE_STATE = "Done"
+# The hourly limits stop only a runaway, never a normal hour (the owner, 2 Nov 2026,
+# KIT-357): three times the first proposal of 100 lookups, 30 actions and 30 answers.
+# The bridge keeps its own answer limit, so the notifier's relay keeps its default.
+DEFAULT_MAX_QUESTIONS_PER_HOUR = 300
+DEFAULT_MAX_ACTIONS_PER_HOUR = 90
+DEFAULT_RELAY_MAX_PER_HOUR = 90
 MAX_THREAD_PAGES = 10
 # KIT-295: the notifier's record of the pages it posts into a DM as the bridge's own app.
 # Its pages look like the bridge's own posts there, so the bridge reads which ones it made.
@@ -404,14 +410,16 @@ CONFIG_KEYS = {
     "question_ttl_hours": "how long a question can be answered (default 24)",
     "lookback_days": "how far back each pass reads the channel (default 7)",
     "max_questions_per_hour": "how many requests the bridge looks up in the tracker in an "
-                              "hour, found or not (default 20)",
+                              "hour, found or not (default %d, a runaway's limit)"
+                              % DEFAULT_MAX_QUESTIONS_PER_HOUR,
     "max_history_pages": "how many pages of channel history one pass may read (default 10)",
     "run_timeout_seconds": "wall clock for one pass (default 120; with the writer on, at "
                            "least writer_timeout_seconds + 25)",
     "act": "whether a verified yes acts in the tracker (default false: ask and record only)",
     "plan_it_state": "the name of each team's Plan it state (default Plan it)",
     "max_actions_per_hour": "how many actions the bridge takes in an hour, each child "
-                            "started included (default 10)",
+                            "started included (default %d, a runaway's limit)"
+                            % DEFAULT_MAX_ACTIONS_PER_HOUR,
     "ready_state": "the name of each team's to-do state an approved epic moves to "
                    "(default Todo)",
     "done_state": "the name of each team's done state a plan moves to once every piece of "
@@ -426,7 +434,8 @@ CONFIG_KEYS = {
     "pings_file": "the notifier's record of agent:blocked pings (default "
                   "<state_dir>/notifier-bridge-pings.json, where the notifier writes it)",
     "relay_max_chars": "a longer answer is refused, never cut (default the relay's, 1000)",
-    "relay_max_per_hour": "answers passed on in an hour (default the relay's, 6)",
+    "relay_max_per_hour": "answers passed on in an hour (default %d, a runaway's limit)"
+                          % DEFAULT_RELAY_MAX_PER_HOUR,
     "notifier_bot_user_id": "optional: the notifier app's own Slack bot user id. A member's "
                             "reply under one of its posts that the pings file does not hold "
                             "is then refused aloud, never ignored",
@@ -485,7 +494,7 @@ EXAMPLE_CONFIG = {
     "dm_user_ids": [],
     "question_ttl_hours": 24,
     "lookback_days": 7,
-    "max_questions_per_hour": 20,
+    "max_questions_per_hour": DEFAULT_MAX_QUESTIONS_PER_HOUR,
     "act": False,
     "done_state": DEFAULT_DONE_STATE,
     "ask_tech_lead": False,
@@ -639,12 +648,13 @@ def validate_config(raw):
         "allowed_slack_users": raw.get("allowed_slack_users", []),
         "question_ttl_hours": raw.get("question_ttl_hours", 24),
         "lookback_days": raw.get("lookback_days", 7),
-        "max_questions_per_hour": raw.get("max_questions_per_hour", 20),
+        "max_questions_per_hour": raw.get("max_questions_per_hour",
+                                          DEFAULT_MAX_QUESTIONS_PER_HOUR),
         "max_history_pages": raw.get("max_history_pages", 10),
         "run_timeout_seconds": raw.get("run_timeout_seconds", DEFAULT_RUN_TIMEOUT),
         "act": raw.get("act", False),
         "plan_it_state": raw.get("plan_it_state") or "Plan it",
-        "max_actions_per_hour": raw.get("max_actions_per_hour", 10),
+        "max_actions_per_hour": raw.get("max_actions_per_hour", DEFAULT_MAX_ACTIONS_PER_HOUR),
         "ready_state": raw.get("ready_state") or "Todo",
         "done_state": raw.get("done_state") or DEFAULT_DONE_STATE,
         "agent_user_name": raw.get("agent_user_name", ""),
@@ -652,7 +662,7 @@ def validate_config(raw):
         "handoff_states": raw.get("handoff_states", list(DEFAULT_HANDOFF_STATES)),
         "pings_file": raw.get("pings_file") or "",
         "relay_max_chars": raw.get("relay_max_chars", notify.DEFAULT_RELAY_MAX_CHARS),
-        "relay_max_per_hour": raw.get("relay_max_per_hour", notify.DEFAULT_RELAY_MAX_PER_HOUR),
+        "relay_max_per_hour": raw.get("relay_max_per_hour", DEFAULT_RELAY_MAX_PER_HOUR),
         "notifier_bot_user_id": raw.get("notifier_bot_user_id") or "",
         "notifier_plist": raw.get("notifier_plist") or "",
         "run_interval_seconds": raw.get("run_interval_seconds", DEFAULT_RUN_INTERVAL),
@@ -11007,6 +11017,22 @@ def selftest():
                    "(default 30, at most 100; 0: none)" in CONFIG_KEYS["forward_history_messages"],
                    "(default 8000, at most 20000)" in CONFIG_KEYS["forward_history_chars"]])),
               ([100, 60, 30, 8000], [True] * 4))
+
+        # KIT-357: the hourly limits stop only a runaway, never a normal hour (the owner,
+        # 2 Nov). Read with the keys absent, as a config the installer writes has them.
+        def case_runaway_limits():
+            raw = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER, bot_user_id=ME,
+                       state_dir=os.path.join(tmp, "kit-357-limits"))
+            keys = ("max_questions_per_hour", "max_actions_per_hour", "relay_max_per_hour")
+            for key in keys:
+                raw.pop(key, None)
+            c = validate_config(raw)
+            return ([c[k] for k in keys], notify.DEFAULT_RELAY_MAX_PER_HOUR,
+                    ["(default %d, a runaway's limit)" % n in CONFIG_KEYS[k]
+                     for k, n in zip(keys, (300, 90, 90))])
+        check("kit-357: 300 lookups, 90 actions and 90 answers an hour by default; the "
+              "notifier's relay keeps its own", outcome(case_runaway_limits),
+              ([300, 90, 90], 6, [True] * 3))
 
         def case_owner_defaults_in_use():
             c, s, t = asked_tl("tl-defaults-in-use", *["question %d?" % i for i in range(11)])
