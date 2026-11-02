@@ -22,6 +22,21 @@ asks and records, and a verified "yes" changes nothing. With `act` on:
   Plan it. The question records the ticket as it showed it (its title, text, team, labels
   and state); a yes after any of them changed moves nothing and closes the question.
 
+  REPLAN (KIT-244). A verified "yes" to a `replan` question moves an idea that sits in Plan
+  it out to its team's first backlog state and straight back in, AS THE OWNER, so the
+  planner sees a new move and starts a new planning run. It is asked only for a fresh idea
+  in Plan it whose planning runs have all ended, none of which filed a plan that still
+  stands (an epic carrying that run's receipt, not canceled), and whose newest move into
+  Plan it either carries a planning run or is at least REPLAN_SETTLE_SECONDS old. A run and
+  a plan count only when the owner's key filed them, as the planner and the executor do.
+  Naming one of the planner's planning tickets asks about its idea, and the question names
+  both. Every check is made again before the move, and so is what the question showed: the
+  newest run and the newest move. The re-plan is recorded as under way before the first
+  move, and the comment naming who said yes is written as soon as that move lands, so a
+  pass cut midway is finished by the next one. Afterwards the idea's history is read the
+  planner's own way. A move back the history does not show, a move back that failed, or
+  one whose landing can't be read is said, and that pass exits 1.
+
   APPROVE (KIT-223). A verified "yes" to an `approve` question moves an epic the idea gate
   filed (`provenance:agent`, every child `provenance:epic`) to its team's `ready_state`,
   and records it as approved. From then on, every pass hands its children to the agent
@@ -96,8 +111,9 @@ WHO ASKED COMES FROM SLACK, NEVER FROM TEXT
 
 THE BRIDGE ASKS, A MEMBER ANSWERS
 
-  A request is one strict line, `plan <ticket id>` or `approve <epic id>`, from anyone in
-  the channel, the chat bot included: asking is harmless. The bridge reads the ticket from
+  A request is one strict line, `plan <ticket id>`, `replan <ticket id>` or
+  `approve <epic id>`, from anyone in the channel, the chat bot included: asking is
+  harmless. The bridge reads the ticket from
   the tracker with the owner's key and posts its OWN question in that thread, carrying only
   facts it read itself. A question is answered by a reply `yes` or `no` in its thread,
   after it, from a verified member. A `yes` binds to the question recorded in this job's
@@ -299,7 +315,8 @@ MAX_THREAD_PAGES = 10
 NOTIFIER_DM_POSTS_SCHEMA = "pipeline-notifier-dm-posts/1"
 NOTIFIER_DM_POSTS_NAME = "notifier-dm-posts.json"
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
-DM_HELP = ("I can do `plan <ticket id>`, `approve <ticket id>` and yes or no here. To "
+DM_HELP = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` and "
+           "yes or no here. To "
            "answer a dev, reply in the thread under its message. For anything else, ask "
            "the tech lead in the chat channel for now.")
 # The notifier's pages that ask the member something: a dev or the planner stopped to ask,
@@ -474,7 +491,11 @@ SLACK_USER_RE = re.compile(r"^[UW][A-Z0-9]{8,}$")
 TEAM_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}$")
 TICKET_RE = r"[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}"
 # The whole grammar. A request is one line and nothing else; so is an answer.
-REQUEST_RE = re.compile(r"^(plan|approve)\s+(%s)$" % TICKET_RE, re.IGNORECASE)
+REQUEST_RE = re.compile(r"^(plan|replan|approve)\s+(%s)$" % TICKET_RE, re.IGNORECASE)
+# A re-plan (KIT-244): a planning ticket in one of these state types has ended, and a move
+# into Plan it this recent with no run yet may be the one the planner is starting on now.
+REPLAN_RUN_ENDED = ("completed", "canceled")
+REPLAN_SETTLE_SECONDS = 15 * 60
 YES_RE = re.compile(r"^yes(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 NO_RE = re.compile(r"^no(?:\s+(%s))?[\s.!]*$" % TICKET_RE, re.IGNORECASE)
 _LEADING_MENTION_RE = re.compile(r"^<@([UWB][A-Z0-9]+)(?:\|[^>]*)?>\s*")
@@ -1195,7 +1216,7 @@ query BridgeIssue($id: String!) {
     state { id name type }
     team { key }
     labels(first: 50) { nodes { name } }
-    creator { name displayName }
+    creator { id name displayName }
   }
 }"""
 # An epic and its children, with what blocks each child. The page sizes are bounded, and a
@@ -1244,6 +1265,20 @@ query BridgePiece($id: String!) {
     }
   }
 }""" % PIECE_LINKS
+# A re-plan's searches (KIT-244): the planner's planning tickets for one idea, and the epics
+# the executor filed from them, each found by a line the planner or the executor wrote.
+# Archived tickets count: an archived run still ran, and an archived epic still stands
+# unless it was canceled. A page that runs over is refused, never read as complete.
+Q_FIND_BY_LINE = """
+query BridgeFindByLine($filter: IssueFilter!, $after: String) {
+  issues(filter: $filter, first: 50, after: $after, includeArchived: true) {
+    nodes { id identifier description state { name type } creator { id } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+# A search for `Idea: PROD-6` also finds every run for PROD-60 to PROD-69 and on, filtered
+# out afterwards. So the matches are read page by page, up to this many pages.
+FIND_MAX_PAGES = 6
 # THE BRIDGE'S ONLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299). The selftest pins
 # them: no other write exists in this file, the move carries `stateId` and nothing else,
 # the delegation carries `delegateId` and nothing else, and a finished plan's follow-up is
@@ -1435,6 +1470,67 @@ class TrackerClient(object):
             return None, "%d teams have the key %s" % (len(nodes), team_key)
         return nodes[0]["id"], None
 
+    def backlog_state(self, team_key):
+        """(id, name, None) for the team's first backlog state by position, or (None, None,
+        why): where a re-plan parks an idea for a moment (KIT-244). A backlog state starts
+        nothing: no job acts on an idea that enters one."""
+        nodes = ((self.linear(poller.Q_TEAM, {"key": team_key}).get("teams") or {})
+                 .get("nodes")) or []
+        if len(nodes) != 1:
+            return None, None, "%d teams have the key %s" % (len(nodes), team_key)
+        backlog = sorted((s for s in ((nodes[0].get("states") or {}).get("nodes") or [])
+                          if s.get("type") == "backlog" and s.get("id")),
+                         key=lambda s: s.get("position") or 0)
+        if not backlog:
+            return None, None, "%s has no backlog state" % team_key
+        return backlog[0]["id"], backlog[0].get("name") or "Backlog", None
+
+    def find_by_line(self, team_key, lines):
+        """Tickets on one team whose description holds any of these lines, archived ones
+        included (KIT-244), read page by page. More than FIND_MAX_PAGES pages is refused:
+        "could not read them all" is never "there are none"."""
+        if not lines:
+            return []
+        where = [{"description": {"contains": line}} for line in lines]
+        flt = {"team": {"key": {"eq": team_key}}}
+        flt.update(where[0] if len(where) == 1 else {"or": where})
+        nodes, after = [], None
+        for _ in range(FIND_MAX_PAGES):
+            conn = ((self._query(Q_FIND_BY_LINE, {"filter": flt, "after": after}) or {})
+                    .get("issues") or {})
+            nodes.extend(conn.get("nodes") or [])
+            info = conn.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                return nodes
+            after = info.get("endCursor")
+            if not after:
+                break
+        raise BridgeError("more tickets on %s match than the bridge reads (%d pages)"
+                          % (team_key, FIND_MAX_PAGES))
+
+    def planning_runs(self, team_key, idea, owner):
+        """The planner's planning tickets for one idea, open or closed: the planner's own
+        tickets, filed with the owner's key (run_idea), never a look-alike (KIT-244)."""
+        return [n for n in self.find_by_line(team_key, [poller.IDEA_PREFIX + idea])
+                if run_idea(n, owner) == idea]
+
+    def filed_plans(self, team_key, runs, owner):
+        """The epics the executor filed from any of these planning tickets: each carries
+        that run's receipt, `Plan id: <run>/<digest>`, and was filed with the owner's key, as
+        the executor files (KIT-244)."""
+        lines = [poller.executor.PLAN_RECEIPT_PREFIX + r + "/" for r in runs]
+        return [n for n in self.find_by_line(team_key, lines)
+                if any(line in (n.get("description") or "") for line in lines)
+                and (n.get("creator") or {}).get("id") == owner]
+
+    def plan_trigger(self, issue_id, plan_it_id):
+        """The move into Plan it the planner would act on now, read the planner's own way
+        (pipeline_plan_poller.latest_trigger), or None (KIT-244)."""
+        try:
+            return poller.latest_trigger(self.linear, issue_id, plan_it_id)
+        except poller.PollerError as exc:
+            raise BridgeError("the history of the idea could not be read whole: %s" % exc)
+
     def piece(self, issue_id):
         """One finished piece of a plan: its links and its newest comments (KIT-299)."""
         data = self._query(Q_PIECE, {"id": issue_id})
@@ -1578,11 +1674,44 @@ def question_text(issue, requester, cfg, now, by_bot=False, dm=False):
     return head + body + "\n" + bind
 
 
-def question_parts(issue, requester, cfg, now, by_bot=False, dm=False):
+def run_idea(node, owner):
+    """The idea a planning ticket of the planner's was written for, or None (KIT-244). The
+    ticket is the planner's own (pipeline_plan_poller.is_run_ticket: its routing tag and a
+    `Planning-run trigger:` line), filed with the owner's key as the planner files them, and
+    carries exactly one `Idea: <id>` line above the fence that quotes the idea (run_body). A
+    session can edit a ticket, so this only chooses what the bridge ASKS about: the question
+    names the ticket that was named and the idea it then read, and every check runs on that
+    idea."""
+    text = node.get("description") or ""
+    if not poller.is_run_ticket(node) or (node.get("creator") or {}).get("id") != owner:
+        return None
+    head = text.split(poller.FENCE_OPEN, 1)[0].splitlines()
+    if not any(line.startswith(poller.TRIGGER_PREFIX) for line in head):
+        return None
+    ideas = [line[len(poller.IDEA_PREFIX):].strip() for line in head
+             if line.startswith(poller.IDEA_PREFIX)]
+    if len(ideas) != 1 or not re.match(r"^%s$" % TICKET_RE, ideas[0]):
+        return None
+    return ideas[0].upper()
+
+
+def history_epoch(text):
+    """A tracker time (`2026-11-02T00:03:22.164Z`) as seconds, or None."""
+    return epoch((text or "")[:19] + "Z") if text else None
+
+
+def newest_run(runs):
+    """The planning ticket with the highest number, or "" (KIT-244)."""
+    return max((r.get("identifier") or "" for r in runs), key=ticket_number, default="")
+
+
+def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None, via=""):
     """(head, body, bind, facts): a plan question in the pieces the writer needs (KIT-297).
     The head asks, so the writer is never given it. The bind is what a yes agrees to, and
     who asked: posted verbatim, never the model's. head + body + newline + bind is the
-    question as it always read."""
+    question as it always read. With `runs` (a list, perhaps empty) it is a re-plan
+    question instead (KIT-244), naming the idea's newest planning run, and `via` the
+    planning ticket that was named in its place."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -1594,17 +1723,33 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False):
         who = "the chat bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
-    then = ("the bridge moves it to %s for you" % cfg["plan_it_state"] if cfg["act"] else
-            "the bridge records it; acting is switched off here, so nothing moves")
+    if runs is None:
+        then = "the bridge moves it to %s for you" % cfg["plan_it_state"]
+    else:
+        then = ("the bridge moves it out of %s and straight back in for you, so the planner "
+                "starts a new run" % cfg["plan_it_state"])
+    if not cfg["act"]:
+        then = "the bridge records it; acting is switched off here, so nothing moves"
     # In a DM the question is a message of its own, and a yes of its own answers it
     # (KIT-295). The terms a yes agrees to read the same in both.
     body = ("%s “%s”: in %s on %s, filed by %s."
             % (issue.get("identifier"), title, state, team, creator))
+    last = newest_run(runs or [])
+    if runs is not None:
+        body += (" Its last planning run, %s, has ended." % last if last
+                 else " It has no planning run yet.")
+        if via:
+            body += " You named %s, one of its planning runs." % via
     bind = ("Reply `yes` %s within %d hours, and %s. Reply `no` to drop it. "
             "(Asked for by %s.)"
             % ("here" if dm else "in this thread", cfg["question_ttl_hours"], then, who))
     facts = {"ticket": issue.get("identifier"), "title": title, "state": state, "team": team,
              "filed_by": creator, "needs": "his answer to the fixed line after this message"}
+    if runs is not None:
+        facts["last_run"] = last or "none"
+        if via:
+            facts["named"] = via
+        return "*Plan this again?* ", body, bind, facts
     return "*Plan this?* ", body, bind, facts
 
 
@@ -2218,6 +2363,7 @@ class Pass(object):
         self.dm_errors = []                # each member whose DM could not be opened
         self.secrets = live_secrets(cfg)
         self.release_errors = []
+        self.replan_errors = []            # re-plans left half done or unconfirmed (KIT-244)
         self.notifier = None               # the watch's line for the summary (KIT-285)
         self.watch_error = None
         # written, fell_back: messages the writer wrote, and ones that went out plain while
@@ -2445,6 +2591,7 @@ class Pass(object):
         self.expire()
         self.prune()
         self.save()
+        self.stranded_replans()
         loud = []
         if self.release_errors:
             loud.append("could not follow %d approved epic(s): %s"
@@ -2456,6 +2603,9 @@ class Pass(object):
                             o.get("ticket") or "?" for o in self.state["owed"])))
         if self.watch_error:
             loud.append(self.watch_error)
+        if self.replan_errors:
+            loud.append("%d re-plan(s) need a look, as said where they were asked: %s"
+                        % (len(self.replan_errors), "; ".join(self.replan_errors)))
         if self.dm_errors:
             loud.append("%d member DM(s) could not be opened and were not read; every channel "
                         "was. %s" % (len(self.dm_errors), "; ".join(self.dm_errors)))
@@ -3147,6 +3297,9 @@ class Pass(object):
         if kind == "approve":
             self.request_approve(channel, msg, thread, requester, ident, by_bot, dm)
             return
+        if kind == "replan":
+            self.request_replan(channel, msg, thread, requester, ident, by_bot, dm)
+            return
         issue = self.tracker.issue(ident)
         if not issue or not issue.get("identifier"):
             self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
@@ -3160,10 +3313,13 @@ class Pass(object):
                                 "team not planned", ticket=issue["identifier"])
             return
         if (issue.get("state") or {}).get("name") == self.cfg["plan_it_state"]:
-            # The yes path's own words: a ticket already there is not asked about.
+            # The yes path's own words: a ticket already there is not asked about. Its
+            # planning may have ended without a plan, so say how to start it again (KIT-244).
             self.refuse_request(channel, msg, thread, "%s is already in %s."
                                 % (issue["identifier"], self.cfg["plan_it_state"]),
-                                "already in plan it", ticket=issue["identifier"])
+                                "already in plan it", ticket=issue["identifier"],
+                                bind="To plan it again, type `replan %s`."
+                                % issue["identifier"])
             return
         live = self.tracker.live_work(issue["id"])
         if live:
@@ -3174,6 +3330,98 @@ class Pass(object):
             return
         self.ask(channel, msg, thread, kind, issue, requester,
                  question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm))
+
+    def request_replan(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
+        """A `replan` request (KIT-244): an idea in Plan it whose planning ended without a
+        plan that stands. A planning ticket of the planner's is read as its idea, and the
+        question names the idea."""
+        issue = self.tracker.issue(ident)
+        if not issue or not issue.get("identifier"):
+            self.refuse_request(channel, msg, thread, "I can't find %s in the tracker."
+                                % ident, "not found", ticket=ident)
+            return
+        idea, named = run_idea(issue, self.cfg["owner_user_id"]), ""
+        if idea:
+            named = issue["identifier"]
+            issue = self.tracker.issue(idea)
+            if not issue or not issue.get("identifier"):
+                self.refuse_request(channel, msg, thread, "%s is a planning run for %s, and "
+                                    "I can't find %s in the tracker." % (named, idea, idea),
+                                    "not found", ticket=named)
+                return
+            if any(q.get("status") == OPEN and q.get("ticket") == issue["identifier"]
+                   for q in self.state["questions"].values()):
+                self.refuse_request(channel, msg, thread, "%s already has an open question."
+                                    % issue["identifier"], "already asked",
+                                    bind="Answer that one.", ticket=issue["identifier"])
+                return
+        team = (issue.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            self.refuse_request(channel, msg, thread, "%s is on %s, and the bridge plans only "
+                                "on %s." % (issue["identifier"], team or "no team",
+                                            ", ".join(self.cfg["team_keys"])),
+                                "team not planned", ticket=issue["identifier"])
+            return
+        refusal, runs, newest = self.replan_refusal(issue, team)
+        if refusal:
+            text, bind, why = refusal
+            self.refuse_request(channel, msg, thread, text, why, bind=bind,
+                                ticket=issue["identifier"])
+            return
+        self.ask(channel, msg, thread, "replan", issue, requester,
+                 question_parts(issue, requester, self.cfg, self.now, by_bot=by_bot, dm=dm,
+                                runs=runs, via=named),
+                 extra={"last_run": newest_run(runs), "newest_move": newest})
+
+    def replan_refusal(self, issue, team):
+        """((text, bind, why) or None, the idea's planning runs, the id of its newest move into
+        Plan it or None): why this idea may not be planned again now (KIT-244). Read before
+        asking and again before moving, since a run may have started, or a plan been filed,
+        in between. Each reason is the planner's or the executor's own record, never a guess.
+
+        A run and a plan count only when the owner's key filed them, as the planner and the
+        executor do: a session can write a ticket that looks like either."""
+        ident, plan_it, owner = (issue["identifier"], self.cfg["plan_it_state"],
+                                 self.cfg["owner_user_id"])
+        if (issue.get("state") or {}).get("name") != plan_it:
+            return ("%s isn't in %s, so there is no planning to repeat." % (ident, plan_it),
+                    "To plan it, type `plan %s`." % ident, "not in plan it"), [], None
+        live = self.tracker.live_work(issue["id"])
+        if live:
+            return ("%s looks like live work, so I won't plan it again: %s."
+                    % (ident, "; ".join(live)), "", "live work"), [], None
+        runs = self.tracker.planning_runs(team, ident, owner)
+        going = sorted((r["identifier"] for r in runs if ((r.get("state") or {}).get("type"))
+                        not in REPLAN_RUN_ENDED), key=ticket_number)
+        if going:
+            return ("%s is still being planned, in %s." % (ident, ", ".join(going)),
+                    "Ask again once that run has finished.", "run open"), runs, None
+        names = [r["identifier"] for r in runs]
+        standing = sorted((p for p in self.tracker.filed_plans(team, names, owner)
+                           if ((p.get("state") or {}).get("type")) != "canceled"),
+                          key=lambda p: ticket_number(p.get("identifier")))
+        if standing:
+            return ("%s already has a plan: %s." % (ident, ", ".join(
+                "%s (%s)" % (p.get("identifier") or "?", (p.get("state") or {}).get("name")
+                             or "?") for p in standing)),
+                    "Approve that plan, or cancel it before you plan the idea again.",
+                    "plan filed"), runs, None
+        state_id, why = self.tracker.team_state(team, plan_it)
+        if not state_id:
+            return ("I can't plan %s again: %s." % (ident, why), "", "no state"), runs, None
+        newest = self.tracker.plan_trigger(issue["id"], state_id)
+        if newest and not any(poller.TRIGGER_PREFIX + newest["id"] in (r.get("description")
+                                                                         or "") for r in runs):
+            moved = history_epoch(newest.get("createdAt"))
+            if moved is None or self.now - moved < REPLAN_SETTLE_SECONDS:
+                # The planner may be starting on that move right now: a second move would
+                # give the idea two runs at once. Older than this, the planner refused it or
+                # is held (a cap, a stop), and the planner only ever acts on the newest move.
+                return ("%s was moved to %s moments ago, and the planner has not started on "
+                        "it yet." % (ident, plan_it),
+                        "Give it %d minutes, then ask again." % (REPLAN_SETTLE_SECONDS // 60),
+                        "planner not started"), runs, None
+        return None, runs, (newest or {}).get("id")
 
     def request_approve(self, channel, msg, thread, requester, ident, by_bot=False, dm=False):
         if not self.cfg["agent_user_name"].strip():
@@ -3223,7 +3471,8 @@ class Pass(object):
         return any((n or {}).get("status") not in poller.SESSION_FINISHED
                    for n in self.tracker.sessions_on(node["id"]))
 
-    def ask(self, channel, msg, thread, kind, issue, requester, parts, children=None):
+    def ask(self, channel, msg, thread, kind, issue, requester, parts, children=None,
+            extra=None):
         # The head and body, then the bind on a line of its own, as a question always read.
         # The writer is given the body only: the head asks, and only the bind may.
         head, body, bind, facts = parts
@@ -3240,6 +3489,9 @@ class Pass(object):
             # A yes approves exactly these children, as they were when the question was
             # asked; any change before the yes approves nothing.
             self.state["questions"][key_of(channel, posted)]["children"] = children
+        if extra:
+            # More of what the member saw (a re-plan's newest run and move, KIT-244).
+            self.state["questions"][key_of(channel, posted)].update(extra)
         self.mark(channel, msg, "asked: %s %s" % (kind, issue["identifier"]))
         self.counts["asked"] += 1
         self.say("  asked: %s %s (requested by %s)" % (kind, issue["identifier"],
@@ -3360,6 +3612,12 @@ class Pass(object):
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
             self.act_followup(channel, thread, q, msg)
             return
+        if q.get("kind") == "replan" and q.get("replanning"):
+            # A re-plan under way, its pass cut (KIT-244 review): the idea may wait outside
+            # Plan it, so no check below may close or refuse it first. The yes that began it
+            # was judged then, and act_replan finishes it from where it stopped.
+            self.act_replan(channel, thread, q, msg)
+            return
         # From here on a question's status changes only AFTER the reply saying so is
         # posted: a failed post leaves it open, and the next pass says it.
         closed = self.question_closed(channel, q)
@@ -3407,7 +3665,8 @@ class Pass(object):
         if not is_yes:
             self.post(channel, thread, "OK, I won't file the notes from %s." % q["ticket"]
                       if q["kind"] == FOLLOWUP else "OK, %s is not %s." % (
-                          q["ticket"], "approved" if q["kind"] == "approve" else "planned"),
+                          q["ticket"], {"approve": "approved", "replan": "planned again"}.get(
+                              q["kind"], "planned")),
                       kind="declined", facts={"ticket": q["ticket"]})
             q.update(status=DECLINED, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, "declined: %s" % q["ticket"])
@@ -3436,6 +3695,8 @@ class Pass(object):
             self.act_approve(channel, thread, q, msg)
         elif q["kind"] == FOLLOWUP:
             self.act_followup(channel, thread, q, msg)
+        elif q["kind"] == "replan":
+            self.act_replan(channel, thread, q, msg)
         else:
             self.act_plan(channel, thread, q, msg)
 
@@ -3568,6 +3829,208 @@ class Pass(object):
         self.counts["acted"] = self.counts.get("acted", 0) + 1
         self.say("  acted: moved %s to %s for %s" % (q["ticket"], self.cfg["plan_it_state"],
                                                      msg["user"]))
+
+    def act_replan(self, channel, thread, q, msg):
+        """Move the idea out of Plan it to its team's first backlog state and straight back
+        in, as the owner, so the planner sees a new move and starts a new run (KIT-244).
+
+        A fresh yes is re-read and every check made again first, including what the question
+        showed: the idea's newest planning run and its newest move. The re-plan is recorded as
+        under way, and saved, BEFORE the first move, and the comment naming who said yes is
+        written as soon as that move lands. So a pass cut anywhere after that (a deadline, a
+        lost reply, a crash) is finished by the next pass from where it stopped
+        (resume_replan), never judged again as a fresh question. A move back that did not
+        land is said with the one line that finishes it, one whose landing can't be read is
+        said as unknown, and a move the history does not show is said; each keeps that pass
+        loud (exit 1)."""
+        def finish(status, text, what, kind="replan-refused", bind=""):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
+                      facts={"ticket": q["ticket"]})
+            by, said_at = replan_yes(q, msg)
+            q.update(status=status, answered_by=by, answered_ts=said_at)
+            self.mark(channel, msg, what)
+        under_way = q.get("replanning")
+        # A re-plan already under way is the same action, counted when it began.
+        if not under_way and self.refused_over_limit(channel, thread, msg):
+            return
+        plan_it_name = self.cfg["plan_it_state"]
+        issue = self.tracker.issue(q["ticket"])
+        if not issue or not issue.get("id"):
+            finish(REFUSED, "I can't find %s in the tracker any more, so nothing %s moved."
+                   % (q["ticket"], "more was" if under_way else "was"), "refused: gone")
+            return
+        team = (issue.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            finish(REFUSED, "%s is now on %s, which the bridge does not plan on, so nothing "
+                   "%s moved." % (q["ticket"], team or "no team",
+                                  "more was" if under_way else "was"), "refused: team")
+            return
+        plan_it, why = self.tracker.team_state(team, plan_it_name)
+        if not plan_it:
+            finish(REFUSED, "I can't move %s: %s." % (q["ticket"], why), "refused: no state")
+            return
+        if under_way:
+            self.resume_replan(issue, plan_it, q, msg, finish)
+            return
+        if ticket_fingerprint(issue) != q.get("fingerprint"):
+            finish(REFUSED, "%s changed since I asked (its title, text, team, labels or "
+                   "state), so nothing was moved, and I have closed the question." % q["ticket"],
+                   "refused: changed since asked", bind="Ask again with `replan %s`." % q["ticket"])
+            return
+        refusal, runs, newest = self.replan_refusal(issue, team)
+        if refusal:
+            text, bind, why = refusal
+            finish(REFUSED, "%s Nothing was moved." % text, "refused: " + why, bind=bind)
+            return
+        if (newest_run(runs), newest) != (q.get("last_run"), q.get("newest_move")):
+            # The question named the idea's newest run, and stood on its newest move. A run
+            # or a move since then is a new situation, so this yes moves nothing.
+            finish(REFUSED, "%s's planning changed since I asked (a new run or a new move), so "
+                   "nothing was moved, and I have closed the question." % q["ticket"],
+                   "refused: planning changed since asked",
+                   bind="Ask again with `replan %s`." % q["ticket"])
+            return
+        park, park_name, why = self.tracker.backlog_state(team)
+        if not park:
+            finish(REFUSED, "I can't plan %s again: %s, so it has nowhere to wait for a "
+                   "moment. Nothing was moved." % (q["ticket"], why), "refused: no backlog")
+            return
+        if self.dry:
+            self.say("  [dry-run] would move %s to %s and back to %s"
+                     % (q["ticket"], park_name, plan_it_name))
+            return
+        # Recorded, and saved, before anything moves: from here on a retried yes resumes.
+        q["replanning"] = {"park": park, "park_name": park_name, "before": newest,
+                           "parked": False, "commented": False, "at": self.now,
+                           "by": msg["user"], "said_at": msg.get("ts")}
+        self.save()
+        self.replan_moves(issue, plan_it, q, msg, finish)
+
+    def replan_moves(self, issue, plan_it, q, msg, finish):
+        """Both moves: out to the backlog, the comment, then back into Plan it (KIT-244)."""
+        rec = q["replanning"]
+        self.tracker.move(issue["id"], rec["park"])
+        self.state["acted_at"].append(self.now)
+        rec["parked"] = True
+        self.save()
+        owed = self.replan_attribution(issue, q, msg)
+        self.replan_back(issue, plan_it, q, msg, finish, owed)
+
+    def replan_attribution(self, issue, q, msg):
+        """The comment naming who said yes, written as soon as the idea leaves Plan it, so
+        the owner's moves are never unexplained, and owed when it fails (KIT-244). Its
+        words say what this yes does, so they hold however the move back turns out."""
+        rec = q["replanning"]
+        if rec.get("commented"):
+            return ""
+        by, said_at = replan_yes(q, msg)
+        body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
+                "who said yes in Slack at %s. It moves the idea out of %s to %s and straight "
+                "back in, so the planner starts a new planning run."
+                % (self.name_of(by), by, iso(ts_float(said_at)),
+                   self.cfg["plan_it_state"], rec.get("park_name") or "the backlog"))
+        owed = ""
+        try:
+            self.tracker.comment(issue["id"], body)
+        except BridgeError as exc:
+            # The move stands: it cannot be taken back. The record of who said yes is owed.
+            self.say("  NOTE: %s was moved, but its attribution comment failed: %s"
+                     % (q["ticket"], exc))
+            self.owe(issue["id"], q["ticket"], body)
+            owed = (" The idea was moved, but the comment naming who approved it could not "
+                    "be written; I will try again.")
+        rec["commented"] = True
+        self.save()
+        return owed
+
+    def replan_back(self, issue, plan_it, q, msg, finish, owed):
+        """The move back into Plan it, then the history check. A move back whose reply
+        failed is re-read before anything is said, since it may have landed (KIT-244)."""
+        rec, plan_it_name = q["replanning"], self.cfg["plan_it_state"]
+        park_name = rec.get("park_name") or "the backlog"
+        try:
+            self.tracker.move(issue["id"], plan_it)
+        except BridgeError as exc:
+            try:
+                now_in = ((self.tracker.issue(q["ticket"]) or {}).get("state") or {}).get("id")
+            except BridgeError:
+                now_in = None
+            if now_in == rec["park"]:
+                # Parked and not back: say where it waits, and the one line that finishes
+                # the move, since `plan` asks about an idea outside Plan it.
+                self.replan_errors.append("%s was left in %s: %s" % (q["ticket"], park_name,
+                                                                     exc))
+                finish(DONE, "I moved %s to %s, but moving it back into %s failed, so no "
+                       "planning run starts.%s" % (q["ticket"], park_name, plan_it_name, owed),
+                       "partial: left %s in %s" % (q["ticket"], park_name),
+                       kind="replan-partial", bind="To finish, type `plan %s`." % q["ticket"])
+                return
+            if now_in != plan_it:
+                self.replan_errors.append("%s: the move back may not have landed: %s"
+                                          % (q["ticket"], exc))
+                finish(DONE, "I moved %s to %s, and I can't tell whether the move back into %s "
+                       "landed.%s" % (q["ticket"], park_name, plan_it_name, owed),
+                       "partial: %s unknown" % q["ticket"], kind="replan-partial",
+                       bind="Look at %s in the tracker. If it isn't in %s, type `plan %s`."
+                       % (q["ticket"], plan_it_name, q["ticket"]))
+                return
+            # It landed, and only the reply was lost: the history says the rest.
+        self.replan_verify(issue, plan_it, q, msg, finish, owed)
+
+    def replan_verify(self, issue, plan_it, q, msg, finish, owed):
+        """The planner starts a run only on a move its own reading of the history shows: a
+        new move into Plan it, by the owner, since the one the question stood on."""
+        rec, plan_it_name = q["replanning"], self.cfg["plan_it_state"]
+        by = replan_yes(q, msg)[0]
+        unseen = ""
+        try:
+            after = self.tracker.plan_trigger(issue["id"], plan_it)
+        except BridgeError as exc:
+            after, unseen = None, "I could not read its history to check (%s)" % exc
+        if not unseen and (not after or after.get("id") == rec.get("before")
+                           or after.get("actorId") != self.cfg["owner_user_id"]):
+            unseen = "its history does not show the move back in"
+        if unseen:
+            self.replan_errors.append("%s: %s" % (q["ticket"], unseen))
+            finish(DONE, "I moved %s out of %s and back in for <@%s>, but %s, so the planner "
+                   "may not start.%s" % (q["ticket"], plan_it_name, by, unseen, owed),
+                   "done: moved %s, unconfirmed" % q["ticket"], kind="replan-unconfirmed",
+                   bind="If no planning run starts within ten minutes, move %s out of %s and "
+                   "back in by hand." % (q["ticket"], plan_it_name))
+        else:
+            finish(DONE, "Moved %s out of %s and back in for <@%s>. The planner starts a new "
+                   "run within a few minutes.%s" % (q["ticket"], plan_it_name, by, owed),
+                   "done: replanned %s" % q["ticket"], kind="replan-moved")
+        self.counts["acted"] = self.counts.get("acted", 0) + 1
+        self.say("  acted: moved %s out of %s and back in for %s"
+                 % (q["ticket"], plan_it_name, by))
+
+    def resume_replan(self, issue, plan_it, q, msg, finish):
+        """Finish a re-plan an earlier pass began and did not end (KIT-244). The yes was
+        recorded as under way before the first move, so it is never judged again as a fresh
+        question: where the idea is now says where that pass stopped."""
+        rec = q["replanning"]
+        where = (issue.get("state") or {})
+        if where.get("id") not in (rec.get("park"), plan_it):
+            finish(DONE, "I began planning %s again for this yes, and it's in %s now, so I've "
+                   "left it there." % (q["ticket"], notify.safe_title(where.get("name")
+                                                                       or "another state")),
+                   "done: %s moved elsewhere mid re-plan" % q["ticket"], kind="replan-partial",
+                   bind="To plan it, type `plan %s`." % q["ticket"])
+            return
+        if self.dry:
+            self.say("  [dry-run] would finish planning %s again" % q["ticket"])
+            return
+        if where.get("id") == plan_it and not rec.get("parked"):
+            # The first move never landed: do both now.
+            self.replan_moves(issue, plan_it, q, msg, finish)
+            return
+        owed = self.replan_attribution(issue, q, msg)
+        if where.get("id") == rec.get("park"):
+            self.replan_back(issue, plan_it, q, msg, finish, owed)
+        else:
+            self.replan_verify(issue, plan_it, q, msg, finish, owed)
 
     def act_approve(self, channel, thread, q, msg):
         """Move the epic to its team's ready state, as the owner, and record it as approved,
@@ -4367,9 +4830,24 @@ class Pass(object):
     def expire(self):
         ttl = self.cfg["question_ttl_hours"] * 3600
         for q in self.state["questions"].values():
-            if q.get("status") == OPEN and self.now - q.get("asked_at", 0) > ttl:
+            # A re-plan under way is never closed by the clock: its idea may wait outside
+            # Plan it. run() says it each pass until a yes finishes it (KIT-244 review).
+            if q.get("status") == OPEN and not q.get("replanning") and (
+                    self.now - q.get("asked_at", 0) > ttl):
                 q["status"] = EXPIRED
                 self.counts["expired"] += 1
+
+    def stranded_replans(self):
+        """Re-plans begun for a yes and not finished by the end of this pass: their yes
+        was cut short, deleted, or is past the window read (KIT-244 review). The idea may
+        wait outside Plan it, so each keeps the pass loud until a yes finishes it."""
+        for q in self.state["questions"].values():
+            if q.get("kind") == "replan" and q.get("replanning") and q.get("status") == OPEN:
+                self.replan_errors.append(
+                    "%s: a re-plan began for a yes and has not finished, and the idea may be "
+                    "waiting in %s. Reply `yes %s` where it was asked to finish it"
+                    % (q["ticket"], q["replanning"].get("park_name") or "the backlog",
+                       q["ticket"]))
 
     def prune(self):
         horizon = self.now - (self.cfg["lookback_days"] + 1) * 86400
@@ -4401,6 +4879,13 @@ class Pass(object):
             self.state[name] = dict((k, v) for k, v in self.state[name].items() if fresh(k))
         self.state["forwarded_at"] = [t for t in self.state["forwarded_at"]
                                       if isinstance(t, (int, float)) and t > self.now - 3600]
+
+
+def replan_yes(q, msg):
+    """(who said yes, when): the yes that began a re-plan, as recorded when it began, so a
+    later pass that finishes it names that person, whichever message brings it back."""
+    rec = q.get("replanning") or {}
+    return rec.get("by") or msg["user"], rec.get("said_at") or msg.get("ts")
 
 
 def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None,
@@ -4654,6 +5139,18 @@ class FakeTracker(object):
         self.live_threads = {"TOD-5": ["root-5"]}   # ticket -> the agent's session threads
         self.thread_reads, self.thread_replies = [], []
         self.reply_raises = None
+        # KIT-244: an idea's planning tickets, the epics filed from each one, and each
+        # issue's moves into Plan it as the planner reads them, newest last. A move into
+        # Plan it is recorded unless the issue is in `history_drops`; `move_raises` names
+        # the move (counted from 1) that fails.
+        self.runs, self.plans, self.triggers = {}, {}, {}
+        self.history_drops, self.move_raises, self.trigger_raises = set(), None, None
+        self.no_backlog, self.searches, self.move_actor = False, [], OWNER
+        # (move number, whether the tracker applied it first, the exception, a step to run
+        # before raising): a move whose reply is lost, or a pass cut at that point.
+        self.move_fail = None
+        self.trigger_fail, self.trigger_reads = None, 0     # (read number, exception)
+        self.state_kinds["st-backlog"] = "backlog"
         for i in self.issues.values():
             i["state"]["id"] = "st-backlog"
 
@@ -4718,12 +5215,68 @@ class FakeTracker(object):
         return "reply-%d" % len(self.thread_replies)
 
     def move(self, issue_id, state_id):
+        if self.move_raises is not None and len(self.moves) + 1 == self.move_raises:
+            raise BridgeError("the tracker would not move the ticket (simulated)")
+        self.move_calls = getattr(self, "move_calls", 0) + 1
+        fail = self.move_fail if (self.move_fail or (0,))[0] == self.move_calls else None
+        if fail and not fail[1]:
+            if fail[3]:
+                fail[3]()
+            raise fail[2]
         self.moves.append((issue_id, state_id))
-        names = {"st-plan-it": "Plan it", "st-todo": "Todo", "st-done": "Done"}
+        names = {"st-plan-it": "Plan it", "st-todo": "Todo", "st-done": "Done",
+                 "st-backlog": "Backlog"}
         for i in self.issues.values():
             if i["id"] == issue_id:
                 i["state"] = {"id": state_id, "name": names.get(state_id, state_id),
                               "type": self.state_kinds.get(state_id, "unstarted")}
+        if state_id == "st-plan-it" and issue_id not in self.history_drops:
+            trail = self.triggers.setdefault(issue_id, [])
+            trail.append({"id": "hist-%s-%d" % (issue_id, len(trail) + 1),
+                          "createdAt": "2025-10-09T08:53:20.000Z", "actorId": self.move_actor})
+        if fail:
+            if fail[3]:
+                fail[3]()
+            raise fail[2]
+
+    def backlog_state(self, team_key):
+        if self.no_backlog:
+            return None, None, "%s has no backlog state" % team_key
+        return "st-backlog", "Backlog", None
+
+    def planning_runs(self, team_key, idea, owner):
+        # The real client's filter, so the selftest exercises it: the planner's own tickets.
+        self.searches.append(("runs", team_key, idea))
+        return [dict(r) for r in self.runs.get(idea, []) if run_idea(r, owner) == idea]
+
+    def filed_plans(self, team_key, runs, owner):
+        self.searches.append(("plans", team_key, tuple(runs)))
+        return [dict(p) for r in runs for p in self.plans.get(r, [])
+                if (p.get("creator") or {}).get("id") == owner]
+
+    def plan_trigger(self, issue_id, plan_it_id):
+        self.trigger_reads += 1
+        if self.trigger_raises is not None:
+            raise self.trigger_raises
+        if self.trigger_fail and self.trigger_fail[0] == self.trigger_reads:
+            raise self.trigger_fail[1]
+        trail = self.triggers.get(issue_id) or []
+        return dict(trail[-1]) if trail else None
+
+    def add_run(self, idea, run, kind="completed", trigger=None, creator=OWNER):
+        """A planning ticket of the planner's for `idea`, in a state of `kind`, as the
+        planner writes it (run_body): its routing tag first, then its trigger and idea."""
+        self.runs.setdefault(idea, []).append({
+            "id": "uuid-" + run, "identifier": run, "creator": {"id": creator},
+            "state": {"name": kind.title(), "type": kind},
+            "description": run_text(idea, trigger or ("hist-" + run))})
+
+    def in_plan_it(self, ident, moved_at="2025-10-09T07:00:00.000Z", trigger=None):
+        """The idea sits in Plan it, moved there by the owner at `moved_at`."""
+        issue = self.issues[ident]
+        issue["state"] = {"id": "st-plan-it", "name": "Plan it", "type": "unstarted"}
+        self.triggers[issue["id"]] = [{"id": trigger or "hist-%s-0" % ident,
+                                       "createdAt": moved_at, "actorId": OWNER}]
 
     def delegate(self, issue_id, agent_id):
         self.delegations.append((issue_id, agent_id))
@@ -4794,6 +5347,15 @@ class FakeTracker(object):
         if self.fail:
             raise BridgeError("the tracker could not be read (simulated)")
         return self.issues.get(ident)
+
+
+def run_text(idea, trigger):
+    """A planning ticket's description as the planner writes it (pipeline_plan_poller.run_body),
+    with Linear's escaping of the routing tag's bracket (seen live on TOD-134)."""
+    return ("\\%s\n\n**Planning run** for **%s**.\n\n%s%s\n%s%s\n\n%s\nTitle: x\n%s"
+            % (poller.machine.planning_tag(poller.machine.PLANNING_PREFIX + "prod"), idea,
+               poller.TRIGGER_PREFIX, trigger, poller.IDEA_PREFIX, idea, poller.FENCE_OPEN,
+               poller.FENCE_CLOSE))
 
 
 def _config_error(raw):
@@ -5839,9 +6401,10 @@ def selftest():
                                        "type": "unstarted"}
         s.add(ALICE, "plan PROD-5")
         run(c, s, t)
-        check("already-in-plan-it-is-refused-before-asking",
+        check("already-in-plan-it-is-refused-before-asking, and says how to plan it again "
+              "(KIT-244)",
               (posted(s), json.load(open(state_path(c)))["questions"]),
-              (["PROD-5 is already in Plan it."], {}))
+              (["PROD-5 is already in Plan it. To plan it again, type `replan PROD-5`."], {}))
 
         # 3: a yes binds to the terms its question stated. Settings changed since it was
         # asked (acting switched on or off, another Plan it state, another time limit) close
@@ -7897,9 +8460,10 @@ def selftest():
         #     own, so it notifies. Commands and yes or no work there with no thread; a bare
         #     yes binds only when one question is open in that DM, after every check a
         #     channel makes. Each case runs alone, so one that raises fails as itself.
-        dm_help = ("I can do `plan <ticket id>`, `approve <ticket id>` and yes or no here. To "
-                   "answer a dev, reply in the thread under its message. For anything else, "
-                   "ask the tech lead in the chat channel for now.")
+        dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>` "
+                   "and yes or no here. To answer a dev, reply in the thread under its "
+                   "message. For anything else, ask the tech lead in the chat channel for "
+                   "now.")
         unrecorded_ping = ("I can't pass that on to a session: this ping was not recorded for "
                            "the bridge, so I can't tell which session is waiting. Pings sent "
                            "before BRIDGE_PINGS=yes are not recorded, and neither is one the "
@@ -10256,6 +10820,573 @@ def selftest():
                ["forward-refused"], [tl_asking, "I have news.\n\nAsk again in a bit."],
                ["forward-no-answer"], []))
 
+        # 19. RE-PLAN FROM SLACK (KIT-244). `replan <id>` asks about an idea in Plan it whose
+        #     planning ended without a plan that stands. A yes moves it out to the backlog
+        #     and straight back in, as the owner, so the planner starts a new run, and the
+        #     history is read back the planner's way. Each case runs alone.
+        def rp_world(name, **over):
+            c, s, t = world(name, **dict({"act": True}, **over))
+            run(c, s, t)                                    # the first pass, empty
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            return c, s, t
+
+        def rp_ask(name, line="replan PROD-6", **over):
+            c, s, t = rp_world(name, **over)
+            root = s.add(ALICE, line)
+            run(c, s, t)
+            return c, s, t, root
+
+        rp_bind = ("Reply `yes` in this thread within 24 hours, and the bridge moves it out of "
+                   "Plan it and straight back in for you, so the planner starts a new run. "
+                   "Reply `no` to drop it. (Asked for by <@%s>.)" % ALICE)
+
+        def case_rp_asks():
+            c, s, t, _root = rp_ask("rp-asks")
+            qs = list(json.load(open(state_path(c)))["questions"].values())
+            return (posted(s)[-1], [(q["kind"], q["ticket"], q["status"]) for q in qs],
+                    qs[0]["promised"] if qs else None)
+        check("replan-asks-about-an-idea-whose-planning-ended", outcome(case_rp_asks),
+              ("*Plan this again?* PROD-6 “Light mode”: in Plan it on PROD, filed by Chat "
+               "bot. Its last planning run, PROD-50, has ended.\n" + rp_bind,
+               [("replan", "PROD-6", OPEN)],
+               {"act": True, "question_ttl_hours": 24, "plan_it_state": "Plan it"}))
+
+        def case_rp_yes():
+            c, s, t, root = rp_ask("rp-yes")
+            s.add(BOB, "yes", thread=root)
+            code, _out = run(c, s, t)
+            said = t.comments[-1][1] if t.comments else ""
+            return (code, t.moves, posted(s)[-1], len(t.comments),
+                    "said yes in Slack" in said and BOB in said, status_of(c),
+                    len(t.triggers["uuid-6"]))
+        check("replan-a-yes-moves-it-out-to-the-backlog-and-back-in, as the owner, once",
+              outcome(case_rp_yes),
+              (EXIT_OK, [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")],
+               "Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
+               "run within a few minutes." % BOB, 1, True, [DONE], 2))
+
+        def case_rp_no():
+            c, s, t, root = rp_ask("rp-no")
+            s.add(BOB, "no", thread=root)
+            run(c, s, t)
+            return t.moves, posted(s)[-1]
+        check("replan-a-no-moves-nothing", outcome(case_rp_no),
+              ([], "OK, PROD-6 is not planned again."))
+
+        def case_rp_act_off():
+            c, s, t, root = rp_ask("rp-act-off", act=False)
+            asked = posted(s)[-1]
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return t.moves, "acting is switched off here" in asked, "switched off" in posted(s)[-1]
+        check("replan-with-acting-off-moves-nothing", outcome(case_rp_act_off),
+              ([], True, True))
+
+        def rp_refused(name, setup, line="replan PROD-6"):
+            c, s, t = rp_world(name)
+            setup(t)
+            s.add(ALICE, line)
+            run(c, s, t)
+            return posted(s)[-1], json.load(open(state_path(c)))["questions"], t.moves
+
+        plan_70 = {"id": "uuid-70", "identifier": "PROD-70", "creator": {"id": OWNER},
+                   "state": {"name": "Todo", "type": "unstarted"}}
+        for name, setup, want in (
+                ("not-in-plan-it", lambda t: t.set_state("PROD-6", "backlog"),
+                 "PROD-6 isn't in Plan it, so there is no planning to repeat. To plan it, "
+                 "type `plan PROD-6`."),
+                ("a-run-still-open", lambda t: t.add_run("PROD-6", "PROD-51", "started",
+                                                         trigger="T2"),
+                 "PROD-6 is still being planned, in PROD-51. Ask again once that run has "
+                 "finished."),
+                ("a-plan-that-stands", lambda t: t.plans.__setitem__("PROD-50", [plan_70]),
+                 "PROD-6 already has a plan: PROD-70 (Todo). Approve that plan, or cancel it "
+                 "before you plan the idea again."),
+                ("live-work", lambda t: t.live.__setitem__("uuid-6", ["it has an agent "
+                                                                     "session"]),
+                 "PROD-6 looks like live work, so I won't plan it again: it has an agent "
+                 "session."),
+                ("a-move-the-planner-has-yet-to-start-on", lambda t: t.triggers["uuid-6"].append(
+                    {"id": "T9", "createdAt": "2025-10-09T08:50:00.000Z", "actorId": OWNER}),
+                 "PROD-6 was moved to Plan it moments ago, and the planner has not started on "
+                 "it yet. Give it 15 minutes, then ask again."),
+                ("another-team", lambda t: t.issues["PROD-6"].__setitem__("team", {"key": "OPS"}),
+                 "PROD-6 is on OPS, and the bridge plans only on PROD.")):
+            check("replan-refused-before-asking: " + name,
+                  outcome(lambda: rp_refused("rp-" + name, setup)), (want, {}, []))
+
+        def case_rp_old_move():
+            # A move the planner never picked up, long enough ago (it refused to start, or
+            # was stopped): asking is allowed, since no run can be starting on it now.
+            c, s, t = rp_world("rp-old-move")
+            t.triggers["uuid-6"].append({"id": "T9", "createdAt": "2025-10-09T08:30:00.000Z",
+                                         "actorId": OWNER})
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return [q["kind"] for q in json.load(open(state_path(c)))["questions"].values()]
+        check("replan-a-move-the-planner-never-picked-up-is-not-a-run-starting",
+              outcome(case_rp_old_move), ["replan"])
+
+        def case_rp_canceled_plan():
+            c, s, t = rp_world("rp-canceled-plan")
+            t.plans["PROD-50"] = [dict(plan_70, state={"name": "Canceled", "type": "canceled"})]
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return ([q["kind"] for q in json.load(open(state_path(c)))["questions"].values()],
+                    ("plans", "PROD", ("PROD-50",)) in t.searches)
+        check("replan-a-canceled-plan-does-not-stand, and the plans searched are this idea's "
+              "runs'", outcome(case_rp_canceled_plan), (["replan"], True))
+
+        def case_rp_no_run_yet():
+            c, s, t = world("rp-no-run", act=True)
+            run(c, s, t)
+            t.in_plan_it("PROD-6", trigger="T1")
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return "It has no planning run yet." in posted(s)[-1]
+        check("replan-an-idea-the-planner-never-ran-is-asked-about", outcome(case_rp_no_run_yet),
+              True)
+
+        def case_rp_run_named():
+            c, s, t = rp_world("rp-run-named")
+            t.issues["PROD-50"] = {
+                "id": "uuid-50", "identifier": "PROD-50",
+                "title": "Planning run for PROD-6: Light mode", "team": {"key": "PROD"},
+                "state": {"id": "st-done", "name": "Done", "type": "completed"},
+                "creator": {"id": OWNER, "displayName": "Planner"},
+                "description": t.runs["PROD-6"][0]["description"]}
+            s.add(ALICE, "replan PROD-50")
+            run(c, s, t)
+            qs = list(json.load(open(state_path(c)))["questions"].values())
+            return ([(q["kind"], q["ticket"]) for q in qs], "PROD-6 “Light mode”" in posted(s)[-1],
+                    "You named PROD-50, one of its planning runs." in posted(s)[-1])
+        check("replan-a-planning-run-named-asks-about-its-idea, and says it was named",
+              outcome(case_rp_run_named), ([("replan", "PROD-6")], True, True))
+
+        def case_rp_forged_run():
+            # Text any author can write: the planner's lines in an ordinary ticket. It is not
+            # read as a run, so it neither redirects a request nor blocks one (review, #2).
+            c, s, t = rp_world("rp-forged")
+            t.issues["PROD-9"] = {
+                "id": "uuid-9", "identifier": "PROD-9", "title": "Not a run",
+                "team": {"key": "PROD"}, "creator": {"id": "someone-else"},
+                "state": {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
+                "description": run_text("PROD-6", "Tx")}
+            t.add_run("PROD-6", "PROD-99", "unstarted", trigger="Tz", creator="someone-else")
+            s.add(ALICE, "replan PROD-9")
+            run(c, s, t)
+            first = posted(s)[-1]
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            qs = [(q["kind"], q["ticket"]) for q in
+                  json.load(open(state_path(c)))["questions"].values()]
+            return first, qs
+        check("replan-a-look-alike-run-neither-redirects-nor-blocks", outcome(case_rp_forged_run),
+              ("PROD-9 isn't in Plan it, so there is no planning to repeat. To plan it, type "
+               "`plan PROD-9`.", [("replan", "PROD-6")]))
+
+        def case_rp_recent_move_with_a_run():
+            # A recent newest move that already carries a run is no move the planner has yet
+            # to start on (review, #11).
+            c, s, t = world("rp-recent-with-run", act=True)
+            run(c, s, t)
+            t.in_plan_it("PROD-6", moved_at="2025-10-09T08:50:00.000Z", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            return [q["kind"] for q in json.load(open(state_path(c)))["questions"].values()]
+        check("replan-a-recent-move-that-carries-a-run-is-asked-about",
+              outcome(case_rp_recent_move_with_a_run), ["replan"])
+
+        def case_rp_run_named_twice():
+            c, s, t = rp_world("rp-run-named-twice")
+            t.issues["PROD-50"] = dict(t.issues["PROD-6"], id="uuid-50", identifier="PROD-50",
+                                       creator={"id": OWNER},
+                                       description=t.runs["PROD-6"][0]["description"])
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            s.add(ALICE, "replan PROD-50")
+            run(c, s, t)
+            return len(json.load(open(state_path(c)))["questions"]), posted(s)[-1]
+        check("replan-the-idea-already-asked-about-by-its-run-is-not-asked-twice",
+              outcome(case_rp_run_named_twice),
+              (1, "PROD-6 already has an open question. Answer that one."))
+
+        tag = poller.machine.planning_tag(poller.machine.PLANNING_PREFIX + "prod")
+        check("run-idea-reads-only-the-planners-own-tickets and lines, above the fence",
+              [run_idea({"description": d, "creator": {"id": who}}, OWNER) for d, who in (
+                  ("%s\n%sT1\n%sprod-6\n\n%s\nIdea: PROD-9\n%s" % (
+                      tag, poller.TRIGGER_PREFIX, poller.IDEA_PREFIX, poller.FENCE_OPEN,
+                      poller.FENCE_CLOSE), OWNER),
+                  ("%s\n%sPROD-6\n" % (tag, poller.IDEA_PREFIX), OWNER),
+                  ("%s\n%sT1\n%sPROD-6\n%sPROD-7\n" % (tag, poller.TRIGGER_PREFIX,
+                                                       poller.IDEA_PREFIX, poller.IDEA_PREFIX),
+                   OWNER),
+                  ("%s\n%sT1\n%snot an id\n" % (tag, poller.TRIGGER_PREFIX, poller.IDEA_PREFIX),
+                   OWNER),
+                  ("%sT1\n%sPROD-6\n" % (poller.TRIGGER_PREFIX, poller.IDEA_PREFIX), OWNER),
+                  (run_text("PROD-6", "T1"), "someone-else"),
+                  (run_text("PROD-6", "T1"), OWNER),
+                  ("", OWNER), (None, OWNER))],
+              ["PROD-6", None, None, None, None, None, "PROD-6", None, None])
+
+        def rp_after_yes(name, setup):
+            c, s, t, root = rp_ask(name)
+            setup(t)
+            s.add(BOB, "yes", thread=root)
+            code, out = run(c, s, t)
+            return code, t.moves, posted(s)[-1], status_of(c), out
+
+        def case_rp_rechecked():
+            got = rp_after_yes("rp-recheck", lambda t: t.add_run("PROD-6", "PROD-51", "started",
+                                                                 trigger="T2"))
+            return got[:4]
+        check("replan-every-check-runs-again-before-the-move: a run started since the "
+              "question moves nothing", outcome(case_rp_rechecked),
+              (EXIT_OK, [], "PROD-6 is still being planned, in PROD-51. Nothing was moved. Ask "
+                            "again once that run has finished.", [REFUSED]))
+
+        def case_rp_changed():
+            got = rp_after_yes("rp-changed", lambda t: t.issues["PROD-6"].__setitem__(
+                "title", "Light mode, changed"))
+            return got[1], got[2]
+        check("replan-a-ticket-changed-since-asked-moves-nothing", outcome(case_rp_changed),
+              ([], "PROD-6 changed since I asked (its title, text, team, labels or state), so "
+                   "nothing was moved, and I have closed the question. Ask again with "
+                   "`replan PROD-6`."))
+
+        def case_rp_no_backlog():
+            got = rp_after_yes("rp-no-backlog", lambda t: setattr(t, "no_backlog", True))
+            return got[1], got[2]
+        check("replan-a-team-with-no-backlog-state-moves-nothing", outcome(case_rp_no_backlog),
+              ([], "I can't plan PROD-6 again: PROD has no backlog state, so it has nowhere "
+                   "to wait for a moment. Nothing was moved."))
+
+        def case_rp_half():
+            code, moves, last, statuses, out = rp_after_yes(
+                "rp-half", lambda t: setattr(t, "move_raises", 2))
+            return code, moves, last, statuses, "PROD-6 was left in Backlog" in out
+        check("replan-a-failed-move-back-is-said-with-the-line-that-finishes-it, and the pass "
+              "exits 1", outcome(case_rp_half),
+              (EXIT_ERROR, [("uuid-6", "st-backlog")],
+               "I moved PROD-6 to Backlog, but moving it back into Plan it failed, so no "
+               "planning run starts. To finish, type `plan PROD-6`.", [DONE], True))
+
+        def case_rp_unseen():
+            code, moves, last, statuses, out = rp_after_yes(
+                "rp-unseen", lambda t: t.history_drops.add("uuid-6"))
+            return code, len(moves), last, statuses, "does not show the move back in" in out
+        check("replan-a-move-the-history-does-not-show-is-said, and the pass exits 1",
+              outcome(case_rp_unseen),
+              (EXIT_ERROR, 2, "I moved PROD-6 out of Plan it and back in for <@%s>, but its "
+               "history does not show the move back in, so the planner may not start. If no "
+               "planning run starts within ten minutes, move PROD-6 out of Plan it and back "
+               "in by hand." % BOB, [DONE], True))
+
+        def case_rp_other_actor():
+            # The newest move into Plan it is someone else's: the planner starts no run on
+            # it, so the bridge's move is not confirmed.
+            code, moves, last, _st, _out = rp_after_yes(
+                "rp-other-actor", lambda t: setattr(t, "move_actor", "someone-else"))
+            return code, len(moves), "does not show the move back in" in last
+        check("replan-a-move-back-the-history-credits-to-someone-else-is-not-confirmed",
+              outcome(case_rp_other_actor), (EXIT_ERROR, 2, True))
+
+        def case_rp_history_unread():
+            def setup(t):
+                real = t.plan_trigger
+                reads = [0]
+
+                def flaky(issue_id, plan_it_id):
+                    reads[0] += 1
+                    if reads[0] >= 2:          # after the moves; the first read is at the yes
+                        raise BridgeError("simulated")
+                    return real(issue_id, plan_it_id)
+                t.plan_trigger = flaky
+            code, moves, last, _st, _out = rp_after_yes("rp-history-unread", setup)
+            return code, len(moves), "I could not read its history to check" in last
+        check("replan-a-history-it-could-not-read-afterwards-is-could-not-check, never done",
+              outcome(case_rp_history_unread), (EXIT_ERROR, 2, True))
+
+        # A re-plan cut midway is finished by the next pass, from where it stopped, never
+        # judged again as a fresh question (review, the three-lens finding).
+        def rp_cut(name, setup, after=None):
+            c, s, t, root = rp_ask(name)
+            setup(t)
+            s.add(BOB, "yes", thread=root)
+            try:
+                first = run(c, s, t)[0]
+            except Deadline:
+                first = "cut"
+            t.move_fail, t.trigger_fail, t.fail = None, None, False
+            if after:
+                after(t)
+            code, out = run(c, s, t, at=now + 60)
+            return (first, code, t.moves, len(t.comments), posted(s)[-1], status_of(c), out)
+
+        moved_ok = ("Moved PROD-6 out of Plan it and back in for <@%s>. The planner starts a new "
+                    "run within a few minutes." % BOB)
+        both = [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")]
+
+        def case_rp_cut_between():
+            got = rp_cut("rp-cut-between",
+                         lambda t: setattr(t, "move_fail", (2, False, Deadline(), None)))
+            return got[:6]
+        check("replan-cut-between-the-moves: the next pass moves it back, once, and says so",
+              outcome(case_rp_cut_between), ("cut", EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_cut_after_both():
+            got = rp_cut("rp-cut-after", lambda t: setattr(t, "trigger_fail",
+                                                          (3, Deadline())))
+            return got[:6]
+        check("replan-cut-after-both-moves: the next pass checks the history and moves nothing "
+              "more", outcome(case_rp_cut_after_both), ("cut", EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_first_move_lost():
+            got = rp_cut("rp-first-lost", lambda t: setattr(
+                t, "move_fail", (1, False, BridgeError("simulated"), None)))
+            return got[:6]
+        check("replan-a-first-move-that-never-landed-is-made-by-the-next-pass",
+              outcome(case_rp_first_move_lost), (EXIT_ERROR, EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_first_reply_lost():
+            # The first move landed and only its reply was lost: the re-plan was recorded as
+            # under way before it, so the next pass finds the idea parked and finishes.
+            got = rp_cut("rp-first-reply-lost", lambda t: setattr(
+                t, "move_fail", (1, True, BridgeError("simulated"), None)))
+            return got[:6]
+        check("replan-a-first-move-whose-reply-was-lost-is-finished-by-the-next-pass",
+              outcome(case_rp_first_reply_lost), (EXIT_ERROR, EXIT_OK, both, 1, moved_ok, [DONE]))
+
+        def case_rp_moved_elsewhere():
+            got = rp_cut("rp-elsewhere",
+                         lambda t: setattr(t, "move_fail", (2, False, Deadline(), None)),
+                         after=lambda t: t.set_state("PROD-6", "unstarted"))
+            return got[1:6]
+        check("replan-an-idea-moved-elsewhere-midway-is-left-there-and-said",
+              outcome(case_rp_moved_elsewhere),
+              (EXIT_OK, [("uuid-6", "st-backlog")], 1,
+               "I began planning PROD-6 again for this yes, and it's in Todo now, so I've left "
+               "it there. To plan it, type `plan PROD-6`.", [DONE]))
+
+        def case_rp_back_reply_lost():
+            # The move back landed, and only its reply was lost: no false "failed".
+            code, moves, last, statuses, _out = rp_after_yes(
+                "rp-back-lost", lambda t: setattr(
+                    t, "move_fail", (2, True, BridgeError("simulated"), None)))
+            return code, moves, last, statuses
+        check("replan-a-move-back-whose-reply-was-lost-is-read-again-and-confirmed",
+              outcome(case_rp_back_reply_lost), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_back_unknown():
+            def setup(t):
+                t.move_fail = (2, False, BridgeError("simulated"),
+                               lambda: setattr(t, "fail", True))
+            code, moves, last, _st, out = rp_after_yes("rp-back-unknown", setup)
+            return code, moves, last, "may not have landed" in out
+        check("replan-a-move-back-it-cannot-read-again-is-said-as-unknown, and the pass exits 1",
+              outcome(case_rp_back_unknown),
+              (EXIT_ERROR, [("uuid-6", "st-backlog")],
+               "I moved PROD-6 to Backlog, and I can't tell whether the move back into Plan it "
+               "landed. Look at PROD-6 in the tracker. If it isn't in Plan it, type "
+               "`plan PROD-6`.", True))
+
+        # Stage E review: a re-plan under way is finished by the next pass even when a check
+        # that closes or refuses an answer would now fire on its yes (the question edited,
+        # the person who said yes now a guest), since that yes was judged when it began. A
+        # yes the next pass cannot read keeps every pass loud, the clock never closes it,
+        # and a later yes finishes it, naming who said yes first.
+        def rp_cut_then(name, between, cut=(2, False, Deadline(), None)):
+            c, s, t, root = rp_ask(name)
+            t.move_fail = cut
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            between(s)
+            return c, s, t, root
+
+        def edit_the_replan_question(s):
+            for m in s.messages:
+                if "Plan this again?" in m.get("text", ""):
+                    m["edited"] = {"user": ME, "ts": "1"}
+
+        def bob_now_a_guest(s):
+            s.profiles[BOB] = dict(s.profiles[BOB], is_restricted=True)
+
+        def delete_bobs_yes(s):
+            s.messages = [m for m in s.messages
+                          if not (m.get("user") == BOB and m.get("text") == "yes")]
+
+        for name, between in (("question-edited", edit_the_replan_question),
+                              ("yes-giver-now-a-guest", bob_now_a_guest)):
+            def case_rp_then(name=name, between=between):
+                c, s, t, _root = rp_cut_then("rp-then-" + name, between)
+                code, _out = run(c, s, t, at=now + 60)
+                return code, t.moves, posted(s)[-1], status_of(c)
+            check("replan-cut-then-%s: the next pass still finishes it" % name,
+                  outcome(case_rp_then), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_yes_gone():
+            c, s, t, root = rp_cut_then("rp-yes-gone", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)
+            late = run(c, s, t, at=now + 25 * 3600)        # past the question's 24 hours
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 25 * 3600 + 30)
+            code, _out = run(c, s, t, at=now + 25 * 3600 + 60)
+            q = list(json.load(open(state_path(c)))["questions"].values())[0]
+            return (first[0], "has not finished" in first[1], "Reply `yes PROD-6`" in first[1],
+                    late[0], "has not finished" in late[1], code, t.moves, posted(s)[-1],
+                    q["status"], q["answered_by"])
+        check("replan-its-yes-gone: every pass is loud, the clock never closes it, and a later "
+              "yes finishes it, for whoever said yes first", outcome(case_rp_yes_gone),
+              (EXIT_ERROR, True, True, EXIT_ERROR, True, EXIT_OK, both, moved_ok, DONE, BOB))
+
+        def case_rp_named_on_resume():
+            # Cut before the comment naming who said yes: the pass that finishes it, brought
+            # back by ALICE's yes, still names BOB.
+            c, s, t, root = rp_cut_then("rp-named", delete_bobs_yes,
+                                        cut=(1, True, BridgeError("simulated"), None))
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            said = t.comments[-1][1] if t.comments else ""
+            return code, len(t.comments), BOB in said, ALICE in said, posted(s)[-1]
+        check("replan-resumed-by-another-yes-names-who-said-yes-first",
+              outcome(case_rp_named_on_resume), (EXIT_OK, 1, True, False, moved_ok))
+
+        def case_rp_partial_is_explained():
+            # The comment naming who said yes lands as soon as the idea leaves Plan it, so a
+            # move back that fails still leaves the owner's move explained.
+            c, s, t, root = rp_ask("rp-partial-explained")
+            t.move_raises = 2
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t)
+            return len(t.comments), "said yes in Slack" in (t.comments[-1][1] if t.comments
+                                                            else "")
+        check("replan-a-failed-move-back-still-leaves-the-comment-naming-who-said-yes",
+              outcome(case_rp_partial_is_explained), (1, True))
+
+        def case_rp_changed_planning():
+            # The question named PROD-50 as the last run. A run since then, from a move since
+            # then, is a new situation: the old yes moves nothing (review, #4).
+            got = rp_after_yes("rp-changed-planning", lambda t: (
+                t.add_run("PROD-6", "PROD-51", "canceled", trigger="T2"),
+                t.triggers["uuid-6"].append({"id": "T2", "createdAt": "2025-10-09T07:30:00.000Z",
+                                             "actorId": OWNER})))
+            return got[1], got[2], got[3]
+        check("replan-a-run-or-move-since-the-question-moves-nothing",
+              outcome(case_rp_changed_planning),
+              ([], "PROD-6's planning changed since I asked (a new run or a new move), so "
+                   "nothing was moved, and I have closed the question. Ask again with "
+                   "`replan PROD-6`.", [REFUSED]))
+
+        def case_rp_written():
+            fw = FakeWriter()
+            c, s, t = wworld("w-replan", act=True, dm_user_ids=[ALICE])
+            wrun(c, s, t, fw)
+            t.in_plan_it("PROD-6", trigger="T1")
+            t.add_run("PROD-6", "PROD-50", "completed", trigger="T1")
+            s.add(ALICE, "replan PROD-6", channel=DM)
+            wrun(c, s, t, fw)
+            s.add(ALICE, "yes", channel=DM)
+            wrun(c, s, t, fw)
+            asked, moved = fw.last("question-replan"), fw.last("replan-moved")
+            bad = [(x["kind"], why) for x in fw.calls
+                   for why in [voice.check_text(x["fallback"], 100000, x["keep"],
+                                                voice.fact_links(x["facts"]),
+                                                voice.fact_ids(x["facts"], x["keep"]))]
+                   if why]
+            return asked["facts"]["last_run"], moved["fallback"], t.moves, bad
+        check("writer-replan: the question's last run is a fact, the move is written with the "
+              "member's name, and no text handed to the writer fails its own checks",
+              outcome(case_rp_written),
+              ("PROD-50", "Moved PROD-6 out of Plan it and back in for Alice Example. The "
+                          "planner starts a new run within a few minutes.",
+               [("uuid-6", "st-backlog"), ("uuid-6", "st-plan-it")], []))
+
+        # The real client's searches: one team, the planner's or the executor's own line,
+        # archived tickets read, a page that runs over refused; and the backlog state is the
+        # team's first by position.
+        def case_rp_wiring():
+            seen = []
+            run6, run60 = run_text("PROD-6", "T1"), run_text("PROD-60", "T7")
+
+            def transport(url, headers, payload=None, timeout=20):
+                q, v = payload["query"], payload["variables"]
+                seen.append((q.split("(")[0].split()[-1], v))
+                if "BridgeFindByLine" in q:
+                    lines = [w["description"]["contains"] for w in
+                             v["filter"].get("or") or [v["filter"]]]
+                    if any("PROD-99" in line for line in lines):
+                        # Always another page: past FIND_MAX_PAGES the read is refused.
+                        return {"data": {"issues": {"nodes": [], "pageInfo": {
+                            "hasNextPage": True, "endCursor": "c%s" % (v.get("after") or "")}}}}
+                    pages = [
+                        [{"id": "r2", "identifier": "PROD-60", "state": {"type": "completed"},
+                          "creator": {"id": OWNER}, "description": run60},
+                         {"id": "r3", "identifier": "PROD-61", "state": {"type": "unstarted"},
+                          "creator": {"id": "someone-else"}, "description": run6}],
+                        [{"id": "r1", "identifier": "PROD-50", "state": {"type": "completed"},
+                          "creator": {"id": OWNER}, "description": run6},
+                         {"id": "e1", "identifier": "PROD-70", "state": {"type": "unstarted"},
+                          "creator": {"id": OWNER}, "description": "x\n\nPlan id: PROD-50/abc"},
+                         {"id": "e2", "identifier": "PROD-71", "state": {"type": "unstarted"},
+                          "creator": {"id": "someone-else"},
+                          "description": "x\n\nPlan id: PROD-50/def"}]]
+                    page = 1 if v.get("after") == "p2" else 0
+                    return {"data": {"issues": {"nodes": [n for n in pages[page] if any(
+                        line in n["description"] for line in lines)], "pageInfo": {
+                        "hasNextPage": page == 0, "endCursor": "p2" if page == 0 else None}}}}
+                if "PlanTeam" in q:
+                    return {"data": {"teams": {"nodes": [{"id": "team-prod", "key": "PROD",
+                                                          "states": {"nodes": [
+                        {"id": "st-icebox", "name": "Icebox", "type": "backlog", "position": 2},
+                        {"id": "st-backlog", "name": "Backlog", "type": "backlog",
+                         "position": 1},
+                        {"id": "st-plan-it", "name": "Plan it", "type": "unstarted",
+                         "position": 3}]}, "labels": {"nodes": []}}]}}}
+                if "PlanHistory" in q:
+                    return {"data": {"issue": {"createdAt": "2025-10-01T00:00:00.000Z",
+                                               "creator": {"id": OWNER}, "history": {
+                        "nodes": [{"id": "h1", "createdAt": "2025-10-02T00:00:00.000Z",
+                                   "actorId": OWNER, "fromStateId": "st-backlog",
+                                   "toStateId": "st-plan-it"},
+                                  {"id": "h2", "createdAt": "2025-10-03T00:00:00.000Z",
+                                   "actorId": OWNER, "fromStateId": "st-backlog",
+                                   "toStateId": "st-plan-it"}],
+                        "pageInfo": {"hasNextPage": False}}}}}
+                raise AssertionError("unexpected query: %s" % q[:60])
+            real_http = globals()["_http_json"]
+            globals()["_http_json"] = transport
+            try:
+                tc = TrackerClient("k")
+                runs = [r["identifier"] for r in tc.planning_runs("PROD", "PROD-6", OWNER)]
+                plans = [p["identifier"] for p in tc.filed_plans("PROD", ["PROD-50"], OWNER)]
+                none = tc.filed_plans("PROD", [], OWNER)
+                before_over = len(seen)
+                try:
+                    tc.filed_plans("PROD", ["PROD-50", "PROD-99"], OWNER)
+                    over = "read as complete"
+                except BridgeError as exc:
+                    over = "more tickets" in str(exc)
+                over_reads = len(seen) - before_over
+                backlog = tc.backlog_state("PROD")
+                trig = (tc.plan_trigger("uuid-6", "st-plan-it") or {}).get("id")
+            finally:
+                globals()["_http_json"] = real_http
+            finds = [v for op, v in seen if op == "BridgeFindByLine"]
+            return (runs, plans, none, over, over_reads, backlog, trig, finds[0]["filter"],
+                    [f.get("after") for f in finds[:2]], sorted(finds[2]["filter"]))
+        check("replan-wiring: the searches page, keep only the owner's own runs and plans, and "
+              "read the backlog state and the history the planner's way",
+              outcome(case_rp_wiring),
+              (["PROD-50"], ["PROD-70"], [], True, FIND_MAX_PAGES,
+               ("st-backlog", "Backlog", None), "h2",
+               {"team": {"key": {"eq": "PROD"}}, "description": {"contains": "Idea: PROD-6"}},
+               [None, "p2"], ["description", "team"]))
+
     # 14. EXACTLY FOUR TRACKER WRITES (KIT-222, KIT-223, KIT-299): a state move carrying
     #     `stateId` only (an idea, an approved epic, a finished plan), a delegation carrying
     #     `delegateId` only, a comment, and a finished plan's follow-up carrying a team, a
@@ -10275,9 +11406,11 @@ def selftest():
           (re.search(r"issueCreate\(input: \{ teamId: \$teamId, title: \$title, "
                      r"description: \$description \}\)", body) is not None,
            body.count("issueCreate(")), (True, 1))
+    # The moves: a plan, a finished plan, the epic's approval, and a re-plan's two, out to
+    # the backlog and back into Plan it (KIT-244).
     check("the-move-and-the-follow-up-are-the-only-callers",
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
-           len(re.findall(r"_query\(M_FOLLOWUP", body))), (3, 1, 1))
+           len(re.findall(r"_query\(M_FOLLOWUP", body))), (5, 1, 1))
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",

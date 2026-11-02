@@ -9,10 +9,12 @@ The bridge lets a trusted member of your Slack workspace act as you, from the ch
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
 checks with Slack itself who said yes.
 
-**It does three things, and only once you switch it on.** With `ACT=yes`:
+**It does four things, and only once you switch it on.** With `ACT=yes`:
 
 - a verified "yes" to `plan <ticket id>` moves that idea into Plan it, as you, and the
   planner starts on it;
+- a verified "yes" to `replan <ticket id>` moves an idea whose planning ended without a
+  plan out of Plan it and straight back in, as you, so the planner starts again (KIT-244);
 - a verified "yes" to `approve <epic id>` moves the epic to Todo. Then it hands the children
   to the agent, as you, in the order the plan needs them;
 - a verified member's reply under an `agent:blocked` ping, the one saying a dev stopped to ask
@@ -219,7 +221,8 @@ Not that: *… looks like live work …*. The ticket is delegated, has a session
 children, a pull request, or a `provenance:*` or `agent:*` label. The bridge refuses exactly
 what the planner would.
 
-A ticket already in Plan it is refused before the bridge asks.
+A ticket already in Plan it is refused before the bridge asks. The refusal tells you how to
+plan it again, with `replan`.
 
 Before it moves anything, the bridge reads the ticket again. One already in Plan it is said
 and left alone. One that moved to another team is refused. One whose title, text, team,
@@ -229,6 +232,35 @@ asks you to ask again. It acts at most 10 times an hour.
 If the comment naming who said yes cannot be written, the move still stands. The thread says
 so, and every pass tries the comment again. Until it lands, each pass exits 1 and `verify`
 shows the job failing.
+
+### Plan an idea again
+
+When a plan is refused, or a planning run ends with no plan, say `replan <ticket id>`. Name
+the idea, or the planning-run ticket a page linked: the bridge asks about the idea either
+way, and says which ticket you named. It asks *Plan this again?* and names the idea's last
+planning run. Reply `yes`.
+
+The bridge moves the idea out of Plan it to your team's first backlog state, and straight back
+in, as you. The planner sees a new move and starts a new run. The idea gets one comment
+naming who said yes, as soon as it leaves Plan it.
+
+Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
+minutes.*
+Not that: *… is still being planned …*. A planning run is still going. Ask again once it ends.
+Not that: *… already has a plan …*. An epic filed from this idea still stands. Approve it, or
+cancel it first. Cancel it rather than delete it: a deleted epic may still count.
+Not that: *… was moved to Plan it moments ago …*. The planner may be starting on that move.
+Wait 15 minutes, then ask again.
+Not that: *… planning changed since I asked …*. A run or a move came after the question.
+Ask again, so you see where it stands now.
+
+Every check runs again before the move. If a pass stops halfway, the next pass finishes the
+same yes from where it stopped. An edited question, or a later post, never stops it then.
+If that yes is gone, every pass exits 1 and says so, and the idea may wait in the backlog
+state. Reply `yes <ticket id>` where it was asked, and the next pass finishes it, for whoever
+said yes first. Afterwards the bridge reads the idea's history the way the planner does. If
+the move back in doesn't show there, the move back failed, or the bridge can't tell whether
+it landed, the thread says what to do, and that pass exits 1.
 
 ---
 
@@ -527,7 +559,8 @@ be opened stops no channel and no other member's DM, and each one is named.
 
 What works in the DM:
 
-- `plan <ticket id>` and `approve <epic id>`, each as a line of its own.
+- `plan <ticket id>`, `replan <ticket id>` and `approve <epic id>`, each as a line of its
+  own.
 - `yes` or `no` as a line of its own. It answers the one open question in that DM. With two
   open, the bridge asks you for `yes <ticket id>`.
 - `yes` in the thread under a question answers that question.
@@ -619,8 +652,8 @@ goes to the dispatcher's chat bot, the tech lead. Its answer comes back to your 
 2. Your DM says `Asking the tech lead…`.
 3. The tech lead answers in the thread under that post. Each pass, the bridge posts each
    answer in your DM, as a message of its own.
-4. If the answer is exactly `plan <ticket id>` or `approve <epic id>`, the bridge asks you its
-   own question in the DM instead. Answer it with `yes` or `no`, as usual.
+4. If the answer is exactly `plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`,
+   the bridge asks you its own question in the DM instead. Answer it with `yes` or `no`, as usual.
 
 **Setting it up.**
 
@@ -783,8 +816,8 @@ The bridge checks every answer with Slack's own records. It refuses:
 A message the bridge cannot handle three passes running is given up on, said once, and
 passed over, so one bad message cannot stall it.
 
-A request (`plan <ticket id>` or `approve <epic id>`) can come from anyone, the chat bot
-included. Asking is harmless; only the answer acts. It looks up at most 20 requests an hour,
+A request (`plan <ticket id>`, `replan <ticket id>` or `approve <epic id>`) can come from
+anyone, the chat bot included. Asking is harmless; only the answer acts. It looks up at most 20 requests an hour,
 found or not, and asks one question per ticket at a time. Past that limit it refuses requests
 without reading them, and says so once an hour. A request from the chat bot credits "the chat
 bot", with no mention.
