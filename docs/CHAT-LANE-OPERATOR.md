@@ -778,6 +778,7 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
 | `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder, ends with `/`, is not a path, is longer than 4096 characters or re-opens a file piece 5 denies (in any spelling the disk treats as the same name, with or without `/private`, or through a linked folder), or when a trust file is a symbolic link, a hard link, not a regular file, larger than 1 MiB, holds the text `PRIVATE KEY`, holds no PEM certificate, or holds a line shaped like a secret or a setting (a config that also holds a certificate). Lines say how many text lines a trust file holds beside its certificates, and when the role account could change it after the check. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
 | `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
+| `chat-model` | the model a chat turn starts on and its backup, from the dispatcher's config, differ. It then lists the last five chat turns, newest first: when, the model, what each cost and how it ended. **Fails** when the backup is the model itself: every chat turn then fails before it starts. Says `UNKNOWN` when the dispatcher's env file sets a model override, whose value it does not read. See *The tech lead's model* |
 | `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
@@ -885,6 +886,30 @@ your hand-over, and the bridge acts only on a member's yes to its own question.
 
 ---
 
+## The tech lead's model
+
+The chat bot runs on the dispatcher's one default model: `claudeDefaultModel` in its config,
+or Opus when that is unset. Its backup is `claudeDefaultFallbackModel`, or Sonnet. No setting
+picks a model for chat alone (`EdgeWorker.js:715-721`).
+
+- **The backup must differ from the model.** If they match, the SDK refuses the pair. Every
+  chat turn then fails before it starts, and nothing reaches the turn's log.
+- **The same setting picks every other session's model too,** unless its ticket has a model
+  label or a `[model=…]` tag. That covers coding, planning, and a fix asked of a running
+  session. A repository entry's own `model` is never read (`RunnerSelectionService.js:297-310`,
+  `RunnerConfigBuilder.js:173-175`). Reviews carry their own label, so they don't move.
+- **The dispatcher's env file can override both at start,** with `CYRUS_CLAUDE_DEFAULT_MODEL`
+  and its three siblings. `verify` reads only their names. Set the config's keys instead.
+- **What each reply costs** is in `verify`'s `chat-model` row: the last five turns, newest
+  first, each from its own log. A thread's log adds up every turn so far, so the row takes
+  off the turn before. When it can't, it says "for the thread so far".
+
+Good: `chat turns start on opus, with sonnet as the backup`, then one line per turn.
+Not that: `every chat turn fails before it starts`. Set `claudeDefaultFallbackModel` to a
+different model. The config reloads on its own.
+
+---
+
 ## What `CYRUS_HOST_EXTERNAL=true` changes
 
 It is set to turn on Slack's signature check. It does five things.
@@ -917,6 +942,7 @@ read.
 |---|---|
 | Set `slackAllowedTools` | Live, for chat sessions started or resumed after the file changes (`ConfigManager.js:51-62, 181`; `EdgeWorker.js:362-381`; `ChatSessionHandler.js:139, 279`). A session still running keeps its old list (`ChatSessionHandler.js:70-77`). |
 | Remove `slackAllowedTools` | At restart only: a reload keeps the old value (`ConfigManager.js:181`). |
+| Set `claudeDefaultModel` or `claudeDefaultFallbackModel` | Live, for chat turns and sessions that start after the file changes (`ConfigManager.js:237-244`; `EdgeWorker.js:405`). A turn already running keeps its model. Removing either takes a restart, so to go back, write the old value. |
 | Add or change a name in the env file | Live (`Application.js:52-78`), except the listening address and address checks, which are read at start. `env-names` replaces the file with a rename, which the watcher may not count as a change (see *What is not proven*), so count on the restart. |
 | Remove a name from the env file | At restart only: a reload sets names and never unsets one (`Application.js:54`). |
 | **Delete** `promptDefaults`, `slackMcpConfigs` or any other config key | At restart only, and worse: the merge keeps the old value (`ConfigManager.js:176-183`), so the reloaded config equals the old one and nothing is re-applied at all — while the log still prints the reload line. Set the key to an empty value instead, or restart. `verify` reads the file, so both rows go green either way. |

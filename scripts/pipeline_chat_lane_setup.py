@@ -18,9 +18,10 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
               Reads no live file, needs no role-account access, runs anywhere. Exit 0, or
               2 on a conf error.
     verify    read-only live measurement: four files, any trust file (a yes or no for
-              a private key, never its bytes), and the newest chat session's start-up
-              tool list (names only), as the role account, and pf's loaded rules as
-              root. One outcome per check.
+              a private key, never its bytes), the newest chat session's start-up
+              tool list (names only), and the last few chat turns' models and costs,
+              as the role account, and pf's loaded rules as root. One outcome per
+              check.
     merge     pieces 1, 2 and 5 into the dispatcher config and the role account's user
               settings. Dry run by default; `--apply` writes.
     env-names piece 3: asks for the chat app's two secrets at hidden prompts and writes
@@ -85,8 +86,8 @@ installer's `verify` on purpose. That one still runs under a model with its cred
 reads gated off, because most of its rows measure something that holds no credential.
 Here every row reads the dispatcher's config (which holds the tracker's OAuth tokens —
 the dispatcher writes them there, cyrus-edge-worker EdgeWorker.js:5154-5211) or its env
-file (which holds the chat bot's token). The probe prints names and tool lists only, but
-a session has no business running it: there is no gated-off version that still measures
+file (which holds the chat bot's token). The probe prints names, tool lists, model names
+and costs only, but a session has no business running it: there is no gated-off version that still measures
 anything. Tamper-evident, not tamper-proof — the markers are environment variables a
 session could unset (see the same note in scripts/pipeline_stage_e_setup.py).
 
@@ -2254,13 +2255,14 @@ def print_card(cid, conf=None, broken=False):
 # --------------------------------------------------------------------------- #
 # verify — one read-only program, run as the role account.
 #
-# It prints NAMES, BOOLEANS and TOOL LISTS. It never prints a value from the env file, a
-# token from the config, or the settings file's `env` block. Every read is wrapped, and an
-# error is reported by its class, never its message (a parse error's message can quote the
-# file). Every `open` in it takes one argument: read mode.
+# It prints NAMES, BOOLEANS, TOOL LISTS, MODEL NAMES and COSTS. It never prints a value from
+# the env file, a token from the config, the settings file's `env` block, or a word of any
+# message in a log. Every read is wrapped, and an error is reported by its class, never its
+# message (a parse error's message can quote the file). Every `open` in it takes one
+# argument: read mode.
 # --------------------------------------------------------------------------- #
 FACTS_PY = r'''
-import fcntl, hashlib, json, os, pathlib, re, stat, sys
+import fcntl, hashlib, json, os, pathlib, re, stat, sys, time
 QUOTES = "\"'`"
 
 def raw_of(path):
@@ -2269,6 +2271,28 @@ def raw_of(path):
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 LINE = re.compile(r"^\s*(?:export\s+)?([\w.-]+)\s*(?:=|:\s)(.*)$")
+# A model's name as the config and a turn's log carry it (KIT-355). The charset is narrow on
+# purpose: a value outside it is reported as "unreadable" and never printed.
+MODEL_NAME = re.compile(r"^[A-Za-z0-9._:/@\[\]-]{1,100}$")
+WORD = re.compile(r"^[a-z_]{1,40}$")
+TURN_FILE = re.compile(r"^session-(.+)-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.jsonl$")
+MODEL_KEYS = ("claudeDefaultModel", "defaultModel", "claudeDefaultFallbackModel",
+              "defaultFallbackModel")
+TURNS_KEPT = 5
+
+def model_name(v):
+    # The dispatcher skips a value that is not truthy (`a || b`), so this does too.
+    if not v:
+        return None
+    return v if isinstance(v, str) and MODEL_NAME.match(v) else "unreadable"
+
+def money(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+        return None
+    return round(float(v), 6)
+
+def word(v):
+    return v if isinstance(v, str) and WORD.match(v) else None
 
 def why(exc):
     if isinstance(exc, FileNotFoundError):
@@ -2347,6 +2371,7 @@ def config(path):
             "defaultDisallowedTools": tools(c.get("defaultDisallowedTools")),
             "promptDefaults": prompt_lists(c.get("promptDefaults")),
             "entries": entries,
+            "models": dict((k, model_name(c.get(k))) for k in MODEL_KEYS),
             "sha256": digest(raw)}
 
 def present(raw):
@@ -2655,6 +2680,137 @@ def chat_tools(logs):
             continue
     return {"sessions": len(files), "none": True}
 
+def turns_of(path):
+    # One run's log, top to bottom: a turn opens at its system/init and closes at its result
+    # (sdk.d.ts 5525-5528, 5690). Kept: model names, enum words and numbers. Never a message.
+    turns, cur = [], None
+    with pathlib.Path(path).open("rb") as fh:
+        for line in fh:
+            try:
+                entry = json.loads(line.decode("utf-8", "replace"))
+            except (ValueError, RecursionError):
+                continue
+            m = entry.get("message") if (isinstance(entry, dict)
+                                         and entry.get("type") == "sdk-message") else None
+            if not isinstance(m, dict):
+                continue
+            at = entry.get("timestamp")
+            at = at[:40] if isinstance(at, str) else None
+            kind, sub = m.get("type"), m.get("subtype")
+            fell = kind == "system" and sub in ("model_fallback", "model_refusal_fallback")
+            if not (kind in ("assistant", "result") or fell
+                    or (kind == "system" and sub == "init")):
+                continue
+            if cur is None or cur["outcome"] is not None:
+                cur = {"at": at, "model": None, "answeredBy": [], "fellBackTo": [],
+                       "errors": [], "outcome": None, "isError": None, "total": None}
+                turns.append(cur)
+            if sub == "init" and kind == "system":
+                # A turn's own model: the one it started on (AgentSessionManager.js 174-180).
+                # An init re-emitted inside an open turn names the same turn.
+                if cur["model"] is None:
+                    cur["model"] = model_name(m.get("model"))
+            elif fell:
+                name = model_name(m.get("fallback_model"))
+                if name and name not in cur["fellBackTo"]:
+                    cur["fellBackTo"].append(name)
+            elif kind == "assistant":
+                err = word(m.get("error"))
+                if err and err not in cur["errors"]:
+                    cur["errors"].append(err)
+                inner = m.get("message") if isinstance(m.get("message"), dict) else {}
+                if m.get("parent_tool_use_id") is None and inner.get("model") != "<synthetic>":
+                    name = model_name(inner.get("model"))
+                    if name and name not in cur["answeredBy"]:
+                        cur["answeredBy"].append(name)
+            else:
+                cur["outcome"] = word(sub) or "result"
+                cur["isError"] = m.get("is_error") is True
+                cur["total"] = money(m.get("total_cost_usd"))
+    return turns
+
+def first_line_start(path):
+    # A run's start, from its metadata line: a run's pending file and its real one share it.
+    with pathlib.Path(path).open("rb") as fh:
+        try:
+            d = json.loads(fh.readline().decode("utf-8", "replace"))
+        except (ValueError, RecursionError):
+            return None
+    v = d.get("startedAt") if isinstance(d, dict) else None
+    return v[:40] if isinstance(v, str) else None
+
+def chat_turns(logs):
+    # The last few chat turns: the model each started on and answered with, and what each
+    # cost (KIT-355). A thread's every run logs a new file under logs/slack-<first event
+    # id>/, named session-<claude session id>-<UTC start>.jsonl; a run that never heard from
+    # the model keeps only its session-pending-<start>.jsonl (ClaudeRunner.js 996-1032). A
+    # result's total_cost_usd counts every turn of that claude session so far, a resume's
+    # too (sdk.d.ts 5563-5573), so a turn's own cost is its total less the one before it.
+    try:
+        dirs = [e.path for e in os.scandir(logs)
+                if e.name.startswith("slack-") and e.is_dir(follow_symlinks=False)]
+    except Exception as exc:
+        return {"error": why(exc)}
+    runs = []
+    for d in dirs:
+        try:
+            for e in os.scandir(d):
+                m = TURN_FILE.match(e.name)
+                if m and e.is_file(follow_symlinks=False):
+                    runs.append((m.group(2), d, m.group(1), e.path))
+        except Exception:
+            continue
+    sessions = {}
+    for start, d, sid, path in runs:
+        if sid != "pending":
+            sessions.setdefault((d, sid), []).append((start, path))
+    newest = sorted(sessions, key=lambda k: max(sessions[k]), reverse=True)[:TURNS_KEPT]
+    turns = []
+    for key in newest:
+        files = sorted(sessions[key])
+        window = files[-(TURNS_KEPT + 1):]
+        prev = None
+        for start, path in window:
+            try:
+                found = turns_of(path)
+            except Exception:
+                continue
+            for t in found:
+                total = t.pop("total")
+                if total is None:
+                    t["cost"], t["costNote"] = None, "unknown"
+                elif prev is None or total < prev:
+                    # The session's first turn costs exactly its total; a total met first
+                    # past the window's edge holds the turns before it too.
+                    first = prev is None and (start, path) == files[0]
+                    t["cost"] = total
+                    t["costNote"] = "exact" if first else "so-far"
+                else:
+                    t["cost"], t["costNote"] = round(total - prev, 6), "exact"
+                if total is not None:
+                    prev = total
+                t["run"] = start
+                turns.append(t)
+    turns.sort(key=lambda t: (t["run"], t["at"] or ""), reverse=True)
+    last = turns[0]["run"] if turns else ""
+    silent, silent_at, now = 0, None, time.time()
+    for start, d, sid, path in sorted(runs, reverse=True):
+        if sid != "pending" or start <= last:
+            continue
+        try:
+            if now - os.stat(path, follow_symlinks=False).st_mtime < 120:
+                continue
+            began = first_line_start(path)
+            partner = [p for s2, d2, sid2, p in runs if d2 == d and sid2 != "pending"
+                       and s2 >= start and first_line_start(p) == began]
+        except Exception:
+            continue
+        if not partner:
+            silent += 1
+            silent_at = silent_at or start
+    return {"turns": turns[:TURNS_KEPT], "files": len(runs), "silent": silent,
+            "silentAt": silent_at}
+
 def front_door(path, matcher):
     # Only the lines that START with the matcher: the caller decides which of them is the
     # `path` line. The file holds no secret; these lines are an allowlist.
@@ -2684,7 +2840,8 @@ if "--trust" in ARGS:
     ARGS, TRUST = ARGS[:ARGS.index("--trust")], ARGS[ARGS.index("--trust") + 1:]
 out = {"config": config(ARGS[0]), "env": env(ARGS[1]),
        "userSettings": user_settings(TRUST), "chatRules": chat_rules(ARGS[0]),
-       "chatTools": chat_tools(os.path.join(os.path.dirname(ARGS[0]), "logs"))}
+       "chatTools": chat_tools(os.path.join(os.path.dirname(ARGS[0]), "logs")),
+       "chatTurns": chat_turns(os.path.join(os.path.dirname(ARGS[0]), "logs"))}
 if len(ARGS) > 4:
     out["frontDoor"] = front_door(ARGS[3], ARGS[4])
 print(json.dumps(out))
@@ -3342,6 +3499,128 @@ def check_chat_tools(ct):
                 "merges, reviews or writes a pull request" % (when, len(tracker)))
 
 
+# KIT-355. The dispatcher's env file overrides the config's model pair at start
+# (cyrus-ai WorkerService.js:173-180); a reload then takes the file's key when it has one
+# (ConfigManager.js:237-244).
+MODEL_ENV_NAMES = ("CYRUS_CLAUDE_DEFAULT_MODEL", "CYRUS_DEFAULT_MODEL",
+                   "CYRUS_CLAUDE_DEFAULT_FALLBACK_MODEL", "CYRUS_DEFAULT_FALLBACK_MODEL")
+MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
+
+def model_family(name):
+    """`sonnet` for `sonnet` and for `claude-sonnet-5-5[1m]`; None when it can't tell."""
+    n = (name or "").lower()
+    n = n[:-4] if n.endswith("[1m]") else n
+    for family in MODEL_FAMILIES:
+        if n == family or (n.startswith("claude") and family in n):
+            return family
+    return None
+
+
+def chat_model_pair(models):
+    """The model and backup a chat turn starts with: claudeDefaultModel, else defaultModel,
+    else opus; the backup likewise, else sonnet (RunnerSelectionService.js:46-49, 65-69,
+    EdgeWorker.js:715-721). The probe already left out a value that is not truthy."""
+    m = models if isinstance(models, dict) else {}
+    return (m.get("claudeDefaultModel") or m.get("defaultModel") or "opus",
+            m.get("claudeDefaultFallbackModel") or m.get("defaultFallbackModel") or "sonnet")
+
+
+def _turn_when(stamp):
+    """`2026-11-02 10:15 UTC` from either stamp a log carries."""
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2})[-:](\d{2})", stamp or "")
+    return "%s %s:%s UTC" % m.groups() if m else "at an unknown time"
+
+
+def chat_turn_lines(ct):
+    """The last few chat turns, newest first, one line each: when, the model, what it cost
+    and how it ended. The probe keeps names, words and numbers only."""
+    if not isinstance(ct, dict) or ct.get("error"):
+        return ["the chat turns' logs could not be read (%s)"
+                % ((ct or {}).get("error") if isinstance(ct, dict) else "not measured")]
+    out = []
+    if ct.get("silent"):
+        out.append("%d chat run(s) after the last logged turn heard nothing from the model, "
+                   "the newest started %s. The dispatcher's own log says why: look for "
+                   "`Session error`" % (ct["silent"], _turn_when(ct.get("silentAt"))))
+    turns = [t for t in ct.get("turns") or [] if isinstance(t, dict)]
+    if not turns:
+        return out + ["no chat turn is logged yet. Ask the bot one question, then run verify "
+                      "again to see its model and what it cost"]
+    out.append("The last %d chat turn(s), newest first:" % len(turns))
+    for t in turns:
+        model = t.get("model") or "a model its log does not name"
+        said = [n for n in t.get("answeredBy") or [] if n != t.get("model")]
+        cost = t.get("cost")
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+            money = "cost unknown"
+        elif t.get("costNote") == "exact":
+            money = "$%.4f" % cost
+        else:
+            money = "$%.4f for the thread so far" % cost
+        ending = ("not finished" if t.get("outcome") is None
+                  else "failed" if t.get("isError") or t.get("outcome") != "success"
+                  else "finished")
+        extra = []
+        if said:
+            extra.append("answered by %s" % ", ".join(said))
+        if t.get("fellBackTo"):
+            extra.append("fell back to %s" % ", ".join(t["fellBackTo"]))
+        if t.get("errors"):
+            extra.append("errors: %s" % ", ".join(t["errors"]))
+        out.append("- %s: %s, %s, %s%s" % (_turn_when(t.get("at") or t.get("run")), model,
+                                            money, ending,
+                                            "; " + "; ".join(extra) if extra else ""))
+    return out
+
+
+def check_chat_model(cfg, env_facts, ct):
+    """The tech lead's model (KIT-355): the pair a chat turn starts with, from the
+    dispatcher's config, and the last few turns as their own logs recorded them. The same
+    pair is every label-less ticket session's model too: an entry's own `model` is never
+    read (RunnerSelectionService.js:297-310, RunnerConfigBuilder.js:173-175; KIT-377)."""
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    model, backup = chat_model_pair(models)
+    lines = chat_turn_lines(ct)
+    names = set((env_facts or {}).get("names") or [])
+    over = [n for n in MODEL_ENV_NAMES if n in names]
+    if over:
+        return _row("chat-model", UNKNOWN,
+                    "the dispatcher's env file sets %s, which the dispatcher takes over the "
+                    "config's model at start. Its value is not read here, so the model a chat "
+                    "turn starts with is not known" % ", ".join(over),
+                    ["take it out of the env file and set claudeDefaultModel in the config "
+                     "instead; the env file is read at start, so restart the dispatcher when "
+                     "it is idle (card CK-C5)"] + lines)
+    # The key the dispatcher takes is the first truthy one in its chain; the probe left the
+    # others out, and marked a value outside the model charset "unreadable".
+    used = [next((k for k in chain if models.get(k)), None)
+            for chain in (("claudeDefaultModel", "defaultModel"),
+                          ("claudeDefaultFallbackModel", "defaultFallbackModel"))]
+    unread = [k for k in used if k and models.get(k) == "unreadable"]
+    if unread:
+        return _row("chat-model", UNKNOWN,
+                    "the dispatcher config's %s is not a model name this check can read"
+                    % " and ".join(unread), lines)
+    if model == backup:
+        return _row("chat-model", FAILED,
+                    "every chat turn fails before it starts: the backup model is %s, the "
+                    "model itself, and the SDK refuses that pair (sdk.mjs:144)" % model,
+                    ["set claudeDefaultFallbackModel in the dispatcher config to a "
+                     "different model, for example %s. The config reloads on its own"
+                     % ("sonnet" if model_family(model) == "opus" else "opus")] + lines)
+    notes = []
+    if model_family(model) and model_family(model) == model_family(backup):
+        notes.append("the backup, %s, is %s under another name, so it backs up nothing"
+                     % (backup, model))
+    notes.append("This is also the model of every coding and planning session whose ticket "
+                 "has no model label or [model=…] tag: the dispatcher never reads a "
+                 "repository entry's own model. Reviews carry their own label")
+    return _row("chat-model", ALREADY_DONE,
+                "chat turns start on %s, with %s as the backup" % (model, backup),
+                notes + lines)
+
+
 def check_chat_rules(conf, cr):
     """KIT-226: the chat bot's rules, byte for byte what this checkout composes. Off until
     Step 14 sets CHAT_RULES=on: the rules hand every request to the bridge, so they wait
@@ -3431,7 +3710,7 @@ def check_front_door(conf, fd):
 
 CHECKS = ("grant", "coding-fence", "chat-mcp-configs", "dispatcher-env", "ip-validation-off",
           "notifier-token-absent", "hosted-keys-absent", "port-block", "user-settings",
-          "chat-tools", "trust-files", "chat-rules", "front-door")
+          "chat-tools", "chat-model", "trust-files", "chat-rules", "front-door")
 
 
 def evaluate(facts, conf, pf=None):
@@ -3447,11 +3726,13 @@ def evaluate(facts, conf, pf=None):
         env_facts = facts.get("env") or {"error": "missing"}
         us = facts.get("userSettings") or {"error": "missing"}
         if cfg.get("error"):
-            rows.extend(_config_unmeasured(cfg, ("grant", "coding-fence", "chat-mcp-configs")))
+            rows.extend(_config_unmeasured(cfg, ("grant", "coding-fence", "chat-mcp-configs",
+                                                 "chat-model")))
         else:
             rows.append(check_grant(cfg))
             rows.append(check_fence(cfg, env_facts))
             rows.append(check_chat_mcp(cfg))
+            rows.append(check_chat_model(cfg, env_facts, facts.get("chatTurns")))
         rows.append(check_env(conf, env_facts))
         rows.append(check_ip_validation_off(env_facts))
         rows.append(check_notifier_absent(conf, env_facts))
@@ -3545,13 +3826,13 @@ def cmd_verify(conf, runner, sudo):
     account = conf["ROLE_ACCOUNT"]
     say("Chat lane verify — read-only. It reads the dispatcher config, its env file, the")
     say("user settings, any trust file, the front door's config and the newest chat")
-    say("session's log as %s, through one program that prints names, tool lists," % account)
-    say("allowlist paths and yes-or-no answers, never a value or a message, and asks pf, as")
-    say("root, what it has loaded. Your login password")
+    say("sessions' logs as %s, through one program that prints names, tool lists," % account)
+    say("model names, costs, allowlist paths and yes-or-no answers, never a secret or a")
+    say("message, and asks pf, as root, what it has loaded. Your login password")
     say("may be asked for, once.")
-    sudo.acquire("`verify` reads four files and the newest chat session's start-up tool list "
-                 "as the %s role account, and asks pf, as root, which rules it holds. It "
-                 "changes nothing." % account, "verify")
+    sudo.acquire("`verify` reads four files, the newest chat session's start-up tool list and "
+                 "the last few chat turns' models and costs as the %s role account, and asks "
+                 "pf, as root, which rules it holds. It changes nothing." % account, "verify")
     facts, why = probe_facts(runner, conf)
     rows = evaluate(facts, conf, pf_probe(runner))
     if facts is None:
@@ -5807,6 +6088,175 @@ def _selftest_body():
                "chat-tools" in CHECKS
                and CHECKS.index("chat-tools") == CHECKS.index("user-settings") + 1, CHECKS)
 
+        # -- KIT-355: the chat-model row. The pair a chat turn starts with comes from the
+        # config, and the last few turns' models and costs from their own logs, named as
+        # the dispatcher names them. No message, cwd or result text ever reaches the
+        # output: each fixture carries a sentinel there, scanned for at the end.
+        def turn_log(folder, sid, stamp, records, started=None, mtime=900):
+            lines = [json.dumps({"type": "session-metadata",
+                                 "sessionId": None if sid == "pending" else sid,
+                                 "startedAt": started or stamp,
+                                 "workingDirectory": "/w/" + SENTINELS[2]})]
+            lines += [json.dumps({"type": "sdk-message", "timestamp": at, "message": m})
+                      for at, m in records]
+            p = os.path.join(logs_root, folder, "session-%s-%s.jsonl" % (sid, stamp))
+            _put(p, "\n".join(lines) + "\n")
+            if mtime is not None:
+                os.utime(p, (mtime, mtime))
+            made.append(p)
+            return p
+
+        def init(model):
+            return {"type": "system", "subtype": "init", "model": model,
+                    "cwd": "/w/" + SENTINELS[2], "session_id": "s"}
+
+        def said(model, error=None):
+            m = {"type": "assistant", "parent_tool_use_id": None,
+                 "message": {"model": model, "content": [{"type": "text",
+                                                          "text": SENTINELS[2]}]}}
+            if error:
+                m["error"] = error
+            return m
+
+        def result(total, error=False):
+            return {"type": "result", "subtype": "success", "is_error": error,
+                    "result": "said " + SENTINELS[2], "errors": [SENTINELS[2]],
+                    "total_cost_usd": total,
+                    "modelUsage": {"claude-opus-5-5": {"costUSD": total}}}
+
+        made = []
+        day = "2026-11-02T%s-00-00-000Z"
+        turn_log("slack-Ev1", "u1", day % "10", [
+            ("2026-11-02T10:00:01.000Z", init("claude-opus-5-5")),
+            ("2026-11-02T10:00:09.000Z", said("claude-opus-5-5")),
+            ("2026-11-02T10:00:10.000Z", result(1.2))])
+        turn_log("slack-Ev1", "u1", day % "11", [
+            ("2026-11-02T11:00:01.000Z", init("claude-sonnet-5-5")),
+            ("2026-11-02T11:00:05.000Z", said("claude-sonnet-5-5")),
+            ("2026-11-02T11:00:06.000Z", result(1.35))])
+        turn_log("slack-Ev2", "u2", day % "09", [
+            ("2026-11-02T09:00:01.000Z", init("claude-opus-5-5")),
+            ("2026-11-02T09:00:02.000Z", {"type": "system", "subtype": "model_fallback",
+                                          "original_model": "claude-opus-5-5",
+                                          "fallback_model": "claude-sonnet-5-5",
+                                          "content": SENTINELS[2]}),
+            ("2026-11-02T09:00:03.000Z", said("<synthetic>", "rate_limit")),
+            ("2026-11-02T09:00:04.000Z", result(None, error=True))])
+        # a run that never heard from the model: only its pending file, long since written
+        turn_log("slack-Ev1", "pending", day % "12", [], mtime=1000)
+        # a run that did hear from it, though no turn began: its real file shares the start
+        turn_log("slack-Ev1", "pending", day % "14", [], mtime=1000)
+        turn_log("slack-Ev1", "u4", "2026-11-02T14-00-01-000Z", [
+            ("2026-11-02T14:00:01.000Z", {"type": "system", "subtype": "api_retry"})],
+            started=day % "14")
+        # a run that is starting right now is not counted yet
+        turn_log("slack-Ev2", "pending", day % "13", [], mtime=None)
+        facts = facts_of(probe(dict(good_config(), claudeDefaultModel="sonnet",
+                                    claudeDefaultFallbackModel="opus", defaultModel=""),
+                               good_env(), good_settings))
+        ct = facts.get("chatTurns") or {}
+        turns = ct.get("turns") or []
+        expect("chat-model-probe-reads-the-config-pair",
+               (facts.get("config") or {}).get("models") == {
+                   "claudeDefaultModel": "sonnet", "defaultModel": None,
+                   "claudeDefaultFallbackModel": "opus", "defaultFallbackModel": None},
+               (facts.get("config") or {}).get("models"))
+        expect("chat-model-probe-reads-turns-newest-first",
+               [(t.get("model"), t.get("cost"), t.get("costNote")) for t in turns] == [
+                   ("claude-sonnet-5-5", 0.15, "exact"), ("claude-opus-5-5", 1.2, "exact"),
+                   ("claude-opus-5-5", None, "unknown")], turns)
+        expect("chat-model-probe-reads-a-failed-turn",
+               len(turns) == 3 and turns[2].get("isError") is True
+               and turns[2].get("errors") == ["rate_limit"]
+               and turns[2].get("fellBackTo") == ["claude-sonnet-5-5"]
+               and turns[2].get("answeredBy") == [], turns[2:])
+        expect("chat-model-probe-counts-a-silent-run-only-once-it-is-old",
+               ct.get("silent") == 1 and ct.get("silentAt") == day % "12", ct)
+        row = check_chat_model(facts.get("config") or {}, facts.get("env"), ct)
+        text = _row_text(row)
+        expect("chat-model-row-lists-the-turns",
+               row["outcome"] == ALREADY_DONE
+               and "chat turns start on sonnet, with opus as the backup" in text
+               and "2026-11-02 11:00 UTC: claude-sonnet-5-5, $0.1500, finished" in text
+               and "2026-11-02 10:00 UTC: claude-opus-5-5, $1.2000, finished" in text
+               and "cost unknown, failed; fell back to claude-sonnet-5-5; errors: rate_limit"
+               in text and "heard nothing from the model" in text
+               and "never reads a repository entry's own model" in text, text)
+        # a thread whose window starts past its first run: the first total met counts the
+        # turns before it, and says so; earlier unfinished turns' costs are unknown
+        for n in range(1, 8):
+            turn_log("slack-Ev3", "u3", "2026-11-03T%02d-00-00-000Z" % n, [
+                ("2026-11-03T%02d:00:01.000Z" % n, init("claude-sonnet-5-5"))]
+                + ([("2026-11-03T%02d:00:02.000Z" % n, result(0.1 * n))]
+                   if n in (1, 7) else []))
+        ct = facts_of(probe(good_config(), good_env(), good_settings)).get("chatTurns") or {}
+        turns = ct.get("turns") or []
+        expect("chat-model-probe-says-a-total-that-holds-earlier-turns",
+               len(turns) == 5 and turns[0].get("costNote") == "so-far"
+               and abs(turns[0].get("cost", 0) - 0.7) < 1e-9
+               and [t.get("outcome") for t in turns[1:]] == [None] * 4
+               and ct.get("silent") == 0, (ct, turns))
+        expect("chat-model-row-says-thread-so-far",
+               "$0.7000 for the thread so far, finished" in _row_text(
+                   check_chat_model({}, {}, ct))
+               and "not finished" in _row_text(check_chat_model({}, {}, ct)),
+               _row_text(check_chat_model({}, {}, ct)))
+        for p in made:
+            os.unlink(p)
+        for folder in ("slack-Ev1", "slack-Ev2", "slack-Ev3"):
+            os.rmdir(os.path.join(logs_root, folder))
+        # a value outside the model charset is never printed, and the row says it can't read it
+        facts = facts_of(probe(dict(good_config(), claudeDefaultModel="x " + SENTINELS[3]),
+                               good_env(), good_settings))
+        row = check_chat_model(facts.get("config") or {}, facts.get("env"),
+                               facts.get("chatTurns"))
+        expect("chat-model-unreadable-is-never-printed",
+               (facts.get("config") or {}).get("models", {}).get("claudeDefaultModel")
+               == "unreadable" and row["outcome"] == UNKNOWN
+               and "claudeDefaultModel is not a model name" in _row_text(row), row)
+        # the row on its own, for every pair the dispatcher can be handed
+        for label, models, names, want, needle in (
+                ("defaults", {}, [], ALREADY_DONE, "start on opus, with sonnet as the backup"),
+                ("equal-pair", {"claudeDefaultModel": "sonnet"}, [], FAILED,
+                 "every chat turn fails before it starts"),
+                ("equal-legacy-pair", {"defaultModel": "haiku",
+                                       "defaultFallbackModel": "haiku"}, [], FAILED,
+                 "claudeDefaultFallbackModel in the dispatcher config to a different model, "
+                 "for example opus"),
+                ("opus-pair-names-sonnet", {"claudeDefaultModel": "opus",
+                                            "claudeDefaultFallbackModel": "opus"}, [], FAILED,
+                 "for example sonnet"),
+                ("sonnet-with-opus", {"claudeDefaultModel": "sonnet",
+                                      "claudeDefaultFallbackModel": "opus"}, [], ALREADY_DONE,
+                 "start on sonnet, with opus as the backup"),
+                ("same-model-two-names", {"claudeDefaultModel": "sonnet",
+                                          "claudeDefaultFallbackModel": "claude-sonnet-5-5"},
+                 [], ALREADY_DONE, "so it backs up nothing"),
+                ("shadowed-unreadable", {"claudeDefaultModel": "sonnet",
+                                         "defaultModel": "unreadable",
+                                         "claudeDefaultFallbackModel": "opus"}, [],
+                 ALREADY_DONE, "start on sonnet"),
+                ("unreadable-backup", {"defaultFallbackModel": "unreadable"}, [], UNKNOWN,
+                 "defaultFallbackModel is not a model name"),
+                ("env-override", {}, ["CYRUS_DEFAULT_MODEL", "SLACK_BOT_TOKEN"], UNKNOWN,
+                 "sets CYRUS_DEFAULT_MODEL")):
+            r = check_chat_model({"models": models}, {"names": names},
+                                 {"turns": [], "files": 0, "silent": 0})
+            expect("chat-model-" + label, r["outcome"] == want and needle in _row_text(r), r)
+        expect("chat-model-env-override-says-restart",
+               "card CK-C5" in _row_text(check_chat_model(
+                   {}, {"names": ["CYRUS_CLAUDE_DEFAULT_FALLBACK_MODEL"]}, None)))
+        expect("chat-model-family", [model_family(n) for n in (
+            "sonnet", "claude-sonnet-5-5[1m]", "claude-opus-5-5", "HAIKU", "gpt-5", None)]
+            == ["sonnet", "sonnet", "opus", "haiku", None, None])
+        expect("chat-model-follows-chat-tools",
+               CHECKS.index("chat-model") == CHECKS.index("chat-tools") + 1, CHECKS)
+        rows = evaluate(facts_of(probe("{not json " + SENTINELS[3], good_env(),
+                                       good_settings)), vconf)
+        expect("chat-model-unmeasured-on-a-broken-config",
+               [r["outcome"] for r in rows if r["check"] == "chat-model"] == [FAILED],
+               [(r["check"], r["outcome"]) for r in rows])
+
         # the port block: healthy, then one mutant per way it can be wrong
         ran = probe(good_config(), good_env(), good_settings)
         for label, pf, want_row, want_rc, needle in (
@@ -6155,6 +6605,15 @@ def _selftest_body():
            and flat_ops.count("Every full run of `verify` also prints `%s`" % said) == 2
            and "and this line never changes its exit code" in flat_ops,
            flat_ops.count(said))
+    # Step 12's table names every row verify prints, and no other (KIT-355 added one).
+    listed = re.findall(r"^\| `([a-z-]+)` \|", _between(ops_doc, "\n### Step 12", "\n### "),
+                        re.M)
+    expect("doc-verify-table-is-checks", sorted(listed) == sorted(CHECKS), (listed, CHECKS))
+    model_doc = " ".join(_between(ops_doc, "\n## The tech lead's model", "\n## ").split())
+    expect("doc-tech-lead-model-says-the-traps", all(t in model_doc for t in (
+        "The backup must differ from the model", "A repository entry's own `model` is never "
+        "read", "Reviews carry their own label", "`CYRUS_CLAUDE_DEFAULT_MODEL`",
+        "for the thread so far")), model_doc[:600])
     # The log rule, both ways round: no Received line means resend; a Received line with
     # no Processing line for its event ID means the check ran again and dropped it, so
     # resend; both lines mean it may have run, so a second mention could pay twice.
