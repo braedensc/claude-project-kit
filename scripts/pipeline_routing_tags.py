@@ -7,10 +7,12 @@ THE DISPATCHER READS ROUTING DIRECTIVES OUT OF A TICKET'S DESCRIPTION (KIT-41). 
 `[repo=…]` (optionally `#branch`) or an unbracketed `repo=`/`repos=` picks the repository
 entry and branch a session works in, and `[model=…]` / `[agent=…]` pick its runner (cyrus
 0.2.73 RepositoryRouter.js parseRepoTagsFromDescription; RunnerSelectionService.js:90-95).
-Everything the kit copies into a ticket from text it did not write, an idea, a planning
-session's plan, a review's quoted criteria, a session's finding, has every directive
-replaced with a mark that holds none, so that text cannot pick where or on what a session
-runs once a person hands the ticket over.
+The plan executor, the planner job, the review poller and the finding poller pass every text
+they copy into a ticket and did not write, an idea, a planning session's plan, a review's
+quoted criteria, a session's finding, through `neutralize_routing`, which replaces every
+directive with a mark that holds none, so that text cannot pick where or on what a session
+runs once a person hands the ticket over. The bounce driver's own scrub, which the notifier
+and the Slack bridge share, is not this one yet (KIT-384).
 
 JUDGED AS LINEAR WILL STORE IT (KIT-381). Linear parses a description as CommonMark and
 writes it back: backslash escapes of ASCII punctuation and character references (decimal,
@@ -18,89 +20,150 @@ hex, named) come back decoded, so `[agent\\=codex]` or `[agent&#61;codex]`, whic
 literal pattern matches, is stored as `\\[agent=codex\\]`, a live tag. Raw HTML, comments,
 zero-width and fullwidth characters are kept as written (both measured live, KIT-382 and
 KIT-383, 2 Nov 2026). So the patterns run on the text as it reads after those decodes,
-and the matching slice of the ORIGINAL text is replaced. The view is decoded up to
-DECODE_ROUNDS times, because a later save of the ticket in an editor decodes again
-(`&amp;#61;` is `=` after two). Code is judged like the rest, though Linear leaves escapes
-in code alone: a wrong guess at where code starts would leave a live tag, and replacing an
-escaped tag inside code costs nothing real.
+and the matching slice of the ORIGINAL text is replaced. A later save of the ticket in an
+editor may decode again (`&amp;#61;` is `=` after two), so the view is decoded until it
+stops changing, up to DECODE_ROUNDS times: a spelling nested deeper needs more saves than
+any ticket gets, and the cap keeps a crafted chain from costing more than that many scans.
+Code is judged like the rest, though Linear leaves escapes in code alone: a wrong guess at
+where code starts would leave a live tag, and replacing an escaped tag inside code costs
+nothing real.
 
 The patterns are deliberately WIDER than the dispatcher's: any case for `repo`, spaces
 inside the brackets, and an unbracketed `repo=` after any non-word character, not just
 whitespace. A diff line reads `+repo=x`, and a parser one version newer may well accept it.
+Never a newline inside the brackets, though: no parser reads a tag across lines, and
+allowing one let nested tags settle one level per pass (review of KIT-381).
+
+COST. The review poller runs this over a whole pull request's diff, megabytes at times. A
+decode is one regex scan, and only the decoded tokens are kept, as compact arrays, to map a
+hit back to the original text; ordinary text keeps nothing.
 
 The plan executor, the planner job, the review poller and the finding poller import this
 file; none keeps a copy.
 """
 import bisect
 import html.entities
+from array import array
 import re
 import sys
 
-BRACKET_TAG_RE = re.compile(r"\\?\[\s*(?:repos?|model|agent)\s*=[^\]\n]*\\?\]", re.IGNORECASE)
+BRACKET_TAG_RE = re.compile(r"\\?\[[^\S\n]*(?:repos?|model|agent)[^\S\n]*=[^\]\n]*\\?\]",
+                            re.IGNORECASE)
 UNBRACKETED_REPO_RE = re.compile(r"(^|[^A-Za-z0-9_])repos?=[A-Za-z0-9_\-/.#,]+",
                                  re.IGNORECASE | re.MULTILINE)
 ROUTING_TAG_MARK = "(removed-routing-tag)"
+EQUALS_MARK = "(removed-equals-sign)"
 
 # CommonMark 0.31: a backslash escapes any ASCII punctuation character, and an entity or
-# numeric character reference is replaced by its character, outside code.
+# numeric character reference is replaced by its character, outside code. One pattern finds
+# both, so a decode is one scan in the regex engine, not a loop over every character.
 ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
-CHAR_REF_RE = re.compile(r"&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|([A-Za-z][A-Za-z0-9]{0,31}));")
+_TOKEN_RE = re.compile(r"\\([!-/:-@\[-`{-~])"
+                       r"|&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|([A-Za-z][A-Za-z0-9]{0,31}));")
 NAMED_REFS = dict((name[:-1], text) for name, text in html.entities.html5.items()
                   if name.endswith(";"))
-DECODE_ROUNDS = 4
+# Linear's store is one decode; each later save of the ticket in an editor may be another.
+# A spelling nested deeper than this needs more saves than any ticket gets. The loop stops
+# as soon as a decode changes nothing, which for ordinary text is at once.
+DECODE_ROUNDS = 16
 SETTLE_PASSES = 8
 
 
-def _ref_text(match):
-    if match.group(3) is not None:
-        return NAMED_REFS.get(match.group(3))
-    code = int(match.group(1)) if match.group(1) is not None else int(match.group(2), 16)
+def _token_text(match):
+    """What one escape or reference decodes to; None for a name that is no entity, which
+    stays as written."""
+    if match.group(1) is not None:
+        return match.group(1)
+    if match.group(4) is not None:
+        return NAMED_REFS.get(match.group(4))
+    code = int(match.group(2)) if match.group(2) is not None else int(match.group(3), 16)
     if code == 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
         return "\ufffd"
     return chr(code)
 
 
 def decode_once(text):
-    """(decoded, spans): `text` after one CommonMark decode, each decoded character mapped to
-    the slice of `text`, as (start, end), it came from."""
-    out, spans, i, n = [], [], 0, len(text)
-    while i < n:
-        c = text[i]
-        if c == "\\" and i + 1 < n and text[i + 1] in ASCII_PUNCT:
-            out.append(text[i + 1])
-            spans.append((i, i + 2))
-            i += 2
-            continue
-        if c == "&":
-            match = CHAR_REF_RE.match(text, i)
-            value = _ref_text(match) if match else None
-            if value:
-                for ch in value:
-                    out.append(ch)
-                    spans.append((i, match.end()))
-                i = match.end()
-                continue
-        out.append(c)
-        spans.append((i, i + 1))
-        i += 1
-    return "".join(out), spans
+    """(decoded, tokens): `text` after one CommonMark decode, and where each decoded token
+    went: four arrays, in order, of its start and end in `decoded` and its start and end in
+    `text`. Every other character is copied one for one, so the tokens alone map a position
+    back, in a few bytes per token rather than an entry per character."""
+    out_start, out_end, src_start, src_end = (array("q"), array("q"), array("q"),
+                                              array("q"))
+    shrunk = [0]
+
+    def replace(match):
+        value = _token_text(match)
+        if not value:
+            return match.group(0)
+        start, end = match.span()
+        at = start - shrunk[0]
+        out_start.append(at)
+        out_end.append(at + len(value))
+        src_start.append(start)
+        src_end.append(end)
+        shrunk[0] += end - start - len(value)
+        return value
+
+    decoded = _TOKEN_RE.sub(replace, text)
+    return decoded, (out_start, out_end, src_start, src_end)
+
+
+def _source_slice(tokens, pos):
+    """The slice of a decode's input that the character at `pos` of its output came from."""
+    out_start, out_end, src_start, src_end = tokens
+    k = bisect.bisect_right(out_start, pos) - 1
+    if k >= 0:
+        if pos < out_end[k]:
+            return src_start[k], src_end[k]
+        pos += src_end[k] - out_end[k]
+    return pos, pos + 1
 
 
 def stored_view(text):
-    """(view, spans): `text` as it reads after up to DECODE_ROUNDS decodes, each character
-    of the view mapped to the slice of `text` it came from."""
-    view, spans = text, [(i, i + 1) for i in range(len(text))]
+    """(view, rounds, unsettled): `text` as it reads after up to DECODE_ROUNDS decodes, each
+    round's tokens, which `original_slice` walks back, and the view's spans that would still
+    decode after the last round."""
+    view, rounds = text, []
     for _ in range(DECODE_ROUNDS):
-        decoded, src = decode_once(view)
-        if decoded == view:
-            break
-        spans = [(spans[a][0], spans[b - 1][1]) for a, b in src]
+        decoded, tokens = decode_once(view)
+        if not tokens[0]:
+            return view, rounds, []
+        rounds.append(tokens)
         view = decoded
-    return view, spans
+    tokens = decode_once(view)[1]
+    return view, rounds, list(zip(tokens[2], tokens[3]))
+
+
+def original_slice(rounds, start, end):
+    """The slice of the original text that the view's characters [start, end) came from."""
+    for tokens in reversed(rounds):
+        start = _source_slice(tokens, start)[0]
+        end = _source_slice(tokens, end - 1)[1]
+    return start, end
+
+
+def _bracket_spans(view):
+    """BRACKET_TAG_RE's matches in `view`, as `finditer` finds them, in linear time. A
+    match ends at the first `]` after its start, on the same line, so each lies within one
+    stretch that ends at a `]`, and each stretch is searched once. A plain `finditer`
+    rescans to the end of the line from every start, so a long line of unclosed tags took
+    minutes (review of KIT-381)."""
+    spans, start = [], 0
+    while True:
+        close = view.find("]", start)
+        if close < 0:
+            return spans
+        newline = view.rfind("\n", start, close)
+        if newline >= 0:
+            start = newline + 1
+        match = BRACKET_TAG_RE.search(view, start, close + 1)
+        if match:
+            spans.append(match.span())
+        start = close + 1
 
 
 def _view_spans(view):
-    bracketed = [m.span() for m in BRACKET_TAG_RE.finditer(view)]
+    bracketed = _bracket_spans(view)
     starts = [a for a, _ in bracketed]
     found = list(bracketed)
     for m in UNBRACKETED_REPO_RE.finditer(view):
@@ -116,31 +179,57 @@ def _view_spans(view):
 def directive_spans(text):
     """Every directive the dispatcher could read in `text`, written or once decoded, as the
     (start, end) slices of `text` they come from, in order. A bracketed tag also matches the
-    unbracketed pattern inside itself; that is counted once."""
+    unbracketed pattern inside itself; that is counted once. Text that still decodes after
+    DECODE_ROUNDS counts as a directive where it does: nothing ordinary is nested that deep,
+    and what it would read as after more saves is not judged (review of KIT-381)."""
     text = str(text or "")
-    view, spans = stored_view(text)
-    return [(spans[a][0], spans[b - 1][1]) for a, b in _view_spans(view)]
+    view, rounds, unsettled = stored_view(text)
+    return sorted([original_slice(rounds, a, b) for a, b in _view_spans(view)]
+                  + [original_slice(rounds, a, b) for a, b in unsettled])
+
+
+def _replaced(text, spans, mark):
+    """`text` with each of `spans` (in order) replaced by `mark`, overlapping ones as one."""
+    cuts = []
+    for start, end in spans:
+        if cuts and start < cuts[-1][1]:
+            cuts[-1] = (cuts[-1][0], max(cuts[-1][1], end))
+        else:
+            cuts.append((start, end))
+    pieces, last = [], 0
+    for start, end in cuts:
+        pieces += [text[last:start], mark]
+        last = end
+    return "".join(pieces) + text[last:]
+
+
+def without_equals(text):
+    """`text` with every `=` it reads as, however spelt, replaced by EQUALS_MARK. No
+    directive can be read without one, and the mark holds none."""
+    view, rounds, _unsettled = stored_view(text)
+    return _replaced(text, [original_slice(rounds, i, i + 1)
+                            for i, ch in enumerate(view) if ch == "="], EQUALS_MARK)
 
 
 def neutralize_routing(text):
     """`text` with every directive the dispatcher could read, written or once decoded,
     replaced with ROUTING_TAG_MARK. The mark holds none, so the result can be asserted
-    clean, and text with no directive comes back byte for byte."""
+    clean, and text with no directive comes back byte for byte.
+
+    One pass settles it: a tag found inside another is inside that one's match, since
+    neither pattern lets a match span a newline or a `]` (review of KIT-381: a newline
+    after each nested `[` once took one pass per level). The passes after the first are a
+    guard only, and it never raises: a job that raised here would fail its whole pass on
+    one crafted text. Past them, every `=` goes, and with it every directive."""
     if not text:
         return text
     out = str(text)
     for _ in range(SETTLE_PASSES):
-        cuts = []
-        for start, end in directive_spans(out):
-            if cuts and start < cuts[-1][1]:
-                cuts[-1] = (cuts[-1][0], max(cuts[-1][1], end))
-            else:
-                cuts.append((start, end))
-        if not cuts:
+        spans = directive_spans(out)
+        if not spans:
             return out
-        for start, end in reversed(cuts):
-            out = out[:start] + ROUTING_TAG_MARK + out[end:]
-    raise ValueError("routing directives did not settle in %d passes" % SETTLE_PASSES)
+        out = _replaced(out, spans, ROUTING_TAG_MARK)
+    return without_equals(out) if directive_spans(out) else out
 
 
 # --------------------------------------------------------------------------- #
@@ -151,7 +240,9 @@ def neutralize_routing(text):
 # (RepositoryRouter.js parseRepoTagsFromDescription, case-sensitive).
 _DISPATCHER_TAG_RE = re.compile(r"\\?\[(agent|model)=([a-zA-Z0-9_.:/-]+)\\?\]", re.IGNORECASE)
 _DISPATCHER_REPO_RE = re.compile(r"\\?\[repo=([a-zA-Z0-9_\-/.#]+)\\?\]")
-_DISPATCHER_BARE_RE = re.compile(r"(?:^|[\s\n])repos?=([a-zA-Z0-9_\-/.#,]+)", re.MULTILINE)
+# JavaScript's \s also holds U+FEFF, and Python's does not (review of KIT-381).
+_DISPATCHER_BARE_RE = re.compile(r"(?:^|[\s\n\ufeff])repos?=([a-zA-Z0-9_\-/.#,]+)",
+                                 re.MULTILINE)
 
 
 def dispatcher_reads(stored):
@@ -203,7 +294,7 @@ def selftest_cases():
             failures.append("%s: %s" % (name, detail))
 
     for form in MEASURED_SPELLINGS:
-        for frame in ("%s", "before %s after", "one\n%s\nthree", "`%s`", "```\n%s\n```"):
+        for frame in ("%s", "before %s after", "one\n%s\nthree", "` %s `", "```\n%s\n```"):
             text = frame % form
             out = neutralize_routing(text)
             left = [r for rounds in range(4) for r in dispatcher_reads(decoded(out, rounds))]
@@ -225,7 +316,84 @@ def selftest_cases():
     check("touching-directives-keep-a-mark-each",
           neutralize_routing("[repo=a][agent\\=b]repo=c") == ROUTING_TAG_MARK * 3,
           neutralize_routing("[repo=a][agent\\=b]repo=c"))
+    # Nested tags settle in one pass and never raise (review of KIT-381: with a newline
+    # allowed after `[`, each level took a pass of its own, and eight levels raised, which
+    # failed every pass of the job that met them).
+    for opener in ("[ agent=", "[\nagent=", "[agent\n=", "[&#10;agent=", "\\[ model\t="):
+        for depth in (1, 8, 300):
+            text = opener * depth + "x" + "]" * depth
+            try:
+                out = neutralize_routing(text)
+            except Exception as exc:  # noqa: BLE001 - the case is that it never raises
+                out = "raised %r" % exc
+            left = [r for rounds in range(4) for r in dispatcher_reads(decoded(out, rounds))]
+            check("nested:%r:%d" % (opener, depth),
+                  not left and directive_spans(out) == [] and not out.startswith("raised"),
+                  (out[:80], left))
+    # The guard past the passes: with no `=` left in how the text reads, nothing is a
+    # directive, however the `=` was spelt.
+    stripped = without_equals("a [agent\\=x] b repo&#61;y c [model&amp;#61;z] d = e")
+    check("fallback-leaves-no-equals-sign",
+          directive_spans(stripped) == [] and "=" not in decoded(stripped, DECODE_ROUNDS)
+          and stripped.count(EQUALS_MARK) == 4, stripped)
+    # …and neutralize_routing reaches it, rather than raising, when the passes run out.
+    global SETTLE_PASSES
+    passes, SETTLE_PASSES = SETTLE_PASSES, 0
+    try:
+        out = neutralize_routing("a [agent\\=x] b = c")
+    except Exception as exc:  # noqa: BLE001 - the case is that it never raises
+        out = "raised %r" % exc
+    finally:
+        SETTLE_PASSES = passes
+    check("out-of-passes-falls-back-and-never-raises",
+          out == "a [agent%sx] b %s c" % (EQUALS_MARK, EQUALS_MARK), out)
+    # A spelling nested fifteen deep, sixteen decodes, is replaced whole, and one nested
+    # deeper is replaced where it still decodes: nothing is left to a later save.
+    deep = "[agent&" + "amp;" * 15 + "#61;codex]"
+    check("sixteen-decodes-replaced-whole", neutralize_routing(deep) == ROUTING_TAG_MARK,
+          neutralize_routing(deep))
+    deeper = "[agent&" + "amp;" * (DECODE_ROUNDS + 3) + "#61;codex]"
+    out = neutralize_routing(deeper)
+    check("deeper-spelling-is-not-left-for-later-saves",
+          not [r for rounds in range(DECODE_ROUNDS + 8)
+               for r in dispatcher_reads(decoded(out, rounds))]
+          and ROUTING_TAG_MARK in out, out)
+    check("a-byte-order-mark-before-repo",
+          neutralize_routing("\ufeffrepo=x") == "\ufeff" + ROUTING_TAG_MARK
+          and dispatcher_reads("\ufeffrepo=x") == ["\ufeffrepo=x"],
+          (neutralize_routing("\ufeffrepo=x"), dispatcher_reads("\ufeffrepo=x")))
+    # Linear in the text's size: the review poller runs this over a whole diff (review of
+    # KIT-381: a per-character map cost gigabytes on a large one, and replacing each tag in
+    # turn was quadratic).
+    import time
+    started = time.time()
+    plain = "+    x = compute(a, b)  # an ordinary line of a large diff\n" * 40000
+    tagged = "+[repo=x] repo=y [agent\\=z]\n" * 30000
+    unclosed = "+" + "[agent=" * 50000 + "\n+ x]\n"
+    same = neutralize_routing(plain) == plain and neutralize_routing(unclosed) == unclosed
+    marks = neutralize_routing(tagged).count(ROUTING_TAG_MARK)
+    took = time.time() - started
+    check("large-texts-in-linear-time", same and marks == 90000 and took < 10,
+          (same, marks, round(took, 2)))
+    import tracemalloc
+    tracing = tracemalloc.is_tracing()
+    if not tracing:
+        tracemalloc.start()
+    if hasattr(tracemalloc, "reset_peak"):
+        tracemalloc.reset_peak()
+    neutralize_routing(plain)
+    peak = tracemalloc.get_traced_memory()[1]
+    if not tracing:
+        tracemalloc.stop()
+    check("large-texts-in-little-memory", peak < (64 << 20), "%d MB" % (peak >> 20))
     rng = random.Random(381)
+    # The stretch-by-stretch search finds exactly what `finditer` would.
+    bits = ["[", "]", "\\", "\n", " ", "\t", "agent", "model", "repo", "=", "x", "[agent=",
+            "[ model =", "\\[repo=b\\]", "]]", "[["]
+    differ = [t for t in ("".join(rng.choice(bits) for _ in range(rng.randint(0, 24)))
+                          for _ in range(3000))
+              if _bracket_spans(t) != [m.span() for m in BRACKET_TAG_RE.finditer(t)]]
+    check("stretch-search-is-finditer", not differ, differ[:2])
 
     def spell(ch):
         forms = [ch, "&#%d;" % ord(ch), "&#%s%d;" % ("0" * rng.randint(1, 3), ord(ch)),
@@ -258,27 +426,40 @@ def selftest_cases():
         for name, src in (("pipeline_routing_tags.py", 'X = r"%s"\n' % BRACKET_TAG_RE.pattern),
                           ("a_copy.py", 'X = r"%s"\n' % BRACKET_TAG_RE.pattern),
                           ("b_copy.py", 'Y = r"%s"\n' % UNBRACKETED_REPO_RE.pattern),
+                          ("c_reordered.py",
+                           'Z = re.compile(r"\\[\\s*(?:agent|model|repos?)\\s*=", re.I)\n'),
+                          ("pipeline_bounce_local.py", 'B = re.compile(r"(repos?|model|agent)=")\n'),
                           ("clean.py", "Z = 1\n"), ("notes.txt", BRACKET_TAG_RE.pattern)):
             with open(os.path.join(planted, name), "w", encoding="utf-8") as fh:
                 fh.write(src)
-        check("a-planted-copy-is-found", copies_in(planted) == ["a_copy.py", "b_copy.py"],
+        check("a-planted-copy-is-found",
+              copies_in(planted) == ["a_copy.py", "b_copy.py", "c_reordered.py"],
               copies_in(planted))
     finally:
         shutil.rmtree(planted, ignore_errors=True)
     return cases[0], failures
 
 
+# Scripts that still keep a routing scrub of their own, each with the ticket that ends it.
+OWN_SCRUB_UNTIL = {"pipeline_bounce_local.py": "KIT-384"}
+
+
 def copies_in(directory):
-    """The scripts in `directory`, other than this one, that carry their own copy of either
-    pattern's distinctive source text."""
+    """The scripts in `directory`, other than this one, that carry a copy of either pattern:
+    its distinctive source text, or a compiled pattern naming repo, model and agent on one
+    line, as a reordered copy would. OWN_SCRUB_UNTIL is left out."""
     import os
     found = []
     for name in sorted(os.listdir(directory)):
-        if not name.endswith(".py") or name == "pipeline_routing_tags.py":
+        if (not name.endswith(".py") or name == "pipeline_routing_tags.py"
+                or name in OWN_SCRUB_UNTIL):
             continue
         with open(os.path.join(directory, name), encoding="utf-8") as fh:
             src = fh.read()
-        if "(?:repos?|model|agent)" in src or "repos?=[A-Za-z0-9_" in src:
+        if ("(?:repos?|model|agent)" in src or "repos?=[A-Za-z0-9_" in src
+                or any("re.compile(" in line
+                       and all(word in line.lower() for word in ("repo", "model", "agent"))
+                       for line in src.splitlines())):
             found.append(name)
     return found
 

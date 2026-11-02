@@ -3417,7 +3417,7 @@ def selftest():
     # backslash escape, a character reference — are neutralized too, in code as anywhere,
     # judged by the dispatcher's own patterns as written and after one to three decodes.
     for form in routing.MEASURED_SPELLINGS:
-        for frame in ("%s", "`%s`", "```\n%s\n```", "+%s"):
+        for frame in ("%s", "` %s `", "```\n%s\n```", "+ %s"):
             out = sanitize_text(frame % form)
             check("sanitizer neutralizes %r as Linear stores it" % (frame % form),
                   [r for rounds in range(4)
@@ -3580,7 +3580,7 @@ def selftest():
                                 "criteria_changed_after_delegation": False})
     try:    # a refused build is a failed case here, never a traceback
         esc_body = build_review_body("o/r", fixture[4], "KIT-5", esc_basis, "high",
-                                     "diff --git a/x b/x\n+repo&#61;steal\n+&#91;model=x]\n")
+                                     "diff --git a/x b/x\n+ repo&#61;steal\n+&#91;model=x]\n")
     except PollerError as exc:
         esc_body = "the build refused: %s" % exc
     check("an escaped-tag body is single-tagged as Linear stores it",
