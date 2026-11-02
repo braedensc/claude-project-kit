@@ -352,8 +352,10 @@ wall clock.
 
 ### What a planning run came to (KIT-373)
 
-The executor writes what it did to a file the job names (`--verdict-file`), on every exit.
-The job records it on the run in `seen.json` as `result`, and its note on the idea says which:
+The executor writes what it did to a file the job names (`--verdict-file`), on every exit
+Python sees; a run killed outright writes none, which reads as `could-not-tell`. The job
+records a finished run's result in `seen.json` as `result`, and an errored attempt's as
+`last_result`. Its note on the idea says which:
 
 | `result` | The note on the idea |
 |---|---|
@@ -361,30 +363,46 @@ The job records it on the run in `seen.json` as `result`, and its note on the id
 | `questions` | the session asked you questions, and how many |
 | `no-plan` | no plan came back, and how the session ended |
 | `refused` | the plan was refused; the reasons are on the planning ticket |
-| `errored` | the run is tried again, up to three times, then given up on |
+| `errored` | the run is tried again, up to three times, then given up on. Kept as `last_result` until then |
 | `could-not-tell` | the executor's file was missing, unreadable, or did not fit its exit code. The note names the three possible results instead. It is never read as filed |
 
 The file also gives a `kind`: which rule refused a plan (`readiness-gate`, `cut-off`,
-`schema`, `retarget`, `credential-shape`, `config`), or what failed (`tracker`, `partial`,
-`config`).
+`schema`, `retarget`, `credential-shape`, `config`), what failed (`tracker`, `partial`,
+`config`, `input`, `gate`, `unexpected`, or `unknown` when no exit recorded one), or what
+else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`, `off`,
+`dry-run`).
 
 **How the session ended** is recorded beside it, as `ending`:
 
 - `response`: it posted a final message.
 - `error`, with a kind read from the error's text: `limit` (a usage or rate limit),
-  `billing`, `max-turns`, `execution-error`, or `unknown`. Text the job cannot name is
-  `unknown`, never a limit.
+  `billing`, `max-turns`, or `unknown`. Text the job cannot name is `unknown`, never a
+  limit: a ticket number such as PROD-429, or *Context limit reached*, is not one.
 - `nothing`: it ended without a message.
-- `stopped`: someone stopped it. Either its final message is the dispatcher's own notice
-  (*Session stopped — PROD-101 was marked as Done or Canceled.*), or its planning ticket
-  was found completed or canceled while the job still had it open. A stopped run is
-  never given to the executor, and its ticket is never moved: the idea is told, once, to
-  move the idea out of Plan it and back in to plan it again.
+- `stopped`: someone stopped it by closing or deleting its planning ticket. Either its
+  final message is the dispatcher's own notice (*Session stopped — PROD-101 was marked as
+  Done or Canceled.*), or the ticket was found completed, canceled or deleted while the
+  job still had it open. The session's own ending is kept beside it, as `session`. A
+  stopped run is never given to the executor, and its ticket is never moved. The idea is
+  told once: that nothing was filed, or, after an attempt that filed part of the plan,
+  where to look. It is then asked to move the idea out of Plan it and back in, unless a
+  newer move is already waiting.
+  - **A stop pages no one.** The note carries no mark, so the notifier does not page it.
+    The executor's mark is the only page a run gets, until the job pages for itself.
+  - **Only a closed or deleted ticket counts.** The session panel's Stop button leaves
+    the ticket open. The run then reads as a session that ended without a plan.
+  - **A ticket closed before its routing note** is a stop, not a misroute, when nothing
+    ran: no session, or the dispatcher's own stop notice. Any other missing note still
+    stops planning.
+  - **A ticket whose state cannot be read** holds its result back for up to three passes,
+    then files it as it did before.
 
 ## 7. What is not proven
 
 - **Nothing here has run live.** The routing note's exact rendered shape and its delay after
-  delegation are read from the dispatcher's source (0.2.69). The probe measures both.
+  delegation are read from the dispatcher's source (0.2.69). The probe measures both. So
+  are the stop notice's stored shape, and the state read with `trashed` that finds a
+  stopped run (KIT-373): neither has been seen on a live planning ticket.
 - **A misrouted ticket runs for seconds.** The check catches it; nothing prevents it.
 - **Team agent guidance reaches planners.** It cannot be read through the API. The probe
   asks a person to check it, and nothing re-checks it later.

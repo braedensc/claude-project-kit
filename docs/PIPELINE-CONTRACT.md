@@ -1082,7 +1082,9 @@ invisible `<!-- pipeline-escalation: <label> -->` mark, the same shape a stopped
 comment uses, so the **human-action notifier** (`docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md`)
 can grep the tracker and page the owner. One exception: with `--defer-mark`, a no-output or
 a rejection report is posted without its mark, so the job that started the run can page
-after it decides what to do (KIT-373). A summary and a question always keep theirs. The idea
+after it decides what to do (KIT-373). A summary, a question and a partial filing's report
+always keep theirs. The planner job does not pass the flag until it pages for itself
+(PL-3): until then, the executor's mark is the only page a no-plan or refused run gets. The idea
 gate is the *producer* of those marks for the planning lane; the notifier is the
 *consumer*. The executor **neutralizes any `<!--` sequence
 in the session's own text** (question bodies, notes, titles) before embedding it, so a session
