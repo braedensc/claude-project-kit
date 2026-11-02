@@ -1095,13 +1095,21 @@ CONF_DEFAULTS = {"NOTIFIER_TOKEN_ENV": "NOTIFIER_SLACK_BOT_TOKEN",
 # subcommand that needs one refuses, naming it.
 CONF_OPTIONAL = ("DISPATCHER_SERVICE", "FRONT_DOOR_SERVICE", "FRONT_DOOR_CONFIG",
                  "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER", "IDEA_TEAM_KEYS",
-                 "HEALTH_STATUS_FILE", "SANDBOX_TRUST_FILES")
+                 "HEALTH_STATUS_FILE", "SANDBOX_TRUST_FILES", "CHAT_MODEL",
+                 "CHAT_BACKUP_MODEL")
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # What `front-door` needs, and what verify's front-door row needs.
 FRONT_DOOR_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_BIN", "FRONT_DOOR_MATCHER")
 FRONT_DOOR_READ_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_MATCHER")
 _HOST_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _MATCHER_RE = re.compile(r"^@[A-Za-z0-9_-]+$")
+# CHAT_MODEL and CHAT_BACKUP_MODEL (KIT-385): the Claude names the dispatcher takes, as the
+# planner's TICKET_MODEL does.
+_CHAT_MODEL_RE = re.compile(r"^(?:fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,60})\Z")
+# The backup the dispatcher itself picks for a ticket session's model, by family
+# (RunnerSelectionService.js:156-168, at 0.2.73). A chat turn's backup is
+# claudeDefaultFallbackModel instead, so CHAT_BACKUP_MODEL defaults to this.
+DISPATCHER_BACKUP = {"fable": "opus", "opus": "sonnet", "sonnet": "haiku", "haiku": "sonnet"}
 _EXTRA_CRED_PREFIXES = ("xoxp-", "xoxa-", "xoxe", "xapp-")
 
 
@@ -1205,12 +1213,49 @@ def validate_conf(values):
     if conf.get("BRIDGE_DM_QUESTIONS") not in ("off", "on"):
         errors.append("BRIDGE_DM_QUESTIONS is off or on: on only when bridge.conf sets "
                       "ASK_TECH_LEAD=yes (got %r)" % conf.get("BRIDGE_DM_QUESTIONS"))
+    errors.extend(chat_model_problems(conf))
     role_env = conf.get("ROLE_ENV_FILE") or ""
     if not role_env.startswith(("/", "~/")) or role_env in ("/", "~/"):
         errors.append("ROLE_ENV_FILE must be an absolute path, or start with ~/ for the role "
                       "account's own home (got %r)" % role_env)
     errors.extend(trust_file_problems(conf))
     return conf, errors
+
+
+def chat_pair_wanted(conf):
+    """(model, backup) that `merge` writes as the dispatcher's global pair, which every chat
+    turn starts with (KIT-385); None while CHAT_MODEL is unset, and merge leaves the pair
+    alone. The backup is CHAT_BACKUP_MODEL, else the dispatcher's own pick for the model."""
+    model = (conf or {}).get("CHAT_MODEL") or ""
+    if not model:
+        return None
+    return model, ((conf or {}).get("CHAT_BACKUP_MODEL")
+                   or DISPATCHER_BACKUP.get(model_family(model) or "") or "")
+
+
+def chat_model_problems(conf):
+    """Every reason CHAT_MODEL and CHAT_BACKUP_MODEL cannot be written as a pair."""
+    model, backup = conf.get("CHAT_MODEL") or "", conf.get("CHAT_BACKUP_MODEL") or ""
+    errors = ["%s must be fable, opus, sonnet, haiku or a claude- model id such as "
+              "claude-sonnet-5-5 (got %r)" % (key, value)
+              for key, value in (("CHAT_MODEL", model), ("CHAT_BACKUP_MODEL", backup))
+              if value and not _CHAT_MODEL_RE.match(value)]
+    if errors:
+        return errors
+    if backup and not model:
+        return ["CHAT_BACKUP_MODEL is set and CHAT_MODEL is not. A backup is half a pair: "
+                "set CHAT_MODEL too, or take CHAT_BACKUP_MODEL out"]
+    if not model:
+        return []
+    model, backup = chat_pair_wanted(conf)
+    if not backup:
+        return ["CHAT_MODEL %r is in no family the dispatcher picks a backup for: set "
+                "CHAT_BACKUP_MODEL to a different model" % model]
+    if model == backup or same_model(model, backup):
+        return ["the backup, %s, is the same model as CHAT_MODEL, %s. The SDK refuses a "
+                "backup equal to its model, so every chat turn would fail before it starts "
+                "(sdk.mjs:144): set CHAT_BACKUP_MODEL to a different model" % (backup, model)]
+    return []
 
 
 def load_conf(path):
@@ -2204,6 +2249,38 @@ CARDS = {
                 "scope counts only after the reinstall; or groups:read added to the "
                 "notifier's or the bridge's app instead of the chat lane's"),
     },
+}
+
+CARDS["CK-C8"] = {
+    "title": "Move the tech lead to another model, keeping every pipeline ticket on its own",
+    "why": ("A chat turn runs on the dispatcher's one global pair, claudeDefaultModel and "
+            "claudeDefaultFallbackModel; nothing picks a model for chat alone "
+            "(EdgeWorker.js:715-721). A ticket session with no [model=…] tag and no model "
+            "label runs on that same model, because an entry's own model is never read "
+            "(KIT-377). So the tickets the pipeline makes must carry their tag BEFORE the "
+            "pair moves. One script does it in that order and asks you once; these are its "
+            "steps, should you want to read them first."),
+    "do": ["1. In stage-a.conf and stage-e.conf, set TICKET_MODEL to the model tickets keep",
+           "   (opus today), then run the update, so the planner and the finding poller",
+           "   open every ticket they file with that tag:",
+           "    python3 scripts/pipeline_install.py --conf <your stage-a.conf>",
+           "2. Run the switch, as yourself, in a terminal. It checks both live configs carry",
+           "   the tag, lists the open pipeline tickets filed before the tags existed, and",
+           "   asks one yes. Then it tags them, sets CHAT_MODEL in chat-lane.conf, and runs",
+           "   merge --apply and verify:",
+           "    python3 scripts/pipeline_model_switch.py --to sonnet --conf <stage-a.conf> \\",
+           "        --stage-e-conf <stage-e.conf> --chat-lane-conf <chat-lane.conf>",
+           "3. Ask the bot one question in a NEW thread, then run verify. Its chat-model row",
+           "   says NOT CHECKED until a turn has run on the new pair:",
+           "    %s verify" % ME,
+           "To go back, run step 2 with --to opus. Do not just take CHAT_MODEL out: unset,",
+           "merge leaves the pair alone, and a config key removed by hand keeps its old",
+           "value in the running dispatcher until a restart (ConfigManager.js:237-244)."],
+    "good": ("the switch ended on 'Switched' or 'Done', and verify's chat-model row says chat "
+             "turns start on the new model, with the newest turn on it"),
+    "not": ("'TICKET_MODEL is not set' or 'still runs without TICKET_MODEL' — the tickets "
+            "would have moved with the tech lead: do step 1 first; or a chat-model row that "
+            "FAILS 'chat-lane.conf asks for': merge --apply did not write the pair"),
 }
 
 NEVER = [
@@ -3682,15 +3759,24 @@ def chat_turn_lines(ct):
     return out
 
 
-def check_chat_model(cfg, env_facts, ct):
+def check_chat_model(cfg, env_facts, ct, conf=None):
     """The tech lead's model (KIT-355): the pair a chat turn starts with, from the
     dispatcher's config, and the last few turns as their own logs recorded them. The model
     is every label-less ticket session's too, since an entry's own `model` is never read;
     those sessions pick their own backup from it (RunnerSelectionService.js:297-310,
-    RunnerConfigBuilder.js:173-175, at 0.2.73; KIT-377)."""
+    RunnerConfigBuilder.js:173-175, at 0.2.73; KIT-377). When chat-lane.conf names a pair
+    (CHAT_MODEL, KIT-385), the config must hold that pair."""
     models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
     model, backup = chat_model_pair(models)
     lines = chat_turn_lines(ct)
+    wanted = chat_pair_wanted(conf)
+    if wanted and (models.get("claudeDefaultModel"),
+                   models.get("claudeDefaultFallbackModel")) != wanted:
+        return _row("chat-model", FAILED,
+                    "chat-lane.conf asks for %s, with %s as the backup, but chat turns start "
+                    "on %s, with %s as the backup" % (wanted + (model, backup)),
+                    ["run  merge , then  merge --apply . It writes the pair as one, and the "
+                     "config reloads on its own"] + lines)
     env_facts = env_facts if isinstance(env_facts, dict) else {}
     over = [n for n in MODEL_ENV_NAMES if n in set(env_facts.get("names") or [])]
     # The key the dispatcher takes is the first truthy one in its chain; the probe left the
@@ -3901,7 +3987,7 @@ def evaluate(facts, conf, pf=None):
             rows.append(check_grant(cfg))
             rows.append(check_fence(cfg, env_facts))
             rows.append(check_chat_mcp(cfg))
-            rows.append(check_chat_model(cfg, env_facts, facts.get("chatTurns")))
+            rows.append(check_chat_model(cfg, env_facts, facts.get("chatTurns"), conf))
         rows.append(check_env(conf, env_facts))
         rows.append(check_ip_validation_off(env_facts))
         rows.append(check_notifier_absent(conf, env_facts))
@@ -4059,7 +4145,9 @@ BACKUP_TAG = "pre-chat-lane"
 # it cannot extend), 2 a malformed patch, 3 refused: the file is not the one the plan read,
 # checked as it starts and again just before the config is written.
 MERGE_WRITER_PY = r'''
-import hashlib, json, os, sys, time
+import hashlib, json, os, re, sys, time
+
+MODEL_NAME = re.compile(r"^(?:fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,60})\Z")
 
 def say(msg):
     print(msg)
@@ -4163,6 +4251,15 @@ def apply_op(cfg, op):
         if not isinstance(grant, list) or not all(isinstance(t, str) for t in grant):
             stop(2, "the patch's grant is not a list of tool names. Nothing was written.")
         cfg["slackAllowedTools"] = grant
+    elif kind == "model-pair":
+        # Both keys in one write: a backup equal to its model fails every chat turn, and
+        # the SDK says so nowhere a person would look (KIT-385).
+        model, backup = op.get("model"), op.get("backup")
+        if (not all(isinstance(v, str) and MODEL_NAME.match(v) for v in (model, backup))
+                or model == backup):
+            stop(2, "the patch's model pair is not two different model names. Nothing was "
+                    "written.")
+        cfg["claudeDefaultModel"], cfg["claudeDefaultFallbackModel"] = model, backup
     else:
         stop(2, "the patch names an unknown operation. Nothing was written.")
 
@@ -4706,6 +4803,26 @@ def merge_plan(conf, facts):
                          % ", ".join(extra))
         ops.append({"op": "grant", "set": wanted})
         lines.append("GRANT       slackAllowedTools = %s" % json.dumps(wanted))
+    # KIT-385: the tech lead's model pair, when chat-lane.conf names one. Written as the
+    # global pair, in this same write, and never as an entry's own `model`: the dispatcher
+    # never reads that (RunnerSelectionService.js:297-310 at 0.2.73; KIT-377).
+    pair = chat_pair_wanted(conf)
+    if pair:
+        models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+        over = [n for n in MODEL_ENV_NAMES if n in env_names]
+        if over:
+            lines.append("CANNOT      the dispatcher's env file sets %s, which the dispatcher "
+                         "takes over the config at start. The model pair is not written: take "
+                         "%s out of the env file, then restart the dispatcher when it is idle "
+                         "(card CK-C5)" % (", ".join(over), "it" if len(over) == 1 else "them"))
+        elif (models.get("claudeDefaultModel"), models.get("claudeDefaultFallbackModel")) \
+                == pair:
+            lines.append("ok          chat turns already start on %s, with %s as the backup"
+                         % pair)
+        else:
+            ops.append({"op": "model-pair", "model": pair[0], "backup": pair[1]})
+            lines.append("MODEL       claudeDefaultModel = %s, claudeDefaultFallbackModel = %s "
+                         "(was: %s, with %s as the backup)" % (pair + chat_model_pair(models)))
     if active and active[0].get("mcpAllowedTools"):
         lines.append("WARNING     the first active entry %s lists %s in allowedTools, and the "
                      "dispatcher adds those to the chat grant (RunnerConfigBuilder.js:63-66). "
@@ -4848,6 +4965,11 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
     say("")
     para("The dispatcher reloads its config on a change (ConfigManager.js:51-62): its log "
          "says \"Config file changed, reloading...\". Nothing was restarted.", "")
+    if any(op.get("op") == "model-pair" for op in ops):
+        para("The tech lead's model is now %s, with %s as the backup, for chat turns that "
+             "start from here; a turn already running keeps its model. Ask the bot one "
+             "question in a NEW thread, then run verify: its chat-model row says NOT CHECKED "
+             "until a turn has run on the new pair." % chat_pair_wanted(conf), "")
     if set(deny_add) & set(diff_deny_rules()):
         para("The diff rules reach a session only when it starts. A session already running "
              "keeps the tools it started with: a chat thread's session, a coding session "
@@ -8679,6 +8801,155 @@ def _selftest_kit197(expect, conf):
             expect("front-door-remove-last-path-refused", rc == EX_BLOCKED
                    and _read(fd_path) == "@dispatcher path /slack-webhook\n", (rc, out[-300:]))
     group("front-door", front_door)
+
+    # -- KIT-385: the tech lead's model pair, from chat-lane.conf ----------------------
+    def chat_model_switch():
+        import hashlib
+        cases = (
+            ({"CHAT_MODEL": "sonnet"}, ("sonnet", "haiku"), []),
+            ({"CHAT_MODEL": "opus"}, ("opus", "sonnet"), []),
+            ({"CHAT_MODEL": "haiku"}, ("haiku", "sonnet"), []),
+            ({"CHAT_MODEL": "fable"}, ("fable", "opus"), []),
+            ({"CHAT_MODEL": "claude-sonnet-5-5"}, ("claude-sonnet-5-5", "haiku"), []),
+            ({"CHAT_MODEL": "sonnet", "CHAT_BACKUP_MODEL": "opus"}, ("sonnet", "opus"), []),
+            ({"CHAT_MODEL": "claude-mystery", "CHAT_BACKUP_MODEL": "sonnet"},
+             ("claude-mystery", "sonnet"), []),
+            ({}, None, []),
+            ({"CHAT_MODEL": "sonnet", "CHAT_BACKUP_MODEL": "sonnet"}, None, ["same model"]),
+            ({"CHAT_MODEL": "claude-sonnet-5-5", "CHAT_BACKUP_MODEL": "sonnet"}, None,
+             ["same model"]),
+            ({"CHAT_BACKUP_MODEL": "opus"}, None, ["half a pair"]),
+            ({"CHAT_MODEL": "claude-mystery"}, None, ["CHAT_BACKUP_MODEL to a different"]),
+            ({"CHAT_MODEL": "Sonnet"}, None, ["must be fable, opus"]),
+            ({"CHAT_MODEL": "gpt-5"}, None, ["must be fable, opus"]),
+            ({"CHAT_MODEL": "sonnet", "CHAT_BACKUP_MODEL": "sonnet "}, None,
+             ["must be fable, opus"]))
+        for extra, pair, needles in cases:
+            values = dict(conf)
+            values.pop("CHAT_MODEL", None)
+            values.pop("CHAT_BACKUP_MODEL", None)
+            values.update(extra)
+            vconf, errors = validate_conf(values)
+            errors = [e for e in errors if "CHAT_" in e or "backup" in e]
+            label = ",".join("%s=%s" % kv for kv in sorted(extra.items())) or "unset"
+            expect("chat-model-conf:" + label,
+                   (chat_pair_wanted(vconf) if not needles else None) == pair
+                   and len(errors) == len(needles)
+                   and all(n in e for n, e in zip(needles, errors)), (errors, pair))
+
+        # The plan: the pair as ONE op, only when it differs, and never past an env override.
+        models = {"claudeDefaultModel": "opus", "defaultModel": None,
+                  "claudeDefaultFallbackModel": "sonnet", "defaultFallbackModel": None}
+
+        def plan(extra, live=None, env_names=()):
+            facts = {"config": {"entries": [], "models": live or models},
+                     "env": {"names": list(env_names), "empty": []},
+                     "userSettings": {"error": "missing"}}
+            lines, ops, _deny, _allow = merge_plan(dict(conf, **extra), facts)
+            return [l for l in lines if "claudeDefaultModel" in l or "model pair" in l
+                    or "already start on" in l], [o for o in ops if o["op"] == "model-pair"]
+
+        lines, ops = plan({"CHAT_MODEL": "sonnet"})
+        expect("chat-model-plan-writes-the-pair-as-one",
+               ops == [{"op": "model-pair", "model": "sonnet", "backup": "haiku"}]
+               and lines == ["MODEL       claudeDefaultModel = sonnet, "
+                             "claudeDefaultFallbackModel = haiku (was: opus, with sonnet as "
+                             "the backup)"], (lines, ops))
+        lines, ops = plan({"CHAT_MODEL": "sonnet"},
+                          dict(models, claudeDefaultModel="sonnet",
+                               claudeDefaultFallbackModel="haiku"))
+        expect("chat-model-plan-leaves-a-matching-pair", ops == [] and lines == [
+            "ok          chat turns already start on sonnet, with haiku as the backup"],
+            (lines, ops))
+        lines, ops = plan({"CHAT_MODEL": "sonnet"}, env_names=("CYRUS_CLAUDE_DEFAULT_MODEL",))
+        expect("chat-model-plan-refuses-past-an-env-override",
+               ops == [] and len(lines) == 1 and lines[0].startswith("CANNOT")
+               and "CYRUS_CLAUDE_DEFAULT_MODEL" in lines[0], (lines, ops))
+        lines, ops = plan({})
+        expect("chat-model-plan-unset-leaves-the-pair-alone", lines == [] and ops == [],
+               (lines, ops))
+
+        # verify: a config that does not hold the pair the conf asks for FAILS.
+        row = check_chat_model({"models": models}, {"names": []}, {"turns": []},
+                               dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-fails-a-pair-the-merge-has-not-written",
+               row["outcome"] == FAILED and "chat-lane.conf asks for sonnet, with haiku as the "
+               "backup, but chat turns start on opus, with sonnet as the backup"
+               in _row_text(row) and "merge --apply" in _row_text(row), _row_text(row))
+        row = check_chat_model({"models": dict(models, claudeDefaultModel="sonnet",
+                                               claudeDefaultFallbackModel="haiku")},
+                               {"names": []}, {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-a-written-pair-waits-for-a-turn",
+               row["outcome"] == UNKNOWN and "no chat turn is logged yet" in _row_text(row),
+               _row_text(row))
+
+        # The REAL writer: the pair in one write, the entries' own keys untouched, and an
+        # equal or malformed pair refused with nothing written.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            wconf = dict(conf, DISPATCHER_CONFIG=cfg_path,
+                         DISPATCHER_ENV_FILE=os.path.join(tmp, "dispatcher", ".env"))
+            fixture = dict(_merge_fixture(), claudeDefaultModel="opus",
+                           claudeDefaultFallbackModel="sonnet")
+            _put(cfg_path, json.dumps(fixture, indent=2) + "\n")
+            raw = _read_bytes(cfg_path)
+            sha = hashlib.sha256(raw).hexdigest()
+            py = shlex.quote(sys.executable)
+
+            def run(op):
+                return subprocess.run(["/bin/sh", "-c", "cd / && " + merge_writer_command(
+                    wconf).replace("/usr/bin/python3", py)], input=json.dumps(
+                    {"configSha256": sha, "config": [op], "deny": []}), capture_output=True,
+                    text=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
+
+            for label, op in (("equal", {"op": "model-pair", "model": "sonnet",
+                                         "backup": "sonnet"}),
+                              ("not-a-name", {"op": "model-pair", "model": "sonnet; rm",
+                                              "backup": "haiku"}),
+                              ("missing", {"op": "model-pair", "model": "sonnet"})):
+                ran = run(op)
+                expect("chat-model-writer-refuses:" + label, ran.returncode == 2
+                       and _read_bytes(cfg_path) == raw, (ran.returncode, ran.stdout[-200:]))
+            ran = run({"op": "model-pair", "model": "sonnet", "backup": "haiku"})
+            after = json.loads(_read(cfg_path))
+            expect("chat-model-writer-writes-the-pair",
+                   ran.returncode == 0 and after.get("claudeDefaultModel") == "sonnet"
+                   and after.get("claudeDefaultFallbackModel") == "haiku"
+                   and [r for r in after["repositories"] if "model" in r] == []
+                   and dict(after, claudeDefaultModel="opus",
+                            claudeDefaultFallbackModel="sonnet") == fixture,
+                   (ran.returncode, ran.stdout[-300:]))
+
+        # …and through `merge --apply` itself, read by the REAL probe.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "role-home")
+            os.makedirs(home)
+            cfg_path = os.path.join(tmp, "dispatcher", "config.json")
+            env_path = os.path.join(tmp, "dispatcher", ".env")
+            mconf = dict(conf, DISPATCHER_CONFIG=cfg_path, DISPATCHER_ENV_FILE=env_path,
+                         FRONT_DOOR_CONFIG=os.path.join(tmp, "front", "Caddyfile"),
+                         CHAT_MODEL="sonnet")
+            _put(cfg_path, json.dumps(_fenced_fixture(), indent=2) + "\n")
+            _put(env_path, "CYRUS_HOST_EXTERNAL=true\n")
+            _put(os.path.join(home, ".claude", "settings.json"),
+                 json.dumps({"permissions": {"deny": user_deny_patterns(mconf)}}) + "\n")
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            after = json.loads(_read(cfg_path))
+            expect("chat-model-merge-apply-writes-the-pair",
+                   after.get("claudeDefaultModel") == "sonnet"
+                   and after.get("claudeDefaultFallbackModel") == "haiku"
+                   and "MODEL       claudeDefaultModel = sonnet" in out
+                   and "Ask the bot one question in a NEW thread" in " ".join(out.split()),
+                   (rc, out[-600:]))
+            rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
+                               True)
+            expect("chat-model-merge-again-has-nothing-to-write",
+                   "ok          chat turns already start on sonnet, with haiku as the backup"
+                   in out and "MODEL       " not in out, out[-600:])
+    group("chat-model-switch", chat_model_switch)
 
     # -- each writer's own guards, run directly: the checks the subcommands never reach
     # because their plan is right (a wrong name, a wrong `from`, a moved settings file, a

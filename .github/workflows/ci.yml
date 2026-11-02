@@ -336,6 +336,16 @@ jobs:
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
 
+      # The tech lead's model switch (KIT-385): the owner's one script. It refuses under a
+      # model, as root and without a terminal; stops before its one question when a
+      # TICKET_MODEL is unset or not yet in the planner's or finding poller's live config,
+      # or no Linear key is found; tags only open, unstarted pieces and findings with no
+      # model of their own, re-read just before each write; and only then writes
+      # CHAT_MODEL and runs the chat lane's merge --apply and verify. A "no" changes
+      # nothing.
+      - name: Tech lead model switch selftest (tickets first, one yes, agent-refused)
+        run: python3 scripts/pipeline_model_switch.py --selftest
+
       # The Slack bridge (KIT-220, KIT-221): the one job that may act for the owner from
       # the chat. Every sender checked with Slack itself (guests, bots, deactivated and
       # other-workspace accounts, edits, files and subtypes refused), its own question
