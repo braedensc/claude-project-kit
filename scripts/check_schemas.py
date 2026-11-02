@@ -70,6 +70,7 @@ SCHEMAS = {
     "telemetry-block": ("telemetry-block.schema.json", "4.", "name"),
     "safe-outputs": ("safe-outputs.schema.json", "8.", "name"),
     "review-findings": ("review-findings.schema.json", "14.", "name"),
+    "browser-check": ("browser-check.schema.json", "15.", "name"),
 }
 
 # Schema paths §1 documents in a row's PROSE rather than as rows of their own.
@@ -105,10 +106,12 @@ def schema_paths(schema, root=None, prefix="", seen=None):
         return paths
     if "$ref" in schema:
         ref = schema["$ref"]
-        marker = (ref, prefix)
-        if marker in seen:  # a self-referential $ref would otherwise not terminate
+        # A $ref already being expanded above this point is recursion (§15's `target`
+        # nests itself as `within`), and the path grows each level, so the guard is the
+        # ref alone. Siblings never share a stack, so a ref reused side by side still counts.
+        if any(seen_ref == ref for seen_ref, _seen_at in seen):
             return paths
-        seen = seen | {marker}
+        seen = seen | {(ref, prefix)}
         schema = jsm._effective(schema, root)
     for key, sub in (schema.get("properties") or {}).items():
         child = f"{prefix}.{key}" if prefix else key
@@ -536,6 +539,38 @@ VALID_REVIEW_FINDINGS = {
 }
 
 
+# §15: a plan's browser checks, as the dark-mode epic's would have read (KIT-302).
+VALID_BROWSER_CHECK = {
+    "schema": "pipeline-browser-check/1",
+    "checks": [
+        {"id": "home", "scenario": "signed-in", "viewports": ["desktop", "phone"],
+         "modes": ["light", "dark"], "open": "/",
+         "steps": [{"do": "expect", "on": {"css": "body"}, "at": "first-paint",
+                    "css": {"background-color": "rgb(var(--c-bg))"}},
+                   {"do": "screenshot", "name": "home"}],
+         "look": "Dark: no white or cream surface; cards lift off the board."},
+        {"id": "settings", "viewports": ["desktop", "phone"], "modes": ["default"],
+         "open": "/", "criteria": [2, 3],
+         "steps": [{"do": "click", "on": {"role": "button", "name": "Settings",
+                                         "within": {"role": "navigation", "name": "Account"}},
+                    "only": ["desktop"]},
+                   {"do": "fill", "on": {"label": "Name"}, "text": "Ada"},
+                   {"do": "expect", "on": {"role": "switch"}, "contrast": {"min": 3}},
+                   {"do": "screenshot", "name": "settings"}]},
+    ],
+}
+
+
+def _validating(node):
+    """A schema node with its words for people (description, $comment) taken out at every
+    depth, so two copies of one definition compare on what they enforce."""
+    if isinstance(node, dict):
+        return {k: _validating(v) for k, v in node.items() if k not in ("description", "$comment")}
+    if isinstance(node, list):
+        return [_validating(v) for v in node]
+    return node
+
+
 def _without(document, *keys):
     copy = json.loads(json.dumps(document))
     node = copy
@@ -670,6 +705,50 @@ FIXTURES = [
      _with(VALID_REVIEW_FINDINGS, "blocked", None), True, None),
     ("review-findings", "blocked-is-not-a-number",
      _with(VALID_REVIEW_FINDINGS, "blocked", 5), False, "type"),
+
+    # §15: data only. A verb outside the closed list, a URL where a path goes, or a step
+    # with nothing to act on is refused, never guessed at (KIT-302).
+    ("browser-check", "valid", VALID_BROWSER_CHECK, True, None),
+    ("browser-check", "wrong-marker",
+     _with(VALID_BROWSER_CHECK, "schema", "pipeline-browser-check/2"), False, "const"),
+    ("browser-check", "no-checks", _with(VALID_BROWSER_CHECK, "checks", []), False,
+     "minItems"),
+    ("browser-check", "an-invented-verb",
+     _with(VALID_BROWSER_CHECK, "checks.0.steps.1", {"do": "eval", "name": "x"}), False,
+     "const"),
+    ("browser-check", "a-url-is-not-a-path",
+     _with(VALID_BROWSER_CHECK, "checks.0.open", "https://example.com/"), False, "pattern"),
+    ("browser-check", "a-protocol-relative-path",
+     _with(VALID_BROWSER_CHECK, "checks.0.open", "//example.com/"), False, "pattern"),
+    ("browser-check", "a-click-on-nothing",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "click"}), False, "required"),
+    ("browser-check", "a-check-with-no-mode",
+     _without(VALID_BROWSER_CHECK, "checks", 0, "modes"), False, "required"),
+    ("browser-check", "contrast-past-21",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.2.contrast", {"min": 22}), False, "maximum"),
+    # A `wait` or `emulate` that names nothing would do nothing, so it is refused (KIT-322
+    # review). A wait names `for` or `ms`, one of them; an emulate names one or both.
+    ("browser-check", "a-wait-for-nothing",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait"}), False, "required"),
+    ("browser-check", "a-wait-on-a-viewport-only",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait", "only": ["phone"]}), False,
+     "required"),
+    ("browser-check", "a-wait-for-a-target-and-a-pause",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0",
+           {"do": "wait", "for": {"css": "main"}, "ms": 200}), False, "additionalProperties"),
+    ("browser-check", "a-wait-for-a-target",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait", "for": {"css": "main"}}),
+     True, None),
+    ("browser-check", "a-pause",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "wait", "ms": 200}), True, None),
+    ("browser-check", "an-emulate-of-nothing",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate"}), False, "required"),
+    ("browser-check", "an-emulate-of-both",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0",
+           {"do": "emulate", "colorScheme": "dark", "reducedMotion": "reduce"}), True, None),
+    ("browser-check", "an-emulate-of-motion-alone",
+     _with(VALID_BROWSER_CHECK, "checks.1.steps.0", {"do": "emulate", "reducedMotion": "reduce"}),
+     True, None),
 ]
 
 
@@ -686,6 +765,23 @@ def selftest():
 
     note()
     failures += check_parity()
+
+    # A mode a check names is the same shape in delivery.json (§1 `acceptance.modes`) and
+    # in a ticket's own block (§15): one definition, two places, held equal here.
+    # Every keyword is compared, not only `properties`, so a side that drops
+    # `additionalProperties: false` or adds `required` goes red (KIT-322 review). Only the
+    # words a person reads are left out.
+    note()
+    try:
+        in_delivery = _validating(load_schema("delivery")["$defs"]["acceptanceMode"])
+        in_block = _validating(load_schema("browser-check")["$defs"]["mode"])
+    except (OSError, ValueError, KeyError) as e:
+        failures.append(f"acceptance modes: cannot compare — {e}")
+    else:
+        if in_delivery != in_block:
+            failures.append("schemas/delivery.schema.json $defs/acceptanceMode and "
+                            "schemas/browser-check.schema.json $defs/mode differ: a mode "
+                            "must mean the same thing in delivery.json and in a ticket")
 
     # The shipped example is the spec's own shape. This is the check that stops
     # delivery.example.json drifting away from §1 again.

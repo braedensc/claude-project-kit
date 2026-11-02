@@ -306,6 +306,37 @@ exits 0 and emits nothing. A project can run the whole pipeline and never persis
 > at the point of use. Adding it to the guard validator would imply the guards
 > depend on it, which is the opposite of true.
 
+### `acceptance` (optional)
+
+Absent ⇒ **the acceptance check is off**, in exactly the sense §2 gives the word: a finished
+plan closes as it does today, and the readiness gate skips its browser-check rules and names
+them as skipped. Present ⇒ the project says how a session runs its app for a browser check
+**with no real services**, and planning must write checks a machine can run (§15). The
+decision record is `docs/adr/2026-11-02-acceptance-check-before-the-last-merge.md`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `setup` | string \| null | Run once on the fresh checkout before `build`, e.g. `npm ci`. Default `null`: the checkout needs nothing. |
+| `build` | string \| null | Run from the repo root on a fresh checkout of the pull request being checked. Produces what `serve` serves. Its environment holds no secret: dummy service settings belong in the project's own script, never in an env file (the kit's secret guards will not let a session read one). `null` only when `serve.mode` is `command` and that command builds as it starts. |
+| `serve.mode` | enum `files`\|`command` | `files`: the browser's requests to `serve.origin` are answered from `serve.dir`. No port is opened and no process runs. `command`: `serve.command` starts a local server at `serve.url`. Prefer `files`; `command` is for an app that renders on a server. |
+| `serve.dir` | string | `files` only. The repo-relative folder `build` writes. Gitignored. |
+| `serve.fallback` | string \| null | `files` only. The file served for a path that has no file. Default `index.html` (a single-page app); `null` answers 404. |
+| `serve.origin` | string | `files` only. The origin the app loads at. Default `http://127.0.0.1:9`: a loopback origin is a secure context, and Chromium refuses port 9 outright, so a request that escapes interception reaches nothing. |
+| `serve.command` | string | `command` only. Starts the app with its own fakes for every service. The runner stops its whole process group when the check ends. |
+| `serve.url` | string | `command` only. Where that server answers. Loopback only: `127.0.0.1`, `localhost` or `[::1]`. |
+| `serve.readySeconds` | integer | `command` only. How long to wait for `serve.url` before the run is *could not run*. Default `120`. |
+| `fakeBackend` | string \| null | Repo-relative path of the project's own fake-backend module (§15). It answers every request the app makes to a service. `null`: no module, and every request to anything but the app's origin is aborted. Either way each aborted request is listed in the result. A coding session can edit this file in the pull request it is judged on, so list it in `autonomy.riskPaths`, which puts it behind a person's review. |
+| `scenarios` | string[] | The data sets the fake backend serves, by name: `signed-in`, `signed-out`, `empty`. A check names one; the first is the default. Required when `fakeBackend` is set. |
+| `viewports` | object → `{width, height, mobile?}` | Named screen sizes a check may name. Default `desktop` (1280×800) and `phone` (390×844, `mobile`: touch, a mobile user agent, device pixel ratio 2). |
+| `modes` | object → `{colorScheme?, reducedMotion?, locale?, timezoneId?, localStorage?}` | Named app states a check may name: a theme, a locale, reduced motion. Data only. `default` is built in (no emulation, empty storage) and cannot be redefined. A ticket may declare more in its own block (§15). |
+| `uiPaths` | string[] | Globs, in `autonomy.riskPaths` syntax. A ticket whose Pointers or acceptance criteria name a matching path is a **UI ticket**. Under `--strict` a UI ticket must carry a browser check, or say `No browser check:` and why (§15). |
+
+> **Judged at the warning tier, never the error tier.** The section gates no autonomy: an
+> acceptance check can only hold a plan's close or file a follow-up. So a typo here never
+> makes `delivery.json` broken (§2). Its consumers refuse a malformed one at the point of
+> use, loudly: the readiness gate exits 2 naming the field, and the acceptance run reports
+> *could not run* (§13).
+
 ---
 
 ## 2. The pipeline is optional
@@ -1420,6 +1451,7 @@ exist.
 | §4 telemetry block | `schemas/telemetry-block.schema.json` | bidirectional by field name |
 | §8 safe-outputs request file | `schemas/safe-outputs.schema.json` | bidirectional by field name |
 | §14 review findings file | `schemas/review-findings.schema.json` | bidirectional by field name |
+| §15 browser check block | `schemas/browser-check.schema.json` | bidirectional by field name |
 
 **Amending one of those sections means amending its schema in the same PR.** That is not
 a convention here — CI names the missing half.
@@ -1678,3 +1710,113 @@ Conforming here earns a review nothing. A schema-valid findings file can be wron
 every one of them, and no tier treats "the reviewer produced a well-formed document" as
 "the change is good". **Agent-authored ⇒ reporting, never authority**, exactly as
 everywhere else in this document.
+
+---
+
+## 15. Browser check block
+
+A plan's checks that a machine can run in a browser (KIT-302). One fenced `json` block,
+`"schema": "pipeline-browser-check/1"`, in a ticket's `## Test plan`, or in an epic's
+`## How we will know it works` for checks that span the whole feature. The acceptance session
+runs each check through the look tool, in the kit's own sandbox, against the app built the
+way `delivery.json` `acceptance` says (§1). Machine-readable: `schemas/browser-check.schema.json`.
+
+**Data only.** Every step is one verb from a closed list, read by the acceptance runner.
+Nothing in a block is evaluated as code, a path is never a URL, and a verb outside the list
+refuses the whole block. Conforming earns a plan nothing: a block says what to look at, and
+the session and its skeptic pass decide what they saw.
+
+### The block
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-browser-check/1"` | An unrecognized value refuses the block. |
+| `modes` | object → mode | App states this ticket's checks may name, beyond `acceptance.modes`. A name may not repeat one `delivery.json` declares. At most 6. |
+| `checks` | check[] | 1 to 12. |
+
+### A check
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | Lowercase, digits and `-`. Unique in the block. |
+| `criteria` | integer[] | 1-based positions of the ticket's acceptance criteria this check proves. Child tickets only. |
+| `scenario` | string | A name from `acceptance.scenarios`. Default: its first. |
+| `viewports` | string[] | Names from `acceptance.viewports` (default `desktop`, `phone`). Every check runs once per viewport and mode. |
+| `modes` | string[] | `default`, a name from `acceptance.modes`, or one this block declares. |
+| `open` | string | A path on the app's own origin, starting `/`. Never a URL, never `//`. |
+| `steps` | step[] | 1 to 25, run in order. |
+| `look` | string | What a person would judge in this check's screenshots, in plain words. The acceptance session judges it; the runner never does. |
+
+### A target
+
+What a step acts on, found the way a person would find it. At least one field.
+
+| Field | Type | Notes |
+|---|---|---|
+| `role` | string | An accessibility role: `button`, `heading`, `tab`, `switch`. |
+| `name` | string | The accessible name, with `role`. |
+| `text` | string | Visible text. |
+| `label` | string | A form field's label. |
+| `placeholder` | string | A form field's placeholder. |
+| `testId` | string | A `data-testid`, when nothing a person sees is unique. |
+| `css` | string | A CSS selector, the last resort. |
+| `exact` | boolean | Match `name` or `text` exactly. |
+| `nth` | integer | Which match, from 0; `-1` is the last. |
+| `within` | target | Search inside this target only. |
+
+### Steps
+
+Each step is `{"do": <verb>, …}`. The verbs: `click`, `hover`, `fill`, `press`, `reload`,
+`goto`, `wait`, `emulate`, `addClass`, `removeClass`, `setStorage`, `screenshot` and
+`expect`. Any step may carry `only`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `do` | string | The verb. |
+| `on` | target | What `click`, `hover`, `fill`, `addClass`, `removeClass`, `screenshot` and `expect` act on. Required for all but `screenshot`. |
+| `only` | string[] | Run this step only on these viewports: a phone menu a desktop does not have. |
+| `text` | string | `fill`: what to type. `expect`: the text the target holds. |
+| `key` | string | `press`: a key, such as `Enter` or `Shift+Tab`. |
+| `path` | string | `goto`: a path on the app's origin, as `open`. |
+| `for` | target | `wait`: until this target is visible. A `wait` names `for` or `ms`, not both. |
+| `ms` | integer | `wait`: a pause, at most 2000. |
+| `colorScheme` | string | `emulate`: `light`, `dark` or `no-preference`. An `emulate` names this, `reducedMotion`, or both. |
+| `reducedMotion` | string | `emulate`: `reduce` or `no-preference`. |
+| `class` | string | `addClass`, `removeClass`: one class name. |
+| `values` | object | `setStorage`: localStorage keys and string values, then a reload. |
+| `name` | string | `screenshot`: its name in the result. |
+| `full` | boolean | `screenshot`: the full page, not the viewport. |
+| `at` | string | `expect`: `first-paint` judges the page before its scripts run, the moment a flash would show. |
+| `part` | string | `expect`: `placeholder`, `before`, `after` or `marker`, a part of the target. |
+| `visible` | boolean | `expect`: shown or not. |
+| `count` | integer | `expect`: how many match. |
+| `hasClass` | string | `expect`: the target carries this class. |
+| `lacksClass` | string | `expect`: it does not. |
+| `attr` | object | `expect`: attribute values, at most 4. |
+| `css` | object | `expect`: computed style values, at most 4, such as `{"background-color": "rgb(18 18 18)"}`. |
+| `contrast` | object | `expect`: `{"min": <ratio>}`, the text-to-background contrast ratio, 1 to 21. |
+| `min` | number | The ratio `contrast` asks for. |
+
+### A mode
+
+The same shape as `acceptance.modes` in §1, and `scripts/check_schemas.py` holds the two
+equal: `colorScheme` (`light`, `dark` or `no-preference`), `reducedMotion` (`reduce` or
+`no-preference`), `locale` (such as `en-GB`), `timezoneId` (such as `Europe/London`), and
+`localStorage` (keys and string values set before the page loads). Every field is optional.
+
+An example, the shape the dark-mode plan's epic would have carried:
+
+```json
+{"schema": "pipeline-browser-check/1", "checks": [
+  {"id": "home", "scenario": "signed-in", "viewports": ["desktop", "phone"],
+   "modes": ["light", "dark"], "open": "/",
+   "steps": [{"do": "expect", "on": {"css": "body"}, "at": "first-paint",
+              "css": {"background-color": "rgb(var(--c-bg))"}},
+             {"do": "screenshot", "name": "home"}],
+   "look": "Dark: no white or cream surface; cards lift off the board."}
+]}
+```
+
+Which names exist (viewports, modes, scenarios), which criteria a check may point at, and when
+a UI ticket must carry a block are the readiness gate's rules (`scripts/check_ticket_dor.py`),
+not shape.
