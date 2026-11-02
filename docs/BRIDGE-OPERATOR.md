@@ -268,13 +268,14 @@ A later answer is judged like any answer (KIT-358):
 - A `no` never moves the idea.
 - With `ACT=no`, nothing moves. The re-plan waits, and every pass says so. Reply `no` to end it,
   or switch acting on and reply `yes`.
-- If the first move never landed, nothing waits outside Plan it. The question is an ordinary
-  one again, and it expires like one.
+- If the first move never landed and the idea is still in Plan it, nothing waits outside Plan
+  it. The question is an ordinary one again, and it expires like one.
 - If the idea is back in Plan it, moved on, or gone, the next pass closes the re-plan and says
-  so once.
-- If the question was asked where the bridge no longer reads, the next pass closes it, and says
-  so in Slack where the notifier watch speaks. That covers a channel taken off `CHANNEL_IDS`,
-  and a member taken off `DM_USER_IDS`.
+  so where it was asked. Back in Plan it, it first reads the history, as below.
+- If the Plan it state can't be found, every pass names that as the cause until it is fixed.
+- If the question was asked where the bridge no longer reads, the next pass closes it. It says
+  so in Slack where the notifier watch speaks, once in each place. That covers a channel taken
+  off `CHANNEL_IDS`, and a member taken off `DM_USER_IDS`.
 - The comment naming who said yes is written as soon as the bridge knows the idea left Plan
   it, even when the reply to that move was lost.
 
