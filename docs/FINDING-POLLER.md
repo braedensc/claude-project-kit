@@ -56,9 +56,11 @@ source's **project** when it has one, with:
 - a **provenance line** in the body naming the source ticket, and the source's epic when it
   has one, both read from the tracker.
 - **no routing directive of the session's.** A `[repo=…]`, `repo=…`, `[model=…]` or
-  `[agent=…]` in the session's title or body is replaced with `(removed-routing-tag)`. Once
-  a person hands the ticket to the agent, a directive left in would pick its repository,
-  branch, model or runner. The plan executor and the review poller do the same.
+  `[agent=…]` in the session's title or body is replaced with `(removed-routing-tag)`. So is
+  one spelt with an escape, like `[agent\=codex]` or `[agent&#61;codex]`: Linear turns it into
+  a live tag when it stores the text. Once a person hands the ticket to the agent, a
+  directive left in would pick its repository, branch, model or runner. The plan executor
+  and the review poller do the same.
 - **the model tag, when `TICKET_MODEL` is set in stage-e.conf:** a `[model=<it>]` line
   opening the description. The dispatcher's default model also runs the chat bot, so set
   this before moving that default. Empty files no tag. Two limits:

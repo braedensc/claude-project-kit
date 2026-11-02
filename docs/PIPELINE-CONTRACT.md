@@ -983,7 +983,9 @@ both — so it cannot write to the board or to its own supervision; its only out
 proposed tree, in its final message, which a credential-holding executor validates and
 materialises. The executor neutralizes every dispatcher routing directive (`[repo=…]`,
 `repo=`, `[model=…]`, `[agent=…]`) in every title and body the session wrote before the
-readiness gate reads them, because a filed child is text a person may later delegate. The
+readiness gate reads them, because a filed child is text a person may later delegate. A
+directive spelt with a backslash escape or a character reference counts too: Linear decodes
+those when it stores the text (`scripts/pipeline_routing_tags.py`). The
 tree is the *same* `ticket-create` type, carrying `epic` and `children` instead of a flat
 `title`/`body`:
 

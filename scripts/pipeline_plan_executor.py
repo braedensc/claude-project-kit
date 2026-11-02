@@ -147,6 +147,8 @@ import check_schemas  # noqa: E402  document_problems: the one definition of "co
 import pipeline_review_local as _publisher  # noqa: E402
 # The one definition of a planning ticket, shared with the planner job and the Stage E jobs.
 import pipeline_machine_tickets as _machine  # noqa: E402
+# The one definition of a routing directive, shared with the planner job and both pollers.
+import pipeline_routing_tags as _routing  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -230,17 +232,12 @@ def split_ticket_id(ticket_id):
 
 
 # THE DISPATCHER READS ROUTING DIRECTIVES OUT OF A TICKET DESCRIPTION: a bracketed
-# `[repo=…]` (optionally `#branch`, and Linear's escaped `\[…\]`), an unbracketed
-# `repo=`/`repos=`, and the `[model=…]` / `[agent=…]` runner selectors. Everything a
-# planning session wrote becomes a title or description a person may later delegate,
-# and a tag left in it would pick that child's repository, branch or runner — one that
-# loads none of the kit's guards (KIT-41). These patterns are COPIED from the review
-# poller, which verified them against the dispatcher's source; --selftest asserts the
-# two files still agree, so neither can drift.
-_BRACKET_TAG_RE = re.compile(r"\\?\[\s*(?:repos?|model|agent)\s*=[^\]\n]*\\?\]", re.IGNORECASE)
-_UNBRACKETED_REPO_RE = re.compile(r"(^|[^A-Za-z0-9_])repos?=[A-Za-z0-9_\-/.#,]+",
-                                  re.IGNORECASE | re.MULTILINE)
-ROUTING_TAG_MARK = "(removed-routing-tag)"
+# `[repo=…]` (optionally `#branch`), an unbracketed `repo=`/`repos=`, and the `[model=…]` /
+# `[agent=…]` runner selectors. Everything a planning session wrote becomes a title or
+# description a person may later delegate, and a tag left in it would pick that child's
+# repository, branch or runner — one that loads none of the kit's guards (KIT-41). What a
+# directive is, judged as Linear will store the text (KIT-381), is pipeline_routing_tags.py.
+ROUTING_TAG_MARK = _routing.ROUTING_TAG_MARK
 # KIT-379: the one `[model=…]` tag this executor writes itself, on the first line of each
 # child it files, so the child runs on the model the deployment chose (TICKET_MODEL) and not
 # on the dispatcher's default model, which the tech lead also runs on. The dispatcher takes
@@ -270,11 +267,9 @@ def dispatcher_model(description, default):
 
 
 def neutralize_routing(text):
-    """Replace every dispatcher routing directive with a mark that contains none."""
-    if not text:
-        return text
-    out = _BRACKET_TAG_RE.sub(ROUTING_TAG_MARK, str(text))
-    return _UNBRACKETED_REPO_RE.sub(lambda m: m.group(1) + ROUTING_TAG_MARK, out)
+    """Replace every dispatcher routing directive, as written or as Linear will decode it,
+    with a mark that contains none (pipeline_routing_tags.neutralize_routing)."""
+    return _routing.neutralize_routing(text)
 
 
 def scrub_plan(plan, comments):
@@ -2363,12 +2358,26 @@ def selftest():
             check("tag-neutralized:%s" % tag, tag in filed, False)
         check("tag-mark-present", ROUTING_TAG_MARK in filed, True)
         check("routing-mark-has-no-directive", neutralize_routing(ROUTING_TAG_MARK), ROUTING_TAG_MARK)
-        # …and the patterns are the review poller's, not a drifting copy.
-        import pipeline_review_poller as _poller
-        check("routing-patterns-match-poller",
-              (_BRACKET_TAG_RE.pattern, _UNBRACKETED_REPO_RE.pattern, ROUTING_TAG_MARK),
-              (_poller._BRACKET_TAG_RE.pattern, _poller._UNBRACKETED_REPO_RE.pattern,
-               _poller.ROUTING_TAG_MARK))
+        # KIT-381: a directive spelt so that only Linear's store makes it one — a backslash
+        # escape, a character reference — is replaced too. Judged by the dispatcher's own
+        # patterns on the filed text as written and after one to three decodes.
+        fakeE = FakeLinear()
+        escaped = _tree()
+        escaped["requests"][0]["epic"]["body"] = "Plan it. [agent\\=codex] and repo&#61;other/x"
+        escaped["requests"][0]["children"][0]["body"] = (
+            _GOOD_CHILD_BODY + "\n&#91;repo=other-repo#evil-branch] `[model&equals;x]`\n")
+        escaped["requests"][0]["children"][1]["title"] = "Do it \\[agent\\=codex\\]"
+        check("escaped-tree-files", run(escaped, client=fakeE), EXIT_OK)
+        filed = "\n".join(i["title"] + "\n" + i["description"] for i in fakeE.issues)
+        check("escaped-tags-neutralized-as-stored",
+              [r for rounds in range(4)
+               for r in _routing.dispatcher_reads(_routing.decoded(filed, rounds))], [])
+        check("escaped-tags-marked-where-they-stood",
+              ["Plan it. %s and %s" % (ROUTING_TAG_MARK, ROUTING_TAG_MARK) in filed,
+               "\n%s `%s`\n" % (ROUTING_TAG_MARK, ROUTING_TAG_MARK) in filed,
+               "Do it %s\n" % ROUTING_TAG_MARK in filed], [True, True, True])
+        cases_r, failures_r = _routing.selftest_cases()
+        check("routing-helper-selftest", (failures_r, cases_r > 100), ([], True))
 
         # 37. A CONFIG GAP IS THE EXECUTOR'S FAILURE, before the gate and before a
         #     dry run can call it valid.

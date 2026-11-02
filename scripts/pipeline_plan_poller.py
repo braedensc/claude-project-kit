@@ -166,6 +166,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import pipeline_plan_executor as executor  # noqa: E402  the one definition of a proposal
 import pipeline_machine_tickets as machine  # noqa: E402  the one definition of a planning ticket
+import pipeline_routing_tags as routing  # noqa: E402  the one definition of a routing directive
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -778,13 +779,9 @@ def sanitize_text(text):
 
 
 def routing_directives_in(text):
-    """Every directive the dispatcher could parse out of `text`, deduped where the two
-    shapes overlap (the review poller's rule, on the executor's parity-pinned patterns)."""
-    spans = [m.span() for m in executor._BRACKET_TAG_RE.finditer(text)]
-    for m in executor._UNBRACKETED_REPO_RE.finditer(text):
-        if not any(a <= m.start() and m.end() <= b for a, b in spans):
-            spans.append(m.span())
-    return [text[a:b] for a, b in sorted(spans)]
+    """Every directive the dispatcher could parse out of `text` once Linear has stored it,
+    as the text it comes from, counted once where the two shapes overlap (KIT-381)."""
+    return [text[a:b] for a, b in routing.directive_spans(text)]
 
 
 def is_run_ticket(issue):
@@ -2322,6 +2319,7 @@ def selftest():
     check("moves-target-own-ticket-only",
           re.findall(r'linear\(M_CLOSE_RUN, \{"id": ([^,]+),', body_src), ['rec["run_ticket_id"]'])
     check("helper-selftest", machine.selftest(), 0)
+    check("routing-helper-selftest", routing.selftest_cases()[1], [])
 
     tmp = tempfile.mkdtemp(prefix="plan-poller-selftest-")
     try:
@@ -2474,6 +2472,16 @@ def selftest():
             except PollerError:
                 filed = False
             check("model-one-directive:" + label, filed, ok)
+        # KIT-381: the check judges the body as Linear will store it, so a directive spelt
+        # with an escape or a character reference is refused like a literal one, each alone.
+        for form in routing.MEASURED_SPELLINGS:
+            try:
+                assert_one_directive(run_m["description"] + "\n" + form,
+                                     "stage-a-planning-product", "opus")
+                filed = True
+            except PollerError:
+                filed = False
+            check("escaped-directive-refused:%r" % form, filed, False)
         check("model-config-valid",
               validate_config(dict(EXAMPLE_CONFIG, ticket_model="claude-sonnet-5-5")), [])
         for bad in ("gpt-5", "Opus", "opus[1m]", "sonnet ", 7, ""):
@@ -2907,6 +2915,12 @@ def selftest():
             check("review-sanitizer-settles:%r" % bad[:24],
                   (routing_directives_in(sanitize_text(bad)),
                    "untrusted" in sanitize_text(bad).lower()), ([], False))
+        # KIT-381: an idea's directive spelt so that only Linear's store makes it live is
+        # cleaned too, judged by the dispatcher's own patterns after one to three decodes.
+        for form in routing.MEASURED_SPELLINGS:
+            check("escaped-idea-directive-cleaned:%r" % form,
+                  [r for rounds in range(4) for r in routing.dispatcher_reads(
+                      routing.decoded(sanitize_text("idea %s here" % form), rounds))], [])
         f = FakeLinear(FakeClock())
         f.add_idea(145, description="Please [repo=product] here")
         f.add_idea(146)
