@@ -255,9 +255,12 @@ Not that: *… planning changed since I asked …*. A run or a move came after t
 Ask again, so you see where it stands now.
 
 Every check runs again before the move. If a pass stops halfway, the next pass finishes the
-same yes from where it stopped. Afterwards the bridge reads the idea's history the way the
-planner does. If the move back in doesn't show there, the move back failed, or the bridge
-can't tell whether it landed, the thread says what to do, and that pass exits 1.
+same yes from where it stopped. An edited question, or a later post, never stops it then.
+If that yes is gone, every pass exits 1 and says so, and the idea may wait in the backlog
+state. Reply `yes <ticket id>` where it was asked, and the next pass finishes it, for whoever
+said yes first. Afterwards the bridge reads the idea's history the way the planner does. If
+the move back in doesn't show there, the move back failed, or the bridge can't tell whether
+it landed, the thread says what to do, and that pass exits 1.
 
 ---
 

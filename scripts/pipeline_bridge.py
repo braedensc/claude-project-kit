@@ -2591,6 +2591,7 @@ class Pass(object):
         self.expire()
         self.prune()
         self.save()
+        self.stranded_replans()
         loud = []
         if self.release_errors:
             loud.append("could not follow %d approved epic(s): %s"
@@ -3611,6 +3612,12 @@ class Pass(object):
             # can't be confirmed. Never "acts on nothing" for a ticket that may exist.
             self.act_followup(channel, thread, q, msg)
             return
+        if q.get("kind") == "replan" and q.get("replanning"):
+            # A re-plan under way, its pass cut (KIT-244 review): the idea may wait outside
+            # Plan it, so no check below may close or refuse it first. The yes that began it
+            # was judged then, and act_replan finishes it from where it stopped.
+            self.act_replan(channel, thread, q, msg)
+            return
         # From here on a question's status changes only AFTER the reply saying so is
         # posted: a failed post leaves it open, and the next pass says it.
         closed = self.question_closed(channel, q)
@@ -3840,7 +3847,8 @@ class Pass(object):
             # Posted first: the status changes only after the reply saying so lands.
             self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
                       facts={"ticket": q["ticket"]})
-            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            by, said_at = replan_yes(q, msg)
+            q.update(status=status, answered_by=by, answered_ts=said_at)
             self.mark(channel, msg, what)
         under_way = q.get("replanning")
         # A re-plan already under way is the same action, counted when it began.
@@ -3894,7 +3902,8 @@ class Pass(object):
             return
         # Recorded, and saved, before anything moves: from here on a retried yes resumes.
         q["replanning"] = {"park": park, "park_name": park_name, "before": newest,
-                           "parked": False, "commented": False, "at": self.now}
+                           "parked": False, "commented": False, "at": self.now,
+                           "by": msg["user"], "said_at": msg.get("ts")}
         self.save()
         self.replan_moves(issue, plan_it, q, msg, finish)
 
@@ -3915,10 +3924,11 @@ class Pass(object):
         rec = q["replanning"]
         if rec.get("commented"):
             return ""
+        by, said_at = replan_yes(q, msg)
         body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
                 "who said yes in Slack at %s. It moves the idea out of %s to %s and straight "
                 "back in, so the planner starts a new planning run."
-                % (self.name_of(msg["user"]), msg["user"], iso(ts_float(msg.get("ts"))),
+                % (self.name_of(by), by, iso(ts_float(said_at)),
                    self.cfg["plan_it_state"], rec.get("park_name") or "the backlog"))
         owed = ""
         try:
@@ -3972,6 +3982,7 @@ class Pass(object):
         """The planner starts a run only on a move its own reading of the history shows: a
         new move into Plan it, by the owner, since the one the question stood on."""
         rec, plan_it_name = q["replanning"], self.cfg["plan_it_state"]
+        by = replan_yes(q, msg)[0]
         unseen = ""
         try:
             after = self.tracker.plan_trigger(issue["id"], plan_it)
@@ -3983,17 +3994,17 @@ class Pass(object):
         if unseen:
             self.replan_errors.append("%s: %s" % (q["ticket"], unseen))
             finish(DONE, "I moved %s out of %s and back in for <@%s>, but %s, so the planner "
-                   "may not start.%s" % (q["ticket"], plan_it_name, msg["user"], unseen, owed),
+                   "may not start.%s" % (q["ticket"], plan_it_name, by, unseen, owed),
                    "done: moved %s, unconfirmed" % q["ticket"], kind="replan-unconfirmed",
                    bind="If no planning run starts within ten minutes, move %s out of %s and "
                    "back in by hand." % (q["ticket"], plan_it_name))
         else:
             finish(DONE, "Moved %s out of %s and back in for <@%s>. The planner starts a new "
-                   "run within a few minutes.%s" % (q["ticket"], plan_it_name, msg["user"], owed),
+                   "run within a few minutes.%s" % (q["ticket"], plan_it_name, by, owed),
                    "done: replanned %s" % q["ticket"], kind="replan-moved")
         self.counts["acted"] = self.counts.get("acted", 0) + 1
         self.say("  acted: moved %s out of %s and back in for %s"
-                 % (q["ticket"], plan_it_name, msg["user"]))
+                 % (q["ticket"], plan_it_name, by))
 
     def resume_replan(self, issue, plan_it, q, msg, finish):
         """Finish a re-plan an earlier pass began and did not end (KIT-244). The yes was
@@ -4819,9 +4830,24 @@ class Pass(object):
     def expire(self):
         ttl = self.cfg["question_ttl_hours"] * 3600
         for q in self.state["questions"].values():
-            if q.get("status") == OPEN and self.now - q.get("asked_at", 0) > ttl:
+            # A re-plan under way is never closed by the clock: its idea may wait outside
+            # Plan it. run() says it each pass until a yes finishes it (KIT-244 review).
+            if q.get("status") == OPEN and not q.get("replanning") and (
+                    self.now - q.get("asked_at", 0) > ttl):
                 q["status"] = EXPIRED
                 self.counts["expired"] += 1
+
+    def stranded_replans(self):
+        """Re-plans begun for a yes and not finished by the end of this pass: their yes
+        was cut short, deleted, or is past the window read (KIT-244 review). The idea may
+        wait outside Plan it, so each keeps the pass loud until a yes finishes it."""
+        for q in self.state["questions"].values():
+            if q.get("kind") == "replan" and q.get("replanning") and q.get("status") == OPEN:
+                self.replan_errors.append(
+                    "%s: a re-plan began for a yes and has not finished, and the idea may be "
+                    "waiting in %s. Reply `yes %s` where it was asked to finish it"
+                    % (q["ticket"], q["replanning"].get("park_name") or "the backlog",
+                       q["ticket"]))
 
     def prune(self):
         horizon = self.now - (self.cfg["lookback_days"] + 1) * 86400
@@ -4853,6 +4879,13 @@ class Pass(object):
             self.state[name] = dict((k, v) for k, v in self.state[name].items() if fresh(k))
         self.state["forwarded_at"] = [t for t in self.state["forwarded_at"]
                                       if isinstance(t, (int, float)) and t > self.now - 3600]
+
+
+def replan_yes(q, msg):
+    """(who said yes, when): the yes that began a re-plan, as recorded when it began, so a
+    later pass that finishes it names that person, whichever message brings it back."""
+    rec = q.get("replanning") or {}
+    return rec.get("by") or msg["user"], rec.get("said_at") or msg.get("ts")
 
 
 def run_once(cfg, slack, tracker, dry_run, now=None, out=sys.stdout, writer=None,
@@ -11158,6 +11191,70 @@ def selftest():
                "I moved PROD-6 to Backlog, and I can't tell whether the move back into Plan it "
                "landed. Look at PROD-6 in the tracker. If it isn't in Plan it, type "
                "`plan PROD-6`.", True))
+
+        # Stage E review: a re-plan under way is finished by the next pass even when a check
+        # that closes or refuses an answer would now fire on its yes (the question edited,
+        # the person who said yes now a guest), since that yes was judged when it began. A
+        # yes the next pass cannot read keeps every pass loud, the clock never closes it,
+        # and a later yes finishes it, naming who said yes first.
+        def rp_cut_then(name, between, cut=(2, False, Deadline(), None)):
+            c, s, t, root = rp_ask(name)
+            t.move_fail = cut
+            s.add(BOB, "yes", thread=root)
+            try:
+                run(c, s, t)
+            except Deadline:
+                pass
+            t.move_fail = None
+            between(s)
+            return c, s, t, root
+
+        def edit_the_replan_question(s):
+            for m in s.messages:
+                if "Plan this again?" in m.get("text", ""):
+                    m["edited"] = {"user": ME, "ts": "1"}
+
+        def bob_now_a_guest(s):
+            s.profiles[BOB] = dict(s.profiles[BOB], is_restricted=True)
+
+        def delete_bobs_yes(s):
+            s.messages = [m for m in s.messages
+                          if not (m.get("user") == BOB and m.get("text") == "yes")]
+
+        for name, between in (("question-edited", edit_the_replan_question),
+                              ("yes-giver-now-a-guest", bob_now_a_guest)):
+            def case_rp_then(name=name, between=between):
+                c, s, t, _root = rp_cut_then("rp-then-" + name, between)
+                code, _out = run(c, s, t, at=now + 60)
+                return code, t.moves, posted(s)[-1], status_of(c)
+            check("replan-cut-then-%s: the next pass still finishes it" % name,
+                  outcome(case_rp_then), (EXIT_OK, both, moved_ok, [DONE]))
+
+        def case_rp_yes_gone():
+            c, s, t, root = rp_cut_then("rp-yes-gone", delete_bobs_yes)
+            first = run(c, s, t, at=now + 60)
+            late = run(c, s, t, at=now + 25 * 3600)        # past the question's 24 hours
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 25 * 3600 + 30)
+            code, _out = run(c, s, t, at=now + 25 * 3600 + 60)
+            q = list(json.load(open(state_path(c)))["questions"].values())[0]
+            return (first[0], "has not finished" in first[1], "Reply `yes PROD-6`" in first[1],
+                    late[0], "has not finished" in late[1], code, t.moves, posted(s)[-1],
+                    q["status"], q["answered_by"])
+        check("replan-its-yes-gone: every pass is loud, the clock never closes it, and a later "
+              "yes finishes it, for whoever said yes first", outcome(case_rp_yes_gone),
+              (EXIT_ERROR, True, True, EXIT_ERROR, True, EXIT_OK, both, moved_ok, DONE, BOB))
+
+        def case_rp_named_on_resume():
+            # Cut before the comment naming who said yes: the pass that finishes it, brought
+            # back by ALICE's yes, still names BOB.
+            c, s, t, root = rp_cut_then("rp-named", delete_bobs_yes,
+                                        cut=(1, True, BridgeError("simulated"), None))
+            s.add(ALICE, "yes PROD-6", thread=root, at=now + 30)
+            code, _out = run(c, s, t, at=now + 60)
+            said = t.comments[-1][1] if t.comments else ""
+            return code, len(t.comments), BOB in said, ALICE in said, posted(s)[-1]
+        check("replan-resumed-by-another-yes-names-who-said-yes-first",
+              outcome(case_rp_named_on_resume), (EXIT_OK, 1, True, False, moved_ok))
 
         def case_rp_partial_is_explained():
             # The comment naming who said yes lands as soon as the idea leaves Plan it, so a
