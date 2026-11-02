@@ -13087,10 +13087,12 @@ def _selftest_body():
                and MONITOR_HEARTBEAT.startswith("state/"), "heartbeat path drifted")
         # KIT-300 review: the step reads the monitor's awake marks from this file, so a
         # rename on either side would quietly bring back the after-sleep false alarm.
+        # KIT-361: the whole path, not its file name and a folder prefix, which a file in a
+        # folder under state/ would pass.
         expect("monitor-names-agree",
                os.path.dirname(hbm.state_path(_mcfg)) == _mcfg["monitor_state_dir"]
-               and os.path.basename(hbm.state_path(_mcfg)) == os.path.basename(MONITOR_STATE)
-               and MONITOR_STATE.startswith("state/"), "monitor state path drifted")
+               and os.path.relpath(hbm.state_path(_mcfg), os.path.dirname(_mcfg["state_dir"]))
+               == MONITOR_STATE, "monitor state path drifted")
     except hbm.MonitorError as exc:
         failures.append("monitor-config-accepted: the monitor refused this file's config: %s" % exc)
     expect("monitor-names-agree",
@@ -13397,6 +13399,36 @@ def _selftest_body():
         got = _awake_monitor(5565, 1500, marks=False)
         expect("monitor-with-no-marks-is-judged-by-the-clock",
                isinstance(got, str) and "NOT RUNNING" in got and "awake" not in got, got)
+
+        # KIT-361: the marks as the real monitor writes them. Each pass marks itself as it
+        # starts, a fraction after the whole second its beat is stamped with, and the pass
+        # before the last one came before a sleep.
+        def _real_marks(beat_age, slept_before):
+            ctx_r, fake_r = _monitor_ctx(beat_age=beat_age)
+            clock_now, now_wall = 100000.0, time.time()
+            beat_doc = json.loads(next(a[2] for a in fake_r.answers if a[0] == MONITOR_HEARTBEAT))
+            at = _heartbeat_epoch(beat_doc)
+            last = [at + 0.35, clock_now - (now_wall - at) + 0.35]
+            prev = [at - 1800 - slept_before, last[1] - 1800]
+            fake_r.answers = [(MONITOR_STATE, 0, json.dumps({"awake_marks": [prev, last]}))] + \
+                list(fake_r.answers)
+            saved = (hbm._awake_clock, hbm._boot_wall)
+            hbm._awake_clock, hbm._boot_wall = (lambda: clock_now), (lambda: now_wall - 10 ** 7)
+            try:
+                return step_heartbeat_monitor(ctx_r, apply_it=False)
+            except (Unknown, SetupError) as exc:
+                return "raised: %s" % exc
+            finally:
+                hbm._awake_clock, hbm._boot_wall = saved
+        got = _real_marks(7200, 8 * 3600)
+        expect("monitor-stopped-after-a-post-sleep-pass-is-not-running",
+               isinstance(got, str) and "NOT RUNNING" in got, got)
+        got = _real_marks(4500, 1800)
+        expect("monitor-nap-before-its-last-pass-is-not-taken-off-its-age",
+               isinstance(got, str) and "NOT RUNNING" in got, got)
+        got = _real_marks(1200, 1200)
+        expect("monitor-healthy-after-a-sleep-says-no-made-up-sleep",
+               isinstance(got, tuple) and got[0] is True and "slept" not in got[1], got)
 
         # …and one that runs but cannot page is a failure, not a pass.
         ctxE, _fE = _monitor_ctx(result="error")
