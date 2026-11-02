@@ -314,6 +314,12 @@ UNRECORDED_PING_SAYS = ("I can't pass that on to a session: this ping was not re
                         "notifier failed to record (it pages that one again).")
 UNRECORDED_PING_BIND = "Answer under the newer ping, or in the tracker."
 UNRECORDED_PING = UNRECORDED_PING_SAYS + " " + UNRECORDED_PING_BIND
+# KIT-332: a reply under a dev's question in a DM while the notifier records no pings, so
+# no answer can reach any session. Its fix is a setting, said by name.
+PINGS_OFF_SAYS = ("I can't pass that on to the dev: answering a dev from this DM isn't "
+                  "switched on here. The notifier needs BRIDGE_PINGS=yes in its settings "
+                  "before I can tell which session is waiting.")
+PINGS_OFF_BIND = "Until then, answer in the tracker."
 # KIT-297: said after everything else, at most once a day, when the writer is on and a
 # message went out in its plain words.
 WRITER_NOTE = "(I couldn't reach my writer, so this one's the plain version.)"
@@ -409,8 +415,9 @@ CONFIG_KEYS = {
                             "is then refused aloud, never ignored",
     "notifier_plist": "optional: the notifier's LaunchDaemon plist. Set, each pass checks the "
                       "notifier's heartbeat beside pings_file against how often that plist "
-                      "runs it, and says in the first channel when it goes quiet or keeps "
-                      "failing (KIT-285). Absent, no notifier is watched",
+                      "runs it, and says when it goes quiet or keeps failing (KIT-285): in each "
+                      "listed member's DM with dm_user_ids set (KIT-332), else in the first "
+                      "channel. Absent, no notifier is watched",
     "run_interval_seconds": "optional: how often launchd runs this job, its plist's "
                             "StartInterval (default 60). The notifier watch reads a gap in "
                             "its own passes of over twice this plus run_timeout_seconds as "
@@ -2492,9 +2499,9 @@ class Pass(object):
 
     # -- the notifier (KIT-285) ----------------------------------------------------
     def watch_notifier(self):
-        """Judge the notifier's heartbeat (judge_notifier). A problem is said once in the
-        first channel, and so is each other kind the first time it comes, and its end once
-        more. Its record is a file of its own, written through, so a pass that stops later
+        """Judge the notifier's heartbeat (judge_notifier). A problem is said once where
+        the owner looks (watch_destinations: the DMs, else the first channel), and so is
+        each other kind the first time it comes, and its end once more. Its record is a file of its own, written through, so a pass that stops later
         keeps the watch's clock, and a first pass that stops is still a first pass."""
         if not self.cfg["notifier_plist"]:
             self.notifier = "OFF (notifier_plist is unset, so no notifier is watched here)"
@@ -2602,12 +2609,26 @@ class Pass(object):
         rec["said_kinds"] = before[2] + [said] if said else []
         self.record_watch(rec)
         try:
-            self.post(self.cfg["channel_ids"][0], None, text, kind=kind, bind=bind,
-                      join=" ", facts={"notifier": said or fact or "back"})
+            for channel in self.watch_destinations():
+                self.post(channel, None, text, kind=kind, bind=bind, join=" ",
+                          facts={"notifier": said or fact or "back"})
         except (BridgeError, Deadline):
             rec["said"], rec["said_beat"], rec["said_kinds"] = before
             self.record_watch(rec)
             raise
+
+    def watch_destinations(self):
+        """Where the notifier watch speaks (KIT-332): in each listed member's DM the bridge
+        already reads, since in DM mode that is where the owner looks, and in the first
+        channel when no member is listed or no listed DM is read yet. The watch never opens
+        a DM itself: a DM read for the first time is a baseline (open_dms), and one the
+        watch put in the state would skip it."""
+        dms = []
+        for uid in self.cfg["dm_user_ids"]:
+            channel = self.state["dms"].get(uid)
+            if isinstance(channel, str) and DM_RE.match(channel) and channel not in dms:
+                dms.append(channel)
+        return dms or [self.cfg["channel_ids"][0]]
 
     def record_watch(self, rec):
         """Write-through, as save() is; the bridge's own dry run records nothing."""
@@ -3815,6 +3836,21 @@ class Pass(object):
             self.mark(channel, msg, "refused answer: ping not recorded")
             self.counts["refused"] += 1
             self.say("  refused an answer under an unrecorded post, thread %s" % thread)
+            return True
+        if (self.dm_posts.get(key_of(channel, thread)) or {}).get("mark") == notify.ESC_BLOCKED:
+            # A dev's question the pings file does not hold (KIT-332). Telling the owner to
+            # reply under that same kind of message would send them round in a circle.
+            if not os.path.exists(self.cfg["pings_file"]):
+                self.post(channel, None, PINGS_OFF_SAYS, kind="pings-off",
+                          bind=PINGS_OFF_BIND, join=" ")
+                self.mark(channel, msg, "refused answer: answering is off (no pings file)")
+            else:
+                self.post(channel, None, UNRECORDED_PING_SAYS, kind="ping-unrecorded",
+                          bind=UNRECORDED_PING_BIND, join=" ")
+                self.mark(channel, msg, "refused answer: ping not recorded")
+            self.counts["refused"] += 1
+            self.say("  refused an answer under a dev's question it can't relay, thread %s"
+                     % thread)
             return True
         self.post(channel, None, "I can't pass that on to a session: that message is not "
                   "waiting on an answer.", kind="page-not-waiting", bind="To answer a dev, "
@@ -7254,7 +7290,7 @@ def selftest():
               EXIT_USAGE)
 
         # 13b. THE NOTIFIER WATCH (KIT-285). Its heartbeat is judged on every pass: a problem
-        #      is said once in the first channel, its end once more, and with no notifier
+        #      is said once where the owner looks, its end once more, and with no notifier
         #      named the watch is OFF. The bridge runs every minute, as launchd runs it at
         #      its default 60 s, so a longer gap is a sleep. Each case runs alone, so one
         #      that raises fails as itself. Times are pinned on a UTC clock.
@@ -7467,6 +7503,43 @@ def selftest():
             check("watch: a heartbeat a minute ahead of this clock is read, not refused",
                   outcome(lambda: unreadable_once("skew", body=stamped(at=iso(now + 60)))),
                   (EXIT_OK, EXIT_OK, [], False))
+
+            # KIT-332: with members listed for DMs, the watch speaks in each listed DM the
+            # bridge already reads, where the owner looks, not in the first channel. Until a
+            # listed DM is read (its first pass is a baseline), the first channel hears it,
+            # and the watch never opens a DM itself.
+            def dm_said(s):
+                return sorted((ch, x) for ch, th, x in s.posts if th is None and ch[:1] == "D")
+
+            def case_dm_quiet():
+                c, s, t, hb = nworld("watch-dm", dm_user_ids=[ALICE, BOB])
+                beat(hb, now)
+                minutes(c, s, t, now, now + quiet)
+                run(c, s, t, at=now + quiet + 1)
+                return mine(s), dm_said(s)
+            check("watch: in DM mode a problem is said in each listed member's DM, not in the "
+                  "channel (KIT-332)", outcome(case_dm_quiet),
+                  ([], [("D0ALICE001", quiet_text), ("D0BOB00001", quiet_text)]))
+
+            def case_dm_first_pass():
+                c, s, t, _hb = nworld("watch-dm-first", no_interval, dm_user_ids=[ALICE])
+                code, _out = run(c, s, t)
+                return code, mine(s), dm_said(s), s.reads.count("conversations.open")
+            check("watch: before any listed DM is read, the first channel hears it, and the "
+                  "watch opens no DM of its own", outcome(case_dm_first_pass),
+                  (EXIT_OK, [unreadable_text], [], 1))
+
+            def case_dm_back():
+                c, s, t, hb = nworld("watch-dm-back", dm_user_ids=[ALICE])
+                beat(hb, now)
+                minutes(c, s, t, now, now + quiet)
+                run(c, s, t, at=now + quiet + 1)
+                beat(hb, now + quiet + 30)
+                run(c, s, t, at=now + quiet + 61)
+                return [x[:24] for _ch, x in dm_said(s)], mine(s)
+            check("watch: in DM mode the notifier coming back is said in the DM too",
+                  outcome(case_dm_back),
+                  (["I haven't heard from the", "The notifier is back: it"], []))
 
             def case_unreadable_back():
                 c, s, t, hb = nworld("watch-unreadable-back")
@@ -8230,6 +8303,29 @@ def selftest():
                                             for th, x in in_dm(s)]
         check("dm-a-reply-under-a-page-not-waiting-on-one-is-refused-and-said",
               outcome(case_unwaited), (EXIT_OK, [], [(None, True)]))
+
+        # KIT-332: a reply under a dev's question the pings file does not hold is never told
+        # to reply under that same kind of message. With no pings file at all (BRIDGE_PINGS
+        # off), it names the setting; with one that misses this page, it says the page was
+        # not recorded, as in a channel.
+        def case_blocked_unrelayable(name, with_pings):
+            c, s, t = dmworld(name, act=True, agent_user_name="Agent", team_keys=["PROD", "TOD"])
+            page = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
+            ledger(c, page, mark="agent:blocked")
+            if with_pings:
+                other = s.add(ME, ping_text(), channel=DM, bot_id=BOT)
+                pinged(c, other)
+            s.add(ALICE, "use the second helper", thread=page, channel=DM)
+            code, _o = run(c, s, t)
+            said = [x for th, x in in_dm(s) if th is None][-1:]
+            return (code, t.thread_replies, said,
+                    any("reply under the message saying it stopped" in x for x in said))
+        check("dm-a-dev-question-with-answering-off-names-the-setting",
+              outcome(lambda: case_blocked_unrelayable("dm-pings-off", False)),
+              (EXIT_OK, [], [PINGS_OFF_SAYS + " " + PINGS_OFF_BIND], False))
+        check("dm-a-dev-question-the-pings-file-misses-says-it-was-not-recorded",
+              outcome(lambda: case_blocked_unrelayable("dm-pings-missed", True)),
+              (EXIT_OK, [], [unrecorded_ping], False))
 
         # A page the notifier posted as this app but failed to record is in neither file:
         # a reply under it reaches no session, and is refused aloud as in a channel.
