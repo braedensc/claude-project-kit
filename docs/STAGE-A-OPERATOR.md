@@ -69,7 +69,8 @@ Never both on one ticket.
 8. The executor files the tree into the same team's backlog, or refuses it and says why.
    It files the epic as `provenance:agent`, every child as `provenance:epic`, and makes the
    epic every child's parent.
-9. The job tells the idea where the result is, and closes the planning ticket.
+9. The job tells the idea what the result was and where it is, and closes the planning
+   ticket (section 6 lists the results and how a session can end).
 10. **You approve, then you release.** Move the epic to the state the project maps to
     `ready`. That approves the tree. It releases the children only where the approve step
     is installed and switched on (`docs/AUTONOMY.md`). That step is off by default, and then
@@ -348,6 +349,37 @@ Everything the job owns sits under the role account's home:
 Exit codes: `0` the pass ran, `1` something will be retried, was given up on, or planning is
 blocked, and it says so, `2` config or credential, nothing was touched, `4` the pass hit its
 wall clock.
+
+### What a planning run came to (KIT-373)
+
+The executor writes what it did to a file the job names (`--verdict-file`), on every exit.
+The job records it on the run in `seen.json` as `result`, and its note on the idea says which:
+
+| `result` | The note on the idea |
+|---|---|
+| `filed` | a plan was filed, awaiting your approval |
+| `questions` | the session asked you questions, and how many |
+| `no-plan` | no plan came back, and how the session ended |
+| `refused` | the plan was refused; the reasons are on the planning ticket |
+| `errored` | the run is tried again, up to three times, then given up on |
+| `could-not-tell` | the executor's file was missing, unreadable, or did not fit its exit code. The note names the three possible results instead. It is never read as filed |
+
+The file also gives a `kind`: which rule refused a plan (`readiness-gate`, `cut-off`,
+`schema`, `retarget`, `credential-shape`, `config`), or what failed (`tracker`, `partial`,
+`config`).
+
+**How the session ended** is recorded beside it, as `ending`:
+
+- `response`: it posted a final message.
+- `error`, with a kind read from the error's text: `limit` (a usage or rate limit),
+  `billing`, `max-turns`, `execution-error`, or `unknown`. Text the job cannot name is
+  `unknown`, never a limit.
+- `nothing`: it ended without a message.
+- `stopped`: someone stopped it. Either its final message is the dispatcher's own notice
+  (*Session stopped — PROD-101 was marked as Done or Canceled.*), or its planning ticket
+  was found completed or canceled while the job still had it open. A stopped run is
+  never given to the executor, and its ticket is never moved: the idea is told, once, to
+  move the idea out of Plan it and back in to plan it again.
 
 ## 7. What is not proven
 

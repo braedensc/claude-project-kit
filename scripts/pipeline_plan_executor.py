@@ -95,7 +95,7 @@ Usage:
                               --config <planned repo>/delivery.json
                               --repo-root <planned repo checkout>
                               [--idea TEAM-122] [--key-env NAME] [--model-tag MODEL]
-                              [--dry-run]
+                              [--verdict-file PATH] [--defer-mark] [--dry-run]
     pipeline_plan_executor.py --selftest
 
   WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
@@ -124,6 +124,16 @@ Usage:
                  description: the dispatcher's default model also runs the tech
                  lead, so a deployment that moves that default keeps its coding
                  sessions on the model it chose. Absent, nothing changes.
+    --verdict-file  where to write what the run came to (KIT-373): one JSON object,
+                 written on EVERY exit, bad arguments and crashes included, by an
+                 atomic rename. `class` is filed, questions, no-plan, refused or
+                 errored; `kind` says which way (readiness-gate, cut-off, schema,
+                 retarget, credential-shape, partial, tracker, config, …); `filed`,
+                 `questions`, and at most 20 cleaned `reasons` of 300 characters.
+                 It adds no tracker write, and the exit codes do not change.
+    --defer-mark  post a no-plan or a refused report WITHOUT its page mark, so the
+                 job that started this run can page after it decides what to do. A
+                 filed plan and a question keep their marks.
   The planner job (scripts/pipeline_plan_poller.py) supplies all of these (KIT-150).
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
@@ -1195,7 +1205,9 @@ def _forced_ids(cfg, finding_cfg):
 
 
 def materialise(args, client=None):
-    """Validate → DoR-gate → create, or reject. Returns an exit code."""
+    """Validate → DoR-gate → create, or reject. Returns an exit code, and records what
+    the run came to in RUN["verdict"] (KIT-373)."""
+    RUN.pop("verdict", None)
     # ── Config (§2: absent delivery.json is OFF, not broken) ────────────────
     config_path = args.config or "delivery.json"
     if not os.path.exists(config_path):
@@ -1207,19 +1219,24 @@ def materialise(args, client=None):
                   "ran and its output cannot be filed. The reader handed this executor "
                   "the wrong path, or the planned repository lost its config. Nothing "
                   "was created." % (config_path, args.pinned), file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config",
+                        ["the planned repository has no delivery.json"])
         print("::notice:: no %s — the pipeline is not configured, so there is no "
               "tree to materialise (§2)." % config_path)
-        return EXIT_OK
+        return _end(EXIT_OK, "no-plan", "off", ["the pipeline is not configured here"])
     try:
         cfg = json.load(open(config_path, encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print("::error:: %s is unreadable: %s" % (config_path, exc), file=sys.stderr)
-        return EXIT_ERRORED
-    if cfg.get("version") != SUPPORTED_VERSION:
+        return _end(EXIT_ERRORED, "errored", "config",
+                    ["the planned repository's delivery.json could not be read"])
+    if not isinstance(cfg, dict) or cfg.get("version") != SUPPORTED_VERSION:
         print("::error:: %s version %r unrecognized — refusing to guess."
-              % (config_path, cfg.get("version")), file=sys.stderr)
-        return EXIT_ERRORED
+              % (config_path, cfg.get("version") if isinstance(cfg, dict) else None),
+              file=sys.stderr)
+        return _end(EXIT_ERRORED, "errored", "config",
+                    ["the planned repository's delivery.json is not version %d"
+                     % SUPPORTED_VERSION])
 
     team_key = cfg["linear"]["teamKey"]
     finding_cfg = cfg["linear"].get("findingTicket")
@@ -1231,14 +1248,14 @@ def materialise(args, client=None):
         doc, verdict, message = load_requests(args.requests)
     if verdict == "errored":
         print("::error:: %s" % message, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "input", [message])
     if verdict == "skipped":
         return _no_output(args, client, cfg, team_key, finding_cfg, message)
     if verdict == "malformed":
         # The session attempted a proposal; nobody can read it. Its own output, so
         # `rejected`, reported on its ticket like every other refusal.
         return _reject(args, client, cfg, team_key, finding_cfg, args.pinned,
-                       "the proposal could not be read", ["- %s" % message])
+                       "the proposal could not be read", ["- %s" % message], "cut-off")
 
     # ── Validate the batch WHOLE, partition into plan + questions ──────────
     plan, comments, errors = find_requests(doc)
@@ -1251,13 +1268,13 @@ def materialise(args, client=None):
               "ticket from whatever started the session, never the tree's own "
               "source_ticket_id — defaulting it would compare the session's claim "
               "with itself. Nothing was created.", file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no pinned ticket"])
     if args.pinned:
         try:
             pinned_team = split_ticket_id(args.pinned)[0]
         except ExecutorError as exc:
             print("::error:: --pinned %s" % exc, file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config", ["--pinned %s" % exc])
         if pinned_team != team_key:
             # A plan is filed on the team its idea is on (KIT-184). A pinned ticket on
             # another team means the planner job's settings and this repository's
@@ -1268,7 +1285,9 @@ def materialise(args, client=None):
                   "is filed on the team its idea is on, so this run refuses rather than file "
                   "the tree somewhere else. Nothing was created."
                   % (args.pinned, pinned_team, config_path, team_key), file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config",
+                        ["%s is on the team %s, but the planned repository names %s"
+                         % (args.pinned, pinned_team, team_key)])
     pinned = args.pinned or (plan.get("source_ticket_id") if plan else None)
     plan, comments = scrub_plan(plan, comments)
     comments, telemetry = split_telemetry(comments)
@@ -1283,24 +1302,34 @@ def materialise(args, client=None):
         print("::error:: credential shapes in the proposal: %s"
               % ", ".join(secret_hits_in(plan, comments)), file=sys.stderr)
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
-                       SECRET_REJECT_REASON, [])
+                       SECRET_REJECT_REASON, [], "credential-shape")
+    # Each refusal's KIND names the rule that refused it, first rule first: the plan kind
+    # switched off is the project's config; a ticket other than the pin is a retarget;
+    # anything else in the shape or the caps is the schema.
+    kind = "schema"
     if not errors and plan:
         errors = validate_plan(plan, pinned, bool(finding_cfg))
+        kind = ("config" if not finding_cfg else "retarget"
+                if plan.get("source_ticket_id") != pinned else "schema")
     if not errors:
         errors = comment_errors(comments, pinned)
+        kind = ("retarget" if any(c.get("ticket_id") != pinned for c in comments)
+                else "schema")
     if not errors and not plan and not comments:
         errors = ["the batch carried neither a plan nor a question%s"
                   % (" (only a telemetry block)" if telemetry else "")]
+        kind = "schema"
     if not errors and (plan or comments) and pinned is None:
         errors = ["no dispatcher-pinned ticket id — cannot verify the target; the "
                   "dispatcher supplies it via --pinned"]
+        kind = "config"
     if errors:
         # All-or-nothing: a refused batch posts only its rejection, never the
         # session's questions (§8). The report goes to the pinned/own ticket.
         return _reject(args, client, cfg, team_key, finding_cfg,
                        pinned or (plan or {}).get("source_ticket_id"),
                        "the batch was refused before any create",
-                       ["- %s" % e for e in errors])
+                       ["- %s" % e for e in errors], kind)
 
     # ── No plan, only question(s): the planner needs the owner's input ─────
     if not plan:
@@ -1314,7 +1343,7 @@ def materialise(args, client=None):
         forced = _forced_ids(cfg, finding_cfg)
     except ExecutorError as exc:
         print("::error:: %s" % exc, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", [str(exc)])
 
     # ── The DoR gate over every child (§5) ─────────────────────────────────
     children = plan["children"]
@@ -1328,19 +1357,20 @@ def materialise(args, client=None):
         ok, reports = run_dor(child_tickets, config_path, args.repo_root)
     except ExecutorError as exc:
         print("::error:: %s" % exc, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "gate", [str(exc)])
     if not ok:
         return _reject(args, client, cfg, team_key, finding_cfg, pinned,
                        "%d child(ren) failed the Definition-of-Ready gate" %
                        sum(1 for r in reports if r.get("errors")),
-                       [DOR_JUDGED_AS_FILED] + dor_failure_lines(reports, children))
+                       [DOR_JUDGED_AS_FILED] + dor_failure_lines(reports, children),
+                       "readiness-gate")
 
     # ── Everything passed. Create. (dry-run stops here.) ───────────────────
     if args.dry_run:
         print("::notice:: [dry-run] tree for %s valid and DoR-clean: 1 epic, %d "
               "children, %d note(s) — nothing created."
               % (pinned, len(children), len(comments)))
-        return EXIT_OK
+        return _end(EXIT_OK, "filed", "dry-run", ["a dry run: nothing was created"])
 
     client = client or _live_client(args)
     if client is None:
@@ -1348,7 +1378,7 @@ def materialise(args, client=None):
               "credential, so the validated tree cannot be filed. Nothing was "
               "created, and this is not a verdict on the tree." % _key_env(args),
               file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
 
     return _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments,
                    idea=getattr(args, "idea", None), model=getattr(args, "model_tag", None))
@@ -1375,26 +1405,30 @@ def _no_output(args, client, cfg, team_key, finding_cfg, message):
     0, so an empty run whose note failed was silent twice over: nothing on the board
     and a clean exit for the reader. A reader retries an errored run."""
     print("::notice:: %s" % message)
+    # The kind tells an absent final message (the planner job gives none for a session
+    # that ended in an error or said nothing) from one that carried no proposal.
+    kind = "no-message" if message.startswith(("no final message", "no request file")) \
+        else "no-proposal"
     target = args.pinned
     # Not gated on the plan kind: an empty run is visible whether or not the
     # project has turned plans on, because a session ran either way.
     if args.dry_run or not target:
-        return EXIT_OK
+        return _end(EXIT_OK, "no-plan", kind, [message])
     client = client or _live_client(args)
     if client is None:
         print("::error:: no credential — the empty run on %s could not be surfaced, so "
               "nothing anywhere says it happened" % target, file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
     try:
         src = client.resolve_idea(target)
-        client.post_comment(src["id"], render_no_output_comment(target))
+        client.post_comment(src["id"], _unmarked(render_no_output_comment(target), args))
         print("::notice:: verdict=skipped (surfaced): the empty run is now visible on %s"
               % target)
     except (ExecutorError, IndexError) as exc:
         print("::error:: could not surface the empty run on %s: %s" % (target, exc),
               file=sys.stderr)
-        return EXIT_ERRORED
-    return EXIT_OK
+        return _end(EXIT_ERRORED, "errored", "tracker", [str(exc)])
+    return _end(EXIT_OK, "no-plan", kind, [message])
 
 
 def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
@@ -1405,13 +1439,14 @@ def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
     print("::notice:: verdict=escalated — the planning session raised %d question(s) "
           "on %s and filed no plan." % (len(comments), pinned))
     if args.dry_run:
-        return EXIT_OK
+        return _end(EXIT_OK, "questions", "dry-run", ["a dry run: nothing was asked"],
+                    questions=len(comments))
     client = client or _live_client(args)
     if client is None:
         print("::error:: no credential — the planner's question(s) on %s could not be "
               "delivered. A question nobody sees is worse than none." % pinned,
               file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
     try:
         src = client.resolve_idea(pinned)
         for c in comments:
@@ -1419,13 +1454,14 @@ def _escalate(args, client, cfg, team_key, finding_cfg, pinned, comments):
     except (ExecutorError, IndexError) as exc:
         print("::error:: could not deliver the planner's question(s) on %s: %s"
               % (pinned, exc), file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "tracker", [str(exc)])
     print("::notice:: delivered %d question(s) on %s — awaiting the owner." %
           (len(comments), pinned))
-    return EXIT_OK
+    return _end(EXIT_OK, "questions", "asked", questions=len(comments))
 
 
-def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_lines):
+def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_lines,
+            kind="schema"):
     """Post the rejection back on the idea ticket (best-effort) and exit rejected.
     A tree that was READ and REFUSED is the session's own output, never this
     executor's failure (§13) — so the exit code is `rejected`, even if the
@@ -1444,8 +1480,8 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
         if client is None:
             print("::error:: no credential — the rejection could not be reported on %s"
                   % target, file=sys.stderr)
-            return EXIT_ERRORED
-        body = render_rejection_comment(target, reason, detail_lines)
+            return _end(EXIT_ERRORED, "errored", "config", ["no tracker credential"])
+        body = _unmarked(render_rejection_comment(target, reason, detail_lines), args)
         try:
             src = client.resolve_idea(target)
             client.post_comment(src["id"], body)
@@ -1453,8 +1489,8 @@ def _reject(args, client, cfg, team_key, finding_cfg, source_id, reason, detail_
         except (ExecutorError, IndexError) as exc:
             print("::error:: could not post the rejection comment on %s: %s"
                   % (target, exc), file=sys.stderr)
-            return EXIT_ERRORED
-    return EXIT_REJECTED
+            return _end(EXIT_ERRORED, "errored", "tracker", [str(exc)])
+    return _end(EXIT_REJECTED, "refused", kind, [reason] + list(detail_lines))
 
 
 def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=None,
@@ -1482,7 +1518,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
             except (ExecutorError, IndexError, KeyError, TypeError) as exc:
                 print("::error:: could not list what was created on %s: %s — the partial "
                       "tree is visible only in this log" % (pinned, exc), file=sys.stderr)
-        return EXIT_ERRORED
+        return _end(EXIT_ERRORED, "errored", "partial" if created else "tracker",
+                    [msg] + ["created: %s" % c for c in created], filed=bool(created))
 
     src_id = [None]
     digest = plan_digest(pinned, plan)
@@ -1495,7 +1532,9 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
         if src.get("team_key") and src["team_key"] != team_key:
             print("::error:: %s is on the team %s, not %s. Nothing was created."
                   % (pinned, src["team_key"], team_key), file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "config",
+                        ["%s is on the team %s, not %s" % (pinned, src["team_key"],
+                                                           team_key)])
         src_id[0] = src["id"]
         team_id = client.resolve_team(team_key)
 
@@ -1517,7 +1556,8 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 print("::notice:: verdict=already-filed: this proposal was filed earlier as "
                       "%s (%s) with its %d child(ren); nothing was filed again."
                       % (earlier["identifier"], receipt, want))
-                return EXIT_OK
+                return _end(EXIT_OK, "filed", "already-filed",
+                            ["filed earlier as %s" % earlier["identifier"]], filed=True)
             msg = ("this proposal was filed earlier as %s, and that epic holds %d of its %d "
                    "children — an earlier run failed partway. Nothing was filed again."
                    % (earlier["identifier"], len(have), want))
@@ -1530,7 +1570,7 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
                 print("::error:: could not report the incomplete tree on %s: %s"
                       % (pinned, exc), file=sys.stderr)
             print("::error:: %s" % msg, file=sys.stderr)
-            return EXIT_ERRORED
+            return _end(EXIT_ERRORED, "errored", "partial", [msg], filed=True)
 
         # Asked before anything is created, so the answer rides in the summary the
         # owner reads when approving. A lookup that fails is SAID, never skipped.
@@ -1610,11 +1650,93 @@ def _create(client, cfg, team_key, finding_cfg, forced, pinned, plan, comments=N
           "provenance:agent/epic, %s)%s — awaiting the owner's approval."
           % (epic["identifier"], len(created_children), pinned, receipt,
              " + %d note(s)" % len(comments) if comments else ""))
-    return EXIT_OK
+    return _end(EXIT_OK, "filed", "created",
+                ["filed %s with %d child(ren)" % (epic["identifier"], len(created_children))],
+                filed=True)
 
 
 DEFAULT_KEY_ENV = "LINEAR_API_KEY"
 KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+# --------------------------------------------------------------------------- #
+# What the run came to (KIT-373). The exit code says filed-or-reported, rejected or
+# errored; the planner job needs more than that to say on the idea what happened, and,
+# later, to decide whether to try again. So each exit records a class and a kind here,
+# and `main` writes the record to --verdict-file whatever way the run ends. The record
+# is reporting: nothing reads it to decide what this executor may do.
+# --------------------------------------------------------------------------- #
+VERDICT_SCHEMA = "pipeline-plan-verdict/1"
+VERDICT_CLASSES = ("filed", "questions", "no-plan", "refused", "errored")
+VERDICT_REASONS_MAX = 20
+VERDICT_REASON_CHARS = 300
+# A reason may quote a path (an absent message's temp file); only its last part is kept.
+_ABS_PATH_RE = re.compile(r"(?<![\w.~])/(?:[^\s/]+/)+([^\s/]+)")
+RUN = {}
+
+
+def verdict_reasons(lines):
+    """At most VERDICT_REASONS_MAX lines, each on one line and at most
+    VERDICT_REASON_CHARS: routing directives and comment markers neutralised, a path cut
+    to its last part, and a line that looks like a credential withheld whole. The planner
+    may quote them on the idea, so they are cleaned like everything else filed there."""
+    out = []
+    for line in lines or ():
+        text = _ABS_PATH_RE.sub(r"\1", " ".join(str(line).split()))
+        text = _sanitize(neutralize_routing(text))
+        if _publisher.secret_hits(text):
+            text = "(a line was withheld here: it looked like a credential)"
+        if text:
+            out.append(text[:VERDICT_REASON_CHARS])
+        if len(out) == VERDICT_REASONS_MAX:
+            break
+    return out
+
+
+def _end(code, cls, kind, reasons=(), filed=False, questions=0):
+    """Record what the run came to, and return its exit code unchanged."""
+    RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
+                      "filed": bool(filed), "questions": int(questions),
+                      "reasons": verdict_reasons(reasons), "exit": code}
+    return code
+
+
+def _verdict_path(argv):
+    """--verdict-file's value, found before argparse runs, so a refused argument list
+    still writes one."""
+    for i, arg in enumerate(argv):
+        if arg == "--verdict-file" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--verdict-file="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def write_verdict(path, code):
+    """The recorded verdict, or `errored`/`unknown` when no exit recorded one, written to
+    `path` by a rename: a reader sees the whole object or the file it had before."""
+    if not path:
+        return
+    doc = dict(RUN.get("verdict") or {"schema": VERDICT_SCHEMA, "class": "errored",
+                                       "kind": "unknown", "filed": False, "questions": 0,
+                                       "reasons": []}, exit=code)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print("::error:: could not write the verdict to %s: %s — the planner reads that "
+              "as 'could not tell'" % (path, exc.strerror or exc), file=sys.stderr)
+
+
+def _unmarked(body, args):
+    """`body` without its page mark (its first line) when --defer-mark is set."""
+    if getattr(args, "defer_mark", False) and body.startswith("<!-- pipeline-escalation:"):
+        return body.split("\n", 1)[1] if "\n" in body else ""
+    return body
 
 
 def _key_env(args=None):
@@ -2651,6 +2773,163 @@ def selftest():
                   "Approving starts no work by itself" in text
                   and "delegate each child yourself" in text, True)
 
+        # ── What the run came to (KIT-373) ───────────────────────────────────
+        # 56. EVERY EXIT RECORDS A CLASS AND A KIND, beside an unchanged exit code.
+        def verdict_of(code):
+            v = RUN.get("verdict") or {}
+            return code, v.get("class"), v.get("kind"), v.get("filed"), v.get("questions")
+
+        fakeV = FakeLinear()
+        check("verdict:filed", verdict_of(run(_tree(), client=fakeV)),
+              (EXIT_OK, "filed", "created", True, 0))
+        check("verdict:already-filed", verdict_of(run(_tree(), client=fakeV)),
+              (EXIT_OK, "filed", "already-filed", True, 0))
+        check("verdict:questions", verdict_of(run(_batch(_comment("which one?")),
+                                                  client=FakeLinear())),
+              (EXIT_OK, "questions", "asked", False, 1))
+        check("verdict:no-proposal", verdict_of(run_msg("I could not plan this.",
+                                                        FakeLinear())),
+              (EXIT_OK, "no-plan", "no-proposal", False, 0))
+        check("verdict:no-message", verdict_of(run_msg("", FakeLinear(), write=False)),
+              (EXIT_OK, "no-plan", "no-message", False, 0))
+        # Each run is made inside the loop, so the verdict read is that run's own.
+        for label, go, want in (
+                ("cut-off", lambda: run_msg("Here is the plan:\n" + cut, FakeLinear()),
+                 "cut-off"),
+                ("credential-shape", lambda: run(leaky, client=FakeLinear()),
+                 "credential-shape"),
+                ("retarget", lambda: run(retarget, client=FakeLinear()), "retarget"),
+                ("question-retarget", lambda: run(_batch(_comment("q", tid="KIT-999")),
+                                                  client=FakeLinear()), "retarget"),
+                ("schema", lambda: run(bad, client=FakeLinear()), "schema"),
+                ("too-many-questions", lambda: run(_batch(*[_comment("q%d" % n)
+                                                            for n in range(4)]),
+                                                   client=FakeLinear()), "schema"),
+                ("plans-off", lambda: run(_tree(), client=FakeLinear(), config=off_path),
+                 "config"),
+                ("readiness-gate", lambda: run(dor_bad, client=FakeLinear()),
+                 "readiness-gate")):
+            check("verdict:refused:" + label, verdict_of(go()),
+                  (EXIT_REJECTED, "refused", want, False, 0))
+        failing_post = FakeLinear()
+        failing_post.fail_post = True
+        for label, go, want in (
+                ("no-config", lambda: run(_tree(), client=FakeLinear(),
+                                          config=os.path.join(tmp, "absent.json")), "config"),
+                ("config-gap", lambda: run(_tree(), client=FakeLinear(), config=np_path),
+                 "config"),
+                ("tracker", lambda: run(_batch(_comment("q")), client=failing_post),
+                 "tracker")):
+            check("verdict:errored:" + label, verdict_of(go())[:3],
+                  (EXIT_ERRORED, "errored", want))
+        partway = FakeLinear()
+        partway.fail_on_create = 2
+        check("verdict:errored:partial", verdict_of(run(_tree(), client=partway)),
+              (EXIT_ERRORED, "errored", "partial", True, 0))
+        check("verdict:dry-run-files-nothing", verdict_of(run(_tree(), dry_run=True))[1:4],
+              ("filed", "dry-run", False))
+
+        # 57. REASONS ARE CLEANED: one line, at most 300 characters and 20 lines, a path
+        #     cut to its last part, routing directives and comment markers made inert, and
+        #     a line that looks like a credential withheld whole.
+        cleaned = verdict_reasons(["see /var/tmp/x/final-message-ab.md now",
+                                   "[repo=evil#main] and <!-- pipeline-escalation: x -->",
+                                   "key " + fake_key, "x" * 400, "a\nb"] + ["n"] * 30)
+        check("reasons-path-cut", cleaned[0], "see final-message-ab.md now")
+        check("reasons-directive-and-marker-inert",
+              ("[repo=" in cleaned[1], "<!--" in cleaned[1], ROUTING_TAG_MARK in cleaned[1]),
+              (False, False, True))
+        check("reasons-credential-withheld", (fake_key in cleaned[2], "withheld" in cleaned[2]),
+              (False, True))
+        check("reasons-capped", (len(cleaned[3]), cleaned[4], len(cleaned)),
+              (VERDICT_REASON_CHARS, "a b", VERDICT_REASONS_MAX))
+
+        # 58. MAIN WRITES THE FILE ON EVERY EXIT, by a rename: a return, a refused
+        #     argument list, and a crash, which still exits as before.
+        vpath = os.path.join(tmp, "verdict.json")
+        msg_path = os.path.join(tmp, "verdict-message.md")
+        with open(msg_path, "w", encoding="utf-8") as fh:
+            fh.write("No plan here.")
+
+        def main_verdict(argv):
+            if os.path.exists(vpath):
+                os.unlink(vpath)
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = "exit %s" % exc.code
+            except Exception as exc:  # noqa: BLE001 - the crash case re-raises
+                code = "raised %s" % type(exc).__name__
+            try:
+                doc = json.load(open(vpath, encoding="utf-8"))
+            except (OSError, ValueError):
+                doc = {}
+            return code, doc.get("schema"), doc.get("class"), doc.get("kind"), doc.get("exit")
+
+        check("main-writes-on-a-return",
+              main_verdict(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                            "--dry-run", "--verdict-file", vpath]),
+              (EXIT_OK, VERDICT_SCHEMA, "no-plan", "no-proposal", EXIT_OK))
+        check("main-writes-on-refused-arguments",
+              main_verdict(["--verdict-file", vpath, "--key-env", "lower case"]),
+              ("exit 2", VERDICT_SCHEMA, "errored", "config", 2))
+        real_materialise = globals()["materialise"]
+        globals()["materialise"] = lambda args, client=None: {}["boom"]
+        try:
+            check("main-writes-on-a-crash-and-still-raises",
+                  main_verdict(["--message", msg_path, "--verdict-file", vpath]),
+                  ("raised KeyError", VERDICT_SCHEMA, "errored", "unexpected", 1))
+        finally:
+            globals()["materialise"] = real_materialise
+        if os.path.exists(vpath):
+            os.unlink(vpath)
+        check("main-without-the-flag-writes-nothing",
+              (main(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                     "--dry-run"]), os.path.exists(vpath)), (EXIT_OK, False))
+        check("verdict-file-is-private",
+              (main(["--message", msg_path, "--config", cfg_path, "--repo-root", tmp,
+                     "--dry-run", "--verdict-file", vpath]),
+               oct(os.stat(vpath).st_mode & 0o777)), (EXIT_OK, oct(0o600)))
+
+        # 59. --defer-mark: a no-plan or refused report loses ONLY its page mark; a filed
+        #     plan and a question keep theirs.
+        def report(fake, defer, fn):
+            fn(fake, defer)
+            return fake.comments[-1][1] if fake.comments else ""
+
+        def msg_run(text, fake, defer):
+            mpath = os.path.join(tmp, "defer-message.md")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            return materialise(argparse.Namespace(
+                requests=None, message=mpath, config=cfg_path, repo_root=tmp,
+                dry_run=False, pinned="KIT-777", defer_mark=defer), client=fake)
+
+        def req_run(doc, fake, defer):
+            req = os.path.join(tmp, "defer-requests.json")
+            json.dump(doc, open(req, "w"))
+            return materialise(argparse.Namespace(
+                requests=req, config=cfg_path, repo_root=tmp, dry_run=False,
+                pinned="KIT-777", defer_mark=defer), client=fake)
+
+        for label, fn, mark in (
+                ("no-plan", lambda f, d: msg_run("Nothing to plan.", f, d), ESC_NO_OUTPUT),
+                ("refused", lambda f, d: req_run(retarget, f, d), ESC_REJECTED)):
+            kept = report(FakeLinear(), False, fn)
+            deferred = report(FakeLinear(), True, fn)
+            check("defer-mark-drops-the-mark:" + label,
+                  (kept.startswith(_marker(mark)), _marker(mark) in deferred,
+                   deferred == kept.split("\n", 1)[1]), (True, False, True))
+        for label, fn, mark in (
+                ("filed", lambda f, d: req_run(_tree(), f, d), ESC_AWAITING_APPROVAL),
+                ("questions", lambda f, d: req_run(_batch(_comment("q?")), f, d),
+                 ESC_NEEDS_INPUT)):
+            fake = FakeLinear()
+            fn(fake, True)
+            check("defer-mark-keeps-the-mark:" + label,
+                  any(b.startswith(_marker(mark)) for _i, b in fake.comments), True)
+
+
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
         for f in failures:
@@ -2664,6 +2943,29 @@ def selftest():
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv=None):
+    """Run, and write the verdict on EVERY exit when --verdict-file names a path: a
+    refused argument list (SystemExit), a crash (re-raised: exit 1 and its traceback, as
+    before), or a return."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    path = _verdict_path(argv)
+    RUN.pop("verdict", None)
+    try:
+        code = _main(argv)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else EXIT_ERRORED
+        if "verdict" not in RUN:
+            _end(code, "errored", "config", ["the executor's arguments were refused"])
+        write_verdict(path, code)
+        raise
+    except BaseException as exc:
+        _end(1, "errored", "unexpected", ["%s: %s" % (type(exc).__name__, exc)])
+        write_verdict(path, 1)
+        raise
+    write_verdict(path, code)
+    return code
+
+
+def _main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--requests", help="path to a pipeline-safe-outputs/1 file")
     ap.add_argument("--message", help="path to a planning session's FINAL MESSAGE, as the "
@@ -2683,6 +2985,11 @@ def main(argv=None):
                     help="the model each child runs on, written as a `[model=…]` tag on the "
                          "first line of its description (KIT-379): fable, opus, sonnet, "
                          "haiku or a claude- model name. Absent, no tag is written")
+    ap.add_argument("--verdict-file",
+                    help="write what the run came to here, as one JSON object, on every "
+                         "exit (KIT-373)")
+    ap.add_argument("--defer-mark", action="store_true",
+                    help="post a no-plan or refused report without its page mark")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and DoR-gate, but create nothing")
     ap.add_argument("--selftest", action="store_true", help="run built-in fixtures and exit")

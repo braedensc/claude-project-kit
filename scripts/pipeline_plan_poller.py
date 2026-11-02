@@ -1489,6 +1489,12 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
 # collect — the read-back
 # --------------------------------------------------------------------------- #
 FINISHED_OK = "The planning run **%s** finished. Its result is on %s: a plan awaiting your approval, questions for you, or a note that no plan came back."
+# KIT-373: the note says WHICH, from the executor's verdict. FINISHED_OK above is kept for
+# a run whose verdict could not be read: it never claims a plan was filed.
+FINISHED_FILED = "The planning run **%s** finished and filed a plan. It is on %s, awaiting your approval."
+FINISHED_QUESTIONS = "The planning run **%s** finished with %s for you. They are on %s."
+FINISHED_NO_PLAN = "The planning run **%s** finished without a plan: %s. Its note is on %s. Move the idea out of %s and back in to plan it again."
+STOPPED = "The planning run **%s** was stopped: its planning ticket was closed before a plan came back, so nothing was filed. Move the idea out of %s and back in to plan it again."
 FINISHED_REJECTED = "The planning run **%s** finished, and its plan was refused. The reasons are on %s. Nothing was filed. Move the idea out of %s and back in to plan it again."
 GAVE_UP = "### Filing this idea's plan failed\n\nThe planning run **%s** finished, but filing its result failed %d times. The planner job's log has the reason. Move the idea out of %s and back in to plan it again."
 TIMED_OUT = "### The planning run timed out\n\nThe planning run **%s** did not finish within %d hours, so it was closed and nothing was filed. Move the idea out of %s and back in to plan it again."
@@ -1559,6 +1565,116 @@ def delivery_team(path):
         return None
 
 
+# HOW A PLANNING SESSION ENDED (KIT-373), recorded beside what its result came to. The
+# dispatcher posts a stopped session's last response itself, in these words (cyrus 0.2.73
+# EdgeWorker.js:2571; the same in 0.2.74). An error activity's text names its kind only in
+# words, so a kind is read from the words the kit has measured, and anything else is
+# `unknown`, never a limit: a later retry decides by these kinds.
+STOP_NOTICE = "Session stopped — %s was marked as Done or Canceled."
+ERROR_KINDS = (
+    ("limit", re.compile(r"you.ve hit your|usage limit|session limit|rate.?limit|\b429\b|"
+                         r"limit reached|temporarily limiting requests|quota exceeded|"
+                         r"insufficient capacity", re.IGNORECASE)),
+    ("billing", re.compile(r"billing|credit balance|insufficient (?:credit|funds)|"
+                           r"payment required", re.IGNORECASE)),
+    ("max-turns", re.compile(r"max(?:imum)?[ _-]?turns", re.IGNORECASE)),
+    ("execution-error", re.compile(r"error_during_execution|execution error",
+                                   re.IGNORECASE)),
+)
+ENDING_WORDS = {
+    ("response", ""): "its final message held no plan",
+    ("nothing", ""): "the session ended without saying anything",
+    ("error", "limit"): "the session hit a usage or rate limit",
+    ("error", "billing"): "the session hit a billing problem",
+    ("error", "max-turns"): "the session ran out of turns",
+    ("error", "execution-error"): "the session failed while it ran",
+    ("error", "unknown"): "the session ended in an error the planner cannot name",
+}
+Q_RUN_STATE = """
+query PlanRunState($id: String!) {
+  issue(id: $id) { id state { type } }
+}"""
+
+
+def session_ending(kind, body, run_ticket):
+    """{"how": response | error | nothing | stopped, ...}: how the session ended, from its
+    newest response or error activity (final_output's kind and body)."""
+    if kind == "response":
+        text = machine._BACKSLASH_ESCAPE_RE.sub(r"\1", str(body or "")).strip()
+        if text == STOP_NOTICE % run_ticket:
+            return {"how": "stopped", "by": "notice"}
+        return {"how": "response"}
+    if kind == "error":
+        for name, pattern in ERROR_KINDS:
+            if pattern.search(str(body or "")):
+                return {"how": "error", "kind": name}
+        return {"how": "error", "kind": "unknown"}
+    return {"how": "nothing"}
+
+
+def ending_words(ending):
+    return ENDING_WORDS.get(((ending or {}).get("how"), (ending or {}).get("kind") or ""),
+                            "the session ended in a way the planner cannot name")
+
+
+def run_ticket_closed(linear, rec):
+    """True when this job's planning ticket was completed or canceled by someone else
+    while its own record still has the run open."""
+    data = linear(Q_RUN_STATE, {"id": rec["run_ticket_id"]})
+    state = (((data or {}).get("issue") or {}).get("state") or {}).get("type")
+    return state in ("completed", "canceled")
+
+
+def read_verdict(path, code):
+    """What the executor said its run came to (--verdict-file), when the file holds one
+    whose class fits the exit code; None, 'could not tell', for an absent, empty,
+    unreadable or contradictory file. It is never read as filed by default."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != executor.VERDICT_SCHEMA:
+        return None
+    fits = {executor.EXIT_OK: ("filed", "questions", "no-plan"),
+            executor.EXIT_REJECTED: ("refused",)}.get(code, ("errored",))
+    if doc.get("class") not in fits:
+        return None
+    questions = doc.get("questions")
+    return {"class": doc["class"], "kind": str(doc.get("kind") or "")[:40],
+            "filed": doc.get("filed") is True,
+            "questions": questions if isinstance(questions, int) and questions > 0 else 0}
+
+
+def finished_note(cfg, rec, code, result, ending):
+    """The idea's note for a run whose executor answered 0 or 3."""
+    run = rec["run_ticket"]
+    if code == executor.EXIT_REJECTED:
+        return FINISHED_REJECTED % (run, run, cfg["plan_it_state"])
+    cls = (result or {}).get("class")
+    if cls == "filed":
+        return FINISHED_FILED % (run, run)
+    if cls == "questions":
+        n = result["questions"]
+        return FINISHED_QUESTIONS % (run, "%d question%s" % (n, "" if n == 1 else "s")
+                                     if n else "questions", run)
+    if cls == "no-plan":
+        return FINISHED_NO_PLAN % (run, ending_words(ending), run, cfg["plan_it_state"])
+    return FINISHED_OK % (run, run)
+
+
+def _finish_stopped(cfg, linear, seen, rec, ending, dry_run):
+    """A run someone stopped: its planning ticket is closed already, so the idea is told
+    and the record closed, and the ticket is never moved (that would move it to Done)."""
+    rec.update(status="close-pending", stopped=True, verdict="stopped", ending=ending,
+               note=STOPPED % (rec["run_ticket"], cfg["plan_it_state"]), note_posted=False,
+               at=_now_iso())
+    save_seen(cfg["state_dir"], seen, dry_run)
+    _deliver_note(cfg, linear, seen, rec, dry_run)
+    rec["status"] = "closed"
+    save_seen(cfg["state_dir"], seen, dry_run)
+
+
 def run_executor(argv, env=None):
     """The executor as a separate process, so a crash in it is an exit code here — and a
     run that overran its time is an errored exit, retried and then given up on."""
@@ -1590,7 +1706,12 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 continue
             if rec["status"] == "close-pending":
                 _deliver_note(cfg, linear, seen, rec, dry_run)
-                _close(cfg, linear, teams, seen, tid, rec, dry_run, stats)
+                if rec.get("stopped"):
+                    # Its ticket was closed by someone else: never moved by this job.
+                    rec["status"] = "closed"
+                    save_seen(cfg["state_dir"], seen, dry_run)
+                else:
+                    _close(cfg, linear, teams, seen, tid, rec, dry_run, stats)
                 continue
             if not rec.get("routing"):
                 verdict, evidence = check_routing(cfg, linear, rec, clock, budget_end)
@@ -1610,6 +1731,19 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                 rec["idea_notified"] = True
                 save_seen(cfg["state_dir"], seen, dry_run)
             status, kind, body = final_output(linear, rec["session_id"])
+            # STOPPED BY SOMEONE (KIT-373): checked before the time-out, so a run whose
+            # ticket a person closed is never timed out and moved, nor given to the
+            # executor. The dispatcher's own notice is read first; the ticket's state
+            # covers a stop whose notice never landed.
+            ending = session_ending(kind, body, rec["run_ticket"])
+            if ending["how"] != "stopped" and run_ticket_closed(linear, rec):
+                ending = {"how": "stopped", "by": "state"}
+            if ending["how"] == "stopped":
+                stats["stopped"] += 1
+                log("collect %s: %s was stopped (%s) — nothing filed, the ticket left as it is"
+                    % (rec["idea"], rec["run_ticket"], ending["by"]))
+                _finish_stopped(cfg, linear, seen, rec, ending, dry_run)
+                continue
             age = clock.time() - ((_parse_iso(rec.get("created_at"))
                                    or datetime.now(timezone.utc)).timestamp())
             if status not in SESSION_FINISHED:
@@ -1636,11 +1770,16 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                     % (rec["repo"], named, rec["idea"], rec["team_key"]))
                 _finish_run(cfg, linear, teams, seen, tid, rec, TEAM_MISMATCH % (
                     rec["run_ticket"], rec["repo"], named or "no team", rec["team_key"],
-                    cfg["plan_it_state"]), dry_run, stats, verdict="team-mismatch")
+                    cfg["plan_it_state"]), dry_run, stats, verdict="team-mismatch",
+                    ending=ending)
                 continue
             fd, message = tempfile.mkstemp(dir=cfg["state_dir"] if os.path.isdir(
                 cfg["state_dir"]) else None, prefix="final-message-", suffix=".md")
             os.close(fd)
+            # Beside the message, under a name only this run uses; never made in advance,
+            # so an executor that wrote nothing leaves no file, which reads "could not tell".
+            verdict_path = message[:-len(".md")] + ".verdict.json"
+            result = None
             try:
                 if kind == "response":
                     with open(message, "w", encoding="utf-8") as fh:
@@ -1660,6 +1799,7 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                         "--repo-root", path, "--key-env", cfg["linear_key_env"]]
                 if cfg.get("ticket_model"):
                     argv += ["--model-tag", cfg["ticket_model"]]
+                argv += ["--verdict-file", verdict_path]
                 if dry_run:
                     argv.append("--dry-run")
                 # Counted BEFORE the run: a run cut off by the pass's own clock still counts,
@@ -1670,14 +1810,16 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                         % (rec["idea"], rec["attempts"]))
                     _finish_run(cfg, linear, teams, seen, tid, rec, GAVE_UP % (
                         rec["run_ticket"], rec["attempts"], cfg["plan_it_state"]), dry_run,
-                        stats, verdict="gave-up")
+                        stats, verdict="gave-up", ending=ending)
                     continue
                 rec["attempts"] = int(rec.get("attempts") or 0) + 1
                 save_seen(cfg["state_dir"], seen, dry_run)
                 code = executor_runner(argv)
+                result = read_verdict(verdict_path, code)
             finally:
-                if os.path.exists(message):
-                    os.unlink(message)
+                for leftover in (message, verdict_path):
+                    if os.path.exists(leftover):
+                        os.unlink(leftover)
             if dry_run:
                 print("  [dry-run] executor exit %d for %s (checkout %s)"
                       % (code, rec["run_ticket"], sha[:12]))
@@ -1685,21 +1827,22 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
             if code in (executor.EXIT_OK, executor.EXIT_REJECTED):
                 stats["collected"] += 1
                 # A refusal says how to plan again, like a give-up or a time-out (KIT-304):
-                # the page that points here promises "what to do next".
-                note = (FINISHED_OK % (rec["run_ticket"], rec["run_ticket"])
-                        if code == executor.EXIT_OK else FINISHED_REJECTED % (
-                            rec["run_ticket"], rec["run_ticket"], cfg["plan_it_state"]))
-                _finish_run(cfg, linear, teams, seen, tid, rec, note, dry_run, stats, exit=code,
-                            checkout_sha=sha, verdict="filed-or-reported"
-                            if code == executor.EXIT_OK else "rejected")
+                # the page that points here promises "what to do next". The note says which
+                # result it was, from the executor's verdict (KIT-373).
+                _finish_run(cfg, linear, teams, seen, tid, rec,
+                            finished_note(cfg, rec, code, result, ending), dry_run, stats,
+                            exit=code, checkout_sha=sha, verdict="filed-or-reported"
+                            if code == executor.EXIT_OK else "rejected",
+                            result=result or {"class": "could-not-tell"}, ending=ending)
                 continue
+            rec["last_result"] = result or {"class": "could-not-tell"}
             if rec["attempts"] >= COLLECT_RETRY_PASSES:
                 log("FAIL: filing %s's plan failed %d times (exit %d) — given up, and the idea "
                     "says so" % (rec["idea"], rec["attempts"], code))
                 stats["gave_up"] += 1
                 _finish_run(cfg, linear, teams, seen, tid, rec, GAVE_UP % (
                     rec["run_ticket"], rec["attempts"], cfg["plan_it_state"]), dry_run, stats,
-                    verdict="gave-up", exit=code)
+                    verdict="gave-up", exit=code, ending=ending)
             else:
                 save_seen(cfg["state_dir"], seen, dry_run)
                 log("FAIL: the executor exited %d for %s — retry %d of %d next pass"
@@ -1876,11 +2019,12 @@ def run_once(cfg, linear, dry_run, stats, checkout=prepare_checkout,
     warn_direct(cfg, linear, teams, ideas, seen, sessions, dry_run, stats)
     print("plan-poller: %d idea(s) in %s over %d team(s), %d planning run(s) started, %d "
           "routing(s) confirmed, %d misrouted, %d collected, %d still running, %d refused "
-          "(%d as live work), %d timed out, %d given up, %d direct session(s) warned, %d "
-          "error(s)%s" % (stats["ideas_in_plan_it"], cfg["plan_it_state"], len(teams),
-                          stats["started"], stats["routing_ok"], stats["misrouted"],
-                          stats["collected"], stats["waiting"], stats["refused"],
-                          stats["refused_live"], stats["timed_out"], stats["gave_up"],
+          "(%d as live work), %d timed out, %d stopped, %d given up, %d direct session(s) "
+          "warned, %d error(s)%s" % (stats["ideas_in_plan_it"], cfg["plan_it_state"],
+                          len(teams), stats["started"], stats["routing_ok"],
+                          stats["misrouted"], stats["collected"], stats["waiting"],
+                          stats["refused"], stats["refused_live"], stats["timed_out"],
+                          stats["stopped"], stats["gave_up"],
                           stats["direct_warned"], stats["errors"],
                           ("; %d new move(s) waiting on a run in flight" % stats["waiting_run"]
                            if stats["waiting_run"] else "")
@@ -1899,7 +2043,7 @@ def new_stats():
                           "collected", "waiting", "refused", "refused_live", "timed_out",
                           "gave_up", "direct_warned", "errors", "waiting_cap",
                           "waiting_daily_cap", "waiting_budget", "waiting_run",
-                          "planning_blocked", "message_chars_max"), 0)
+                          "planning_blocked", "message_chars_max", "stopped"), 0)
 
 
 def write_heartbeat(state_dir, code, started_at, started_mono, stats, dry_run, error=""):
@@ -2227,6 +2371,10 @@ class FakeLinear(object):
             self.ideas[v["input"]["issueId"]]["updatedAt"] = "c%d" % len(self.comments)
         return {"commentCreate": {"success": True}}
 
+    def _PlanRunState(self, v):
+        issue = self.issues.get(v["id"]) or {}
+        return {"issue": {"id": v["id"], "state": issue.get("state") or {"type": "started"}}}
+
     def _PlanCloseRun(self, v):
         self.moves.append((v["id"], v["input"]["stateId"]))
         if v["id"] in self.issues:
@@ -2343,12 +2491,25 @@ def selftest():
 
         calls = []
 
-        def fake_executor(code=0):
+        def fake_executor(code=0, verdict="auto"):
+            """Plays the executor: records its argv and message, and writes a verdict as
+            the real one does (KIT-373): by default the class its exit code means; or a
+            given dict, "garbage", or "missing" (nothing written)."""
             def runner(argv):
                 args = dict(zip(argv[::2], argv[1::2]))
                 msg = args["--message"]
                 calls.append({"argv": list(argv), "message": open(msg).read()
                               if os.path.exists(msg) else None})
+                where = args.get("--verdict-file")
+                doc = verdict
+                if doc == "auto":
+                    doc = {"class": {0: "filed", 3: "refused"}.get(code, "errored"),
+                           "kind": {0: "created", 3: "schema"}.get(code, "tracker"),
+                           "filed": code == 0, "questions": 0, "reasons": []}
+                if where and doc != "missing":
+                    with open(where, "w", encoding="utf-8") as fh:
+                        fh.write("{not json" if doc == "garbage" else json.dumps(
+                            dict(doc, schema=executor.VERDICT_SCHEMA, exit=code)))
                 return code
             return runner
 
@@ -3094,6 +3255,144 @@ def selftest():
         fake_checkout.team.clear()
         check("team-mismatch-not-filed", (calls, sm["gave_up"], len(f.moves)), ([], 1, 1))
         check("team-mismatch-told", comments_on(f, "idea-76", "names the team OTHER") != [], True)
+
+        # 17b. WHAT THE RUN CAME TO, AND HOW THE SESSION ENDED (KIT-373). The executor
+        #      writes its verdict to a file this job names; the note on the idea says which
+        #      result it was, and a file that is absent, garbage or contradicts the exit
+        #      code reads "could not tell", never "filed".
+        def collected(number, runner, ending=("response", None), name=None):
+            del calls[:]
+            fc = FakeLinear(FakeClock())
+            fc.add_idea(number)
+            cfg_c = cfg_for(name or "verdict-%d" % number)
+            one_pass(cfg_c, fc)
+            run_c = runs(fc)[0]
+            how, text = ending
+            if how == "response":
+                fc.finish(run_c["id"], text or final_message(synthetic_plan(
+                    run_c["identifier"], 1)))
+            elif how == "error":
+                fc.finish(run_c["id"], text, kind="error", status="error")
+            else:
+                fc.finish(run_c["id"])
+            fc.clock.advance(120)
+            code_c, stats_c = one_pass(cfg_c, fc, runner=runner)
+            rec = [r for r in load_seen(cfg_c["state_dir"])["triggers"].values()
+                   if r.get("idea") == "PROD-%d" % number][0]
+            notes = [b for i, b in fc.comments if i == "idea-%d" % number]
+            return code_c, rec, notes[-1] if notes else "", fc, run_c, cfg_c, stats_c
+
+        for label, runner, want_class, needle in (
+                ("filed", fake_executor(0), "filed", "finished and filed a plan"),
+                ("questions", fake_executor(0, {"class": "questions", "kind": "asked",
+                                                "filed": False, "questions": 2,
+                                                "reasons": []}),
+                 "questions", "finished with 2 questions for you"),
+                ("no-plan", fake_executor(0, {"class": "no-plan", "kind": "no-proposal",
+                                              "filed": False, "questions": 0,
+                                              "reasons": []}),
+                 "no-plan", "finished without a plan: its final message held no plan"),
+                ("refused", fake_executor(3), "refused", "its plan was refused"),
+                ("missing", fake_executor(0, "missing"), "could-not-tell",
+                 "a plan awaiting your approval, questions for you, or a note"),
+                ("garbage", fake_executor(0, "garbage"), "could-not-tell",
+                 "a plan awaiting your approval, questions for you, or a note"),
+                ("contradicts-the-exit", fake_executor(0, {"class": "refused", "kind": "x",
+                                                           "filed": False, "questions": 0,
+                                                           "reasons": []}),
+                 "could-not-tell", "a plan awaiting your approval, questions for you")):
+            code_v, rec_v, note_v, f_v, run_v, c_v, _s = collected(80, runner,
+                                                                   name="verdict-" + label)
+            check("verdict-read:%s" % label,
+                  (code_v, rec_v.get("result", {}).get("class"), needle in note_v,
+                   f_v.moves), (EXIT_OK, want_class, True, [(run_v["id"], "prod-done")]))
+        argv_v = calls[0]["argv"]
+        check("verdict-file-passed-as-a-pair-before-dry-run",
+              (dict(zip(argv_v[::2], argv_v[1::2])).get("--verdict-file", "").endswith(
+                  ".verdict.json"), argv_v[-2] == "--verdict-file"), (True, True))
+        check("verdict-file-removed-after-the-run",
+              [n for n in os.listdir(c_v["state_dir"]) if n.endswith(".verdict.json")], [])
+        check("read-verdict-absent-file", read_verdict(os.path.join(c_v["state_dir"], "no"),
+                                                       0), None)
+
+        # How the session ended, recorded beside the verdict, and named on a no-plan note.
+        no_plan = fake_executor(0, {"class": "no-plan", "kind": "no-message", "filed": False,
+                                    "questions": 0, "reasons": []})
+        for label, ending, want, words in (
+                ("limit", ("error", "You've hit your session limit · resets 3pm"),
+                 {"how": "error", "kind": "limit"}, "hit a usage or rate limit"),
+                ("throttle", ("error", "API Error: Server is temporarily limiting requests "
+                                       "(not your usage limit)"),
+                 {"how": "error", "kind": "limit"}, "hit a usage or rate limit"),
+                ("billing", ("error", "Your credit balance is too low"),
+                 {"how": "error", "kind": "billing"}, "billing problem"),
+                ("max-turns", ("error", "error_max_turns: reached maximum turns"),
+                 {"how": "error", "kind": "max-turns"}, "ran out of turns"),
+                ("execution", ("error", "error_during_execution"),
+                 {"how": "error", "kind": "execution-error"}, "failed while it ran"),
+                ("unknown", ("error", "Something odd happened"),
+                 {"how": "error", "kind": "unknown"}, "an error the planner cannot name"),
+                ("nothing", ("nothing", None), {"how": "nothing"},
+                 "ended without saying anything")):
+            _c, rec_e, note_e, _f, _r, _cfg, _s = collected(81, no_plan, ending,
+                                                            name="ending-" + label)
+            check("ending:%s" % label, (rec_e.get("ending"), words in note_e), (want, True))
+        check("ending-unknown-is-never-a-limit",
+              session_ending("error", "the limit of my patience", "PROD-1"),
+              {"how": "error", "kind": "unknown"})
+        check("ending-a-response", session_ending("response", "here is a plan", "PROD-1"),
+              {"how": "response"})
+
+        # STOPPED BY SOMEONE: the dispatcher's own notice, or the planning ticket closed
+        # while this job's record still has it open. Nothing goes to the executor, the
+        # ticket is never moved (it would go to Done), and the idea is told, once.
+        for label, setup in (
+                ("notice", lambda fs, rs: fs.finish(rs["id"], STOP_NOTICE % rs["identifier"])),
+                ("notice-as-linear-escapes-it",
+                 lambda fs, rs: fs.finish(rs["id"], "Session stopped — %s was marked as "
+                                                    "Done or Canceled\\." % rs["identifier"])),
+                ("state", lambda fs, rs: fs.issues[rs["id"]].update(
+                    state={"type": "canceled"})),
+                ("state-past-the-timeout", None)):
+            del calls[:]
+            fs = FakeLinear(FakeClock())
+            fs.add_idea(82)
+            cs = cfg_for("stopped-" + label)
+            one_pass(cs, fs)
+            rs = runs(fs)[0]
+            if setup is None:
+                fs.issues[rs["id"]]["state"] = {"type": "completed"}
+                fs.clock.advance(cs["session_timeout_seconds"] + 60)
+            else:
+                setup(fs, rs)
+                fs.clock.advance(120)
+            code_s, stats_s = one_pass(cs, fs, runner=fake_executor(0))
+            rec_s = [r for r in load_seen(cs["state_dir"])["triggers"].values()
+                     if r.get("idea") == "PROD-82"][0]
+            check("stopped:%s" % label,
+                  (code_s, calls, fs.moves, rec_s["status"], rec_s.get("verdict"),
+                   len(comments_on(fs, "idea-82", "was stopped")), stats_s["stopped"],
+                   stats_s["timed_out"]),
+                  (EXIT_OK, [], [], "closed", "stopped", 1, 1, 0))
+            one_pass(cs, fs, runner=fake_executor(0))
+            check("stopped-told-once:%s" % label,
+                  (len(comments_on(fs, "idea-82", "was stopped")), calls, fs.moves),
+                  (1, [], []))
+        # A stop whose note could not be posted is told on the next pass, still unmoved.
+        fs = FakeLinear(FakeClock())
+        fs.add_idea(83)
+        cs = cfg_for("stopped-note-retry")
+        one_pass(cs, fs)
+        rs = runs(fs)[0]
+        fs.finish(rs["id"], STOP_NOTICE % rs["identifier"])
+        fs.clock.advance(120)
+        fs.fail_times["PlanComment"] = 1
+        one_pass(cs, fs, runner=fake_executor(0))
+        first = len(comments_on(fs, "idea-83", "was stopped"))
+        one_pass(cs, fs, runner=fake_executor(0))
+        check("stopped-note-retried-and-never-moved",
+              (first, len(comments_on(fs, "idea-83", "was stopped")), fs.moves, calls),
+              (0, 1, [], []))
 
         # 18. THE DIRECT WARNING watches only ideas in Plan it (sessions AFTER the move) and
         #     this job's own tickets — never the team's real work.
