@@ -274,7 +274,8 @@ A later answer is judged like any answer (KIT-358):
   so where it was asked. Back in Plan it, it first reads the history, as below.
 - If the Plan it state can't be found, every pass names that as the cause until it is fixed.
 - If the question was asked where the bridge no longer reads, the next pass closes it. It says
-  so in Slack where the notifier watch speaks, once in each place. That covers a channel taken
+  so in Slack where the notifier watch speaks, once in each place. It closes once any place
+  has heard it, and the pass's line names a place that refused. That covers a channel taken
   off `CHANNEL_IDS`, and a member taken off `DM_USER_IDS`.
 - The comment naming who said yes is written as soon as the bridge knows the idea left Plan
   it, even when the reply to that move was lost.
