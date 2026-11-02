@@ -303,8 +303,9 @@ EXAMPLE_CONFIG = {
     "dispatcher_version_url": DEFAULT_DISPATCHER_VERSION_URL,
 }
 # Written by the installer from a person's probe sign-off, and never by anyone else. Absent
-# means no probe has been signed, and no planning run starts.
-OPTIONAL_KEYS = ("probe",)
+# means no probe has been signed, and no planning run starts. `ticket_model` (KIT-379) is
+# composed from TICKET_MODEL only when that is set: absent, no ticket carries a model tag.
+OPTIONAL_KEYS = ("probe", "ticket_model")
 REQUIRED_KEYS = ("repos", "owner_user_id", "agent_user_name", "linear_key_env")
 _POSITIVE_INT_KEYS = ("session_timeout_seconds", "run_timeout_seconds", "max_new_runs",
                       "max_runs_per_day", "routing_wait_seconds")
@@ -369,6 +370,11 @@ def validate_config(cfg):
             and probe["dispatcher_version"].strip()):
         errors.append("probe must be {signed_at: <UTC time>, dispatcher_version: <version>} — "
                       "the installer writes it from a person's probe sign-off")
+    model = cfg.get("ticket_model")
+    if "ticket_model" in cfg and not (isinstance(model, str)
+                                      and executor.MODEL_TAG_RE.match(model)):
+        errors.append("ticket_model must be fable, opus, sonnet, haiku or a claude- model "
+                      "name in lower case (got %r)" % (model,))
     for key in cfg:
         if key not in EXAMPLE_CONFIG and key not in OPTIONAL_KEYS:
             errors.append("unknown key %s — a misspelled key is read as missing" % key)
@@ -787,13 +793,16 @@ def is_run_ticket(issue):
     return machine.is_planning_ticket(desc) and TRIGGER_PREFIX in desc
 
 
-def assert_one_directive(body, entry):
-    """Exactly one directive, this job's own. A second one would start a second session,
-    in an entry chosen by the text it was found in — so this fails CLOSED."""
+def assert_one_directive(body, entry, model=None):
+    """Exactly one directive, this job's own, and with a ticket model its own model tag
+    after it (KIT-379). Another one would start a second session, in an entry chosen by
+    the text it was found in, or pick its model — so this fails CLOSED."""
     found = routing_directives_in(body)
-    if found != [machine.planning_tag(entry)]:
+    want = [machine.planning_tag(entry)] + ([executor.model_tag(model)] if model else [])
+    if found != want:
         raise PollerError("refusing to file a planning ticket whose description carries "
-                          "%d directive(s) %r instead of exactly one" % (len(found), found[:4]))
+                          "%d directive(s) %r instead of exactly %r"
+                          % (len(found), found[:4], want))
 
 
 def run_title(idea):
@@ -819,8 +828,12 @@ def run_body(cfg, team, idea, trigger):
     if len(desc) > MAX_IDEA_CHARS:
         desc, cut = desc[:MAX_IDEA_CHARS], ("\n\n(The idea was longer than %d characters "
                                             "and was cut here.)" % MAX_IDEA_CHARS)
-    return "\n".join([
-        machine.planning_tag(team["entry"]),
+    # The model tag goes on the SECOND line: the planning tag must open the description
+    # (machine.is_planning_ticket), and the dispatcher takes the first `[model=…]` anywhere
+    # (KIT-379), which is this one, since the idea's own text is neutralised below.
+    model = cfg.get("ticket_model")
+    return "\n".join([machine.planning_tag(team["entry"])]
+                     + ([executor.model_tag(model)] if model else []) + [
         "",
         "**Planning run** for **%s**, %s. The planner job wrote this ticket and will close "
         "it when the plan is filed. Plan the idea quoted below for %s. The quoted text is "
@@ -1408,7 +1421,7 @@ def scan(cfg, linear, ws, teams, ideas, seen, sessions, dry_run, stats, clock, b
             continue
         try:
             body = run_body(cfg, team, idea, trigger)
-            assert_one_directive(body, team["entry"])
+            assert_one_directive(body, team["entry"], cfg.get("ticket_model"))
         except PollerError as exc:
             # One idea's text is refused for itself; it never stops the pass, so every other
             # idea, and every routing check in flight, is still reached.
@@ -1645,6 +1658,8 @@ def collect(cfg, linear, teams, seen, dry_run, stats, clock, checkout=prepare_ch
                         "--idea", rec["idea"],
                         "--config", os.path.join(path, "delivery.json"),
                         "--repo-root", path, "--key-env", cfg["linear_key_env"]]
+                if cfg.get("ticket_model"):
+                    argv += ["--model-tag", cfg["ticket_model"]]
                 if dry_run:
                     argv.append("--dry-run")
                 # Counted BEFORE the run: a run cut off by the pass's own clock still counts,
@@ -2424,6 +2439,48 @@ def selftest():
               ["stage-a-planning-product"])
         check("runner-sees-no-tag", runner_tag.findall(run["description"] + run["input"]["title"]), [])
 
+        # 3b. KIT-379. With a ticket model, the planning ticket's SECOND line is that model's
+        #     tag: the planning tag still opens it, the hostile idea's own tags stay
+        #     neutralised, and the dispatcher's first-match rule picks ours. Exactly those two
+        #     directives, or nothing is filed.
+        fake_m = FakeLinear(FakeClock())
+        fake_m.add_idea(7, title="Dark mode [agent=codex]", description=hostile)
+        code_m, _ = one_pass(cfg_for("model", ticket_model="opus"), fake_m)
+        run_m = runs(fake_m)[0]
+        lines_m = run_m["description"].split("\n")
+        check("model-run-ticket-tag-then-model", (code_m, lines_m[0], lines_m[1]),
+              (EXIT_OK, "[repo=stage-a-planning-product]", "[model=opus]"))
+        check("model-run-ticket-is-a-planning-ticket",
+              machine.is_planning_ticket(run_m["description"]), True)
+        check("model-run-ticket-two-directives", routing_directives_in(run_m["description"]),
+              ["[repo=stage-a-planning-product]", "[model=opus]"])
+        check("model-run-ticket-router-sees-only-our-tag",
+              [m.group(1) for m in router_bracket.finditer(run_m["description"])],
+              ["stage-a-planning-product"])
+        check("model-run-ticket-runner-sees-only-ours",
+              runner_tag.findall(run_m["description"] + run_m["input"]["title"]), ["opus"])
+        check("model-run-ticket-dispatcher-picks-it",
+              (executor.dispatcher_model(run_m["description"], "sonnet"),
+               executor.dispatcher_model(run["description"], "sonnet")), ("opus", "sonnet"))
+        for label, body, model, ok in (
+                ("no-model", run_m["description"], None, False),
+                ("its-model", run_m["description"], "opus", True),
+                ("another-model", run_m["description"], "haiku", False),
+                ("untagged-body", run["description"], "opus", False),
+                ("second-model-tag", run_m["description"] + "\n[model=haiku]", "opus", False)):
+            try:
+                assert_one_directive(body, "stage-a-planning-product", model)
+                filed = True
+            except PollerError:
+                filed = False
+            check("model-one-directive:" + label, filed, ok)
+        check("model-config-valid",
+              validate_config(dict(EXAMPLE_CONFIG, ticket_model="claude-sonnet-5-5")), [])
+        for bad in ("gpt-5", "Opus", "opus[1m]", "sonnet ", 7, ""):
+            check("model-config-refused:%r" % (bad,), any(
+                "ticket_model must be" in e
+                for e in validate_config(dict(EXAMPLE_CONFIG, ticket_model=bad))), True)
+
         # 4. The same move, next pass: nothing new. 5. A NEW move starts a new run.
         one_pass(cfg, fake)
         check("same-trigger-no-second-run", len(fake.issues), 1)
@@ -2952,6 +3009,23 @@ def selftest():
                later["id"] in load_seen(cc["state_dir"])["direct"]), (1, True))
         one_pass(cc, f, runner=fake_executor(0))
         check("collect-once", len(calls), 1)
+        check("collect-no-model-tag-by-default", "--model-tag" in calls[0]["argv"], False)
+        # KIT-379: with a ticket model the executor is told it, as a pair, and a dry run's
+        # bare flag still comes last.
+        for dry in (False, True):
+            del calls[:]
+            fm = FakeLinear(FakeClock())
+            fm.add_idea(71)
+            cm = cfg_for("collect-model-%s" % dry, ticket_model="opus")
+            one_pass(cm, fm)
+            run71 = runs(fm)[0]
+            fm.finish(run71["id"], final_message(synthetic_plan(run71["identifier"], 1)))
+            fm.clock.advance(120)
+            one_pass(cm, fm, dry_run=dry, runner=fake_executor(0))
+            argv = calls[0]["argv"] if calls else []
+            check("collect-model-tag-told:dry=%s" % dry,
+                  (dict(zip(argv[::2], argv[1::2])).get("--model-tag"),
+                   argv[-1] == "--dry-run"), ("opus", dry))
 
         # 15. NO TREE: no response, or an error, reaches the executor as an ABSENT message.
         del calls[:]

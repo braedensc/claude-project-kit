@@ -582,11 +582,16 @@ OPTIONAL_CONF_KEYS = {
                        "planner job's tracker key (default %r). Name the review jobs' "
                        "own file (`.stage-e/env`) to reuse their key: then nothing is "
                        "asked for, and revoking that key stops both" % ".stage-a/env",
+    "TICKET_MODEL": "the model each planning ticket and each planned piece runs on: fable, "
+                    "opus, sonnet, haiku or a claude- model name. Set it before moving the "
+                    "dispatcher's default model, which the chat bot also runs on. Unset "
+                    "(the default), they run on that default",
 }
 CONF_DEFAULTS = {"PLAN_IT_STATE": "Plan it", "POLL_INTERVAL_SECONDS": "300",
                  "GITHUB_TOKEN_ENV": "", "MAX_RUNS_PER_DAY": "10",
                  "ROUTING_WAIT_SECONDS": "120", "DISPATCHER_PORT": "3456",
-                 "DISPATCHER_ROUTER_FILE": "", "LINEAR_KEY_FILE": ".stage-a/env"}
+                 "DISPATCHER_ROUTER_FILE": "", "LINEAR_KEY_FILE": ".stage-a/env",
+                 "TICKET_MODEL": ""}
 # A path under the role account's home: relative, plain characters, no `..`. It travels
 # into a shell fragment run as that account, so its shape is the whole safety.
 KEY_FILE_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*(/[A-Za-z0-9_.][A-Za-z0-9_.-]*)*$")
@@ -717,6 +722,10 @@ def validate_conf(conf):
                       "are two different keys — yours, for provisioning, and the "
                       "executor's, stored under the role account — and one name for both "
                       "is how your own key ends up in the executor's file")
+    model = conf.get("TICKET_MODEL", "")
+    if model and not poller.executor.MODEL_TAG_RE.match(model):
+        errors.append("TICKET_MODEL must be fable, opus, sonnet, haiku or a claude- model "
+                      "name, in lower case (got %r)" % model)
     for key in conf:
         if key not in CONF_KEYS and key not in OPTIONAL_CONF_KEYS:
             errors.append("unknown key %s — a misspelled key is read as missing" % key)
@@ -1986,6 +1995,10 @@ def poller_config(ctx):
         "routing_wait_seconds": int(conf_value(conf, "ROUTING_WAIT_SECONDS")),
         "dispatcher_version_url": version_url(conf),
     }
+    # KIT-379: composed only when set, so a config written before the key existed is still,
+    # byte for byte, the composed one.
+    if conf_value(conf, "TICKET_MODEL"):
+        doc["ticket_model"] = conf_value(conf, "TICKET_MODEL")
     probe = (ctx.state.data.get("ids") or {}).get("probe") or {}
     if (ctx.state.attested("CA-PROBE") and probe.get("dispatcher_version")
             and not probe_uncovered(probe, rows)):
@@ -6504,6 +6517,12 @@ def _wizard_and_key_cases(check, tmp):
                   dict(GOOD_CONF, LINEAR_KEY_FILE=bad))), True)
     check("conf-key-file-shared-ok", validate_conf(dict(GOOD_CONF, LINEAR_KEY_FILE=".stage-e/env")),
           [])
+    # KIT-379: TICKET_MODEL is optional, and refused unless it is a name the dispatcher's
+    # own tag reader takes, in lower case.
+    check("conf-ticket-model-ok", validate_conf(dict(GOOD_CONF, TICKET_MODEL="opus")), [])
+    for bad in ("Opus", "gpt-5", "opus[1m]", "claude-"):
+        check("conf-ticket-model-refused:%s" % bad, any("TICKET_MODEL" in e for e in validate_conf(
+            dict(GOOD_CONF, TICKET_MODEL=bad))), True)
 
     # L. THE TOOL LIST, read the ways a session writes it.
     sections = parse_tool_report(PROBE_REPLY_OK)
@@ -7553,6 +7572,14 @@ def selftest():
             old._out = []
             cmd_verify(old)
             check("probe-old-sign-off-refused", old.state.outcome("probe"), FAILED)
+            # KIT-379: the planner job's config carries ticket_model only when TICKET_MODEL is
+            # set, so a config composed before the key existed is unchanged.
+            for model in ("", "opus"):
+                mc = _ctx(os.path.join(tmp, "ticket-model-%s" % (model or "unset")),
+                          conf=dict(GOOD_CONF, TICKET_MODEL=model), tracker=_ready_tracker())
+                check("poller-config-ticket-model:%s" % (model or "unset"),
+                      json.loads(poller_config(mc)).get("ticket_model", "absent"),
+                      model or "absent")
             # The routing code's fingerprint, when the file is named: read as the
             # dispatcher's account by the real program, recorded, and re-checked.
             router = os.path.join(tmp, "RepositoryRouter.js")
