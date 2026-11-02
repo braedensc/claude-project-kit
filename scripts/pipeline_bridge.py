@@ -2501,8 +2501,9 @@ class Pass(object):
     def watch_notifier(self):
         """Judge the notifier's heartbeat (judge_notifier). A problem is said once where
         the owner looks (watch_destinations: the DMs, else the first channel), and so is
-        each other kind the first time it comes, and its end once more. Its record is a file of its own, written through, so a pass that stops later
-        keeps the watch's clock, and a first pass that stops is still a first pass."""
+        each other kind the first time it comes, and its end once more. Its record is a
+        file of its own, written through, so a pass that stops later keeps the watch's
+        clock, and a first pass that stops is still a first pass."""
         if not self.cfg["notifier_plist"]:
             self.notifier = "OFF (notifier_plist is unset, so no notifier is watched here)"
             return
