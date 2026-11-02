@@ -23,7 +23,8 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
               as the role account, and pf's loaded rules as root. One outcome per
               check.
     merge     pieces 1, 2 and 5 into the dispatcher config and the role account's user
-              settings. Dry run by default; `--apply` writes.
+              settings, and, when chat-lane.conf sets CHAT_MODEL, the tech lead's model
+              pair (KIT-385). Dry run by default; `--apply` writes.
     env-names piece 3: asks for the chat app's two secrets at hidden prompts and writes
               the four names into the dispatcher's env file. `--remove` takes them out.
     front-door piece 7: adds the Slack path to the front door's one allowlist line.
@@ -35,7 +36,8 @@ decision and correction of 2026-09-17), and VERIFIES the live result.
               door), CK-C3 (the live check in the channel), CK-C4 (the dispatcher's port,
               from a second device), CK-C5 (restart the dispatcher, only when it is
               idle), CK-C6 (turn the lane off), CK-C7 (give the chat app groups:read,
-              before any dispatcher upgrade past 0.2.73).
+              before any dispatcher upgrade past 0.2.73), CK-C8 (move the tech lead to
+              another model: `pipeline_model_switch.py` does it in one run).
 
 WHAT CHANGED ON 2026-09-24 (owner decision, KIT-197).  This file used to print and read
 only. The chat lane was then switched on by hand on a deployment, and three live-file
@@ -1104,11 +1106,13 @@ FRONT_DOOR_READ_KEYS = ("FRONT_DOOR_CONFIG", "FRONT_DOOR_MATCHER")
 _HOST_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _MATCHER_RE = re.compile(r"^@[A-Za-z0-9_-]+$")
 # CHAT_MODEL and CHAT_BACKUP_MODEL (KIT-385): the Claude names the dispatcher takes, as the
-# planner's TICKET_MODEL does.
+# planner's TICKET_MODEL does. Not the `[1m]` suffix and not a list of backups: one plain
+# name each.
 _CHAT_MODEL_RE = re.compile(r"^(?:fable|opus|sonnet|haiku|claude-[a-z0-9][a-z0-9.-]{0,60})\Z")
-# The backup the dispatcher itself picks for a ticket session's model, by family
-# (RunnerSelectionService.js:156-168, at 0.2.73). A chat turn's backup is
-# claudeDefaultFallbackModel instead, so CHAT_BACKUP_MODEL defaults to this.
+# The backup the dispatcher picks for each of the four aliases (RunnerSelectionService.js:
+# 156-168, at 0.2.73), applied here by family. The dispatcher itself matches the alias only
+# and picks sonnet for any other name. A chat turn's backup is claudeDefaultFallbackModel,
+# which `merge` writes, so this is only CHAT_BACKUP_MODEL's default.
 DISPATCHER_BACKUP = {"fable": "opus", "opus": "sonnet", "sonnet": "haiku", "haiku": "sonnet"}
 _EXTRA_CRED_PREFIXES = ("xoxp-", "xoxa-", "xoxe", "xapp-")
 
@@ -1251,10 +1255,13 @@ def chat_model_problems(conf):
     if not backup:
         return ["CHAT_MODEL %r is in no family the dispatcher picks a backup for: set "
                 "CHAT_BACKUP_MODEL to a different model" % model]
-    if model == backup or same_model(model, backup):
-        return ["the backup, %s, is the same model as CHAT_MODEL, %s. The SDK refuses a "
-                "backup equal to its model, so every chat turn would fail before it starts "
-                "(sdk.mjs:144): set CHAT_BACKUP_MODEL to a different model" % (backup, model)]
+    # Only the SAME NAME is refused: that is all the SDK refuses (sdk.mjs:144 compares the
+    # two strings). An alias and a full id of one family may name two models, so verify
+    # notes such a pair and never fails it (review of KIT-385).
+    if model == backup:
+        return ["the backup, %s, is CHAT_MODEL itself. The SDK refuses a backup equal to its "
+                "model, so every chat turn would fail before it starts (sdk.mjs:144): set "
+                "CHAT_BACKUP_MODEL to a different model" % backup]
     return []
 
 
@@ -2261,26 +2268,34 @@ CARDS["CK-C8"] = {
             "pair moves. One script does it in that order and asks you once; these are its "
             "steps, should you want to read them first."),
     "do": ["1. In stage-a.conf and stage-e.conf, set TICKET_MODEL to the model tickets keep",
-           "   (opus today), then run the update, so the planner and the finding poller",
-           "   open every ticket they file with that tag:",
-           "    python3 scripts/pipeline_install.py --conf <your stage-a.conf>",
-           "2. Run the switch, as yourself, in a terminal. It checks both live configs carry",
-           "   the tag, lists the open pipeline tickets filed before the tags existed, and",
-           "   asks one yes. Then it tags them, sets CHAT_MODEL in chat-lane.conf, and runs",
-           "   merge --apply and verify:",
-           "    python3 scripts/pipeline_model_switch.py --to sonnet --conf <stage-a.conf> \\",
-           "        --stage-e-conf <stage-e.conf> --chat-lane-conf <chat-lane.conf>",
+           "   (the one they run on now), then run the update, so the planner and the",
+           "   finding poller open every ticket they file with that tag:",
+           "    python3 scripts/pipeline_install.py --conf <your stage-a.conf> \\",
+           "        --stage-e-conf <your stage-e.conf>",
+           "2. Run the switch, as yourself, in a terminal. It asks for your Mac password",
+           "   once, checks the chat lane's merge would write the pair and nothing else,",
+           "   checks both live configs carry the tag, lists the open pipeline tickets that",
+           "   still run on the default, in progress or not, and asks one yes. Then it tags",
+           "   them, sets CHAT_MODEL in chat-lane.conf, runs merge --apply, reads the pair",
+           "   back, and runs verify:",
+           "    python3 scripts/pipeline_model_switch.py --to sonnet \\",
+           "        --conf <your stage-a.conf> --stage-e-conf <your stage-e.conf> \\",
+           "        --chat-lane-conf <your chat-lane.conf>",
            "3. Ask the bot one question in a NEW thread, then run verify. Its chat-model row",
-           "   says NOT CHECKED until a turn has run on the new pair:",
+           "   says UNKNOWN until a turn has run on the new pair:",
            "    %s verify" % ME,
-           "To go back, run step 2 with --to opus. Do not just take CHAT_MODEL out: unset,",
-           "merge leaves the pair alone, and a config key removed by hand keeps its old",
-           "value in the running dispatcher until a restart (ConfigManager.js:237-244)."],
-    "good": ("the switch ended on 'Switched' or 'Done', and verify's chat-model row says chat "
-             "turns start on the new model, with the newest turn on it"),
+           "To go back, run step 2 with --to set to the model tickets keep: no ticket moves,",
+           "so it skips the ticket checks. Do not just take CHAT_MODEL out: unset, merge",
+           "leaves the pair alone, and a config key removed by hand keeps its old value in",
+           "the running dispatcher until a restart (ConfigManager.js:237-244)."],
+    "good": ("the switch ended on 'Done:' or 'Switched: chat turns now start on', and, once a "
+             "turn has run, verify's chat-model row says chat turns start on the new model, "
+             "with the newest turn on it"),
     "not": ("'TICKET_MODEL is not set' or 'still runs without TICKET_MODEL' — the tickets "
-            "would have moved with the tech lead: do step 1 first; or a chat-model row that "
-            "FAILS 'chat-lane.conf asks for': merge --apply did not write the pair"),
+            "would have moved with the tech lead: do step 1 first; 'other chat-lane changes "
+            "are waiting' — run merge on its own first and read what it writes; 'the "
+            "dispatcher's env file sets' — take that name out, then restart (card CK-C5); or "
+            "a chat-model row that FAILS 'chat-lane.conf asks for': the pair did not take"),
 }
 
 NEVER = [
@@ -3765,18 +3780,16 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
     is every label-less ticket session's too, since an entry's own `model` is never read;
     those sessions pick their own backup from it (RunnerSelectionService.js:297-310,
     RunnerConfigBuilder.js:173-175, at 0.2.73; KIT-377). When chat-lane.conf names a pair
-    (CHAT_MODEL, KIT-385), the config must hold that pair."""
+    (CHAT_MODEL, KIT-385), the config must hold that pair. That is judged LAST of the
+    failures, after an env file that hides the pair and a pair that fails every turn, so the
+    row names the cause to fix first (review of KIT-385)."""
     models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
     model, backup = chat_model_pair(models)
     lines = chat_turn_lines(ct)
     wanted = chat_pair_wanted(conf)
-    if wanted and (models.get("claudeDefaultModel"),
-                   models.get("claudeDefaultFallbackModel")) != wanted:
-        return _row("chat-model", FAILED,
-                    "chat-lane.conf asks for %s, with %s as the backup, but chat turns start "
-                    "on %s, with %s as the backup" % (wanted + (model, backup)),
-                    ["run  merge , then  merge --apply . It writes the pair as one, and the "
-                     "config reloads on its own"] + lines)
+    write_it = ("run  merge , then  merge --apply . It writes chat-lane.conf's pair, %s with "
+                "%s as the backup, as one, and the config reloads on its own" % wanted
+                if wanted else None)
     env_facts = env_facts if isinstance(env_facts, dict) else {}
     over = [n for n in MODEL_ENV_NAMES if n in set(env_facts.get("names") or [])]
     # The key the dispatcher takes is the first truthy one in its chain; the probe left the
@@ -3790,8 +3803,8 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
         return _row("chat-model", FAILED,
                     "every chat turn fails before it starts: the backup model is %s, the "
                     "model itself, and the SDK refuses that pair (sdk.mjs:144)" % model,
-                    ["set claudeDefaultFallbackModel in the dispatcher config to a "
-                     "different model, for example %s. The config reloads on its own"
+                    [write_it or "set claudeDefaultFallbackModel in the dispatcher config to "
+                     "a different model, for example %s. The config reloads on its own"
                      % ("sonnet" if model_family(model) == "opus" else "opus")] + lines)
     silent = ct.get("silent") if isinstance(ct, dict) else 0
     if silent:
@@ -3820,11 +3833,19 @@ def check_chat_model(cfg, env_facts, ct, conf=None):
                     "starts with is not known" % ", ".join(over),
                     ["take it out of the env file and set %s in the config instead; the env "
                      "file is read at start, so restart the dispatcher when it is idle "
-                     "(card CK-C5)" % " and ".join(keys)] + lines)
+                     "(card CK-C5)" % " and ".join(keys)]
+                    + (["while it is there, merge does not write chat-lane.conf's pair: it "
+                        "would hold only until the next restart"] if wanted else []) + lines)
     if unread:
         return _row("chat-model", UNKNOWN,
                     "the dispatcher config's %s is not a model name this check can read"
-                    % " and ".join(unread), lines)
+                    % " and ".join(unread), [write_it] + lines if wanted else lines)
+    # The pair the dispatcher takes, legacy keys included, against the one the conf names.
+    if wanted and (model, backup) != wanted:
+        return _row("chat-model", FAILED,
+                    "chat-lane.conf asks for %s, with %s as the backup, but chat turns start "
+                    "on %s, with %s as the backup" % (wanted + (model, backup)),
+                    [write_it] + lines)
     # The pair is right on paper; whether a turn RUNS on it is read from the newest turn.
     turns = [t for t in (ct.get("turns") or []) if isinstance(t, dict)] \
         if isinstance(ct, dict) and not ct.get("error") else None
@@ -4803,26 +4824,12 @@ def merge_plan(conf, facts):
                          % ", ".join(extra))
         ops.append({"op": "grant", "set": wanted})
         lines.append("GRANT       slackAllowedTools = %s" % json.dumps(wanted))
-    # KIT-385: the tech lead's model pair, when chat-lane.conf names one. Written as the
-    # global pair, in this same write, and never as an entry's own `model`: the dispatcher
-    # never reads that (RunnerSelectionService.js:297-310 at 0.2.73; KIT-377).
-    pair = chat_pair_wanted(conf)
-    if pair:
-        models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
-        over = [n for n in MODEL_ENV_NAMES if n in env_names]
-        if over:
-            lines.append("CANNOT      the dispatcher's env file sets %s, which the dispatcher "
-                         "takes over the config at start. The model pair is not written: take "
-                         "%s out of the env file, then restart the dispatcher when it is idle "
-                         "(card CK-C5)" % (", ".join(over), "it" if len(over) == 1 else "them"))
-        elif (models.get("claudeDefaultModel"), models.get("claudeDefaultFallbackModel")) \
-                == pair:
-            lines.append("ok          chat turns already start on %s, with %s as the backup"
-                         % pair)
-        else:
-            ops.append({"op": "model-pair", "model": pair[0], "backup": pair[1]})
-            lines.append("MODEL       claudeDefaultModel = %s, claudeDefaultFallbackModel = %s "
-                         "(was: %s, with %s as the backup)" % (pair + chat_model_pair(models)))
+    # KIT-385: the tech lead's model pair, when chat-lane.conf names one, in this same write.
+    line, op, _why = model_pair_plan(conf, facts)
+    if line:
+        lines.append(line)
+    if op:
+        ops.append(op)
     if active and active[0].get("mcpAllowedTools"):
         lines.append("WARNING     the first active entry %s lists %s in allowedTools, and the "
                      "dispatcher adds those to the chat grant (RunnerConfigBuilder.js:63-66). "
@@ -4884,16 +4891,80 @@ def merge_plan(conf, facts):
     return lines, ops, deny_add, allow_add
 
 
+def model_pair_plan(conf, facts):
+    """(plan line, the write, why it is not written) for the tech lead's model pair
+    (KIT-385); (None, None, None) while chat-lane.conf names no pair. `merge` and the model
+    switch both read it, so the two cannot judge the pair apart.
+
+    Written as the global pair, never as an entry's own `model`: the dispatcher never reads
+    that (RunnerSelectionService.js:297-310 at 0.2.73; KIT-377). A model name in the
+    dispatcher's env file takes the pair over at start, and an empty one does not
+    (WorkerService.js:173-180), so only a name with a value counts. An env file the probe
+    could not read rules nothing out, so the pair is not written past it either."""
+    pair = chat_pair_wanted(conf)
+    if not pair:
+        return None, None, None
+    cfg = facts.get("config") or {}
+    env_facts = facts.get("env") if isinstance(facts.get("env"), dict) else {}
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    error = env_facts.get("error")
+    over = [n for n in MODEL_ENV_NAMES if n in set(env_facts.get("names") or [])]
+    if error and error != "missing":
+        why = ("the dispatcher's env file could not be read (%s), so whether it sets the "
+               "model is not known" % error)
+        fix = ("let the role account read it, or correct DISPATCHER_ENV_FILE in "
+               "chat-lane.conf, then run this again")
+    elif over:
+        why = ("the dispatcher's env file sets %s, which the dispatcher takes over the config "
+               "at start" % ", ".join(over))
+        fix = ("take %s out of the env file, then restart the dispatcher when it is idle "
+               "(card CK-C5)" % ("it" if len(over) == 1 else "them"))
+    else:
+        why = fix = None
+    if why:
+        return ("CANNOT      %s. The model pair is not written: %s" % (why, fix), None,
+                "%s: %s" % (why, fix))
+    if (models.get("claudeDefaultModel"), models.get("claudeDefaultFallbackModel")) == pair:
+        return ("ok          chat turns already start on %s, with %s as the backup" % pair,
+                None, None)
+    return ("MODEL       claudeDefaultModel = %s, claudeDefaultFallbackModel = %s (was: %s, "
+            "with %s as the backup)" % (pair + chat_model_pair(models)),
+            {"op": "model-pair", "model": pair[0], "backup": pair[1]}, None)
+
+
+def check_model_pair(conf, facts):
+    """`merge`'s own row for the model pair, so its exit says whether the pair is in place:
+    BLOCKED while it cannot be written, FAILED while it is still to write, ALREADY-DONE once
+    claudeDefaultModel and claudeDefaultFallbackModel hold it (review of KIT-385). None while
+    chat-lane.conf names no pair."""
+    if not chat_pair_wanted(conf):
+        return None
+    cfg = facts.get("config") or {"error": "missing"}
+    if cfg.get("error"):
+        return _row("model-pair", UNKNOWN, "the dispatcher config is %s, so the model pair "
+                    "was not read" % cfg["error"])
+    _line, op, why = model_pair_plan(conf, facts)
+    if why:
+        return _row("model-pair", BLOCKED, why[0].upper() + why[1:])
+    if op:
+        return _row("model-pair", FAILED,
+                    "the config does not hold chat-lane.conf's pair, %s with %s as the backup"
+                    % chat_pair_wanted(conf), ["run  merge --apply  again"])
+    return _row("model-pair", ALREADY_DONE, "chat turns start on %s, with %s as the backup, "
+                "as chat-lane.conf asks" % chat_pair_wanted(conf))
+
+
 def merge_rows(conf, facts):
     """The grant, coding-fence, user-settings and trust-files rows, as `verify` prints
-    them."""
+    them, and the model pair's own row when chat-lane.conf names one."""
     cfg = facts.get("config") or {"error": "missing"}
     env_facts = facts.get("env") or {"error": "missing"}
     us = facts.get("userSettings") or {"error": "missing"}
     rows = (_config_unmeasured(cfg, ("grant", "coding-fence")) if cfg.get("error") else
             [check_grant(cfg), check_fence(cfg, env_facts)])
+    pair_row = check_model_pair(conf, facts)
     return rows + [check_user_settings(conf, us, env_facts),
-                   check_trust_files(conf, us, env_facts)]
+                   check_trust_files(conf, us, env_facts)] + ([pair_row] if pair_row else [])
 
 
 def cmd_merge(conf, runner, sudo, apply_it=False):
@@ -4903,9 +4974,9 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
         return EX_REFUSED
     account = conf["ROLE_ACCOUNT"]
     say("Chat-lane merge — %s" % ("APPLY" if apply_it else "DRY RUN: nothing will be changed"))
-    say("  Pieces 1, 2 and 5, planned from what verify's probe reads as %s. It prints entry"
-        % account)
-    say("  names, key names and tool lists, never a value.")
+    say("  Pieces 1, 2 and 5%s, planned from what verify's probe reads as %s. It prints"
+        % (", and the tech lead's model pair" if chat_pair_wanted(conf) else "", account))
+    say("  entry names, key names, model names and tool lists, never a value.")
     sudo.acquire("`merge` reads the dispatcher config and the user settings as the %s role "
                  "account%s." % (account, ", and writes them as that account" if apply_it
                                  else ", and changes nothing"), _resume("merge", apply_it))
@@ -4968,8 +5039,8 @@ def cmd_merge(conf, runner, sudo, apply_it=False):
     if any(op.get("op") == "model-pair" for op in ops):
         para("The tech lead's model is now %s, with %s as the backup, for chat turns that "
              "start from here; a turn already running keeps its model. Ask the bot one "
-             "question in a NEW thread, then run verify: its chat-model row says NOT CHECKED "
-             "until a turn has run on the new pair." % chat_pair_wanted(conf), "")
+             "question in a NEW thread, then run verify: its chat-model row says UNKNOWN until "
+             "a turn has run on the new pair." % chat_pair_wanted(conf), "")
     if set(deny_add) & set(diff_deny_rules()):
         para("The diff rules reach a session only when it starts. A session already running "
              "keeps the tools it started with: a chat thread's session, a coding session "
@@ -6709,7 +6780,7 @@ def _selftest_body():
                                              "costNote": "exact", "at": "T"}],
                                   "files": 1, "silent": 0})
             expect("chat-model-" + label, r["outcome"] == want and needle in _row_text(r), r)
-        # NOT CHECKED until a turn is seen running on the pair: none logged, the logs
+        # UNKNOWN until a turn is seen running on the pair: none logged, the logs
         # unreadable, or the newest turn on another model (one from before a change). A full
         # id and its alias are the same model; so is a [1m] one.
         pair = {"models": {"claudeDefaultModel": "sonnet", "claudeDefaultFallbackModel": "opus"}}
@@ -8815,9 +8886,12 @@ def _selftest_kit197(expect, conf):
             ({"CHAT_MODEL": "claude-mystery", "CHAT_BACKUP_MODEL": "sonnet"},
              ("claude-mystery", "sonnet"), []),
             ({}, None, []),
-            ({"CHAT_MODEL": "sonnet", "CHAT_BACKUP_MODEL": "sonnet"}, None, ["same model"]),
-            ({"CHAT_MODEL": "claude-sonnet-5-5", "CHAT_BACKUP_MODEL": "sonnet"}, None,
-             ["same model"]),
+            ({"CHAT_MODEL": "sonnet", "CHAT_BACKUP_MODEL": "sonnet"}, None,
+             ["CHAT_MODEL itself"]),
+            # Two names of one family may be two models, and the SDK refuses only the same
+            # name, so this pair is the person's to choose (review of KIT-385).
+            ({"CHAT_MODEL": "claude-sonnet-5-5", "CHAT_BACKUP_MODEL": "sonnet"},
+             ("claude-sonnet-5-5", "sonnet"), []),
             ({"CHAT_BACKUP_MODEL": "opus"}, None, ["half a pair"]),
             ({"CHAT_MODEL": "claude-mystery"}, None, ["CHAT_BACKUP_MODEL to a different"]),
             ({"CHAT_MODEL": "Sonnet"}, None, ["must be fable, opus"]),
@@ -8841,13 +8915,52 @@ def _selftest_kit197(expect, conf):
         models = {"claudeDefaultModel": "opus", "defaultModel": None,
                   "claudeDefaultFallbackModel": "sonnet", "defaultFallbackModel": None}
 
-        def plan(extra, live=None, env_names=()):
+        def plan(extra, live=None, env_names=(), empty=(), env=None):
             facts = {"config": {"entries": [], "models": live or models},
-                     "env": {"names": list(env_names), "empty": []},
+                     "env": env or {"names": list(env_names), "empty": list(empty)},
                      "userSettings": {"error": "missing"}}
             lines, ops, _deny, _allow = merge_plan(dict(conf, **extra), facts)
             return [l for l in lines if "claudeDefaultModel" in l or "model pair" in l
                     or "already start on" in l], [o for o in ops if o["op"] == "model-pair"]
+
+        # Every one of the four env names takes the pair over at start, so each is refused;
+        # an empty one takes nothing over (WorkerService.js:173-180), and an env file that
+        # cannot be read rules nothing out (review of KIT-385).
+        for name in MODEL_ENV_NAMES:
+            lines, ops = plan({"CHAT_MODEL": "sonnet"}, env_names=(name,))
+            expect("chat-model-plan-refuses-past:" + name,
+                   ops == [] and len(lines) == 1 and lines[0].startswith("CANNOT")
+                   and name in lines[0], (lines, ops))
+        lines, ops = plan({"CHAT_MODEL": "sonnet"}, empty=("CYRUS_CLAUDE_DEFAULT_MODEL",))
+        expect("chat-model-plan-an-empty-env-name-overrides-nothing",
+               ops == [{"op": "model-pair", "model": "sonnet", "backup": "haiku"}], (lines, ops))
+        lines, ops = plan({"CHAT_MODEL": "sonnet"}, env={"error": "unreadable"})
+        expect("chat-model-plan-refuses-past-an-unread-env-file",
+               ops == [] and len(lines) == 1 and lines[0].startswith("CANNOT")
+               and "could not be read (unreadable)" in lines[0], (lines, ops))
+        lines, ops = plan({"CHAT_MODEL": "sonnet"}, env={"error": "missing"})
+        expect("chat-model-plan-no-env-file-overrides-nothing",
+               ops == [{"op": "model-pair", "model": "sonnet", "backup": "haiku"}], (lines, ops))
+
+        # merge's own model-pair row, so its exit says whether the pair is in place.
+        pair_conf = dict(conf, CHAT_MODEL="sonnet")
+        in_place = dict(models, claudeDefaultModel="sonnet", claudeDefaultFallbackModel="haiku")
+        for label, facts, want in (
+                ("in-place", {"config": {"models": in_place}, "env": {"names": []}},
+                 ALREADY_DONE),
+                ("still-to-write", {"config": {"models": models}, "env": {"names": []}}, FAILED),
+                ("env-override", {"config": {"models": in_place},
+                                  "env": {"names": ["CYRUS_DEFAULT_MODEL"]}}, BLOCKED),
+                ("config-unread", {"config": {"error": "unreadable"}, "env": {"names": []}},
+                 UNKNOWN)):
+            row = check_model_pair(pair_conf, facts)
+            expect("chat-model-merge-row:" + label, row["outcome"] == want, _row_text(row))
+        expect("chat-model-merge-row-absent-without-a-pair",
+               (check_model_pair(conf, {"config": {"models": models}}),
+                [r["check"] for r in merge_rows(conf, {"config": {"models": models},
+                                                       "env": {"names": []},
+                                                       "userSettings": {"error": "missing"}})]),
+               (None, ["grant", "coding-fence", "user-settings", "trust-files"]))
 
         lines, ops = plan({"CHAT_MODEL": "sonnet"})
         expect("chat-model-plan-writes-the-pair-as-one",
@@ -8882,6 +8995,32 @@ def _selftest_kit197(expect, conf):
         expect("chat-model-verify-a-written-pair-waits-for-a-turn",
                row["outcome"] == UNKNOWN and "no chat turn is logged yet" in _row_text(row),
                _row_text(row))
+
+        # What hides the pair, or fails every turn, is named before the conf's pair is
+        # compared: merge can fix neither (review of KIT-385).
+        row = check_chat_model({"models": models}, {"names": ["CYRUS_CLAUDE_DEFAULT_MODEL"]},
+                               {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-an-env-override-comes-first",
+               row["outcome"] == UNKNOWN and "env file sets CYRUS_CLAUDE_DEFAULT_MODEL"
+               in _row_text(row) and "merge does not write chat-lane.conf's pair"
+               in _row_text(row) and "asks for" not in _row_text(row), _row_text(row))
+        row = check_chat_model({"models": dict(models, claudeDefaultFallbackModel="opus")},
+                               {"names": []}, {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-an-equal-pair-comes-first-with-merge-as-its-fix",
+               row["outcome"] == FAILED and "every chat turn fails before it starts"
+               in _row_text(row) and "merge --apply" in _row_text(row), _row_text(row))
+        row = check_chat_model({"models": models}, {"names": []},
+                               {"turns": [], "silent": 2, "silentAt": "2026-11-02T10:15"},
+                               dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-silent-runs-come-first",
+               row["outcome"] == FAILED and "heard nothing from the model" in _row_text(row),
+               _row_text(row))
+        # The pair the dispatcher takes, legacy keys included, is the one compared.
+        row = check_chat_model({"models": {"defaultModel": "sonnet",
+                                           "defaultFallbackModel": "haiku"}},
+                               {"names": []}, {"turns": []}, dict(conf, CHAT_MODEL="sonnet"))
+        expect("chat-model-verify-reads-the-legacy-keys",
+               row["outcome"] == UNKNOWN and "asks for" not in _row_text(row), _row_text(row))
 
         # The REAL writer: the pair in one write, the entries' own keys untouched, and an
         # equal or malformed pair refused with nothing written.
@@ -8939,16 +9078,25 @@ def _selftest_kit197(expect, conf):
                                True)
             after = json.loads(_read(cfg_path))
             expect("chat-model-merge-apply-writes-the-pair",
-                   after.get("claudeDefaultModel") == "sonnet"
+                   rc == EX_OK and after.get("claudeDefaultModel") == "sonnet"
                    and after.get("claudeDefaultFallbackModel") == "haiku"
                    and "MODEL       claudeDefaultModel = sonnet" in out
-                   and "Ask the bot one question in a NEW thread" in " ".join(out.split()),
-                   (rc, out[-600:]))
+                   and "Ask the bot one question in a NEW thread" in " ".join(out.split())
+                   and "model-pair" in out, (rc, out[-600:]))
             rc, out = _capture(cmd_merge, mconf, _RoleMachine(home, _pf_answers()), _FakeSudo(),
                                True)
             expect("chat-model-merge-again-has-nothing-to-write",
-                   "ok          chat turns already start on sonnet, with haiku as the backup"
-                   in out and "MODEL       " not in out, out[-600:])
+                   rc == EX_OK and "ok          chat turns already start on sonnet, with "
+                   "haiku as the backup" in out and "MODEL       " not in out, (rc, out[-600:]))
+            # An env name that takes the pair over: nothing is written, and merge's exit
+            # says so, where it used to exit 0 (review of KIT-385).
+            _put(env_path, "CYRUS_HOST_EXTERNAL=true\nCYRUS_CLAUDE_DEFAULT_MODEL=opus\n")
+            rc, out = _capture(cmd_merge, dict(mconf, CHAT_MODEL="haiku"),
+                               _RoleMachine(home, _pf_answers()), _FakeSudo(), True)
+            expect("chat-model-merge-past-an-env-override-exits-blocked",
+                   rc == EX_BLOCKED and json.loads(_read(cfg_path)) == after
+                   and "CANNOT      the dispatcher's env file sets CYRUS_CLAUDE_DEFAULT_MODEL"
+                   in out, (rc, out[-600:]))
     group("chat-model-switch", chat_model_switch)
 
     # -- each writer's own guards, run directly: the checks the subcommands never reach

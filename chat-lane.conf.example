@@ -173,14 +173,19 @@ FRONT_DOOR_MATCHER=@dispatcher
 # That pair is also every ticket's model unless the ticket carries a [model=…]
 # tag or a model label. So set TICKET_MODEL in stage-a.conf and stage-e.conf
 # first, and move it with scripts/pipeline_model_switch.py, which does both in
-# order (card CK-C8). To go back, set it to opus; taking it out is not undo.
+# order (card CK-C8). To go back, run the switch with --to set to the model
+# tickets keep; taking CHAT_MODEL out is not undo.
 #
-# RULE: fable, opus, sonnet, haiku or a claude- model id.
+# RULE: fable, opus, sonnet, haiku or a claude- model id. One plain name: not
+# the [1m] suffix, and not a list.
 #CHAT_MODEL=sonnet
 
-# Optional. The backup for CHAT_MODEL. Unset, it is the dispatcher's own pick:
-# fable backs up to opus, opus to sonnet, sonnet to haiku, haiku to sonnet.
+# Optional. The backup for CHAT_MODEL. Unset, it is the backup the dispatcher
+# picks for that model's alias, by family: fable backs up to opus, opus to
+# sonnet, sonnet to haiku, haiku to sonnet.
 #
-# RULE: as CHAT_MODEL, and not the same model: the SDK refuses a backup equal
-# to its model, and every chat turn would fail before it starts.
+# RULE: as CHAT_MODEL, and not the same name: the SDK refuses a backup equal
+# to its model, and every chat turn would fail before it starts. Two names of
+# one family (sonnet and claude-sonnet-5-5) are allowed, but may be one model,
+# which backs up nothing: verify notes that.
 #CHAT_BACKUP_MODEL=haiku

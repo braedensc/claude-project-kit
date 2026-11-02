@@ -305,8 +305,10 @@ repository's entry is never read.
   of an approved plan opens with one. Each runs on that model, whatever the default is.
 - Set it **before** you move the default model, or planning and building move with it.
 - Reviews carry their own model label, `MODEL_LABEL` in `stage-e.conf`.
-- A piece filed before you set it has no line, and runs on the default. So does a ticket
-  you file and hand to the agent yourself, unless it carries a model label.
+- A piece filed before you set it has no line, and runs on the default. Moving the default
+  with `scripts/pipeline_model_switch.py` tags those first (card CK-C8). A ticket you file
+  and hand to the agent yourself is not tagged, and runs on the default unless it carries a
+  model label.
 
 **If the dispatcher's own setup tool rebuilds its settings file,** the planning entries are
 dropped with everything else it did not write. Run the one command again: it finds them

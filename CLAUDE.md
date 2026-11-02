@@ -231,8 +231,9 @@ npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built int
 npm run test:install         # the one command (scripts/pipeline_install.py): skills, then
                              #   Stage E after a yes, then Stage A; refused under a model
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
-npm run test:model-switch    # the tech lead's model switch (KIT-385): tickets tagged first,
-                             #   one yes, then CHAT_MODEL and merge; refused under a model
+npm run test:model-switch    # the tech lead's model switch (KIT-385): the pair alone or no
+                             #   go, every open pipeline ticket on the default tagged first
+                             #   (the dispatcher's own rule), one yes, the pair read back
 npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
                              #   catch-up after sleep, its own three tracker writes pinned,
                              #   made only with act on
