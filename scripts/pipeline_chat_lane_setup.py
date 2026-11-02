@@ -2753,19 +2753,22 @@ def turns_of(path):
         if not (kind in ("assistant", "result") or fell
                 or (kind == "system" and sub == "init")):
             continue
-        if cur is None or cur["outcome"] is not None:
+        # An init after the open turn was answered starts the next turn: that one ended
+        # with no result. An init re-emitted before any answer belongs to the same turn.
+        if (cur is None or cur["outcome"] is not None
+                or (kind == "system" and sub == "init" and cur["answered"])):
             cur = {"at": at, "model": None, "answeredBy": [], "fellBackTo": [],
                    "errors": [], "outcome": None, "isError": None, "total": None,
-                   "zeroed": False}
+                   "zeroed": False, "answered": False}
             turns.append(cur)
         if sub == "init" and kind == "system":
             # A turn's own model: the one it started on (AgentSessionManager.js 174-180).
-            # An init re-emitted inside an open turn names the same turn.
             if cur["model"] is None:
                 cur["model"] = model_name(m.get("model"))
         elif fell:
             keep(cur["fellBackTo"], model_name(m.get("fallback_model")))
         elif kind == "assistant":
+            cur["answered"] = True
             keep(cur["errors"], word(m.get("error")))
             inner = m.get("message") if isinstance(m.get("message"), dict) else {}
             if m.get("parent_tool_use_id") is None and inner.get("model") != "<synthetic>":
@@ -2829,7 +2832,7 @@ def chat_turns(logs):
     for key in newest:
         files = sorted(sessions[key])
         window = files[-(TURNS_KEPT + 1):]
-        prev, ended = None, []
+        prev, ended, unpriced = None, [], 0
         for start, path in window:
             try:
                 found = turns_of(path)
@@ -2838,19 +2841,24 @@ def chat_turns(logs):
                 continue
             for t in found:
                 total, zeroed = t.pop("total"), t.pop("zeroed")
+                t.pop("answered")
                 if total is None or zeroed or (prev is not None and total < prev):
                     # A total only grows within a session: a zeroed one, or one below the
                     # last, says nothing about this turn and is never the next one's base.
                     t["cost"], t["costNote"] = None, "unknown"
+                    unpriced += 1
                 elif prev is None:
                     # The session's first turn costs exactly its total; a total met first
                     # past the window's edge holds the turns before it too.
-                    first = (start, path) == files[0]
+                    first = (start, path) == files[0] and not unpriced
                     t["cost"], t["costNote"] = total, "exact" if first else "so-far"
                 else:
-                    t["cost"], t["costNote"] = round(total - prev, 6), "exact"
+                    # Exact unless a turn since the last priced one logged no cost: its
+                    # spend is in this difference too.
+                    t["cost"] = round(total - prev, 6)
+                    t["costNote"] = "with-%d" % unpriced if unpriced else "exact"
                 if total is not None and not zeroed and (prev is None or total >= prev):
-                    prev = total
+                    prev, unpriced = total, 0
                 t["run"] = start
                 t["open"] = False
                 ended.append((t, young))
@@ -3627,6 +3635,9 @@ def chat_turn_lines(ct):
             money = "cost unknown"
         elif t.get("costNote") == "exact":
             money = "$%.4f" % cost
+        elif str(t.get("costNote") or "").startswith("with-"):
+            money = ("$%.4f, with the turn(s) before it that logged no cost of their own (%s)"
+                     % (cost, str(t["costNote"])[5:]))
         else:
             money = "$%.4f for the thread so far" % cost
         ending = ("still running" if t.get("outcome") is None and t.get("open")
@@ -3703,6 +3714,29 @@ def check_chat_model(cfg, env_facts, ct):
         return _row("chat-model", UNKNOWN,
                     "the dispatcher config's %s is not a model name this check can read"
                     % " and ".join(unread), lines)
+    # The pair is right on paper; whether a turn RUNS on it is read from the newest turn.
+    turns = [t for t in (ct.get("turns") or []) if isinstance(t, dict)] \
+        if isinstance(ct, dict) and not ct.get("error") else None
+    if turns is None:
+        return _row("chat-model", UNKNOWN,
+                    "chat turns start on %s, with %s as the backup, but the chat turns' logs "
+                    "could not be read, so no turn shows it" % (model, backup), lines)
+    if not turns:
+        return _row("chat-model", UNKNOWN,
+                    "chat turns start on %s, with %s as the backup, but no chat turn is "
+                    "logged yet, so none has been seen running on it" % (model, backup), lines)
+    newest = turns[0].get("model")
+    ran, wants = model_family(newest), model_family(model)
+    if newest and (ran != wants if ran and wants else bare_model(newest) != bare_model(model)):
+        return _row("chat-model", UNKNOWN,
+                    "chat turns start on %s, with %s as the backup, but the newest turn, %s, "
+                    "ran on %s: it started before a change, or the running dispatcher holds "
+                    "another value than its config file" % (model, backup,
+                                                              _turn_when(turns[0].get("at")),
+                                                              newest),
+                    ["ask the bot one question in a NEW thread, then run verify again. If the "
+                     "newest turn still runs on %s, restart the dispatcher when it is idle "
+                     "(card CK-C5)" % newest] + lines)
     notes = []
     if model_family(model) and model_family(model) == model_family(backup):
         notes.append("the backup, %s, is in the same family as %s, so it may be the same "
@@ -5832,6 +5866,22 @@ def _selftest_body():
         chat_log("slack-new", "new", chat_reads, 3001)
         chat_log("slack-new", "pending", [], 4000, init=False)
         chat_log("PROD-7", "coding", chat_writes, 5000)
+        # KIT-355: one finished chat turn on the default model, named as the dispatcher
+        # names a run's log, so a clean verify sees a turn running on its pair. It has no
+        # tool list, and is the oldest file, so the chat-tools reader passes it over.
+        baseline_turn = os.path.join(logs_root, "slack-new",
+                                     "session-new-2026-10-01T09-00-00-000Z.jsonl")
+
+        def put_baseline_turn():
+            _put(baseline_turn, "\n".join(json.dumps(d) for d in (
+                {"type": "session-metadata", "startedAt": "2026-10-01T09:00:00.000Z"},
+                {"type": "sdk-message", "timestamp": "2026-10-01T09:00:01.000Z", "message": {
+                    "type": "system", "subtype": "init", "model": "claude-opus-5-5"}},
+                {"type": "sdk-message", "timestamp": "2026-10-01T09:00:09.000Z", "message": {
+                    "type": "result", "subtype": "success", "is_error": False,
+                    "total_cost_usd": 0.42}})) + "\n")
+            os.utime(baseline_turn, (500, 500))
+        put_baseline_turn()
 
         ran = probe(good_config(), good_env(), good_settings)
         outputs.append(ran.stdout + ran.stderr)
@@ -6118,7 +6168,7 @@ def _selftest_body():
         expect("chat-tools-reads-the-newest-chat-session",
                ct.get("tracker") == ["mcp__linear__get_diff", "mcp__linear__get_issue",
                                      "mcp__linear__list_diffs"]
-               and ct.get("sessions") == 3 and ct.get("startedAt", "").endswith(":01.000Z")
+               and ct.get("sessions") == 4 and ct.get("startedAt", "").endswith(":01.000Z")
                and ct.get("toolCount") == len(chat_reads), ct)
         newest = chat_log("slack-newest", "newest", chat_writes, 6000)
         rows = evaluate(facts_of(probe(good_config(), good_env(), good_settings)), vconf)
@@ -6221,6 +6271,7 @@ def _selftest_body():
 
         made = []
         day = "2026-11-02T%s-00-00-000Z"
+        os.unlink(baseline_turn)        # these cases count every turn; put back below
         turn_log("slack-Ev1", "u1", day % "10", [
             ("2026-11-02T10:00:01.000Z", init("claude-opus-5-5")),
             ("2026-11-02T10:00:09.000Z", said("claude-opus-5-5")),
@@ -6351,10 +6402,16 @@ def _selftest_body():
             ("2026-11-02T09:00:02.000Z", dict(result(0, error=True), num_turns=0))])
         costs = [(t.get("at")[11:13], t.get("cost"), t.get("costNote"))
                  for t in turns_now().get("turns") or []]
+        # A difference across a turn that logged no cost holds that turn's spend too, and
+        # says so.
         expect("chat-model-zeroed-result-is-not-a-base",
-               costs == [("14", 0.05, "exact"), ("13", None, "unknown"),
-                         ("12", 0.25, "exact"), ("11", None, "unknown"),
+               costs == [("14", 0.05, "with-1"), ("13", None, "unknown"),
+                         ("12", 0.25, "with-1"), ("11", None, "unknown"),
                          ("10", 1.2, "exact")], costs)
+        expect("chat-model-a-difference-across-an-unpriced-turn-says-so",
+               "$0.2500, with the turn(s) before it that logged no cost of their own (1)"
+               in _row_text(check_chat_model({}, {}, turns_now())),
+               _row_text(check_chat_model({}, {}, turns_now())))
         clear_turns()
         turn_log("slack-Ev6", "u6", day % "09", [
             ("2026-11-02T09:00:01.000Z", init("opus")),
@@ -6362,6 +6419,21 @@ def _selftest_body():
         costs = [(t.get("cost"), t.get("costNote")) for t in turns_now().get("turns") or []]
         expect("chat-model-a-crashed-first-run-is-not-free", costs == [(None, "unknown")],
                costs)
+        clear_turns()
+        # A turn answered but never finished, then the next turn's init in the same log: two
+        # turns, the first ended without a result, the second on its own model. Its total
+        # holds the first one's spend too.
+        turn_log("slack-Ev7", "u7", day % "10", [
+            ("2026-11-02T10:00:01.000Z", init("claude-opus-5-5")),
+            ("2026-11-02T10:00:02.000Z", said("claude-opus-5-5")),
+            ("2026-11-02T10:05:01.000Z", init("claude-sonnet-5-5")),
+            ("2026-11-02T10:05:02.000Z", said("claude-sonnet-5-5")),
+            ("2026-11-02T10:05:03.000Z", result(0.5))])
+        got = [(t.get("model"), t.get("outcome"), t.get("cost"), t.get("costNote"))
+               for t in turns_now().get("turns") or []]
+        expect("chat-model-an-unfinished-turn-does-not-swallow-the-next",
+               got == [("claude-sonnet-5-5", "success", 0.5, "so-far"),
+                       ("claude-opus-5-5", None, None, "unknown")], got)
         clear_turns()
         # Turns sort by their own time: a follow-up fed into a running session is a later
         # turn in an older run's file. A subagent's own fallback is not the turn's; a [1m]
@@ -6429,6 +6501,7 @@ def _selftest_body():
                == [(None, "result", 0.4)]
                and time.time() - began < 30, (got.get("config"), ct))
         clear_turns()
+        put_baseline_turn()
         # a value outside the model charset is never printed, and the row says it can't read it
         facts = facts_of(probe(dict(good_config(), claudeDefaultModel="x " + SENTINELS[3]),
                                good_env(), good_settings))
@@ -6467,9 +6540,33 @@ def _selftest_body():
                  "defaultFallbackModel is not a model name"),
                 ("env-override", {}, ["CYRUS_DEFAULT_MODEL", "SLACK_BOT_TOKEN"], UNKNOWN,
                  "sets CYRUS_DEFAULT_MODEL")):
+            # The newest turn ran on the pair's own model, so only the pair is judged here.
+            ran = chat_model_pair(models)[0]
             r = check_chat_model({"models": models}, {"names": names},
-                                 {"turns": [], "files": 0, "silent": 0})
+                                 {"turns": [{"model": ran, "outcome": "success", "cost": 0.1,
+                                             "costNote": "exact", "at": "T"}],
+                                  "files": 1, "silent": 0})
             expect("chat-model-" + label, r["outcome"] == want and needle in _row_text(r), r)
+        # NOT CHECKED until a turn is seen running on the pair: none logged, the logs
+        # unreadable, or the newest turn on another model (one from before a change). A full
+        # id and its alias are the same model; so is a [1m] one.
+        pair = {"models": {"claudeDefaultModel": "sonnet", "claudeDefaultFallbackModel": "opus"}}
+        on = lambda m: {"turns": [{"model": m, "outcome": "success", "cost": 0.1,
+                                   "costNote": "exact", "at": "2026-11-02T10:00:01.000Z"}],
+                        "files": 1, "silent": 0}
+        for label, ct_in, want, needle in (
+                ("no-turn-yet", {"turns": [], "files": 0, "silent": 0}, UNKNOWN,
+                 "no chat turn is logged yet"),
+                ("logs-unreadable", {"error": "unreadable"}, UNKNOWN, "so no turn shows it"),
+                ("newest-on-another-model", on("claude-opus-5-5"), UNKNOWN,
+                 "ran on claude-opus-5-5: it started before a change"),
+                ("newest-on-the-pair", on("claude-sonnet-5-5"), ALREADY_DONE,
+                 "chat turns start on sonnet"),
+                ("newest-on-the-pair-1m", on("claude-sonnet-5-5[1m]"), ALREADY_DONE,
+                 "chat turns start on sonnet")):
+            r = check_chat_model(pair, {"names": []}, ct_in)
+            expect("chat-model-seen-running:" + label,
+                   r["outcome"] == want and needle in _row_text(r), r)
         expect("chat-model-env-override-says-restart",
                "card CK-C5" in _row_text(check_chat_model(
                    {}, {"names": ["CYRUS_CLAUDE_DEFAULT_FALLBACK_MODEL"]}, None)))
