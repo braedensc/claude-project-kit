@@ -675,14 +675,18 @@ Not that: `writer FAILED fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set`. Do ste
 Not that: `fallback: the writer exited 1: Anthropic refused the token`. The token is wrong,
 expired or revoked. Do steps 2 and 3 again.
 Not that: `NOT CHECKED`, or `writer UNKNOWN`, with `a usage limit was reached`, `Anthropic
-is limiting requests` or `could not reach Anthropic`. The token is stored, and nothing is
-known about it yet. Wait for the limit to reset, or check this Mac's connection, then run
-`verify`.
+is limiting requests`, `Anthropic had a server error` or `could not reach Anthropic`. The
+token is stored, and nothing is known about it yet. Wait for the limit to reset, or try again
+later, or check this Mac's connection, then run `verify`.
+Not that: `the organization has turned off Claude subscription access for Claude Code`. A new
+token won't help. An admin of your Claude organization must turn that access back on. Then
+run `writer-token` again.
 Not that: `could not start`. `WRITER_BIN` is not a path the role account can run. A path in
 your own home folder will not do: install claude where every account can run it. Then do
 step 1 again.
-Not that: `NOT CHECKED: … the role account's copy of the kit is older than this installer`.
-The token is stored. Run `python3 scripts/pipeline_install.py` and say yes, then `verify`.
+Not that: `NOT CHECKED: … the role account's copy of the kit is older than this installer`,
+or `writer UNKNOWN` saying the same. The token is stored. Run
+`python3 scripts/pipeline_install.py` and say yes, then `verify`.
 
 To turn it off, set `WRITER=no` and run `install --apply`.
 

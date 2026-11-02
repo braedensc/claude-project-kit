@@ -1143,10 +1143,9 @@ def check_new_writer_token(conf, runner):
     rc, last, said = probe_writer(conf, runner, compose_config(dict(conf, WRITER="yes")))
     why = last[len("fallback: "):] if last.startswith("fallback: ") else ""
     verdict = bridge.voice.token_verdict(why) if why else "failed"
-    if (rc == bridge.voice.EXIT_USAGE and last.startswith(OLD_PROBE_SAYS)
-            and "[Errno 2]" in last):
-        # The role account's clone has a probe from before `--config -` (KIT-301 fix
-        # review): the clone is behind, which says nothing about the token.
+    if clone_behind(rc, last):
+        # The role account's clone is behind (KIT-301 fix review, KIT-360), which says
+        # nothing about the token.
         say("NOT CHECKED: the token is stored, but the role account's copy of the kit is "
             "older than this installer, so its writer can't be tried with these settings. "
             "Bring it up to date with `python3 scripts/pipeline_install.py`, then `verify`.")
@@ -1174,9 +1173,24 @@ def check_new_writer_token(conf, runner):
 OLD_PROBE_SAYS = "FAIL: could not read --config -:"
 
 
+def clone_behind(rc, last):
+    """True when the role account's copy of the kit is older than this installer: its probe
+    predates `--config -` and reads the dash as a file (KIT-301 fix review), or the copy
+    predates the writer and has no pipeline_voice.py at all (KIT-360). ROLE_KIT_CLONE is
+    always the update's own copy, so either means the update has not moved it yet."""
+    if "[Errno 2]" not in last:
+        return False
+    return ((rc == bridge.voice.EXIT_USAGE and last.startswith(OLD_PROBE_SAYS))
+            or (rc == 2 and "can't open file" in last and "pipeline_voice.py" in last))
+
+
 def failed_fix(why):
     """What to do after writer-token's check failed, by its reason (KIT-301 fix review):
     never `install --apply`, which would install a writer that cannot write."""
+    if bridge.voice.ORG_OFF in why:
+        return ("A new token won't help: an admin of your Claude organization has turned "
+                "off Claude subscription access for Claude Code. Ask them to turn it back "
+                "on, then run `writer-token` again (card CK-B5).")
     if "Anthropic refused the token" in why:
         return ("The token is wrong, expired or revoked. Make a new one with `claude "
                 "setup-token`, then run `writer-token` again (card CK-B5).")
@@ -1402,6 +1416,10 @@ def writer_row(conf, runner):
     rc, last, said = probe_writer(conf, runner)
     if rc == 0 and last == "written by the model":
         return ("writer", se.ALREADY_DONE, "a sample message was written by the model")
+    if clone_behind(rc, last):
+        return ("writer", se.UNKNOWN, "the role account's copy of the kit is older than this "
+                "installer, so the writer was not tried. Bring it up to date with `python3 "
+                "scripts/pipeline_install.py` (KIT-360)")
     why = last[len("fallback: "):] if last.startswith("fallback: ") else ""
     if why and bridge.voice.token_verdict(why) == "unasked":
         # Anthropic could not be asked, so the writer's state is not known (KIT-301 review).
@@ -2437,11 +2455,21 @@ def selftest():
             # which with WRITER=no, as here, is to turn the writer on.
             nxt = "The writer is still off. Set WRITER=yes in the conf"
             for name, rc_, said, code, words, then in (
+                    # KIT-360: a clone from before the writer has no voice script: it is
+                    # behind, which says nothing about the token.
                     ("no-voice-script", 2, "/usr/bin/python3: can't open file "
                      "'/h/.stage-e/kit/scripts/pipeline_voice.py': [Errno 2] No such file or "
-                     "directory", EX_FAILED, "FAILED: the token is stored, but the writer's "
-                     "check says: /usr/bin/python3: can't open file",
-                     "Fix what it says, then run `writer-token` again"),
+                     "directory", EX_UNKNOWN, "NOT CHECKED: the token is stored, but the role "
+                     "account's copy of the kit is older than this installer", nxt),
+                    ("a-server-error", 1, "A sample.\nthe claude CLI said: API Error: 500 "
+                     "Internal server error.\nfallback: the writer exited 1: Anthropic had a "
+                     "server error", EX_UNKNOWN, "NOT CHECKED: the token is stored, but "
+                     "Anthropic could not be asked (Anthropic had a server error)", nxt),
+                    ("the-organization-turned-it-off", 1, "A sample.\nthe claude CLI said: "
+                     "Your organization has disabled Claude subscription access\nfallback: the "
+                     "writer exited 1: the organization has turned off Claude subscription "
+                     "access for Claude Code", EX_FAILED, "check says: fallback: the writer "
+                     "exited 1: the organization has turned off", "A new token won't help"),
                     ("cannot-start", 1, "A sample.\nfallback: could not start "
                      "/opt/homebrew/bin/claude: No such file or directory", EX_FAILED,
                      "check says: fallback: could not start /opt/homebrew/bin/claude",
@@ -2635,6 +2663,14 @@ def selftest():
                   (got[0], got[2]) if isinstance(got, tuple) else got,
                   (EX_UNKNOWN, ("UNKNOWN", "Anthropic could not be asked (%s), so the writer "
                                 "was not tried" % bridge.voice.THROTTLED)))
+            # KIT-360: a role copy from before the writer has no voice script: it is behind,
+            # which says nothing about the writer, so the row is UNKNOWN with the update.
+            got = outcome(lambda: writer_rows(wconf, 2, "/usr/bin/python3: can't open file "
+                                              "'/h/.stage-e/kit/scripts/pipeline_voice.py': "
+                                              "[Errno 2] No such file or directory\n"))
+            check("verify-writer-row-on: a role copy older than the writer is UNKNOWN",
+                  (got[0], got[2][0], "pipeline_install.py" in got[2][1])
+                  if isinstance(got, tuple) and got[2] else got, (EX_UNKNOWN, "UNKNOWN", True))
             got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: "
                                               "Something odd happened\nfallback: the writer "
                                               "exited 1\n"))

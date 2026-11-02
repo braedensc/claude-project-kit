@@ -451,8 +451,17 @@ def _attempt(cfg, kind, facts, fallback, keep, runner, now):
 # your session limit · resets 3pm", and a throttle says it is "not your usage limit". A
 # status settles the reason first. Then each wording is named in fixed words, first match
 # wins, so `why` says what to fix without carrying a word of the CLI's own.
+# A 5xx is Anthropic's side failing, which says nothing about the token (KIT-360).
+SERVER_FAILED = "Anthropic had a server error"
 STATUS_REASONS = {401: "Anthropic refused the token", 403: "Anthropic refused the token",
-                  529: "Anthropic is overloaded"}
+                  500: SERVER_FAILED, 502: SERVER_FAILED, 503: SERVER_FAILED,
+                  504: SERVER_FAILED, 529: "Anthropic is overloaded"}
+# A Team or Enterprise admin can turn off Claude subscription access for Claude Code. The
+# CLI then answers 401 or 403 with words that say so, and a new token from the same account
+# fails the same way, so it is named apart from a refused token, before the status (KIT-360).
+ORG_OFF = "the organization has turned off Claude subscription access for Claude Code"
+ORG_OFF_RE = re.compile(r"organi[sz]ation has disabled claude subscription|"
+                        r"not allowed for this organi[sz]ation", re.IGNORECASE)
 LIMITED = "a usage limit was reached"
 THROTTLED = "Anthropic is limiting requests for now, and it is not your usage limit"
 REFUSAL_REASONS = (
@@ -465,6 +474,9 @@ REFUSAL_REASONS = (
     (re.compile(r"you.ve hit your|usage limit|rate.?limit|\b429\b|limit reached",
                 re.IGNORECASE), LIMITED),
     (re.compile(r"overloaded|high load|\b529\b", re.IGNORECASE), "Anthropic is overloaded"),
+    (re.compile(r"server-side issue|internal server error|service unavailable|bad gateway|"
+                r"gateway time-?out|no response from (?:the )?api|api error: 50[0234]\b",
+                re.IGNORECASE), SERVER_FAILED),
     (re.compile(r"connect|can.t reach|internet|timed out|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|"
                 r"network|certificate|socket|getaddrinfo|fetch failed", re.IGNORECASE),
      "the claude CLI could not reach Anthropic"),
@@ -472,13 +484,15 @@ REFUSAL_REASONS = (
 # The reasons that say nothing about the token, since Anthropic could not be asked
 # (KIT-301 review). token_verdict reads them.
 UNASKED = (LIMITED, THROTTLED, "Anthropic is overloaded",
-           "the claude CLI could not reach Anthropic")
+           "the claude CLI could not reach Anthropic", SERVER_FAILED)
 
 
 def refusal_reason(said, status=None):
     """The fixed words for a refusal: from the API's HTTP status where that settles it,
     else from what the CLI said, or "" when neither fits. A 429 whose words name neither
     kind of limit is read as the subscription's."""
+    if ORG_OFF_RE.search(said or ""):
+        return ORG_OFF
     if status in STATUS_REASONS:
         return STATUS_REASONS[status]
     for pattern, reason in REFUSAL_REASONS:
@@ -970,7 +984,18 @@ def selftest():
                  "(EAI_AGAIN)", None, reach),
                 ("refused-connection", "Connection refused — a firewall or proxy may be "
                  "blocking it (ECONNREFUSED)", None, reach),
-                ("timed-out", "Request timed out", None, reach)):
+                ("timed-out", "Request timed out", None, reach),
+                # KIT-360: a 5xx says nothing about the token, and an admin's switch is not
+                # a refused token, whatever the status beside it.
+                ("a-500", "API Error: 500 Internal server error. This is a server-side "
+                 "issue, usually temporary — try again in a moment.", 500, SERVER_FAILED),
+                ("a-503-in-other-words", "API Error: Request rejected", 503, SERVER_FAILED),
+                ("no-response", "API Error: No response from API", None, SERVER_FAILED),
+                ("the-organization-turned-it-off", "Your organization has disabled Claude "
+                 "subscription access for Claude Code · Use an Anthropic API key instead, or "
+                 "ask your admin to enable access", 403, ORG_OFF),
+                ("the-organization-oauth-words", "OAuth authentication is currently not "
+                 "allowed for this organization.", 401, ORG_OFF)):
             doc = {"type": "result", "subtype": "success", "is_error": True, "result": said}
             if status is not None:
                 doc["api_error_status"] = status
@@ -1003,6 +1028,8 @@ def selftest():
                 ("the writer reported an error: " + THROTTLED, "unasked"),
                 ("the writer exited 1: Anthropic is overloaded", "unasked"),
                 ("the writer exited 1: the claude CLI could not reach Anthropic", "unasked"),
+                ("the writer exited 1: " + SERVER_FAILED, "unasked"),
+                ("the writer exited 1: " + ORG_OFF, "failed"),
                 ("the writer took longer than 60 seconds", "unasked"),
                 ("the model's text asks him a question", "works"),
                 ("the writer returned no text", "works")):
