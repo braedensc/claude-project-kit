@@ -160,8 +160,10 @@ _MENTIONS = (("<@", "a mention"), ("<!", "a broadcast"), ("<#", "a channel link"
 _ID = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-[0-9]+(?![A-Za-z0-9])")
 # How to reply, or what a yes or a no does. Only the caller's bind may say that, so a bare
 # yes in the owner's DM can only ever answer the question the bind names. So is a command
-# he could type (plan PROD-6, and replan PROD-6 since KIT-244), told or quoted, and a
-# sentence that starts by telling him to reply or respond in some way (KIT-297 review).
+# he could type (plan PROD-6, and replan PROD-6 since KIT-244), told or quoted (in quotes,
+# backticks, or Slack's bold, italic or strike marks, which the bridge strips before it reads
+# a command), and a sentence that starts by telling him to reply or respond in some way
+# (KIT-297 review). `replan <id>` is never ordinary prose, so it is refused on its own.
 _REPLY_ASK = re.compile(
     r"\b(?:reply|respond|answer|say|type|send|write)\b[^.!?,;\n]{0,40}?"
     r"\b(?:yes|no|ok|okay|approve|approved)\b"
@@ -170,7 +172,8 @@ _REPLY_ASK = re.compile(
     r"|[\"'“‘`*_]\s*(?:yes|no|ok|okay|approve)\s*[\"'”’`*_]"
     r"|\b(?:reply|respond|answer|say|type|send|write|post|use)\b[^.!?,;\n]{0,40}?"
     r"\b(?:plan|replan|approve)\s+[A-Z][A-Z0-9]*-[0-9]+"
-    r"|[\"'“‘`]\s*(?:plan|replan|approve|yes|no)\s+[A-Z][A-Z0-9]*-[0-9]+"
+    r"|[\"'“‘`*_~]\s*(?:plan|replan|approve|yes|no)\s+[A-Z][A-Z0-9]*-[0-9]+"
+    r"|\breplan\s+[A-Z][A-Z0-9]*-[0-9]+"
     r"|(?:^|[.!?:;]\s+|\n\s*)(?:please\s+|just\s+)?(?:reply|respond)\s+"
     r"(?:with|in|here|under|below|by|when|on)\b",
     re.IGNORECASE)
@@ -854,6 +857,13 @@ def selftest():
                 # before its "plan", so it is named on its own.
                 ("a-replan-told", "PROD-6's plan was refused. Type replan PROD-6 to retry."),
                 ("a-replan-quoted", "PROD-6's plan was refused. `replan PROD-6` retries."),
+                # Slack's own marks quote a command too, and a bare `replan <id>` is one.
+                ("a-replan-in-bold", "PROD-6's plan was refused. *replan PROD-6* retries."),
+                ("a-replan-in-italics", "PROD-6's plan was refused. _replan PROD-6_ retries."),
+                ("a-replan-bare", "PROD-6's plan was refused. Replan PROD-6 to try again."),
+                ("a-replan-after-try", "PROD-6's plan was refused. Try replan PROD-6."),
+                ("a-yes-in-bold", "PROD-6 is ready to plan again. *yes PROD-6* moves it."),
+                ("a-plan-struck", "PROD-6 waits. ~plan PROD-6~ starts it."),
                 ("reply-in-any-words", "PROD-6 is blocked. Reply with a thumbs up on it."),
                 ("respond-in-any-words", "PROD-6 is blocked. Please respond in the thread.")):
             fell_back("reply-ask-" + name, FakeRunner(reply(said)),

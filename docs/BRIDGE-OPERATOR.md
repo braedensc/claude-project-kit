@@ -237,22 +237,27 @@ shows the job failing.
 
 When a plan is refused, or a planning run ends with no plan, say `replan <ticket id>`. Name
 the idea, or the planning-run ticket a page linked: the bridge asks about the idea either
-way. It asks *Plan this again?* and names the idea's last planning run. Reply `yes`.
+way, and says which ticket you named. It asks *Plan this again?* and names the idea's last
+planning run. Reply `yes`.
 
 The bridge moves the idea out of Plan it to your team's first backlog state, and straight back
-in, as you. The planner sees a new move and starts a new run.
+in, as you. The planner sees a new move and starts a new run. The idea gets one comment
+naming who said yes, as soon as it leaves Plan it.
 
 Good: *Moved … out of Plan it and back in for @you. The planner starts a new run within a few
-minutes.* The idea gets one comment naming who said yes.
+minutes.*
 Not that: *… is still being planned …*. A planning run is still going. Ask again once it ends.
 Not that: *… already has a plan …*. An epic filed from this idea still stands. Approve it, or
-cancel it first.
+cancel it first. Cancel it rather than delete it: a deleted epic may still count.
 Not that: *… was moved to Plan it moments ago …*. The planner may be starting on that move.
 Wait 15 minutes, then ask again.
+Not that: *… planning changed since I asked …*. A run or a move came after the question.
+Ask again, so you see where it stands now.
 
-Every check runs again before the move. Afterwards the bridge reads the idea's history the
-way the planner does. If the move back in doesn't show there, or the move back failed, the
-thread says what to do, and that pass exits 1.
+Every check runs again before the move. If a pass stops halfway, the next pass finishes the
+same yes from where it stopped. Afterwards the bridge reads the idea's history the way the
+planner does. If the move back in doesn't show there, the move back failed, or the bridge
+can't tell whether it landed, the thread says what to do, and that pass exits 1.
 
 ---
 
