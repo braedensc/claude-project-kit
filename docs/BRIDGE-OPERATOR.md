@@ -610,6 +610,8 @@ known about it yet. Wait for the limit to reset, or check this Mac's connection,
 Not that: `could not start`. `WRITER_BIN` is not a path the role account can run. A path in
 your own home folder will not do: install claude where every account can run it. Then do
 step 1 again.
+Not that: `NOT CHECKED: … the role account's copy of the kit is older than this installer`.
+The token is stored. Run `python3 scripts/pipeline_install.py` and say yes, then `verify`.
 
 To turn it off, set `WRITER=no` and run `install --apply`.
 

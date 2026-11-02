@@ -509,13 +509,15 @@ TOKEN_SHOWN = "(not shown: it carries part of the token)"
 
 def carries_token(said, token):
     """True when `said` holds any TOKEN_WINDOW characters in a row of the token, with every
-    space and line break taken out first (KIT-301 review). The exact token is cut out
-    before this, but a token the CLI broke across lines, or only part of one, is not that
-    string. The sk-ant-oat01- prefix alone is shorter than a window, so naming it is not."""
+    character a token cannot hold taken out first: spaces and line breaks, and any other
+    break, such as a pipe, an ellipsis, a zero-width space or a colour code (KIT-301
+    reviews). The exact token is cut out before this, but a token the CLI broke up, or only
+    part of one, is not that string. The sk-ant-oat01- prefix alone is shorter than a
+    window, so naming it is not."""
     token = (token or "").strip()
     if not token:
         return False
-    flat = "".join((said or "").split())
+    flat = re.sub(r"[^A-Za-z0-9_-]", "", said or "")
     width = min(TOKEN_WINDOW, len(token))
     return any(token[i:i + width] in flat for i in range(len(token) - width + 1))
 
@@ -1022,7 +1024,16 @@ def selftest():
                 # stderr's last line alone is read, and this one holds no reason words.
                 ("its-tail-on-stderr", FakeRunner("", returncode=1, stderr=(
                     "Failed to authenticate. Authorization: Bearer %s\n%s\n"
-                    % (real[:53], real[53:]))), "the writer exited 1")):
+                    % (real[:53], real[53:]))), "the writer exited 1"),
+                # KIT-301 fix review: a break that is not a space hides nothing either.
+                ("split-by-pipes", FakeRunner(json.dumps(
+                    {"is_error": True, "result": "Failed to authenticate: " + "|".join(
+                        real[i:i + 15] for i in range(0, len(real), 15))}), returncode=1),
+                 named),
+                ("split-by-zero-width-spaces", FakeRunner(json.dumps(
+                    {"is_error": True, "result": "Failed to authenticate: " + "\u200b".join(
+                        real[i:i + 15] for i in range(0, len(real), 15))}), returncode=1),
+                 named)):
             res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=run, explain=True)
             check("explain-hides-part-of-the-token:" + name,
                   (res["said"], any(real[i:i + 8] in json.dumps(res) for i in range(13, 88)),
