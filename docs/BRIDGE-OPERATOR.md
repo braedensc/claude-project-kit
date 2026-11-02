@@ -587,26 +587,29 @@ To turn it on, follow card CK-B5:
 python3 scripts/pipeline_bridge_setup.py card CK-B5
 ```
 
-1. In your own terminal, run `claude setup-token`. It prints a token that starts
-   `sk-ant-oat`.
-2. Run `python3 scripts/pipeline_bridge_setup.py writer-token` and paste it at the hidden
-   prompt. If the token wrapped onto a second line, paste it one line at a time, and press
-   Return only after the last. The prompt stops at a line break, and a token cut short is
-   refused. Then it tries the token once.
-3. Run `command -v claude`. In `bridge.conf`, set `WRITER_BIN` to the full path it prints,
+1. Run `command -v claude`. In `bridge.conf`, set `WRITER_BIN` to the full path it prints,
    and set `WRITER=yes`. The job runs under launchd, whose PATH is short, so a bare
    `claude` will not do.
+2. In your own terminal, run `claude setup-token`. It prints a token that starts
+   `sk-ant-oat`.
+3. Run `python3 scripts/pipeline_bridge_setup.py writer-token` and paste it at the hidden
+   prompt. If the token wrapped onto a second line, paste the first line and press Return.
+   It asks for the rest at another hidden prompt. Never paste any of it at the shell's own
+   prompt. Then it tries the token once, with the writer settings from step 1.
 4. Run `install --apply`, then `verify`.
 
-Good: `verify`'s `writer` row says a sample message was written by the model.
-Not that: `writer FAILED fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set`. Do step 2 again.
+Good: `writer-token` says `Checked`, and `verify`'s `writer` row says a sample message was
+written by the model.
+Not that: `writer FAILED fallback: CLAUDE_WRITER_OAUTH_TOKEN is not set`. Do step 3 again.
 Not that: `fallback: the writer exited 1: Anthropic refused the token`. The token is wrong,
-expired or revoked. Run `claude setup-token` again, then step 2.
-Not that: `… a usage limit was reached` or `… could not reach Anthropic`. The token is fine.
-Wait for the limit to reset, or check this Mac's connection.
+expired or revoked. Do steps 2 and 3 again.
+Not that: `NOT CHECKED`, or `writer UNKNOWN`, with `a usage limit was reached`, `Anthropic
+is limiting requests` or `could not reach Anthropic`. The token is stored, and nothing is
+known about it yet. Wait for the limit to reset, or check this Mac's connection, then run
+`verify`.
 Not that: `could not start`. `WRITER_BIN` is not a path the role account can run. A path in
 your own home folder will not do: install claude where every account can run it. Then do
-step 3 again.
+step 1 again.
 
 To turn it off, set `WRITER=no` and run `install --apply`.
 

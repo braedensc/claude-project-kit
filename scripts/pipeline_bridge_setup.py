@@ -93,6 +93,11 @@ WRITER_TOKEN_RE = re.compile(r"^sk-ant-oat[0-9]{2}-[A-Za-z0-9_-]{20,}$")
 # terminal: the hidden prompt keeps only what comes before a line break (KIT-301). A
 # change in the token's format would show as this refusal, said, never as a silent pass.
 WRITER_TOKEN_MIN_CHARS = 100
+# A token cut there is never refused at its first line: the rest is asked for at further
+# hidden prompts, up to this many lines in all. Refusing at once would send the owner's
+# next paste, the token's tail, to the shell's visible prompt and its history (KIT-301
+# review).
+WRITER_TOKEN_MAX_LINES = 6
 LABEL_RE = re.compile(r"^[a-z][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*){2,}$")
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{0,31}$")
 PATH_RE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]+$")
@@ -629,13 +634,6 @@ CARDS = {
     ], "`launchctl print system/{JOB_LABEL}` says it could not find the service.",
        "removing the plist alone: launchd keeps a loaded job until it is booted out."),
     "CK-B5": ("Turn the writer on (KIT-297)", [
-        "In your own terminal, as yourself, run:  claude setup-token . Sign in when it asks. "
-        "It prints a long token that starts sk-ant-oat. It runs on your Claude "
-        "subscription, not an API key.",
-        "Put it in place, at a hidden prompt:  python3 {SELF} writer-token --conf {CONF} . "
-        "Paste the token there. It is never printed. If it wrapped onto a second line, paste "
-        "it one line at a time, and press Return only after the last: the prompt stops at a "
-        "line break, and a token cut short is refused. It then tries the token once.",
         "Find the claude program:  command -v claude . It prints a full path, such as "
         "/opt/homebrew/bin/claude. The job runs under launchd, whose PATH is short, so it "
         "needs that full path, not the bare name. Check the job's account can run it:  sudo "
@@ -643,6 +641,14 @@ CARDS = {
         "will not do. If that is where yours is, install claude somewhere every account "
         "can run it, such as /opt/homebrew/bin or /usr/local/bin, and use that path.",
         "In the conf, set WRITER=yes and WRITER_BIN=<that path>.",
+        "In your own terminal, as yourself, run:  claude setup-token . Sign in when it asks. "
+        "It prints a long token that starts sk-ant-oat. It runs on your Claude "
+        "subscription, not an API key.",
+        "Put it in place, at a hidden prompt:  python3 {SELF} writer-token --conf {CONF} . "
+        "Paste the token there. It is never printed. If it wrapped onto a second line, paste "
+        "the first line and press Return: it asks for the rest at another hidden prompt. "
+        "Never paste any of it at the shell's own prompt. It then tries the token once, "
+        "with the writer settings from line 2.",
         "Write the config:  python3 {SELF} install --conf {CONF} --apply . The job reads it "
         "on its next pass.",
         "Then:  python3 {SELF} verify --conf {CONF} . Its writer row has the writer write one "
@@ -1038,20 +1044,30 @@ def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
                      % (conf["ENV_FILE"], conf["ROLE_ACCOUNT"]), "writer-token")
     except se.NoPrivilege as exc:
         return no_privilege(exc, "writer-token")
-    value = (reader or getpass.getpass)(
-        "First run `claude setup-token` in your own terminal, then paste the token it prints "
-        "(hidden). If it wraps onto a second line, paste it one line at a time, and press "
-        "Return only after the last: ")
-    value = (value or "").strip()
+    read = reader or getpass.getpass
+    value = (read("First run `claude setup-token` in your own terminal, then paste the token "
+                  "it prints (hidden). If it wraps onto a second line, paste the first line "
+                  "and press Return, and I'll ask for the rest: ") or "").strip()
+    lines = 1
+    while (WRITER_TOKEN_RE.match(value) and len(value) < WRITER_TOKEN_MIN_CHARS
+           and lines < WRITER_TOKEN_MAX_LINES):
+        more = (read("That is %d characters, and a whole token has about 108, so it wrapped. "
+                     "Paste its next line (hidden), or press Return on an empty line to stop: "
+                     % len(value)) or "").strip()
+        if not more:
+            break
+        # A fresh first line starts the token again; any other line goes on the end.
+        value = more if more.startswith("sk-ant-") else value + more
+        lines += 1
     if not WRITER_TOKEN_RE.match(value):
-        say("REFUSED: that is not a token from `claude setup-token` (it starts sk-ant-oat). An "
-            "API key is refused too: it would bill each message. Nothing was written.")
+        say("REFUSED: %s a token from `claude setup-token` (it starts sk-ant-oat). An API key "
+            "is refused too: it would bill each message. Nothing was written."
+            % ("that is not" if lines == 1 else "the lines you pasted do not make"))
         return EX_USAGE
     if len(value) < WRITER_TOKEN_MIN_CHARS:
         say("REFUSED: that token has %d characters, and a whole one from `claude setup-token` "
-            "has about 108. It was probably cut where it wrapped onto a second line. Paste it "
-            "again one line at a time, and press Return only after the last. Nothing was "
-            "written." % len(value))
+            "has about 108, so part of it is missing. Run `writer-token` again, and paste each "
+            "line at the hidden prompt that asks for it. Nothing was written." % len(value))
         return EX_USAGE
     runner.dry_run = False
     res = runner.as_role(conf["ROLE_ACCOUNT"],
@@ -1074,20 +1090,46 @@ def cmd_writer_token(conf, runner, sudo, reader=None, tty=None):
         return EX_FAILED
     # Tried once, straight away, the way the job runs it (KIT-301): a token Anthropic
     # refuses is said now, with the CLI's reason, not at the first message that falls back.
-    rc, last = probe_writer(conf, runner)
-    if rc == bridge.voice.EXIT_USAGE:
-        say("NOT CHECKED: the bridge's config isn't installed yet, so the writer can't be "
-            "tried. `verify` tries it after `install --apply`.")
-    elif rc == 0 and last == "written by the model":
-        say("Checked: the writer wrote its sample message with the new token.")
-    else:
-        say("FAILED: the token is stored, but the writer's check says: %s" % (
-            last[:200] or "nothing"))
-        return EX_FAILED
+    # It is tried with the writer settings in the conf, which `install --apply` is about to
+    # write, not with the config installed before them (KIT-301 review).
+    code = check_new_writer_token(conf, runner)
     if conf["WRITER"] != "yes":
-        say("The writer is still off. Set WRITER=yes and WRITER_BIN in the conf, then "
-            "`install --apply` (card CK-B5).")
-    return EX_OK
+        say("The writer is still off. Set WRITER=yes in the conf, then `install --apply` and "
+            "`verify` (card CK-B5).")
+    else:
+        say("Next: `install --apply`, if the conf changed, then `verify` (card CK-B5).")
+    return code
+
+
+def check_new_writer_token(conf, runner):
+    """The writer's probe, as the role account, with the token just stored and the conf's
+    writer settings given on stdin (KIT-301 review). FAILED only when the token, or the
+    writer as the conf sets it up, is at fault. Anthropic not answering says nothing about
+    the token: NOT CHECKED. A sample that only failed a check on its words still shows
+    the token works."""
+    if not conf["WRITER_BIN"]:
+        say("NOT CHECKED: WRITER_BIN is not set in the conf, so the writer can't be tried. "
+            "Set it (card CK-B5), then run `writer-token` again, or `verify` after "
+            "`install --apply`.")
+        return EX_UNKNOWN
+    rc, last, said = probe_writer(conf, runner, compose_config(dict(conf, WRITER="yes")))
+    why = last[len("fallback: "):] if last.startswith("fallback: ") else ""
+    verdict = bridge.voice.token_verdict(why) if why else "failed"
+    if rc == 0 and last == "written by the model":
+        say("Checked: the writer wrote its sample message with the new token.")
+        return EX_OK
+    if verdict == "works":
+        say("Checked: Anthropic took the new token, but a check refused the model's sample "
+            "message (%s), so that one would go out in its plain words." % why[:200])
+        return EX_OK
+    if verdict == "unasked":
+        say("NOT CHECKED: the token is stored, but Anthropic could not be asked (%s). That "
+            "says nothing about the token. Run `writer-token` again later, or `verify` after "
+            "`install --apply`." % unasked_reason(why)[:200])
+        return EX_UNKNOWN
+    say("FAILED: the token is stored, but the writer's check says: %s"
+        % (probe_detail(last, said)[:300] or "nothing"))
+    return EX_FAILED
 
 
 def cmd_install(conf, runner, sudo, apply_it):
@@ -1240,40 +1282,78 @@ def cmd_verify(conf, runner, sudo, now=None):
     return EX_OK
 
 
-def writer_command(conf):
+def writer_command(conf, from_stdin=False):
     """The writer's probe, as the job would run it (KIT-297): the job's PATH, the env file
-    sourced as job_command sources it, Apple's interpreter, and the job's own config."""
+    sourced as job_command sources it, Apple's interpreter, and the job's own config, or
+    with `from_stdin` the config given on stdin (KIT-301 review)."""
     script = conf["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + VOICE_SCRIPT
+    config = "-" if from_stdin else '"%s"' % sh_path(conf["BRIDGE_CONFIG"])
     return ('PATH=%s; export PATH; set -a; . "%s"; set +a; exec /usr/bin/python3 "%s" probe '
-            '--config "%s"' % (shlex.quote(se.DAEMON_PATH), sh_path(conf["ENV_FILE"]),
-                               sh_path(script), sh_path(conf["BRIDGE_CONFIG"])))
+            '--config %s' % (shlex.quote(se.DAEMON_PATH), sh_path(conf["ENV_FILE"]),
+                             sh_path(script), config))
 
 
-def probe_writer(conf, runner):
-    """(exit code, last line): the writer's probe as the role account, the way the job runs
-    it. The last line is the probe's verdict, with the CLI's reason in fixed words since
-    KIT-301; a line shaped like a credential is never shown."""
-    res = runner.as_role(conf["ROLE_ACCOUNT"], writer_command(conf))
-    said = ((res.out or "").strip() or (res.err or "").strip()).splitlines() or [""]
-    last = said[-1].strip()
+def probe_writer(conf, runner, doc=None):
+    """(exit code, last line, the CLI's words): the writer's probe as the role account, the
+    way the job runs it. The last line is the probe's verdict, with the CLI's reason in
+    fixed words since KIT-301. With `doc` the probe reads that config, on stdin, instead of
+    the installed one (KIT-301 review). The CLI's words arrive with the token cut out, and
+    a line shaped like a credential is never shown."""
+    if doc is None:
+        res = runner.as_role(conf["ROLE_ACCOUNT"], writer_command(conf))
+    else:
+        res = runner.as_role(conf["ROLE_ACCOUNT"], writer_command(conf, from_stdin=True),
+                             stdin=json.dumps(doc) + "\n")
+    lines = [line.strip() for line in ((res.out or "").strip() or (res.err or "").strip())
+             .splitlines()] or [""]
+    last = lines[-1]
+    said = next((line[len(bridge.voice.CLI_SAID):] for line in lines
+                 if line.startswith(bridge.voice.CLI_SAID)), "")
     if bridge.notify.secret_hits(last):
         last = "its last line is shaped like a credential, so it is not shown"
-    return res.rc, last
+    if said and bridge.notify.secret_hits(said):
+        said = "(not shown: it is shaped like a credential)"
+    return res.rc, last, said
+
+
+# A fallback that names no reason (KIT-301 review): the CLI's own words, already cut and
+# scanned, are the only clue, so they are shown beside it.
+UNNAMED_FALLBACK_RE = re.compile(r"^fallback: the writer (?:exited -?\d+|reported an error)$")
+
+
+def probe_detail(last, said):
+    """The probe's verdict line, with what the CLI said when the line names no reason."""
+    if said and UNNAMED_FALLBACK_RE.match(last):
+        return "%s (the claude CLI said: %s)" % (last, said)
+    return last
+
+
+def unasked_reason(why):
+    """A fallback's fixed reason alone: "a usage limit was reached", not the exit code."""
+    head, _sep, reason = why.partition(": ")
+    return reason if head.startswith(("the writer exited", "the writer reported")) else why
 
 
 def writer_row(conf, runner):
     """KIT-297: with WRITER=yes, the writer writes one sample message as the role account,
-    as the job would. Good only when it says the model wrote it; anything else is FAILED,
-    with the probe's last line (a line shaped like a credential is never shown). It reads
-    the installed config: until `install --apply` writes WRITER=yes there, the config row
-    says so."""
+    as the job would. Good only when it says the model wrote it. Anthropic not answering (a
+    limit, an overload, the network) is UNKNOWN, since it says nothing about the writer
+    (KIT-301 review). Anything else is FAILED, with the probe's last line, and the CLI's
+    words when that line names no reason; a line shaped like a credential is never shown.
+    It reads the installed config: until `install --apply` writes WRITER=yes there, the
+    config row says so."""
     if conf["WRITER"] != "yes":
         return ("writer", se.SKIPPED, "off: WRITER is no, so every message goes out in its "
                 "plain words")
-    rc, last = probe_writer(conf, runner)
+    rc, last, said = probe_writer(conf, runner)
     if rc == 0 and last == "written by the model":
         return ("writer", se.ALREADY_DONE, "a sample message was written by the model")
-    return ("writer", se.FAILED, last[:200] or "the probe printed nothing")
+    why = last[len("fallback: "):] if last.startswith("fallback: ") else ""
+    if why and bridge.voice.token_verdict(why) == "unasked":
+        # Anthropic could not be asked, so the writer's state is not known (KIT-301 review).
+        return ("writer", se.UNKNOWN, "Anthropic could not be asked (%s), so the writer was "
+                "not tried" % unasked_reason(why)[:160])
+    return ("writer", se.FAILED, probe_detail(last, said)[:300] or "the probe printed nothing")
 
 
 def loaded_row(conf, loaded):
@@ -1431,6 +1511,7 @@ class _RoleRunner(se.Runner):
         self.stdins = []
         # The writer's probe (KIT-297): answered as told, never run, so no CLI starts here.
         self.probe_rc, self.probe_out, self.probes = probe_rc, probe_out, []
+        self.probe_stdins = []
 
     def _exec(self, argv, stdin, timeout, cwd=None):
         import subprocess
@@ -1441,6 +1522,7 @@ class _RoleRunner(se.Runner):
                 return se.Result(self.job_rc, self.job_out, self.job_err)
             if "pipeline_voice.py" in script and " probe " in script:
                 self.probes.append(script)
+                self.probe_stdins.append(stdin)
                 return se.Result(self.probe_rc, self.probe_out, "")
             p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True,
                                text=True, env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
@@ -2135,12 +2217,20 @@ def selftest():
             prompts = []
 
             def typed(value):
+                # A list is one answer per prompt, then empty lines (KIT-301 review).
+                answers = list(value) if isinstance(value, list) else None
+
                 def reader(prompt):
                     prompts.append(prompt)
-                    return value
+                    if answers is None:
+                        return value
+                    return answers.pop(0) if answers else ""
                 return reader
 
-            def writer_token(c_=conf, value="x", tty=True, sudo=None, runner=None):
+            # CK-B5 sets WRITER_BIN before writer-token, so its check has a program to run.
+            bconf = dict(conf, WRITER_BIN="/opt/homebrew/bin/claude")
+
+            def writer_token(c_=bconf, value="x", tty=True, sudo=None, runner=None):
                 return cap(cmd_writer_token, c_, runner or r, sudo or _FakeSudo(),
                            typed(value), tty)
             os.environ[AGENT_ENV_MARKERS[0]] = ""
@@ -2187,17 +2277,38 @@ def selftest():
             check("writer-token-asks-for-the-setup-token-first-and-says-the-writer-is-off",
                   (bool(prompts) and "run `claude setup-token` in your own terminal"
                    in prompts[-1], "Set WRITER=yes" in str(got)), (True, True))
-            # KIT-301: the prompt warns about the wrap, a token cut at a line break is refused
-            # by its length, and the stored token is tried once, the way the job runs it.
-            check("writer-token-prompt-says-to-paste-a-wrapped-token-one-line-at-a-time",
-                  bool(prompts) and "one line at a time" in prompts[-1], True)
+            # KIT-301: the prompt says how to paste a wrapped token, a token cut at a line
+            # break is completed at further hidden prompts or refused by its length, and the
+            # stored token is tried once, the way the job runs it.
+            check("writer-token-prompt-says-how-to-paste-a-wrapped-token",
+                  bool(prompts) and "paste the first line and press Return" in prompts[-1],
+                  True)
             before = saved_env = open(envp).read()
             cut = "sk-ant-oat01-" + "c" * 60
-            got = outcome(lambda: writer_token(value=cut))
+            del prompts[:]
+            got = outcome(lambda: writer_token(value=[cut, ""]))
+            check("writer-token-asks-for-the-rest-of-a-cut-token-at-a-hidden-prompt",
+                  (len(prompts), "Paste its next line (hidden)" in prompts[-1],
+                   "73 characters" in prompts[-1]), (2, True, True))
             check("writer-token-refuses-a-token-cut-at-a-line-break",
-                  (got[0], "has 73 characters" in got[1], "wrapped onto a second line" in got[1],
+                  (got[0], "has 73 characters" in got[1], "part of it is missing" in got[1],
                    open(envp).read() == before, "c" * 60 in got[1])
                   if isinstance(got, tuple) else got, (EX_USAGE, True, True, True, False))
+            # The refusal comes only after the owner stops, or after the last line it asks
+            # for, never while the token's tail is still to come (KIT-301 review).
+            del prompts[:]
+            got = outcome(lambda: writer_token(value=cut))
+            check("writer-token-stops-asking-after-its-last-line",
+                  (got[0], len(prompts)) if isinstance(got, tuple) else got,
+                  (EX_USAGE, WRITER_TOKEN_MAX_LINES))
+            del prompts[:]
+            got = outcome(lambda: writer_token(value=[cut, "sk-ant-oat01-" + "j" * 50, ""]))
+            check("writer-token-a-new-first-line-starts-the-token-again",
+                  (got[0], "has 63 characters" in got[1], len(prompts))
+                  if isinstance(got, tuple) else got, (EX_USAGE, True, 3))
+            check("writer-token-refuses-lines-that-make-no-token",
+                  outcome(lambda: (lambda g: (g[0], "the lines you pasted do not make" in g[1]))(
+                      writer_token(value=[cut, "c" * 20 + " $(id)"]))), (EX_USAGE, True))
             check("writer-token-tries-the-token-it-stored",
                   ("Checked: the writer wrote its sample message" in str(got_written),
                    len(probes_written)), (True, 1))
@@ -2210,13 +2321,69 @@ def selftest():
                   (got[0], "the token is stored, but the writer's check says: fallback: the "
                    "writer exited 1: Anthropic refused the token" in got[1])
                   if isinstance(got, tuple) else got, (EX_FAILED, True))
-            not_yet = _RoleRunner(home, root, probe_rc=2, probe_out=(
-                "FAIL: could not read --config\n"))
-            got = outcome(lambda: writer_token(value="sk-ant-oat01-" + "g" * 95,
-                                               runner=not_yet))
-            check("writer-token-before-install-says-not-checked",
-                  (got[0], "NOT CHECKED: the bridge's config isn't installed yet" in got[1])
-                  if isinstance(got, tuple) else got, (EX_OK, True))
+            # KIT-301 review: the check uses the conf's writer settings, given on stdin, not
+            # the config installed before them.
+            tried = _RoleRunner(home, root)
+            got = outcome(lambda: writer_token(dict(bconf, WRITER_MODEL="haiku",
+                                                    WRITER_TOKEN_ENV="CLAUDE_WRITER_OAUTH_TOKEN"),
+                                               "sk-ant-oat01-" + "g" * 95, runner=tried))
+            sent = (json.loads(tried.probe_stdins[0]) if tried.probe_stdins
+                    and tried.probe_stdins[0] else {})
+            check("writer-token-tries-the-confs-writer-settings",
+                  (got[0] if isinstance(got, tuple) else got,
+                   [p_.endswith(" probe --config -") for p_ in tried.probes],
+                   [sent.get(k) for k in ("writer", "writer_bin", "writer_model",
+                                          "writer_token_env")]),
+                  (EX_OK, [True], [True, "/opt/homebrew/bin/claude", "haiku",
+                                   "CLAUDE_WRITER_OAUTH_TOKEN"]))
+            unset = _RoleRunner(home, root)
+            got = outcome(lambda: writer_token(conf, "sk-ant-oat01-" + "h" * 95, runner=unset))
+            check("writer-token-without-writer-bin-says-not-checked",
+                  (got[0], "NOT CHECKED: WRITER_BIN is not set" in got[1], unset.probes,
+                   "Set WRITER=yes in the conf" in got[1])
+                  if isinstance(got, tuple) else got, (EX_UNKNOWN, True, [], True))
+            # What the check found decides the verdict: FAILED only for the token or the
+            # writer's own setup, NOT CHECKED when Anthropic could not be asked, and
+            # Checked when Anthropic took the token and only a check on the words failed.
+            for name, rc_, said, code, words in (
+                    ("no-voice-script", 2, "/usr/bin/python3: can't open file "
+                     "'/h/.stage-e/kit/scripts/pipeline_voice.py': [Errno 2] No such file or "
+                     "directory", EX_FAILED, "FAILED: the token is stored, but the writer's "
+                     "check says: /usr/bin/python3: can't open file"),
+                    ("cannot-start", 1, "A sample.\nfallback: could not start "
+                     "/opt/homebrew/bin/claude: No such file or directory", EX_FAILED,
+                     "check says: fallback: could not start /opt/homebrew/bin/claude"),
+                    ("a-usage-limit", 1, "A sample.\nthe claude CLI said: You've hit your "
+                     "session limit · resets 3pm\nfallback: the writer exited 1: a usage "
+                     "limit was reached", EX_UNKNOWN, "NOT CHECKED: the token is stored, but "
+                     "Anthropic could not be asked (a usage limit was reached)"),
+                    ("a-timeout", 1, "A sample.\nfallback: the writer took longer than 60 "
+                     "seconds", EX_UNKNOWN, "could not be asked (the writer took longer than "
+                     "60 seconds)"),
+                    ("a-check-on-the-words", 1, "A sample.\nfallback: the model's text asks "
+                     "him a question", EX_OK, "Checked: Anthropic took the new token, but a "
+                     "check refused the model's sample message (the model's text asks him a "
+                     "question)"),
+                    ("an-unnamed-refusal", 1, "A sample.\nthe claude CLI said: Something odd "
+                     "happened\nfallback: the writer exited 1", EX_FAILED, "check says: "
+                     "fallback: the writer exited 1 (the claude CLI said: Something odd "
+                     "happened)")):
+                found = _RoleRunner(home, root, probe_rc=rc_, probe_out=said + "\n")
+                got = outcome(lambda: writer_token(value="sk-ant-oat01-" + "k" * 95,
+                                                   runner=found))
+                check("writer-token-check-verdict:" + name,
+                      (got[0], words in got[1], "Next: `install --apply`" in got[1]
+                       or "Set WRITER=yes in the conf" in got[1])
+                      if isinstance(got, tuple) else got, (code, True, True))
+            # A token that wrapped, pasted a line at a time: stored whole (KIT-301 review).
+            whole = "sk-ant-oat01-" + "m" * 60 + "n" * 35
+            del prompts[:]
+            got = outcome(lambda: writer_token(value=[whole[:73], whole[73:]]))
+            env_text = open(envp).read()
+            check("writer-token-joins-a-wrapped-token-pasted-a-line-at-a-time",
+                  (got[0], "CLAUDE_WRITER_OAUTH_TOKEN=%s\n" % whole in env_text, len(prompts),
+                   "n" * 35 in got[1], "m" * 40 in got[1])
+                  if isinstance(got, tuple) else got, (EX_OK, True, 2, False, False))
             with open(envp, "w") as fh:           # the cases below start from the first write
                 fh.write(saved_env)
             got = outcome(lambda: writer_token(dict(conf, WRITER_TOKEN_ENV="OTHER_WRITER_TOKEN"),
@@ -2349,6 +2516,27 @@ def selftest():
                                               % ("sk-ant-oat01-" + "q" * 40)))
             check("verify-writer-row-on: a last line shaped like a credential is never shown",
                   (got[2][0], "q" * 40 in got[2][1]) if isinstance(got, tuple) and got[2]
+                  else got, ("FAILED", False))
+            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: "
+                                              "API Error: Server is temporarily limiting "
+                                              "requests (not your usage limit)\nfallback: the "
+                                              "writer exited 1: %s\n" % bridge.voice.THROTTLED))
+            check("verify-writer-row-on: Anthropic not answering is UNKNOWN (KIT-301 review)",
+                  (got[0], got[2]) if isinstance(got, tuple) else got,
+                  (EX_UNKNOWN, ("UNKNOWN", "Anthropic could not be asked (%s), so the writer "
+                                "was not tried" % bridge.voice.THROTTLED)))
+            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: "
+                                              "Something odd happened\nfallback: the writer "
+                                              "exited 1\n"))
+            check("verify-writer-row-on: an unnamed fallback shows the CLI's words",
+                  got[2] if isinstance(got, tuple) else got,
+                  ("FAILED", "fallback: the writer exited 1 (the claude CLI said: Something odd "
+                             "happened)"))
+            got = outcome(lambda: writer_rows(wconf, 1, "A sample.\nthe claude CLI said: %s\n"
+                                              "fallback: the writer exited 1\n"
+                                              % ("xoxb-" + "q" * 30)))
+            check("verify-writer-row-on: the CLI's words shaped like a credential are not shown",
+                  (got[2][0], "q" * 30 in got[2][1]) if isinstance(got, tuple) and got[2]
                   else got, ("FAILED", False))
             got = outcome(lambda: writer_rows(dict(wconf, WRITER_TOKEN_ENV="NOT_THERE_TOKEN")))
             check("verify-writer-row-on: the credentials row needs the writer's token by name",
