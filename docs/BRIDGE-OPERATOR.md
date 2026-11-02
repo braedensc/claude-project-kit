@@ -255,12 +255,25 @@ Not that: *… planning changed since I asked …*. A run or a move came after t
 Ask again, so you see where it stands now.
 
 Every check runs again before the move. If a pass stops halfway, the next pass finishes the
-same yes from where it stopped. An edited question, or a later post, never stops it then.
+same yes from where it stopped. An edited question, or a later post, never stops that yes.
 If that yes is gone, every pass exits 1 and says so, and the idea may wait in the backlog
 state. Reply `yes <ticket id>` where it was asked, and the next pass finishes it, for whoever
-said yes first. Afterwards the bridge reads the idea's history the way the planner does. If
-the move back in doesn't show there, the move back failed, or the bridge can't tell whether
-it landed, the thread says what to do, and that pass exits 1.
+said yes first. Reply `no <ticket id>` instead to leave the idea where it is.
+
+A later answer is judged like any answer (KIT-358):
+- A bot's or a guest's yes is refused, and so is a bare one after a post the bridge can't vouch for.
+- Before the move back, the bridge checks again for a planning run or a plan. If one appeared,
+  the idea stays in the backlog state, and the thread says why.
+- A `no` never moves the idea.
+- With `ACT=no`, nothing moves. The re-plan waits, and every pass says so.
+- If the first move never landed, nothing waits outside Plan it. The question is an ordinary
+  one again, and it expires like one.
+- If the question was asked where the bridge no longer reads, the next pass closes it and says
+  so once. That covers a channel taken off `CHANNEL_IDS`, and a member taken off `DM_USER_IDS`.
+
+Afterwards the bridge reads the idea's history the way the planner does. If the move back in
+doesn't show there, the move back failed, or the bridge can't tell whether it landed, the
+thread says what to do, and that pass exits 1.
 
 ---
 
