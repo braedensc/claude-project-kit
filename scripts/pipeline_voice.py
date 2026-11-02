@@ -510,17 +510,31 @@ TOKEN_WINDOW = 16
 TOKEN_SHOWN = "(not shown: it carries part of the token)"
 
 
+# Terminal escape sequences, taken out whole before the window check (KIT-359). A colour
+# code's digits and final letter are in the token's alphabet, so taking out only its ESC
+# and "[" left them between a token's pieces, and a token cut into pieces under a window
+# long was never matched. An OSC keeps its text, which could hold the token: only its
+# opening goes. ESC and the OSC's end are not in the alphabet, so the flattening takes them.
+TERMINAL_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"      # CSI, whole: colours and cursor moves
+    r"|\x9b[0-?]*[ -/]*[@-~]"       # the same, in its one-byte form
+    r"|\x1b\]8;[^;\x07\x1b]*;"      # a link's opening, up to its address
+    r"|\x1b\][0-9]*;"               # any other OSC's opening; its text stays
+    r"|\x1b[ -~]"                   # any two-character escape
+    r"|\[[0-9;]*m")                 # a colour code whose ESC is already gone
+
+
 def carries_token(said, token):
     """True when `said` holds any TOKEN_WINDOW characters in a row of the token, with every
     character a token cannot hold taken out first: spaces and line breaks, and any other
-    break, such as a pipe, an ellipsis, a zero-width space or a colour code (KIT-301
-    reviews). The exact token is cut out before this, but a token the CLI broke up, or only
-    part of one, is not that string. The sk-ant-oat01- prefix alone is shorter than a
-    window, so naming it is not."""
+    break, such as a pipe, an ellipsis or a zero-width space (KIT-301 reviews), and every
+    terminal escape sequence, whole (KIT-359). The exact token is cut out before this, but
+    a token the CLI broke up, or only part of one, is not that string. The sk-ant-oat01-
+    prefix alone is shorter than a window, so naming it is not."""
     token = (token or "").strip()
     if not token:
         return False
-    flat = re.sub(r"[^A-Za-z0-9_-]", "", said or "")
+    flat = re.sub(r"[^A-Za-z0-9_-]", "", TERMINAL_ESCAPE_RE.sub("", said or ""))
     width = min(TOKEN_WINDOW, len(token))
     return any(token[i:i + width] in flat for i in range(len(token) - width + 1))
 
@@ -1041,12 +1055,38 @@ def selftest():
             check("explain-hides-part-of-the-token:" + name,
                   (res["said"], any(real[i:i + 8] in json.dumps(res) for i in range(13, 88)),
                    res["why"]), (TOKEN_SHOWN, False, why))
+        # KIT-359: a colour code's digits and letter are in the token's alphabet, so a code
+        # between pieces under a window long hid every piece. The token here holds no digit
+        # and no m past its prefix, so no code's leftover can stand in for a token character.
+        lettered = "sk-ant-oat01-" + ("QwErTyUiOpAsDfGhJkLzXcVbNq" * 4)[:95]
+        os.environ[TOKEN_VAR] = lettered
+        for label, code in (("colour-resets", "\x1b[0m"), ("colours", "\x1b[31m"),
+                            ("bold-colours", "\x1b[1;31m"), ("256-colours", "\x1b[38;5;208m"),
+                            ("one-byte-csi", "\x9b31m"), ("colour-codes-without-esc", "[0m"),
+                            ("link-ends", "\x1b]8;;\x1b\\"), ("link-ends-bel", "\x1b]8;;\x07"),
+                            ("cursor-saves", "\x1b7")):
+            res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=FakeRunner(json.dumps(
+                {"is_error": True, "result": "Failed to authenticate: " + code.join(
+                    lettered[i:i + 15] for i in range(0, len(lettered), 15))}), returncode=1),
+                explain=True)
+            check("explain-hides-part-of-the-token:split-by-" + label,
+                  (res["said"], any(lettered[i:i + 8] in json.dumps(res) for i in range(13, 88)),
+                   res["why"]), (TOKEN_SHOWN, False, named))
+        os.environ[TOKEN_VAR] = real
         plain_refusal = "Failed to authenticate. API Error: 401 OAuth access token is invalid."
         res = write(cfg, "blocked", FACTS, PLAIN, keep=KEEP, runner=FakeRunner(json.dumps(
             {"is_error": True, "result": plain_refusal}), returncode=1), explain=True)
         check("explain-shows-a-refusal-that-carries-none-of-the-token",
               (res["said"], carries_token("a token that starts sk-ant-oat01-", real)),
               (plain_refusal, False))
+        # KIT-359: colour codes alone are not a token, and a link's address still counts.
+        coloured = "\x1b[1;31mFailed to authenticate.\x1b[0m API Error: 401 \x1b[38;5;208m"
+        check("colour-codes-alone-are-not-the-token", carries_token(coloured, real), False)
+        check("a-link-address-with-the-token-is-the-token",
+              carries_token("see \x1b]8;;https://example.invalid/?t=%s\x1b\\here\x1b]8;;\x1b\\"
+                            % real[20:60], real), True)
+        check("a-title-with-the-token-is-the-token",
+              carries_token("\x1b]0;%s\x07 Failed to authenticate." % real[20:60], real), True)
         os.environ[TOKEN_VAR] = TOKEN
         fell_back("error-subtype", FakeRunner(reply(MODEL, subtype="error_max_turns")),
                   "the writer reported an error")
