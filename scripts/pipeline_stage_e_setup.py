@@ -3820,6 +3820,21 @@ def step_configs(ctx, apply_it):
     stale = [f for f, want in wanted.items() if current.get(f) != want]
     if not stale:
         return True, "all %d config files match what this conf produces" % len(wanted), notes
+    if "finding/poller.json" in stale and "ticket_model" in finding:
+        # KIT-380: a finding poller from before the key refuses the WHOLE config as an
+        # unknown key and then files nothing. The `code` step moves the clone only to
+        # origin, so an installer run from a checkout ahead of it can meet an older poller.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_finding_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the finding poller's own code, to see whether it "
+                          "knows TICKET_MODEL", "run this from a terminal as yourself")
+        if code.ok and '"ticket_model"' not in (code.out or ""):
+            raise SetupError("TICKET_MODEL is set, but the role account's clone runs a "
+                             "finding poller from before that key, which would refuse its "
+                             "whole config and file nothing. Nothing was written. Leave "
+                             "TICKET_MODEL empty until origin carries the change, then run "
+                             "this again.")
     if not apply_it:
         return False, "would rewrite: " + ", ".join(sorted(stale)), notes
 
@@ -7929,14 +7944,33 @@ def _selftest_body():
     # takes only a model name the finding poller takes.
     cases += 1
     composed = {}
+    new_poller = 'CONFIG_KEYS = {"teams", "ticket_model"}\n'
     for model in ("", "opus"):
         ctxTM, fakeTM = _settled_ctx(dict(conf, TICKET_MODEL=model))
         fakeTM.answers = [("cat $HOME/.stage-e/finding/poller.json", 0, ""),
+                          ("cat $HOME/.stage-e/kit/scripts/pipeline_finding_poller.py", 0,
+                           new_poller),
                           ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeTM.answers)
         step_configs(ctxTM, apply_it=True)
         wrote = [w for w in fakeTM.writes
                  if "cat >" in _fmt(w["argv"]) and "finding/poller.json" in _fmt(w["argv"])]
         composed[model] = json.loads(wrote[0]["stdin"]) if wrote else {}
+    # …and never for a finding poller from before the key, which would refuse the whole
+    # config and file nothing: refused, with nothing written.
+    ctxOld, fakeOld = _settled_ctx(dict(conf, TICKET_MODEL="opus"))
+    fakeOld.answers = [("cat $HOME/.stage-e/finding/poller.json", 0, ""),
+                       ("cat $HOME/.stage-e/kit/scripts/pipeline_finding_poller.py", 0,
+                        'CONFIG_KEYS = {"teams"}\n'),
+                       ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeOld.answers)
+    try:
+        step_configs(ctxOld, apply_it=True)
+        old_refused = ""
+    except SetupError as exc:
+        old_refused = str(exc)
+    expect("configs-ticket-model-old-poller-refused",
+           "file nothing" in old_refused
+           and not [w for w in fakeOld.writes if "cat >" in _fmt(w["argv"])],
+           "an old finding poller was handed ticket_model: %r" % old_refused)
     untagged, tagged = composed[""], composed["opus"]
     expect("configs-finding-ticket-model",
            untagged and "ticket_model" not in untagged

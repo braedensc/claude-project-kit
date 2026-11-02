@@ -221,6 +221,21 @@ def neutralize_routing(text):
     return _UNBRACKETED_REPO_RE.sub(lambda m: m.group(1) + ROUTING_TAG_MARK, out)
 
 
+def capped_title(title):
+    """The session's title, its directives neutralised, cut to the cap. A mark is longer
+    than the tag it replaces, so a title within the cap can outgrow it; the cut never
+    leaves half a mark behind."""
+    out = neutralize_routing(title or "")
+    if len(out) <= DEFAULT_TITLE_CAP:
+        return out
+    out = out[:DEFAULT_TITLE_CAP]
+    start = out.rfind("(")
+    if start != -1 and out[start:] != ROUTING_TAG_MARK and ROUTING_TAG_MARK.startswith(
+            out[start:]):
+        out = out[:start].rstrip()
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Errors + logging
 # --------------------------------------------------------------------------- #
@@ -375,6 +390,7 @@ EXAMPLE_CONFIG = {
     "watermark_overlap_minutes": 15,
     "max_per_source": 3,
     "max_per_run": 20,
+    "ticket_model": "opus",
 }
 
 
@@ -568,7 +584,7 @@ def creation_input(cfg, team_id, backlog_state_id, prov_label_id, extra_label_id
     model = cfg.get("ticket_model")
     inp = {
         "teamId": team_id,
-        "title": neutralize_routing(title or "")[:DEFAULT_TITLE_CAP],
+        "title": capped_title(title),
         "description": (("[model=%s]\n\n" % model) if model else "") + build_finding_body(
             source_id, neutralize_routing(body), parent_id),
         "stateId": backlog_state_id,
@@ -1464,6 +1480,16 @@ def selftest():
        and tagged["description"].count("[model=") == 1)
     ok("create: the rest is the untagged text",
        tagged["description"] == "[model=opus]\n\n" + inp["description"])
+    # A mark is longer than the tag it replaces: a title within the cap can outgrow it, and
+    # the cut never leaves half a mark.
+    long_title = "x" * 189 + " [model=a]"
+    capped = creation_input(cfg, "TEAM", "BACKLOG", "PROVAGENT", [], long_title, "b",
+                            "KIT-9")["title"]
+    ok("create: a neutralised title is cut without half a mark",
+       len(capped) <= DEFAULT_TITLE_CAP and "(removed-" not in capped
+       and capped == "x" * 189)
+    ok("create: a short title keeps its whole mark",
+       capped_title("fix [repo=x] now") == "fix %s now" % ROUTING_TAG_MARK)
     import pipeline_plan_executor as _executor
     ok("routing: the copied patterns agree with the plan executor's",
        (_BRACKET_TAG_RE.pattern, _UNBRACKETED_REPO_RE.pattern, ROUTING_TAG_MARK)
