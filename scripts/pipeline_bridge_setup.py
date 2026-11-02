@@ -40,7 +40,8 @@ could post a question that looked like the bridge's.
               `writer` row has the writer write one sample message, as the job would; with
               WRITER=no it says the writer is off (KIT-297).
     card      CK-B1 create the Slack app, CK-B2 load the job, CK-B3 turn the bridge off,
-              CK-B4 prove it live, CK-B5 turn the writer on.
+              CK-B4 prove it live, CK-B5 turn the writer on, CK-B6 answer devs from the DM
+              and hear when the notifier stops (KIT-332).
 
 WHO RUNS SUDO. `token`, `writer-token`, `install` and `verify` ask for the administrator
 password once, then run sudo themselves: as the role account (`sudo -u`), and as root to
@@ -664,6 +665,21 @@ CARDS = {
     ], "verify's writer row says a sample message was written by the model.",
        "an API key (it starts sk-ant-api). `writer-token` refuses it: it would bill each "
        "message, and your subscription is what pays here."),
+    "CK-B6": ("Answer devs from your DM, and hear when the notifier stops (KIT-332)", [
+        "In notifier.conf, set BRIDGE_PINGS=yes, then:  python3 {NOTIFIER_SETUP} run . The "
+        "notifier then records which of its pages wait on an answer.",
+        "In this conf, check that NOTIFIER_STATE_DIR is notifier.conf's STATE_DIR, and set "
+        "NOTIFIER_JOB_LABEL to notifier.conf's JOB_LABEL. The bridge reads the notifier's "
+        "heartbeat and its plist from those.",
+        "Write the config:  python3 {SELF} install --conf {CONF} --apply .",
+        "After the notifier's next pass:  python3 {SELF} verify --conf {CONF} .",
+        "On the next real question: reply under the message saying a dev stopped to ask "
+        "you something, in your DM.",
+    ], "verify's pings and notifier rows read ALREADY-DONE, and your reply is sent to the "
+       "dev's session.",
+       "setting NOTIFIER_JOB_LABEL while the role account's clone has an older bridge. It "
+       "refuses the key, and every pass stops, until `python3 scripts/pipeline_install.py` "
+       "moves the clone."),
 }
 
 
@@ -677,6 +693,8 @@ def card_values(conf, conf_path):
     return {"APP_NAME": conf["APP_NAME"], "JOB_LABEL": conf["JOB_LABEL"],
             "ROLE_ACCOUNT": conf["ROLE_ACCOUNT"],
             "PLIST": plist_path(conf), "SELF": os.path.abspath(__file__),
+            "NOTIFIER_SETUP": os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "pipeline_notifier_setup.py"),
             "CONF": conf_path, "ENV_FILE": conf["ENV_FILE"],
             "DECOY": conf["ENV_FILE"] + ".decoy-proof",
             "ENV_RULE": chat_lane._path_rule(conf["ENV_FILE"]),
@@ -1490,12 +1508,15 @@ def notifier_row(conf, facts, runner, now):
 def pings_row(conf, facts):
     """The notifier writes its pings file on its first pass with BRIDGE_PINGS=yes, so a
     missing file means that is off, or the two jobs name different state dirs. With
-    NOTIFIER_BOT_USER_ID set the owner has turned answering on, so a missing file blocks."""
+    NOTIFIER_BOT_USER_ID set the owner has turned answering on, so a missing file blocks.
+    So it does with DM_USER_IDS set (KIT-332): the DM is then where the owner answers a
+    dev, and without the file every such answer is refused."""
     path = pings_file(conf)
     if facts.get("pings_error"):
         return ("pings", se.UNKNOWN, "%s could not be read (%s)" % (path, facts["pings_error"]))
     if facts.get("pings_missing"):
-        return ("pings", se.BLOCKED if conf["NOTIFIER_BOT_USER_ID"] else se.SKIPPED,
+        answering = conf["NOTIFIER_BOT_USER_ID"] or split_list(conf["DM_USER_IDS"])
+        return ("pings", se.BLOCKED if answering else se.SKIPPED,
                 "no pings file at %s: BRIDGE_PINGS=yes is not set in notifier.conf, or its "
                 "STATE_DIR is not NOTIFIER_STATE_DIR. Until it is there, no reply under a "
                 "ping is answered (docs/BRIDGE-OPERATOR.md, Step 10)" % path)
@@ -1858,6 +1879,12 @@ def selftest():
                   outcome(lambda: [e.split(" ")[0] for e in validate_conf(dict(values,
                                                                                **over))[1]]),
                   [key])
+        check("card-b6-answers-devs-and-watches-the-notifier (KIT-332)",
+              outcome(lambda: [n for n in (
+                  "BRIDGE_PINGS=yes", "pipeline_notifier_setup.py run", "NOTIFIER_STATE_DIR",
+                  "NOTIFIER_JOB_LABEL", "install --conf bridge.conf --apply",
+                  "verify --conf bridge.conf", "ALREADY-DONE", "pipeline_install.py")
+                  if n not in cap(print_card, "CK-B6", conf)[1]]), [])
         check("card-b5-turns-the-writer-on-step-by-step",
               outcome(lambda: [n for n in (
                   "claude setup-token", "writer-token --conf bridge.conf", "command -v claude",
@@ -2644,6 +2671,14 @@ def selftest():
             check("verify-no-pings-file-blocks-once-pings-are-on",
                   (rc, bool(re.search(r"pings\s+BLOCKED", out)), "BRIDGE_PINGS=yes" in out),
                   (EX_BLOCKED, True, True))
+            # KIT-332: with DM_USER_IDS set the DM is where the owner answers a dev, so a
+            # missing pings file blocks there too, naming BRIDGE_PINGS=yes.
+            dconf = dict(conf, DM_USER_IDS="U0ALICE001")
+            rc, out = cap(cmd_verify, dconf, _RoleRunner(home, root, loaded=True),
+                          _FakeSudo(), now=at + 30)
+            check("verify-no-pings-file-blocks-in-dm-mode (KIT-332)",
+                  (bool(re.search(r"pings\s+BLOCKED", out)), "BRIDGE_PINGS=yes" in out,
+                   bool(re.search(r"pings\s+SKIPPED", out))), (True, True, False))
             pings_path = os.path.join(home, ".stage-e", "state", "notifier-bridge-pings.json")
             for name, doc, want_row in (
                     ("not-the-notifiers", {"schema": "other/1", "messages": {}},

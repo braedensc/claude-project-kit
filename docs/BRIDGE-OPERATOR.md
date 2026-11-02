@@ -395,6 +395,16 @@ The notifier pings you when a session stops with a question. Once this step is d
 under that ping is passed to the session as your answer. The notifier's own reply relay stays
 off: the bridge replaces it, with the same rules and a check with Slack on who replied.
 
+**In DM mode** (`DM_USER_IDS` set), the notifier's pages already come into your DM through
+the bridge's app, and the bridge tells them apart by the notifier's own record of them. So
+there is no pings channel to invite, and no `NOTIFIER_BOT_USER_ID`. Do steps 3 and 5 to 7
+only. Then reply under the *stopped to ask you something* message, in your DM. Card CK-B6
+has this step and Step 11 in order:
+
+```sh
+python3 scripts/pipeline_bridge_setup.py card CK-B6
+```
+
 1. Invite the bridge's app to the notifier's pings channel.
 2. Add that channel's id to `CHANNEL_IDS` in `bridge.conf`, after the chat channel's.
 3. In `bridge.conf`, set `NOTIFIER_STATE_DIR` to the `STATE_DIR` in `notifier.conf`. Both
@@ -422,7 +432,10 @@ python3 scripts/pipeline_bridge_setup.py verify
 Good: the `pings` row reads `ALREADY-DONE`. The notifier writes that file on its first pass
 with `BRIDGE_PINGS=yes`.
 Not that: `pings BLOCKED no pings file at …`. Either `BRIDGE_PINGS` is still `no`, or the
-two state dirs differ. Fix step 3 or step 5.
+two state dirs differ. Fix step 3 or step 5. With `DM_USER_IDS` set this row blocks too:
+the DM is where you answer a dev.
+Not that, in your DM: *I can't pass that on to the dev: answering a dev from this DM isn't
+switched on here.* `BRIDGE_PINGS` is still `no`. Do steps 5 to 7.
 
 Try it on the next real ping: reply under it, in its thread.
 
@@ -500,8 +513,11 @@ What it says in Slack, and when:
 Each of the first three ends with the command that checks the notifier: *To check it, run
 `python3 scripts/pipeline_notifier_setup.py verify` in your kit checkout.*
 
-- **Once each.** It posts as the bridge, as a message of its own in the first channel in
-  `CHANNEL_IDS`. It says each one once, even after a restart: it keeps what it said in a
+- **Where.** With `DM_USER_IDS` set, it posts in each listed member's DM, where you look.
+  Until a listed DM has been read once, the first channel in `CHANNEL_IDS` hears it. Without
+  `DM_USER_IDS`, it is that channel.
+- **Once each.** It posts as the bridge, as a message of its own. It says each one once,
+  even after a restart: it keeps what it said in a
   file of its own, `bridge-notifier-watch.json` in its `STATE_DIR`. If that file can't be
   read, it starts again, and may say once more each problem it had already said. If the
   notifier is back before the bridge says one again, the bridge doesn't say it is back. A
