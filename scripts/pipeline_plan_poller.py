@@ -2938,6 +2938,18 @@ def selftest():
         check("rejected-says-how-to-plan-again (KIT-304)",
               comments_on(f, "idea-75", "Move the idea out of Plan it and back in to plan it "
                                         "again") != [], True)
+        # Stage E review: the note names the team's own state, not the default's name.
+        f = FakeLinear(FakeClock())
+        f.teams["PROD"]["states"][1]["name"] = "Ready to plan"
+        f.add_idea(75)
+        cr = cfg_for("rejected-renamed", plan_it_state="Ready to plan")
+        one_pass(cr, f)
+        f.finish(runs(f)[0]["id"], "no plan")
+        code, _ = one_pass(cr, f, runner=fake_executor(3))
+        check("rejected-names-the-teams-own-plan-it-state (KIT-304 review)",
+              (code, comments_on(f, "idea-75", "Move the idea out of Ready to plan and back in "
+                                               "to plan it again") != [],
+               comments_on(f, "idea-75", "out of Plan it") == []), (EXIT_OK, True, True))
         del calls[:]
         f = FakeLinear(FakeClock())
         f.add_idea(76)
