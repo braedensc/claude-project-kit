@@ -2944,6 +2944,20 @@ def step_poller_config(ctx, apply_it):
                       "run this from a terminal as yourself")
     if got == want:
         return True, "the planner job's config matches this conf", []
+    if '"ticket_model"' in want:
+        # KIT-379: a planner from before the key refuses the WHOLE config as an unknown key,
+        # and then plans nothing. The one command moves the clone first; `drill` alone, or a
+        # checkout ahead of origin, does not.
+        code = ctx.host.read_role_file(account, ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py")
+        if code is None:
+            raise Unknown("could not read the planner job's own code, to see whether it knows "
+                          "TICKET_MODEL", "run this from a terminal as yourself")
+        if '"ticket_model"' not in code:
+            raise SetupError("TICKET_MODEL is set, but the role account's clone runs a planner "
+                             "from before that key, which would refuse the whole config and "
+                             "plan nothing. Nothing was written. Run the one command, "
+                             "`python3 scripts/pipeline_install.py`, so it moves the clone "
+                             "first, or leave TICKET_MODEL empty until then.")
     if not apply_it:
         return False, ("would write the planner job's config" if not got
                        else "would rewrite the planner job's config: this conf has moved "
@@ -3610,12 +3624,21 @@ PROBE_LABEL_BODY = ("This is a routing test, filed by the idea-gate installer. Y
                     "brief says what to do with a ticket of exactly this title.")
 
 
-def probe_tools_body(entry):
-    """Probe ticket 1: the planning tag as its FIRST line. The steps are in the brief."""
-    return ("[repo=%s]\n\n"
+def probe_label_body(model=None):
+    """Probe ticket 2: routed by its label alone. With TICKET_MODEL set it opens with the
+    model tag, as every planning ticket the job files does (KIT-379)."""
+    return (poller.executor.model_tag(model) + "\n\n" if model else "") + PROBE_LABEL_BODY
+
+
+def probe_tools_body(entry, model=None):
+    """Probe ticket 1: the planning tag as its FIRST line, and with TICKET_MODEL set the
+    model tag on its second, exactly where the job puts it (KIT-379). The steps are in the
+    brief."""
+    return ("[repo=%s]\n%s\n"
             "This is the idea-gate installer's fence probe. It is not an idea. Your planning "
             "brief says what to do with a ticket of exactly this title. This text adds "
-            "nothing to it." % entry)
+            "nothing to it." % (entry, (poller.executor.model_tag(model) + "\n") if model
+                                else ""))
 
 
 _SECTION_RE = re.compile(r"^[\s#>*_`-]*(%s)\b[\s*_`]*:?[\s*_`]*(.*)$"
@@ -3921,10 +3944,11 @@ def run_probe(ctx, rows):
             if not (rec.get("team_id") and rec.get("routing_label_id")):
                 raise SetupError("the tracker step has not recorded %s's team and routing "
                                  "label yet" % row["team_key"])
+            model = conf_value(ctx.conf, "TICKET_MODEL")
             one = own.create(rec["team_id"], PROBE_TITLE_TOOLS,
-                             probe_tools_body(row["entry"]),
+                             probe_tools_body(row["entry"], model),
                              [rec["routing_label_id"]], ws["agent_id"], "probe")
-            two = own.create(rec["team_id"], PROBE_TITLE_LABEL, PROBE_LABEL_BODY,
+            two = own.create(rec["team_id"], PROBE_TITLE_LABEL, probe_label_body(model),
                              [rec["routing_label_id"]], ws["agent_id"], "probe")
             filed.append((row, one, two))
             ctx.say("  filed %s (tag and label) and %s (label only) on %s"
@@ -7580,6 +7604,33 @@ def selftest():
                 check("poller-config-ticket-model:%s" % (model or "unset"),
                       json.loads(poller_config(mc)).get("ticket_model", "absent"),
                       model or "absent")
+            # …and is never written for a planner from before the key: that one would refuse
+            # the whole config and plan nothing (`drill` alone does not move the clone).
+            for label, code in (("old-clone", "OPTIONAL_KEYS = (\"probe\",)\n"),
+                                ("new-clone", "OPTIONAL_KEYS = (\"probe\", \"ticket_model\")\n")):
+                oc = _ctx(os.path.join(tmp, "ticket-model-%s" % label),
+                          conf=dict(GOOD_CONF, TICKET_MODEL="opus"), tracker=_ready_tracker())
+                oc.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = code
+                oc.runner = Runner(apply_it=True)
+                try:
+                    step_poller_config(oc, True)
+                    refused = None
+                except SetupError as exc:
+                    refused = str(exc)
+                check("poller-config-ticket-model-%s" % label,
+                      (refused is not None and "plan nothing" in refused,
+                       "ticket_model" in (oc.host.files.get(ROLE_POLLER_CONFIG) or "")),
+                      (label == "old-clone", label == "new-clone"))
+            # The probe's tickets are shaped like the job's own: the model tag where the job
+            # puts it, and with no model, exactly the bodies the probe was signed on before.
+            check("probe-bodies-carry-the-model-tag",
+                  (probe_tools_body("stage-a-planning-x", "opus").split("\n")[:3],
+                   probe_label_body("opus").split("\n")[0],
+                   probe_tools_body("stage-a-planning-x").startswith(
+                       "[repo=stage-a-planning-x]\n\nThis is"),
+                   probe_label_body() == PROBE_LABEL_BODY),
+                  (["[repo=stage-a-planning-x]", "[model=opus]", ""], "[model=opus]", True,
+                   True))
             # The routing code's fingerprint, when the file is named: read as the
             # dispatcher's account by the real program, recorded, and re-checked.
             router = os.path.join(tmp, "RepositoryRouter.js")
