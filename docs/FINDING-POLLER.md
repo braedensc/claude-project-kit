@@ -55,6 +55,16 @@ source's **project** when it has one, with:
   ticket is never assigned to the session's identity.
 - a **provenance line** in the body naming the source ticket, and the source's epic when it
   has one, both read from the tracker.
+- **no routing directive of the session's.** A `[repo=…]`, `repo=…`, `[model=…]` or
+  `[agent=…]` in the session's title or body is replaced with `(removed-routing-tag)`. Once
+  a person hands the ticket to the agent, a directive left in would pick its repository,
+  branch, model or runner. The plan executor and the review poller do the same.
+- **the model tag, when `TICKET_MODEL` is set in stage-e.conf:** a `[model=<it>]` line
+  opening the description. The dispatcher's default model also runs the chat bot, so set
+  this before moving that default. Empty files no tag. Two limits:
+  - a finding filed before you set it carries no tag, and runs on the default;
+  - the tag beats a model label, so a model label added at hand-over does nothing. To run a
+    tagged finding on another model, edit its tag line.
 
 It then records the source comment id in its seen-set, links the new ticket to its source
 with one `related` link (never a parent, so a finding never reads as part of an approved

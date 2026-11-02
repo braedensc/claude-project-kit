@@ -360,6 +360,18 @@ HEALTH_STATUS_FILE=
 # RULE: the same value as WATCH_INTERVAL_SECONDS in update.conf (at least 600).
 HEALTH_WATCH_INTERVAL_SECONDS=3600
 
+# The model a filed finding runs on, once you hand it to the agent.  The finding
+# poller writes it as a `[model=...]` line opening the ticket.  The dispatcher's
+# default model also runs the chat bot, so set this BEFORE you move that default,
+# or a finding you hand over moves with it.  A finding filed before you set it has
+# no line.  The line beats a model label, so to run one finding on another model,
+# edit its line.  Review tickets and the bounce driver's fix tickets carry
+# MODEL_LABEL instead, which a default never moves.
+#
+# RULE: fable, opus, sonnet, haiku or a claude- model name, in lower case, or
+# EMPTY, which files findings with no tag.
+TICKET_MODEL=
+
 # The severity at or above which review findings are called out in the pull
 # request comment.  The BOUNCE threshold is a different number and comes from
 # each repository's own `delivery.json` on its committed default branch.  Keep
