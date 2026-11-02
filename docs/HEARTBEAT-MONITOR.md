@@ -406,7 +406,10 @@ and would revert anything written into it. The step judges only the shape of the
 before the job is loaded.
 
 `verify` re-measures all of it. A loaded monitor whose heartbeat is older than two of its
-intervals, plus two minutes and one pass, is **NOT RUNNING** (exit 4). One whose last pass
+intervals, plus two minutes and one pass, is **NOT RUNNING** (exit 4). That age is awake
+time, read from the marks the monitor's own passes record, because launchd counts no time
+asleep. So after a lid-close the monitor is not called stopped while it waits for its next
+pass. With no marks to read, the clock judges, as before. One whose last pass
 ended `error`, `usage` or `timeout` is a failure. `off` unloads a monitor an earlier run
 installed and removes its plist, so the next boot does not load it again. If launchd still
 holds the job after the unload, the step fails, names the `sudo launchctl bootout` command,

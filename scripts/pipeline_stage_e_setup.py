@@ -5583,6 +5583,9 @@ MONITOR_SCRIPT = "pipeline_heartbeat_monitor.py"
 MONITOR_CONFIG = "monitor.json"
 MONITOR_LOG = "monitor.log"
 MONITOR_HEARTBEAT = "state/monitor-heartbeat.json"
+# The monitor's own state, beside its heartbeat: each pass records one [wall, awake clock]
+# mark there (KIT-211), which is how its own beat is aged in awake time (KIT-300).
+MONITOR_STATE = "state/monitor-state.json"
 # scripts/pipeline_heartbeat_monitor.py's own names, held here for the reason
 # COMPONENT_EXIT_DECLINED is: this file runs while the clone carrying that script is the
 # thing being installed. The battery imports the monitor and asserts they still agree.
@@ -5858,6 +5861,32 @@ def _read_monitor_heartbeat(ctx):
     return doc, None
 
 
+def _monitor_awake_age(ctx, stamp):
+    """Awake seconds since the monitor's beat at `stamp`, or None (KIT-300).
+
+    The monitor runs on launchd's StartInterval, which counts no time asleep, so after a sleep
+    its beat is old by the clock and on time by its own schedule. It is aged here the way the
+    monitor ages every other job's beat since KIT-211: from the [wall, awake clock] marks its
+    passes record in its state, read as the role account. None when the state, its marks or
+    the clock can't be read; the caller then judges by the wall clock, as before."""
+    got = ctx.runner.as_role(ctx.account, "cat %s/%s 2>/dev/null"
+                             % (ctx.stage_home, MONITOR_STATE))
+    if not got.ok or not got.out.strip():
+        return None
+    try:
+        state = json.loads(got.out)
+    except ValueError:
+        return None
+    marks = state.get("awake_marks") if isinstance(state, dict) else None
+    if not isinstance(marks, list):
+        return None
+    import pipeline_heartbeat_monitor as hbm
+    try:
+        return hbm.awake_age(stamp, time.time(), hbm._awake_clock(), marks, hbm._boot_wall())
+    except (TypeError, ValueError):
+        return None
+
+
 def _heartbeat_epoch(doc):
     try:
         return datetime.fromisoformat(str(doc.get("at") or "").replace("Z", "+00:00")).timestamp()
@@ -6105,22 +6134,31 @@ def step_heartbeat_monitor(ctx, apply_it):
     loaded = r.as_root(["launchctl", "print", "system/" + label]).ok
     doc, why_not = _read_monitor_heartbeat(ctx)
     stamp = _heartbeat_epoch(doc) if doc else None
-    age = None if stamp is None else time.time() - stamp
+    wall_age = None if stamp is None else time.time() - stamp
+    # Aged in AWAKE time when the monitor's own marks allow (KIT-300): launchd counts no sleep,
+    # so after a lid-close the beat is old by the clock and on time by its schedule.
+    awake = None if stamp is None else _monitor_awake_age(ctx, stamp)
+    age = awake if awake is not None else wall_age
+    slept = ""
+    if awake is not None and wall_age is not None and wall_age - awake >= 60:
+        slept = (" in awake time (%d s by the clock: the Mac slept for %d min of that)"
+                 % (int(wall_age), int((wall_age - awake) // 60)))
     real = bool(doc) and not doc.get("dry_run")
 
     if not conf_stale and not plist_stale and loaded and real and age is not None:
         if age > monitor_stale_after(conf):
             raise Unknown("the heartbeat monitor is loaded and NOT RUNNING: its last heartbeat is "
-                          "%d s old, past the %d s two passes may take"
-                          % (int(age), monitor_stale_after(conf)),
+                          "%d s old%s, past the %d s two passes may take"
+                          % (int(age), " in awake time" if awake is not None else "",
+                             monitor_stale_after(conf)),
                           "read %s/.stage-e/%s; `sudo launchctl print system/%s` names the "
                           "last exit" % (ctx.role_home, MONITOR_LOG, label))
         if doc.get("result") not in MONITOR_GOOD_RESULTS:
             raise SetupError("the heartbeat monitor runs and could not do its job: its last pass "
                              "ended `%s` — %s" % (doc.get("result"),
                                                   str(doc.get("detail") or "")[:300]))
-        return True, ("loaded, commenting on %s; its last pass was %d s ago and ended `%s`; %s"
-                      % (ticket, int(age), doc.get("result"), watch_note)), list(watch_notes)
+        return True, ("loaded, commenting on %s; its last pass was %d s ago%s and ended `%s`; %s"
+                      % (ticket, int(age), slept, doc.get("result"), watch_note)), list(watch_notes)
 
     if not apply_it:
         todo = (["write ~/.stage-e/%s" % MONITOR_CONFIG] if conf_stale else []) \
@@ -13321,6 +13359,34 @@ def _selftest_body():
             failures.append("monitor-stale: a stale heartbeat read as installed")
         except Unknown as exc:
             expect("monitor-stale", "NOT RUNNING" in str(exc), str(exc))
+
+        # KIT-300: its beat is aged in AWAKE time, from the marks its own passes record. A
+        # beat 5565 s old by the clock, 25 min of it awake (the Mac slept), is on time; one
+        # stale in awake time is still NOT RUNNING; with no marks the clock judges, as before.
+        def _awake_monitor(beat_age, awake_since, marks=True):
+            ctx_a, fake_a = _monitor_ctx(beat_age=beat_age)
+            clock_now, now_wall = 100000.0, time.time()
+            state = {"awake_marks": [[now_wall - beat_age, clock_now - awake_since]]}
+            if marks:
+                fake_a.answers = [(MONITOR_STATE, 0, json.dumps(state))] + list(fake_a.answers)
+            saved = (hbm._awake_clock, hbm._boot_wall)
+            hbm._awake_clock, hbm._boot_wall = (lambda: clock_now), (lambda: now_wall - 10 ** 7)
+            try:
+                return step_heartbeat_monitor(ctx_a, apply_it=False)
+            except (Unknown, SetupError) as exc:
+                return "raised: %s" % exc
+            finally:
+                hbm._awake_clock, hbm._boot_wall = saved
+        got = _awake_monitor(5565, 1500)
+        expect("monitor-asleep-is-on-time: a beat old by the clock, recent in awake time, holds",
+               isinstance(got, tuple) and got[0] is True
+               and "1500 s ago in awake time" in got[1] and "slept for 67 min" in got[1], got)
+        got = _awake_monitor(5565, 5000)
+        expect("monitor-stale-in-awake-time-is-not-running",
+               isinstance(got, str) and "NOT RUNNING" in got and "in awake time" in got, got)
+        got = _awake_monitor(5565, 1500, marks=False)
+        expect("monitor-with-no-marks-is-judged-by-the-clock",
+               isinstance(got, str) and "NOT RUNNING" in got and "awake" not in got, got)
 
         # …and one that runs but cannot page is a failure, not a pass.
         ctxE, _fE = _monitor_ctx(result="error")
