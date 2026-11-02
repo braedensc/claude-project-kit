@@ -2437,11 +2437,29 @@ def selftest():
         one_pass(cfg, fake)
         check("new-move-waits-and-is-said-once", (len(fake.issues), len(
             [b for i, b in fake.comments if i == "idea-7" and "still going" in b])), (1, 1))
+        # Stage E review: a second move during the same run waits too, with a note of its
+        # own, and the first move's note is not posted again. Once the run ends, ONE new run
+        # starts, for the newest move.
+        fake.ideas["idea-7"]["history"].append({"id": "move-7c", "createdAt":
+                                                "2026-09-19T12:30:00Z", "actorId": OWNER,
+                                                "toStateId": "prod-plan-it"})
+        fake.ideas["idea-7"]["updatedAt"] = "u4"
+        one_pass(cfg, fake)
+        fake.ideas["idea-7"]["updatedAt"] = "u5"           # the note itself moved updatedAt
+        one_pass(cfg, fake)
+        check("a-second-move-during-the-run-waits-with-its-own-note (KIT-328 review)",
+              (len(fake.issues), len([b for i, b in fake.comments
+                                      if i == "idea-7" and "still going" in b])), (1, 2))
         fake.finish(runs(fake)[0]["id"], final_message(synthetic_plan(
             runs(fake)[0]["identifier"], 1)))
         one_pass(cfg, fake)                                # collect ends the first run
         one_pass(cfg, fake)                                # and the waiting move starts
         check("new-move-new-run once the first has ended", len(runs(fake)), 2)
+        check("only-the-newest-waiting-move-starts-a-run (KIT-328 review)",
+              ("move-7c" in runs(fake)[1]["description"],
+               "move-7b" in runs(fake)[1]["description"]), (True, False))
+        one_pass(cfg, fake)
+        check("no-run-for-the-move-it-passed-over", len(runs(fake)), 2)
 
         # 6. ONLY THE OWNER STARTS A RUN.
         fake2 = FakeLinear(FakeClock())
