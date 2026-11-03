@@ -5737,6 +5737,35 @@ def _selftest(identity=(True, True, True), reached=()):
               (real_slack.base, sent, who.get("user_id")),
               ("https://slack.com/api", [("https://slack.com/api/auth.test",
                                           "Bearer xoxb-test")], ME))
+        # The job's own construction, end to end: run_command builds both clients from the
+        # two credentials its config names, each going only where it belongs. A swap would
+        # send the tracker key to Slack (review of KIT-388).
+        job_cfg = cfg_for("job-construction")
+        heard = []
+
+        def both_answer(url, headers, payload=None, timeout=20):
+            heard.append((url.split("?")[0], headers.get("Authorization")))
+            if url.startswith("https://slack.com/api/auth.test"):
+                return {"ok": True, "user_id": ME, "team_id": TEAM, "bot_id": "B0BRIDGE01"}
+            return {"data": {}}
+        saved_env = dict((k, os.environ.get(k)) for k in (job_cfg["slack_token_env"],
+                                                          job_cfg["linear_key_env"]))
+        guard_transport, guard_bridge = transport._http_json, globals()["_http_json"]
+        os.environ[job_cfg["slack_token_env"]] = "slack-token-for-the-job"
+        os.environ[job_cfg["linear_key_env"]] = "lin-key-for-the-job"
+        transport._http_json = globals()["_http_json"] = both_answer
+        try:
+            run_command(job_cfg, True, 30, out=io.StringIO())
+        finally:
+            transport._http_json, globals()["_http_json"] = guard_transport, guard_bridge
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        check("the-job-sends-each-credential-only-where-it-belongs",
+              heard[:2], [("https://slack.com/api/auth.test", "Bearer slack-token-for-the-job"),
+                          (TRACKER_API, "lin-key-for-the-job")])
 
         def world(name, **over):
             cfg = cfg_for(name, **over)
@@ -12164,15 +12193,25 @@ def _selftest(identity=(True, True, True), reached=()):
     #     file or in the modules split out of it (KIT-312), so none can hide in one.
     import ast
     tree = ast.parse(src)
-    split_modules = sorted(
-        {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
-         and (n.module or "").startswith("pipeline_bridge_")}
-        | {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names
-           if a.name.startswith("pipeline_bridge_")})
-    for name in split_modules:
+    def split_imports(text):
+        found = ast.parse(text)
+        return ({n.module for n in ast.walk(found) if isinstance(n, ast.ImportFrom)
+                 and (n.module or "").startswith("pipeline_bridge_")}
+                | {a.name for n in ast.walk(found) if isinstance(n, ast.Import)
+                   for a in n.names if a.name.startswith("pipeline_bridge_")})
+    # Followed until nothing new turns up: a module a split module imports is scanned too
+    # (review of KIT-388).
+    split_modules, todo = set(), split_imports(src)
+    while todo:
+        name = todo.pop()
+        if name in split_modules:
+            continue
+        split_modules.add(name)
         with open(os.path.join(HERE, name + ".py"), encoding="utf-8") as fh:
             split = fh.read()
+        todo |= split_imports(split) - split_modules
         body = body + split[:split.index("# Selftest — offline")]
+    split_modules = sorted(split_modules)
     check("the-write-pins-read-the-split-modules-too",
           (split_modules != [], "class SlackClient(" in body, "def _http_json(" in body),
           (True, True, True))
