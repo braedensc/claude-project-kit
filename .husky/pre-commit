@@ -71,8 +71,16 @@ fi
 # symlink and a submodule stay out: the commit holds no file content for them
 # (a link holds only its target's path), and secretlint would read through a
 # link, or refuse a commit whose only named paths are missing.
+# Paths secretlint never reads are left out too, matched as it matches them (in any
+# letter case): a `node_modules` folder, its five config names and `.secretlintignore*`.
+# Named alone, they made it fail "no target files", which read as a found secret.
 STAGED=$(git diff --cached --raw --no-renames --diff-filter=d \
-  | awk -F '\t' '{ split($1, m, " "); if (m[2] == "100644" || m[2] == "100755") print $2 }' \
+  | awk -F '\t' '{ split($1, m, " "); if (m[2] != "100644" && m[2] != "100755") next
+      n = split(tolower($2), p, "/")
+      for (i = 1; i <= n; i++)
+        if (p[i] == "node_modules" || p[i] ~ /^\.secretlintrc(\.(json|yaml|yml|js))?$/ ||
+            index(p[i], ".secretlintignore") == 1) next
+      print $2 }' \
   || true)
 if [ -n "$STAGED" ]; then
   if [ -x node_modules/.bin/secretlint ]; then
@@ -96,18 +104,30 @@ if [ -n "$STAGED" ]; then
     exit 1
   fi
 
+  # Can it run at all? A Node too old for it (16 cannot; 18 can) fails every call, and
+  # without this test that failure read as a missing flag, then as a found secret.
+  if ! "$SECRETLINT" --help > /dev/null 2>&1; then
+    echo ""
+    echo "  BLOCKED: secretlint could not run here, so the secret scan did not run."
+    echo "  Run '$SECRETLINT --help' to see why, and check which Node is first on PATH."
+    echo "  (Do NOT bypass with --no-verify; that silently disables the local secret scan.)"
+    echo ""
+    exit 1
+  fi
+
   # `--no-gitignore`: a staged path is going into the commit whatever .gitignore
   # says, and secretlint skips an ignored path even when it is named (KIT-400).
   # Its parser takes the flag only on Node 22.4 or newer; where it can't, the scan
   # runs without it and says what it misses, rather than refusing every commit.
-  # `--` ends the options, so a staged name that looks like one is read as a path.
+  # `--` ends the options, so a staged name that looks like one is read as a path,
+  # and `printf` passes every name as it is (`echo` swallows a lone `-n`).
   IGNORE_FLAG="--no-gitignore"
   if ! "$SECRETLINT" --no-gitignore --help > /dev/null 2>&1; then
     IGNORE_FLAG=""
     echo "  NOTE: this secretlint cannot take --no-gitignore (Node 22.4 or newer is"
     echo "        needed), so a staged file .gitignore covers is not scanned."
   fi
-  if ! echo "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG --; then
+  if ! printf '%s\n' "$STAGED" | xargs "$SECRETLINT" --secretlintrc .secretlintrc.json $IGNORE_FLAG --; then
     echo ""
     echo "  BLOCKED: secretlint found a potential secret in staged files."
     echo "  Remove the secret value and reference it by env var name only."

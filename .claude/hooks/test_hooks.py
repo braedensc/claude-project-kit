@@ -3270,10 +3270,14 @@ def main():
     # hook runs as git runs it (`sh -e`) in a throwaway repo, with a stand-in scanner that
     # models what of secretlint 13 the hook leans on: `--` ends the options, a path that
     # is not there is skipped and a run where none is fails, a path .gitignore covers is
-    # skipped unless told `--no-gitignore` (KIT-400), and a marker is refused. Its "old"
-    # variant refuses `--no-gitignore`, as secretlint does on Node before 22.4. So CI needs
-    # no npm install for it.
-    def scanner_text(old_node=False):
+    # skipped unless told `--no-gitignore` (KIT-400), a path it never reads (a
+    # `node_modules` folder, its five config names, `.secretlintignore*`, in any letter
+    # case) is skipped as if it were not there, and a marker is refused. Its "old" variant
+    # refuses `--no-gitignore`, as secretlint does on Node before 22.4; its "dead" one
+    # fails every call, as it does on Node 16. So CI needs no npm install for it.
+    def scanner_text(node="new"):
+        if node == "dead":
+            return "#!/bin/sh\necho \"SyntaxError: Unexpected token '?'\" >&2\nexit 2\n"
         return "\n".join([
             "#!/bin/sh",
             'skip=""; honour_ignore=1; found=0; paths=""',
@@ -3285,13 +3289,18 @@ def main():
             '      --) paths=1; continue;;',
             '      --secretlintrc) skip=1; continue;;',
             ('      --no-gitignore) echo "Unknown option --no-gitignore" >&2; exit 2;;'
-             if old_node else '      --no-gitignore) honour_ignore=""; continue;;'),
+             if node == "old" else '      --no-gitignore) honour_ignore=""; continue;;'),
             '      --help) exit 0;;',
             '      --*) continue;;',
             '    esac',
             '  fi',
             '  echo "$a" >> "$SCAN_LOG"',
             '  [ -e "$a" ] || continue',
+            '  case "/$(printf "%s" "$a" | tr "[:upper:]" "[:lower:]")/" in',
+            '    */node_modules/*|*/.secretlintignore*) continue;;',
+            '    */.secretlintrc/*|*/.secretlintrc.json/*|*/.secretlintrc.yaml/*) continue;;',
+            '    */.secretlintrc.yml/*|*/.secretlintrc.js/*) continue;;',
+            '  esac',
             '  found=1',
             '  if [ -n "$honour_ignore" ] && git check-ignore -q --no-index -- "$a"; then continue; fi',
             '  if grep -q -- PRECOMMIT-MARKER "$a"; then echo "marker in $a" >&2; exit 1; fi',
@@ -3299,7 +3308,7 @@ def main():
             'if [ "$found" = 0 ]; then echo "Not found target files" >&2; exit 2; fi',
             "exit 0", ""])
 
-    def precommit_case(stage, old_node=False):
+    def precommit_case(stage, node="new", shell="sh"):
         """(exit, stderr, staged name-status, scanned paths) for one staged change."""
         root = os.path.realpath(tempfile.mkdtemp(prefix="precommit-battery-"))
         _PRECOMMIT_TMP.append(root)
@@ -3309,7 +3318,7 @@ def main():
         bin_dir = os.path.join(root, "node_modules", ".bin")
         os.makedirs(bin_dir)
         with open(os.path.join(bin_dir, "secretlint"), "w") as fh:
-            fh.write(scanner_text(old_node))
+            fh.write(scanner_text(node))
         os.chmod(os.path.join(bin_dir, "secretlint"), 0o755)
         with open(os.path.join(root, ".gitignore"), "w") as fh:
             fh.write("node_modules/\nignored/\n")
@@ -3328,7 +3337,7 @@ def main():
         status = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-status"],
                                 capture_output=True, text=True, env=_git_env()).stdout
         log = os.path.join(root, "node_modules", "scanned.log")
-        r = subprocess.run(["sh", "-e", os.path.join(".husky", "pre-commit")], cwd=root,
+        r = subprocess.run([shell, "-e", os.path.join(".husky", "pre-commit")], cwd=root,
                            capture_output=True, text=True, timeout=60,
                            env={**_git_env(), "SCAN_LOG": log})
         scanned = open(log).read().split("\n") if os.path.exists(log) else []
@@ -3383,38 +3392,79 @@ def main():
     def stage_delete(root):
         _git(root, "rm", "-q", "gone.md")
 
+    def stage_unread_only(root):
+        # Only paths secretlint never reads, so it has nothing to scan, which is not a
+        # finding. Mixed case, since it matches them in any.
+        with open(os.path.join(root, ".secretlintrc.json"), "a") as fh:
+            fh.write("\n")
+        os.makedirs(os.path.join(root, "sub"))
+        os.makedirs(os.path.join(root, "lib", "Node_Modules"))
+        for name in (".secretlintignore", os.path.join("sub", ".SecretLintRC.Yml"),
+                     os.path.join("lib", "Node_Modules", "notes.md")):
+            with open(os.path.join(root, name), "w") as fh:
+                fh.write("plain\n")
+        _git(root, "add", "-f", "--", ".secretlintrc.json", ".secretlintignore",
+             os.path.join("sub", ".SecretLintRC.Yml"),
+             os.path.join("lib", "Node_Modules", "notes.md"))
+
+    def stage_config_lookalike(root):
+        # Named like its config, but not one of the five names: secretlint reads it.
+        with open(os.path.join(root, ".secretlintrc.cjs"), "w") as fh:
+            fh.write("PRECOMMIT-MARKER\n")
+        _git(root, "add", ".secretlintrc.cjs")
+
+    def stage_dash_n(root):
+        # The only staged path is `-n`, which `echo` takes as its option and prints nothing.
+        with open(os.path.join(root, "-n"), "w") as fh:
+            fh.write("PRECOMMIT-MARKER\n")
+        _git(root, "add", "--", "-n")
+
     _PRECOMMIT_TMP = []
     found = "secretlint found a potential secret"
     old_note = "cannot take --no-gitignore"
-    for name, stage, kind, want_rc, want_found, want_read, old_node in (
+    dead_said = "secretlint could not run here"
+    for name, stage, kind, want_rc, want_found, want_read, node in (
             ("a modified file holding a secret is refused", stage_modify, "M", 1, True,
-             "plain.md", False),
+             "plain.md", "new"),
             ("a RENAMED file holding a secret is refused", stage_rename, "R", 1, True,
-             "big2.md", False),
+             "big2.md", "new"),
             ("a link that BECOMES A FILE holding a secret is refused", stage_link_to_file,
-             "T", 1, True, "link.md", False),
+             "T", 1, True, "link.md", "new"),
             ("an EXECUTABLE file holding a secret is refused", stage_executable, "A", 1, True,
-             "deploy.sh", False),
+             "deploy.sh", "new"),
             ("a file NAMED LIKE AN OPTION holding a secret is refused", stage_option_name,
-             "A", 1, True, "--output=report.txt", False),
+             "A", 1, True, "--output=report.txt", "new"),
+            ("a lone file named -n holding a secret is refused", stage_dash_n, "A", 1, True,
+             "-n", "new"),
+            ("a file only named like secretlint's config, holding a secret, is refused",
+             stage_config_lookalike, "A", 1, True, ".secretlintrc.cjs", "new"),
             ("a tracked file .gitignore covers, holding a secret, is refused", stage_ignored,
-             "M", 1, True, os.path.join("ignored", "held.md"), False),
+             "M", 1, True, os.path.join("ignored", "held.md"), "new"),
             ("a file that becomes a link commits: only the link's text is committed",
-             stage_file_to_link, "T", 0, False, None, False),
+             stage_file_to_link, "T", 0, False, None, "new"),
             ("a renamed file holding no secret commits", lambda r: stage_rename(r, False),
-             "R", 0, False, None, False),
+             "R", 0, False, None, "new"),
             ("a commit that only deletes commits, and the deleted path is never scanned",
-             stage_delete, "D", 0, False, None, False),
+             stage_delete, "D", 0, False, None, "new"),
+            ("a commit of only paths secretlint never reads (its config, node_modules) "
+             "commits", stage_unread_only, "A", 0, False, None, "new"),
             ("on a Node too old for --no-gitignore, a secret is still refused, and it says so",
-             stage_modify, "M", 1, True, "plain.md", True),
+             stage_modify, "M", 1, True, "plain.md", "old"),
             ("on a Node too old for --no-gitignore, an ignored file is not scanned, and it "
-             "says so", stage_ignored, "M", 0, False, None, True)):
+             "says so", stage_ignored, "M", 0, False, None, "old"),
+            ("where secretlint cannot run at all, the commit is refused as not scanned, "
+             "not as a found secret", stage_modify, "M", 1, False, None, "dead")):
         seq_ran += 1
-        rc, said, status, scanned = precommit_case(stage, old_node)
+        # The echo of dash, and of a Linux sh that is bash, swallows a lone `-n`; macOS's
+        # own sh prints it. So that case runs under bash, as a Linux sh would run it.
+        shell = "bash" if stage is stage_dash_n and shutil.which("bash") else "sh"
+        rc, said, status, scanned = precommit_case(stage, node, shell)
         ok = (status[:1] == kind and rc == want_rc and (found in said) == want_found
               and "could not find the secretlint binary" not in said
               and (want_read is None or want_read in scanned)
-              and (old_note in said) == old_node
+              and (old_note in said) == (node == "old")
+              and (dead_said in said) == (node == "dead")
+              and (node != "dead" or scanned == [])
               and (kind != "D" or "gone.md" not in scanned))
         print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-151): {name}"
               + ("" if ok else f" — rc={rc} status={status.strip()!r} scanned={scanned} "
