@@ -919,8 +919,10 @@ with each path, and asks for `yes`:
 - **Two messages in the back room**, posted as the bridge's bot, each mentioning the tech
   lead. The bridge's relay never follows them into your DM.
 - **One line in the role account's `~/.claude/settings.json`**: the deny, for the second
-  message's turn only. The file is copied first, and put back byte for byte.
-- **The memory folder**: copied first, and put back to that copy at the end.
+  message's turn only. The file is copied first, with the role account's own note of what
+  changed, and put back byte for byte from that copy.
+- **The memory folder**: only the probe's own note, `probe-<mark>.md`, and any line that
+  names it, taken out at the end. Every other note stays as it is, whoever wrote it.
 
 It posts the four answers on the test ticket and on each `--record-on` ticket. It usually
 takes about 15 minutes, and up to 45 when the dispatcher is busy. It costs two tech-lead
@@ -932,7 +934,12 @@ turn that never tried what it was asked measured nothing, so NOT MEASURED is nev
 Not that: `NOT DONE`. It exits 1. Something was not put back, and its line names the file
 and where the copy is.
 
-If you stop a run, the next run lists what is still out and puts it back first.
+If you stop a run, the next run lists what is still out and puts it back first. Its record,
+in `~/.chat-lane-probe/`, only says what is still out: every put-back acts on paths worked
+out from the confs. One run at a time: a second one says so and changes nothing.
+
+A turn only counts for answer 1 if it started while the deny was in the file. A dispatcher
+that caps its sessions can hold a turn back; such a turn reads NOT MEASURED, never no.
 
 **What each answer leads to.**
 

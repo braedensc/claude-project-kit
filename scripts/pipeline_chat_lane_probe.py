@@ -34,13 +34,18 @@ put-back read back, before the probe ends:
     lead. Each starts one tech-lead turn. The bridge's own relay never follows them: it
     follows only the threads it opened itself.
   - the role account's `~/.claude/settings.json`: one deny line, for the second turn only.
-    The file is copied first, into the role account's backups folder, and put back byte
-    for byte as soon as that turn's tool list is read. If the file changed in between, it
-    is left alone, and the probe says so and where the copy is.
-  - the shared memory folder: copied first, and put back to that copy at the end.
+    The file is copied first, into the role account's backups folder, with that account's
+    own note of what it changed, and put back byte for byte as soon as that turn's tool
+    list is read. If the file changed in between, it is left alone, and the probe says so
+    and where the copy is.
+  - the shared memory folder: only the probe's own note, `probe-<mark>.md`, and any line
+    that names it, taken out at the end. Every other note stays as it is, whoever wrote it.
   - comments: the four answers, on the test ticket and on each `--record-on` ticket.
 A record of what is still out goes in `~/.chat-lane-probe/state.json`, in your own home, so
-a run that was stopped is put back first by the next one.
+a run that was stopped is put back first by the next one. That record only says WHAT is
+still out: every put-back acts on paths worked out from the confs, and on the role
+account's own copy and note, so an edited record cannot point a write anywhere else. One
+run at a time: a second run waits for the first's lock.
 
 WHAT IT NEVER DOES. It never restarts anything and never loads a job. It never prints,
 logs or posts a credential: the bridge's token and your tracker key are read once, as the
@@ -156,7 +161,7 @@ _SLACK_ID_RE = re.compile(r"^[UWBC][A-Z0-9]{2,20}$")
 # a message. It must run on the system's Python 3.9.
 # --------------------------------------------------------------------------- #
 ROLE_PY = r'''
-import hashlib, json, os, re, shutil, stat, sys
+import hashlib, json, os, re, stat, sys
 
 LINE_MAX = 1 << 20
 FILE_TAIL = 16 << 20
@@ -166,6 +171,10 @@ MEMORY_BYTES_MAX = 20 << 20
 ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,8}$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# The probe's own mark, and its own copy folder. Nothing else is ever removed or put back.
+NONCE_RE = re.compile(r"^chlp[0-9a-f]{10}$")
+RUN_ROOT_RE = re.compile(r"/\.stage-e/backups/chat-lane-probe-[0-9a-f]{6}$")
+TOOL_RULE_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_]+$")
 
 
 class Refused(Exception):
@@ -352,17 +361,25 @@ def act_facts(p):
     return {"settings": s, "logs": lg, "memory": m}
 
 
-def act_deny_add(p):
-    path, rule, backup, expect = plain(p["settings"]), p["rule"], plain(p["backup"]), p.get("expect")
-    if not isinstance(rule, str) or not rule.startswith("mcp__"):
-        raise Refused("the probe adds a tool rule only")
-    try:
-        raw, st = read_regular(path, SETTINGS_MAX)
-        before, mode = digest(raw), stat.S_IMODE(st.st_mode)
-    except FileNotFoundError:
-        raw, before, mode = None, None, 0o600
-    if before != expect:
-        raise Refused("the settings file changed after the check, so nothing was written")
+def run_root(p):
+    """The run's own copy folder, under the role account's backups folder: the only place
+    a put-back reads a copy from."""
+    root = plain(p["run_root"])
+    if not RUN_ROOT_RE.search(root):
+        raise Refused("not one of the probe's own copy folders")
+    return root
+
+
+def tool_rule(rule):
+    if not isinstance(rule, str) or not TOOL_RULE_RE.match(rule):
+        raise Refused("the probe adds one tool rule, and nothing else")
+    return rule
+
+
+def with_rule(raw, rule):
+    """The settings file's bytes with `rule` added to permissions.deny, exactly as deny-add
+    writes them. The same input gives the same bytes, so a put-back recomputes what the
+    probe wrote from the role account's own copy, and trusts no record of it."""
     try:
         doc = {} if raw is None else json.loads(raw.decode("utf-8"))
     except ValueError:
@@ -374,146 +391,120 @@ def act_deny_add(p):
     if rule in deny:
         raise Refused("the rule is already in the file")
     deny.append(rule)
-    new = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+    return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+
+
+def act_deny_add(p):
+    path, rule, root, expect = plain(p["settings"]), tool_rule(p["rule"]), run_root(p), p.get("expect")
+    try:
+        raw, st = read_regular(path, SETTINGS_MAX)
+        before, mode = digest(raw), stat.S_IMODE(st.st_mode) & 0o777
+    except FileNotFoundError:
+        raw, before, mode = None, None, 0o600
+    if before != expect:
+        raise Refused("the settings file changed after the check, so nothing was written")
+    new = with_rule(raw, rule)
+    makedirs700(root)
+    # The role account's own record of what it is about to change. A put-back reads this,
+    # never the record in the owner's home, which anything running as them could edit.
+    write_new(os.path.join(root, "settings.manifest"), json.dumps(
+        {"existed": raw is not None, "mode": mode, "rule": rule, "before": before}).encode(),
+        0o600)
     if raw is not None:
-        makedirs700(os.path.dirname(backup))
-        write_new(backup, raw, 0o600)
+        write_new(os.path.join(root, "settings.json"), raw, 0o600)
     else:
         makedirs700(os.path.dirname(path))
     write_atomic(path, new, mode)
     after = sha_of(path)
     if after != digest(new):
         raise Refused("the settings file did not read back as written")
-    return {"before": before, "after": after, "mode": mode}
+    return {"before": before, "after": after}
 
 
 def act_deny_restore(p):
-    path, before, after = plain(p["settings"]), p.get("before"), p["after"]
-    backup = plain(p["backup"]) if before is not None else None
-    now = sha_of(path)
-    if now == before:
-        if backup and sha_of(backup) == before:
-            os.unlink(backup)
-            drop_parent(backup)
-        return {"restored": "already"}
-    if now != after:
-        raise Refused("the settings file changed after the probe's edit, so it was left as "
-                      "it is")
-    if before is None:
-        os.unlink(path)
-        if sha_of(path) is not None:
-            raise Refused("the settings file is still there")
-        return {"restored": "yes"}
-    raw, _st = read_regular(backup, SETTINGS_MAX)
-    if digest(raw) != before:
+    path, root = plain(p["settings"]), run_root(p)
+    manifest = os.path.join(root, "settings.manifest")
+    try:
+        meta = json.loads(read_regular(manifest, 1 << 16)[0].decode("utf-8"))
+    except FileNotFoundError:
+        return {"restored": "nothing"}           # deny-add never got as far as its record
+    copy = os.path.join(root, "settings.json")
+    rule, mode = tool_rule(meta.get("rule")), int(meta.get("mode") or 0o600) & 0o777
+    original = read_regular(copy, SETTINGS_MAX)[0] if meta.get("existed") else None
+    if original is not None and digest(original) != meta.get("before"):
         raise Refused("the copy no longer matches the original, so it was not put back")
-    write_atomic(path, raw, int(p.get("mode") or 0o600))
-    if sha_of(path) != before:
-        raise Refused("the settings file did not read back as the original")
-    os.unlink(backup)
-    drop_parent(backup)
-    return {"restored": "yes"}
+    was = digest(original) if original is not None else None
+    now = sha_of(path)
+    if now != was:
+        if now != digest(with_rule(original, rule)):
+            raise Refused("the settings file changed after the probe's edit, so it was left "
+                          "as it is")
+        if original is None:
+            os.unlink(path)
+        else:
+            write_atomic(path, original, mode)
+        if sha_of(path) != was:
+            raise Refused("the settings file did not read back as the original")
+    for done in (copy, manifest):
+        try:
+            os.unlink(done)
+        except FileNotFoundError:
+            pass
+    drop_parent(manifest)
+    return {"restored": "yes" if now != was else "already"}
 
 
-def act_snapshot(p):
-    root, backup = plain(p["memory"]), plain(p["backup"])
+def nonce_of(p):
+    nonce = p.get("nonce")
+    if not isinstance(nonce, str) or not NONCE_RE.match(nonce):
+        raise Refused("not one of the probe's own marks")
+    return nonce
+
+
+def is_probe_note(rel, nonce):
+    return os.path.basename(rel) == "probe-%s.md" % nonce
+
+
+def act_memory_scan(p):
+    """The files in the shared memory folder that hold the probe's mark, or are its note."""
+    root, nonce = plain(p["memory"]), nonce_of(p)
     if not plain_dir(root):
-        return {"exists": False}
+        return {"exists": False, "files": [], "count": 0, "total": 0}
     dirs, files, odd = walk(root)
-    if odd:
-        raise Refused("the folder holds a link or a special file, so it could not be put back "
-                      "safely")
-    if (len(files) > MEMORY_FILES_MAX
-            or sum(st.st_size for st in files.values()) > MEMORY_BYTES_MAX):
-        raise Refused("the folder is larger than the probe copies")
-    if os.path.lexists(backup):
-        raise Refused("a copy from another run is in the way")
-    makedirs700(backup)
-    listing = {}
-    for rel in sorted(files):
-        raw, st = read_regular(os.path.join(root, rel), MEMORY_BYTES_MAX)
-        dst = os.path.join(backup, rel)
-        makedirs700(os.path.dirname(dst))
-        write_new(dst, raw, 0o600)
-        listing[rel] = {"sha256": digest(raw), "mode": stat.S_IMODE(st.st_mode)}
-    return {"exists": True, "dirs": dirs, "files": listing}
-
-
-def act_memory_diff(p):
-    root, snap, nonce = plain(p["memory"]), p["snapshot"], p["nonce"].encode("utf-8")
-    if not plain_dir(root):
-        return {"exists": False, "new": 0, "changed": 0, "removed": 0, "nonce_files": []}
-    dirs, files, odd = walk(root)
-    before = snap.get("files", {}) if snap.get("exists") else {}
-    new = changed = 0
-    nonce_files = []
+    if len(files) > MEMORY_FILES_MAX:
+        raise Refused("the folder holds more files than the probe reads")
+    hits = []
     for rel in sorted(files):
         raw, _st = read_regular(os.path.join(root, rel), MEMORY_BYTES_MAX)
-        if rel not in before:
-            new += 1
-        elif digest(raw) != before[rel]["sha256"]:
-            changed += 1
-        else:
-            continue
-        if nonce and nonce in raw:
-            nonce_files.append(rel[:200])
-    removed = len([rel for rel in before if rel not in files])
-    return {"exists": True, "new": new, "changed": changed, "removed": removed,
-            "odd": len(odd), "nonce_files": nonce_files[:5]}
+        if is_probe_note(rel, nonce) or nonce.encode("utf-8") in raw:
+            hits.append(rel[:200])
+    return {"exists": True, "files": hits[:20], "count": len(hits), "total": len(files)}
 
 
-def act_memory_restore(p):
-    root, snap = plain(p["memory"]), p["snapshot"]
-    backup = plain(p["backup"])
-    if "/chat-lane-probe-" not in backup:
-        raise Refused("not one of the probe's own copies")
-    existed = bool(snap.get("exists"))
-    before = snap.get("files", {}) if existed else {}
+def act_memory_clean(p):
+    """Takes the probe's own note out, and nothing else: the note file it asked for, and
+    any line elsewhere that names its mark (an index line). Every other note stays as it
+    is, whoever wrote it and whenever. A link is never followed, and never touched."""
+    root, nonce = plain(p["memory"]), nonce_of(p)
+    mark = nonce.encode("utf-8")
     if not plain_dir(root):
-        if existed:
-            raise Refused("the folder is gone, so it was not put back")
-    else:
-        dirs, files, odd = walk(root)
-        if odd:
-            raise Refused("a link or a special file appeared in the folder, so it was left as "
-                          "it is")
-        for rel in files:
-            if rel not in before:
-                os.unlink(os.path.join(root, rel))
-        for rel, meta in sorted(before.items()):
-            target = os.path.join(root, rel)
-            if sha_of(target, MEMORY_BYTES_MAX) != meta["sha256"]:
-                raw, _st = read_regular(os.path.join(backup, rel), MEMORY_BYTES_MAX)
-                if digest(raw) != meta["sha256"]:
-                    raise Refused("a copy no longer matches the folder as it was")
-                os.makedirs(os.path.dirname(target), 0o700, exist_ok=True)
-                write_atomic(target, raw, int(meta.get("mode") or 0o600))
-        kept = set(snap.get("dirs", []))
-        for d in sorted(dirs, key=lambda x: -x.count("/")):
-            if d not in kept:
-                try:
-                    os.rmdir(os.path.join(root, d))
-                except OSError:
-                    pass
-        if not existed:
-            try:
-                os.rmdir(root)
-            except OSError:
-                pass
-    # Read back: the folder is as it was, or gone when it was not there before.
-    if existed:
-        dirs, files, odd = walk(root)
-        same = (not odd and sorted(files) == sorted(before)
-                and all(sha_of(os.path.join(root, r), MEMORY_BYTES_MAX) == before[r]["sha256"]
-                        for r in before))
-        if not same:
-            raise Refused("the folder did not read back as it was")
-    elif os.path.lexists(root):
-        raise Refused("the folder was not there before, and something is still in it")
-    if plain_dir(backup):
-        shutil.rmtree(backup)
-    drop_parent(backup)
-    return {"restored": "yes"}
+        return {"removed": 0, "edited": 0}
+    removed = edited = 0
+    dirs, files, odd = walk(root)
+    for rel in sorted(files):
+        target = os.path.join(root, rel)
+        raw, st = read_regular(target, MEMORY_BYTES_MAX)
+        if is_probe_note(rel, nonce):
+            os.unlink(target)
+            removed += 1
+        elif mark in raw:
+            kept = b"".join(ln for ln in raw.splitlines(True) if mark not in ln)
+            write_atomic(target, kept, stat.S_IMODE(st.st_mode) & 0o777)
+            edited += 1
+    left = act_memory_scan(p)
+    if left["count"]:
+        raise Refused("the probe's note is still in %d file(s) of the folder" % left["count"])
+    return {"removed": removed, "edited": edited}
 
 
 def log_lines(p):
@@ -602,7 +593,7 @@ def act_chat_log(p):
             if isinstance(wd, str) and (wd == workspace or wd.endswith(tail)):
                 found.append((os.lstat(q).st_mtime, q))
     found.sort()
-    init, count, results, uses, order, denials = None, None, [], {}, [], []
+    init, init_at, count, results, uses, order, denials = None, None, None, [], {}, [], []
     for _mtime, q in found:
         for line in log_lines(q):
             try:
@@ -621,7 +612,7 @@ def act_chat_log(p):
                 if init is None:
                     names = [str(t)[:120] for t in m["tools"]]
                     init = sorted(t for t in names if t.startswith(prefix) or t in listed)
-                    count = len(names)
+                    count, init_at = len(names), at
             elif kind == "assistant":
                 for b in blocks(m):
                     if b.get("type") != "tool_use" or b.get("name") not in watched:
@@ -645,8 +636,8 @@ def act_chat_log(p):
                 for d in m.get("permission_denials") or []:
                     if isinstance(d, dict):
                         denials.append(str(d.get("tool_name"))[:120])
-    return {"files": len(found), "init_tools": init, "tool_count": count, "results": results,
-            "uses": [uses[i] for i in order], "denials": denials}
+    return {"files": len(found), "init_tools": init, "init_at": init_at, "tool_count": count,
+            "results": results, "uses": [uses[i] for i in order], "denials": denials}
 
 
 def act_ticket_log(p):
@@ -683,9 +674,9 @@ def act_ticket_log(p):
 
 
 ACTIONS = {"secret": act_secret, "facts": act_facts, "deny-add": act_deny_add,
-           "deny-restore": act_deny_restore, "snapshot": act_snapshot,
-           "memory-diff": act_memory_diff, "memory-restore": act_memory_restore,
-           "chat-log": act_chat_log, "ticket-log": act_ticket_log}
+           "deny-restore": act_deny_restore, "memory-scan": act_memory_scan,
+           "memory-clean": act_memory_clean, "chat-log": act_chat_log,
+           "ticket-log": act_ticket_log}
 
 try:
     payload = json.loads(sys.stdin.read() or "{}")
@@ -697,7 +688,7 @@ except (OSError, KeyError, TypeError, ValueError) as exc:
 '''
 
 # The actions above that change a file. Every other one only reads.
-ROLE_WRITES = ("deny-add", "deny-restore", "snapshot", "memory-restore")
+ROLE_WRITES = ("deny-add", "deny-restore", "memory-clean")
 
 
 class ProbeError(Exception):
@@ -706,6 +697,10 @@ class ProbeError(Exception):
     def __init__(self, message, code=EX_FAILED):
         Exception.__init__(self, message)
         self.code = code
+
+
+class HandOver(ProbeError):
+    """A put-back the probe will not make: handed to you once, in words, never retried."""
 
 
 class RoleHost(object):
@@ -858,15 +853,19 @@ class Tracker(object):
         return out
 
     def cancel_own(self, issue_id, state_id, owner_id):
-        """To the team's canceled state, which also stops any session on it. Only a ticket
-        with this probe's own title, filed by you: the ledger is a file, and a file can be
-        edited, so the ticket itself is asked."""
-        issue = self.issue(issue_id) or {}
-        if issue.get("title") != PROBE_TITLE or (issue.get("creator") or {}).get("id") != owner_id:
-            raise ProbeError("refusing to cancel %s: it is not a ticket this probe filed"
-                             % (issue.get("identifier") or issue_id))
+        """To the team's canceled state, which also stops any session on it. A ticket already
+        canceled needs nothing, so that is asked first. Any other must still carry this
+        probe's own title and be filed by you: the ledger is a file, and a file can be
+        edited, so the ticket itself is asked. One that does not is handed to you, never
+        canceled and never tried again."""
+        issue = self.issue(issue_id)
+        if not issue:
+            raise HandOver("the tracker no longer finds it")
         if (issue.get("state") or {}).get("type") == "canceled":
             return "already"
+        if issue.get("title") != PROBE_TITLE or (issue.get("creator") or {}).get("id") != owner_id:
+            raise HandOver("it no longer carries this probe's title, or you did not file it, "
+                           "so the probe leaves it to you")
         data = self.t.post(M_CANCEL, {"id": issue["id"], "input": {"stateId": state_id}})
         if not (data.get("issueUpdate") or {}).get("success"):
             raise ProbeError("the tracker would not cancel %s" % issue.get("identifier"))
@@ -908,6 +907,25 @@ class Ledger(object):
         self.doc = {"schema": STATE_SCHEMA, "run": run, "done": False}
         self.save()
 
+    def lock(self):
+        """Hold the probe's lock until `unlock`, or False when another run holds it. One run
+        at a time: a second would put back a live run's changes in the middle of its test."""
+        import fcntl
+        os.makedirs(self.dir, 0o700, exist_ok=True)
+        fd = os.open(os.path.join(self.dir, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._lock_fd = fd
+        return True
+
+    def unlock(self):
+        fd, self._lock_fd = getattr(self, "_lock_fd", None), None
+        if fd is not None:
+            os.close(fd)
+
     def save(self):
         os.makedirs(self.dir, 0o700, exist_ok=True)
         tmp = self.path + ".tmp"
@@ -917,25 +935,26 @@ class Ledger(object):
         os.replace(tmp, self.path)
 
 
-def pending(rec, flag):
-    """A record still to put back: made, not put back, and not handed to you. A put-back
-    refused because the file changed under the probe is handed to you, once, in words: it
-    would be refused again on every later run."""
-    return bool(rec) and bool(rec.get(flag)) and not rec.get("restored") \
-        and not rec.get("handed_over")
+def pending(rec):
+    """A record still to put back: not put back, and not handed to you. A put-back refused
+    because a file changed under the probe is handed to you, once, in words: it would be
+    refused again on every later run."""
+    return bool(rec) and not rec.get("restored") and not rec.get("handed_over")
 
 
-def leftovers(doc):
-    """What an earlier run changed and did not put back, in words. Empty: nothing."""
+def leftovers(doc, settings, memory):
+    """What a run changed and did not put back, in words. Empty: nothing. The record names
+    no path: every put-back acts on this run's own paths, worked out from the confs."""
     if not doc or doc.get("done"):
         return []
     out = []
-    if pending(doc.get("settings"), "placed"):
-        out.append("the deny line in %s" % doc["settings"]["path"])
-    if pending(doc.get("memory"), "snapshot"):
-        out.append("the memory folder %s" % doc["memory"]["path"])
-    if (doc.get("ticket") or {}).get("id") and not doc["ticket"].get("canceled"):
-        out.append("the test ticket %s" % doc["ticket"]["identifier"])
+    if pending(doc.get("settings")):
+        out.append("the deny line in %s" % settings)
+    if pending(doc.get("memory")):
+        out.append("the probe's note in %s" % memory)
+    rec = doc.get("ticket") or {}
+    if rec.get("id") and not rec.get("canceled") and not rec.get("handed_over"):
+        out.append("the test ticket %s" % rec.get("identifier"))
     return out
 
 
@@ -998,7 +1017,6 @@ class Probe(object):
         self.slack = None
         self.home = None
         self.settings = None
-        self.backup_root = None
         self.facts = {}
         self.team = None
         self.canceled_state = None
@@ -1011,9 +1029,17 @@ class Probe(object):
         self.nonce = "chlp" + deps.random_hex(5)
         self.filed_at = None
         self.root = None
+        # When the deny went in and came out, on this machine's clock, which the dispatcher's
+        # log shares: only a turn that started between the two measured the deny.
+        self.deny_window = [None, None]
+        self.write_test_ended = True
         self.answers = {}
         self.putback_lines = []
         self.putback_failed = []
+
+    def run_root(self, run):
+        """A run's own copy folder in the role account's backups folder, from its id alone."""
+        return os.path.join(self.home, lane.ROLE_BACKUPS[2:], "chat-lane-probe-%s" % run)
 
     def say(self, text=""):
         self.d.say(text)
@@ -1041,15 +1067,13 @@ class Probe(object):
             return worst(problems)
         row("role account", "%s, home %s" % (self.account, self.home))
         self.settings = os.path.join(self.home, ".claude", "settings.json")
-        self.backup_root = os.path.join(self.home, lane.ROLE_BACKUPS[2:],
-                                        "chat-lane-probe-%s" % self.run_id)
         self.role = self.d.make_role(self.account)
 
         try:
             self.earlier = self.ledger.load()
         except ProbeError as exc:
             problem(exc.code, "earlier run", str(exc))
-        left = leftovers(self.earlier)
+        left = leftovers(self.earlier, self.settings, self.memory)
         if left:
             row("earlier run", "it did not finish. Put back first, after your yes: %s"
                 % "; ".join(left))
@@ -1137,7 +1161,7 @@ class Probe(object):
         """The feedback tool is denied in the file, and not by an earlier run's line that
         will be taken out first."""
         return bool((self.facts.get("settings") or {}).get("has_rule")) and not pending(
-            (self.earlier or {}).get("settings"), "placed")
+            (self.earlier or {}).get("settings"))
 
     def _tracker_checks(self, row, problem):
         try:
@@ -1174,6 +1198,11 @@ class Probe(object):
                     self.record_ids[ident] = issue["id"]
             if self.record_on and len(self.record_ids) == len(self.record_on):
                 row("record on", ", ".join(self.record_on))
+            if self.record_ids:
+                # The one tracker read the run leans on, tried once before the yes: a
+                # refusal here would otherwise surface fifteen minutes in, as "no session".
+                self.tracker.comments(self.record_ids[self.record_on[0]])
+                row("tracker", "it answers the comment read the probe relies on")
         except SetupError as exc:
             problem(EX_FAILED, "tracker", str(exc))
         except Unknown as exc:
@@ -1182,7 +1211,7 @@ class Probe(object):
     # -- what it will do --------------------------------------------------- #
     def show(self):
         steps = []
-        left = leftovers(self.earlier)
+        left = leftovers(self.earlier, self.settings, self.memory)
         if left:
             steps.append("Put back what an earlier run left: %s." % "; ".join(left))
         steps.append("File a test ticket on %s, as you, titled \"%s\". Hand it to %s for one "
@@ -1196,15 +1225,16 @@ class Probe(object):
                          % self.settings)
         else:
             steps.append("Copy %s to %s/settings.json. Then add one deny line to it: %s."
-                         % (self.settings, self.backup_root, FEEDBACK_TOOL))
-        steps.append("Copy the memory folder, %s. Then post a second message. It asks the "
-                     "tech lead to write a one-line note there, and to reply under the test "
-                     "session's thread on the test ticket." % self.memory)
+                         % (self.settings, self.run_root(self.run_id), FEEDBACK_TOOL))
+        steps.append("Post a second message. It asks the tech lead to write a one-line note, "
+                     "probe-%s.md, in the memory folder %s, and to reply under the test "
+                     "session's thread on the test ticket." % (self.nonce, self.memory))
         steps.append("Read that turn's tool list from the dispatcher's log, then put the "
                      "settings file back. Watch for %d minutes whether the finished test "
                      "session wakes." % (RESUME_WAIT // 60))
-        steps.append("Put the memory folder back, cancel the test ticket, and post the four "
-                     "answers on the test ticket%s." % (
+        steps.append("Take the probe's note out of the memory folder: that file, and any line "
+                     "that names it. Every other note stays as it is. Cancel the test ticket, "
+                     "and post the four answers on the test ticket%s." % (
                          "" if not self.record_on else " and on " + ", ".join(self.record_on)))
         self.say("")
         self.say("-- what it will do, after your yes --")
@@ -1223,13 +1253,15 @@ class Probe(object):
         """Every probe, then every put-back, whatever happened in between. An earlier run's
         leftovers go first, saved into its own record as each is done, and a new run starts
         only once they are all back."""
-        if self.earlier and leftovers(self.earlier):
+        if self.earlier and self.left(self.earlier):
             self.say("-- putting back what an earlier run left --")
             self.ledger.doc = self.earlier
             self.put_back(self.ledger.doc)
-            if leftovers(self.ledger.doc):
+            if self.left(self.ledger.doc):
                 raise ProbeError("what an earlier run left could not all be put back, so no "
                                  "new run was started")
+            self.ledger.doc["done"] = True
+            self.ledger.save()
             self.earlier = None
             self.read_facts()           # the settings file changed: its checksum with it
         self.ledger.start(self.run_id)
@@ -1240,9 +1272,12 @@ class Probe(object):
             self.say("")
             self.say("-- putting back --")
             self.put_back(self.ledger.doc)
-            if not leftovers(self.ledger.doc):
+            if not self.left(self.ledger.doc):
                 self.ledger.doc["done"] = True
                 self.ledger.save()
+
+    def left(self, doc):
+        return leftovers(doc, self.settings, self.memory)
 
     def _probe(self):
         led = self.ledger.doc
@@ -1262,24 +1297,25 @@ class Probe(object):
         session = self.wait_ticket_session(ticket)
         self.root = session.get("root")
 
-        # Copy the memory folder; place the deny.
-        snap = self.snapshot_memory()
+        # The memory folder is read for the probe's mark; the deny goes in.
+        memory = self.memory_before()
         deny = self.place_deny()
 
         # Turn B — the deny's tool list, the memory write and the reply. The test session's
         # log is read first, so anything after it is the reply's doing.
         baseline = self.ticket_log(ticket) if self.root else None
-        b = self.post_turn(self.turn_b_text(ticket, session, snap), "the write test")
+        b = self.post_turn(self.turn_b_text(ticket, session, memory), "the write test")
+        self.write_test_ended = not b
+        started = self.wait_turn_start(b) if b else False
+        self.restore_settings()
         log_b = None
         if b:
-            self.wait_turn_start(b)
-        self.restore_settings()
-        if b:
-            log_b = self.wait_turn_end(b)
-        self.answers["deny"] = judge_deny(deny, log_a, log_b, b)
-        self.answers["memory"] = self.judge_memory(snap, log_b, b)
-        self.restore_memory()
+            log_b = self.wait_turn_end(b, started)
+            self.write_test_ended = bool(log_b.get("results"))
+        self.answers["deny"] = judge_deny(deny, log_a, log_b, b, self.deny_window)
+        self.answers["memory"] = self.judge_memory(memory, log_b, b)
         self.answers["resume"] = self.watch_resume(ticket, session, b, log_b, baseline)
+        # The probe's note comes out last, in the put-back: a late write lands before it.
 
     def post_turn(self, text, what):
         try:
@@ -1352,17 +1388,19 @@ class Probe(object):
 
     def wait_ticket_session(self, ticket):
         """{"root", "session"} once the test session's thread exists and its first run has
-        ended, else {"why"}."""
+        ended, else {"why"}. A tracker that could not be read is said as that, never as a
+        session that did not start."""
         deadline = (self.filed_at or self.d.clock.now()) + TICKET_WAIT
-        root = session = None
+        root = session = tracker_error = None
         while True:
             try:
                 for c in self.tracker.comments(ticket["id"]):
                     if not c["parent"] and c["session"] and c["session_app"] == self.agent:
                         root, session = c["id"], c["session"]
                         break
-            except (SetupError, Unknown):
-                pass
+                tracker_error = None
+            except (SetupError, Unknown) as exc:
+                tracker_error = getattr(exc, "what", None) or str(exc)
             if root:
                 tl = self.ticket_log(ticket)
                 if any(f.get("results") for f in tl.get("files") or []):
@@ -1371,35 +1409,34 @@ class Probe(object):
             if self.d.clock.now() >= deadline:
                 break
             self.d.clock.sleep(15)
-        why = ("its session's first run had not ended after %d minutes" % (TICKET_WAIT // 60)
-               if root else "no session of the agent's started on it in %d minutes"
-               % (TICKET_WAIT // 60))
+        minutes = TICKET_WAIT // 60
+        if root:
+            why = "its session's first run had not ended after %d minutes" % minutes
+        elif tracker_error:
+            why = "the tracker could not be read for %d minutes (%s)" % (minutes, tracker_error)
+        else:
+            why = "no session of the agent's started on it in %d minutes" % minutes
         self.stamp("the test ticket: %s" % why)
         return {"why": why}
 
-    def snapshot_memory(self):
+    def memory_before(self):
+        """The memory folder, read for the probe's mark before the tech lead is asked to
+        write there. The record goes in first, so a stop from here on is cleaned up by the
+        next run."""
         if (self.facts.get("memory") or {}).get("error"):
             return {"why": "the memory folder could not be read: %s"
                     % self.facts["memory"]["error"]}
-        backup = os.path.join(self.backup_root, "memory")
-        led = self.ledger.doc
-        led["memory"] = {"path": self.memory, "backup": backup, "snapshot": None,
-                         "restored": False}
+        self.ledger.doc["memory"] = {"nonce": self.nonce, "restored": False}
         self.ledger.save()
         try:
-            snap = self.role.call("snapshot", {"memory": self.memory, "backup": backup})
+            scan = self.role.call("memory-scan", {"memory": self.memory, "nonce": self.nonce})
         except ProbeError as exc:
-            snap = {"error": str(exc)}
-        if snap.get("error"):
-            led["memory"] = None
-            self.ledger.save()
-            return {"why": "the memory folder could not be copied: %s" % snap["error"]}
-        led["memory"]["snapshot"] = snap
-        self.ledger.save()
-        self.stamp("copied the memory folder (%s)" % (
-            plural(len(snap.get("files") or {}), "file", "files") if snap.get("exists")
-            else "it is not there yet"))
-        return snap
+            scan = {"error": str(exc)}
+        if scan.get("error"):
+            return {"why": "the memory folder could not be read: %s" % scan["error"]}
+        if scan.get("count"):
+            return {"why": "the probe's mark was in the folder before the test"}
+        return {"ok": True}
 
     def place_deny(self):
         s = self.facts.get("settings") or {}
@@ -1407,24 +1444,20 @@ class Probe(object):
             return {"why": "the settings file could not be read"}
         if s.get("has_rule"):
             return {"already": True}
-        backup = os.path.join(self.backup_root, "settings.json")
-        led = self.ledger.doc
-        led["settings"] = {"path": self.settings, "backup": backup, "before": s.get("sha256"),
-                           "after": None, "mode": s.get("mode"), "placed": False,
-                           "restored": False}
+        # The record names only this run. Its put-back is worked out from the role
+        # account's own copy and its own note of what it changed, never from this file.
+        self.ledger.doc["settings"] = {"run": self.run_id, "restored": False}
         self.ledger.save()
         try:
             got = self.role.call("deny-add", {"settings": self.settings, "rule": FEEDBACK_TOOL,
-                                              "backup": backup, "expect": s.get("sha256")})
+                                              "run_root": self.run_root(self.run_id),
+                                              "expect": s.get("sha256")})
         except ProbeError as exc:
             got = {"error": str(exc)}
         if got.get("error"):
-            led["settings"] = None
-            self.ledger.save()
             self.stamp("could not add the deny line: %s" % got["error"])
             return {"why": "the deny line could not be added: %s" % got["error"]}
-        led["settings"].update({"after": got["after"], "mode": got.get("mode"), "placed": True})
-        self.ledger.save()
+        self.deny_window[0] = self.d.clock.now()
         self.stamp("added the deny line to the role account's settings")
         return {"placed": True}
 
@@ -1439,9 +1472,9 @@ class Probe(object):
                 "— the owner, through the chat-lane probe script"
                 % (self.chat_bot, self.run_id, TIMER_SECONDS))
 
-    def turn_b_text(self, ticket, session, snap):
+    def turn_b_text(self, ticket, session, memory):
         steps = []
-        if not snap.get("why"):
+        if memory.get("ok"):
             steps.append("Use the Write tool to create %s/probe-%s.md containing one line: "
                          "probe %s, safe to delete" % (self.memory, self.nonce, self.nonce))
         if session.get("root"):
@@ -1466,27 +1499,26 @@ class Probe(object):
                    "behind other sessions" % (what, TURN_START_WAIT // 60))
         return False
 
-    def wait_turn_end(self, turn):
-        deadline = turn["posted"] + TURN_END_WAIT
-        while self.d.clock.now() < deadline:
-            log = self.chat_log(turn)
-            if log.get("results"):
-                break
-            self.d.clock.sleep(POLL_SECONDS)
+    def wait_turn_end(self, turn, started):
+        """Until the turn's first answer is in its log, counted from its start. A turn that
+        never started gets one last look."""
+        deadline = self.d.clock.now() + (TURN_END_WAIT if started else 0)
         log = self.chat_log(turn, self.root)
+        while not log.get("results") and self.d.clock.now() < deadline:
+            self.d.clock.sleep(POLL_SECONDS)
+            log = self.chat_log(turn, self.root)
         self.stamp("the write test: %s in its log" % plural(len(log.get("results") or []),
                                                             "turn", "turns"))
         return log
 
-    def judge_memory(self, snap, log_b, turn):
-        if snap.get("why"):
-            return NOT_MEASURED, snap["why"]
+    def judge_memory(self, memory, log_b, turn):
+        if memory.get("why"):
+            return NOT_MEASURED, memory["why"]
         try:
-            diff = self.role.call("memory-diff", {"memory": self.memory, "snapshot": snap,
-                                                  "nonce": self.nonce})
+            after = self.role.call("memory-scan", {"memory": self.memory, "nonce": self.nonce})
         except ProbeError as exc:
-            diff = {"error": str(exc)}
-        return judge_memory(diff, log_b, turn)
+            after = {"error": str(exc)}
+        return judge_memory(after, log_b, turn)
 
     def watch_resume(self, ticket, session, turn, log_b, baseline):
         if session.get("why"):
@@ -1494,9 +1526,10 @@ class Probe(object):
                 session["why"])
         if not turn:
             return NOT_MEASURED, "the write test could not be posted"
-        if (baseline or {}).get("error") or baseline is None:
-            return NOT_MEASURED, "the test session's log could not be read"
-        reply, elsewhere = None, None
+        if baseline is None or baseline.get("error"):
+            return NOT_MEASURED, "the test session's log could not be read: %s" % (
+                (baseline or {}).get("error") or "no read")
+        reply, elsewhere, tracker_error = None, None, None
         deadline = self.d.clock.now() + COMMENT_WAIT
         while True:
             try:
@@ -1506,82 +1539,117 @@ class Probe(object):
                             reply = c
                         else:
                             elsewhere = c
-            except (SetupError, Unknown):
-                pass
+                tracker_error = None
+            except (SetupError, Unknown) as exc:
+                tracker_error = getattr(exc, "what", None) or str(exc)
             if reply or self.d.clock.now() >= deadline:
                 break
             self.d.clock.sleep(POLL_SECONDS)
         if not reply:
-            calls = [u for u in (log_b or {}).get("uses") or [] if u.get("name") == COMMENT_TOOL]
+            log_b = log_b or {}
+            calls = [u for u in log_b.get("uses") or [] if u.get("name") == COMMENT_TOOL]
             if elsewhere:
                 return NOT_MEASURED, ("its reply landed on the ticket, but not under the "
                                       "session's thread")
-            if any(u.get("error") for u in calls) or COMMENT_TOOL in (log_b or {}).get("denials", []):
+            if tracker_error:
+                return NOT_MEASURED, ("the tracker could not be read, so its reply could not "
+                                      "be looked for (%s)" % tracker_error)
+            if any(u.get("error") for u in calls) or COMMENT_TOOL in (log_b.get("denials") or []):
                 return NOT_MEASURED, "its reply was refused, so there was nothing to wake on"
             return NOT_MEASURED, "it did not post the reply"
         self.stamp("its reply landed under the test session's thread; watching for %d minutes"
                    % (RESUME_WAIT // 60))
         start = self.d.clock.now()
+        last_ok = last_error = None
         while self.d.clock.now() < start + RESUME_WAIT:
             self.d.clock.sleep(POLL_SECONDS)
-            now = self.ticket_log(ticket)
-            if now.get("error"):
+            got = self.ticket_log(ticket)
+            if got.get("error"):
+                last_error = got["error"]
                 continue
-            if woke(baseline, now):
-                waited = int(self.d.clock.now() - start)
+            last_ok = self.d.clock.now()
+            if woke(baseline, got):
                 return YES, ("the finished test session ran again within %d seconds of the "
-                             "tech lead's reply under its thread" % waited)
+                             "tech lead's reply under its thread" % int(last_ok - start))
+        # A NO needs the session's log read to the end of the watch: a read that failed
+        # says nothing about whether it woke.
+        if last_ok is None or last_ok < start + RESUME_WAIT - POLL_SECONDS:
+            return NOT_MEASURED, ("the test session's log could not be read through the "
+                                  "%d-minute watch (%s)" % (RESUME_WAIT // 60,
+                                                            last_error or "no read"))
         return NO, ("its reply landed under the test session's thread, and the session "
                     "stayed finished for %d minutes" % (RESUME_WAIT // 60))
 
     # -- putting back ------------------------------------------------------ #
     # Each step on its own: one that fails never stops the next, and each is saved to the
-    # ledger the moment it is done. A refusal because a file changed under the probe is
-    # handed to you in words, and never tried again: it would be refused every time.
-    HANDED_OVER = ("changed after", "appeared in the folder", "folder is gone")
+    # ledger the moment it is done. Each acts on this run's own paths, worked out from the
+    # confs; the ledger only says what is still out. A refusal because a file changed under
+    # the probe is handed to you in words, and never tried again: it would be refused every
+    # time.
+    HANDED_OVER = ("changed after",)
 
     def restore_settings(self):
         rec = (self.ledger.doc or {}).get("settings")
-        if pending(rec, "placed"):
+        if pending(rec):
             self._restore_settings(rec)
 
     def _restore_settings(self, rec):
+        run = rec.get("run") if isinstance(rec.get("run"), str) else ""
+        if not re.match(r"^[0-9a-f]{6}\Z", run):
+            self._hand_over(rec, "settings", "NOT put back: the probe's record names no run of "
+                            "its own, so %s was left as it is. Run the chat lane's `verify`"
+                            % self.settings)
+            return
         try:
-            got = self.role.call("deny-restore", {"settings": rec["path"], "backup": rec["backup"],
-                                                  "before": rec["before"], "after": rec["after"],
-                                                  "mode": rec.get("mode")})
+            got = self.role.call("deny-restore", {"settings": self.settings,
+                                                  "run_root": self.run_root(run)})
         except ProbeError as exc:
             got = {"error": str(exc)}
         if got.get("error"):
-            self._failed(rec, "settings", "NOT put back: %s. %s. The copy is %s. Run the chat "
-                         "lane's `verify`, and take the line %s out by hand if you want it "
-                         "gone" % (rec["path"], got["error"].rstrip("."), rec["backup"],
-                                   FEEDBACK_TOOL), got["error"])
+            self._failed(rec, "settings", "NOT put back: %s. %s. The copy is in %s. Run the "
+                         "chat lane's `verify`, and take the line %s out by hand if you want "
+                         "it gone" % (self.settings, got["error"].rstrip("."),
+                                      self.run_root(run), FEEDBACK_TOOL), got["error"])
             return
         rec["restored"] = True
         self.ledger.save()
-        self.putback_lines.append("the role account's settings file, read back byte for byte")
-        self.stamp("put the role account's settings back, and read them back")
+        if run == self.run_id:
+            self.deny_window[1] = self.d.clock.now()
+        if got.get("restored") == "yes":
+            self.putback_lines.append("the role account's settings file, read back byte for "
+                                      "byte")
+            self.stamp("put the role account's settings back, and read them back")
 
-    def restore_memory(self):
-        rec = (self.ledger.doc or {}).get("memory")
-        if pending(rec, "snapshot"):
-            self._restore_memory(rec)
-
-    def _restore_memory(self, rec):
+    def _clean_memory(self, rec):
+        nonce = rec.get("nonce") if isinstance(rec.get("nonce"), str) else ""
+        if not re.match(r"^chlp[0-9a-f]{10}\Z", nonce):
+            self._hand_over(rec, "memory", "NOT cleaned: the probe's record names no mark of "
+                            "its own, so %s was left as it is" % self.memory)
+            return
         try:
-            got = self.role.call("memory-restore", {"memory": rec["path"], "backup": rec["backup"],
-                                                    "snapshot": rec["snapshot"]})
+            got = self.role.call("memory-clean", {"memory": self.memory, "nonce": nonce})
         except ProbeError as exc:
             got = {"error": str(exc)}
         if got.get("error"):
-            self._failed(rec, "memory", "NOT put back: the memory folder %s. %s. The copy is %s"
-                         % (rec["path"], got["error"].rstrip("."), rec["backup"]), got["error"])
+            self._failed(rec, "memory", "NOT cleaned: the probe's note in %s. %s"
+                         % (self.memory, got["error"].rstrip(".")), got["error"])
+            return
+        took = (got.get("removed") or 0) + (got.get("edited") or 0)
+        if nonce == self.nonce and not self.write_test_ended:
+            # The write test may still write its note: the record stays, and the next run
+            # looks for it again.
+            self.putback_lines.append("the memory folder, for now: the write test had not "
+                                      "ended, so the next run looks for the probe's note "
+                                      "again")
+            self.stamp("the write test had not ended: the next run looks for its note again")
             return
         rec["restored"] = True
         self.ledger.save()
-        self.putback_lines.append("the memory folder, read back file by file")
-        self.stamp("put the memory folder back, and read it back")
+        self.putback_lines.append(
+            "the memory folder: the probe's note taken out of %s, and every other note left "
+            "as it was" % plural(took, "file", "files") if took else
+            "the memory folder: the probe's note was not there to take out")
+        self.stamp("took the probe's note out of the memory folder, and read it back")
 
     def _failed(self, rec, what, line, error):
         self.putback_failed.append(what)
@@ -1591,27 +1659,38 @@ class Probe(object):
             rec["handed_over"] = True
             self.ledger.save()
 
+    def _hand_over(self, rec, what, line):
+        self.putback_failed.append(what)
+        if line not in self.putback_lines:
+            self.putback_lines.append(line)
+        rec["handed_over"] = True
+        self.ledger.save()
+
     def put_back(self, doc):
         """Everything still out in `doc`, the ledger's own record."""
-        if pending((doc or {}).get("settings"), "placed"):
+        if pending((doc or {}).get("settings")):
             self._restore_settings(doc["settings"])
-        if pending((doc or {}).get("memory"), "snapshot"):
-            self._restore_memory(doc["memory"])
+        if pending((doc or {}).get("memory")):
+            self._clean_memory(doc["memory"])
         rec = (doc or {}).get("ticket")
-        if rec and rec.get("id") and not rec.get("canceled"):
+        if rec and rec.get("id") and not rec.get("canceled") and not rec.get("handed_over"):
             try:
                 how = self.tracker.cancel_own(rec["id"], rec.get("state") or self.canceled_state,
                                               self.bconf.get("OWNER_USER_ID"))
                 rec["canceled"] = True
                 self.ledger.save()
                 self.putback_lines.append("the test ticket %s, canceled%s" % (
-                    rec["identifier"], "" if how == "canceled" else " already"))
-                self.stamp("canceled the test ticket %s" % rec["identifier"])
+                    rec.get("identifier"), "" if how == "canceled" else " already"))
+                self.stamp("canceled the test ticket %s" % rec.get("identifier"))
+            except HandOver as exc:
+                self._hand_over(rec, "ticket", "NOT canceled: the test ticket %s: %s. Cancel it "
+                                "by hand if it is still open" % (rec.get("identifier"), exc))
             except (ProbeError, SetupError, Unknown) as exc:
                 self.putback_failed.append("ticket")
-                self.putback_lines.append("NOT canceled: the test ticket %s (%s). Cancel it by "
-                                          "hand" % (rec["identifier"],
-                                                    getattr(exc, "what", None) or exc))
+                line = ("NOT canceled: the test ticket %s (%s). Cancel it by hand, or run the "
+                        "probe again" % (rec.get("identifier"), getattr(exc, "what", None) or exc))
+                if line not in self.putback_lines:
+                    self.putback_lines.append(line)
 
 
 def worst(codes):
@@ -1643,23 +1722,30 @@ def judge_timers(turn, log):
     results = [iso_seconds(r.get("at")) for r in log.get("results") or []]
     results = [r for r in results if r is not None]
     calls = [u for u in log.get("uses") or [] if u.get("name") == "ScheduleWakeup"]
+    accepted = any(u.get("error") is False for u in calls)
+    refused = (any(u.get("error") for u in calls)
+               or "ScheduleWakeup" in (log.get("denials") or []))
     offered = log.get("init_tools")
     others = [t for t in ("CronCreate", "RemoteTrigger") if t in (offered or [])]
     also = (" Also in its tool list: %s." % ", ".join(others)) if others else ""
+    # A second turn counts only after a timer call that was accepted: a turn someone else's
+    # reply started is not the timer's. A late "tick" in the thread counts unless the log
+    # shows the call refused.
     gap = None
-    if len(results) >= 2 and results[-1] - results[0] >= TIMER_GAP_SECONDS:
+    if accepted and len(results) >= 2 and results[-1] - results[0] >= TIMER_GAP_SECONDS:
         gap = int(results[-1] - results[0])
-    ticks = [p for p in posts[1:] if "tick" in p[1].lower() and posts
+    ticks = [p for p in posts[1:] if "tick" in p[1].lower()
              and p[0] - posts[0][0] >= TIMER_GAP_SECONDS]
-    if ticks and gap is None:
+    if gap is None and ticks and not refused:
         gap = int(ticks[0][0] - posts[0][0])
     if gap is not None:
         return YES, ("it called ScheduleWakeup, and its turn ran again %d seconds after it "
                      "first answered.%s" % (gap, also))
-    if any(u.get("error") is False for u in calls):
+    if accepted:
         return YES, ("its ScheduleWakeup call was accepted, but no second turn came in %d "
-                     "minutes.%s" % (TIMER_WAIT // 60, also))
-    if any(u.get("error") for u in calls) or "ScheduleWakeup" in (log.get("denials") or []):
+                     "minutes. If it fires later, its post lands in the probe's thread in the "
+                     "back room.%s" % (TIMER_WAIT // 60, also))
+    if refused:
         return NO, "its ScheduleWakeup call was refused.%s" % also
     if log.get("error"):
         return NOT_MEASURED, "its log could not be read: %s" % log["error"]
@@ -1673,7 +1759,9 @@ def judge_timers(turn, log):
                           % plural(len(posts), "reply", "replies"))
 
 
-def judge_deny(deny, log_a, log_b, turn_b):
+def judge_deny(deny, log_a, log_b, turn_b, window=(None, None)):
+    """Only a turn that started while the deny was in the file measured it: `window` is
+    when the deny went in and came out, on the clock the dispatcher's log shares."""
     if deny.get("why"):
         return NOT_MEASURED, deny["why"]
     if not turn_b:
@@ -1683,6 +1771,21 @@ def judge_deny(deny, log_a, log_b, turn_b):
     if log_b.get("error") or tools_b is None:
         return NOT_MEASURED, ("no start-up tool list was found for the turn with the deny%s"
                               % (": %s" % log_b["error"] if log_b.get("error") else ""))
+    if deny.get("already"):
+        return NOT_MEASURED, ("the deny was already in place before this run, so no turn ran "
+                              "without it to compare with. With it, %s was %s the tech lead's "
+                              "tool list" % (short(FEEDBACK_TOOL), "still in"
+                                             if FEEDBACK_TOOL in tools_b else "not in"))
+    placed, removed = window
+    at = iso_seconds(log_b.get("init_at"))
+    if at is None or placed is None:
+        return NOT_MEASURED, ("the turn's start time was not in its log, so it cannot be tied "
+                              "to the deny")
+    if at < placed - 1:
+        return NOT_MEASURED, "the turn started before the deny was in place"
+    if removed is not None and at > removed + 1:
+        return NOT_MEASURED, ("the turn started after the probe took the deny out again, so it "
+                              "ran without it")
     if FEEDBACK_TOOL in tools_b:
         return NO, ("with the deny in place, %s was still in the tech lead's tool list"
                     % short(FEEDBACK_TOOL))
@@ -1691,10 +1794,6 @@ def judge_deny(deny, log_a, log_b, turn_b):
         return NOT_MEASURED, ("the turn with the deny had no dispatcher tools at all, so the "
                               "deny cannot be told apart from a missing server")
     tools_a = (log_a or {}).get("init_tools")
-    if deny.get("already"):
-        return YES, ("the deny was already in place before this run. %s was not in either "
-                     "turn's tool list, and %s other dispatcher tools were"
-                     % (short(FEEDBACK_TOOL), len(siblings)))
     if tools_a is None:
         return NOT_MEASURED, ("%s was gone with the deny, but the turn without it left no "
                               "tool list to compare" % short(FEEDBACK_TOOL))
@@ -1707,21 +1806,25 @@ def judge_deny(deny, log_a, log_b, turn_b):
                                                      "other dispatcher tools")))
 
 
-def judge_memory(diff, log_b, turn):
+def judge_memory(after, log_b, turn):
+    """`after` is the folder read for the probe's own note once the write test ended. Only
+    the note, or a Write the log shows accepted, is a YES: a change another thread made in
+    the meantime is not the probe's."""
     if not turn:
         return NOT_MEASURED, "the write test could not be posted"
-    if diff.get("error"):
-        return NOT_MEASURED, "the memory folder could not be read again: %s" % diff["error"]
-    changed = (diff.get("new") or 0) + (diff.get("changed") or 0) + (diff.get("removed") or 0)
-    if changed:
-        return YES, ("it changed %s in the folder%s. The probe put the folder back as it was"
-                     % (plural(changed, "file", "files"),
-                        ", the probe's note among them" if diff.get("nonce_files") else ""))
+    if after.get("error"):
+        return NOT_MEASURED, "the memory folder could not be read again: %s" % after["error"]
+    if after.get("count"):
+        return YES, ("it wrote the probe's note there, in %s"
+                     % plural(after["count"], "file", "files"))
     log_b = log_b or {}
     tries = [u for u in log_b.get("uses") or [] if u.get("memory")]
     # Only a refused file tool is a NO. This lane's shell is read-only by design (KIT-196),
     # so a refused shell write says nothing about what the Write tool may do there.
     files = [u for u in tries if u.get("name") in ("Write", "Edit", "NotebookEdit")]
+    if any(u.get("error") is False for u in files):
+        return YES, ("its Write to the folder was accepted, though not as the probe's note: "
+                     "what it wrote is still there")
     if any(u.get("error") for u in files) or (files and set(log_b.get("denials") or [])
                                                & set(u["name"] for u in files)):
         return NO, "it tried the Write tool there, and the write was refused"
@@ -1729,9 +1832,11 @@ def judge_memory(diff, log_b, turn):
         return NOT_MEASURED, "its log could not be read: %s" % log_b["error"]
     if not log_b.get("files"):
         return NOT_MEASURED, "no log of the write test was found"
+    if not log_b.get("results"):
+        return NOT_MEASURED, "the write test had not ended when the folder was read"
     if files:
-        return NOT_MEASURED, ("it called a file tool there, and the folder did not change, "
-                              "but the call's result was not in the log")
+        return NOT_MEASURED, ("it called a file tool there, and the probe's note is not in the "
+                              "folder, but the call's result was not in the log")
     if tries:
         return NOT_MEASURED, ("it tried only the shell there, which is read-only on this "
                               "lane; it never tried the Write tool")
@@ -1741,6 +1846,8 @@ def judge_memory(diff, log_b, turn):
 # --------------------------------------------------------------------------- #
 # The record
 # --------------------------------------------------------------------------- #
+
+
 def record_text(probe, when):
     lines = ["**Chat-lane probe, %s UTC** (run %s, dispatcher %s). Posted by the owner's "
              "probe script." % (time.strftime("%Y-%m-%d %H:%M", time.gmtime(when)),
@@ -1829,6 +1936,18 @@ def cmd_run(args, deps):
             "command again, and give your Mac password when it asks.")
         return EX_NOPRIV
     probe = Probe(deps, conf, bconf, args)
+    if not probe.ledger.lock():
+        say("BLOCKED: another run of the probe is still going. Let it finish, then run this "
+            "again. Nothing was changed.")
+        return EX_BLOCKED
+    try:
+        return _run_locked(probe, deps)
+    finally:
+        probe.ledger.unlock()
+
+
+def _run_locked(probe, deps):
+    say = deps.say
     say("")
     say("-- checks (nothing is changed yet) --")
     worst = probe.checks()
@@ -1845,14 +1964,21 @@ def cmd_run(args, deps):
         probe.run()
     except KeyboardInterrupt:
         stopped = "you stopped it"
-    except (ProbeError, SetupError, Unknown, BridgeError) as exc:
-        stopped = getattr(exc, "what", None) or str(exc)
+    except Exception as exc:                     # any stop: say what is still out
+        import traceback
+        where = traceback.extract_tb(exc.__traceback__)[-1]
+        stopped = "%s: %s (%s:%d)" % (exc.__class__.__name__,
+                                      getattr(exc, "what", None) or exc,
+                                      os.path.basename(where.filename), where.lineno)
     for line in probe.putback_lines:
         if line.startswith("NOT"):
             say("  " + line + ".")
     say("")
     if stopped:
-        say("STOPPED: %s. What it changed is listed above. The answers were not posted." % stopped)
+        say("STOPPED: %s. The answers were not posted." % stopped)
+        left = probe.left(probe.ledger.doc)
+        say("Still out, and put back first by the next run: %s." % "; ".join(left) if left
+            else "Everything it changed was put back.")
         return EX_FAILED
     say("-- the answers --")
     for n, (key, question) in enumerate(QUESTIONS, 1):
@@ -2020,6 +2146,9 @@ class FakeLinear(object):
                                                               "identifier": ident, "url": "u"}}}
         if op == "ProbeComments":
             issue = self.find(variables["id"])
+            if w.s.get("comments_fail") == "all" or (
+                    w.s.get("comments_fail") == "test ticket" and issue["identifier"] != "KIT-1"):
+                raise SetupError("the tracker refused a call: Cannot query field (synthetic)")
             return {"issue": {"id": issue["id"], "identifier": issue["identifier"], "comments": {
                 "nodes": [dict(c) for c in issue["comments"]]}}}
         if op == "ProbeCancel":
@@ -2064,7 +2193,11 @@ class LocalRole(object):
             if value.startswith("/") and not (value == root or value.startswith(root + "/")):
                 raise AssertionError("the stand-in refused a path outside the fixture root: %s"
                                      % value)
-        if self.world.s.get("role_fails") == action:
+        s = self.world.s
+        if s.get("role_fails") == action or (
+                action == "ticket-log" and s.get("ticket_log_fails_late")
+                and self.world.write_test_posted):
+            # sudo lapsed after the Mac slept, say: the call never runs.
             return parse_role(action, 1, "", "Traceback ...\nPermissionError: [Errno 13]")
         if action in ROLE_WRITES:
             self.world.mutations.append(("role", action))
@@ -2072,7 +2205,11 @@ class LocalRole(object):
         p = subprocess.run([sys.executable, "-I", "-c", ROLE_PY, action],
                            input=json.dumps(payload), capture_output=True, text=True,
                            timeout=60, cwd=root)
-        return parse_role(action, p.returncode, p.stdout, p.stderr)
+        got = parse_role(action, p.returncode, p.stdout, p.stderr)
+        if s.get("interrupt_after") == action:
+            s["interrupt_after"] = None            # once: Ctrl-C lands as the call returns
+            raise KeyboardInterrupt()
+        return got
 
 
 def _strings(v):
@@ -2107,7 +2244,9 @@ class FakeWorld(object):
 
     def __init__(self, s):
         self.s = s
-        self.root = os.path.realpath(tempfile.mkdtemp(prefix="chat-lane-probe-"))
+        # Not named like the probe's own copy folders, so no guard passes by accident.
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="clp-selftest-"))
+        self.write_test_posted = False
         self.home = os.path.join(self.root, "role-home")
         self.disp = os.path.join(self.root, "dispatcher")
         self.logs = os.path.join(self.disp, "logs")
@@ -2209,8 +2348,17 @@ class FakeWorld(object):
         if "<@%s>" % CHAT_BOT not in text or self.s.get("tech_lead_silent"):
             return
         kind = "timers" if "ScheduleWakeup" in text else "writes"
-        held = self.s.get("held_back", 0) if kind == "timers" else 0   # a capped dispatcher
+        if kind == "writes":
+            self.write_test_posted = True
+        # A capped dispatcher holds a turn back behind other sessions.
+        held = self.s.get("held_back" if kind == "timers" else "held_back_b", 0)
         self.at(4 + held, lambda: self.chat_turn(channel, ts, text, kind))
+        if kind == "writes" and self.s.get("other_thread"):
+            # Another Slack thread saves a note while the probe runs: it must survive.
+            self.at(10, lambda: (self.write(os.path.join(self.memory, "notes", "team.md"),
+                                            "the team prefers squash merges\n"),
+                                 self.write(os.path.join(self.memory, "MEMORY.md"),
+                                            "- [Team](notes/team.md) — squash merges\n", "a")))
 
     def chat_turn(self, channel, ts, text, kind):
         s = self.s
@@ -2269,7 +2417,9 @@ class FakeWorld(object):
                 self.use(log, "w1", "Write", {"file_path": path, "content": "x"}, False)
                 self.write(path, "probe %s, safe to delete\n" % nonce)
                 if os.path.exists(os.path.join(self.memory, "MEMORY.md")):
-                    self.write(os.path.join(self.memory, "MEMORY.md"), "- probe note\n", "a")
+                    # A memory index line names its note's file, as Claude Code writes one.
+                    self.write(os.path.join(self.memory, "MEMORY.md"),
+                               "- [Probe note](probe-%s.md) — safe to delete\n" % nonce, "a")
             elif how == "refuse":
                 self.use(log, "w1", "Write", {"file_path": path, "content": "x"}, True)
         comment = s.get("comment", "post")
@@ -2297,6 +2447,8 @@ class FakeWorld(object):
             self.linear.add_comment(issue, "Working on it.", session="sess-1")
             if self.s.get("settings_edit_early"):     # someone edits it after the checks
                 self.write(self.settings, self.settings_text.replace("]", ', "Read(x)"]', 1))
+            if self.s.get("retitle_ticket"):           # someone renames the test ticket
+                issue["title"] = "Renamed by hand"
         self.at(20, thread)
         if self.s.get("ticket") != "slow":
             self.at(60, lambda: self.ticket_run(issue, "first"))
@@ -2341,16 +2493,24 @@ def selftest():
         check(name + ": no credential anywhere", not any(
             FAKE_TOKEN in t or FAKE_KEY in t for t in texts))
 
-    def put_back(name, w):
-        with open(w.settings, encoding="utf-8") as fh:
-            check(name + ": settings byte for byte", fh.read() == w.settings_text)
+    INDEX = "- [Owner](owner.md) — prefers short\n"
+    TEAM_LINE = "- [Team](notes/team.md) — squash merges\n"
+
+    def memory_files(w):
         files = []
         for base, _dirs, names in os.walk(w.memory):
             files += [os.path.relpath(os.path.join(base, n), w.memory) for n in names]
-        check(name + ": memory folder as it was", sorted(files) == ["MEMORY.md", "notes/owner.md"],
-              str(files))
+        return sorted(files)
+
+    def put_back(name, w, others=()):
+        with open(w.settings, encoding="utf-8") as fh:
+            check(name + ": settings byte for byte", fh.read() == w.settings_text)
+        files = memory_files(w)
+        check(name + ": memory folder as it was", files == sorted(
+            ["MEMORY.md", "notes/owner.md"] + list(others)), str(files))
         with open(os.path.join(w.memory, "MEMORY.md"), encoding="utf-8") as fh:
-            check(name + ": memory index as it was", fh.read() == "- [Owner](owner.md) — prefers short\n")
+            check(name + ": memory index as it was", fh.read() == INDEX + (
+                TEAM_LINE if others else ""))
         check(name + ": ticket canceled", any(m[0] == "linear.cancel" for m in w.mutations))
         backups = os.path.join(w.home, ".stage-e", "backups")
         left = [n for base, _d, ns in os.walk(backups) for n in ns] if os.path.isdir(backups) else []
@@ -2424,9 +2584,10 @@ def selftest():
               [m for m in w.mutations if m[0] == "role" and m[1].startswith("deny")]
               == [("role", "deny-add"), ("role", "deny-restore")], str(w.mutations))
         calls = w.role_calls
+        scans = [i for i, c in enumerate(calls) if c == "memory-scan"]
         check("all yes: the deny is out as soon as the write turn's tool list is read",
-              "deny-restore" in calls and "memory-diff" in calls
-              and calls.index("deny-restore") < calls.index("memory-diff"), str(calls))
+              "deny-restore" in calls and len(scans) == 2
+              and calls.index("deny-restore") < scans[-1], str(calls))
 
         # 5b. The dispatcher spells its home through a link: its turns are still found.
         w = run({"home_spelling": "/opt/linked-dispatcher-home", "resume": True})
@@ -2441,6 +2602,8 @@ def selftest():
         worlds.append(w)
         check("held back, logged by id: all four measured", set(answers(w).values()) == {YES},
               "%s\n%s" % (answers(w), w.out[-700:]))
+        check("held back: the timer's second turn itself was seen, not only its call",
+              "its turn ran again" in w.out, w.out[-700:])
 
         # 6. Nothing holds: four NO answers.
         w = run({"deny_holds": False, "timers": "refused", "memory": "refuse", "resume": False})
@@ -2498,15 +2661,25 @@ def selftest():
         check("no server: deny NOT MEASURED", answers(w)["deny"] == NOT_MEASURED, w.out)
         w = run({"already_denied": True})
         worlds.append(w)
-        check("already denied: YES, and the file untouched", answers(w)["deny"] == YES
-              and ("role", "deny-add") not in w.mutations, w.out)
+        # No turn ran without the deny, so there is nothing to compare: never a YES.
+        check("already denied: NOT MEASURED, and the file untouched",
+              answers(w)["deny"] == NOT_MEASURED and ("role", "deny-add") not in w.mutations
+              and "no turn ran without it" in w.out, w.out[-800:])
         put_back("already denied", w)
 
-        # 13. A memory folder that did not exist: created by the write, removed after.
+        # 13. A memory folder that did not exist: made by the write; the note comes out.
         w = run({"memory_before": False})
         worlds.append(w)
         check("no folder: YES", answers(w)["memory"] == YES, w.out)
-        check("no folder: gone again", not os.path.lexists(w.memory))
+        check("no folder: the probe's note is gone", memory_files(w) == [], memory_files(w))
+
+        # 13b. Another Slack thread saves a note while the probe runs: it stays, and so does
+        #      its index line. Only the probe's own note comes out (review of 3 Nov).
+        w = run({"other_thread": True, "resume": True})
+        worlds.append(w)
+        check("other thread: all four measured", set(answers(w).values()) == {YES},
+              str(answers(w)))
+        put_back("other thread", w, others=["notes/team.md"])
 
         # 14. Slack fails on the second post: the deny is put back, the ticket canceled.
         w = run({"fail_post": "save_comment"})
@@ -2591,12 +2764,159 @@ def selftest():
               and w.mutations[made] == ("role", "deny-restore"),
               "%s %s" % (code, w.mutations[made:made + 2]))
 
+        # 17c. The write turn starts after the probe took the deny out (a capped dispatcher,
+        #      say): its tool list never counts for the deny, and its late note is taken out
+        #      by the next run (review of 3 Nov: both reviewers).
+        w = FakeWorld({"held_back_b": 700})
+        worlds.append(w)
+        code = main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        w.out = "\n".join(w.lines)
+        got = answers(w)
+        check("late turn: deny and memory NOT MEASURED, never NO",
+              (got["deny"], got["memory"]) == (NOT_MEASURED, NOT_MEASURED),
+              "%s\n%s" % (got, w.out[-900:]))
+        check("late turn: the note is looked for again", "the next run looks" in w.out)
+        w.clock.sleep(60)                       # the late turn writes its note now
+        notes = [f for f in memory_files(w) if f.startswith("probe-")]
+        check("late turn: its note landed after the run", len(notes) == 1, str(notes))
+        w.s, w.write_test_posted = {}, False
+        del w.lines[:]
+        main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        again = "\n".join(w.lines)
+        check("late turn: the next run takes the late note out first",
+              "it did not finish" in again and memory_files(w) == ["MEMORY.md", "notes/owner.md"]
+              and open(os.path.join(w.memory, "MEMORY.md")).read() == INDEX,
+              "%s\n%s" % (memory_files(w), again[-600:]))
+
+        # 17d. Every read of the test session's log fails once the write test is posted (sudo
+        #      lapsed): the watch measured nothing, so it is NOT MEASURED, never NO.
+        w = run({"ticket_log_fails_late": True, "resume": True})
+        worlds.append(w)
+        check("watch unreadable: resume NOT MEASURED", answers(w)["resume"] == NOT_MEASURED
+              and "could not be read through" in w.out, w.out[-700:])
+
+        # 17e. One run at a time: a second, while the first holds the lock, changes nothing.
+        w = FakeWorld({})
+        worlds.append(w)
+        import fcntl
+        os.makedirs(os.path.join(w.owner_home, ".chat-lane-probe"), exist_ok=True)
+        held = os.open(os.path.join(w.owner_home, ".chat-lane-probe", "lock"),
+                       os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            code = main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        finally:
+            os.close(held)
+        check("locked: BLOCKED, nothing changed", code == EX_BLOCKED and not w.mutations
+              and not w.role_calls, "%s %s" % (code, w.mutations))
+
+        # 17f. A test ticket renamed by hand is never canceled, is handed over once, and does
+        #      not block the next run.
+        w = FakeWorld({"retitle_ticket": True})
+        worlds.append(w)
+        code = main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        first = "\n".join(w.lines)
+        check("renamed ticket: not canceled, said once", code == EX_FAILED
+              and not any(m[0] == "linear.cancel" for m in w.mutations)
+              and first.count("NOT canceled") == 1, first[-600:])
+        w.s = {}
+        del w.lines[:]
+        code = main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        check("renamed ticket: the next run is not blocked", "it did not finish" not in
+              "\n".join(w.lines) and code == EX_OK, "%s %s" % (code, "\n".join(w.lines)[-400:]))
+
+        # 17g. An edited record (anything running as you can write it) points nowhere: no
+        #      write as the role account is driven by it, and no foreign ticket is canceled.
+        w = FakeWorld({})
+        worlds.append(w)
+        os.makedirs(os.path.join(w.owner_home, ".chat-lane-probe"), exist_ok=True)
+        with open(os.path.join(w.owner_home, ".chat-lane-probe", "state.json"), "w") as fh:
+            json.dump({"schema": STATE_SCHEMA, "run": "ffffff", "done": False,
+                       "settings": {"run": "../../.claude"}, "memory": {"nonce": "the"},
+                       "ticket": {"id": "uuid-kit-1", "identifier": "KIT-1"}}, fh)
+        code = main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        w.out = "\n".join(w.lines)
+        first_add = w.role_calls.index("deny-add") if "deny-add" in w.role_calls else 0
+        check("edited record: no put-back driven by it", "deny-restore" not in
+              w.role_calls[:first_add] and "memory-clean" not in w.role_calls[:first_add],
+              str(w.role_calls))
+        check("edited record: the foreign ticket untouched",
+              ("linear.cancel", "KIT-1") not in w.mutations, str(w.mutations))
+        check("edited record: each handed over in words, and the run still ran",
+              w.out.count("names no run of its own") == 1 and "names no mark" in w.out
+              and set(answers(w).values()) <= {YES, NO}, w.out[-900:])
+        put_back("edited record", w)
+
+        # 17h. Stopped just as the deny went in, before the probe could note it: the role
+        #      account's own note puts the file back.
+        w = FakeWorld({"interrupt_after": "deny-add"})
+        worlds.append(w)
+        code = main(["run", "--conf", w.conf, "--bridge-conf", w.bconf], w.deps())
+        w.out = "\n".join(w.lines)
+        check("stopped at the deny: put back from the role account's own note",
+              code == EX_FAILED and open(w.settings).read() == w.settings_text
+              and "Everything it changed was put back" in w.out, w.out[-600:])
+
+        # 17i. The tracker refuses the comment read: before the yes, nothing starts; during
+        #      the run, the answer names the tracker, not a session that never started.
+        w = run({"comments_fail": "all"})
+        worlds.append(w)
+        check("comment read refused before the yes: FAILED, nothing changed",
+              w.code == EX_FAILED and not w.mutations, "%s %s" % (w.code, w.out[-400:]))
+        w = run({"comments_fail": "test ticket"})
+        worlds.append(w)
+        check("comment read refused in the run: resume NOT MEASURED, the tracker named",
+              answers(w)["resume"] == NOT_MEASURED and "tracker could not be read" in w.out,
+              w.out[-700:])
+
+        # 17j. The role account's program keeps its own guards, whatever it is handed.
+        w = FakeWorld({})
+        worlds.append(w)
+        role = LocalRole(w)
+        bad_mark = role.call("memory-clean", {"memory": w.memory, "nonce": "the"})
+        bad_root = role.call("deny-restore", {"settings": w.settings, "run_root": os.path.join(
+            w.home, ".claude")})
+        bad_rule = role.call("deny-add", {"settings": w.settings, "rule": "Bash(rm *)",
+                                          "run_root": os.path.join(
+                                              w.home, ".stage-e", "backups",
+                                              "chat-lane-probe-abcdef"), "expect": None})
+        check("role program: refuses a mark, a folder and a rule not its own",
+              "own marks" in (bad_mark.get("error") or "")
+              and "copy folders" in (bad_root.get("error") or "")
+              and "one tool rule" in (bad_rule.get("error") or ""),
+              "%s %s %s" % (bad_mark, bad_root, bad_rule))
+        check("role program: the folder and the file untouched by those",
+              memory_files(w) == ["MEMORY.md", "notes/owner.md"]
+              and open(w.settings).read() == w.settings_text)
+
         # 18. The functions that judge, on their own.
+        check("timers: a refused call plus someone's later reply is not a timer", judge_timers(
+            {"posts": [(100.0, "refused"), (140.0, "ok")]},
+            {"files": 1, "init_tools": ["ScheduleWakeup"], "denials": ["ScheduleWakeup"],
+             "uses": [{"name": "ScheduleWakeup", "error": True}],
+             "results": [{"at": "2026-11-03T10:00:00.000Z"}, {"at": "2026-11-03T10:00:40.000Z"}]})[0]
+            == NO)
+        inside = {"init_tools": [SERVER_TOOLS[0]], "init_at": "2026-11-03T10:00:10.000Z"}
+        control = {"init_tools": [SERVER_TOOLS[0], FEEDBACK_TOOL]}
+        t0 = iso_seconds("2026-11-03T10:00:00.000Z")
+        check("deny: a turn inside the window is measured", judge_deny(
+            {"placed": True}, control, inside, {"ts": "1"}, (t0, t0 + 20))[0] == YES)
+        check("deny: a turn after the deny came out is NOT MEASURED", judge_deny(
+            {"placed": True}, control, dict(inside, init_tools=[SERVER_TOOLS[0], FEEDBACK_TOOL]),
+            {"ts": "1"}, (t0, t0 + 5))[0] == NOT_MEASURED)
         check("timers: a quick second turn is not a timer", judge_timers(
             {"posts": [(100.0, "set")]},
             {"files": 1, "init_tools": ["ScheduleWakeup"], "uses": [],
              "results": [{"at": "2026-11-03T10:00:00.000Z"}, {"at": "2026-11-03T10:00:05.000Z"}]})[0]
             == NOT_MEASURED)
+        quick = judge_timers(
+            {"posts": [(100.0, "set")]},
+            {"files": 1, "init_tools": ["ScheduleWakeup"],
+             "uses": [{"name": "ScheduleWakeup", "error": False}],
+             "results": [{"at": "2026-11-03T10:00:00.000Z"}, {"at": "2026-11-03T10:00:05.000Z"}]})
+        check("timers: an accepted call and a quick second turn is not the timer firing",
+              quick[0] == YES and "accepted" in quick[1] and "ran again" not in quick[1],
+              str(quick))
         w = FakeWorld({})
         worlds.append(w)
         try:
@@ -2610,20 +2930,25 @@ def selftest():
             {"posts": [(100.0, "set"), (105.0, "tick")]},
             {"files": 1, "init_tools": ["ScheduleWakeup"], "results": [], "uses": []})[0]
             == NOT_MEASURED)
+        window = (t0, t0 + 20)
         check("deny: no control is not a YES", judge_deny(
-            {"placed": True}, None, {"init_tools": [SERVER_TOOLS[0]]}, {"ts": "1"})[0]
-            == NOT_MEASURED)
+            {"placed": True}, None, inside, {"ts": "1"}, window)[0] == NOT_MEASURED)
         check("deny: missing in both is not a YES", judge_deny(
-            {"placed": True}, {"init_tools": [SERVER_TOOLS[0]]},
-            {"init_tools": [SERVER_TOOLS[0]]}, {"ts": "1"})[0] == NOT_MEASURED)
+            {"placed": True}, {"init_tools": [SERVER_TOOLS[0]]}, inside, {"ts": "1"},
+            window)[0] == NOT_MEASURED)
+        ended = [{"at": "2026-11-03T10:00:30.000Z"}]
         shell_only = {"files": 1, "uses": [{"name": "Bash", "memory": True, "error": True}],
-                      "denials": ["Bash"]}
-        check("memory: a refused shell write is not a NO", judge_memory(
-            {"new": 0, "changed": 0, "removed": 0}, shell_only, {"ts": "1"})[0] == NOT_MEASURED)
+                      "denials": ["Bash"], "results": ended}
+        judged = judge_memory({"count": 0}, shell_only, {"ts": "1"})
+        check("memory: a refused shell write is not a NO", judged[0] == NOT_MEASURED
+              and "only the shell" in judged[1], str(judged))
         check("memory: a refused Write is a NO", judge_memory(
-            {"new": 0, "changed": 0, "removed": 0},
-            {"files": 1, "uses": [{"name": "Write", "memory": True, "error": True}]},
+            {"count": 0}, {"files": 1, "results": ended,
+                           "uses": [{"name": "Write", "memory": True, "error": True}]},
             {"ts": "1"})[0] == NO)
+        check("memory: another thread's change is not the probe's YES", judge_memory(
+            {"count": 0}, {"files": 1, "results": ended, "uses": []}, {"ts": "1"})[0]
+            == NOT_MEASURED)
         check("woke: a new file or a new turn", woke({"files": [{"name": "a", "results": 1}]},
                                                      {"files": [{"name": "a", "results": 2}]})
               and not woke({"files": [{"name": "a", "results": 1}]},
