@@ -374,7 +374,7 @@ JOB_KEY_FROM = {
     "forward_history_chars": "FORWARD_HISTORY_CHARS",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
-_VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(\-0-9]|b['\"]|(?:None|True|False)\b)")
+_VALUE_TAIL_RE = re.compile(r", got (?=['\"\[{(])")
 
 
 def in_conf_terms(message):
@@ -383,11 +383,12 @@ def in_conf_terms(message):
     job's own, and is said to be. What follows `got` is the value as given, and stays as
     it was: a value that is spelled like a key is still that value (Stage E's review)."""
     text = message[len("config "):] if message.startswith("config ") else message
-    # A template that echoes the value at its end writes `got %r` or `got %d`, so that value
-    # opens with a quote, a bracket, a digit, a sign or a constant. A ", got " inside an
-    # echoed state name ("Todo, got it") is followed by a word, and is passed over. A value
-    # echoed mid-template (a path, the joined state names) is renamed only where it holds a
-    # quoted key name (final delta review of KIT-292).
+    # A template that echoes the value at its end writes `got %r` or `got %d`. Only a value
+    # that opens with a quote or a bracket can hold a quoted key name, so only that starts
+    # the tail: a ", got " inside an echoed state name ("Todo, got it") is passed over, and
+    # a number or a constant reads the same renamed or not. A value echoed mid-template (a
+    # path, the joined state names) is renamed only where it holds a quoted key name (final
+    # reviews of KIT-292).
     found = _VALUE_TAIL_RE.search(text)
     text, got, given = (text[:found.start()], "", text[found.start():]) if found else (
         text, "", "")
@@ -438,6 +439,11 @@ def doc_writes(source):
     def is_doc(node):
         return isinstance(node, ast.Name) and node.id == "doc"
     for node in ast.walk(ast.parse(source)):
+        # Every dict literal's constant keys count as written, wherever it is: a mapping
+        # built apart and merged in later, `{**doc, "k": v}`, or `update(**{...})` (final
+        # review of KIT-292).
+        if isinstance(node, ast.Dict):
+            written.update(k for k in (key_of(n) for n in node.keys if n is not None) if k)
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and is_doc(
                 getattr(node, "value", None)):
             dynamic.append("an alias of doc")
@@ -456,7 +462,7 @@ def doc_writes(source):
                 is_doc(node.func.value):
             if node.func.attr == "update":
                 written.update(k.arg for k in node.keywords if k.arg)
-                for arg in node.args:
+                for arg in list(node.args) + [k.value for k in node.keywords if not k.arg]:
                     from_mapping(arg)
             elif node.func.attr in ("setdefault", "__setitem__"):
                 key = key_of(node.args[0]) if node.args else None
@@ -1934,9 +1940,13 @@ def selftest():
                                   "doc.update(dict(sneaky_key=True))",
                                   "doc.update([('sneaky_key', True)])",
                                   "alias = doc\n    alias['sneaky_key'] = True",
-                                  "doc.__setitem__(k, True)", "doc |= {'sneaky_key': True}")]
+                                  "doc.__setitem__(k, True)", "doc |= {'sneaky_key': True}",
+                                  "doc.update(**{'sneaky_key': True})",
+                                  "extra = {'sneaky_key': True}\n    doc.update(**extra)",
+                                  "return {**doc, 'sneaky_key': True}",
+                                  "doc.update(**extra_of(conf))")]
         check("kit292-the-compose-scan-sees-every-spelling-of-a-write",
-              [bool(dyn) or "sneaky_key" in wrote for wrote, dyn in spellings], [True] * 7)
+              [bool(dyn) or "sneaky_key" in wrote for wrote, dyn in spellings], [True] * 11)
         # The only key written by a name is the HISTORY_KEYS loop's, counted above.
         check("kit292-compose-config-writes-no-other-key-by-a-name", len(dynamic), 1)
         check("kit292-every-key-compose-config-writes-has-its-entry",
@@ -1957,6 +1967,11 @@ def selftest():
                             "'ready_state' or 'plan_it_state'. A child sits there"),
               "HANDOFF_STATES names Todo, got it, which is also READY_STATE or PLAN_IT_STATE. "
               "A child sits there")
+        check("kit292-a-got-before-a-number-inside-names-is-no-value-tail",
+              in_conf_terms("config 'handoff_states' names Todo, got 5 left, which is also "
+                            "'ready_state' or 'plan_it_state'."),
+              "HANDOFF_STATES names Todo, got 5 left, which is also READY_STATE or "
+              "PLAN_IT_STATE.")
         check("kit292-every-value-tail-the-job-writes-is-left-as-given",
               [in_conf_terms("config 'epic_wip' must be at most 10, got 12"),
                in_conf_terms("config 'act' must be true or false, got None"),
