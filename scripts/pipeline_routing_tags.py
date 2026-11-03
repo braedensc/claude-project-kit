@@ -250,9 +250,10 @@ def stored_spans(text, pattern):
 def neutralize_stored(text, pattern, mark, opener):
     """`text` with every match of `pattern`, written or once decoded, replaced with `mark`,
     as neutralize_routing does for directives. `mark` must hold no match. Text with none
-    comes back byte for byte. `opener` is the one character every match needs (`<` for a
-    fence token): past SETTLE_PASSES, every one the text reads as goes instead, with every
-    span still decoding, so a crafted text can't make a job raise (KIT-386)."""
+    comes back byte for byte. `opener` holds the characters a match needs one of (`<` for a
+    fence token; every line break for a line rule): past SETTLE_PASSES, every one the text
+    reads as goes instead, with every span still decoding, so a crafted text can't make a
+    job raise (KIT-386, KIT-402)."""
     if not text:
         return text
     out = str(text)
@@ -265,7 +266,7 @@ def neutralize_stored(text, pattern, mark, opener):
         return out
     view, rounds, unsettled = stored_view(out)
     return _replaced(out, sorted([original_slice(rounds, i, i + 1)
-                                  for i, ch in enumerate(view) if ch == opener]
+                                  for i, ch in enumerate(view) if ch in opener]
                                  + [original_slice(rounds, a, b) for a, b in unsettled]), mark)
 
 

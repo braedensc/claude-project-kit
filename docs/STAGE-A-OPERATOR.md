@@ -142,6 +142,13 @@ and it cannot merge.
 - Runs one planning run per idea at a time. A new move into Plan it while a run for that idea
   is still going waits, with one note on the idea. It starts when that run ends, if it is still
   the newest move.
+- Runs one pass at a time. A pass holds a lock, `~/.stage-a/state/poller.lock`. A pass that
+  finds it held says so in the log, writes nothing, not even its heartbeat, and exits 0.
+- Never plans over a plan that stands. Before any move starts a run, new or held while an
+  earlier run finished, the job looks for an epic filed from one of the idea's own planning
+  runs: it carries that run's `Plan id:` line, was filed with your key, and is not canceled.
+  If one stands, the idea gets one note naming it, as the bridge's `replan` says it, and no
+  run starts. Approve that plan, or cancel it, before you plan the idea again.
 - Starts nothing while planning is stopped, while the dispatcher's version is not the
   probe's, or while any team's Plan it state, routing label or cancel state is wrong. A Plan
   it typed **started** is the worst case: the dispatcher moves every session's ticket into the
@@ -312,6 +319,52 @@ repository's entry is never read.
   and hand to the agent yourself is not tagged, and runs on the default unless it carries a
   model label.
 
+**A failed plan, run again by itself.** Off until you say yes. The one command asks you once,
+when `stage-a.conf` has no `AUTO_REPLAN` line, and writes your answer there. To change it
+later, edit that line and run the one command again.
+
+- **What is run again:** a plan the readiness gate or the schema refused, a cut-off
+  proposal, a run with no plan or no answer, a usage or rate limit (two hours later), and
+  a time-out.
+- **How often:** up to `AUTO_REPLAN_TRIES` more runs for one move, 2 by default, so three in
+  all. At most `AUTO_REPLAN_PER_DAY` re-runs start in a day, 20 by default. That is a
+  runaway's limit, counted apart from `MAX_RUNS_PER_DAY`. A re-run shares the per-pass limit
+  of three with new moves.
+- **What the re-run is told.** Its planning ticket carries an `<untrusted-earlier-attempts>`
+  block before the idea: every earlier run of the move, newest first, and how each ended.
+  A refusal brings the executor's own reasons, cleaned. A time-out, an empty answer or a
+  limit gets the job's fixed words. The first line says which attempt this is and asks for
+  a different approach.
+- **What is never run again:**
+  - questions it asked you;
+  - a run someone stopped;
+  - an error that a wait cannot fix;
+  - a partial filing;
+  - a refusal for naming another ticket, for a request kind a plan may not carry, or for
+    text shaped like a credential;
+  - the plan kind switched off, a wrong team, or a config or key error;
+  - an idea whose title or text you changed since its first run.
+- **A time-out** waits for its session to read ended, for up to an hour. If the session
+  then left a real final message, that message is filed, with no new session. If it is
+  still going after the hour, nothing runs again, and you are paged.
+- **A filing that failed three times**, with nothing filed, runs the executor once more an
+  hour later, over the same message. No new session starts.
+- **Before a re-run starts,** the job checks again. The idea must still be in Plan it, not be
+  live work, and have no plan that stands, and today's re-runs must be under the limit. A
+  failed check drops the re-run and pages you once. A newer move of yours, a `replan` from
+  the bridge included, drops it with a note on the idea, and the job acts on that move
+  instead. A re-run owed for more than a day of the machine being awake is dropped, and
+  you are paged. A time-out's session is watched for an hour of awake time too.
+- **What you hear.** A re-run starting adds a note to the idea, and pages no one. With
+  re-runs on, the executor's own page for a refusal or an empty run is held back, and the
+  job pages once, when the move ends without a plan. That page names every run and how
+  each ended. It sits on the last run's planning ticket. When a run's result could not be
+  read, the page says what came of it is not certain, never that no plan was filed. A run
+  that filed part of a plan is paged by the executor's own report, so the job adds none.
+- **Its record** is `~/.stage-a/state/replans.json`. A re-run is written there as owed
+  before its ticket exists. If that file cannot be read, nothing is run again, the run that
+  would have been is paged, and each pass exits 1 until a person looks.
+
 **If the dispatcher's own setup tool rebuilds its settings file,** the planning entries are
 dropped with everything else it did not write. Run the one command again: it finds them
 missing and puts them back.
@@ -343,7 +396,9 @@ Everything the job owns sits under the role account's home:
 |---|---|
 | `~/.stage-a/state/heartbeat.json` | That a pass **finished**, and what it decided: `ok`, `error`, `usage` or `timeout`. Stale means not running; fresh and not `ok` means it ran and could not do it. A pass that is blocked from planning reports `error`, and its log says why. |
 | `~/.stage-a/state/stop.json` | Present only while planning is stopped. It holds the evidence: the ticket, the session, the routing note or its absence, and the times. |
-| `~/.stage-a/state/seen.json` | Which moves have been handled, each planning run's routing verdict, and runs per day. A cache: the tracker is the authority. |
+| `~/.stage-a/state/seen.json` | Which moves have been handled, each planning run's routing verdict, runs per day, and each pass's `[wall, awake]` mark. A cache: the tracker is the authority. |
+| `~/.stage-a/state/replans.json` | Only with re-runs on: each move's runs, how each ended, and any re-run owed, started or dropped, with re-runs per day. Unreadable stops every re-run, and the pass exits 1. |
+| `~/.stage-a/state/poller.lock` | The pass's lock. One pass at a time holds it. |
 | `~/.stage-a/poller.log` | What each pass did, one line per decision. |
 | `~/.stage-a/poller.json` | The job's config, written by the installer. It holds the probe the job is pinned to, and no credential. |
 | `~/.stage-a/kit` | The code the job runs. The installer fast-forwards it. |
@@ -370,7 +425,8 @@ records a finished run's result in `seen.json` as `result`, and an errored attem
 | `could-not-tell` | the executor's file was missing, unreadable, or did not fit its exit code. The note names the three possible results instead. It is never read as filed |
 
 The file also gives a `kind`: which rule refused a plan (`readiness-gate`, `cut-off`,
-`schema`, `retarget`, `credential-shape`, `config`), what failed (`tracker`, `partial`,
+`schema`, `retarget`, `request-kind` for a request a plan may not carry, `credential-shape`,
+`config`), what failed (`tracker`, `partial`,
 `unconfirmed` when a create the tracker never confirmed may have landed, `config`, `input`,
 `gate`, `unexpected`, or `unknown` when no exit recorded one), or what
 else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`, `off`,
@@ -405,7 +461,8 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   Each note then says: if you have moved the idea back into Plan it since, that move
   starts its next run; if not, move it out and back in.
   - **A stop pages no one.** The note carries no mark, so the notifier does not page it.
-    The executor's mark is the only page a run gets, until the job pages for itself.
+    With re-runs off, the executor's mark is the only page a run gets. With them on, the
+    job pages a move that ends without a plan, once, and a stop is never one of those.
   - **Only a closed or deleted ticket counts.** The session panel's Stop button leaves
     the ticket open. The run then reads as a session that ended without a plan.
   - **A ticket closed before its routing note** is a stop, not a misroute, only when it
@@ -422,6 +479,10 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
     the third it is filed as it was before. A stop notice whose ticket's state stays
     unreadable is held the same way, and on the third pass it is a stop: never filed,
     never moved.
+- **A run times out after four hours awake.** Each pass records how long the machine has
+  been awake, so a run is never timed out for hours the Mac slept through. On a machine
+  whose awake clock cannot be read, the wall clock counts, as before. The time-out note
+  says which it used.
 - **Every note that closes a run says what its attempts left.** A give-up or a refusal
   after an attempt that filed part of the plan says so and points to the list; after an
   attempt whose result is not known it says that. Either way it asks you to look for the
