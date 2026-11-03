@@ -829,12 +829,16 @@ def selftest():
     if _validating(a) != _validating(c):
         failures.append("_validating kept a note, so two copies that differ only in their "
                         "words for people compared unequal")
-    # A value is data, whole: a `description` key inside a const is part of it.
-    d = {"const": {"description": "on"}, "enum": [{"$comment": "x"}]}
-    e = {"const": {"description": "off"}, "enum": [{"$comment": "y"}]}
-    if _validating(d) == _validating(e):
-        failures.append("_validating stripped keys inside a const or an enum value, so two "
-                        "schemas that accept different values compared equal")
+    # A value is data, whole: a `description` key inside a const, an enum, a default or an
+    # example is part of it. One pair per keyword, so dropping any one of them fails.
+    for keyword, one, other in (
+            ("const", {"description": "on"}, {"description": "off"}),
+            ("enum", [{"$comment": "x"}], [{"$comment": "y"}]),
+            ("default", {"description": "a"}, {"description": "b"}),
+            ("examples", [{"description": "a"}], [{"description": "b"}])):
+        if _validating({keyword: one}) == _validating({keyword: other}):
+            failures.append("_validating stripped keys inside a %s value, so two schemas "
+                            "that differ in it compared equal" % keyword)
 
     # The shipped example is the spec's own shape. This is the check that stops
     # delivery.example.json drifting away from §1 again.
