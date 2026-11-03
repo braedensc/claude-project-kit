@@ -4529,6 +4529,14 @@ def _relay_selftest(ok, tmp, good, tkt):
     ok("a literal escalation mark comes out with no angle bracket and pages nothing",
        not any(c in clean_relay_text(literal) for c in "<>")
        and find_mark(clean_relay_text(literal)) is None)
+    # KIT-384: a relayed text, which the bridge also copies into its follow-up ticket, carries
+    # no directive the dispatcher reads once Linear stores it, however it was spelt.
+    import pipeline_routing_tags as routing
+    live = [(form, d) for form in routing.MEASURED_SPELLINGS
+            for d in [d for r in range(4)
+                      for d in routing.dispatcher_reads(routing.decoded(clean_relay_text(
+                          "relay %s now" % form), r))]]
+    ok("a relayed text carries no live directive, however it was spelt", live == [])
     strip_first = closing.replace("<", "").replace(">", "")
     ok("the ORDER matters: strip-then-decode would leave a real closing tag",
        "</content>" in decode_chat_entities(strip_first))
