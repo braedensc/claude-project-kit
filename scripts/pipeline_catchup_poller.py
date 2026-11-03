@@ -587,12 +587,14 @@ def classify(node, cfg, now, ledger, gate_open=True):
 
 
 def reprompt_body(node):
+    """The reply that hands a lost delegation over again. It names no cause: this job sees
+    only that nothing picked the hand-over up, never why (KIT-390). On 30 Oct the
+    dispatcher was reachable the whole time a hand-over sat unstarted (KIT-293)."""
     issue = node.get("issue") or {}
     ident = issue.get("identifier") or "this issue"
-    return ("**Catch-up.** This delegation was made while the dispatcher could not be reached, "
-            "and it never started. Please start the work %s was delegated for: read %s with "
-            "your Linear tools and treat it as a new delegation.\n\n%s"
-            % (ident, ident, MARK % node.get("id")))
+    return ("**Catch-up.** This delegation was never picked up, so it is being sent again. "
+            "Please start the work %s was delegated for: read %s with your Linear tools and "
+            "treat it as a new delegation.\n\n%s" % (ident, ident, MARK % node.get("id")))
 
 
 def thread_has_mark(data, session_id):
@@ -1369,6 +1371,13 @@ def selftest():
         check("…as a reply under the session's own root comment, carrying the marker",
               (reply.get("issueId"), reply.get("parentId"), MARK % "s1" in reply.get("body", "")),
               ("i-s1", "c-root", True))
+        # It says what this job saw, never a cause it cannot know (KIT-390).
+        check("…saying the hand-over was never picked up and is sent again, naming no cause",
+              ("was never picked up, so it is being sent again" in reply.get("body", ""),
+               "treat it as a new delegation" in reply.get("body", ""),
+               [w for w in ("could not be reached", "unreachable", "was down", "offline",
+                            "outage") if w in reply.get("body", "").lower()]),
+              (True, True, []))
         check("…and the ledger records it posted",
               load_ledger(ledger_path(cr["state_dir"])).get("s1", {}).get("state"), "posted")
         fake = FakeLinear([session("s1", 8, ident="KIT-1")])
