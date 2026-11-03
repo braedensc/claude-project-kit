@@ -13,6 +13,7 @@ second *rendering* of the one that already existed.
 | [`safe-outputs.schema.json`](safe-outputs.schema.json) | §8 safe-outputs request file | the session agent | the safe-outputs validator |
 | [`review-findings.schema.json`](review-findings.schema.json) | §14 review findings file | the review session | the review lane's normalizer — the workflow on `github-actions`, `scripts/pipeline_review_local.py` on a dispatcher-side lane — then the bounce and merge tiers |
 | [`browser-check.schema.json`](browser-check.schema.json) | §15 browser check block | the planning session, in a ticket's `## Test plan` or an epic's `## How we will know it works` | the readiness gate, then the acceptance session's look tool (KIT-302) |
+| [`pipeline-status.schema.json`](pipeline-status.schema.json) | §16 status file | the status job, `scripts/pipeline_status_local.py` | the tech lead, the daily summaries, the heartbeat monitor (KIT-335) |
 
 **Every one of them is enforced at write time, not only in CI.** A producer validates
 what it is about to write and refuses to write a document that does not conform — see
@@ -50,8 +51,8 @@ Defense in depth. Conforming to a schema earns a document nothing.
 python3 scripts/check_schemas.py --instance delivery.json --schema delivery
 ```
 
-`--schema` takes `delivery`, `pin`, `telemetry-block`, `safe-outputs` or
-`review-findings` or `browser-check`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
+`--schema` takes `delivery`, `pin`, `telemetry-block`, `safe-outputs`,
+`review-findings`, `browser-check` or `pipeline-status`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
 parity, and `--selftest` is what CI runs.
 
 ## Generating a document
