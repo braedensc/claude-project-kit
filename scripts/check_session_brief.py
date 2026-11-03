@@ -12,8 +12,10 @@ OWN code, imported:
 
   * every `pipeline-escalation` mark the brief shows is one the notifier's `find_mark`
     reads, and one its `is_authorised` accepts from a session (some marks it takes only
-    from the plan executor or the heartbeat monitor); `agent:blocked` and
-    `agent:needs-human` are both shown;
+    from the plan executor, the heartbeat monitor or the bounce driver); `agent:blocked`
+    and `needs-human-session` are both shown (KIT-282: the older `agent:needs-human` still
+    pages, but its page cannot say a session stopped, so the brief shows the new one); and
+    each is one the GitHub Actions dispatch template's own reader matches;
   * the brief's worked example comment carries its mark where `find_mark` looks for it:
     the comment's first line;
   * the brief's fenced finding example parses with the finding poller's `parse_finding`.
@@ -32,20 +34,43 @@ import pipeline_notify_local as notify  # noqa: E402
 import pipeline_finding_poller as finding  # noqa: E402
 
 BRIEF = os.path.join(os.path.dirname(HERE), "docs", "SESSION-BRIEF.md")
+# The GitHub Actions lane's dispatcher reads a session's mark with its own regex, which is the
+# other machine a copied mark must reach (KIT-282). Its alternation, on its one line.
+DISPATCH_TEMPLATE = os.path.join(os.path.dirname(HERE), "templates", "workflows",
+                                 "pipeline-dispatch.yml")
+_TEMPLATE_READER_RE = re.compile(r'r"<!--\\s\*pipeline-escalation:\\s\*\(([^)]*)\)\\s\*-->"')
 _SHOWN_MARK_RE = re.compile(r"<!--\s*pipeline-escalation:[^>]*-->")
 _FINDING_FENCE_RE = re.compile(r"````markdown\n(```json\n.*?\n```)\n````", re.S)
 # A worked example comment: a ```markdown block. Only one showing a mark is judged as an
 # escalation, so the finding example and any plain comment example are left alone.
 _EXAMPLE_RE = re.compile(r"```markdown\n(.*?)\n```", re.S)
-# The notifier takes some marks only from the plan executor or the heartbeat monitor. A
-# session is neither, so its marks are judged as coming from an author on neither list.
+# The notifier takes some marks only from the plan executor, the heartbeat monitor or the
+# bounce driver. A session is none of them, so its marks are judged as coming from an author
+# on no list.
 SESSION_AUTHOR = "a-session"
 _OTHER_ACTORS = {"executor_actor_ids": ["the-plan-executor"],
-                 "monitor_actor_ids": ["the-heartbeat-monitor"]}
+                 "monitor_actor_ids": ["the-heartbeat-monitor"],
+                 "bounce_actor_ids": ["the-bounce-driver"]}
 
 
-def problems(text):
+def template_reads(template):
+    """The marks the dispatch template's escalation reader matches, or None when its one
+    reader line cannot be found: a check that finds no reader judges nothing."""
+    found = _TEMPLATE_READER_RE.findall(template)
+    if len(found) != 1:
+        return None
+    return set(found[0].split("|"))
+
+
+def problems(text, template=None):
     out = []
+    if template is None:
+        with open(DISPATCH_TEMPLATE, encoding="utf-8") as fh:
+            template = fh.read()
+    reads = template_reads(template)
+    if reads is None:
+        out.append("the GitHub Actions dispatch template's escalation reader could not be "
+                   "found, so the marks it reads cannot be checked")
     shown = _SHOWN_MARK_RE.findall(text)
     if not shown:
         out.append("the brief shows no escalation mark")
@@ -59,7 +84,10 @@ def problems(text):
                        "from a session" % mark)
         else:
             named.add(name)
-    for needed in (notify.ESC_BLOCKED, notify.ESC_NEEDS_HUMAN):
+            if reads is not None and name not in reads:
+                out.append("the brief tells a session to write %r, which the GitHub Actions "
+                           "dispatch template does not read" % mark)
+    for needed in (notify.ESC_BLOCKED, notify.ESC_NEEDS_HUMAN_SESSION):
         if needed not in named:
             out.append("the brief never shows the %s mark" % needed)
     examples = [b for b in _EXAMPLE_RE.findall(text) if "pipeline-escalation" in b]
@@ -87,9 +115,32 @@ def selftest():
     reworded = text.replace("pipeline-escalation: agent:blocked", "pipeline-escalation: blocked")
     if not problems(reworded):
         failures.append("a reworded mark passed")
-    no_human = text.replace("agent:needs-human -->", "agent:blocked -->")
+    no_human = text.replace("needs-human-session -->", "agent:blocked -->")
     if not any("needs-human" in p for p in problems(no_human)):
         failures.append("a brief without the needs-human mark passed")
+    # KIT-282: the older mark still pages, but its page cannot say a session stopped, so a
+    # brief that still tells a session to write it is a brief behind its reader.
+    old_mark = text.replace("needs-human-session -->", "agent:needs-human -->")
+    if not any("needs-human-session" in p for p in problems(old_mark)):
+        failures.append("a brief showing the older agent:needs-human mark in place of "
+                        "needs-human-session passed")
+    # …and a brief telling a session to write the bounce driver's mark is refused: the
+    # notifier would page it only in agent:needs-human's general words.
+    spent = text.replace("needs-human-session -->", "fixes-spent -->")
+    if not any("refuses from a session" in p for p in problems(spent)):
+        failures.append("a brief telling a session to write the bounce driver's fixes-spent "
+                        "mark passed")
+    # The GitHub Actions lane reads a session's mark too, with its own regex: a mark the brief
+    # shows that it does not read leaves that lane's ticket unlabelled.
+    template = open(DISPATCH_TEMPLATE, encoding="utf-8").read()
+    behind = template.replace("|needs-human-session|", "|", 1)
+    if behind == template:
+        failures.append("could not find the template's reader to build a case on")
+    elif not any("dispatch template does not read" in p for p in problems(text, behind)):
+        failures.append("a dispatch template that does not read needs-human-session passed")
+    if not any("reader could not be found" in p
+               for p in problems(text, template.replace("pipeline-escalation:", "x:"))):
+        failures.append("a dispatch template whose reader the check cannot find passed")
     broken = text.replace('{"schema": "pipeline-finding/1"', '{"schema": "pipeline-finding/2"')
     if not problems(broken):
         failures.append("a finding example of the wrong schema passed")
@@ -130,7 +181,7 @@ def selftest():
         for f in failures:
             print("  - %s" % f)
         return 1
-    print("OK: check_session_brief selftest (8 cases)")
+    print("OK: check_session_brief selftest (12 cases)")
     return 0
 
 

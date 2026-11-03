@@ -34,7 +34,8 @@ One pass every few minutes, as the role account:
 3. For each new mark, it posts one message of three lines: a sentence or two in plain
    words saying what happened and what, if anything, you need to do; the ticket's title and
    id; and a link. Nothing else.
-4. For `agent:blocked` and `agent:needs-human`, it also adds that label to the ticket.
+4. For `agent:blocked`, and for each mark that means a person must take over, it also adds
+   that label to the ticket: `agent:blocked` or `agent:needs-human`, as the table says.
 
 | Mark | Who writes it | What the ping says | Label added |
 |---|---|---|---|
@@ -42,11 +43,15 @@ One pass every few minutes, as the role account:
 | `planning-needs-input` | the plan executor | the planner stopped to ask you something, and filed no plan | `agent:blocked` |
 | `planning-no-output` | the plan executor | a planning run ended without a plan, so nothing was filed | `agent:blocked` |
 | `planning-rejected` | the plan executor | a plan couldn't be filed; the ticket says why | none |
+| `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; in direct messages it ends with `Reply replan <idea>` where a replan can work | none |
 | `agent:blocked` | a stopped session | a dev stopped to ask you something | `agent:blocked` |
-| `agent:needs-human` | a stopped session, the planner job on a planning ticket it could not route, or the bounce driver when a fix budget is spent | work has stopped and needs a person; the ticket says why | `agent:needs-human` |
+| `needs-human-session` | a stopped session | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
+| `needs-human-routing` | the planner job, on a planning ticket it could not route | the planning run was cancelled, and planning is stopped until you sign the probe again | `agent:needs-human` |
+| `fixes-spent` | the bounce driver, when a fix budget is spent | the automatic fixes ran out and the last problem is still there; a person decides what's next | `agent:needs-human` |
+| `agent:needs-human` | any of the three above, as each wrote it before KIT-282 | work has stopped and needs a person; the ticket says why | `agent:needs-human` |
 | `daemon-health-incident` | the heartbeat monitor | one or more watched jobs need a look | none |
 | `daemon-health-recovered` | the heartbeat monitor | every watched job is checking in again; nothing more is needed | none |
-| `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link | none |
+| `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link, how many small notes the review left, and whether the `hooks-change` label is still owed | none |
 | `finding-filed` | the finding job | a dev's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
 
 A ping reads like this:
@@ -59,9 +64,18 @@ https://linear.app/example-org/issue/KIT-777
 
 **The words for each mark are in `MARKS` in `scripts/pipeline_notify_local.py`,** and its
 selftest pins every one, word for word. Each ping says only what its mark means. The
-notifier never reads the rest of the comment, so it never guesses. That is why the
-`agent:needs-human` ping does not say which of its three causes it was: the comment on the
-ticket does.
+notifier never reads the rest of the comment, so it never guesses. That is why the old
+`agent:needs-human` ping does not say which of its three causes it was. Each cause now
+writes a mark of its own (KIT-282), and the old one still pages, in its general words, so a
+comment written before the change is not missed.
+
+**A cause is named only when its writer could vouch for it.** `needs-human-session` counts
+from anyone, since a session writes it. `needs-human-routing` counts from the executor's
+author ids (`EXECUTOR_ACTOR_IDS`): the planner job runs the executor with the same key.
+`fixes-spent` counts from the bounce driver's (`BOUNCE_ACTOR_IDS`). From anyone else, or
+while `BOUNCE_ACTOR_IDS` is unset, either still pings, but in the general `agent:needs-human`
+words. The pass names each one from the wrong author, and says
+`fixes-spent marks: OFF` while the key is unset. A stop is never left unpaged.
 
 **The title always sits on its own line, in quotes.** It loses its double quote marks, the
 characters that look like one, and any pair of single quote marks, so none of them can end
@@ -70,7 +84,22 @@ sentence.
 
 **The four planning marks count only from the executor's author ids** (`EXECUTOR_ACTOR_IDS`).
 A session that can comment could otherwise forge one. A planning mark from anyone else is
-skipped, never paged.
+skipped, never paged. So does the planner job's `planning-failed` mark: the job runs the
+executor with the same key.
+
+**The planning-failed page reads one line from the job's comment** (KIT-338): its second
+line, in exactly this shape, or the page falls back to general words.
+
+```text
+Ended: timed-out; runs: 2; filed: nothing; replan: TOD-140
+```
+
+`Ended` says how planning stopped, from a fixed list. `runs` is how many runs the move had.
+`filed` says nothing was filed, or that some may have been. `replan` is there only where a
+replan can work. In direct messages, where the Slack bridge reads your reply, the page then
+ends with `Reply replan TOD-140 to plan it again.` In a channel it says the ticket shows how
+to plan it again. The planner job holds back the executor's own refused or empty-run page,
+so one run never pages twice.
 
 **The two daemon-health marks count only from the monitor's author ids**
 (`MONITOR_ACTOR_IDS`, KIT-156). They are the heartbeat monitor's page
@@ -88,6 +117,19 @@ notifier reads pings, oldest first.
 and skipped, and unset it is OFF and said every pass. Its ping links the pull request named
 on the comment's second line, only when that line is exactly one. Anything else, and the
 ping links the ticket.
+
+Two more lines count, each only in its exact shape (KIT-337). The third line,
+`Small notes: <n>`, puts the number of small notes the review left into the ping. The
+fourth, `Label owed: hooks-change`, is there only when the Hooks change guard still waits
+and the pull request has no `hooks-change` label. The ping then says only you can add that
+label, and to read the hook changes first. A line in any other shape is left out, and a
+comment from before these lines pings as it always did.
+
+```text
+The review is done and found nothing it thought worth sending back, so this pull request is yours to merge. It left 2 small notes, which are on the pull request. GitHub won't merge it until it has the hooks-change label, and only you can add that. Read the hook changes, then add the label to the pull request.
+Ticket: "Refresh tokens" (KIT-777)
+https://github.com/example-org/example-repo/pull/41
+```
 
 **The finding-filed mark counts only from the finding job's author ids**
 (`FINDING_ACTOR_IDS`, KIT-243), on the same rules. Its ping names and links the new ticket.
@@ -116,8 +158,8 @@ channel.
   each wake is a paid model turn. Left empty, the `handover` row says each list that is set
   is not proven free of it.
 - The installer checks each id's shape. It never asks Slack whose id it is.
-- A mention makes a forged mark louder too. The `agent:*` marks are accepted from any author,
-  so a session that writes many of them buzzes your phone for each, up to
+- A mention makes a forged mark louder too. The `agent:*` marks and `needs-human-session` are
+  accepted from any author, so a session that writes many of them buzzes your phone for each, up to
   `MAX_EVENTS_PER_PASS` a pass.
 - Setting it changes the notifier's config, so `CK-N4` comes back. After the merge that
   brings it, follow *After a merge that changes the notifier*, below.
@@ -728,7 +770,10 @@ share. It stops there, before it changes anything: run the two again in the orde
   request. So before you merge on that page, open the pull request. Read Stage E's review
   comment and the checks there: no tracker key can write
   those. The ticket's move to the needs-approval lane is a weaker sign, because that key can
-  move a ticket too. The page itself merges nothing. (KIT-225, KIT-263)
+  move a ticket too. The page itself merges nothing. (KIT-225, KIT-263) The same key can
+  write its `Small notes` and `Label owed` lines too, so a forged page can miscount the
+  notes or say a label is owed when it isn't; the checks on the pull request are still the
+  truth. (KIT-337)
 - **That a live ready-to-merge comment pages and links the pull request.** The selftests
   drive both ends; no live conclusion has yet. (KIT-227)
 - **Whether every comment posted with that key starts with its writer's own text.** The

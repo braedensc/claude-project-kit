@@ -2042,7 +2042,9 @@ def step_labels(ctx, apply_it):
     if bouncers_off:
         notes.append("BOUNCE_ACTOR_IDS=off: the notifier's config names no bounce-driver author, "
                      "so it pages on the ready-to-merge mark from nobody and says "
-                     "`ready-to-merge marks: OFF` on every pass (KIT-225).")
+                     "`ready-to-merge marks: OFF` on every pass (KIT-225). A spent fix budget "
+                     "still pages, but in the general needs-a-person words, and every pass says "
+                     "`fixes-spent marks: OFF` (KIT-282).")
     if finders_off:
         notes.append("FINDING_ACTOR_IDS=off: the notifier's config names no finding-job author, "
                      "so it pages on the finding-filed mark from nobody and says "
@@ -2845,7 +2847,8 @@ def ready_to_merge_lines(ctx):
     if bouncers == [MONITOR_OFF]:
         off.append("the ready-to-merge page: BOUNCE_ACTOR_IDS=off, so this notifier pages on the "
                    "bounce driver's ready-to-merge mark from nobody and says `ready-to-merge "
-                   "marks: OFF` on every pass (KIT-225)")
+                   "marks: OFF` on every pass (KIT-225). Its spent-budget page still comes, in "
+                   "the general needs-a-person words (KIT-282)")
         return on, off, unproven
     try:
         doc, why_not = read_role_json(ctx, BOUNCE_CONFIG_PATH, "the bounce driver's config")

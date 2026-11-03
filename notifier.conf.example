@@ -141,6 +141,9 @@ MONITOR_ACTOR_IDS=self
 # Same values as above: `self`, actor ids, or `off`.  The driver writes the
 # mark with the Stage E key, so `self` is right when both use one key.
 # The mark carries no label.  Anything holding that key can write one.
+# Its fixes-spent mark, the page that a pull request's fix budget ran out,
+# counts from these ids too (KIT-282).  From anyone else, or with `off`, it
+# still pages, in the general needs-a-person words.
 BOUNCE_ACTOR_IDS=self
 
 # Who may author the finding job's finding-filed mark: the page that says a

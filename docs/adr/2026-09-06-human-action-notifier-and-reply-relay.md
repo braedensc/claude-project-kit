@@ -361,6 +361,10 @@ lane write the rest:
 | `agent:blocked` (marker) | a stopped working session (`/work` step 5) | a session is blocked on a decision | yes (this is the case §6 already names) |
 | `agent:needs-human` | bounce driver | the bounce budget is spent | yes |
 | `agent:needs-human` | planner job (idea gate), on the cancelled planning ticket | a planning ticket's routing could not be confirmed; all planning is stopped until the probe is signed again (KIT-184) | yes — the label lands on that dead planning ticket, never on the idea |
+| `needs-human-session` (KIT-282) | a stopped working session, any author | it stopped for good; a person takes it from here | `agent:needs-human` |
+| `needs-human-routing` (KIT-282) | planner job, accepted only from `executor_actor_ids` | the `agent:needs-human` planner row above, under a mark of its own | `agent:needs-human`, on that dead planning ticket |
+| `fixes-spent` (KIT-282) | bounce driver, accepted only from `bounce_actor_ids` | the `agent:needs-human` bounce-driver row above, under a mark of its own | `agent:needs-human` |
+| `planning-failed` (KIT-338) | planner job, accepted only from `executor_actor_ids` | planning stopped without a plan: how, and what to do next | no — the run is over and its ticket closed, so the page is the cue |
 | review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision |
 | `daemon-health-incident` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | a watched Stage E daemon, or the notifier, needs a look | no — daemon health is not a ticket's lifecycle |
 | `daemon-health-recovered` | heartbeat monitor (KIT-156), accepted only from `monitor_actor_ids` | the watched daemons are reporting again | no — daemon health is not a ticket's lifecycle |
@@ -400,6 +404,29 @@ notifier cannot page on never exists silently.
 > each mention id's shape: it cannot refuse the chat bot's own id, because it does not know
 > it. The words live in `MARKS` in `scripts/pipeline_notify_local.py`, and its selftest
 > pins each one.
+
+> **Note, 2026-11-03: each needs-a-person cause has its own mark, and the ready page says
+> more (KIT-282, KIT-337).** The first gap above is closed. A stopped session writes
+> `needs-human-session`, the planner job `needs-human-routing`, and the bounce driver
+> `fixes-spent`, and each page names its cause. Each still adds `agent:needs-human`. The
+> planner job's and the bounce driver's count only from their keys' author ids; from anyone
+> else, or while `bounce_actor_ids` is unset, they page as `agent:needs-human` does, in its
+> general words, and the pass names them, so a stop is never left unpaged and a cause is
+> never named without a key holder behind it. The old mark is still read, in its general
+> words. The ready-to-merge page now also reads two exact-shape lines from the bounce
+> driver's comment: `Small notes: <n>` and `Label owed: hooks-change`. They reach
+> `build_message` as a count and a flag in a typed `detail`, which refuses text, so
+> decision 2 still holds by construction.
+
+> **Note, 2026-11-03: the planner job pages every stop without a plan (KIT-338).** It writes
+> one mark of its own, `planning-failed`, on a refusal before a run and on every run that
+> ends without a plan, a stopped run included, and it now holds the executor's own refused or
+> empty-run page back on every run, so a run never pages twice. The page is built from one
+> exact-shape line on the comment's line 2, read only from `executor_actor_ids`: how planning
+> ended (a key from a fixed list), the runs, whether anything may have been filed, and the
+> idea to replan where a replan can work. These reach `build_message` as a key, a count, a
+> flag and a ticket id in its exact shape, so decision 2 still holds. In direct messages the
+> page ends with `Reply replan <idea> to plan it again.`, added after the words.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 

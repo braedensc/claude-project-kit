@@ -4284,12 +4284,18 @@ query StageADrillRuns($filter: IssueFilter!) {
 
 
 def front_door_answer(ctx, idea_id):
-    """The job's answer on the idea when it started nothing — its comment, whole — or None
-    while it has posted none."""
+    """The job's answer on the idea when it started nothing — its comment from its heading
+    on — or None while it has posted none.
+
+    Since KIT-338 a refusal is a page: the planning-failed mark and one line sit above its
+    heading, and are skipped here. A job clone older than that posts the heading first, and
+    is read the same way, so the installer and the job it drives need not match."""
     data = ctx.tracker.post(Q_DRILL_IDEA, {"id": idea_id})
     nodes = ((((data.get("issue") or {}).get("comments")) or {}).get("nodes")) or []
     for node in sorted(nodes, key=lambda n: n.get("createdAt") or ""):
         body = (node.get("body") or "").strip()
+        if body.startswith(poller.FAILED_MARK + "\n"):
+            body = (body.split("\n", 2) + [""])[2].strip()
         if body.startswith(FRONT_DOOR_HEADINGS):
             return body
     return None
@@ -6336,8 +6342,10 @@ def _selftest_one_command(check, tmp):
             if broken and in_plan_it:
                 iid = ideas[-1]
                 move = poller.latest_trigger(t.post, iid, PLAN_IT["id"])
-                said = host.drill_refuses or (None if move else poller.REFUSED_NO_MOVE % (
-                    "Plan it", "Plan it"))
+                # As the job posts it since KIT-338: a page, its heading below the mark.
+                said = host.drill_refuses or (None if move else poller.refused_page(
+                    "no-move", t.issues[iid].get("identifier") or "PROD-1",
+                    poller.REFUSED_NO_MOVE % ("Plan it", "Plan it")))
                 if said:
                     t.comments.setdefault(iid, []).append({"body": said, "createdAt": now_iso()})
                 elif host.drill_files:
@@ -6487,13 +6495,20 @@ def _drill_cases(check, drill_world):
     kind, _why = drill_outcome(dl)
     check("drill-wakes-the-job-only-once-the-creation-reads-back",
           (kind, refusals(dl), dl.host.kicks >= 1), ("passed", [], True))
-    dr, _r = drill_world("drill-front-door-refusal",
-                         refuses=poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))
-    kind, why = drill_outcome(dr)
-    check("drill-front-door-refusal-is-said-at-once",
-          (kind, "front door" in why, "can be checked" in why, dr.sleeps, restored(dr),
-           "drill" in (dr.state.data["ids"] or {})),
-          ("could-not-test", True, True, [], True, False))
+    # KIT-338: the job's refusal is a page now, its heading below the planning-failed mark and
+    # its line; and a job clone older than that posts the heading first. Each is found at once,
+    # and "the job said" quotes its words, never the mark or the line.
+    for label, refusal in (
+            ("page", poller.refused_page("no-move", "PROD-900",
+                                         poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))),
+            ("older-clone", poller.REFUSED_NO_MOVE % ("Plan it", "Plan it"))):
+        dr, _r = drill_world("drill-front-door-refusal-" + label, refuses=refusal)
+        kind, why = drill_outcome(dr)
+        check("drill-front-door-refusal-is-said-at-once:" + label,
+              (kind, "front door" in why, "can be checked" in why, dr.sleeps, restored(dr),
+               "drill" in (dr.state.data["ids"] or {}), "pipeline-escalation" in why,
+               "Ended:" in why),
+              ("could-not-test", True, True, [], True, False, False, False))
     dz, _r = drill_world("drill-no-planning-ticket", files=False)
     kind, why = drill_outcome(dz)
     check("drill-with-no-planning-ticket-did-not-test-the-miss-detection",

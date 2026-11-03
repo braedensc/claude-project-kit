@@ -319,12 +319,15 @@ escalating path, and they must agree:
 |---|---|---|
 | Ambiguous, contradictory or empty acceptance criteria | `<!-- pipeline-escalation: agent:blocked -->` | `blocked` / `needs_clarification` |
 | The work would drift outside the ticket's scope fence | `<!-- pipeline-escalation: agent:blocked -->` | `blocked` / `out_of_scope` |
-| The change would touch `autonomy.riskPaths` | `<!-- pipeline-escalation: agent:needs-human -->` | `blocked` / `risk_paths` |
+| The change would touch `autonomy.riskPaths` | `<!-- pipeline-escalation: needs-human-session -->` | `blocked` / `risk_paths` |
 
 The marker is an HTML comment so it is invisible in rendered markdown and exact to match:
-`<!--\s*pipeline-escalation:\s*(agent:blocked|agent:needs-human)\s*-->`. The bold line
-under it is for the human reading the ticket; the machine reads the comment marker and
-the telemetry `error_class`.
+`<!--\s*pipeline-escalation:\s*(agent:blocked|needs-human-session|agent:needs-human)\s*-->`.
+The bold line under it is for the human reading the ticket; the machine reads the comment
+marker and the telemetry `error_class`. `needs-human-session` requests `agent:needs-human`
+and tells the owner's page that a session stopped (KIT-282); the older
+`<!-- pipeline-escalation: agent:needs-human -->` still requests the same label, but a page
+built from it cannot say why, so write the one in the table.
 
 > **Why the session asks for a label instead of applying one.** `agent:*` labels are
 > dispatcher-owned (§6): a session that sets its own lifecycle labels is editing its own

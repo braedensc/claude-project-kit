@@ -103,9 +103,10 @@ but it is the case this design is built to catch:
 - **The circuit breaker.** A wrong note, or none, trips it:
   1. the evidence is written first, because cancelling deletes the session's working copy;
   2. the ticket is cancelled;
-  3. you are paged: the planning ticket gets an `agent:needs-human` mark the notifier reads
-     (the notifier scans only the teams in its `TEAM_KEYS`, so each planned repository's
-     team must be listed there);
+  3. you are paged: the planning ticket gets a `needs-human-routing` mark the notifier reads
+     (KIT-282), and the page says planning stopped and that the probe must be signed again;
+     the notifier adds `agent:needs-human`, and scans only the teams in its `TEAM_KEYS`, so
+     each planned repository's team must be listed there;
   4. the idea gets a note;
   5. **all planning stops**, on every team.
 
@@ -131,7 +132,10 @@ and it cannot merge.
   that history holds no state change at all, the owner must have created the ticket instead.
   Any recorded state change, by anyone, means only a recorded move into Plan it counts.
 - Says each refusal once per ticket, until the ticket's history changes. A new move gets a
-  new answer.
+  new answer. Each refusal is a page (KIT-338): it opens with the `planning-failed` mark and
+  a line saying how planning ended, and the notifier pages you once. In your direct
+  messages the page ends with `Reply replan <idea>`, where a replan can work: not for live
+  work, a plan that stands, or a history too long to read.
 - Never counts your creation of a ticket it already told has no move. That includes ideas
   an older version refused; each gets the note once more. Move it out of Plan it and back
   in.
@@ -355,12 +359,13 @@ later, edit that line and run the one command again.
   the bridge included, drops it with a note on the idea, and the job acts on that move
   instead. A re-run owed for more than a day of the machine being awake is dropped, and
   you are paged. A time-out's session is watched for an hour of awake time too.
-- **What you hear.** A re-run starting adds a note to the idea, and pages no one. With
-  re-runs on, the executor's own page for a refusal or an empty run is held back, and the
-  job pages once, when the move ends without a plan. That page names every run and how
+- **What you hear.** A re-run starting adds a note to the idea, and pages no one. The
+  executor's own page for a refusal or an empty run is held back on every run, and the job
+  pages once, when the move ends without a plan (KIT-338). That page names every run and how
   each ended. It sits on the last run's planning ticket. When a run's result could not be
   read, the page says what came of it is not certain, never that no plan was filed. A run
   that filed part of a plan is paged by the executor's own report, so the job adds none.
+  With re-runs off, the same page comes for the one run there is.
 - **Its record** is `~/.stage-a/state/replans.json`. A re-run is written there as owed
   before its ticket exists. If that file cannot be read, nothing is run again, the run that
   would have been is paged, and each pass exits 1 until a person looks.
@@ -460,9 +465,9 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
 
   Each note then says: if you have moved the idea back into Plan it since, that move
   starts its next run; if not, move it out and back in.
-  - **A stop pages no one.** The note carries no mark, so the notifier does not page it.
-    With re-runs off, the executor's mark is the only page a run gets. With them on, the
-    job pages a move that ends without a plan, once, and a stop is never one of those.
+  - **A stop pages you once** (KIT-338), on the closed planning ticket, since whoever
+    closed it may not be you. The note on the idea still carries no mark, so the page is
+    the only one.
   - **Only a closed or deleted ticket counts.** The session panel's Stop button leaves
     the ticket open. The run then reads as a session that ended without a plan.
   - **A ticket closed before its routing note** is a stop, not a misroute, only when it
