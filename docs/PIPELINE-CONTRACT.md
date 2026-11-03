@@ -18,6 +18,7 @@ exists to prevent.
 | [Autonomy tiers](#11-autonomy-tiers) | — | — | the approve and merge gates |
 | [Machine-readable schemas](#12-machine-readable-schemas) | `schemas/`, committed | this document (amend both together) | producers, validators, CI |
 | [Absence is not failure](#13-absence-is-not-failure) | — | — | every pipeline job that can legitimately do nothing |
+| [Status file](#16-status-file) | the role account's home, outside every worktree | the status job | the tech lead, the daily summaries, the heartbeat monitor |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -1448,8 +1449,8 @@ should be allowed to spend more, and then allows itself, does not have a budget.
 
 ## 12. Machine-readable schemas
 
-Every structure above is prose, and prose is what agents *read and try to follow*. Five
-of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
+Every structure in this document is prose, and prose is what agents *read and try to follow*.
+Seven of them are also **JSON Schema (draft 2020-12) files under `schemas/`**, and those files
 are not a second source of truth — they are this document in a form a machine can
 enforce. `scripts/check_schemas.py` fails CI if the two disagree about which fields
 exist.
@@ -1462,6 +1463,7 @@ exist.
 | §8 safe-outputs request file | `schemas/safe-outputs.schema.json` | bidirectional by field name |
 | §14 review findings file | `schemas/review-findings.schema.json` | bidirectional by field name |
 | §15 browser check block | `schemas/browser-check.schema.json` | bidirectional by field name |
+| §16 status file | `schemas/pipeline-status.schema.json` | bidirectional by field name |
 
 **Amending one of those sections means amending its schema in the same PR.** That is not
 a convention here — CI names the missing half.
@@ -1830,3 +1832,220 @@ An example, the shape the dark-mode plan's epic would have carried:
 Which names exist (viewports, modes, scenarios), which criteria a check may point at, and when
 a UI ticket must carry a block are the readiness gate's rules (`scripts/check_ticket_dor.py`),
 not shape.
+
+---
+
+## 16. Status file
+
+One file says where every plan stands: its pieces, their pull requests, each pull request's
+merge state, the required checks named in the job's config, and the newest Stage E review
+(KIT-335). The status job, `scripts/pipeline_status_local.py`, writes it each pass. It runs
+with no AI, as the role account, like the Stage E jobs. The tech lead, the daily summaries
+and the GitHub-only pages read this file. None of them holds a GitHub token (owner decision
+5, KIT-306 path A). Machine-readable: `schemas/pipeline-status.schema.json`. The job checks
+its document against that schema before it writes, and writes nothing that does not conform.
+
+**Fields only.** Every value is an id, a cleaned title, a state from a closed list, a count,
+a time or a link. No pull request, comment or review text reaches the file, and no pull
+request title: the ticket's own title names the piece. A cleaned title is one line, at most
+120 characters, with no angle bracket, ampersand, pipe or backtick, and no control, format
+or other hidden character (Unicode categories Cc, Cf, Co and Cs, and variation selectors):
+a title a session wrote cannot carry text only a model would read. A reader can quote it as
+data.
+
+**Reporting, never authority.** A session can write a ticket's title and labels and a pull
+request's branch. Nothing may read this file to decide what to run, merge or approve.
+
+### Where the facts come from
+
+| Source | What it gives | Read how |
+|---|---|---|
+| `tracker` | Each plan the idea gate filed: an issue labelled `provenance:agent`, with no parent and at least one child. Its children are the pieces. Each piece's pull requests are the links the GitHub integration attached, the bridge's own rule (KIT-299). A link of any other source is passed over, since a session can attach any link to its own ticket. | Linear, with the role account's key |
+| `github` | Each linked pull request's state, merge state, labels and head commit, and the check runs on that commit. | GitHub REST, with the role account's token |
+| `reviews` | The review poller's outcome record for each pull request: `<review_state_dir>/outcomes/<owner>__<repo>__pr-<n>.json`. | The file system, as the role account |
+
+A plan is listed while it is open, and for `lookback_hours` (default 72) after it finishes.
+So a summary can say what shipped since the day before.
+
+### Shape
+
+```json
+{
+  "schema": "pipeline-status/1",
+  "written_at": "2026-11-03T18:05:00Z",
+  "started_at": "2026-11-03T18:04:31Z",
+  "result": "partial",
+  "error": null,
+  "lookback_hours": 72,
+  "sources": {
+    "tracker": {"state": "read", "asked": 3, "answered": 3, "reason": null, "read_at": "2026-11-03T18:04:40Z"},
+    "github": {"state": "partly-read", "asked": 4, "answered": 3, "reason": "acme/app#41: GitHub answered HTTP 404", "read_at": "2026-11-03T18:04:52Z"},
+    "reviews": {"state": "read", "asked": 2, "answered": 2, "reason": null, "read_at": "2026-11-03T18:04:52Z"}
+  },
+  "counts": {"plans": 1, "pieces": 2, "pull_requests": 2, "open": 1, "merged": 1, "closed": 0, "unknown": 0, "conflicting": 1},
+  "plans": [{
+    "id": "ENG-300", "title": "Dark mode", "url": "https://linear.app/acme/issue/ENG-300",
+    "team": "ENG", "state": "In Progress", "state_type": "started",
+    "created_at": "2026-11-01T09:00:00Z", "updated_at": "2026-11-03T17:00:00Z",
+    "completed_at": null, "canceled_at": null, "pieces_complete": true,
+    "pieces": [{
+      "id": "ENG-301", "title": "Back the palette with CSS variables",
+      "url": "https://linear.app/acme/issue/ENG-301", "state": "Needs Approval",
+      "state_type": "unstarted", "started_at": "2026-11-02T10:00:00Z", "completed_at": null,
+      "canceled_at": null, "updated_at": "2026-11-03T16:30:00Z", "flags": [],
+      "prs_complete": true,
+      "prs": [{
+        "repo": "acme/app", "number": 40, "url": "https://github.com/acme/app/pull/40",
+        "source": "github", "error": null, "state": "open", "draft": false,
+        "opened_at": "2026-11-02T11:00:00Z", "updated_at": "2026-11-03T16:00:00Z",
+        "merged_at": null, "closed_at": null, "head_sha": "0123456789ab", "base": "main",
+        "mergeable": "conflicting", "merge_state": "dirty", "labels": ["conflict"],
+        "checks": {"result": "waiting", "required": [
+          {"name": "Kit checks", "state": "passing", "waits_on_person": false},
+          {"name": "Hooks change guard", "state": "failing", "waits_on_person": true}]},
+        "review": {"state": "notes", "at": "2026-11-03T15:00:00Z", "max_severity": "low",
+                   "findings": 2, "current": true}
+      }]
+    }]
+  }],
+  "findings": [{"kind": "github", "state": "unknown", "summary": "partly-read: acme/app#41: GitHub answered HTTP 404"}],
+  "firing": []
+}
+```
+
+The example leaves out the plan's second piece for room. Its pull request, #41, is the one
+GitHub answered 404 for, and the tracker's link says it is merged. `counts` and `sources` cover
+both pieces.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-status/1"` | A reader that does not know the value refuses the file. |
+| `written_at` | time | When this pass wrote it. Its age is the answer to "how old is this?". The heartbeat monitor judges the job stale by it. |
+| `started_at` | time | When this pass began reading. |
+| `result` | `ok` \| `partial` \| `failed` | `ok`: every source was read. `partial`: at least one was not read whole (exit 3). `failed`: no source that is on could be read (exit 1). See *Exit codes and the heartbeat* for a pass with no network. |
+| `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line saying why, with both credentials scrubbed, and every source that is on is `could-not-read`. A pass cut short by its clock or a cap is `partial`, and that source's `reason` says so. |
+| `lookback_hours` | integer | How long a finished plan stays listed. |
+| `sources` | object | `tracker`, `github` and `reviews`, each a source below. |
+| `counts` | object | `plans`, `pieces`, `pull_requests`, and the pull requests that are `open`, `merged`, `closed`, `unknown` and `conflicting`. A quiet day says what was checked from these. |
+| `plans` | plan[] | At most 100. Empty when the tracker could not be read: `sources.tracker` says so. |
+| `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
+| `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
+
+Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source gave none.
+
+### A source
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every question was answered. `partly-read`: some were not. `could-not-read`: none was, or none could be asked. `off`: the config turns it off (`reviews` only). |
+| `asked` | integer | Questions put to it this pass: tracker queries; GitHub requests (a probe, then each pull request and each check-run listing); review records looked for. |
+| `answered` | integer | How many it answered. A review record that does not exist is an answer: no review yet. |
+| `reason` | string \| null | Why it was not read whole: a missing key, an HTTP status, a timeout. Null when it was, or when it is off. |
+| `read_at` | time \| null | When this pass last had an answer from it. |
+
+A reader says "I couldn't check" for a source that is not `read`. It never guesses (KIT-348).
+
+### A plan
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | The epic's ticket id. |
+| `title` | string | Cleaned. |
+| `url` | string \| null | The ticket's link in the tracker. |
+| `team` | string | The team key. |
+| `state` | string | The state's name, cleaned. |
+| `state_type` | enum | The tracker's own kind: `triage`, `backlog`, `unstarted`, `started`, `completed` or `canceled`; `unknown` for any other. |
+| `created_at`, `updated_at`, `completed_at`, `canceled_at` | time \| null | From the tracker. |
+| `pieces_complete` | boolean | False when the plan has more children than one read holds (50). |
+| `pieces` | piece[] | In ticket-number order. |
+
+### A piece
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `title`, `url`, `state`, `state_type` | as a plan's | |
+| `started_at`, `completed_at`, `canceled_at`, `updated_at` | time \| null | A piece's start and finish, for the evening wrap (KIT-349). |
+| `flags` | string[] | The lifecycle labels on it, from a closed list: `agent:blocked`, `agent:needs-human`, `blocked:capacity`, `hooks-change` (§6). |
+| `prs_complete` | boolean | False when it has more links than one read holds (25). |
+| `prs` | pull request[] | Empty when no pull request is linked yet. |
+
+### A pull request
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | `owner/name`. |
+| `number` | integer | |
+| `url` | string | Its GitHub link. |
+| `source` | `github` \| `tracker` | `github`: GitHub answered this pass. `tracker`: it did not, so `state` is what the tracker's link says, and `error` says why. |
+| `error` | string \| null | Why GitHub was not read for it, or for its check runs. Null when both were. |
+| `state` | `open` \| `merged` \| `closed` \| `unknown` | |
+| `draft` | boolean \| null | |
+| `opened_at`, `updated_at`, `merged_at`, `closed_at` | time \| null | From GitHub. |
+| `head_sha` | string \| null | The head commit, cut to 12 characters. |
+| `base` | string \| null | The branch it merges into. |
+| `mergeable` | `mergeable` \| `conflicting` \| `unknown` | A conflict that waits on a person (KIT-350). `unknown` until GitHub has worked it out. |
+| `merge_state` | string \| null | GitHub's own word: `clean`, `dirty`, `blocked`, `behind`, `unstable`, `draft`, `has_hooks` or `unknown`. |
+| `labels` | string[] | Pipeline labels from a closed list: `conflict` (the conflict loop's) and `hooks-change`. |
+| `checks` | object | `result`, and `required`: one check below per name the config lists for this repository, in its order. |
+| `review` | object | The newest Stage E review, below. |
+
+`checks.result` is `passing` when every named check passed, and `failing` when one that does
+not wait on a person failed. It is `pending` when one that does not wait on a person is
+running or has not started, and `waiting` when only checks that wait on a person are not
+passing. `none` means the config
+names no check for this repository, and `unknown` means the checks were not read.
+
+### A check
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | The check's name from `required_checks` in the job's config, cleaned like a title. Runs are matched on the name as configured. |
+| `state` | `passing` \| `failing` \| `pending` \| `missing` \| `unknown` | The newest run of that name on the head commit. `missing`: no run of that name. `unknown`: the runs were not read, or GitHub listed only some and this name was not among them; the pull request's `error` says which. |
+| `waits_on_person` | boolean | True for a check only a person turns green, such as the `hooks-change` label's guard (`human_pending_checks` in the config). |
+
+### A review
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | enum | `none`: no review on record. `clean`: reviewed, nothing found. `notes`: findings below the threshold. `findings`: findings at or above it, so Stage E sends it back. `partial`: whole files were withheld from the reviewer and nothing it saw met the threshold, so a person reviews the rest; never `clean` (KIT-138). `not-reviewed`: the reviewer could not judge it. `unknown`: the record could not be read, or reviews are off. |
+| `at` | time \| null | When the review was recorded. |
+| `max_severity` | `low` \| `medium` \| `high` \| `critical` \| null | |
+| `findings` | integer \| null | How many findings. Never what they say. |
+| `current` | boolean \| null | True when the review judged the pull request's current head. Null when either head is unknown. |
+
+### A finding
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | `tracker` \| `github` \| `reviews` | The source. |
+| `state` | `unknown` \| `firing` | `unknown` never pages. `firing` pages, and only on a `failed` pass. |
+| `summary` | string | The source's state and reason, on one line. |
+
+### Exit codes and the heartbeat
+
+The file is the job's heartbeat, in the health watch's words (`findings`, `firing`), so the
+heartbeat monitor can read it the way it reads the health watch's file. Its row is KIT-411's,
+with the step that installs the job. `ok` and `partial` are good results, and a source not
+read whole is a finding that does not page: one source down for a pass is a network blip or a
+dark wake, and the jobs that use that source page it if it stays down. `failed` fires its
+sources, a pass that stopped on an error carries `error`, and a file that stops being written
+is stale.
+
+**A pass with no network is `partial`, not `failed`, when reviews are on.** The tracker and
+GitHub are `could-not-read`, and the review records are still `read`, with nothing to look
+up. That is deliberate: a laptop makes dark wakes with no network all night, and a page must
+mean something is broken. The review poller, the bounce driver and the catch-up poller use the
+same tracker key and GitHub token, and they page an outage that lasts. `failed` is reached
+when the review records cannot be read either, or reviews are off, or the pass crashes.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every source was read, and the file was written. |
+| 3 | The file was written, and at least one source was not read whole. It names which. A pass with no network lands here when reviews are on. |
+| 1 | No source that is on could be read, the pass crashed, or the file could not be written or did not conform. A file that did not conform is not written at all. |
+| 2 | Usage or config: nothing was read or written. |
+
+A `--dry-run` reads everything, checks the document, prints its summary and where it would
+write, and writes nothing. `--print` also prints the document.

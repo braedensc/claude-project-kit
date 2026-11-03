@@ -249,6 +249,11 @@ jobs:
       # webhook's three states, the cap, the ledger and the thread backstop.
       - name: Stage E catch-up poller selftest (lost delegations, one re-prompt each)
         run: python3 scripts/pipeline_catchup_poller.py --selftest
+      # The status job (KIT-335, contract §16): one file of where every plan stands, for the
+      # tech lead. Offline, both transports stood in for: fields only, a source that fails is
+      # said and the file still written, in the words the heartbeat monitor reads.
+      - name: Stage E status job selftest (fields only, a failed source said, never guessed)
+        run: python3 scripts/pipeline_status_local.py --selftest
       # Stage E's bounce driver (same ADR, decision 5, option 4). Offline, every read
       # and write stubbed and recorded: bounce numbers N-1/N/N+1 ⇒ bounce/bounce/exhaust,
       # the ledger row lands BEFORE the re-prompt is sent (a failed send is still spent,
